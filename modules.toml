@@ -12,5 +12,8 @@
 # Module edges form no cycle. External crates are not listed here; deny.toml governs them.
 # Covers cargo crates only (no AOSP / ninja modules yet).
 
+[generators]
+crates = ["atl-bridgegen"]
+
 [xtask]
 crates = ["xtask"]

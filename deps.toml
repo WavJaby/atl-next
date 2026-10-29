@@ -28,6 +28,13 @@ arch = "git"
 scope = ["build", "test"]
 used_by = ["xtask:check", "xtask:fetch", "xtask:patch"]
 
+[libclang]
+debian = "libclang-19-dev"
+# Arch's clang package ships libclang
+arch = "clang"
+scope = ["build"]
+used_by = ["crate:atl-bridgegen"]
+
 [python3-venv]
 debian = "python3-venv"
 # Arch's python package includes venv/ensurepip
