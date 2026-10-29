@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Pinned exact release. Needs stable `c_variadic` (bionic bridge varargs shells): verified on 1.99.1,
+# `extern "C" fn f(n: i32, mut args: ...)` + `VaList::next_arg`.
+# No `targets` list: arches come only from arches.toml; xtask adds targets from there.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

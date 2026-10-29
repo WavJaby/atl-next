@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+//! `xtask check`: the static + unit test tiers.
+
+use std::path::Path;
+use std::process::{Command, ExitCode};
+
+use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
+
+use crate::{arches, spdx};
+
+#[derive(clap::Args)]
+pub struct Args {
+    /// Run only these steps (repeatable).
+    #[arg(long, value_enum)]
+    only: Vec<Step>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Step {
+    /// rustfmt, check mode
+    Fmt,
+    /// SPDX header on every tracked or new, non-ignored file
+    Spdx,
+    /// repo tables (arches.toml) parse with their schema and invariants
+    Tables,
+    /// clippy on all targets, warnings denied
+    Clippy,
+    /// cargo-deny: advisories, bans, licences, sources
+    Deny,
+    /// cargo test, whole workspace
+    Test,
+}
+
+const ALL: [Step; 6] = [
+    Step::Fmt,
+    Step::Spdx,
+    Step::Tables,
+    Step::Clippy,
+    Step::Deny,
+    Step::Test,
+];
+
+impl Step {
+    fn name(self) -> &'static str {
+        match self {
+            Step::Fmt => "fmt",
+            Step::Spdx => "spdx",
+            Step::Tables => "tables",
+            Step::Clippy => "clippy",
+            Step::Deny => "deny",
+            Step::Test => "test",
+        }
+    }
+
+    fn run(self, root: &Path) -> Result<()> {
+        match self {
+            Step::Fmt => cargo(root, &["fmt", "--all", "--check"]),
+            Step::Spdx => spdx::check(root),
+            Step::Tables => {
+                let arches = arches::load(root)?;
+                eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
+                Ok(())
+            }
+            Step::Clippy => cargo(
+                root,
+                &[
+                    "clippy",
+                    "--workspace",
+                    "--all-targets",
+                    "--locked",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            ),
+            Step::Deny => {
+                // a missing tool fails the step; skipping would report a check that never ran
+                cargo(root, &["deny", "--version"])
+                    .context("cargo-deny not installed: cargo install --locked cargo-deny")?;
+                cargo(root, &["deny", "--locked", "check"])
+            }
+            Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
+        }
+    }
+}
+
+pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let steps: Vec<Step> = ALL
+        .into_iter()
+        .filter(|s| args.only.is_empty() || args.only.contains(s))
+        .collect();
+    let mut failed = Vec::new();
+    for step in &steps {
+        eprintln!("== check: {}", step.name());
+        if let Err(e) = step.run(root) {
+            eprintln!("== check: {} FAILED: {e:#}", step.name());
+            failed.push(step.name());
+        }
+    }
+    if failed.is_empty() {
+        println!("check: ok ({} steps)", steps.len());
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!(
+            "check: FAILED {} of {} steps: {}",
+            failed.len(),
+            steps.len(),
+            failed.join(", ")
+        );
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+fn cargo(root: &Path, args: &[&str]) -> Result<()> {
+    // `CARGO` is set by `cargo run` to the cargo of the pinned toolchain
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(args)
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("spawning cargo {}", args.join(" ")))?;
+    if !status.success() {
+        bail!("cargo {} exited with {status}", args.join(" "));
+    }
+    Ok(())
+}

@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: MIT
+# The only list of architectures. Every name a tool needs for an arch is a column here; nothing converts
+# arch names ad hoc. Adding an arch = one row here + its per-arch modules, no edits elsewhere.
+#
+# Row key: ART instruction-set string (`GetInstructionSetString`), also the per-arch module name.
+#   pointer_bits      32 | 64
+# `[<arch>.host]` present = we build and run on it (one 64-bit process per app):
+#   rust              Rust target triple of the host build
+#   meson_cpu_family  meson `cpu_family` (QEMU cross files)
+#   debian            Debian architecture name
+#   archlinux         Arch Linux architecture; absent where Arch has no official port
+# `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
+# the QEMU bridge):
+#   android_abis      APK `lib/<abi>/` names, preferred first
+#   clang             clang triple for guest bionic and guest libs (Soong `ClangTriple`)
+#   qemu_target       QEMU linux-user target (`<qemu_target>-linux-user`)
+#
+# No priority or engine columns: ABI preference (native > translated 64-bit > translated 32-bit) follows
+# from host match and pointer_bits; one translator engine exists.
+# Later-goal arches get a row when work on them starts.
+
+[arm]
+pointer_bits = 32
+
+[arm.guest]
+android_abis = ["armeabi-v7a", "armeabi"]
+clang = "armv7a-linux-androideabi"
+qemu_target = "arm"
+
+[arm64]
+pointer_bits = 64
+
+[arm64.host]
+rust = "aarch64-unknown-linux-gnu"
+meson_cpu_family = "aarch64"
+debian = "arm64"
+
+[arm64.guest]
+android_abis = ["arm64-v8a"]
+clang = "aarch64-linux-android"
+qemu_target = "aarch64"
+
+[riscv64]
+pointer_bits = 64
+
+[riscv64.host]
+rust = "riscv64gc-unknown-linux-gnu"
+meson_cpu_family = "riscv64"
+debian = "riscv64"
+
+[riscv64.guest]
+android_abis = ["riscv64"]
+clang = "riscv64-linux-android"
+qemu_target = "riscv64"
+
+[x86]
+pointer_bits = 32
+
+[x86.guest]
+android_abis = ["x86"]
+clang = "i686-linux-android"
+qemu_target = "i386"
+
+[x86_64]
+pointer_bits = 64
+
+[x86_64.host]
+rust = "x86_64-unknown-linux-gnu"
+meson_cpu_family = "x86_64"
+debian = "amd64"
+archlinux = "x86_64"
+
+[x86_64.guest]
+android_abis = ["x86_64"]
+clang = "x86_64-linux-android"
+qemu_target = "x86_64"

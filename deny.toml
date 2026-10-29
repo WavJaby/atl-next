@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+# cargo-deny policy for every crate we link. Crate licences only; the licence gate for upstream C/C++
+# sources is a separate xtask step.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+# Only what the current dependency graph needs. A new licence is a deliberate addition checked
+# against the licence rules: no GPL-3 linked into the runtime; no GPL-2.0-only without a linking
+# exception anywhere.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.93
+
+[bans]
+# one version of each crate in the graph
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Host toolkit / desktop-bus crates are reachable only through the platform layer: core crates depend
+# on the `atl-platform-*` facades. When a `-<os>` implementation crate is created, it is added to the
+# matching entry's `wrappers` -- the only crates allowed to depend on it directly.
+deny = [
+    { crate = "gtk4", reason = "platform layer only" },
+    { crate = "gtk4-sys", reason = "platform layer only" },
+    { crate = "gdk4", reason = "platform layer only" },
+    { crate = "gdk4-sys", reason = "platform layer only" },
+    { crate = "gdk4-wayland", reason = "platform layer only" },
+    { crate = "wayland-client", reason = "platform layer only" },
+    { crate = "wayland-backend", reason = "platform layer only" },
+    { crate = "wayland-sys", reason = "platform layer only" },
+    { crate = "zbus", reason = "platform layer only" },
+    { crate = "ashpd", reason = "platform layer only" },
+    { crate = "windows", reason = "platform layer only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
