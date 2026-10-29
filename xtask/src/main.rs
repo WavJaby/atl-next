@@ -7,6 +7,7 @@
 mod arches;
 mod check;
 mod deps;
+mod providers;
 mod sources;
 mod spdx;
 

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, sources, spdx};
+use crate::{arches, deps, providers, sources, spdx};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,7 +22,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches.toml, sources.toml, deps.toml) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers) parse with their schema and invariants
     Tables,
     /// clippy on all targets, warnings denied
     Clippy,
@@ -67,8 +67,11 @@ impl Step {
                     sources.aosp.projects.len(),
                     sources.git.len()
                 );
-                let deps = deps::load(root, &deps::Consumers::collect(root, &sources)?)?;
+                let consumers = deps::Consumers::collect(root, &sources)?;
+                let deps = deps::load(root, &consumers)?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
+                let providers = providers::load(root, &consumers.crates, &deps)?;
+                eprintln!("tables: {} ok ({} rows)", providers::FILE, providers.len());
                 Ok(())
             }
             Step::Clippy => cargo(

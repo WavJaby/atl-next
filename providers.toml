@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Android.bp modules of the host build that are not built from AOSP source, and who provides them
+# instead. Unlisted modules are built from AOSP source by the converter. Guest-side libraries (guest
+# bionic, thunks) are the bridge's concern, not this table's.
+#
+# Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree).
+#   provider  crate:<workspace crate>   our Rust crate, built with cargo-c into the prefix
+#             deps:<deps.toml row>      a system library; that row needs `pkgconfig` and
+#                                       `used_by` containing `upstream:aosp`
+#   reason    why AOSP's own module is not used
+# Artifacts are not listed: they follow from the provider (cargo-c output, pkg-config).
+# Rows are added when their provider exists.
