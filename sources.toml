@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# The upstream manifest: where each upstream comes from and the commit it is pinned to. Fetch only:
+# build order comes from the converter's ninja graph and providers.toml, never from here. Patches are
+# not listed; they are whatever patches/<upstream>/ holds.
+#
+# [aosp] -- every AOSP project, checked out in AOSP tree layout (Android.bp paths are tree-relative):
+#   remote    URL prefix; a project's URL = remote + its path
+#   tag       the one AOSP tag every project is pinned to
+#   projects  AOSP tree path -> commit the tag resolves to in that project
+#             (checkout src/aosp/<path>, patches patches/aosp/<path>/)
+# [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
+#   git       clone URL
+#   tag       release tag
+#   commit    commit the tag resolves to
+#
+# The commit is the content pin; fetch verifies the tag still resolves to it, so a moved tag fails.
+# Rows are added when a build step first needs them.
+
+[aosp]
+remote = "https://android.googlesource.com/platform/"
+tag = "android-16.0.0_r1"
+
+[aosp.projects]

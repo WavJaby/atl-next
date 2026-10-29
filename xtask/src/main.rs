@@ -6,6 +6,7 @@
 
 mod arches;
 mod check;
+mod sources;
 mod spdx;
 
 use std::path::PathBuf;
