@@ -23,6 +23,7 @@ tag = "android-16.0.0_r1"
 [aosp.projects]
 art = "ed6c006bd06ae060bd9698fd2cb25c4865512ec3"
 bionic = "09a271af557444c9a6b3f3146d6d474156fd6cdb"
+"frameworks/libs/native_bridge_support" = "b527289974e3883460370012325ab3736d59268a"
 
 [qemu]
 git = "https://gitlab.com/qemu-project/qemu.git"
