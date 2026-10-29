@@ -21,3 +21,10 @@ remote = "https://android.googlesource.com/platform/"
 tag = "android-16.0.0_r1"
 
 [aosp.projects]
+art = "ed6c006bd06ae060bd9698fd2cb25c4865512ec3"
+bionic = "09a271af557444c9a6b3f3146d6d474156fd6cdb"
+
+[qemu]
+git = "https://gitlab.com/qemu-project/qemu.git"
+tag = "v11.1.3"
+commit = "005c61c0ef6f6ae615283440b4bb7be51b2c6ddd"

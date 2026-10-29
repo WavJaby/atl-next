@@ -7,6 +7,7 @@
 mod arches;
 mod check;
 mod deps;
+mod fetch;
 mod licenses;
 mod modules;
 mod providers;
@@ -40,6 +41,12 @@ enum Command {
     /// Distro rows: package installed (dpkg-query / pacman), `min` met (pkg-config for libraries,
     /// package version otherwise). Cargo rows: exact version in `cargo install --list`. Read-only.
     Deps(deps::Args),
+    /// Upstream checkouts under <workspace>/src at the pins in sources.toml.
+    ///
+    /// Dry run by default (offline): shows what each checkout needs. Checkouts are shallow (the pinned
+    /// tag only); `git fetch --unshallow` inside one before bisecting. A checkout on a branch belongs to
+    /// `xtask patch`; one with uncommitted changes is never moved.
+    Fetch(fetch::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -48,6 +55,7 @@ fn main() -> Result<ExitCode> {
     match cli.command {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
+        Command::Fetch(args) => fetch::run(&root, &args),
     }
 }
 

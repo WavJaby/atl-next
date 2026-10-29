@@ -19,8 +19,8 @@
 [cargo-deny]
 cargo = "cargo-deny"
 version = "0.20.2"
-scope = ["test"]
-used_by = ["xtask:check"]
+scope = ["build", "test"]
+used_by = ["xtask:check", "xtask:fetch"]
 
 [git]
 debian = "git"
