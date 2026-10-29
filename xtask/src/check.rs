@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, providers, sources, spdx};
+use crate::{arches, deps, modules, providers, sources, spdx, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -24,6 +24,8 @@ enum Step {
     Spdx,
     /// repo tables (arches, sources, deps, providers) parse with their schema and invariants
     Tables,
+    /// modules.toml equals the real cross-module crate graph
+    Modules,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -32,10 +34,11 @@ enum Step {
     Test,
 }
 
-const ALL: [Step; 6] = [
+const ALL: [Step; 7] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
+    Step::Modules,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -47,6 +50,7 @@ impl Step {
             Step::Fmt => "fmt",
             Step::Spdx => "spdx",
             Step::Tables => "tables",
+            Step::Modules => "modules",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -67,11 +71,22 @@ impl Step {
                     sources.aosp.projects.len(),
                     sources.git.len()
                 );
-                let consumers = deps::Consumers::collect(root, &sources)?;
-                let deps = deps::load(root, &consumers)?;
+                let workspace = workspace::load(root)?;
+                let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
-                let providers = providers::load(root, &consumers.crates, &deps)?;
+                let providers = providers::load(root, &workspace.crates, &deps)?;
                 eprintln!("tables: {} ok ({} rows)", providers::FILE, providers.len());
+                Ok(())
+            }
+            Step::Modules => {
+                let workspace = workspace::load(root)?;
+                let modules = modules::load(root, &workspace)?;
+                eprintln!(
+                    "modules: {} ok ({} modules, {} crate edges)",
+                    modules::FILE,
+                    modules.len(),
+                    workspace.edges.len()
+                );
                 Ok(())
             }
             Step::Clippy => cargo(

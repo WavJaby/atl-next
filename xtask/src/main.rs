@@ -7,9 +7,11 @@
 mod arches;
 mod check;
 mod deps;
+mod modules;
 mod providers;
 mod sources;
 mod spdx;
+mod workspace;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

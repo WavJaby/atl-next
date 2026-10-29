@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::sources::{self, Sources};
+use crate::workspace::{self, Workspace};
 
 pub const FILE: &str = "deps.toml";
 
@@ -45,14 +46,14 @@ pub struct Consumers {
 }
 
 impl Consumers {
-    pub fn collect(root: &Path, sources: &Sources) -> Result<Self> {
+    pub fn new(workspace: &Workspace, sources: &Sources) -> Self {
         let mut upstreams: BTreeSet<String> = sources.git.keys().cloned().collect();
         upstreams.insert("aosp".to_owned());
-        Ok(Self {
-            crates: workspace_crates(root)?,
+        Self {
+            crates: workspace.crates.clone(),
             upstreams,
             xtask: crate::subcommands(),
-        })
+        }
     }
 
     fn resolve(&self, reference: &str) -> Result<()> {
@@ -68,35 +69,6 @@ impl Consumers {
         ensure!(known.contains(name), "`{reference}`: no such {kind}");
         Ok(())
     }
-}
-
-fn workspace_crates(root: &Path) -> Result<BTreeSet<String>> {
-    #[derive(Deserialize)]
-    struct Metadata {
-        packages: Vec<Package>,
-    }
-    #[derive(Deserialize)]
-    struct Package {
-        name: String,
-    }
-    let out = crate::cargo_command()
-        .args([
-            "metadata",
-            "--no-deps",
-            "--offline",
-            "--format-version",
-            "1",
-        ])
-        .current_dir(root)
-        .output()
-        .context("running cargo metadata")?;
-    ensure!(
-        out.status.success(),
-        "cargo metadata: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: Metadata = serde_json::from_slice(&out.stdout).context("parsing cargo metadata")?;
-    Ok(meta.packages.into_iter().map(|p| p.name).collect())
 }
 
 pub fn load(root: &Path, consumers: &Consumers) -> Result<Deps> {
@@ -212,7 +184,7 @@ enum Distro {
 
 pub fn run(root: &Path, _args: &Args) -> Result<ExitCode> {
     let sources = sources::load(root)?;
-    let deps = load(root, &Consumers::collect(root, &sources)?)?;
+    let deps = load(root, &Consumers::new(&workspace::load(root)?, &sources))?;
     let distro = host_distro()?;
     let cargo_installed = cargo_installed()?;
     let mut problems = Vec::new();

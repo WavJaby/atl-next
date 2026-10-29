@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Architecture modules and the edges between them. `cargo xtask check` step `modules` fails unless this
+# file equals the real crate graph: an undeclared edge fails, and so does a declaration no edge uses.
+# Architecture diagrams are generated from it, never drawn by hand.
+#
+# Row key: module name.
+#   crates     workspace crates of this module; every crate is in exactly one module
+#   exports    crates other modules may depend on (the module's interface); default none
+#   uses       modules whose exports this module depends on; default none
+#   [<module>.direct_link.<target>]
+#     reason   a declared crossing into non-exported crates of <target> (e.g. zero-copy buffer sharing)
+# Module edges form no cycle. External crates are not listed here; deny.toml governs them.
+# Covers cargo crates only (no AOSP / ninja modules yet).
+
+[xtask]
+crates = ["xtask"]
