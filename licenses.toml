@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# The one licence policy: which licences may be compiled into each shipped artifact. A licence not listed
+# for an artifact fails, so a new licence is a reviewed change here. `cargo xtask check` step `tables`
+# checks: ids exist in the SPDX list and are not deprecated; no bare GPL-2.0-only anywhere (only as an
+# explicit `GPL-2.0-only WITH <exception>` entry); no GPL-3 family in `runtime`; deny.toml's crate allow
+# list stays within `runtime`.
+#
+# [artifact.<name>]
+#   allow        SPDX licences, each `<id>` or `<id> WITH <exception>`
+#     runtime    the ART process, atld, our libraries and everything they link
+# [upstream.<name>]   a sources.toml upstream
+#   unlabelled   licence of its files that carry no licence header, from the upstream's LICENSE text
+# Rows are added when a compiled set first needs them.
+
+[artifact.runtime]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, modules, providers, sources, spdx, workspace};
+use crate::{arches, deps, licenses, modules, providers, sources, spdx, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,7 +22,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses) parse with their schema and invariants
     Tables,
     /// modules.toml equals the real cross-module crate graph
     Modules,
@@ -72,10 +72,17 @@ impl Step {
                     sources.git.len()
                 );
                 let workspace = workspace::load(root)?;
-                let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
+                let consumers = deps::Consumers::new(&workspace, &sources);
+                let deps = deps::load(root, &consumers)?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
                 let providers = providers::load(root, &workspace.crates, &deps)?;
                 eprintln!("tables: {} ok ({} rows)", providers::FILE, providers.len());
+                let licenses = licenses::load(root, &consumers.upstreams)?;
+                eprintln!(
+                    "tables: {} ok ({} artifacts, deny.toml within runtime)",
+                    licenses::FILE,
+                    licenses.artifact.len()
+                );
                 Ok(())
             }
             Step::Modules => {

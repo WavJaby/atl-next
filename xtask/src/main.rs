@@ -7,6 +7,7 @@
 mod arches;
 mod check;
 mod deps;
+mod licenses;
 mod modules;
 mod providers;
 mod sources;
