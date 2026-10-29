@@ -2,14 +2,16 @@
 # The one licence policy: which licences may be compiled into each shipped artifact. A licence not listed
 # for an artifact fails, so a new licence is a reviewed change here. `cargo xtask check` step `tables`
 # checks: ids exist in the SPDX list and are not deprecated; no bare GPL-2.0-only anywhere (only as an
-# explicit `GPL-2.0-only WITH <exception>` entry); no GPL-3 family in `runtime`; deny.toml's crate allow
-# list stays within `runtime`.
+# explicit `GPL-2.0-only WITH <exception>` entry); GPL-3 family in `runtime` only `WITH` an exception that
+# frees its users (GCC runtime, Bison); once `qemu-bridge` exists, `runtime` stays within it (runtime code
+# shares the bridge's process); deny.toml's crate allow list stays within `runtime`.
 #
 # [artifact.<name>]
-#   allow        SPDX licences, each `<id>` or `<id> WITH <exception>`
-#     runtime    the ART process, atld, our libraries and everything they link
+#   allow          SPDX licences, each `<id>` or `<id> WITH <exception>`
+#     runtime      the ART process, atld, our libraries and everything they link
+#     qemu-bridge  the dlopened QEMU bridge, distributed as GPL-3.0-or-later: licences combinable with GPL-3
 # [upstream.<name>]   a sources.toml upstream
-#   unlabelled   licence of its files that carry no licence header, from the upstream's LICENSE text
+#   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text
 # Rows are added when a compiled set first needs them.
 
 [artifact.runtime]

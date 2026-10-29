@@ -11,6 +11,8 @@ use crate::sources;
 
 pub const FILE: &str = "licenses.toml";
 const RUNTIME: &str = "runtime";
+/// The GPL-3.0-or-later QEMU bridge; its allow list = licences combinable with GPL-3.
+const BRIDGE: &str = "qemu-bridge";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,15 +82,16 @@ fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses> {
         let mut seen = BTreeSet::new();
         for entry in &artifact.allow {
             let licence = parse_licence(entry).with_context(|| format!("[artifact.{name}]"))?;
-            // CLAUDE.md licence rules: GPL-2.0-only only with a linking exception; no GPL-3 in the runtime
+            // CLAUDE.md licence rules: GPL-2.0-only only with a linking exception; GPL-3 in the
+            // runtime only with an exception that frees its users (GCC runtime, Bison)
             ensure!(
                 !(licence.id == "GPL-2.0-only" && licence.exception.is_none()),
                 "[artifact.{name}]: bare GPL-2.0-only; only `GPL-2.0-only WITH <linking exception>`"
             );
+            let gpl3 = licence.id.starts_with("GPL-3.0") || licence.id.starts_with("AGPL-3.0");
             ensure!(
-                !(name == RUNTIME
-                    && (licence.id.starts_with("GPL-3.0") || licence.id.starts_with("AGPL-3.0"))),
-                "[artifact.{RUNTIME}]: `{entry}` -- no GPL-3 family in the runtime"
+                !(name == RUNTIME && gpl3 && licence.exception.is_none()),
+                "[artifact.{RUNTIME}]: bare `{entry}`; GPL-3 only as `<id> WITH <exception>`"
             );
             ensure!(
                 seen.insert(licence),
@@ -108,7 +111,29 @@ fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses> {
             "[upstream.{name}]: unlabelled takes a plain id"
         );
     }
+    check_bridge_superset(&licenses)?;
     Ok(licenses)
+}
+
+/// Runtime code shares a process with the GPL-3 bridge, so every runtime licence must also be one
+/// the bridge may be combined with. Active once the bridge artifact exists.
+fn check_bridge_superset(licenses: &Licenses) -> Result<()> {
+    let Some(bridge) = licenses.artifact.get(BRIDGE) else {
+        return Ok(());
+    };
+    let bridge: BTreeSet<Licence> = bridge
+        .allow
+        .iter()
+        .map(|e| parse_licence(e))
+        .collect::<Result<_>>()?;
+    for entry in &licenses.artifact[RUNTIME].allow {
+        ensure!(
+            bridge.contains(&parse_licence(entry)?),
+            "[artifact.{RUNTIME}] `{entry}` is not in [artifact.{BRIDGE}]: everything in a \
+             bridge-loaded process must be combinable with GPL-3"
+        );
+    }
+    Ok(())
 }
 
 /// Crates link into the runtime, so cargo-deny may allow nothing the runtime does not.
@@ -156,7 +181,8 @@ mod tests {
     #[test]
     fn runtime_bridge_and_unlabelled() {
         let text = "[artifact.runtime]\nallow = [\"MIT\", \"GPL-2.0-only WITH Classpath-exception-2.0\"]\n\
-                    [artifact.qemu-bridge]\nallow = [\"GPL-2.0-or-later\", \"GPL-3.0-or-later\"]\n\
+                    [artifact.qemu-bridge]\nallow = [\"MIT\", \"GPL-2.0-only WITH Classpath-exception-2.0\", \
+                    \"GPL-2.0-or-later\", \"GPL-3.0-or-later\"]\n\
                     [upstream.qemu]\nunlabelled = \"GPL-2.0-or-later\"\n";
         let licenses = parse(text, &upstreams()).unwrap();
         assert_eq!(licenses.upstream["qemu"].unlabelled, "GPL-2.0-or-later");
@@ -183,11 +209,20 @@ mod tests {
         let bare = "[artifact.qemu-bridge]\nallow = [\"GPL-2.0-only\"]\n";
         assert!(err(&format!("{RUNTIME_MIT}{bare}")).contains("bare GPL-2.0-only"));
         assert!(
-            err("[artifact.runtime]\nallow = [\"GPL-3.0-or-later\"]\n").contains("no GPL-3 family")
+            err("[artifact.runtime]\nallow = [\"GPL-3.0-or-later\"]\n").contains("GPL-3 only as")
         );
-        assert!(
-            err("[artifact.runtime]\nallow = [\"AGPL-3.0-only\"]\n").contains("no GPL-3 family")
-        );
+        assert!(err("[artifact.runtime]\nallow = [\"AGPL-3.0-only\"]\n").contains("GPL-3 only as"));
+        // libgcc_s and Bison parsers: GPL-3 with an exception that frees their users
+        let text = "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH GCC-exception-3.1\", \
+                    \"GPL-3.0-or-later WITH Bison-exception-2.2\"]\n";
+        assert!(parse(text, &upstreams()).is_ok());
+    }
+
+    #[test]
+    fn runtime_within_bridge() {
+        let text = "[artifact.runtime]\nallow = [\"MIT\", \"Apache-2.0\"]\n\
+                    [artifact.qemu-bridge]\nallow = [\"MIT\", \"GPL-3.0-or-later\"]\n";
+        assert!(err(text).contains("`Apache-2.0` is not in [artifact.qemu-bridge]"));
     }
 
     #[test]
