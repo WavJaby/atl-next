@@ -11,6 +11,7 @@ mod fetch;
 mod git;
 mod licenses;
 mod modules;
+mod notice;
 mod patch;
 mod providers;
 mod sources;
@@ -56,6 +57,13 @@ enum Command {
     /// checkout; every commit carries `Upstream-Status:` and `Patch-Reason:` trailers. After a pin
     /// bump: `xtask fetch`, `--rebase`, resolve, `--export`.
     Patch(patch::Args),
+    /// Licence of every source file in a fetched upstream checkout (read-only).
+    ///
+    /// Per file: a `paths` entry of the upstream in licenses.toml (longest prefix), else its SPDX tag,
+    /// else its notice read by fixed phrase rules, else the upstream's `unlabelled` licence when the
+    /// file has no notice at all. An unrecognised notice is reported, never guessed. The licence
+    /// gate applies the same resolution to what a build links.
+    Licence(notice::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -66,6 +74,7 @@ fn main() -> Result<ExitCode> {
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
+        Command::Licence(args) => notice::run(&root, &args),
     }
 }
 

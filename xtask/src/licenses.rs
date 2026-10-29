@@ -31,7 +31,19 @@ pub struct Artifact {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
-    pub unlabelled: String,
+    /// Licence of files with no licence notice at all.
+    pub unlabelled: Option<String>,
+    /// Path prefix (relative to the upstream root) -> licence, for notices the rules cannot read.
+    #[serde(default)]
+    pub paths: BTreeMap<String, PathLicence>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathLicence {
+    /// SPDX expression.
+    pub licence: String,
+    pub reason: String,
 }
 
 /// One allow entry: an SPDX licence, optionally `WITH` an exception.
@@ -104,12 +116,26 @@ fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses> {
             upstreams.contains(name),
             "[upstream.{name}]: not a sources.toml upstream"
         );
-        let licence =
-            parse_licence(&upstream.unlabelled).with_context(|| format!("[upstream.{name}]"))?;
-        ensure!(
-            licence.exception.is_none(),
-            "[upstream.{name}]: unlabelled takes a plain id"
-        );
+        if let Some(unlabelled) = &upstream.unlabelled {
+            let licence =
+                parse_licence(unlabelled).with_context(|| format!("[upstream.{name}]"))?;
+            ensure!(
+                licence.exception.is_none(),
+                "[upstream.{name}]: unlabelled takes a plain id"
+            );
+        }
+        for (prefix, entry) in &upstream.paths {
+            let at = format!("[upstream.{name}.paths.\"{prefix}\"]");
+            ensure!(
+                !prefix.is_empty()
+                    && !prefix.starts_with('/')
+                    && !prefix.split('/').any(|c| c == ".."),
+                "{at}: not a relative path prefix"
+            );
+            ::spdx::Expression::parse(&entry.licence)
+                .with_context(|| format!("{at}: bad SPDX expression `{}`", entry.licence))?;
+            ensure!(!entry.reason.trim().is_empty(), "{at}: empty reason");
+        }
     }
     check_bridge_superset(&licenses)?;
     Ok(licenses)
@@ -185,7 +211,10 @@ mod tests {
                     \"GPL-2.0-or-later\", \"GPL-3.0-or-later\"]\n\
                     [upstream.qemu]\nunlabelled = \"GPL-2.0-or-later\"\n";
         let licenses = parse(text, &upstreams()).unwrap();
-        assert_eq!(licenses.upstream["qemu"].unlabelled, "GPL-2.0-or-later");
+        assert_eq!(
+            licenses.upstream["qemu"].unlabelled.as_deref(),
+            Some("GPL-2.0-or-later")
+        );
     }
 
     #[test]
@@ -230,6 +259,17 @@ mod tests {
         assert!(err("[artifact.runtime]\nallow = [\"MIT\", \"MIT\"]\n").contains("listed twice"));
         let text = format!("{RUNTIME_MIT}[upstream.gone]\nunlabelled = \"MIT\"\n");
         assert!(err(&text).contains("not a sources.toml upstream"));
+    }
+
+    #[test]
+    fn path_entries() {
+        let ok = format!(
+            "{RUNTIME_MIT}[upstream.qemu.paths.\"linux-user/\"]\nlicence = \"GPL-2.0-or-later\"\nreason = \"r\"\n"
+        );
+        assert!(parse(&ok, &upstreams()).is_ok());
+        assert!(err(&ok.replace("linux-user/", "../x")).contains("not a relative path prefix"));
+        assert!(err(&ok.replace("reason = \"r\"", "reason = \" \"")).contains("empty reason"));
+        assert!(err(&ok.replace("GPL-2.0-or-later", "GPL-2.0-or-later AND")).contains("bad SPDX"));
     }
 
     #[test]

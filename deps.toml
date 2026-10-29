@@ -19,11 +19,18 @@
 [cargo-deny]
 cargo = "cargo-deny"
 version = "0.20.2"
-scope = ["build", "test"]
-used_by = ["xtask:check", "xtask:fetch"]
+scope = ["test"]
+used_by = ["xtask:check"]
 
 [git]
 debian = "git"
 arch = "git"
-scope = ["test"]
-used_by = ["xtask:check"]
+scope = ["build", "test"]
+used_by = ["xtask:check", "xtask:fetch", "xtask:patch"]
+
+[python3-venv]
+debian = "python3-venv"
+# Arch's python package includes venv/ensurepip
+arch = "python"
+scope = ["build"]
+used_by = ["upstream:qemu"]

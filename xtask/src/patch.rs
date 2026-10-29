@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use crate::git::{Ident, git, git_isolated};
 use crate::licenses::{self, Licenses};
 use crate::sources::{self, Checkout};
-use crate::{fetch, spdx, workspace};
+use crate::{fetch, notice, workspace};
 
 const BRANCH: &str = "atl-patches";
 /// Commit `atl-patches` is based on. A rebase after a pin bump needs the old base, and shallow
@@ -398,8 +398,8 @@ fn commits_with_trailers(dir: &Path, range: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-/// Licence of everything `commit` touches: each file's SPDX tag (old version, else new), else the
-/// upstream's `unlabelled` licence from licenses.toml; several are joined with AND.
+/// Licence of everything `commit` touches, each file (old version, else new) resolved by
+/// `notice::resolve`; several are joined with AND.
 fn patch_licence(dir: &Path, commit: &str, key: &str, licenses: &Licenses) -> Result<String> {
     let paths = git(
         Some(dir),
@@ -409,18 +409,7 @@ fn patch_licence(dir: &Path, commit: &str, key: &str, licenses: &Licenses) -> Re
     for path in paths.lines() {
         let text = git(Some(dir), &["show", &format!("{commit}^:{path}")])
             .or_else(|_| git(Some(dir), &["show", &format!("{commit}:{path}")]))?;
-        let expr = match spdx::tag_value(&text, spdx::UPSTREAM_TAG_LINES) {
-            Some(e) => e.to_owned(),
-            None => licenses
-                .upstream
-                .get(key)
-                .map(|u| u.unlabelled.clone())
-                .with_context(|| {
-                    format!(
-                        "{path}: no SPDX tag, and licenses.toml has no [upstream.{key}] unlabelled"
-                    )
-                })?,
-        };
+        let expr = notice::resolve(path, &text, licenses.upstream.get(key))?;
         ::spdx::Expression::parse(&expr).with_context(|| format!("{path}: bad SPDX `{expr}`"))?;
         exprs.insert(expr);
     }

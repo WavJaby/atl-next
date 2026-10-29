@@ -16,3 +16,8 @@
 
 [artifact.runtime]
 allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[upstream.qemu]
+# QEMU's LICENSE: "Source files with no licensing information are released under the GNU General
+# Public License, version 2 or (at your option) any later version."
+unlabelled = "GPL-2.0-or-later"
