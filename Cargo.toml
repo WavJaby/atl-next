@@ -16,6 +16,7 @@ publish = false
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 
 # Inherited by every crate via `[lints] workspace = true`; such a crate cannot add lints in its own

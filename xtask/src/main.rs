@@ -6,14 +6,16 @@
 
 mod arches;
 mod check;
+mod deps;
 mod sources;
 mod spdx;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 /// Single build/check driver of the ATL-next repo. Read-only or dry-run by default.
 #[derive(Parser)]
@@ -29,6 +31,11 @@ enum Command {
     /// Runs every step in order and keeps going after a failure, so one run reports every problem.
     /// Read-only: nothing is reformatted or fixed (`cargo fmt` itself does that).
     Check(check::Args),
+    /// Host dependencies from deps.toml.
+    ///
+    /// Distro rows: package installed (dpkg-query / pacman), `min` met (pkg-config for libraries,
+    /// package version otherwise). Cargo rows: exact version in `cargo install --list`. Read-only.
+    Deps(deps::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -36,7 +43,21 @@ fn main() -> Result<ExitCode> {
     let root = repo_root()?;
     match cli.command {
         Command::Check(args) => check::run(&root, &args),
+        Command::Deps(args) => deps::run(&root, &args),
     }
+}
+
+/// Subcommand names, the targets of `xtask:<name>` references in deps.toml.
+pub fn subcommands() -> BTreeSet<String> {
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_owned())
+        .collect()
+}
+
+/// `cargo` of the pinned toolchain: `CARGO` is set by `cargo run`.
+pub fn cargo_command() -> std::process::Command {
+    std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
 
 /// The checkout being worked on (main repo or a worktree), i.e. the parent of `xtask/`.

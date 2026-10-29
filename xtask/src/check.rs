@@ -2,12 +2,12 @@
 //! `xtask check`: the static + unit test tiers.
 
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, sources, spdx};
+use crate::{arches, deps, sources, spdx};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,7 +22,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches.toml, sources.toml) parse with their schema and invariants
+    /// repo tables (arches.toml, sources.toml, deps.toml) parse with their schema and invariants
     Tables,
     /// clippy on all targets, warnings denied
     Clippy,
@@ -67,6 +67,8 @@ impl Step {
                     sources.aosp.projects.len(),
                     sources.git.len()
                 );
+                let deps = deps::load(root, &deps::Consumers::collect(root, &sources)?)?;
+                eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
                 Ok(())
             }
             Step::Clippy => cargo(
@@ -120,9 +122,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 fn cargo(root: &Path, args: &[&str]) -> Result<()> {
-    // `CARGO` is set by `cargo run` to the cargo of the pinned toolchain
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
+    let status = crate::cargo_command()
         .args(args)
         .current_dir(root)
         .status()

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# What must be installed outside the repo, and who needs it. Checked by `cargo xtask check` (schema,
+# references) and `cargo xtask deps --check` (this host). Tools that rewrite this file keep comments and
+# order (toml_edit).
+#
+# Row key: logical name. A row has exactly one source:
+#   distro  debian, arch        package name per distro (Arch: x86_64 only); absent = not packaged there
+#           pkgconfig           libraries only: pkg-config module; their versions are checked through it
+#           min, min_reason     minimum upstream version and why: the pkg-config version for libraries,
+#                               else the package version without epoch and revision
+#   cargo   cargo, version      crate installed with `cargo install --locked`, exact version
+# Every row:
+#   scope    build | runtime | test (static checks count as test)
+#   used_by  typed references, each checked to exist: crate:<workspace crate>,
+#            upstream:<sources.toml name or aosp>, xtask:<subcommand>
+# Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check).
+# Rows are added when a consumer first needs them.
+
+[cargo-deny]
+cargo = "cargo-deny"
+version = "0.20.2"
+scope = ["test"]
+used_by = ["xtask:check"]
+
+[git]
+debian = "git"
+arch = "git"
+scope = ["test"]
+used_by = ["xtask:check"]

@@ -94,7 +94,8 @@ fn is_tree_path(s: &str) -> bool {
     })
 }
 
-fn is_name(s: &str) -> bool {
+/// Row name of sources.toml and deps.toml: `[a-z0-9-]`, starting alphanumeric.
+pub fn is_name(s: &str) -> bool {
     s.bytes()
         .next()
         .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())

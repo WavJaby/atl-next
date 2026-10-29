@@ -9,6 +9,12 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 - The repo holds only our code, the manifests and `patches/<upstream>/`. Never commit upstream sources, imported AOSP Java or generated code.
 - `cargo xtask` is the only build/test driver. Read-only or dry-run by default.
 
+## Tables
+
+- Repo tables (`arches.toml`, `sources.toml`, `deps.toml`, ...) document their columns in their own header; `cargo xtask check` step `tables` validates them.
+- Every column is either checked by a script against its real source or derived and not stored. Adding a column adds its check in the same change. Cross-references are typed and checked to exist; a reason a script must enforce is a field, not a comment.
+- Rows are added when a consumer first needs them. Tools that rewrite a table use `toml_edit`, keeping comments and order.
+
 ## Languages
 
 - Rust for everything we write, tools and generators included. Java only for the api-impl surface ART requires. Go only for the Blueprint -> ninja converter. No Python. Assembly only inside Rust (`global_asm!` / naked functions).
