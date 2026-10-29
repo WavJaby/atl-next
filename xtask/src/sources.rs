@@ -2,7 +2,7 @@
 //! `sources.toml`: the upstream manifest (fetch pins only). Column meanings live in that file's header.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -32,6 +32,55 @@ pub struct GitUpstream {
     pub git: String,
     pub tag: String,
     pub commit: String,
+}
+
+/// One upstream checkout: where it lives under `<workspace>/src` (and under `patches/`), and its pin.
+pub struct Checkout {
+    /// `aosp/<path>` or `<name>`; the same relative path under `src/` and `patches/`.
+    pub dir: PathBuf,
+    pub url: String,
+    pub tag: String,
+    pub commit: String,
+    pub pin: Pin,
+    /// Key of the upstream's `[upstream.<key>]` row in licenses.toml (`aosp` for every AOSP project).
+    pub licence_key: String,
+}
+
+/// Where a checkout's commit lives in sources.toml.
+pub enum Pin {
+    Aosp(String),
+    Git(String),
+}
+
+impl Sources {
+    /// Upstream names as other tables reference them: each git upstream, plus `aosp`.
+    pub fn upstream_names(&self) -> std::collections::BTreeSet<String> {
+        self.git
+            .keys()
+            .cloned()
+            .chain(["aosp".to_owned()])
+            .collect()
+    }
+
+    pub fn checkouts(&self) -> Vec<Checkout> {
+        let aosp = self.aosp.projects.iter().map(|(path, commit)| Checkout {
+            dir: Path::new("aosp").join(path),
+            url: format!("{}{path}", self.aosp.remote),
+            tag: self.aosp.tag.clone(),
+            commit: commit.clone(),
+            pin: Pin::Aosp(path.clone()),
+            licence_key: "aosp".to_owned(),
+        });
+        let git = self.git.iter().map(|(name, up)| Checkout {
+            dir: PathBuf::from(name),
+            url: up.git.clone(),
+            tag: up.tag.clone(),
+            commit: up.commit.clone(),
+            pin: Pin::Git(name.clone()),
+            licence_key: name.clone(),
+        });
+        aosp.chain(git).collect()
+    }
 }
 
 pub fn load(root: &Path) -> Result<Sources> {

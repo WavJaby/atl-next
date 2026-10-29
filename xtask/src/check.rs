@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, licenses, modules, providers, sources, spdx, workspace};
+use crate::{arches, deps, licenses, modules, patch, providers, sources, spdx, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -26,6 +26,8 @@ enum Step {
     Tables,
     /// modules.toml equals the real cross-module crate graph
     Modules,
+    /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
+    Drift,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -34,11 +36,12 @@ enum Step {
     Test,
 }
 
-const ALL: [Step; 7] = [
+const ALL: [Step; 8] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
     Step::Modules,
+    Step::Drift,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -51,6 +54,7 @@ impl Step {
             Step::Spdx => "spdx",
             Step::Tables => "tables",
             Step::Modules => "modules",
+            Step::Drift => "drift",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -96,6 +100,7 @@ impl Step {
                 );
                 Ok(())
             }
+            Step::Drift => patch::check(root),
             Step::Clippy => cargo(
                 root,
                 &[

@@ -15,6 +15,13 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 - Every column is either checked by a script against its real source or derived and not stored. Adding a column adds its check in the same change. Cross-references are typed and checked to exist; a reason a script must enforce is a field, not a comment.
 - Rows are added when a consumer first needs them. Tools that rewrite a table use `toml_edit`, keeping comments and order.
 
+## Upstream patches
+
+- Upstreams are checked out under `<workspace>/src/<upstream>` by `cargo xtask fetch` (shallow, at the `sources.toml` pin). Change upstream code only as commits on branch `atl-patches` inside the checkout, then `cargo xtask patch --export <upstream>` writes them to `patches/<upstream>/` (reproducible bytes; the SPDX expression of the patched files is inserted after `---`). Step `drift` of `cargo xtask check` fails while a checkout has uncommitted or unexported work.
+- Every patch commit carries the trailers `Upstream-Status:` (Pending / Submitted [where] / Backport / Denied / Inappropriate [why]) and `Patch-Reason:` (why the launcher, loader or environment cannot do it). Patches stay small and rebase-stable; one whose reason is gone is deleted at the next upgrade.
+- `patches/<upstream>/LICENSE` holds the upstream's licence text.
+- After a pin bump: `cargo xtask fetch --execute`, `cargo xtask patch --rebase <upstream>`, resolve conflicts, `--export`.
+
 ## Languages
 
 - Rust for everything we write, tools and generators included. Java only for the api-impl surface ART requires. Go only for the Blueprint -> ninja converter. No Python. Assembly only inside Rust (`global_asm!` / naked functions).

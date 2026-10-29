@@ -8,8 +8,10 @@ mod arches;
 mod check;
 mod deps;
 mod fetch;
+mod git;
 mod licenses;
 mod modules;
+mod patch;
 mod providers;
 mod sources;
 mod spdx;
@@ -47,6 +49,13 @@ enum Command {
     /// tag only); `git fetch --unshallow` inside one before bisecting. A checkout on a branch belongs to
     /// `xtask patch`; one with uncommitted changes is never moved.
     Fetch(fetch::Args),
+    /// Our commits on upstream checkouts: branch atl-patches <-> patches/<upstream>/*.patch.
+    ///
+    /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only;
+    /// `xtask check` step `drift` runs the same test). Develop by committing on atl-patches inside the
+    /// checkout; every commit carries `Upstream-Status:` and `Patch-Reason:` trailers. After a pin
+    /// bump: `xtask fetch`, `--rebase`, resolve, `--export`.
+    Patch(patch::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -56,6 +65,7 @@ fn main() -> Result<ExitCode> {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
+        Command::Patch(args) => patch::run(&root, &args),
     }
 }
 

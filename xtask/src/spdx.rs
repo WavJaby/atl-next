@@ -29,6 +29,13 @@ pub fn check(root: &Path) -> Result<()> {
             continue;
         }
         let bytes = std::fs::read(root.join(rel)).with_context(|| format!("reading {rel}"))?;
+        if rel.starts_with("patches/") {
+            if let Some(problem) = check_patch_dir_file(root, rel, &String::from_utf8_lossy(&bytes))
+            {
+                bad.push(problem);
+            }
+            continue;
+        }
         match header_license(&String::from_utf8_lossy(&bytes)) {
             Some(OUR_LICENSE) => {}
             Some(other) => bad.push(format!("{rel}: licence {other}, expected {OUR_LICENSE}")),
@@ -81,9 +88,43 @@ fn candidate_files(root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-/// The licence expression of the first SPDX tag within `HEADER_LINES`, comment closers stripped.
 fn header_license(text: &str) -> Option<&str> {
-    text.lines().take(HEADER_LINES).find_map(|line| {
+    tag_value(text, HEADER_LINES)
+}
+
+/// Under `patches/<upstream>/`: the upstream's `LICENSE` text, and `*.patch` files carrying the
+/// licence of the files they patch (any valid SPDX expression, placed after `---` by `xtask patch`).
+fn check_patch_dir_file(root: &Path, rel: &str, text: &str) -> Option<String> {
+    let path = Path::new(rel);
+    if path.file_name().is_some_and(|n| n == "LICENSE") {
+        return None;
+    }
+    if path.extension().is_none_or(|e| e != "patch") {
+        return Some(format!(
+            "{rel}: only *.patch and LICENSE belong under patches/"
+        ));
+    }
+    if !root.join(path.with_file_name("LICENSE")).exists() {
+        return Some(format!(
+            "{rel}: no LICENSE (the upstream's licence text) beside it"
+        ));
+    }
+    let head = text.split("\ndiff --git ").next().unwrap_or(text);
+    let Some((_, rest)) = head.split_once(TAG) else {
+        return Some(format!("{rel}: no `{TAG}` before the diff"));
+    };
+    let expr = rest.lines().next().unwrap_or("").trim();
+    ::spdx::Expression::parse(expr)
+        .err()
+        .map(|e| format!("{rel}: bad SPDX expression `{expr}`: {e}"))
+}
+
+/// Lines searched in upstream files, whose tag often follows a copyright block (QEMU, Linux style).
+pub const UPSTREAM_TAG_LINES: usize = 30;
+
+/// The licence expression of the first SPDX tag within `max_lines`, comment closers stripped.
+pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
+    text.lines().take(max_lines).find_map(|line| {
         let (_, rest) = line.split_once(TAG)?;
         let rest = rest.trim();
         let rest = rest

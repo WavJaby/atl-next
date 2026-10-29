@@ -47,11 +47,9 @@ pub struct Consumers {
 
 impl Consumers {
     pub fn new(workspace: &Workspace, sources: &Sources) -> Self {
-        let mut upstreams: BTreeSet<String> = sources.git.keys().cloned().collect();
-        upstreams.insert("aosp".to_owned());
         Self {
             crates: workspace.crates.clone(),
-            upstreams,
+            upstreams: sources.upstream_names(),
             xtask: crate::subcommands(),
         }
     }

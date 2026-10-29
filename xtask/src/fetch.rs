@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! `xtask fetch`: upstream checkouts under `<workspace>/src` at the pins in sources.toml.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::path::Path;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::sources::{self, Sources};
+use crate::git::git;
+use crate::sources::{self, Checkout, Pin};
 use crate::workspace;
 
 #[derive(clap::Args)]
@@ -23,42 +24,8 @@ pub struct Args {
     write: bool,
 }
 
-/// One checkout: where it lives under `src/` and what it is pinned to.
-struct Checkout {
-    dir: PathBuf,
-    url: String,
-    tag: String,
-    commit: String,
-    pin: Pin,
-}
-
-/// Where the commit lives in sources.toml, for `--bump --write`.
-enum Pin {
-    Aosp(String),
-    Git(String),
-}
-
-fn checkouts(sources: &Sources) -> Vec<Checkout> {
-    let aosp = sources.aosp.projects.iter().map(|(path, commit)| Checkout {
-        dir: Path::new("aosp").join(path),
-        url: format!("{}{path}", sources.aosp.remote),
-        tag: sources.aosp.tag.clone(),
-        commit: commit.clone(),
-        pin: Pin::Aosp(path.clone()),
-    });
-    let git = sources.git.iter().map(|(name, up)| Checkout {
-        dir: PathBuf::from(name),
-        url: up.git.clone(),
-        tag: up.tag.clone(),
-        commit: up.commit.clone(),
-        pin: Pin::Git(name.clone()),
-    });
-    aosp.chain(git).collect()
-}
-
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let sources = sources::load(root)?;
-    let all = checkouts(&sources);
+    let all = sources::load(root)?.checkouts();
     if args.bump {
         return bump(root, &all, args.write);
     }
@@ -177,19 +144,36 @@ fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             git(Some(dir), &["init", "-q"])?;
             git(Some(dir), &["remote", "add", "origin", &c.url])?;
-            fetch_pin(c, dir)
+            fetch_pin(c, dir)?;
+            checkout_pin(c, dir)
         }
         Action::MoveToPin => {
             verify_tag(c)?;
-            fetch_pin(c, dir)
+            fetch_pin(c, dir)?;
+            checkout_pin(c, dir)
         }
         Action::AtPin { .. } | Action::LeaveBranch(_) => Ok(()),
         Action::Blocked(why) => bail!("{why}"),
     }
 }
 
-/// Shallow-fetch the pinned tag, check it is the pinned commit, check it out detached.
-fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
+fn checkout_pin(c: &Checkout, dir: &Path) -> Result<()> {
+    git(
+        Some(dir),
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "-q",
+            "--detach",
+            &c.commit,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Shallow-fetch the pinned tag into `dir` and check it is the pinned commit.
+pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
     let refspec = format!("+refs/tags/{0}:refs/tags/{0}", c.tag);
     git(
         Some(dir),
@@ -205,22 +189,11 @@ fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
         c.tag,
         c.commit
     );
-    git(
-        Some(dir),
-        &[
-            "-c",
-            "advice.detachedHead=false",
-            "checkout",
-            "-q",
-            "--detach",
-            &c.commit,
-        ],
-    )?;
     Ok(())
 }
 
 /// The remote's current commit for the tag must be the pin: a moved tag fails here.
-fn verify_tag(c: &Checkout) -> Result<()> {
+pub fn verify_tag(c: &Checkout) -> Result<()> {
     let now = remote_tag_commit(&c.url, &c.tag)?;
     ensure!(
         now == c.commit,
@@ -316,24 +289,10 @@ fn bump(root: &Path, all: &[Checkout], write: bool) -> Result<ExitCode> {
     })
 }
 
-/// `git <args>` (in `dir` if given); stdout trimmed, stderr in the error.
-fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    if let Some(d) = dir {
-        cmd.current_dir(d);
-    }
-    let out = cmd.args(args).output().context("running git")?;
-    ensure!(
-        out.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -424,6 +383,7 @@ mod tests {
                 tag: "v1".into(),
                 commit: commit.into(),
                 pin: Pin::Git("up".into()),
+                licence_key: "up".into(),
             }
         }
     }
