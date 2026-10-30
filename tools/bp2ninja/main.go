@@ -2,7 +2,7 @@
 
 // Command bp2ninja converts the Android.bp modules some goals need into one ninja file that builds them
 // for a Linux glibc host (plan D7-2; M2). Runtime libraries come from each module's android source set,
-// build tools (aidl) from their host source set. Only the goals' dependency closure is emitted.
+// build tools (aidl, aprotoc, genrule tools) from their host source set. Only the goals' dependency closure is emitted.
 //
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //

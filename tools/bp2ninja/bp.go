@@ -24,7 +24,13 @@ type Obj struct {
 
 func newObj() *Obj { return &Obj{m: map[string]Val{}} }
 
-func (o *Obj) get(k string) Val { return o.m[k] }
+// The getters take a nil *Obj (an absent block) as empty, so `p.obj("proto").strs("x")` needs no guard.
+func (o *Obj) get(k string) Val {
+	if o == nil {
+		return nil
+	}
+	return o.m[k]
+}
 
 func (o *Obj) set(k string, v Val) {
 	if _, ok := o.m[k]; !ok {
@@ -34,20 +40,20 @@ func (o *Obj) set(k string, v Val) {
 }
 
 func (o *Obj) obj(k string) *Obj {
-	if v, ok := o.m[k].(*Obj); ok {
+	if v, ok := o.get(k).(*Obj); ok {
 		return v
 	}
 	return nil
 }
 
 func (o *Obj) str(k string) string {
-	s, _ := o.m[k].(string)
+	s, _ := o.get(k).(string)
 	return s
 }
 
 func (o *Obj) strs(k string) []string {
 	var out []string
-	if l, ok := o.m[k].([]Val); ok {
+	if l, ok := o.get(k).([]Val); ok {
 		for _, v := range l {
 			if s, ok := v.(string); ok {
 				out = append(out, s)
@@ -58,7 +64,7 @@ func (o *Obj) strs(k string) []string {
 }
 
 func (o *Obj) boolean(k string, def bool) bool {
-	if b, ok := o.m[k].(bool); ok {
+	if b, ok := o.get(k).(bool); ok {
 		return b
 	}
 	return def

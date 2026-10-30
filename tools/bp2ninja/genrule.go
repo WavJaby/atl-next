@@ -489,15 +489,3 @@ func (g *Graph) useGen(n, gn *Node) {
 	n.gen = append(n.gen, gn.rule.deps...)
 	n.genIncs = append(n.genIncs, gn.rule.incs...)
 }
-
-// genSources adds a genrule's outputs to n's compile set by extension; other outputs are only waited on
-// (headers, tables). An output kind a cc module cannot take is a problem.
-func (g *Graph) genSources(n, gn *Node) {
-	for _, o := range gn.rule.outs {
-		switch filepath.Ext(o) {
-		case ".h", ".hh", ".hpp", ".hxx", ".inc", ".def":
-		default:
-			g.addFile(n, o, g.genDir(gn, ""))
-		}
-	}
-}

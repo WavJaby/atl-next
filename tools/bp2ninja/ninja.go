@@ -85,6 +85,10 @@ rule link
 rule aidl
   command = $aidl --lang=cpp $flags -h $hdir -o $sdir $in
   description = aidl $in
+rule protoc
+  command = $aprotoc --cpp_out=$params:$outdir --dependency_out=$dep -I $base $flags $in
+  depfile = $dep
+  description = protoc $in
 rule yacc
   command = $bison -d --defines=$hdr -o $src $in
   description = bison $in
@@ -101,16 +105,6 @@ rule genrule
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(g.tree))
-	var aidlTool *Node
-	needAidl := false
-	for _, n := range g.order {
-		if len(n.aidl) > 0 {
-			needAidl = true
-		}
-	}
-	if needAidl {
-		aidlTool = g.node("aidl", Host, Binary, "bp2ninja (aidl sources)")
-	}
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
 		base := filepath.Join(g.out, n.side.String(), n.name)
@@ -130,41 +124,8 @@ func (g *Graph) emit(tools Tools) string {
 		}
 	}
 	for _, n := range g.order {
-		for _, a := range n.aidl {
-			rel := strings.TrimSuffix(strings.TrimPrefix(a.file, a.root+"/"), ".aidl")
-			cpp := filepath.Join(g.genDir(n, "src"), rel+".cpp")
-			hdr := filepath.Join(g.genDir(n, "include"), rel+".h")
-			flags := []string{}
-			for _, r := range aidlRoots(n) {
-				flags = append(flags, "-I"+g.abs(r))
-			}
-			tool := ""
-			if aidlTool != nil {
-				tool = aidlTool.out
-			}
-			fmt.Fprintf(&b, "build %s %s: aidl %s | %s\n  aidl = %s\n  flags = %s\n  hdir = %s\n  sdir = %s\n",
-				esc(cpp), esc(hdr), esc(g.abs(a.file)), esc(tool), esc(tool), shellQuote(flags), esc(g.genDir(n, "include")), esc(g.genDir(n, "src")))
-			n.srcs = append(n.srcs, cpp)
-			n.gen = append(n.gen, cpp, hdr)
-		}
-	}
-	// grammars: x.yy -> x.cpp + x.h, x.ll -> x.cpp (Soong's naming), in the module's gen dir, which then
-	// is on its include path (aidl's sources include "aidl_language_y.h")
-	for _, n := range g.order {
-		for _, f := range n.gram {
-			rel := strings.TrimPrefix(f, n.mod.Dir+"/")
-			ext := filepath.Ext(rel)
-			outExt := map[string]string{".yy": ".cpp", ".ll": ".cpp", ".y": ".c", ".l": ".c"}[ext]
-			gen := filepath.Join(g.genDir(n, "src"), strings.TrimSuffix(rel, ext)+outExt)
-			if ext == ".yy" || ext == ".y" {
-				hdr := strings.TrimSuffix(gen, outExt) + ".h"
-				fmt.Fprintf(&b, "build %s %s: yacc %s\n  hdr = %s\n  src = %s\n", esc(gen), esc(hdr), esc(g.abs(f)), esc(hdr), esc(gen))
-				n.gen = append(n.gen, hdr)
-			} else {
-				fmt.Fprintf(&b, "build %s: lex %s\n", esc(gen), esc(g.abs(f)))
-			}
-			n.srcs = append(n.srcs, gen)
-			n.gen = append(n.gen, gen)
+		for _, e := range n.edges {
+			g.emitEdge(&b, e)
 		}
 	}
 	for _, n := range g.order {
@@ -214,29 +175,6 @@ func (g *Graph) emit(tools Tools) string {
 	return b.String()
 }
 
-func aidlRoots(n *Node) []string {
-	seen := map[string]bool{}
-	var out []string
-	add := func(d string) {
-		if !seen[d] {
-			seen[d] = true
-			out = append(out, d)
-		}
-	}
-	for _, a := range n.aidl {
-		add(a.root)
-	}
-	if a := n.props.obj("aidl"); a != nil {
-		for _, d := range a.strs("local_include_dirs") {
-			add(filepath.Join(n.mod.Dir, d))
-		}
-		for _, d := range a.strs("include_dirs") {
-			add(d)
-		}
-	}
-	return out
-}
-
 type langFlags struct{ c, cxx, asm []string }
 
 // compileFlags: Soong's language defaults (read from its global.go), the module's flags, then include
@@ -247,6 +185,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
 	common := []string{"-fPIC", "-O2", "-w"}
 	common = append(common, p.strs("cflags")...)
+	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")
 	var inc []string
 	for _, d := range p.strs("local_include_dirs") {
@@ -258,12 +197,6 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	inc = append(inc, "-I"+g.abs(n.mod.Dir))
 	inc = append(inc, n.exports...)
 	inc = append(inc, n.genIncs...)
-	if len(n.aidl) > 0 {
-		inc = append(inc, "-I"+g.genDir(n, "include"))
-	}
-	for _, f := range n.gram {
-		inc = append(inc, "-I"+filepath.Join(g.genDir(n, "src"), filepath.Dir(strings.TrimPrefix(f, n.mod.Dir+"/"))))
-	}
 	for _, d := range append(append(append(append([]*Node{}, n.deps.headers...), n.deps.static...), n.deps.shared...), n.deps.whole...) {
 		inc = append(inc, d.exports...)
 	}

@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -52,18 +53,21 @@ type key struct {
 type Node struct {
 	key
 	mod   *Module
-	props *Obj // after defaults, target/arch/multilib and kind blocks
-	srcs  []string
-	aidl  []aidlSrc
-	gram  []string // .ll / .yy grammar sources, generated into C++ by flex / bison
+	props *Obj     // after defaults, target/arch/multilib and kind blocks
+	srcs  []string // compiled sources: plain ones and the outputs of generators
 	deps  struct{ whole, static, shared, headers []*Node }
+	// libraries a source generator added to deps (protobuf runtime): their exports travel on, as export_*_lib_headers would
+	reexport []*Node
 	// exported include flags, transitive through export_*_lib_headers
 	exports []string
 	out     string // archive, shared object or binary
 	objs    []string
-	gen     []string // files generated for it (aidl, flex/bison, genrule output): its compiles wait for them
-	// genrules: usedGens are those n consumes; genIncs their include flags; genExports those of its
-	// export_generated_headers, handed to dependents
+	gen     []string // files generated for it (generator headers, genrule output): its compiles wait for them
+	// source generators (gensrc.go): their edges, include flags and cflags for n's compiles
+	edges     []genEdge
+	genCflags []string
+	// genrules: usedGens are those n consumes; genIncs their include flags and the generators'; genExports
+	// those of its export_generated_headers and of generators with their export property set, handed to dependents
 	usedGens   map[*Node]bool
 	genIncs    []string
 	genExports []string
@@ -83,8 +87,6 @@ func genClosure(n *Node, seen map[*Node]bool, out *[]string) {
 	}
 }
 
-type aidlSrc struct{ file, root string } // tree-relative file and its import root
-
 type Graph struct {
 	tree, out string
 	cfg       Config
@@ -100,6 +102,8 @@ type Graph struct {
 	missing map[string]bool
 	// genrule scripts by path, written by writeScripts after emit
 	scripts map[string]string
+	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
+	tools map[string]*Node
 }
 
 func (g *Graph) problem(format string, args ...any) {
@@ -286,11 +290,10 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	n := &Node{key: k, mod: m}
 	g.nodes[k] = n
 	n.props = g.flatten(m, side, kind)
+	var files []srcFile
 	for _, s := range n.props.strs("srcs") {
-		g.addSrc(n, s)
+		files = append(files, g.srcFiles(n, s)...)
 	}
-	// defaults and target blocks may list one file twice; Soong builds it once
-	n.srcs = dedup(without(n.srcs, g.expand(n, n.props.strs("exclude_srcs"))))
 	dep := func(list string, want Kind) []*Node {
 		var out []*Node
 		for _, r := range n.props.strs(list) {
@@ -326,31 +329,55 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		}
 		if gn := g.genNode(r, side, m.Name); gn != nil {
 			g.useGen(n, gn)
-			g.genSources(n, gn)
+			for _, o := range gn.rule.outs {
+				// headers are only waited on
+				if !isHeaderSrc(o) {
+					files = append(files, srcFile{path: o, root: g.genDir(gn, ""), gen: gn})
+				}
+			}
 		}
 	}
+	g.genSources(n, dedupSrcs(files, g.expand(n, n.props.strs("exclude_srcs"))))
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
 	return n
 }
 
-func (g *Graph) addSrc(n *Node, s string) {
+// srcFiles expands one `srcs` entry of n; the genrules it names are consumed (n's compiles wait for them).
+func (g *Graph) srcFiles(n *Node, s string) []srcFile {
 	files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.mod.Name)
+	var out []srcFile
 	for _, f := range files {
 		if f.gen != nil {
 			g.useGen(n, f.gen)
 			// headers a genrule produces are only waited on
-			switch filepath.Ext(f.path) {
-			case ".h", ".hh", ".hpp", ".hxx", ".inc", ".def":
+			if isHeaderSrc(f.path) {
 				continue
 			}
 		}
-		g.addFile(n, f.path, f.root)
+		out = append(out, f)
 	}
+	return out
+}
+
+// dedupSrcs drops excluded (exclude_srcs) and repeated sources; defaults and target blocks may list one file twice, Soong builds it once.
+func dedupSrcs(files []srcFile, exclude []string) []srcFile {
+	skip := map[string]bool{}
+	for _, e := range exclude {
+		skip[e] = true
+	}
+	var out []srcFile
+	for _, f := range files {
+		if !skip[f.path] {
+			skip[f.path] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // srcFile is one file a `srcs`-style entry names: tree-relative, or absolute under the build dir when a
-// genrule (gen) produces it. root is the import root aidl sources need.
+// genrule (gen) produces it. root is the import root aidl and proto sources need.
 type srcFile struct {
 	path, root string
 	gen        *Node
@@ -408,19 +435,6 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 	return nil, false
 }
 
-func (g *Graph) addFile(n *Node, f, root string) {
-	switch filepath.Ext(f) {
-	case ".c", ".cc", ".cpp", ".cxx", ".S", ".s":
-		n.srcs = append(n.srcs, f)
-	case ".aidl":
-		n.aidl = append(n.aidl, aidlSrc{f, root})
-	case ".ll", ".l", ".yy", ".y":
-		n.gram = append(n.gram, f)
-	default:
-		g.problem("%s: source %s of an unsupported kind", n.mod.Name, f)
-	}
-}
-
 func (g *Graph) expand(n *Node, pats []string) []string { return g.globs(n.mod.Dir, pats) }
 
 // globs resolves paths and globs (`**` included) relative to dir; results are tree-relative.
@@ -459,20 +473,6 @@ func (g *Graph) baseType(t string) string {
 	return t
 }
 
-func without(list, drop []string) []string {
-	skip := map[string]bool{}
-	for _, d := range drop {
-		skip[d] = true
-	}
-	var out []string
-	for _, s := range list {
-		if !skip[s] {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 // exportsOf: the include flags a node hands to its dependents.
 func (g *Graph) exportsOf(n *Node) []string {
 	out := append([]string{}, n.genExports...)
@@ -482,11 +482,6 @@ func (g *Graph) exportsOf(n *Node) []string {
 	for _, d := range n.props.strs("export_system_include_dirs") {
 		out = append(out, "-isystem", g.abs(filepath.Join(n.mod.Dir, d)))
 	}
-	if len(n.aidl) > 0 {
-		if a := n.props.obj("aidl"); a != nil && a.boolean("export_aidl_headers", false) {
-			out = append(out, "-I"+g.genDir(n, "include"))
-		}
-	}
 	reexport := map[string]bool{}
 	for _, l := range []string{"export_header_lib_headers", "export_static_lib_headers", "export_shared_lib_headers"} {
 		for _, r := range n.props.strs(l) {
@@ -494,7 +489,7 @@ func (g *Graph) exportsOf(n *Node) []string {
 		}
 	}
 	for _, d := range append(append(append(append([]*Node{}, n.deps.headers...), n.deps.static...), n.deps.shared...), n.deps.whole...) {
-		if reexport[d.name] || d.kind == Headers && reexport[d.mod.Name] {
+		if reexport[d.name] || d.kind == Headers && reexport[d.mod.Name] || slices.Contains(n.reexport, d) {
 			out = append(out, d.exports...)
 		}
 	}
@@ -527,7 +522,13 @@ func dedup(in []string) []string {
 	return out
 }
 
-func (g *Graph) abs(rel string) string { return filepath.Join(g.tree, rel) }
+// abs: a tree-relative path under the tree, an absolute one (generated file) as is.
+func (g *Graph) abs(rel string) string {
+	if filepath.IsAbs(rel) {
+		return rel
+	}
+	return filepath.Join(g.tree, rel)
+}
 
 func (g *Graph) genDir(n *Node, sub string) string {
 	return filepath.Join(g.out, "gen", n.side.String(), n.name, sub)
