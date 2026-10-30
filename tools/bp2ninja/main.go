@@ -60,8 +60,16 @@ func run(tree, out string, cfg Config, tools Tools, goals []string) error {
 		g.node(goal, Device, Shared, "goal")
 	}
 	ninja := g.emit(tools)
-	if err := os.MkdirAll(out, 0o755); err != nil {
+	compat := filepath.Join(out, "compat", "cxx")
+	if err := os.MkdirAll(compat, 0o755); err != nil {
 		return err
+	}
+	for _, h := range cxxCompat {
+		link := filepath.Join(compat, filepath.Base(h))
+		os.Remove(link)
+		if err := os.Symlink(filepath.Join(tree, h), link); err != nil {
+			return err
+		}
 	}
 	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err

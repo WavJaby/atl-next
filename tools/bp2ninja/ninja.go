@@ -269,6 +269,9 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		cppstd = g.soong.CppStd
 	}
 	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), p.strs("cppflags")...)
+	if n.side == Device {
+		cxx = append(cxx, "-I"+filepath.Join(g.out, "compat", "cxx"))
+	}
 	if !p.boolean("rtti", false) {
 		cxx = append(cxx, "-fno-rtti")
 	}
