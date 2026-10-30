@@ -16,6 +16,7 @@ mod notice;
 mod par;
 mod patch;
 mod providers;
+mod prune;
 mod soong;
 mod sources;
 mod spdx;

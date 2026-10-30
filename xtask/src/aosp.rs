@@ -278,23 +278,25 @@ impl Index {
     }
 
     /// The project to fetch for a dependency reference as Soong prints it (`name`, `:name`,
-    /// `name{.tag}`, `//dir:name`). A bare name prefers the root namespace, then a source module over a
-    /// prebuilt; a name still left in several projects is ambiguous, never guessed.
+    /// `name{.tag}`, `//dir:name`). `//dir:name` names a soong_namespace or the package directory of a
+    /// root-namespace module (`//external/llvm-libc:llvmlibc`). A bare name prefers the root namespace,
+    /// then a source module over a prebuilt; a name still left in several projects is ambiguous, never
+    /// guessed.
     pub fn project_for(&self, reference: &str) -> Result<&str, String> {
         let reference = reference.trim_start_matches(':');
         let reference = reference.split('{').next().unwrap_or(reference);
-        let (namespace, name) = match reference.strip_prefix("//") {
+        let (dir, name) = match reference.strip_prefix("//") {
             Some(r) => match r.split_once(':') {
-                Some((ns, name)) => (Some(ns), name),
+                Some((dir, name)) => (Some(dir), name),
                 None => return Err(format!("{reference}: not a module reference")),
             },
             None => (None, reference),
         };
         let defs = self.modules.get(name).ok_or("not in any Android.bp")?;
-        let mut cands: Vec<&Definition> = match namespace {
-            Some(ns) => defs
+        let mut cands: Vec<&Definition> = match dir {
+            Some(dir) => defs
                 .iter()
-                .filter(|d| d.namespace.as_deref() == Some(ns))
+                .filter(|d| d.namespace.as_deref() == Some(dir) || parent_dir(&d.file) == dir)
                 .collect(),
             None => {
                 let root: Vec<_> = defs.iter().filter(|d| d.namespace.is_none()).collect();
@@ -312,14 +314,28 @@ impl Index {
         match projects.len() {
             1 => Ok(projects.into_iter().next().unwrap_or_default()),
             0 => Err(format!(
-                "no definition in namespace //{}",
-                namespace.unwrap_or_default()
+                "no definition in namespace or package //{}",
+                dir.unwrap_or_default()
             )),
             _ => Err(format!(
                 "ambiguous: {}",
                 projects.into_iter().collect::<Vec<_>>().join(", ")
             )),
         }
+    }
+
+    /// (module, directory of each blueprint file defining it).
+    pub fn dirs_of<'a>(&'a self, names: &'a BTreeSet<String>) -> Vec<(&'a str, &'a str)> {
+        names
+            .iter()
+            .flat_map(|n| {
+                self.modules
+                    .get(n)
+                    .into_iter()
+                    .flatten()
+                    .map(move |d| (n.as_str(), parent_dir(&d.file)))
+            })
+            .collect()
     }
 
     /// `names` plus every `defaults` module they inherit from, transitively (any definition of a name).
@@ -1015,6 +1031,12 @@ func init() {
         // bare name -> root namespace; explicit namespace -> only it
         assert_eq!(index.project_for("libz"), Ok("external/zlib"));
         assert_eq!(index.project_for("//device/x:libz"), Ok("device/x"));
+        // `//dir:name` also names a root-namespace module by its package directory
+        assert_eq!(
+            index.project_for("//external/zlib:libz"),
+            Ok("external/zlib")
+        );
+        assert!(index.project_for("//elsewhere:libz").is_err());
         // a prebuilt is taken when it is all there is
         assert_eq!(index.project_for("tool"), Ok("prebuilts/t"));
         assert!(

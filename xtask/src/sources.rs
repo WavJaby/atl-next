@@ -174,7 +174,7 @@ fn is_commit(s: &str) -> bool {
 }
 
 /// `a/b/c`: no empty, `.` or `..` component, no leading or trailing `/`.
-fn is_tree_path(s: &str) -> bool {
+pub fn is_tree_path(s: &str) -> bool {
     s.split('/').all(|c| {
         !c.is_empty()
             && c != "."

@@ -198,6 +198,11 @@ fn edit_sources(
 #[derive(Debug)]
 enum Local {
     Missing,
+    /// `.git` without a HEAD: a clone interrupted before its checkout (multi-GB prebuilts). `files` =
+    /// anything beside `.git`, which then is not ours to delete.
+    Unborn {
+        files: bool,
+    },
     Present {
         head: String,
         branch: Option<String>,
@@ -208,6 +213,8 @@ enum Local {
 #[derive(Debug, PartialEq)]
 enum Action {
     Clone,
+    /// git cannot resume a cut-off fetch (it leaves `shallow.lock` and a partial pack): start over.
+    Reclone,
     AtPin {
         dirty: bool,
     },
@@ -221,6 +228,7 @@ impl Action {
     fn describe(&self) -> String {
         match self {
             Action::Clone => "missing -> clone".into(),
+            Action::Reclone => "interrupted clone -> delete, clone again".into(),
             Action::AtPin { dirty: false } => "at pin".into(),
             Action::AtPin { dirty: true } => "at pin, uncommitted changes".into(),
             Action::MoveToPin => "elsewhere -> move to pin".into(),
@@ -233,6 +241,10 @@ impl Action {
 fn decide(local: &Local, pin: &str) -> Action {
     match local {
         Local::Missing => Action::Clone,
+        Local::Unborn { files: false } => Action::Reclone,
+        Local::Unborn { files: true } => {
+            Action::Blocked("git repository without commits holding files; remove it by hand")
+        }
         Local::Present { head, dirty, .. } if head == pin => Action::AtPin { dirty: *dirty },
         Local::Present {
             branch: Some(b), ..
@@ -253,7 +265,12 @@ fn inspect(dir: &Path) -> Result<Local> {
         "{} exists but is not a git checkout",
         dir.display()
     );
-    let head = git(Some(dir), &["rev-parse", "HEAD"]).context("checkout has no HEAD")?;
+    let Ok(head) = git(Some(dir), &["rev-parse", "-q", "--verify", "HEAD"]) else {
+        let files = std::fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .any(|e| e.file_name() != ".git");
+        return Ok(Local::Unborn { files });
+    };
     let branch = git(Some(dir), &["symbolic-ref", "-q", "--short", "HEAD"]).ok();
     let dirty = !git(
         Some(dir),
@@ -276,6 +293,10 @@ fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
             git(Some(dir), &["remote", "add", "origin", c.url()?])?;
             fetch_pin(c, dir)?;
             checkout_pin(c, dir)
+        }
+        Action::Reclone => {
+            std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+            apply(&Action::Clone, c, dir)
         }
         Action::MoveToPin => {
             verify_tag(c)?;
@@ -541,6 +562,38 @@ mod tests {
             decide(&inspect(&dir).unwrap(), &c.commit),
             Action::AtPin { dirty: false }
         );
+        std::fs::remove_dir_all(&src).unwrap();
+    }
+
+    #[test]
+    fn interrupted_clone_is_recloned() {
+        let remote = Remote::new("reclone");
+        let src = remote.dir.with_extension("src");
+        let _ = std::fs::remove_dir_all(&src);
+        let c = remote.checkout(&remote.first);
+        let dir = src.join(&c.dir);
+        // what a killed `git fetch --depth 1` leaves (measured on prebuilts/clang): a stale lock that
+        // makes every later fetch fail, and a partial pack
+        std::fs::create_dir_all(&dir).unwrap();
+        git(Some(&dir), &["init", "-q"]).unwrap();
+        std::fs::write(dir.join(".git/shallow.lock"), "").unwrap();
+        std::fs::write(dir.join(".git/objects/pack/tmp_pack_x"), "partial").unwrap();
+        let local = inspect(&dir).unwrap();
+        assert_eq!(decide(&local, &c.commit), Action::Reclone);
+        apply(&Action::Reclone, &c, &dir).unwrap();
+        assert_eq!(
+            decide(&inspect(&dir).unwrap(), &c.commit),
+            Action::AtPin { dirty: false }
+        );
+        // a commit-less repository with someone's files in it is never deleted
+        let other = src.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git(Some(&other), &["init", "-q"]).unwrap();
+        std::fs::write(other.join("notes.txt"), "mine").unwrap();
+        assert!(matches!(
+            decide(&inspect(&other).unwrap(), &c.commit),
+            Action::Blocked(_)
+        ));
         std::fs::remove_dir_all(&src).unwrap();
     }
 

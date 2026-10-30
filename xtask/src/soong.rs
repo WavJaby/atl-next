@@ -17,11 +17,12 @@ use anyhow::{Context, Result, ensure};
 
 use crate::aosp::{self, Index, Manifest};
 use crate::arches::{self, Arch, Arches};
-use crate::{fetch, sources, workspace};
+use crate::{fetch, prune, sources, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Build goals (Make module names), e.g. `libnative_bridge_guest_libc.native_bridge`.
+    /// Build goals: Soong module names (each builds every variant); a module in a soong_namespace as
+    /// `//<namespace dir>:<name>`, e.g. `//frameworks/libs/native_bridge_support/android_api/libc:libnative_bridge_guest_libc`.
     #[arg(required = true)]
     goals: Vec<String>,
     /// Arch ATL runs on = AOSP's device arch: an arches.toml row with `[host]` and `[guest]`.
@@ -50,6 +51,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = ws.join("out").join("aosp").join(&product.name);
     let logs = ws.join("out").join("aosp").join("logs");
     std::fs::create_dir_all(&logs)?;
+    // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
+    // fetched by the loop, which only adds unpinned ones
+    if args.fetch_missing {
+        fetch::add_and_fetch(root, &[])?;
+    }
     let mut round = 0;
     loop {
         round += 1;
@@ -57,6 +63,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let manifest = aosp::load(root, &sources.aosp)?
             .context("AOSP manifest not fetched: xtask fetch --execute")?;
         write_product(&tree, &manifest, &product)?;
+        prune::apply(&tree, &prune::load(root, &sources)?)?;
         let release = release(&tree)?;
         let log = logs.join(format!("{}-{round}.log", product.name));
         println!(
@@ -141,6 +148,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("soong: unresolved {u}");
         }
         if want.is_empty() {
+            // a module still failing with nothing left to fetch is one ATL may not need: its directory is
+            // an aosp-prune.toml candidate, decided by a person (it may hold a module a goal needs)
+            for (module, dir) in index.dirs_of(&failing) {
+                println!("soong: prune candidate {dir:<48} (module {module})");
+            }
             println!("soong: nothing new to fetch; stopping");
             return Ok(ExitCode::FAILURE);
         }
@@ -259,9 +271,11 @@ fn build(
     let file = std::fs::File::create(log).with_context(|| log.display().to_string())?;
     let status = Command::new("build/soong/soong_ui.bash")
         .current_dir(tree)
+        // --soong-only: no Kati over Soong's Android.mk export; ATL uses no Make packaging, and Kati rejects
+        // any exported module with a missing dependency (e.g. ART's conscrypt-host test helper).
         // -k: keep going, so one round reports every missing piece
-        .args(["--make-mode", "-k"])
-        .args(goals)
+        .args(["--make-mode", "--soong-only", "-k"])
+        .args(goals.iter().map(|g| ninja_goal(g)))
         .env("TARGET_PRODUCT", product)
         .env("TARGET_RELEASE", release)
         .env("TARGET_BUILD_VARIANT", BUILD_VARIANT)
@@ -274,6 +288,15 @@ fn build(
         .status()
         .with_context(|| format!("running soong_ui.bash in {}", tree.display()))?;
     Ok(status.success())
+}
+
+/// Soong's phony target for a module: its name, or for `//a/b:name` (a soong_namespace module)
+/// `a.b-name`, the form soong-only builds emit (measured: `frameworks.libs…android_api.libc-libnative_bridge_guest_libc`).
+fn ninja_goal(goal: &str) -> String {
+    match goal.strip_prefix("//").and_then(|r| r.split_once(':')) {
+        Some((dir, name)) => format!("{}-{name}", dir.replace('/', ".")),
+        None => goal.to_owned(),
+    }
 }
 
 // ---- what a failed build is missing ----------------------------------------------------------------
@@ -297,12 +320,15 @@ impl Missing {
 
 /// Phrases of a line reporting a missing file (lowercase); other lines may name paths in prose
 /// ("a usage example in prebuilts/sdk") and are not evidence.
-const MISSING_FILE: [&str; 5] = [
+const MISSING_FILE: [&str; 6] = [
     "no such file",
     "not found",
     "does not exist",
     "cannot find",
+    // Make
     "no rule to make target",
+    // ninja: 'X', needed by 'Y', missing and no known rule to make it
+    "no known rule to make it",
 ];
 
 /// Modules a Soong analysis error is about: `error: … module "X" variant "…": …`, or a panic under
@@ -336,7 +362,12 @@ fn missing(log: &str, tree_prefix: &str) -> Missing {
         map.entry(key.to_owned())
             .or_insert_with(|| line.trim().to_owned());
     };
+    let mut previous = "";
     for line in log.lines() {
+        // the line after `FAILED: <outputs>` is the failing command: its inputs (a `--sysroot` in an
+        // unfetched prebuilt, say) are evidence even when the tool's error only says `'time.h' file not
+        // found`
+        let command = std::mem::replace(&mut previous, line).starts_with("FAILED: ");
         if let Some((_, rest)) = line.split_once(UNDEFINED)
             && let Some((name, _)) = rest.split_once('"')
         {
@@ -356,7 +387,7 @@ fn missing(log: &str, tree_prefix: &str) -> Missing {
                     note(&mut out.modules, entry, line);
                 }
             }
-        } else if MISSING_FILE.iter().any(|p| line.to_lowercase().contains(p)) {
+        } else if command || MISSING_FILE.iter().any(|p| line.to_lowercase().contains(p)) {
             for p in path_tokens(line, tree_prefix) {
                 note(&mut out.paths, &p, line);
             }
@@ -432,6 +463,10 @@ bash: /t/src/aosp/prebuilts/go/linux-x86/bin/go: No such file or directory
 art/runtime/x.cc:3:10: fatal error: 'foo.h' file not found
 error: art/artd/binder/Android.bp:25:1: unrecognized module type \"aidl_interface\"
 Please see the documentation of the prebuilt_apis module type (and a usage example in prebuilts/sdk)
+FAILED: ninja: 'prebuilts/rust/linux-x86/1.83.0/bin/rustc', needed by '/t/out/lib.a', missing and no known rule to make it
+FAILED: /t/out/putil.o
+clang++ --sysroot prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot -c /t/src/aosp/external/icu/putil.cpp
+external/icu/putil.cpp:52:10: fatal error: 'time.h' file not found
 ";
         let m = missing(log, "/t/src/aosp/");
         let keys = |b: &BTreeMap<String, String>| b.keys().cloned().collect::<Vec<_>>();
@@ -444,12 +479,26 @@ Please see the documentation of the prebuilt_apis module type (and a usage examp
             keys(&m.paths),
             [
                 "art/runtime/x.cc",
+                "external/icu/putil.cpp",
                 "external/qux/a.c",
-                "prebuilts/go/linux-x86/bin/go"
+                "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot",
+                "prebuilts/go/linux-x86/bin/go",
+                "prebuilts/rust/linux-x86/1.83.0/bin/rustc"
             ]
         );
         assert!(m.modules["libz"].contains("depends on undefined"));
         assert_eq!(keys(&m.module_types), ["aidl_interface"]);
+    }
+
+    #[test]
+    fn namespaced_goal() {
+        assert_eq!(
+            ninja_goal(
+                "//frameworks/libs/native_bridge_support/android_api/libc:libnative_bridge_guest_libc"
+            ),
+            "frameworks.libs.native_bridge_support.android_api.libc-libnative_bridge_guest_libc"
+        );
+        assert_eq!(ninja_goal("libart"), "libart");
     }
 
     #[test]

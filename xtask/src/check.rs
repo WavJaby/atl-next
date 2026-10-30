@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, licenses, modules, patch, providers, sources, spdx, workspace};
+use crate::{arches, deps, licenses, modules, patch, providers, prune, sources, spdx, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -87,6 +87,8 @@ impl Step {
                     licenses::FILE,
                     licenses.artifact.len()
                 );
+                let prune = prune::load(root, &sources)?;
+                eprintln!("tables: {} ok ({} rows)", prune::FILE, prune.len());
                 Ok(())
             }
             Step::Modules => {

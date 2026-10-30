@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Directories of the AOSP tree Soong must not see.
+# Soong analyses every module of every fetched project, and in a subset tree some module types panic on a missing dependency instead of naming it;
+# when such a module is one ATL never builds, its directory is pruned here rather than the tree grown or Soong patched.
+# `xtask soong` puts Soong's own marker `.find-ignore` in each directory before a build (the finder skips it and everything below) and removes markers whose row is gone.
+# `xtask soong --fetch-missing` prints candidates; a person adds the row, since a directory may also hold a module a goal needs (the build then fails naming it).
+#
+# Row key: tree path of the directory, inside a pinned AOSP project (checked; the directory must exist when xtask soong runs).
+#   reason   why ATL needs no module below it
+# Rows are added when a build first trips over them.
+
+["build/make/target/product/generic"]
+reason = "generic system image modules (android_system_image); ATL builds libraries, never device images"
+
+["system/apex/apexd/apexd_testdata"]
+reason = "test APEXes for apexd's own tests"
+
+["system/apex/tests"]
+reason = "APEX test suites and test APEXes"
