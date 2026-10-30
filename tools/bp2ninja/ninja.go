@@ -228,13 +228,16 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		cppstd = g.soong.CppStd
 	}
 	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), p.strs("cppflags")...)
+	c := append(append([]string{"-std=" + cstd}, common...), p.strs("conlyflags")...)
 	if n.side == Device {
-		cxx = append(cxx, "-I"+filepath.Join(g.out, "compat", "cxx"))
+		dev := append([]string{weakAvailability}, g.soong.APILevels...)
+		dev = append(dev, "-I"+filepath.Join(g.out, "compat", "device"), "-include", deviceForced)
+		cxx = append(append(cxx, dev...), "-I"+filepath.Join(g.out, "compat", "cxx"))
+		c = append(c, dev...)
 	}
 	if !p.boolean("rtti", false) {
 		cxx = append(cxx, "-fno-rtti")
 	}
-	c := append(append([]string{"-std=" + cstd}, common...), p.strs("conlyflags")...)
 	asm := append(append([]string{}, common...), p.strs("asflags")...)
 	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...)}
 }

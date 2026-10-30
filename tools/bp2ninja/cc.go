@@ -278,16 +278,37 @@ func kindOf(t string, want Kind) (Kind, bool) {
 	return 0, false
 }
 
-// cxxCompat: bionic headers AOSP code relies on and glibc lacks or differs in, put first on the C++
-// include path of device-side modules (never C: stdatomic.h's C branch needs bionic's bits/). Include
-// name -> tree-relative file, linked unchanged into <out>/compat/cxx.
-//   - stdatomic.h: in C++ bionic maps it onto <atomic>; clang's is incompatible with <atomic> before
-//     C++23 (liblog, libbinder, libutils' LightRefBase.h include it from C++).
-//   - linux/ashmem.h: Android's ashmem uapi, absent from distro kernel headers (libcutils
-//     ashmem-dev.cpp; at run time a mainline kernel takes its memfd path).
-var cxxCompat = map[string]string{
-	"stdatomic.h":    "bionic/libc/include/stdatomic.h",
-	"linux/ashmem.h": "bionic/libc/kernel/uapi/linux/ashmem.h",
+// cxxCompat: bionic headers AOSP code relies on and glibc lacks or differs in, put first on the C++ include path of device-side modules (never C: stdatomic.h's C branch needs bionic's bits/), linked unchanged into <out>/compat/cxx.
+//   - stdatomic.h: in C++ bionic maps it onto <atomic>; clang's is incompatible with <atomic> before C++23 (liblog, libbinder, libutils' LightRefBase.h include it from C++).
+//   - linux/ashmem.h: Android's ashmem uapi, absent from distro kernel headers (libcutils ashmem-dev.cpp; at run time a mainline kernel takes its memfd path).
+var cxxCompat = []compatHeader{
+	{"stdatomic.h", "bionic/libc/include/stdatomic.h"},
+	{"linux/ashmem.h", "bionic/libc/kernel/uapi/linux/ashmem.h"},
+}
+
+// deviceCompat: bionic headers on the include path of every device-side C and C++ compile, linked unchanged into <out>/compat/device.
+// Bionic's sys/cdefs.h includes both into every translation unit that includes a libc header; glibc's does not, and AOSP headers use their macros without including them (icu's ndk_headers, nativewindow's hardware_buffer_aidl.h, libsync's sync.h).
+//   - android/versioning.h: __INTRODUCED_IN & co.; with weakAvailability they are availability(android, …) attributes, which clang ignores on a linux-gnu target. Force-included (deviceForced).
+//   - android/api-level.h: for sources that include it by name (it declares android_get_device_api_level and android_get_application_target_sdk_version, which bionic implements and glibc lacks); its level macros reach every compile as -D flags (apiLevels).
+var deviceCompat = []compatHeader{
+	{"android/versioning.h", "bionic/libc/include/android/versioning.h"},
+	{"android/api-level.h", "bionic/libc/include/android/api-level.h"},
+}
+
+// deviceForced: the deviceCompat header every device-side C and C++ compile force-includes; not assembly, nothing there uses it.
+// Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
+const deviceForced = "android/versioning.h"
+
+// compatHeader: include name -> tree-relative file.
+type compatHeader struct{ name, path string }
+
+func compatPath(set []compatHeader, name string) string {
+	for _, h := range set {
+		if h.name == name {
+			return h.path
+		}
+	}
+	panic("compat header " + name + " not in its set")
 }
 
 // node builds (once) the node for a reference, depth first.
