@@ -307,11 +307,16 @@ impl Index {
         };
         // a module a generator creates during analysis (`java_sdk_library` X makes `X.stubs`,
         // `X.stubs.source.api.contribution`, …) is in no Android.bp: its longest dotted prefix is.
-        // An aidl_interface's backends (`foo-V2-cpp`) come first: their interface name is itself dotted
-        let aidl = aidl_interface_of(name)
-            .and_then(|iface| self.modules.get(iface))
-            .filter(|defs| defs.iter().any(|d| d.module_type == "aidl_interface"));
-        let defs = aidl
+        // The modules of an aidl_interface (`foo-V2-cpp`), a hidl_interface (`a.b@1.0_genc++`) and a
+        // sysprop_library (`libFoo`) come first: their base names are themselves dotted
+        let owned_by = |base: Option<&str>, module_type: &str| {
+            base.and_then(|b| self.modules.get(b))
+                .filter(|defs| defs.iter().any(|d| d.module_type == module_type))
+        };
+        let generated = owned_by(aidl_interface_of(name), "aidl_interface")
+            .or_else(|| owned_by(hidl_interface_of(name), "hidl_interface"))
+            .or_else(|| owned_by(name.strip_prefix("lib"), "sysprop_library"));
+        let defs = generated
             .or_else(|| {
                 std::iter::successors(Some(name), |n| n.rsplit_once('.').map(|(head, _)| head))
                     .find_map(|n| self.modules.get(n))
@@ -628,6 +633,18 @@ fn aidl_interface_of(name: &str) -> Option<&str> {
         Some(iface) if digits > 0 => iface,
         _ => base,
     })
+}
+
+/// Suffixes of the modules a hidl_interface `<pkg>@<ver>` creates that the converter builds (system/tools/hidl/build/fqName.go `sourcesName`,
+/// `headersName`, `fileGroupName`; longest first). The cc library has the interface's own name.
+const HIDL_GENERATED: [&str; 3] = ["_genc++_headers", "_genc++", "_hal"];
+
+/// `pkg@ver` of a name `pkg@ver_genc++` & co. a hidl_interface creates (the caller checks it is one).
+fn hidl_interface_of(name: &str) -> Option<&str> {
+    let base = HIDL_GENERATED
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    base.contains('@').then_some(base)
 }
 
 /// The innermost namespace directory that is `dir` or one of its parents.
@@ -1162,6 +1179,57 @@ func init() {
         assert_eq!(index.project_for("a.b-ndk"), Ok("hw/a"));
         // a `-cpp` name of something that is no aidl_interface stays unresolved
         assert!(index.project_for("libx-cpp").is_err());
+    }
+
+    #[test]
+    fn hidl_and_sysprop_names() {
+        for (name, iface) in [
+            (
+                "android.hidl.base@1.0_genc++",
+                Some("android.hidl.base@1.0"),
+            ),
+            (
+                "android.hidl.base@1.0_genc++_headers",
+                Some("android.hidl.base@1.0"),
+            ),
+            ("a.b@2.13_hal", Some("a.b@2.13")),
+            ("a.b@2.13", None),
+            ("libhidl_genc++", None),
+        ] {
+            assert_eq!(hidl_interface_of(name), iface, "{name}");
+        }
+        let def = |t: &str, p: &str| Definition {
+            module_type: t.into(),
+            project: p.into(),
+            file: format!("{p}/Android.bp"),
+            namespace: None,
+            defaults: vec![],
+        };
+        let index = Index {
+            modules: BTreeMap::from([
+                ("a.b@1.0".to_owned(), vec![def("hidl_interface", "hw/ab")]),
+                // the dotted prefix `a.b` is another project's module
+                ("a.b".to_owned(), vec![def("hidl_package_root", "other")]),
+                (
+                    "com.x.Props".to_owned(),
+                    vec![def("sysprop_library", "sys/x")],
+                ),
+                ("com".to_owned(), vec![def("cc_library", "wrong")]),
+                ("libplain".to_owned(), vec![def("cc_library", "plain")]),
+                ("plain".to_owned(), vec![def("cc_library", "wrong")]),
+            ]),
+            module_types: BTreeMap::new(),
+        };
+        assert_eq!(index.project_for("a.b@1.0_genc++"), Ok("hw/ab"));
+        assert_eq!(index.project_for("a.b@1.0_genc++_headers"), Ok("hw/ab"));
+        assert_eq!(index.project_for(":a.b@1.0_hal"), Ok("hw/ab"));
+        assert_eq!(index.project_for("a.b@1.0"), Ok("hw/ab"));
+        // a version no Android.bp has stays unresolved: neither the package root `a.b` nor a prefix is guessed
+        assert!(index.project_for("a.b@9.9_genc++").is_err());
+        // `lib<name>` of a sysprop_library; a library that exists keeps its own project; `lib<name>` of a non-sysprop module is not mapped
+        assert_eq!(index.project_for("libcom.x.Props"), Ok("sys/x"));
+        assert_eq!(index.project_for("libplain"), Ok("plain"));
+        assert!(index.project_for("libcom.y.Props").is_err());
     }
 
     #[test]
