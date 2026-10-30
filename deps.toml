@@ -16,11 +16,30 @@
 # Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check).
 # Rows are added when a consumer first needs them.
 
+[bison]
+debian = "bison"
+arch = "bison"
+scope = ["build"]
+used_by = ["xtask:native"]
+
 [cargo-deny]
 cargo = "cargo-deny"
 version = "0.20.2"
 scope = ["test"]
 used_by = ["xtask:check"]
+
+# the distro C/C++ toolchain of the converter route (plan D7-2): clang, lld, llvm-ar, libc++
+[clang]
+debian = "clang-19"
+arch = "clang"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+[flex]
+debian = "flex"
+arch = "flex"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 [git]
 debian = "git"
@@ -28,12 +47,50 @@ arch = "git"
 scope = ["build", "test"]
 used_by = ["xtask:aosp", "xtask:check", "xtask:fetch", "xtask:patch"]
 
+# Go builds the converter (tools/bp2ninja), the one Go program allowed (CLAUDE.md)
+[go]
+debian = "golang-1.24-go"
+arch = "go"
+scope = ["build"]
+used_by = ["xtask:native"]
+
 [libclang]
 debian = "libclang-19-dev"
 # Arch's clang package ships libclang
 arch = "clang"
 scope = ["build"]
 used_by = ["crate:atl-bridgegen"]
+
+# AOSP's C++ assumes libc++ (libstdc++ 14 rejects libbase); the distro's, matching its clang
+[libcxx]
+debian = "libc++-19-dev"
+arch = "libc++"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+[libcxxabi]
+debian = "libc++abi-19-dev"
+arch = "libc++abi"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+[lld]
+debian = "lld-19"
+arch = "lld"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+[llvm]
+debian = "llvm-19"
+arch = "llvm"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+[ninja]
+debian = "ninja-build"
+arch = "ninja"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 [python3-venv]
 debian = "python3-venv"

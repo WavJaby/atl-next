@@ -12,6 +12,7 @@ mod fetch;
 mod git;
 mod licenses;
 mod modules;
+mod native;
 mod notice;
 mod par;
 mod patch;
@@ -71,6 +72,12 @@ enum Command {
     /// failed build's missing modules and paths are pinned (sources.toml) and fetched, then it builds
     /// again; every added project is printed with the log line that asked for it.
     Soong(soong::Args),
+    /// AOSP native modules built for this Linux host by our Blueprint converter (tools/bp2ninja).
+    ///
+    /// Runtime libraries come from each module's android source set compiled for glibc, build tools
+    /// (aidl) from their host source set; bionic itself is replaced by the system C library. Output in
+    /// <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`).
+    Native(native::Args),
     /// Our commits on upstream checkouts: branch atl-patches <-> patches/<upstream>/*.patch.
     ///
     /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only;
@@ -96,6 +103,7 @@ fn main() -> Result<ExitCode> {
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Soong(args) => soong::run(&root, &args),
+        Command::Native(args) => native::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
     }
