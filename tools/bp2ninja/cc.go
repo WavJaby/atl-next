@@ -83,10 +83,12 @@ type Graph struct {
 	cfg       Config
 	soong     SoongConfig
 	omit      map[string]bool
-	mods      [2]map[string][]*Module
-	nodes     map[key]*Node
-	order     []*Node
-	problems  []string
+	// soong_config_module_type name -> wrapped module type
+	configTypes map[string]string
+	mods        [2]map[string][]*Module
+	nodes       map[key]*Node
+	order       []*Node
+	problems    []string
 }
 
 func (g *Graph) problem(format string, args ...any) {
@@ -112,8 +114,9 @@ func (g *Graph) lookup(ref string, side Side) *Module {
 			continue
 		}
 		t := m.Type
+		// fdo_profile: PGO profile data sharing a library's name, never its code
 		if strings.Contains(t, "prebuilt") || strings.Contains(t, "_import") || strings.HasPrefix(t, "ndk_") ||
-			strings.HasPrefix(t, "llndk") || strings.Contains(t, "stubs") {
+			strings.HasPrefix(t, "llndk") || strings.Contains(t, "stubs") || t == "fdo_profile" {
 			continue
 		}
 		cands = append(cands, m)
@@ -158,6 +161,18 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 		for _, b := range targetBlocks(side, g.cfg.Arch) {
 			if o := t.obj(b); o != nil {
 				base = merge(base, o)
+			}
+		}
+	}
+	// soong_config_variables: no Soong config variable (nor the release flags some map to) is set for
+	// this build yet, so each variable's conditions_default applies
+	if sv := p.obj("soong_config_variables"); sv != nil {
+		base = removeKey(base, "soong_config_variables")
+		for _, v := range sv.keys {
+			if o := sv.obj(v); o != nil {
+				if d := o.obj("conditions_default"); d != nil {
+					base = merge(base, d)
+				}
 			}
 		}
 	}
@@ -222,7 +237,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		g.problem("%s: %s module %s not found", from, side, ref)
 		return nil
 	}
-	kind, ok := kindOf(m.Type, want)
+	kind, ok := kindOf(g.baseType(m.Type), want)
 	if !ok {
 		g.problem("%s: %s is a %s (unsupported)", from, m.Name, m.Type)
 		return nil
@@ -304,6 +319,29 @@ func (g *Graph) globs(dir string, pats []string) []string {
 		out = append(out, globTree(filepath.Join(g.tree, dir), p, dir)...)
 	}
 	return out
+}
+
+func removeKey(o *Obj, k string) *Obj {
+	out := newObj()
+	for _, key := range o.keys {
+		if key != k {
+			out.set(key, o.m[key])
+		}
+	}
+	return out
+}
+
+// baseType: the module type behind a `soong_config_module_type` wrapper (libandroid_runtime is a
+// `cc_library_shared_for_libandroid_runtime`), else the type itself.
+func (g *Graph) baseType(t string) string {
+	for i := 0; i < 8; i++ {
+		b, ok := g.configTypes[t]
+		if !ok {
+			return t
+		}
+		t = b
+	}
+	return t
 }
 
 func without(list, drop []string) []string {

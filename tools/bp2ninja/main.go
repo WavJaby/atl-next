@@ -63,6 +63,14 @@ func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals 
 			g.problem("%s eval: %s", Side(side), p)
 		}
 	}
+	g.configTypes = map[string]string{}
+	for _, list := range g.mods[Device] {
+		for _, m := range list {
+			if m.Type == "soong_config_module_type" {
+				g.configTypes[m.Name] = m.Props.str("module_type")
+			}
+		}
+	}
 	// providers.toml's own check cannot see the tree; this one can
 	for m := range omit {
 		if len(g.mods[Device][m])+len(g.mods[Host][m]) == 0 {
