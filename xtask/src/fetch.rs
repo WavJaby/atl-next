@@ -34,13 +34,35 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    Ok(if fetch(root, args)? {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// `xtask fetch --add <paths> --execute`: pin AOSP projects and check them out.
+pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
+    let args = Args {
+        execute: true,
+        bump: false,
+        write: false,
+        add: paths.to_vec(),
+        jobs: None,
+    };
+    ensure!(fetch(root, &args)?, "fetch failed (rows above)");
+    Ok(())
+}
+
+/// False when a checkout failed (its row says why).
+fn fetch(root: &Path, args: &Args) -> Result<bool> {
     let src = workspace::root_dir(root)?.join("src");
     let mut sources = sources::load(root)?;
-    let mut failed = 0;
+    let mut rows = Rows::default();
     // the manifest first: it names every other AOSP project's repository
     if !args.bump {
         let c = sources.manifest_checkout();
-        failed += usize::from(!report("fetch", &c, sync(&src, &c, args.execute)));
+        rows.add(&c, sync(&src, &c, args.execute));
     }
     let manifest = aosp::load(root, &sources.aosp)?;
     let jobs = args
@@ -62,16 +84,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let results = par::map(&all, jobs, |c| sync(&src, c, args.execute));
     for (c, result) in all.iter().zip(results) {
-        failed += usize::from(!report("fetch", c, result));
+        rows.add(c, result);
     }
+    println!("fetch: {} checkouts at pin", rows.at_pin);
     if args.execute
         && let Some(m) = &manifest
     {
         let made = aosp::apply_links(&src.join("aosp"), m)?;
-        println!(
-            "fetch: {:<40} {made} link/copy files created",
-            "aosp (manifest links)"
-        );
+        println!("fetch: {made} manifest link/copy files created");
     } else if !args.execute {
         println!(
             "fetch: dry run ({} checkouts under {}); --execute applies",
@@ -79,33 +99,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             src.display()
         );
     }
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(rows.failed == 0)
 }
 
 /// What the checkout needs; with `execute`, also do it.
-fn sync(src: &Path, c: &Checkout, execute: bool) -> Result<String> {
+fn sync(src: &Path, c: &Checkout, execute: bool) -> Result<Action> {
     let dir = src.join(&c.dir);
     let action = decide(&inspect(&dir)?, &c.commit);
     if execute {
         apply(&action, c, &dir)?;
     }
-    Ok(action.describe())
+    Ok(action)
 }
 
-/// Print one checkout's row; false on failure.
-fn report(verb: &str, c: &Checkout, result: Result<String>) -> bool {
-    match result {
-        Ok(shown) => {
-            println!("{verb}: {:<40} {shown}", c.dir.display());
-            true
-        }
-        Err(e) => {
-            println!("{verb}: {:<40} FAILED: {e:#}", c.dir.display());
-            false
+/// Checkout rows: a clean one at its pin is only counted, every other one is printed.
+#[derive(Default)]
+struct Rows {
+    at_pin: usize,
+    failed: usize,
+}
+
+impl Rows {
+    fn add(&mut self, c: &Checkout, result: Result<Action>) {
+        match result {
+            Ok(Action::AtPin { dirty: false }) => self.at_pin += 1,
+            Ok(action) => println!("fetch: {:<40} {}", c.dir.display(), action.describe()),
+            Err(e) => {
+                self.failed += 1;
+                println!("fetch: {:<40} FAILED: {e:#}", c.dir.display());
+            }
         }
     }
 }
@@ -351,7 +373,7 @@ fn peeled_commit(ls_remote: &str, tag: &str) -> Option<String> {
 
 // ---- --bump ------------------------------------------------------------------------------------
 
-fn bump(root: &Path, all: &[Checkout], write: bool, jobs: usize) -> Result<ExitCode> {
+fn bump(root: &Path, all: &[Checkout], write: bool, jobs: usize) -> Result<bool> {
     let mut moved = Vec::new();
     let mut failed = 0;
     let resolved = par::map(all, jobs, |c| remote_tag_commit(c.url()?, &c.tag));
@@ -395,11 +417,7 @@ fn bump(root: &Path, all: &[Checkout], write: bool, jobs: usize) -> Result<ExitC
             sources::FILE
         );
     }
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(failed == 0)
 }
 
 #[cfg(test)]

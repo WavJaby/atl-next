@@ -16,6 +16,7 @@ mod notice;
 mod par;
 mod patch;
 mod providers;
+mod soong;
 mod sources;
 mod spdx;
 mod workspace;
@@ -61,6 +62,14 @@ enum Command {
     /// index; `--which` reads it. Names come from each module's literal `name:` only: a name built
     /// from variables is not indexed.
     Aosp(aosp::Args),
+    /// AOSP modules built by upstream Soong in the pinned subset tree (phase-1 route).
+    ///
+    /// The product (ATL host arch = AOSP device arch, guest arch = AOSP native-bridge arch) is generated
+    /// from arches.toml into <tree>/device/atl/; TARGET_RELEASE follows the tag's BUILD_ID. Output in
+    /// <workspace>/out/aosp/<product>, one log per build under out/aosp/logs. With --fetch-missing a
+    /// failed build's missing modules and paths are pinned (sources.toml) and fetched, then it builds
+    /// again; every added project is printed with the log line that asked for it.
+    Soong(soong::Args),
     /// Our commits on upstream checkouts: branch atl-patches <-> patches/<upstream>/*.patch.
     ///
     /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only;
@@ -85,6 +94,7 @@ fn main() -> Result<ExitCode> {
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
+        Command::Soong(args) => soong::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
     }

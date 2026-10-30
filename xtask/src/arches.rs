@@ -16,6 +16,7 @@ pub type Arches = BTreeMap<String, Arch>;
 #[serde(deny_unknown_fields)]
 pub struct Arch {
     pub pointer_bits: u32,
+    pub soong_arch_variant: Option<String>,
     pub host: Option<Host>,
     pub guest: Option<Guest>,
 }
