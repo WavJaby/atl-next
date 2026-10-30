@@ -11,6 +11,17 @@ use serde::Deserialize;
 use crate::deps::Deps;
 
 pub const FILE: &str = "providers.toml";
+/// Provider of a module nothing provides on this host: a dependency on it is dropped.
+pub const NONE: &str = "none";
+
+/// Modules whose dependencies the converter drops (`provider = "none"`).
+pub fn omitted(providers: &Providers) -> Vec<&str> {
+    providers
+        .iter()
+        .filter(|(_, row)| row.provider == NONE)
+        .map(|(module, _)| module.as_str())
+        .collect()
+}
 
 /// Row key = Android.bp module name.
 pub type Providers = BTreeMap<String, Provider>;
@@ -39,6 +50,9 @@ fn parse(text: &str, crates: &BTreeSet<String>, deps: &Deps) -> Result<Providers
 fn validate(module: &str, row: &Provider, crates: &BTreeSet<String>, deps: &Deps) -> Result<()> {
     ensure!(is_module_name(module), "not an Android.bp module name");
     ensure!(!row.reason.trim().is_empty(), "empty reason");
+    if row.provider == NONE {
+        return Ok(());
+    }
     match row.provider.split_once(':') {
         Some(("crate", name)) => ensure!(crates.contains(name), "no workspace crate `{name}`"),
         Some(("deps", name)) => {
@@ -55,7 +69,7 @@ fn validate(module: &str, row: &Provider, crates: &BTreeSet<String>, deps: &Deps
             );
         }
         _ => bail!(
-            "provider `{}` is not crate:<name> or deps:<name>",
+            "provider `{}` is not crate:<name>, deps:<name> or {NONE}",
             row.provider
         ),
     }
@@ -121,6 +135,16 @@ mod tests {
             err("[x]\nprovider = \"deps:zlib\"\nreason = \"r\"\n")
                 .contains("lacks `upstream:aosp`")
         );
+    }
+
+    #[test]
+    fn none_drops_the_dependency() {
+        let (crates, deps) = fixtures();
+        let text = "[libdl_android]\nprovider = \"none\"\nreason = \"bionic linker API\"\n\
+                    [libicuuc]\nprovider = \"deps:icu\"\nreason = \"r\"\n";
+        let providers = parse(text, &crates, &deps).unwrap();
+        assert_eq!(super::omitted(&providers), ["libdl_android"]);
+        assert!(err("[x]\nprovider = \"none\"\nreason = \"\"\n").contains("empty reason"));
     }
 
     #[test]

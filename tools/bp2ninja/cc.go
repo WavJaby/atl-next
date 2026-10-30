@@ -82,6 +82,7 @@ type Graph struct {
 	tree, out string
 	cfg       Config
 	soong     SoongConfig
+	omit      map[string]bool
 	mods      [2]map[string][]*Module
 	nodes     map[key]*Node
 	order     []*Node
@@ -198,14 +199,6 @@ func kindOf(t string, want Kind) (Kind, bool) {
 	return 0, false
 }
 
-// bionic is the C library of an android build; on a glibc target the system's libc, kernel headers and
-// libm/libdl take its place, so a dependency on bionic itself is dropped, never built or included
-// (bionic's headers on the include path shadow glibc's: `__GLIBC_USE is not defined`).
-var hostLibc = map[string]bool{
-	"libc": true, "libm": true, "libdl": true,
-	"libc_headers": true, "libc_uapi_headers": true, "bionic_libc_platform_headers": true,
-}
-
 // cxxCompat: bionic headers AOSP code relies on and glibc lacks or differs in, put first on the C++
 // include path of device-side modules (never C: stdatomic.h's C branch needs bionic's bits/). Include
 // name -> tree-relative file, linked unchanged into <out>/compat/cxx.
@@ -220,7 +213,8 @@ var cxxCompat = map[string]string{
 
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
-	if hostLibc[strings.TrimPrefix(ref, ":")] {
+	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs)
+	if g.omit[strings.TrimPrefix(ref, ":")] {
 		return nil
 	}
 	m := g.lookup(ref, side)

@@ -27,18 +27,25 @@ func main() {
 	ar := flag.String("ar", "llvm-ar", "archiver")
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
+	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	flag.Parse()
 	if *tree == "" || *out == "" || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch}, Tools{*cc, *cxx, *ar, *bison, *flex}, flag.Args()); err != nil {
+	omitted := map[string]bool{}
+	for _, m := range strings.Split(*omit, ",") {
+		if m != "" {
+			omitted[m] = true
+		}
+	}
+	if err := run(*tree, *out, Config{Arch: *arch}, Tools{*cc, *cxx, *ar, *bison, *flex}, omitted, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
 }
 
-func run(tree, out string, cfg Config, tools Tools, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -47,13 +54,19 @@ func run(tree, out string, cfg Config, tools Tools, goals []string) error {
 	if err != nil {
 		return err
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
 		mods, problems := ev.modules(files)
 		g.mods[side] = mods
 		for _, p := range problems {
 			g.problem("%s eval: %s", Side(side), p)
+		}
+	}
+	// providers.toml's own check cannot see the tree; this one can
+	for m := range omit {
+		if len(g.mods[Device][m])+len(g.mods[Host][m]) == 0 {
+			g.problem("providers.toml: %s names no module in the tree", m)
 		}
 	}
 	for _, goal := range goals {

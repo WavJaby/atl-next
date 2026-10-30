@@ -10,7 +10,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{arches, workspace};
+use crate::{arches, deps, providers, sources, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -69,13 +69,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .status()
         .context("running go build")?;
     ensure!(status.success(), "building bp2ninja failed");
+    let sources = sources::load(root)?;
+    let workspace = workspace::load(root)?;
+    let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
+    let providers = providers::load(root, &workspace.crates, &deps)?;
+    let omit = providers::omitted(&providers).join(",");
     let status = Command::new(&converter)
         .arg("-tree")
         .arg(&tree)
         .arg("-out")
         .arg(&out)
         .args([
-            "-arch", &args.host, "-cc", &args.cc, "-cxx", &args.cxx, "-ar", &args.ar,
+            "-arch", &args.host, "-cc", &args.cc, "-cxx", &args.cxx, "-ar", &args.ar, "-omit",
+            &omit,
         ])
         .args(&args.goals)
         .status()
