@@ -197,7 +197,7 @@ type langFlags struct{ c, cxx, asm []string }
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
 	common := []string{"-fPIC", "-O2", "-w"}
-	common = append(common, p.strs("cflags")...)
+	common = append(common, moduleFlags(p, "cflags")...)
 	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")
 	var inc []string
@@ -230,8 +230,8 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if cppstd == "" || cppstd == "experimental" {
 		cppstd = g.soong.CppStd
 	}
-	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), p.strs("cppflags")...)
-	c := append(append([]string{"-std=" + cstd}, common...), p.strs("conlyflags")...)
+	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), moduleFlags(p, "cppflags")...)
+	c := append(append([]string{"-std=" + cstd}, common...), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
 		dev := append([]string{weakAvailability}, g.soong.APILevels...)
 		dev = append(dev, "-I"+filepath.Join(g.out, "compat", "device"), "-include", deviceForced)
@@ -241,8 +241,32 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if !p.boolean("rtti", false) {
 		cxx = append(cxx, "-fno-rtti")
 	}
-	asm := append(append([]string{}, common...), p.strs("asflags")...)
+	asm := append(append([]string{}, common...), moduleFlags(p, "asflags")...)
 	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...)}
+}
+
+// moduleFlags: a module's flag property as the argv Soong's command line gives clang.
+// Soong escapes each entry with proptools.NinjaAndShellEscapeList (cc/compiler.go), whose ShellEscape leaves an entry of shell-safe characters and spaces unquoted, so the shell splits it into words (`-include AndroidFixup.h` is two arguments; cc/check.go validates exactly that form); an entry with any other shell-unsafe character is single-quoted whole and stays one argument.
+// shellQuote then re-quotes our argv for the ninja file.
+func moduleFlags(p *Obj, prop string) []string {
+	var out []string
+	for _, f := range p.strs(prop) {
+		if strings.IndexFunc(f, func(r rune) bool { return r != ' ' && soongShellUnsafe(r) }) == -1 {
+			out = append(out, strings.Fields(f)...)
+		} else {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// soongShellUnsafe: blueprint proptools.shellUnsafeChar; safe = letters, digits and `_ + - = . , /`.
+func soongShellUnsafe(r rune) bool {
+	switch {
+	case 'A' <= r && r <= 'Z', 'a' <= r && r <= 'z', '0' <= r && r <= '9':
+		return false
+	}
+	return !strings.ContainsRune("_+-=.,/", r)
 }
 
 // linkLibs: whole archives, the static closure, shared libraries (also those static dependencies
