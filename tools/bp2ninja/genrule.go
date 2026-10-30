@@ -20,7 +20,8 @@ import (
 //     generated files and tools, which live outside the tree; $(out) / $(genDir) are absolute. Ninja creates the output directories.
 //   - Anything that cannot be built (unsupported tool, unresolved input, bad cmd) still gets its build edge, whose script prints
 //     `error: ...` and fails, so consumers see a failed genrule step, not a ninja "missing and no known rule" for every compile.
-//   - Not supported, reported as problems: gensrcs, use_nsjail, device_first_srcs / device_common_srcs / common_os_srcs, $(build_number_file).
+//   - gensrcs: a genrule whose command runs once per input (gensrcsCommands).
+//   - Not supported, reported as problems: use_nsjail, device_first_srcs / device_common_srcs / common_os_srcs, $(build_number_file).
 //     `$(depfile)` is no genrule variable in Soong ("unknown variable"), so it is none here.
 
 // genOutLimit: more outputs than this go behind one phony target for consumers (genrule.go GenerateAndroidBuildActions).
@@ -51,7 +52,9 @@ type genRule struct {
 	broken   string // first reason the command cannot run
 }
 
-func isGenType(t string) bool { return t == "genrule" || t == "cc_genrule" }
+func isGenType(t string) bool {
+	return t == "genrule" || t == "cc_genrule" || t == "gensrcs" || t == "java_genrule" || t == "java_genrule_host"
+}
 
 // genNode builds (once) the genrule node a reference names. A reference of another type is a problem,
 // a reference no module answers to is also recorded for notFound.
@@ -133,6 +136,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 	for _, e := range g.globs(m.Dir, p.strs("exclude_srcs")) {
 		exclude[e] = true
 	}
+	var inputs []srcFile
 	for _, s := range p.strs("srcs") {
 		files, ok := g.resolveSrc(m.Dir, n.side, s, m.Name)
 		l := genLabel{name: s}
@@ -147,6 +151,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 			}
 			l.files = append(l.files, f.path)
 			r.inputs = append(r.inputs, f.path)
+			inputs = append(inputs, f)
 		}
 		if !ok {
 			l.err = "srcs " + s + " unresolved"
@@ -155,6 +160,9 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 		addLabel(l)
 	}
 	genDir := g.genDir(n, "")
+	if g.baseType(m.Type) == "gensrcs" {
+		r.outs, r.cmd = gensrcsCommands(genDir, r.cmd, p.str("output_extension"), p.str("trim_extension"), inputs, fail)
+	}
 	seen := map[string]bool{}
 	for _, o := range p.strs("out") {
 		path := filepath.Join(genDir, o)
@@ -458,6 +466,44 @@ func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 	if r.phony != "" {
 		fmt.Fprintf(b, "build %s: phony %s\n", esc(r.phony), join(r.outs))
 	}
+}
+
+// gensrcsCommands is gensrcs' task generator (genrule.go NewGenSrcs): one output per input under <genDir>/gensrcs, and the command run
+// once per input with $(in) / $(out) bound, each as `bash -c '…'`, joined with &&; the other variables are expanded later as a genrule's.
+// Output path (paths.go genPathWithExtAndTrimExt): a tree file's tree-relative path, a generated file's path below its generator's
+// directory, with trim_extension cut and output_extension appended, else the extension replaced. Not sharded: shards only split the work.
+func gensrcsCommands(genDir, raw, ext, trim string, inputs []srcFile, fail func(string, ...any)) (outs []string, cmd string) {
+	var cmds []string
+	for _, f := range inputs {
+		rel := f.path
+		if f.gen != nil {
+			rel = strings.TrimPrefix(f.path, f.root+"/")
+		}
+		switch {
+		case trim != "" && ext != "":
+			rel = strings.TrimSuffix(rel, trim) + "." + ext
+		case trim != "":
+			rel = strings.TrimSuffix(rel, trim)
+		default:
+			rel = strings.TrimSuffix(rel, filepath.Ext(rel)) + "." + ext
+		}
+		out := filepath.Join(genDir, "gensrcs", rel)
+		outs = append(outs, out)
+		c, err := expandVars(raw, func(name string) (string, error) {
+			switch name {
+			case "in":
+				return shellEscape(f.path), nil
+			case "out":
+				return shellEscape(out), nil
+			}
+			return "$(" + name + ")", nil
+		})
+		if err != nil {
+			fail("cmd: %v", err)
+		}
+		cmds = append(cmds, "bash -c "+shellEscape(c))
+	}
+	return outs, strings.Join(cmds, " && ")
 }
 
 // writeScripts writes the genrule scripts, leaving unchanged ones alone: a newer script would rerun its genrule.

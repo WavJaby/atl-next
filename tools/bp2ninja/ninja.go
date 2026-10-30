@@ -178,7 +178,10 @@ func (g *Graph) emit(tools Tools) string {
 			defaults = append(defaults, n.out)
 		}
 	}
-	fmt.Fprintf(&b, "\ndefault %s\n", join(defaults))
+	// none with only Java goals; ninja rejects an empty default statement
+	if len(defaults) > 0 {
+		fmt.Fprintf(&b, "\ndefault %s\n", join(defaults))
+	}
 	return b.String()
 }
 

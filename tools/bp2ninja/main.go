@@ -6,6 +6,10 @@
 //
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
+// Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need -jdk, -build-tools, -aconfig and
+// -release, and -metalava where API stubs are built; with them, a goal that names a Java module builds as one. -measure writes
+// <out>/measure.txt (measure.go) instead of a build.
+//
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
 // module references behind the "not found" problems) and <out>/missing-paths.txt (tree directories named by path that do not
 // exist), both one per line, unique and sorted: what the caller may fetch. Exits 0 even with problems, which the caller reports.
@@ -30,6 +34,13 @@ func main() {
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
+	var jt JavaTools
+	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
+	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
+	flag.StringVar(&jt.Metalava, "metalava", "", "Java goals: metalava.jar droidstubs run")
+	flag.StringVar(&jt.Aconfig, "aconfig", "", "Java goals: aconfig binary")
+	release := flag.String("release", "", "Java goals: build/release config (TARGET_RELEASE): build flags and aconfig values")
+	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	flag.Parse()
 	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || flag.NArg() == 0 {
 		flag.Usage()
@@ -41,13 +52,20 @@ func main() {
 			omitted[m] = true
 		}
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, omitted, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
 }
 
-func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals []string) error {
+// javaSetup: the Java tools and release config; read only when a goal is a Java module.
+type javaSetup struct {
+	tools   JavaTools
+	release string
+	measure bool
+}
+
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -79,10 +97,36 @@ func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals 
 			g.problem("providers.toml: %s names no module in the tree", m)
 		}
 	}
+	// Java tools given: Java goals are built (java.go)
+	if js.tools.JDK != "" {
+		if err := g.initJava(js); err != nil {
+			return err
+		}
+	}
+	if js.measure {
+		if g.java == nil {
+			return fmt.Errorf("-measure needs the Java tools (-jdk …)")
+		}
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(out, "measure.txt"), []byte(g.measure(goals)), 0o644)
+	}
 	for _, goal := range goals {
+		if g.java != nil {
+			if m := g.lookupJava(goal, Device); m != nil && g.isJava(m.Type) {
+				if n := g.jnode(goal, Device, "goal"); n != nil {
+					g.java.outs = append(g.java.outs, n.output()...)
+				}
+				continue
+			}
+		}
 		g.node(goal, Device, Shared, "goal")
 	}
 	ninja := g.emit(tools)
+	if g.java != nil {
+		ninja += g.java.ninja(g)
+	}
 	compat := filepath.Join(out, "compat", "cxx")
 	for name, h := range cxxCompat {
 		link := filepath.Join(compat, name)

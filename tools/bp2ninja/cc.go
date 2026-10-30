@@ -72,6 +72,8 @@ type Node struct {
 	genIncs    []string
 	genExports []string
 	rule       *genRule // Kind Gen only
+	// cc_object modules srcs name (`:bcm_object`)
+	objSrcs []*Node
 }
 
 // genClosure: generated files n and its dependencies produce; n's compiles wait for them (headers).
@@ -109,6 +111,8 @@ type Graph struct {
 	// aidl_interface modules by name/side (nil = none), and the backends synthesized from them by ref/side (aidliface.go)
 	aidlIfaces map[string]*aidlIface
 	aidlMods   map[string]*Module
+	// Java modules (java.go)
+	java *javaGraph
 }
 
 func (g *Graph) problem(format string, args ...any) {
@@ -145,7 +149,16 @@ func sortedKeys(m map[string]bool) []string {
 
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports
 // and NDK/LLNDK stubs lose to a source definition of the same name.
-func (g *Graph) lookup(ref string, side Side) *Module {
+func (g *Graph) lookup(ref string, side Side) *Module { return g.lookupWith(ref, side, isPrebuiltType) }
+
+// isPrebuiltType: module types lookup skips. fdo_profile: PGO profile data sharing a library's name, never its code.
+func isPrebuiltType(t string) bool {
+	return strings.Contains(t, "prebuilt") || strings.Contains(t, "_import") || strings.HasPrefix(t, "ndk_") ||
+		strings.HasPrefix(t, "llndk") || strings.Contains(t, "stubs") || t == "fdo_profile"
+}
+
+// lookupWith is lookup with the module types to skip given; among several candidates the first by directory wins.
+func (g *Graph) lookupWith(ref string, side Side, skip func(string) bool) *Module {
 	ref = strings.TrimPrefix(ref, ":")
 	if i := strings.IndexByte(ref, '#'); i >= 0 {
 		ref = ref[:i]
@@ -161,10 +174,7 @@ func (g *Graph) lookup(ref string, side Side) *Module {
 		if dir != "" && m.Dir != dir && !strings.HasPrefix(m.Dir, dir+"/") {
 			continue
 		}
-		t := m.Type
-		// fdo_profile: PGO profile data sharing a library's name, never its code
-		if strings.Contains(t, "prebuilt") || strings.Contains(t, "_import") || strings.HasPrefix(t, "ndk_") ||
-			strings.HasPrefix(t, "llndk") || strings.Contains(t, "stubs") || t == "fdo_profile" {
+		if skip(m.Type) {
 			continue
 		}
 		cands = append(cands, m)
@@ -188,7 +198,8 @@ func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj
 			continue
 		}
 		seen[d] = true
-		dm := g.lookup(d, side)
+		// a defaults module never loses to a prebuilt; its (soong_config) type may contain "stubs"
+		dm := g.lookupWith(d, side, func(t string) bool { return isPrebuiltType(t) && !strings.HasSuffix(t, "_defaults") })
 		if dm == nil {
 			g.problem("%s: defaults %s not found", m.Name, d)
 			g.notFound(d)
@@ -322,7 +333,8 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		}
 		return out
 	}
-	n.deps.whole = dep("whole_static_libs", Static)
+	// cc_object modules named in srcs (srcFiles) are linked whole, as Soong links their object
+	n.deps.whole = append(dep("whole_static_libs", Static), n.objSrcs...)
 	n.deps.static = dep("static_libs", Static)
 	n.deps.shared = dep("shared_libs", Shared)
 	n.deps.headers = dep("header_libs", Headers)
@@ -364,6 +376,14 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 
 // srcFiles expands one `srcs` entry of n; the genrules it names are consumed (n's compiles wait for them).
 func (g *Graph) srcFiles(n *Node, s string) []srcFile {
+	if isRef(s) {
+		if m := g.lookup(s, n.side); m != nil && g.baseType(m.Type) == "cc_object" {
+			if o := g.node(s, n.side, Static, n.mod.Name); o != nil {
+				n.objSrcs = append(n.objSrcs, o)
+			}
+			return nil
+		}
+	}
 	files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.mod.Name)
 	var out []srcFile
 	for _, f := range files {
