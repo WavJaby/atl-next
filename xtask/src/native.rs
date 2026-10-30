@@ -35,6 +35,9 @@ pub struct Args {
     /// runs once, after that.
     #[arg(long)]
     fetch_missing: bool,
+    /// Build directory (default `<workspace>/out/native/<host>`): concurrent checkouts keep their outputs apart.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 }
 
 /// First error lines echoed per failing module; the ninja log keeps all of them.
@@ -48,8 +51,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let ws = workspace::root_dir(root)?;
     let tree = ws.join("src").join("aosp");
-    let tool_dir = ws.join("out").join("bp2ninja");
-    let out = ws.join("out").join("native").join(&args.host);
+    // go.work and the converter binary name this checkout's tools/bp2ninja: with an explicit --out they live there too, so concurrent checkouts do not overwrite each other's
+    let (out, tool_dir) = match &args.out {
+        Some(dir) => {
+            let dir = std::path::absolute(dir)?;
+            (dir.clone(), dir.join("bp2ninja"))
+        }
+        None => (
+            ws.join("out").join("native").join(&args.host),
+            ws.join("out").join("bp2ninja"),
+        ),
+    };
+    std::fs::create_dir_all(&out)?;
     std::fs::create_dir_all(&tool_dir)?;
     let go_work = tool_dir.join("go.work");
     std::fs::write(
