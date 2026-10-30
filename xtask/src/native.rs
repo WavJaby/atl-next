@@ -10,7 +10,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::aosp::{Index, Prebuilts};
+use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::{arches, deps, fetch, providers, sources, workspace};
 
 #[derive(clap::Args)]
@@ -30,8 +30,8 @@ pub struct Args {
     /// Archiver (deps.toml row `llvm`).
     #[arg(long, default_value = "llvm-ar-19")]
     ar: String,
-    /// Before building, convert again and again: pin and fetch the AOSP projects defining the modules
-    /// the converter reports missing (`missing.txt`), until a round finds nothing new to fetch. Ninja
+    /// Before building, convert again and again: pin and fetch the AOSP projects behind the modules and
+    /// tree paths the converter reports missing (`missing.txt`, `missing-paths.txt`), until a round finds nothing new to fetch. Ninja
     /// runs once, after that.
     #[arg(long)]
     fetch_missing: bool,
@@ -112,13 +112,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let problems = std::fs::read_to_string(out.join("problems.txt")).unwrap_or_default();
         if args.fetch_missing {
             let missing = std::fs::read_to_string(out.join("missing.txt")).unwrap_or_default();
+            let paths = std::fs::read_to_string(out.join("missing-paths.txt")).unwrap_or_default();
             let sources = sources::load(root)?;
             let index = Index::load(root, &sources.aosp)?;
+            let manifest = aosp::load(root, &sources.aosp)?
+                .context("the AOSP manifest checkout is missing: run `cargo xtask fetch`")?;
             let pinned: BTreeSet<&str> = sources.aosp.projects.keys().map(String::as_str).collect();
-            let (want, unresolved) = wanted(&index, &missing, &problems, &pinned);
+            let found = Found {
+                modules: &missing,
+                paths: &paths,
+                problems: &problems,
+            };
+            let (want, unresolved) = wanted(&found, &index, &manifest, &pinned);
             println!(
-                "native: round {round}: {} modules missing, {} projects to fetch",
-                missing.lines().filter(|l| !l.is_empty()).count(),
+                "native: round {round}: {} modules + {} paths missing, {} projects to fetch",
+                lines(&missing).count(),
+                lines(&paths).count(),
                 want.len()
             );
             if !want.is_empty() {
@@ -167,32 +176,56 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     Ok(ExitCode::FAILURE)
 }
 
-/// Unpinned projects defining the converter's `missing.txt` references (one per line), each with the
-/// first `problems.txt` line naming the reference; plus the references no project can be named for.
+/// One converter round's output files.
+struct Found<'a> {
+    /// `missing.txt`: module references no module of the tree answers to
+    modules: &'a str,
+    /// `missing-paths.txt`: tree directories modules name by path that do not exist
+    paths: &'a str,
+    problems: &'a str,
+}
+
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty())
+}
+
+/// Unpinned projects behind the converter's missing references and paths, each with the first `problems.txt`
+/// line naming it; plus what no project to fetch can be named for.
 fn wanted(
+    found: &Found,
     index: &Index,
-    missing: &str,
-    problems: &str,
+    manifest: &Manifest,
     pinned: &BTreeSet<&str>,
 ) -> (BTreeMap<String, String>, Vec<String>) {
-    let why = |module: &str| {
-        // a problem line names a reference as one token: `:name` (filegroup), `name`, `//dir:name#tag`
-        let line = problems.lines().find(|l| {
-            l.split_whitespace()
-                .any(|t| t.trim_start_matches(':').split('#').next() == Some(module))
-        });
-        format!("module {module}: {}", line.unwrap_or("(no problem line)"))
-    };
-    index.unpinned_projects(
-        missing
+    // a problem line names a reference as one token: `:name` (filegroup), `name`, `//dir:name#tag`, a path
+    let line = |name: &str| {
+        found
+            .problems
             .lines()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(|m| (m, why(m))),
+            .find(|l| {
+                l.split_whitespace()
+                    .any(|t| t.trim_start_matches(':').split('#').next() == Some(name))
+            })
+            .unwrap_or("(no problem line)")
+            .to_owned()
+    };
+    let (mut want, mut unresolved) = index.unpinned_projects(
+        lines(found.modules).map(|m| (m, format!("module {m}: {}", line(m)))),
         pinned,
         // the converter builds from source only: a prebuilt is no answer to fetch
         Prebuilts::Never,
-    )
+    );
+    for path in lines(found.paths) {
+        match manifest.project_of(path) {
+            Some(p) if !pinned.contains(p) => {
+                want.entry(p.to_owned())
+                    .or_insert_with(|| format!("path {path}: {}", line(path)));
+            }
+            Some(p) => unresolved.push(format!("{path}: in pinned {p}, yet missing")),
+            None => unresolved.push(format!("{path}: in no manifest project")),
+        }
+    }
+    (want, unresolved)
 }
 
 /// Failed ninja steps grouped by `<side>/<module>` (from the output path), with their first errors.
@@ -245,6 +278,47 @@ mod tests {
         .unwrap()
     }
 
+    /// Manifest of the fake tree: external/gemmlowp unpinned, external/png pinned.
+    fn manifest() -> Manifest {
+        crate::aosp::parse(r#"<manifest><default revision="r"/><project path="external/gemmlowp" name="g"/><project path="external/png" name="p"/></manifest>"#).unwrap()
+    }
+
+    fn run(
+        missing: &str,
+        paths: &str,
+        problems: &str,
+        pinned: &BTreeSet<&str>,
+    ) -> (BTreeMap<String, String>, Vec<String>) {
+        let found = Found {
+            modules: missing,
+            paths,
+            problems,
+        };
+        wanted(&found, &index(), &manifest(), pinned)
+    }
+
+    #[test]
+    fn missing_paths_to_projects() {
+        let problems = "libtflite: include dir external/gemmlowp/fixedpoint does not exist\n";
+        let paths = "external/gemmlowp/fixedpoint\nexternal/png/include\nnowhere/x\n";
+        let (want, unresolved) = run("", paths, problems, &BTreeSet::from(["external/png"]));
+        // the longest manifest project containing the path, evidence = the problem line naming the path
+        assert_eq!(
+            want,
+            BTreeMap::from([(
+                "external/gemmlowp".to_owned(),
+                format!("path external/gemmlowp/fixedpoint: {}", problems.trim())
+            )])
+        );
+        assert_eq!(
+            unresolved,
+            [
+                "external/png/include: in pinned external/png, yet missing",
+                "nowhere/x: in no manifest project"
+            ]
+        );
+    }
+
     #[test]
     fn missing_references_to_projects() {
         let problems = "\
@@ -262,7 +336,7 @@ nope
 
 ";
         let pinned = BTreeSet::from(["external/png"]);
-        let (want, unresolved) = wanted(&index(), missing, problems, &pinned);
+        let (want, unresolved) = run(missing, "", problems, &pinned);
         // `//dir:name` reaches the package directory; one project per reference, evidence = first line
         assert_eq!(
             want.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -277,7 +351,7 @@ nope
             "module //external/zlib:libz: libandroid_runtime: device module //external/zlib:libz not found"
         );
         // no problem line names it: still wanted, evidence says so
-        let (want, _) = wanted(&index(), "libz", "", &BTreeSet::new());
+        let (want, _) = run("libz", "", "", &BTreeSet::new());
         assert_eq!(want["external/zlib"], "module libz: (no problem line)");
         // a pinned definition (lookup rule, not absent checkout), an ambiguous and an unknown name
         assert_eq!(
@@ -289,17 +363,14 @@ nope
             ]
         );
         // nothing missing -> nothing to do
-        assert_eq!(
-            wanted(&index(), "\n", problems, &pinned),
-            Default::default()
-        );
+        assert_eq!(run("\n", "\n", problems, &pinned), Default::default());
     }
 
     #[test]
     fn evidence_matches_whole_tokens() {
         let p =
             "x: device module libzstd not found\ny: source :libz#tag is not a known filegroup\n";
-        let (want, _) = wanted(&index(), "libz", p, &BTreeSet::new());
+        let (want, _) = run("libz", "", p, &BTreeSet::new());
         assert_eq!(
             want["external/zlib"],
             "module libz: y: source :libz#tag is not a known filegroup"

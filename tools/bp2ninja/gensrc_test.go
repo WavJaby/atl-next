@@ -292,7 +292,7 @@ func TestMissingGeneratorTool(t *testing.T) {
 	if len(l.edges) != 2 || l.edges[0].toolNode != nil || l.edges[0].toolVar != "aprotoc" {
 		t.Errorf("edges %+v", l.edges)
 	}
-	if got := strings.Join(g.missingRefs(), ","); got != "aprotoc,libprotobuf-cpp-lite" {
+	if got := strings.Join(sortedKeys(g.missing), ","); got != "aprotoc,libprotobuf-cpp-lite" {
 		t.Errorf("missing %q", got)
 	}
 	n := 0

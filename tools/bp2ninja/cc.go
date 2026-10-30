@@ -100,6 +100,8 @@ type Graph struct {
 	problems    []string
 	// references no module of the tree answers to (see notFound)
 	missing map[string]bool
+	// tree-relative directories modules name by path (include_dirs) that do not exist
+	missingPaths map[string]bool
 	// genrule scripts by path, written by writeScripts after emit
 	scripts map[string]string
 	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
@@ -118,16 +120,20 @@ func (g *Graph) notFound(ref string) {
 	if i := strings.IndexByte(ref, '#'); i >= 0 {
 		ref = ref[:i]
 	}
-	if g.missing == nil {
-		g.missing = map[string]bool{}
-	}
-	g.missing[ref] = true
+	g.missing = addKey(g.missing, ref)
 }
 
-// missingRefs: the recorded references, sorted.
-func (g *Graph) missingRefs() []string {
-	out := make([]string, 0, len(g.missing))
-	for r := range g.missing {
+func addKey(m map[string]bool, k string) map[string]bool {
+	if m == nil {
+		m = map[string]bool{}
+	}
+	m[k] = true
+	return m
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for r := range m {
 		out = append(out, r)
 	}
 	sort.Strings(out)

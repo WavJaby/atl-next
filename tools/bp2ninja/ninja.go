@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -192,6 +193,11 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		inc = append(inc, "-I"+g.abs(filepath.Join(n.mod.Dir, d)))
 	}
 	for _, d := range p.strs("include_dirs") {
+		// a tree path, not a module reference: an absent one is usually an unfetched project (tflite -> external/gemmlowp)
+		if _, err := os.Stat(g.abs(d)); err != nil {
+			g.problem("%s: include dir %s does not exist", n.mod.Name, d)
+			g.missingPaths = addKey(g.missingPaths, filepath.Clean(d))
+		}
 		inc = append(inc, "-I"+g.abs(d))
 	}
 	inc = append(inc, "-I"+g.abs(n.mod.Dir))

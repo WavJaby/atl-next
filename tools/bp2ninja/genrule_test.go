@@ -310,7 +310,7 @@ cc_library_static { name: "l2" }
 	g.node("l", Device, Static, "t")
 	// a name the tree lacks is recorded for fetching, with no `not supported yet` / `not a known filegroup`
 	// problem of its own for the genrule case; a module of another type under a name is only a problem
-	if got := strings.Join(g.missingRefs(), ","); got != "absent,nowhere" {
+	if got := strings.Join(sortedKeys(g.missing), ","); got != "absent,nowhere" {
 		t.Errorf("missing %q", got)
 	}
 	n := g.nodes[key{"g", Device, Gen}]

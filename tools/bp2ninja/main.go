@@ -6,9 +6,9 @@
 //
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
-// Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and
-// properties) and <out>/missing.txt (the module references behind the "not found" problems, one per
-// line, unique and sorted: what the caller may fetch); exits 0 even with problems, which the caller reports.
+// Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
+// module references behind the "not found" problems) and <out>/missing-paths.txt (tree directories named by path that do not
+// exist), both one per line, unique and sorted: what the caller may fetch. Exits 0 even with problems, which the caller reports.
 package main
 
 import (
@@ -104,8 +104,10 @@ func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals 
 		return err
 	}
 	// always written, empty included: a stale list of an earlier run must never be read as current
-	if err := os.WriteFile(filepath.Join(out, "missing.txt"), []byte(strings.Join(g.missingRefs(), "\n")+"\n"), 0o644); err != nil {
-		return err
+	for file, set := range map[string]map[string]bool{"missing.txt": g.missing, "missing-paths.txt": g.missingPaths} {
+		if err := os.WriteFile(filepath.Join(out, file), []byte(strings.Join(sortedKeys(set), "\n")+"\n"), 0o644); err != nil {
+			return err
+		}
 	}
 	srcs := 0
 	for _, n := range g.order {
