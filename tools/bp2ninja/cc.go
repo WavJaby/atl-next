@@ -106,6 +106,9 @@ type Graph struct {
 	scripts map[string]string
 	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
 	tools map[string]*Node
+	// aidl_interface modules by name/side (nil = none), and the backends synthesized from them by ref/side (aidliface.go)
+	aidlIfaces map[string]*aidlIface
+	aidlMods   map[string]*Module
 }
 
 func (g *Graph) problem(format string, args ...any) {
@@ -167,6 +170,10 @@ func (g *Graph) lookup(ref string, side Side) *Module {
 		cands = append(cands, m)
 	}
 	if len(cands) == 0 {
+		// `<iface>[-V<n>]-<cpp|ndk>`: made by the aidl_interface module type, defined in no Android.bp
+		if dir == "" {
+			return g.aidlBackend(ref, side)
+		}
 		return nil
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].Dir < cands[j].Dir })
@@ -280,8 +287,11 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	}
 	m := g.lookup(ref, side)
 	if m == nil {
-		g.problem("%s: %s module %s not found", from, side, ref)
-		g.notFound(ref)
+		// a backend of an aidl_interface the tree has: lookup recorded why there is none, and the name is nothing to fetch
+		if !g.aidlOwned(ref) {
+			g.problem("%s: %s module %s not found", from, side, ref)
+			g.notFound(ref)
+		}
 		return nil
 	}
 	kind, ok := kindOf(g.baseType(m.Type), want)
@@ -299,6 +309,9 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	var files []srcFile
 	for _, s := range n.props.strs("srcs") {
 		files = append(files, g.srcFiles(n, s)...)
+	}
+	if m.aidl != nil {
+		files = append(files, m.aidl.srcs...)
 	}
 	dep := func(list string, want Kind) []*Node {
 		var out []*Node

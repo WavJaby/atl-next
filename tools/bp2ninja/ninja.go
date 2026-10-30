@@ -84,7 +84,8 @@ rule link
   command = $cxx $mode -o $out $in $libs
   description = link $out
 rule aidl
-  command = $aidl --lang=cpp $flags -h $hdir -o $sdir $in
+  command = $aidl --lang=$lang $flags --ninja -d $dep -h $hdir -o $sdir $in
+  depfile = $dep
   description = aidl $in
 rule protoc
   command = $aprotoc --cpp_out=$params:$outdir --dependency_out=$dep -I $base $flags $in
@@ -124,9 +125,14 @@ func (g *Graph) emit(tools Tools) string {
 			g.emitGen(&b, n)
 		}
 	}
+	// a cc_library used as static and as shared is two nodes of one module: its generator outputs are named by module, so both write the same edges
+	emitted := map[string]bool{}
 	for _, n := range g.order {
 		for _, e := range n.edges {
-			g.emitEdge(&b, e)
+			if !emitted[e.outs[0]] {
+				emitted[e.outs[0]] = true
+				g.emitEdge(&b, e)
+			}
 		}
 	}
 	for _, n := range g.order {

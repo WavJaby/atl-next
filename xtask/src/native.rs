@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::{arches, deps, fetch, providers, sources, workspace};
@@ -161,6 +161,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let text = std::fs::read_to_string(&log)?;
     let failures = failures(&text, &format!("{}/", out.display()));
+    if failures.is_empty() {
+        // ninja failed without a failed step: it could not load the graph (duplicate rule, missing input)
+        let err = std::fs::read_to_string(out.join("ninja.err")).unwrap_or_default();
+        bail!(
+            "ninja failed before building a step: {}",
+            err.lines().next().unwrap_or("(no ninja.err)")
+        );
+    }
     let total: usize = failures.values().map(|f| f.0).sum();
     println!(
         "native: {total} failed steps in {} modules (log {})",

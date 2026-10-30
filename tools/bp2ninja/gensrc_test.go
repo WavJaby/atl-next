@@ -83,11 +83,29 @@ func TestAidlGenerator(t *testing.T) {
 	a := srcFile{path: "r1/android/os/IFoo.aidl", root: "r1"}
 	b := srcFile{path: "r2/com/Bar.aidl", root: "r2"}
 	r := aidlGen.gen(g, n, a, []srcFile{a, b})
-	if want := []string{tGen + "/src/android/os/IFoo.cpp", tGen + "/include/android/os/IFoo.h"}; !reflect.DeepEqual(r.edge.outs, want) {
-		t.Errorf("outs %v, want %v", r.edge.outs, want)
+	// aidl_gen_rule.go: X.h, BpX.h, BnX.h per type; a leading I followed by an upper-case letter is not part of the Bp/Bn name
+	wantOuts := []string{
+		tGen + "/src/android/os/IFoo.cpp", tGen + "/include/android/os/IFoo.h", tGen + "/include/android/os/BpFoo.h", tGen + "/include/android/os/BnFoo.h",
 	}
-	if want := "-I/t/r1 -I/t/r2 -I/t/p/q/loc -I/t/inc/dir"; r.edge.vars[0][0] != "flags" || r.edge.vars[0][1] != want {
-		t.Errorf("flags %v, want %s", r.edge.vars[0], want)
+	if !reflect.DeepEqual(r.edge.outs, wantOuts) || !reflect.DeepEqual(r.waits, wantOuts[1:]) {
+		t.Errorf("outs %v waits %v, want %v", r.edge.outs, r.waits, wantOuts)
+	}
+	vars := map[string]string{}
+	for _, v := range r.edge.vars {
+		vars[v[0]] = v[1]
+	}
+	if want := "-I/t/r1 -I/t/r2 -I/t/p/q/loc -I/t/inc/dir"; vars["flags"] != want || vars["lang"] != "cpp" {
+		t.Errorf("flags %q lang %q, want %s cpp", vars["flags"], vars["lang"], want)
+	}
+	if vars["dep"] != tGen+"/src/android/os/IFoo.cpp.d" {
+		t.Errorf("depfile %q", vars["dep"])
+	}
+	// no I prefix to drop: lower-case second letter, or no second letter
+	for in, want := range map[string]string{"Ifoo": "BpIfoo.h", "I": "BpI.h", "IBar": "BpBar.h", "Baz": "BpBaz.h", "I2": "Bp2.h"} {
+		f := srcFile{path: "r1/" + in + ".aidl", root: "r1"}
+		if outs := aidlGen.gen(g, n, f, []srcFile{f}).edge.outs; outs[2] != tGen+"/include/"+want {
+			t.Errorf("%s: client header %s, want %s", in, outs[2], want)
+		}
 	}
 	if want := []string{"-I" + tGen + "/include"}; !reflect.DeepEqual(r.incs, want) || !reflect.DeepEqual(r.exports, want) {
 		t.Errorf("incs %v exports %v, want %v", r.incs, r.exports, want)
@@ -188,6 +206,17 @@ func TestEmitEdge(t *testing.T) {
 	b.Reset()
 	g.emitEdge(&b, genEdge{rule: "lex", outs: []string{"/o/a.c"}, in: "/t/a.l"})
 	if want := "build /o/a.c: lex /t/a.l\n"; b.String() != want {
+		t.Errorf("edge %q, want %q", b.String(), want)
+	}
+	// implicit inputs (aidl .hash files) follow the tool after `|`, with or without one
+	b.Reset()
+	g.emitEdge(&b, genEdge{rule: "aidl", outs: []string{"/o/a.cpp"}, in: "/t/a.aidl", toolVar: "aidl", toolNode: &Node{out: "/o/aidl"}, implicit: []string{"/t/x y/.hash"}})
+	if want := "build /o/a.cpp: aidl /t/a.aidl | /o/aidl /t/x$ y/.hash\n  aidl = /o/aidl\n"; b.String() != want {
+		t.Errorf("edge %q, want %q", b.String(), want)
+	}
+	b.Reset()
+	g.emitEdge(&b, genEdge{rule: "aidl", outs: []string{"/o/a.cpp"}, in: "/t/a.aidl", implicit: []string{"/t/.hash"}})
+	if want := "build /o/a.cpp: aidl /t/a.aidl | /t/.hash\n"; b.String() != want {
 		t.Errorf("edge %q, want %q", b.String(), want)
 	}
 }

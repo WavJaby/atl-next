@@ -32,8 +32,9 @@ type genEdge struct {
 	rule     string
 	outs     []string
 	in       string
-	toolVar  string // = srcGen.tool
-	toolNode *Node  // nil with toolVar set: the tool is missing (problem recorded); the edge fails
+	toolVar  string   // = srcGen.tool
+	toolNode *Node    // nil with toolVar set: the tool is missing (problem recorded); the edge fails
+	implicit []string // inputs beside `in` and the tool that rebuild the edge (aidl .hash files)
 	vars     [][2]string
 }
 
@@ -159,12 +160,19 @@ func (g *Graph) hostTool(name string, n *Node) *Node {
 // emitEdge writes one generator edge.
 func (g *Graph) emitEdge(b *strings.Builder, e genEdge) {
 	fmt.Fprintf(b, "build %s: %s %s", join(e.outs), e.rule, esc(e.in))
+	tool := ""
+	if e.toolNode != nil {
+		tool = e.toolNode.out
+	}
+	implicit := append([]string{}, e.implicit...)
+	if tool != "" {
+		implicit = append([]string{tool}, implicit...)
+	}
+	if len(implicit) > 0 {
+		fmt.Fprintf(b, " | %s", join(implicit))
+	}
 	if e.toolVar != "" {
-		tool := ""
-		if e.toolNode != nil {
-			tool = e.toolNode.out
-		}
-		fmt.Fprintf(b, " | %s\n  %s = %s", esc(tool), e.toolVar, esc(tool))
+		fmt.Fprintf(b, "\n  %s = %s", e.toolVar, esc(tool))
 	}
 	b.WriteString("\n")
 	for _, v := range e.vars {
@@ -172,30 +180,52 @@ func (g *Graph) emitEdge(b *strings.Builder, e genEdge) {
 	}
 }
 
-// genAidl: x.aidl -> src/x.cpp + include/x.h, relative to the source's import root; every root of the node's aidl sources and
-// aidl.local_include_dirs / include_dirs are import paths.
+// genAidl: x.aidl -> src/x.cpp + include/x.h, relative to the source's import root, by `aidl --lang=<cpp|ndk> --ninja`.
+//   - Headers (aidl_gen_rule.go): X.h, BpX.h, BnX.h for every type, BpX/BnX with a leading `I` of X dropped when followed by an upper-case letter
+//     (aidl_to_cpp_common.cpp's heuristic); ndk puts them below `aidl/`. All three are outputs and waited on.
+//   - A cc module with .aidl srcs is cpp: every root of its aidl sources and aidl.local_include_dirs / include_dirs are import paths.
+//     An aidl_interface backend (n.mod.aidl, aidliface.go) brings its own lang and flags.
 func genAidl(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 	rel := strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")
 	srcDir, hdrDir := g.genDir(n, "src"), g.genDir(n, "include")
-	cpp, hdr := filepath.Join(srcDir, rel+".cpp"), filepath.Join(hdrDir, rel+".h")
-	var roots []string
-	for _, p := range peers {
-		roots = appendMissing(roots, []string{p.root})
+	cpp := filepath.Join(srcDir, rel+".cpp")
+	lang, prefix := "cpp", ""
+	var flags, implicit []string
+	if s := n.mod.aidl; s != nil {
+		lang = s.lang
+		if lang == "ndk" {
+			prefix = "aidl"
+		}
+		flags, implicit = s.flags(g, f)
+	} else {
+		var roots []string
+		for _, p := range peers {
+			roots = appendMissing(roots, []string{p.root})
+		}
+		a := n.props.obj("aidl")
+		for _, d := range a.strs("local_include_dirs") {
+			roots = appendMissing(roots, []string{filepath.Join(n.mod.Dir, d)})
+		}
+		roots = appendMissing(roots, a.strs("include_dirs"))
+		for _, r := range roots {
+			flags = append(flags, "-I"+g.abs(r))
+		}
 	}
-	a := n.props.obj("aidl")
-	for _, d := range a.strs("local_include_dirs") {
-		roots = appendMissing(roots, []string{filepath.Join(n.mod.Dir, d)})
+	pkg, typ := filepath.Split(rel)
+	base := typ
+	if len(base) >= 2 && base[0] == 'I' && strings.ToUpper(base)[1] == base[1] {
+		base = base[1:]
 	}
-	roots = appendMissing(roots, a.strs("include_dirs"))
-	flags := make([]string, len(roots))
-	for i, r := range roots {
-		flags[i] = "-I" + g.abs(r)
+	outs, hdrs := []string{cpp}, []string{}
+	for _, h := range []string{typ, "Bp" + base, "Bn" + base} {
+		hdrs = append(hdrs, filepath.Join(hdrDir, prefix, pkg, h+".h"))
 	}
+	outs = append(outs, hdrs...)
 	return genOut{
-		edge: genEdge{rule: "aidl", outs: []string{cpp, hdr}, in: g.abs(f.path), vars: [][2]string{
-			{"flags", shellQuote(flags)}, {"hdir", esc(hdrDir)}, {"sdir", esc(srcDir)},
+		edge: genEdge{rule: "aidl", outs: outs, in: g.abs(f.path), implicit: implicit, vars: [][2]string{
+			{"lang", lang}, {"flags", shellQuote(flags)}, {"hdir", esc(hdrDir)}, {"sdir", esc(srcDir)}, {"dep", esc(cpp + ".d")},
 		}},
-		srcs: []string{cpp}, waits: []string{hdr}, incs: []string{"-I" + hdrDir}, exports: []string{"-I" + hdrDir},
+		srcs: []string{cpp}, waits: hdrs, incs: []string{"-I" + hdrDir}, exports: []string{"-I" + hdrDir},
 	}
 }
 
