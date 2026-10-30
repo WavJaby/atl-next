@@ -13,7 +13,7 @@ import (
 // cc/proto.go + android/proto.go. Each generator turns one source into one ninja edge and says what the node gets: compile sources,
 // headers its compiles wait for, include dirs and cflags for its compiles, include dirs it exports, runtime libraries it needs.
 //   - Output layout is ours, not Soong's, for aidl and bison/flex (gen/<side>/<module>/{src,include}); protobuf follows Soong's gen/<module>/proto.
-//   - Not supported, reported as problems: .sysprop, .rscript, .fs (gen.go has arms for them), proto.plugin, nanopb proto types, proto.output_params.
+//   - Not supported, reported as problems: .rscript, .fs (gen.go has arms for them), proto.plugin, nanopb proto types, proto.output_params.
 //   - bison/flex take no module flags (yacc.flags, lex.flags, gen_location_hh are ignored), as before this table existed.
 //   - Compiles wait on generated headers only; a generated source is a plain input of its own compile (Soong: aidlOrderOnlyDeps, protoOrderOnlyDeps).
 
@@ -21,8 +21,8 @@ import (
 type srcGen struct {
 	// tool: host cc binary (module name, also the ninja variable holding its path) the edge runs; "" = a system tool (bison, flex).
 	tool string
-	// export: `block`, `prop` of the bool property that hands the generated include dirs to dependents ("" = never exported).
-	export [2]string
+	// export: whether n hands the generated include dirs to its dependents (nil = never exported).
+	export func(n *Node) bool
 	// gen builds the edge of one source. peers: all sources of the node this generator handles (aidl roots span them).
 	gen func(g *Graph, n *Node, f srcFile, peers []srcFile) genOut
 }
@@ -54,16 +54,22 @@ type genOut struct {
 	libs    []genLib
 }
 
+// exportProp: exported when the bool property `block.prop` is set.
+func exportProp(block, prop string) func(*Node) bool {
+	return func(n *Node) bool { return n.props.obj(block).boolean(prop, false) }
+}
+
 var (
-	aidlGen  = &srcGen{tool: "aidl", export: [2]string{"aidl", "export_aidl_headers"}, gen: genAidl}
-	yaccGen  = &srcGen{gen: genYacc}
-	lexGen   = &srcGen{gen: genLex}
-	protoGen = &srcGen{tool: "aprotoc", export: [2]string{"proto", "export_proto_headers"}, gen: genProto}
+	aidlGen    = &srcGen{tool: "aidl", export: exportProp("aidl", "export_aidl_headers"), gen: genAidl}
+	yaccGen    = &srcGen{gen: genYacc}
+	lexGen     = &srcGen{gen: genLex}
+	protoGen   = &srcGen{tool: "aprotoc", export: exportProp("proto", "export_proto_headers"), gen: genProto}
+	syspropGen = &srcGen{tool: "sysprop_cpp", export: func(*Node) bool { return true }, gen: genSysprop}
 )
 
 // srcGens: extension -> generator (gen.go genSources' cases).
 var srcGens = map[string]*srcGen{
-	".aidl": aidlGen, ".y": yaccGen, ".yy": yaccGen, ".l": lexGen, ".ll": lexGen, ".proto": protoGen,
+	".aidl": aidlGen, ".y": yaccGen, ".yy": yaccGen, ".l": lexGen, ".ll": lexGen, ".proto": protoGen, ".sysprop": syspropGen,
 }
 
 func isCompileSrc(ext string) bool {
@@ -116,7 +122,7 @@ func (g *Graph) genSources(n *Node, files []srcFile) {
 		n.gen = append(n.gen, r.waits...)
 		n.genIncs = append(n.genIncs, r.incs...)
 		n.genCflags = appendMissing(n.genCflags, r.cflags)
-		if sg.export != [2]string{} && n.props.obj(sg.export[0]).boolean(sg.export[1], false) {
+		if sg.export != nil && sg.export(n) {
 			n.genExports = append(n.genExports, r.exports...)
 		}
 		libs = append(libs, r.libs...)
@@ -313,5 +319,21 @@ func genProto(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 		srcs: []string{cc}, waits: []string{hdr}, incs: incs, exports: incs,
 		cflags: []string{"-DGOOGLE_PROTOBUF_NO_RTTI"},
 		libs:   []genLib{{lib, p.boolean("static", false)}},
+	}
+}
+
+// genSysprop: x.sysprop -> <gen>/sysprop/x.sysprop.cpp, include/x.sysprop.h and public/include/x.sysprop.h, by sysprop_cpp (cc/gen.go genSysprop;
+// x = the source's path below its import root, Soong's Rel()). Compiles of the module see sysprop/include (compiler.go); dependents of a library
+// get it too, the internal headers (cc/library.go: the platform variant, see sysprop.go). Both header sets are waited on.
+func genSysprop(g *Graph, n *Node, f srcFile, _ []srcFile) genOut {
+	rel := strings.TrimPrefix(f.path, f.root+"/")
+	dir := g.genDir(n, "sysprop")
+	inc := filepath.Join(dir, "include")
+	cpp, hdr, pub := filepath.Join(dir, rel+".cpp"), filepath.Join(inc, rel+".h"), filepath.Join(dir, "public", "include", rel+".h")
+	return genOut{
+		edge: genEdge{rule: "sysprop", outs: []string{cpp, hdr, pub}, in: g.abs(f.path), vars: [][2]string{
+			{"hdir", esc(filepath.Dir(hdr))}, {"pdir", esc(filepath.Dir(pub))}, {"sdir", esc(filepath.Dir(cpp))}, {"incname", esc(rel + ".h")},
+		}},
+		srcs: []string{cpp}, waits: []string{hdr, pub}, incs: []string{"-I" + inc}, exports: []string{"-I" + inc},
 	}
 }

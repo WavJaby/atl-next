@@ -61,8 +61,11 @@ func isGenType(t string) bool {
 func (g *Graph) genNode(ref string, side Side, from string) *Node {
 	m := g.lookup(ref, side)
 	if m == nil {
-		g.problem("%s: %s module %s not found", from, side, ref)
-		g.notFound(ref)
+		// made by a module type the tree has: synth recorded why there is none
+		if !g.synthOwned(ref) {
+			g.problem("%s: %s module %s not found", from, side, ref)
+			g.notFound(ref)
+		}
 		return nil
 	}
 	if !isGenType(g.baseType(m.Type)) {
@@ -76,21 +79,41 @@ func (g *Graph) genNode(ref string, side Side, from string) *Node {
 	n := &Node{key: k, mod: m}
 	g.nodes[k] = n
 	n.props = g.flatten(m, side, Gen)
-	n.rule = g.buildGenRule(n)
+	if m.hidl != nil {
+		n.rule = g.hidlRule(n)
+	} else {
+		n.rule = g.buildGenRule(n)
+	}
 	g.order = append(g.order, n)
 	return n
 }
 
-func (g *Graph) buildGenRule(n *Node) *genRule {
-	m, p := n.mod, n.props
-	r := &genRule{cmd: p.str("cmd"), script: filepath.Join(g.genDir(n, ""), "genrule.sh")}
-	fail := func(format string, args ...any) {
+// newGenRule: an empty rule of n whose first failure is a problem and the reason its script fails.
+func (g *Graph) newGenRule(n *Node) (*genRule, func(string, ...any)) {
+	r := &genRule{script: filepath.Join(g.genDir(n, ""), "genrule.sh")}
+	return r, func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
-		g.problem("%s: %s", m.Name, msg)
+		g.problem("%s: %s", n.mod.Name, msg)
 		if r.broken == "" {
 			r.broken = msg
 		}
 	}
+}
+
+// consumerDeps sets what consumers wait for: the outputs, or one phony behind many (genrule.go GenerateAndroidBuildActions).
+func (r *genRule) consumerDeps(genDir string) {
+	if len(r.outs) <= genOutLimit {
+		r.deps = r.outs
+		return
+	}
+	r.phony = filepath.Join(genDir, "genrule-phony")
+	r.deps = []string{r.phony}
+}
+
+func (g *Graph) buildGenRule(n *Node) *genRule {
+	m, p := n.mod, n.props
+	r, fail := g.newGenRule(n)
+	r.cmd = p.str("cmd")
 	addLabel := func(l genLabel) {
 		for _, o := range r.labels {
 			if o.name == l.name {
@@ -185,12 +208,7 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 	} else {
 		r.incs = []string{"-I" + genDir}
 	}
-	if len(r.outs) <= genOutLimit {
-		r.deps = r.outs
-	} else {
-		r.phony = filepath.Join(genDir, "genrule-phony")
-		r.deps = []string{r.phony}
-	}
+	r.consumerDeps(genDir)
 	return r
 }
 

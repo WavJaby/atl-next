@@ -91,6 +91,9 @@ rule protoc
   command = $aprotoc --cpp_out=$params:$outdir --dependency_out=$dep -I $base $flags $in
   depfile = $dep
   description = protoc $in
+rule sysprop
+  command = $sysprop_cpp --header-dir=$hdir --public-header-dir=$pdir --source-dir=$sdir --include-name=$incname $in
+  description = sysprop $in
 rule yacc
   command = $bison -d --defines=$hdr -o $src $in
   description = bison $in

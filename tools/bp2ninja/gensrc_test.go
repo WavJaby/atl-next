@@ -236,7 +236,7 @@ cc_library_static { name: "libq", srcs: ["q.proto"], proto: { static: true } }
 cc_binary { name: "user", srcs: ["u.cc"], shared_libs: ["libp"] }
 cc_library_static {
     name: "mixed",
-    srcs: ["a.cc", "x.yy", "y.ll", "z.aidl", "b.cc", "skip.yy", "x.yy", "w.sysprop"],
+    srcs: ["a.cc", "x.yy", "y.ll", "z.aidl", "b.cc", "skip.yy", "x.yy", "w.rscript"],
     exclude_srcs: ["skip.yy"],
     aidl: { export_aidl_headers: true },
 }
@@ -286,7 +286,7 @@ func TestGeneratedSourcesOfModules(t *testing.T) {
 		t.Errorf("libq exports %v, want %v", libq.exports, want)
 	}
 
-	// srcs order kept in place; exclude_srcs reaches generated sources; a repeated source is generated once; .sysprop is unsupported
+	// srcs order kept in place; exclude_srcs reaches generated sources; a repeated source is generated once; .rscript is unsupported
 	m := g.node("mixed", Device, Static, "t")
 	wantSrcs = []string{"p/a.cc", gd("mixed") + "/src/x.cpp", gd("mixed") + "/src/y.cpp", gd("mixed") + "/src/z.cpp", "p/b.cc"}
 	if !reflect.DeepEqual(m.srcs, wantSrcs) {
@@ -302,7 +302,7 @@ func TestGeneratedSourcesOfModules(t *testing.T) {
 	if want := []string{"-I" + gd("mixed") + "/include"}; !reflect.DeepEqual(m.exports, want) {
 		t.Errorf("mixed exports %v, want %v", m.exports, want)
 	}
-	if want := "mixed: source p/w.sysprop of an unsupported kind"; !slices.Contains(g.problems, want) {
+	if want := "mixed: source p/w.rscript of an unsupported kind"; !slices.Contains(g.problems, want) {
 		t.Errorf("problems %v lack %q", g.problems, want)
 	}
 	// the tool each generator needs is one host binary node, built once

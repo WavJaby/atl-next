@@ -108,9 +108,11 @@ type Graph struct {
 	scripts map[string]string
 	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
 	tools map[string]*Node
-	// aidl_interface modules by name/side (nil = none), and the backends synthesized from them by ref/side (aidliface.go)
+	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
 	aidlIfaces map[string]*aidlIface
-	aidlMods   map[string]*Module
+	hidlIfaces map[string]*hidlIface
+	// modules synthesized by ref/side (synth.go), nil = none
+	synthMods map[string]*Module
 	// Java modules (java.go)
 	java *javaGraph
 }
@@ -180,13 +182,17 @@ func (g *Graph) lookupWith(ref string, side Side, skip func(string) bool) *Modul
 		cands = append(cands, m)
 	}
 	if len(cands) == 0 {
-		// `<iface>[-V<n>]-<cpp|ndk>`: made by the aidl_interface module type, defined in no Android.bp
+		// made by a module type's load hook, defined in no Android.bp (synth.go)
 		if dir == "" {
-			return g.aidlBackend(ref, side)
+			return g.synth(ref, side)
 		}
 		return nil
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].Dir < cands[j].Dir })
+	// a hidl_interface is named like the cc library its load hook creates
+	if cands[0].Type == "hidl_interface" {
+		return g.hidlLibrary(cands[0], side)
+	}
 	return cands[0]
 }
 
@@ -319,8 +325,8 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	}
 	m := g.lookup(ref, side)
 	if m == nil {
-		// a backend of an aidl_interface the tree has: lookup recorded why there is none, and the name is nothing to fetch
-		if !g.aidlOwned(ref) {
+		// made by a module type the tree has: lookup recorded why there is none, and the name is nothing to fetch
+		if !g.synthOwned(ref) {
 			g.problem("%s: %s module %s not found", from, side, ref)
 			g.notFound(ref)
 		}

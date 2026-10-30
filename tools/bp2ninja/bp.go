@@ -104,8 +104,10 @@ type Module struct {
 	Name  string
 	Dir   string // tree-relative directory of its blueprint file
 	Props *Obj
-	// set on a module no Android.bp defines: an aidl_interface backend (aidliface.go) with its aidl command line and sources
+	// set on a module no Android.bp defines (synth.go): an aidl_interface backend (aidliface.go) with its aidl command line and sources,
+	// a hidl-gen run of a hidl_interface (hidliface.go)
 	aidl *aidlSpec
+	hidl *hidlGen
 }
 
 // Config is what select() conditions see. PointerBits comes from the arch's arches.toml row, never from its name.

@@ -13,8 +13,8 @@ import (
 )
 
 // aidl_interface backends: Soong creates `<iface>[-V<n>]-<lang>` cc libraries in the interface's load hook, no Android.bp defines them.
-// Spec: system/tools/aidl/build/{aidl_interface.go, aidl_interface_backends.go, aidl_gen_rule.go}. lookup falls back to aidlBackend, which
-// synthesizes the Module; its sources go through the extension table (gensrc.go genAidl) like any cc module's, with per-interface flags.
+// Spec: system/tools/aidl/build/{aidl_interface.go, aidl_interface_backends.go, aidl_gen_rule.go}. lookup falls back to synth (synth.go), which
+// calls synthAidl to make the Module; its sources go through the extension table (gensrc.go genAidl) like any cc module's, with per-interface flags.
 //   - Names (addLibrary): the next version (latest frozen + 1, "1" with no versions) and every frozen version are `<iface>-V<v>-<lang>`; an
 //     unstable interface has no versions and one unversioned `<iface>-<lang>`. A stable interface has no unversioned backend.
 //   - Sources: a frozen version = aidl_api/<iface>/<v>/**/*.aidl under the module dir (root = that dir); the next version = the module's `srcs` (root
@@ -108,7 +108,7 @@ func (g *Graph) aidlIfaceOf(name string, side Side) *aidlIface {
 	return i
 }
 
-// aidlOwned: ref names a backend of an aidl_interface the tree has, so lookup said why it failed and the name is no missing module.
+// aidlOwned: ref names a backend of an aidl_interface the tree has.
 func (g *Graph) aidlOwned(ref string) bool {
 	iface, _, _, ok := parseAidlRef(strings.TrimPrefix(ref, ":"))
 	return ok && (g.aidlIfaceOf(iface, Device) != nil || g.aidlIfaceOf(iface, Host) != nil)
@@ -258,21 +258,6 @@ type aidlSpec struct {
 	prevReported bool
 }
 
-// aidlBackend: lookup's fallback for `<iface>[-V<n>]-<lang>`. nil without a problem: ref names no backend of an aidl_interface (a plain missing
-// module); nil with one: the backend does not exist or is not supported.
-func (g *Graph) aidlBackend(ref string, side Side) *Module {
-	k := ref + "/" + side.String()
-	if m, ok := g.aidlMods[k]; ok {
-		return m
-	}
-	m := g.synthAidl(ref, side)
-	if g.aidlMods == nil {
-		g.aidlMods = map[string]*Module{}
-	}
-	g.aidlMods[k] = m
-	return m
-}
-
 func strVals(list []string) []Val {
 	out := make([]Val, len(list))
 	for i, s := range list {
@@ -281,6 +266,8 @@ func strVals(list []string) []Val {
 	return out
 }
 
+// synthAidl: the backend `<iface>[-V<n>]-<lang>` (synth.go). nil without a problem: ref names no backend of an aidl_interface; nil with one: the
+// backend does not exist or is not supported.
 func (g *Graph) synthAidl(ref string, side Side) *Module {
 	name, ver, lang, ok := parseAidlRef(ref)
 	if !ok {
