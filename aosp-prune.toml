@@ -11,9 +11,3 @@
 
 ["build/make/target/product/generic"]
 reason = "generic system image modules (android_system_image); ATL builds libraries, never device images"
-
-["system/apex/apexd/apexd_testdata"]
-reason = "test APEXes for apexd's own tests"
-
-["system/apex/tests"]
-reason = "APEX test suites and test APEXes"
