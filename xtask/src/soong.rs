@@ -19,6 +19,8 @@ use crate::aosp::{self, Index, Manifest};
 use crate::arches::{self, Arch, Arches};
 use crate::{fetch, prune, sources, workspace};
 
+mod graph;
+
 #[derive(clap::Args)]
 pub struct Args {
     /// Build goals: Soong module names (each builds every variant); a module in a soong_namespace as
@@ -43,6 +45,8 @@ const PRODUCT_DIR: &str = "device/atl";
 const BUILD_VARIANT: &str = "eng";
 /// Error lines echoed per failed round; the log keeps all of them.
 const ERRORS_SHOWN: usize = 20;
+/// soong_ui's line once the analysis passed and ninja runs (`ui/build/ninja.go`).
+const NINJA_STARTED: &str = "Starting ninja...";
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ws = workspace::root_dir(root)?;
@@ -114,9 +118,31 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let index = Index::load(root, &sources.aosp)?;
         let pinned: BTreeSet<&str> = sources.aosp.projects.keys().map(String::as_str).collect();
         let tree_prefix = format!("{}/", tree.display());
-        let mut found = missing(&text, &tree_prefix);
+        let mut found = missing_from_log(&text, &tree_prefix);
         let failing = failing_modules(&text);
-        if found.is_empty() && !failing.is_empty() {
+        let soong_out = out.join("soong");
+        // soong_ui starts ninja only after the analysis passed (a cached one included), so its ninja
+        // files then describe the tree as it is
+        if text.contains(NINJA_STARTED) {
+            // analysis passed: Soong's own records of what the goals' closure misses
+            let graph_log = logs.join(format!("{}-{round}-graph.log", product.name));
+            build(
+                &tree,
+                &out,
+                &product.name,
+                &release,
+                &["json-module-graph".to_owned()],
+                true,
+                &graph_log,
+            )?;
+            let lines = graph::missing_lines(
+                &soong_out.join("module-graph.json"),
+                &soong_out,
+                &product.name,
+                &args.goals,
+            )?;
+            add_records(&mut found, &lines, &tree_prefix);
+        } else if found.is_empty() && !failing.is_empty() {
             // Allowed-missing deps are silent until a goal builds them, yet a missing `defaults` module
             // already changes a module's analysis (service-art lost its scopes). A strict analysis names
             // every undefined dependency; only those of the failing modules count.
@@ -136,7 +162,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &strict,
             )?;
             let strict_text = String::from_utf8_lossy(&std::fs::read(&strict)?).into_owned();
-            found = missing(&strict_text, &tree_prefix);
+            found = missing_from_log(&strict_text, &tree_prefix);
             // a failing module's defaults are part of it (service-art <- service-art-defaults)
             let scope = index.with_defaults(&failing);
             found
@@ -352,22 +378,48 @@ const UNDEFINED: &str = "depends on undefined module \"";
 /// Blueprint parse error for a module type no plugin registers.
 const UNKNOWN_TYPE: &str = "unrecognized module type \"";
 /// Soong's error rule under ALLOW_MISSING_DEPENDENCIES: entries are module references, tree paths or
-/// whole messages (`android/paths.go`).
+/// whole messages (`android/paths.go`). Read from Soong's records (`graph`), never from a build log,
+/// which shows only the rules a goal happened to run.
 const MISSING_DEPS: &str = "missing dependencies: ";
 
-/// `tree_prefix` = the tree's absolute path with a trailing `/`, stripped from absolute paths.
-fn missing(log: &str, tree_prefix: &str) -> Missing {
+fn note(map: &mut BTreeMap<String, String>, key: &str, line: &str) {
+    map.entry(key.to_owned())
+        .or_insert_with(|| line.trim().to_owned());
+}
+
+/// Soong's recorded missing dependencies (`module X (variant) missing dependencies: a, b`).
+fn add_records(out: &mut Missing, lines: &[String], tree_prefix: &str) {
+    for line in lines {
+        let Some((_, rest)) = line.split_once(MISSING_DEPS) else {
+            continue;
+        };
+        for entry in rest.split(", ").map(str::trim).filter(|e| !e.is_empty()) {
+            let is_path = entry.contains('/') && !entry.starts_with("//");
+            if entry.contains(char::is_whitespace) || is_path {
+                for p in path_tokens(entry, tree_prefix) {
+                    note(&mut out.paths, &p, line);
+                }
+            } else {
+                note(&mut out.modules, entry, line);
+            }
+        }
+    }
+}
+
+/// What a build log says is missing, beyond Soong's recorded missing dependencies. `tree_prefix` = the
+/// tree's absolute path with a trailing `/`, stripped from absolute paths.
+fn missing_from_log(log: &str, tree_prefix: &str) -> Missing {
     let mut out = Missing::default();
-    let note = |map: &mut BTreeMap<String, String>, key: &str, line: &str| {
-        map.entry(key.to_owned())
-            .or_insert_with(|| line.trim().to_owned());
-    };
     let mut previous = "";
     for line in log.lines() {
         // the line after `FAILED: <outputs>` is the failing command: its inputs (a `--sysroot` in an
         // unfetched prebuilt, say) are evidence even when the tool's error only says `'time.h' file not
         // found`
         let command = std::mem::replace(&mut previous, line).starts_with("FAILED: ");
+        if line.contains(MISSING_DEPS) {
+            // an error rule a goal ran: read from Soong's records with all the others
+            continue;
+        }
         if let Some((_, rest)) = line.split_once(UNDEFINED)
             && let Some((name, _)) = rest.split_once('"')
         {
@@ -376,24 +428,31 @@ fn missing(log: &str, tree_prefix: &str) -> Missing {
             && let Some((module_type, _)) = rest.split_once('"')
         {
             note(&mut out.module_types, module_type, line);
-        } else if let Some((_, rest)) = line.split_once(MISSING_DEPS) {
-            for entry in rest.split(", ").map(str::trim).filter(|e| !e.is_empty()) {
-                let is_path = entry.contains('/') && !entry.starts_with("//");
-                if entry.contains(char::is_whitespace) || is_path {
-                    for p in path_tokens(entry, tree_prefix) {
-                        note(&mut out.paths, &p, line);
-                    }
-                } else {
-                    note(&mut out.modules, entry, line);
-                }
-            }
         } else if command || MISSING_FILE.iter().any(|p| line.to_lowercase().contains(p)) {
             for p in path_tokens(line, tree_prefix) {
                 note(&mut out.paths, &p, line);
             }
+            if let Some(module) = missing_output_module(line, tree_prefix) {
+                note(&mut out.modules, module, line);
+            }
         }
     }
     out
+}
+
+/// ninja's `'<path>', needed by '…', missing and no known rule to make it` for a path outside the tree:
+/// an installed artifact no rule makes because its module is not in the tree, as a host tool a genrule
+/// names by path (`…/host/linux-x86/bin/aprotoc`). Its file stem is the module name to look up.
+fn missing_output_module<'a>(line: &'a str, tree_prefix: &str) -> Option<&'a str> {
+    if !line.contains("no known rule to make it") {
+        return None;
+    }
+    let (_, rest) = line.split_once("ninja: '")?;
+    let (path, _) = rest.split_once('\'')?;
+    if !path.starts_with('/') || path.starts_with(tree_prefix) {
+        return None;
+    }
+    Path::new(path).file_stem()?.to_str()
 }
 
 /// Relative path-like tokens (`a/b`), absolute ones under the tree made relative.
@@ -468,25 +527,38 @@ FAILED: /t/out/putil.o
 clang++ --sysroot prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot -c /t/src/aosp/external/icu/putil.cpp
 external/icu/putil.cpp:52:10: fatal error: 'time.h' file not found
 ";
-        let m = missing(log, "/t/src/aosp/");
+        let m = missing_from_log(log, "/t/src/aosp/");
         let keys = |b: &BTreeMap<String, String>| b.keys().cloned().collect::<Vec<_>>();
-        assert_eq!(
-            keys(&m.modules),
-            ["//ns/dir:libbaz", ":gen{.h}", "libbar", "libz"]
-        );
-        // only lines reporting a missing file: not `FAILED:` outputs, not prose
+        // the error rule's line is skipped: Soong's records are read from its ninja files instead
+        assert_eq!(keys(&m.modules), ["libz"]);
+        // only lines reporting a missing file or a failing command: not `FAILED:` outputs, not prose
         assert_eq!(
             keys(&m.paths),
             [
                 "art/runtime/x.cc",
                 "external/icu/putil.cpp",
-                "external/qux/a.c",
                 "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot",
                 "prebuilts/go/linux-x86/bin/go",
                 "prebuilts/rust/linux-x86/1.83.0/bin/rustc"
             ]
         );
         assert!(m.modules["libz"].contains("depends on undefined"));
+        let mut records = Missing::default();
+        add_records(
+            &mut records,
+            &["module libfoo (linux_glibc_x86_64) missing dependencies: libbar, //ns/dir:libbaz, external/qux/a.c, :gen{.h}".to_owned()],
+            "/t/src/aosp/",
+        );
+        assert_eq!(
+            keys(&records.modules),
+            ["//ns/dir:libbaz", ":gen{.h}", "libbar"]
+        );
+        assert_eq!(keys(&records.paths), ["external/qux/a.c"]);
+        let tool = missing_from_log(
+            "FAILED: ninja: '/t/out/host/linux-x86/bin/aprotoc', needed by '/t/out/x.rs', missing and no known rule to make it",
+            "/t/src/aosp/",
+        );
+        assert_eq!(keys(&tool.modules), ["aprotoc"]);
         assert_eq!(keys(&m.module_types), ["aidl_interface"]);
     }
 
