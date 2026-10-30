@@ -61,11 +61,11 @@ func run(tree, out string, cfg Config, tools Tools, goals []string) error {
 	}
 	ninja := g.emit(tools)
 	compat := filepath.Join(out, "compat", "cxx")
-	if err := os.MkdirAll(compat, 0o755); err != nil {
-		return err
-	}
-	for _, h := range cxxCompat {
-		link := filepath.Join(compat, filepath.Base(h))
+	for name, h := range cxxCompat {
+		link := filepath.Join(compat, name)
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			return err
+		}
 		os.Remove(link)
 		if err := os.Symlink(filepath.Join(tree, h), link); err != nil {
 			return err

@@ -206,12 +206,17 @@ var hostLibc = map[string]bool{
 	"libc_headers": true, "libc_uapi_headers": true, "bionic_libc_platform_headers": true,
 }
 
-// cxxCompat: bionic headers whose C++ behaviour AOSP code relies on, put first on the C++ include path
-// of device-side modules (never C: their C branches need bionic's bits/). Tree-relative paths, linked
-// unchanged into <out>/compat/cxx.
+// cxxCompat: bionic headers AOSP code relies on and glibc lacks or differs in, put first on the C++
+// include path of device-side modules (never C: stdatomic.h's C branch needs bionic's bits/). Include
+// name -> tree-relative file, linked unchanged into <out>/compat/cxx.
 //   - stdatomic.h: in C++ bionic maps it onto <atomic>; clang's is incompatible with <atomic> before
 //     C++23 (liblog, libbinder, libutils' LightRefBase.h include it from C++).
-var cxxCompat = []string{"bionic/libc/include/stdatomic.h"}
+//   - linux/ashmem.h: Android's ashmem uapi, absent from distro kernel headers (libcutils
+//     ashmem-dev.cpp; at run time a mainline kernel takes its memfd path).
+var cxxCompat = map[string]string{
+	"stdatomic.h":    "bionic/libc/include/stdatomic.h",
+	"linux/ashmem.h": "bionic/libc/kernel/uapi/linux/ashmem.h",
+}
 
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
