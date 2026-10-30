@@ -226,6 +226,15 @@ pub struct Args {
 /// The index of one tag, beside its sparse checkouts under `<workspace>/cache/aosp-bp/<tag>/`.
 const INDEX_FILE: &str = "index.json";
 
+/// Whether a prebuilt definition may answer a reference: Soong can use one when no source module of
+/// the name exists; our converter never builds prebuilts (binary VNDK snapshots would be fetched for
+/// nothing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prebuilts {
+    Fallback,
+    Never,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Index {
     /// Module name -> every definition.
@@ -283,6 +292,10 @@ impl Index {
     /// then a source module over a prebuilt; a name still left in several projects is ambiguous, never
     /// guessed.
     pub fn project_for(&self, reference: &str) -> Result<&str, String> {
+        self.resolve(reference, Prebuilts::Fallback)
+    }
+
+    fn resolve(&self, reference: &str, prebuilts: Prebuilts) -> Result<&str, String> {
         let reference = reference.trim_start_matches(':');
         let reference = reference.split('{').next().unwrap_or(reference);
         let (dir, name) = match reference.strip_prefix("//") {
@@ -311,7 +324,7 @@ impl Index {
                 }
             }
         };
-        if cands.iter().any(|d| !d.is_prebuilt()) {
+        if prebuilts == Prebuilts::Never || cands.iter().any(|d| !d.is_prebuilt()) {
             cands.retain(|d| !d.is_prebuilt());
         }
         let projects: BTreeSet<&str> = cands.iter().map(|d| d.project.as_str()).collect();
@@ -326,6 +339,30 @@ impl Index {
                 projects.into_iter().collect::<Vec<_>>().join(", ")
             )),
         }
+    }
+
+    /// Unpinned project -> why it is wanted, for module references that are missing from the tree
+    /// (`(reference, why)` pairs, `why` echoed back per project: first reference wins); plus what could
+    /// not be mapped to a project to fetch. A reference defined in a pinned project is a different
+    /// problem (a lookup rule of the consumer, not an absent checkout), so it is unresolved, not wanted.
+    pub fn unpinned_projects<'a>(
+        &self,
+        refs: impl IntoIterator<Item = (&'a str, String)>,
+        pinned: &BTreeSet<&str>,
+        prebuilts: Prebuilts,
+    ) -> (BTreeMap<String, String>, Vec<String>) {
+        let mut want = BTreeMap::new();
+        let mut unresolved = Vec::new();
+        for (module, why) in refs {
+            match self.resolve(module, prebuilts) {
+                Ok(p) if !pinned.contains(p) => {
+                    want.entry(p.to_owned()).or_insert(why);
+                }
+                Ok(p) => unresolved.push(format!("{module}: defined in pinned {p}, yet missing")),
+                Err(e) => unresolved.push(format!("{module}: {e}")),
+            }
+        }
+        (want, unresolved)
     }
 
     /// (module, directory of each blueprint file defining it).
@@ -1041,8 +1078,10 @@ func init() {
             Ok("external/zlib")
         );
         assert!(index.project_for("//elsewhere:libz").is_err());
-        // a prebuilt is taken when it is all there is
+        // a prebuilt is taken when it is all there is, unless the consumer never builds prebuilts
         assert_eq!(index.project_for("tool"), Ok("prebuilts/t"));
+        assert!(index.resolve("tool", Prebuilts::Never).is_err());
+        assert_eq!(index.resolve("libc", Prebuilts::Never), Ok("bionic"));
         assert!(
             index
                 .project_for("dup")

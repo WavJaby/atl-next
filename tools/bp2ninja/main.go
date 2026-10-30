@@ -6,8 +6,9 @@
 //
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
-// Writes <out>/build.ninja and <out>/problems.txt (missing modules, unsupported module types and
-// properties); exits 0 even with problems, which the caller reports.
+// Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and
+// properties) and <out>/missing.txt (the module references behind the "not found" problems, one per
+// line, unique and sorted: what the caller may fetch); exits 0 even with problems, which the caller reports.
 package main
 
 import (
@@ -96,6 +97,10 @@ func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals 
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(out, "problems.txt"), []byte(strings.Join(g.problems, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+	// always written, empty included: a stale list of an earlier run must never be read as current
+	if err := os.WriteFile(filepath.Join(out, "missing.txt"), []byte(strings.Join(g.missingRefs(), "\n")+"\n"), 0o644); err != nil {
 		return err
 	}
 	srcs := 0

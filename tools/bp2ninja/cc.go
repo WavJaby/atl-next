@@ -89,10 +89,36 @@ type Graph struct {
 	nodes       map[key]*Node
 	order       []*Node
 	problems    []string
+	// references no module of the tree answers to (see notFound)
+	missing map[string]bool
 }
 
 func (g *Graph) problem(format string, args ...any) {
 	g.problems = append(g.problems, fmt.Sprintf(format, args...))
+}
+
+// notFound records a reference lookup that found no module: a module, defaults or filegroup the tree
+// lacks, which the caller may fetch. Stored the way the AOSP index takes it (`name`, `//dir:name`: no
+// leading `:`, no `#tag`), so a project can be looked up without re-parsing prose.
+func (g *Graph) notFound(ref string) {
+	ref = strings.TrimPrefix(ref, ":")
+	if i := strings.IndexByte(ref, '#'); i >= 0 {
+		ref = ref[:i]
+	}
+	if g.missing == nil {
+		g.missing = map[string]bool{}
+	}
+	g.missing[ref] = true
+}
+
+// missingRefs: the recorded references, sorted.
+func (g *Graph) missingRefs() []string {
+	out := make([]string, 0, len(g.missing))
+	for r := range g.missing {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports
@@ -139,6 +165,7 @@ func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj
 		dm := g.lookup(d, side)
 		if dm == nil {
 			g.problem("%s: defaults %s not found", m.Name, d)
+			g.notFound(d)
 			continue
 		}
 		acc = merge(acc, g.resolveDefaults(dm, side, seen))
@@ -235,6 +262,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	m := g.lookup(ref, side)
 	if m == nil {
 		g.problem("%s: %s module %s not found", from, side, ref)
+		g.notFound(ref)
 		return nil
 	}
 	kind, ok := kindOf(g.baseType(m.Type), want)
@@ -280,6 +308,10 @@ func (g *Graph) addSrc(n *Node, s string) {
 		fg := g.lookup(s, n.side)
 		if fg == nil || fg.Type != "filegroup" {
 			g.problem("%s: source %s is not a known filegroup", n.mod.Name, s)
+			// a module of another type under that name is defined, not missing
+			if fg == nil {
+				g.notFound(s)
+			}
 			return
 		}
 		root := filepath.Join(fg.Dir, fg.Props.str("path"))

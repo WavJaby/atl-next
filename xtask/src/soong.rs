@@ -490,16 +490,18 @@ fn resolve(
                 .or_insert_with(|| format!("path {path}: {line}"));
         }
     }
-    for (module, line) in &found.modules {
-        match index.project_for(module) {
-            Ok(p) if !pinned.contains(p) => {
-                want.entry(p.to_owned())
-                    .or_insert_with(|| format!("module {module}: {line}"));
-            }
-            Ok(p) => unresolved.push(format!("{module}: defined in pinned {p}, yet missing")),
-            Err(e) => unresolved.push(format!("{module}: {e}")),
-        }
+    let (modules, unknown) = index.unpinned_projects(
+        found
+            .modules
+            .iter()
+            .map(|(module, line)| (module.as_str(), format!("module {module}: {line}"))),
+        pinned,
+        aosp::Prebuilts::Fallback,
+    );
+    for (project, why) in modules {
+        want.entry(project).or_insert(why);
     }
+    unresolved.extend(unknown);
     for (module_type, line) in &found.module_types {
         match index.project_for_type(module_type) {
             Ok(p) if !pinned.contains(p) => {
