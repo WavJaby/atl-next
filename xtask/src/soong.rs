@@ -378,8 +378,9 @@ const UNDEFINED: &str = "depends on undefined module \"";
 /// Blueprint parse error for a module type no plugin registers.
 const UNKNOWN_TYPE: &str = "unrecognized module type \"";
 /// Soong's error rule under ALLOW_MISSING_DEPENDENCIES: entries are module references, tree paths or
-/// whole messages (`android/paths.go`). Read from Soong's records (`graph`), never from a build log,
-/// which shows only the rules a goal happened to run.
+/// whole messages (`android/paths.go`). Two sources, not one quantity twice: the log holds the rules
+/// ninja ran (needed for sure, host tools a rule calls by path included -- `turbine`, `metalava`), the
+/// records (`graph`) hold those of the goals' closure that never ran (a header library's dropped dep).
 const MISSING_DEPS: &str = "missing dependencies: ";
 
 fn note(map: &mut BTreeMap<String, String>, key: &str, line: &str) {
@@ -390,18 +391,24 @@ fn note(map: &mut BTreeMap<String, String>, key: &str, line: &str) {
 /// Soong's recorded missing dependencies (`module X (variant) missing dependencies: a, b`).
 fn add_records(out: &mut Missing, lines: &[String], tree_prefix: &str) {
     for line in lines {
-        let Some((_, rest)) = line.split_once(MISSING_DEPS) else {
-            continue;
-        };
-        for entry in rest.split(", ").map(str::trim).filter(|e| !e.is_empty()) {
-            let is_path = entry.contains('/') && !entry.starts_with("//");
-            if entry.contains(char::is_whitespace) || is_path {
-                for p in path_tokens(entry, tree_prefix) {
-                    note(&mut out.paths, &p, line);
-                }
-            } else {
-                note(&mut out.modules, entry, line);
+        add_record(out, line, tree_prefix);
+    }
+}
+
+fn add_record(out: &mut Missing, line: &str, tree_prefix: &str) {
+    let Some((_, rest)) = line.split_once(MISSING_DEPS) else {
+        return;
+    };
+    // a ninja error rule echoes its message: `echo "module X missing dependencies: a, b" && false`
+    let rest = rest.split('"').next().unwrap_or(rest);
+    for entry in rest.split(", ").map(str::trim).filter(|e| !e.is_empty()) {
+        let is_path = entry.contains('/') && !entry.starts_with("//");
+        if entry.contains(char::is_whitespace) || is_path {
+            for p in path_tokens(entry, tree_prefix) {
+                note(&mut out.paths, &p, line);
             }
+        } else {
+            note(&mut out.modules, entry, line);
         }
     }
 }
@@ -417,7 +424,7 @@ fn missing_from_log(log: &str, tree_prefix: &str) -> Missing {
         // found`
         let command = std::mem::replace(&mut previous, line).starts_with("FAILED: ");
         if line.contains(MISSING_DEPS) {
-            // an error rule a goal ran: read from Soong's records with all the others
+            add_record(&mut out, line, tree_prefix);
             continue;
         }
         if let Some((_, rest)) = line.split_once(UNDEFINED)
@@ -529,14 +536,18 @@ external/icu/putil.cpp:52:10: fatal error: 'time.h' file not found
 ";
         let m = missing_from_log(log, "/t/src/aosp/");
         let keys = |b: &BTreeMap<String, String>| b.keys().cloned().collect::<Vec<_>>();
-        // the error rule's line is skipped: Soong's records are read from its ninja files instead
-        assert_eq!(keys(&m.modules), ["libz"]);
+        // an error rule ninja ran counts (its module is needed for sure)
+        assert_eq!(
+            keys(&m.modules),
+            ["//ns/dir:libbaz", ":gen{.h}", "libbar", "libz"]
+        );
         // only lines reporting a missing file or a failing command: not `FAILED:` outputs, not prose
         assert_eq!(
             keys(&m.paths),
             [
                 "art/runtime/x.cc",
                 "external/icu/putil.cpp",
+                "external/qux/a.c",
                 "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot",
                 "prebuilts/go/linux-x86/bin/go",
                 "prebuilts/rust/linux-x86/1.83.0/bin/rustc"
@@ -554,6 +565,14 @@ external/icu/putil.cpp:52:10: fatal error: 'time.h' file not found
             ["//ns/dir:libbaz", ":gen{.h}", "libbar"]
         );
         assert_eq!(keys(&records.paths), ["external/qux/a.c"]);
+        // the echoed form of a rule's command line
+        let mut echoed = Missing::default();
+        add_record(
+            &mut echoed,
+            "echo \"module turbine missing dependencies: jspecify, auto_value_plugin\" && false",
+            "/t/src/aosp/",
+        );
+        assert_eq!(keys(&echoed.modules), ["auto_value_plugin", "jspecify"]);
         let tool = missing_from_log(
             "FAILED: ninja: '/t/out/host/linux-x86/bin/aprotoc', needed by '/t/out/x.rs', missing and no known rule to make it",
             "/t/src/aosp/",
