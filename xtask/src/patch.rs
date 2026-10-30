@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use crate::git::{Ident, git, git_isolated};
 use crate::licenses::{self, Licenses};
 use crate::sources::{self, Checkout};
-use crate::{fetch, notice, workspace};
+use crate::{aosp, fetch, notice, workspace};
 
 const BRANCH: &str = "atl-patches";
 /// Commit `atl-patches` is based on. A rebase after a pin bump needs the old base, and shallow
@@ -51,7 +51,9 @@ impl Up<'_> {
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sources = sources::load(root)?;
     let licenses = licenses::load(root, &sources.upstream_names())?;
-    let all = sources.checkouts();
+    // --rebase fetches, so AOSP rows need their URLs from the manifest
+    let names = aosp::load(root, &sources.aosp)?.map(|m| m.names());
+    let all = sources.checkouts(names.as_ref());
     let src = workspace::root_dir(root)?.join("src");
     let ups: Vec<Up> = all.iter().map(|c| up(c, &src, root)).collect();
     let pick = |names: &[String]| -> Result<Vec<&Up>> {
@@ -118,7 +120,8 @@ pub fn check(root: &Path) -> Result<()> {
     let licenses = licenses::load(root, &sources.upstream_names())?;
     let src = workspace::root_dir(root)?.join("src");
     let (mut present, mut problems) = (0, Vec::new());
-    for c in &sources.checkouts() {
+    let all = sources.checkouts(None);
+    for c in &all {
         let u = up(c, &src, root);
         match drift(&u, &licenses) {
             Ok(None) => {}
@@ -135,7 +138,7 @@ pub fn check(root: &Path) -> Result<()> {
     ensure!(problems.is_empty(), "{} drift problems", problems.len());
     eprintln!(
         "drift: {present} checkouts in step, {} not fetched",
-        sources.checkouts().len() - present
+        all.len() - present
     );
     Ok(())
 }
@@ -534,7 +537,7 @@ mod tests {
         fn checkout(&self, tag: &str) -> Checkout {
             Checkout {
                 dir: PathBuf::from("up"),
-                url: format!("file://{}", self.upstream.display()),
+                url: Some(format!("file://{}", self.upstream.display())),
                 tag: tag.into(),
                 commit: self.up(&["rev-parse", &format!("{tag}^{{commit}}")]),
                 pin: Pin::Git("up".into()),

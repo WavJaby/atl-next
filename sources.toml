@@ -4,10 +4,12 @@
 # not listed; they are whatever patches/<upstream>/ holds.
 #
 # [aosp] -- every AOSP project, checked out in AOSP tree layout (Android.bp paths are tree-relative):
-#   remote    URL prefix; a project's URL = remote + its path
+#   remote    host URL; a repository's URL = remote + its git name
 #   tag       the one AOSP tag every project is pinned to
+#   manifest  commit the tag resolves to in platform/manifest (checkout src/aosp-manifest): maps each
+#             tree path to its git name and lists the tree's link/copy files
 #   projects  AOSP tree path -> commit the tag resolves to in that project
-#             (checkout src/aosp/<path>, patches patches/aosp/<path>/)
+#             (checkout src/aosp/<path>, patches patches/aosp/<path>/; `xtask fetch --add` adds rows)
 # [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
 #   git       clone URL
 #   tag       release tag
@@ -17,12 +19,16 @@
 # Rows are added when a build step first needs them.
 
 [aosp]
-remote = "https://android.googlesource.com/platform/"
+remote = "https://android.googlesource.com/"
 tag = "android-16.0.0_r1"
+manifest = "2e764235335a27ee8cc8efc16baef4c0f6a5b3fe"
 
 [aosp.projects]
 art = "ed6c006bd06ae060bd9698fd2cb25c4865512ec3"
 bionic = "09a271af557444c9a6b3f3146d6d474156fd6cdb"
+"build/blueprint" = "dcb14f2e146f40cf1f212efb220e9aa1f3cfc280"
+"build/make" = "874fa586c48ae230ebfcff0df1b9c1b004fa8f7c"
+"build/soong" = "533c3c2c9166b49caa556518bb547d8f9acf9594"
 "frameworks/libs/native_bridge_support" = "b527289974e3883460370012325ab3736d59268a"
 libnativehelper = "5c36ece5ac42b20f0e384d9e57400f2f22aad9fb"
 

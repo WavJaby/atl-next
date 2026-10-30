@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: MIT
 //! `xtask fetch`: upstream checkouts under `<workspace>/src` at the pins in sources.toml.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::aosp::{self, Manifest};
 use crate::git::git;
-use crate::sources::{self, Checkout, Pin};
-use crate::workspace;
+use crate::sources::{self, Checkout, Pin, Sources};
+use crate::{par, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Clone missing checkouts and move clean detached ones to their pin, after checking on the remote
-    /// that each tag still resolves to its pinned commit.
+    /// that each tag still resolves to its pinned commit; then create the AOSP manifest's link/copy files.
     #[arg(long, conflicts_with = "bump")]
     execute: bool,
     /// Resolve every tag on its remote and show where the pins would move (network, read-only).
@@ -22,37 +24,58 @@ pub struct Args {
     /// With --bump: write the resolved commits into sources.toml.
     #[arg(long, requires = "bump")]
     write: bool,
+    /// Pin AOSP projects (tree paths of the fetched manifest) at the commit the tag resolves to: adds
+    /// their sources.toml rows, then goes on as without it. Already pinned paths are skipped.
+    #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with = "bump")]
+    add: Vec<String>,
+    /// Parallel git processes (default: the AOSP manifest's `sync-j`).
+    #[arg(long)]
+    jobs: Option<usize>,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let all = sources::load(root)?.checkouts();
-    if args.bump {
-        return bump(root, &all, args.write);
-    }
     let src = workspace::root_dir(root)?.join("src");
+    let mut sources = sources::load(root)?;
     let mut failed = 0;
-    for c in &all {
-        let dir = src.join(&c.dir);
-        let result = (|| {
-            let action = decide(&inspect(&dir)?, &c.commit);
-            let shown = action.describe();
-            if args.execute {
-                apply(&action, c, &dir)?;
-            }
-            Ok::<_, anyhow::Error>(shown)
-        })();
-        match result {
-            Ok(shown) => println!("fetch: {:<40} {shown}", c.dir.display()),
-            Err(e) => {
-                failed += 1;
-                println!("fetch: {:<40} FAILED: {e:#}", c.dir.display());
-            }
-        }
+    // the manifest first: it names every other AOSP project's repository
+    if !args.bump {
+        let c = sources.manifest_checkout();
+        failed += usize::from(!report("fetch", &c, sync(&src, &c, args.execute)));
     }
-    if !args.execute {
+    let manifest = aosp::load(root, &sources.aosp)?;
+    let jobs = args
+        .jobs
+        .unwrap_or(manifest.as_ref().map_or(aosp::DEFAULT_SYNC_J, |m| m.sync_j));
+    if !args.add.is_empty() {
+        let m = manifest
+            .as_ref()
+            .context("--add needs the AOSP manifest (xtask fetch --execute)")?;
+        add(root, &sources, m, &args.add, jobs)?;
+        sources = sources::load(root)?;
+    }
+    let names = manifest.as_ref().map(Manifest::names);
+    let all = sources.checkouts(names.as_ref());
+    if args.bump {
+        let mut all = all;
+        all.insert(0, sources.manifest_checkout());
+        return bump(root, &all, args.write, jobs);
+    }
+    let results = par::map(&all, jobs, |c| sync(&src, c, args.execute));
+    for (c, result) in all.iter().zip(results) {
+        failed += usize::from(!report("fetch", c, result));
+    }
+    if args.execute
+        && let Some(m) = &manifest
+    {
+        let made = aosp::apply_links(&src.join("aosp"), m)?;
+        println!(
+            "fetch: {:<40} {made} link/copy files created",
+            "aosp (manifest links)"
+        );
+    } else if !args.execute {
         println!(
             "fetch: dry run ({} checkouts under {}); --execute applies",
-            all.len(),
+            all.len() + 1,
             src.display()
         );
     }
@@ -61,6 +84,91 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// What the checkout needs; with `execute`, also do it.
+fn sync(src: &Path, c: &Checkout, execute: bool) -> Result<String> {
+    let dir = src.join(&c.dir);
+    let action = decide(&inspect(&dir)?, &c.commit);
+    if execute {
+        apply(&action, c, &dir)?;
+    }
+    Ok(action.describe())
+}
+
+/// Print one checkout's row; false on failure.
+fn report(verb: &str, c: &Checkout, result: Result<String>) -> bool {
+    match result {
+        Ok(shown) => {
+            println!("{verb}: {:<40} {shown}", c.dir.display());
+            true
+        }
+        Err(e) => {
+            println!("{verb}: {:<40} FAILED: {e:#}", c.dir.display());
+            false
+        }
+    }
+}
+
+/// sources.toml rows for `paths` at the commit the tag resolves to in each; all or nothing.
+fn add(
+    root: &Path,
+    sources: &Sources,
+    manifest: &Manifest,
+    paths: &[String],
+    jobs: usize,
+) -> Result<()> {
+    let unique: BTreeSet<&String> = paths.iter().collect();
+    let new: Vec<&String> = unique
+        .iter()
+        .filter(|p| !sources.aosp.projects.contains_key(**p))
+        .copied()
+        .collect();
+    if new.is_empty() {
+        println!("fetch: all {} paths already pinned", unique.len());
+        return Ok(());
+    }
+    let resolved = par::map(&new, jobs, |path| {
+        let project = manifest
+            .projects
+            .get(*path)
+            .with_context(|| format!("{path}: not in the AOSP manifest"))?;
+        remote_tag_commit(&sources.aosp_url(&project.name), &sources.aosp.tag)
+            .with_context(|| path.to_string())
+    });
+    let commits = resolved.into_iter().collect::<Result<Vec<_>>>()?;
+    edit_sources(root, |doc| {
+        let table = doc["aosp"]["projects"]
+            .as_table_mut()
+            .context("[aosp.projects] is not a table")?;
+        for (path, commit) in new.iter().zip(&commits) {
+            table.insert(path, toml_edit::value(commit.as_str()));
+        }
+        table.sort_values();
+        Ok(())
+    })?;
+    println!(
+        "fetch: pinned {} new AOSP projects ({} already pinned)",
+        new.len(),
+        unique.len() - new.len()
+    );
+    Ok(())
+}
+
+/// Rewrite sources.toml in place (comments and order kept), then re-validate it.
+fn edit_sources(
+    root: &Path,
+    f: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+) -> Result<()> {
+    let path = root.join(sources::FILE);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing sources.toml")?;
+    f(&mut doc)?;
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
+    sources::load(root).context("sources.toml after rewrite")?;
+    Ok(())
 }
 
 // ---- local state and the action it calls for -------------------------------------------------
@@ -143,7 +251,7 @@ fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
             verify_tag(c)?;
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             git(Some(dir), &["init", "-q"])?;
-            git(Some(dir), &["remote", "add", "origin", &c.url])?;
+            git(Some(dir), &["remote", "add", "origin", c.url()?])?;
             fetch_pin(c, dir)?;
             checkout_pin(c, dir)
         }
@@ -177,7 +285,15 @@ pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
     let refspec = format!("+refs/tags/{0}:refs/tags/{0}", c.tag);
     git(
         Some(dir),
-        &["fetch", "-q", "--depth", "1", "--no-tags", &c.url, &refspec],
+        &[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            "--no-tags",
+            c.url()?,
+            &refspec,
+        ],
     )?;
     let fetched = git(
         Some(dir),
@@ -194,12 +310,12 @@ pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
 
 /// The remote's current commit for the tag must be the pin: a moved tag fails here.
 pub fn verify_tag(c: &Checkout) -> Result<()> {
-    let now = remote_tag_commit(&c.url, &c.tag)?;
+    let url = c.url()?;
+    let now = remote_tag_commit(url, &c.tag)?;
     ensure!(
         now == c.commit,
-        "tag {} on {} now resolves to {now}, pin says {} (moved tag, or run --bump)",
+        "tag {} on {url} now resolves to {now}, pin says {} (moved tag, or run --bump)",
         c.tag,
-        c.url,
         c.commit
     );
     Ok(())
@@ -235,11 +351,12 @@ fn peeled_commit(ls_remote: &str, tag: &str) -> Option<String> {
 
 // ---- --bump ------------------------------------------------------------------------------------
 
-fn bump(root: &Path, all: &[Checkout], write: bool) -> Result<ExitCode> {
+fn bump(root: &Path, all: &[Checkout], write: bool, jobs: usize) -> Result<ExitCode> {
     let mut moved = Vec::new();
     let mut failed = 0;
-    for c in all {
-        match remote_tag_commit(&c.url, &c.tag) {
+    let resolved = par::map(all, jobs, |c| remote_tag_commit(c.url()?, &c.tag));
+    for (c, result) in all.iter().zip(resolved) {
+        match result {
             Ok(now) if now == c.commit => {
                 println!("bump: {:<40} {} unchanged", c.dir.display(), c.tag)
             }
@@ -259,21 +376,17 @@ fn bump(root: &Path, all: &[Checkout], write: bool) -> Result<ExitCode> {
         }
     }
     if write && !moved.is_empty() {
-        let path = root.join(sources::FILE);
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let mut doc: toml_edit::DocumentMut = text.parse().context("parsing sources.toml")?;
-        for (c, now) in &moved {
-            match &c.pin {
-                Pin::Aosp(p) => {
-                    doc["aosp"]["projects"][p.as_str()] = toml_edit::value(now.as_str())
+        edit_sources(root, |doc| {
+            for (c, now) in &moved {
+                let now = toml_edit::value(now.as_str());
+                match &c.pin {
+                    Pin::Aosp(p) => doc["aosp"]["projects"][p.as_str()] = now,
+                    Pin::Manifest => doc["aosp"]["manifest"] = now,
+                    Pin::Git(name) => doc[name.as_str()]["commit"] = now,
                 }
-                Pin::Git(name) => doc[name.as_str()]["commit"] = toml_edit::value(now.as_str()),
             }
-        }
-        std::fs::write(&path, doc.to_string())
-            .with_context(|| format!("writing {}", path.display()))?;
-        sources::load(root).context("sources.toml after --write")?;
+            Ok(())
+        })?;
         println!("bump: wrote {} pins to {}", moved.len(), sources::FILE);
     } else if !moved.is_empty() {
         println!(
@@ -379,7 +492,7 @@ mod tests {
         fn checkout(&self, commit: &str) -> Checkout {
             Checkout {
                 dir: PathBuf::from("up"),
-                url: format!("file://{}", self.dir.display()),
+                url: Some(format!("file://{}", self.dir.display())),
                 tag: "v1".into(),
                 commit: commit.into(),
                 pin: Pin::Git("up".into()),

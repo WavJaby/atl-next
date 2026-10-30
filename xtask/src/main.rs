@@ -4,6 +4,7 @@
 // Terminal output is this tool's product, not logging.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod aosp;
 mod arches;
 mod check;
 mod deps;
@@ -12,6 +13,7 @@ mod git;
 mod licenses;
 mod modules;
 mod notice;
+mod par;
 mod patch;
 mod providers;
 mod sources;
@@ -46,10 +48,19 @@ enum Command {
     Deps(deps::Args),
     /// Upstream checkouts under <workspace>/src at the pins in sources.toml.
     ///
-    /// Dry run by default (offline): shows what each checkout needs. Checkouts are shallow (the pinned
-    /// tag only); `git fetch --unshallow` inside one before bisecting. A checkout on a branch belongs to
+    /// Dry run by default (offline): shows what each checkout needs. The AOSP manifest (pinned in
+    /// sources.toml) is fetched first: it maps tree paths to repositories and holds the tree's link/copy
+    /// files; the other checkouts then run in parallel. Checkouts are shallow (the pinned tag only);
+    /// `git fetch --unshallow` inside one before bisecting. A checkout on a branch belongs to
     /// `xtask patch`; one with uncommitted changes is never moved.
     Fetch(fetch::Args),
+    /// Which AOSP project defines a module, from an index of every manifest project's `Android.bp`.
+    ///
+    /// `--index` fetches only the `Android.bp` files of every project in the pinned manifest (shallow,
+    /// blobless, sparse; under <workspace>/cache/aosp-bp/<tag>, kept between runs) and rebuilds the
+    /// index; `--which` reads it. Names come from each module's literal `name:` only: a name built
+    /// from variables is not indexed.
+    Aosp(aosp::Args),
     /// Our commits on upstream checkouts: branch atl-patches <-> patches/<upstream>/*.patch.
     ///
     /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only;
@@ -73,6 +84,7 @@ fn main() -> Result<ExitCode> {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
+        Command::Aosp(args) => aosp::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
     }

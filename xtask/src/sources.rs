@@ -22,9 +22,14 @@ pub struct Sources {
 pub struct Aosp {
     pub remote: String,
     pub tag: String,
+    /// `platform/manifest` commit the tag resolves to: project git names and the tree's link/copy files.
+    pub manifest: String,
     /// AOSP tree path -> pinned commit.
     pub projects: BTreeMap<String, String>,
 }
+
+/// Directory of the manifest checkout under `src/`: outside the AOSP tree, which Soong scans.
+pub const AOSP_MANIFEST_DIR: &str = "aosp-manifest";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +43,8 @@ pub struct GitUpstream {
 pub struct Checkout {
     /// `aosp/<path>` or `<name>`; the same relative path under `src/` and `patches/`.
     pub dir: PathBuf,
-    pub url: String,
+    /// None for an AOSP project while the manifest (which holds its git name) is not fetched.
+    pub url: Option<String>,
     pub tag: String,
     pub commit: String,
     pub pin: Pin,
@@ -49,6 +55,7 @@ pub struct Checkout {
 /// Where a checkout's commit lives in sources.toml.
 pub enum Pin {
     Aosp(String),
+    Manifest,
     Git(String),
 }
 
@@ -62,10 +69,31 @@ impl Sources {
             .collect()
     }
 
-    pub fn checkouts(&self) -> Vec<Checkout> {
+    /// URL of the AOSP repository with this git name (the manifest's `name`, not the tree path).
+    pub fn aosp_url(&self, name: &str) -> String {
+        format!("{}{name}", self.aosp.remote)
+    }
+
+    /// The AOSP manifest's own checkout; its URL needs nothing from the manifest.
+    pub fn manifest_checkout(&self) -> Checkout {
+        Checkout {
+            dir: PathBuf::from(AOSP_MANIFEST_DIR),
+            url: Some(self.aosp_url("platform/manifest")),
+            tag: self.aosp.tag.clone(),
+            commit: self.aosp.manifest.clone(),
+            pin: Pin::Manifest,
+            licence_key: "aosp".to_owned(),
+        }
+    }
+
+    /// Every pinned upstream checkout (the manifest is fetch's own concern, not one of them).
+    /// `names` (manifest path -> git name) gives AOSP project URLs.
+    pub fn checkouts(&self, names: Option<&BTreeMap<String, String>>) -> Vec<Checkout> {
         let aosp = self.aosp.projects.iter().map(|(path, commit)| Checkout {
             dir: Path::new("aosp").join(path),
-            url: format!("{}{path}", self.aosp.remote),
+            url: names
+                .and_then(|n| n.get(path))
+                .map(|name| self.aosp_url(name)),
             tag: self.aosp.tag.clone(),
             commit: commit.clone(),
             pin: Pin::Aosp(path.clone()),
@@ -73,13 +101,21 @@ impl Sources {
         });
         let git = self.git.iter().map(|(name, up)| Checkout {
             dir: PathBuf::from(name),
-            url: up.git.clone(),
+            url: Some(up.git.clone()),
             tag: up.tag.clone(),
             commit: up.commit.clone(),
             pin: Pin::Git(name.clone()),
             licence_key: name.clone(),
         });
         aosp.chain(git).collect()
+    }
+}
+
+impl Checkout {
+    pub fn url(&self) -> Result<&str> {
+        self.url
+            .as_deref()
+            .context("AOSP manifest not fetched or lacks this path (xtask fetch --execute)")
     }
 }
 
@@ -99,6 +135,11 @@ fn validate(sources: &Sources) -> Result<()> {
     let aosp = &sources.aosp;
     ensure!(aosp.remote.ends_with('/'), "aosp.remote must end with `/`");
     ensure!(!aosp.tag.is_empty(), "aosp.tag is empty");
+    ensure!(
+        is_commit(&aosp.manifest),
+        "aosp.manifest `{}` is not a full commit hash",
+        aosp.manifest
+    );
     for (path, commit) in &aosp.projects {
         ensure!(
             is_tree_path(path),
@@ -156,7 +197,7 @@ pub fn is_name(s: &str) -> bool {
 mod tests {
     use super::parse;
 
-    const AOSP: &str = "[aosp]\nremote = \"https://h/platform/\"\ntag = \"t\"\n[aosp.projects]\n";
+    const AOSP: &str = "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"0123456789abcdef0123456789abcdef01234567\"\n[aosp.projects]\n";
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn err(text: &str) -> String {

@@ -66,7 +66,7 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
     use anyhow::Context;
     let sources = crate::sources::load(root)?;
     let licenses = crate::licenses::load(root, &sources.upstream_names())?;
-    let all = sources.checkouts();
+    let all = sources.checkouts(None);
     let c = all
         .iter()
         .find(|c| c.dir.display().to_string() == args.upstream)
