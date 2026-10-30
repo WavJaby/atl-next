@@ -37,9 +37,10 @@ const (
 	Shared
 	Headers
 	Binary
+	Gen // genrule / cc_genrule: outputs only, no cc artifact
 )
 
-func (k Kind) String() string { return [...]string{"static", "shared", "headers", "binary"}[k] }
+func (k Kind) String() string { return [...]string{"static", "shared", "headers", "binary", "gen"}[k] }
 
 type key struct {
 	name string
@@ -60,7 +61,13 @@ type Node struct {
 	exports []string
 	out     string // archive, shared object or binary
 	objs    []string
-	gen     []string // files generated for it (aidl, flex/bison output)
+	gen     []string // files generated for it (aidl, flex/bison, genrule output): its compiles wait for them
+	// genrules: usedGens are those n consumes; genIncs their include flags; genExports those of its
+	// export_generated_headers, handed to dependents
+	usedGens   map[*Node]bool
+	genIncs    []string
+	genExports []string
+	rule       *genRule // Kind Gen only
 }
 
 // genClosure: generated files n and its dependencies produce; n's compiles wait for them (headers).
@@ -91,6 +98,8 @@ type Graph struct {
 	problems    []string
 	// references no module of the tree answers to (see notFound)
 	missing map[string]bool
+	// genrule scripts by path, written by writeScripts after emit
+	scripts map[string]string
 }
 
 func (g *Graph) problem(format string, args ...any) {
@@ -209,7 +218,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 		}
 	}
 	if ml := p.obj("multilib"); ml != nil {
-		if o := ml.obj("lib64"); o != nil {
+		if o := ml.obj(g.cfg.Multilib()); o != nil {
 			base = merge(base, o)
 		}
 	}
@@ -295,8 +304,30 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	n.deps.static = dep("static_libs", Static)
 	n.deps.shared = dep("shared_libs", Shared)
 	n.deps.headers = dep("header_libs", Headers)
-	for _, gname := range append(n.props.strs("generated_headers"), n.props.strs("generated_sources")...) {
-		g.problem("%s: generated %s not supported yet", m.Name, gname)
+	exported := map[string]bool{}
+	for _, r := range n.props.strs("export_generated_headers") {
+		exported[r] = true
+	}
+	for _, r := range n.props.strs("generated_headers") {
+		if gn := g.genNode(r, side, m.Name); gn != nil {
+			g.useGen(n, gn)
+			if exported[r] {
+				n.genExports = append(n.genExports, gn.rule.incs...)
+			}
+		}
+	}
+	skip := map[string]bool{}
+	for _, r := range n.props.strs("exclude_generated_sources") {
+		skip[r] = true
+	}
+	for _, r := range n.props.strs("generated_sources") {
+		if skip[r] {
+			continue
+		}
+		if gn := g.genNode(r, side, m.Name); gn != nil {
+			g.useGen(n, gn)
+			g.genSources(n, gn)
+		}
 	}
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
@@ -304,25 +335,77 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 }
 
 func (g *Graph) addSrc(n *Node, s string) {
-	if strings.HasPrefix(s, ":") {
-		fg := g.lookup(s, n.side)
-		if fg == nil || fg.Type != "filegroup" {
-			g.problem("%s: source %s is not a known filegroup", n.mod.Name, s)
-			// a module of another type under that name is defined, not missing
-			if fg == nil {
-				g.notFound(s)
+	files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.mod.Name)
+	for _, f := range files {
+		if f.gen != nil {
+			g.useGen(n, f.gen)
+			// headers a genrule produces are only waited on
+			switch filepath.Ext(f.path) {
+			case ".h", ".hh", ".hpp", ".hxx", ".inc", ".def":
+				continue
 			}
-			return
 		}
-		root := filepath.Join(fg.Dir, fg.Props.str("path"))
-		for _, f := range g.globs(fg.Dir, fg.Props.strs("srcs")) {
-			g.addFile(n, f, root)
+		g.addFile(n, f.path, f.root)
+	}
+}
+
+// srcFile is one file a `srcs`-style entry names: tree-relative, or absolute under the build dir when a
+// genrule (gen) produces it. root is the import root aidl sources need.
+type srcFile struct {
+	path, root string
+	gen        *Node
+}
+
+// isRef: a srcs entry naming a module (`:name`, `//dir:name`) rather than a path.
+func isRef(s string) bool { return strings.HasPrefix(s, ":") || strings.HasPrefix(s, "//") }
+
+// resolveSrc expands one entry of srcs / tool_files written in dir: a path or glob, `:name` or
+// `//dir:name` naming a filegroup (its srcs, recursively) or a genrule (its outputs). ok=false: a
+// reference no known module of those types answers to (problem recorded).
+func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFile, ok bool) {
+	if !isRef(s) {
+		for _, f := range g.globs(dir, []string{s}) {
+			files = append(files, srcFile{path: f, root: dir})
 		}
-		return
+		return files, true
 	}
-	for _, f := range g.globs(n.mod.Dir, []string{s}) {
-		g.addFile(n, f, n.mod.Dir)
+	m := g.lookup(s, side)
+	switch {
+	case m != nil && isGenType(g.baseType(m.Type)):
+		gn := g.genNode(s, side, from)
+		for _, o := range gn.rule.outs {
+			files = append(files, srcFile{path: o, root: g.genDir(gn, ""), gen: gn})
+		}
+		return files, true
+	case m != nil && m.Type == "filegroup":
+		root := filepath.Join(m.Dir, m.Props.str("path"))
+		ok = true
+		exclude := map[string]bool{}
+		for _, e := range g.globs(m.Dir, m.Props.strs("exclude_srcs")) {
+			exclude[e] = true
+		}
+		for _, e := range m.Props.strs("srcs") {
+			sub, subOK := g.resolveSrc(m.Dir, side, e, from)
+			ok = ok && subOK
+			for _, f := range sub {
+				if f.gen == nil && exclude[f.path] {
+					continue
+				}
+				// a nested reference keeps the root of the group that owns the file
+				if f.gen == nil && !isRef(e) {
+					f.root = root
+				}
+				files = append(files, f)
+			}
+		}
+		return files, ok
 	}
+	g.problem("%s: source %s is not a known filegroup", from, s)
+	// a module of another type under that name is defined, not missing
+	if m == nil {
+		g.notFound(s)
+	}
+	return nil, false
 }
 
 func (g *Graph) addFile(n *Node, f, root string) {
@@ -392,7 +475,7 @@ func without(list, drop []string) []string {
 
 // exportsOf: the include flags a node hands to its dependents.
 func (g *Graph) exportsOf(n *Node) []string {
-	var out []string
+	out := append([]string{}, n.genExports...)
 	for _, d := range n.props.strs("export_include_dirs") {
 		out = append(out, "-I"+g.abs(filepath.Join(n.mod.Dir, d)))
 	}

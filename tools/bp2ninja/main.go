@@ -4,7 +4,7 @@
 // for a Linux glibc host (plan D7-2; M2). Runtime libraries come from each module's android source set,
 // build tools (aidl) from their host source set. Only the goals' dependency closure is emitted.
 //
-// Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -cc clang -cxx clang++ -ar llvm-ar goal...
+// Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and
 // properties) and <out>/missing.txt (the module references behind the "not found" problems, one per
@@ -22,7 +22,8 @@ import (
 func main() {
 	tree := flag.String("tree", "", "AOSP source tree (absolute)")
 	out := flag.String("out", "", "build directory (absolute)")
-	arch := flag.String("arch", "x86_64", "Soong arch name of the host")
+	arch := flag.String("arch", "", "Soong arch name of the host (arches.toml row key)")
+	bits := flag.Int("pointer-bits", 0, "pointer width of -arch (its arches.toml pointer_bits)")
 	cc := flag.String("cc", "clang", "C compiler")
 	cxx := flag.String("cxx", "clang++", "C++ compiler and linker driver")
 	ar := flag.String("ar", "llvm-ar", "archiver")
@@ -30,7 +31,7 @@ func main() {
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	flag.Parse()
-	if *tree == "" || *out == "" || flag.NArg() == 0 {
+	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -40,7 +41,7 @@ func main() {
 			omitted[m] = true
 		}
 	}
-	if err := run(*tree, *out, Config{Arch: *arch}, Tools{*cc, *cxx, *ar, *bison, *flex}, omitted, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, omitted, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -92,6 +93,9 @@ func run(tree, out string, cfg Config, tools Tools, omit map[string]bool, goals 
 		if err := os.Symlink(filepath.Join(tree, h), link); err != nil {
 			return err
 		}
+	}
+	if err := g.writeScripts(); err != nil {
+		return err
 	}
 	if err := os.WriteFile(filepath.Join(out, "build.ninja"), []byte(ninja), 0o644); err != nil {
 		return err

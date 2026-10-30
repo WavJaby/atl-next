@@ -91,12 +91,16 @@ rule yacc
 rule lex
   command = $flex -o$out $in
   description = flex $in
+rule genrule
+  command = cd "$root" && /bin/bash $script
+  description = genrule $name
+  restat = 1
 `
 
 // emit writes the ninja file for every node.
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(g.tree))
 	var aidlTool *Node
 	needAidl := false
 	for _, n := range g.order {
@@ -117,6 +121,12 @@ func (g *Graph) emit(tools Tools) string {
 			n.out = filepath.Join(base, n.name+".so")
 		case Binary:
 			n.out = filepath.Join(base, n.name)
+		}
+	}
+	// genrules: tools' paths are known now
+	for _, n := range g.order {
+		if n.kind == Gen {
+			g.emitGen(&b, n)
 		}
 	}
 	for _, n := range g.order {
@@ -158,7 +168,7 @@ func (g *Graph) emit(tools Tools) string {
 		}
 	}
 	for _, n := range g.order {
-		if n.kind == Headers {
+		if n.kind == Headers || n.kind == Gen {
 			continue
 		}
 		flags := g.compileFlags(n)
@@ -247,6 +257,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	}
 	inc = append(inc, "-I"+g.abs(n.mod.Dir))
 	inc = append(inc, n.exports...)
+	inc = append(inc, n.genIncs...)
 	if len(n.aidl) > 0 {
 		inc = append(inc, "-I"+g.genDir(n, "include"))
 	}

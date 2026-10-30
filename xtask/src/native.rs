@@ -42,12 +42,10 @@ const ERRORS_PER_MODULE: usize = 2;
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    ensure!(
-        arches.get(&args.host).is_some_and(|a| a.host.is_some()),
-        "{}: not a host arch in {}",
-        args.host,
-        arches::FILE
-    );
+    let pointer_bits = match arches.get(&args.host) {
+        Some(a) if a.host.is_some() => a.pointer_bits.to_string(),
+        _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
+    };
     let ws = workspace::root_dir(root)?;
     let tree = ws.join("src").join("aosp");
     let tool_dir = ws.join("out").join("bp2ninja");
@@ -94,7 +92,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-out")
             .arg(&out)
             .args([
-                "-arch", &args.host, "-cc", &args.cc, "-cxx", &args.cxx, "-ar", &args.ar, "-omit",
+                "-arch",
+                &args.host,
+                "-pointer-bits",
+                &pointer_bits,
+                "-cc",
+                &args.cc,
+                "-cxx",
+                &args.cxx,
+                "-ar",
+                &args.ar,
+                "-omit",
                 &omit,
             ])
             .args(&args.goals)

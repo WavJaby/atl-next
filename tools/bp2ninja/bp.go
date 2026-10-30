@@ -100,10 +100,14 @@ type Module struct {
 	Props *Obj
 }
 
-// Config is what select() conditions see.
+// Config is what select() conditions see. PointerBits comes from the arch's arches.toml row, never from its name.
 type Config struct {
-	Arch string
+	Arch        string
+	PointerBits int
 }
+
+// Multilib is Soong's multilib name for the arch: `multilib: { lib32/lib64 }` blocks, cc_genrule's CC_MULTILIB.
+func (c Config) Multilib() string { return fmt.Sprintf("lib%d", c.PointerBits) }
 
 // evaluator turns blueprint expressions into values for one side (os) of the build.
 type evaluator struct {
