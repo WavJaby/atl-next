@@ -109,6 +109,9 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
+	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
+	partial     map[string]Partial
+	droppedSrcs map[string]bool
 	// soong_config_module_type name -> wrapped module type
 	configTypes map[string]string
 	mods        [2]map[string][]*Module
@@ -393,6 +396,9 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	}
 	// a provided shared object links shared, and first, whichever list names it (static_libs, whole_static_libs included); a provided archive stays where it is named
 	var provided []*Node
+	if p := g.partialProvider(n); p != nil {
+		provided = append(provided, p)
+	}
 	dep := func(refs []string, want Kind) []*Node {
 		var out []*Node
 		for _, r := range refs {
@@ -451,7 +457,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 			}
 		}
 	}
-	g.genSources(n, dedupSrcs(files, g.expand(n, n.props.strs("exclude_srcs"))))
+	g.genSources(n, g.dropPartial(n, dedupSrcs(files, g.expand(n, n.props.strs("exclude_srcs")))))
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
 	return n

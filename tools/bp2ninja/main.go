@@ -7,7 +7,8 @@
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
 // Device modules link Soong's implicit system_shared_libs; a module in the -provided file (built by xtask: our crate, an upstream) stands in for its
-// Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles.
+// Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles. A module in the -srcs file is built
+// without the sources its row lists, linking the row's provider (if any) first for their symbols.
 //
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need -jdk, -build-tools, -aconfig and
 // -release, and -metalava where API stubs are built; with them, a goal that names a Java module builds as one. -measure writes
@@ -41,6 +42,7 @@ func main() {
 	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {lib, include, defines} of modules built outside the tree (providers.toml `crate:` and `upstream:`, provided.go)")
+	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
@@ -59,12 +61,17 @@ func main() {
 			omitted[m] = true
 		}
 	}
-	provided, err := readProvided(*providedFile)
+	provided, err := readJSON[Provided](*providedFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
+	partial, err := readJSON[Partial](*srcsFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
+		os.Exit(1)
+	}
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm}, javaSetup{jt, *release, *measure}, omitted, provided, partial, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -77,7 +84,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -92,7 +99,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.Yasm, soong.NoYasm, err = readYasmFlags(tree, cfg.Arch); err != nil {
 		return err
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
 		mods, problems := ev.modules(files)
@@ -112,6 +119,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// providers.toml's own check cannot see the tree; this one can
 	names := sortedKeys(omit)
 	for m := range provided {
+		names = append(names, m)
+	}
+	for m := range partial {
 		names = append(names, m)
 	}
 	for _, m := range names {
@@ -147,6 +157,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		if n := g.node(goal, Device, Shared, "goal"); n != nil {
 			ccGoals = append(ccGoals, n)
 		}
+	}
+	if err := g.checkPartial(); err != nil {
+		return err
 	}
 	ninja := g.emit(tools)
 	if g.java != nil {

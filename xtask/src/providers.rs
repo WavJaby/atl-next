@@ -14,12 +14,21 @@ pub const FILE: &str = "providers.toml";
 /// Provider of a module nothing provides on this host: a dependency on it is dropped.
 pub const NONE: &str = "none";
 
-/// Modules whose dependencies the converter drops (`provider = "none"`).
+/// Modules whose dependencies the converter drops (`provider = "none"` for the whole module).
 pub fn omitted(providers: &Providers) -> Vec<&str> {
     providers
         .iter()
-        .filter(|(_, row)| row.provider == NONE)
+        .filter(|(_, row)| row.provider == NONE && row.srcs.is_empty())
         .map(|(module, _)| module.as_str())
+        .collect()
+}
+
+/// Rows replacing only some sources of a module (`srcs`): (module, row).
+pub fn partial(providers: &Providers) -> Vec<(&str, &Provider)> {
+    providers
+        .iter()
+        .filter(|(_, row)| !row.srcs.is_empty())
+        .map(|(module, row)| (module.as_str(), row))
         .collect()
 }
 
@@ -53,6 +62,15 @@ pub struct Provided {
     pub defines: Vec<String>,
 }
 
+/// One `srcs` row as `xtask native` hands it to the converter in `<out>/srcs.json` (bp2ninja provided.go `Partial`): the module is built from the tree without these sources, linking the provider's artifact if it has one.
+#[derive(Debug, Serialize)]
+pub struct Partial {
+    /// As the row lists them: relative to the module's directory.
+    pub srcs: Vec<String>,
+    /// None for `provider = "none"`: nothing replaces the dropped sources.
+    pub provider: Option<Provided>,
+}
+
 /// Row key = Android.bp module name.
 pub type Providers = BTreeMap<String, Provider>;
 
@@ -61,6 +79,9 @@ pub type Providers = BTreeMap<String, Provider>;
 pub struct Provider {
     pub provider: String,
     pub reason: String,
+    /// Empty = the whole module.
+    #[serde(default)]
+    pub srcs: Vec<String>,
 }
 
 /// What a provider may name: workspace crates, sources.toml git upstreams.
@@ -93,6 +114,15 @@ fn parse(text: &str, targets: &Targets) -> Result<Providers> {
 fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     ensure!(is_module_name(module), "not an Android.bp module name");
     ensure!(!row.reason.trim().is_empty(), "empty reason");
+    // that each names a source of the module at the pin needs the tree: the converter checks it (bp2ninja provided.go checkPartial)
+    let mut seen = BTreeSet::new();
+    for src in &row.srcs {
+        ensure!(
+            is_src_path(src),
+            "srcs: `{src}` is not a plain path relative to the module's directory"
+        );
+        ensure!(seen.insert(src), "srcs: `{src}` listed twice");
+    }
     if row.provider == NONE {
         return Ok(());
     }
@@ -127,6 +157,14 @@ fn is_module_name(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+}
+
+/// A `srcs` entry: a file path under the module's directory, as Android.bp `srcs` write one; no glob (the check is per file), no module reference, nothing leaving the directory.
+fn is_src_path(s: &str) -> bool {
+    // an empty component also rejects "", a leading or trailing `/`, and `//`
+    !s.starts_with(':')
+        && !s.contains(['*', '?', '[', '\\'])
+        && s.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 #[cfg(test)]
@@ -200,6 +238,41 @@ mod tests {
         assert!(err("[x]\nprovider = \"deps:icu\"\nreason = \"r\"\n").contains("is not crate:"));
         assert!(
             err("[x]\nprovider = \"crate:atl-nativeloader\"\nreason = \" \"\n")
+                .contains("empty reason")
+        );
+    }
+
+    #[test]
+    fn srcs_rows() {
+        let text = "[libskia]\nprovider = \"none\"\nreason = \"r\"\nsrcs = [\"src/codec/SkRawCodec.cpp\"]\n\
+                    [libandroid_runtime]\nprovider = \"crate:atl-nativeloader\"\nreason = \"r\"\nsrcs = [\"a.cpp\"]\n\
+                    [libdl]\nprovider = \"none\"\nreason = \"r\"\n";
+        let providers = parsed(text).unwrap();
+        // a srcs row keeps its module: only the whole-module `none` row drops dependencies
+        assert_eq!(super::omitted(&providers), ["libdl"]);
+        let partial: Vec<&str> = super::partial(&providers).iter().map(|(m, _)| *m).collect();
+        assert_eq!(partial, ["libandroid_runtime", "libskia"]);
+        // its crate is still built
+        assert_eq!(
+            super::crates(&providers),
+            [("libandroid_runtime", "atl-nativeloader")]
+        );
+        let row = |srcs: &str| format!("[x]\nprovider = \"none\"\nreason = \"r\"\nsrcs = {srcs}\n");
+        for bad in [
+            "[\"\"]",
+            "[\"/abs.cpp\"]",
+            "[\"../up.cpp\"]",
+            "[\"a//b.cpp\"]",
+            "[\"./a.cpp\"]",
+            "[\"*.cpp\"]",
+            "[\":filegroup\"]",
+        ] {
+            assert!(err(&row(bad)).contains("not a plain path"), "{bad}");
+        }
+        assert!(err(&row("[\"a.cpp\", \"a.cpp\"]")).contains("listed twice"));
+        // the reason stays required on a srcs row
+        assert!(
+            err("[x]\nprovider = \"none\"\nreason = \"\"\nsrcs = [\"a.cpp\"]\n")
                 .contains("empty reason")
         );
     }

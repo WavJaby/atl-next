@@ -62,6 +62,64 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 	}
 }
 
+// A `srcs` row: the module is still built from the tree, without the listed files (both the plain srcs and target-block ones), and links its provider first; a `none` row links nothing. A listed file that is no source of the module fails the conversion.
+func TestPartialModule(t *testing.T) {
+	files := map[string]string{"p/Android.bp": `
+cc_library_shared { name: "librt", srcs: ["keep.cc", "drop.cc"], target: { android: { srcs: ["dev.cc"] } } }
+cc_library_static { name: "libsk", srcs: ["codec.cc", "raw.cc"] }
+cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
+`, "p/u.cc": ""}
+	lib := "/crates/lib/libatl_stubs.so"
+	g := graphFor(t, files)
+	g.partial = map[string]Partial{
+		"librt":      {Srcs: []string{"drop.cc", "dev.cc"}, Provider: &Provided{Lib: lib}},
+		"libsk":      {Srcs: []string{"raw.cc"}},
+		"libunbuilt": {Srcs: []string{"u.cc"}},
+	}
+	for _, goal := range []string{"librt", "libsk"} {
+		g.node(goal, Device, Shared, "goal")
+	}
+	if err := g.checkPartial(); err != nil {
+		t.Fatal(err)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
+	for _, src := range []string{"/p/drop.cc", "/p/dev.cc", "/p/raw.cc"} {
+		if strings.Contains(ninja, src) {
+			t.Errorf("%s is compiled", src)
+		}
+	}
+	for _, src := range []string{"/p/keep.cc", "/p/codec.cc"} {
+		if !strings.Contains(ninja, src) {
+			t.Errorf("%s is not compiled", src)
+		}
+	}
+	for _, n := range g.order {
+		l, _ := g.linkLibs(n)
+		switch n.name {
+		case "librt":
+			if !slices.Equal(l[:2], []string{lib, "-Wl,-rpath,/crates/lib"}) {
+				t.Errorf("librt link libs %q", l)
+			}
+		case "libsk":
+			if slices.ContainsFunc(l, func(s string) bool { return strings.HasSuffix(s, ".so") }) {
+				t.Errorf("none row links a provider: %q", l)
+			}
+		}
+	}
+
+	// a file the module does not compile (built), a file that does not exist (not built)
+	g = graphFor(t, files)
+	g.partial = map[string]Partial{
+		"librt":      {Srcs: []string{"drop.cc", "gone.cc"}},
+		"libunbuilt": {Srcs: []string{"moved.cc"}},
+	}
+	g.node("librt", Device, Shared, "goal")
+	err := g.checkPartial()
+	if err == nil || !strings.Contains(err.Error(), "librt: gone.cc is not one of its sources") || !strings.Contains(err.Error(), "libunbuilt: p/moved.cc does not exist") {
+		t.Errorf("checkPartial: %v", err)
+	}
+}
+
 // Soong's implicit system_shared_libs and atl-bionic standing in for libc (the providers.toml rows libc = crate:atl-bionic, libm / libdl = none).
 func TestSystemSharedLibsAndProvidedLibc(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `

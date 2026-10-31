@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
-use crate::providers::Provided;
+use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
     arches, farm, fetch, none_gate, patch, provided_gate, providers, sources, triage, upstream,
@@ -136,8 +136,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("native: building upstream {name} from {}", src.display());
         provided.extend(upstream::build(&src, &out, recipe, &toolchain)?);
     }
+    // a srcs row's provider stands in for some sources of its module, not for the module
+    let partial: BTreeMap<&str, Partial> = providers::partial(&providers)
+        .into_iter()
+        .map(|(module, row)| {
+            let provider = provided.remove(module);
+            let srcs = row.srcs.clone();
+            (module, Partial { srcs, provider })
+        })
+        .collect();
     let provided_file = out.join("provided.json");
     std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
+    let srcs_file = out.join("srcs.json");
+    std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
     let mut table: Vec<String> = Vec::new();
     let mut round = 0;
@@ -166,6 +177,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ])
             .arg("-provided")
             .arg(&provided_file)
+            .arg("-srcs")
+            .arg(&srcs_file)
             .args(&args.goals)
             .status()
             .context("running bp2ninja")?;
@@ -222,7 +235,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
-    let gate_ok = gate(&out, &provided)?;
+    let libs = provided
+        .values()
+        .chain(partial.values().filter_map(|p| p.provider.as_ref()))
+        .map(|p| p.lib.as_path());
+    let gate_ok = gate(&out, libs)?;
     if status.success() {
         println!("native: built -> {}", out.display());
         return Ok(if gate_ok && table_check(&table) {
@@ -331,8 +348,13 @@ fn build_crates(
             lib.display()
         );
         for module in modules {
+            let part = if providers[module].srcs.is_empty() {
+                ""
+            } else {
+                " (its srcs row)"
+            };
             println!(
-                "native: provided {module} = crate {krate} -> {}",
+                "native: provided {module}{part} = crate {krate} -> {}",
                 lib.display()
             );
             built.insert(
@@ -349,13 +371,12 @@ fn build_crates(
 }
 
 /// The provided gate (provided_gate.rs) over the device artifacts ninja produced; false on a violation.
-/// Every provided shared object, whatever its row kind: the converter links each one first, and an in-tree strong definition of a provided symbol is a second implementation wherever it comes from.
+/// Every provided shared object, whatever its row kind (`srcs` rows' included): the converter links each one first, and an in-tree strong definition of a provided symbol is a second implementation wherever it comes from.
 /// Archives are not checked: their members are copied into the dependent, so there is no DT_NEEDED order or cross-object lookup to get wrong.
-fn gate(out: &Path, provided: &BTreeMap<String, Provided>) -> Result<bool> {
-    let exported = provided
-        .values()
-        .filter(|p| p.lib.extension().is_some_and(|e| e == "so"))
-        .map(|p| provided_gate::exported(&p.lib))
+fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<bool> {
+    let exported = libs
+        .filter(|lib| lib.extension().is_some_and(|e| e == "so"))
+        .map(provided_gate::exported)
         .collect::<Result<Vec<_>>>()?;
     if exported.is_empty() {
         return Ok(true);
