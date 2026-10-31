@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -190,13 +191,12 @@ func (g *Graph) emit(tools Tools) string {
 
 type langFlags struct{ c, cxx, asm []string }
 
-// compileFlags: Soong's language defaults (read from its global.go), the module's flags, then include
-// paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
+// compileFlags: Soong's language defaults and global defines (read from its global.go), the module's flags, then include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
 // -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures.
 // libc++: AOSP's C++ assumes it (libstdc++ 14 rejects libbase's non-const set comparator).
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
-	common := []string{"-fPIC", "-O2", "-w"}
+	common := append([]string{"-fPIC", "-O2", "-w"}, g.soong.GlobalDefines...)
 	common = append(common, moduleFlags(p, "cflags")...)
 	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")
@@ -233,8 +233,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), moduleFlags(p, "cppflags")...)
 	c := append(append([]string{"-std=" + cstd}, common...), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
-		dev := append([]string{weakAvailability}, g.soong.APILevels...)
-		dev = append(dev, "-I"+filepath.Join(g.out, "compat", "device"), "-include", deviceForced)
+		dev := slices.Concat(g.soong.APILevels, []string{"-I" + filepath.Join(g.out, "compat", "device"), "-include", deviceForced})
 		cxx = append(append(cxx, dev...), "-I"+filepath.Join(g.out, "compat", "cxx"))
 		c = append(c, dev...)
 	}

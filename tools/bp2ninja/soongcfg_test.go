@@ -36,12 +36,18 @@ func soongTree(t *testing.T, cflags, soongLevel, bionicLevel string) string {
 
 func TestSoongConfigAvailability(t *testing.T) {
 	weak := `"-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__",`
-	cfg, err := readSoongConfig(soongTree(t, weak, "10000", "10000"))
+	// global.go:106-112 order, with a warning and a codegen flag around them
+	cfg, err := readSoongConfig(soongTree(t, `"-Wall", "-DANDROID", "-DNDEBUG", "-UDEBUG", `+weak+` "-faddrsig",`, "10000", "10000"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.CStd != "gnu23" || cfg.CppStd != "gnu++20" || len(cfg.GlobalIncludes) != 1 {
 		t.Fatalf("config %+v", cfg)
+	}
+	// only the preprocessor flags, in Soong's order
+	defines := []string{"-DANDROID", "-DNDEBUG", "-UDEBUG", "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"}
+	if !slices.Equal(cfg.GlobalDefines, defines) {
+		t.Errorf("GlobalDefines %q, want %q", cfg.GlobalDefines, defines)
 	}
 	// the triple's level first, then the header's numeric level names in file order; the symbolic __ANDROID_API__ line is not one
 	want := []string{"-D__ANDROID_API__=10000", "-D__ANDROID_API_FUTURE__=10000", "-D__ANDROID_API_U__=34"}

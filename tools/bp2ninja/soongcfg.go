@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 )
 
 // SoongConfig: the global C/C++ settings Soong applies to every module, read from the pinned tree's
@@ -19,7 +20,10 @@ import (
 type SoongConfig struct {
 	CStd, CppStd   string   // CStdVersion, CppStdVersion
 	GlobalIncludes []string // commonGlobalIncludes that exist in the tree (Soong skips missing ones)
-	APILevels      []string // device-side -D flags: bionic's level names and __ANDROID_API__ (apiLevels)
+	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
+	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here.
+	GlobalDefines []string
+	APILevels     []string // device-side -D flags: bionic's level names and __ANDROID_API__ (apiLevels)
 }
 
 // weakAvailability: Soong's global define (commonGlobalCflags) that puts bionic's versioning.h in weak mode: __INTRODUCED_IN becomes a plain availability attribute and __BIONIC_AVAILABILITY_GUARD is 1, so every declaration stays visible.
@@ -84,7 +88,12 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 	if cfg.CStd == "" || cfg.CppStd == "" {
 		return cfg, fmt.Errorf("%s: CStdVersion/CppStdVersion not found", path)
 	}
-	if !slices.Contains(cflags, weakAvailability) {
+	for _, f := range cflags {
+		if strings.HasPrefix(f, "-D") || strings.HasPrefix(f, "-U") {
+			cfg.GlobalDefines = append(cfg.GlobalDefines, f)
+		}
+	}
+	if !slices.Contains(cfg.GlobalDefines, weakAvailability) {
 		return cfg, fmt.Errorf("%s: commonGlobalCflags lacks %s (deviceCompat assumes it)", path, weakAvailability)
 	}
 	cfg.APILevels, err = apiLevels(tree)
