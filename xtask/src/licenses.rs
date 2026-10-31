@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::sources;
 
 pub const FILE: &str = "licenses.toml";
-const RUNTIME: &str = "runtime";
+pub const RUNTIME: &str = "runtime";
 /// The GPL-3.0-or-later QEMU bridge; its allow list = licences combinable with GPL-3.
 const BRIDGE: &str = "qemu-bridge";
 
@@ -44,6 +44,19 @@ pub struct PathLicence {
     /// SPDX expression.
     pub licence: String,
     pub reason: String,
+}
+
+impl Licenses {
+    /// Whether a file under SPDX expression `expr` may be compiled into `artifact`: `OR` needs one allowed side, `AND` both, and each licence (`<id>` or `<id> WITH <exception>`) must be an allow entry as written.
+    pub fn allows(&self, artifact: &str, expr: &str) -> Result<bool> {
+        let artifact = self
+            .artifact
+            .get(artifact)
+            .with_context(|| format!("no [artifact.{artifact}]"))?;
+        let expr = ::spdx::Expression::parse(expr)
+            .with_context(|| format!("`{expr}` is not an SPDX expression"))?;
+        Ok(expr.evaluate(|req| artifact.allow.iter().any(|a| *a == req.to_string())))
+    }
 }
 
 /// One allow entry: an SPDX licence, optionally `WITH` an exception.
@@ -80,7 +93,7 @@ pub fn load(root: &Path, upstreams: &BTreeSet<String>) -> Result<Licenses> {
     Ok(licenses)
 }
 
-fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses> {
+pub(crate) fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses> {
     let licenses: Licenses = toml::from_str(text)?;
     ensure!(
         licenses.artifact.contains_key(RUNTIME),
@@ -270,6 +283,24 @@ mod tests {
         assert!(err(&ok.replace("linux-user/", "../x")).contains("not a relative path prefix"));
         assert!(err(&ok.replace("reason = \"r\"", "reason = \" \"")).contains("empty reason"));
         assert!(err(&ok.replace("GPL-2.0-or-later", "GPL-2.0-or-later AND")).contains("bad SPDX"));
+    }
+
+    #[test]
+    fn allowed_expressions() {
+        let text = "[artifact.runtime]\nallow = [\"MIT\", \"GPL-2.0-only WITH Classpath-exception-2.0\", \"GPL-2.0-or-later\"]\n";
+        let licenses = parse(text, &upstreams()).unwrap();
+        let allows = |e: &str| licenses.allows(RUNTIME, e).unwrap();
+        assert!(allows("MIT"));
+        assert!(allows("GPL-2.0-or-later"));
+        assert!(allows("GPL-2.0-only WITH Classpath-exception-2.0"));
+        // the exception is what makes GPL-2.0-only allowed
+        assert!(!allows("GPL-2.0-only"));
+        assert!(!allows("Apache-2.0"));
+        assert!(allows("Apache-2.0 OR MIT"));
+        assert!(!allows("Apache-2.0 AND MIT"));
+        // a licence the SPDX list lacks (a `paths` entry's LicenseRef) is denied unless listed
+        assert!(!allows("LicenseRef-Adobe-DNG-SDK"));
+        assert!(licenses.allows("qemu-bridge", "MIT").is_err());
     }
 
     #[test]

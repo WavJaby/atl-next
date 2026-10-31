@@ -19,8 +19,8 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
-    arches, farm, fetch, none_gate, patch, provided_gate, providers, sources, triage, upstream,
-    workspace,
+    arches, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate, providers,
+    sources, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -239,7 +239,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
         .map(|p| p.lib.as_path());
-    let gate_ok = gate(&out, libs)?;
+    let gate_ok = gate(&out, libs)? & licence_gate(root, &layout, &sources, &out, args.verbose)?;
     if status.success() {
         println!("native: built -> {}", out.display());
         return Ok(if gate_ok && table_check(&table) {
@@ -393,6 +393,48 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<bool> {
         println!("native:   gate: {v}");
     }
     Ok(report.violations.is_empty())
+}
+
+/// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file.
+fn licence_gate(
+    root: &Path,
+    layout: &Layout,
+    sources: &sources::Sources,
+    out: &Path,
+    verbose: bool,
+) -> Result<bool> {
+    let licenses = licenses::load(root, &sources.upstream_names())?;
+    let roots = licence_gate::roots(layout, &sources.checkouts(None));
+    let report = licence_gate::check(&std::fs::canonicalize(out)?, &roots, &licenses)?;
+    println!(
+        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} members of libraries built outside ninja; {} licences denied, {} files unresolved",
+        report.artifacts,
+        report.checked,
+        report.generated,
+        report.system,
+        report.outside,
+        report.denied.len(),
+        report.unresolved.len()
+    );
+    let shown = |n: usize| if verbose { n } else { n.min(5) };
+    for (expr, files) in &report.denied {
+        println!(
+            "native:   licence: `{expr}` is not allowed in [artifact.{}]: {} files",
+            licenses::RUNTIME,
+            files.len()
+        );
+        for (file, artifact) in files.iter().take(shown(files.len())) {
+            println!("native:     {file} (in {artifact})");
+        }
+    }
+    for u in report
+        .unresolved
+        .iter()
+        .take(shown(report.unresolved.len()))
+    {
+        println!("native:   licence: unresolved {u}");
+    }
+    Ok(report.ok())
 }
 
 /// One converter round's output files.

@@ -10,12 +10,18 @@
 #   allow          SPDX licences, each `<id>` or `<id> WITH <exception>`
 #     runtime      the ART process, atld, our libraries and everything they link
 #     qemu-bridge  the dlopened QEMU bridge, distributed as GPL-3.0-or-later: licences combinable with GPL-3
-# [upstream.<name>]   a sources.toml upstream
+# [upstream.<name>]   a sources.toml upstream (`aosp`: every AOSP project, paths relative to the tree root)
 #   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text
+#   [upstream.<name>.paths."<path prefix>"]   licence (SPDX expression; LicenseRef-<name> for one the SPDX list lacks) + reason, for files whose notice the phrase rules cannot read; longest prefix wins, before any tag or notice
+# `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`).
 # Rows are added when a compiled set first needs them.
 
 [artifact.runtime]
 allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[upstream.aosp.paths."external/dng_sdk/"]
+licence = "LicenseRef-Adobe-DNG-SDK"
+reason = "Adobe's DNG SDK Licence Agreement with its DNG patent licence (PATENTS: rights granted \"solely to permit the reading and writing of image files that comply with the DNG Specification\"): a field-of-use restriction GPL-3 forbids, so never allowed where the GPL-3 QEMU bridge may load; the file headers only point at the agreement, which the phrase rules do not read"
 
 [upstream.boringssl]
 # BoringSSL's LICENSE is the Apache License 2.0; its one other licence (Go's, "parts of the TLS test suite") covers ssl/test/runner, which libcrypto/libssl never compile.

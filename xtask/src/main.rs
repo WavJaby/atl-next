@@ -11,6 +11,7 @@ mod deps;
 mod farm;
 mod fetch;
 mod git;
+mod licence_gate;
 mod licenses;
 mod modules;
 mod native;
@@ -83,6 +84,7 @@ enum Command {
     /// Runtime libraries come from each module's android source set compiled for glibc, build tools
     /// (aidl) from their host source set; bionic itself is replaced by the system C library. Output in
     /// <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`) against the goals: which failed modules each goal reaches, those with no failed dependency first (most modules waiting on them first), each with its cause (compiler `error:` lines, a link's undefined symbols).
+    /// Gates over what was built, each failing the run: the provided gate (provided libraries win symbol lookup) and the licence gate (every source and header linked into a device artifact has a licence licenses.toml allows in the runtime).
     /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
     /// Task copies (`xtask patch --edit`) replace their src/ checkout; with AOSP ones the converter reads the link farm src-wt/<task>/aosp-tree, regenerated every round.
     Native(native::Args),
