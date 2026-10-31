@@ -22,12 +22,21 @@ const (
 
 func (s Side) String() string { return [...]string{"device", "host"}[s] }
 
-// targetBlocks lists the `target: {…}` blocks a side applies, in Soong's order of generality.
-func targetBlocks(s Side, arch string) []string {
+// osBlocks: the OS-only `target: {…}` blocks a side applies, in Soong's order (android/arch.go setOSProperties, the os mutator: before any arch block).
+// not_windows is a host class block; android64/android32 follow the device's pointer width.
+func osBlocks(s Side, pointerBits int) []string {
 	if s == Device {
-		return []string{"linux", "bionic", "not_windows", "android", "linux_" + arch, "android_" + arch}
+		return []string{"linux", "bionic", "android", fmt.Sprintf("android%d", pointerBits)}
 	}
-	return []string{"host", "not_windows", "linux", "glibc", "host_linux", "linux_glibc", "linux_glibc_" + arch}
+	return []string{"host", "linux", "host_linux", "glibc", "linux_glibc", "not_windows"}
+}
+
+// osArchBlocks: the OS+arch `target: {…}` blocks, in Soong's order (android/arch.go getArchProperties, after `arch` and `multilib`).
+func osArchBlocks(s Side, arch string) []string {
+	if s == Device {
+		return []string{"linux_" + arch, "bionic_" + arch, "android_" + arch}
+	}
+	return []string{"linux_" + arch, "linux_glibc_" + arch, "glibc_" + arch}
 }
 
 // Kind is the artifact a node produces.
@@ -220,28 +229,21 @@ func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj
 	return merge(acc, m.Props)
 }
 
-// flatten applies the blocks of one side, arch and kind onto the base properties.
+// flatten applies the blocks of one side, arch and kind onto the base properties, in Soong's order: soong_config_variables (a load hook), OS blocks (os mutator), `arch` with its variant and feature sub-blocks, `multilib`, OS+arch blocks (arch mutator), `static`/`shared` (link mutator).
+// The order decides flag order: libz's `arch: { x86_64 }` -DCPU_NO_SIMD must precede its `target: { android_x86_64 }` -UCPU_NO_SIMD.
 func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	p := g.resolveDefaults(m, side, map[string]bool{})
 	base := newObj()
 	for _, k := range p.keys {
 		switch k {
-		case "target", "arch", "multilib", "shared", "static", "defaults":
+		case "target", "arch", "multilib", "shared", "static", "defaults", "soong_config_variables":
 		default:
 			base.set(k, p.m[k])
-		}
-	}
-	if t := p.obj("target"); t != nil {
-		for _, b := range targetBlocks(side, g.cfg.Arch) {
-			if o := t.obj(b); o != nil {
-				base = merge(base, o)
-			}
 		}
 	}
 	// soong_config_variables: no Soong config variable (nor the release flags some map to) is set for
 	// this build yet, so each variable's conditions_default applies
 	if sv := p.obj("soong_config_variables"); sv != nil {
-		base = removeKey(base, "soong_config_variables")
 		for _, v := range sv.keys {
 			if o := sv.obj(v); o != nil {
 				if d := o.obj("conditions_default"); d != nil {
@@ -250,9 +252,27 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 			}
 		}
 	}
+	target := func(blocks []string) {
+		if t := p.obj("target"); t != nil {
+			for _, b := range blocks {
+				if o := t.obj(b); o != nil {
+					base = merge(base, o)
+				}
+			}
+		}
+	}
+	target(osBlocks(side, g.cfg.PointerBits))
 	if a := p.obj("arch"); a != nil {
 		if o := a.obj(g.cfg.Arch); o != nil {
 			base = merge(base, o)
+			// variant and feature sub-blocks: only the device toolchain has a variant and features
+			if side == Device {
+				for _, b := range g.soong.Device.blocks() {
+					if s := o.obj(b); s != nil {
+						base = merge(base, s)
+					}
+				}
+			}
 		}
 	}
 	if ml := p.obj("multilib"); ml != nil {
@@ -260,6 +280,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 			base = merge(base, o)
 		}
 	}
+	target(osArchBlocks(side, g.cfg.Arch))
 	if kind == Static || kind == Shared {
 		if o := p.obj(kind.String()); o != nil {
 			base = merge(base, o)

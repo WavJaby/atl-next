@@ -26,6 +26,132 @@ type SoongConfig struct {
 	APILevel      string // device-side -D__ANDROID_API__ (apiLevel)
 	// cc/config/bionic.go bionicDefaultSharedLibraries: what a device module links when it sets no system_shared_libs (cc/linker.go; `[]` opts out)
 	SystemSharedLibs []string
+	Device           DeviceArch // readDeviceArch
+}
+
+// DeviceArch: the ISA Soong's device toolchain targets for the arch and its arches.toml variant (android/arch.go decodeArch, cc/config/<arch>_device.go <arch>ToolchainFactory).
+// Device-side sources rely on it: libz's android_x86_64 block defines ADLER32_SIMD_SSSE3 because Android's x86_64 ABI includes SSSE3, and its intrinsics need -mssse3.
+// Host-side modules get none: Soong sets arch features for the Android OS only.
+type DeviceArch struct {
+	Variant  string
+	Features []string // android/arch_list.go androidArchFeatureMap[arch][variant]
+	// <arch>ArchVariantCflags[variant] + <arch>ArchFeatureCflags[feature] per feature: the ISA part of the toolchain cflags.
+	// riscv64's -march sits in riscv64Cflags with non-ISA flags instead; it is read when riscv64 hosts are built (plan S5 phase 6).
+	Cflags []string
+}
+
+// blocks: the `arch: { <arch>: { … } }` sub-blocks Soong applies after the arch's own (android/arch.go archPropertiesValues): the variant (`-`, `.` -> `_`), then each feature.
+func (d DeviceArch) blocks() []string {
+	var out []string
+	if d.Variant != "" {
+		out = append(out, strings.NewReplacer("-", "_", ".", "_").Replace(d.Variant))
+	}
+	return append(out, d.Features...)
+}
+
+// readDeviceArch: DeviceArch for cfg from the pinned Soong; fails where Soong's toolchain factory would panic (an unknown variant).
+func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
+	d := DeviceArch{Variant: cfg.ArchVariant}
+	parse := func(rel string) (*ast.File, error) {
+		return parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+	}
+	// Soong's ArchType identifier for the arch name: `X86_64 = newArch("x86_64", "lib64")`
+	archGo, err := parse("build/soong/android/arch.go")
+	if err != nil {
+		return d, err
+	}
+	ident := ""
+	for name, v := range valueSpecs(archGo) {
+		if c, ok := v.(*ast.CallExpr); ok && len(c.Args) > 0 {
+			if f, ok := c.Fun.(*ast.Ident); ok && f.Name == "newArch" && goString(c.Args[0]) == cfg.Arch {
+				ident = name
+			}
+		}
+	}
+	if ident == "" {
+		return d, fmt.Errorf("build/soong/android/arch.go: no newArch(%q)", cfg.Arch)
+	}
+	list, err := parse("build/soong/android/arch_list.go")
+	if err != nil {
+		return d, err
+	}
+	if m, ok := valueSpecs(list)["androidArchFeatureMap"].(*ast.CompositeLit); ok {
+		for _, e := range m.Elts {
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				if k, ok := kv.Key.(*ast.Ident); ok && k.Name == ident {
+					d.Features = stringMap(kv.Value)[cfg.ArchVariant]
+				}
+			}
+		}
+	} else {
+		return d, fmt.Errorf("build/soong/android/arch_list.go: androidArchFeatureMap not found")
+	}
+	rel := "build/soong/cc/config/" + cfg.Arch + "_device.go"
+	dev, err := parse(rel)
+	if err != nil {
+		return d, err
+	}
+	specs := valueSpecs(dev)
+	v, ok := specs[cfg.Arch+"ArchVariantCflags"]
+	if !ok {
+		return d, fmt.Errorf("%s: %sArchVariantCflags not found", rel, cfg.Arch)
+	}
+	variants := stringMap(v)
+	vflags, ok := variants[cfg.ArchVariant]
+	if !ok && (cfg.ArchVariant != "" || len(variants) > 0) {
+		return d, fmt.Errorf("%s: unknown %s arch variant %q", rel, cfg.Arch, cfg.ArchVariant)
+	}
+	d.Cflags = vflags
+	// absent for arches whose features select no flags (arm64)
+	features := stringMap(specs[cfg.Arch+"ArchFeatureCflags"])
+	for _, f := range d.Features {
+		d.Cflags = append(d.Cflags, features[f]...)
+	}
+	return d, nil
+}
+
+// valueSpecs: a file's top-level `name = value` declarations.
+func valueSpecs(f *ast.File) map[string]ast.Expr {
+	out := map[string]ast.Expr{}
+	for _, decl := range f.Decls {
+		if g, ok := decl.(*ast.GenDecl); ok {
+			for _, s := range g.Specs {
+				if v, ok := s.(*ast.ValueSpec); ok {
+					for i, name := range v.Names {
+						if i < len(v.Values) {
+							out[name.Name] = v.Values[i]
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func goString(e ast.Expr) string {
+	if l, ok := e.(*ast.BasicLit); ok && l.Kind == token.STRING {
+		s, _ := strconv.Unquote(l.Value)
+		return s
+	}
+	return ""
+}
+
+// stringMap: a `map[string][]string{…}` literal (nil for anything else).
+func stringMap(e ast.Expr) map[string][]string {
+	lit, ok := e.(*ast.CompositeLit)
+	if !ok {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, el := range lit.Elts {
+		if kv, ok := el.(*ast.KeyValueExpr); ok {
+			if l, ok := stringList(kv.Value); ok {
+				out[goString(kv.Key)] = l
+			}
+		}
+	}
+	return out
 }
 
 // weakAvailability: Soong's global define (commonGlobalCflags) that puts bionic's versioning.h in weak mode: __INTRODUCED_IN becomes a plain availability attribute and __BIONIC_AVAILABILITY_GUARD is 1, so every declaration stays visible.

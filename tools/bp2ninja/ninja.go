@@ -191,12 +191,16 @@ func (g *Graph) emit(tools Tools) string {
 
 type langFlags struct{ c, cxx, asm []string }
 
-// compileFlags: Soong's language defaults and global defines (read from its global.go), the module's flags, then include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
+// compileFlags: Soong's language defaults and global defines (read from its global.go), on the device side its toolchain's ISA flags (DeviceArch), the module's flags, then include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
 // -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures.
 // libc++: AOSP's C++ assumes it (libstdc++ 14 rejects libbase's non-const set comparator).
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
 	common := append([]string{"-fPIC", "-O2", "-w"}, g.soong.GlobalDefines...)
+	// Soong's toolchain cflags precede the module's (cc/compiler.go), so a module's own -mno-* wins
+	if n.side == Device {
+		common = append(common, g.soong.Device.Cflags...)
+	}
 	common = append(common, moduleFlags(p, "cflags")...)
 	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")

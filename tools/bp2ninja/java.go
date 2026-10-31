@@ -226,10 +226,7 @@ func (g *Graph) flattenJava(m *Module, side Side) *Obj {
 		}
 	}
 	if t := p.obj("target"); t != nil {
-		for _, b := range targetBlocks(side, "") {
-			if strings.HasSuffix(b, "_") {
-				continue
-			}
+		for _, b := range osBlocks(side, g.cfg.PointerBits) {
 			if o := t.obj(b); o != nil {
 				base = merge(base, o)
 			}

@@ -52,8 +52,11 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    let pointer_bits = match arches.get(&args.host) {
-        Some(a) if a.host.is_some() => a.pointer_bits.to_string(),
+    let (pointer_bits, arch_variant) = match arches.get(&args.host) {
+        Some(a) if a.host.is_some() => (
+            a.pointer_bits.to_string(),
+            a.soong_arch_variant.clone().unwrap_or_default(),
+        ),
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
     let layout = Layout::of(root)?;
@@ -145,6 +148,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &args.host,
                 "-pointer-bits",
                 &pointer_bits,
+                "-arch-variant",
+                &arch_variant,
                 "-cc",
                 &args.cc,
                 "-cxx",

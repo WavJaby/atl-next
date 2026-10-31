@@ -32,6 +32,7 @@ func main() {
 	out := flag.String("out", "", "build directory (absolute)")
 	arch := flag.String("arch", "", "Soong arch name of the host (arches.toml row key)")
 	bits := flag.Int("pointer-bits", 0, "pointer width of -arch (its arches.toml pointer_bits)")
+	variant := flag.String("arch-variant", "", "Soong arch variant of the device side (its arches.toml soong_arch_variant; empty = Soong's baseline)")
 	cc := flag.String("cc", "clang", "C compiler")
 	cxx := flag.String("cxx", "clang++", "C++ compiler and linker driver")
 	ar := flag.String("ar", "llvm-ar", "archiver")
@@ -62,7 +63,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -82,6 +83,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	soong, err := readSoongConfig(tree)
 	if err != nil {
+		return err
+	}
+	if soong.Device, err = readDeviceArch(tree, cfg); err != nil {
 		return err
 	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nodes: map[key]*Node{}}
