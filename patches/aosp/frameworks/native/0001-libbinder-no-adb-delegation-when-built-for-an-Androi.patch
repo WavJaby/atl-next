@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 31 Oct 2026 11:37:39 +0800
+Subject: [PATCH] libbinder: no adb delegation when built for an Android API
+ level
+
+BINDER_SERVICEMANAGEMENT_DELEGATION_SUPPORT keys on __ANDROID__ alone.
+A device build whose toolchain uses a non-Android triple defines
+__ANDROID_API__ but not __ANDROID__; it then compiles the host-only
+createRpcDelegateServiceManager, whose getDeviceService lives in
+ServiceManagerHost.cpp (target.host srcs only), and libbinder fails
+to link. Treat __ANDROID_API__ as a device build in the .cpp and in
+the public header declaration. No change for Soong variants: device
+and linux_bionic define __ANDROID__, glibc/musl hosts define neither.
+
+Upstream-Status: Pending
+Patch-Reason: the condition is evaluated at compile time inside IServiceManager.cpp and IServiceManager.h; the launcher, loader and environment cannot reach it, and defining __ANDROID__ breaks the distro libc++ the host build uses
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/IServiceManager.cpp              | 3 ++-
+ libs/binder/include/binder/IServiceManager.h | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/libs/binder/IServiceManager.cpp b/libs/binder/IServiceManager.cpp
+index c9ca64647264152f5b3610c7f59bd91e697388df..e241f28aa632a231368a5ed0db4339bb5eedf2b2 100644
+--- a/libs/binder/IServiceManager.cpp
++++ b/libs/binder/IServiceManager.cpp
+@@ -43,7 +43,8 @@
+ #include <binder/IPermissionController.h>
+ #endif
+ 
+-#if !(defined(__ANDROID__) || defined(__FUCHSIA))
++// __ANDROID_API__ without __ANDROID__: a device build whose toolchain does not use an Android triple.
++#if !(defined(__ANDROID__) || defined(__ANDROID_API__) || defined(__FUCHSIA))
+ #define BINDER_SERVICEMANAGEMENT_DELEGATION_SUPPORT
+ #endif
+ 
+diff --git a/libs/binder/include/binder/IServiceManager.h b/libs/binder/include/binder/IServiceManager.h
+index d248f22e89d256372b040fa02664ef2ca0d3024a..9f6f1dad4a3943bead85c074c17cd397a52b9077 100644
+--- a/libs/binder/include/binder/IServiceManager.h
++++ b/libs/binder/include/binder/IServiceManager.h
+@@ -329,7 +329,7 @@ LIBBINDER_EXPORTED status_t delegateAccessor(const String16& name, const sp<IBin
+                                              sp<IBinder>* delegator);
+ #endif // __TRUSTY__
+ 
+-#ifndef __ANDROID__
++#if !(defined(__ANDROID__) || defined(__ANDROID_API__))
+ // Create an IServiceManager that delegates the service manager on the device via adb.
+ // This is can be set as the default service manager at program start, so that
+ // defaultServiceManager() returns it:
