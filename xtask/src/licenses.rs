@@ -11,6 +11,8 @@ use crate::sources;
 
 pub const FILE: &str = "licenses.toml";
 pub const RUNTIME: &str = "runtime";
+/// The licence key every AOSP project shares.
+pub const AOSP: &str = "aosp";
 /// The GPL-3.0-or-later QEMU bridge; its allow list = licences combinable with GPL-3.
 const BRIDGE: &str = "qemu-bridge";
 
@@ -46,7 +48,64 @@ pub struct PathLicence {
     pub reason: String,
 }
 
+/// Licence of a checkout's files that carry no notice, or why there is none.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Unlabelled {
+    Licence(String),
+    Missing(String),
+}
+
+/// Prefix of the AOSP `license_kind` modules (build/soong/licenses/Android.bp) that name an SPDX id.
+const SPDX_KIND: &str = "SPDX-license-identifier-";
+
+/// An AOSP project's default from its `license` modules' kinds: exactly one kind, naming a valid SPDX id. Owner decision 2026-10-31: several kinds do not say which file has which, so those files stay unresolved (a `paths` entry each).
+pub fn aosp_default(project: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
+    let p = project.display();
+    let mut each = kinds.iter();
+    let (Some(kind), None) = (each.next(), each.next()) else {
+        return Unlabelled::Missing(if kinds.is_empty() {
+            format!("{p}'s Android.bp declares no licence kind")
+        } else {
+            let listed: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            format!(
+                "{p}'s Android.bp declares several licence kinds ({}), not which file has which",
+                listed.join(", ")
+            )
+        });
+    };
+    match kind
+        .strip_prefix(SPDX_KIND)
+        .and_then(|id| crate::notice::normalize_tag(id).ok())
+    {
+        Some(id) => Unlabelled::Licence(id),
+        None => Unlabelled::Missing(format!(
+            "{p}'s Android.bp licence kind {kind} is no SPDX id"
+        )),
+    }
+}
+
 impl Licenses {
+    /// Licence of the notice-less files of a checkout keyed `key`, checked out at `dir`; `project` = its AOSP tree path (empty for the AOSP tree root and other upstreams).
+    /// An AOSP project's is derived from its Android.bp (`aosp_default`), never stored; another upstream's is its `unlabelled`.
+    pub fn unlabelled(&self, key: &str, project: &Path, dir: &Path) -> Result<Unlabelled> {
+        if key == AOSP {
+            if project.as_os_str().is_empty() {
+                return Ok(Unlabelled::Missing("it is in no AOSP project".to_owned()));
+            }
+            let kinds = crate::aosp::license_kinds(dir)
+                .with_context(|| format!("reading the Android.bp files of {}", dir.display()))?;
+            return Ok(aosp_default(project, &kinds));
+        }
+        Ok(
+            match self.upstream.get(key).and_then(|u| u.unlabelled.clone()) {
+                Some(l) => Unlabelled::Licence(l),
+                None => {
+                    Unlabelled::Missing(format!("[upstream.{key}] has no `unlabelled` licence"))
+                }
+            },
+        )
+    }
+
     /// Whether a file under SPDX expression `expr` may be compiled into `artifact`: `OR` needs one allowed side, `AND` both, and each licence (`<id>` or `<id> WITH <exception>`) must be an allow entry as written.
     pub fn allows(&self, artifact: &str, expr: &str) -> Result<bool> {
         let artifact = self
@@ -130,6 +189,10 @@ pub(crate) fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses
             "[upstream.{name}]: not a sources.toml upstream"
         );
         if let Some(unlabelled) = &upstream.unlabelled {
+            ensure!(
+                name != AOSP,
+                "[upstream.{AOSP}]: no `unlabelled`; each project's comes from its Android.bp license modules"
+            );
             let licence =
                 parse_licence(unlabelled).with_context(|| format!("[upstream.{name}]"))?;
             ensure!(
@@ -301,6 +364,101 @@ mod tests {
         // a licence the SPDX list lacks (a `paths` entry's LicenseRef) is denied unless listed
         assert!(!allows("LicenseRef-Adobe-DNG-SDK"));
         assert!(licenses.allows("qemu-bridge", "MIT").is_err());
+    }
+
+    #[test]
+    fn aosp_unlabelled_is_derived_not_stored() {
+        let text = format!("{RUNTIME_MIT}[upstream.aosp]\nunlabelled = \"Apache-2.0\"\n");
+        assert!(err(&text).contains("comes from its Android.bp"));
+    }
+
+    #[test]
+    fn aosp_default_needs_one_spdx_kind() {
+        let p = Path::new("external/x");
+        let d = |kinds: &[&str]| aosp_default(p, &kinds.iter().map(|k| (*k).to_owned()).collect());
+        let missing = |kinds: &[&str], why: &str| match d(kinds) {
+            Unlabelled::Missing(m) => assert!(m.contains(why), "{m}"),
+            l => panic!("{kinds:?} gave {l:?}"),
+        };
+        assert_eq!(
+            d(&["SPDX-license-identifier-Apache-2.0"]),
+            Unlabelled::Licence("Apache-2.0".into())
+        );
+        // AOSP's kind uses the deprecated id; GPL-2.0 is GPL-2.0-only in the SPDX list
+        assert_eq!(
+            d(&["SPDX-license-identifier-GPL-2.0"]),
+            Unlabelled::Licence("GPL-2.0-only".into())
+        );
+        missing(&[], "no licence kind");
+        // external/skia's kinds (abridged): which file has which is not stated
+        missing(
+            &[
+                "SPDX-license-identifier-Apache-2.0",
+                "SPDX-license-identifier-MIT",
+            ],
+            "several licence kinds",
+        );
+        missing(&["legacy_notice"], "is no SPDX id");
+        // AOSP kinds exist for unversioned families; the SPDX list has no such id
+        missing(&["SPDX-license-identifier-BSD"], "is no SPDX id");
+    }
+
+    #[test]
+    fn aosp_kinds_read_from_the_project_blueprints() {
+        let tmp = std::env::temp_dir().join(format!("xtask-licence-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let nested = tmp.join("nested");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let license = |kind: &str| {
+            format!(
+                "license {{\n    name: \"l\",\n    license_kinds: [\n        \"{kind}\",\n    ],\n}}\n"
+            )
+        };
+        let mit = "SPDX-license-identifier-MIT";
+        std::fs::write(
+            tmp.join("Android.bp"),
+            format!("build = [\"more.bp\"]\n{}", license(mit)),
+        )
+        .unwrap();
+        std::fs::write(tmp.join("more.bp"), license(mit)).unwrap();
+        std::fs::write(
+            tmp.join("sub/Android.bp"),
+            "cc_library { name: \"x\", srcs: [\"x.c\"] }\n",
+        )
+        .unwrap();
+        // a nested project is its own: its kinds are not this project's
+        std::fs::write(
+            nested.join("Android.bp"),
+            license("SPDX-license-identifier-GPL-2.0"),
+        )
+        .unwrap();
+        let licenses = parse(RUNTIME_MIT, &upstreams()).unwrap();
+        let got = licenses.unlabelled(AOSP, Path::new("external/x"), &tmp);
+        // a `build = [...]` file with a second kind makes the project multi-kind
+        std::fs::write(
+            tmp.join("more.bp"),
+            license("SPDX-license-identifier-Apache-2.0"),
+        )
+        .unwrap();
+        let two = licenses.unlabelled(AOSP, Path::new("external/x"), &tmp);
+        let root = licenses.unlabelled(AOSP, Path::new(""), &tmp);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(got.unwrap(), Unlabelled::Licence("MIT".into()));
+        assert!(matches!(two.unwrap(), Unlabelled::Missing(m) if m.contains("several")));
+        assert!(matches!(root.unwrap(), Unlabelled::Missing(m) if m.contains("no AOSP project")));
+        // other upstreams: their `unlabelled`, or none
+        let qemu = format!("{RUNTIME_MIT}[upstream.qemu]\nunlabelled = \"GPL-2.0-or-later\"\n");
+        let licenses = parse(&qemu, &upstreams()).unwrap();
+        let none = Path::new("");
+        assert_eq!(
+            licenses.unlabelled("qemu", none, none).unwrap(),
+            Unlabelled::Licence("GPL-2.0-or-later".into())
+        );
+        assert!(matches!(
+            licenses.unlabelled("boringssl", none, none).unwrap(),
+            Unlabelled::Missing(m) if m.contains("no `unlabelled`")
+        ));
     }
 
     #[test]

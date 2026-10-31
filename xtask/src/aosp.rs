@@ -590,6 +590,33 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
     Ok(())
 }
 
+/// Every `license_kinds` entry of the `license` modules in the blueprint files of the project checked out at `dir` (nested projects excluded; `build = [...]` files followed).
+pub fn license_kinds(dir: &Path) -> Result<BTreeSet<String>> {
+    let mut bps = Vec::new();
+    find_files(dir, &|n| n == "Android.bp", &mut bps)?;
+    let mut kinds = BTreeSet::new();
+    while let Some(bp) = bps.pop() {
+        let parsed = parse_bp(&String::from_utf8_lossy(&std::fs::read(&bp)?));
+        if let Some(parent) = bp.parent() {
+            bps.extend(
+                parsed
+                    .build
+                    .iter()
+                    .map(|f| parent.join(f))
+                    .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
+            );
+        }
+        kinds.extend(
+            parsed
+                .modules
+                .into_iter()
+                .filter(|m| m.module_type == "license")
+                .flat_map(|m| m.license_kinds),
+        );
+    }
+    Ok(kinds)
+}
+
 /// Module types a Go file registers: `Register…ModuleType("name", …)` with a literal name.
 fn registered_types(go: &str) -> Vec<String> {
     const CALL: &str = "ModuleType(\"";
@@ -813,6 +840,8 @@ struct BpModule {
     srcs: Vec<String>,
     /// `defaults: [...]`: modules whose properties this one inherits.
     defaults: Vec<String>,
+    /// `license_kinds: [...]` of a `license` module.
+    license_kinds: Vec<String>,
 }
 
 impl BpModule {
@@ -886,7 +915,10 @@ fn parse_bp(text: &str) -> BpFile {
             Token::Ident(id)
                 if depth == 1
                     && in_module
-                    && matches!(id.as_str(), "pluginFor" | "srcs" | "defaults") =>
+                    && matches!(
+                        id.as_str(),
+                        "pluginFor" | "srcs" | "defaults" | "license_kinds"
+                    ) =>
             {
                 if toks.get(i + 1) == Some(&Token::Punct(':'))
                     && let Some(list) = string_list(&toks, i + 2)
@@ -895,6 +927,7 @@ fn parse_bp(text: &str) -> BpFile {
                     match id.as_str() {
                         "srcs" => m.srcs = list,
                         "defaults" => m.defaults = list,
+                        "license_kinds" => m.license_kinds = list,
                         _ => m.plugin_for = list,
                     }
                 }

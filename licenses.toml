@@ -11,7 +11,7 @@
 #     runtime      the ART process, atld, our libraries and everything they link
 #     qemu-bridge  the dlopened QEMU bridge, distributed as GPL-3.0-or-later: licences combinable with GPL-3
 # [upstream.<name>]   a sources.toml upstream (`aosp`: every AOSP project, paths relative to the tree root)
-#   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text
+#   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text. Not for `aosp`: an AOSP project's is derived from its Android.bp `license` modules (exactly one `SPDX-license-identifier-<id>` kind -> <id>; several kinds, or none, -> no default)
 #   [upstream.<name>.paths."<path prefix>"]   licence (SPDX expression; LicenseRef-<name> for one the SPDX list lacks) + reason, for files whose notice the phrase rules cannot read; longest prefix wins, before any tag or notice
 # `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`).
 # Rows are added when a compiled set first needs them.

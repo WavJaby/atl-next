@@ -14,14 +14,14 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::licenses::{self, Licenses};
+use crate::licenses::{self, Licenses, Unlabelled};
 use crate::notice;
 
 /// Toolchain and distro files: the platform's.
 const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64"];
 
 /// A checkout as the gate places files: its canonical directory, its licence key, and where it sits inside its upstream (an AOSP project's tree path; empty for other upstreams).
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Root {
     pub dir: PathBuf,
     pub key: String,
@@ -134,17 +134,24 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
         let real = std::fs::canonicalize(&file).unwrap_or(file);
         placed.entry(real).or_insert(artifact);
     }
+    // per reached checkout, derived once (an AOSP project's reads its Android.bp files)
+    let mut unlabelled: BTreeMap<&Path, Unlabelled> = BTreeMap::new();
     for (file, artifact) in placed {
         let name = artifact
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         match place(&file, roots, out) {
-            Place::Upstream { key, rel } => {
+            Place::Upstream { root, rel } => {
                 let text = String::from_utf8_lossy(
                     &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
                 )
                 .into_owned();
-                match notice::resolve(&rel, &text, licenses.upstream.get(key)) {
+                if !unlabelled.contains_key(root.dir.as_path()) {
+                    let u = licenses.unlabelled(&root.key, &root.prefix, &root.dir)?;
+                    unlabelled.insert(&root.dir, u);
+                }
+                let fallback = &unlabelled[root.dir.as_path()];
+                match notice::resolve(&rel, &text, licenses.upstream.get(&root.key), fallback) {
                     Ok(expr) => {
                         report.checked += 1;
                         if !licenses.allows(licenses::RUNTIME, &expr)? {
@@ -198,7 +205,7 @@ fn is_system(path: &Path) -> bool {
 
 #[derive(Debug, PartialEq)]
 enum Place<'a> {
-    Upstream { key: &'a str, rel: String },
+    Upstream { root: &'a Root, rel: String },
     Generated,
     System,
     Unknown,
@@ -214,7 +221,7 @@ fn place<'a>(path: &Path, roots: &'a [Root], out: &Path) -> Place<'a> {
         && let Ok(rest) = path.strip_prefix(&r.dir)
     {
         let rel = r.prefix.join(rest).display().to_string();
-        return Place::Upstream { key: &r.key, rel };
+        return Place::Upstream { root: r, rel };
     }
     if path.starts_with(out) {
         Place::Generated
@@ -288,26 +295,21 @@ fn parse_deps(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
 
 /// The roots of every fetched checkout (`checkouts` as sources.toml lists them) plus the AOSP tree itself, for files the manifest's link/copy files put outside any project.
 pub fn roots(layout: &atl_layout::Layout, checkouts: &[crate::sources::Checkout]) -> Vec<Root> {
-    let aosp = Path::new("aosp");
     let mut roots: Vec<Root> = checkouts
         .iter()
         .filter_map(|c| {
             let dir = std::fs::canonicalize(layout.locate(&c.dir).dir).ok()?;
-            let prefix = c
-                .dir
-                .strip_prefix(aosp)
-                .map_or_else(|_| PathBuf::new(), Path::to_path_buf);
             Some(Root {
                 dir,
                 key: c.licence_key.clone(),
-                prefix,
+                prefix: c.licence_prefix(),
             })
         })
         .collect();
     if let Ok(dir) = std::fs::canonicalize(crate::farm::shared_tree(layout)) {
         roots.push(Root {
             dir,
-            key: "aosp".to_owned(),
+            key: licenses::AOSP.to_owned(),
             prefix: PathBuf::new(),
         });
     }
@@ -460,8 +462,8 @@ mod tests {
             },
         ];
         let out = Path::new("/out/n");
-        let up = |key: &'static str, rel: &str| Place::Upstream {
-            key,
+        let up = |root: usize, rel: &str| Place::Upstream {
+            root: &roots[root],
             rel: rel.to_owned(),
         };
         assert_eq!(
@@ -470,7 +472,7 @@ mod tests {
                 &roots,
                 out
             ),
-            up("aosp", "external/dng_sdk/source/a.cpp")
+            up(0, "external/dng_sdk/source/a.cpp")
         );
         assert_eq!(
             place(
@@ -478,11 +480,11 @@ mod tests {
                 &roots,
                 out
             ),
-            up("aosp", "external/skia/src/x.cpp")
+            up(1, "external/skia/src/x.cpp")
         );
         assert_eq!(
             place(Path::new("/src/boringssl/crypto/a.cc"), &roots, out),
-            up("boringssl", "crypto/a.cc")
+            up(2, "crypto/a.cc")
         );
         assert_eq!(
             place(Path::new("/out/n/gen/x.h"), &roots, out),

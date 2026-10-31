@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 
-use crate::licenses::{PathLicence, Upstream};
+use crate::licenses::{PathLicence, Unlabelled, Upstream};
 use crate::spdx;
 
 /// Lines searched for the leading comment block that holds the notice.
@@ -82,13 +82,18 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
         base.display()
     );
     let upstream = licenses.upstream.get(&c.licence_key);
+    let prefix = c.licence_prefix();
+    let unlabelled = licenses.unlabelled(&c.licence_key, &prefix, &checkout)?;
     let mut files = Vec::new();
     walk(&base, &mut files)?;
     let (mut counts, mut failed) = (BTreeMap::<String, usize>::new(), Vec::new());
     for f in &files {
-        let rel = f.strip_prefix(&checkout).unwrap_or(f).display().to_string();
+        let rel = prefix
+            .join(f.strip_prefix(&checkout).unwrap_or(f))
+            .display()
+            .to_string();
         let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
-        match resolve(&rel, &text, upstream) {
+        match resolve(&rel, &text, upstream, &unlabelled) {
             Ok(id) => *counts.entry(id).or_default() += 1,
             Err(e) => failed.push(format!("{e:#}")),
         }
@@ -140,9 +145,14 @@ fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> 
     Ok(())
 }
 
-/// Licence of `path` in an upstream: per-path entry (longest prefix) > SPDX tag > notice >
-/// `unlabelled` (files with no notice only) > error.
-pub fn resolve(path: &str, text: &str, upstream: Option<&Upstream>) -> Result<String> {
+/// Licence of `path` (relative to its upstream's root: an AOSP file by its tree path) in an upstream: per-path entry (longest prefix) > SPDX tag > notice >
+/// its checkout's `unlabelled` licence (files with no notice only) > error.
+pub fn resolve(
+    path: &str,
+    text: &str,
+    upstream: Option<&Upstream>,
+    unlabelled: &Unlabelled,
+) -> Result<String> {
     if let Some(entry) = upstream.and_then(|u| longest_prefix(&u.paths, path)) {
         return Ok(entry.licence.clone());
     }
@@ -153,9 +163,13 @@ pub fn resolve(path: &str, text: &str, upstream: Option<&Upstream>) -> Result<St
             )
         }),
         Identified::Notice(e) => Ok(e),
-        Identified::NoNotice => match upstream.and_then(|u| u.unlabelled.clone()) {
-            Some(l) => Ok(l),
-            None => bail!("{path}: no licence notice and no `unlabelled` licence for its upstream"),
+        Identified::NoNotice => match unlabelled {
+            Unlabelled::Licence(l) => Ok(l.clone()),
+            Unlabelled::Missing(why) => {
+                bail!(
+                    "{path}: no licence notice, and {why}; add a `paths` entry for it in licenses.toml"
+                )
+            }
         },
         Identified::Unrecognised => {
             bail!(
@@ -168,7 +182,7 @@ pub fn resolve(path: &str, text: &str, upstream: Option<&Upstream>) -> Result<St
 /// An upstream's tag as a strict SPDX expression: deprecated GNU ids spelled out (`GPL-2.0` ->
 /// `GPL-2.0-only`, `GPL-2.0+` -> `GPL-2.0-or-later`, as the SPDX list defines them), operators in
 /// upper case. Anything else that does not parse strictly is rejected.
-fn normalize_tag(tag: &str) -> Result<String> {
+pub(crate) fn normalize_tag(tag: &str) -> Result<String> {
     let spaced = tag.replace('(', " ( ").replace(')', " ) ");
     let words: Vec<String> = spaced
         .split_whitespace()
@@ -495,6 +509,27 @@ mod tests {
         // there is no GPL 2.1 (only LGPL 2.1): a mistaken notice is not turned into an id
         let no_such = "/* GNU General Public License version 2.1 or any later version */\n";
         assert_eq!(id(no_such), Identified::Unrecognised);
+    }
+
+    #[test]
+    fn no_notice_takes_the_checkout_default_or_fails_with_its_reason() {
+        let bare = "#pragma once\n#define X 1\n";
+        let default = Unlabelled::Licence("Apache-2.0".into());
+        assert_eq!(
+            resolve("a/x.h", bare, None, &default).unwrap(),
+            "Apache-2.0"
+        );
+        let why =
+            Unlabelled::Missing("external/x's Android.bp declares several licence kinds".into());
+        let e = format!("{:#}", resolve("a/x.h", bare, None, &why).unwrap_err());
+        assert!(
+            e.contains("a/x.h: no licence notice, and external/x's"),
+            "{e}"
+        );
+        // the default never overrides a notice
+        let mit =
+            "/* Permission is hereby granted, free of charge, to any person obtaining a copy */\n";
+        assert_eq!(resolve("a/y.c", mit, None, &default).unwrap(), "MIT");
     }
 
     #[test]

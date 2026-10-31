@@ -783,6 +783,13 @@ fn branch_patches(u: &Up, base: &str, licenses: &Licenses) -> Result<Vec<(String
     let dir = &u.checkout;
     let range = format!("{base}..{}", u.branch);
     let commits = commits_with_trailers(dir, &range)?;
+    let prefix = u.c.licence_prefix();
+    let unlabelled = licenses.unlabelled(&u.c.licence_key, &prefix, dir)?;
+    let scope = Scope {
+        key: &u.c.licence_key,
+        prefix: &prefix,
+        unlabelled: &unlabelled,
+    };
     let tmp = std::env::temp_dir().join(format!(
         "xtask-patch-{}-{}",
         std::process::id(),
@@ -816,7 +823,7 @@ fn branch_patches(u: &Up, base: &str, licenses: &Licenses) -> Result<Vec<(String
             .into_iter()
             .zip(&commits)
             .map(|((name, text), commit)| {
-                let expr = patch_licence(dir, commit, &u.c.licence_key, licenses)?;
+                let expr = patch_licence(dir, commit, &scope, licenses)?;
                 Ok((name, insert_spdx(&text, &expr)?))
             })
             .collect()
@@ -858,9 +865,16 @@ fn commits_with_trailers(dir: &Path, range: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+/// What `notice::resolve` needs of one checkout: its licence key, its place under the key's root, its notice-less files' licence.
+struct Scope<'a> {
+    key: &'a str,
+    prefix: &'a Path,
+    unlabelled: &'a licenses::Unlabelled,
+}
+
 /// Licence of everything `commit` touches, each file (old version, else new) resolved by
 /// `notice::resolve`; several are joined with AND.
-fn patch_licence(dir: &Path, commit: &str, key: &str, licenses: &Licenses) -> Result<String> {
+fn patch_licence(dir: &Path, commit: &str, scope: &Scope, licenses: &Licenses) -> Result<String> {
     let paths = git(
         Some(dir),
         &["diff", "--name-only", &format!("{commit}^"), commit],
@@ -869,7 +883,13 @@ fn patch_licence(dir: &Path, commit: &str, key: &str, licenses: &Licenses) -> Re
     for path in paths.lines() {
         let text = git(Some(dir), &["show", &format!("{commit}^:{path}")])
             .or_else(|_| git(Some(dir), &["show", &format!("{commit}:{path}")]))?;
-        let expr = notice::resolve(path, &text, licenses.upstream.get(key))?;
+        let rel = scope.prefix.join(path).display().to_string();
+        let expr = notice::resolve(
+            &rel,
+            &text,
+            licenses.upstream.get(scope.key),
+            scope.unlabelled,
+        )?;
         ::spdx::Expression::parse(&expr).with_context(|| format!("{path}: bad SPDX `{expr}`"))?;
         exprs.insert(expr);
     }

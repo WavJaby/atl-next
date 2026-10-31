@@ -112,6 +112,14 @@ impl Sources {
 }
 
 impl Checkout {
+    /// Where the checkout's files sit under its licence key's root: an AOSP project's tree path (licenses.toml `paths` of `aosp` are tree-relative), empty otherwise.
+    pub fn licence_prefix(&self) -> PathBuf {
+        match &self.pin {
+            Pin::Aosp(path) => PathBuf::from(path),
+            Pin::Manifest | Pin::Git(_) => PathBuf::new(),
+        }
+    }
+
     pub fn url(&self) -> Result<&str> {
         self.url
             .as_deref()
