@@ -12,6 +12,12 @@
 # Module edges form no cycle. External crates are not listed here; deny.toml governs them.
 # Covers cargo crates only (no AOSP / ninja modules yet).
 
+# the bionic-only C API for source-built AOSP code (bridge 1 class b); the loader uses it later
+[bionic]
+crates = ["atl-bionic"]
+exports = ["atl-bionic"]
+uses = ["generators"]
+
 # binder IPC: uapi wire types, the userspace driver core
 [binder]
 crates = ["atl-binder-wire", "atl-binderd"]

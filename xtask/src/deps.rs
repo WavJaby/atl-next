@@ -302,7 +302,8 @@ fn cargo_installed() -> Result<BTreeMap<String, String>> {
     Ok(parse_install_list(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// `cargo install --list`: one `<crate> v<version>[ (<source>)]:` line per crate, binaries indented.
+/// `cargo install --list`: one `<crate> v<version>[+<build>][ (<source>)]:` line per crate, binaries
+/// indented. Build metadata does not identify a SemVer version and is dropped.
 fn parse_install_list(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter(|l| !l.starts_with(char::is_whitespace))
@@ -310,6 +311,7 @@ fn parse_install_list(text: &str) -> BTreeMap<String, String> {
             let mut words = l.trim_end_matches(':').split_whitespace();
             let name = words.next()?;
             let version = words.next()?.strip_prefix('v')?.trim_end_matches(':');
+            let version = version.split_once('+').map_or(version, |(v, _)| v);
             Some((name.to_owned(), version.to_owned()))
         })
         .collect()
@@ -402,9 +404,11 @@ mod tests {
 
     #[test]
     fn install_list() {
-        let text = "cargo-deny v0.20.2:\n    cargo-deny\nfoo v1.0.0 (/src/foo):\n    foo\n";
+        let text = "cargo-deny v0.20.2:\n    cargo-deny\nfoo v1.0.0 (/src/foo):\n    foo\ncargo-c v0.10.26+cargo-0.100.0:\n    cargo-cbuild\n";
         let list = parse_install_list(text);
         assert_eq!(list["cargo-deny"], "0.20.2");
         assert_eq!(list["foo"], "1.0.0");
+        // SemVer build metadata is not part of the version (cargo-c names its cargo with it)
+        assert_eq!(list["cargo-c"], "0.10.26");
     }
 }
