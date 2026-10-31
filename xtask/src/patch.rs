@@ -784,11 +784,9 @@ fn branch_patches(u: &Up, base: &str, licenses: &Licenses) -> Result<Vec<(String
     let range = format!("{base}..{}", u.branch);
     let commits = commits_with_trailers(dir, &range)?;
     let prefix = u.c.licence_prefix();
-    let unlabelled = licenses.unlabelled(&u.c.licence_key, &prefix, dir)?;
     let scope = Scope {
         key: &u.c.licence_key,
         prefix: &prefix,
-        unlabelled: &unlabelled,
     };
     let tmp = std::env::temp_dir().join(format!(
         "xtask-patch-{}-{}",
@@ -865,11 +863,10 @@ fn commits_with_trailers(dir: &Path, range: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-/// What `notice::resolve` needs of one checkout: its licence key, its place under the key's root, its notice-less files' licence.
+/// What `notice::resolve` needs of one checkout: its licence key, its place under the key's root.
 struct Scope<'a> {
     key: &'a str,
     prefix: &'a Path,
-    unlabelled: &'a licenses::Unlabelled,
 }
 
 /// Licence of everything `commit` touches, each file (old version, else new) resolved by
@@ -884,12 +881,9 @@ fn patch_licence(dir: &Path, commit: &str, scope: &Scope, licenses: &Licenses) -
         let text = git(Some(dir), &["show", &format!("{commit}^:{path}")])
             .or_else(|_| git(Some(dir), &["show", &format!("{commit}:{path}")]))?;
         let rel = scope.prefix.join(path).display().to_string();
-        let expr = notice::resolve(
-            &rel,
-            &text,
-            licenses.upstream.get(scope.key),
-            scope.unlabelled,
-        )?;
+        let at = Path::new(path).parent().unwrap_or(Path::new(""));
+        let unlabelled = || licenses.unlabelled(scope.key, scope.prefix, dir, at);
+        let expr = notice::resolve(&rel, &text, licenses.upstream.get(scope.key), unlabelled)?;
         ::spdx::Expression::parse(&expr).with_context(|| format!("{path}: bad SPDX `{expr}`"))?;
         exprs.insert(expr);
     }

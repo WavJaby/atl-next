@@ -669,45 +669,61 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
     Ok(())
 }
 
-/// Licence kinds the blueprint files of AOSP project `project` (tree path), checked out at `dir`, declare: those of its own `license` modules, plus those of every `license` module its `licenses` / `default_applicable_licenses` entries name, wherever defined (`build/soong/licenses`' `Android-Apache-2.0`). Nested projects excluded; `build = [...]` files followed.
-/// Inner `Err`: a reference the index cannot resolve to one `license` module with kinds, so the project's kinds are unknown.
-pub fn license_kinds(
+/// The Soong package holding directory `at` (inside the checkout `dir` of AOSP project `project`, a tree path) and the licence kinds its blueprint files declare: those of its `license` modules plus those of every `license` module its `licenses` / `default_applicable_licenses` entries name, wherever defined (`build/soong/licenses`' `Android-Apache-2.0`); `build = [...]` files followed.
+/// The package is the nearest of `at` and its ancestors up to `dir` with an `Android.bp` declaring any licence: Soong gives a module its package's default, and one project may hold hundreds of packages under different licences (external/rust/android-crates-io: a crate each).
+/// Returns the package's tree path; inner `Err`: no package declares a licence, or a reference the index cannot resolve to one `license` module with kinds.
+pub fn package_kinds(
     dir: &Path,
     project: &Path,
+    at: &Path,
     index: &Index,
-) -> Result<Result<BTreeSet<String>, String>> {
-    let mut bps = Vec::new();
-    find_files(dir, &|n| n == "Android.bp", &mut bps)?;
-    let mut kinds = BTreeSet::new();
-    let mut refs = BTreeSet::new();
-    while let Some(bp) = bps.pop() {
-        let parsed = parse_bp(&String::from_utf8_lossy(&std::fs::read(&bp)?));
-        let parent = bp.parent().unwrap_or(dir);
-        bps.extend(
-            parsed
-                .build
-                .iter()
-                .map(|f| parent.join(f))
-                .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
-        );
-        let from = project
-            .join(parent.strip_prefix(dir).unwrap_or(Path::new("")))
-            .display()
-            .to_string();
-        for m in parsed.modules {
-            if m.module_type == "license" {
-                kinds.extend(m.license_kinds);
+) -> Result<Result<(PathBuf, BTreeSet<String>), String>> {
+    let mut pkg = dir.join(at);
+    loop {
+        let mut bps = vec![pkg.join("Android.bp")];
+        let mut kinds = BTreeSet::new();
+        let mut refs = BTreeSet::new();
+        while let Some(bp) = bps.pop() {
+            let Ok(bytes) = std::fs::read(&bp) else {
+                continue;
+            };
+            let parsed = parse_bp(&String::from_utf8_lossy(&bytes));
+            bps.extend(
+                parsed
+                    .build
+                    .iter()
+                    .map(|f| pkg.join(f))
+                    .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
+            );
+            for m in parsed.modules {
+                if m.module_type == "license" {
+                    kinds.extend(m.license_kinds);
+                }
+                refs.extend(m.licenses);
             }
-            refs.extend(m.licenses.into_iter().map(|l| (l, from.clone())));
+        }
+        let tree = match pkg.strip_prefix(dir) {
+            Ok(rel) if !rel.as_os_str().is_empty() => project.join(rel),
+            _ => project.to_path_buf(),
+        };
+        if !kinds.is_empty() || !refs.is_empty() {
+            let from = tree.display().to_string();
+            for name in &refs {
+                match index.license_kinds_of(name, &from) {
+                    Ok(k) => kinds.extend(k.iter().cloned()),
+                    Err(e) => return Ok(Err(format!("licence {name} (from {from}): {e}"))),
+                }
+            }
+            return Ok(Ok((tree, kinds)));
+        }
+        if pkg == dir || !pkg.pop() || !pkg.starts_with(dir) {
+            return Ok(Err(format!(
+                "no Android.bp from {} up to {} declares a licence",
+                project.join(at).display(),
+                project.display()
+            )));
         }
     }
-    for (name, from) in &refs {
-        match index.license_kinds_of(name, from) {
-            Ok(k) => kinds.extend(k.iter().cloned()),
-            Err(e) => return Ok(Err(format!("licence {name} (from {from}): {e}"))),
-        }
-    }
-    Ok(Ok(kinds))
 }
 
 /// TARGET_RELEASE of the pinned tag: AOSP release builds use the release config named by the build

@@ -15,7 +15,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::licenses::{self, Licenses, Unlabelled};
+use crate::licenses::{self, Licenses};
 use crate::notice;
 
 /// Toolchain and distro files: the platform's.
@@ -140,8 +140,6 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
         let real = std::fs::canonicalize(&file).unwrap_or(file);
         placed.entry(real).or_insert(artifact);
     }
-    // per reached checkout, derived once (an AOSP project's reads its Android.bp files)
-    let mut unlabelled: BTreeMap<&Path, Unlabelled> = BTreeMap::new();
     for (file, artifact) in placed {
         let name = artifact
             .file_name()
@@ -152,11 +150,13 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
                     &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
                 )
                 .into_owned();
-                if !unlabelled.contains_key(root.dir.as_path()) {
-                    let u = licenses.unlabelled(&root.key, &root.prefix, &root.dir)?;
-                    unlabelled.insert(&root.dir, u);
-                }
-                let fallback = &unlabelled[root.dir.as_path()];
+                // only a notice-less file reads its package's Android.bp files
+                let at = file
+                    .strip_prefix(&root.dir)
+                    .ok()
+                    .and_then(Path::parent)
+                    .unwrap_or(Path::new(""));
+                let fallback = || licenses.unlabelled(&root.key, &root.prefix, &root.dir, at);
                 match notice::resolve(&rel, &text, licenses.upstream.get(&root.key), fallback) {
                     Ok(expr) => {
                         report.checked += 1;

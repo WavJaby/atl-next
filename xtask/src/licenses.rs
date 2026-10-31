@@ -95,9 +95,9 @@ pub enum Unlabelled {
 /// Prefix of the AOSP `license_kind` modules (build/soong/licenses/Android.bp) that name an SPDX id.
 const SPDX_KIND: &str = "SPDX-license-identifier-";
 
-/// An AOSP project's default from its `license` modules' kinds: exactly one kind, naming a valid SPDX id. Owner decision 2026-10-31: several kinds do not say which file has which, so those files stay unresolved (a `paths` entry each).
-pub fn aosp_default(project: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
-    let p = project.display();
+/// An AOSP package's default from its licence kinds (`aosp::package_kinds`): exactly one kind, naming a valid SPDX id. Owner decision 2026-10-31: several kinds do not say which file has which, so those files stay unresolved (a `paths` entry each).
+pub fn aosp_default(package: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
+    let p = package.display();
     let mut each = kinds.iter();
     let (Some(kind), None) = (each.next(), each.next()) else {
         return Unlabelled::Missing(if kinds.is_empty() {
@@ -121,9 +121,15 @@ pub fn aosp_default(project: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
 }
 
 impl Licenses {
-    /// Licence of the notice-less files of a checkout keyed `key`, checked out at `dir`; `project` = its AOSP tree path (empty for the AOSP tree root and other upstreams).
-    /// An AOSP project's is derived from its Android.bp (`aosp_default`) and the AOSP module index its licence references resolve through, never stored; another upstream's is its `unlabelled`.
-    pub fn unlabelled(&self, key: &str, project: &Path, dir: &Path) -> Result<Unlabelled> {
+    /// Licence of the notice-less files in directory `at` of a checkout keyed `key`, checked out at `dir`; `project` = its AOSP tree path (empty for the AOSP tree root and other upstreams), `at` relative to `dir`.
+    /// An AOSP file's is derived from the Android.bp of its Soong package (`aosp::package_kinds`, `aosp_default`) and the AOSP module index its licence references resolve through, never stored; another upstream's is its `unlabelled`, whatever `at`.
+    pub fn unlabelled(
+        &self,
+        key: &str,
+        project: &Path,
+        dir: &Path,
+        at: &Path,
+    ) -> Result<Unlabelled> {
         if key == AOSP {
             if project.as_os_str().is_empty() {
                 return Ok(Unlabelled::Missing("it is in no AOSP project".to_owned()));
@@ -132,11 +138,11 @@ impl Licenses {
                 Ok(i) => i,
                 Err(why) => return Ok(Unlabelled::Missing(why.to_owned())),
             };
-            let kinds = crate::aosp::license_kinds(dir, project, index)
+            let kinds = crate::aosp::package_kinds(dir, project, at, index)
                 .with_context(|| format!("reading the Android.bp files of {}", dir.display()))?;
             return Ok(match kinds {
-                Ok(kinds) => aosp_default(project, &kinds),
-                Err(why) => Unlabelled::Missing(format!("{}: {why}", project.display())),
+                Ok((package, kinds)) => aosp_default(&package, &kinds),
+                Err(why) => Unlabelled::Missing(why),
             });
         }
         Ok(
@@ -491,36 +497,35 @@ mod tests {
     }
 
     #[test]
-    fn aosp_kinds_read_from_the_project_blueprints() {
+    fn aosp_default_is_the_package_one() {
         let tmp = std::env::temp_dir().join(format!("xtask-licence-kinds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let nested = tmp.join("nested");
-        std::fs::create_dir_all(nested.join(".git")).unwrap();
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
-        let license = |kind: &str| {
+        std::fs::create_dir_all(tmp.join("crate/src")).unwrap();
+        let license = |name: &str, kind: &str| {
             format!(
-                "license {{\n    name: \"l\",\n    license_kinds: [\n        \"{kind}\",\n    ],\n}}\n"
+                "license {{\n    name: \"{name}\",\n    license_kinds: [\n        \"{kind}\",\n    ],\n}}\n"
             )
         };
         let mit = "SPDX-license-identifier-MIT";
-        std::fs::write(
-            tmp.join("Android.bp"),
-            format!("build = [\"more.bp\"]\n{}", license(mit)),
-        )
-        .unwrap();
-        std::fs::write(tmp.join("more.bp"), license(mit)).unwrap();
-        std::fs::write(
-            tmp.join("sub/Android.bp"),
-            "cc_library { name: \"x\", srcs: [\"x.c\"] }\n",
-        )
-        .unwrap();
-        // a nested project is its own: its kinds are not this project's
-        std::fs::write(
-            nested.join("Android.bp"),
-            license("SPDX-license-identifier-GPL-2.0"),
-        )
-        .unwrap();
         let apache = "SPDX-license-identifier-Apache-2.0";
+        let write = |file: &str, text: &str| std::fs::write(tmp.join(file), text).unwrap();
+        write(
+            "Android.bp",
+            &format!("build = [\"more.bp\"]\n{}", license("l", mit)),
+        );
+        write("more.bp", &license("l", mit));
+        // a package declaring no licence: its files are the enclosing package's
+        write(
+            "sub/Android.bp",
+            "cc_library { name: \"x\", srcs: [\"x.c\"] }\n",
+        );
+        // android-crates-io's shape: each crate a package with its own default
+        let crate_bp = format!(
+            "package {{\n    default_applicable_licenses: [\"crate_l\"],\n}}\n{}",
+            license("crate_l", apache)
+        );
+        write("crate/Android.bp", &crate_bp);
         let mut licenses = parse(RUNTIME_MIT, &upstreams()).unwrap();
         // build/soong/licenses' shared module; a second `l` elsewhere is not the one external/x means
         licenses.aosp_index = AospIndex::of(crate::aosp::Index::of_licenses(&[
@@ -531,56 +536,76 @@ mod tests {
             ),
             ("l", "external/x/Android.bp", &[mit]),
             ("l", "external/y/Android.bp", &[apache]),
+            ("crate_l", "external/x/crate/Android.bp", &[apache]),
         ]));
         let x = Path::new("external/x");
-        let kinds = |licenses: &Licenses| licenses.unlabelled(AOSP, x, &tmp).unwrap();
-        let got = kinds(&licenses);
-        // a `build = [...]` file with a second kind makes the project multi-kind
-        std::fs::write(tmp.join("more.bp"), license(apache)).unwrap();
-        let two = kinds(&licenses);
-        // a module's `licenses` naming a shared module adds that module's kinds
-        std::fs::write(tmp.join("more.bp"), "").unwrap();
-        let sub = "cc_library { name: \"x\", licenses: [\"Android-Apache-2.0\"] }\n";
-        std::fs::write(tmp.join("sub/Android.bp"), sub).unwrap();
-        let shared = kinds(&licenses);
+        let at = |licenses: &Licenses, dir: &str| {
+            licenses.unlabelled(AOSP, x, &tmp, Path::new(dir)).unwrap()
+        };
+        let root = at(&licenses, "");
+        let fallback = at(&licenses, "sub");
+        let in_crate = at(&licenses, "crate/src");
+        // a `build = [...]` file with a second kind makes the package multi-kind
+        write("more.bp", &license("l2", apache));
+        let two = at(&licenses, "");
+        // a module's `licenses` naming a shared module: that module's kinds
+        write("more.bp", "");
+        write(
+            "sub/Android.bp",
+            "cc_library { name: \"x\", licenses: [\"Android-Apache-2.0\"] }\n",
+        );
+        let shared = at(&licenses, "sub");
         // system/server_configurable_flags' shape: no license module, only the shared default
-        std::fs::write(tmp.join("sub/Android.bp"), "").unwrap();
         let only_shared =
             "package {\n    default_applicable_licenses: [\"Android-Apache-2.0\"],\n}\n";
-        std::fs::write(tmp.join("Android.bp"), only_shared).unwrap();
-        let referenced = kinds(&licenses);
-        // `l` from external/x resolves to external/x's, the nearest enclosing definition
+        write("Android.bp", only_shared);
+        let referenced = at(&licenses, "");
+        // `l` from external/x/sub resolves to external/x's, the nearest enclosing definition
         let own = "package {\n    default_applicable_licenses: [\"l\"],\n}\n";
-        std::fs::write(tmp.join("sub/Android.bp"), own).unwrap();
-        let nearest = kinds(&licenses);
-        std::fs::write(tmp.join("sub/Android.bp"), own.replace("\"l\"", "\"gone\"")).unwrap();
-        let dangling = kinds(&licenses);
-        let root = licenses.unlabelled(AOSP, Path::new(""), &tmp);
+        write("sub/Android.bp", own);
+        let nearest = at(&licenses, "sub");
+        write("sub/Android.bp", &own.replace("\"l\"", "\"gone\""));
+        let dangling = at(&licenses, "sub");
+        let no_project = licenses.unlabelled(AOSP, Path::new(""), &tmp, Path::new(""));
         // without an index, references cannot be followed
         let unindexed = parse(RUNTIME_MIT, &upstreams()).unwrap();
-        let no_index = kinds(&unindexed);
+        let no_index = at(&unindexed, "");
+        // no Android.bp up to the project root declares a licence
+        write("Android.bp", "");
+        write("sub/Android.bp", "");
+        let none = at(&licenses, "sub");
         std::fs::remove_dir_all(&tmp).unwrap();
-        assert_eq!(got, Unlabelled::Licence("MIT".into()));
+        assert_eq!(root, Unlabelled::Licence("MIT".into()));
+        assert_eq!(fallback, Unlabelled::Licence("MIT".into()));
+        assert_eq!(in_crate, Unlabelled::Licence("Apache-2.0".into()));
         assert!(matches!(two, Unlabelled::Missing(m) if m.contains("several")));
-        assert!(matches!(shared, Unlabelled::Missing(m) if m.contains("several")));
+        assert_eq!(shared, Unlabelled::Licence("Apache-2.0".into()));
         assert_eq!(referenced, Unlabelled::Licence("Apache-2.0".into()));
-        assert!(matches!(nearest, Unlabelled::Missing(m) if m.contains("several")));
+        assert_eq!(nearest, Unlabelled::Licence("MIT".into()));
         assert!(
             matches!(&dangling, Unlabelled::Missing(m) if m.contains("licence gone (from external/x/sub): no license module")),
             "{dangling:?}"
         );
-        assert!(matches!(root.unwrap(), Unlabelled::Missing(m) if m.contains("no AOSP project")));
+        assert!(
+            matches!(no_project.unwrap(), Unlabelled::Missing(m) if m.contains("no AOSP project"))
+        );
         assert!(matches!(no_index, Unlabelled::Missing(m) if m.contains("no AOSP module index")));
-        // other upstreams: their `unlabelled`, or none
+        assert!(
+            matches!(&none, Unlabelled::Missing(m) if m.contains("no Android.bp from external/x/sub up to external/x")),
+            "{none:?}"
+        );
+        // other upstreams: their `unlabelled` wherever the file is, or none
         let qemu = format!("{RUNTIME_MIT}[upstream.qemu]\nunlabelled = \"GPL-2.0-or-later\"\n");
         let licenses = parse(&qemu, &upstreams()).unwrap();
         let none = Path::new("");
         assert_eq!(
-            licenses.unlabelled("qemu", none, none).unwrap(),
+            licenses
+                .unlabelled("qemu", none, none, Path::new("linux-user"))
+                .unwrap(),
             Unlabelled::Licence("GPL-2.0-or-later".into())
         );
         assert!(matches!(
-            licenses.unlabelled("boringssl", none, none).unwrap(),
+            licenses.unlabelled("boringssl", none, none, none).unwrap(),
             Unlabelled::Missing(m) if m.contains("no `unlabelled`")
         ));
     }

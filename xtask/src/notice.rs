@@ -89,17 +89,16 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
     );
     let upstream = licenses.upstream.get(&c.licence_key);
     let prefix = c.licence_prefix();
-    let unlabelled = licenses.unlabelled(&c.licence_key, &prefix, &checkout)?;
     let mut files = Vec::new();
     walk(&base, &mut files)?;
     let (mut counts, mut failed) = (BTreeMap::<String, usize>::new(), Vec::new());
     for f in &files {
-        let rel = prefix
-            .join(f.strip_prefix(&checkout).unwrap_or(f))
-            .display()
-            .to_string();
+        let inside = f.strip_prefix(&checkout).unwrap_or(f);
+        let rel = prefix.join(inside).display().to_string();
         let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
-        match resolve(&rel, &text, upstream, &unlabelled) {
+        let at = inside.parent().unwrap_or(std::path::Path::new(""));
+        let unlabelled = || licenses.unlabelled(&c.licence_key, &prefix, &checkout, at);
+        match resolve(&rel, &text, upstream, unlabelled) {
             Ok(id) => *counts.entry(id).or_default() += 1,
             Err(e) => failed.push(format!("{e:#}")),
         }
@@ -152,12 +151,12 @@ fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> 
 }
 
 /// Licence of `path` (relative to its upstream's root: an AOSP file by its tree path) in an upstream: per-path entry (longest prefix) > SPDX tag > notice >
-/// its checkout's `unlabelled` licence (files with no notice only) > error.
+/// the `unlabelled` licence of its place (files with no notice only; `Licenses::unlabelled`, derived only when needed) > error.
 pub fn resolve(
     path: &str,
     text: &str,
     upstream: Option<&Upstream>,
-    unlabelled: &Unlabelled,
+    unlabelled: impl FnOnce() -> Result<Unlabelled>,
 ) -> Result<String> {
     if let Some(entry) = upstream.and_then(|u| longest_prefix(&u.paths, path)) {
         return Ok(entry.licence.clone());
@@ -169,8 +168,8 @@ pub fn resolve(
             )
         }),
         Identified::Notice(e) => Ok(e),
-        Identified::NoNotice => match unlabelled {
-            Unlabelled::Licence(l) => Ok(l.clone()),
+        Identified::NoNotice => match unlabelled()? {
+            Unlabelled::Licence(l) => Ok(l),
             Unlabelled::Missing(why) => {
                 bail!(
                     "{path}: no licence notice, and {why}; add a `paths` entry for it in licenses.toml"
@@ -717,20 +716,24 @@ mod tests {
         let bare = "#pragma once\n#define X 1\n";
         let default = Unlabelled::Licence("Apache-2.0".into());
         assert_eq!(
-            resolve("a/x.h", bare, None, &default).unwrap(),
+            resolve("a/x.h", bare, None, || Ok(default.clone())).unwrap(),
             "Apache-2.0"
         );
         let why =
             Unlabelled::Missing("external/x's Android.bp declares several licence kinds".into());
-        let e = format!("{:#}", resolve("a/x.h", bare, None, &why).unwrap_err());
+        let e = format!(
+            "{:#}",
+            resolve("a/x.h", bare, None, || Ok(why)).unwrap_err()
+        );
         assert!(
             e.contains("a/x.h: no licence notice, and external/x's"),
             "{e}"
         );
-        // the default never overrides a notice
+        // the default never overrides a notice, and is not even derived for one
         let mit =
             "/* Permission is hereby granted, free of charge, to any person obtaining a copy */\n";
-        assert_eq!(resolve("a/y.c", mit, None, &default).unwrap(), "MIT");
+        let underived = || -> Result<Unlabelled> { panic!("derived for a file with a notice") };
+        assert_eq!(resolve("a/y.c", mit, None, underived).unwrap(), "MIT");
     }
 
     #[test]
