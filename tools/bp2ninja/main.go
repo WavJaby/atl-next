@@ -113,14 +113,19 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			g.problem("%s eval: %s", Side(side), p)
 		}
 	}
-	g.configTypes = map[string]string{}
+	g.baseTypes = map[string]string{}
 	for _, list := range g.mods[Device] {
 		for _, m := range list {
 			if m.Type == "soong_config_module_type" {
-				g.configTypes[m.Name] = m.Props.str("module_type")
+				g.baseTypes[m.Name] = m.Props.str("module_type")
 			}
 		}
 	}
+	art, err := readArtPlugin(tree, cfg)
+	if err != nil {
+		return err
+	}
+	g.loadArt(art)
 	// providers.toml's own check cannot see the tree; this one can
 	names := sortedKeys(omit)
 	for m := range provided {

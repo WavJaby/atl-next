@@ -49,3 +49,24 @@ cc_library {
 		}
 	}
 }
+
+// Soong's static / shared properties are arch-variant (cc/library.go StaticProperties, SharedProperties): a target block's part merges into the module's own, after it, for that kind only.
+func TestFlattenKindInTarget(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library {
+    name: "libk",
+    cflags: ["-DBASE"],
+    static: { cflags: ["-DSTATIC"] },
+    target: { android: { static: { cflags: ["-DANDROID_STATIC"] }, shared: { cflags: ["-DANDROID_SHARED"] } } },
+}
+`})
+	for kind, want := range map[Kind][]string{Static: {"-DBASE", "-DSTATIC", "-DANDROID_STATIC"}, Shared: {"-DBASE", "-DANDROID_SHARED"}} {
+		p := g.flatten(g.lookup("libk", Device), Device, kind)
+		if got := p.strs("cflags"); !slices.Equal(got, want) {
+			t.Errorf("%s: cflags %q, want %q", kind, got, want)
+		}
+		if p.has("static") || p.has("shared") {
+			t.Errorf("%s: static / shared blocks left in the properties", kind)
+		}
+	}
+}

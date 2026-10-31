@@ -151,7 +151,7 @@ func graphFor(t *testing.T, files map[string]string) *Graph {
 		t.Fatal(err)
 	}
 	cfg := Config{Arch: "x86_64", PointerBits: 64}
-	g := &Graph{tree: tree, out: out, cfg: cfg, nodes: map[key]*Node{}, configTypes: map[string]string{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, nodes: map[key]*Node{}, baseTypes: map[string]string{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		mods, problems := (&evaluator{cfg: cfg, os: osName}).modules(parsed)
 		if len(problems) > 0 {

@@ -122,12 +122,12 @@ type Graph struct {
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
 	partial     map[string]Partial
 	droppedSrcs map[string]bool
-	// soong_config_module_type name -> wrapped module type
-	configTypes map[string]string
-	mods        [2]map[string][]*Module
-	nodes       map[key]*Node
-	order       []*Node
-	problems    []string
+	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)
+	baseTypes map[string]string
+	mods      [2]map[string][]*Module
+	nodes     map[key]*Node
+	order     []*Node
+	problems  []string
 	// references no module of the tree answers to (see notFound)
 	missing map[string]bool
 	// tree-relative directories modules name by path (include_dirs) that do not exist
@@ -249,9 +249,10 @@ func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj
 func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	p := g.resolveDefaults(m, side, map[string]bool{})
 	base := newObj()
+	// `static` / `shared` stay in base: arch and target blocks may hold them too (Soong's StaticProperties / SharedProperties are arch-variant; ART's codegen hook writes target.android.static), each merged into the module's own
 	for _, k := range p.keys {
 		switch k {
-		case "target", "arch", "multilib", "shared", "static", "defaults", "soong_config_variables":
+		case "target", "arch", "multilib", "defaults", "soong_config_variables":
 		default:
 			base.set(k, p.m[k])
 		}
@@ -300,10 +301,13 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 		}
 	}
 	target(osArchBlocks(osSide, g.cfg.Arch))
+	var part *Obj
 	if kind == Static || kind == Shared {
-		if o := p.obj(kind.String()); o != nil {
-			base = merge(base, o)
-		}
+		part = base.obj(kind.String())
+	}
+	base = removeKey(removeKey(base, "static"), "shared")
+	if part != nil {
+		base = merge(base, part)
 	}
 	return base
 }
@@ -629,10 +633,10 @@ func removeKey(o *Obj, k string) *Obj {
 }
 
 // baseType: the module type behind a `soong_config_module_type` wrapper (libandroid_runtime is a
-// `cc_library_shared_for_libandroid_runtime`), else the type itself.
+// `cc_library_shared_for_libandroid_runtime`) or an ART plugin type (libdexfile_support is an `art_cc_library_static`), else the type itself.
 func (g *Graph) baseType(t string) string {
 	for i := 0; i < 8; i++ {
-		b, ok := g.configTypes[t]
+		b, ok := g.baseTypes[t]
 		if !ok {
 			return t
 		}
