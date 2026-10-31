@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Failure triage for `xtask native`: ninja's failed steps grouped by module directory (`<side>/<module>`), each with its cause (compiler `error:` lines, a link's undefined symbols),
+//! Failure triage for `xtask native`: ninja's failed steps grouped by module directory (`<side>/<module>`), each with its cause (compiler `error:` / rustc `error[E…]:` lines, a link's undefined symbols),
 //! ranked against the converter's `graph.json` (tools/bp2ninja graph.go): which failed modules each goal reaches, which have no failed dependency (fixing one lets it finish), how many closure modules wait on each.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,8 +40,10 @@ const UNDEFINED: &str = "error: undefined symbol: ";
 const UNDEFINED_REF: &str = "undefined reference to `";
 /// GNU ld's other errors, which carry no `error:`; the key starts at the phrase.
 const LD_ERRORS: &[&str] = &["multiple definition of `", "ld: cannot find "];
-/// clang's driver line after any link error: the cause is the linker's own lines.
-const LINK_FAILED: &str = "linker command failed";
+/// Summary lines after the real errors: clang's driver line after any link error (the cause is the linker's own lines), rustc's count.
+const SUMMARIES: &[&str] = &["linker command failed", "error: aborting due to "];
+/// rustc's coded errors (`error[E0554]: …`), which carry no `error:`.
+const RUSTC_ERROR: &str = "error[E";
 
 /// Failed ninja steps by module directory, from `ninja.log` (stdout of `ninja -k 0`: `FAILED: <outputs>`, the command line, its output, then the next `[n/m]` status line).
 /// `prefixes` (build dir, tree, each with a trailing `/`) are cut from the module path and from cause lines.
@@ -108,7 +110,7 @@ fn module_dir(rel: &str) -> String {
     }
 }
 
-/// One step's output into its module: undefined symbols, else `error:` lines (the driver's link line only when nothing else), else the last output line (a script's own message).
+/// One step's output into its module: undefined symbols, else `error:` / `error[E…]:` lines (a summary line only when nothing else), else the last output line (a script's own message).
 fn add_step(f: &mut Failed, out: &[&str], prefixes: &[&str]) {
     f.steps += 1;
     let mut errors: Vec<&str> = Vec::new();
@@ -121,12 +123,16 @@ fn add_step(f: &mut Failed, out: &[&str], prefixes: &[&str]) {
             f.undefined
                 .insert(rest.rsplit_once('\'').map_or(rest, |(s, _)| s).to_owned());
             undefined = true;
-        } else if l.contains("error:") || LD_ERRORS.iter().any(|p| l.contains(p)) {
+        } else if l.contains("error:")
+            || l.contains(RUSTC_ERROR)
+            || LD_ERRORS.iter().any(|p| l.contains(p))
+        {
             errors.push(l.trim());
         }
     }
-    if errors.iter().any(|e| !e.contains(LINK_FAILED)) || undefined {
-        errors.retain(|e| !e.contains(LINK_FAILED));
+    let summary = |e: &&str| SUMMARIES.iter().any(|s| e.contains(s));
+    if errors.iter().any(|e| !summary(e)) || undefined {
+        errors.retain(|e| !summary(e));
     }
     if errors.is_empty() && !undefined {
         errors.extend(out.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty()));
@@ -135,7 +141,8 @@ fn add_step(f: &mut Failed, out: &[&str], prefixes: &[&str]) {
     for e in errors {
         let line = prefixes.iter().fold(e.to_owned(), |l, p| l.replace(p, ""));
         // `file:line:col: error: msg` and `file: error: msg` -> `error: msg`: one message in many files is one cause
-        let key = std::iter::once("error:")
+        let key = ["error:", RUSTC_ERROR]
+            .into_iter()
             .chain(LD_ERRORS.iter().copied())
             .find_map(|p| line.find(p))
             .map_or(line.as_str(), |i| &line[i..])
@@ -495,6 +502,29 @@ clang++: error: linker command failed with exit code 1 (use -v to see invocation
         assert_eq!(
             failures(log, &["/o/"])["device/a"].errors[0].line,
             "clang++: error: linker command failed with exit code 1"
+        );
+    }
+
+    /// rustc's shape: `error[E…]: msg`, its `-->` location line, then `error: aborting due to …`: the coded line is the cause.
+    #[test]
+    fn rustc_causes() {
+        let log = "\
+FAILED: /o/host/libpm/libpm.rlib
+rustc /t/pm/lib.rs
+error[E0554]: `#![feature]` may not be used on the stable release channel
+  --> /t/pm/lib.rs:88:51
+error: aborting due to 1 previous error
+";
+        let f = &failures(log, &["/o/", "/t/"])["host/libpm"];
+        assert_eq!(
+            f.errors,
+            [Cause {
+                key: "error[E0554]: `#![feature]` may not be used on the stable release channel"
+                    .to_owned(),
+                line: "error[E0554]: `#![feature]` may not be used on the stable release channel"
+                    .to_owned(),
+                steps: 1
+            }]
         );
     }
 
