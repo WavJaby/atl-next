@@ -54,7 +54,7 @@ func TestSyspropLibrary(t *testing.T) {
 	for i, rel := range []string{"A.sysprop", "sub/B.sysprop"} {
 		e := n.edges[i]
 		wantOuts := []string{gd + "/sysprop/" + rel + ".cpp", gd + "/sysprop/include/" + rel + ".h", gd + "/sysprop/public/include/" + rel + ".h"}
-		if e.rule != "sysprop" || e.toolVar != "sysprop_cpp" || !reflect.DeepEqual(e.outs, wantOuts) || e.in != g.abs("p/"+rel) {
+		if e.rule != "sysprop" || len(e.tools) != 1 || e.tools[0].v != "sysprop_cpp" || !reflect.DeepEqual(e.outs, wantOuts) || e.in != g.abs("p/"+rel) {
 			t.Errorf("edge %d: %+v", i, e)
 		}
 		reldir := filepath.Dir(rel)
@@ -99,7 +99,7 @@ func TestSyspropLibrary(t *testing.T) {
 		t.Errorf("user waits %v", waits)
 	}
 	// sysprop_cpp is one host binary
-	if tool := g.nodes[key{"sysprop_cpp", Host, Binary}]; tool == nil || n.edges[0].toolNode != tool || n.edges[1].toolNode != tool {
+	if tool := g.nodes[key{"sysprop_cpp", Host, Binary}]; tool == nil || n.edges[0].tools[0].node != tool || n.edges[1].tools[0].node != tool {
 		t.Errorf("tool %v", tool)
 	}
 }

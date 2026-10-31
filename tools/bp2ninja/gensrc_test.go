@@ -196,7 +196,7 @@ func TestEmitEdge(t *testing.T) {
 	g := &Graph{tree: tTree, out: tOut}
 	tool := &Node{out: "/o/host/aprotoc/aprotoc"}
 	var b strings.Builder
-	g.emitEdge(&b, genEdge{rule: "protoc", outs: []string{"/o/a.pb.cc", "/o/a.pb.h"}, in: "/t/a.proto", toolVar: "aprotoc", toolNode: tool,
+	g.emitEdge(&b, genEdge{rule: "protoc", outs: []string{"/o/a.pb.cc", "/o/a.pb.h"}, in: "/t/a.proto", tools: []edgeTool{{"aprotoc", tool}},
 		vars: [][2]string{{"params", "lite"}, {"base", "/t"}}})
 	want := "build /o/a.pb.cc /o/a.pb.h: protoc /t/a.proto | /o/host/aprotoc/aprotoc\n  aprotoc = /o/host/aprotoc/aprotoc\n  params = lite\n  base = /t\n"
 	if b.String() != want {
@@ -210,8 +210,14 @@ func TestEmitEdge(t *testing.T) {
 	}
 	// implicit inputs (aidl .hash files) follow the tool after `|`, with or without one
 	b.Reset()
-	g.emitEdge(&b, genEdge{rule: "aidl", outs: []string{"/o/a.cpp"}, in: "/t/a.aidl", toolVar: "aidl", toolNode: &Node{out: "/o/aidl"}, implicit: []string{"/t/x y/.hash"}})
+	g.emitEdge(&b, genEdge{rule: "aidl", outs: []string{"/o/a.cpp"}, in: "/t/a.aidl", tools: []edgeTool{{"aidl", &Node{out: "/o/aidl"}}}, implicit: []string{"/t/x y/.hash"}})
 	if want := "build /o/a.cpp: aidl /t/a.aidl | /o/aidl /t/x$ y/.hash\n  aidl = /o/aidl\n"; b.String() != want {
+		t.Errorf("edge %q, want %q", b.String(), want)
+	}
+	// several tools (aprotoc + a protoc plugin): each an implicit input in order and a variable; a missing one is an empty variable, so the edge fails
+	b.Reset()
+	g.emitEdge(&b, genEdge{rule: "protoc_rust", outs: []string{"/o/a.rs"}, in: "/t/a.proto", tools: []edgeTool{{"aprotoc", tool}, {"plugin", &Node{out: "/o/plugin"}}, {"other", nil}}})
+	if want := "build /o/a.rs: protoc_rust /t/a.proto | /o/host/aprotoc/aprotoc /o/plugin\n  aprotoc = /o/host/aprotoc/aprotoc\n  plugin = /o/plugin\n  other = \n"; b.String() != want {
 		t.Errorf("edge %q, want %q", b.String(), want)
 	}
 	b.Reset()
@@ -260,7 +266,7 @@ func TestGeneratedSourcesOfModules(t *testing.T) {
 	if !reflect.DeepEqual(libp.exports, wantExports) {
 		t.Errorf("libp exports %v, want %v", libp.exports, wantExports)
 	}
-	if len(libp.edges) != 2 || libp.edges[0].toolNode == nil || libp.edges[0].toolNode != g.nodes[key{"aprotoc", Host, Binary}] {
+	if len(libp.edges) != 2 || libp.edges[0].tools[0].node == nil || libp.edges[0].tools[0].node != g.nodes[key{"aprotoc", Host, Binary}] {
 		t.Errorf("libp edges %+v", libp.edges)
 	}
 	if f := g.compileFlags(libp); !strings.Contains(strings.Join(f.cxx, " "), "-DGOOGLE_PROTOBUF_NO_RTTI") {
@@ -306,7 +312,7 @@ func TestGeneratedSourcesOfModules(t *testing.T) {
 		t.Errorf("problems %v lack %q", g.problems, want)
 	}
 	// the tool each generator needs is one host binary node, built once
-	if n := g.nodes[key{"aidl", Host, Binary}]; n == nil || m.edges[2].toolNode != n {
+	if n := g.nodes[key{"aidl", Host, Binary}]; n == nil || m.edges[2].tools[0].node != n {
 		t.Errorf("aidl tool node %v, edge %+v", n, m.edges[2])
 	}
 	if len(g.tools) != 2 {
@@ -318,7 +324,7 @@ func TestMissingGeneratorTool(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `cc_library_static { name: "l", srcs: ["a.proto", "b.proto"] }`})
 	l := g.node("l", Device, Static, "t")
 	// the edge stays (it fails in ninja, not as a missing rule), the missing tool is one problem and one fetchable reference
-	if len(l.edges) != 2 || l.edges[0].toolNode != nil || l.edges[0].toolVar != "aprotoc" {
+	if len(l.edges) != 2 || !slices.Equal(l.edges[0].tools, []edgeTool{{"aprotoc", nil}}) {
 		t.Errorf("edges %+v", l.edges)
 	}
 	if got := strings.Join(sortedKeys(g.missing), ","); got != "aprotoc,libprotobuf-cpp-lite" {

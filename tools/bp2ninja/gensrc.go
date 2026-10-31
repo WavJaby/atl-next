@@ -32,10 +32,15 @@ type genEdge struct {
 	rule     string
 	outs     []string
 	in       string
-	toolVar  string   // = srcGen.tool
-	toolNode *Node    // nil with toolVar set: the tool is missing (problem recorded); the edge fails
-	implicit []string // inputs beside `in` and the tool that rebuild the edge (aidl .hash files)
+	tools    []edgeTool // host tools the command runs: srcGen.tool, protoc plugins (rust_protobuf)
+	implicit []string   // inputs beside `in` and the tools that rebuild the edge (aidl .hash files)
 	vars     [][2]string
+}
+
+// edgeTool: a host tool of an edge and the ninja variable holding its path. node nil: the tool is missing (problem recorded); the edge fails.
+type edgeTool struct {
+	v    string
+	node *Node
 }
 
 // genLib is a runtime library a generator's output needs (Soong cc/proto.go protoDeps): linked, and its exports re-exported.
@@ -113,9 +118,8 @@ func (g *Graph) genSources(n *Node, files []srcFile) {
 		if r.edge.rule == "" {
 			continue
 		}
-		r.edge.toolVar = sg.tool
 		if sg.tool != "" {
-			r.edge.toolNode = g.hostTool(sg.tool, n)
+			r.edge.tools = []edgeTool{{sg.tool, g.hostTool(sg.tool, n)}}
 		}
 		g.addGen(n, r, sg.export != nil && sg.export(n))
 		libs = append(libs, r.libs...)
@@ -174,21 +178,24 @@ func (g *Graph) hostTool(name string, n *Node) *Node {
 // emitEdge writes one generator edge.
 func (g *Graph) emitEdge(b *strings.Builder, e genEdge) {
 	fmt.Fprintf(b, "build %s: %s %s", join(e.outs), e.rule, esc(e.in))
-	tool := ""
-	if e.toolNode != nil {
-		tool = e.toolNode.out
+	var implicit []string
+	for _, t := range e.tools {
+		if t.node != nil {
+			implicit = append(implicit, t.node.out)
+		}
 	}
-	implicit := append([]string{}, e.implicit...)
-	if tool != "" {
-		implicit = append([]string{tool}, implicit...)
-	}
+	implicit = append(implicit, e.implicit...)
 	if len(implicit) > 0 {
 		fmt.Fprintf(b, " | %s", join(implicit))
 	}
-	if e.toolVar != "" {
-		fmt.Fprintf(b, "\n  %s = %s", e.toolVar, esc(tool))
-	}
 	b.WriteString("\n")
+	for _, t := range e.tools {
+		path := ""
+		if t.node != nil {
+			path = t.node.out
+		}
+		fmt.Fprintf(b, "  %s = %s\n", t.v, esc(path))
+	}
 	for _, v := range e.vars {
 		fmt.Fprintf(b, "  %s = %s\n", v[0], v[1])
 	}

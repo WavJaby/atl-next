@@ -28,7 +28,8 @@ import (
 //     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
 //     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
-//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), source providers (rust_bindgen, rust_protobuf, rust_aconfig_library) in srcs.
+//   - Source providers (rust_protobuf): rlibs whose crate root a build step generates, rustsrc.go.
+//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), source providers in srcs, provider types without a rustSourceProviders row (rust_bindgen, rust_aconfig_library).
 
 // rustOSSide: the side whose OS blocks every Rust module takes, whatever its own side (flatten): rustc compiles for linux_glibc.
 const rustOSSide = Host
@@ -51,7 +52,9 @@ type rustCrate struct {
 	// generated files srcs names (`:genrule`), copied into outDir, which env!("OUT_DIR") names (rust/builder.go: the cp rule + rustEnvVars)
 	srcDeps []string
 	outDir  string
-	flags   []string
+	// a source provider's generated sources (rustsrc.go), root first
+	source rustSource
+	flags  []string
 	// direct crate dependencies by the name the source uses (aliases applied)
 	externs []rustExtern
 	broken  string // first reason it cannot be compiled; its step fails with it
@@ -65,8 +68,12 @@ type rustExtern struct {
 // isRustType: a module type built by rustNode.
 func isRustType(t string) bool { return strings.HasPrefix(t, "rust_") && t != "rust_defaults" }
 
-// rustKind: kindOf for Rust module types; ok=false for variants that are not built (dylib, cdylib, source providers).
+// rustKind: kindOf for Rust module types; ok=false for variants that are not built (dylib, cdylib, source providers without a row).
 func rustKind(t string, want Kind) (Kind, bool) {
+	if rustSourceProviders[t] != nil {
+		// source_provider.go NewSourceProviderModule: a library; only its rlib is built here
+		return Rlib, true
+	}
 	switch t {
 	case "rust_library", "rust_library_rlib", "rust_library_host", "rust_library_host_rlib", "rust_ffi_static", "rust_ffi_host_static":
 		return Rlib, true
@@ -102,12 +109,18 @@ func (g *Graph) rustNode(n *Node) {
 		// binary.go: a binary's crate is named after its stem
 		r.crateName = strings.ReplaceAll(g.rustStem(n), "-", "_")
 	}
-	// crate root: crate_root, else the one plain source of srcs, else the first output of its first generated source (compiler.go srcPathFromModuleSrcs)
-	if cr := p.str("crate_root"); cr != "" {
+	// crate root: a source provider's first output (library.go checkedCrateRootPath), else crate_root, else the one plain source of srcs, else the first output of its first generated source
+	// (compiler.go srcPathFromModuleSrcs)
+	sp := rustSourceProviders[g.baseType(m.Type)]
+	if cr := p.str("crate_root"); cr != "" && sp == nil {
 		r.root = filepath.Join(m.Dir, cr)
 	}
 	var plain []string
-	for _, s := range p.strs("srcs") {
+	var srcs []string
+	if sp == nil {
+		srcs = p.strs("srcs")
+	}
+	for _, s := range srcs {
 		if !isRef(s) {
 			plain = append(plain, s)
 			continue
@@ -132,7 +145,7 @@ func (g *Graph) rustNode(n *Node) {
 			r.srcDeps = append(r.srcDeps, f.path)
 		}
 	}
-	if r.root == "" {
+	if r.root == "" && sp == nil {
 		switch {
 		case len(plain) > 1:
 			fail("srcs can only contain one path for a rust file and source providers prefixed by \":\"")
@@ -176,7 +189,11 @@ func (g *Graph) rustNode(n *Node) {
 			r.externs = append(r.externs, rustExtern{name, d})
 		}
 	}
-	for _, ref := range slices.Concat(p.strs("rustlibs"), p.strs("rlibs")) {
+	var spCrates []string
+	if sp != nil {
+		spCrates = sp.crates()
+	}
+	for _, ref := range slices.Concat(p.strs("rustlibs"), p.strs("rlibs"), spCrates) {
 		crate(ref, n.side, Rlib)
 	}
 	// proc macros run in the compiler: host crates whatever the side
@@ -184,6 +201,12 @@ func (g *Graph) rustNode(n *Node) {
 		crate(ref, Host, ProcMacro)
 	}
 	n.deps.crates = uniqueNodes(n.deps.crates)
+	if sp != nil {
+		r.source = sp.gen(g, n, fail)
+		if len(r.source.outs) > 0 {
+			r.root = r.source.outs[0]
+		}
+	}
 	ccDeps := func(refs []string, want Kind) []*Node {
 		var out []*Node
 		for _, ref := range refs {
@@ -455,6 +478,10 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 		cp := filepath.Join(r.outDir, filepath.Base(s))
 		fmt.Fprintf(b, "build %s: cp %s\n", esc(cp), esc(g.abs(s)))
 		implicit = append(implicit, cp)
+	}
+	// a provider's root (rustc's input) names its other outputs as modules (builder.go: srcProviderFiles are implicits)
+	if len(r.source.outs) > 1 {
+		implicit = append(implicit, r.source.outs[1:]...)
 	}
 	libs, inputs, linked := rustLibFlags(r.externs)
 	implicit = append(implicit, inputs...)

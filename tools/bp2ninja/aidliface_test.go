@@ -200,7 +200,7 @@ func TestAidlBackendFrozenVersion(t *testing.T) {
 		t.Errorf("libcutils is not exported: %v", n.exports)
 	}
 	// the aidl tool is the host binary, built once
-	if e.toolNode == nil || e.toolNode != g.nodes[key{"aidl", Host, Binary}] || e.toolVar != "aidl" {
+	if tool := g.nodes[key{"aidl", Host, Binary}]; tool == nil || !slices.Equal(e.tools, []edgeTool{{"aidl", tool}}) {
 		t.Errorf("tool %+v", e)
 	}
 	// frozen common-V2 has its own .hash: no --previous_api_dir although version > 1

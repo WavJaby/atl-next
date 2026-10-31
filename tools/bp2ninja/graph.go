@@ -32,8 +32,10 @@ func (n *Node) stepDeps() []*Node {
 		deps = append(deps, gn)
 	}
 	for _, e := range n.edges {
-		if e.toolNode != nil {
-			deps = append(deps, e.toolNode)
+		for _, t := range e.tools {
+			if t.node != nil {
+				deps = append(deps, t.node)
+			}
 		}
 	}
 	if n.rule != nil {
