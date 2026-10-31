@@ -365,7 +365,7 @@ func TestHidlEmit(t *testing.T) {
 	}
 	// (the gen dir holds `@` and `+`, which proptools.ShellEscape quotes)
 	want := filepath.Join(g.out, "host", "hidl-gen", "hidl-gen") + " -R -p . -o '" + gd + "' -L c++-sources '-randroid.hidl:hw' 'android.hidl.foo@1.0'"
-	if got := g.scripts[gd+"/genrule.sh"]; !strings.HasPrefix(got, want+"\n") {
+	if got := g.genFiles[gd+"/genrule.sh"]; !strings.HasPrefix(got, want+"\n") {
 		t.Errorf("script %q, want prefix %q", got, want)
 	}
 }

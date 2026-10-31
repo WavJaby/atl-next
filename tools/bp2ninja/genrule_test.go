@@ -170,7 +170,7 @@ genrule {
     name: "gen_a",
     srcs: [":protos", "extra.txt"],
     tool_files: ["run.sh"],
-    tools: ["pytool", "rusty"],
+    tools: ["pytool", "jtool"],
     cmd: "$(location) $(location pytool) $(in) $(genDir)/x",
     out: ["x/a.cc", "x/a.h"],
     export_include_dirs: ["x"],
@@ -178,7 +178,7 @@ genrule {
 genrule { name: "gen_b", srcs: [":gen_a"], cmd: "cat $(in) > $(out)", out: ["b.cc"] }
 cc_genrule { name: "gen_c", cmd: "echo $$CC_ARCH", out: ["c.h"] }
 python_binary_host { name: "pytool", main: "tool.py", srcs: ["tool.py"] }
-rust_binary_host { name: "rusty" }
+java_binary_host { name: "jtool" }
 cc_library_static {
     name: "lib",
     srcs: [":gen_b"],
@@ -210,8 +210,8 @@ cc_library_static { name: "user", header_libs: ["lib"], static_libs: ["lib"] }
 	if strings.Join(a.rule.incs, " ") != strings.Join(wantInc, " ") {
 		t.Errorf("gen_a incs %v, want %v", a.rule.incs, wantInc)
 	}
-	// rust tool: unsupported, the genrule is broken and its edge will fail with the reason
-	if !strings.Contains(a.rule.broken, "tool rusty is a rust_binary_host (unsupported)") {
+	// Java tool: unsupported, the genrule is broken and its edge will fail with the reason
+	if !strings.Contains(a.rule.broken, "tool jtool is a java_binary_host (unsupported)") {
 		t.Errorf("gen_a broken = %q", a.rule.broken)
 	}
 	// a python_binary_host of one file runs as `python3 <main>`
@@ -296,7 +296,7 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	if b.String() != want {
 		t.Errorf("edge %q, want %q", b.String(), want)
 	}
-	if g.scripts[g.out+"/gen/device/g/genrule.sh"] != wantScript {
+	if g.genFiles[g.out+"/gen/device/g/genrule.sh"] != wantScript {
 		t.Error("script not recorded for writing")
 	}
 }

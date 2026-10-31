@@ -47,10 +47,14 @@ const (
 	Shared
 	Headers
 	Binary
-	Gen // genrule / cc_genrule: outputs only, no cc artifact
+	Gen       // genrule / cc_genrule: outputs only, no cc artifact
+	Rlib      // Rust library crate (rust.go)
+	ProcMacro // Rust proc-macro crate, host only (rust.go)
 )
 
-func (k Kind) String() string { return [...]string{"static", "shared", "headers", "binary", "gen"}[k] }
+func (k Kind) String() string {
+	return [...]string{"static", "shared", "headers", "binary", "gen", "rlib", "proc-macro"}[k]
+}
 
 type key struct {
 	name string
@@ -64,7 +68,8 @@ type Node struct {
 	mod   *Module
 	props *Obj     // after defaults, target/arch/multilib and kind blocks
 	srcs  []string // compiled sources: plain ones and the outputs of generators
-	deps  struct{ whole, static, shared, headers []*Node }
+	// crates: a Rust node's rustlibs and proc_macros (rust.go); a cc node's rlibs are in whole / static
+	deps struct{ whole, static, shared, headers, crates []*Node }
 	// libraries a source generator added to deps (protobuf runtime): their exports travel on, as export_*_lib_headers would
 	reexport []*Node
 	// exported include flags, transitive through export_*_lib_headers
@@ -85,6 +90,11 @@ type Node struct {
 	objSrcs []*Node
 	// built outside ninja by xtask (provided.go): out and exports only, never in g.order
 	provided bool
+	// Rust nodes only (rust.go)
+	rust *rustCrate
+	// final cc links: the generated staticlib holding the link's Rust (rust.go rustStaticlib), "" = none; whole: linked whole
+	rustlib      string
+	rustlibWhole bool
 }
 
 // genClosure: generated files n and its dependencies produce; n's compiles wait for them (headers).
@@ -122,8 +132,8 @@ type Graph struct {
 	missing map[string]bool
 	// tree-relative directories modules name by path (include_dirs) that do not exist
 	missingPaths map[string]bool
-	// genrule scripts by path, written by writeScripts after emit
-	scripts map[string]string
+	// files emit generates (genrule scripts, Rust staticlib roots) by path, written by writeGenFiles after emit
+	genFiles map[string]string
 	// host binaries source generators run (gensrc.go hostTool), nil entry = module missing
 	tools map[string]*Node
 	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
@@ -296,6 +306,9 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 
 // kindOf is the artifact a module produces when used with `want` (Static/Shared as the dependent asks).
 func kindOf(t string, want Kind) (Kind, bool) {
+	if isRustType(t) {
+		return rustKind(t, want)
+	}
 	switch {
 	case strings.HasSuffix(t, "_headers"):
 		return Headers, true
@@ -306,10 +319,10 @@ func kindOf(t string, want Kind) (Kind, bool) {
 	case t == "cc_library_shared" || t == "cc_library_host_shared":
 		return Shared, true
 	case t == "cc_library" || t == "cc_object":
-		if want == Headers || want == Binary {
-			return Shared, true
+		if want == Static || want == Shared {
+			return want, true
 		}
-		return want, true
+		return Shared, true
 	}
 	return 0, false
 }
@@ -353,6 +366,9 @@ func compatPath(set []compatHeader, name string) string {
 	panic("compat header " + name + " not in its set")
 }
 
+// stlModules: Soong's STL libraries (cc/stl.go). Every link takes the toolchain's libc++ (-stdlib=libc++, linkLibs), so a module naming one directly (libcxx's shared_libs) needs nothing more.
+var stlModules = map[string]bool{"libc++": true, "libc++_static": true}
+
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	name := strings.TrimPrefix(ref, ":")
@@ -361,6 +377,9 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		if from != "goal" {
 			g.dropped = addKey(g.dropped, side.String()+"/"+from+" "+name)
 		}
+		return nil
+	}
+	if stlModules[name] {
 		return nil
 	}
 	if p, ok := g.provided[name]; ok {
@@ -387,6 +406,11 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	n := &Node{key: k, mod: m}
 	g.nodes[k] = n
 	n.props = g.flatten(m, side, kind)
+	if isRustType(g.baseType(m.Type)) {
+		g.rustNode(n)
+		g.order = append(g.order, n)
+		return n
+	}
 	var files []srcFile
 	for _, s := range n.props.strs("srcs") {
 		files = append(files, g.srcFiles(n, s)...)
@@ -674,9 +698,17 @@ func (g *Graph) genDir(n *Node, sub string) string {
 	return filepath.Join(g.out, "gen", n.side.String(), n.name, sub)
 }
 
-// staticClosure: archives a final link needs for n's static (and whole static) dependencies.
+// staticClosure: archives a final link needs for n's static (and whole static) dependencies; through a Rust node also its library crates, whose cc libraries the final link takes (rust.go).
 func staticClosure(n *Node, seen map[*Node]bool, out *[]*Node) {
-	for _, d := range append(append([]*Node{}, n.deps.whole...), n.deps.static...) {
+	deps := slices.Concat(n.deps.whole, n.deps.static)
+	if n.rust != nil {
+		for _, c := range n.deps.crates {
+			if c.kind == Rlib {
+				deps = append(deps, c)
+			}
+		}
+	}
+	for _, d := range deps {
 		if seen[d] {
 			continue
 		}

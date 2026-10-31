@@ -45,8 +45,8 @@ func globTree(base, pattern, dir string) []string {
 	return out
 }
 
-// Tools are the host programs the generated rules call.
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm string }
+// Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -111,15 +111,30 @@ rule genrule
   command = cd "$root" && /bin/bash $script
   description = genrule $name
   restat = 1
+rule rustc
+  command = $env $rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && grep ^$out: $out.d.raw > $out.d
+  depfile = $out.d
+  deps = gcc
+  description = rustc $in
+rule cp
+  command = cp $in $out
+  description = cp $out
+rule fail
+  command = echo $msg >&2 && exit 1
+  description = fail $out
 `
 
 // emit writes the ninja file for every node.
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(tools.Yasm), esc(g.tree))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree))
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
 		base := filepath.Join(g.out, n.side.String(), n.name)
+		if n.rust != nil {
+			n.out = g.rustOut(n)
+			continue
+		}
 		switch n.kind {
 		case Static:
 			n.out = filepath.Join(base, n.name+".a")
@@ -146,6 +161,10 @@ func (g *Graph) emit(tools Tools) string {
 		}
 	}
 	for _, n := range g.order {
+		if n.rust != nil {
+			g.emitRust(&b, n, tools)
+			continue
+		}
 		if n.kind == Headers || n.kind == Gen {
 			continue
 		}
@@ -182,6 +201,7 @@ func (g *Graph) emit(tools Tools) string {
 		case Static:
 			fmt.Fprintf(&b, "build %s: ar %s\n", esc(n.out), join(n.objs))
 		case Shared, Binary:
+			n.rustlib, n.rustlibWhole = g.rustStaticlib(&b, n)
 			libs, inputs := g.linkLibs(n)
 			mode := "-Wl,--no-undefined"
 			if n.kind == Shared {
@@ -301,7 +321,7 @@ func soongShellUnsafe(r rune) bool {
 	return !strings.ContainsRune("_+-=.,/", r)
 }
 
-// linkLibs: provided shared objects, whole archives, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
+// linkLibs: provided shared objects, whole archives, the generated Rust staticlib, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
 // Provided shared objects come first, so they lead the output's DT_NEEDED and the process's lookup order: their strong definitions beat weak fallbacks elsewhere (libbase's and libcutils' __system_property_*); xtask's provided gate checks the result. Soong links system_shared_libs last (LateSharedLibs), where bionic's libc has no fallbacks to beat.
 // An archive has no place in DT_NEEDED or the lookup order: its members are copied into the output, so it links in the group like any static library.
 func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
@@ -322,15 +342,27 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		}
 	}
 	addShared(n.deps.shared)
-	if len(n.deps.whole) > 0 {
-		libs = append(libs, "-Wl,--whole-archive")
-		for _, d := range n.deps.whole {
-			libs = append(libs, d.out)
-			inputs = append(inputs, d.out)
+	// rlibs link through the generated staticlib (rust.go rustStaticlib)
+	var wholeLibs []string
+	for _, d := range n.deps.whole {
+		if d.rust == nil {
+			wholeLibs = append(wholeLibs, d.out)
 		}
+	}
+	if n.rustlibWhole {
+		wholeLibs = append(wholeLibs, n.rustlib)
+	}
+	if len(wholeLibs) > 0 {
+		libs = append(libs, "-Wl,--whole-archive")
+		libs = append(libs, wholeLibs...)
+		inputs = append(inputs, wholeLibs...)
 		libs = append(libs, "-Wl,--no-whole-archive")
 	}
 	libs = append(libs, "-Wl,--start-group")
+	if n.rustlib != "" && !n.rustlibWhole {
+		libs = append(libs, n.rustlib)
+		inputs = append(inputs, n.rustlib)
+	}
 	for _, d := range closure {
 		addShared(d.deps.shared)
 		if !whole[d] && d.kind == Static {

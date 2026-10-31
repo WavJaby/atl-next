@@ -134,6 +134,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
     let srcs_file = out.join("srcs.json");
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
+    let rust = rust_toolchain(root)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
     let mut table: Vec<String> = Vec::new();
     let mut round = 0;
@@ -159,7 +160,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &args.ar,
                 "-omit",
                 &omit,
+                "-rust-version",
+                &rust.version,
             ])
+            .arg("-rustc")
+            .arg(&rust.rustc)
             .arg("-provided")
             .arg(&provided_file)
             .arg("-srcs")
@@ -279,6 +284,37 @@ fn table_check(problems: &[String]) -> bool {
         println!("native:   table: {p}");
     }
     problems.is_empty()
+}
+
+/// The rustc AOSP Rust modules build with: rust-toolchain.toml's, the toolchain this repo builds with (no second Rust toolchain; Soong's `prebuilts/rust` goes with Soong).
+struct RustToolchain {
+    rustc: std::path::PathBuf,
+    /// `x.y.z`: Soong's ANDROID_RUST_VERSION
+    version: String,
+}
+
+/// Resolves rust-toolchain.toml's rustc through rustup in the repo root (ninja runs elsewhere, where rustup would not see the pin).
+fn rust_toolchain(root: &Path) -> Result<RustToolchain> {
+    let out = Command::new("rustup")
+        .args(["which", "rustc"])
+        .current_dir(root)
+        .output()
+        .context("running rustup which rustc")?;
+    ensure!(out.status.success(), "rustup which rustc failed");
+    let rustc = std::path::PathBuf::from(String::from_utf8(out.stdout)?.trim());
+    let out = Command::new(&rustc)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {} --version", rustc.display()))?;
+    ensure!(out.status.success(), "{} --version failed", rustc.display());
+    // `rustc 1.99.1 (<hash> <date>)`
+    let text = String::from_utf8(out.stdout)?;
+    let version = text
+        .split_whitespace()
+        .nth(1)
+        .with_context(|| format!("unexpected rustc --version output {text:?}"))?
+        .to_owned();
+    Ok(RustToolchain { rustc, version })
 }
 
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and

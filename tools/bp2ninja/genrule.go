@@ -465,10 +465,7 @@ func (g *Graph) genScript(n *Node) string {
 // emitGen writes the build edge of one genrule node and records its script for the caller to write.
 func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 	r := n.rule
-	if g.scripts == nil {
-		g.scripts = map[string]string{}
-	}
-	g.scripts[r.script] = g.genScript(n)
+	g.genFile(r.script, g.genScript(n))
 	var implicit []string
 	for _, f := range append(append([]string{}, r.inputs...), r.implicit...) {
 		if !filepath.IsAbs(f) {
@@ -524,9 +521,17 @@ func gensrcsCommands(genDir, raw, ext, trim string, inputs []srcFile, fail func(
 	return outs, strings.Join(cmds, " && ")
 }
 
-// writeScripts writes the genrule scripts, leaving unchanged ones alone: a newer script would rerun its genrule.
-func (g *Graph) writeScripts() error {
-	for path, body := range g.scripts {
+// genFile records a file emit generates, for writeGenFiles.
+func (g *Graph) genFile(path, body string) {
+	if g.genFiles == nil {
+		g.genFiles = map[string]string{}
+	}
+	g.genFiles[path] = body
+}
+
+// writeGenFiles writes the generated files (genrule scripts, Rust staticlib roots), leaving unchanged ones alone: a newer file would rerun its step.
+func (g *Graph) writeGenFiles() error {
+	for path, body := range g.genFiles {
 		if old, err := os.ReadFile(path); err == nil && string(old) == body {
 			continue
 		}
