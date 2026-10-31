@@ -114,13 +114,32 @@ pub type Providers = BTreeMap<String, Provider>;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
-    /// One provider, or several linked in this order (written as a string or a list).
-    #[serde(deserialize_with = "one_or_many")]
+    /// One provider, or several linked in this order (written as a string or a list); empty on a `rust_os` row.
+    #[serde(default, deserialize_with = "one_or_many")]
     pub provider: Vec<String>,
     pub reason: String,
     /// Empty = the whole module.
     #[serde(default)]
     pub srcs: Vec<String>,
+    /// The tree builds the module, as the OS's userspace instead of linux_glibc's (bp2ninja rust.go rustOSSide).
+    pub rust_os: Option<RustOs>,
+}
+
+/// `rust_os` values: the OS whose Android.bp `target` blocks a device Rust module takes; linux_glibc, every other crate's, is never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RustOs {
+    /// android blocks + `--cfg atl_android_userspace`, for a crate whose Android behaviour this runtime provides.
+    Android,
+}
+
+/// Modules the converter compiles as Android userspace (`rust_os = "android"`); that each is a device Rust module needs the tree, the converter checks it (bp2ninja rust.go checkRustAndroid).
+pub fn rust_android(providers: &Providers) -> Vec<&str> {
+    providers
+        .iter()
+        .filter(|(_, row)| row.rust_os == Some(RustOs::Android))
+        .map(|(module, _)| module.as_str())
+        .collect()
 }
 
 impl Provider {
@@ -182,6 +201,13 @@ fn parse(text: &str, targets: &Targets) -> Result<Providers> {
 fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     ensure!(is_module_name(module), "not an Android.bp module name");
     ensure!(!row.reason.trim().is_empty(), "empty reason");
+    if row.rust_os.is_some() {
+        ensure!(
+            row.provider.is_empty() && row.srcs.is_empty(),
+            "rust_os: the tree builds the module, so the row has no provider or srcs"
+        );
+        return Ok(());
+    }
     // that each names a source of the module at the pin needs the tree: the converter checks it (bp2ninja provided.go checkPartial)
     let mut seen = BTreeSet::new();
     for src in &row.srcs {
@@ -194,7 +220,10 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     if row.is_none() {
         return Ok(());
     }
-    ensure!(!row.provider.is_empty(), "empty provider list");
+    ensure!(
+        !row.provider.is_empty(),
+        "empty provider list (a row without one needs rust_os)"
+    );
     let mut seen = BTreeSet::new();
     for p in &row.provider {
         ensure!(seen.insert(p), "provider `{p}` listed twice");
@@ -408,6 +437,37 @@ mod tests {
             err("[x]\nprovider = \"crate:atl-nativeloader\"\nreason = \" \"\n")
                 .contains("empty reason")
         );
+    }
+
+    #[test]
+    fn rust_os_rows() {
+        let text = "[librustutils]\nrust_os = \"android\"\nreason = \"r\"\n\
+                    [libdl]\nprovider = \"none\"\nreason = \"r\"\n";
+        let providers = parsed(text).unwrap();
+        assert_eq!(rust_android(&providers), ["librustutils"]);
+        // built from the tree: provided by nothing, dropped by nothing
+        assert_eq!(super::omitted(&providers), ["libdl"]);
+        assert!(super::partial(&providers).is_empty());
+        assert!(super::crates(&providers).is_empty());
+        for bad in [
+            "provider = \"none\"\n",
+            "provider = \"crate:atl-nativeloader\"\n",
+            "srcs = [\"a.rs\"]\n",
+        ] {
+            assert!(
+                err(&format!(
+                    "[x]\nrust_os = \"android\"\nreason = \"r\"\n{bad}"
+                ))
+                .contains("no provider or srcs"),
+                "{bad}"
+            );
+        }
+        assert!(err("[x]\nrust_os = \"android\"\nreason = \" \"\n").contains("empty reason"));
+        // linux_glibc is every other crate's OS, never written
+        assert!(
+            err("[x]\nrust_os = \"linux_glibc\"\nreason = \"r\"\n").contains("unknown variant")
+        );
+        assert!(err("[x]\nreason = \"r\"\n").contains("needs rust_os"));
     }
 
     #[test]

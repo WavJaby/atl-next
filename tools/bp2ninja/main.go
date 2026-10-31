@@ -8,7 +8,7 @@
 //
 // Device modules link Soong's implicit system_shared_libs; a module in the -provided file (built by xtask: our crate, an upstream) stands in for its
 // Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles. A module in the -srcs file is built
-// without the sources its row lists, linking the row's provider (if any) first for their symbols.
+// without the sources its row lists, linking the row's provider (if any) first for their symbols. A device Rust module in -rust-android takes its android target blocks and --cfg atl_android_userspace (rust.go).
 //
 // -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values.
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools, and -metalava where
@@ -46,6 +46,7 @@ func main() {
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
+	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
@@ -58,12 +59,16 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	omitted := map[string]bool{}
-	for _, m := range strings.Split(*omit, ",") {
-		if m != "" {
-			omitted[m] = true
+	set := func(list string) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range strings.Split(list, ",") {
+			if m != "" {
+				out[m] = true
+			}
 		}
+		return out
 	}
+	omitted, android := set(*omit), set(*rustAndroid)
 	provided, err := readJSON[Provided](*providedFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
@@ -78,7 +83,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -91,7 +96,7 @@ type javaSetup struct {
 	measure          bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -109,7 +114,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
 		return err
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
 		mods, problems := ev.modules(files)
@@ -139,11 +144,13 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	for m := range partial {
 		names = append(names, m)
 	}
+	names = append(names, sortedKeys(rustAndroid)...)
 	for _, m := range names {
 		if len(g.mods[Device][m])+len(g.mods[Host][m]) == 0 {
 			g.problem("providers.toml: %s names no module in the tree", m)
 		}
 	}
+	g.checkRustAndroid()
 	if (js.aconfig == "") != (js.release == "") {
 		return fmt.Errorf("-aconfig and -release are given together")
 	}

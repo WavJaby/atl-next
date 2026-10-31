@@ -27,12 +27,42 @@ import (
 //     cc device code is written against the Android userspace API, which this build provides without __ANDROID__, so android blocks stay right for it.
 //     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
 //     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
+//   - Exception, providers.toml `rust_os = "android"` (g.rustAndroid): a device crate whose Android behaviour this runtime provides (system properties, liblog) takes the android blocks
+//     and gets `--cfg atl_android_userspace` (rustAndroidCfg), which a patch to its source adds to exactly the `target_os = "android"` gates it needs; its host variant is untouched.
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
 //   - Source providers (rust_protobuf, rust_bindgen): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
 //   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
 
-// rustOSSide: the side whose OS blocks every Rust module takes, whatever its own side (flatten): rustc compiles for linux_glibc.
-const rustOSSide = Host
+// rustOSSide: the side whose OS blocks a Rust module takes on side (flatten): rustc compiles for linux_glibc, so Host, but Device for a device variant of a rust_os = "android" row.
+func (g *Graph) rustOSSide(m *Module, side Side) Side {
+	if side == Device && g.rustAndroid[m.Name] {
+		return Device
+	}
+	return Host
+}
+
+// rustAndroidCfg: the cfg a rust_os = "android" crate gets; never a builtin, so rustc sets it nowhere else, and a patched gate reads `any(target_os = "android", atl_android_userspace)`.
+const rustAndroidCfg = "atl_android_userspace"
+
+// checkRustAndroid: every rust_os = "android" row names a Rust module with a device variant; the field means nothing elsewhere, so a row on a cc module, a host-only crate or a renamed module would be silently dead.
+// A row naming no module at all is reported with the other providers.toml rows.
+func (g *Graph) checkRustAndroid() {
+	for _, name := range sortedKeys(g.rustAndroid) {
+		mods := g.mods[Device][name]
+		if len(mods) == 0 {
+			continue
+		}
+		for _, m := range mods {
+			t := g.baseType(m.Type)
+			switch {
+			case !isRustType(t):
+				g.problem("providers.toml: %s: rust_os on a %s, not a Rust module", name, m.Type)
+			case strings.Contains(t, "_host") || t == "rust_proc_macro" || !m.Props.boolean("device_supported", true):
+				g.problem("providers.toml: %s: rust_os on a %s, which has no device variant", name, m.Type)
+			}
+		}
+	}
+}
 
 // rustDefaultEdition:rust/config/global.go DefaultEdition, the edition of a crate without `edition`.
 const rustDefaultEdition = "2021"
@@ -266,6 +296,9 @@ func (g *Graph) rustNode(n *Node) {
 	// compiler.go cfgFlags / featureFlags
 	for _, c := range p.strs("cfgs") {
 		r.flags = append(r.flags, "--cfg", c)
+	}
+	if g.rustOSSide(m, n.side) == Device {
+		r.flags = append(r.flags, "--cfg", rustAndroidCfg)
 	}
 	for _, f := range p.strs("features") {
 		r.flags = append(r.flags, "--cfg", `feature="`+f+`"`)

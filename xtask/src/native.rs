@@ -103,6 +103,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &providers::Targets::new(&workspace.crates, &sources, &deps),
     )?;
     let omit = providers::omitted(&providers).join(",");
+    let rust_android = providers::rust_android(&providers).join(",");
     patch::preflight(root, providers::upstreams(&providers))?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
     // fetched by the loop, which only adds unpinned ones
@@ -142,7 +143,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         upstreams.extend(upstream::build(&src, &out, recipe, &toolchain)?);
     }
     let mut provided = BTreeMap::new();
-    for (module, row) in providers.iter().filter(|(_, row)| !row.is_none()) {
+    // rust_os rows have no provider: the tree builds them
+    for (module, row) in providers
+        .iter()
+        .filter(|(_, row)| !row.is_none() && !row.provider.is_empty())
+    {
         let parts = row
             .provider
             .iter()
@@ -227,6 +232,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &args.ar,
                 "-omit",
                 &omit,
+                "-rust-android",
+                &rust_android,
                 "-rust-version",
                 &rust.version,
             ])

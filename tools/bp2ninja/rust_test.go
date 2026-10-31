@@ -322,6 +322,74 @@ cc_library_static {
 	}
 }
 
+// A rust_os = "android" row: its device variant takes the android OS and OS+arch blocks and gets atl_android_userspace; its host variant, and every other crate, keep linux_glibc and no cfg.
+func TestRustAndroidRow(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+rust_library {
+    name: "liblog_like",
+    crate_name: "log_like",
+    srcs: ["lib.rs"],
+    host_supported: true,
+    target: {
+        android: { rustlibs: ["libandroid_only"], cfgs: ["default_log_impl"] },
+        linux_glibc: { rustlibs: ["libglibc_only"] },
+        linux_glibc_x86_64: { cfgs: ["glibc_x86_64"] },
+        android_x86_64: { cfgs: ["android_x86_64"] },
+    },
+}
+rust_library { name: "libandroid_only", crate_name: "android_only", srcs: ["a.rs"], host_supported: true }
+rust_library { name: "libglibc_only", crate_name: "glibc_only", srcs: ["g.rs"], host_supported: true }
+`})
+	g.rustAndroid = map[string]bool{"liblog_like": true}
+	g.checkRustAndroid()
+	if g.node("liblog_like", Device, Rlib, "goal") == nil || g.node("liblog_like", Host, Rlib, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc"})
+	cfg := []string{"--cfg", "atl_android_userspace"}
+	dev := ninjaEdgeVars(ninja, filepath.Join(g.out, "device/liblog_like/liblog_like.rlib"))
+	libs, flags := shWords(t, dev["libs"]), shWords(t, dev["flags"])
+	if !containsSeq(libs, []string{"--extern", "android_only=" + filepath.Join(g.out, "device/libandroid_only/libandroid_only.rlib")}) || slices.ContainsFunc(libs, func(s string) bool { return strings.Contains(s, "glibc_only") }) {
+		t.Errorf("device liblog_like libs %q: want the android block's crate only", libs)
+	}
+	for _, want := range [][]string{cfg, {"--cfg", "default_log_impl"}, {"--cfg", "android_x86_64"}} {
+		if !containsSeq(flags, want) {
+			t.Errorf("device liblog_like flags %q lack %q", flags, want)
+		}
+	}
+	if slices.Contains(flags, "glibc_x86_64") {
+		t.Errorf("device liblog_like flags %q: linux_glibc_x86_64 block taken", flags)
+	}
+	host := ninjaEdgeVars(ninja, filepath.Join(g.out, "host/liblog_like/liblog_like.rlib"))
+	if f := shWords(t, host["flags"]); containsSeq(f, cfg) || !containsSeq(f, []string{"--cfg", "glibc_x86_64"}) {
+		t.Errorf("host liblog_like flags %q: want the linux_glibc blocks, no %s", f, rustAndroidCfg)
+	}
+	// a crate without a row: no cfg
+	if f := shWords(t, ninjaEdgeVars(ninja, filepath.Join(g.out, "device/libandroid_only/libandroid_only.rlib"))["flags"]); containsSeq(f, cfg) {
+		t.Errorf("libandroid_only flags %q: no row, no cfg", f)
+	}
+}
+
+// The rows checkRustAndroid refuses: the field on a cc module, a host-only crate or a proc macro would be silently dead.
+func TestRustAndroidRowRefused(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_static { name: "libcc", srcs: ["c.cc"] }
+rust_library_host { name: "libhost", crate_name: "host", srcs: ["h.rs"] }
+rust_proc_macro { name: "libmac", crate_name: "mac", srcs: ["m.rs"] }
+rust_library { name: "libok", crate_name: "ok", srcs: ["o.rs"] }
+`})
+	g.rustAndroid = map[string]bool{"libcc": true, "libhost": true, "libmac": true, "libok": true}
+	g.checkRustAndroid()
+	want := []string{
+		"providers.toml: libcc: rust_os on a cc_library_static, not a Rust module",
+		"providers.toml: libhost: rust_os on a rust_library_host, which has no device variant",
+		"providers.toml: libmac: rust_os on a rust_proc_macro, which has no device variant",
+	}
+	if !slices.Equal(g.problems, want) {
+		t.Errorf("problems %q, want %q", g.problems, want)
+	}
+}
+
 // containsSeq: want appears in list as consecutive elements.
 func containsSeq(list, want []string) bool {
 	for i := 0; i+len(want) <= len(list); i++ {

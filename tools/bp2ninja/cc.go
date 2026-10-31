@@ -126,6 +126,8 @@ type Graph struct {
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
 	partial     map[string]Partial
 	droppedSrcs map[string]bool
+	// providers.toml `rust_os = "android"` rows: device Rust modules compiled as Android userspace (rust.go rustOSSide)
+	rustAndroid map[string]bool
 	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)
 	baseTypes map[string]string
 	mods      [2]map[string][]*Module
@@ -286,7 +288,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	}
 	osSide := side
 	if isRustType(g.baseType(m.Type)) {
-		osSide = rustOSSide
+		osSide = g.rustOSSide(m, side)
 	}
 	target(osBlocks(osSide, g.cfg.PointerBits))
 	if a := p.obj("arch"); a != nil {
