@@ -617,6 +617,20 @@ pub fn license_kinds(dir: &Path) -> Result<BTreeSet<String>> {
     Ok(kinds)
 }
 
+/// TARGET_RELEASE of the pinned tag: AOSP release builds use the release config named by the build
+/// ID's first field (`BP2A.250605.031.A2` -> `bp2a`). Kati rejects a name build/release lacks.
+pub fn target_release(tree: &Path) -> Result<String> {
+    let file = tree.join("build/make/core/build_id.mk");
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let id = text
+        .lines()
+        .find_map(|l| l.strip_prefix("BUILD_ID="))
+        .with_context(|| format!("no BUILD_ID= in {}", file.display()))?;
+    let field = id.split('.').next().unwrap_or(id);
+    Ok(field.to_lowercase())
+}
+
 /// Module types a Go file registers: `Register…ModuleType("name", …)` with a literal name.
 fn registered_types(go: &str) -> Vec<String> {
     const CALL: &str = "ModuleType(\"";

@@ -60,14 +60,14 @@ func TestJavaVersion(t *testing.T) {
 }
 
 func TestDefaultJavaVersion(t *testing.T) {
-	g := &Graph{java: &javaGraph{release: &Release{flags: map[string]string{"RELEASE_TARGET_JAVA_21": "true"}}}}
+	g := &Graph{java: &javaGraph{}, release: &Release{flags: map[string]string{"RELEASE_TARGET_JAVA_21": "true"}}}
 	// defaultJavaLanguageVersion: <=29 -> 8, <=31 -> 9, <=33 -> 11, newer / current -> 21 with RELEASE_TARGET_JAVA_21
 	for s, want := range map[string]string{"29": "1.8", "31": "1.9", "33": "11", "34": "21", "current": "21", "none": "21"} {
 		if got := g.defaultJavaVersion(Device, parseSdk(s)).String(); got != want {
 			t.Errorf("sdk %s: %s, want %s", s, got, want)
 		}
 	}
-	g.java.release.flags["RELEASE_TARGET_JAVA_21"] = ""
+	g.release.flags["RELEASE_TARGET_JAVA_21"] = ""
 	if got := g.defaultJavaVersion(Host, sdkSpec{}).String(); got != "17" {
 		t.Errorf("host without RELEASE_TARGET_JAVA_21: %s, want 17", got)
 	}
@@ -154,8 +154,9 @@ func javaTestGraph(t *testing.T, files map[string]string, flags map[string]strin
 	for k, v := range flags {
 		fl[k] = v
 	}
-	g.java = &javaGraph{tools: JavaTools{JDK: "/jdk", BuildTools: "/bt", Metalava: "/m.jar", Aconfig: "/aconfig"},
-		cfg: JavaConfig{JavacHeapSize: "1M"}, release: &Release{Name: "r", flags: fl}, nodes: map[jKey]*jNode{}}
+	g.release = &Release{Name: "r", flags: fl}
+	g.acfg = &aconfigGraph{tool: "/aconfig", decls: map[string]*aconfigDecl{}}
+	g.java = &javaGraph{tools: JavaTools{JDK: "/jdk", BuildTools: "/bt", Metalava: "/m.jar"}, cfg: JavaConfig{JavacHeapSize: "1M"}, nodes: map[jKey]*jNode{}}
 	return g
 }
 

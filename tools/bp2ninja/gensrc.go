@@ -117,14 +117,7 @@ func (g *Graph) genSources(n *Node, files []srcFile) {
 		if sg.tool != "" {
 			r.edge.toolNode = g.hostTool(sg.tool, n)
 		}
-		n.edges = append(n.edges, r.edge)
-		n.srcs = append(n.srcs, r.srcs...)
-		n.gen = append(n.gen, r.waits...)
-		n.genIncs = append(n.genIncs, r.incs...)
-		n.genCflags = appendMissing(n.genCflags, r.cflags)
-		if sg.export != nil && sg.export(n) {
-			n.genExports = append(n.genExports, r.exports...)
-		}
+		g.addGen(n, r, sg.export != nil && sg.export(n))
 		libs = append(libs, r.libs...)
 	}
 	for _, l := range libs {
@@ -138,6 +131,21 @@ func (g *Graph) genSources(n *Node, files []srcFile) {
 		}
 		*list = append(*list, d)
 		n.reexport = append(n.reexport, d)
+	}
+}
+
+// addGen records one generator's edge and what it hands n (rule "" = nothing generated); its libs are the caller's.
+func (g *Graph) addGen(n *Node, r genOut, export bool) {
+	if r.edge.rule == "" {
+		return
+	}
+	n.edges = append(n.edges, r.edge)
+	n.srcs = append(n.srcs, r.srcs...)
+	n.gen = append(n.gen, r.waits...)
+	n.genIncs = append(n.genIncs, r.incs...)
+	n.genCflags = appendMissing(n.genCflags, r.cflags)
+	if export {
+		n.genExports = append(n.genExports, r.exports...)
 	}
 }
 

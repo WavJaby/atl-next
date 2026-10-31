@@ -128,6 +128,8 @@ rule fail
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree))
+	// before the cc edges: ninja needs a rule defined before its first use
+	b.WriteString(g.acfg.ninja())
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
 		base := filepath.Join(g.out, n.side.String(), n.name)

@@ -26,9 +26,9 @@ import (
 //     R8 (optimize), javac sharding, services, kotlin.
 
 // JavaTools are the host programs and directories the Java rules run, given by the caller (all absolute). Soong's equivalents:
-// ANDROID_JAVA_HOME, the soong_zip / merge_zips / zip2zip / zipalign host tools, metalava.jar, aconfig.
+// ANDROID_JAVA_HOME, the soong_zip / merge_zips / zip2zip / zipalign host tools, metalava.jar. aconfig and the release config are the Graph's (aconfig.go).
 type JavaTools struct {
-	JDK, BuildTools, Metalava, Aconfig string
+	JDK, BuildTools, Metalava string
 }
 
 type jKey struct {
@@ -61,21 +61,18 @@ type jNode struct {
 	// droiddoc_exported_dir
 	expDir     string
 	expDirDeps []string
-	// aconfig_declarations
-	aconfig *aconfigDecl
 	// java_binary_host: the runnable wrapper and its jar
 	tool string
 }
 
 // javaGraph holds the Java side of a Graph.
 type javaGraph struct {
-	tools   JavaTools
-	cfg     JavaConfig
-	release *Release
-	nodes   map[jKey]*jNode
-	order   []*jNode
-	b       strings.Builder
-	outs    []string
+	tools JavaTools
+	cfg   JavaConfig
+	nodes map[jKey]*jNode
+	order []*jNode
+	b     strings.Builder
+	outs  []string
 	// java_sdk_library components synthesised so far (stubs.go), by name + side
 	synth map[string]*Module
 }
@@ -84,7 +81,7 @@ type javaGraph struct {
 var javaTypes = map[string]bool{
 	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true,
 	"java_import": true, "java_import_host": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
-	"aconfig_declarations": true, "droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true,
+	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true,
 }
 
 func (g *Graph) isJava(t string) bool { return javaTypes[g.baseType(t)] }
@@ -103,21 +100,16 @@ func (g *Graph) lookupJava(ref string, side Side) *Module {
 	return g.sdkLibComponent(strings.TrimPrefix(name, ":"), side)
 }
 
-// initJava reads what Java nodes need: the tools, Soong's Java flags and the release config.
-func (g *Graph) initJava(js javaSetup) error {
-	t := js.tools
-	if t.BuildTools == "" || t.Aconfig == "" || js.release == "" {
+// initJava reads what Java nodes need: the tools and Soong's Java flags; the release config and aconfig must be set up already.
+func (g *Graph) initJava(t JavaTools) error {
+	if t.BuildTools == "" || g.acfg == nil {
 		return fmt.Errorf("java: -jdk, -build-tools, -aconfig and -release are required together")
 	}
 	cfg, err := readJavaConfig(g.tree, t.JDK)
 	if err != nil {
 		return err
 	}
-	rel, err := readRelease(g.tree, js.release)
-	if err != nil {
-		return err
-	}
-	g.java = &javaGraph{tools: t, cfg: cfg, release: rel, nodes: map[jKey]*jNode{}}
+	g.java = &javaGraph{tools: t, cfg: cfg, nodes: map[jKey]*jNode{}}
 	return nil
 }
 
@@ -199,8 +191,6 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 		g.apiLibrary(n)
 	case "droiddoc_exported_dir":
 		g.exportedDir(n)
-	case "aconfig_declarations":
-		g.aconfigDeclarations(n)
 	case "java_aconfig_library":
 		g.aconfigJavaLib(n)
 	case "java_sdk_library":
@@ -320,7 +310,7 @@ func (g *Graph) defaultJavaVersion(side Side, s sdkSpec) javaVersion {
 			}
 		}
 	}
-	if g.java.release.Bool("RELEASE_TARGET_JAVA_21") {
+	if g.release.Bool("RELEASE_TARGET_JAVA_21") {
 		return 21
 	}
 	return 17
@@ -802,18 +792,18 @@ func (g *Graph) javaDex(n *jNode, d javaDeps, s sdkSpec, jar string) {
 	if minSdk == "" {
 		minSdk = s.level
 	}
-	platform, final := g.java.release.PlatformSdk()
+	platform, final := g.release.PlatformSdk()
 	if _, err := strconv.Atoi(minSdk); err != nil {
 		// current / none / core_platform / a codename: ApiLevel.EffectiveVersion
 		minSdk = platform
 	}
 	platformBuild := !s.stable()
 	if minSdk == futureApiLevel || !final && minSdk == platform {
-		minSdk = g.java.release.Flag("RELEASE_PLATFORM_SDK_VERSION")
+		minSdk = g.release.Flag("RELEASE_PLATFORM_SDK_VERSION")
 		platformBuild = true
 	}
 	// dex container format (DEX v41) from API 36 (W), while the platform is 36 or Baklava
-	r := g.java.release
+	r := g.release
 	lvl, _ := strconv.Atoi(minSdk)
 	plat, _ := strconv.Atoi(r.Flag("RELEASE_PLATFORM_SDK_VERSION"))
 	if lvl >= 36 && !p.boolean("no_dex_container", false) && r.Bool("RELEASE_USE_DEX_V41") &&
@@ -1111,8 +1101,8 @@ func (j *javaGraph) header(g *Graph) string {
 	javacVm := "-J-Xmx" + c.JavacHeapSize + " " + strings.Join(c.JavacVmFlags, " ")
 	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' -d $srcjardir || [ $$? -eq 11 ]; done) && find $srcjardir -name '*.java' | sort > $srcjardir/list`
 	var b strings.Builder
-	fmt.Fprintf(&b, "jdk = %s\nsoongzip = %s\nmergezips = %s\nzip2zip = %s\nzipalign = %s\naconfig = %s\n", esc(tools.JDK), bt("soong_zip"),
-		bt("merge_zips"), bt("zip2zip"), bt("zipalign"), esc(tools.Aconfig))
+	fmt.Fprintf(&b, "jdk = %s\nsoongzip = %s\nmergezips = %s\nzip2zip = %s\nzipalign = %s\n", esc(tools.JDK), bt("soong_zip"),
+		bt("merge_zips"), bt("zip2zip"), bt("zipalign"))
 	fmt.Fprintf(&b, `rule javac
   command = rm -rf $outdir $annodir $srcjardir $out.tmp && mkdir -p $outdir $annodir $srcjardir && %s && (if [ -s $srcjardir/list ] || [ -s $out.rsp ]; then cd $root && $jdk/bin/javac %s %s $processorpath $processor $flags $bootcp $cp -source $ver -target $ver -d $outdir -s $annodir @$out.rsp @$srcjardir/list; fi) && $soongzip -jar -o $out -C $outdir -D $outdir && rm -rf $outdir $srcjardir
   rspfile = $out.rsp
@@ -1152,6 +1142,6 @@ rule installexec
   description = install $out
 `, unpack, javacVm, strings.Join(c.CommonJdkFlags, " "), strings.Join(c.D8Flags, " "), strings.Join(c.JavaVmFlags, " "), c.JlinkVersion)
 	b.WriteString(j.stubsRules(g, unpack))
-	b.WriteString(aconfigRules)
+	b.WriteString(aconfigJavaRule)
 	return b.String()
 }

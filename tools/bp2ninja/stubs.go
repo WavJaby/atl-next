@@ -271,7 +271,7 @@ func (g *Graph) sdkLibModule(lib *Module, p *Obj, s *apiScope, kind, name string
 			set("compile_dex", true)
 		}
 		static := lib.Name + ".stubs" + s.suffix + ".from-source"
-		if p.boolean("build_from_text_stub", true) && g.java.release != nil {
+		if p.boolean("build_from_text_stub", true) && g.release != nil {
 			// java_api_library: from-text stubs (BuildFromTextStub is on in this configuration)
 			static = lib.Name + ".stubs" + s.suffix + ".from-text"
 		}

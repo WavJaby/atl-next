@@ -70,7 +70,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .context("AOSP manifest not fetched: xtask fetch --execute")?;
         write_product(&tree, &manifest, &product)?;
         prune::apply(&tree, &prune::load(root, &sources)?)?;
-        let release = release(&tree)?;
+        let release = aosp::target_release(&tree)?;
         let log = logs.join(format!("{}-{round}.log", product.name));
         println!(
             "soong: round {round}: {} TARGET_RELEASE={release} -> {}",
@@ -269,20 +269,6 @@ fn write_product(tree: &Path, manifest: &Manifest, product: &Product) -> Result<
         }
     }
     Ok(())
-}
-
-/// TARGET_RELEASE of the pinned tag: AOSP release builds use the release config named by the build
-/// ID's first field (`BP2A.250605.031.A2` -> `bp2a`). Kati rejects a name build/release lacks.
-fn release(tree: &Path) -> Result<String> {
-    let file = tree.join("build/make/core/build_id.mk");
-    let text =
-        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-    let id = text
-        .lines()
-        .find_map(|l| l.strip_prefix("BUILD_ID="))
-        .with_context(|| format!("no BUILD_ID= in {}", file.display()))?;
-    let field = id.split('.').next().unwrap_or(id);
-    Ok(field.to_lowercase())
 }
 
 /// `allow_missing`: ALLOW_MISSING_DEPENDENCIES, the subset tree's normal mode; off = a strict analysis

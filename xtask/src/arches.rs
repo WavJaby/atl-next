@@ -30,6 +30,15 @@ pub struct Host {
     pub meson_cpu_family: String,
     pub debian: String,
     pub archlinux: Option<String>,
+    pub soong_prebuilt_os: Option<String>,
+}
+
+impl Host {
+    /// `<tree>/prebuilts/build-tools/<soong_prebuilt_os>/bin`: Soong's prebuilt build-only tools for a build on this host; None where Soong ships none.
+    pub fn prebuilt_build_tools(&self, tree: &Path) -> Option<std::path::PathBuf> {
+        let os = self.soong_prebuilt_os.as_deref()?;
+        Some(tree.join(BUILD_TOOLS).join(os).join("bin"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,9 +129,79 @@ fn kernel_arch_matches(android_bp: &str, arches: &Arches) -> Result<()> {
     Ok(())
 }
 
+/// Soong's config, an upstream path: PrebuiltOS names the prebuilts directories.
+const SOONG_CONFIG_GO: &str = "aosp/build/soong/android/config.go";
+/// Tree-relative directory of the prebuilt build tools, one subdirectory per PrebuiltOS.
+const BUILD_TOOLS: &str = "prebuilts/build-tools";
+
+/// Every `soong_prebuilt_os` is a value Soong's PrebuiltOS returns on Linux, and `prebuilts/build-tools/<it>/bin` exists in the checkout `layout`
+/// resolves. Which row gets which value (PrebuiltOS keys on Go's GOARCH, a name this table does not carry) is not checked.
+pub fn check_prebuilt_os(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
+    let path = layout.locate(Path::new(SOONG_CONFIG_GO)).dir;
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading {}: run `cargo xtask fetch --execute`",
+            path.display()
+        )
+    })?;
+    let known =
+        linux_prebuilt_os(&text).with_context(|| format!("{FILE} vs {}", path.display()))?;
+    let tools = layout.locate(&Path::new("aosp").join(BUILD_TOOLS)).dir;
+    for (name, host) in arches
+        .iter()
+        .filter_map(|(n, a)| Some((n, a.host.as_ref()?)))
+    {
+        let Some(os) = &host.soong_prebuilt_os else {
+            continue;
+        };
+        ensure!(
+            known.contains(os),
+            "{FILE}: {name}: soong_prebuilt_os {os} is not a Linux PrebuiltOS of {} ({known:?})",
+            path.display()
+        );
+        let bin = tools.join(os).join("bin");
+        ensure!(
+            bin.is_dir(),
+            "{FILE}: {name}: soong_prebuilt_os {os}: {} does not exist",
+            bin.display()
+        );
+    }
+    Ok(())
+}
+
+/// The values `func (c *config) PrebuiltOS()` returns in its `case "linux":` arm.
+fn linux_prebuilt_os(config_go: &str) -> Result<Vec<String>> {
+    let start = config_go
+        .find("func (c *config) PrebuiltOS() string {")
+        .context("no PrebuiltOS")?;
+    let body = &config_go[start..];
+    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+    let linux = body
+        .split_once("case \"linux\":")
+        .context("PrebuiltOS has no linux case")?
+        .1;
+    // the linux arm ends at the next GOOS case, the first `case` indented one tab like it
+    let linux = &linux[..linux.find("\n\tcase ").unwrap_or(linux.len())];
+    let out: Vec<String> = linux
+        .split("return \"")
+        .skip(1)
+        .filter_map(|s| s.split_once('"').map(|(v, _)| v.to_owned()))
+        .collect();
+    ensure!(!out.is_empty(), "PrebuiltOS returns nothing for linux");
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kernel_arch_matches, parse};
+    use super::{kernel_arch_matches, linux_prebuilt_os, parse};
+
+    #[test]
+    fn prebuilt_os_from_soong() {
+        // build/soong/android/config.go's shape: GOOS switch, linux arm switching on GOARCH
+        let go = "func (c *config) PrebuiltOS() string {\n\tswitch runtime.GOOS {\n\tcase \"linux\":\n\t\tswitch runtime.GOARCH {\n\t\tcase \"amd64\":\n\t\t\treturn \"linux-x86\"\n\t\tcase \"arm64\":\n\t\t\treturn \"linux-arm64\"\n\t\tdefault:\n\t\t\tpanic(1)\n\t\t}\n\tcase \"darwin\":\n\t\treturn \"darwin-x86\"\n\t}\n}\n";
+        assert_eq!(linux_prebuilt_os(go).unwrap(), ["linux-x86", "linux-arm64"]);
+        assert!(linux_prebuilt_os("func other() {}").is_err());
+    }
 
     const GUEST: &str = "android_abis = [\"x\"]\nclang = \"c\"\nqemu_target = \"q\"\n";
     const K: &str = "kernel_arch = \"k\"\n";

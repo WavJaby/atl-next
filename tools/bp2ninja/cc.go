@@ -141,6 +141,9 @@ type Graph struct {
 	hidlIfaces map[string]*hidlIface
 	// modules synthesized by ref/side (synth.go), nil = none
 	synthMods map[string]*Module
+	// build/release config (release.go) and aconfig codegen (aconfig.go); nil without -release / -aconfig
+	release *Release
+	acfg    *aconfigGraph
 	// Java modules (java.go)
 	java *javaGraph
 }
@@ -326,7 +329,7 @@ func kindOf(t string, want Kind) (Kind, bool) {
 		return Static, true
 	case t == "cc_library_shared" || t == "cc_library_host_shared":
 		return Shared, true
-	case t == "cc_library" || t == "cc_object":
+	case t == "cc_library" || t == "cc_object" || t == ccAconfigType:
 		if want == Static || want == Shared {
 			return want, true
 		}
@@ -419,6 +422,10 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		g.order = append(g.order, n)
 		return n
 	}
+	aconfig := g.baseType(m.Type) == ccAconfigType
+	if aconfig {
+		g.ccAconfigDeps(n)
+	}
 	var files []srcFile
 	for _, s := range n.props.strs("srcs") {
 		files = append(files, g.srcFiles(n, s)...)
@@ -490,6 +497,9 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		}
 	}
 	g.genSources(n, g.dropPartial(n, dedupSrcs(files, g.expand(n, n.props.strs("exclude_srcs")))))
+	if aconfig {
+		g.addGen(n, g.ccAconfigGen(n), true)
+	}
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
 	return n

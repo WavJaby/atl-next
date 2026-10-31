@@ -154,7 +154,7 @@ func (g *Graph) measureRef(ms *measurement, ref string, side Side) {
 	if sm := p.str("system_modules"); sm != "" {
 		g.measureRef(ms, sm, side)
 	}
-	if javaTypes[t] && side == Device && t != "java_system_modules" && t != "aconfig_declarations" && t != "droiddoc_exported_dir" {
+	if javaTypes[t] && side == Device && t != "java_system_modules" && t != "droiddoc_exported_dir" {
 		n := &jNode{jKey: jKey{m.Name, side}, mod: m, props: p}
 		if sd, err := g.decodeSdk(n, parseSdk(p.str("sdk_version"))); err == nil {
 			for _, r := range append(append(append(sd.boot, sd.java9...), sd.classpath...), sd.sysModules) {

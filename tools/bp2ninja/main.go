@@ -10,9 +10,9 @@
 // Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles. A module in the -srcs file is built
 // without the sources its row lists, linking the row's provider (if any) first for their symbols.
 //
-// Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need -jdk, -build-tools, -aconfig and
-// -release, and -metalava where API stubs are built; with them, a goal that names a Java module builds as one. -measure writes
-// <out>/measure.txt (measure.go) instead of a build.
+// -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values.
+// Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools, and -metalava where
+// API stubs are built; with them, a goal that names a Java module builds as one. -measure writes <out>/measure.txt (measure.go) instead of a build.
 //
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
 // module references behind the "not found" problems) and <out>/missing-paths.txt (tree directories named by path that do not
@@ -49,8 +49,8 @@ func main() {
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
 	flag.StringVar(&jt.Metalava, "metalava", "", "Java goals: metalava.jar droidstubs run")
-	flag.StringVar(&jt.Aconfig, "aconfig", "", "Java goals: aconfig binary")
-	release := flag.String("release", "", "Java goals: build/release config (TARGET_RELEASE): build flags and aconfig values")
+	aconfig := flag.String("aconfig", "", "aconfig binary (aconfig flag libraries; Java goals)")
+	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values; given with -aconfig")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	flag.Parse()
 	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || flag.NArg() == 0 {
@@ -73,17 +73,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion}, javaSetup{jt, *release, *measure}, omitted, provided, partial, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
 }
 
-// javaSetup: the Java tools and release config; read only when a goal is a Java module.
+// javaSetup: the Java tools (read only when given), the aconfig tool and the release config.
 type javaSetup struct {
-	tools   JavaTools
-	release string
-	measure bool
+	tools            JavaTools
+	aconfig, release string
+	measure          bool
 }
 
 func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, goals []string) error {
@@ -139,9 +139,18 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			g.problem("providers.toml: %s names no module in the tree", m)
 		}
 	}
+	if (js.aconfig == "") != (js.release == "") {
+		return fmt.Errorf("-aconfig and -release are given together")
+	}
+	if js.release != "" {
+		if g.release, err = readRelease(tree, js.release); err != nil {
+			return err
+		}
+		g.acfg = &aconfigGraph{tool: js.aconfig, decls: map[string]*aconfigDecl{}}
+	}
 	// Java tools given: Java goals are built (java.go)
 	if js.tools.JDK != "" {
-		if err := g.initJava(js); err != nil {
+		if err := g.initJava(js.tools); err != nil {
 			return err
 		}
 	}

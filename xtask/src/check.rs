@@ -74,7 +74,9 @@ impl Step {
             Step::Spdx => spdx::check(root),
             Step::Tables => {
                 let arches = arches::load(root)?;
-                arches::check_kernel_arch(&Layout::of(root)?, &arches)?;
+                let layout = Layout::of(root)?;
+                arches::check_kernel_arch(&layout, &arches)?;
+                arches::check_prebuilt_os(&layout, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(
