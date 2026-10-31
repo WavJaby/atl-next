@@ -234,6 +234,10 @@ reason = "as stubs/callback.h; its header stubs/time.h carries protobuf's BSD-3-
 licence = "BSD-3-Clause"
 reason = "the configured copy of speexdsp_config_types.h.in; speex/COPYING is Xiph's BSD-3-Clause"
 
+[upstream.aosp.paths."external/rust/cxx/"]
+licence = "Apache-2.0 OR MIT"
+reason = "no file carries a notice; cxx/Cargo.toml and each sub-crate's: license = \"MIT OR Apache-2.0\". Its Android.bp lists both kinds (the large-scale change's \"apply every license found\"), which reads as several, not as the choice"
+
 [upstream.aosp.paths."external/sqlite/dist/sqlite-autoconf-3440300/sqlite3.c"]
 licence = "blessing"
 reason = "SQLite's blessing in place of a notice (\"The author disclaims copyright to this source code. In place of a legal notice, here is a blessing\"), also sqlite/LICENSE: SPDX blessing"
