@@ -3,6 +3,8 @@
 package main
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -70,7 +72,7 @@ func TestRustCrateFlags(t *testing.T) {
 	}
 	// builder.go rustEnvVars with cargo_env_compat: CARGO_BIN_NAME for a binary, the version split at its dots
 	tool := ninjaEdgeVars(ninja, filepath.Join(out, "host/tool/tool"))
-	if env := words(tool["env"]); !slices.Equal(env, []string{"OUT_DIR=out", "ANDROID_RUST_VERSION=1.2.3", "CARGO_BIN_NAME=tool", "CARGO_CRATE_NAME=tool", "CARGO_PKG_NAME=tool",
+	if env := words(tool["env"]); !slices.Equal(env, []string{"OUT_DIR=out", "ANDROID_RUST_VERSION=1.2.3", "RUSTC_BOOTSTRAP=-1", "CARGO_BIN_NAME=tool", "CARGO_CRATE_NAME=tool", "CARGO_PKG_NAME=tool",
 		"CARGO_PKG_VERSION=1.2.3", "CARGO_PKG_VERSION_MAJOR=1", "CARGO_PKG_VERSION_MINOR=2", "CARGO_PKG_VERSION_PATCH=3"}) {
 		t.Errorf("tool env %q", env)
 	}
@@ -138,6 +140,177 @@ rust_library { name: "libgen", crate_name: "gen", srcs: ["lib.rs", ":gen_rs"] }
 	}
 	if env := shWords(t, rs["env"]); env[0] != "OUT_DIR="+outDir {
 		t.Errorf("env %q", env)
+	}
+}
+
+// soongRustBuilder / soongPaths: the pinned android-16.0.0_r1 shapes readRustFeatureGate reads (rust/builder.go transformSrctoCrate's -Zallow-features condition; android/paths.go IsThirdPartyPath and its exceptions), trimmed to those statements.
+const soongRustBuilder = `package rust
+
+func transformSrctoCrate(ctx ModuleContext) {
+	// Disallow experimental features
+	modulePath := ctx.ModuleDir()
+	if !(android.IsThirdPartyPath(modulePath) || strings.HasPrefix(modulePath, "prebuilts")) {
+		rustcFlags = append(rustcFlags, "-Zallow-features=\"\"")
+	}
+}
+`
+
+const soongPaths = `package android
+
+var thirdPartyDirPrefixExceptions = []*regexp.Regexp{
+	regexp.MustCompile("^vendor/[^/]*google[^/]*/"),
+	regexp.MustCompile("^hardware/google/"),
+	regexp.MustCompile("^hardware/interfaces/"),
+	regexp.MustCompile("^hardware/libhardware[^/]*/"),
+	regexp.MustCompile("^hardware/ril/"),
+}
+
+func IsThirdPartyPath(path string) bool {
+	thirdPartyDirPrefixes := []string{"external/", "vendor/", "hardware/"}
+
+	if HasAnyPrefix(path, thirdPartyDirPrefixes) {
+		for _, prefix := range thirdPartyDirPrefixExceptions {
+			if prefix.MatchString(path) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+`
+
+func writeTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	tree := t.TempDir()
+	for p, text := range files {
+		full := filepath.Join(tree, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tree
+}
+
+func soongRustGate(t *testing.T) RustFeatureGate {
+	t.Helper()
+	gate, err := readRustFeatureGate(writeTree(t, map[string]string{"build/soong/rust/builder.go": soongRustBuilder, "build/soong/android/paths.go": soongPaths}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gate
+}
+
+// The gate is Soong's: third-party = an IsThirdPartyPath prefix not matching an exception, or the condition's own prebuilts prefix; everything else is first-party.
+func TestRustFeatureGate(t *testing.T) {
+	gate := soongRustGate(t)
+	for dir, want := range map[string]string{
+		"external/rust/android-crates-io/crates/proc-macro2": "1",
+		"vendor/acme/lib":           "1",
+		"hardware/acme/hal":         "1",
+		"prebuilts/rust/linux-x86":  "1",
+		"hardware/interfaces/audio": "-1", // an exception
+		"vendor/google_devices/x":   "-1", // an exception
+		"frameworks/base/libs":      "-1",
+		"system/librustutils":       "-1",
+		"external":                  "-1", // HasAnyPrefix takes "external/"
+	} {
+		if got := gate.bootstrap(dir); got != want {
+			t.Errorf("bootstrap(%s) = %s, want %s", dir, got, want)
+		}
+	}
+	// a Soong whose condition changed shape is reported, not guessed
+	for name, builder := range map[string]string{
+		"no IsThirdPartyPath": strings.Replace(soongRustBuilder, "android.IsThirdPartyPath(modulePath) || ", "", 1),
+		"unknown call":        strings.Replace(soongRustBuilder, "android.IsThirdPartyPath(modulePath)", "android.IsVendor(modulePath)", 1),
+		"not negated":         strings.Replace(soongRustBuilder, "if !(", "if (", 1),
+	} {
+		if _, err := readRustFeatureGate(writeTree(t, map[string]string{"build/soong/rust/builder.go": builder, "build/soong/android/paths.go": soongPaths})); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+	if _, err := readRustFeatureGate(writeTree(t, map[string]string{"build/soong/rust/builder.go": soongRustBuilder,
+		"build/soong/android/paths.go": strings.Replace(soongPaths, "thirdPartyDirPrefixes :=", "dirs :=", 1)})); err == nil {
+		t.Error("renamed thirdPartyDirPrefixes: no error")
+	}
+}
+
+// RUSTC_BOOTSTRAP is per rustc edge: 1 for a third-party crate, -1 for a first-party one (stable whatever the caller's environment), and rustc honours both.
+func TestRustBootstrapPerCrate(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"external/crates/pm2/Android.bp": `rust_library_host { name: "libpm2", crate_name: "pm2", srcs: ["lib.rs"] }`,
+		"system/first/Android.bp":        `rust_library_host { name: "libfirst", crate_name: "first", srcs: ["lib.rs"], rustlibs: ["libpm2"] }`,
+	})
+	g.soong.RustFeatures = soongRustGate(t)
+	if g.node("libfirst", Host, Rlib, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc"})
+	for mod, want := range map[string]string{"libpm2/libpm2.rlib": "RUSTC_BOOTSTRAP=1", "libfirst/libfirst.rlib": "RUSTC_BOOTSTRAP=-1"} {
+		if env := shWords(t, ninjaEdgeVars(ninja, filepath.Join(g.out, "host", mod))["env"]); !slices.Contains(env, want) {
+			t.Errorf("%s env %q lacks %s", mod, env, want)
+		}
+	}
+	if strings.Contains(ninja[:strings.Index(ninja, "\nbuild ")], "RUSTC_BOOTSTRAP") {
+		t.Error("RUSTC_BOOTSTRAP set outside the rustc edges")
+	}
+	rustc, err := exec.LookPath("rustc")
+	if err != nil {
+		t.Skip("no rustc: the env values are checked, not their effect")
+	}
+	src := filepath.Join(t.TempDir(), "f.rs")
+	if err := os.WriteFile(src, []byte("#![feature(rustc_attrs)]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for v, ok := range map[string]bool{"1": true, "-1": false} {
+		cmd := exec.Command(rustc, "--crate-type=lib", "--emit=metadata", "--out-dir", filepath.Dir(src), src)
+		cmd.Env = append(os.Environ(), "RUSTC_BOOTSTRAP="+v)
+		if out, err := cmd.CombinedOutput(); (err == nil) != ok {
+			t.Errorf("RUSTC_BOOTSTRAP=%s: #![feature] compiled = %v, want %v: %s", v, err == nil, ok, out)
+		}
+	}
+}
+
+// A Rust device crate takes the linux_glibc OS blocks (rustc's target_os), a cc device module the android ones; the crate keeps device codegen flags.
+func TestRustDeviceOSBlocks(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+rust_library {
+    name: "liblog_like",
+    crate_name: "log_like",
+    srcs: ["lib.rs"],
+    target: {
+        android: { rustlibs: ["libandroid_only"] },
+        linux_glibc: { rustlibs: ["libglibc_only"] },
+        linux_glibc_x86_64: { cfgs: ["glibc_x86_64"] },
+        android_x86_64: { cfgs: ["android_x86_64"] },
+    },
+}
+rust_library { name: "libandroid_only", crate_name: "android_only", srcs: ["a.rs"] }
+rust_library { name: "libglibc_only", crate_name: "glibc_only", srcs: ["g.rs"] }
+cc_library_static {
+    name: "libcc_like",
+    srcs: ["c.cc"],
+    target: { android: { cflags: ["-DANDROID_BLOCK"] }, linux_glibc: { cflags: ["-DGLIBC_BLOCK"] } },
+}
+`})
+	if g.node("liblog_like", Device, Rlib, "goal") == nil || g.node("libcc_like", Device, Static, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc"})
+	rs := ninjaEdgeVars(ninja, filepath.Join(g.out, "device/liblog_like/liblog_like.rlib"))
+	libs, flags := shWords(t, rs["libs"]), shWords(t, rs["flags"])
+	if !containsSeq(libs, []string{"--extern", "glibc_only=" + filepath.Join(g.out, "device/libglibc_only/libglibc_only.rlib")}) || slices.ContainsFunc(libs, func(s string) bool { return strings.Contains(s, "android_only") }) {
+		t.Errorf("liblog_like libs %q: want the linux_glibc block's crate only", libs)
+	}
+	if !containsSeq(flags, []string{"--cfg", "glibc_x86_64"}) || slices.Contains(flags, "android_x86_64") || !containsSeq(flags, []string{"-C", "panic=abort"}) {
+		t.Errorf("liblog_like flags %q: want linux_glibc_x86_64 cfgs and device panic=abort", flags)
+	}
+	cc := shWords(t, ninjaEdgeVars(ninja, filepath.Join(g.out, "obj/device/libcc_like"))["flags"])
+	if !slices.Contains(cc, "-DANDROID_BLOCK") || slices.Contains(cc, "-DGLIBC_BLOCK") {
+		t.Errorf("libcc_like flags %q: want the android block only", cc)
 	}
 }
 

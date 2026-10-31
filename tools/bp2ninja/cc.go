@@ -276,7 +276,11 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 			}
 		}
 	}
-	target(osBlocks(side, g.cfg.PointerBits))
+	osSide := side
+	if isRustType(g.baseType(m.Type)) {
+		osSide = rustOSSide
+	}
+	target(osBlocks(osSide, g.cfg.PointerBits))
 	if a := p.obj("arch"); a != nil {
 		if o := a.obj(g.cfg.Arch); o != nil {
 			base = merge(base, o)
@@ -295,7 +299,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 			base = merge(base, o)
 		}
 	}
-	target(osArchBlocks(side, g.cfg.Arch))
+	target(osArchBlocks(osSide, g.cfg.Arch))
 	if kind == Static || kind == Shared {
 		if o := p.obj(kind.String()); o != nil {
 			base = merge(base, o)

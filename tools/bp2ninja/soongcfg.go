@@ -33,7 +33,8 @@ type SoongConfig struct {
 	NoYasm [2]string
 	// cc/config/bionic.go bionicDefaultSharedLibraries: what a device module links when it sets no system_shared_libs (cc/linker.go; `[]` opts out)
 	SystemSharedLibs []string
-	Device           DeviceArch // readDeviceArch
+	Device           DeviceArch      // readDeviceArch
+	RustFeatures     RustFeatureGate // readRustFeatureGate
 }
 
 // DeviceArch: the ISA Soong's device toolchain targets for the arch and its arches.toml variant (android/arch.go decodeArch, cc/config/<arch>_device.go <arch>ToolchainFactory).

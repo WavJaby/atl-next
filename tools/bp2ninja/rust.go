@@ -4,7 +4,11 @@ package main
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -19,10 +23,17 @@ import (
 //   - Toolchain: the repo's rust-toolchain.toml rustc (stable), with the host's own sysroot, so std, core, alloc and proc_macro come from it; Soong's `--sysroot=/dev/null` + prebuilt std modules are not mirrored.
 //     Soong's -Z flags (stack-protector, remap-cwd-prefix, dylib-lto, link-native-libraries, tls-model, debug-info-for-profiling) need nightly; they harden or tune code, never change what compiles, so they are dropped.
 //   - Device crates build for the host triple (rustc's default target), as cc device modules do: target_os is linux, not android -- the counterpart of cc not defining __ANDROID__.
+//     So a device crate takes the linux_glibc `target: {…}` blocks (rustOSSide), keeping device codegen flags (rustDeviceFlags) -- unlike cc, which keeps android blocks.
+//     cc device code is written against the Android userspace API, which this build provides without __ANDROID__, so android blocks stay right for it.
+//     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
+//     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
 //   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), source providers (rust_bindgen, rust_protobuf, rust_aconfig_library) in srcs.
 
-// rustDefaultEdition: rust/config/global.go DefaultEdition, the edition of a crate without `edition`.
+// rustOSSide: the side whose OS blocks every Rust module takes, whatever its own side (flatten): rustc compiles for linux_glibc.
+const rustOSSide = Host
+
+// rustDefaultEdition:rust/config/global.go DefaultEdition, the edition of a crate without `edition`.
 const rustDefaultEdition = "2021"
 
 // rustStdlibs: rust/config/global.go Stdlibs (+ the sysroot crates a module may name in rustlibs): built into the sysroot, so a reference to one is dropped.
@@ -223,6 +234,126 @@ func (g *Graph) rustNode(n *Node) {
 	}
 }
 
+// RustFeatureGate: which module dirs may use unstable features, read from the pinned Soong (readRustFeatureGate) so an AOSP upgrade brings its own list.
+// rust/builder.go passes `-Zallow-features=""` unless android.IsThirdPartyPath(ModuleDir) or the same condition's HasPrefix(ModuleDir, "prebuilts"): first-party crates are stable-only, third-party ones may use what their rustc offers.
+// The stable toolchain's counterpart is a per-crate RUSTC_BOOTSTRAP (bootstrap), set on the rustc edge only, never in the build's environment.
+type RustFeatureGate struct {
+	prefixes   []string         // android/paths.go IsThirdPartyPath's thirdPartyDirPrefixes
+	exceptions []*regexp.Regexp // android/paths.go thirdPartyDirPrefixExceptions: first-party dirs under those prefixes (hardware/interfaces/)
+	extra      []string         // the builder.go condition's own HasPrefix prefixes
+}
+
+// allows: the gate's condition for a module dir (relative to the tree, Soong's ModuleDir).
+func (r RustFeatureGate) allows(dir string) bool {
+	if slices.ContainsFunc(r.extra, func(p string) bool { return strings.HasPrefix(dir, p) }) {
+		return true
+	}
+	if !slices.ContainsFunc(r.prefixes, func(p string) bool { return strings.HasPrefix(dir, p) }) {
+		return false
+	}
+	return !slices.ContainsFunc(r.exceptions, func(e *regexp.Regexp) bool { return e.MatchString(dir) })
+}
+
+// bootstrap: the crate's RUSTC_BOOTSTRAP: 1 lets a stable rustc take #![feature] (proc-macro2's proc_macro_span cfg); -1 makes it stable whatever the caller's environment holds, as -Zallow-features="" does.
+func (r RustFeatureGate) bootstrap(dir string) string {
+	if r.allows(dir) {
+		return "1"
+	}
+	return "-1"
+}
+
+// readRustFeatureGate: RustFeatureGate from build/soong/rust/builder.go's `-Zallow-features` condition and android/paths.go IsThirdPartyPath; any other shape fails, so a Soong change is read, never guessed.
+func readRustFeatureGate(tree string) (RustFeatureGate, error) {
+	var r RustFeatureGate
+	parse := func(rel string) (*ast.File, error) {
+		return parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+	}
+	const builderGo, pathsGo = "build/soong/rust/builder.go", "build/soong/android/paths.go"
+	builder, err := parse(builderGo)
+	if err != nil {
+		return r, err
+	}
+	// the `if !(…) { … "-Zallow-features=\"\"" … }` statement: its condition's calls are IsThirdPartyPath and HasPrefix only
+	var cond ast.Expr
+	ast.Inspect(builder, func(x ast.Node) bool {
+		if s, ok := x.(*ast.IfStmt); ok && cond == nil {
+			ast.Inspect(s.Body, func(y ast.Node) bool {
+				if l, ok := y.(*ast.BasicLit); ok && strings.Contains(goString(l), "-Zallow-features") {
+					cond = s.Cond
+				}
+				return cond == nil
+			})
+		}
+		return cond == nil
+	})
+	u, ok := cond.(*ast.UnaryExpr)
+	if !ok || u.Op != token.NOT {
+		return r, fmt.Errorf("%s: no `if !(…)` around -Zallow-features", builderGo)
+	}
+	thirdParty := false
+	ast.Inspect(u.X, func(x ast.Node) bool {
+		c, ok := x.(*ast.CallExpr)
+		if !ok {
+			return err == nil
+		}
+		sel, _ := c.Fun.(*ast.SelectorExpr)
+		switch {
+		case sel != nil && sel.Sel.Name == "IsThirdPartyPath":
+			thirdParty = true
+		case sel != nil && sel.Sel.Name == "HasPrefix" && len(c.Args) == 2 && goString(c.Args[1]) != "":
+			r.extra = append(r.extra, goString(c.Args[1]))
+		default:
+			err = fmt.Errorf("%s: unknown call in the -Zallow-features condition", builderGo)
+		}
+		return false
+	})
+	if err != nil {
+		return r, err
+	}
+	if !thirdParty {
+		return r, fmt.Errorf("%s: the -Zallow-features condition no longer calls IsThirdPartyPath", builderGo)
+	}
+	paths, err := parse(pathsGo)
+	if err != nil {
+		return r, err
+	}
+	for _, decl := range paths.Decls {
+		if f, ok := decl.(*ast.FuncDecl); ok && f.Name.Name == "IsThirdPartyPath" {
+			ast.Inspect(f.Body, func(x ast.Node) bool {
+				if a, ok := x.(*ast.AssignStmt); ok && len(a.Lhs) == 1 && len(a.Rhs) == 1 {
+					if id, ok := a.Lhs[0].(*ast.Ident); ok && id.Name == "thirdPartyDirPrefixes" {
+						r.prefixes, _ = stringList(a.Rhs[0])
+					}
+				}
+				return true
+			})
+		}
+	}
+	if len(r.prefixes) == 0 {
+		return r, fmt.Errorf("%s: IsThirdPartyPath's thirdPartyDirPrefixes not found", pathsGo)
+	}
+	list, ok := valueSpecs(paths)["thirdPartyDirPrefixExceptions"].(*ast.CompositeLit)
+	if !ok {
+		return r, fmt.Errorf("%s: thirdPartyDirPrefixExceptions not found", pathsGo)
+	}
+	for _, e := range list.Elts {
+		c, ok := e.(*ast.CallExpr)
+		var sel *ast.SelectorExpr
+		if ok {
+			sel, _ = c.Fun.(*ast.SelectorExpr)
+		}
+		if sel == nil || sel.Sel.Name != "MustCompile" || len(c.Args) != 1 || goString(c.Args[0]) == "" {
+			return r, fmt.Errorf("%s: thirdPartyDirPrefixExceptions entry is not regexp.MustCompile(\"…\")", pathsGo)
+		}
+		re, err := regexp.Compile(goString(c.Args[0]))
+		if err != nil {
+			return r, fmt.Errorf("%s: %v", pathsGo, err)
+		}
+		r.exceptions = append(r.exceptions, re)
+	}
+	return r, nil
+}
+
 // rustStem: a binary's output name (binary.go getStem).
 func (g *Graph) rustStem(n *Node) string {
 	if s := n.props.str("stem"); s != "" {
@@ -238,7 +369,7 @@ func (g *Graph) rustEnv(n *Node, rustVersion string) []string {
 	if len(r.srcDeps) > 0 {
 		env[0] = "OUT_DIR=" + r.outDir
 	}
-	env = append(env, "ANDROID_RUST_VERSION="+rustVersion)
+	env = append(env, "ANDROID_RUST_VERSION="+rustVersion, "RUSTC_BOOTSTRAP="+g.soong.RustFeatures.bootstrap(n.mod.Dir))
 	if p.boolean("cargo_env_compat", false) {
 		if n.kind == Binary {
 			env = append(env, "CARGO_BIN_NAME="+g.rustStem(n))

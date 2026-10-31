@@ -101,6 +101,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.Yasm, soong.NoYasm, err = readYasmFlags(tree, cfg.Arch); err != nil {
 		return err
 	}
+	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
+		return err
+	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
