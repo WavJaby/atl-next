@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-android-runtime"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# cargo-c builds with it; nothing is gated on it
+capi = []
+
+# cargo-c: linked into libandroid_runtime (providers.toml `srcs` row); AndroidRuntime.cpp declares the symbols itself, so no header
+[package.metadata.capi.header]
+generation = false
+
+[lints]
+workspace = true

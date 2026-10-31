@@ -18,6 +18,10 @@ crates = ["atl-bionic"]
 exports = ["atl-bionic"]
 uses = ["generators"]
 
+# framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
+[android-runtime]
+crates = ["atl-android-runtime"]
+
 # binder IPC: uapi wire types, the userspace driver core
 [binder]
 crates = ["atl-binder-wire", "atl-binderd"]

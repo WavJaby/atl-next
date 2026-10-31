@@ -59,6 +59,26 @@ reason = "bionic linker namespace API; our libnativeloader owns namespaces"
 provider = "crate:atl-vndksupport"
 reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace, so AOSP's fallback dlopen/dlclose is the whole behaviour"
 
+# licence: Adobe's DNG SDK carries a DNG-only (field-of-use) patent licence, which GPL-3 forbids and the GPL-3 QEMU bridge shares the process with (licenses.toml `external/dng_sdk/`); RAW/DNG is not shipped
+["libdng_sdk"]
+provider = "none"
+reason = "Adobe DNG SDK: its patent licence is limited to reading/writing DNG (field of use), not combinable with the GPL-3 QEMU bridge in one process"
+
+["libandroid_runtime"]
+provider = "crate:atl-android-runtime"
+reason = "DngCreator's JNI needs libdng_sdk (none: its licence); the Zygote JNI serves a zygote ATL v1 does not have (atld starts each app); the crate's register_* return 0 for them"
+srcs = [
+    "android_hardware_camera2_DngCreator.cpp",
+    "com_android_internal_os_Zygote.cpp",
+    "com_android_internal_os_ZygoteCommandBuffer.cpp",
+    "com_android_internal_os_ZygoteInit.cpp",
+]
+
+["libskia"]
+provider = "none"
+reason = "SkRawCodec is Skia's RAW/DNG decoder over libdng_sdk (none: its licence)"
+srcs = ["src/codec/SkRawCodec.cpp"]
+
 # AOSP's external/boringssl is the frozen FIPS branch, still under the OpenSSL licence, which the GPL-3 QEMU bridge's process cannot hold; upstream relicensed to Apache-2.0
 ["libcrypto"]
 provider = "upstream:boringssl"
