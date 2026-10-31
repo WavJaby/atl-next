@@ -17,10 +17,13 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 
 ## Upstream patches
 
-- Upstreams are checked out under `<workspace>/src/<upstream>` by `cargo xtask fetch` (shallow, at the `sources.toml` pin). Change upstream code only as commits on branch `atl-patches` inside the checkout, then `cargo xtask patch --export <upstream>` writes them to `patches/<upstream>/` (reproducible bytes; the SPDX expression of the patched files is inserted after `---`). Step `drift` of `cargo xtask check` fails while a checkout has uncommitted or unexported work.
+- `cargo xtask fetch --execute` checks each upstream out under `<workspace>/src/<upstream>` (shallow, at the `sources.toml` pin) and, where `patches/<upstream>/` holds patches, puts it on branch `atl-patches` = pin + those patches (`git am`). It never drops a commit on `atl-patches` that `patches/` lacks: it refuses and names the command to run.
+- `cargo xtask native` first runs the drift test on what it builds from (every AOSP checkout, every upstream built for `providers.toml`): an uncommitted edit, or `atl-patches` differing from `patches/`, fails before the converter; a clean checkout is compiled as it is. Step `drift` of `cargo xtask check` runs the same test on every checkout.
+- Change upstream code only as commits on `atl-patches` inside the checkout (start it at the pin: `git switch -c atl-patches`), then `cargo xtask patch --export <upstream>` writes them to `patches/<upstream>/` (reproducible bytes; the SPDX expression of the patched files is inserted after `---`). Export is always explicit: no build writes into the repo.
+- `src/` is shared by every worktree, so an edit there is seen by parallel builds; per-task copies under `src-wt/` do not exist yet.
 - Every patch commit carries the trailers `Upstream-Status:` (Pending / Submitted [where] / Backport / Denied / Inappropriate [why]) and `Patch-Reason:` (why the launcher, loader or environment cannot do it). Patches stay small and rebase-stable; one whose reason is gone is deleted at the next upgrade.
 - `patches/<upstream>/LICENSE` holds the upstream's licence text.
-- After a pin bump: `cargo xtask fetch --execute`, `cargo xtask patch --rebase <upstream>`, resolve conflicts, `--export`.
+- After a pin bump: `cargo xtask fetch --execute` re-applies `patches/` on the new pin. Where they no longer apply it restores the checkout and says so: `cargo xtask patch --rebase <upstream>`, resolve conflicts, `--export`.
 
 ## Languages
 

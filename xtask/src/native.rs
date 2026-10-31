@@ -11,7 +11,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
-use crate::{arches, deps, fetch, providers, sources, upstream, workspace};
+use crate::{arches, deps, fetch, patch, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -94,6 +94,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &providers::Targets::new(&workspace.crates, &deps, &sources),
     )?;
     let omit = providers::omitted(&providers).join(",");
+    patch::preflight(root, providers::upstreams(&providers))?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
     // fetched by the loop, which only adds unpinned ones
     if args.fetch_missing {

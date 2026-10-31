@@ -55,8 +55,8 @@ enum Command {
     /// Dry run by default (offline): shows what each checkout needs. The AOSP manifest (pinned in
     /// sources.toml) is fetched first: it maps tree paths to repositories and holds the tree's link/copy
     /// files; the other checkouts then run in parallel. Checkouts are shallow (the pinned tag only);
-    /// `git fetch --unshallow` inside one before bisecting. A checkout on a branch belongs to
-    /// `xtask patch`; one with uncommitted changes is never moved.
+    /// `git fetch --unshallow` inside one before bisecting.
+    /// An upstream with patches/<upstream>/ ends on branch atl-patches = pin + those patches; commits on atl-patches that patches/ lacks are never dropped (fetch refuses and names the command to run), nor is a checkout with uncommitted changes moved.
     Fetch(fetch::Args),
     /// Which AOSP project defines a module, from an index of every manifest project's `Android.bp`.
     ///
@@ -78,13 +78,13 @@ enum Command {
     /// Runtime libraries come from each module's android source set compiled for glibc, build tools
     /// (aidl) from their host source set; bionic itself is replaced by the system C library. Output in
     /// <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`).
+    /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
     Native(native::Args),
-    /// Our commits on upstream checkouts: branch atl-patches <-> patches/<upstream>/*.patch.
+    /// Our commits on upstream checkouts: branch atl-patches -> patches/<upstream>/*.patch.
     ///
-    /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only;
-    /// `xtask check` step `drift` runs the same test). Develop by committing on atl-patches inside the
-    /// checkout; every commit carries `Upstream-Status:` and `Patch-Reason:` trailers. After a pin
-    /// bump: `xtask fetch`, `--rebase`, resolve, `--export`.
+    /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only; `xtask check` step `drift` and `xtask native` run the same test).
+    /// `xtask fetch --execute` applies patches/. Develop by committing on atl-patches inside the checkout (start it at the pin), every commit with `Upstream-Status:` and `Patch-Reason:` trailers, then `--export`.
+    /// After a pin bump `xtask fetch --execute` re-applies patches/ on the new pin; where they no longer apply: `--rebase`, resolve, `--export`.
     Patch(patch::Args),
     /// Licence of every source file in a fetched upstream checkout (read-only).
     ///
