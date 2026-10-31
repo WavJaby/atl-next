@@ -74,7 +74,7 @@ var srcGens = map[string]*srcGen{
 
 func isCompileSrc(ext string) bool {
 	switch ext {
-	case ".c", ".cc", ".cpp", ".cxx", ".S", ".s":
+	case ".c", ".cc", ".cpp", ".cxx", ".S", ".s", ".asm":
 		return true
 	}
 	return false

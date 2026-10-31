@@ -38,6 +38,7 @@ func main() {
 	ar := flag.String("ar", "llvm-ar", "archiver")
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
+	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {lib, include, defines} of modules built outside the tree (providers.toml `crate:` and `upstream:`, provided.go)")
 	var jt JavaTools
@@ -63,7 +64,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -86,6 +87,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	if soong.Device, err = readDeviceArch(tree, cfg); err != nil {
+		return err
+	}
+	if soong.Yasm, soong.NoYasm, err = readYasmFlags(tree, cfg.Arch); err != nil {
 		return err
 	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nodes: map[key]*Node{}}

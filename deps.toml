@@ -115,3 +115,12 @@ debian = "python3-venv"
 arch = "python"
 scope = ["build"]
 used_by = ["upstream:qemu"]
+
+# Soong's .asm rule is yasm (cc/builder.go, a prebuilt there); its -f/-m flags are yasm syntax. libjpeg-turbo's x86 SIMD sources.
+[yasm]
+debian = "yasm"
+arch = "yasm"
+min = "1.2.0"
+min_reason = "libjpeg-turbo BUILDING.md: if using Yasm, 1.2.0 or later is required"
+scope = ["build"]
+used_by = ["xtask:native"]

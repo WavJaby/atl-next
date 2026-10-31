@@ -46,7 +46,7 @@ func globTree(base, pattern, dir string) []string {
 }
 
 // Tools are the host programs the generated rules call.
-type Tools struct{ CC, CXX, AR, Bison, Flex string }
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -101,6 +101,11 @@ rule yacc
 rule lex
   command = $flex -o$out $in
   description = flex $in
+rule yasm
+  command = $yasm $flags -o $out $in && $yasm $flags -M $in >$out.d
+  depfile = $out.d
+  deps = gcc
+  description = yasm $in
 rule genrule
   command = cd "$root" && /bin/bash $script
   description = genrule $name
@@ -110,7 +115,7 @@ rule genrule
 // emit writes the ninja file for every node.
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(g.tree))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(tools.Yasm), esc(g.tree))
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
 		base := filepath.Join(g.out, n.side.String(), n.name)
@@ -160,6 +165,14 @@ func (g *Graph) emit(tools Tools) string {
 				lang, cc = flags.c, tools.CC
 			case ".S", ".s":
 				lang, cc = flags.asm, tools.CC
+			case ".asm":
+				if why := g.soong.NoYasm[n.side]; why != "" {
+					g.problem("%s: source %s: %s", n.mod.Name, s, why)
+				} else {
+					fmt.Fprintf(&b, "build %s: yasm %s || %s\n  flags = %s\n", esc(obj), esc(src), join(waits), shellQuote(flags.yasm))
+					n.objs = append(n.objs, obj)
+				}
+				continue
 			}
 			fmt.Fprintf(&b, "build %s: cc %s || %s\n  cc = %s\n  flags = %s\n", esc(obj), esc(src), join(waits), esc(cc), shellQuote(lang))
 			n.objs = append(n.objs, obj)
@@ -189,9 +202,10 @@ func (g *Graph) emit(tools Tools) string {
 	return b.String()
 }
 
-type langFlags struct{ c, cxx, asm []string }
+type langFlags struct{ c, cxx, asm, yasm []string }
 
 // compileFlags: Soong's language defaults and global defines (read from its global.go), on the device side its toolchain's ISA flags (DeviceArch), the module's flags, then include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
+// yasm is the whole argv of a .asm compile; the others go to the cc rule.
 // -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures.
 // libc++: AOSP's C++ assumes it (libstdc++ 14 rejects libbase's non-const set comparator).
 func (g *Graph) compileFlags(n *Node) langFlags {
@@ -201,6 +215,9 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if n.side == Device {
 		common = append(common, g.soong.Device.Cflags...)
 	}
+	// .S/.s: Soong's asflags take the global common flags and none of the module's cflags (cc/builder.go transformSourceToObj)
+	asm := append(slices.Clone(common), "-Wno-error")
+	asm = append(append(asm, g.soong.GlobalAsDefines...), moduleFlags(p, "asflags")...)
 	common = append(common, moduleFlags(p, "cflags")...)
 	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")
@@ -217,6 +234,8 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		inc = append(inc, "-I"+g.abs(d))
 	}
 	inc = append(inc, "-I"+g.abs(n.mod.Dir))
+	// .asm: the toolchain's format flags, the module's asflags and its own include dirs only (cc/compiler.go Local.YasmFlags): no defines, no dependencies' exports
+	yasm := slices.Concat(g.soong.Yasm[n.side], moduleFlags(p, "asflags"), inc)
 	inc = append(inc, n.exports...)
 	inc = append(inc, n.genIncs...)
 	for _, d := range append(append(append(append([]*Node{}, n.deps.headers...), n.deps.static...), n.deps.shared...), n.deps.whole...) {
@@ -247,8 +266,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if !p.boolean("rtti", false) {
 		cxx = append(cxx, "-fno-rtti")
 	}
-	asm := append(append([]string{}, common...), moduleFlags(p, "asflags")...)
-	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...)}
+	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...), yasm}
 }
 
 // seesBionic: n depends on the bionic provider directly, so its compiles have bionic's headers.

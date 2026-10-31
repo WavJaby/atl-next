@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,7 +24,13 @@ type SoongConfig struct {
 	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
 	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here.
 	GlobalDefines []string
-	APILevel      string // device-side -D__ANDROID_API__ (apiLevel)
+	// commonGlobalAsflags' -D/-U entries (-D__ASSEMBLY__): Soong adds them to every .S/.s compile (cc/compiler.go "${config.CommonGlobalAsflags}"); same preprocessor-only rule as GlobalDefines.
+	GlobalAsDefines []string
+	APILevel        string // device-side -D__ANDROID_API__ (apiLevel)
+	// per Side: the toolchain's YasmFlags, the format flags of every .asm compile (readYasmFlags)
+	Yasm [2][]string
+	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
+	NoYasm [2]string
 	// cc/config/bionic.go bionicDefaultSharedLibraries: what a device module links when it sets no system_shared_libs (cc/linker.go; `[]` opts out)
 	SystemSharedLibs []string
 	Device           DeviceArch // readDeviceArch
@@ -55,21 +62,9 @@ func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 	parse := func(rel string) (*ast.File, error) {
 		return parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
 	}
-	// Soong's ArchType identifier for the arch name: `X86_64 = newArch("x86_64", "lib64")`
-	archGo, err := parse("build/soong/android/arch.go")
+	ident, err := archIdent(tree, cfg.Arch)
 	if err != nil {
 		return d, err
-	}
-	ident := ""
-	for name, v := range valueSpecs(archGo) {
-		if c, ok := v.(*ast.CallExpr); ok && len(c.Args) > 0 {
-			if f, ok := c.Fun.(*ast.Ident); ok && f.Name == "newArch" && goString(c.Args[0]) == cfg.Arch {
-				ident = name
-			}
-		}
-	}
-	if ident == "" {
-		return d, fmt.Errorf("build/soong/android/arch.go: no newArch(%q)", cfg.Arch)
 	}
 	list, err := parse("build/soong/android/arch_list.go")
 	if err != nil {
@@ -108,6 +103,187 @@ func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 		d.Cflags = append(d.Cflags, features[f]...)
 	}
 	return d, nil
+}
+
+// archIdent: Soong's ArchType identifier for the arch name: `X86_64 = newArch("x86_64", "lib64")` in android/arch.go.
+func archIdent(tree, arch string) (string, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(tree, "build/soong/android/arch.go"), nil, 0)
+	if err != nil {
+		return "", err
+	}
+	for name, v := range valueSpecs(f) {
+		if c, ok := v.(*ast.CallExpr); ok && len(c.Args) > 0 {
+			if f, ok := c.Fun.(*ast.Ident); ok && f.Name == "newArch" && goString(c.Args[0]) == arch {
+				return name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("build/soong/android/arch.go: no newArch(%q)", arch)
+}
+
+// toolchainOS: per side, the android.OsType identifier its toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
+var toolchainOS = [...]string{Device: "Android", Host: "Linux"}
+
+// configVar: a `${config.Name}` reference, how a toolchain method names its pctx variable.
+var configVar = regexp.MustCompile(`^\$\{config\.(\w+)\}$`)
+
+// readYasmFlags: per side, what Soong's yasm rule gets from the toolchain (cc/compiler.go Global.YasmFlags = tc.YasmFlags(): `-f elf64 -m amd64` for x86_64), resolved as Soong's Go would:
+// the factory registerToolchainFactory names for (os, arch) -> the type it returns -> its YasmFlags method, promoted through embedded structs (shallowest wins) -> the pctx.StaticVariable that method's `${config.X}` names.
+// toolchainBase's method returns "" (no flags: arches without .asm sources). A side with no registered factory gets a reason in none (SoongConfig.NoYasm) instead.
+func readYasmFlags(tree, arch string) (out [2][]string, none [2]string, err error) {
+	ident, err := archIdent(tree, arch)
+	if err != nil {
+		return out, none, err
+	}
+	dir := filepath.Join(tree, "build/soong/cc/config")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out, none, err
+	}
+	factories := map[[2]string]string{} // (os, arch) -> factory func
+	funcs := map[string]*ast.FuncDecl{}
+	methods := map[string]string{} // receiver type -> YasmFlags' returned string
+	embeds := map[string][]string{}
+	vars := map[string]ast.Expr{}
+	statics := map[string]string{}
+	sel := func(e ast.Expr) string {
+		if s, ok := e.(*ast.SelectorExpr); ok {
+			return s.Sel.Name
+		}
+		return ""
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			return out, none, err
+		}
+		maps.Copy(vars, valueSpecs(f))
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil {
+					funcs[d.Name.Name] = d
+				} else if d.Name.Name == "YasmFlags" && d.Body != nil && len(d.Body.List) == 1 {
+					if r, ok := d.Body.List[0].(*ast.ReturnStmt); ok && len(r.Results) == 1 {
+						methods[typeName(d.Recv.List[0].Type)] = goString(r.Results[0])
+					}
+				}
+			case *ast.GenDecl:
+				for _, s := range d.Specs {
+					if ts, ok := s.(*ast.TypeSpec); ok {
+						if st, ok := ts.Type.(*ast.StructType); ok {
+							for _, fl := range st.Fields.List {
+								if len(fl.Names) == 0 {
+									embeds[ts.Name.Name] = append(embeds[ts.Name.Name], typeName(fl.Type))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			c, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch {
+			case sel(c.Fun) == "StaticVariable" && len(c.Args) == 2:
+				if l, ok := c.Args[1].(*ast.BasicLit); ok && l.Kind == token.STRING {
+					statics[goString(c.Args[0])] = goString(l)
+				}
+			case isIdent(c.Fun, "registerToolchainFactory") && len(c.Args) == 3:
+				if fn, ok := c.Args[2].(*ast.Ident); ok {
+					factories[[2]string{sel(c.Args[0]), sel(c.Args[1])}] = fn.Name
+				}
+			}
+			return true
+		})
+	}
+	for side, osName := range toolchainOS {
+		where := fmt.Sprintf("%s: toolchain for (%s, %s)", dir, osName, ident)
+		fn := funcs[factories[[2]string{osName, ident}]]
+		if fn == nil {
+			none[side] = "Soong registers no toolchain for (" + osName + ", " + ident + ")"
+			continue
+		}
+		typ := ""
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if r, ok := n.(*ast.ReturnStmt); ok && len(r.Results) == 1 {
+				e := r.Results[0]
+				if id, ok := e.(*ast.Ident); ok {
+					e = vars[id.Name]
+				}
+				if u, ok := e.(*ast.UnaryExpr); ok && u.Op == token.AND {
+					e = u.X
+				}
+				if lit, ok := e.(*ast.CompositeLit); ok {
+					typ = typeName(lit.Type)
+				}
+			}
+			return true
+		})
+		if typ == "" {
+			return out, none, fmt.Errorf("%s: %s returns no toolchain literal", where, fn.Name.Name)
+		}
+		flags, err := promoted(typ, methods, embeds)
+		if err != nil {
+			return out, none, fmt.Errorf("%s: %v", where, err)
+		}
+		if m := configVar.FindStringSubmatch(flags); m != nil {
+			v, ok := statics[m[1]]
+			if !ok {
+				return out, none, fmt.Errorf("%s: no pctx.StaticVariable(%q, <literal>)", where, m[1])
+			}
+			flags = v
+		} else if flags != "" {
+			return out, none, fmt.Errorf("%s: YasmFlags returns %q, not ${config.<var>}", where, flags)
+		}
+		out[side] = strings.Fields(flags)
+	}
+	return out, none, nil
+}
+
+// promoted: the YasmFlags result Go's method promotion gives typ: its own, else the one embedded struct at the shallowest depth that has it.
+func promoted(typ string, methods map[string]string, embeds map[string][]string) (string, error) {
+	for level := []string{typ}; len(level) > 0; {
+		var found []string
+		var next []string
+		for _, t := range level {
+			if _, ok := methods[t]; ok {
+				found = append(found, t)
+			}
+			next = append(next, embeds[t]...)
+		}
+		switch len(found) {
+		case 0:
+			level = next
+		case 1:
+			return methods[found[0]], nil
+		default:
+			return "", fmt.Errorf("YasmFlags ambiguous between %q", found)
+		}
+	}
+	return "", fmt.Errorf("%s has no YasmFlags method", typ)
+}
+
+// typeName: the identifier of a type expression, through one pointer.
+func typeName(e ast.Expr) string {
+	if s, ok := e.(*ast.StarExpr); ok {
+		e = s.X
+	}
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
+}
+
+func isIdent(e ast.Expr, name string) bool {
+	id, ok := e.(*ast.Ident)
+	return ok && id.Name == name
 }
 
 // valueSpecs: a file's top-level `name = value` declarations.
@@ -172,7 +348,7 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 		return SoongConfig{}, err
 	}
 	var cfg SoongConfig
-	var cflags []string
+	var cflags, asflags []string
 	str := func(e ast.Expr) string {
 		if l, ok := e.(*ast.BasicLit); ok && l.Kind == token.STRING {
 			s, _ := strconv.Unquote(l.Value)
@@ -191,11 +367,9 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 					case "CppStdVersion":
 						cfg.CppStd = str(x.Values[i])
 					case "commonGlobalCflags":
-						if lit, ok := x.Values[i].(*ast.CompositeLit); ok {
-							for _, e := range lit.Elts {
-								cflags = append(cflags, str(e))
-							}
-						}
+						cflags, _ = stringList(x.Values[i])
+					case "commonGlobalAsflags":
+						asflags, _ = stringList(x.Values[i])
 					}
 				}
 			}
@@ -219,11 +393,10 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 	if cfg.CStd == "" || cfg.CppStd == "" {
 		return cfg, fmt.Errorf("%s: CStdVersion/CppStdVersion not found", path)
 	}
-	for _, f := range cflags {
-		if strings.HasPrefix(f, "-D") || strings.HasPrefix(f, "-U") {
-			cfg.GlobalDefines = append(cfg.GlobalDefines, f)
-		}
+	defines := func(list []string) []string {
+		return slices.DeleteFunc(list, func(f string) bool { return !strings.HasPrefix(f, "-D") && !strings.HasPrefix(f, "-U") })
 	}
+	cfg.GlobalDefines, cfg.GlobalAsDefines = defines(cflags), defines(asflags)
 	if !slices.Contains(cfg.GlobalDefines, weakAvailability) {
 		return cfg, fmt.Errorf("%s: commonGlobalCflags lacks %s (deviceCompat assumes it)", path, weakAvailability)
 	}
