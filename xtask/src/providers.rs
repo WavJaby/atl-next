@@ -3,10 +3,10 @@
 //! by their own build system instead of AOSP source. Column meanings live in that file's header.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::deps::Deps;
 use crate::upstream;
@@ -30,6 +30,28 @@ pub fn upstreams(providers: &Providers) -> BTreeSet<&str> {
         .values()
         .filter_map(|row| row.provider.strip_prefix("upstream:"))
         .collect()
+}
+
+/// Modules our crates provide (`provider = "crate:<name>"`): (module, crate).
+pub fn crates(providers: &Providers) -> Vec<(&str, &str)> {
+    providers
+        .iter()
+        .filter_map(|(module, row)| {
+            let krate = row.provider.strip_prefix("crate:")?;
+            Some((module.as_str(), krate))
+        })
+        .collect()
+}
+
+/// One module built outside the tree (`crate:` and `upstream:` rows), as `xtask native` hands it to the converter in `<out>/provided.json` (bp2ninja provided.go `Provided`).
+#[derive(Debug, Serialize)]
+pub struct Provided {
+    /// Absolute path of the shared object or archive dependents link.
+    pub lib: PathBuf,
+    /// Header dirs dependents get as `-isystem`.
+    pub include: Vec<PathBuf>,
+    /// `NAME=VALUE` defines the headers depend on, given to dependents as `-D`.
+    pub defines: Vec<String>,
 }
 
 /// Row key = Android.bp module name.
@@ -167,6 +189,10 @@ mod tests {
                     [libicuuc]\nprovider = \"deps:icu\"\nreason = \"r\"\n";
         let providers = parsed(text).unwrap();
         assert_eq!(providers["libicuuc"].provider, "deps:icu");
+        assert_eq!(
+            super::crates(&providers),
+            [("libnativeloader", "atl-nativeloader")]
+        );
     }
 
     #[test]

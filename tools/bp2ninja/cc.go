@@ -74,6 +74,8 @@ type Node struct {
 	rule       *genRule // Kind Gen only
 	// cc_object modules srcs name (`:bcm_object`)
 	objSrcs []*Node
+	// built outside ninja by xtask (provided.go): out and exports only, never in g.order
+	provided bool
 }
 
 // genClosure: generated files n and its dependencies produce; n's compiles wait for them (headers).
@@ -295,17 +297,23 @@ var cxxCompat = []compatHeader{
 }
 
 // deviceCompat: bionic headers on the include path of every device-side C and C++ compile, linked unchanged into <out>/compat/device.
-// Bionic's sys/cdefs.h includes both into every translation unit that includes a libc header; glibc's does not, and AOSP headers use their macros without including them (icu's ndk_headers, nativewindow's hardware_buffer_aidl.h, libsync's sync.h).
+// Bionic's sys/cdefs.h includes it into every translation unit that includes a libc header; glibc's does not, and AOSP headers use its macros without including it (icu's ndk_headers, nativewindow's hardware_buffer_aidl.h, libsync's sync.h).
 //   - android/versioning.h: __INTRODUCED_IN & co.; with weakAvailability they are availability(android, …) attributes, which clang ignores on a linux-gnu target. Force-included (deviceForced).
-//   - android/api-level.h: for sources that include it by name (it declares android_get_device_api_level and android_get_application_target_sdk_version, which bionic implements and glibc lacks); its level macros reach every compile as -D flags (apiLevels).
+//     Function-like macros, no API: not a header atl-bionic generates.
 var deviceCompat = []compatHeader{
 	{"android/versioning.h", "bionic/libc/include/android/versioning.h"},
-	{"android/api-level.h", "bionic/libc/include/android/api-level.h"},
 }
 
 // deviceForced: the deviceCompat header every device-side C and C++ compile force-includes; not assembly, nothing there uses it.
-// Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
+// Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with bionic's api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
 const deviceForced = "android/versioning.h"
+
+// bionicModule: the module whose provider headers are bionic's (system_shared_libs brings it to nearly every device module).
+// bionicForced: its header bionic's sys/cdefs.h brings into every unit that sees bionic's headers (the level names, android_get_device_api_level, …); atl-bionic generates it include-free, so it can be forced.
+const (
+	bionicModule = "libc"
+	bionicForced = "android/api-level.h"
+)
 
 // compatHeader: include name -> tree-relative file.
 type compatHeader struct{ name, path string }
@@ -321,12 +329,13 @@ func compatPath(set []compatHeader, name string) string {
 
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
+	name := strings.TrimPrefix(ref, ":")
 	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs)
-	if g.omit[strings.TrimPrefix(ref, ":")] {
+	if g.omit[name] {
 		return nil
 	}
-	if p, ok := g.provided[strings.TrimPrefix(ref, ":")]; ok {
-		return g.providedNode(strings.TrimPrefix(ref, ":"), side, p)
+	if p, ok := g.provided[name]; ok {
+		return g.providedNode(name, side, p)
 	}
 	m := g.lookup(ref, side)
 	if m == nil {
@@ -356,20 +365,36 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if m.aidl != nil {
 		files = append(files, m.aidl.srcs...)
 	}
-	dep := func(list string, want Kind) []*Node {
+	// a provided shared object links shared, and first, whichever list names it (static_libs, whole_static_libs included); a provided archive stays where it is named
+	var provided []*Node
+	dep := func(refs []string, want Kind) []*Node {
 		var out []*Node
-		for _, r := range n.props.strs(list) {
-			if d := g.node(r, side, want, m.Name); d != nil {
+		for _, r := range refs {
+			d := g.node(r, side, want, m.Name)
+			switch {
+			case d == nil:
+			case d.provided && d.kind == Shared && want != Headers:
+				provided = append(provided, d)
+			default:
 				out = append(out, d)
 			}
 		}
 		return out
 	}
 	// cc_object modules named in srcs (srcFiles) are linked whole, as Soong links their object
-	n.deps.whole = append(dep("whole_static_libs", Static), n.objSrcs...)
-	n.deps.static = dep("static_libs", Static)
-	n.deps.shared = dep("shared_libs", Shared)
-	n.deps.headers = dep("header_libs", Headers)
+	n.deps.whole = append(dep(n.props.strs("whole_static_libs"), Static), n.objSrcs...)
+	n.deps.static = dep(n.props.strs("static_libs"), Static)
+	n.deps.shared = dep(n.props.strs("shared_libs"), Shared)
+	// Soong's implicit system_shared_libs (cc/linker.go): the toolchain's default when unset, `[]` declines it; device only, host tools link the host's C library
+	if side == Device {
+		system := g.soong.SystemSharedLibs
+		if n.props.has("system_shared_libs") {
+			system = n.props.strs("system_shared_libs")
+		}
+		n.deps.shared = append(n.deps.shared, dep(system, Shared)...)
+	}
+	n.deps.shared = uniqueNodes(append(provided, n.deps.shared...))
+	n.deps.headers = dep(n.props.strs("header_libs"), Headers)
 	exported := map[string]bool{}
 	for _, r := range n.props.strs("export_generated_headers") {
 		exported[r] = true
@@ -404,6 +429,18 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
 	return n
+}
+
+func uniqueNodes(list []*Node) []*Node {
+	seen := map[*Node]bool{}
+	var out []*Node
+	for _, n := range list {
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // srcFiles expands one `srcs` entry of n; the genrules it names are consumed (n's compiles wait for them).

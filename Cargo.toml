@@ -16,6 +16,7 @@ anyhow = "1"
 clang = { version = "2.1", features = ["clang_10_0"] }
 clap = { version = "4", features = ["derive"] }
 errno = "0.3"
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 roxmltree = "0.21"
 rustix = { version = "1", features = ["fs", "mm", "thread"] }
 serde = { version = "1", features = ["derive"] }

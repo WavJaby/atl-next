@@ -233,7 +233,10 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), moduleFlags(p, "cppflags")...)
 	c := append(append([]string{"-std=" + cstd}, common...), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
-		dev := slices.Concat(g.soong.APILevels, []string{"-I" + filepath.Join(g.out, "compat", "device"), "-include", deviceForced})
+		dev := []string{g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device"), "-include", deviceForced}
+		if seesBionic(n) {
+			dev = append(dev, "-include", bionicForced)
+		}
 		cxx = append(append(cxx, dev...), "-I"+filepath.Join(g.out, "compat", "cxx"))
 		c = append(c, dev...)
 	}
@@ -242,6 +245,13 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	}
 	asm := append(append([]string{}, common...), moduleFlags(p, "asflags")...)
 	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...)}
+}
+
+// seesBionic: n depends on the bionic provider directly, so its compiles have bionic's headers.
+func seesBionic(n *Node) bool {
+	return slices.ContainsFunc(slices.Concat(n.deps.headers, n.deps.shared), func(d *Node) bool {
+		return d.provided && d.name == bionicModule
+	})
 }
 
 // moduleFlags: a module's flag property as the argv Soong's command line gives clang.
@@ -268,8 +278,9 @@ func soongShellUnsafe(r rune) bool {
 	return !strings.ContainsRune("_+-=.,/", r)
 }
 
-// linkLibs: whole archives, the static closure, shared libraries (also those static dependencies
-// need), and the glibc system libraries bionic folds into libc.
+// linkLibs: provided shared objects, whole archives, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
+// Provided shared objects come first, so they lead the output's DT_NEEDED and the process's lookup order: their strong definitions beat weak fallbacks elsewhere (libbase's and libcutils' __system_property_*); xtask's provided gate checks the result. Soong links system_shared_libs last (LateSharedLibs), where bionic's libc has no fallbacks to beat.
+// An archive has no place in DT_NEEDED or the lookup order: its members are copied into the output, so it links in the group like any static library.
 func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	var closure []*Node
 	staticClosure(n, map[*Node]bool{}, &closure)
@@ -299,18 +310,22 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	libs = append(libs, "-Wl,--start-group")
 	for _, d := range closure {
 		addShared(d.deps.shared)
-		// a static_libs entry the provider supplies as a shared object (provided.go)
-		if d.kind == Shared {
-			addShared([]*Node{d})
-		}
 		if !whole[d] && d.kind == Static {
 			libs = append(libs, d.out)
 			inputs = append(inputs, d.out)
 		}
 	}
 	libs = append(libs, "-Wl,--end-group")
+	var provided []string
 	for _, d := range sharedOrder {
-		if d.kind == Shared {
+		if d.provided {
+			provided = append(provided, d.out, "-Wl,-rpath,"+filepath.Dir(d.out))
+			inputs = append(inputs, d.out)
+		}
+	}
+	libs = append(provided, libs...)
+	for _, d := range sharedOrder {
+		if d.kind == Shared && !d.provided {
 			// absolute build-tree rpath: build tools (aidl) run from here; installed runtime
 			// libraries get their search path from the install layout, not from this
 			libs = append(libs, d.out, "-Wl,-rpath,"+filepath.Dir(d.out))

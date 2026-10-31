@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Upstreams built by their own build system for `providers.toml` rows `upstream:<name>`: `xtask native` configures, builds and installs each into `<out>/upstream/<name>/prefix` before the converter runs, then hands the converter one artifact + compile flags per provided module (bp2ninja `-provided`).
+//! Upstreams built by their own build system for `providers.toml` rows `upstream:<name>`: `xtask native` configures, builds and installs each into `<out>/upstream/<name>/prefix` before the converter runs, then hands the converter one `Provided` entry per module (artifact, include dirs, defines; bp2ninja `-provided`).
 //! CMake only: the one upstream built this way is BoringSSL, and CMake is allowed for it alone (CLAUDE.md). A second build system becomes a `Recipe` field when its first upstream arrives.
 
 use std::collections::BTreeMap;
@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+
+use crate::providers::Provided;
 
 /// How xtask builds one upstream; keyed by its `sources.toml` name.
 pub struct Recipe {
@@ -33,13 +34,6 @@ pub const RECIPES: &[Recipe] = &[Recipe {
 
 pub fn recipe(name: &str) -> Option<&'static Recipe> {
     RECIPES.iter().find(|r| r.name == name)
-}
-
-/// One provided module as the converter reads it (bp2ninja provided.go `Provided`).
-#[derive(Serialize)]
-pub struct Provided {
-    pub lib: String,
-    pub cflags: Vec<String>,
 }
 
 /// The C/C++ toolchain of the converter's build; an upstream is compiled with the same one.
@@ -108,13 +102,11 @@ pub fn build(
             log.display()
         );
     }
-    let mut cflags = vec![format!("-I{}", prefix.join("include").display())];
-    cflags.extend(
-        recipe
-            .shared_defines
-            .iter()
-            .map(|(k, v)| format!("-D{k}={v}")),
-    );
+    let defines: Vec<String> = recipe
+        .shared_defines
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     let mut provided = BTreeMap::new();
     for module in recipe.modules {
         let lib = prefix.join("lib").join(format!("{module}.so"));
@@ -127,8 +119,9 @@ pub fn build(
         provided.insert(
             (*module).to_owned(),
             Provided {
-                lib: lib.display().to_string(),
-                cflags: cflags.clone(),
+                lib,
+                include: vec![prefix.join("include")],
+                defines: defines.clone(),
             },
         );
     }

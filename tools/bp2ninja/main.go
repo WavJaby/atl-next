@@ -6,6 +6,9 @@
 //
 // Usage: bp2ninja -tree <aosp tree> -out <build dir> -arch x86_64 -pointer-bits 64 -cc clang -cxx clang++ -ar llvm-ar goal...
 //
+// Device modules link Soong's implicit system_shared_libs; a module in the -provided file (built by xtask: our crate, an upstream) stands in for its
+// Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles.
+//
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need -jdk, -build-tools, -aconfig and
 // -release, and -metalava where API stubs are built; with them, a goal that names a Java module builds as one. -measure writes
 // <out>/measure.txt (measure.go) instead of a build.
@@ -34,7 +37,7 @@ func main() {
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
-	providedFile := flag.String("provided", "", "JSON file: module -> {lib, cflags} of modules built outside the tree (providers.toml `upstream:`, provided.go)")
+	providedFile := flag.String("provided", "", "JSON file: module -> {lib, include, defines} of modules built outside the tree (providers.toml `crate:` and `upstream:`, provided.go)")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")

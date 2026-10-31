@@ -10,14 +10,15 @@ import (
 	"testing"
 )
 
-// soongTree writes the three files readSoongConfig reads, shaped like the pinned android-16.0.0_r1 ones: global.go's var block (commonGlobalCflags a ValueSpec, commonGlobalIncludes an assignment), config.go's const, api-level.h's #define.
-// 10000 is both upstream values (android/config.go FutureApiLevelInt, api-level.h __ANDROID_API_FUTURE__); U = 34 and the symbolic __ANDROID_API__ default are api-level.h's lines 159 and 101.
+// soongTree writes the four files readSoongConfig reads, shaped like the pinned android-16.0.0_r1 ones: global.go's var block (commonGlobalCflags a ValueSpec, commonGlobalIncludes an assignment), config.go's const, bionic.go's var block, api-level.h's #define.
+// 10000 is both upstream values (android/config.go FutureApiLevelInt, api-level.h __ANDROID_API_FUTURE__); U = 34 and the symbolic __ANDROID_API__ default are api-level.h's lines 159 and 101; libc, libm, libdl is bionic.go's line 22.
 func soongTree(t *testing.T, cflags, soongLevel, bionicLevel string) string {
 	tree := t.TempDir()
 	files := map[string]string{
 		"build/soong/cc/config/global.go": "package config\n\nvar (\n\tcommonGlobalCflags = []string{\n\t\t\"-O2\",\n\t\t" + cflags + "\n\t}\n)\n\n" +
 			"const (\n\tCStdVersion = \"gnu23\"\n\tCppStdVersion = \"gnu++20\"\n)\n\nfunc init() {\n\tcommonGlobalIncludes = []string{\"system/core/include\"}\n}\n",
-		"build/soong/android/config.go": "package android\n\nconst FutureApiLevelInt = " + soongLevel + "\n",
+		"build/soong/cc/config/bionic.go": "package config\n\nvar (\n\tbionicDefaultSharedLibraries = []string{\"libc\", \"libm\", \"libdl\"}\n\n\tbionicCrtBeginStaticBinary, bionicCrtEndStaticBinary = []string{\"crtbegin_static\"}, []string{\"crtend_android\"}\n)\n",
+		"build/soong/android/config.go":   "package android\n\nconst FutureApiLevelInt = " + soongLevel + "\n",
 		"bionic/libc/include/android/api-level.h": "#pragma once\n#define __ANDROID_API_FUTURE__ " + bionicLevel + "\n#ifndef __ANDROID_API__\n" +
 			"#define __ANDROID_API__ __ANDROID_API_FUTURE__\n#endif\n#define __ANDROID_API_U__ 34\n",
 		"system/core/include/.keep": "",
@@ -49,10 +50,12 @@ func TestSoongConfigAvailability(t *testing.T) {
 	if !slices.Equal(cfg.GlobalDefines, defines) {
 		t.Errorf("GlobalDefines %q, want %q", cfg.GlobalDefines, defines)
 	}
-	// the triple's level first, then the header's numeric level names in file order; the symbolic __ANDROID_API__ line is not one
-	want := []string{"-D__ANDROID_API__=10000", "-D__ANDROID_API_FUTURE__=10000", "-D__ANDROID_API_U__=34"}
-	if !slices.Equal(cfg.APILevels, want) {
-		t.Errorf("APILevels %q, want %q", cfg.APILevels, want)
+	// the triple's level only: level names come with the generated api-level.h
+	if cfg.APILevel != "-D__ANDROID_API__=10000" {
+		t.Errorf("APILevel %q", cfg.APILevel)
+	}
+	if want := []string{"libc", "libm", "libdl"}; !slices.Equal(cfg.SystemSharedLibs, want) {
+		t.Errorf("SystemSharedLibs %q, want %q", cfg.SystemSharedLibs, want)
 	}
 	// the forced header is one of the linked ones
 	compatPath(deviceCompat, deviceForced)

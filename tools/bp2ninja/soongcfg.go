@@ -23,7 +23,9 @@ type SoongConfig struct {
 	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
 	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here.
 	GlobalDefines []string
-	APILevels     []string // device-side -D flags: bionic's level names and __ANDROID_API__ (apiLevels)
+	APILevel      string // device-side -D__ANDROID_API__ (apiLevel)
+	// cc/config/bionic.go bionicDefaultSharedLibraries: what a device module links when it sets no system_shared_libs (cc/linker.go; `[]` opts out)
+	SystemSharedLibs []string
 }
 
 // weakAvailability: Soong's global define (commonGlobalCflags) that puts bionic's versioning.h in weak mode: __INTRODUCED_IN becomes a plain availability attribute and __BIONIC_AVAILABILITY_GUARD is 1, so every declaration stays visible.
@@ -31,8 +33,11 @@ type SoongConfig struct {
 // readSoongConfig fails when the pinned Soong no longer passes it: deviceCompat's semantics would then differ from a platform build.
 const weakAvailability = "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"
 
-// apiLevel: an object-like level macro of api-level.h (`__ANDROID_API_FUTURE__`, `__ANDROID_API_U__`, …).
-var apiLevel = regexp.MustCompile(`(?m)^#define (__ANDROID_API_[A-Z0-9_]+__) (\d+)$`)
+// futureLevel: api-level.h's `#define __ANDROID_API_FUTURE__ <n>`.
+var futureLevel = regexp.MustCompile(`(?m)^#define __ANDROID_API_FUTURE__ (\d+)$`)
+
+// bionicHeader: bionic's api-level.h in the tree, the level platform code falls back to.
+const bionicHeader = "bionic/libc/include/android/api-level.h"
 
 func readSoongConfig(tree string) (SoongConfig, error) {
 	path := filepath.Join(tree, "build/soong/cc/config/global.go")
@@ -96,20 +101,65 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 	if !slices.Contains(cfg.GlobalDefines, weakAvailability) {
 		return cfg, fmt.Errorf("%s: commonGlobalCflags lacks %s (deviceCompat assumes it)", path, weakAvailability)
 	}
-	cfg.APILevels, err = apiLevels(tree)
+	if cfg.APILevel, err = apiLevel(tree); err != nil {
+		return cfg, err
+	}
+	cfg.SystemSharedLibs, err = systemSharedLibs(tree)
 	return cfg, err
 }
 
-// apiLevels: -D flags that give every device-side compile what a platform build sees without including anything.
-//   - __ANDROID_API__ = FutureApiLevelInt: Soong gives platform code the triple <arch>-linux-android<FutureApiLevelInt> (cc/compiler.go AddTargetFlags), from which clang defines it; a linux-gnu triple defines nothing.
-//   - api-level.h's level names, verbatim: on bionic every libc include brings them (sys/cdefs.h), and NDK headers use them unincluded (hardware_buffer_aidl.h `__builtin_available(android __ANDROID_API_U__, *)`). The header itself cannot be forced (deviceForced); an explicit include later redefines them identically, which C allows.
-//
-// FutureApiLevelInt must equal __ANDROID_API_FUTURE__, the level api-level.h falls back to; otherwise the two sources disagree on what platform code is and the build stops.
-func apiLevels(tree string) ([]string, error) {
-	path := filepath.Join(tree, "build/soong/android/config.go")
+// stringList: the strings of a `[]string{…}` literal.
+func stringList(e ast.Expr) ([]string, bool) {
+	lit, ok := e.(*ast.CompositeLit)
+	if !ok {
+		return nil, false
+	}
+	var out []string
+	for _, el := range lit.Elts {
+		l, ok := el.(*ast.BasicLit)
+		if !ok || l.Kind != token.STRING {
+			return nil, false
+		}
+		s, _ := strconv.Unquote(l.Value)
+		out = append(out, s)
+	}
+	return out, true
+}
+
+// systemSharedLibs: cc/config/bionic.go bionicDefaultSharedLibraries.
+func systemSharedLibs(tree string) ([]string, error) {
+	path := filepath.Join(tree, "build/soong/cc/config/bionic.go")
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
 		return nil, err
+	}
+	var libs []string
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if v, ok := n.(*ast.ValueSpec); ok {
+			for i, name := range v.Names {
+				if i < len(v.Values) && name.Name == "bionicDefaultSharedLibraries" {
+					libs, found = stringList(v.Values[i])
+				}
+			}
+		}
+		return true
+	})
+	if !found {
+		return nil, fmt.Errorf("%s: bionicDefaultSharedLibraries not found", path)
+	}
+	return libs, nil
+}
+
+// apiLevel: the -D flag for __ANDROID_API__ = FutureApiLevelInt: Soong gives platform code the triple <arch>-linux-android<FutureApiLevelInt> (cc/compiler.go AddTargetFlags), from which clang defines it; a linux-gnu triple defines nothing.
+// The level names (`__ANDROID_API_U__`, …) come with atl-bionic's generated android/api-level.h, force-included where bionic's headers are visible (bionicForced).
+//
+// FutureApiLevelInt must equal bionic's __ANDROID_API_FUTURE__, the level api-level.h falls back to (and atl-bionic reads headers at); otherwise the two sources disagree on what platform code is and the build stops.
+func apiLevel(tree string) (string, error) {
+	path := filepath.Join(tree, "build/soong/android/config.go")
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return "", err
 	}
 	soong := ""
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -125,21 +175,17 @@ func apiLevels(tree string) ([]string, error) {
 		}
 		return true
 	})
-	hdr := filepath.Join(tree, compatPath(deviceCompat, "android/api-level.h"))
+	hdr := filepath.Join(tree, bionicHeader)
 	b, err := os.ReadFile(hdr)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	flags := []string{"-D__ANDROID_API__=" + soong}
 	future := ""
-	for _, m := range apiLevel.FindAllSubmatch(b, -1) {
-		flags = append(flags, "-D"+string(m[1])+"="+string(m[2]))
-		if string(m[1]) == "__ANDROID_API_FUTURE__" {
-			future = string(m[2])
-		}
+	if m := futureLevel.FindSubmatch(b); m != nil {
+		future = string(m[1])
 	}
 	if soong == "" || future != soong {
-		return nil, fmt.Errorf("FutureApiLevelInt %q (%s) and __ANDROID_API_FUTURE__ %q (%s) differ or are missing", soong, path, future, hdr)
+		return "", fmt.Errorf("FutureApiLevelInt %q (%s) and __ANDROID_API_FUTURE__ %q (%s) differ or are missing", soong, path, future, hdr)
 	}
-	return flags, nil
+	return "-D__ANDROID_API__=" + soong, nil
 }

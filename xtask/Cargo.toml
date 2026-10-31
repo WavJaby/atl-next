@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+object.workspace = true
 roxmltree.workspace = true
 serde.workspace = true
 serde_json.workspace = true

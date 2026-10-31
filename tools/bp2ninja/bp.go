@@ -32,6 +32,11 @@ func (o *Obj) get(k string) Val {
 	return o.m[k]
 }
 
+// has: k is set, an empty list included (`system_shared_libs: []` differs from no property).
+func (o *Obj) has(k string) bool {
+	return o.get(k) != nil
+}
+
 func (o *Obj) set(k string, v Val) {
 	if _, ok := o.m[k]; !ok {
 		o.keys = append(o.keys, k)

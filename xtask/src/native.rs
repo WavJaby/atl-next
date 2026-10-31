@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `xtask native`: AOSP native modules built for this Linux host by our Blueprint converter
 //! (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned
-//! `build/blueprint` (through a generated go.work: that path differs per checkout), converts the
-//! goals' closure into ninja, builds it with `ninja -k 0` and summarises the failures by module.
+//! `build/blueprint` (through a generated go.work: that path differs per checkout), builds the
+//! providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their
+//! recipe), converts the goals' closure into ninja, builds it with `ninja -k 0`, summarises the
+//! failures by module and runs the provided gate (provided_gate.rs).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -11,7 +13,8 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
-use crate::{arches, deps, fetch, patch, providers, sources, upstream, workspace};
+use crate::providers::Provided;
+use crate::{arches, deps, fetch, patch, provided_gate, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -100,12 +103,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.fetch_missing {
         fetch::add_and_fetch(root, &[])?;
     }
-    // upstreams built by their own build system, before the converter: it links their installed artifacts
+    // modules built outside the tree, before the converter: it links their artifacts; one entry per module whatever its row kind (crates by cargo-c, upstreams by their own build system)
+    let mut provided = build_crates(root, &out, &providers)?;
     let toolchain = upstream::Toolchain {
         cc: &args.cc,
         cxx: &args.cxx,
     };
-    let mut provided = BTreeMap::new();
     for name in providers::upstreams(&providers) {
         let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
         println!("native: building upstream {name}");
@@ -192,9 +195,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
+    let gate_ok = gate(&out, &provided)?;
     if status.success() {
         println!("native: built -> {}", out.display());
-        return Ok(ExitCode::SUCCESS);
+        return Ok(if gate_ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     let text = std::fs::read_to_string(&log)?;
     let failures = failures(&text, &format!("{}/", out.display()));
@@ -219,6 +227,94 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::FAILURE)
+}
+
+/// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and
+/// `<out>/gen/<crate>/include` (its generated headers), with cargo-c; one cargo target dir per build
+/// directory, so concurrent checkouts do not share artifacts.
+fn build_crates(
+    root: &Path,
+    out: &Path,
+    providers: &providers::Providers,
+) -> Result<BTreeMap<String, Provided>> {
+    let mut built = BTreeMap::new();
+    for (module, krate) in providers::crates(providers) {
+        let prefix = out.join("crates").join(krate);
+        let include = out.join("gen").join(krate).join("include");
+        // headers the crate stopped generating must not stay on the include path
+        if include.exists() {
+            std::fs::remove_dir_all(&include)?;
+        }
+        let status = Command::new("cargo")
+            .args([
+                "cinstall",
+                "--release",
+                "--library-type",
+                "cdylib",
+                "-p",
+                krate,
+            ])
+            .arg("--target-dir")
+            .arg(out.join("cargo"))
+            .arg("--prefix")
+            .arg(&prefix)
+            .arg("--libdir")
+            .arg(prefix.join("lib"))
+            .arg("--includedir")
+            .arg(&include)
+            .current_dir(root)
+            .status()
+            .context("running cargo cinstall (deps.toml row cargo-c)")?;
+        ensure!(status.success(), "building crate {krate} failed");
+        // cargo's library name: the package name with `-` as `_`
+        let lib = prefix
+            .join("lib")
+            .join(format!("lib{}.so", krate.replace('-', "_")));
+        ensure!(
+            lib.is_file(),
+            "{} missing after cargo cinstall",
+            lib.display()
+        );
+        println!(
+            "native: provided {module} = crate {krate} -> {}",
+            lib.display()
+        );
+        built.insert(
+            module.to_owned(),
+            Provided {
+                lib,
+                include: vec![include],
+                defines: Vec::new(),
+            },
+        );
+    }
+    Ok(built)
+}
+
+/// The provided gate (provided_gate.rs) over the device artifacts ninja produced; false on a violation.
+/// Every provided shared object, whatever its row kind: the converter links each one first, and an in-tree strong definition of a provided symbol is a second implementation wherever it comes from.
+/// Archives are not checked: their members are copied into the dependent, so there is no DT_NEEDED order or cross-object lookup to get wrong.
+fn gate(out: &Path, provided: &BTreeMap<String, Provided>) -> Result<bool> {
+    let exported = provided
+        .values()
+        .filter(|p| p.lib.extension().is_some_and(|e| e == "so"))
+        .map(|p| provided_gate::exported(&p.lib))
+        .collect::<Result<Vec<_>>>()?;
+    if exported.is_empty() {
+        return Ok(true);
+    }
+    let report = provided_gate::check(&out.join("device"), &exported)?;
+    println!(
+        "native: provided gate: {} libraries, {} artifacts, {} weak fallbacks lose, {} violations",
+        exported.len(),
+        report.artifacts,
+        report.fallbacks,
+        report.violations.len()
+    );
+    for v in &report.violations {
+        println!("native:   gate: {v}");
+    }
+    Ok(report.violations.is_empty())
 }
 
 /// One converter round's output files.

@@ -8,10 +8,12 @@ import (
 	"strings"
 )
 
-// Provided is a module providers.toml gives to a provider outside the tree, built by xtask before the converter runs (`upstream:` rows): dependents link its artifact and get its compile flags, as from a module the converter built.
+// Provided is a module providers.toml gives to a provider outside the tree (`crate:` and `upstream:` rows), built by xtask before the converter runs: it replaces the tree's definition, and dependents link its artifact and get its headers and defines, as from a module the converter built.
 type Provided struct {
-	Lib    string   `json:"lib"`    // absolute path of the shared object (.so) or archive (.a) dependents link
-	Cflags []string `json:"cflags"` // compile flags its dependents need: include dirs, defines its headers depend on
+	Lib string `json:"lib"` // absolute path of the shared object (.so) or archive (.a) dependents link
+	// header dirs dependents get as -isystem: searched after every -I, so compat/device keeps precedence over bionic's headers; system headers, as bionic's are
+	Include []string `json:"include"`
+	Defines []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
 }
 
 // readProvided reads the -provided file: module name -> Provided, as xtask native writes it.
@@ -37,7 +39,13 @@ func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 	if n, ok := g.nodes[k]; ok {
 		return n
 	}
-	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, exports: p.Cflags}
+	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, provided: true}
+	for _, dir := range p.Include {
+		n.exports = append(n.exports, "-isystem", dir)
+	}
+	for _, d := range p.Defines {
+		n.exports = append(n.exports, "-D"+d)
+	}
 	g.nodes[k] = n
 	return n
 }

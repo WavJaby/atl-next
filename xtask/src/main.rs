@@ -16,6 +16,7 @@ mod native;
 mod notice;
 mod par;
 mod patch;
+mod provided_gate;
 mod providers;
 mod prune;
 mod soong;
