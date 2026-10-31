@@ -16,7 +16,9 @@ use atl_layout::Layout;
 use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::Provided;
 use crate::sources::Pin;
-use crate::{arches, farm, fetch, patch, provided_gate, providers, sources, upstream, workspace};
+use crate::{
+    arches, farm, fetch, patch, provided_gate, providers, sources, triage, upstream, workspace,
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -43,10 +45,10 @@ pub struct Args {
     /// Build directory (default `<workspace>/out/native/<host>`): concurrent checkouts keep their outputs apart.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
+    /// Failure summary: every distinct error message, undefined symbol and failed dependency per module (default: the first few; ninja.log keeps the full output).
+    #[arg(long, short)]
+    verbose: bool,
 }
-
-/// First error lines echoed per failing module; the ninja log keeps all of them.
-const ERRORS_PER_MODULE: usize = 2;
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
@@ -214,7 +216,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         });
     }
     let text = std::fs::read_to_string(&log)?;
-    let failures = failures(&text, &format!("{}/", out.display()));
+    let prefixes = [
+        format!("{}/", out.display()),
+        format!("{}/", tree.display()),
+    ];
+    let failures = triage::failures(&text, &prefixes.each_ref().map(String::as_str));
     if failures.is_empty() {
         // ninja failed without a failed step: it could not load the graph (duplicate rule, missing input)
         let err = std::fs::read_to_string(out.join("ninja.err")).unwrap_or_default();
@@ -223,17 +229,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             err.lines().next().unwrap_or("(no ninja.err)")
         );
     }
-    let total: usize = failures.values().map(|f| f.0).sum();
+    let total: usize = failures.values().map(|f| f.steps).sum();
     println!(
         "native: {total} failed steps in {} modules (log {})",
         failures.len(),
         log.display()
     );
-    for (module, (count, errors)) in &failures {
-        println!("native:   {module}: {count} failed");
-        for e in errors {
-            println!("native:     {e}");
-        }
+    let graph_file = out.join("graph.json");
+    let graph: triage::Graph = serde_json::from_str(
+        &std::fs::read_to_string(&graph_file)
+            .with_context(|| format!("reading {}", graph_file.display()))?,
+    )
+    .with_context(|| format!("parsing {}", graph_file.display()))?;
+    let report = triage::rank(&graph, &failures);
+    for line in triage::render(&report, &failures, args.verbose) {
+        println!("native: {line}");
     }
     Ok(ExitCode::FAILURE)
 }
@@ -378,36 +388,6 @@ fn wanted(
     (want, unresolved)
 }
 
-/// Failed ninja steps grouped by `<side>/<module>` (from the output path), with their first errors.
-fn failures(log: &str, out_prefix: &str) -> BTreeMap<String, (usize, Vec<String>)> {
-    let mut by_module: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
-    let mut current: Option<String> = None;
-    for line in log.lines() {
-        if let Some(outputs) = line.strip_prefix("FAILED: ") {
-            let first = outputs.split(' ').next().unwrap_or(outputs);
-            let rel = first.strip_prefix(out_prefix).unwrap_or(first);
-            // obj/<side>/<module>/…, gen/<side>/<module>/…, <side>/<module>/<artifact>
-            let parts: Vec<&str> = rel.split('/').collect();
-            let module = match parts.as_slice() {
-                ["obj" | "gen", side, module, ..] | [side, module, ..] => {
-                    format!("{side}/{module}")
-                }
-                _ => rel.to_owned(),
-            };
-            by_module.entry(module.clone()).or_default().0 += 1;
-            current = Some(module);
-        } else if let Some(m) = &current
-            && line.contains("error:")
-            && let Some(entry) = by_module.get_mut(m)
-            && entry.1.len() < ERRORS_PER_MODULE
-            && !entry.1.iter().any(|e| e == line.trim())
-        {
-            entry.1.push(line.trim().to_owned());
-        }
-    }
-    by_module
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,29 +504,6 @@ nope
         assert_eq!(
             want["external/zlib"],
             "module libz: y: source :libz#tag is not a known filegroup"
-        );
-    }
-
-    #[test]
-    fn failures_grouped_by_module() {
-        let log = "\
-FAILED: /o/obj/device/liblog/shared/x.o
-x.cpp:1:1: error: boom
-FAILED: /o/gen/host/libaidl-common/src/y.cpp /o/gen/host/libaidl-common/src/y.h
-bison: error
-FAILED: /o/device/libbinder/libbinder.so
-ld.lld: error: undefined symbol: f
-[3/9] cc ok.cpp
-";
-        let f = super::failures(log, "/o/");
-        assert_eq!(
-            f["device/liblog"],
-            (1, vec!["x.cpp:1:1: error: boom".to_owned()])
-        );
-        assert_eq!(f["host/libaidl-common"].0, 1);
-        assert_eq!(
-            f["device/libbinder"].1,
-            ["ld.lld: error: undefined symbol: f"]
         );
     }
 }

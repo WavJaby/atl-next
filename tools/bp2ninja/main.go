@@ -15,7 +15,8 @@
 //
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
 // module references behind the "not found" problems) and <out>/missing-paths.txt (tree directories named by path that do not
-// exist), both one per line, unique and sorted: what the caller may fetch. Exits 0 even with problems, which the caller reports.
+// exist), both one per line, unique and sorted: what the caller may fetch; and <out>/graph.json (graph.go), the cc graph by module directory for
+// the caller's failure triage. Exits 0 even with problems, which the caller reports.
 package main
 
 import (
@@ -125,6 +126,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 		return os.WriteFile(filepath.Join(out, "measure.txt"), []byte(g.measure(goals)), 0o644)
 	}
+	var ccGoals []*Node
 	for _, goal := range goals {
 		if g.java != nil {
 			if m := g.lookupJava(goal, Device); m != nil && g.isJava(m.Type) {
@@ -134,7 +136,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 				continue
 			}
 		}
-		g.node(goal, Device, Shared, "goal")
+		if n := g.node(goal, Device, Shared, "goal"); n != nil {
+			ccGoals = append(ccGoals, n)
+		}
 	}
 	ninja := g.emit(tools)
 	if g.java != nil {
@@ -159,6 +163,13 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(out, "problems.txt"), []byte(strings.Join(g.problems, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+	graph, err := g.graphJSON(ccGoals)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(out, "graph.json"), graph, 0o644); err != nil {
 		return err
 	}
 	// always written, empty included: a stale list of an earlier run must never be read as current
