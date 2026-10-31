@@ -2,7 +2,7 @@
 //! libclang front end: one source parsed once per target -> that arch's view. Every size, alignment,
 //! offset and constant value is clang's, never computed here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -114,6 +114,323 @@ pub fn resolve_include(lang: Lang, target: &Target, name: &str) -> Result<PathBu
         .with_context(|| format!("<{name}> resolved to no file"))
 }
 
+/// What `#include <name>` alone brings in for one target.
+#[derive(Debug, Default)]
+pub struct Probe {
+    /// The file `<name>` resolves to; `None`: the target has no such header (nothing is read then).
+    pub file: Option<PathBuf>,
+    /// The header's own `#error`, when it refuses this target (bionic's `time64.h` on LP64); nothing
+    /// is read then either.
+    pub refused: Option<String>,
+    /// Every file the include reaches, itself included.
+    pub files: BTreeMap<PathBuf, Reached>,
+}
+
+impl Probe {
+    /// The target has the header and can include it.
+    pub fn usable(&self) -> bool {
+        self.file.is_some() && self.refused.is_none()
+    }
+}
+
+/// One file a probe reaches.
+#[derive(Debug, Default)]
+pub struct Reached {
+    /// Its include directives taken in the probe, also those an include guard then skipped.
+    pub includes: Vec<Include>,
+    /// Identifiers it declares (functions, variables, typedefs, enumerators, macros) and the tags it
+    /// defines, as `struct x` / `union x` / `enum x`.
+    pub names: BTreeSet<String>,
+    /// Its macro definitions as written (`NAME body`, `NAME(args) body`), by name.
+    pub macros: BTreeMap<String, String>,
+}
+
+/// One include directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Include {
+    /// As written, without the delimiters.
+    pub name: String,
+    /// `<name>`, not `"name"`.
+    pub angled: bool,
+    pub file: PathBuf,
+}
+
+/// `#include <name>` alone, per name, for one target: what each brings in. Fails on clang errors in an
+/// existing header -- each must compile on its own -- unless every error is an `#error` directive: the
+/// header refusing the target (`Probe::refused`).
+pub fn probe_includes(
+    lang: Lang,
+    target: &Target,
+    names: &[&str],
+) -> Result<BTreeMap<String, Probe>> {
+    let _one_at_a_time = CLANG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let index = Index::new(&clang, false, false);
+    let path = probe_path(lang, "__atl_bridgegen_probe");
+    // file contents for macro definitions, shared by the probes
+    let mut texts = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for name in names {
+        let text = format!("#if __has_include(<{name}>)\n#include <{name}>\n#endif\n");
+        let tu = index
+            .parser(&path)
+            .arguments(&args(lang, target))
+            .unsaved(&[Unsaved::new(&path, text)])
+            .skip_function_bodies(true)
+            .detailed_preprocessing_record(true)
+            .parse()
+            .map_err(|e| anyhow!("libclang could not parse the probe of <{name}>: {e:?}"))?;
+        let one = match refusal(&tu).with_context(|| format!("<{name}> for {}", target.triple))? {
+            Some(msg) => Probe {
+                file: included(&tu, &path)?.first().map(File::get_path),
+                refused: Some(msg),
+                files: BTreeMap::new(),
+            },
+            None => probe(&tu, &path, &mut texts)?,
+        };
+        out.insert((*name).to_owned(), one);
+    }
+    Ok(out)
+}
+
+/// `#include <name>` alone, per name, for one target: the clang errors (`file:line: text`), none for a
+/// header that compiles.
+pub fn include_errors(
+    lang: Lang,
+    target: &Target,
+    names: &[&str],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let units: Vec<String> = names.iter().map(|n| format!("#include <{n}>\n")).collect();
+    let errs = source_errors(lang, target, &units)?;
+    Ok(names.iter().map(|n| (*n).to_owned()).zip(errs).collect())
+}
+
+/// Each source text compiled as its own unit for one target: its clang errors (`file:line: text`).
+pub fn source_errors(lang: Lang, target: &Target, units: &[String]) -> Result<Vec<Vec<String>>> {
+    let _one_at_a_time = CLANG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let index = Index::new(&clang, false, false);
+    let path = probe_path(lang, "__atl_bridgegen_errors");
+    units
+        .iter()
+        .map(|text| {
+            let tu = index
+                .parser(&path)
+                .arguments(&args(lang, target))
+                .unsaved(&[Unsaved::new(&path, text)])
+                .skip_function_bodies(true)
+                .parse()
+                .map_err(|e| anyhow!("libclang could not parse {text:?}: {e:?}"))?;
+            Ok(error_lines(&tu))
+        })
+        .collect()
+}
+
+/// The files the probe unit's main file includes.
+fn included<'tu>(tu: &'tu TranslationUnit, main: &Path) -> Result<Vec<File<'tu>>> {
+    let main = tu.get_file(main).context("probe: no main file")?;
+    Ok(main
+        .get_includes()
+        .iter()
+        .filter_map(Entity::get_file)
+        .collect())
+}
+
+/// `None` without errors; the messages when every error is an `#error` directive; fails otherwise.
+fn refusal(tu: &TranslationUnit) -> Result<Option<String>> {
+    let errs: Vec<_> = tu
+        .get_diagnostics()
+        .into_iter()
+        .filter(|d| matches!(d.get_severity(), Severity::Error | Severity::Fatal))
+        .collect();
+    if errs.is_empty() {
+        return Ok(None);
+    }
+    let directive = |d: &clang::diagnostic::Diagnostic| {
+        let loc = d.get_location().get_file_location();
+        let Some(file) = loc.file else { return false };
+        std::fs::read_to_string(file.get_path()).is_ok_and(|text| {
+            text.lines()
+                .nth(loc.line.saturating_sub(1) as usize)
+                .is_some_and(|l| {
+                    l.trim_start()
+                        .strip_prefix('#')
+                        .is_some_and(|rest| rest.trim_start().starts_with("error"))
+                })
+        })
+    };
+    if errs.iter().all(directive) {
+        let msgs: Vec<String> = errs.iter().map(|d| d.get_text()).collect();
+        return Ok(Some(msgs.join("; ")));
+    }
+    errors(tu).map(|()| None)
+}
+
+/// Where each `<name>` resolves for one target, without reading the headers (they need not compile on
+/// their own); names the target lacks are absent.
+pub fn resolve_includes(
+    lang: Lang,
+    target: &Target,
+    names: &[&str],
+) -> Result<BTreeMap<String, PathBuf>> {
+    let _one_at_a_time = CLANG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let index = Index::new(&clang, false, false);
+    let path = probe_path(lang, "__atl_bridgegen_resolve");
+    let text: String = names
+        .iter()
+        .map(|n| format!("#if __has_include(<{n}>)\n#include <{n}>\n#endif\n"))
+        .collect();
+    let tu = index
+        .parser(&path)
+        .arguments(&args(lang, target))
+        .unsaved(&[Unsaved::new(&path, text)])
+        .single_file_parse(true)
+        .detailed_preprocessing_record(true)
+        .parse()
+        .map_err(|e| anyhow!("libclang could not parse the resolve probe: {e:?}"))?;
+    let main = tu.get_file(&path).context("resolve probe: no main file")?;
+    let mut out = BTreeMap::new();
+    for inc in main.get_includes() {
+        if let (Some(name), Some(file)) = (inc.get_name(), inc.get_file()) {
+            out.insert(name, file.get_path());
+        }
+    }
+    Ok(out)
+}
+
+fn probe_path(lang: Lang, stem: &str) -> PathBuf {
+    std::env::temp_dir().join(match lang {
+        Lang::C => format!("{stem}.c"),
+        Lang::Cxx => format!("{stem}.cc"),
+    })
+}
+
+/// The probe unit's include graph from its main file, and what each reached file declares.
+fn probe(
+    tu: &TranslationUnit,
+    main: &Path,
+    texts: &mut BTreeMap<PathBuf, String>,
+) -> Result<Probe> {
+    let roots = included(tu, main)?;
+    let mut out = Probe {
+        file: roots.first().map(File::get_path),
+        refused: None,
+        files: BTreeMap::new(),
+    };
+    let mut todo = roots;
+    while let Some(f) = todo.pop() {
+        let path = f.get_path();
+        if out.files.contains_key(&path) {
+            continue;
+        }
+        let mut reached = Reached::default();
+        for e in f.get_includes() {
+            let (Some(name), Some(file)) = (e.get_name(), e.get_file()) else {
+                continue;
+            };
+            reached.includes.push(Include {
+                name,
+                angled: is_angled(&e),
+                file: file.get_path(),
+            });
+            todo.push(file);
+        }
+        out.files.insert(path, reached);
+    }
+    declared(&tu.get_entity(), &mut out, texts)?;
+    Ok(out)
+}
+
+/// `<name>`, not `"name"`: the directive's own tokens.
+fn is_angled(directive: &Entity) -> bool {
+    directive
+        .get_range()
+        .is_some_and(|r| r.tokenize().iter().any(|tok| tok.get_spelling() == "<"))
+}
+
+/// Names `parent`'s children declare, into the reached file each is declared in; `extern "C"` blocks
+/// looked into. `texts`: file contents read so far, for macro definitions.
+fn declared(parent: &Entity, out: &mut Probe, texts: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+    for e in parent.get_children() {
+        let kind = e.get_kind();
+        if kind == EntityKind::LinkageSpec {
+            declared(&e, out, texts)?;
+            continue;
+        }
+        let Some(path) = e
+            .get_location()
+            .and_then(|l| l.get_file_location().file)
+            .map(|f| f.get_path())
+        else {
+            continue;
+        };
+        let Some(reached) = out.files.get_mut(&path) else {
+            continue;
+        };
+        match kind {
+            EntityKind::MacroDefinition => {
+                let name = e.get_name().context("unnamed macro")?;
+                let range = e.get_range().context("macro definition without a range")?;
+                if !texts.contains_key(&path) {
+                    let text = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    texts.insert(path.clone(), text);
+                }
+                let text = &texts[&path];
+                let offset =
+                    |l: clang::source::SourceLocation| l.get_file_location().offset as usize;
+                let start = offset(range.get_start());
+                // the range ends at the start of the last token; the text, at that token's end
+                let end = range
+                    .tokenize()
+                    .last()
+                    .map_or(start, |t| offset(t.get_range().get_end()));
+                let def = text
+                    .get(start..end)
+                    .with_context(|| format!("{}: macro {name} out of range", path.display()))?;
+                reached.macros.insert(name.clone(), def.to_owned());
+                reached.names.insert(name);
+            }
+            EntityKind::EnumDecl => {
+                for c in e.get_children() {
+                    if c.get_kind() == EntityKind::EnumConstantDecl {
+                        reached.names.extend(c.get_name());
+                    }
+                }
+                if e.is_definition() && !e.is_anonymous() {
+                    reached
+                        .names
+                        .extend(e.get_name().map(|n| format!("enum {n}")));
+                }
+            }
+            EntityKind::StructDecl | EntityKind::UnionDecl => {
+                if e.is_definition() && !e.is_anonymous() {
+                    let k = if kind == EntityKind::UnionDecl {
+                        "union"
+                    } else {
+                        "struct"
+                    };
+                    reached
+                        .names
+                        .extend(e.get_name().map(|n| format!("{k} {n}")));
+                }
+            }
+            EntityKind::FunctionDecl | EntityKind::VarDecl | EntityKind::TypedefDecl => {
+                reached.names.extend(e.get_name());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn args(lang: Lang, t: &Target) -> Vec<String> {
     let (x, std) = match lang {
         Lang::C => ("c", "-std=gnu11"),
@@ -125,16 +442,20 @@ fn args(lang: Lang, t: &Target) -> Vec<String> {
     args
 }
 
-fn errors(tu: &TranslationUnit) -> Result<()> {
-    let errors: Vec<String> = tu
-        .get_diagnostics()
+/// The unit's errors as `file:line: text`.
+fn error_lines(tu: &TranslationUnit) -> Vec<String> {
+    tu.get_diagnostics()
         .iter()
         .filter(|d| matches!(d.get_severity(), Severity::Error | Severity::Fatal))
         .map(|d| {
             let (file, line, _) = d.get_location().get_presumed_location();
             format!("{file}:{line}: {}", d.get_text())
         })
-        .collect();
+        .collect()
+}
+
+fn errors(tu: &TranslationUnit) -> Result<()> {
+    let errors = error_lines(tu);
     ensure!(
         errors.is_empty(),
         "clang errors:\n  {}",
@@ -205,10 +526,7 @@ fn includes(tu: &TranslationUnit, path: &Path) -> Result<Vec<String>> {
         .iter()
         .map(|e| {
             let name = e.get_name().context("include directive without a name")?;
-            let angled = e
-                .get_range()
-                .is_some_and(|r| r.tokenize().iter().any(|tok| tok.get_spelling() == "<"));
-            Ok(if angled {
+            Ok(if is_angled(e) {
                 format!("<{name}>")
             } else {
                 format!("\"{name}\"")
