@@ -19,8 +19,10 @@
 //! the rest are reported, since a home brings a whole host header for a few names. A name no host header
 //! declares is missing API, not shape.
 //!
-//! Macros: bionic macros the host lacks (`__unused`) are defined where bionic defines them; host headers
-//! that use such a name as an identifier are wrapped to hide it (bionic renames those kernel fields).
+//! Macros: bionic macros the host lacks (`__unused`, `IS_ELF`) are defined, as bionic writes them, in the
+//! wrapper of every public header that brings them in -- defining them itself or through its private
+//! files (`<elf.h>` -> `bits/elf_common.h`); host headers that use such a name as an identifier are
+//! wrapped to hide it (bionic renames those kernel fields).
 //!
 //! Known excess: a glibc header including `x` where bionic's does not (`sys/types.h` -> `sys/select.h`)
 //! now also gets the wrapper's additions to `x`.
@@ -56,7 +58,7 @@ pub struct Inputs<'a> {
     /// Private bionic file (include name) -> host header declaring what it brings in. Every row must
     /// be needed and must declare every needed name.
     pub homes: &'a [(&'a str, &'a str)],
-    /// bionic macros the host lacks, defined in the wrapper of the bionic header defining them.
+    /// bionic macros the host lacks, defined in the wrapper of each public bionic header bringing them in.
     pub macros: &'a [&'a str],
     /// Host headers outside the probes the clash scan reads (the host's kernel uapi), by include name.
     pub scan: &'a BTreeMap<String, PathBuf>,
@@ -177,8 +179,8 @@ fn walk(inputs: &Inputs, probe: &Probe, host_has: &dyn Fn(&str) -> bool) -> Resu
     Ok(out)
 }
 
-/// The shape. Fails on an unneeded or insufficient home, or a forwarded macro the host already has or
-/// no public bionic header defines.
+/// The shape. Fails on an unneeded or insufficient home, or a forwarded macro the host already has, no
+/// public bionic header the host also has brings in, or bionic defines two ways.
 pub fn derive(inputs: &Inputs) -> Result<Shape> {
     let host_has = |n: &str| inputs.host.get(n).is_some_and(Probe::usable);
     let host_all: BTreeSet<&String> = inputs.host.values().flat_map(visible).collect();
@@ -255,8 +257,9 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             !host_all.contains(&(*m).to_owned()),
             "the host's headers define {m}: drop it from the forwarded macros"
         );
-        let (header, def) = macro_home(inputs, m)?;
-        out.entry(header).or_default().defines.push(def);
+        for (header, def) in macro_homes(inputs, m, &host_has)? {
+            out.entry(header).or_default().defines.push(def);
+        }
         for (name, path) in scanned(inputs) {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -317,25 +320,37 @@ fn reduce(extras: &BTreeSet<String>, host: &BTreeMap<String, Probe>) -> Vec<Stri
         .collect()
 }
 
-/// The bionic header defining macro `m` and its definition, from the probes.
-fn macro_home(inputs: &Inputs, m: &str) -> Result<(String, String)> {
-    let defines = |p: &Probe| -> Option<String> {
-        p.file
-            .as_ref()
-            .and_then(|f| p.files.get(f))
-            .and_then(|r: &Reached| r.macros.get(m).cloned())
-    };
-    let found: Vec<(String, String)> = inputs
-        .bionic
-        .iter()
-        .filter(|(n, _)| !is_private(n))
-        .filter_map(|(n, p)| defines(p).map(|d| (n.clone(), d)))
-        .collect();
-    match found.as_slice() {
-        [one] => Ok(one.clone()),
-        [] => bail!("no public bionic header defines {m} itself"),
-        more => bail!("more than one bionic header defines {m}: {more:?}"),
+/// The public bionic headers (the host has them too) bringing macro `m` in -- defined in the header itself
+/// or in a private file its walk enters -- each with the definition, from the probes. An includable
+/// header that defines it is not entered: its own wrapper gets the definition.
+fn macro_homes(
+    inputs: &Inputs,
+    m: &str,
+    host_has: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>> {
+    let mut found = Vec::new();
+    for (name, probe) in inputs.bionic {
+        if is_private(name) || !probe.usable() || !host_has(name) {
+            continue;
+        }
+        let root = probe.file.as_ref().context("usable probe without a file")?;
+        let walk = walk(inputs, probe, host_has)?;
+        let def = std::iter::once(root)
+            .chain(walk.private.iter().map(|(_, f)| f))
+            .find_map(|f| probe.files.get(f).and_then(|r: &Reached| r.macros.get(m)));
+        if let Some(def) = def {
+            found.push((name.clone(), def.clone()));
+        }
     }
+    ensure!(
+        !found.is_empty(),
+        "no public bionic header the host also has defines {m} or brings it in"
+    );
+    ensure!(
+        found.iter().all(|(_, d)| *d == found[0].1),
+        "bionic defines {m} more than one way: {found:?}"
+    );
+    Ok(found)
 }
 
 /// Every host header the clash scan reads, by include name: what the host probes reach, and `scan`.
@@ -490,8 +505,9 @@ mod tests {
 
     /// Two fake libcs. bionic's `w.h` includes `x.h` (the host's does not), private `bits/p.h` (which
     /// includes `y.h` and declares `q`, the host's in `q.h` and `z.h`), and a uapi header; its
-    /// `sys/cdefs.h` defines `__mac`, which the host's `k/u.h` uses as a field name. bionic's `q.h` and
-    /// `z.h` exist so the host's are probed; bionic's `q.h` reaches `y.h`, which the host's lacks.
+    /// `sys/cdefs.h` defines `__mac`, which the host's `k/u.h` uses as a field name; `bits/p.h` defines
+    /// `__pm(x)`. bionic's `q.h` and `z.h` exist so the host's are probed; bionic's `q.h` reaches `y.h`,
+    /// which the host's lacks.
     fn libcs(tag: &str) -> Tmp {
         let root = std::env::temp_dir().join(format!("atl-shape-{tag}-{}", std::process::id()));
         let files: &[(&str, &str)] = &[
@@ -505,7 +521,10 @@ mod tests {
             ),
             ("bionic/x.h", "int x;\n"),
             ("bionic/y.h", "int y;\n"),
-            ("bionic/bits/p.h", "#include <y.h>\nint p_only;\nint q;\n"),
+            (
+                "bionic/bits/p.h",
+                "#include <y.h>\nint p_only;\nint q;\n#define __pm(x) ((x) + \\\n  1)\n",
+            ),
             ("bionic/q.h", "#include <bits/p.h>\n"),
             ("bionic/z.h", "int z;\n"),
             ("uapi/k/u.h", "int kern;\n"),
@@ -536,6 +555,10 @@ mod tests {
     }
 
     fn derived(dir: &Tmp, homes: &[(&str, &str)]) -> Result<Shape> {
+        derived_with(dir, homes, &["__mac", "__pm"])
+    }
+
+    fn derived_with(dir: &Tmp, homes: &[(&str, &str)], macros: &[&str]) -> Result<Shape> {
         let include = dir.0.join("bionic");
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
@@ -554,7 +577,7 @@ mod tests {
             bionic_include: &include,
             uapi: &uapi,
             homes,
-            macros: &["__mac"],
+            macros,
             scan: &scan,
         })
     }
@@ -583,7 +606,14 @@ mod tests {
         );
         // q.h needs no home: its host version declares q itself
         assert_eq!(with_home.wrappers["q.h"].includes, strings(&["y.h"]));
+        // a private file's macro, as written, in every header whose walk enters it
+        let pm = strings(&["__pm(x) ((x) + \\\n  1)"]);
+        assert_eq!(with_home.wrappers["w.h"].defines, pm);
+        assert_eq!(with_home.wrappers["q.h"].defines, pm);
         assert_eq!(with_home.wrappers.len(), 4);
+        // a macro the host defines, or no bionic header brings in, is refused
+        assert!(derived_with(&dir, &[("bits/p.h", "q.h")], &["q"]).is_err());
+        assert!(derived_with(&dir, &[("bits/p.h", "q.h")], &["__nowhere"]).is_err());
         assert!(with_home.gaps.is_empty());
 
         // without the home: reported, with both host headers declaring q (one file each, by name);

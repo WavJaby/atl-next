@@ -46,6 +46,11 @@ const CASES: &[(&str, &str)] = &[
         "sys/cdefs.h: #define __unused __attribute__((__unused__))",
         "#include <sys/types.h>\n#include <linux/sysctl.h>\n#include <linux/icmp.h>\nstatic int v __unused;\n",
     ),
+    // libc_malloc_debug_backtrace MapData.cpp; bare, the call is an undeclared function
+    (
+        "elf.h: #include <bits/elf_common.h>, which defines IS_ELF(ehdr)",
+        "#include <elf.h>\nextern const Elf64_Ehdr e;\nint v = sizeof(IS_ELF(e));\n",
+    ),
 ];
 
 fn target(args: Vec<String>) -> Target {

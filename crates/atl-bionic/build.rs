@@ -120,9 +120,10 @@ const BIONIC_INCLUDE: &str = "bionic/libc/include";
 /// bionic's `<unistd.h>` declares `ioctl` (libnetdutils, libdmabufheap), glibc only `<sys/ioctl.h>`.
 const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 
-/// bionic `sys/cdefs.h` macros the host lacks and AOSP code uses without defining them: `__unused`
-/// (bpf's KernelUtils.h, libtimeinstate).
-const FORWARDED_MACROS: &[&str] = &["__unused"];
+/// bionic macros the host lacks and AOSP code uses without defining them, defined where bionic's headers
+/// bring them in: `__unused` (`sys/cdefs.h`; bpf's KernelUtils.h, libtimeinstate), `IS_ELF` (`elf.h`
+/// via `bits/elf_common.h`; libc_malloc_debug_backtrace MapData.cpp).
+const FORWARDED_MACROS: &[&str] = &["__unused", "IS_ELF"];
 
 /// Generated files: path relative to OUT_DIR -> text.
 type Outputs = Vec<(PathBuf, String)>;
