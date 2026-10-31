@@ -6,7 +6,83 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::Target;
+use crate::c::Kept;
+use crate::{Lang, Source, Target};
+
+/// One C API a crate implements, declared by an upstream file: what its build script generates for it.
+pub struct Api {
+    /// Output stem: `OUT_DIR/<name>.rs`.
+    pub name: &'static str,
+    /// Declaring file, relative to the AOSP tree.
+    pub source: &'static str,
+    pub lang: Lang,
+    /// Where consumers include it (`None`: no public header declares it, nothing to print).
+    pub header: Option<&'static str>,
+    /// Exported by the implementation; only these are declared, so declared == implemented == checked.
+    pub functions: &'static [&'static str],
+    /// Macros (or globs) the C header defines and Rust code uses.
+    pub macros: &'static [&'static str],
+    /// Include directories the source needs besides the target's, relative to the AOSP tree.
+    pub include_dirs: &'static [&'static str],
+    /// What the C header keeps of the source for its callers.
+    pub kept: Kept<'static>,
+}
+
+/// Nothing kept: declarations only.
+pub const DECLARATIONS: Kept<'static> = Kept {
+    includes: false,
+    macros: &[],
+};
+
+/// Generated files of `api` parsed for `target` (plus the API's include dirs), paths relative to
+/// OUT_DIR: `<name>.rs` (its constants and opaque types, and the check that each function of
+/// `implementation`, a Rust path, has the header's signature), `<name>.ir.json`, and with a header
+/// `capi/include/<header>` (exactly `functions`, the constants, what `kept` keeps).
+pub fn api_files(
+    up: &Upstreams,
+    api: &Api,
+    mut target: Target,
+    implementation: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    target.args.extend(
+        api.include_dirs
+            .iter()
+            .map(|d| format!("-I{}", up.aosp(d).display())),
+    );
+    let arch = target.arch.clone();
+    let path = up.aosp(api.source);
+    let src = Source {
+        path: &path,
+        lang: api.lang,
+        also: &[],
+        macros: api.macros,
+    };
+    let iface = crate::interface(api.name, api.source, &src, &[target]).context(api.source)?;
+    let mut files = vec![
+        (
+            format!("{}.rs", api.name).into(),
+            crate::rust::api_module(&iface, &arch, api.functions, implementation)?,
+        ),
+        (
+            format!("{}.ir.json", api.name).into(),
+            crate::to_json(&iface)?,
+        ),
+    ];
+    if let Some(header) = api.header {
+        let view = &iface.arches[&arch];
+        let constants: Vec<&str> = view
+            .constants
+            .keys()
+            .chain(view.strings.keys())
+            .map(String::as_str)
+            .collect();
+        files.push((
+            Path::new("capi/include").join(header),
+            crate::c::header(&iface, &arch, api.functions, &constants, &api.kept)?,
+        ));
+    }
+    Ok(files)
+}
 
 /// The arches.toml row of a host target.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -104,6 +104,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-vndksupport"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -24,6 +24,12 @@ crates = ["atl-binder-wire", "atl-binderd"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
+# libvndksupport for source-built AOSP code (SP-HAL loading, one namespace); the loader's namespaces later
+[vndksupport]
+crates = ["atl-vndksupport"]
+exports = ["atl-vndksupport"]
+uses = ["generators"]
+
 [generators]
 crates = ["atl-bridgegen"]
 # build-dependency of crates whose types are generated from upstream headers

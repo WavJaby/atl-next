@@ -54,8 +54,8 @@ provider = "none"
 reason = "bionic linker namespace API; our libnativeloader owns namespaces"
 
 ["libvndksupport"]
-provider = "none"
-reason = "vendor SP-HAL loading; ATL has no vendor partition"
+provider = "crate:atl-vndksupport"
+reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace, so AOSP's fallback dlopen/dlclose is the whole behaviour"
 
 # AOSP's external/boringssl is the frozen FIPS branch, still under the OpenSSL licence, which the GPL-3 QEMU bridge's process cannot hold; upstream relicensed to Apache-2.0
 ["libcrypto"]

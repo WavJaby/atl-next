@@ -24,36 +24,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_bridgegen::buildscript::{self, HostArch, Upstreams};
+use atl_bridgegen::buildscript::{self, Api, DECLARATIONS, HostArch, Upstreams};
 use atl_bridgegen::c::Kept;
 use atl_bridgegen::ir::{ArchView, Interface, Ty};
 use atl_bridgegen::{Lang, Source, Target, front, shape};
 
-/// One bionic API this crate implements.
-struct Api {
-    /// Output stem: `OUT_DIR/<name>.rs`.
-    name: &'static str,
-    /// Declaring file, relative to the AOSP tree.
-    source: &'static str,
-    lang: Lang,
-    /// Where consumers include it (`None`: no public header declares it, nothing to print).
-    header: Option<&'static str>,
-    /// Exported by `crate::ffi`; only these are declared, so declared == implemented == checked.
-    functions: &'static [&'static str],
-    /// Macros (or globs) the C header defines and Rust code uses.
-    macros: &'static [&'static str],
-    /// Include directories the source needs besides bionic's libc headers, relative to the AOSP tree.
-    include_dirs: &'static [&'static str],
-    /// What the C header keeps of the source for its callers.
-    kept: Kept<'static>,
-}
-
-/// Nothing kept: declarations only.
-const DECLARATIONS: Kept<'static> = Kept {
-    includes: false,
-    macros: &[],
-};
-
+/// The bionic APIs this crate implements, in `crate::ffi`.
 const APIS: &[Api] = &[
     Api {
         name: "system_properties",
@@ -256,42 +232,8 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
     let mut files = Outputs::new();
     let level = future_level(up, host)?;
     for api in APIS {
-        let mut target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
-        target.args.extend(
-            api.include_dirs
-                .iter()
-                .map(|d| format!("-I{}", up.aosp(d).display())),
-        );
-        let path = up.aosp(api.source);
-        let src = Source {
-            path: &path,
-            lang: api.lang,
-            also: &[],
-            macros: api.macros,
-        };
-        let iface = atl_bridgegen::interface(api.name, api.source, &src, &[target])
-            .with_context(|| api.source)?;
-        files.push((
-            format!("{}.rs", api.name).into(),
-            atl_bridgegen::rust::api_module(&iface, &host.arch, api.functions, "crate::ffi")?,
-        ));
-        files.push((
-            format!("{}.ir.json", api.name).into(),
-            atl_bridgegen::to_json(&iface)?,
-        ));
-        if let Some(header) = api.header {
-            let view = &iface.arches[&host.arch];
-            let constants: Vec<&str> = view
-                .constants
-                .keys()
-                .chain(view.strings.keys())
-                .map(String::as_str)
-                .collect();
-            files.push((
-                Path::new("capi/include").join(header),
-                atl_bridgegen::c::header(&iface, &host.arch, api.functions, &constants, &api.kept)?,
-            ));
-        }
+        let target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
+        files.extend(buildscript::api_files(up, api, target, "crate::ffi")?);
     }
     let iface = prop_area(up, bionic_target(up, host, level, Some(libcxx)), out)?;
     check_prop_area_shape(&iface.arches[&host.arch])?;
