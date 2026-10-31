@@ -6,6 +6,7 @@
 //!   and a check that each implementing function has exactly the header's signature.
 //! - `layout_module`: size, alignment and field offsets as constants, for code that reads a layout in
 //!   shared memory through atomics rather than through a Rust type.
+//! - `resolver_module`: exported shells with the header's signatures that forward to an implementation looked up by name at run time.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -187,6 +188,97 @@ pub fn api_module(
     }
     opaque_types(&mut out, view, &opaque)?;
     Ok(out)
+}
+
+/// For each of `functions`, an exported `#[no_mangle]` shell with the header's exact signature that forwards its arguments unchanged to the implementation `resolver` finds by name: `<resolver>::<F>(c"<name>")`, an `unsafe fn(&CStr) -> Option<F>` the crate provides (F = the header's fn-pointer type), called once per function and process (`OnceLock`, so concurrent first calls are safe), its answer kept, `None` included.
+/// Without an implementation the shell runs `on_null(name, return type)`, a diverging Rust expression (`return <value of the return type>`, or a call returning `!`): the caller decides what "no implementation" means for its API.
+/// Opaque types the signatures use are defined; the module holds nothing else. A variadic function has no forwarding shell: fails.
+pub fn resolver_module(
+    iface: &Interface,
+    arch: &str,
+    functions: &[&str],
+    resolver: &str,
+    on_null: &dyn Fn(&str, &Ty) -> Result<String>,
+) -> Result<String> {
+    let view = view(iface, arch)?;
+    let mut out = banner(iface, arch, view);
+    let mut opaque = BTreeSet::new();
+    for f in functions {
+        let sig = view
+            .functions
+            .get(*f)
+            .with_context(|| format!("{}: no function {f}", iface.header))?;
+        ensure!(
+            !sig.variadic,
+            "{f}: a variadic function cannot be forwarded"
+        );
+        // a forwarded record is only ever behind a pointer: no layout to assert, it is opaque here
+        for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+            ensure!(
+                !matches!(t.resolved(), Ty::Record { .. }),
+                "{f}: a record by value (its layout would need asserting; host_module types)"
+            );
+            pointed_records(t, &mut opaque);
+        }
+        let ty = fn_ty(sig, &mut opaque).with_context(|| (*f).to_owned())?;
+        let params = sig
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Ok(format!("p{i}: {}", rust_ty(p, &mut opaque)?)))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| (*f).to_owned())?;
+        let args: Vec<String> = (0..sig.params.len()).map(|i| format!("p{i}")).collect();
+        let ret = match sig.ret.resolved() {
+            Ty::Void => String::new(),
+            _ => format!(" -> {}", rust_ty(&sig.ret, &mut opaque)?),
+        };
+        let fallback = on_null(f, &sig.ret).with_context(|| (*f).to_owned())?;
+        writeln!(
+            out,
+            "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn {name}({params}){ret} {{\n    type F = {ty};\n    static IMPL: ::std::sync::OnceLock<Option<F>> = ::std::sync::OnceLock::new();\n    // SAFETY: F is the header's signature of `{f}`, the name looked up\n    let found = *IMPL.get_or_init(|| unsafe {{ {resolver}::<F>(c\"{f}\") }});\n    let Some(f) = found else {{ {fallback} }};\n    // SAFETY: the implementation of `{f}`, of this exact signature; the caller's contract is its own\n    unsafe {{ f({args}) }}\n}}\n",
+            name = ident(f),
+            params = params.join(", "),
+            args = args.join(", "),
+        )?;
+        // `usize` / `isize` stand for these typedefs only where their width is the pointer's
+        let mut sized = BTreeSet::new();
+        for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+            pointer_sized_uses(t, &mut sized);
+        }
+        for (name, bits) in sized {
+            writeln!(
+                out,
+                "const _: () = assert!(::core::mem::size_of::<usize>() * 8 == {bits}, \"{name}\");"
+            )?;
+        }
+    }
+    for name in &opaque {
+        writeln!(
+            out,
+            "/// Only used behind pointers here.\n#[repr(C)]\n#[allow(non_camel_case_types)]\npub struct {} {{\n    _opaque: [u8; 0],\n}}\n",
+            ident(name)
+        )?;
+    }
+    Ok(out)
+}
+
+/// Records of this interface that `ty` reaches through pointers, into `out`.
+fn pointed_records(ty: &Ty, out: &mut BTreeSet<String>) {
+    match ty {
+        Ty::Record { name } => {
+            out.insert(name.clone());
+        }
+        Ty::Typedef { ty, .. } => pointed_records(ty, out),
+        Ty::Pointer { pointee, .. } => pointed_records(pointee, out),
+        Ty::Array { elem, .. } => pointed_records(elem, out),
+        Ty::Function(sig) => {
+            for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                pointed_records(t, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Constants, and per record a module `<record>` with `SIZE`, `ALIGN` and one `usize` offset per field

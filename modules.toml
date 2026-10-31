@@ -40,6 +40,12 @@ crates = ["atl-debuggerd-client"]
 exports = ["atl-debuggerd-client"]
 uses = ["generators"]
 
+# EGL / GLES extension entry points as symbols, linked next to the host GL loaders (providers.toml)
+[glext]
+crates = ["atl-glext"]
+exports = ["atl-glext"]
+uses = ["generators"]
+
 [generators]
 crates = ["atl-bridgegen"]
 # build-dependency of crates whose types are generated from upstream headers

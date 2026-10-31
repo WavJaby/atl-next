@@ -9,7 +9,7 @@
 //! fails the run.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -109,25 +109,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.fetch_missing {
         fetch::add_and_fetch(root, &[])?;
     }
-    // modules provided outside the tree, before the converter: it links their artifacts; one entry per module whatever its row kind (crates by cargo-c, upstreams by their own build system, system libraries as installed)
-    let mut provided = build_crates(root, &out, &providers)?;
-    for (module, row) in providers::systems(&providers) {
+    // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
+    let crates = build_crates(root, &out, &providers)?;
+    let mut systems = BTreeMap::new();
+    for (_, row) in providers::systems(&providers) {
+        if systems.contains_key(row) {
+            continue;
+        }
         let pkg = deps[row]
             .pkgconfig
             .as_deref()
             .context("providers.toml checked the pkgconfig")?;
         let p = system::resolve(row, pkg)?;
-        println!(
-            "native: provided {module} = system {row} (pkg-config {pkg}) -> {}",
-            p.lib.display()
-        );
-        provided.insert(module.to_owned(), p);
+        println!("native: system {row} (pkg-config {pkg}) -> {}", libs(&p));
+        systems.insert(row, p);
     }
     let toolchain = upstream::Toolchain {
         cc: &args.cc,
         cxx: &args.cxx,
     };
     let checkouts = sources.checkouts(None);
+    // by module: a recipe installs one artifact per module it provides
+    let mut upstreams = BTreeMap::new();
     for name in providers::upstreams(&providers) {
         let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
         let c = checkouts
@@ -136,7 +139,36 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .with_context(|| format!("providers.toml upstream {name} has no sources.toml row"))?;
         let src = layout.locate(&c.dir).dir;
         println!("native: building upstream {name} from {}", src.display());
-        provided.extend(upstream::build(&src, &out, recipe, &toolchain)?);
+        upstreams.extend(upstream::build(&src, &out, recipe, &toolchain)?);
+    }
+    let mut provided = BTreeMap::new();
+    for (module, row) in providers.iter().filter(|(_, row)| !row.is_none()) {
+        let parts = row
+            .provider
+            .iter()
+            .map(|p| {
+                let part = match p.split_once(':') {
+                    Some(("crate", name)) => crates.get(name),
+                    Some(("system", name)) => systems.get(name),
+                    Some(("upstream", _)) => upstreams.get(module),
+                    _ => None,
+                };
+                part.cloned()
+                    .with_context(|| format!("{module}: provider {p} was not built"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let p = Provided::join(parts);
+        let part = if row.srcs.is_empty() {
+            ""
+        } else {
+            " (its srcs row)"
+        };
+        println!(
+            "native: provided {module}{part} = {} -> {}",
+            row.provider.join(" + "),
+            libs(&p)
+        );
+        provided.insert(module.as_str(), p);
     }
     // a srcs row's provider stands in for some sources of its module, not for the module
     let partial: BTreeMap<&str, Partial> = providers::partial(&providers)
@@ -260,11 +292,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
-    let libs = provided
+    let provided_libs: BTreeSet<&Path> = provided
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
-        .map(|p| p.lib.as_path());
-    let gate_ok = gate(&out, libs)? & licence_gate(root, &layout, &sources, &out, args.verbose)?;
+        .flat_map(|p| p.libs.iter().map(PathBuf::as_path))
+        .collect();
+    let gate_ok = gate(&out, provided_libs.into_iter())?
+        & licence_gate(root, &layout, &sources, &out, args.verbose)?;
     if status.success() {
         println!("native: built -> {}", out.display());
         return Ok(if gate_ok && table_check(&table) {
@@ -354,19 +388,19 @@ fn rust_toolchain(root: &Path) -> Result<RustToolchain> {
 
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and
 /// `<out>/gen/<crate>/include` (its generated headers), with cargo-c; one cargo target dir per build
-/// directory, so concurrent checkouts do not share artifacts. A crate providing several modules (atl-bionic:
-/// libc, libasync_safe) is built once; each of its modules gets the same entry.
-fn build_crates(
+/// directory, so concurrent checkouts do not share artifacts. Each crate is built once, however many rows name it (atl-bionic: libc, libasync_safe).
+/// A crate installing no header (its callers include upstream headers) gets no include dir.
+fn build_crates<'a>(
     root: &Path,
     out: &Path,
-    providers: &providers::Providers,
-) -> Result<BTreeMap<String, Provided>> {
-    let mut by_crate: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (module, krate) in providers::crates(providers) {
-        by_crate.entry(krate).or_default().push(module);
-    }
+    providers: &'a providers::Providers,
+) -> Result<BTreeMap<&'a str, Provided>> {
+    let crates: BTreeSet<&str> = providers::crates(providers)
+        .into_iter()
+        .map(|(_, krate)| krate)
+        .collect();
     let mut built = BTreeMap::new();
-    for (krate, modules) in by_crate {
+    for krate in crates {
         let prefix = out.join("crates").join(krate);
         let include = out.join("gen").join(krate).join("include");
         // headers the crate stopped generating must not stay on the include path
@@ -403,27 +437,31 @@ fn build_crates(
             "{} missing after cargo cinstall",
             lib.display()
         );
-        for module in modules {
-            let part = if providers[module].srcs.is_empty() {
-                ""
-            } else {
-                " (its srcs row)"
-            };
-            println!(
-                "native: provided {module}{part} = crate {krate} -> {}",
-                lib.display()
-            );
-            built.insert(
-                module.to_owned(),
-                Provided {
-                    lib: lib.clone(),
-                    include: vec![include.clone()],
-                    defines: Vec::new(),
-                },
-            );
-        }
+        println!("native: crate {krate} -> {}", lib.display());
+        let include = if include.is_dir() {
+            vec![include]
+        } else {
+            Vec::new()
+        };
+        built.insert(
+            krate,
+            Provided {
+                libs: vec![lib],
+                include,
+                defines: Vec::new(),
+            },
+        );
     }
     Ok(built)
+}
+
+/// A provided entry's libraries, for progress lines.
+fn libs(p: &Provided) -> String {
+    p.libs
+        .iter()
+        .map(|l| l.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// The provided gate (provided_gate.rs) over the device artifacts ninja produced; false on a violation.

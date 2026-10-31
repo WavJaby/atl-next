@@ -43,7 +43,7 @@ func main() {
 	rustc := flag.String("rustc", "rustc", "Rust compiler of Rust modules (rust.go), with its own sysroot")
 	rustVersion := flag.String("rust-version", "", "-rustc's version x.y.z (Soong's ANDROID_RUST_VERSION)")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
-	providedFile := flag.String("provided", "", "JSON file: module -> {lib, include, defines} of modules built outside the tree (providers.toml `crate:` and `upstream:`, provided.go)")
+	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
@@ -71,6 +71,10 @@ func main() {
 	partial, err := readJSON[Partial](*srcsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
+		os.Exit(1)
+	}
+	if err := checkLibs(provided, partial); err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
 	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, flag.Args()); err != nil {

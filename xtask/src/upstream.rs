@@ -119,7 +119,7 @@ pub fn build(
         provided.insert(
             (*module).to_owned(),
             Provided {
-                lib,
+                libs: vec![lib],
                 include: vec![prefix.join("include")],
                 defines: defines.clone(),
             },

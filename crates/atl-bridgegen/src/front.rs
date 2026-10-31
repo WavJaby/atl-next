@@ -1144,9 +1144,26 @@ fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
         .get_argument_types()
         .or_else(|| c.get_argument_types())
         .unwrap_or_default();
+    let adjusted = c.get_argument_types().unwrap_or_default();
+    let param = |(i, p): (usize, &Type)| -> Result<Ty> {
+        let written = ty(p, owned)?;
+        // a typedef of an array keeps its name: printers map the ones they know (`va_list`, an array on x86-64) as a whole
+        if !matches!(written, Ty::Array { .. }) {
+            return Ok(written);
+        }
+        // C11 6.7.6.3p7: a parameter written as an array (`GLuint range[2]`) is a pointer; the canonical type is the adjusted one
+        ty(
+            adjusted.get(i).context("no adjusted parameter type")?,
+            owned,
+        )
+    };
     Ok(Signature {
         ret: ty(&ret, owned)?,
-        params: params.iter().map(|p| ty(p, owned)).collect::<Result<_>>()?,
+        params: params
+            .iter()
+            .enumerate()
+            .map(param)
+            .collect::<Result<_>>()?,
         variadic: c.is_variadic(),
     })
 }

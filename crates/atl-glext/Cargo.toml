@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-glext"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# cargo-c builds with it; nothing is gated on it
+capi = []
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+# cargo-c: the shared library linked next to the host libEGL / libGLES* (providers.toml). Its callers include AOSP's own Khronos headers, so it installs none.
+[package.metadata.capi.header]
+enabled = false
+
+[lints]
+workspace = true

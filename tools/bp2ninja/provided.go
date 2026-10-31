@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
-// Provided is a module providers.toml gives to a provider outside the tree (`crate:` and `upstream:` rows), built by xtask before the converter runs: it replaces the tree's definition, and dependents link its artifact and get its headers and defines, as from a module the converter built.
+// Provided is a module providers.toml gives to providers outside the tree (`crate:`, `upstream:` and `system:`), built or resolved by xtask before the converter runs: it replaces the tree's definition, and dependents link its artifacts and get its headers and defines, as from a module the converter built.
 type Provided struct {
-	Lib string `json:"lib"` // absolute path of the shared object (.so) or archive (.a) dependents link
+	// absolute paths dependents link, in order, one per provider of the row: shared objects (.so), or one archive (.a)
+	Libs []string `json:"libs"`
 	// header dirs dependents get as -isystem: searched after every -I, so compat/device keeps precedence over bionic's headers; system headers, as bionic's are
 	Include []string `json:"include"`
 	Defines []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
@@ -22,6 +24,21 @@ type Provided struct {
 type Partial struct {
 	Srcs     []string  `json:"srcs"` // relative to the module's directory, as its Android.bp writes them
 	Provider *Provided `json:"provider"`
+}
+
+// checkLibs: every provided entry names at least one artifact (xtask writes one per provider of its row).
+func checkLibs(provided map[string]Provided, partial map[string]Partial) error {
+	for m, p := range provided {
+		if len(p.Libs) == 0 {
+			return fmt.Errorf("%s: no libs", m)
+		}
+	}
+	for m, p := range partial {
+		if p.Provider != nil && len(p.Provider.Libs) == 0 {
+			return fmt.Errorf("%s: srcs provider without libs", m)
+		}
+	}
+	return nil
 }
 
 // readJSON reads a file xtask native writes (-provided, -srcs); an empty path = none given.
@@ -64,7 +81,7 @@ func (g *Graph) partialProvider(n *Node) *Node {
 	if !ok || part.Provider == nil {
 		return nil
 	}
-	lib := filepath.Base(part.Provider.Lib)
+	lib := filepath.Base(part.Provider.Libs[0])
 	return g.providedNode(strings.TrimSuffix(lib, filepath.Ext(lib)), n.side, *part.Provider)
 }
 
@@ -110,14 +127,18 @@ func keysOf[T any](m map[string]T) map[string]bool {
 // Its only edges: the tree module's export_header_lib_headers, which still reach its dependents -- header-only tree modules the provider's headers include as the replaced ones did (async_safe/log.h -> liblog_headers' android/log.h).
 func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 	kind := Shared
-	if strings.HasSuffix(p.Lib, ".a") {
+	if strings.HasSuffix(p.Libs[0], ".a") {
 		kind = Static
 	}
 	k := key{name, side, kind}
 	if n, ok := g.nodes[k]; ok {
 		return n
 	}
-	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, provided: true}
+	// an archive is linked where it is named, in the static group: several artifacts are linked first, as shared objects only
+	if len(p.Libs) > 1 && slices.ContainsFunc(p.Libs, func(l string) bool { return strings.HasSuffix(l, ".a") }) {
+		g.problem("providers.toml: %s: several providers, one an archive: %s", name, strings.Join(p.Libs, ", "))
+	}
+	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Libs[0], libs: p.Libs, provided: true}
 	g.nodes[k] = n
 	for _, dir := range p.Include {
 		n.exports = append(n.exports, "-isystem", dir)

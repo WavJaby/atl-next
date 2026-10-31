@@ -594,6 +594,47 @@ mod tests {
         assert!(!rustc(&dir, &format!("{checks}{wrong}")).status.success());
     }
 
+    /// Forwarding shells: a parameter written as an array is a pointer (C11 6.7.6.3p7), a record behind a pointer is opaque, the fallback is the caller's; rustc accepts the module. A variadic function has no shell.
+    #[test]
+    fn resolver_shells_compile() {
+        let dir = tmp("resolver");
+        let header = dir.0.join("x.h");
+        std::fs::write(
+            &header,
+            "struct R { int x; };\nvoid range(unsigned int r[2]);\nint get(const struct R *r);\nint say(const char *fmt, ...);\n",
+        )
+        .unwrap();
+        let targets = [target("x86_64", "x86_64-unknown-linux-gnu")];
+        let iface = interface("x", "x.h", &Source::c(&header, &[]), &targets).unwrap();
+        let range = &iface.arches["x86_64"].functions["range"];
+        assert!(matches!(range.params[0], Ty::Pointer { .. }), "{range:?}");
+        let on_null = |_: &str, ret: &Ty| -> Result<String> {
+            Ok(match ret.resolved() {
+                Ty::Void => "return".to_owned(),
+                _ => "return -1".to_owned(),
+            })
+        };
+        let code =
+            rust::resolver_module(&iface, "x86_64", &["range", "get"], "r::resolve", &on_null)
+                .unwrap();
+        for want in [
+            "pub unsafe extern \"C\" fn range(p0: *mut u32) {",
+            "pub unsafe extern \"C\" fn get(p0: *const R) -> i32 {",
+            "else { return -1 };",
+            "pub struct R {",
+        ] {
+            assert!(code.contains(want), "{want:?} missing:\n{code}");
+        }
+        let r = "extern crate std;\nmod r {\n  pub unsafe fn resolve<F: Copy>(_: &core::ffi::CStr) -> Option<F> { None }\n}\n";
+        let out = rustc(&dir, &format!("{r}{code}"));
+        assert!(
+            out.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(rust::resolver_module(&iface, "x86_64", &["say"], "r::resolve", &on_null).is_err());
+    }
+
     /// A C++ source whose types live in a header it includes: classes, `static constexpr` members,
     /// `constexpr` globals, `extern "C"` declarations; internal functions are not interface.
     #[test]

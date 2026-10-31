@@ -18,7 +18,7 @@ cc_library { name: "libuser", srcs: ["u.cc"], shared_libs: ["libother", "libcryp
 cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 `})
 	lib := "/prefix/lib/libcrypto.so"
-	g.provided = map[string]Provided{"libcrypto": {Lib: lib, Include: []string{"/prefix/include"}, Defines: []string{"PFX=X"}}}
+	g.provided = map[string]Provided{"libcrypto": {Libs: []string{lib}, Include: []string{"/prefix/include"}, Defines: []string{"PFX=X"}}}
 	for _, goal := range []string{"libuser", "libstat"} {
 		if g.node(goal, Device, Shared, "goal") == nil {
 			t.Fatalf("%s: problems %v", goal, g.problems)
@@ -62,6 +62,43 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 	}
 }
 
+// A row with several providers (libEGL = the host library + atl-glext): every artifact first on the link line, in the row's order; one shared by two modules is linked once.
+func TestSeveralProviders(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_shared { name: "libEGL", srcs: ["e.cc"] }
+cc_library_shared { name: "libGLESv2", srcs: ["g.cc"] }
+cc_library_shared { name: "libbase", srcs: ["b.cc"] }
+cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "libEGL", "libGLESv2"] }
+`})
+	ext := "/crates/lib/libatl_glext.so"
+	g.provided = map[string]Provided{
+		"libEGL":    {Libs: []string{"/usr/lib/libEGL.so", ext}},
+		"libGLESv2": {Libs: []string{"/usr/lib/libGLESv2.so", ext}},
+	}
+	if g.node("libgui", Device, Shared, "goal") == nil {
+		t.Fatalf("problems %v", g.problems)
+	}
+	for _, n := range g.order {
+		if n.name != "libgui" {
+			continue
+		}
+		l, inputs := g.linkLibs(n)
+		want := []string{"/usr/lib/libEGL.so", "-Wl,-rpath,/usr/lib", ext, "-Wl,-rpath,/crates/lib", "/usr/lib/libGLESv2.so", "-Wl,-rpath,/usr/lib"}
+		if !slices.Equal(l[:len(want)], want) {
+			t.Errorf("link libs %q", l)
+		}
+		if c := slices.Index(inputs, ext); c < 0 || slices.Index(inputs[c+1:], ext) >= 0 {
+			t.Errorf("%s not linked exactly once: %q", ext, inputs)
+		}
+	}
+	// an archive is linked where it is named, so it is never one of several
+	g.provided["libbase"] = Provided{Libs: []string{"/x/libbase.a", ext}}
+	g.providedNode("libbase", Device, g.provided["libbase"])
+	if !slices.ContainsFunc(g.problems, func(p string) bool { return strings.Contains(p, "one an archive") }) {
+		t.Errorf("problems %v", g.problems)
+	}
+}
+
 // A `srcs` row: the module is still built from the tree, without the listed files (both the plain srcs and target-block ones), and links its provider first; a `none` row links nothing. A listed file that is no source of the module fails the conversion.
 func TestPartialModule(t *testing.T) {
 	files := map[string]string{"p/Android.bp": `
@@ -72,7 +109,7 @@ cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
 	lib := "/crates/lib/libatl_stubs.so"
 	g := graphFor(t, files)
 	g.partial = map[string]Partial{
-		"librt":      {Srcs: []string{"drop.cc", "dev.cc"}, Provider: &Provided{Lib: lib}},
+		"librt":      {Srcs: []string{"drop.cc", "dev.cc"}, Provider: &Provided{Libs: []string{lib}}},
 		"libsk":      {Srcs: []string{"raw.cc"}},
 		"libunbuilt": {Srcs: []string{"u.cc"}},
 	}
@@ -134,7 +171,7 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 	// bionic.go's default and the providers.toml rows
 	g.soong = SoongConfig{CStd: "gnu11", CppStd: "gnu++20", APILevel: "-D__ANDROID_API__=10000", SystemSharedLibs: []string{"libc", "libm", "libdl"}}
 	g.omit = map[string]bool{"libm": true, "libdl": true}
-	g.provided = map[string]Provided{"libc": {Lib: "/c/lib/libatl_bionic.so", Include: []string{"/c/include"}}}
+	g.provided = map[string]Provided{"libc": {Libs: []string{"/c/lib/libatl_bionic.so"}, Include: []string{"/c/include"}}}
 	for _, goal := range []string{"liba", "libuser", "libnolibc"} {
 		g.node(goal, Device, Shared, "goal")
 	}

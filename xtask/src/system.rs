@@ -98,7 +98,7 @@ fn provided(flags: &Flags, is_file: impl Fn(&Path) -> bool) -> Result<Provided> 
         })
         .collect::<Result<_>>()?;
     Ok(Provided {
-        lib,
+        libs: vec![lib],
         include,
         defines,
     })
@@ -136,7 +136,7 @@ mod tests {
             files(&["/usr/lib/x86_64-linux-gnu/libEGL.so"]),
         )
         .unwrap();
-        assert_eq!(p.lib, Path::new("/usr/lib/x86_64-linux-gnu/libEGL.so"));
+        assert_eq!(p.libs, [Path::new("/usr/lib/x86_64-linux-gnu/libEGL.so")]);
         assert!(p.include.is_empty() && p.defines.is_empty());
         // -L dirs are searched before libdir, as the linker searches them
         let p = provided(
@@ -152,7 +152,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(p.lib, Path::new("/opt/foo/lib/libfoo.so"));
+        assert_eq!(p.libs, [Path::new("/opt/foo/lib/libfoo.so")]);
         assert_eq!(
             p.include,
             [
