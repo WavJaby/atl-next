@@ -66,10 +66,9 @@ pub fn aosp_default(project: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
         return Unlabelled::Missing(if kinds.is_empty() {
             format!("{p}'s Android.bp declares no licence kind")
         } else {
-            let listed: Vec<&str> = kinds.iter().map(String::as_str).collect();
             format!(
                 "{p}'s Android.bp declares several licence kinds ({}), not which file has which",
-                listed.join(", ")
+                kinds.len()
             )
         });
     };

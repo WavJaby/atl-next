@@ -35,6 +35,8 @@ pub fn identify(text: &str) -> Identified {
         "permission is hereby granted",
         "permission to use",
         "gpl",
+        // IJG's pointer to README.ijg names no licence
+        "conditions of distribution and use",
     ];
     if !mentions.iter().any(|m| n.contains(m)) {
         return Identified::NoNotice;
@@ -303,11 +305,46 @@ fn classify(n: &str) -> Option<String> {
     if has("public domain") {
         found.push("LicenseRef-Public-Domain".to_owned());
     }
+    // HarfBuzz's "Old MIT" licence: the SPDX list's MIT-Modern-Variant text
+    if has(
+        "permission is hereby granted without written agreement and without license or royalty fees to use copy modify and distribute this software and its documentation for any purpose provided that the above copyright notice and the following two paragraphs appear in all copies of this software",
+    ) {
+        found.push("MIT-Modern-Variant".to_owned());
+    }
+    found.extend(pointer_notice(n));
     // one family, or nothing: dual or mixed notices go to a per-path entry
     match found.as_slice() {
         [one] => Some(one.clone()),
         _ => None,
     }
+}
+
+/// Notices that name their project's licence file instead of carrying a licence: each phrase is one project's own wording, so its id is what that project's licence file states.
+fn pointer_notice(n: &str) -> Option<String> {
+    let has = |p: &str| n.contains(p);
+    // ICU 58+: icu/LICENSE is Unicode-3.0, and keeps code from ICU 1.8.1-57.1 (IBM's copyright) under the ICU License
+    if has("license terms of use http www.unicode.org copyright.html") {
+        return Some(if has("international business machines") {
+            "Unicode-3.0 AND ICU".to_owned()
+        } else {
+            "Unicode-3.0".to_owned()
+        });
+    }
+    // Chromium-family wording (pdfium); their LICENSE is BSD-3-Clause
+    if has(
+        "use of this source code is governed by a bsd style license that can be found in the license file",
+    ) {
+        return Some("BSD-3-Clause".to_owned());
+    }
+    // freetype/LICENSE.TXT: FTL or GPL-2.0 "(any later version can be used also)", the user's choice
+    if has("under the terms of the freetype project license") {
+        return Some("FTL OR GPL-2.0-or-later".to_owned());
+    }
+    // libjpeg-turbo/LICENSE.md: README.ijg's licence covers libjpeg's code and its modifications
+    if has("for conditions of distribution and use see the accompanying readme.ijg file") {
+        return Some("IJG".to_owned());
+    }
+    None
 }
 
 /// GNU family: None = not a GNU notice; Some(None) = a GNU notice the rules cannot pin down.
@@ -509,6 +546,46 @@ mod tests {
         // there is no GPL 2.1 (only LGPL 2.1): a mistaken notice is not turned into an id
         let no_such = "/* GNU General Public License version 2.1 or any later version */\n";
         assert_eq!(id(no_such), Identified::Unrecognised);
+    }
+
+    // Verbatim headers of AOSP external/* files at the pinned tag; each expected id is what the project's own licence file states for that notice.
+
+    #[test]
+    fn icu_notices() {
+        // icu4c/source/common/uloc.cpp
+        let ibm = "// © 2016 and later: Unicode, Inc. and others.\n// License & terms of use: http://www.unicode.org/copyright.html\n/*\n**********************************************************************\n*   Copyright (C) 1997-2016, International Business Machines\n*   Corporation and others.  All Rights Reserved.\n**********************************************************************\n*/\n#include \"x.h\"\n";
+        assert_eq!(id(ibm), notice("Unicode-3.0 AND ICU"));
+        let new = "// © 2016 and later: Unicode, Inc. and others.\n// License & terms of use: http://www.unicode.org/copyright.html\n#include \"x.h\"\n";
+        assert_eq!(id(new), notice("Unicode-3.0"));
+    }
+
+    #[test]
+    fn chromium_style_pointer() {
+        // pdfium/core/fxcrt/fx_string.cpp
+        let pdfium = "// Copyright 2017 The PDFium Authors\n// Use of this source code is governed by a BSD-style license that can be\n// found in the LICENSE file.\n\n// Original code copyright 2014 Foxit Software Inc. http://www.foxitsoftware.com\n\n#include \"core/fxcrt/fx_string.h\"\n";
+        assert_eq!(id(pdfium), notice("BSD-3-Clause"));
+    }
+
+    #[test]
+    fn harfbuzz_old_mit() {
+        // harfbuzz_ng/src/hb-buffer.cc
+        let hb = "/*\n * Copyright © 1998-2004  David Turner and Werner Lemberg\n *\n *  This is part of HarfBuzz, a text shaping library.\n *\n * Permission is hereby granted, without written agreement and without\n * license or royalty fees, to use, copy, modify, and distribute this\n * software and its documentation for any purpose, provided that the\n * above copyright notice and the following two paragraphs appear in\n * all copies of this software.\n *\n * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR\n * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES\n */\n\n#include \"hb-buffer.hh\"\n";
+        assert_eq!(id(hb), notice("MIT-Modern-Variant"));
+    }
+
+    #[test]
+    fn freetype_dual_licence() {
+        // freetype/src/base/ftobjs.c
+        let ft = "/****************************************************************************\n *\n * ftobjs.c\n *\n * Copyright (C) 1996-2023 by\n * David Turner, Robert Wilhelm, and Werner Lemberg.\n *\n * This file is part of the FreeType project, and may only be used,\n * modified, and distributed under the terms of the FreeType project\n * license, LICENSE.TXT.  By continuing to use, modify, or distribute\n * this file you indicate that you have read the license and\n * understand and accept it fully.\n *\n */\n\n\n#include <freetype/ftlist.h>\n";
+        // GPL-2.0-or-later, never -only: "any later version can be used also"
+        assert_eq!(id(ft), notice("FTL OR GPL-2.0-or-later"));
+    }
+
+    #[test]
+    fn libjpeg_turbo_ijg() {
+        // libjpeg-turbo/jdapimin.c
+        let ijg = "/*\n * jdapimin.c\n *\n * This file was part of the Independent JPEG Group's software:\n * Copyright (C) 1994-1998, Thomas G. Lane.\n * libjpeg-turbo Modifications:\n * Copyright (C) 2016, 2022, D. R. Commander.\n * For conditions of distribution and use, see the accompanying README.ijg\n * file.\n */\n";
+        assert_eq!(id(ijg), notice("IJG"));
     }
 
     #[test]
