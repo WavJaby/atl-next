@@ -105,6 +105,14 @@ func TestRustStaticlibInFinalLink(t *testing.T) {
 	if !strings.Contains(st[""], filepath.Join(out, "device/libdep/libdep.rlib")) {
 		t.Errorf("staticlib step does not wait for the transitive crate: %s", st[""])
 	}
+	// the depfile lists the crates whose code the output carries: the rlib closure, never the proc macro libdep uses
+	ffi, dep := filepath.Join(out, "device/libffi/libffi.rlib"), filepath.Join(out, "device/libdep/libdep.rlib")
+	if c := shWords(t, st["crates"]); !slices.Equal(c, []string{ffi, dep}) {
+		t.Errorf("staticlib crates %q", c)
+	}
+	if c := ninjaEdgeVars(ninja, dep)["crates"]; c != "" {
+		t.Errorf("libdep crates %q", c)
+	}
 	link := shWords(t, ninjaEdgeVars(ninja, filepath.Join(out, "device/libuser/libuser.so"))["libs"])
 	if !slices.Contains(link, lib) || !slices.Contains(link, filepath.Join(out, "device/libcc/libcc.a")) {
 		t.Errorf("libuser link %q lacks the staticlib or the rlib's cc library", link)

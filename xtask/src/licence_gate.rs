@@ -2,7 +2,8 @@
 //! The licence gate after `xtask native`'s build (CLAUDE.md licence rules): every file that reaches a shipped artifact carries a licence licenses.toml allows in it.
 //! - Shipped artifacts: the device-side link outputs ninja produced (`ninja -t targets rule link`, under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
 //! - Reached files, per artifact: the objects its link loaded, from `<artifact>.trace` (bp2ninja's link rule runs ld with `-t -t`: each object on the command line and each archive member loaded -- those symbol resolution pulled in, every member of a `--whole-archive`); a member is mapped back to its object through the archive's ninja edge (`ninja -t query`). Members are named by file name, so where two objects of one archive share one, both count.
-//!   Then each object's source and headers, from its depfile (`ninja -t deps`).
+//!   An archive whose members are none of its inputs but which has a depfile record was compiled whole by its own edge (rustc's generated staticlib): the archive is the object, whichever of its codegen units ld loaded.
+//!   Then each object's source and headers, from its depfile (`ninja -t deps`); a depfile entry with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
 //! - A file's licence: `notice::resolve` with the `[upstream.<key>]` of the checkout holding it; AOSP projects share key `aosp`, their paths relative to the tree root (`external/dng_sdk/...`).
 //!
 //! Not checked, only counted: files generated into `<out>` (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed); members of archives built outside ninja (providers.toml upstreams, by their own build); system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
@@ -94,6 +95,7 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )?)
     };
+    let deps = parse_deps(&ninja(out, &["-t", "deps"])?);
     for (archive, member, artifact) in &members {
         let Some(objs) = inputs.get(archive) else {
             report.outside += 1;
@@ -103,30 +105,34 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
             .iter()
             .filter(|o| o.file_name().is_some_and(|n| *n == **member))
             .collect();
-        ensure!(
-            !matching.is_empty(),
-            "{}: member {member} is none of its ninja inputs",
-            archive.display()
-        );
-        for o in matching {
-            objects.entry(o.clone()).or_insert(artifact);
+        if !matching.is_empty() {
+            for o in matching {
+                objects.entry(o.clone()).or_insert(artifact);
+            }
+        } else if deps.contains_key(archive) {
+            // compiled whole by its own edge (rustc's staticlib): its members are codegen units, its depfile says what they are made of
+            objects.entry(archive.clone()).or_insert(artifact);
+        } else {
+            anyhow::bail!(
+                "{}: member {member} is none of its ninja inputs",
+                archive.display()
+            );
         }
     }
-    let deps = parse_deps(&ninja(out, &["-t", "deps"])?);
     // file -> first artifact reaching it
     let mut files: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     for (object, artifact) in &objects {
         if is_system(object) {
             continue;
         }
-        let Some(list) = deps.get(object) else {
+        if !deps.contains_key(object) {
             report
                 .unresolved
                 .push(format!("{}: no depfile record", object.display()));
             continue;
-        };
-        for f in list {
-            files.entry(f.clone()).or_insert(artifact);
+        }
+        for f in made_of(object, &deps) {
+            files.entry(f.to_path_buf()).or_insert(artifact);
         }
     }
     let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
@@ -293,6 +299,21 @@ fn parse_deps(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     out
 }
 
+/// The files `output` is made of: its depfile record, where an entry with a record of its own (a build output: an rlib a Rust edge links) stands for what that one is made of, transitively.
+fn made_of<'a>(output: &'a Path, deps: &'a BTreeMap<PathBuf, Vec<PathBuf>>) -> BTreeSet<&'a Path> {
+    let (mut files, mut seen, mut todo) = (BTreeSet::new(), BTreeSet::from([output]), vec![output]);
+    while let Some(o) = todo.pop() {
+        for f in deps.get(o).into_iter().flatten() {
+            if !deps.contains_key(f) {
+                files.insert(f.as_path());
+            } else if seen.insert(f.as_path()) {
+                todo.push(f);
+            }
+        }
+    }
+    files
+}
+
 /// The roots of every fetched checkout (`checkouts` as sources.toml lists them) plus the AOSP tree itself, for files the manifest's link/copy files put outside any project.
 pub fn roots(layout: &atl_layout::Layout, checkouts: &[crate::sources::Checkout]) -> Vec<Root> {
     let mut roots: Vec<Root> = checkouts
@@ -370,9 +391,27 @@ mod tests {
                 l = lib.display(),
             ),
         );
+        let report = build_and_check(&src, &out);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(report.artifacts, 1);
+        let denied: Vec<(&str, Vec<&str>)> = report
+            .denied
+            .iter()
+            .map(|(e, f)| (e.as_str(), f.keys().map(String::as_str).collect()))
+            .collect();
+        // unused.c's GPL-3.0-only never reaches libt.so: only the member symbol resolution loaded counts
+        assert_eq!(denied, [("LicenseRef-Bad", vec!["used.c", "used.h"])]);
+        assert_eq!(report.checked, 3);
+        assert_eq!(report.unresolved.len(), 1, "{:?}", report.unresolved);
+        assert!(report.unresolved[0].contains("stray.h: in no checkout"));
+        assert!(!report.ok());
+    }
+
+    /// Runs ninja in `out`, then the gate with `src` as the one checkout (key `aosp`) and only MIT allowed.
+    fn build_and_check(src: &Path, out: &Path) -> Report {
         let status = Command::new("ninja")
             .arg("-C")
-            .arg(&out)
+            .arg(out)
             .arg("-v")
             .output()
             .unwrap();
@@ -387,24 +426,76 @@ mod tests {
         )
         .unwrap();
         let roots = [Root {
-            dir: std::fs::canonicalize(&src).unwrap(),
+            dir: std::fs::canonicalize(src).unwrap(),
             key: "aosp".into(),
             prefix: PathBuf::new(),
         }];
-        let report = check(&std::fs::canonicalize(&out).unwrap(), &roots, &licenses).unwrap();
+        check(&std::fs::canonicalize(out).unwrap(), &roots, &licenses).unwrap()
+    }
+
+    /// bp2ninja's Rust shape (rustc rule with dep-info depfile + `$crates`, a generated staticlib of `extern crate` roots): `device/libr.so` links `main.cpp.o` and `librustlibs.a`, built by rustc from root.rs (MIT) over the rlib `libdep.rlib` from dep.rs (LicenseRef-Bad) + its module dep_mod.rs (MIT).
+    /// The staticlib's members are codegen units, none of its inputs: the gate must take the archive whole and reach both crates' sources, denying dep.rs; the sysroot's std is reached by no depfile.
+    #[test]
+    fn gate_follows_rust_crates() {
+        let tmp =
+            std::env::temp_dir().join(format!("xtask-licence-gate-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, out) = (tmp.join("src"), tmp.join("out"));
+        for d in [&src, &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let write = |p: &Path, s: &str| std::fs::write(p, s).unwrap();
+        write(
+            &src.join("main.cpp"),
+            "// SPDX-License-Identifier: MIT\nextern \"C\" int rust_used();\nint entry() { return rust_used(); }\n",
+        );
+        write(
+            &src.join("dep.rs"),
+            "// SPDX-License-Identifier: LicenseRef-Bad\nmod dep_mod;\n#[unsafe(no_mangle)]\npub extern \"C\" fn rust_used() -> i32 { dep_mod::VALUE }\n",
+        );
+        write(
+            &src.join("dep_mod.rs"),
+            "// SPDX-License-Identifier: MIT\npub const VALUE: i32 = 1;\n",
+        );
+        write(
+            &src.join("root.rs"),
+            "// SPDX-License-Identifier: MIT\nextern crate dep;\n",
+        );
+        let rlib = out.join("device/libdep/libdep.rlib");
+        let staticlib = out.join("device/libr/generated_rust_staticlib/librustlibs.a");
+        let lib = out.join("device/libr/libr.so");
+        let main = out.join("obj/main.cpp.o");
+        write(
+            &out.join("build.ninja"),
+            &format!(
+                "rule cc\n  command = clang++-19 -fPIC -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
+                 rule rustc\n  command = rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' \"$$line\" $crates > $out.d\n  depfile = $out.d\n  deps = gcc\n\
+                 rule link\n  command = clang++-19 -shared -o $out $in -Wl,-t,-t >$out.trace\n\
+                 build {m}: cc {ms}\n\
+                 build {d}: rustc {ds}\n  flags = --crate-type=rlib --crate-name=dep -C panic=abort --edition=2021\n\
+                 build {s}: rustc {rs} | {d}\n  flags = --crate-type=staticlib --crate-name=generated_rust_staticlib -C panic=abort --edition=2021\n  libs = --extern dep={d} -L dependency={dd}\n  crates = {d}\n\
+                 build {l}: link {m} {s}\n",
+                m = main.display(),
+                ms = src.join("main.cpp").display(),
+                d = rlib.display(),
+                ds = src.join("dep.rs").display(),
+                dd = rlib.parent().unwrap().display(),
+                s = staticlib.display(),
+                rs = src.join("root.rs").display(),
+                l = lib.display(),
+            ),
+        );
+        let report = build_and_check(&src, &out);
         std::fs::remove_dir_all(&tmp).unwrap();
-        assert_eq!(report.artifacts, 1);
         let denied: Vec<(&str, Vec<&str>)> = report
             .denied
             .iter()
             .map(|(e, f)| (e.as_str(), f.keys().map(String::as_str).collect()))
             .collect();
-        // unused.c's GPL-3.0-only never reaches libt.so: only the member symbol resolution loaded counts
-        assert_eq!(denied, [("LicenseRef-Bad", vec!["used.c", "used.h"])]);
-        assert_eq!(report.checked, 3);
-        assert_eq!(report.unresolved.len(), 1, "{:?}", report.unresolved);
-        assert!(report.unresolved[0].contains("stray.h: in no checkout"));
-        assert!(!report.ok());
+        assert_eq!(denied, [("LicenseRef-Bad", vec!["dep.rs"])]);
+        // main.cpp, root.rs, dep.rs, dep_mod.rs
+        assert_eq!(report.checked, 4);
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
     }
 
     #[test]

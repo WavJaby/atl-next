@@ -112,7 +112,7 @@ rule genrule
   description = genrule $name
   restat = 1
 rule rustc
-  command = $env $rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && grep ^$out: $out.d.raw > $out.d
+  command = $env $rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' "$$line" $crates > $out.d
   depfile = $out.d
   deps = gcc
   description = rustc $in

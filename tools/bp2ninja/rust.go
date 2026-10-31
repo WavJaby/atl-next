@@ -421,7 +421,9 @@ func crateClosure(roots []*Node) []*Node {
 }
 
 // rustLibFlags: --extern for the direct crates, -L dependency= for every crate the closure holds (rustc finds the transitive ones there; builder.go makeLibFlags).
-func rustLibFlags(externs []rustExtern) (flags, inputs []string) {
+// linked: the closure's rlibs, whose code (inlined generics included) the output carries. The rustc rule appends them to rustc's dep-info depfile, as a cc depfile lists headers,
+// so `ninja -t deps` holds what each Rust output is made of (xtask's licence gate follows it). Proc macros run at compile time and ship nothing: implicit inputs only.
+func rustLibFlags(externs []rustExtern) (flags, inputs, linked []string) {
 	var roots []*Node
 	for _, e := range externs {
 		flags = append(flags, "--extern", e.name+"="+e.dep.out)
@@ -430,12 +432,15 @@ func rustLibFlags(externs []rustExtern) (flags, inputs []string) {
 	dirs := map[string]bool{}
 	for _, d := range crateClosure(roots) {
 		inputs = append(inputs, d.out)
+		if d.kind != ProcMacro {
+			linked = append(linked, d.out)
+		}
 		if dir := filepath.Dir(d.out); !dirs[dir] {
 			dirs[dir] = true
 			flags = append(flags, "-L", "dependency="+dir)
 		}
 	}
-	return flags, inputs
+	return flags, inputs, linked
 }
 
 // emitRust writes the steps of one Rust node: OUT_DIR copies of its generated sources, then rustc; a broken crate's step fails with the reason.
@@ -451,7 +456,7 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 		fmt.Fprintf(b, "build %s: cp %s\n", esc(cp), esc(g.abs(s)))
 		implicit = append(implicit, cp)
 	}
-	libs, inputs := rustLibFlags(r.externs)
+	libs, inputs, linked := rustLibFlags(r.externs)
 	implicit = append(implicit, inputs...)
 	flags := append([]string{}, r.flags...)
 	if n.kind == Binary {
@@ -461,8 +466,8 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 	}
 	var waits []string
 	genClosure(n, map[*Node]bool{}, &waits)
-	fmt.Fprintf(b, "build %s: rustc %s | %s || %s\n  env = %s\n  flags = %s\n  libs = %s\n", esc(n.out), esc(g.abs(r.root)), join(implicit), join(waits),
-		shellQuote(g.rustEnv(n, tools.RustVersion)), shellQuote(flags), shellQuote(libs))
+	fmt.Fprintf(b, "build %s: rustc %s | %s || %s\n  env = %s\n  flags = %s\n  libs = %s\n  crates = %s\n", esc(n.out), esc(g.abs(r.root)), join(implicit), join(waits),
+		shellQuote(g.rustEnv(n, tools.RustVersion)), shellQuote(flags), shellQuote(libs), shellQuote(linked))
 }
 
 // rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), and the cc libraries its crates need (whole archives, the static closure, shared libraries) as link args.
@@ -511,12 +516,12 @@ func (g *Graph) rustStaticlib(b *strings.Builder, n *Node) (lib string, whole bo
 		lines = append(lines, "extern crate "+r.name+";")
 	}
 	g.genFile(src, strings.Join(lines, "\n")+"\n")
-	libs, inputs := rustLibFlags(roots)
+	libs, inputs, linked := rustLibFlags(roots)
 	flags := append([]string{}, rustGlobalFlags...)
 	if n.side == Device {
 		flags = append(flags, rustDeviceFlags...)
 	}
 	flags = append(flags, "--cap-lints", "allow", "--crate-type=staticlib", "--crate-name=generated_rust_staticlib", "--edition="+rustDefaultEdition)
-	fmt.Fprintf(b, "build %s: rustc %s | %s\n  env = OUT_DIR=out\n  flags = %s\n  libs = %s\n", esc(lib), esc(src), join(inputs), shellQuote(flags), shellQuote(libs))
+	fmt.Fprintf(b, "build %s: rustc %s | %s\n  env = OUT_DIR=out\n  flags = %s\n  libs = %s\n  crates = %s\n", esc(lib), esc(src), join(inputs), shellQuote(flags), shellQuote(libs), shellQuote(linked))
 	return lib, whole
 }
