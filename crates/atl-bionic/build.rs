@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_bridgegen::buildscript::{self, HostArch, Upstreams};
+use atl_bridgegen::c::Kept;
 use atl_bridgegen::ir::{ArchView, Interface, Ty};
 use atl_bridgegen::{Lang, Source, Target, front, shape};
 
@@ -41,7 +42,17 @@ struct Api {
     functions: &'static [&'static str],
     /// Macros (or globs) the C header defines and Rust code uses.
     macros: &'static [&'static str],
+    /// Include directories the source needs besides bionic's libc headers, relative to the AOSP tree.
+    include_dirs: &'static [&'static str],
+    /// What the C header keeps of the source for its callers.
+    kept: Kept<'static>,
 }
+
+/// Nothing kept: declarations only.
+const DECLARATIONS: Kept<'static> = Kept {
+    includes: false,
+    macros: &[],
+};
 
 const APIS: &[Api] = &[
     Api {
@@ -60,6 +71,8 @@ const APIS: &[Api] = &[
             "__system_property_serial",
         ],
         macros: &["PROP_VALUE_MAX", "PROP_NAME_MAX", "PROP_DIRNAME"],
+        include_dirs: &[],
+        kept: DECLARATIONS,
     },
     // bionic's sys/cdefs.h brings it into every unit; ours has no include, so it can be forced
     Api {
@@ -72,6 +85,8 @@ const APIS: &[Api] = &[
             "android_get_application_target_sdk_version",
         ],
         macros: &["__ANDROID_API_*__"],
+        include_dirs: &[],
+        kept: DECLARATIONS,
     },
     // libdl's platform-only setter; ART declares it itself, the launcher calls it (owner Q5)
     Api {
@@ -81,6 +96,31 @@ const APIS: &[Api] = &[
         header: None,
         functions: &["android_set_application_target_sdk_version"],
         macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
+    // libasync_safe (providers.toml row): what the native closure calls (2026-10-31: libmemunreachable,
+    // libc_malloc_debug_backtrace, libunwindstack LogAndroid.cpp, perfetto logging.h, libandroid_runtime
+    // Zygote). Its callers pass `ANDROID_LOG_*` from the `<android/log.h>` it includes and use the
+    // `async_safe_fatal` macro.
+    Api {
+        name: "async_safe",
+        source: "bionic/libc/async_safe/include/async_safe/log.h",
+        lang: Lang::C,
+        header: Some("async_safe/log.h"),
+        functions: &[
+            "async_safe_fatal_no_abort",
+            "async_safe_format_buffer",
+            "async_safe_format_log",
+            "async_safe_format_log_va_list",
+            "async_safe_write_log",
+        ],
+        macros: &[],
+        include_dirs: &["system/logging/liblog/include"],
+        kept: Kept {
+            includes: true,
+            macros: &["async_safe_fatal"],
+        },
     },
 ];
 
@@ -216,7 +256,12 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
     let mut files = Outputs::new();
     let level = future_level(up, host)?;
     for api in APIS {
-        let target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
+        let mut target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
+        target.args.extend(
+            api.include_dirs
+                .iter()
+                .map(|d| format!("-I{}", up.aosp(d).display())),
+        );
         let path = up.aosp(api.source);
         let src = Source {
             path: &path,
@@ -244,7 +289,7 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
                 .collect();
             files.push((
                 Path::new("capi/include").join(header),
-                atl_bridgegen::c::header(&iface, &host.arch, api.functions, &constants)?,
+                atl_bridgegen::c::header(&iface, &host.arch, api.functions, &constants, &api.kept)?,
             ));
         }
     }

@@ -355,6 +355,30 @@ fn is_angled(directive: &Entity) -> bool {
         .is_some_and(|r| r.tokenize().iter().any(|tok| tok.get_spelling() == "<"))
 }
 
+/// Macro definition `e` in `path` as written (`NAME body`, `NAME(args) body`). `texts`: file contents
+/// read so far.
+fn macro_text(e: &Entity, path: &Path, texts: &mut BTreeMap<PathBuf, String>) -> Result<String> {
+    let name = e.get_name().context("unnamed macro")?;
+    let range = e.get_range().context("macro definition without a range")?;
+    if !texts.contains_key(path) {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        texts.insert(path.to_path_buf(), text);
+    }
+    let text = &texts[path];
+    let offset = |l: clang::source::SourceLocation| l.get_file_location().offset as usize;
+    let start = offset(range.get_start());
+    // the range ends at the start of the last token; the text, at that token's end
+    let end = range
+        .tokenize()
+        .last()
+        .map_or(start, |t| offset(t.get_range().get_end()));
+    let def = text
+        .get(start..end)
+        .with_context(|| format!("{}: macro {name} out of range", path.display()))?;
+    Ok(def.to_owned())
+}
+
 /// Names `parent`'s children declare, into the reached file each is declared in; `extern "C"` blocks
 /// looked into. `texts`: file contents read so far, for macro definitions.
 fn declared(parent: &Entity, out: &mut Probe, texts: &mut BTreeMap<PathBuf, String>) -> Result<()> {
@@ -377,25 +401,8 @@ fn declared(parent: &Entity, out: &mut Probe, texts: &mut BTreeMap<PathBuf, Stri
         match kind {
             EntityKind::MacroDefinition => {
                 let name = e.get_name().context("unnamed macro")?;
-                let range = e.get_range().context("macro definition without a range")?;
-                if !texts.contains_key(&path) {
-                    let text = std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading {}", path.display()))?;
-                    texts.insert(path.clone(), text);
-                }
-                let text = &texts[&path];
-                let offset =
-                    |l: clang::source::SourceLocation| l.get_file_location().offset as usize;
-                let start = offset(range.get_start());
-                // the range ends at the start of the last token; the text, at that token's end
-                let end = range
-                    .tokenize()
-                    .last()
-                    .map_or(start, |t| offset(t.get_range().get_end()));
-                let def = text
-                    .get(start..end)
-                    .with_context(|| format!("{}: macro {name} out of range", path.display()))?;
-                reached.macros.insert(name.clone(), def.to_owned());
+                let def = macro_text(&e, &path, texts)?;
+                reached.macros.insert(name.clone(), def);
                 reached.names.insert(name);
             }
             EntityKind::EnumDecl => {
@@ -506,6 +513,7 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
         strings: BTreeMap::new(),
         typedefs: BTreeMap::new(),
         includes: includes(&tu, src.path)?,
+        function_macros: function_macros(&tu, &owned)?,
     };
     decls(&tu.get_entity(), &owned, &mut view)?;
     let macros = macro_names(&tu, &owned, src.macros)?;
@@ -695,6 +703,28 @@ fn insert_constant(
         bail!("{name} defined twice (first as {old:?})");
     }
     Ok(())
+}
+
+/// The function-like macros the interface's files define, as written.
+fn function_macros(tu: &TranslationUnit, owned: &Owned) -> Result<BTreeMap<String, String>> {
+    let mut texts = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for e in tu.get_entity().get_children() {
+        if e.get_kind() != EntityKind::MacroDefinition
+            || !e.is_function_like_macro()
+            || !owned.owns(&e)
+        {
+            continue;
+        }
+        let path = e
+            .get_location()
+            .and_then(|l| l.get_file_location().file)
+            .map(|f| f.get_path())
+            .context("owned macro without a file")?;
+        let name = e.get_name().context("unnamed macro")?;
+        out.insert(name, macro_text(&e, &path, &mut texts)?);
+    }
+    Ok(out)
 }
 
 /// Requested macro names with globs expanded over the object-like macros the interface's files define.

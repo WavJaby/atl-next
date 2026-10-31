@@ -29,7 +29,8 @@ func readProvided(path string) (map[string]Provided, error) {
 	return out, json.Unmarshal(text, &out)
 }
 
-// providedNode: the node of a provided module, one per side; no sources and no edges of its own, so it is not in g.order.
+// providedNode: the node of a provided module, one per side; no sources, so it is not in g.order.
+// Its only edges: the tree module's export_header_lib_headers, which still reach its dependents -- header-only tree modules the provider's headers include as the replaced ones did (async_safe/log.h -> liblog_headers' android/log.h).
 func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 	kind := Shared
 	if strings.HasSuffix(p.Lib, ".a") {
@@ -40,12 +41,22 @@ func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 		return n
 	}
 	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, provided: true}
+	g.nodes[k] = n
 	for _, dir := range p.Include {
 		n.exports = append(n.exports, "-isystem", dir)
 	}
 	for _, d := range p.Defines {
 		n.exports = append(n.exports, "-D"+d)
 	}
-	g.nodes[k] = n
+	if m := g.lookup(name, side); m != nil {
+		for _, r := range g.flatten(m, side, kind).strs("export_header_lib_headers") {
+			// a header dependency, so the dependents' compiles wait for what it generates
+			if h := g.node(r, side, Headers, name); h != nil {
+				n.deps.headers = append(n.deps.headers, h)
+				n.exports = append(n.exports, h.exports...)
+			}
+		}
+		n.exports = dedup(n.exports)
+	}
 	return n
 }

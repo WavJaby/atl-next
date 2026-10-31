@@ -351,7 +351,14 @@ mod tests {
         let view = &iface.arches["x86_64"];
         assert_eq!(view.includes, ["<stdint.h>", "<stdbool.h>", "<stddef.h>"]);
         assert_eq!(view.strings["NAME"], "/dev/x");
-        let text = c::header(&iface, "x86_64", API_FUNCTIONS, API_MACROS).unwrap();
+        let text = c::header(
+            &iface,
+            "x86_64",
+            API_FUNCTIONS,
+            API_MACROS,
+            &c::Kept::default(),
+        )
+        .unwrap();
         for want in [
             "#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n",
             "struct timespec;\ntypedef struct item item;\n",
@@ -387,11 +394,61 @@ mod tests {
     fn c_header_without_standard_types_includes_nothing() {
         let dir = tmp("cfree");
         let iface = api(&dir);
-        let text = c::header(&iface, "x86_64", &["none"], &["LIMIT"]).unwrap();
+        let none = c::Kept::default();
+        let text = c::header(&iface, "x86_64", &["none"], &["LIMIT"], &none).unwrap();
         // force-includable: no libc header runs before the source's own feature macros
         assert!(!text.contains("#include"), "{text}");
-        let err = c::header(&iface, "x86_64", &["absent"], &[]).unwrap_err();
+        let err = c::header(&iface, "x86_64", &["absent"], &[], &none).unwrap_err();
         assert!(format!("{err:#}").contains("absent"));
+    }
+
+    /// A header in the shape of bionic's async_safe/log.h: callers rely on its includes and a
+    /// function-like macro, and a `va_list` variant sits next to a variadic function.
+    const LOG: &str = "#include <stddef.h>\n#include <stdarg.h>\n#define log_fatal(...) \\\n  do { \\\n    log_no_abort(__VA_ARGS__); \\\n  } while (0)\nint log_no_abort(const char *fmt, ...);\nint log_va(int prio, const char *fmt, va_list args);\nsize_t log_len(void);\n";
+
+    #[test]
+    fn kept_source_and_va_list() {
+        let dir = tmp("kept");
+        let header = dir.0.join("log.h");
+        std::fs::write(&header, LOG).unwrap();
+        let iface = interface("log", "log.h", &Source::c(&header, &[]), &[freestanding()]).unwrap();
+        let functions = ["log_no_abort", "log_va", "log_len"];
+        let kept = c::Kept {
+            includes: true,
+            macros: &["log_fatal"],
+        };
+        let text = c::header(&iface, "x86_64", &functions, &[], &kept).unwrap();
+        for want in [
+            // the source's order, then nothing twice (the printer also needs both)
+            "#include <stddef.h>\n#include <stdarg.h>\n\n",
+            "#define log_fatal(...) \\\n  do { \\\n    log_no_abort(__VA_ARGS__); \\\n  } while (0)\n",
+            "int log_no_abort(const char *, ...);\n",
+            "int log_va(int, const char *, va_list);\n",
+        ] {
+            assert!(text.contains(want), "{want:?} missing:\n{text}");
+        }
+        assert_eq!(text.matches("#include").count(), 2, "{text}");
+        let missing = c::Kept {
+            includes: false,
+            macros: &["nope"],
+        };
+        assert!(c::header(&iface, "x86_64", &functions, &[], &missing).is_err());
+
+        // va_list is Rust's VaList, variadic stays `...`, size_t is usize with its width asserted
+        let checks = rust::api_module(&iface, "x86_64", &functions, "imp").unwrap();
+        assert!(
+            checks.contains("assert!(::core::mem::size_of::<usize>() * 8 == 64, \"size_t\")"),
+            "{checks}"
+        );
+        let imp = "mod imp {\n  pub unsafe extern \"C\" fn log_no_abort(_: *const i8, _: ...) -> i32 { 0 }\n  pub unsafe extern \"C\" fn log_va(_: i32, _: *const i8, _: core::ffi::VaList<'_>) -> i32 { 0 }\n  pub unsafe extern \"C\" fn log_len() -> usize { 0 }\n}\n";
+        let out = rustc(&dir, &format!("{checks}{imp}"));
+        assert!(
+            out.status.success(),
+            "{}\n{checks}{imp}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wrong = imp.replace("_: core::ffi::VaList<'_>", "_: *mut core::ffi::c_void");
+        assert!(!rustc(&dir, &format!("{checks}{wrong}")).status.success());
     }
 
     /// The implementation's signatures checked against the header: matching ones compile, a changed

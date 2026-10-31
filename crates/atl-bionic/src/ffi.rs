@@ -5,12 +5,12 @@
 //! Pointer contracts are bionic's (`_Nonnull` strings are NUL-terminated, value buffers hold
 //! `PROP_VALUE_MAX` bytes); null where bionic would crash is refused instead.
 
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::{CStr, VaList, c_char, c_int, c_void};
 use core::sync::atomic::Ordering::Acquire;
 
 use crate::generated::system_properties::{PROP_NAME_MAX, prop_info};
 use crate::props::{Area, PropInfo, VALUE_MAX, Value};
-use crate::{sdk, store};
+use crate::{async_safe, sdk, store};
 
 type ReadCallback = Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u32)>;
 type ForeachCallback = Option<unsafe extern "C" fn(*const prop_info, *mut c_void)>;
@@ -163,4 +163,135 @@ pub extern "C" fn android_get_application_target_sdk_version() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn android_set_application_target_sdk_version(target: c_int) {
     sdk::set_target_sdk(target);
+}
+
+// libasync_safe. A format's arguments are the caller's printf contract; a null format or tag, where
+// bionic would crash, is refused (-1; `fatal` formats nothing).
+
+/// A C `va_list` as the formatter's arguments.
+struct CArgs<'v, 'a>(&'v mut VaList<'a>);
+
+impl<'s> async_safe::Args<'s> for CArgs<'_, '_> {
+    fn int(&mut self) -> c_int {
+        // SAFETY: the format asks for an int here (printf contract)
+        unsafe { self.0.next_arg::<c_int>() }
+    }
+    fn u32(&mut self) -> u32 {
+        // SAFETY: the format asks for a 32-bit value here
+        unsafe { self.0.next_arg::<u32>() }
+    }
+    fn u64(&mut self) -> u64 {
+        // SAFETY: the format asks for a 64-bit value here
+        unsafe { self.0.next_arg::<u64>() }
+    }
+    fn ptr(&mut self) -> usize {
+        // SAFETY: the format asks for a pointer here
+        unsafe { self.0.next_arg::<*const c_void>() as usize }
+    }
+    fn str(&mut self) -> Option<&'s [u8]> {
+        // SAFETY: the format asks for a string here: null or NUL-terminated, alive for the call
+        unsafe { c_str(self.0.next_arg::<*const c_char>()) }
+    }
+}
+
+unsafe extern "C" {
+    // glibc >= 2.32: static English texts, no locale, no allocation (async-signal-safe)
+    safe fn strerrordesc_np(errnum: c_int) -> *const c_char;
+    safe fn strerrorname_np(errnum: c_int) -> *const c_char;
+}
+
+/// The bytes of a static C string glibc returned; none for null.
+fn static_text(p: *const c_char) -> Option<&'static [u8]> {
+    // SAFETY: glibc's error tables are static NUL-terminated strings
+    unsafe { c_str(p) }
+}
+
+const ERRORS: async_safe::Errors = async_safe::Errors {
+    describe: |e| static_text(strerrordesc_np(e)),
+    name: |e| static_text(strerrorname_np(e)),
+};
+
+/// A result as bionic returns it: the count, or -1 with errno set.
+fn count(r: Result<usize, i32>) -> c_int {
+    match r {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            errno::set_errno(errno::Errno(e));
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn async_safe_format_buffer(
+    buffer: *mut c_char,
+    size: usize,
+    format: *const c_char,
+    mut args: ...
+) -> c_int {
+    // SAFETY: bionic's contract, a NUL-terminated format
+    let Some(format) = (unsafe { c_str(format) }) else {
+        return -1;
+    };
+    let buf: &mut [u8] = match (buffer.is_null(), size) {
+        (_, 0) => &mut [],
+        (true, _) => return -1,
+        // SAFETY: bionic's contract, `size` writable bytes no Rust reference aliases
+        (false, _) => unsafe { core::slice::from_raw_parts_mut(buffer.cast(), size) },
+    };
+    let mut out = async_safe::Buffer::new(buf);
+    async_safe::vformat(&mut out, format, &mut CArgs(&mut args), &ERRORS);
+    out.total as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn async_safe_format_log(
+    priority: c_int,
+    tag: *const c_char,
+    format: *const c_char,
+    args: ...
+) -> c_int {
+    // SAFETY: forwarded as received
+    unsafe { async_safe_format_log_va_list(priority, tag, format, args) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn async_safe_format_log_va_list(
+    priority: c_int,
+    tag: *const c_char,
+    format: *const c_char,
+    mut args: VaList<'_>,
+) -> c_int {
+    // SAFETY: bionic's contract, NUL-terminated strings
+    let (Some(tag), Some(format)) = (unsafe { (c_str(tag), c_str(format)) }) else {
+        return -1;
+    };
+    count(async_safe::format_log(
+        priority,
+        tag,
+        format,
+        &mut CArgs(&mut args),
+        &ERRORS,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn async_safe_write_log(
+    priority: c_int,
+    tag: *const c_char,
+    msg: *const c_char,
+) -> c_int {
+    // SAFETY: bionic's contract, NUL-terminated strings
+    let (Some(tag), Some(msg)) = (unsafe { (c_str(tag), c_str(msg)) }) else {
+        return -1;
+    };
+    count(async_safe::write_log(priority, tag, msg))
+}
+
+/// The `async_safe_fatal` macro's call before its `abort()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn async_safe_fatal_no_abort(format: *const c_char, mut args: ...) {
+    // SAFETY: bionic's contract, a NUL-terminated format
+    let format = unsafe { c_str(format) }.unwrap_or_default();
+    async_safe::fatal(None, format, &mut CArgs(&mut args), &ERRORS);
 }

@@ -46,8 +46,8 @@ provider = "none"
 reason = "APEX support; ATL has no APEX"
 
 ["libasync_safe"]
-provider = "none"
-reason = "bionic-internal (defines _LIBC); glibc rejects it"
+provider = "crate:atl-bionic"
+reason = "bionic-internal (defines _LIBC, glibc rejects it); atl-bionic implements the part AOSP code here calls, without allocation, logging to stderr as bionic does without logd"
 
 ["libdl_android"]
 provider = "none"

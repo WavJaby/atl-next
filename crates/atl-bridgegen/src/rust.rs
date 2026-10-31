@@ -111,6 +111,17 @@ pub fn api_module(
             .with_context(|| format!("{}: no function {f}", iface.header))?;
         let ty = fn_ty(sig, &mut opaque).with_context(|| (*f).to_owned())?;
         writeln!(out, "const _: {ty} = {implementation}::{};", ident(f))?;
+        // `usize` / `isize` stand for these typedefs only where their width is the pointer's
+        let mut sized = BTreeSet::new();
+        for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+            pointer_sized_uses(t, &mut sized);
+        }
+        for (name, bits) in sized {
+            writeln!(
+                out,
+                "const _: () = assert!(::core::mem::size_of::<usize>() * 8 == {bits}, \"{name}\");"
+            )?;
+        }
     }
     if !functions.is_empty() {
         writeln!(out)?;
@@ -211,8 +222,40 @@ fn const_ident(name: &str) -> String {
     ident(&name.replace("::", "_"))
 }
 
+/// C typedefs of pointer width, printed as Rust's pointer-sized integers (an implementation then writes
+/// `usize`, not a width); unsigned ones as `usize`, signed as `isize`. A record using one keeps its
+/// layout asserts, a signature gets a width assert (`api_module`).
+const POINTER_SIZED: &[&str] = &["size_t", "ssize_t", "ptrdiff_t", "intptr_t", "uintptr_t"];
+
+/// The `POINTER_SIZED` typedefs `ty` uses, with their C width, into `out`.
+fn pointer_sized_uses<'t>(ty: &'t Ty, out: &mut BTreeSet<(&'t str, u32)>) {
+    match ty {
+        Ty::Typedef { name, ty } => match ty.resolved() {
+            Ty::Int { bits, .. } if POINTER_SIZED.contains(&name.as_str()) => {
+                out.insert((name, *bits));
+            }
+            _ => pointer_sized_uses(ty, out),
+        },
+        Ty::Pointer { pointee, .. } => pointer_sized_uses(pointee, out),
+        Ty::Array { elem, .. } => pointer_sized_uses(elem, out),
+        Ty::Function(sig) => {
+            for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                pointer_sized_uses(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rust_ty(ty: &Ty, opaque: &mut BTreeSet<String>) -> Result<String> {
     Ok(match ty {
+        // a parameter only (a va_list field or return has no FFI meaning): Rust's own va_list ABI type
+        Ty::Typedef { name, .. } if name == "va_list" => "::core::ffi::VaList<'_>".to_owned(),
+        Ty::Typedef { name, ty } if POINTER_SIZED.contains(&name.as_str()) => match ty.resolved() {
+            Ty::Int { signed: false, .. } => "usize".to_owned(),
+            Ty::Int { signed: true, .. } => "isize".to_owned(),
+            _ => rust_ty(ty, opaque)?,
+        },
         Ty::Typedef { ty, .. } => rust_ty(ty, opaque)?,
         Ty::Void => "::core::ffi::c_void".to_owned(),
         Ty::Bool => "bool".to_owned(),
@@ -272,7 +315,7 @@ fn fn_ty(sig: &Signature, opaque: &mut BTreeSet<String>) -> Result<String> {
     }
     let ret = match sig.ret.resolved() {
         Ty::Void => String::new(),
-        r => format!(" -> {}", rust_ty(r, opaque)?),
+        _ => format!(" -> {}", rust_ty(&sig.ret, opaque)?),
     };
     Ok(format!(
         "unsafe extern \"C\" fn({}){ret}",

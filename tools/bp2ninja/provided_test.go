@@ -8,10 +8,11 @@ import (
 	"testing"
 )
 
-// A provided module replaces the tree's definition: no compile or link step of its own, its artifact first on the dependent's link line (shared_libs and static_libs alike), its include dirs (-isystem) and defines on the dependent's compiles.
+// A provided module replaces the tree's definition: no compile or link step of its own, its artifact first on the dependent's link line (shared_libs and static_libs alike), its include dirs (-isystem) and defines on the dependent's compiles, and the header libraries the tree module re-exports.
 func TestProvidedModule(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
-cc_library { name: "libcrypto", srcs: ["c.cc"], export_include_dirs: ["inc"] }
+cc_library_headers { name: "libh", export_include_dirs: ["hinc"] }
+cc_library { name: "libcrypto", srcs: ["c.cc"], export_include_dirs: ["inc"], header_libs: ["libh"], export_header_lib_headers: ["libh"] }
 cc_library_shared { name: "libother", srcs: ["o.cc"] }
 cc_library { name: "libuser", srcs: ["u.cc"], shared_libs: ["libother", "libcrypto"] }
 cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
@@ -53,6 +54,10 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 		i := slices.Index(flags, "-isystem")
 		if compile == "" || i < 0 || flags[i+1] != "/prefix/include" || !slices.Contains(flags, "-DPFX=X") {
 			t.Errorf("%s: compile flags %q", goal, flags)
+		}
+		// the tree's own export dir is not; its re-exported header library's is
+		if !slices.Contains(flags, "-I"+g.abs("p/hinc")) || slices.Contains(flags, "-I"+g.abs("p/inc")) {
+			t.Errorf("%s: header library flags %q", goal, flags)
 		}
 	}
 }

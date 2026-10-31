@@ -255,14 +255,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and
 /// `<out>/gen/<crate>/include` (its generated headers), with cargo-c; one cargo target dir per build
-/// directory, so concurrent checkouts do not share artifacts.
+/// directory, so concurrent checkouts do not share artifacts. A crate providing several modules (atl-bionic:
+/// libc, libasync_safe) is built once; each of its modules gets the same entry.
 fn build_crates(
     root: &Path,
     out: &Path,
     providers: &providers::Providers,
 ) -> Result<BTreeMap<String, Provided>> {
-    let mut built = BTreeMap::new();
+    let mut by_crate: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (module, krate) in providers::crates(providers) {
+        by_crate.entry(krate).or_default().push(module);
+    }
+    let mut built = BTreeMap::new();
+    for (krate, modules) in by_crate {
         let prefix = out.join("crates").join(krate);
         let include = out.join("gen").join(krate).join("include");
         // headers the crate stopped generating must not stay on the include path
@@ -299,18 +304,20 @@ fn build_crates(
             "{} missing after cargo cinstall",
             lib.display()
         );
-        println!(
-            "native: provided {module} = crate {krate} -> {}",
-            lib.display()
-        );
-        built.insert(
-            module.to_owned(),
-            Provided {
-                lib,
-                include: vec![include],
-                defines: Vec::new(),
-            },
-        );
+        for module in modules {
+            println!(
+                "native: provided {module} = crate {krate} -> {}",
+                lib.display()
+            );
+            built.insert(
+                module.to_owned(),
+                Provided {
+                    lib: lib.clone(),
+                    include: vec![include.clone()],
+                    defines: Vec::new(),
+                },
+            );
+        }
     }
     Ok(built)
 }

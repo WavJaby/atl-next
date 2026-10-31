@@ -35,6 +35,8 @@ pub struct ArchView {
     pub typedefs: BTreeMap<String, Ty>,
     /// `#include` directives of the parsed file, in order, as written (`<stdint.h>`).
     pub includes: Vec<String>,
+    /// Function-like macros the interface's files define, as written (`NAME(args) body`).
+    pub function_macros: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
