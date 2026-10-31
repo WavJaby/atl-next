@@ -36,6 +36,8 @@ pub fn identify(text: &str) -> Identified {
         "permission to use",
         // AGG 2.3's "Permission to copy, use, modify, sell and distribute this software is granted"
         "permission to copy",
+        // SQLite's blessing: "The author disclaims copyright to this source code"
+        "disclaims copyright",
         "gpl",
         // IJG's pointer to README.ijg names no licence
         "conditions of distribution and use",
@@ -242,8 +244,8 @@ fn header(text: &str) -> String {
             // NASM / GNU as comments (`.asm`, `.inc`)
             || t.starts_with(';')
             || hash_comment;
-        // a generator's `#line 1 "x.rl"` (Ragel) above the notice it copied from its input: no code, so not the header's end
-        if t.starts_with("#line ") {
+        // a generator's `#line 1 "x.rl"` (Ragel) above the notice it copied from its input, or `#pragma once` above the notice: no code, so not the header's end
+        if t.starts_with("#line ") || t == "#pragma once" {
             continue;
         }
         if !comment {
@@ -670,6 +672,16 @@ mod tests {
         // pdfium/third_party/agg23/agg_array.h: a licence no rule names, never "no notice" (which would take the project default)
         let agg = "\n//----------------------------------------------------------------------------\n// Anti-Grain Geometry - Version 2.3\n// Copyright (C) 2002-2005 Maxim Shemanarev (http://www.antigrain.com)\n//\n// Permission to copy, use, modify, sell and distribute this software\n// is granted provided this copyright notice appears in all copies.\n// This software is provided \"as is\" without express or implied\n// warranty, and with no claim as to its suitability for any purpose.\n//\n";
         assert_eq!(id(agg), Identified::Unrecognised);
+        // sqlite3.h: the blessing in place of a notice
+        let sqlite = "/*\n** 2001-09-15\n**\n** The author disclaims copyright to this source code.  In place of\n** a legal notice, here is a blessing:\n**\n**    May you do good and not evil.\n*/\n";
+        assert_eq!(id(sqlite), Identified::Unrecognised);
+    }
+
+    #[test]
+    fn pragma_once_above_the_notice() {
+        // libbase/include/android-base/no_destructor.h (abridged)
+        let base = "#pragma once\n\n/*\n * Copyright (C) 2019 The Android Open Source Project\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n */\n\n#include <utility>\n";
+        assert_eq!(id(base), notice("Apache-2.0"));
     }
 
     #[test]
