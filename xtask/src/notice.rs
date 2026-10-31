@@ -237,6 +237,8 @@ fn header(text: &str) -> String {
             || t.starts_with("/*")
             || t.starts_with('*')
             || t.starts_with("//")
+            // NASM / GNU as comments (`.asm`, `.inc`)
+            || t.starts_with(';')
             || hash_comment;
         if !comment {
             break;
@@ -342,10 +344,14 @@ fn pointer_notice(n: &str) -> Option<String> {
             "Unicode-3.0".to_owned()
         });
     }
-    // Chromium-family wording (pdfium); their LICENSE is BSD-3-Clause
-    if has(
-        "use of this source code is governed by a bsd style license that can be found in the license file",
-    ) {
+    // Chromium-family wording (pdfium; zlib's Chromium additions name Chromium's LICENSE); their LICENSE is BSD-3-Clause
+    const CHROMIUM: &str =
+        "use of this source code is governed by a bsd style license that can be found in the";
+    if has(&format!("{CHROMIUM} license file"))
+        || has(&format!(
+            "{CHROMIUM} chromium source repository license file"
+        ))
+    {
         return Some("BSD-3-Clause".to_owned());
     }
     // freetype/LICENSE.TXT: FTL or GPL-2.0 "(any later version can be used also)", the user's choice; Adobe's files add a patent grant to the same licence
@@ -621,6 +627,16 @@ mod tests {
         // libjpeg-turbo/jdapimin.c
         let ijg = "/*\n * jdapimin.c\n *\n * This file was part of the Independent JPEG Group's software:\n * Copyright (C) 1994-1998, Thomas G. Lane.\n * libjpeg-turbo Modifications:\n * Copyright (C) 2016, 2022, D. R. Commander.\n * For conditions of distribution and use, see the accompanying README.ijg\n * file.\n */\n";
         assert_eq!(id(ijg), notice("IJG"));
+    }
+
+    #[test]
+    fn asm_and_chromium_variants() {
+        // libjpeg-turbo/simd/x86_64/jsimdcpu.asm: `;` comments, the pointer on line 10
+        let asm = ";\n; jsimdcpu.asm - SIMD instruction support check\n;\n; Copyright 2009 Pierre Ossman <ossman@cendio.se> for Cendio AB\n; Copyright (C) 2016, D. R. Commander.\n;\n; Based on\n; x86 SIMD extension for IJG JPEG library\n; Copyright (C) 1999-2006, MIYASAKA Masaru.\n; For conditions of distribution and use, see copyright notice in jsimdext.inc\n;\n\n%include \"jsimdext.inc\"\n";
+        assert_eq!(id(asm), notice("Zlib"));
+        // zlib/adler32_simd.c
+        let chromium = "/* adler32_simd.c\n *\n * Copyright 2017 The Chromium Authors\n * Use of this source code is governed by a BSD-style license that can be\n * found in the Chromium source repository LICENSE file.\n */\n";
+        assert_eq!(id(chromium), notice("BSD-3-Clause"));
     }
 
     #[test]
