@@ -72,9 +72,10 @@ fn record_differences(ra: &Record, rb: &Record, a: &str, b: &str) -> Vec<String>
     d
 }
 
-/// Representation equality: widths and pointee structure. Signedness, nullability and constness do
-/// not change the bytes (plain `char` is signed on x86 and unsigned on Arm, same 8 bits).
+/// Representation equality: widths and pointee structure. Typedef names, signedness, nullability and
+/// constness do not change the bytes (plain `char` is signed on x86 and unsigned on Arm, same 8 bits).
 fn same_ty(a: &Ty, b: &Ty) -> bool {
+    let (a, b) = (a.resolved(), b.resolved());
     match (a, b) {
         (Ty::Int { bits: ba, .. }, Ty::Int { bits: bb, .. }) => ba == bb,
         (

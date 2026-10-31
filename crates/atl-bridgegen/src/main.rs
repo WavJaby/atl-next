@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use atl_bridgegen::{Target, report, rust};
+use atl_bridgegen::{Lang, Source, Target, report, rust};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -37,9 +37,17 @@ struct Args {
     /// Arch to emit Rust types for (one of the targets), repeatable.
     #[arg(long = "host")]
     hosts: Vec<String>,
-    /// Object-like macro to evaluate as an integer constant, repeatable (enumerators come without it).
+    /// Object-like macro to evaluate (integer or string), or a `*` glob over the macros the header
+    /// defines; repeatable (enumerators come without it).
     #[arg(long = "macro")]
     macros: Vec<String>,
+    /// Parse --header as C++ (a C++ source or header) instead of C.
+    #[arg(long)]
+    cxx: bool,
+    /// Further file whose declarations belong to the interface (a header the C++ source keeps its types
+    /// in), repeatable.
+    #[arg(long)]
+    also: Vec<PathBuf>,
     /// Output directory.
     #[arg(long)]
     out: PathBuf,
@@ -57,7 +65,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| args.header.display().to_string());
     let macros: Vec<&str> = args.macros.iter().map(String::as_str).collect();
-    let iface = atl_bridgegen::interface(&args.name, &args.header, &label, &macros, &targets)?;
+    let src = Source {
+        path: &args.header,
+        lang: if args.cxx { Lang::Cxx } else { Lang::C },
+        also: &args.also,
+        macros: &macros,
+    };
+    let iface = atl_bridgegen::interface(&args.name, &label, &src, &targets)?;
     std::fs::create_dir_all(&args.out)?;
     let write = |file: String, text: &str| -> Result<()> {
         let path = args.out.join(file);

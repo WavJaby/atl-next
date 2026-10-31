@@ -37,7 +37,8 @@ fn main() -> Result<()> {
 
     let generate = || -> Result<(String, String)> {
         let target = buildscript::bionic_uapi_target(&aosp, &host, &triple);
-        let iface = atl_bridgegen::interface("binder", &header, LABEL, MACROS, &[target])?;
+        let src = atl_bridgegen::Source::c(&header, MACROS);
+        let iface = atl_bridgegen::interface("binder", LABEL, &src, &[target])?;
         Ok((
             atl_bridgegen::rust::host_module(&iface, &host.arch)?,
             atl_bridgegen::to_json(&iface)?,

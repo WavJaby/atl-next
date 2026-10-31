@@ -16,6 +16,9 @@ pub struct HostArch {
     pub arch: String,
     /// Linux kernel arch (`asm-<kernel_arch>` uapi directory).
     pub kernel_arch: String,
+    /// clang triple of bionic on this arch (`[<arch>.guest] clang`): the view bionic's own headers are
+    /// parsed in, whatever libc the host build uses.
+    pub bionic_clang: String,
 }
 
 /// The checkout holding `manifest_dir`: the nearest ancestor with arches.toml.
@@ -76,9 +79,15 @@ pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<HostArch> {
         .get("kernel_arch")
         .and_then(|k| k.as_str())
         .with_context(|| format!("arches.toml [{arch}]: no kernel_arch"))?;
+    let bionic_clang = row
+        .get("guest")
+        .and_then(|g| g.get("clang"))
+        .and_then(|c| c.as_str())
+        .with_context(|| format!("arches.toml [{arch}.guest]: no clang triple"))?;
     Ok(HostArch {
         arch: arch.clone(),
         kernel_arch: kernel_arch.to_owned(),
+        bionic_clang: bionic_clang.to_owned(),
     })
 }
 
@@ -126,21 +135,58 @@ pub fn bionic_uapi_target(aosp: &Path, host: &HostArch, clang_triple: &str) -> T
     }
 }
 
+/// The target to parse bionic's own libc headers in: bionic's triple for `host`'s arch, no system
+/// headers, bionic's `libc/include` then its kernel uapi. `cxx_include`: a C++ standard library to put
+/// first (C++ sources); bionic ships none.
+pub fn bionic_libc_target(aosp: &Path, host: &HostArch, cxx_include: Option<&Path>) -> Target {
+    let mut args = vec!["-nostdlibinc".to_owned()];
+    let dirs = cxx_include
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(std::iter::once(aosp.join("bionic/libc/include")))
+        .chain(bionic_uapi_dirs(aosp, host));
+    args.extend(dirs.map(|d| format!("-isystem{}", d.display())));
+    Target {
+        arch: host.arch.clone(),
+        triple: host.bionic_clang.clone(),
+        args,
+    }
+}
+
+/// The host toolchain's libc++ include directory (where `<atomic>` lives), as clang itself finds it
+/// for the target cargo builds for.
+pub fn libcxx_include_dir() -> Result<PathBuf> {
+    let host = Target {
+        arch: String::new(),
+        triple: clang_triple_from_cargo()?,
+        args: vec!["-stdlib=libc++".to_owned()],
+    };
+    let atomic = crate::front::resolve_include(crate::Lang::Cxx, &host, "atomic")?;
+    atomic
+        .parent()
+        .map(Path::to_path_buf)
+        .with_context(|| format!("{} has no directory", atomic.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn host_row_by_rust_triple() {
-        let text = "[a]\nkernel_arch = \"ka\"\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
+        let text = "[a]\nkernel_arch = \"ka\"\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
         assert_eq!(
             host_arch(text, "a-unknown-linux-gnu").unwrap(),
             HostArch {
                 arch: "a".into(),
-                kernel_arch: "ka".into()
+                kernel_arch: "ka".into(),
+                bionic_clang: "a-linux-android".into(),
             }
         );
         // a guest-only row is never a host
         assert!(host_arch(text, "b-linux-android").is_err());
+        // a host must name its bionic triple
+        let no_guest = "[c]\nkernel_arch = \"kc\"\n[c.host]\nrust = \"c-unknown-linux-gnu\"\n";
+        assert!(host_arch(no_guest, "c-unknown-linux-gnu").is_err());
     }
 }

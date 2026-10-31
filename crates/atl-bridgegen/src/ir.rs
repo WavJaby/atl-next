@@ -24,9 +24,17 @@ pub struct ArchView {
     pub records: BTreeMap<String, Record>,
     /// Functions declared by the interface's header.
     pub functions: BTreeMap<String, Signature>,
-    /// Integer constants: the header's enumerators plus the object-like macros the caller asked for,
-    /// each as clang evaluated it for this target (ioctl numbers embed sizes, so they are per arch).
+    /// Integer constants: the header's enumerators, its `const` integer variables (C++ `constexpr`;
+    /// a class member as `<record>::<name>`), plus the object-like macros the caller asked for, each as
+    /// clang evaluated it for this target (ioctl numbers embed sizes, so they are per arch).
     pub constants: BTreeMap<String, Constant>,
+    /// String constants: requested object-like macros that are string literals (`PROP_DIRNAME`) and
+    /// `const char[]` variables, named as `constants` are.
+    pub strings: BTreeMap<String, String>,
+    /// Typedefs the interface declares: name -> the type it names (`prop_info` -> opaque struct).
+    pub typedefs: BTreeMap<String, Ty>,
+    /// `#include` directives of the parsed file, in order, as written (`<stdint.h>`).
+    pub includes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -43,7 +51,7 @@ pub struct Record {
     pub fields: Vec<Field>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordKind {
     Struct,
@@ -72,7 +80,8 @@ pub struct Signature {
     pub variadic: bool,
 }
 
-/// A C type after typedefs are resolved; widths are this arch's.
+/// A C type; widths are this arch's. Typedef names are kept (`Typedef`) for printers that write C;
+/// layout and identity questions look through them (`resolved`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Ty {
@@ -81,6 +90,9 @@ pub enum Ty {
     Int {
         bits: u32,
         signed: bool,
+        /// The builtin type: same bits are distinct types to C++ (`long` / `long long` on LP64, plain
+        /// `char` / `signed char`), so a printed declaration must name this one.
+        c: CInt,
     },
     Float {
         bits: u32,
@@ -100,12 +112,86 @@ pub enum Ty {
     /// A record defined elsewhere (or never): only usable behind a pointer.
     Opaque {
         name: String,
+        /// `struct` or `union`: C names the type by it.
+        record: RecordKind,
     },
     Function(Box<Signature>),
     Array {
         elem: Box<Ty>,
         len: u64,
     },
+    /// A typedef name as written (`uint32_t`, `prop_info`) and the type it stands for.
+    Typedef {
+        name: String,
+        ty: Box<Ty>,
+    },
+}
+
+impl Ty {
+    /// The type behind any typedef names.
+    pub fn resolved(&self) -> &Ty {
+        match self {
+            Ty::Typedef { ty, .. } => ty.resolved(),
+            t => t,
+        }
+    }
+}
+
+/// C builtin integer types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CInt {
+    Char,
+    SignedChar,
+    UnsignedChar,
+    Short,
+    UnsignedShort,
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
+    LongLong,
+    UnsignedLongLong,
+    Int128,
+    UnsignedInt128,
+    Char16,
+    Char32,
+}
+
+impl CInt {
+    /// The type's C spelling.
+    pub fn c_name(self) -> &'static str {
+        match self {
+            CInt::Char => "char",
+            CInt::SignedChar => "signed char",
+            CInt::UnsignedChar => "unsigned char",
+            CInt::Short => "short",
+            CInt::UnsignedShort => "unsigned short",
+            CInt::Int => "int",
+            CInt::UnsignedInt => "unsigned int",
+            CInt::Long => "long",
+            CInt::UnsignedLong => "unsigned long",
+            CInt::LongLong => "long long",
+            CInt::UnsignedLongLong => "unsigned long long",
+            CInt::Int128 => "__int128",
+            CInt::UnsignedInt128 => "unsigned __int128",
+            CInt::Char16 => "char16_t",
+            CInt::Char32 => "char32_t",
+        }
+    }
+
+    /// Suffix that gives an integer literal this type, where C has one.
+    pub fn literal_suffix(self) -> Option<&'static str> {
+        match self {
+            CInt::Int => Some(""),
+            CInt::UnsignedInt => Some("U"),
+            CInt::Long => Some("L"),
+            CInt::UnsignedLong => Some("UL"),
+            CInt::LongLong => Some("LL"),
+            CInt::UnsignedLongLong => Some("ULL"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
