@@ -281,6 +281,16 @@ fn normalize(s: &str) -> String {
 
 fn classify(n: &str) -> Option<String> {
     let has = |p: &str| n.contains(p);
+    // zstd's dual notice; zstd/LICENSE is BSD-3-Clause, COPYING GPL-2.0. Checked first: the family rules below would read only its "GPLv2"
+    if has(
+        "licensed under both the bsd style license found in the license file in the root directory of this source tree and the gplv2 found in the copying file in the root directory of this source tree you may select at your option one of the above listed licenses",
+    ) {
+        return Some("BSD-3-Clause OR GPL-2.0-only".to_owned());
+    }
+    // any other choice of licences: one family read from it would drop the other arms
+    if has("at your option one of") || has("dual licensed") {
+        return None;
+    }
     let mut found = Vec::new();
     if has("apache license version 2.0") || has("apache license 2.0") {
         found.push("Apache-2.0".to_owned());
@@ -627,6 +637,16 @@ mod tests {
         let ft = "/****************************************************************************\n *\n * ftobjs.c\n *\n * Copyright (C) 1996-2023 by\n * David Turner, Robert Wilhelm, and Werner Lemberg.\n *\n * This file is part of the FreeType project, and may only be used,\n * modified, and distributed under the terms of the FreeType project\n * license, LICENSE.TXT.  By continuing to use, modify, or distribute\n * this file you indicate that you have read the license and\n * understand and accept it fully.\n *\n */\n\n\n#include <freetype/ftlist.h>\n";
         // GPL-2.0-or-later, never -only: "any later version can be used also"
         assert_eq!(id(ft), notice("FTL OR GPL-2.0-or-later"));
+    }
+
+    #[test]
+    fn zstd_dual_licence() {
+        // zstd/lib/common/zstd_internal.h; read as plain GPL-2.0-only before, from its "GPLv2" alone
+        let zstd = "/*\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n * All rights reserved.\n *\n * This source code is licensed under both the BSD-style license (found in the\n * LICENSE file in the root directory of this source tree) and the GPLv2 (found\n * in the COPYING file in the root directory of this source tree).\n * You may select, at your option, one of the above-listed licenses.\n */\n\n#ifndef ZSTD_CCOMMON_H_MODULE\n";
+        assert_eq!(id(zstd), notice("BSD-3-Clause OR GPL-2.0-only"));
+        // another choice no rule names is not read as its one recognised arm
+        let other = "/*\n * This source code is licensed under both the Foo license and the GPLv2.\n * You may select, at your option, one of the above-listed licenses.\n */\n";
+        assert_eq!(id(other), Identified::Unrecognised);
     }
 
     #[test]
