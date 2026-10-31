@@ -157,6 +157,8 @@ pub struct Ranked {
     pub blocks: usize,
     /// failed modules among its own dependencies
     pub waits_on: Vec<String>,
+    /// a shortest dependency chain from the first goal reaching it, goal first
+    pub via: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -184,6 +186,32 @@ fn closure<'a>(graph: &'a Graph, from: &'a str) -> BTreeSet<&'a str> {
         }
     }
     seen
+}
+
+/// A shortest chain `from` -> … -> `to` (breadth first), both ends included.
+fn chain(graph: &Graph, from: &str, to: &str) -> Option<Vec<String>> {
+    let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([from]);
+    let mut seen = BTreeSet::from([from]);
+    while let Some(m) = queue.pop_front() {
+        if m == to {
+            let mut path = vec![to.to_owned()];
+            let mut at = to;
+            while let Some(p) = parent.get(at) {
+                path.push((*p).to_owned());
+                at = p;
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for d in graph.deps.get(m).into_iter().flatten() {
+            if seen.insert(d) {
+                parent.insert(d, m);
+                queue.push_back(d);
+            }
+        }
+    }
+    None
 }
 
 pub fn rank(graph: &Graph, failed: &BTreeMap<String, Failed>) -> Report {
@@ -218,6 +246,11 @@ pub fn rank(graph: &Graph, failed: &BTreeMap<String, Failed>) -> Report {
                     .filter(|d| **d != f.as_str() && failed.contains_key(**d))
                     .map(|d| (*d).to_owned())
                     .collect(),
+                via: graph
+                    .goals
+                    .iter()
+                    .find_map(|g| chain(graph, g, f))
+                    .unwrap_or_default(),
             })
         })
         .collect();
@@ -301,12 +334,18 @@ pub fn render(report: &Report, failed: &BTreeMap<String, Failed>, verbose: bool)
             ));
         }
     };
+    let via = |out: &mut Vec<String>, r: &Ranked| {
+        if verbose && !r.via.is_empty() {
+            out.push(format!("    via {}", r.via.join(" -> ")));
+        }
+    };
     let (first, then): (Vec<&Ranked>, Vec<&Ranked>) =
         report.ranked.iter().partition(|r| r.waits_on.is_empty());
     if !first.is_empty() {
         out.push("fix first (no failed dependency), most blocking first:".to_owned());
         for r in first {
             module(&mut out, &r.module, format!(", blocks {}", r.blocks));
+            via(&mut out, r);
         }
     }
     if !then.is_empty() {
@@ -318,6 +357,7 @@ pub fn render(report: &Report, failed: &BTreeMap<String, Failed>, verbose: bool)
                 &r.module,
                 format!(", blocks {}, waits on {waits}", r.blocks),
             );
+            via(&mut out, r);
         }
     }
     if !report.off_path.is_empty() {
@@ -504,23 +544,28 @@ clang++: error: linker command failed with exit code 1 (use -v to see invocation
             }]
         );
         // leaf: mid, other, goal wait on it (stray is outside the closure); tool: mid, goal
+        // via: breadth first in dependency order, so leaf is reached through mid (goal's first dependency), not other
+        let chain = |c: &[&str]| c.iter().map(|m| (*m).to_owned()).collect::<Vec<_>>();
         assert_eq!(
             r.ranked,
             [
                 Ranked {
                     module: "d/leaf".to_owned(),
                     blocks: 3,
-                    waits_on: vec![]
+                    waits_on: vec![],
+                    via: chain(&["d/goal", "d/mid", "d/leaf"]),
                 },
                 Ranked {
                     module: "h/tool".to_owned(),
                     blocks: 2,
-                    waits_on: vec![]
+                    waits_on: vec![],
+                    via: chain(&["d/goal", "d/mid", "h/tool"]),
                 },
                 Ranked {
                     module: "d/mid".to_owned(),
                     blocks: 1,
-                    waits_on: vec!["d/leaf".to_owned(), "h/tool".to_owned()]
+                    waits_on: vec!["d/leaf".to_owned(), "h/tool".to_owned()],
+                    via: chain(&["d/goal", "d/mid"]),
                 },
             ]
         );
@@ -568,5 +613,7 @@ clang++: error: linker command failed with exit code 1 (use -v to see invocation
         assert!(
             all.contains(&"    undefined symbols (8): s0, s1, s2, s3, s4, s5, s6, s7".to_owned())
         );
+        assert!(all.contains(&"    via device/libbinder -> device/liblog".to_owned()));
+        assert!(!text.iter().any(|l| l.contains("via ")));
     }
 }
