@@ -121,6 +121,14 @@ arch = "libc++abi"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# elfutils' libelf built for glibc: AOSP's copy is configured for bionic (providers.toml `libelf`)
+[libelf]
+debian = "libelf-dev"
+arch = "libelf"
+pkgconfig = "libelf"
+scope = ["build", "runtime"]
+used_by = ["upstream:aosp"]
+
 [lld]
 debian = "lld-19"
 arch = "lld"
