@@ -18,15 +18,18 @@
 # LicenseRef-Public-Domain: a "placed in the public domain" notice is a dedication, not a licence, and the SPDX list has no id for it (CC0-1.0 / Unlicense are specific instruments those notices do not use).
 # FTL, ICU, IJG, Libpng, libpng-2.0, MIT-Modern-Variant, Zlib: owner decision 2026-10-31, all GPL-3-compatible permissive licences (FreeType's `FTL OR GPL-2.0-or-later` passes through FTL).
 # GPL-2.0-only WITH Linux-syscall-note: owner decision 2026-10-31; the note frees programs that use the kernel through system calls, i.e. include its uapi headers, so it is a linking exception in the sense of the GPL-2.0-only rule.
+# LicenseRef-AGG-2.3, blessing: owner decision 2026-10-31; AGG 2.3's all-permissive notice (copy/use/modify/sell/distribute if the notice is kept; no SPDX id) and SQLite's public-domain blessing (SPDX `blessing`), both GPL-3-compatible.
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "blessing",
     "FTL",
     "GPL-2.0-only WITH Linux-syscall-note",
     "ICU",
     "IJG",
     "ISC",
+    "LicenseRef-AGG-2.3",
     "LicenseRef-Public-Domain",
     "Libpng",
     "libpng-2.0",
