@@ -247,6 +247,13 @@ fn header(text: &str) -> String {
         if t.starts_with("#line ") || t == "#pragma once" {
             continue;
         }
+        // an include guard (`#ifndef X` / `#define X`) or other conditional above the first comment, e.g. Khronos' khrplatform.h; `#include` still ends the header
+        let guard = ["#ifndef ", "#ifdef ", "#if ", "#define "]
+            .iter()
+            .any(|d| t.starts_with(d));
+        if guard && out.iter().all(|l| l.is_empty()) {
+            continue;
+        }
         if !comment {
             break;
         }
@@ -299,7 +306,15 @@ fn classify(n: &str) -> Option<String> {
         found.push(gnu?);
     }
     if has("permission is hereby granted free of charge to any person obtaining a copy") {
-        found.push("MIT".to_owned());
+        // Khronos' text grants rights to the "Materials" instead of the "Software": SPDX MIT-Khronos-old
+        found.push(
+            if has("associated documentation files the materials to deal in the materials") {
+                "MIT-Khronos-old"
+            } else {
+                "MIT"
+            }
+            .to_owned(),
+        );
     }
     if has(
         "permission to use copy modify and or distribute this software for any purpose with or without fee",
@@ -391,6 +406,10 @@ fn pointer_notice(n: &str) -> Option<String> {
     }
     // fmt's headers point at format.h: MIT, plus an optional exception that only waives the notice in object code
     if has("for the license information refer to format.h") {
+        return Some("MIT".to_owned());
+    }
+    // clap's (clap, clap_builder): names MIT itself; the crates' Cargo.toml offer `MIT OR Apache-2.0`, of which the notice picks MIT
+    if has("licensed under the mit license see license or http opensource.org licenses mit") {
         return Some("MIT".to_owned());
     }
     // libogg's (Xiph) wording; Xiph's COPYING is BSD-3-Clause
@@ -701,6 +720,20 @@ mod tests {
         // libbase/include/android-base/no_destructor.h (abridged)
         let base = "#pragma once\n\n/*\n * Copyright (C) 2019 The Android Open Source Project\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n */\n\n#include <utility>\n";
         assert_eq!(id(base), notice("Apache-2.0"));
+    }
+
+    #[test]
+    fn include_guard_above_the_khronos_notice() {
+        // frameworks/native/opengl/include/KHR/khrplatform.h (abridged)
+        let khr = "#ifndef __khrplatform_h_\n#define __khrplatform_h_\n\n/*\n** Copyright (c) 2008-2009 The Khronos Group Inc.\n**\n** Permission is hereby granted, free of charge, to any person obtaining a\n** copy of this software and/or associated documentation files (the\n** \"Materials\"), to deal in the Materials without restriction, including\n*/\n";
+        assert_eq!(id(khr), notice("MIT-Khronos-old"));
+    }
+
+    #[test]
+    fn clap_mit_notice() {
+        // external/rust/android-crates-io/crates/clap/src/lib.rs
+        let clap = "// Copyright ⓒ 2015-2016 Kevin B. Knapp and [`clap-rs` contributors](https://github.com/clap-rs/clap/graphs/contributors).\n// Licensed under the MIT license\n// (see LICENSE or <http://opensource.org/licenses/MIT>) All files in the project carrying such\n// notice may not be copied, modified, or distributed except according to those terms.\n\n//! > **Command Line Argument Parser for Rust**\n";
+        assert_eq!(id(clap), notice("MIT"));
     }
 
     #[test]
