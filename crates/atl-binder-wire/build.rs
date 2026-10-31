@@ -27,16 +27,15 @@ const MACROS: &[&str] = &[
 fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
-    let workspace = buildscript::workspace(&checkout)?;
-    let header = buildscript::upstream_file(&workspace, HEADER)?;
+    let up = buildscript::Upstreams::of(&checkout)?;
+    let header = up.file(HEADER)?;
     let arches = checkout.join("arches.toml");
     let rust_target = std::env::var("TARGET")?;
     let host = buildscript::host_arch(&std::fs::read_to_string(&arches)?, &rust_target)?;
     let triple = buildscript::clang_triple_from_cargo()?;
-    let aosp = workspace.join("src/aosp");
 
     let generate = || -> Result<(String, String)> {
-        let target = buildscript::bionic_uapi_target(&aosp, &host, &triple);
+        let target = buildscript::bionic_uapi_target(&up, &host, &triple);
         let src = atl_bridgegen::Source::c(&header, MACROS);
         let iface = atl_bridgegen::interface("binder", LABEL, &src, &[target])?;
         Ok((
@@ -56,8 +55,10 @@ fn main() -> Result<()> {
     std::fs::write(out.join("binder.ir.json"), &first.1).context("writing binder.ir.json")?;
 
     println!("cargo::rerun-if-changed={}", arches.display());
-    for dir in buildscript::bionic_uapi_dirs(&aosp, &host) {
-        println!("cargo::rerun-if-changed={}", dir.display());
+    for dir in buildscript::bionic_uapi_dirs(&host) {
+        for path in up.rerun_paths(&dir) {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
     }
     Ok(())
 }

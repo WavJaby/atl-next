@@ -11,12 +11,12 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_layout::Layout;
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
-use crate::layout::Layout;
 use crate::providers::Provided;
 use crate::sources::Pin;
-use crate::{arches, fetch, patch, provided_gate, providers, sources, upstream, workspace};
+use crate::{arches, farm, fetch, patch, provided_gate, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -54,16 +54,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(a) if a.host.is_some() => a.pointer_bits.to_string(),
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
-    let ws = workspace::root_dir(root)?;
     let layout = Layout::of(root)?;
+    let ws = layout.workspace();
     // regenerated every round: --fetch-missing adds projects between rounds
     let aosp_tree = || -> Result<std::path::PathBuf> {
         let sources = sources::load(root)?;
         let manifest = aosp::load(root, &sources.aosp)?;
-        layout.aosp_tree(&sources.checkouts(None), manifest.as_ref())
+        farm::aosp_tree(&layout, &sources.checkouts(None), manifest.as_ref())
     };
     let tree = aosp_tree()?;
-    if tree != layout.shared_tree() {
+    if tree != farm::shared_tree(&layout) {
         println!("native: AOSP tree with task copies: {}", tree.display());
     }
     // go.work and the converter binary name this checkout's tools/bp2ninja: with an explicit --out they live there too, so concurrent checkouts do not overwrite each other's
@@ -124,7 +124,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .iter()
             .find(|c| matches!(&c.pin, Pin::Git(n) if n == name))
             .with_context(|| format!("providers.toml upstream {name} has no sources.toml row"))?;
-        let src = layout.checkout(c).dir;
+        let src = layout.locate(&c.dir).dir;
         println!("native: building upstream {name} from {}", src.display());
         provided.extend(upstream::build(&src, &out, recipe, &toolchain)?);
     }

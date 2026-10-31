@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+atl-layout = { path = "../crates/atl-layout" }
 clap.workspace = true
 object.workspace = true
 roxmltree.workspace = true

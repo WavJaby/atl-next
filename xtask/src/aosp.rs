@@ -10,10 +10,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use atl_layout::Layout;
+
 use crate::git::git;
-use crate::layout::Layout;
+use crate::par;
 use crate::sources::{self, AOSP_MANIFEST_DIR, Aosp, Sources};
-use crate::{par, workspace};
 
 /// The manifest file inside the manifest checkout.
 const MANIFEST_FILE: &str = "default.xml";
@@ -128,9 +129,8 @@ pub fn parse(xml: &str) -> Result<Manifest> {
 /// pinned tag: a manifest checkout left at another tag would name the wrong projects.
 pub fn load(root: &Path, aosp: &Aosp) -> Result<Option<Manifest>> {
     let file = Layout::of(root)?
-        .src()
-        .join(AOSP_MANIFEST_DIR)
-        .join(MANIFEST_FILE);
+        .locate(&Path::new(AOSP_MANIFEST_DIR).join(MANIFEST_FILE))
+        .dir;
     if !file.exists() {
         return Ok(None);
     }
@@ -273,7 +273,8 @@ impl Definition {
 }
 
 fn index_dir(root: &Path, aosp: &Aosp) -> Result<PathBuf> {
-    Ok(workspace::root_dir(root)?
+    Ok(Layout::of(root)?
+        .workspace()
         .join("cache")
         .join("aosp-bp")
         .join(&aosp.tag))

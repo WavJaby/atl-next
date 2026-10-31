@@ -71,7 +71,7 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
         .iter()
         .find(|c| c.dir.display().to_string() == args.upstream)
         .with_context(|| format!("no upstream {}", args.upstream))?;
-    let checkout = crate::layout::Layout::of(root)?.checkout(c).dir;
+    let checkout = atl_layout::Layout::of(root)?.locate(&c.dir).dir;
     let base = args
         .under
         .as_deref()

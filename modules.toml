@@ -28,6 +28,13 @@ uses = ["generators"]
 crates = ["atl-bridgegen"]
 # build-dependency of crates whose types are generated from upstream headers
 exports = ["atl-bridgegen"]
+uses = ["layout"]
+
+# the one resolver of upstream checkouts (src/ or a task copy): xtask and build scripts place sources through it
+[layout]
+crates = ["atl-layout"]
+exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
+uses = ["layout"]

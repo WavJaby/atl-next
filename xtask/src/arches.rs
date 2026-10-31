@@ -82,13 +82,13 @@ fn validate(arches: &Arches) -> Result<()> {
     Ok(())
 }
 
-/// Path of bionic's build file in the fetched AOSP tree; it owns the uapi arch directories.
-const BIONIC_LIBC_BP: &str = "src/aosp/bionic/libc/Android.bp";
+/// bionic's build file, an upstream path; it owns the uapi arch directories.
+const BIONIC_LIBC_BP: &str = "aosp/bionic/libc/Android.bp";
 
 /// Every row's `kernel_arch` is the `asm-` directory bionic's `libc_uapi_headers` exports for that
-/// (Soong) arch. Needs the fetched tree: build scripts parse that uapi, so nothing builds without it.
-pub fn check_kernel_arch(workspace: &Path, arches: &Arches) -> Result<()> {
-    let path = workspace.join(BIONIC_LIBC_BP);
+/// (Soong) arch, in the bionic checkout `layout` resolves. Needs the fetched tree: build scripts parse that uapi, so nothing builds without it.
+pub fn check_kernel_arch(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
+    let path = layout.locate(Path::new(BIONIC_LIBC_BP)).dir;
     let text = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "reading {}: run `cargo xtask fetch --execute`",

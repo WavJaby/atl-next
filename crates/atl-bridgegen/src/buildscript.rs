@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! What a consuming crate's `build.rs` needs around the generator: the checkout and shared workspace it
-//! builds in, and the arches.toml row of the target cargo is building for. Generation always targets
-//! cargo's `TARGET`; one checked target per `cargo check --target` run.
+//! What a consuming crate's `build.rs` needs around the generator: the checkout it builds in, the upstream sources as that checkout resolves them, and the arches.toml row of the target cargo is building for. Generation always targets cargo's `TARGET`; one checked target per `cargo check --target` run.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use atl_layout::Layout;
 
 use crate::Target;
 
@@ -30,37 +29,46 @@ pub fn checkout(manifest_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("no arches.toml above {}", manifest_dir.display()))
 }
 
-/// The shared workspace (`~/atl-next`): parent of the main checkout, found through the git common dir
-/// so every worktree resolves the same `src/`. Same rule as xtask's `workspace::root_dir`.
-pub fn workspace(checkout: &Path) -> Result<PathBuf> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(checkout)
-        .output()
-        .context("running git rev-parse")?;
-    ensure!(
-        out.status.success(),
-        "git rev-parse: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    // <workspace>/repo/.git -> <workspace>
-    common
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .with_context(|| format!("{} has no workspace parent", common.display()))
+/// The upstream sources a build script reads, where `atl_layout` places them for this repo checkout: a task copy (`xtask patch --edit`) replaces its `src/` checkout here exactly as in xtask.
+pub struct Upstreams {
+    layout: Layout,
 }
 
-/// A fetched upstream file, failing with the fetch command when it is absent.
-pub fn upstream_file(workspace: &Path, rel: &str) -> Result<PathBuf> {
-    let path = workspace.join("src").join(rel);
-    ensure!(
-        path.is_file(),
-        "{} missing: run `cargo xtask fetch --execute`",
-        path.display()
-    );
-    Ok(path)
+impl Upstreams {
+    /// The upstreams of the repo checkout `checkout`.
+    pub fn of(checkout: &Path) -> Result<Self> {
+        Ok(Upstreams {
+            layout: Layout::of(checkout)?,
+        })
+    }
+
+    /// `rel`, relative to `src/` (`aosp/bionic/libc/include`), where this checkout reads it.
+    pub fn path(&self, rel: &str) -> PathBuf {
+        self.layout.locate(Path::new(rel)).dir
+    }
+
+    /// An AOSP tree path (`bionic/libc/include`) where this checkout reads it.
+    pub fn aosp(&self, tree_rel: &str) -> PathBuf {
+        self.path(&format!("aosp/{tree_rel}"))
+    }
+
+    /// `path(rel)`, failing with the fetch command when it is not a file.
+    pub fn file(&self, rel: &str) -> Result<PathBuf> {
+        let path = self.path(rel);
+        ensure!(
+            path.is_file(),
+            "{} missing: run `cargo xtask fetch --execute`",
+            path.display()
+        );
+        Ok(path)
+    }
+
+    /// The `cargo::rerun-if-changed` paths for reading `rel`: where it is now, and what moves it (a branch switch, a task copy made or removed).
+    pub fn rerun_paths(&self, rel: &str) -> Vec<PathBuf> {
+        let mut out = vec![self.path(rel)];
+        out.extend(self.layout.resolution_inputs(Path::new(rel)));
+        out
+    }
 }
 
 /// The row whose `[<arch>.host] rust` is `rust_target`, read from arches.toml's text.
@@ -108,25 +116,24 @@ pub fn clang_triple_from_cargo() -> Result<String> {
 
 /// bionic's kernel uapi include directories for `host`, as Soong's `libc_uapi_headers` exports them:
 /// the generic uapi, Android's additions (`linux/compiler_types.h`), the arch's `asm-<kernel_arch>`.
-pub fn bionic_uapi_dirs(aosp: &Path, host: &HostArch) -> Vec<PathBuf> {
-    let kernel = aosp.join("bionic/libc/kernel");
+/// Paths relative to `src/`, for `Upstreams::path` / `rerun_paths`.
+pub fn bionic_uapi_dirs(host: &HostArch) -> Vec<String> {
+    let kernel = "aosp/bionic/libc/kernel";
     vec![
-        kernel.join("uapi"),
-        kernel.join("android/uapi"),
-        kernel
-            .join("uapi")
-            .join(format!("asm-{}", host.kernel_arch)),
+        format!("{kernel}/uapi"),
+        format!("{kernel}/android/uapi"),
+        format!("{kernel}/uapi/asm-{}", host.kernel_arch),
     ]
 }
 
 /// The target to parse a bionic kernel-uapi header for `host`: no system headers, only
 /// `bionic_uapi_dirs`.
-pub fn bionic_uapi_target(aosp: &Path, host: &HostArch, clang_triple: &str) -> Target {
+pub fn bionic_uapi_target(up: &Upstreams, host: &HostArch, clang_triple: &str) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     args.extend(
-        bionic_uapi_dirs(aosp, host)
+        bionic_uapi_dirs(host)
             .iter()
-            .map(|d| format!("-isystem{}", d.display())),
+            .map(|d| format!("-isystem{}", up.path(d).display())),
     );
     Target {
         arch: host.arch.clone(),
@@ -138,13 +145,13 @@ pub fn bionic_uapi_target(aosp: &Path, host: &HostArch, clang_triple: &str) -> T
 /// The target to parse bionic's own libc headers in: bionic's triple for `host`'s arch, no system
 /// headers, bionic's `libc/include` then its kernel uapi. `cxx_include`: a C++ standard library to put
 /// first (C++ sources); bionic ships none.
-pub fn bionic_libc_target(aosp: &Path, host: &HostArch, cxx_include: Option<&Path>) -> Target {
+pub fn bionic_libc_target(up: &Upstreams, host: &HostArch, cxx_include: Option<&Path>) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     let dirs = cxx_include
         .map(Path::to_path_buf)
         .into_iter()
-        .chain(std::iter::once(aosp.join("bionic/libc/include")))
-        .chain(bionic_uapi_dirs(aosp, host));
+        .chain(std::iter::once(up.aosp("bionic/libc/include")))
+        .chain(bionic_uapi_dirs(host).into_iter().map(|d| up.path(&d)));
     args.extend(dirs.map(|d| format!("-isystem{}", d.display())));
     Target {
         arch: host.arch.clone(),

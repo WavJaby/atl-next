@@ -8,14 +8,14 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_layout::Layout;
 
 use crate::aosp::Manifest;
-use crate::git::{Ident, git, git_isolated};
-use crate::layout::Layout;
+use crate::git::{Ident, git, git_isolated, git_raw};
 use crate::licenses::{self, Licenses};
 use crate::prune::{self, Prune};
 use crate::sources::{self, Checkout, Pin, Sources};
-use crate::{aosp, fetch, notice};
+use crate::{aosp, farm, fetch, notice};
 
 /// Patch branch of a shared `src/` checkout; a task copy's is `atl-patches-<task>` (git branches are shared by a repository's worktrees).
 pub const BRANCH: &str = "atl-patches";
@@ -27,10 +27,16 @@ const BASE_REF: &str = "refs/worktree/atl/base";
 const TRAILERS: [&str; 2] = ["Upstream-Status", "Patch-Reason"];
 /// Untracked files named in a drift message; the rest are counted.
 const STRAYS_SHOWN: usize = 3;
+/// `patches/<upstream>/LICENSE` is a copy of the first of these at the top of the upstream at its pin, written by `--export` and compared by the drift test.
+/// AOSP projects ship no LICENSE: their licence text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names.
+const LICENCE_FILES: [&str; 3] = ["LICENSE", "COPYING", "NOTICE"];
+const LICENCE_COPY: &str = "LICENSE";
+/// The fix for patches/ ahead of a checkout: the normal state on main between merging a patch change and the next fetch.
+const FETCH: &str = "cargo xtask fetch --execute (the step after merging a change to patches/)";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one.
+    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one, with LICENSE = the upstream's LICENSE, COPYING or NOTICE at the pin (first found). Refused with no commits past the pin.
     #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with_all = ["rebase", "edit", "done"])]
     export: Vec<String>,
     /// Move the patch branch of these upstreams from their old base onto the current pin (after a bump).
@@ -59,7 +65,7 @@ pub struct Up<'a> {
 impl<'a> Up<'a> {
     /// `c` where `layout` resolves it, its patches under `<root>/patches`.
     pub fn new(c: &'a Checkout, layout: &Layout, root: &Path) -> Self {
-        let l = layout.checkout(c);
+        let l = layout.locate(&c.dir);
         Up {
             c,
             branch: match &l.task {
@@ -173,7 +179,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         if picked.iter().any(|u| matches!(u.c.pin, Pin::Aosp(_))) {
             // the farm follows the task copies left
-            layout.aosp_tree(&all, manifest.as_ref())?;
+            farm::aosp_tree(&layout, &all, manifest.as_ref())?;
         }
     } else {
         for u in &ups {
@@ -340,6 +346,11 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
         return Ok(Some(problems));
     }
     let stored = stored(&u.patches)?;
+    if !stored.is_empty()
+        && let Some(p) = licence_problem(u)?
+    {
+        problems.push(p);
+    }
     if u.on_branch()? {
         match base(u)? {
             None => problems.push(no_base(u)),
@@ -350,7 +361,7 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
             Some(b) => match branch_patches(u, &b, licenses) {
                 Ok(branch) if branch == stored => {}
                 Ok(branch) if unexported(&branch, &stored).is_empty() => problems.push(format!(
-                    "patches/{} holds patches {} lacks: xtask fetch --execute",
+                    "patches/{} holds patches {} lacks: {FETCH}",
                     u.name(),
                     u.branch
                 )),
@@ -363,10 +374,7 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
             },
         }
     } else if !stored.is_empty() {
-        problems.push(format!(
-            "{} patches not applied: xtask fetch --execute",
-            stored.len()
-        ));
+        problems.push(format!("{} patches not applied: {FETCH}", stored.len()));
     } else if git(Some(dir), &["rev-parse", "HEAD"])? != u.c.commit {
         problems.push("not at pin: xtask fetch --execute".to_owned());
     }
@@ -522,8 +530,9 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
 }
 
 /// `--edit`: the task copy of `c`, a worktree of `src/<up>` on `atl-patches-<task>` = pin + this checkout's patches/.
+/// It commits as the repo checkout's identity (`ident`): `user.*` in the copy's own worktree config (`extensions.worktreeConfig`), so it goes with the copy and `src/<up>`, where nobody commits, gets none.
 fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<String> {
-    let (shared, copy, task) = layout.edit_paths(c)?;
+    let (shared, copy, task) = layout.edit_paths(&c.dir)?;
     let branch = format!("{BRANCH}-{task}");
     ensure!(
         !copy.exists(),
@@ -565,7 +574,17 @@ fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<Str
         copy.display()
     );
     let stored = u.stored()?;
-    if let Err(e) = rebuild(&u, &stored, ident) {
+    let made = (|| {
+        git(
+            Some(&shared),
+            &["config", "extensions.worktreeConfig", "true"],
+        )?;
+        for (key, value) in [("user.name", &ident.name), ("user.email", &ident.email)] {
+            git(Some(&copy), &["config", "--worktree", key, value])?;
+        }
+        rebuild(&u, &stored, ident)
+    })();
+    if let Err(e) = made {
         return Err(match remove_copy(&shared, &copy, &branch) {
             Ok(()) => e.context("task copy removed again"),
             Err(r) => e.context(format!("removing the task copy failed too: {r:#}")),
@@ -580,7 +599,7 @@ fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<Str
 
 /// `--done`: remove the task copy and its branch, unless that would lose work.
 fn done(u: &Up, layout: &Layout, licenses: &Licenses) -> Result<String> {
-    let (shared, copy, _) = layout.edit_paths(u.c)?;
+    let (shared, copy, _) = layout.edit_paths(&u.c.dir)?;
     ensure!(
         !u.is_shared(),
         "no task copy {}: nothing to remove",
@@ -643,6 +662,13 @@ fn export(u: &Up, licenses: &Licenses) -> Result<String> {
         u.name()
     );
     let patches = branch_patches(u, &u.c.commit, licenses)?;
+    ensure!(
+        !patches.is_empty(),
+        "{} has no commits past the pin: nothing to export (to drop every patch, delete patches/{}/)",
+        u.branch,
+        u.name()
+    );
+    let (licence_file, licence) = upstream_licence(u)?;
     std::fs::create_dir_all(&u.patches)?;
     for (name, _) in stored(&u.patches)? {
         std::fs::remove_file(u.patches.join(name))?;
@@ -650,12 +676,49 @@ fn export(u: &Up, licenses: &Licenses) -> Result<String> {
     for (name, text) in &patches {
         std::fs::write(u.patches.join(name), text)?;
     }
-    let licence_note = if u.patches.join("LICENSE").exists() {
-        ""
-    } else {
-        " (add patches/<upstream>/LICENSE: the upstream's licence text)"
-    };
-    Ok(format!("exported {} patches{licence_note}", patches.len()))
+    std::fs::write(u.patches.join(LICENCE_COPY), licence)?;
+    Ok(format!(
+        "exported {} patches, {LICENCE_COPY} = {licence_file} at the pin",
+        patches.len()
+    ))
+}
+
+/// The upstream's licence text: the first of `LICENCE_FILES` that is a regular file at the pin (a symlink's blob is its target path, a tree no text), with its name.
+fn upstream_licence(u: &Up) -> Result<(&'static str, String)> {
+    for name in LICENCE_FILES {
+        // `<mode> <type> <blob>\t<name>`, empty when absent
+        let entry = git(Some(&u.checkout), &["ls-tree", &u.c.commit, "--", name])?;
+        let mut f = entry.split_whitespace();
+        if let (Some(mode), Some(_), Some(blob)) = (f.next(), f.next(), f.next())
+            && mode.starts_with("100")
+        {
+            return Ok((name, git_raw(&u.checkout, &["cat-file", "blob", blob])?));
+        }
+    }
+    bail!(
+        "{} has none of {} at the pin: no licence text for patches/{}/{LICENCE_COPY}",
+        u.name(),
+        LICENCE_FILES.join(", "),
+        u.name()
+    )
+}
+
+/// What keeps `patches/<upstream>/LICENSE` from being the upstream's licence text at the pin.
+fn licence_problem(u: &Up) -> Result<Option<String>> {
+    let (name, want) = upstream_licence(u)?;
+    let path = u.patches.join(LICENCE_COPY);
+    let fix = format!("xtask patch --export {}", u.name());
+    Ok(match std::fs::read_to_string(&path) {
+        Err(_) => Some(format!(
+            "patches/{}/{LICENCE_COPY} missing: {fix}",
+            u.name()
+        )),
+        Ok(have) if have != want => Some(format!(
+            "patches/{}/{LICENCE_COPY} is not {name} at the pin: {fix}",
+            u.name()
+        )),
+        Ok(_) => None,
+    })
 }
 
 fn rebase(u: &Up, ident: &Ident) -> Result<String> {
@@ -922,7 +985,10 @@ pub mod fixture {
     /// A trailed patch commit message.
     pub const TRAILED: &str = "fix a\n\nUpstream-Status: Pending\nPatch-Reason: test\n";
 
-    /// Temp tree `<root>`: `upstream/` (a repo with a.c, tag v1); workspaces `<root>/<ws>` hold
+    /// The fixture upstream's licence text.
+    pub const LICENCE: &str = "the up licence\n";
+
+    /// Temp tree `<root>`: `upstream/` (a repo with a.c and LICENSE, tag v1); workspaces `<root>/<ws>` hold
     /// `src/up` and `src-wt/<task>/up`, patches live under `<root>/patches/up`.
     pub struct Fixture {
         pub root: PathBuf,
@@ -943,8 +1009,14 @@ pub mod fixture {
                 "// SPDX-License-Identifier: GPL-2.0-or-later\nint a;\n",
             )
             .unwrap();
+            f.write("LICENSE", LICENCE);
             f.release("one", "v1");
             f
+        }
+
+        /// Delete a file of the upstream (committed by the next `release`).
+        pub fn remove(&self, file: &str) {
+            std::fs::remove_file(self.upstream.join(file)).unwrap();
         }
 
         fn up(&self, args: &[&str]) -> String {
@@ -1186,9 +1258,91 @@ mod tests {
         git(Some(&u.checkout), &["reset", "-q", "--hard", &c.commit]).unwrap();
         let e = check(&u).unwrap_err();
         assert!(
-            e.contains("patches/up holds patches atl-patches lacks: xtask fetch --execute"),
+            e.contains("patches/up holds patches atl-patches lacks: cargo xtask fetch --execute (the step after merging"),
             "{e}"
         );
+        // off the patch branch with patches/ non-empty: the same fix
+        git(
+            Some(&u.checkout),
+            &["checkout", "-q", "--detach", &c.commit],
+        )
+        .unwrap();
+        let e = check(&u).unwrap_err();
+        assert!(
+            e.contains("1 patches not applied: cargo xtask fetch --execute"),
+            "{e}"
+        );
+    }
+
+    /// `patches/<up>/LICENSE` is derived by export from the upstream at the pin and checked by the drift test.
+    #[test]
+    fn licence_copy_is_the_upstream_text() {
+        let f = Fixture::new("licence");
+        let c = f.checkout("v1");
+        let u = f.fetched(&c, "ws");
+        patch_commit(&u, TRAILED);
+        let out = export_ok(&u);
+        assert!(out.contains("LICENSE = LICENSE at the pin"), "{out}");
+        let copy = u.patches.join(LICENCE_COPY);
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), LICENCE);
+        assert_eq!(drift_of(&u), Vec::<String>::new());
+        // a hand edit, then a deletion: drift, fixed by export
+        std::fs::write(&copy, "edited\n").unwrap();
+        assert_eq!(
+            drift_of(&u),
+            ["patches/up/LICENSE is not LICENSE at the pin: xtask patch --export up"]
+        );
+        std::fs::remove_file(&copy).unwrap();
+        assert_eq!(
+            drift_of(&u),
+            ["patches/up/LICENSE missing: xtask patch --export up"]
+        );
+
+        // an AOSP-style upstream: NOTICE only (a symlinked LICENSE is no licence text)
+        f.remove("LICENSE");
+        f.write("NOTICE", "the notice\n");
+        std::os::unix::fs::symlink("NOTICE", f.root.join("upstream/LICENSE")).unwrap();
+        f.release("two", "v2");
+        let c2 = f.checkout("v2");
+        let u2 = f.fetched(&c2, "ws2");
+        patch_commit(&u2, TRAILED);
+        std::fs::remove_dir_all(&u2.patches).unwrap();
+        let out = export_ok(&u2);
+        assert!(out.contains("LICENSE = NOTICE at the pin"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(u2.patches.join(LICENCE_COPY)).unwrap(),
+            "the notice\n"
+        );
+
+        // no licence text at all: export refuses and writes nothing
+        f.remove("NOTICE");
+        f.remove("LICENSE");
+        f.release("three", "v3");
+        let c3 = f.checkout("v3");
+        let u3 = f.fetched(&c3, "ws3");
+        patch_commit(&u3, TRAILED);
+        std::fs::remove_dir_all(&u3.patches).unwrap();
+        let e = format!("{:#}", export(&u3, &licenses()).unwrap_err());
+        assert!(
+            e.contains("up has none of LICENSE, COPYING, NOTICE at the pin"),
+            "{e}"
+        );
+        assert!(!u3.patches.exists());
+    }
+
+    #[test]
+    fn export_without_commits_creates_nothing() {
+        let f = Fixture::new("empty");
+        let c = f.checkout("v1");
+        let u = f.fetched(&c, "ws");
+        // on the patch branch, at the pin, nothing committed
+        git(Some(&u.checkout), &["switch", "-q", "-c", BRANCH]).unwrap();
+        let e = format!("{:#}", export(&u, &licenses()).unwrap_err());
+        assert!(
+            e.contains("atl-patches has no commits past the pin: nothing to export"),
+            "{e}"
+        );
+        assert!(!u.patches.exists());
     }
 
     #[test]
@@ -1281,6 +1435,19 @@ mod tests {
         assert!(on_patch_branch(&shared));
         let e = err(edit(&c, &layout, &f.root, &ident()));
         assert!(e.contains("the task copy is there already"), "{e}");
+        // a plain `git commit` in the copy works with no global config: the repo checkout's identity is the copy's own; src/ gets none
+        git_isolated(
+            &task.checkout,
+            &["commit", "-q", "--allow-empty", "-m", "who"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            git(Some(&task.checkout), &["log", "-1", "--format=%an <%ae>"]).unwrap(),
+            "t <t@t>"
+        );
+        git(Some(&task.checkout), &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        assert!(git_isolated(&shared.checkout, &["config", "user.name"], None).is_err());
 
         // work in the copy: --done refuses each kind of unsaved work
         std::fs::write(task.checkout.join("a.c"), "int dirty;\n").unwrap();

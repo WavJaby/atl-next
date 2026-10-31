@@ -14,11 +14,11 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
+use atl_layout::Layout;
 
 use crate::aosp::{self, Index, Manifest};
 use crate::arches::{self, Arch, Arches};
-use crate::layout::Layout;
-use crate::{fetch, prune, sources, workspace};
+use crate::{farm, fetch, prune, sources};
 
 mod graph;
 
@@ -50,8 +50,9 @@ const ERRORS_SHOWN: usize = 20;
 const NINJA_STARTED: &str = "Starting ninja...";
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let ws = workspace::root_dir(root)?;
-    let tree = Layout::of(root)?.shared_tree();
+    let layout = Layout::of(root)?;
+    let ws = layout.workspace();
+    let tree = farm::shared_tree(&layout);
     let product = product(&arches::load(root)?, &args.host, &args.guest)?;
     let out = ws.join("out").join("aosp").join(&product.name);
     let logs = ws.join("out").join("aosp").join("logs");

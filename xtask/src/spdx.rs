@@ -137,7 +137,32 @@ pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::header_license;
+    use super::{check_patch_dir_file, header_license};
+
+    /// The guards on `patches/`, each made to fire; LICENSE content is the drift test's (patch.rs).
+    #[test]
+    fn patch_dir_guards() {
+        let root = std::env::temp_dir().join(format!("xtask-spdx-patches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("patches/up")).unwrap();
+        let rel = "patches/up/0001-x.patch";
+        let ok = "Subject: x\n---\nSPDX-License-Identifier: MIT\ndiff --git a b\n";
+        let check = |rel: &str, text: &str| check_patch_dir_file(&root, rel, text);
+        assert_eq!(
+            check(rel, ok).as_deref(),
+            Some("patches/up/0001-x.patch: no LICENSE (the upstream's licence text) beside it")
+        );
+        std::fs::write(root.join("patches/up/LICENSE"), "l\n").unwrap();
+        assert_eq!(check(rel, ok), None);
+        assert!(
+            check(rel, "Subject: x\n---\ndiff --git a b\n").is_some_and(|p| p.contains("no `SPDX"))
+        );
+        assert!(
+            check("patches/up/notes.txt", "")
+                .is_some_and(|p| p.contains("only *.patch and LICENSE"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn comment_styles() {

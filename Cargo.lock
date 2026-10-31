@@ -88,11 +88,19 @@ name = "atl-bridgegen"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-layout",
  "clang",
  "clap",
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "atl-layout"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -473,6 +481,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-layout",
  "clap",
  "object",
  "roxmltree",

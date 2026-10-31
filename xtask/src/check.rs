@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::{arches, deps, licenses, modules, patch, providers, prune, sources, spdx, workspace};
+use atl_layout::Layout;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -67,7 +68,7 @@ impl Step {
             Step::Spdx => spdx::check(root),
             Step::Tables => {
                 let arches = arches::load(root)?;
-                arches::check_kernel_arch(&workspace::root_dir(root)?, &arches)?;
+                arches::check_kernel_arch(&Layout::of(root)?, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

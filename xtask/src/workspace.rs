@@ -37,33 +37,6 @@ struct Node {
     dependencies: Vec<String>,
 }
 
-/// The shared workspace (`~/atl-next`): parent of the main checkout, found through the git common dir
-/// so every worktree resolves the same `src/` and `cache/`.
-pub fn root_dir(repo: &Path) -> Result<std::path::PathBuf> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(repo)
-        .output()
-        .context("running git rev-parse")?;
-    ensure!(
-        out.status.success(),
-        "git rev-parse: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let common = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    // <workspace>/repo/.git -> <workspace>
-    common
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .with_context(|| {
-            format!(
-                "git common dir {} has no workspace parent",
-                common.display()
-            )
-        })
-}
-
 pub fn load(root: &Path) -> Result<Workspace> {
     let out = crate::cargo_command()
         .args(["metadata", "--offline", "--locked", "--format-version", "1"])

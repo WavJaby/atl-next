@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_bridgegen::buildscript::{self, HostArch};
+use atl_bridgegen::buildscript::{self, HostArch, Upstreams};
 use atl_bridgegen::ir::{ArchView, Interface, Ty};
 use atl_bridgegen::{Lang, Source, Target};
 
@@ -112,27 +112,26 @@ type Outputs = Vec<(PathBuf, String)>;
 fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
-    let workspace = buildscript::workspace(&checkout)?;
+    let up = Upstreams::of(&checkout)?;
     let arches = checkout.join("arches.toml");
     let host = buildscript::host_arch(
         &std::fs::read_to_string(&arches)?,
         &std::env::var("TARGET")?,
     )?;
-    let aosp = workspace.join("src/aosp");
     for rel in APIS
         .iter()
         .map(|a| a.source)
         .chain(PROP_AREA_SOURCES.iter().copied())
         .chain(PROP_AREA_HEADERS.iter().copied())
     {
-        buildscript::upstream_file(&workspace, &format!("aosp/{rel}"))?;
+        up.file(&format!("aosp/{rel}"))?;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     let libcxx = buildscript::libcxx_include_dir()?;
 
-    let first = generate(&aosp, &host, &libcxx, &out)?;
+    let first = generate(&up, &host, &libcxx, &out)?;
     ensure!(
-        first == generate(&aosp, &host, &libcxx, &out)?,
+        first == generate(&up, &host, &libcxx, &out)?,
         "atl-bridgegen output differs between two runs on the same input"
     );
     for (rel, text) in &first {
@@ -145,7 +144,9 @@ fn main() -> Result<()> {
 
     println!("cargo::rerun-if-changed={}", arches.display());
     for dir in INPUT_DIRS {
-        println!("cargo::rerun-if-changed={}", aosp.join(dir).display());
+        for path in up.rerun_paths(&format!("aosp/{dir}")) {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
     }
     Ok(())
 }
@@ -153,27 +154,27 @@ fn main() -> Result<()> {
 /// The level platform code is built for: bionic's `__ANDROID_API_FUTURE__` (Soong's FutureApiLevelInt,
 /// which the converter checks equal). Headers are read at it, so no declaration is hidden behind an
 /// availability guard.
-fn future_level(aosp: &Path, host: &HostArch) -> Result<u64> {
-    let path = aosp.join("bionic/libc/include/android/api-level.h");
+fn future_level(up: &Upstreams, host: &HostArch) -> Result<u64> {
+    let path = up.aosp("bionic/libc/include/android/api-level.h");
     let src = Source::c(&path, &["__ANDROID_API_FUTURE__"]);
-    let target = buildscript::bionic_libc_target(aosp, host, None);
+    let target = buildscript::bionic_libc_target(up, host, None);
     let iface = atl_bridgegen::interface("api_level", "api-level.h", &src, &[target])?;
     Ok(iface.arches[&host.arch].constants["__ANDROID_API_FUTURE__"].bits)
 }
 
 /// bionic's view at the platform level, with a C++ library first for C++ sources.
-fn bionic_target(aosp: &Path, host: &HostArch, level: u64, cxx: Option<&Path>) -> Target {
-    let mut target = buildscript::bionic_libc_target(aosp, host, cxx);
+fn bionic_target(up: &Upstreams, host: &HostArch, level: u64, cxx: Option<&Path>) -> Target {
+    let mut target = buildscript::bionic_libc_target(up, host, cxx);
     target.triple = format!("{}{level}", target.triple);
     target
 }
 
-fn generate(aosp: &Path, host: &HostArch, libcxx: &Path, out: &Path) -> Result<Outputs> {
+fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Result<Outputs> {
     let mut files = Outputs::new();
-    let level = future_level(aosp, host)?;
+    let level = future_level(up, host)?;
     for api in APIS {
-        let target = bionic_target(aosp, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
-        let path = aosp.join(api.source);
+        let target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
+        let path = up.aosp(api.source);
         let src = Source {
             path: &path,
             lang: api.lang,
@@ -204,7 +205,7 @@ fn generate(aosp: &Path, host: &HostArch, libcxx: &Path, out: &Path) -> Result<O
             ));
         }
     }
-    let iface = prop_area(aosp, bionic_target(aosp, host, level, Some(libcxx)), out)?;
+    let iface = prop_area(up, bionic_target(up, host, level, Some(libcxx)), out)?;
     check_prop_area_shape(&iface.arches[&host.arch])?;
     files.push((
         "prop_area.rs".into(),
@@ -215,22 +216,22 @@ fn generate(aosp: &Path, host: &HostArch, libcxx: &Path, out: &Path) -> Result<O
 }
 
 /// bionic's property-area format: both implementation files in one unit, layouts from their headers.
-fn prop_area(aosp: &Path, mut target: Target, out: &Path) -> Result<Interface> {
+fn prop_area(up: &Upstreams, mut target: Target, out: &Path) -> Result<Interface> {
     let unit = out.join("prop_area_format.cc");
     let text: String = PROP_AREA_SOURCES
         .iter()
-        .map(|s| format!("#include \"{}\"\n", aosp.join(s).display()))
+        .map(|s| format!("#include \"{}\"\n", up.aosp(s).display()))
         .collect();
     std::fs::write(&unit, text)?;
     let also: Vec<PathBuf> = PROP_AREA_SOURCES
         .iter()
         .chain(PROP_AREA_HEADERS)
-        .map(|s| aosp.join(s))
+        .map(|s| up.aosp(s))
         .collect();
     target.args.extend(
         PROP_AREA_INCLUDES
             .iter()
-            .map(|d| format!("-I{}", aosp.join(d).display())),
+            .map(|d| format!("-I{}", up.aosp(d).display())),
     );
     let src = Source {
         path: &unit,
