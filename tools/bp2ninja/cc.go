@@ -105,6 +105,8 @@ type Graph struct {
 	cfg       Config
 	soong     SoongConfig
 	omit      map[string]bool
+	// dependencies dropped by omit: "<side>/<module> <omitted module>"
+	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
 	// soong_config_module_type name -> wrapped module type
@@ -351,8 +353,11 @@ func compatPath(set []compatHeader, name string) string {
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	name := strings.TrimPrefix(ref, ":")
-	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs)
+	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs); recorded for the caller's none gate (graph.go)
 	if g.omit[name] {
+		if from != "goal" {
+			g.dropped = addKey(g.dropped, side.String()+"/"+from+" "+name)
+		}
 		return nil
 	}
 	if p, ok := g.provided[name]; ok {

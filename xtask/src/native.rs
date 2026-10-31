@@ -4,7 +4,9 @@
 //! `build/blueprint` (through a generated go.work: that path differs per checkout), builds the
 //! providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their
 //! recipe), converts the goals' closure into ninja, builds it with `ninja -k 0`, summarises the
-//! failures by module and runs the provided gate (provided_gate.rs).
+//! failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml
+//! rows the converter finds wrong, and `none` rows a still-built module needs (none_gate.rs). Either
+//! fails the run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -17,7 +19,8 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::Provided;
 use crate::sources::Pin;
 use crate::{
-    arches, farm, fetch, patch, provided_gate, providers, sources, triage, upstream, workspace,
+    arches, farm, fetch, none_gate, patch, provided_gate, providers, sources, triage, upstream,
+    workspace,
 };
 
 #[derive(clap::Args)]
@@ -135,6 +138,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let provided_file = out.join("provided.json");
     std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
+    // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
+    let mut table: Vec<String> = Vec::new();
     let mut round = 0;
     loop {
         round += 1;
@@ -201,6 +206,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         for p in problems.lines().filter(|l| !l.is_empty()) {
             println!("native: problem {p}");
         }
+        table.extend(
+            problems
+                .lines()
+                .filter(|l| l.starts_with(providers::FILE))
+                .map(str::to_owned),
+        );
         break;
     }
     let log = out.join("ninja.log");
@@ -214,7 +225,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let gate_ok = gate(&out, &provided)?;
     if status.success() {
         println!("native: built -> {}", out.display());
-        return Ok(if gate_ok {
+        return Ok(if gate_ok && table_check(&table) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -250,7 +261,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for line in triage::render(&report, &failures, args.verbose) {
         println!("native: {line}");
     }
+    table.extend(
+        none_gate::check(&graph, &failures, &tree)
+            .iter()
+            .map(ToString::to_string),
+    );
+    table_check(&table);
     Ok(ExitCode::FAILURE)
+}
+
+/// Prints the table check's problems; true when there are none.
+fn table_check(problems: &[String]) -> bool {
+    println!("native: table check: {} problems", problems.len());
+    for p in problems {
+        println!("native:   table: {p}");
+    }
+    problems.is_empty()
 }
 
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and

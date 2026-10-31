@@ -14,6 +14,7 @@ mod git;
 mod licenses;
 mod modules;
 mod native;
+mod none_gate;
 mod notice;
 mod par;
 mod patch;

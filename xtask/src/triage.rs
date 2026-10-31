@@ -4,11 +4,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// `graph.json`: goal module directories and each module directory's step dependencies.
+/// `graph.json`: goal module directories and each module directory's step dependencies; the providers.toml
+/// `none` edges the converter dropped and those modules' export directories (none_gate.rs).
 #[derive(serde::Deserialize)]
 pub struct Graph {
     pub goals: Vec<String>,
     pub deps: BTreeMap<String, Vec<String>>,
+    /// module directory -> `none` modules its Android.bp names
+    pub dropped: BTreeMap<String, Vec<String>>,
+    /// `none` module directory (`<side>/<name>`) -> tree-relative directories its headers come from
+    pub none_exports: BTreeMap<String, Vec<String>>,
 }
 
 /// One failed module: its failed steps and their causes.
@@ -177,7 +182,8 @@ pub struct Report {
     pub off_path: Vec<String>,
 }
 
-fn closure<'a>(graph: &'a Graph, from: &'a str) -> BTreeSet<&'a str> {
+/// `from` and every module directory its steps wait for, transitively.
+pub fn closure<'a>(graph: &'a Graph, from: &'a str) -> BTreeSet<&'a str> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![from];
     while let Some(m) = stack.pop() {
@@ -499,6 +505,8 @@ clang++: error: linker command failed with exit code 1 (use -v to see invocation
                 .iter()
                 .map(|(m, d)| ((*m).to_owned(), d.iter().map(|x| (*x).to_owned()).collect()))
                 .collect(),
+            dropped: BTreeMap::new(),
+            none_exports: BTreeMap::new(),
         }
     }
 

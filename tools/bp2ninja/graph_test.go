@@ -59,3 +59,35 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 		}
 	}
 }
+
+// providers.toml `none` modules: each dropped edge by module directory, and the directories the omitted module's headers would come from (re-exported header libraries followed), without the omitted module's own lookups counting as the build's problems.
+func TestGraphJSONDroppedNone(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_headers { name: "libh", export_include_dirs: ["h"] }
+cc_library { name: "libnone", defaults: ["gone_defaults"], srcs: ["n.cc"], export_include_dirs: ["inc"], target: { android: { export_system_include_dirs: ["sys"] } }, header_libs: ["libh"], export_header_lib_headers: ["libh"] }
+cc_library { name: "libuser", srcs: ["u.cc"], shared_libs: ["libnone"] }
+cc_library { name: "libgoal", srcs: ["g.cc"], shared_libs: ["libuser"], static_libs: ["libnone"] }
+`})
+	g.omit = map[string]bool{"libnone": true}
+	goal := g.node("libgoal", Device, Shared, "goal")
+	if goal == nil {
+		t.Fatal(g.problems)
+	}
+	b, err := g.graphJSON([]*Node{goal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f graphFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Dropped) != 2 || !slices.Equal(f.Dropped["device/libuser"], []string{"libnone"}) || !slices.Equal(f.Dropped["device/libgoal"], []string{"libnone"}) {
+		t.Errorf("dropped %v", f.Dropped)
+	}
+	if got := f.NoneExports["device/libnone"]; !slices.Equal(got, []string{"p/h", "p/inc", "p/sys"}) || len(f.NoneExports) != 1 {
+		t.Errorf("none exports %v", f.NoneExports)
+	}
+	if len(g.problems) != 0 || len(g.missing) != 0 {
+		t.Errorf("libnone's missing defaults counted: %v %v", g.problems, g.missing)
+	}
+}
