@@ -236,7 +236,7 @@ pub enum Prebuilts {
     Never,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Index {
     /// Module name -> every definition.
     modules: BTreeMap<String, Vec<Definition>>,
@@ -245,7 +245,7 @@ pub struct Index {
     module_types: BTreeMap<String, BTreeSet<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Definition {
     /// e.g. `cc_library`; tells a source module from a prebuilt or an `ndk_library` stub of one name.
     module_type: String,
@@ -259,6 +259,9 @@ pub struct Definition {
     /// Its `defaults` list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     defaults: Vec<String>,
+    /// A `license` module's `license_kinds`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    license_kinds: Vec<String>,
 }
 
 impl Definition {
@@ -280,10 +283,37 @@ fn index_dir(root: &Path, aosp: &Aosp) -> Result<PathBuf> {
         .join(&aosp.tag))
 }
 
+pub fn index_file(root: &Path, aosp: &Aosp) -> Result<PathBuf> {
+    Ok(index_dir(root, aosp)?.join(INDEX_FILE))
+}
+
 impl Index {
     pub fn load(root: &Path, aosp: &Aosp) -> Result<Index> {
-        let file = index_dir(root, aosp)?.join(INDEX_FILE);
-        let text = std::fs::read_to_string(&file)
+        Index::read(&index_file(root, aosp)?)
+    }
+
+    /// An index of `license` modules only: (name, tree path of its blueprint file, kinds).
+    #[cfg(test)]
+    pub(crate) fn of_licenses(defs: &[(&str, &str, &[&str])]) -> Index {
+        let mut modules: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
+        for (name, file, kinds) in defs {
+            modules.entry((*name).to_owned()).or_default().push(Definition {
+                module_type: "license".into(),
+                project: parent_dir(file).into(),
+                file: (*file).into(),
+                namespace: None,
+                defaults: vec![],
+                license_kinds: kinds.iter().map(|k| (*k).to_owned()).collect(),
+            });
+        }
+        Index {
+            modules,
+            module_types: BTreeMap::new(),
+        }
+    }
+
+    pub fn read(file: &Path) -> Result<Index> {
+        let text = std::fs::read_to_string(file)
             .with_context(|| format!("no index {}: xtask aosp --index", file.display()))?;
         serde_json::from_str(&text).with_context(|| file.display().to_string())
     }
@@ -407,6 +437,51 @@ impl Index {
             }
         }
         seen
+    }
+
+    /// `license_kinds` of the `license` module a `licenses` entry in blueprint directory `from` (tree path) names, found as Soong's licensesPropertyGatherer does: `//dir:name` as written; else `name` in the nearest of `from` and its ancestors defining it; else the one definition anywhere.
+    pub fn license_kinds_of(&self, reference: &str, from: &str) -> Result<&[String], String> {
+        let (dir, name) = match reference.strip_prefix("//") {
+            Some(r) => r
+                .split_once(':')
+                .map(|(d, n)| (Some(d), n))
+                .ok_or("not a module reference")?,
+            None => (None, reference),
+        };
+        let defs: Vec<&Definition> = self
+            .modules
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|d| d.module_type == "license")
+            .collect();
+        let within = |d: &Definition| {
+            let at = parent_dir(&d.file);
+            at.is_empty() || from == at || from.starts_with(&format!("{at}/"))
+        };
+        let def = match dir {
+            Some(dir) => defs.iter().find(|d| parent_dir(&d.file) == dir),
+            None => defs
+                .iter()
+                .filter(|d| within(d))
+                .max_by_key(|d| parent_dir(&d.file).len())
+                .or(match defs.as_slice() {
+                    [one] => Some(one),
+                    _ => None,
+                }),
+        }
+        .ok_or_else(|| match defs.len() {
+            0 => "no license module of that name".to_owned(),
+            n => format!("{n} license modules of that name, none enclosing it"),
+        })?;
+        if def.license_kinds.is_empty() {
+            // an index built before kinds were recorded reads the same
+            return Err(format!(
+                "{} declares no licence kind in the index (xtask aosp --index rebuilds it)",
+                def.file
+            ));
+        }
+        Ok(&def.license_kinds)
     }
 
     /// The project whose `soong_build` plugin registers a module type.
@@ -533,6 +608,7 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
                     file: file.clone(),
                     namespace: namespace.clone(),
                     defaults: m.defaults.clone(),
+                    license_kinds: m.license_kinds.clone(),
                 });
             }
         }
@@ -590,31 +666,45 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
     Ok(())
 }
 
-/// Every `license_kinds` entry of the `license` modules in the blueprint files of the project checked out at `dir` (nested projects excluded; `build = [...]` files followed).
-pub fn license_kinds(dir: &Path) -> Result<BTreeSet<String>> {
+/// Licence kinds the blueprint files of AOSP project `project` (tree path), checked out at `dir`, declare: those of its own `license` modules, plus those of every `license` module its `licenses` / `default_applicable_licenses` entries name, wherever defined (`build/soong/licenses`' `Android-Apache-2.0`). Nested projects excluded; `build = [...]` files followed.
+/// Inner `Err`: a reference the index cannot resolve to one `license` module with kinds, so the project's kinds are unknown.
+pub fn license_kinds(
+    dir: &Path,
+    project: &Path,
+    index: &Index,
+) -> Result<Result<BTreeSet<String>, String>> {
     let mut bps = Vec::new();
     find_files(dir, &|n| n == "Android.bp", &mut bps)?;
     let mut kinds = BTreeSet::new();
+    let mut refs = BTreeSet::new();
     while let Some(bp) = bps.pop() {
         let parsed = parse_bp(&String::from_utf8_lossy(&std::fs::read(&bp)?));
-        if let Some(parent) = bp.parent() {
-            bps.extend(
-                parsed
-                    .build
-                    .iter()
-                    .map(|f| parent.join(f))
-                    .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
-            );
-        }
-        kinds.extend(
+        let parent = bp.parent().unwrap_or(dir);
+        bps.extend(
             parsed
-                .modules
-                .into_iter()
-                .filter(|m| m.module_type == "license")
-                .flat_map(|m| m.license_kinds),
+                .build
+                .iter()
+                .map(|f| parent.join(f))
+                .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
         );
+        let from = project
+            .join(parent.strip_prefix(dir).unwrap_or(Path::new("")))
+            .display()
+            .to_string();
+        for m in parsed.modules {
+            if m.module_type == "license" {
+                kinds.extend(m.license_kinds);
+            }
+            refs.extend(m.licenses.into_iter().map(|l| (l, from.clone())));
+        }
     }
-    Ok(kinds)
+    for (name, from) in &refs {
+        match index.license_kinds_of(name, from) {
+            Ok(k) => kinds.extend(k.iter().cloned()),
+            Err(e) => return Ok(Err(format!("licence {name} (from {from}): {e}"))),
+        }
+    }
+    Ok(Ok(kinds))
 }
 
 /// TARGET_RELEASE of the pinned tag: AOSP release builds use the release config named by the build
@@ -856,6 +946,8 @@ struct BpModule {
     defaults: Vec<String>,
     /// `license_kinds: [...]` of a `license` module.
     license_kinds: Vec<String>,
+    /// `licenses: [...]` of a module, `default_applicable_licenses: [...]` of `package`: the `license` modules that apply.
+    licenses: Vec<String>,
 }
 
 impl BpModule {
@@ -931,7 +1023,12 @@ fn parse_bp(text: &str) -> BpFile {
                     && in_module
                     && matches!(
                         id.as_str(),
-                        "pluginFor" | "srcs" | "defaults" | "license_kinds"
+                        "pluginFor"
+                            | "srcs"
+                            | "defaults"
+                            | "license_kinds"
+                            | "licenses"
+                            | "default_applicable_licenses"
                     ) =>
             {
                 if toks.get(i + 1) == Some(&Token::Punct(':'))
@@ -942,6 +1039,7 @@ fn parse_bp(text: &str) -> BpFile {
                         "srcs" => m.srcs = list,
                         "defaults" => m.defaults = list,
                         "license_kinds" => m.license_kinds = list,
+                        "licenses" | "default_applicable_licenses" => m.licenses.extend(list),
                         _ => m.plugin_for = list,
                     }
                 }
@@ -970,6 +1068,32 @@ fn parse_bp(text: &str) -> BpFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn licence_references_resolve_as_soong_does() {
+        let parsed = parse_bp(
+            "package {\n    default_applicable_licenses: [\"a\"],\n}\ncc_library { name: \"x\", licenses: [\"b\", \"c\"] }\n",
+        );
+        assert_eq!(parsed.modules[0].licenses, ["a"]);
+        assert_eq!(parsed.modules[1].licenses, ["b", "c"]);
+        let apache: &[&str] = &["SPDX-license-identifier-Apache-2.0"];
+        let mit: &[&str] = &["SPDX-license-identifier-MIT"];
+        let index = Index::of_licenses(&[
+            ("l", "external/x/Android.bp", mit),
+            ("l", "external/y/Android.bp", apache),
+            ("shared", "build/soong/licenses/Android.bp", apache),
+            ("stale", "external/z/Android.bp", &[]),
+        ]);
+        let of = |r: &str, from: &str| index.license_kinds_of(r, from);
+        assert_eq!(of("l", "external/x/sub").unwrap(), mit);
+        assert_eq!(of("//external/y:l", "external/x").unwrap(), apache);
+        assert_eq!(of("shared", "external/x").unwrap(), apache);
+        // `external/xx` is not inside `external/x`
+        assert!(of("l", "external/xx").unwrap_err().contains("none enclosing"));
+        assert!(of("nope", "external/x").unwrap_err().contains("no license module"));
+        // what an index from before kinds were recorded gives: never read as "no kinds"
+        assert!(of("stale", "external/z").unwrap_err().contains("rebuilds it"));
+    }
 
     #[test]
     fn manifest_projects_links_and_defaults() {
@@ -1123,6 +1247,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: ns.map(Into::into),
             defaults: vec![],
+            license_kinds: vec![],
         };
         let modules = BTreeMap::from([
             (
@@ -1214,6 +1339,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: None,
             defaults: vec![],
+            license_kinds: vec![],
         };
         let index = Index {
             modules: BTreeMap::from([
@@ -1253,6 +1379,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: None,
             defaults: vec![],
+            license_kinds: vec![],
         };
         let index = Index {
             modules: BTreeMap::from([
@@ -1289,6 +1416,7 @@ func init() {
             file: "art/Android.bp".into(),
             namespace: None,
             defaults: defaults.iter().map(|d| (*d).to_owned()).collect(),
+            license_kinds: vec![],
         };
         let index = Index {
             modules: BTreeMap::from([

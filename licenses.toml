@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: MIT
 # The one licence policy: which licences may be compiled into each shipped artifact. A licence not listed
 # for an artifact fails, so a new licence is a reviewed change here. `cargo xtask check` step `tables`
-# checks: ids exist in the SPDX list and are not deprecated; no bare GPL-2.0-only anywhere (only as an
-# explicit `GPL-2.0-only WITH <exception>` entry); GPL-3 family in `runtime` only `WITH` an exception that
-# frees its users (GCC runtime, Bison); once `qemu-bridge` exists, `runtime` stays within it (runtime code
-# shares the bridge's process); deny.toml's crate allow list stays within `runtime`.
+# checks: ids exist in the SPDX list and are not deprecated; GPL-2.0-only anywhere only `WITH` a linking exception (Classpath-exception-2.0, Linux-syscall-note); GPL-3 family in `runtime` only `WITH` an exception that frees its users (GCC-exception-3.1, Bison-exception-2.2); once `qemu-bridge` exists, `runtime` stays within it (runtime code shares the bridge's process); deny.toml's crate allow list stays within `runtime`.
 #
 # [artifact.<name>]
 #   allow          SPDX licences, each `<id>` or `<id> WITH <exception>`; `LicenseRef-<name>` for one the SPDX list lacks
 #     runtime      the ART process, atld, our libraries and everything they link
 #     qemu-bridge  the dlopened QEMU bridge, distributed as GPL-3.0-or-later: licences combinable with GPL-3
 # [upstream.<name>]   a sources.toml upstream (`aosp`: every AOSP project, paths relative to the tree root)
-#   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text. Not for `aosp`: an AOSP project's is derived from its Android.bp `license` modules (exactly one `SPDX-license-identifier-<id>` kind -> <id>; several kinds, or none, -> no default)
+#   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text. Not for `aosp`: an AOSP project's is derived from its Android.bp files -- the kinds of its own `license` modules and of every `license` module its `licenses` / `default_applicable_licenses` name, wherever defined (exactly one `SPDX-license-identifier-<id>` kind -> <id>; several kinds, none, or an unresolvable reference -> no default)
 #   [upstream.<name>.paths."<path prefix>"]   licence (SPDX expression; LicenseRef-<name> for one the SPDX list lacks) + reason, for files whose notice the phrase rules cannot read; longest prefix wins, before any tag or notice
 # `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`).
 # Rows are added when a compiled set first needs them.
