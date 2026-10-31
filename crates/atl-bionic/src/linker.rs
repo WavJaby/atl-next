@@ -1,24 +1,71 @@
 // SPDX-License-Identifier: MIT
 //! Loading a library in a linker namespace: the one place every namespaced load goes through --
 //! `android_dlopen_ext`, and through it libvndksupport's SP-HAL loads (its `android_load_sphal_library`
-//! calls `android_dlopen_ext` as AOSP's does). Our libnativeloader's namespaces plug in here.
+//! calls `android_dlopen_ext` as AOSP's does) -- and the namespace graph libdl_android's API builds
+//! (`android_create_namespace`, `android_link_namespaces`; libgraphicsenv). Our libnativeloader's
+//! namespaces plug in here.
 //!
 //! This host has exactly one namespace: the process's glibc link map. Every exported namespace name
 //! resolves to it, and a load in it is `dlopen(name, flags)`, so a namespace argument is accepted and
 //! ignored. bionic returns null for a name it does not export; here every name is exported, as a load
-//! in any of them lands in the same map.
+//! in any of them lands in the same map. Creating a namespace returns it; linking two is a no-op that
+//! keeps bionic's argument refusals, as every library is already visible to every load.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
 
 /// A linker namespace; only `DEFAULT` exists.
 pub struct Namespace {
     /// bionic's name for the default namespace.
-    _name: &'static str,
+    name: &'static str,
 }
 
 /// The one namespace: every load's, whether the caller names a namespace or not (not zero-sized: its
 /// address is the handle C code holds).
-pub static DEFAULT: Namespace = Namespace { _name: "(default)" };
+pub static DEFAULT: Namespace = Namespace { name: "(default)" };
+
+/// bionic `create_namespace`: a new namespace with the given name, paths, type and parent; here the one
+/// namespace (its paths are glibc's search). bionic's only failure -- an `ALSO_USED_AS_ANONYMOUS`
+/// namespace once the anonymous one is set -- has no meaning with one namespace.
+pub fn create() -> &'static Namespace {
+    &DEFAULT
+}
+
+/// Why `android_link_namespaces` fails; `Display` is bionic's `DL_ERR` text (`linker.cpp`
+/// `link_namespaces`), the `dlerror` detail after `android_link_namespaces failed: `.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkRefusal {
+    /// `namespace_from` null.
+    NullFrom,
+    /// The soname list null or empty; names `from`, `to`.
+    NoSonames(&'static str, &'static str),
+}
+
+impl std::fmt::Display for LinkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            LinkRefusal::NullFrom => write!(f, "error linking namespaces: namespace_from is null."),
+            LinkRefusal::NoSonames(from, to) => write!(
+                f,
+                "error linking namespaces \"{from}\"->\"{to}\": the list of shared libraries is empty."
+            ),
+        }
+    }
+}
+
+/// bionic `link_namespaces`: makes `sonames` (`:`-separated) of `to` (none: the default namespace)
+/// visible from `from`. With one namespace they already are; bionic's refusals stay, in its order.
+pub fn link(
+    from: Option<&Namespace>,
+    to: Option<&Namespace>,
+    sonames: Option<&[u8]>,
+) -> Result<(), LinkRefusal> {
+    let to = to.unwrap_or(&DEFAULT);
+    let from = from.ok_or(LinkRefusal::NullFrom)?;
+    match sonames {
+        Some(s) if !s.is_empty() => Ok(()),
+        _ => Err(LinkRefusal::NoSonames(from.name, to.name)),
+    }
+}
 
 unsafe extern "C" {
     // glibc's libc (>= 2.34 holds libdl)

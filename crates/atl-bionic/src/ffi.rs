@@ -220,6 +220,43 @@ pub unsafe extern "C" fn android_get_exported_namespace(
     }
 }
 
+/// The namespace a C handle names: every non-null handle is one this crate returned, so `DEFAULT`.
+fn namespace(ns: *mut android_namespace_t) -> Option<&'static linker::Namespace> {
+    (!ns.is_null()).then_some(&linker::DEFAULT)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn android_create_namespace(
+    _name: *const c_char,
+    _ld_library_path: *const c_char,
+    _default_library_path: *const c_char,
+    _type: u64,
+    _permitted_when_isolated_path: *const c_char,
+    _parent: *mut android_namespace_t,
+) -> *mut android_namespace_t {
+    core::ptr::from_ref(linker::create()).cast_mut().cast()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_link_namespaces(
+    namespace_from: *mut android_namespace_t,
+    namespace_to: *mut android_namespace_t,
+    shared_libs_sonames: *const c_char,
+) -> bool {
+    // SAFETY: bionic's contract, null or a NUL-terminated string
+    let sonames = unsafe { c_str(shared_libs_sonames) };
+    match linker::link(namespace(namespace_from), namespace(namespace_to), sonames) {
+        Ok(()) => true,
+        Err(r) => {
+            // bionic dlfcn.cpp __bionic_format_dlerror: "<call> failed: <detail>"
+            let detail = CString::new(format!("android_link_namespaces failed: {r}"))
+                .expect("the refusal text has no NUL");
+            linker::fail(&detail);
+            false
+        }
+    }
+}
+
 // libasync_safe. A format's arguments are the caller's printf contract; a null format or tag, where
 // bionic would crash, is refused (-1; `fatal` formats nothing).
 

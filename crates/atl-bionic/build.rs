@@ -66,8 +66,8 @@ const APIS: &[Api] = &[
         kept: DECLARATIONS,
     },
     // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
-    // it, owner Q5) and the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
-    // libvndksupport)
+    // it, owner Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
+    // libvndksupport) and namespace creation / linking (libgraphicsenv)
     Api {
         name: "libdl_android",
         source: "bionic/libdl/libdl_android.cpp",
@@ -76,6 +76,8 @@ const APIS: &[Api] = &[
         functions: &[
             "android_set_application_target_sdk_version",
             "android_get_exported_namespace",
+            "android_create_namespace",
+            "android_link_namespaces",
         ],
         macros: &[],
         include_dirs: &[],

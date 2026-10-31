@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `android_dlopen_ext`, `android_get_exported_namespace` and `android_mallopt` as C calls them. Expected
+//! `android_dlopen_ext`, libdl_android's namespace calls and `android_mallopt` as C calls them. Expected
 //! values: bionic's sources (dlext.h, malloc.h, linker.cpp, dlfcn.cpp, malloc_heapprofd.cpp) and glibc's
 //! (`dl-open.c`, `dlerror.c`), never this crate's.
 
@@ -29,6 +29,19 @@ unsafe extern "C" {
     fn android_dlopen_ext(name: *const c_char, flags: c_int, info: *const DlextInfo)
     -> *mut c_void;
     fn android_get_exported_namespace(name: *const c_char) -> *mut Namespace;
+    fn android_create_namespace(
+        name: *const c_char,
+        ld_library_path: *const c_char,
+        default_library_path: *const c_char,
+        r#type: u64,
+        permitted_when_isolated_path: *const c_char,
+        parent: *mut Namespace,
+    ) -> *mut Namespace;
+    fn android_link_namespaces(
+        from: *mut Namespace,
+        to: *mut Namespace,
+        shared_libs_sonames: *const c_char,
+    ) -> bool;
     fn android_mallopt(opcode: c_int, arg: *mut c_void, arg_size: usize) -> bool;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn dlerror() -> *const c_char;
@@ -76,6 +89,70 @@ fn every_exported_name_is_the_one_namespace() {
         );
         // bionic get_exported_namespace: a null name is no namespace
         assert!(android_get_exported_namespace(std::ptr::null()).is_null());
+    }
+}
+
+#[test]
+fn created_and_linked_namespaces_are_the_one_namespace() {
+    // bionic linker.h ANDROID_NAMESPACE_TYPE_SHARED (2) | _ISOLATED (1), as libgraphicsenv's ANGLE one
+    const SHARED_ISOLATED: u64 = 3;
+    // SAFETY: NUL-terminated strings or null, handles from this API
+    unsafe {
+        let sphal = android_get_exported_namespace(c"sphal".as_ptr());
+        let ns = android_create_namespace(
+            c"ANGLE".as_ptr(),
+            std::ptr::null(),
+            c"/no/such/dir".as_ptr(),
+            SHARED_ISOLATED,
+            c"/no/such/dir".as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(ns, sphal);
+        // a load in it is a plain load
+        let handle = android_dlopen_ext(c"libc.so.6".as_ptr(), RTLD_NOW, &info(USE_NAMESPACE, ns));
+        assert!(!handle.is_null());
+        assert_eq!(dlclose(handle), 0);
+        // bionic link_namespaces: a null target is the default namespace
+        assert!(android_link_namespaces(
+            ns,
+            sphal,
+            c"libc.so:libm.so".as_ptr()
+        ));
+        assert!(android_link_namespaces(
+            ns,
+            std::ptr::null_mut(),
+            c"libc.so".as_ptr()
+        ));
+    }
+}
+
+#[test]
+fn link_refusals_carry_bionic_text() {
+    // dlerror = bionic's "android_link_namespaces failed: <DL_ERR>" (dlfcn.cpp, linker.cpp
+    // link_namespaces; "(default)" is the default namespace's name there), as the object name of glibc's
+    // refusal of a mode without binding (dl-open.c)
+    let glibc = ": invalid mode for dlopen(): Invalid argument";
+    // SAFETY: NUL-terminated strings or null, handles from this API
+    unsafe {
+        let ns = android_get_exported_namespace(c"sphal".as_ptr());
+        let empty = "android_link_namespaces failed: error linking namespaces \"(default)\"->\"(default)\": the list of shared libraries is empty.";
+        for (from, sonames, detail) in [
+            // bionic checks namespace_from before the list
+            (
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                "android_link_namespaces failed: error linking namespaces: namespace_from is null.",
+            ),
+            (ns, std::ptr::null(), empty),
+            (ns, c"".as_ptr(), empty),
+        ] {
+            take_dlerror();
+            assert!(!android_link_namespaces(from, ns, sonames));
+            assert_eq!(
+                take_dlerror().as_deref(),
+                Some(&*format!("{detail}{glibc}"))
+            );
+        }
     }
 }
 

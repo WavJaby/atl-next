@@ -33,7 +33,7 @@ reason = "bionic's copy of the kernel uapi; the distro's kernel headers replace 
 
 ["libdl"]
 provider = "none"
-reason = "bionic; glibc's libdl, plus android_dlopen_ext from libc's provider"
+reason = "bionic; glibc's libdl, plus android_dlopen_ext from atl-bionic"
 
 ["libm"]
 provider = "none"
@@ -57,8 +57,8 @@ provider = "crate:atl-debuggerd-client"
 reason = "requests a dump through tombstoned, which this host lacks; as AOSP's client without tombstoned, every request fails before any signal (bionic's debugger signal is glibc's SIGRTMIN+1, free for apps)"
 
 ["libdl_android"]
-provider = "none"
-reason = "bionic linker namespace API; our libnativeloader owns namespaces; libc's provider has the target SDK setter and android_get_exported_namespace (one namespace)"
+provider = "crate:atl-bionic"
+reason = "bionic linker namespace API; atl-bionic implements what the closure calls (target SDK setter, exported-namespace lookup, namespace create/link) over one namespace, the process's glibc link map; our libnativeloader's namespaces plug in there"
 
 ["libseccomp_policy"]
 provider = "none"

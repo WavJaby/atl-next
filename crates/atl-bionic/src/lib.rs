@@ -11,8 +11,9 @@
 //! - libasync_safe's no-allocation formatting and logging (`async_safe`): what AOSP code built here calls.
 //! - fdsan's error level (`fdsan`); glibc checks no descriptor owner, so it never reports.
 //!
-//! - `android_dlopen_ext` (`dlext`: the extended flags taken) and `android_get_exported_namespace`, both
-//!   through `linker`, the one place namespaced loads go (one namespace here).
+//! - `android_dlopen_ext` (`dlext`: the extended flags taken), `android_get_exported_namespace`,
+//!   `android_create_namespace` and `android_link_namespaces`, all through `linker`, the one place
+//!   namespaced loads go (one namespace here).
 //! - `android_mallopt`: no bionic allocator option exists on glibc; each is refused as bionic refuses
 //!   one it lacks.
 //!
