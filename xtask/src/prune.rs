@@ -12,7 +12,7 @@ use crate::sources::{self, Sources};
 
 pub const FILE: &str = "aosp-prune.toml";
 /// Soong's finder skips a directory holding this file, with everything below it (`ui/build/finder.go`).
-const MARKER: &str = ".find-ignore";
+pub const MARKER: &str = ".find-ignore";
 /// Tree-root list of the markers `apply` placed, so one whose row is gone gets removed.
 const PLACED: &str = ".atl-pruned";
 

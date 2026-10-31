@@ -1,67 +1,137 @@
 // SPDX-License-Identifier: MIT
 //! `xtask patch`: our commits on upstream checkouts, kept as `patches/<upstream>/*.patch` and
-//! re-applied on branch `atl-patches` by `xtask fetch`; plus the drift check that keeps the two identical.
+//! re-applied on the checkout's patch branch by `xtask fetch`; the task copies (`--edit`, `--done`) a task edits them in; plus the drift check that keeps checkout and patches/ identical.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::aosp::Manifest;
 use crate::git::{Ident, git, git_isolated};
+use crate::layout::Layout;
 use crate::licenses::{self, Licenses};
-use crate::sources::{self, Checkout, Pin};
-use crate::{aosp, fetch, notice, workspace};
+use crate::prune::{self, Prune};
+use crate::sources::{self, Checkout, Pin, Sources};
+use crate::{aosp, fetch, notice};
 
+/// Patch branch of a shared `src/` checkout; a task copy's is `atl-patches-<task>` (git branches are shared by a repository's worktrees).
 pub const BRANCH: &str = "atl-patches";
-/// Commit `atl-patches` is based on. A rebase after a pin bump needs the old base, and shallow
-/// checkouts hold no history linking two pins. A branch made by hand at the pin needs none (`base`).
-const BASE_REF: &str = "refs/atl/base";
+/// Commit the patch branch is based on. A rebase after a pin bump needs the old base, and shallow
+/// checkouts hold no history linking two pins. Per worktree (`refs/worktree/`), so `src/<up>` and each task copy keep their own. A branch made by hand at the pin needs none (`base`).
+const BASE_REF: &str = "refs/worktree/atl/base";
 /// Trailers every patch commit carries: upstream status (Yocto values: Pending, Submitted [where],
 /// Backport, Denied, Inappropriate [why]) and why the change cannot live in the launcher/loader/env.
 const TRAILERS: [&str; 2] = ["Upstream-Status", "Patch-Reason"];
+/// Untracked files named in a drift message; the rest are counted.
+const STRAYS_SHOWN: usize = 3;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Write <pin>..atl-patches of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/.
-    #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with = "rebase")]
+    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one.
+    #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with_all = ["rebase", "edit", "done"])]
     export: Vec<String>,
-    /// Move atl-patches of these upstreams from their old base onto the current pin (after a bump).
-    #[arg(long, value_name = "UPSTREAM", num_args = 1..)]
+    /// Move the patch branch of these upstreams from their old base onto the current pin (after a bump).
+    #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with_all = ["edit", "done"])]
     rebase: Vec<String>,
+    /// Make task copies of these upstreams for this repo checkout's branch <task>: src-wt/<task>/<upstream>, a git worktree of src/<upstream> on atl-patches-<task> = pin + this checkout's patches/<upstream>/. Every xtask command then uses it instead of src/<upstream>.
+    #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with = "done")]
+    edit: Vec<String>,
+    /// Remove these task copies and their branch; refused while one holds uncommitted, untracked or unexported work.
+    #[arg(long, value_name = "UPSTREAM", num_args = 1..)]
+    done: Vec<String>,
 }
 
-/// One upstream as this module sees it.
+/// One upstream as this module sees it: the checkout the layout resolves, and its patch branch.
 pub struct Up<'a> {
     c: &'a Checkout,
     checkout: PathBuf,
     patches: PathBuf,
+    branch: String,
+    /// The task owning the checkout; None = shared `src/`.
+    task: Option<String>,
+    /// Untracked files xtask itself puts there (`declared`), paths inside the checkout.
+    untracked: BTreeSet<String>,
 }
 
 impl<'a> Up<'a> {
-    /// `c` checked out under `src`, its patches under `<root>/patches`.
-    pub fn new(c: &'a Checkout, src: &Path, root: &Path) -> Self {
+    /// `c` where `layout` resolves it, its patches under `<root>/patches`.
+    pub fn new(c: &'a Checkout, layout: &Layout, root: &Path) -> Self {
+        let l = layout.checkout(c);
         Up {
             c,
-            checkout: src.join(&c.dir),
+            branch: match &l.task {
+                Some(t) => format!("{BRANCH}-{t}"),
+                None => BRANCH.to_owned(),
+            },
+            checkout: l.dir,
+            task: l.task,
             patches: root.join("patches").join(&c.dir),
+            untracked: BTreeSet::new(),
         }
     }
 
     fn name(&self) -> String {
         self.c.dir.display().to_string()
     }
+
+    pub fn checkout(&self) -> &Path {
+        &self.checkout
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.task.is_none()
+    }
+
+    /// patches/<upstream>/ of this repo checkout.
+    pub fn stored(&self) -> Result<Vec<(String, String)>> {
+        stored(&self.patches)
+    }
+
+    fn on_branch(&self) -> Result<bool> {
+        Ok(git(
+            Some(&self.checkout),
+            &["symbolic-ref", "-q", "--short", "HEAD"],
+        )
+        .is_ok_and(|b| b == self.branch))
+    }
+
+    fn has_branch(&self) -> Result<bool> {
+        has_branch(&self.checkout, &self.branch)
+    }
+}
+
+/// Every checkout of `all` as `layout` places it, with the untracked files `declared` for it.
+fn ups<'a>(
+    all: &'a [Checkout],
+    layout: &Layout,
+    root: &Path,
+    declared: &BTreeMap<PathBuf, BTreeSet<String>>,
+) -> Vec<Up<'a>> {
+    all.iter()
+        .map(|c| {
+            let mut u = Up::new(c, layout, root);
+            u.untracked = declared.get(&c.dir).cloned().unwrap_or_default();
+            u
+        })
+        .collect()
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sources = sources::load(root)?;
     let licenses = licenses::load(root, &sources.upstream_names())?;
-    // --rebase fetches, so AOSP rows need their URLs from the manifest
-    let names = aosp::load(root, &sources.aosp)?.map(|m| m.names());
-    let all = sources.checkouts(names.as_ref());
-    let src = workspace::root_dir(root)?.join("src");
-    let ups: Vec<Up> = all.iter().map(|c| Up::new(c, &src, root)).collect();
+    // --rebase and --edit fetch, so AOSP rows need their URLs from the manifest
+    let manifest = aosp::load(root, &sources.aosp)?;
+    let all = sources.checkouts(manifest.as_ref().map(Manifest::names).as_ref());
+    let layout = Layout::of(root)?;
+    let declared = declared(&sources, manifest.as_ref(), &prune::load(root, &sources)?);
+    let ups = ups(&all, &layout, root, &declared);
     let pick = |names: &[String]| -> Result<Vec<&Up>> {
         names
             .iter()
@@ -86,14 +156,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     } else if !args.rebase.is_empty() {
         let ident = Ident::of_repo(root)?;
+        let main = fetch::Main::load(root)?;
         for u in pick(&args.rebase)? {
-            report(u.name(), rebase(u, &ident));
+            let r = shared_allowed(u, &main).and_then(|()| rebase(u, &ident));
+            report(u.name(), r);
+        }
+    } else if !args.edit.is_empty() {
+        let ident = Ident::of_repo(root)?;
+        for u in pick(&args.edit)? {
+            report(u.name(), edit(u.c, &layout, root, &ident));
+        }
+    } else if !args.done.is_empty() {
+        let picked = pick(&args.done)?;
+        for u in &picked {
+            report(u.name(), done(u, &layout, &licenses));
+        }
+        if picked.iter().any(|u| matches!(u.c.pin, Pin::Aosp(_))) {
+            // the farm follows the task copies left
+            layout.aosp_tree(&all, manifest.as_ref())?;
         }
     } else {
         for u in &ups {
             let shown = match drift(u, &licenses) {
                 Ok(None) => Ok("no checkout".to_owned()),
-                Ok(Some(p)) if p.is_empty() => Ok("in step".to_owned()),
+                Ok(Some(p)) if p.is_empty() => Ok(match &u.task {
+                    Some(_) => format!("in step (task copy {})", u.checkout.display()),
+                    None => "in step".to_owned(),
+                }),
                 Ok(Some(p)) => Err(anyhow::anyhow!(p.join("; "))),
                 Err(e) => Err(e),
             };
@@ -107,13 +196,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
+/// A mutation of a shared checkout (rebase, fetch's settle) only for a repo checkout whose pin and patches/ are main's.
+pub fn shared_allowed(u: &Up, main: &fetch::Main) -> Result<()> {
+    if u.is_shared()
+        && let Some(why) = main.refusal(u.c, &u.stored()?)
+    {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
 /// The drift check behind `xtask check`: every present checkout matches its pin and patches/.
 pub fn check(root: &Path) -> Result<()> {
     let sources = sources::load(root)?;
     let licenses = licenses::load(root, &sources.upstream_names())?;
-    let src = workspace::root_dir(root)?.join("src");
     let all = sources.checkouts(None);
-    let ups: Vec<Up> = all.iter().map(|c| Up::new(c, &src, root)).collect();
+    let ups = loaded_ups(root, &sources, &all)?;
     let (present, problems) = problems(&ups, &licenses);
     for p in &problems {
         eprintln!("drift: {p}");
@@ -131,15 +229,52 @@ pub fn check(root: &Path) -> Result<()> {
 pub fn preflight<'a>(root: &Path, upstreams: impl IntoIterator<Item = &'a str>) -> Result<()> {
     let sources = sources::load(root)?;
     let licenses = licenses::load(root, &sources.upstream_names())?;
-    let src = workspace::root_dir(root)?.join("src");
     let upstreams: BTreeSet<&str> = upstreams.into_iter().collect();
-    let all = sources.checkouts(None);
-    let ups: Vec<Up> = all
-        .iter()
+    let all: Vec<Checkout> = sources
+        .checkouts(None)
+        .into_iter()
         .filter(|c| built_from(c, &upstreams))
-        .map(|c| Up::new(c, &src, root))
         .collect();
-    in_step(&ups, &licenses)
+    in_step(&loaded_ups(root, &sources, &all)?, &licenses)
+}
+
+/// `ups` with the declared untracked files read from the manifest and the prune table.
+fn loaded_ups<'a>(root: &Path, sources: &Sources, all: &'a [Checkout]) -> Result<Vec<Up<'a>>> {
+    let manifest = aosp::load(root, &sources.aosp)?;
+    let declared = declared(sources, manifest.as_ref(), &prune::load(root, sources)?);
+    Ok(ups(all, &Layout::of(root)?, root, &declared))
+}
+
+/// Untracked files xtask itself puts in AOSP checkouts, by checkout dir (`aosp/<project>`), as paths inside it: the manifest's link/copy destinations (`xtask fetch`) and the prune markers (`xtask soong`). Any other untracked file is drift: a new file not committed on the patch branch.
+fn declared(
+    sources: &Sources,
+    manifest: Option<&Manifest>,
+    prune: &Prune,
+) -> BTreeMap<PathBuf, BTreeSet<String>> {
+    let mut out: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut add = |tree_path: &str| {
+        // the longest pinned project holding it
+        let owner = sources
+            .aosp
+            .projects
+            .keys()
+            .filter(|p| tree_path.starts_with(&format!("{p}/")))
+            .max_by_key(|p| p.len());
+        if let Some(p) = owner {
+            out.entry(Path::new("aosp").join(p))
+                .or_default()
+                .insert(tree_path[p.len() + 1..].to_owned());
+        }
+    };
+    for project in manifest.iter().flat_map(|m| m.projects.values()) {
+        for link in &project.links {
+            add(&link.dest);
+        }
+    }
+    for dir in prune.keys() {
+        add(&format!("{dir}/{}", prune::MARKER));
+    }
+    out
 }
 
 fn built_from(c: &Checkout, upstreams: &BTreeSet<&str>) -> bool {
@@ -186,12 +321,26 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
     if is_dirty(dir)? {
         problems.push("uncommitted changes".to_owned());
     }
+    let strays = strays(u)?;
+    if !strays.is_empty() {
+        let more = strays.len().saturating_sub(STRAYS_SHOWN);
+        problems.push(format!(
+            "untracked {}{}: commit on {} or delete",
+            strays[..strays.len().min(STRAYS_SHOWN)].join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            },
+            u.branch
+        ));
+    }
     if rebase_in_progress(dir)? {
         problems.push("rebase in progress".to_owned());
         return Ok(Some(problems));
     }
     let stored = stored(&u.patches)?;
-    if on_branch(dir)? {
+    if u.on_branch()? {
         match base(u)? {
             None => problems.push(no_base(u)),
             Some(b) if b != u.c.commit => problems.push(format!(
@@ -201,11 +350,13 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
             Some(b) => match branch_patches(u, &b, licenses) {
                 Ok(branch) if branch == stored => {}
                 Ok(branch) if unexported(&branch, &stored).is_empty() => problems.push(format!(
-                    "patches/{} holds patches {BRANCH} lacks: xtask fetch --execute",
-                    u.name()
+                    "patches/{} holds patches {} lacks: xtask fetch --execute",
+                    u.name(),
+                    u.branch
                 )),
                 Ok(_) => problems.push(format!(
-                    "{BRANCH} differs from patches/{0}: xtask patch --export {0}",
+                    "{} differs from patches/{1}: xtask patch --export {1}",
+                    u.branch,
                     u.name()
                 )),
                 Err(e) => problems.push(format!("{e:#}")),
@@ -222,7 +373,20 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
     Ok(Some(problems))
 }
 
-/// `xtask fetch`'s second step, once the checkout is at its pin or on atl-patches: make atl-patches
+/// Untracked files of the checkout (`.gitignore`d ones excluded) that xtask did not put there.
+fn strays(u: &Up) -> Result<Vec<String>> {
+    let out = git(
+        Some(&u.checkout),
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|f| !u.untracked.contains(*f))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `xtask fetch`'s second step, once the checkout is at its pin or on its patch branch: make the branch
 /// the pin + patches/<upstream>. Refuses rather than drop a commit patches/ does not hold. Without
 /// `execute` only says what it would do. None = nothing to report.
 pub fn settle(
@@ -238,7 +402,7 @@ pub fn settle(
         // dry run of a clone
         return Ok((n > 0).then(|| format!("then apply {n} patches")));
     }
-    let on = on_branch(dir)?;
+    let on = u.on_branch()?;
     if !on && stored.is_empty() {
         return Ok(None);
     }
@@ -247,10 +411,14 @@ pub fn settle(
         "rebase in progress: finish it (git rebase --continue / --abort) first"
     );
     let pin = u.c.commit.as_str();
-    if has_branch(dir)? {
+    if u.has_branch()? {
         let b = base(u)?.with_context(|| no_base(u))?;
-        let branch = branch_patches(u, &b, licenses)
-            .context("atl-patches holds commits patches/ cannot hold; fix them, then --export")?;
+        let branch = branch_patches(u, &b, licenses).with_context(|| {
+            format!(
+                "{} holds commits patches/ cannot hold; fix them, then --export",
+                u.branch
+            )
+        })?;
         let lost = unexported(&branch, &stored);
         if !lost.is_empty() {
             let how = if b == pin {
@@ -259,12 +427,12 @@ pub fn settle(
                 format!("xtask patch --rebase {0}, then --export {0}", u.name())
             };
             bail!(
-                "{BRANCH} holds {} commits not in patches/{} ({}): {how}; or, if they are stale, `git -C {} checkout --detach && git -C {} branch -D {BRANCH}`",
+                "{0} holds {1} commits not in patches/{2} ({3}): {how}; or, if they are stale, `git -C {4} checkout --detach && git -C {4} branch -D {0}`",
+                u.branch,
                 lost.len(),
                 u.name(),
                 lost.join(", "),
                 dir.display(),
-                dir.display()
             );
         }
         if on && b == pin && branch == stored {
@@ -285,22 +453,23 @@ pub fn settle(
     Ok(Some(format!("applied {n} patches")))
 }
 
-/// atl-patches := pin + `stored` (git am). On failure the checkout's branch, HEAD and base go back
+/// patch branch := pin + `stored` (git am). On failure the checkout's branch, HEAD and base go back
 /// to what they were.
 fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
     let dir = &u.checkout;
     let pin = u.c.commit.as_str();
-    // fetch leaves a checkout on atl-patches where it is, so a new pin may not be here yet
+    let branch = u.branch.as_str();
+    // fetch leaves a checkout on its patch branch where it is, so a new pin may not be here yet
     if git(Some(dir), &["cat-file", "-e", &format!("{pin}^{{commit}}")]).is_err() {
         fetch::verify_tag(u.c)?;
         fetch::fetch_pin(u.c, dir)?;
     }
-    let was_on = on_branch(dir)?;
+    let was_on = u.on_branch()?;
     let head = git(Some(dir), &["rev-parse", "HEAD"])?;
-    let branch_ref = format!("refs/heads/{BRANCH}");
+    let branch_ref = format!("refs/heads/{branch}");
     let old_branch = git(Some(dir), &["rev-parse", "-q", "--verify", &branch_ref]).ok();
     let old_base = git(Some(dir), &["rev-parse", "-q", "--verify", BASE_REF]).ok();
-    git(Some(dir), &["checkout", "-q", "-B", BRANCH, pin])?;
+    git(Some(dir), &["checkout", "-q", "-B", branch, pin])?;
     git(Some(dir), &["update-ref", BASE_REF, pin])?;
     let files: Vec<String> = stored
         .iter()
@@ -319,11 +488,11 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
     let restored = (|| -> Result<()> {
         git(Some(dir), &["checkout", "-q", "--detach", &head])?;
         match &old_branch {
-            Some(b) => git(Some(dir), &["branch", "-q", "-f", BRANCH, b])?,
-            None => git(Some(dir), &["branch", "-q", "-D", BRANCH])?,
+            Some(b) => git(Some(dir), &["branch", "-q", "-f", branch, b])?,
+            None => git(Some(dir), &["branch", "-q", "-D", branch])?,
         };
         if was_on {
-            git(Some(dir), &["checkout", "-q", BRANCH])?;
+            git(Some(dir), &["checkout", "-q", branch])?;
         }
         match &old_base {
             Some(b) => git(Some(dir), &["update-ref", BASE_REF, b])?,
@@ -352,15 +521,125 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
     }
 }
 
+/// `--edit`: the task copy of `c`, a worktree of `src/<up>` on `atl-patches-<task>` = pin + this checkout's patches/.
+fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<String> {
+    let (shared, copy, task) = layout.edit_paths(c)?;
+    let branch = format!("{BRANCH}-{task}");
+    ensure!(
+        !copy.exists(),
+        "{} exists: the task copy is there already",
+        copy.display()
+    );
+    ensure!(
+        shared.join(".git").exists(),
+        "{} is not fetched: xtask fetch --execute",
+        shared.display()
+    );
+    ensure!(
+        !has_branch(&shared, &branch)?,
+        "branch {branch} exists in {0} without a task copy: `git -C {0} branch -D {branch}` if it is stale",
+        shared.display()
+    );
+    // only objects and the tag ref: the shared checkout itself does not move
+    if git(
+        Some(&shared),
+        &["cat-file", "-e", &format!("{}^{{commit}}", c.commit)],
+    )
+    .is_err()
+    {
+        fetch::verify_tag(c)?;
+        fetch::fetch_pin(c, &shared)?;
+    }
+    if let Some(parent) = copy.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path = copy.display().to_string();
+    git(
+        Some(&shared),
+        &["worktree", "add", "-q", "--detach", &path, &c.commit],
+    )?;
+    let u = Up::new(c, layout, root);
+    ensure!(
+        u.checkout == copy,
+        "the layout does not resolve {}",
+        copy.display()
+    );
+    let stored = u.stored()?;
+    if let Err(e) = rebuild(&u, &stored, ident) {
+        return Err(match remove_copy(&shared, &copy, &branch) {
+            Ok(()) => e.context("task copy removed again"),
+            Err(r) => e.context(format!("removing the task copy failed too: {r:#}")),
+        });
+    }
+    Ok(format!(
+        "task copy {} on {branch} = pin + {} patches",
+        copy.display(),
+        stored.len()
+    ))
+}
+
+/// `--done`: remove the task copy and its branch, unless that would lose work.
+fn done(u: &Up, layout: &Layout, licenses: &Licenses) -> Result<String> {
+    let (shared, copy, _) = layout.edit_paths(u.c)?;
+    ensure!(
+        !u.is_shared(),
+        "no task copy {}: nothing to remove",
+        copy.display()
+    );
+    ensure!(
+        !is_dirty(&u.checkout)?,
+        "uncommitted changes in {}",
+        copy.display()
+    );
+    let strays = strays(u)?;
+    ensure!(
+        strays.is_empty(),
+        "untracked {} in {}",
+        strays.join(", "),
+        copy.display()
+    );
+    if u.has_branch()? {
+        let b = base(u)?.with_context(|| no_base(u))?;
+        let lost = unexported(&branch_patches(u, &b, licenses)?, &u.stored()?);
+        ensure!(
+            lost.is_empty(),
+            "{} holds {} commits not in patches/{} ({}): xtask patch --export {}",
+            u.branch,
+            lost.len(),
+            u.name(),
+            lost.join(", "),
+            u.name()
+        );
+    }
+    remove_copy(&shared, &copy, &u.branch)?;
+    layout.remove_empty_parents(&copy);
+    Ok(format!("task copy removed; src/{} in use again", u.name()))
+}
+
+fn remove_copy(shared: &Path, copy: &Path, branch: &str) -> Result<()> {
+    // --force: the caller checked there is nothing to lose (or made the copy a moment ago)
+    git(
+        Some(shared),
+        &["worktree", "remove", "--force", &copy.display().to_string()],
+    )?;
+    if has_branch(shared, branch)? {
+        git(Some(shared), &["branch", "-q", "-D", branch])?;
+    }
+    Ok(())
+}
+
 fn export(u: &Up, licenses: &Licenses) -> Result<String> {
     let dir = &u.checkout;
     ensure!(
-        dir.exists() && on_branch(dir)?,
-        "not on {BRANCH}: nothing to export"
+        dir.exists() && u.on_branch()?,
+        "{} not on {}: nothing to export",
+        dir.display(),
+        u.branch
     );
     ensure!(
         base(u)?.as_deref() == Some(u.c.commit.as_str()),
-        "{BRANCH} is not based on the pin: xtask patch --rebase {}",
+        "{} is not based on the pin: xtask patch --rebase {}",
+        u.branch,
         u.name()
     );
     let patches = branch_patches(u, &u.c.commit, licenses)?;
@@ -382,7 +661,7 @@ fn export(u: &Up, licenses: &Licenses) -> Result<String> {
 fn rebase(u: &Up, ident: &Ident) -> Result<String> {
     let dir = &u.checkout;
     let pin = u.c.commit.as_str();
-    ensure!(dir.exists() && on_branch(dir)?, "not on {BRANCH}");
+    ensure!(dir.exists() && u.on_branch()?, "not on {}", u.branch);
     ensure!(
         !rebase_in_progress(dir)?,
         "finish the rebase (git rebase --continue / --abort) first"
@@ -397,17 +676,20 @@ fn rebase(u: &Up, ident: &Ident) -> Result<String> {
         fetch::verify_tag(u.c)?;
         fetch::fetch_pin(u.c, dir)?;
     }
-    let resumed = git(Some(dir), &["merge-base", "--is-ancestor", pin, BRANCH]).is_ok();
+    let resumed = git(Some(dir), &["merge-base", "--is-ancestor", pin, &u.branch]).is_ok();
     if !resumed {
-        git_isolated(dir, &["rebase", "-q", "--onto", pin, &old, BRANCH], Some(ident)).with_context(
-            || {
-                format!(
-                    "conflicts: resolve in {}, `git rebase --continue`, then rerun xtask patch --rebase {}",
-                    dir.display(),
-                    u.name()
-                )
-            },
-        )?;
+        git_isolated(
+            dir,
+            &["rebase", "-q", "--onto", pin, &old, &u.branch],
+            Some(ident),
+        )
+        .with_context(|| {
+            format!(
+                "conflicts: resolve in {}, `git rebase --continue`, then rerun xtask patch --rebase {}",
+                dir.display(),
+                u.name()
+            )
+        })?;
     }
     git(Some(dir), &["update-ref", BASE_REF, pin])?;
     Ok(format!(
@@ -431,12 +713,12 @@ fn unexported(branch: &[(String, String)], stored: &[(String, String)]) -> Vec<S
 /// Distinct temp dirs for concurrent exports in one process (`xtask fetch` settles in parallel).
 static EXPORTS: AtomicUsize = AtomicUsize::new(0);
 
-/// `<base>..atl-patches` as patch files, byte-for-byte reproducible: global git config ignored,
+/// `<base>..<patch branch>` as patch files, byte-for-byte reproducible: global git config ignored,
 /// commit ids zeroed, full blob ids, no signature (`--no-stat` would drop the `---` line); each gets the SPDX expression of the files
 /// it touches after its `---` line, where `git am` ignores it.
 fn branch_patches(u: &Up, base: &str, licenses: &Licenses) -> Result<Vec<(String, String)>> {
     let dir = &u.checkout;
-    let range = format!("{base}..{BRANCH}");
+    let range = format!("{base}..{}", u.branch);
     let commits = commits_with_trailers(dir, &range)?;
     let tmp = std::env::temp_dir().join(format!(
         "xtask-patch-{}-{}",
@@ -574,6 +856,7 @@ fn stored(dir: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Tracked files changed. Untracked ones are `strays`' concern: fetch may rebuild a branch beside them.
 fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(!git(
         Some(dir),
@@ -582,30 +865,26 @@ fn is_dirty(dir: &Path) -> Result<bool> {
     .is_empty())
 }
 
-fn on_branch(dir: &Path) -> Result<bool> {
-    Ok(git(Some(dir), &["symbolic-ref", "-q", "--short", "HEAD"]).is_ok_and(|b| b == BRANCH))
-}
-
-fn has_branch(dir: &Path) -> Result<bool> {
+fn has_branch(dir: &Path, branch: &str) -> Result<bool> {
     Ok(git(
         Some(dir),
         &[
             "rev-parse",
             "-q",
             "--verify",
-            &format!("refs/heads/{BRANCH}"),
+            &format!("refs/heads/{branch}"),
         ],
     )
     .is_ok())
 }
 
-/// What atl-patches is based on: `BASE_REF`, else (a branch started by hand) the newest tag it contains -- a shallow checkout holds only the pinned tags, so that is the pin it was started at, even after a bump.
+/// What the patch branch is based on: `BASE_REF`, else (a branch started by hand) the newest tag it contains -- a shallow checkout holds only the pinned tags, so that is the pin it was started at, even after a bump.
 fn base(u: &Up) -> Result<Option<String>> {
     let dir = &u.checkout;
     if let Ok(b) = git(Some(dir), &["rev-parse", "-q", "--verify", BASE_REF]) {
         return Ok(Some(b));
     }
-    let Ok(tag) = git(Some(dir), &["describe", "--tags", "--abbrev=0", BRANCH]) else {
+    let Ok(tag) = git(Some(dir), &["describe", "--tags", "--abbrev=0", &u.branch]) else {
         return Ok(None);
     };
     Ok(Some(git(
@@ -616,7 +895,8 @@ fn base(u: &Up) -> Result<Option<String>> {
 
 fn no_base(u: &Up) -> String {
     format!(
-        "{BRANCH} has no {BASE_REF} and contains no pinned tag: rename it (`git -C {} branch -m {BRANCH} <name>`), then start {BRANCH} at the pin {}",
+        "{0} has no {BASE_REF} and contains no pinned tag: rename it (`git -C {1} branch -m {0} <name>`), then start {0} at the pin {2}",
+        u.branch,
         u.checkout.display(),
         u.c.commit
     )
@@ -642,8 +922,8 @@ pub mod fixture {
     /// A trailed patch commit message.
     pub const TRAILED: &str = "fix a\n\nUpstream-Status: Pending\nPatch-Reason: test\n";
 
-    /// Temp tree `<root>`: `upstream/` (a repo with a.c, tag v1); checkouts go under `<root>/<src>/up`,
-    /// patches under `<root>/patches/up`.
+    /// Temp tree `<root>`: `upstream/` (a repo with a.c, tag v1); workspaces `<root>/<ws>` hold
+    /// `src/up` and `src-wt/<task>/up`, patches live under `<root>/patches/up`.
     pub struct Fixture {
         pub root: PathBuf,
         upstream: PathBuf,
@@ -698,19 +978,24 @@ pub mod fixture {
             }
         }
 
-        /// `<root>/<src>`: a src directory as `xtask fetch` sees it.
-        pub fn src(&self, src: &str) -> PathBuf {
-            self.root.join(src)
+        /// Workspace `<root>/<ws>` as a repo checkout on `branch` sees it (None = main).
+        pub fn layout(&self, ws: &str, branch: Option<&str>) -> Layout {
+            Layout::new(&self.root.join(ws), branch)
         }
 
-        /// `c` under `<root>/<src>`, whether checked out or not.
-        pub fn at<'a>(&self, c: &'a Checkout, src: &str) -> Up<'a> {
-            Up::new(c, &self.src(src), &self.root)
+        /// `c` in workspace `<root>/<ws>` on main, whether checked out or not.
+        pub fn at<'a>(&self, c: &'a Checkout, ws: &str) -> Up<'a> {
+            Up::new(c, &self.layout(ws, None), &self.root)
         }
 
-        /// A checkout of `c` under `<root>/<src>`, detached at the pin.
-        pub fn fetched<'a>(&self, c: &'a Checkout, src: &str) -> Up<'a> {
-            let u = self.at(c, src);
+        /// `c` as a repo checkout on `branch` resolves it in workspace `<root>/<ws>`.
+        pub fn on<'a>(&self, c: &'a Checkout, ws: &str, branch: &str) -> Up<'a> {
+            Up::new(c, &self.layout(ws, Some(branch)), &self.root)
+        }
+
+        /// A checkout of `c` in `<root>/<ws>/src`, detached at the pin.
+        pub fn fetched<'a>(&self, c: &'a Checkout, ws: &str) -> Up<'a> {
+            let u = self.at(c, ws);
             std::fs::create_dir_all(&u.checkout).unwrap();
             git(Some(&u.checkout), &["init", "-q"]).unwrap();
             fetch::fetch_pin(c, &u.checkout).unwrap();
@@ -740,12 +1025,12 @@ pub mod fixture {
         }
     }
 
-    /// Start atl-patches at the pin (as a developer does by hand) unless on it, and commit a line
+    /// Start the patch branch at the pin (as a developer does by hand) unless on it, and commit a line
     /// added to a.c with `msg`.
     pub fn patch_commit(u: &Up, msg: &str) {
         let d = &u.checkout;
-        if !on_branch(d).unwrap() {
-            git(Some(d), &["switch", "-q", "-c", BRANCH, &u.c.commit]).unwrap();
+        if !u.on_branch().unwrap() {
+            git(Some(d), &["switch", "-q", "-c", &u.branch, &u.c.commit]).unwrap();
         }
         let a = d.join("a.c");
         let text = std::fs::read_to_string(&a).unwrap();
@@ -777,7 +1062,7 @@ pub mod fixture {
     }
 
     pub fn on_patch_branch(u: &Up) -> bool {
-        on_branch(&u.checkout).unwrap()
+        u.on_branch().unwrap()
     }
 
     pub fn base_ref(u: &Up) -> Option<String> {
@@ -798,7 +1083,7 @@ mod tests {
     fn export_is_reproducible_and_clears_drift() {
         let f = Fixture::new("cycle");
         let c = f.checkout("v1");
-        let u = f.fetched(&c, "src");
+        let u = f.fetched(&c, "ws");
         patch_commit(&u, TRAILED);
 
         let out = branch_patches(&u, &c.commit, &licenses()).unwrap();
@@ -826,7 +1111,7 @@ mod tests {
     fn missing_trailer_blocks_export() {
         let f = Fixture::new("trailer");
         let c = f.checkout("v1");
-        let u = f.fetched(&c, "src");
+        let u = f.fetched(&c, "ws");
         patch_commit(&u, "no trailers here");
         let e = format!(
             "{:#}",
@@ -839,13 +1124,13 @@ mod tests {
     fn rebase_onto_new_pin() {
         let f = Fixture::new("rebase");
         let c1 = f.checkout("v1");
-        let u1 = f.fetched(&c1, "src");
+        let u1 = f.fetched(&c1, "ws");
         patch_commit(&u1, TRAILED);
         // upstream moves on: a new file and tag v2
         f.write("b.c", "int b;\n");
         f.release("two", "v2");
         let c2 = f.checkout("v2");
-        let u2 = f.at(&c2, "src");
+        let u2 = f.at(&c2, "ws");
 
         assert!(drift_of(&u2)[0].contains("pin moved"));
         rebase(&u2, &ident()).unwrap();
@@ -864,7 +1149,7 @@ mod tests {
     fn preflight_guards() {
         let f = Fixture::new("preflight");
         let c = f.checkout("v1");
-        let u = f.fetched(&c, "src");
+        let mut u = f.fetched(&c, "ws");
         let check =
             |u: &Up| in_step(std::slice::from_ref(u), &licenses()).map_err(|e| format!("{e:#}"));
         // detached at the pin, no patches: in step
@@ -874,6 +1159,19 @@ mod tests {
         let e = check(&u).unwrap_err();
         assert!(e.contains("up: uncommitted changes"), "{e}");
         git(Some(&u.checkout), &["checkout", "-q", "--", "a.c"]).unwrap();
+        // a new file never committed; one xtask declares is no stray, nor is an ignored one
+        for file in ["new.c", "link.h", "build.o"] {
+            std::fs::write(u.checkout.join(file), "").unwrap();
+        }
+        std::fs::write(u.checkout.join(".git/info/exclude"), "*.o\n").unwrap();
+        u.untracked.insert("link.h".into());
+        let e = check(&u).unwrap_err();
+        assert!(
+            e.contains("up: untracked new.c: commit on atl-patches or delete"),
+            "{e}"
+        );
+        std::fs::remove_file(u.checkout.join("new.c")).unwrap();
+        check(&u).unwrap();
         // a commit patches/ lacks
         patch_commit(&u, TRAILED);
         let e = check(&u).unwrap_err();
@@ -894,10 +1192,37 @@ mod tests {
     }
 
     #[test]
+    fn declared_untracked_files() {
+        let sources: Sources = toml::from_str(
+            "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"m\"\n\
+             [aosp.projects]\n\"build\" = \"c\"\n\"build/make\" = \"c\"\n",
+        )
+        .unwrap();
+        let m = crate::aosp::parse(r#"<manifest><default revision="r"/><project path="build/make" name="m"><linkfile src="core" dest="build/core"/><linkfile src="x" dest="Makefile"/></project></manifest>"#).unwrap();
+        let prune: Prune =
+            toml::from_str("[\"build/make/target/generic\"]\nreason = \"r\"\n").unwrap();
+        let d = declared(&sources, Some(&m), &prune);
+        // each file in the longest project holding it; one outside every project is nobody's
+        assert_eq!(
+            d,
+            BTreeMap::from([
+                (
+                    PathBuf::from("aosp/build"),
+                    BTreeSet::from(["core".to_owned()])
+                ),
+                (
+                    PathBuf::from("aosp/build/make"),
+                    BTreeSet::from(["target/generic/.find-ignore".to_owned()])
+                ),
+            ])
+        );
+    }
+
+    #[test]
     fn branch_without_base_is_refused() {
         let f = Fixture::new("nobase");
         let c = f.checkout("v1");
-        let u = f.fetched(&c, "src");
+        let u = f.fetched(&c, "ws");
         // a branch sharing no history with any pinned tag: nothing says what its commits are relative to
         let d = &u.checkout;
         git(Some(d), &["switch", "-q", "--orphan", BRANCH]).unwrap();
@@ -923,6 +1248,80 @@ mod tests {
             settle(&u, &licenses(), Some(&ident()), true).unwrap_err()
         );
         assert!(e.contains("contains no pinned tag"), "{e}");
+    }
+
+    /// `--edit` makes the task copy every command then resolves; `--done` removes it only when nothing is lost.
+    #[test]
+    fn task_copy_cycle() {
+        let f = Fixture::new("edit");
+        let c = f.checkout("v1");
+        let shared = f.fetched(&c, "ws");
+        // main's patches, applied in src/ as fetch does
+        patch_commit(&shared, TRAILED);
+        export_ok(&shared);
+        let layout = f.layout("ws", Some("t"));
+        let err = |r: Result<String>| format!("{:#}", r.unwrap_err());
+
+        // refused on main and with a stale branch of the task's name
+        let e = err(edit(&c, &f.layout("ws", None), &f.root, &ident()));
+        assert!(e.contains("task copies belong to a task branch"), "{e}");
+        git(Some(&shared.checkout), &["branch", "atl-patches-t"]).unwrap();
+        let e = err(edit(&c, &layout, &f.root, &ident()));
+        assert!(e.contains("branch atl-patches-t exists"), "{e}");
+        git(Some(&shared.checkout), &["branch", "-D", "atl-patches-t"]).unwrap();
+
+        edit(&c, &layout, &f.root, &ident()).unwrap();
+        let task = f.on(&c, "ws", "t");
+        assert_eq!(task.checkout, f.root.join("ws/src-wt/t/up"));
+        assert_eq!(task.branch, "atl-patches-t");
+        // pin + this checkout's patches, its own base ref; src/ untouched
+        assert_eq!(tree(&task), tree(&shared));
+        assert_eq!(base_ref(&task).as_deref(), Some(c.commit.as_str()));
+        assert_eq!(drift_of(&task), Vec::<String>::new());
+        assert!(on_patch_branch(&shared));
+        let e = err(edit(&c, &layout, &f.root, &ident()));
+        assert!(e.contains("the task copy is there already"), "{e}");
+
+        // work in the copy: --done refuses each kind of unsaved work
+        std::fs::write(task.checkout.join("a.c"), "int dirty;\n").unwrap();
+        let e = err(done(&task, &layout, &licenses()));
+        assert!(e.contains("uncommitted changes"), "{e}");
+        git(Some(&task.checkout), &["checkout", "-q", "--", "a.c"]).unwrap();
+        std::fs::write(task.checkout.join("new.c"), "").unwrap();
+        let e = err(done(&task, &layout, &licenses()));
+        assert!(e.contains("untracked new.c"), "{e}");
+        std::fs::remove_file(task.checkout.join("new.c")).unwrap();
+        patch_commit(
+            &task,
+            "fix b\n\nUpstream-Status: Pending\nPatch-Reason: test\n",
+        );
+        let e = err(done(&task, &layout, &licenses()));
+        assert!(
+            e.contains("atl-patches-t holds 1 commits not in patches/up"),
+            "{e}"
+        );
+        // exported from the task copy, src/ still main's
+        export_ok(&task);
+        assert_eq!(drift_of(&task), Vec::<String>::new());
+        assert!(!drift_of(&shared).is_empty());
+        done(&task, &layout, &licenses()).unwrap();
+        assert!(!f.root.join("ws/src-wt/t").exists());
+        assert!(!has_branch(&shared.checkout, "atl-patches-t").unwrap());
+        assert!(f.on(&c, "ws", "t").is_shared());
+        let e = err(done(&f.on(&c, "ws", "t"), &layout, &licenses()));
+        assert!(e.contains("nothing to remove"), "{e}");
+
+        // --edit again: the task's exported patches come back
+        edit(&c, &layout, &f.root, &ident()).unwrap();
+        let again = f.on(&c, "ws", "t");
+        assert_eq!(drift_of(&again), Vec::<String>::new());
+        // a failed git am leaves no copy behind
+        done(&again, &layout, &licenses()).unwrap();
+        std::fs::write(f.root.join("patches/up/0003-bad.patch"), "not a patch\n").unwrap();
+        let e = err(edit(&c, &layout, &f.root, &ident()));
+        assert!(e.contains("task copy removed again"), "{e}");
+        assert!(!f.root.join("ws/src-wt/t/up").exists());
+        assert!(!has_branch(&shared.checkout, "atl-patches-t").unwrap());
     }
 
     #[test]

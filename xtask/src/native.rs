@@ -13,7 +13,9 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
+use crate::layout::Layout;
 use crate::providers::Provided;
+use crate::sources::Pin;
 use crate::{arches, fetch, patch, provided_gate, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
@@ -53,7 +55,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
     let ws = workspace::root_dir(root)?;
-    let tree = ws.join("src").join("aosp");
+    let layout = Layout::of(root)?;
+    // regenerated every round: --fetch-missing adds projects between rounds
+    let aosp_tree = || -> Result<std::path::PathBuf> {
+        let sources = sources::load(root)?;
+        let manifest = aosp::load(root, &sources.aosp)?;
+        layout.aosp_tree(&sources.checkouts(None), manifest.as_ref())
+    };
+    let tree = aosp_tree()?;
+    if tree != layout.shared_tree() {
+        println!("native: AOSP tree with task copies: {}", tree.display());
+    }
     // go.work and the converter binary name this checkout's tools/bp2ninja: with an explicit --out they live there too, so concurrent checkouts do not overwrite each other's
     let (out, tool_dir) = match &args.out {
         Some(dir) => {
@@ -105,15 +117,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         cc: &args.cc,
         cxx: &args.cxx,
     };
+    let checkouts = sources.checkouts(None);
     for name in providers::upstreams(&providers) {
         let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
-        println!("native: building upstream {name}");
-        provided.extend(upstream::build(
-            &ws.join("src").join(name),
-            &out,
-            recipe,
-            &toolchain,
-        )?);
+        let c = checkouts
+            .iter()
+            .find(|c| matches!(&c.pin, Pin::Git(n) if n == name))
+            .with_context(|| format!("providers.toml upstream {name} has no sources.toml row"))?;
+        let src = layout.checkout(c).dir;
+        println!("native: building upstream {name} from {}", src.display());
+        provided.extend(upstream::build(&src, &out, recipe, &toolchain)?);
     }
     let provided_file = out.join("provided.json");
     std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
@@ -122,7 +135,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         round += 1;
         let status = Command::new(&converter)
             .arg("-tree")
-            .arg(&tree)
+            .arg(aosp_tree()?)
             .arg("-out")
             .arg(&out)
             .args([

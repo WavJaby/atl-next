@@ -1,18 +1,91 @@
 // SPDX-License-Identifier: MIT
-//! `xtask fetch`: upstream checkouts under `<workspace>/src` at the pins in sources.toml, with
-//! `patches/<upstream>/` applied on branch `atl-patches`.
+//! `xtask fetch`: upstream checkouts at the pins in sources.toml, with `patches/<upstream>/` applied
+//! on the checkout's patch branch -- each checkout where the layout resolves it: `src/<up>` (only
+//! while this repo checkout's pin and patches are origin/main's, `Main`) or the task copy.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Manifest};
-use crate::git::{Ident, git};
+use crate::git::{Ident, git, git_raw};
+use crate::layout::Layout;
 use crate::licenses::{self, Licenses};
 use crate::sources::{self, Checkout, Pin, Sources};
-use crate::{par, patch, workspace};
+use crate::{par, patch};
+
+/// The trunk as fetch compares against it: what `src/` holds.
+pub const MAIN_REF: &str = "origin/main";
+
+/// What `src/` holds: origin/main's pins and patches. Fetch (and `xtask patch --rebase`) change a shared checkout only for a repo checkout whose pin and patches/<up>/ equal these; a task's own go to its task copy (`xtask patch --edit`), so no worktree rewrites what the others build from.
+#[derive(Default)]
+pub struct Main {
+    pins: BTreeMap<PathBuf, String>,
+    patches: BTreeMap<PathBuf, Vec<(String, String)>>,
+}
+
+impl Main {
+    pub fn load(root: &Path) -> Result<Self> {
+        let show = |path: &str| git_raw(root, &["show", &format!("{MAIN_REF}:{path}")]);
+        let text = show(sources::FILE).with_context(|| {
+            format!(
+                "reading {MAIN_REF}:{} (fetch compares against it)",
+                sources::FILE
+            )
+        })?;
+        let sources =
+            sources::parse(&text).with_context(|| format!("in {MAIN_REF}:{}", sources::FILE))?;
+        let mut pins: BTreeMap<PathBuf, String> = sources
+            .checkouts(None)
+            .into_iter()
+            .map(|c| (c.dir, c.commit))
+            .collect();
+        let m = sources.manifest_checkout();
+        pins.insert(m.dir, m.commit);
+        let mut patches: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+        let files = git(
+            Some(root),
+            &["ls-tree", "-r", "--name-only", MAIN_REF, "--", "patches"],
+        )?;
+        for file in files.lines().filter(|f| f.ends_with(".patch")) {
+            let p = Path::new(file);
+            if let (Some(dir), Some(name)) = (
+                p.parent().and_then(|d| d.strip_prefix("patches").ok()),
+                p.file_name(),
+            ) {
+                patches
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .push((name.to_string_lossy().into_owned(), show(file)?));
+            }
+        }
+        for list in patches.values_mut() {
+            list.sort();
+        }
+        Ok(Main { pins, patches })
+    }
+
+    /// Why the shared checkout of `c` must stay as it is for a repo checkout whose patches/<up>/ is `stored`: None when pin and patches are main's, or main has no such row (a new checkout nothing on main reads).
+    pub fn refusal(&self, c: &Checkout, stored: &[(String, String)]) -> Option<String> {
+        let pin = self.pins.get(&c.dir)?;
+        let main = self.patches.get(&c.dir).map_or(&[][..], Vec::as_slice);
+        let what = match (*pin != c.commit, stored != main) {
+            (false, false) => return None,
+            (true, false) => "pin",
+            (false, true) => "patches/",
+            (true, true) => "pin and patches/",
+        };
+        let how = match c.pin {
+            Pin::Manifest => "merge the bump to main first".to_owned(),
+            _ => format!("xtask patch --edit {} for a task copy", c.dir.display()),
+        };
+        Some(format!(
+            "this checkout's {what} differ from {MAIN_REF}'s, and src/ holds main's: {how}"
+        ))
+    }
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -60,11 +133,16 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
 
 /// False when a checkout failed (its row says why).
 fn fetch(root: &Path, args: &Args) -> Result<bool> {
-    let src = workspace::root_dir(root)?.join("src");
+    let layout = Layout::of(root)?;
     let mut sources = sources::load(root)?;
     let ctx = Ctx {
         root,
-        src: &src,
+        layout: &layout,
+        main: if args.bump {
+            Main::default()
+        } else {
+            Main::load(root)?
+        },
         licenses: licenses::load(root, &sources.upstream_names())?,
         // only `git am` needs it, and only then is its absence an error
         ident: Ident::of_repo(root).ok(),
@@ -102,13 +180,13 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
     if args.execute
         && let Some(m) = &manifest
     {
-        let made = aosp::apply_links(&src.join("aosp"), m)?;
+        let made = aosp::apply_links(&layout.shared_tree(), m)?;
         println!("fetch: {made} manifest link/copy files created");
     } else if !args.execute {
         println!(
             "fetch: dry run ({} checkouts under {}); --execute applies",
             all.len() + 1,
-            src.display()
+            layout.src().display()
         );
     }
     Ok(rows.failed == 0)
@@ -117,7 +195,8 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
 /// What every checkout's sync shares.
 struct Ctx<'a> {
     root: &'a Path,
-    src: &'a Path,
+    layout: &'a Layout,
+    main: Main,
     licenses: Licenses,
     ident: Option<Ident>,
     execute: bool,
@@ -131,11 +210,12 @@ struct Row {
 
 /// What the checkout needs; with `execute`, also do it.
 fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
-    let u = patch::Up::new(c, ctx.src, ctx.root);
-    let dir = ctx.src.join(&c.dir);
-    let action = decide(&inspect(&dir)?, &c.commit);
+    let u = patch::Up::new(c, ctx.layout, ctx.root);
+    patch::shared_allowed(&u, &ctx.main)?;
+    let dir = u.checkout();
+    let action = decide(&inspect(dir)?, &c.commit, u.branch());
     if ctx.execute {
-        apply(&action, c, &dir)?;
+        apply(&action, c, dir)?;
     }
     let patches = match action {
         Action::LeaveBranch(_) | Action::Blocked(_) => None,
@@ -259,7 +339,7 @@ enum Action {
         dirty: bool,
     },
     MoveToPin,
-    /// On atl-patches: `patch::settle` decides, wherever HEAD is.
+    /// On the checkout's patch branch: `patch::settle` decides, wherever HEAD is.
     PatchBranch,
     /// On a branch that is not ours.
     LeaveBranch(String),
@@ -274,14 +354,15 @@ impl Action {
             Action::AtPin { dirty: false } => "at pin".into(),
             Action::AtPin { dirty: true } => "at pin, uncommitted changes".into(),
             Action::MoveToPin => "elsewhere -> move to pin".into(),
-            Action::PatchBranch => format!("on {}", patch::BRANCH),
+            Action::PatchBranch => "on its patch branch".into(),
             Action::LeaveBranch(b) => format!("on branch {b}, left alone"),
             Action::Blocked(why) => format!("blocked: {why}"),
         }
     }
 }
 
-fn decide(local: &Local, pin: &str) -> Action {
+/// `patch_branch`: the checkout's own (`atl-patches`, or `atl-patches-<task>` in a task copy).
+fn decide(local: &Local, pin: &str, patch_branch: &str) -> Action {
     match local {
         Local::Missing => Action::Clone,
         Local::Unborn { files: false } => Action::Reclone,
@@ -290,7 +371,7 @@ fn decide(local: &Local, pin: &str) -> Action {
         }
         Local::Present {
             branch: Some(b), ..
-        } if b == patch::BRANCH => Action::PatchBranch,
+        } if b == patch_branch => Action::PatchBranch,
         Local::Present { head, dirty, .. } if head == pin => Action::AtPin { dirty: *dirty },
         Local::Present {
             branch: Some(b), ..
@@ -493,6 +574,11 @@ mod tests {
 
     use super::*;
 
+    /// `decide` for a shared checkout (shadows the glob import).
+    fn decide(local: &Local, pin: &str) -> Action {
+        super::decide(local, pin, patch::BRANCH)
+    }
+
     #[test]
     fn peeled_commit_prefers_annotated_target() {
         // `git ls-remote` format: <sha>\t<ref>; an annotated tag also lists its target as `^{}`
@@ -531,6 +617,16 @@ mod tests {
         assert_eq!(
             decide(&at("x", Some(patch::BRANCH), false), "p"),
             Action::PatchBranch
+        );
+        // a task copy's patch branch is its own; the shared name there is someone else's branch
+        let task = "atl-patches-t";
+        assert_eq!(
+            super::decide(&at("x", Some(task), false), "p", task),
+            Action::PatchBranch
+        );
+        assert_eq!(
+            super::decide(&at("x", Some(patch::BRANCH), false), "p", task),
+            Action::LeaveBranch(patch::BRANCH.into())
         );
         assert!(matches!(
             decide(&at("x", None, true), "p"),
@@ -668,10 +764,16 @@ mod tests {
 
     use crate::patch::fixture::*;
 
-    fn ctx<'a>(f: &'a Fixture, src: &'a Path, execute: bool) -> Ctx<'a> {
+    /// Fetch in `layout` with a main that has no row of the fixture's upstream: nothing refused.
+    fn ctx<'a>(f: &'a Fixture, layout: &'a Layout, execute: bool) -> Ctx<'a> {
+        with_main(f, layout, execute, Main::default())
+    }
+
+    fn with_main<'a>(f: &'a Fixture, layout: &'a Layout, execute: bool, main: Main) -> Ctx<'a> {
         Ctx {
             root: &f.root,
-            src,
+            layout,
+            main,
             licenses: licenses(),
             ident: Some(ident()),
             execute,
@@ -692,29 +794,134 @@ mod tests {
         let dev = f.fetched(&c, "dev");
         patch_commit(&dev, TRAILED);
         export_ok(&dev);
-        let src = f.src("src");
+        let ws = f.layout("ws", None);
 
-        let row = sync(&ctx(&f, &src, false), &c).unwrap();
+        let row = sync(&ctx(&f, &ws, false), &c).unwrap();
         assert_eq!(row.action, Action::Clone);
         assert_eq!(row.patches.as_deref(), Some("then apply 1 patches"));
-        let row = sync(&ctx(&f, &src, true), &c).unwrap();
+        let row = sync(&ctx(&f, &ws, true), &c).unwrap();
         assert_eq!(row.patches.as_deref(), Some("applied 1 patches"));
         // the developer's tree, rebuilt from patches/ alone
-        let u = f.at(&c, "src");
+        let u = f.at(&c, "ws");
         assert!(on_patch_branch(&u));
         assert_eq!(tree(&u), tree(&dev));
         assert_eq!(drift_of(&u), Vec::<String>::new());
         // in step: nothing to report
-        let row = sync(&ctx(&f, &src, true), &c).unwrap();
+        let row = sync(&ctx(&f, &ws, true), &c).unwrap();
         assert_eq!((row.action, row.patches), (Action::PatchBranch, None));
+    }
+
+    /// src/ keeps main's pins and patches: another checkout's go to its task copy, never into src/.
+    #[test]
+    fn fetch_keeps_src_on_main() {
+        let f = Fixture::new("fetch-main");
+        let c = f.checkout("v1");
+        let shared = f.fetched(&c, "ws");
+        // this checkout's patches/ holds a patch main lacks
+        let dev = f.fetched(&c, "dev");
+        patch_commit(&dev, TRAILED);
+        export_ok(&dev);
+        let stored = dev.stored().unwrap();
+        let main = |commit: &str, patches: Vec<(String, String)>| Main {
+            pins: BTreeMap::from([(PathBuf::from("up"), commit.to_owned())]),
+            patches: BTreeMap::from([(PathBuf::from("up"), patches)]),
+        };
+        let on_main = f.layout("ws", None);
+        let before = head(&shared);
+        for execute in [false, true] {
+            let e = sync_err(
+                &with_main(&f, &on_main, execute, main(&c.commit, vec![])),
+                &c,
+            );
+            assert!(
+                e.contains("this checkout's patches/ differ from origin/main's")
+                    && e.contains("xtask patch --edit up"),
+                "{e}"
+            );
+        }
+        let other = "0".repeat(40);
+        let e = sync_err(&with_main(&f, &on_main, true, main(&other, vec![])), &c);
+        assert!(e.contains("pin and patches/ differ"), "{e}");
+        assert_eq!(head(&shared), before);
+        assert!(!on_patch_branch(&shared));
+
+        // a task copy is the task's own: fetch settles it, src/ stays as it was
+        let copy = f.root.join("ws/src-wt/t/up");
+        git(
+            Some(shared.checkout()),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &copy.display().to_string(),
+                &c.commit,
+            ],
+        )
+        .unwrap();
+        let on_task = f.layout("ws", Some("t"));
+        let row = sync(&with_main(&f, &on_task, true, main(&c.commit, vec![])), &c).unwrap();
+        assert_eq!(row.patches.as_deref(), Some("applied 1 patches"));
+        let task = f.on(&c, "ws", "t");
+        assert_eq!(task.checkout(), copy);
+        assert!(on_patch_branch(&task));
+        assert_eq!(drift_of(&task), Vec::<String>::new());
+        assert_eq!(head(&shared), before);
+
+        // once main holds the patch, src/ follows it
+        let row = sync(&with_main(&f, &on_main, true, main(&c.commit, stored)), &c).unwrap();
+        assert_eq!(row.patches.as_deref(), Some("applied 1 patches"));
+        assert!(on_patch_branch(&shared));
+    }
+
+    /// Main read from a repository's origin/main: pins, and patch texts byte for byte.
+    #[test]
+    fn main_from_origin() {
+        let f = Fixture::new("fetch-origin");
+        let repo = f.root.join("repo");
+        std::fs::create_dir_all(repo.join("patches/up")).unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(
+            repo.join(sources::FILE),
+            format!(
+                "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"{commit}\"\n[aosp.projects]\n\n[up]\ngit = \"file:///x\"\ntag = \"v1\"\ncommit = \"{commit}\"\n"
+            ),
+        )
+        .unwrap();
+        let text = "Subject: x\n---\ndiff\n\n";
+        std::fs::write(repo.join("patches/up/0001-x.patch"), text).unwrap();
+        std::fs::write(repo.join("patches/up/LICENSE"), "l\n").unwrap();
+        let g = |args: &[&str]| git(Some(&repo), args).unwrap();
+        g(&["init", "-q"]);
+        g(&["add", "-A"]);
+        g(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "m",
+        ]);
+        let e = format!("{:#}", Main::load(&repo).err().expect("no origin/main yet"));
+        assert!(e.contains("reading origin/main:sources.toml"), "{e}");
+        g(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let main = Main::load(&repo).unwrap();
+        assert_eq!(main.pins[Path::new("up")], commit);
+        assert_eq!(main.pins[Path::new("aosp-manifest")], commit);
+        assert_eq!(
+            main.patches[Path::new("up")],
+            [("0001-x.patch".to_owned(), text.to_owned())]
+        );
     }
 
     #[test]
     fn fetch_refuses_to_drop_unexported_commits() {
         let f = Fixture::new("fetch-refuse");
         let c = f.checkout("v1");
-        let u = f.fetched(&c, "src");
-        let src = f.src("src");
+        let u = f.fetched(&c, "ws");
+        let ws = f.layout("ws", None);
         patch_commit(&u, TRAILED);
         export_ok(&u);
         patch_commit(
@@ -723,7 +930,7 @@ mod tests {
         );
         let before = head(&u);
         for execute in [false, true] {
-            let e = sync_err(&ctx(&f, &src, execute), &c);
+            let e = sync_err(&ctx(&f, &ws, execute), &c);
             assert!(
                 e.contains("atl-patches holds 1 commits not in patches/up")
                     && e.contains("xtask patch --export up"),
@@ -733,14 +940,14 @@ mod tests {
         assert_eq!(head(&u), before);
         // the same branch while HEAD is detached: rebuilding it would reset the branch, so refused too
         git(
-            Some(&src.join("up")),
+            Some(u.checkout()),
             &["checkout", "-q", "--detach", &c.commit],
         )
         .unwrap();
-        let e = sync_err(&ctx(&f, &src, true), &c);
+        let e = sync_err(&ctx(&f, &ws, true), &c);
         assert!(e.contains("xtask patch --export up"), "{e}");
         assert_eq!(
-            git(Some(&src.join("up")), &["rev-parse", patch::BRANCH]).unwrap(),
+            git(Some(u.checkout()), &["rev-parse", patch::BRANCH]).unwrap(),
             before
         );
     }
@@ -749,23 +956,23 @@ mod tests {
     fn pin_bump_reapplies_or_restores() {
         let f = Fixture::new("fetch-bump");
         let c1 = f.checkout("v1");
-        let u1 = f.fetched(&c1, "src");
-        let src = f.src("src");
+        let u1 = f.fetched(&c1, "ws");
+        let ws = f.layout("ws", None);
         patch_commit(&u1, TRAILED);
         export_ok(&u1);
         // in step; fetch records the base a later bump needs
-        assert_eq!(sync(&ctx(&f, &src, true), &c1).unwrap().patches, None);
+        assert_eq!(sync(&ctx(&f, &ws, true), &c1).unwrap().patches, None);
         assert_eq!(base_ref(&u1).as_deref(), Some(c1.commit.as_str()));
 
         // v2 leaves a.c alone: patches/ applies on the new pin, byte-identical
         f.write("b.c", "int b;\n");
         f.release("two", "v2");
         let c2 = f.checkout("v2");
-        let row = sync(&ctx(&f, &src, true), &c2).unwrap();
+        let row = sync(&ctx(&f, &ws, true), &c2).unwrap();
         assert_eq!(row.patches.as_deref(), Some("applied 1 patches"));
-        let u2 = f.at(&c2, "src");
+        let u2 = f.at(&c2, "ws");
         assert_eq!(base_ref(&u2).as_deref(), Some(c2.commit.as_str()));
-        assert!(src.join("up/b.c").exists());
+        assert!(u2.checkout().join("b.c").exists());
         assert_eq!(drift_of(&u2), Vec::<String>::new());
 
         // v3 rewrites the line the patch's context needs: git am fails, the checkout is put back
@@ -776,7 +983,7 @@ mod tests {
         f.release("three", "v3");
         let c3 = f.checkout("v3");
         let before = head(&u2);
-        let e = sync_err(&ctx(&f, &src, true), &c3);
+        let e = sync_err(&ctx(&f, &ws, true), &c3);
         assert!(
             e.contains("does not apply at the pin; checkout restored: xtask patch --rebase up"),
             "{e}"

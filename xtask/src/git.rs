@@ -50,7 +50,18 @@ pub fn git_isolated(dir: &Path, args: &[&str], ident: Option<&Ident>) -> Result<
     run(cmd, args)
 }
 
-fn run(mut cmd: Command, args: &[&str]) -> Result<String> {
+/// `git <args>` in `dir`, stdout untrimmed (file contents, e.g. `git show <ref>:<path>`).
+pub fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    raw(cmd, args)
+}
+
+fn run(cmd: Command, args: &[&str]) -> Result<String> {
+    Ok(raw(cmd, args)?.trim().to_owned())
+}
+
+fn raw(mut cmd: Command, args: &[&str]) -> Result<String> {
     let out = cmd.args(args).output().context("running git")?;
     ensure!(
         out.status.success(),
@@ -58,5 +69,5 @@ fn run(mut cmd: Command, args: &[&str]) -> Result<String> {
         args.join(" "),
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

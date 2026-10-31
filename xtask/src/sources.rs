@@ -125,7 +125,7 @@ pub fn load(root: &Path) -> Result<Sources> {
     parse(&text).with_context(|| format!("in {FILE}"))
 }
 
-fn parse(text: &str) -> Result<Sources> {
+pub fn parse(text: &str) -> Result<Sources> {
     let sources: Sources = toml::from_str(text)?;
     validate(&sources)?;
     Ok(sources)

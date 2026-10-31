@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::git::git;
+use crate::layout::Layout;
 use crate::sources::{self, AOSP_MANIFEST_DIR, Aosp, Sources};
 use crate::{par, workspace};
 
@@ -126,8 +127,8 @@ pub fn parse(xml: &str) -> Result<Manifest> {
 /// The fetched manifest, or None while its checkout does not exist. Its default revision must be the
 /// pinned tag: a manifest checkout left at another tag would name the wrong projects.
 pub fn load(root: &Path, aosp: &Aosp) -> Result<Option<Manifest>> {
-    let file = workspace::root_dir(root)?
-        .join("src")
+    let file = Layout::of(root)?
+        .src()
         .join(AOSP_MANIFEST_DIR)
         .join(MANIFEST_FILE);
     if !file.exists() {
@@ -191,7 +192,7 @@ pub fn apply_links(tree: &Path, manifest: &Manifest) -> Result<usize> {
 }
 
 /// Path of `to` relative to the directory holding `from` (both under the same root).
-fn relative(from: &Path, to: &Path) -> PathBuf {
+pub fn relative(from: &Path, to: &Path) -> PathBuf {
     let from_dir: Vec<_> = from
         .parent()
         .map(|p| p.components().collect())

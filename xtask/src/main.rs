@@ -10,6 +10,7 @@ mod check;
 mod deps;
 mod fetch;
 mod git;
+mod layout;
 mod licenses;
 mod modules;
 mod native;
@@ -58,6 +59,7 @@ enum Command {
     /// files; the other checkouts then run in parallel. Checkouts are shallow (the pinned tag only);
     /// `git fetch --unshallow` inside one before bisecting.
     /// An upstream with patches/<upstream>/ ends on branch atl-patches = pin + those patches; commits on atl-patches that patches/ lacks are never dropped (fetch refuses and names the command to run), nor is a checkout with uncommitted changes moved.
+    /// src/ holds origin/main's pins and patches: a shared checkout is changed only where this repo checkout's pin and patches/<upstream>/ equal origin/main's; elsewhere fetch refuses, and a task's own go to its task copy (`xtask patch --edit`), which fetch settles instead.
     Fetch(fetch::Args),
     /// Which AOSP project defines a module, from an index of every manifest project's `Android.bp`.
     ///
@@ -80,11 +82,12 @@ enum Command {
     /// (aidl) from their host source set; bionic itself is replaced by the system C library. Output in
     /// <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`).
     /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
+    /// Task copies (`xtask patch --edit`) replace their src/ checkout; with AOSP ones the converter reads the link farm src-wt/<task>/aosp-tree, regenerated every round.
     Native(native::Args),
-    /// Our commits on upstream checkouts: branch atl-patches -> patches/<upstream>/*.patch.
+    /// Our commits on upstream checkouts: patch branch -> patches/<upstream>/*.patch.
     ///
-    /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only; `xtask check` step `drift` and `xtask native` run the same test).
-    /// `xtask fetch --execute` applies patches/. Develop by committing on atl-patches inside the checkout (start it at the pin), every commit with `Upstream-Status:` and `Patch-Reason:` trailers, then `--export`.
+    /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only; `xtask check` step `drift` and `xtask native` run the same test). Untracked files count, except those xtask puts there (manifest link/copy files, prune markers).
+    /// `xtask fetch --execute` applies patches/. Develop on a task branch: `--edit <upstream>` makes the task copy src-wt/<task>/<upstream> on atl-patches-<task>; commit there, every commit with `Upstream-Status:` and `Patch-Reason:` trailers, then `--export`; `--done` removes the copy.
     /// After a pin bump `xtask fetch --execute` re-applies patches/ on the new pin; where they no longer apply: `--rebase`, resolve, `--export`.
     Patch(patch::Args),
     /// Licence of every source file in a fetched upstream checkout (read-only).

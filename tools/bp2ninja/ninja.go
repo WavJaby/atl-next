@@ -32,7 +32,7 @@ func globTree(base, pattern, dir string) []string {
 	re.WriteString("$")
 	rx := regexp.MustCompile(re.String())
 	var out []string
-	filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+	walkTree(base, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
