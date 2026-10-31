@@ -271,10 +271,19 @@ pub fn render(report: &Report, failed: &BTreeMap<String, Failed>, verbose: bool)
         let f = &failed[m];
         out.push(format!("  {m}: {} failed{head}", f.steps));
         if !f.undefined.is_empty() {
+            // demangled C++ parameter lists run to hundreds of characters: by default one `name(…)` per overload set
+            let shown: BTreeSet<String> = f
+                .undefined
+                .iter()
+                .map(|s| match s.split_once('(') {
+                    Some((name, _)) if !verbose => format!("{name}(…)"),
+                    _ => s.clone(),
+                })
+                .collect();
             out.push(format!(
                 "    undefined symbols ({}): {}",
                 f.undefined.len(),
-                names(&mut f.undefined.iter().map(String::as_str))
+                names(&mut shown.iter().map(String::as_str))
             ));
         }
         for c in f.errors.iter().take(cap(ERRORS_PER_MODULE)) {
@@ -415,6 +424,23 @@ clang++: error: linker command failed with exit code 1 (use -v to see invocation
                 "ld: cannot find -lfoo: No such file or directory"
             ]
         );
+    }
+
+    /// Overloads collapse into one `name(…)` by default; --verbose keeps every signature. The count is of symbols either way.
+    #[test]
+    fn render_shortens_signatures() {
+        let mut f = failed(&["d/a"]);
+        f.get_mut("d/a").expect("made above").undefined =
+            ["ns::f(int)", "ns::f(std::string const&)", "g"]
+                .map(String::from)
+                .into();
+        let r = rank(&graph(&["d/a"], &[("d/a", &[])]), &f);
+        assert!(
+            render(&r, &f, false).contains(&"    undefined symbols (3): g, ns::f(…)".to_owned())
+        );
+        assert!(render(&r, &f, true).contains(
+            &"    undefined symbols (3): g, ns::f(int), ns::f(std::string const&)".to_owned()
+        ));
     }
 
     #[test]
