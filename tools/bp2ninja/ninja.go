@@ -46,7 +46,8 @@ func globTree(base, pattern, dir string) []string {
 }
 
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion string }
+// LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -125,6 +126,11 @@ rule rustc
   depfile = $out.d
   deps = gcc
   description = rustc $in
+rule bindgen
+  command = CLANG_PATH=$clang LIBCLANG_PATH=$libclang RUSTFMT=$rustfmt $bindgen $flags $$(cat /dev/null $flagfiles) $in -o $out -- -MD -MF $out.d $cflags
+  depfile = $out.d
+  deps = gcc
+  description = bindgen $in
 rule cp
   command = cp $in $out
   description = cp $out
@@ -136,7 +142,9 @@ rule fail
 // emit writes the ninja file for every node.
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison), esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree))
+	// rustfmt: bindgen.go's ${config.RustBin}/rustfmt, the toolchain's own beside rustc
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
+		esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")))
 	// before the cc edges: ninja needs a rule defined before its first use
 	b.WriteString(g.acfg.ninja())
 	// paths first: links need their dependencies' outputs
@@ -155,9 +163,9 @@ func (g *Graph) emit(tools Tools) string {
 			n.out = filepath.Join(base, n.name)
 		}
 	}
-	// genrules: tools' paths are known now
+	// genrules: tools' paths are known now (a Rust source variant's steps are its edges)
 	for _, n := range g.order {
-		if n.kind == Gen {
+		if n.kind == Gen && n.rust == nil {
 			g.emitGen(&b, n)
 		}
 	}
@@ -257,18 +265,24 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	for _, d := range p.strs("local_include_dirs") {
 		inc = append(inc, "-I"+g.abs(filepath.Join(n.mod.Dir, d)))
 	}
-	for _, d := range p.strs("include_dirs") {
-		// a tree path, not a module reference: an absent one is usually an unfetched project (tflite -> external/gemmlowp)
-		if _, err := os.Stat(g.abs(d)); err != nil {
-			g.problem("%s: include dir %s does not exist", n.mod.Name, d)
-			g.missingPaths = addKey(g.missingPaths, filepath.Clean(d))
+	// a Rust bindgen module (rustsrc.go) takes only local_include_dirs of its own: its include_dirs / export_include_dirs are its crate's exports, its dir no include path (bindgen.go)
+	cc := n.rust == nil
+	if cc {
+		for _, d := range p.strs("include_dirs") {
+			// a tree path, not a module reference: an absent one is usually an unfetched project (tflite -> external/gemmlowp)
+			if _, err := os.Stat(g.abs(d)); err != nil {
+				g.problem("%s: include dir %s does not exist", n.mod.Name, d)
+				g.missingPaths = addKey(g.missingPaths, filepath.Clean(d))
+			}
+			inc = append(inc, "-I"+g.abs(d))
 		}
-		inc = append(inc, "-I"+g.abs(d))
+		inc = append(inc, "-I"+g.abs(n.mod.Dir))
 	}
-	inc = append(inc, "-I"+g.abs(n.mod.Dir))
 	// .asm: the toolchain's format flags, the module's asflags and its own include dirs only (cc/compiler.go Local.YasmFlags): no defines, no dependencies' exports
 	yasm := slices.Concat(g.soong.Yasm[n.side], moduleFlags(p, "asflags"), inc)
-	inc = append(inc, n.exports...)
+	if cc {
+		inc = append(inc, n.exports...)
+	}
 	inc = append(inc, n.genIncs...)
 	for _, d := range append(append(append(append([]*Node{}, n.deps.headers...), n.deps.static...), n.deps.shared...), n.deps.whole...) {
 		inc = append(inc, d.exports...)

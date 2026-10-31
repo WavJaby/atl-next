@@ -34,6 +34,7 @@ type genEdge struct {
 	in       string
 	tools    []edgeTool // host tools the command runs: srcGen.tool, protoc plugins (rust_protobuf)
 	implicit []string   // inputs beside `in` and the tools that rebuild the edge (aidl .hash files)
+	order    []string   // generated headers the edge waits for (bindgen's cc dependencies'), its depfile tracks them after
 	vars     [][2]string
 }
 
@@ -187,6 +188,9 @@ func (g *Graph) emitEdge(b *strings.Builder, e genEdge) {
 	implicit = append(implicit, e.implicit...)
 	if len(implicit) > 0 {
 		fmt.Fprintf(b, " | %s", join(implicit))
+	}
+	if len(e.order) > 0 {
+		fmt.Fprintf(b, " || %s", join(e.order))
 	}
 	b.WriteString("\n")
 	for _, t := range e.tools {

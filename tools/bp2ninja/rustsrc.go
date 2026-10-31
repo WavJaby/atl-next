@@ -11,11 +11,11 @@ import (
 
 // Rust source providers, following build/soong/rust/source_provider.go (the spec): a Rust library module whose crate root a build step generates.
 //   - Soong splits such a module into a source variant (the generation; BaseSourceProvider.OutputFiles, crate root first) and library variants compiling it.
-//     Here one rlib node holds both: the provider puts its generation steps on n.edges (emitted with every generator's, their tools are step deps) and its outputs on rustCrate.source; rustc's root is the first output.
+//     Here the rlib node holds both: the provider puts its generation steps on n.edges (emitted with every generator's, their tools are step deps) and its outputs on rustCrate.source; rustc's root is the first output.
+//     A crate whose srcs names a provider (`srcs: ["lib.rs", ":x_bindgen"]`) takes the source variant alone: a Kind Gen node, no rustc step, its outputs copied into that crate's OUT_DIR (rust.go).
+//     Both nodes write the same edges, emitted once.
 //   - A provider is one rustSourceProviders row: the crates it adds (SourceProviderDeps) and its generation (GenerateSource). Its module's srcs are not read.
-//   - rust_protobuf[_host] (protobuf.go) is the only row. What each later one adds:
-//     rust_bindgen: the bindgen host tool, clang flags and include dirs from its cc deps (depClangFlags, depIncludePaths), and `srcs: [":x_bindgen"]` references from other crates
-//     (the source variant's outputs copied into OUT_DIR for include!) -- rustNode refuses a provider in srcs until then.
+//   - Rows: rust_protobuf[_host] (protobuf.go), rust_bindgen[_host] (bindgen.go). What each later one adds:
 //     rust_aconfig_library: `aconfig create-rust-lib` over an aconfig_declarations cache (aconfig.go's graph) and its storage crates as rustlibs.
 //     aidl_interface's rust backend: `aidl --lang=rust` over the interface's sources (aidliface.go), a generated mod file of the packages, libbinder_rs.
 
@@ -30,12 +30,15 @@ type rustSource struct {
 type rustSourceProvider interface {
 	// crates: rustlibs it adds to its module's (SourceProviderDeps)
 	crates() []string
-	// gen writes n's generation steps on n.edges (GenerateSource); n's crates are resolved by then. fail marks the crate broken.
+	// gen writes n's generation steps on n.edges (GenerateSource); n's cc libraries (whole_static_libs, static_libs, shared_libs) are resolved by then, in an rlib also its crates. fail marks the node broken.
 	gen(g *Graph, n *Node, fail func(string, ...any)) rustSource
 }
 
 // rustSourceProviders: module type -> provider.
-var rustSourceProviders = map[string]rustSourceProvider{"rust_protobuf": rustProtobuf{}, "rust_protobuf_host": rustProtobuf{}}
+var rustSourceProviders = map[string]rustSourceProvider{
+	"rust_protobuf": rustProtobuf{}, "rust_protobuf_host": rustProtobuf{},
+	"rust_bindgen": rustBindgen{}, "rust_bindgen_host": rustBindgen{},
+}
 
 // rustProtobuf: rust_protobuf[_host].
 type rustProtobuf struct{}
@@ -121,4 +124,84 @@ func (rustProtobuf) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource
 		src.protoIncludes = append(src.protoIncludes, g.abs(filepath.Join(m.Dir, d)))
 	}
 	return src
+}
+
+// rustBindgen: rust_bindgen[_host].
+type rustBindgen struct{}
+
+// rustBindgenTool: the binary rust_bindgen runs (bindgen.go bindgenCmd, HostBinToolVariable "bindgen"), the rust_binary_host of external/rust/android-crates-io/crates/bindgen-cli built like any host tool.
+// Its clang-sys (feature runtime) loads libclang at run time from LIBCLANG_PATH: the cc side's clang's (Tools.LibClang), where Soong takes its own prebuilt clang's.
+const rustBindgenTool = "bindgen"
+
+// rustBionicLibs: rust/compiler.go bionicDeps, the cc libraries bindgen.go SourceProviderDeps adds on a bionic toolchain (device) unless no_stdlibs: bionic's headers reach clang through their exports.
+var rustBionicLibs = []string{"liblog", "libc", "libm", "libdl"}
+
+func (rustBindgen) crates() []string { return nil }
+
+// gen: bindgen.go GenerateSource. `bindgen <bindgen_flags> <flag files' words> <wrapper_src> -o <source_stem>.rs -- <clang flags>`, with clang's depfile.
+//   - Clang flags: the cc compile's of the same side (compileFlags: global defines, device toolchain cflags, API level and forced bionic headers, cflags, cppflags, local_include_dirs, the exports of
+//     header_libs, static_libs, shared_libs and bionicDeps, global includes), so the bindings' layouts are those of the C/C++ this build compiles; -target and -nostdlibinc are not mirrored, as cc does not.
+//     Then the C or C++ -std (getStdVersion: cpp_std or c_std set, else the wrapper's extension .hpp/.hh = C++), `-x c` / `-x c++`, and Soong's two warning suppressions.
+//   - The cc libraries' generated headers are waited on (depGeneratedHeaders); the depfile tracks every header read.
+//   - Not supported, reported: custom_bindgen, handle_static_inline / static_inline_library (no user in the tree's native closure).
+func (rustBindgen) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
+	p, m := n.props, n.mod
+	if p.str("custom_bindgen") != "" {
+		fail("custom_bindgen is unsupported")
+	}
+	if p.boolean("handle_static_inline", false) || p.str("static_inline_library") != "" {
+		fail("handle_static_inline is unsupported")
+	}
+	stem := p.str("source_stem")
+	if stem == "" {
+		fail("source_stem property is undefined but required for rust_bindgen modules")
+		return rustSource{}
+	}
+	wrapper := p.str("wrapper_src")
+	if wrapper == "" || isRef(wrapper) {
+		fail("wrapper_src: invalid path to wrapper source")
+		return rustSource{}
+	}
+	for _, f := range p.strs("cflags") {
+		if f == "-x c++" || f == "-xc++" {
+			fail("cflags: -x c++ should not be specified in cflags; setting cpp_std specifies this is a C++ header, or change the file extension to '.hpp' or '.hh'")
+		}
+		if strings.HasPrefix(f, "-std=") {
+			fail("cflags: -std should not be specified in cflags; instead use c_std or cpp_std")
+		}
+	}
+	if p.str("c_std") != "" && p.str("cpp_std") != "" {
+		fail("c_std: c_std and cpp_std cannot both be defined at the same time.")
+	}
+	for _, ref := range p.strs("header_libs") {
+		if d := g.node(ref, n.side, Headers, m.Name); d != nil {
+			n.deps.headers = append(n.deps.headers, d)
+		}
+	}
+	if n.side == Device && !p.boolean("no_stdlibs", false) {
+		for _, ref := range rustBionicLibs {
+			if d := g.node(ref, n.side, Shared, m.Name); d != nil {
+				n.deps.shared = append(n.deps.shared, d)
+			}
+		}
+		n.deps.shared = uniqueNodes(n.deps.shared)
+	}
+	lang := g.compileFlags(n)
+	cflags := append(slices.Clone(lang.c), "-x", "c")
+	if p.has("cpp_std") || !p.has("c_std") && slices.Contains([]string{".hpp", ".hh"}, filepath.Ext(wrapper)) {
+		cflags = append(slices.Clone(lang.cxx), "-x", "c++")
+	}
+	cflags = append(cflags, "-Wno-unused-command-line-argument", "-Wno-unknown-warning-option")
+	var flagFiles []string
+	for _, f := range p.strs("bindgen_flag_files") {
+		flagFiles = append(flagFiles, g.abs(filepath.Join(m.Dir, f)))
+	}
+	var waits []string
+	genClosure(n, map[*Node]bool{}, &waits)
+	out := filepath.Join(g.genDir(n, ""), stem+".rs")
+	n.edges = append(n.edges, genEdge{rule: "bindgen", outs: []string{out}, in: g.abs(filepath.Join(m.Dir, wrapper)), tools: []edgeTool{{"bindgen", g.hostTool(rustBindgenTool, n)}},
+		implicit: flagFiles, order: waits, vars: [][2]string{
+			{"flags", shellQuote(moduleFlags(p, "bindgen_flags"))}, {"flagfiles", shellQuote(flagFiles)}, {"cflags", shellQuote(cflags)},
+		}})
+	return rustSource{outs: []string{out}}
 }

@@ -28,8 +28,8 @@ import (
 //     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
 //     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
-//   - Source providers (rust_protobuf): rlibs whose crate root a build step generates, rustsrc.go.
-//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), source providers in srcs, provider types without a rustSourceProviders row (rust_bindgen, rust_aconfig_library).
+//   - Source providers (rust_protobuf, rust_bindgen): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
+//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
 
 // rustOSSide: the side whose OS blocks every Rust module takes, whatever its own side (flatten): rustc compiles for linux_glibc.
 const rustOSSide = Host
@@ -49,9 +49,11 @@ var rustDeviceFlags = []string{"-C", "panic=abort"}
 // rustCrate is what a Rust node compiles.
 type rustCrate struct {
 	crateType, crateName, root string
-	// generated files srcs names (`:genrule`), copied into outDir, which env!("OUT_DIR") names (rust/builder.go: the cp rule + rustEnvVars)
+	// generated files srcs names (`:genrule`, `:provider`), copied into outDir, which env!("OUT_DIR") names (rust/builder.go: the cp rule + rustEnvVars)
 	srcDeps []string
 	outDir  string
+	// source variants of the providers srcs names (rust.go sourceDepTag)
+	providers []*Node
 	// a source provider's generated sources (rustsrc.go), root first
 	source rustSource
 	flags  []string
@@ -71,7 +73,10 @@ func isRustType(t string) bool { return strings.HasPrefix(t, "rust_") && t != "r
 // rustKind: kindOf for Rust module types; ok=false for variants that are not built (dylib, cdylib, source providers without a row).
 func rustKind(t string, want Kind) (Kind, bool) {
 	if rustSourceProviders[t] != nil {
-		// source_provider.go NewSourceProviderModule: a library; only its rlib is built here
+		// source_provider.go NewSourceProviderModule: a library, only its rlib built here; Gen = its source variant (generation only), what another crate's srcs names
+		if want == Gen {
+			return Gen, true
+		}
 		return Rlib, true
 	}
 	switch t {
@@ -100,6 +105,23 @@ func (g *Graph) rustNode(n *Node) {
 			r.broken = msg
 		}
 	}
+	sp := rustSourceProviders[g.baseType(m.Type)]
+	ccDeps := func(refs []string, want Kind) []*Node {
+		var out []*Node
+		for _, ref := range refs {
+			if d := g.node(ref, n.side, want, m.Name); d != nil {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+	n.deps.whole = ccDeps(p.strs("whole_static_libs"), Static)
+	n.deps.static = ccDeps(p.strs("static_libs"), Static)
+	n.deps.shared = ccDeps(p.strs("shared_libs"), Shared)
+	if n.kind == Gen {
+		r.source = sp.gen(g, n, fail)
+		return
+	}
 	r.crateType = map[Kind]string{Rlib: "rlib", ProcMacro: "proc-macro", Binary: "bin"}[n.kind]
 	r.crateName = p.str("crate_name")
 	if r.crateName == "" {
@@ -111,7 +133,6 @@ func (g *Graph) rustNode(n *Node) {
 	}
 	// crate root: a source provider's first output (library.go checkedCrateRootPath), else crate_root, else the one plain source of srcs, else the first output of its first generated source
 	// (compiler.go srcPathFromModuleSrcs)
-	sp := rustSourceProviders[g.baseType(m.Type)]
 	if cr := p.str("crate_root"); cr != "" && sp == nil {
 		r.root = filepath.Join(m.Dir, cr)
 	}
@@ -125,24 +146,44 @@ func (g *Graph) rustNode(n *Node) {
 			plain = append(plain, s)
 			continue
 		}
-		if dm := g.lookup(s, n.side); dm != nil && !isGenType(g.baseType(dm.Type)) && dm.Type != "filegroup" {
-			fail("source %s is a %s (unsupported)", s, dm.Type)
-			continue
-		}
-		files, ok := g.resolveSrc(m.Dir, n.side, s, m.Name)
-		if !ok {
-			fail("source %s unresolved", s)
-		}
-		for _, f := range files {
-			if f.gen != nil {
-				g.useGen(n, f.gen)
-			}
-			// builder.go: the copies share OUT_DIR, one file name each
-			if slices.ContainsFunc(r.srcDeps, func(s string) bool { return filepath.Base(s) == filepath.Base(f.path) }) {
-				fail("multiple source providers generate the same filename output: %s", filepath.Base(f.path))
+		var paths []string
+		dm := g.lookup(s, n.side)
+		switch {
+		case dm != nil && rustSourceProviders[g.baseType(dm.Type)] != nil:
+			// rust.go depsToPaths: every output of the provider's source variant
+			d := g.node(s, n.side, Gen, m.Name)
+			if d == nil || d.rust == nil {
+				fail("source %s unresolved", s)
 				continue
 			}
-			r.srcDeps = append(r.srcDeps, f.path)
+			if d.rust.broken != "" {
+				fail("source %s: %s", s, d.rust.broken)
+				continue
+			}
+			r.providers = append(r.providers, d)
+			paths = d.rust.source.outs
+		case dm != nil && !isGenType(g.baseType(dm.Type)) && dm.Type != "filegroup":
+			fail("source %s is a %s (unsupported)", s, dm.Type)
+			continue
+		default:
+			files, ok := g.resolveSrc(m.Dir, n.side, s, m.Name)
+			if !ok {
+				fail("source %s unresolved", s)
+			}
+			for _, f := range files {
+				if f.gen != nil {
+					g.useGen(n, f.gen)
+				}
+				paths = append(paths, f.path)
+			}
+		}
+		for _, path := range paths {
+			// builder.go: the copies share OUT_DIR, one file name each
+			if slices.ContainsFunc(r.srcDeps, func(s string) bool { return filepath.Base(s) == filepath.Base(path) }) {
+				fail("multiple source providers generate the same filename output: %s", filepath.Base(path))
+				continue
+			}
+			r.srcDeps = append(r.srcDeps, path)
 		}
 	}
 	if r.root == "" && sp == nil {
@@ -207,18 +248,6 @@ func (g *Graph) rustNode(n *Node) {
 			r.root = r.source.outs[0]
 		}
 	}
-	ccDeps := func(refs []string, want Kind) []*Node {
-		var out []*Node
-		for _, ref := range refs {
-			if d := g.node(ref, n.side, want, m.Name); d != nil {
-				out = append(out, d)
-			}
-		}
-		return out
-	}
-	n.deps.whole = ccDeps(p.strs("whole_static_libs"), Static)
-	n.deps.static = ccDeps(p.strs("static_libs"), Static)
-	n.deps.shared = ccDeps(p.strs("shared_libs"), Shared)
 	// library.go: include_dirs (deprecated) and export_include_dirs both reach the cc modules linking the library
 	for _, d := range slices.Concat(p.strs("include_dirs"), p.strs("export_include_dirs")) {
 		n.exports = append(n.exports, "-I"+g.abs(filepath.Join(m.Dir, d)))
@@ -408,10 +437,12 @@ func (g *Graph) rustEnv(n *Node, rustVersion string) []string {
 	return env
 }
 
-// rustOut: the file a Rust node produces (library.go: lib<crate>.rlib; proc_macro.go: lib<crate>.so; a binary its stem).
+// rustOut: the file a Rust node produces (library.go: lib<crate>.rlib; proc_macro.go: lib<crate>.so; a binary its stem); a source variant none, its generated sources are on its edges.
 func (g *Graph) rustOut(n *Node) string {
 	base := filepath.Join(g.out, n.side.String(), n.name)
 	switch n.kind {
+	case Gen:
+		return ""
 	case Rlib:
 		return filepath.Join(base, "lib"+n.rust.crateName+".rlib")
 	case ProcMacro:
@@ -469,6 +500,9 @@ func rustLibFlags(externs []rustExtern) (flags, inputs, linked []string) {
 // emitRust writes the steps of one Rust node: OUT_DIR copies of its generated sources, then rustc; a broken crate's step fails with the reason.
 func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 	r := n.rust
+	if n.kind == Gen {
+		return
+	}
 	if r.broken != "" {
 		fmt.Fprintf(b, "build %s: fail\n  msg = %s\n", esc(n.out), shellQuote([]string{fmt.Sprintf("error: rust %s: %s", n.name, r.broken)}))
 		return

@@ -184,6 +184,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let srcs_file = out.join("srcs.json");
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
     let rust = rust_toolchain(root)?;
+    let libclang = libclang_dir(&args.cc)?;
     // aconfig flag libraries: Soong's prebuilt aconfig (owner decision J2) and the pinned tag's release config; a host Soong ships no prebuilts for gets neither, and the converter reports each such library
     let aconfig: Vec<std::ffi::OsString> = match host.prebuilt_build_tools(&tree) {
         Some(bin) => vec![
@@ -231,6 +232,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ])
             .arg("-rustc")
             .arg(&rust.rustc)
+            .arg("-libclang")
+            .arg(&libclang)
             .arg("-provided")
             .arg(&provided_file)
             .arg("-srcs")
@@ -384,6 +387,27 @@ fn rust_toolchain(root: &Path) -> Result<RustToolchain> {
         .with_context(|| format!("unexpected rustc --version output {text:?}"))?
         .to_owned();
     Ok(RustToolchain { rustc, version })
+}
+
+/// The directory of `cc`'s own libclang.so (deps.toml row `libclang`), which rust_bindgen's bindgen loads: the clang that compiles the C/C++ also parses the headers the bindings describe.
+/// `-print-file-name` answers from the driver's library search path; a name it cannot find comes back bare.
+fn libclang_dir(cc: &str) -> Result<PathBuf> {
+    let out = Command::new(cc)
+        .arg("-print-file-name=libclang.so")
+        .output()
+        .with_context(|| format!("running {cc} -print-file-name=libclang.so"))?;
+    ensure!(
+        out.status.success(),
+        "{cc} -print-file-name=libclang.so failed"
+    );
+    let lib = PathBuf::from(String::from_utf8(out.stdout)?.trim());
+    ensure!(
+        lib.is_absolute() && lib.exists(),
+        "{cc} finds no libclang.so: install deps.toml row `libclang` (`cargo xtask deps --check`)"
+    );
+    let dir = lib.parent().context("libclang.so has no parent")?;
+    dir.canonicalize()
+        .with_context(|| format!("resolving {}", dir.display()))
 }
 
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and

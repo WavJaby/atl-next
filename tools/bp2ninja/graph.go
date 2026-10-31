@@ -25,9 +25,12 @@ type graphFile struct {
 
 func (n *Node) dir() string { return n.side.String() + "/" + n.name }
 
-// stepDeps: the nodes n's steps wait for: linked and header libraries, Rust crates, cc_object sources, consumed genrules, the host tools of its generators and of its genrule command.
+// stepDeps: the nodes n's steps wait for: linked and header libraries, Rust crates and source providers, cc_object sources, consumed genrules, the host tools of its generators and of its genrule command.
 func (n *Node) stepDeps() []*Node {
 	deps := slices.Concat(n.deps.whole, n.deps.static, n.deps.shared, n.deps.headers, n.deps.crates, n.objSrcs)
+	if n.rust != nil {
+		deps = append(deps, n.rust.providers...)
+	}
 	for gn := range n.usedGens {
 		deps = append(deps, gn)
 	}

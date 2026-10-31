@@ -99,12 +99,13 @@ arch = "go"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# xtask native: rust_bindgen's bindgen loads the libclang of the `clang` row's clang (libclang_dir)
 [libclang]
 debian = "libclang-19-dev"
 # Arch's clang package ships libclang
 arch = "clang"
 scope = ["build"]
-used_by = ["crate:atl-binder-wire", "crate:atl-bionic", "crate:atl-bridgegen"]
+used_by = ["crate:atl-binder-wire", "crate:atl-bionic", "crate:atl-bridgegen", "xtask:native"]
 
 # AOSP's C++ assumes libc++ (libstdc++ 14 rejects libbase); the distro's, matching its clang.
 # atl-bionic's build parses bionic's C++ prop-area sources against its headers (bionic ships no C++ library).
