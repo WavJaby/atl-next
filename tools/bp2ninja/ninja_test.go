@@ -34,3 +34,21 @@ func TestModuleFlagsMatchSoong(t *testing.T) {
 		}
 	}
 }
+
+// Every depfile rule folds into .ninja_deps: otherwise ninja loads the depfile at startup and refuses the whole build when it names an undeclared output
+// (protoc's mod.rs, measured on a rebuild), so a rebuild of an existing out dir stops before any step.
+func TestDepfileRulesUseDeps(t *testing.T) {
+	rules := 0
+	for _, r := range strings.Split(header, "\nrule ")[1:] {
+		name, body, _ := strings.Cut(r, "\n")
+		if strings.Contains(body, "  depfile = ") {
+			rules++
+			if !strings.Contains(body, "  deps = gcc\n") {
+				t.Errorf("rule %s has a depfile but no `deps = gcc`", name)
+			}
+		}
+	}
+	if rules == 0 {
+		t.Fatal("no depfile rule found: header parse broken")
+	}
+}
