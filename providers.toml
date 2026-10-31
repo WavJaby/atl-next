@@ -42,7 +42,7 @@ reason = "bionic; glibc's libm"
 # platform-only modules (converter measurement 2026-10-31)
 ["ld-android"]
 provider = "none"
-reason = "bionic dynamic linker stub; linker namespaces are our libnativeloader's job"
+reason = "bionic dynamic linker stub; glibc's ld.so is the linker, the namespace API comes from atl-bionic (libdl_android row)"
 
 ["libapexsupport"]
 provider = "none"
