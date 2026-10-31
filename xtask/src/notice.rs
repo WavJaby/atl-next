@@ -247,10 +247,12 @@ fn header(text: &str) -> String {
         if t.starts_with("#line ") || t == "#pragma once" {
             continue;
         }
-        // an include guard (`#ifndef X` / `#define X`) or other conditional above the first comment, e.g. Khronos' khrplatform.h; `#include` still ends the header
+        // an include guard (`#ifndef X` / `#define X`), conditional or C++ linkage block above the first comment, e.g. Khronos' khrplatform.h, gl3.h; `#include` still ends the header
         let guard = ["#ifndef ", "#ifdef ", "#if ", "#define "]
             .iter()
-            .any(|d| t.starts_with(d));
+            .any(|d| t.starts_with(d))
+            || t == "#endif"
+            || t == "extern \"C\" {";
         if guard && out.iter().all(|l| l.is_empty()) {
             continue;
         }
@@ -727,6 +729,9 @@ mod tests {
         // frameworks/native/opengl/include/KHR/khrplatform.h (abridged)
         let khr = "#ifndef __khrplatform_h_\n#define __khrplatform_h_\n\n/*\n** Copyright (c) 2008-2009 The Khronos Group Inc.\n**\n** Permission is hereby granted, free of charge, to any person obtaining a\n** copy of this software and/or associated documentation files (the\n** \"Materials\"), to deal in the Materials without restriction, including\n*/\n";
         assert_eq!(id(khr), notice("MIT-Khronos-old"));
+        // frameworks/native/opengl/include/GLES3/gl3.h (abridged): C++ linkage block before the notice
+        let gl3 = "#ifndef __gl3_h_\n#define __gl3_h_ 1\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n/*\n** Copyright (c) 2013-2017 The Khronos Group Inc.\n**\n** Permission is hereby granted, free of charge, to any person obtaining a\n** copy of this software and/or associated documentation files (the\n** \"Materials\"), to deal in the Materials without restriction, including\n*/\n";
+        assert_eq!(id(gl3), notice("MIT-Khronos-old"));
     }
 
     #[test]
