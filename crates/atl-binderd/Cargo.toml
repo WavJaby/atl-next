@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-binderd"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+atl-binder-wire = { path = "../atl-binder-wire" }
+
+[lints]
+workspace = true

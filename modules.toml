@@ -14,7 +14,8 @@
 
 # binder IPC: uapi wire types, the userspace driver core
 [binder]
-crates = ["atl-binder-wire"]
+crates = ["atl-binder-wire", "atl-binderd"]
+exports = ["atl-binderd"]
 uses = ["generators"]
 
 [generators]

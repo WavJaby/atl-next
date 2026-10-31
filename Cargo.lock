@@ -67,6 +67,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-binderd"
+version = "0.0.0"
+dependencies = [
+ "atl-binder-wire",
+]
+
+[[package]]
 name = "atl-bridgegen"
 version = "0.0.0"
 dependencies = [
