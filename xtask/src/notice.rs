@@ -34,6 +34,8 @@ pub fn identify(text: &str) -> Identified {
         "redistribut",
         "permission is hereby granted",
         "permission to use",
+        // AGG 2.3's "Permission to copy, use, modify, sell and distribute this software is granted"
+        "permission to copy",
         "gpl",
         // IJG's pointer to README.ijg names no licence
         "conditions of distribution and use",
@@ -240,6 +242,10 @@ fn header(text: &str) -> String {
             // NASM / GNU as comments (`.asm`, `.inc`)
             || t.starts_with(';')
             || hash_comment;
+        // a generator's `#line 1 "x.rl"` (Ragel) above the notice it copied from its input: no code, so not the header's end
+        if t.starts_with("#line ") {
+            continue;
+        }
         if !comment {
             break;
         }
@@ -647,6 +653,23 @@ mod tests {
         // the block ends at `*/`: a notice after the code that follows is not read
         let after = "/* x.c\nno notice here */\nint x;\n/* Public domain */\n";
         assert_eq!(id(after), Identified::NoNotice);
+    }
+
+    #[test]
+    fn ragel_line_directive_above_the_notice() {
+        // harfbuzz_ng/src/hb-number-parser.hh (abridged): Ragel's `#line` first, the .rl's notice below it
+        let ragel = "#line 1 \"hb-number-parser.rl\"\n/*\n * Copyright © 2019  Ebrahim Byagowi\n *\n *  This is part of HarfBuzz, a text shaping library.\n *\n * Permission is hereby granted, without written agreement and without\n * license or royalty fees, to use, copy, modify, and distribute this\n * software and its documentation for any purpose, provided that the\n * above copyright notice and the following two paragraphs appear in\n * all copies of this software.\n */\n\n#ifndef HB_NUMBER_PARSER_HH\n";
+        assert_eq!(id(ragel), notice("MIT-Modern-Variant"));
+        // a `#line` is skipped, not a comment: code after it still ends the header
+        let code = "#line 1 \"x.rl\"\n#include \"x.h\"\n/* Public domain */\n";
+        assert_eq!(id(code), Identified::NoNotice);
+    }
+
+    #[test]
+    fn agg_notice_is_a_notice() {
+        // pdfium/third_party/agg23/agg_array.h: a licence no rule names, never "no notice" (which would take the project default)
+        let agg = "\n//----------------------------------------------------------------------------\n// Anti-Grain Geometry - Version 2.3\n// Copyright (C) 2002-2005 Maxim Shemanarev (http://www.antigrain.com)\n//\n// Permission to copy, use, modify, sell and distribute this software\n// is granted provided this copyright notice appears in all copies.\n// This software is provided \"as is\" without express or implied\n// warranty, and with no claim as to its suitability for any purpose.\n//\n";
+        assert_eq!(id(agg), Identified::Unrecognised);
     }
 
     #[test]
