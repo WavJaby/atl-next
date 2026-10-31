@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The Blueprint -> ninja converter `tools/bp2ninja` as Go sees it: one go.work naming this checkout's converter and the pinned `build/blueprint` (that path differs per checkout and task copy), offline.
-//! `xtask native` builds it from here; `xtask check` step `converter` builds, vets and tests it, so a converter that does not compile fails before any native run.
+//! `xtask native` builds it from here; `xtask check` step `converter` gofmt-checks, builds, vets and tests it, so a converter that does not compile fails before any native run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,8 +49,33 @@ pub fn go(root: &Path, go_work: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Step `converter` of `xtask check`: build, vet and test under a go.work in the checkout's cargo target dir (per checkout, ignored).
+/// Go files under `dir` that `gofmt` would rewrite (`gofmt -l`), relative to `dir`.
+fn unformatted(dir: &Path) -> Result<Vec<String>> {
+    let out = Command::new("gofmt")
+        .args(["-l", "."])
+        .current_dir(dir)
+        .output()
+        .context("running gofmt -l")?;
+    ensure!(
+        out.status.success(),
+        "gofmt -l exited with {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8(out.stdout)?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Step `converter` of `xtask check`: gofmt, build, vet and test under a go.work in the checkout's cargo target dir (per checkout, ignored).
 pub fn check(root: &Path) -> Result<()> {
+    let bad = unformatted(&root.join(DIR))?;
+    ensure!(
+        bad.is_empty(),
+        "{DIR}: not gofmt-formatted (gofmt -w): {}",
+        bad.join(", ")
+    );
     let dir = root.join("target").join("bp2ninja");
     let work = go_work(root, &Layout::of(root)?, &dir)?;
     let bin = dir.join("bp2ninja").display().to_string();
@@ -86,5 +111,20 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
         ok.unwrap();
         assert!(broken.is_err());
+    }
+
+    /// gofmt -l names a misformatted file and nothing for a formatted one (the probe responds both ways).
+    #[test]
+    fn unformatted_names_misformatted_files() {
+        let tmp = std::env::temp_dir().join(format!("xtask-gofmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("ok.go"), "package x\n\nfunc F() {}\n").unwrap();
+        let clean = unformatted(&tmp);
+        std::fs::write(tmp.join("bad.go"), "package x\nfunc  G( ) {}\n").unwrap();
+        let dirty = unformatted(&tmp);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(clean.unwrap().is_empty());
+        assert_eq!(dirty.unwrap(), ["bad.go"]);
     }
 }
