@@ -15,6 +15,11 @@ pub const RUNTIME: &str = "runtime";
 pub const AOSP: &str = "aosp";
 /// The GPL-3.0-or-later QEMU bridge; its allow list = licences combinable with GPL-3.
 const BRIDGE: &str = "qemu-bridge";
+/// The exceptions under which GPL-2.0-only code may enter a process: each lets code of any licence use it.
+/// Classpath: linking with independent modules (libcore ojluni, libjdwp; owner 2026-10-29). Linux-syscall-note: programs using the kernel through system calls, i.e. the kernel uapi headers (owner 2026-10-31).
+const GPL2_LINKING_EXCEPTIONS: &[&str] = &["Classpath-exception-2.0", "Linux-syscall-note"];
+/// The exceptions under which GPL-3 code may enter the runtime: each frees the works using it from copyleft (libgcc_s, Bison parsers).
+const GPL3_FREEING_EXCEPTIONS: &[&str] = &["GCC-exception-3.1", "Bison-exception-2.2"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,15 +182,23 @@ pub(crate) fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses
         for entry in &artifact.allow {
             let licence = parse_licence(entry).with_context(|| format!("[artifact.{name}]"))?;
             // CLAUDE.md licence rules: GPL-2.0-only only with a linking exception; GPL-3 in the
-            // runtime only with an exception that frees its users (GCC runtime, Bison)
-            ensure!(
-                !(licence.id == "GPL-2.0-only" && licence.exception.is_none()),
-                "[artifact.{name}]: bare GPL-2.0-only; only `GPL-2.0-only WITH <linking exception>`"
-            );
+            // runtime only with an exception that frees its users
+            if licence.id == "GPL-2.0-only" {
+                ensure!(
+                    licence
+                        .exception
+                        .is_some_and(|e| GPL2_LINKING_EXCEPTIONS.contains(&e)),
+                    "[artifact.{name}]: `{entry}`; GPL-2.0-only only `WITH` one of {GPL2_LINKING_EXCEPTIONS:?}"
+                );
+            }
             let gpl3 = licence.id.starts_with("GPL-3.0") || licence.id.starts_with("AGPL-3.0");
             ensure!(
-                !(name == RUNTIME && gpl3 && licence.exception.is_none()),
-                "[artifact.{RUNTIME}]: bare `{entry}`; GPL-3 only as `<id> WITH <exception>`"
+                !(name == RUNTIME
+                    && gpl3
+                    && !licence
+                        .exception
+                        .is_some_and(|e| GPL3_FREEING_EXCEPTIONS.contains(&e))),
+                "[artifact.{RUNTIME}]: `{entry}`; GPL-3 only `WITH` one of {GPL3_FREEING_EXCEPTIONS:?}"
             );
             ensure!(
                 seen.insert(licence),
@@ -328,11 +341,19 @@ mod tests {
     #[test]
     fn licence_rules() {
         let bare = "[artifact.qemu-bridge]\nallow = [\"GPL-2.0-only\"]\n";
-        assert!(err(&format!("{RUNTIME_MIT}{bare}")).contains("bare GPL-2.0-only"));
-        assert!(
-            err("[artifact.runtime]\nallow = [\"GPL-3.0-or-later\"]\n").contains("GPL-3 only as")
-        );
-        assert!(err("[artifact.runtime]\nallow = [\"AGPL-3.0-only\"]\n").contains("GPL-3 only as"));
+        assert!(err(&format!("{RUNTIME_MIT}{bare}")).contains("GPL-2.0-only only `WITH`"));
+        // the kernel uapi headers' and libcore's forms
+        let text = "[artifact.runtime]\nallow = [\"GPL-2.0-only WITH Linux-syscall-note\", \
+                    \"GPL-2.0-only WITH Classpath-exception-2.0\"]\n";
+        assert!(parse(text, &upstreams()).is_ok());
+        // a real SPDX exception that is no linking exception: it only frees configure scripts
+        let text = "[artifact.runtime]\nallow = [\"GPL-2.0-only WITH Autoconf-exception-2.0\"]\n";
+        assert!(err(text).contains("GPL-2.0-only only `WITH`"));
+        let gpl3 = "GPL-3 only `WITH`";
+        assert!(err("[artifact.runtime]\nallow = [\"GPL-3.0-or-later\"]\n").contains(gpl3));
+        assert!(err("[artifact.runtime]\nallow = [\"AGPL-3.0-only\"]\n").contains(gpl3));
+        let text = "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH Autoconf-exception-3.0\"]\n";
+        assert!(err(text).contains(gpl3));
         // libgcc_s and Bison parsers: GPL-3 with an exception that frees their users
         let text = "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH GCC-exception-3.1\", \
                     \"GPL-3.0-or-later WITH Bison-exception-2.2\"]\n";
@@ -380,6 +401,14 @@ mod tests {
         // a licence the SPDX list lacks (a `paths` entry's LicenseRef) is denied unless listed
         assert!(!allows("LicenseRef-Adobe-DNG-SDK"));
         assert!(licenses.allows("qemu-bridge", "MIT").is_err());
+        // FreeType's dual licence passes through its FTL arm alone; GPL-2.0-or-later is never needed
+        let text = "[artifact.runtime]\nallow = [\"FTL\", \"GPL-2.0-only WITH Linux-syscall-note\"]\n";
+        let licenses = parse(text, &upstreams()).unwrap();
+        let allows = |e: &str| licenses.allows(RUNTIME, e).unwrap();
+        assert!(allows("FTL OR GPL-2.0-or-later"));
+        assert!(!allows("GPL-2.0-or-later"));
+        assert!(allows("GPL-2.0-only WITH Linux-syscall-note"));
+        assert!(!allows("GPL-2.0-only"));
     }
 
     #[test]
