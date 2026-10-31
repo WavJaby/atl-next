@@ -204,7 +204,9 @@ func (g *Graph) emitEdge(b *strings.Builder, e genEdge) {
 // genAidl: x.aidl -> src/x.cpp + include/x.h, relative to the source's import root, by `aidl --lang=<cpp|ndk> --ninja`.
 //   - Headers (aidl_gen_rule.go): X.h, BpX.h, BnX.h for every type, BpX/BnX with a leading `I` of X dropped when followed by an upper-case letter
 //     (aidl_to_cpp_common.cpp's heuristic); ndk puts them below `aidl/`. All three are outputs and waited on.
-//   - A cc module with .aidl srcs is cpp: every root of its aidl sources and aidl.local_include_dirs / include_dirs are import paths.
+//   - A cc module with .aidl srcs or aidl.libs is cpp, flags as cc/compiler.go: aidl.flags, -I of aidl.local_include_dirs, aidl.include_dirs and
+//     the aidl.libs import dirs, -t (aidl.generate_traces, default true), --min_sdk_version (min_sdk_version, else sdk_version, else platform_apis:
+//     cc.go MinSdkVersion of the platform variant). Then -I of every root of its aidl sources: Soong passes each source's own root only, a subset.
 //     An aidl_interface backend (n.mod.aidl, aidliface.go) brings its own lang and flags.
 func genAidl(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 	rel := strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")
@@ -219,15 +221,27 @@ func genAidl(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 		}
 		flags, implicit = s.flags(g, f)
 	} else {
+		a := n.props.obj("aidl")
+		flags = append(flags, a.strs("flags")...)
+		var dirs []string
+		for _, d := range a.strs("local_include_dirs") {
+			dirs = appendMissing(dirs, []string{filepath.Join(n.mod.Dir, d)})
+		}
+		dirs = appendMissing(dirs, a.strs("include_dirs"))
+		dirs = appendMissing(dirs, n.aidlIncs)
+		for _, d := range dirs {
+			flags = append(flags, "-I"+g.abs(d))
+		}
+		if a.boolean("generate_traces", true) {
+			flags = append(flags, "-t")
+		}
+		flags = append(flags, "--min_sdk_version="+ccMinSdk(n))
 		var roots []string
 		for _, p := range peers {
-			roots = appendMissing(roots, []string{p.root})
+			if !slices.Contains(dirs, p.root) {
+				roots = appendMissing(roots, []string{p.root})
+			}
 		}
-		a := n.props.obj("aidl")
-		for _, d := range a.strs("local_include_dirs") {
-			roots = appendMissing(roots, []string{filepath.Join(n.mod.Dir, d)})
-		}
-		roots = appendMissing(roots, a.strs("include_dirs"))
 		for _, r := range roots {
 			flags = append(flags, "-I"+g.abs(r))
 		}
@@ -248,6 +262,58 @@ func genAidl(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 		}},
 		srcs: []string{cpp}, waits: hdrs, incs: []string{"-I" + hdrDir}, exports: []string{"-I" + hdrDir},
 	}
+}
+
+// ccMinSdk: cc.go MinSdkVersion for the platform variant ("apex_inherit" counts as unset there), "platform_apis" when nothing is set (compiler.go).
+func ccMinSdk(n *Node) string {
+	v := n.props.str("min_sdk_version")
+	if v == "" || v == "apex_inherit" {
+		v = n.props.str("sdk_version")
+	}
+	if v == "" {
+		v = "platform_apis"
+	}
+	return v
+}
+
+// ccAidlLibs: a cc module's aidl.libs (cc/compiler.go Aidl.Libs, cc/gen.go genSources): the aidl_library modules' srcs, compiled into the
+// module like its own .aidl srcs, and their import dirs (aidl_library.go IncludeDirs: <dir>/strip_import_prefix, transitive through deps),
+// kept in n.aidlIncs. A source's root is its library's <dir>/strip_import_prefix (PathsWithModuleSrcSubDir), also for files of a filegroup.
+//   - Soong generates these under gen/aidl_library, apart from gen/aidl of the srcs, and export_aidl_headers exports both; here both share
+//     the module's src/include dirs.
+//   - aidl.libs with aidl.include_dirs / local_include_dirs is a Soong error, a problem here (the libs are still used).
+func (g *Graph) ccAidlLibs(n *Node) []srcFile {
+	a := n.props.obj("aidl")
+	libs := a.strs("libs")
+	if len(libs) > 0 && (len(a.strs("include_dirs")) > 0 || len(a.strs("local_include_dirs")) > 0) {
+		g.problem("%s: aidl.libs and aidl.include_dirs / local_include_dirs are set together (Soong rejects this)", n.mod.Name)
+	}
+	var out []srcFile
+	for _, ref := range libs {
+		dirs := g.aidlLibraryDirs(ref, n.side, n.mod.Name, map[string]bool{})
+		if dirs == nil {
+			continue
+		}
+		n.aidlIncs = appendMissing(n.aidlIncs, dirs)
+		m := g.lookup(ref, n.side)
+		p := g.flatten(m, n.side, Gen)
+		root := dirs[0]
+		for _, s := range p.strs("srcs") {
+			files, _ := g.resolveSrc(m.Dir, n.side, s, n.mod.Name)
+			for _, f := range files {
+				if filepath.Ext(f.path) != ".aidl" {
+					continue
+				}
+				if f.gen == nil {
+					f.root = root
+				} else {
+					g.useGen(n, f.gen)
+				}
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // genYacc: x.yy -> x.cpp + x.h, x.y -> x.c + x.h (Soong's GenPathWithExt naming), under src/<path below the module dir>, which is

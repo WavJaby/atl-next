@@ -85,7 +85,9 @@ type Node struct {
 	usedGens   map[*Node]bool
 	genIncs    []string
 	genExports []string
-	rule       *genRule // Kind Gen only
+	// aidl import dirs of the aidl_library modules aidl.libs names (ccAidlLibs)
+	aidlIncs []string
+	rule     *genRule // Kind Gen only
 	// cc_object modules srcs name (`:bcm_object`)
 	objSrcs []*Node
 	// built outside ninja by xtask (provided.go): out and exports only, never in g.order
@@ -435,6 +437,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if m.aidl != nil {
 		files = append(files, m.aidl.srcs...)
 	}
+	files = append(files, g.ccAidlLibs(n)...)
 	// a provided shared object links shared, and first, whichever list names it (static_libs, whole_static_libs included); a provided archive stays where it is named
 	var provided []*Node
 	if p := g.partialProvider(n); p != nil {

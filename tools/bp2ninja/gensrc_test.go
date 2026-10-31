@@ -77,8 +77,9 @@ func TestGrammarGenerators(t *testing.T) {
 }
 
 func TestAidlGenerator(t *testing.T) {
-	// aidl names its outputs by the package path below the import root; roots of all sources, then aidl.local_include_dirs (below the
-	// module dir), then aidl.include_dirs (tree-relative) are the -I flags of every edge
+	// aidl names its outputs by the package path below the import root. Flags (cc/compiler.go): aidl.local_include_dirs (below the module dir),
+	// aidl.include_dirs (tree-relative), -t (generate_traces defaults to true), --min_sdk_version (platform_apis: no min_sdk_version / sdk_version);
+	// then the roots of all sources (gen.go: each source's own root)
 	g, n := tableNode(objOf("aidl", objOf("local_include_dirs", []string{"loc"}, "include_dirs", []string{"inc/dir"}, "export_aidl_headers", true)))
 	a := srcFile{path: "r1/android/os/IFoo.aidl", root: "r1"}
 	b := srcFile{path: "r2/com/Bar.aidl", root: "r2"}
@@ -94,7 +95,7 @@ func TestAidlGenerator(t *testing.T) {
 	for _, v := range r.edge.vars {
 		vars[v[0]] = v[1]
 	}
-	if want := "-I/t/r1 -I/t/r2 -I/t/p/q/loc -I/t/inc/dir"; vars["flags"] != want || vars["lang"] != "cpp" {
+	if want := "-I/t/p/q/loc -I/t/inc/dir -t --min_sdk_version=platform_apis -I/t/r1 -I/t/r2"; vars["flags"] != want || vars["lang"] != "cpp" {
 		t.Errorf("flags %q lang %q, want %s cpp", vars["flags"], vars["lang"], want)
 	}
 	if vars["dep"] != tGen+"/src/android/os/IFoo.cpp.d" {
@@ -109,6 +110,59 @@ func TestAidlGenerator(t *testing.T) {
 	}
 	if want := []string{"-I" + tGen + "/include"}; !reflect.DeepEqual(r.incs, want) || !reflect.DeepEqual(r.exports, want) {
 		t.Errorf("incs %v exports %v, want %v", r.incs, r.exports, want)
+	}
+}
+
+// aidl.libs (cc/compiler.go, cc/gen.go, aidl_library.go): the libraries' srcs are compiled into the module, named below <dir>/strip_import_prefix.
+const aidlLibTree = `
+cc_binary_host { name: "aidl", srcs: ["aidl.cc"] }
+filegroup { name: "extra", srcs: ["x/android/gui/Extra.aidl"], path: "x" }
+aidl_library { name: "hdrs", hdrs: [":extra"] }
+aidl_library { name: "lib", srcs: ["aidl/**/*.aidl"], strip_import_prefix: "aidl", deps: ["hdrs"] }
+cc_library_static {
+    name: "s",
+    min_sdk_version: "29",
+    aidl: { export_aidl_headers: true, libs: ["lib"], flags: ["--foo"], generate_traces: false },
+}
+cc_library_static { name: "bad", srcs: ["b.cc"], aidl: { libs: ["lib"], include_dirs: ["inc"] } }
+cc_binary { name: "user", srcs: ["u.cc"], static_libs: ["s"] }
+`
+
+func TestAidlLibs(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": aidlLibTree, "p/aidl/android/gui/FrameEvent.aidl": "", "p/x/android/gui/Extra.aidl": ""})
+	gd := filepath.Join(g.out, "gen", "device", "s")
+	s := g.node("s", Device, Static, "t")
+	if want := []string{gd + "/src/android/gui/FrameEvent.cpp"}; !reflect.DeepEqual(s.srcs, want) {
+		t.Fatalf("s srcs %v, want %v", s.srcs, want)
+	}
+	// headers by the path below strip_import_prefix (Rel()); hdrs-only libraries generate nothing
+	hdrs := []string{gd + "/include/android/gui/FrameEvent.h", gd + "/include/android/gui/BpFrameEvent.h", gd + "/include/android/gui/BnFrameEvent.h"}
+	if len(s.edges) != 1 || !reflect.DeepEqual(s.edges[0].outs[1:], hdrs) {
+		t.Fatalf("s edges %+v", s.edges)
+	}
+	// aidl.flags, then the import dirs: lib's p/aidl, then its dep's p (no prefix); no -t (generate_traces false); min_sdk_version 29.
+	// The source root p/aidl is already an import dir: not repeated
+	var flags string
+	for _, v := range s.edges[0].vars {
+		if v[0] == "flags" {
+			flags = v[1]
+		}
+	}
+	if want := "--foo -I" + g.abs("p/aidl") + " -I" + g.abs("p") + " --min_sdk_version=29"; flags != want {
+		t.Errorf("flags %q, want %q", flags, want)
+	}
+	// export_aidl_headers covers aidl.libs output (library.go: gen/aidl_library); a dependent waits for the headers
+	if want := []string{"-I" + gd + "/include"}; !reflect.DeepEqual(s.exports, want) {
+		t.Errorf("s exports %v, want %v", s.exports, want)
+	}
+	var waits []string
+	genClosure(g.node("user", Device, Binary, "t"), map[*Node]bool{}, &waits)
+	if !reflect.DeepEqual(waits, hdrs) {
+		t.Errorf("user waits %v, want %v", waits, hdrs)
+	}
+	g.node("bad", Device, Static, "t")
+	if want := "bad: aidl.libs and aidl.include_dirs / local_include_dirs are set together (Soong rejects this)"; !slices.Contains(g.problems, want) {
+		t.Errorf("problems %v lack %q", g.problems, want)
 	}
 }
 
