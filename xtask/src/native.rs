@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask native`: AOSP native modules built for this Linux host by our Blueprint converter
 //! (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned
-//! `build/blueprint` (through a generated go.work: that path differs per checkout), builds the
+//! `build/blueprint` (converter.rs), builds the
 //! providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their
 //! recipe), converts the goals' closure into ninja, builds it with `ninja -k 0`, summarises the
 //! failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml
@@ -19,8 +19,8 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
-    arches, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate, providers,
-    sources, triage, upstream, workspace,
+    arches, converter, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate,
+    providers, sources, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -86,29 +86,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
     };
     std::fs::create_dir_all(&out)?;
-    std::fs::create_dir_all(&tool_dir)?;
-    let go_work = tool_dir.join("go.work");
-    std::fs::write(
-        &go_work,
-        format!(
-            "go 1.24\n\nuse {}\n\nreplace github.com/google/blueprint => {}\n",
-            root.join("tools/bp2ninja").display(),
-            tree.join("build/blueprint").display()
-        ),
-    )?;
+    let go_work = converter::go_work(root, &layout, &tool_dir)?;
     let converter = tool_dir.join("bp2ninja");
-    let status = Command::new("go")
-        .args(["build", "-o"])
-        .arg(&converter)
-        .arg(".")
-        .current_dir(root.join("tools/bp2ninja"))
-        .env("GOWORK", &go_work)
-        // the pinned blueprint is the only dependency: no toolchain or module downloads
-        .env("GOTOOLCHAIN", "local")
-        .env("GOPROXY", "off")
-        .status()
-        .context("running go build")?;
-    ensure!(status.success(), "building bp2ninja failed");
+    converter::go(
+        root,
+        &go_work,
+        &["build", "-o", &converter.display().to_string(), "."],
+    )
+    .context("building bp2ninja")?;
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
     let providers = providers::load(root, &providers::Targets::new(&workspace.crates, &sources))?;

@@ -7,6 +7,7 @@
 mod aosp;
 mod arches;
 mod check;
+mod converter;
 mod deps;
 mod farm;
 mod fetch;

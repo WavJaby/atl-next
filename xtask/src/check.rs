@@ -7,7 +7,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
-use crate::{arches, deps, licenses, modules, patch, providers, prune, sources, spdx, workspace};
+use crate::{
+    arches, converter, deps, licenses, modules, patch, providers, prune, sources, spdx, workspace,
+};
 use atl_layout::Layout;
 
 #[derive(clap::Args)]
@@ -35,9 +37,11 @@ enum Step {
     Deny,
     /// cargo test, whole workspace
     Test,
+    /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
+    Converter,
 }
 
-const ALL: [Step; 8] = [
+const ALL: [Step; 9] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -46,6 +50,7 @@ const ALL: [Step; 8] = [
     Step::Clippy,
     Step::Deny,
     Step::Test,
+    Step::Converter,
 ];
 
 impl Step {
@@ -59,6 +64,7 @@ impl Step {
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
+            Step::Converter => "converter",
         }
     }
 
@@ -125,6 +131,7 @@ impl Step {
                 cargo(root, &["deny", "--locked", "check"])
             }
             Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
+            Step::Converter => converter::check(root),
         }
     }
 }
