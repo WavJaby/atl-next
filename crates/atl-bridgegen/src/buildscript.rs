@@ -30,12 +30,13 @@ pub struct Api {
 
 /// Nothing kept: declarations only.
 pub const DECLARATIONS: Kept<'static> = Kept {
-    includes: false,
+    includes: &[],
     macros: &[],
+    types: &[],
 };
 
 /// Generated files of `api` parsed for `target` (plus the API's include dirs), paths relative to
-/// OUT_DIR: `<name>.rs` (its constants and opaque types, and the check that each function of
+/// OUT_DIR: `<name>.rs` (its constants, opaque types and records, and the check that each function of
 /// `implementation`, a Rust path, has the header's signature), `<name>.ir.json`, and with a header
 /// `capi/include/<header>` (exactly `functions`, the constants, what `kept` keeps).
 pub fn api_files(
@@ -61,7 +62,7 @@ pub fn api_files(
     let mut files = vec![
         (
             format!("{}.rs", api.name).into(),
-            crate::rust::api_module(&iface, &arch, api.functions, implementation)?,
+            crate::rust::api_module(&iface, &arch, api.functions, api.kept.types, implementation)?,
         ),
         (
             format!("{}.ir.json", api.name).into(),
@@ -82,6 +83,73 @@ pub fn api_files(
         ));
     }
     Ok(files)
+}
+
+/// The build script of a crate implementing (or importing) only `apis`, each checked against
+/// `implementation`: generates `api_files` for cargo's target in bionic's view (a C++ source with the
+/// host's libc++ first) twice and fails unless byte-identical, replaces `OUT_DIR/capi` (a header the
+/// generation stopped writing must not stay on the include path), writes the files. Returns the paths
+/// cargo reruns the script on, for it to print (only a build script prints).
+pub fn api_crate(apis: &[Api], implementation: &str) -> Result<Vec<PathBuf>> {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let checkout = checkout(&manifest)?;
+    let up = Upstreams::of(&checkout)?;
+    let arches = checkout.join("arches.toml");
+    let host = host_arch(
+        &std::fs::read_to_string(&arches)?,
+        &std::env::var("TARGET")?,
+    )?;
+    for api in apis {
+        up.file(&format!("aosp/{}", api.source))?;
+    }
+    let libcxx = if apis.iter().any(|a| a.lang == Lang::Cxx) {
+        Some(libcxx_include_dir()?)
+    } else {
+        None
+    };
+    let generate = || -> Result<Vec<(PathBuf, String)>> {
+        let mut files = Vec::new();
+        for api in apis {
+            let cxx = libcxx.as_deref().filter(|_| api.lang == Lang::Cxx);
+            let target = bionic_libc_target(&up, &host, cxx);
+            files.extend(api_files(&up, api, target, implementation)?);
+        }
+        Ok(files)
+    };
+    let files = generate()?;
+    ensure!(
+        files == generate()?,
+        "atl-bridgegen output differs between two runs on the same input"
+    );
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    let capi = out.join("capi");
+    if capi.exists() {
+        std::fs::remove_dir_all(&capi)?;
+    }
+    for (rel, text) in &files {
+        let path = out.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
+    // a source's includes are read too: its directory and the API's include directories
+    let mut inputs: Vec<String> = Vec::new();
+    for api in apis {
+        let dir = Path::new(api.source)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        inputs.push(dir);
+        inputs.extend(api.include_dirs.iter().map(|d| (*d).to_owned()));
+    }
+    inputs.sort();
+    inputs.dedup();
+    let mut rerun = vec![arches];
+    for rel in inputs {
+        rerun.extend(up.rerun_paths(&format!("aosp/{rel}")));
+    }
+    Ok(rerun)
 }
 
 /// The arches.toml row of a host target.

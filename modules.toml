@@ -28,10 +28,16 @@ crates = ["atl-binder-wire", "atl-binderd"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
-# libvndksupport for source-built AOSP code (SP-HAL loading, one namespace); the loader's namespaces later
+# libvndksupport for source-built AOSP code (SP-HAL loading through bionic's android_dlopen_ext, as AOSP's); uses bionic only in tests (its C ABI is resolved from libc's provider at run time)
 [vndksupport]
 crates = ["atl-vndksupport"]
 exports = ["atl-vndksupport"]
+uses = ["generators", "bionic"]
+
+# libdebuggerd_client for source-built AOSP code: dump requests fail as without tombstoned
+[debuggerd]
+crates = ["atl-debuggerd-client"]
+exports = ["atl-debuggerd-client"]
 uses = ["generators"]
 
 [generators]

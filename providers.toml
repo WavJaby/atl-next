@@ -21,7 +21,7 @@ reason = "bionic-internal headers; the system C library replaces bionic"
 
 ["libc"]
 provider = "crate:atl-bionic"
-reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels, fdsan level), its generated headers, include wrappers giving glibc's headers bionic's include shape, and substitutes for bionic-only headers that mean the same on glibc"
+reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels, fdsan level, android_dlopen_ext and the exported-namespace lookup in one namespace, android_mallopt refusing every option), its generated headers, include wrappers giving glibc's headers bionic's include shape, and substitutes for bionic-only headers that mean the same on glibc"
 
 ["libc_headers"]
 provider = "none"
@@ -33,7 +33,7 @@ reason = "bionic's copy of the kernel uapi; the distro's kernel headers replace 
 
 ["libdl"]
 provider = "none"
-reason = "bionic; glibc's libdl"
+reason = "bionic; glibc's libdl, plus android_dlopen_ext from libc's provider"
 
 ["libm"]
 provider = "none"
@@ -52,9 +52,13 @@ reason = "APEX support; ATL has no APEX"
 provider = "crate:atl-bionic"
 reason = "bionic-internal (defines _LIBC, glibc rejects it); atl-bionic implements the part AOSP code here calls, without allocation, logging to stderr as bionic does without logd"
 
+["libdebuggerd_client"]
+provider = "crate:atl-debuggerd-client"
+reason = "requests a dump through tombstoned, which this host lacks; as AOSP's client without tombstoned, every request fails before any signal (bionic's debugger signal is glibc's SIGRTMIN+1, free for apps)"
+
 ["libdl_android"]
 provider = "none"
-reason = "bionic linker namespace API; our libnativeloader owns namespaces"
+reason = "bionic linker namespace API; our libnativeloader owns namespaces; libc's provider has the target SDK setter and android_get_exported_namespace (one namespace)"
 
 ["libseccomp_policy"]
 provider = "none"

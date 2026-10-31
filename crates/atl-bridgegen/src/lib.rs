@@ -414,8 +414,9 @@ mod tests {
         let iface = interface("log", "log.h", &Source::c(&header, &[]), &[freestanding()]).unwrap();
         let functions = ["log_no_abort", "log_va", "log_len"];
         let kept = c::Kept {
-            includes: true,
+            includes: &["<stddef.h>", "<stdarg.h>"],
             macros: &["log_fatal"],
+            types: &[],
         };
         let text = c::header(&iface, "x86_64", &functions, &[], &kept).unwrap();
         for want in [
@@ -428,14 +429,25 @@ mod tests {
             assert!(text.contains(want), "{want:?} missing:\n{text}");
         }
         assert_eq!(text.matches("#include").count(), 2, "{text}");
-        let missing = c::Kept {
-            includes: false,
-            macros: &["nope"],
-        };
-        assert!(c::header(&iface, "x86_64", &functions, &[], &missing).is_err());
+        for missing in [
+            c::Kept {
+                macros: &["nope"],
+                ..Default::default()
+            },
+            c::Kept {
+                includes: &["<stdint.h>"],
+                ..Default::default()
+            },
+            c::Kept {
+                types: &["nope_t"],
+                ..Default::default()
+            },
+        ] {
+            assert!(c::header(&iface, "x86_64", &functions, &[], &missing).is_err());
+        }
 
         // va_list is Rust's VaList, variadic stays `...`, size_t is usize with its width asserted
-        let checks = rust::api_module(&iface, "x86_64", &functions, "imp").unwrap();
+        let checks = rust::api_module(&iface, "x86_64", &functions, &[], "imp").unwrap();
         assert!(
             checks.contains("assert!(::core::mem::size_of::<usize>() * 8 == 64, \"size_t\")"),
             "{checks}"
@@ -451,6 +463,106 @@ mod tests {
         assert!(!rustc(&dir, &format!("{checks}{wrong}")).status.success());
     }
 
+    /// A header in the shape of bionic's android/dlext.h and bionic/malloc.h: callers build a typedef'd
+    /// anonymous struct the function takes, use one no function names, and an enum from a `"…"` include.
+    const EXT: &str = "#include <stdint.h>\n#include <stddef.h>\n#include \"kind.h\"\nstruct ns;\ntypedef struct {\n  uint64_t flags;\n  void *_Nullable addr;\n  size_t size;\n  int fd;\n  struct ns *_Nullable space;\n} info;\ntypedef struct {\n  uint8_t *buffer;\n  size_t n;\n} leak;\nenum { USE_NS = 0x200 };\nvoid *_Nullable open_ext(const char *_Nullable name, int flags, const info *_Nullable i);\nint dump(int pid, enum kind k);\n";
+
+    #[test]
+    fn record_definitions_with_layout_asserts() {
+        let dir = tmp("crecords");
+        std::fs::write(
+            dir.0.join("kind.h"),
+            "enum kind : unsigned char { K_NATIVE, K_JAVA };\n",
+        )
+        .unwrap();
+        let header = dir.0.join("ext.h");
+        std::fs::write(&header, EXT).unwrap();
+        let src = Source {
+            path: &header,
+            lang: Lang::Cxx,
+            also: &[],
+            macros: &[],
+        };
+        let iface = interface("ext", "ext.h", &src, &[freestanding()]).unwrap();
+        let functions = ["open_ext", "dump"];
+        let kept = c::Kept {
+            includes: &["\"kind.h\""],
+            types: &["leak"],
+            ..Default::default()
+        };
+        let text = c::header(&iface, "x86_64", &functions, &["USE_NS"], &kept).unwrap();
+        // x86-64 psABI: u64 at 0, pointer at 8, size_t at 16, int at 24 (4 bytes padding), pointer at
+        // 32; 40 bytes, 8-aligned
+        for want in [
+            "#include \"kind.h\"\n#include <stddef.h>\n#include <stdint.h>\n",
+            "struct ns;\n",
+            // libclang reports no nullability on a C++ declaration's types; layout is what counts
+            "typedef struct {\n  uint64_t flags;\n  void * addr;\n  size_t size;\n  int fd;\n  struct ns * space;\n} info;\n",
+            "typedef struct {\n  uint8_t * buffer;\n  size_t n;\n} leak;\n",
+            "static_assert(sizeof(info) == 40, ",
+            "_Static_assert(__builtin_offsetof(info, space) == 32, ",
+            "_Static_assert(__alignof__(leak) == 8, ",
+            // C++ gives this enum `unsigned int`
+            "#define USE_NS 512U\n",
+            // the enum's underlying type
+            "int dump(int, unsigned char);\n",
+        ] {
+            assert!(text.contains(want), "{want:?} missing:\n{text}");
+        }
+        // read back in both languages: the asserts hold, the layouts are the source's
+        let printed = dir.0.join("printed.h");
+        std::fs::write(&printed, &text).unwrap();
+        let view = &iface.arches["x86_64"];
+        // kind.h is C++ (a fixed underlying type); both languages read a C stand-in
+        std::fs::write(dir.0.join("kind.h"), "enum kind { K_NATIVE };\n").unwrap();
+        for lang in [Lang::C, Lang::Cxx] {
+            let src = Source {
+                path: &printed,
+                lang,
+                also: &[],
+                macros: &[],
+            };
+            let back = interface("back", "printed.h", &src, &[freestanding()]).unwrap();
+            let bv = &back.arches["x86_64"];
+            for r in ["info", "leak"] {
+                assert_eq!(bv.records[r], view.records[r], "{r} ({lang:?})");
+            }
+            assert_eq!(bv.functions["open_ext"], view.functions["open_ext"]);
+        }
+        // a field of another width than the source's (a host typedef narrower than bionic's) fails the
+        // caller's compile: fd moves to 20
+        let shifted = dir.0.join("shifted.h");
+        let narrow = text.replace("  size_t size;\n", "  uint32_t size;\n");
+        assert_ne!(narrow, text);
+        std::fs::write(&shifted, narrow).unwrap();
+        assert!(
+            interface(
+                "s",
+                "shifted.h",
+                &Source::c(&shifted, &[]),
+                &[freestanding()]
+            )
+            .is_err()
+        );
+
+        // the Rust side gets the same records with rustc's layout asserted equal
+        let checks = rust::api_module(&iface, "x86_64", &["open_ext"], &["leak"], "imp").unwrap();
+        for want in [
+            "pub struct info {\n    pub flags: u64,\n    pub addr: *mut ::core::ffi::c_void,\n    pub size: usize,\n    pub fd: i32,\n    pub space: *mut ns,\n}\n",
+            "pub struct leak {\n",
+            "assert!(::core::mem::offset_of!(info, space) == 32);",
+        ] {
+            assert!(checks.contains(want), "{want:?} missing:\n{checks}");
+        }
+        let imp = "mod imp {\n  use super::info;\n  pub unsafe extern \"C\" fn open_ext(_: *const i8, _: i32, _: *const info) -> *mut core::ffi::c_void { core::ptr::null_mut() }\n}\n";
+        let out = rustc(&dir, &format!("{checks}{imp}"));
+        assert!(
+            out.status.success(),
+            "{}\n{checks}{imp}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// The implementation's signatures checked against the header: matching ones compile, a changed
     /// return type does not.
     #[test]
@@ -462,7 +574,8 @@ mod tests {
         );
         let dir = tmp("apicheck");
         let iface = api(&dir);
-        let checks = rust::api_module(&iface, "x86_64", &["set", "find", "visit"], "imp").unwrap();
+        let checks =
+            rust::api_module(&iface, "x86_64", &["set", "find", "visit"], &[], "imp").unwrap();
         assert!(checks.contains("pub const LIMIT: i32 = 92;"), "{checks}");
         assert!(
             checks.contains("pub const NAME: &str = \"/dev/x\";"),

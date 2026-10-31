@@ -7,10 +7,13 @@
 
 use core::ffi::{CStr, VaList, c_char, c_int, c_void};
 use core::sync::atomic::Ordering::Acquire;
+use std::ffi::CString;
 
+use crate::generated::dlext::android_dlextinfo;
+use crate::generated::libdl_android::android_namespace_t;
 use crate::generated::system_properties::{PROP_NAME_MAX, prop_info};
 use crate::props::{Area, PropInfo, VALUE_MAX, Value};
-use crate::{async_safe, sdk, store};
+use crate::{async_safe, dlext, linker, sdk, store};
 
 type ReadCallback = Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u32)>;
 type ForeachCallback = Option<unsafe extern "C" fn(*const prop_info, *mut c_void)>;
@@ -169,6 +172,52 @@ pub extern "C" fn android_set_application_target_sdk_version(target: c_int) {
 #[unsafe(no_mangle)]
 pub extern "C" fn android_fdsan_set_error_level(new_level: u32) -> u32 {
     crate::fdsan::set_error_level(new_level)
+}
+
+/// bionic/malloc.h. glibc's allocator has none of bionic's options (allocation limit, leak info,
+/// GWP-ASan, heapprofd, zygote profiling), so every opcode gets what bionic gives one it does not handle
+/// (`HeapprofdMallopt`, malloc_heapprofd.cpp): `errno = ENOTSUP`, false.
+#[unsafe(no_mangle)]
+pub extern "C" fn android_mallopt(_opcode: c_int, _arg: *mut c_void, _arg_size: usize) -> bool {
+    errno::set_errno(errno::Errno(rustix::io::Errno::NOTSUP.raw_os_error()));
+    false
+}
+
+// android/dlext.h (libdl) and libdl_android's exported-namespace lookup, through `linker`.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_dlopen_ext(
+    filename: *const c_char,
+    flags: c_int,
+    info: *const android_dlextinfo,
+) -> *mut c_void {
+    // SAFETY: bionic's contract, null or an android_dlextinfo
+    let info = unsafe { info.as_ref() };
+    let (ext, has_namespace) =
+        info.map_or((0, false), |i| (i.flags, !i.library_namespace.is_null()));
+    if let Err(r) = dlext::check(ext, has_namespace) {
+        let detail =
+            CString::new(format!("dlopen failed: {r}")).expect("the refusal text has no NUL");
+        linker::fail(&detail);
+        return core::ptr::null_mut();
+    }
+    // the namespace USE_NAMESPACE names and the caller's are both the one namespace
+    // SAFETY: dlopen's contract is the caller's
+    unsafe { linker::open(filename, flags, &linker::DEFAULT) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_get_exported_namespace(
+    name: *const c_char,
+) -> *mut android_namespace_t {
+    // SAFETY: bionic's contract, a NUL-terminated string
+    match unsafe { c_str(name) } {
+        // bionic: a null name exports nothing
+        None => core::ptr::null_mut(),
+        Some(name) => core::ptr::from_ref(linker::exported(name))
+            .cast_mut()
+            .cast(),
+    }
 }
 
 // libasync_safe. A format's arguments are the caller's printf contract; a null format or tag, where

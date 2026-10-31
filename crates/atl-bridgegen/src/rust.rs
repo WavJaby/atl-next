@@ -2,8 +2,8 @@
 //! Rust backends for one host arch. A header change that moves a field or changes a signature fails the
 //! build, not a run.
 //! - `host_module`: `#[repr(C)]` types, each with compile-time asserts that rustc's layout equals clang's.
-//! - `api_module`: the constants and opaque types of an API we implement, and a check that each
-//!   implementing function has exactly the header's signature.
+//! - `api_module`: the constants, opaque types and records (as `host_module`'s) of an API we implement,
+//!   and a check that each implementing function has exactly the header's signature.
 //! - `layout_module`: size, alignment and field offsets as constants, for code that reads a layout in
 //!   shared memory through atomics rather than through a Rust type.
 
@@ -12,7 +12,7 @@ use std::fmt::Write;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::ir::{ArchView, Constant, Interface, Nullability, RecordKind, Signature, Ty};
+use crate::ir::{ArchView, Constant, Interface, Nullability, Record, RecordKind, Signature, Ty};
 
 /// Rust keywords that can appear as C identifiers; emitted as raw identifiers.
 const KEYWORDS: &[&str] = &[
@@ -43,67 +43,126 @@ pub fn host_module(iface: &Interface, arch: &str) -> Result<String> {
     let mut opaque = BTreeSet::new();
     constants(&mut out, view, &mut opaque)?;
     for (name, record) in &view.records {
-        // rustc's own layout rules would give natural alignment; clang's attributes are carried over
-        // and the asserts below prove the result
-        let repr = if record.packed {
-            format!("C, packed({})", record.align)
-        } else if record.aligned {
-            format!("C, align({})", record.align)
-        } else {
-            "C".to_owned()
-        };
-        let keyword = match record.kind {
-            RecordKind::Struct => "struct",
-            RecordKind::Union => "union",
-        };
-        writeln!(
-            out,
-            "#[repr({repr})]\n#[derive(Clone, Copy)]\n#[allow(non_camel_case_types, non_snake_case)]\npub {keyword} {} {{",
-            ident(name)
-        )?;
-        for f in &record.fields {
-            let ty = rust_ty(&f.ty, &mut opaque).with_context(|| format!("{name}.{}", f.name))?;
-            writeln!(out, "    pub {}: {ty},", ident(&f.name))?;
-        }
-        writeln!(out, "}}")?;
-        let n = ident(name);
-        writeln!(
-            out,
-            "const _: () = assert!(::core::mem::size_of::<{n}>() == {});",
-            record.size
-        )?;
-        writeln!(
-            out,
-            "const _: () = assert!(::core::mem::align_of::<{n}>() == {});",
-            record.align
-        )?;
-        for f in &record.fields {
-            writeln!(
-                out,
-                "const _: () = assert!(::core::mem::offset_of!({n}, {}) == {});",
-                ident(&f.name),
-                f.offset
-            )?;
-        }
-        writeln!(out)?;
+        record_item(&mut out, name, record, &mut opaque)?;
     }
     opaque_types(&mut out, view, &opaque)?;
     Ok(out)
 }
 
-/// Constants and opaque types of `arch`'s view, and for each of `functions` a check that
-/// `<implementation>::<function>` has the header's signature exactly: a fn item coerces to the
-/// header's fn-pointer type only then.
+/// `#[repr(C)]` type of `record` with asserts that rustc's layout equals clang's.
+fn record_item(
+    out: &mut String,
+    name: &str,
+    record: &Record,
+    opaque: &mut BTreeSet<String>,
+) -> Result<()> {
+    // rustc's own layout rules would give natural alignment; clang's attributes are carried over
+    // and the asserts below prove the result
+    let repr = if record.packed {
+        format!("C, packed({})", record.align)
+    } else if record.aligned {
+        format!("C, align({})", record.align)
+    } else {
+        "C".to_owned()
+    };
+    let keyword = match record.kind {
+        RecordKind::Struct => "struct",
+        RecordKind::Union => "union",
+    };
+    writeln!(
+        out,
+        "#[repr({repr})]\n#[derive(Clone, Copy)]\n#[allow(non_camel_case_types, non_snake_case, dead_code)]\npub {keyword} {} {{",
+        ident(name)
+    )?;
+    for f in &record.fields {
+        let ty = rust_ty(&f.ty, opaque).with_context(|| format!("{name}.{}", f.name))?;
+        writeln!(out, "    pub {}: {ty},", ident(&f.name))?;
+    }
+    writeln!(out, "}}")?;
+    let n = ident(name);
+    writeln!(
+        out,
+        "const _: () = assert!(::core::mem::size_of::<{n}>() == {});",
+        record.size
+    )?;
+    writeln!(
+        out,
+        "const _: () = assert!(::core::mem::align_of::<{n}>() == {});",
+        record.align
+    )?;
+    for f in &record.fields {
+        writeln!(
+            out,
+            "const _: () = assert!(::core::mem::offset_of!({n}, {}) == {});",
+            ident(&f.name),
+            f.offset
+        )?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Records of the interface `ty` uses, by value or behind pointers, and those their fields use, into `out`.
+fn records_used(view: &ArchView, ty: &Ty, out: &mut BTreeSet<String>) {
+    match ty {
+        Ty::Record { name } => {
+            if out.insert(name.clone())
+                && let Some(r) = view.records.get(name)
+            {
+                for f in &r.fields {
+                    records_used(view, &f.ty, out);
+                }
+            }
+        }
+        Ty::Typedef { ty, .. } => records_used(view, ty, out),
+        Ty::Pointer { pointee, .. } => records_used(view, pointee, out),
+        Ty::Array { elem, .. } => records_used(view, elem, out),
+        Ty::Function(sig) => {
+            for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                records_used(view, t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Constants, opaque types, and the records `functions` and the typedefs `types` use, of `arch`'s view
+/// (`types`: what the printed C header defines besides, so both sides check the same layouts); and for
+/// each of `functions` a check that `<implementation>::<function>` has the header's signature exactly:
+/// a fn item coerces to the header's fn-pointer type only then.
 pub fn api_module(
     iface: &Interface,
     arch: &str,
     functions: &[&str],
+    types: &[&str],
     implementation: &str,
 ) -> Result<String> {
     let view = view(iface, arch)?;
     let mut out = banner(iface, arch, view);
     let mut opaque = BTreeSet::new();
     constants(&mut out, view, &mut opaque)?;
+    let mut records = BTreeSet::new();
+    for f in functions {
+        let sig = view
+            .functions
+            .get(*f)
+            .with_context(|| format!("{}: no function {f}", iface.header))?;
+        records_used(view, &Ty::Function(Box::new(sig.clone())), &mut records);
+    }
+    for t in types {
+        let ty = view
+            .typedefs
+            .get(*t)
+            .with_context(|| format!("{}: no typedef {t}", iface.header))?;
+        records_used(view, ty, &mut records);
+    }
+    for name in &records {
+        let record = view
+            .records
+            .get(name)
+            .with_context(|| format!("{}: no record {name}", iface.header))?;
+        record_item(&mut out, name, record, &mut opaque)?;
+    }
     for f in functions {
         let sig = view
             .functions

@@ -65,13 +65,18 @@ const APIS: &[Api] = &[
         include_dirs: &[],
         kept: DECLARATIONS,
     },
-    // libdl's platform-only setter; ART declares it itself, the launcher calls it (owner Q5)
+    // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
+    // it, owner Q5) and the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
+    // libvndksupport)
     Api {
         name: "libdl_android",
         source: "bionic/libdl/libdl_android.cpp",
         lang: Lang::Cxx,
         header: None,
-        functions: &["android_set_application_target_sdk_version"],
+        functions: &[
+            "android_set_application_target_sdk_version",
+            "android_get_exported_namespace",
+        ],
         macros: &[],
         include_dirs: &[],
         kept: DECLARATIONS,
@@ -94,9 +99,18 @@ const APIS: &[Api] = &[
         ],
         macros: &[],
         include_dirs: &["system/logging/liblog/include"],
+        // all of its includes, as its callers saw them before the list was explicit
         kept: Kept {
-            includes: true,
+            includes: &[
+                "<sys/cdefs.h>",
+                "<stdarg.h>",
+                "<stddef.h>",
+                "<stdint.h>",
+                "<stdlib.h>",
+                "<android/log.h>",
+            ],
             macros: &["async_safe_fatal"],
+            types: &[],
         },
     },
     // what the native closure calls of fdsan (2026-10-31: libsfplugin_ccodec C2NodeImpl.cpp)
@@ -109,6 +123,35 @@ const APIS: &[Api] = &[
         macros: &[],
         include_dirs: &[],
         kept: DECLARATIONS,
+    },
+    // libdl's extended dlopen (2026-10-31: libEGL, libgraphicsenv, libstagefright, libvulkan,
+    // libvndksupport); callers build android_dlextinfo and pass ANDROID_DLEXT_USE_NAMESPACE
+    Api {
+        name: "dlext",
+        source: "bionic/libc/include/android/dlext.h",
+        lang: Lang::C,
+        header: Some("android/dlext.h"),
+        functions: &["android_dlopen_ext"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
+    // a platform header (bionic_libc_platform_headers), C++: what the closure uses (2026-10-31:
+    // libmediautils LimitProcessMemory.cpp M_SET_ALLOCATION_LIMIT_BYTES, MemoryLeakTrackUtil.cpp the leak
+    // info struct). The GWP-ASan options struct (default member initialisers, a nested enum) is not printed.
+    Api {
+        name: "malloc",
+        source: "bionic/libc/platform/bionic/malloc.h",
+        lang: Lang::Cxx,
+        header: Some("bionic/malloc.h"),
+        functions: &["android_mallopt"],
+        macros: &[],
+        include_dirs: &[],
+        kept: Kept {
+            includes: &[],
+            macros: &[],
+            types: &["android_mallopt_leak_info_t"],
+        },
     },
 ];
 

@@ -101,6 +101,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-debuggerd-client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+]
+
+[[package]]
 name = "atl-layout"
 version = "0.0.0"
 dependencies = [
@@ -112,6 +120,7 @@ name = "atl-vndksupport"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-bionic",
  "atl-bridgegen",
 ]
 
