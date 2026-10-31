@@ -94,6 +94,8 @@ type Graph struct {
 	cfg       Config
 	soong     SoongConfig
 	omit      map[string]bool
+	// providers.toml rows built outside the tree (provided.go)
+	provided map[string]Provided
 	// soong_config_module_type name -> wrapped module type
 	configTypes map[string]string
 	mods        [2]map[string][]*Module
@@ -322,6 +324,9 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs)
 	if g.omit[strings.TrimPrefix(ref, ":")] {
 		return nil
+	}
+	if p, ok := g.provided[strings.TrimPrefix(ref, ":")]; ok {
+		return g.providedNode(strings.TrimPrefix(ref, ":"), side, p)
 	}
 	m := g.lookup(ref, side)
 	if m == nil {

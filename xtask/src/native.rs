@@ -11,7 +11,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
-use crate::{arches, deps, fetch, providers, sources, workspace};
+use crate::{arches, deps, fetch, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -89,13 +89,34 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
     let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
-    let providers = providers::load(root, &workspace.crates, &deps)?;
+    let providers = providers::load(
+        root,
+        &providers::Targets::new(&workspace.crates, &deps, &sources),
+    )?;
     let omit = providers::omitted(&providers).join(",");
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
     // fetched by the loop, which only adds unpinned ones
     if args.fetch_missing {
         fetch::add_and_fetch(root, &[])?;
     }
+    // upstreams built by their own build system, before the converter: it links their installed artifacts
+    let toolchain = upstream::Toolchain {
+        cc: &args.cc,
+        cxx: &args.cxx,
+    };
+    let mut provided = BTreeMap::new();
+    for name in providers::upstreams(&providers) {
+        let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
+        println!("native: building upstream {name}");
+        provided.extend(upstream::build(
+            &ws.join("src").join(name),
+            &out,
+            recipe,
+            &toolchain,
+        )?);
+    }
+    let provided_file = out.join("provided.json");
+    std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
     let mut round = 0;
     loop {
         round += 1;
@@ -118,6 +139,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 "-omit",
                 &omit,
             ])
+            .arg("-provided")
+            .arg(&provided_file)
             .args(&args.goals)
             .status()
             .context("running bp2ninja")?;

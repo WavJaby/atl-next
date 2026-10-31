@@ -173,6 +173,11 @@ libnativehelper = "5c36ece5ac42b20f0e384d9e57400f2f22aad9fb"
 "tools/metalava" = "a2548e478c121d5801137d636f6e83af37eafc99"
 "tools/platform-compat" = "db0de6104d8527114a7ae441b0a9c35f885d2876"
 
+[boringssl]
+git = "https://boringssl.googlesource.com/boringssl"
+tag = "0.20261020.0"
+commit = "d3bf4795ad5b79d646cddf2fec687da5b9b502db"
+
 [qemu]
 git = "https://gitlab.com/qemu-project/qemu.git"
 tag = "v11.1.3"

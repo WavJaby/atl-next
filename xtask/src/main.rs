@@ -21,6 +21,7 @@ mod prune;
 mod soong;
 mod sources;
 mod spdx;
+mod upstream;
 mod workspace;
 
 use std::collections::BTreeSet;

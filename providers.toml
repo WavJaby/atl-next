@@ -5,9 +5,10 @@
 # Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree).
 #   provider  crate:<workspace crate>   our Rust crate, built with cargo-c into the prefix
 #             deps:<deps.toml row>      a system library; that row needs `pkgconfig` and `used_by` containing `upstream:aosp`
+#             upstream:<sources.toml>   a git upstream built by its own build system into <out>/upstream/<name>/prefix by `xtask native`, before the converter; xtask holds its build recipe (upstream.rs), which must list the module
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
 #   reason    why AOSP's own module is not used
-# Artifacts are not listed: they follow from the provider (cargo-c output, pkg-config).
+# Artifacts are not listed: they follow from the provider (cargo-c output, pkg-config, the upstream recipe's install).
 # Rows are added when their provider exists, or when a build first trips over a module that must not be built.
 
 # bionic is an android build's C library; on glibc the system's libc, kernel headers, libm and libdl take its place (its headers on the include path shadow glibc's)
@@ -55,3 +56,12 @@ reason = "bionic linker namespace API; our libnativeloader owns namespaces"
 ["libvndksupport"]
 provider = "none"
 reason = "vendor SP-HAL loading; ATL has no vendor partition"
+
+# AOSP's external/boringssl is the frozen FIPS branch, still under the OpenSSL licence, which the GPL-3 QEMU bridge's process cannot hold; upstream relicensed to Apache-2.0
+["libcrypto"]
+provider = "upstream:boringssl"
+reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0"
+
+["libssl"]
+provider = "upstream:boringssl"
+reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0"

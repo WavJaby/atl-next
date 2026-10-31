@@ -34,6 +34,7 @@ func main() {
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
+	providedFile := flag.String("provided", "", "JSON file: module -> {lib, cflags} of modules built outside the tree (providers.toml `upstream:`, provided.go)")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
@@ -52,7 +53,12 @@ func main() {
 			omitted[m] = true
 		}
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, flag.Args()); err != nil {
+	provided, err := readProvided(*providedFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
+		os.Exit(1)
+	}
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits}, Tools{*cc, *cxx, *ar, *bison, *flex}, javaSetup{jt, *release, *measure}, omitted, provided, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -65,7 +71,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -74,7 +80,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err != nil {
 		return err
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
 		mods, problems := ev.modules(files)
@@ -92,7 +98,11 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 	}
 	// providers.toml's own check cannot see the tree; this one can
-	for m := range omit {
+	names := sortedKeys(omit)
+	for m := range provided {
+		names = append(names, m)
+	}
+	for _, m := range names {
 		if len(g.mods[Device][m])+len(g.mods[Host][m]) == 0 {
 			g.problem("providers.toml: %s names no module in the tree", m)
 		}

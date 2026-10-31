@@ -35,6 +35,15 @@ arch = "clang"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# CMake only for upstream BoringSSL (CLAUDE.md); its CMakeLists.txt needs 3.22
+[cmake]
+debian = "cmake"
+arch = "cmake"
+min = "3.22"
+min_reason = "BoringSSL CMakeLists.txt: cmake_minimum_required(VERSION 3.22)"
+scope = ["build"]
+used_by = ["upstream:boringssl"]
+
 [flex]
 debian = "flex"
 arch = "flex"

@@ -299,6 +299,10 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	libs = append(libs, "-Wl,--start-group")
 	for _, d := range closure {
 		addShared(d.deps.shared)
+		// a static_libs entry the provider supplies as a shared object (provided.go)
+		if d.kind == Shared {
+			addShared([]*Node{d})
+		}
 		if !whole[d] && d.kind == Static {
 			libs = append(libs, d.out)
 			inputs = append(inputs, d.out)

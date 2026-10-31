@@ -17,6 +17,23 @@
 [artifact.runtime]
 allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
 
+[upstream.boringssl]
+# BoringSSL's LICENSE is the Apache License 2.0; its one other licence (Go's, "parts of the TLS test suite") covers ssl/test/runner, which libcrypto/libssl never compile.
+# Header-less files (gen/ perlasm output, third_party/fiat, a few internal headers) fall under it.
+unlabelled = "Apache-2.0"
+
+[upstream.boringssl.paths."crypto/chacha/chacha.cc"]
+licence = "Apache-2.0"
+reason = "Apache-2.0 header; the added note that it is adapted from public-domain eSTREAM code is not a licence notice the phrase rules accept"
+
+[upstream.boringssl.paths."crypto/curve25519/"]
+licence = "Apache-2.0"
+reason = "Apache-2.0 header; the added note that parts come from public-domain SUPERCOP ref10 is not a licence notice the phrase rules accept"
+
+[upstream.boringssl.paths."crypto/poly1305/"]
+licence = "Apache-2.0"
+reason = "Apache-2.0 header; the added note that poly1305-donna is public domain is not a licence notice the phrase rules accept"
+
 [upstream.qemu]
 # QEMU's LICENSE: "Source files with no licensing information are released under the GNU General
 # Public License, version 2 or (at your option) any later version."
