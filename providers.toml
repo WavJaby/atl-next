@@ -5,12 +5,13 @@
 # Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree).
 #   provider  crate:<workspace crate>   our Rust crate, built with cargo-c into the prefix
 #             upstream:<sources.toml>   a git upstream built by its own build system into <out>/upstream/<name>/prefix by `xtask native`, before the converter; xtask holds its build recipe (upstream.rs), which must list the module
+#             system:<deps.toml row>    a host system library, linked as installed; the row needs `pkgconfig` and `used_by` containing `upstream:aosp`. `xtask native` resolves it with pkg-config (system.rs): its one `-l` library found in its `-L` dirs then its `libdir` (`lib<name>.so`), its `-I` dirs, its `-D` defines; anything else fails the run
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
 #   reason    why AOSP's own module is not used
 #   srcs      optional: only these sources of the module (paths relative to its directory, as its Android.bp writes them; no globs) are replaced, the rest is still built from AOSP source. `none` drops them; any other provider is linked into the module first, for their symbols.
 #             The converter fails when a listed file is not one of the module's sources at the pin (where the goals build it; elsewhere, when the file does not exist).
-# Artifacts are not listed: they follow from the provider (cargo-c output, the upstream recipe's install).
-# `crate:` and `upstream:` modules are provided: `xtask native` builds them before the converter and hands it one entry per module (<out>/provided.json: artifact, include dirs, defines); dependents link the artifact first and get the headers as -isystem.
+# Artifacts are not listed: they follow from the provider (cargo-c output, the upstream recipe's install, pkg-config).
+# `crate:`, `upstream:` and `system:` modules are provided: `xtask native` builds or resolves them before the converter and hands it one entry per module (<out>/provided.json: artifact, include dirs, defines); dependents link the artifact first and get the headers as -isystem. The tree module's export_header_lib_headers still reach dependents as the tree exports them (an -I is searched before every -isystem).
 # Rows are added when their provider exists, or when a build first trips over a module that must not be built.
 
 # bionic is an android build's C library; on glibc the system's libc, kernel headers, libm and libdl take its place (its headers on the include path shadow glibc's)
@@ -62,6 +63,29 @@ reason = "Zygote's seccomp policy; only the Zygote JNI uses it (excluded from li
 ["libvndksupport"]
 provider = "crate:atl-vndksupport"
 reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace, so AOSP's fallback dlopen/dlclose is the whole behaviour"
+
+# GL and Vulkan loaders: the host's (libglvnd dispatching to Mesa, the Khronos Vulkan loader), owner decision 2026-10-31.
+# Headers stay AOSP's (gl_headers, vulkan_headers, through the tree modules' export_header_lib_headers): the Khronos registry headers the pinned AOSP code is written against (hwui uses EGL_TELEMETRY_HINT_ANDROID, absent from Debian 13's 2021 eglext.h); the Khronos ABI only grows, so they declare the host library correctly.
+# AOSP's libEGL_getProcAddress is a static helper of AOSP's libEGL alone: no row, nothing else links it.
+["libEGL"]
+provider = "system:egl"
+reason = "AOSP's GL loaders keep their dispatch tables in bionic's TLS_SLOT_OPENGL_API via __get_tls() (opengl/libs/hooks.h, bionic/tls.h), which on glibc is glibc's own thread block; it loads drivers only as Android EGL HALs. The host libEGL loads the desktop's driver"
+
+["libGLESv1_CM"]
+provider = "system:glesv1-cm"
+reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES_CM/gl.cpp) into AOSP's libEGL; the host's GLESv1_CM dispatches into the host libEGL"
+
+["libGLESv2"]
+provider = "system:glesv2"
+reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES2/gl2.cpp) into AOSP's libEGL; the host's GLESv2 dispatches into the host libEGL"
+
+["libGLESv3"]
+provider = "system:glesv2"
+reason = "AOSP's libGLESv3 is libGLESv2's sources under a second name (same TLS dispatch); on the desktop libGLESv2 carries the ES 3.x entry points (glesv2.pc: OpenGL ES v2/v3)"
+
+["libvulkan"]
+provider = "system:vulkan"
+reason = "AOSP's loader finds drivers only as Android HALs (hwvulkan via hw_get_module, sphal namespace via android_dlopen_ext); desktop drivers are Khronos ICDs, found by the Khronos loader, which GTK in the same process loads too: two loaders would export the same vk* symbols into one flat namespace"
 
 # licence: Adobe's DNG SDK carries a DNG-only (field-of-use) patent licence, which GPL-3 forbids and the GPL-3 QEMU bridge shares the process with (licenses.toml `external/dng_sdk/`); RAW/DNG is not shipped
 ["libdng_sdk"]

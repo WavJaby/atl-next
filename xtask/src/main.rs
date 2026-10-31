@@ -26,6 +26,7 @@ mod prune;
 mod soong;
 mod sources;
 mod spdx;
+mod system;
 mod triage;
 mod upstream;
 mod workspace;

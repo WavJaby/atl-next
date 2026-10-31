@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Gate after `xtask native`'s build: the shared libraries providers.toml provides outside the tree (`crate:` and `upstream:` rows) win the process's symbol lookup over the weak fallbacks AOSP code carries for non-bionic builds (libbase's and libcutils' `__system_property_*`, system/libbase/properties.cpp), and nothing in the tree implements their API a second time. Per device artifact:
+//! Gate after `xtask native`'s build: the shared libraries providers.toml provides outside the tree (`crate:`, `upstream:` and `system:` rows) win the process's symbol lookup over the weak fallbacks AOSP code carries for non-bionic builds (libbase's and libcutils' `__system_property_*`, system/libbase/properties.cpp), and nothing in the tree implements their API a second time. Per device artifact:
+//! (System libraries get both rules too: the converter links every provided library first, so the order holds by construction, and the symbol rule is what catches an in-tree module still implementing, say, `egl*` next to the host's libEGL.)
 //! - the provided libraries it needs lead its DT_NEEDED: ld.so searches the executable's needed list breadth first, so provided libraries ahead of every other entry in every list precede every library carrying a fallback;
 //! - every symbol it defines that a provided library exports is weak in a shared library (a strong one would be a second implementation of the provided API), and absent from an executable (an executable's own definition binds before any library's).
 

@@ -89,8 +89,10 @@ impl Step {
                 let consumers = deps::Consumers::new(&workspace, &sources);
                 let deps = deps::load(root, &consumers)?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
-                let providers =
-                    providers::load(root, &providers::Targets::new(&workspace.crates, &sources))?;
+                let providers = providers::load(
+                    root,
+                    &providers::Targets::new(&workspace.crates, &sources, &deps),
+                )?;
                 eprintln!("tables: {} ok ({} rows)", providers::FILE, providers.len());
                 let licenses = licenses::load(root, &consumers.upstreams)?;
                 eprintln!(

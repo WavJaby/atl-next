@@ -3,7 +3,7 @@
 //! (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned
 //! `build/blueprint` (converter.rs), builds the
 //! providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their
-//! recipe), converts the goals' closure into ninja, builds it with `ninja -k 0`, summarises the
+//! recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`, summarises the
 //! failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml
 //! rows the converter finds wrong, and `none` rows a still-built module needs (none_gate.rs). Either
 //! fails the run.
@@ -19,8 +19,8 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
-    arches, converter, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate,
-    providers, sources, triage, upstream, workspace,
+    arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate,
+    providers, sources, system, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -97,7 +97,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .context("building bp2ninja")?;
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
-    let providers = providers::load(root, &providers::Targets::new(&workspace.crates, &sources))?;
+    let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
+    let providers = providers::load(
+        root,
+        &providers::Targets::new(&workspace.crates, &sources, &deps),
+    )?;
     let omit = providers::omitted(&providers).join(",");
     patch::preflight(root, providers::upstreams(&providers))?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
@@ -105,8 +109,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.fetch_missing {
         fetch::add_and_fetch(root, &[])?;
     }
-    // modules built outside the tree, before the converter: it links their artifacts; one entry per module whatever its row kind (crates by cargo-c, upstreams by their own build system)
+    // modules provided outside the tree, before the converter: it links their artifacts; one entry per module whatever its row kind (crates by cargo-c, upstreams by their own build system, system libraries as installed)
     let mut provided = build_crates(root, &out, &providers)?;
+    for (module, row) in providers::systems(&providers) {
+        let pkg = deps[row]
+            .pkgconfig
+            .as_deref()
+            .context("providers.toml checked the pkgconfig")?;
+        let p = system::resolve(row, pkg)?;
+        println!(
+            "native: provided {module} = system {row} (pkg-config {pkg}) -> {}",
+            p.lib.display()
+        );
+        provided.insert(module.to_owned(), p);
+    }
     let toolchain = upstream::Toolchain {
         cc: &args.cc,
         cxx: &args.cxx,

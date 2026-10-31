@@ -51,6 +51,14 @@ min_reason = "BoringSSL CMakeLists.txt: cmake_minimum_required(VERSION 3.22)"
 scope = ["build"]
 used_by = ["upstream:boringssl"]
 
+# providers.toml system: rows (GL/Vulkan loaders): the dev package carries the .pc and the lib<name>.so link name
+[egl]
+debian = "libegl-dev"
+arch = "libglvnd"
+pkgconfig = "egl"
+scope = ["build", "runtime"]
+used_by = ["upstream:aosp"]
+
 [flex]
 debian = "flex"
 arch = "flex"
@@ -62,6 +70,20 @@ debian = "git"
 arch = "git"
 scope = ["build", "test"]
 used_by = ["xtask:aosp", "xtask:check", "xtask:fetch", "xtask:patch"]
+
+[glesv1-cm]
+debian = "libgles-dev"
+arch = "libglvnd"
+pkgconfig = "glesv1_cm"
+scope = ["build", "runtime"]
+used_by = ["upstream:aosp"]
+
+[glesv2]
+debian = "libgles-dev"
+arch = "libglvnd"
+pkgconfig = "glesv2"
+scope = ["build", "runtime"]
+used_by = ["upstream:aosp"]
 
 # Go builds the converter (tools/bp2ninja), the one Go program allowed (CLAUDE.md)
 [go]
@@ -109,12 +131,26 @@ arch = "ninja"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# resolves deps.toml pkgconfig modules: versions (xtask deps) and providers.toml system: rows (xtask native)
+[pkgconf]
+debian = "pkgconf"
+arch = "pkgconf"
+scope = ["build"]
+used_by = ["xtask:deps", "xtask:native"]
+
 [python3-venv]
 debian = "python3-venv"
 # Arch's python package includes venv/ensurepip
 arch = "python"
 scope = ["build"]
 used_by = ["upstream:qemu"]
+
+[vulkan]
+debian = "libvulkan-dev"
+arch = "vulkan-icd-loader"
+pkgconfig = "vulkan"
+scope = ["build", "runtime"]
+used_by = ["upstream:aosp"]
 
 # Soong's .asm rule is yasm (cc/builder.go, a prebuilt there); its -f/-m flags are yasm syntax. libjpeg-turbo's x86 SIMD sources.
 [yasm]
