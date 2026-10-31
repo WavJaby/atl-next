@@ -220,11 +220,17 @@ fn longest_prefix<'a>(
         .map(|(_, e)| e)
 }
 
-/// The leading comment block: comment and blank lines until the first code line.
+/// The leading comment block: comment and blank lines until the first code line. Inside a `/* */` block every line is comment, `*`-prefixed or not.
 fn header(text: &str) -> String {
     let mut out = Vec::new();
+    let mut in_block = false;
     for line in text.lines().take(NOTICE_LINES) {
         let t = line.trim_start();
+        if in_block {
+            in_block = !t.contains("*/");
+            out.push(t);
+            continue;
+        }
         // `#include` / `#define` are code; `# ` and `#!` are comments
         let hash_comment = t == "#" || t.starts_with("# ") || t.starts_with("#!");
         let comment = t.is_empty()
@@ -234,6 +240,10 @@ fn header(text: &str) -> String {
             || hash_comment;
         if !comment {
             break;
+        }
+        // an opening `/*` whose block does not close on this line
+        if let Some(rest) = t.strip_prefix("/*") {
+            in_block = !rest.contains("*/");
         }
         out.push(t);
     }
@@ -323,7 +333,9 @@ fn classify(n: &str) -> Option<String> {
 fn pointer_notice(n: &str) -> Option<String> {
     let has = |p: &str| n.contains(p);
     // ICU 58+: icu/LICENSE is Unicode-3.0, and keeps code from ICU 1.8.1-57.1 (IBM's copyright) under the ICU License
-    if has("license terms of use http www.unicode.org copyright.html") {
+    if has("license terms of use http www.unicode.org copyright.html")
+        || has("license terms of use https www.unicode.org copyright.html")
+    {
         return Some(if has("international business machines") {
             "Unicode-3.0 AND ICU".to_owned()
         } else {
@@ -336,13 +348,36 @@ fn pointer_notice(n: &str) -> Option<String> {
     ) {
         return Some("BSD-3-Clause".to_owned());
     }
-    // freetype/LICENSE.TXT: FTL or GPL-2.0 "(any later version can be used also)", the user's choice
-    if has("under the terms of the freetype project license") {
+    // freetype/LICENSE.TXT: FTL or GPL-2.0 "(any later version can be used also)", the user's choice; Adobe's files add a patent grant to the same licence
+    if has("freetype project license license.txt") {
         return Some("FTL OR GPL-2.0-or-later".to_owned());
     }
     // libjpeg-turbo/LICENSE.md: README.ijg's licence covers libjpeg's code and its modifications
     if has("for conditions of distribution and use see the accompanying readme.ijg file") {
         return Some("IJG".to_owned());
+    }
+    // zlib's files point at zlib.h; libjpeg-turbo's SIMD files at simd/nasm/jsimdext.inc: both carry the zlib licence
+    if has("for conditions of distribution and use see copyright notice in zlib.h")
+        || has("for conditions of distribution and use see copyright notice in jsimdext.inc")
+    {
+        return Some("Zlib".to_owned());
+    }
+    // png.h: PNG Reference Library License version 2 (libpng 1.6.36+), version 1 for the code of 0.5 through 1.6.35
+    if has("this code is released under the libpng license") {
+        return Some("libpng-2.0 AND Libpng".to_owned());
+    }
+    // fmt's headers point at format.h: MIT, plus an optional exception that only waives the notice in object code
+    if has("for the license information refer to format.h") {
+        return Some("MIT".to_owned());
+    }
+    // libogg's (Xiph) wording; Xiph's COPYING is BSD-3-Clause
+    if has("governed by a bsd style source license included with this source in copying") {
+        return Some("BSD-3-Clause".to_owned());
+    }
+    // modp_b64.h; modp_b64.cc carries BSD-3-Clause ("Neither the name of the modp.com ...")
+    // (`_` is a word break after normalize)
+    if has("released under bsd license see modp b64.c for details") {
+        return Some("BSD-3-Clause".to_owned());
     }
     None
 }
@@ -586,6 +621,44 @@ mod tests {
         // libjpeg-turbo/jdapimin.c
         let ijg = "/*\n * jdapimin.c\n *\n * This file was part of the Independent JPEG Group's software:\n * Copyright (C) 1994-1998, Thomas G. Lane.\n * libjpeg-turbo Modifications:\n * Copyright (C) 2016, 2022, D. R. Commander.\n * For conditions of distribution and use, see the accompanying README.ijg\n * file.\n */\n";
         assert_eq!(id(ijg), notice("IJG"));
+    }
+
+    #[test]
+    fn block_comment_lines_without_a_star() {
+        // lzma/C/LzmaDec.c: the notice is the block's second line, not `*`-prefixed
+        let lzma = "/* LzmaDec.c -- LZMA Decoder\n2023-04-07 : Igor Pavlov : Public domain */\n\n#include \"Precomp.h\"\n";
+        assert_eq!(id(lzma), notice("LicenseRef-Public-Domain"));
+        // the block ends at `*/`: a notice after the code that follows is not read
+        let after = "/* x.c\nno notice here */\nint x;\n/* Public domain */\n";
+        assert_eq!(id(after), Identified::NoNotice);
+    }
+
+    #[test]
+    fn more_pointer_notices() {
+        // icu4c/source/common/emojiprops.cpp: https
+        let icu = "// © 2021 and later: Unicode, Inc. and others.\n// License & terms of use: https://www.unicode.org/copyright.html\n\n// emojiprops.cpp\n";
+        assert_eq!(id(icu), notice("Unicode-3.0"));
+        // freetype/src/psaux/psarrst.c (Adobe), abridged after the licence sentence
+        let adobe = "/****************************************************************************\n *\n * psarrst.c\n *\n * Copyright 2007-2013 Adobe Systems Incorporated.\n *\n * This software, and all works of authorship, whether in source or\n * object code form as indicated by the copyright notice(s) included\n * herein (collectively, the \"Work\") is made available, and may only be\n * used, modified, and distributed under the FreeType Project License,\n * LICENSE.TXT.  Additionally, subject to the terms and conditions of the\n * FreeType Project License, each contributor to the Work hereby grants\n */\n";
+        assert_eq!(id(adobe), notice("FTL OR GPL-2.0-or-later"));
+        // zlib/adler32.c
+        let zlib = "/* adler32.c -- compute the Adler-32 checksum of a data stream\n * Copyright (C) 1995-2011, 2016 Mark Adler\n * For conditions of distribution and use, see copyright notice in zlib.h\n */\n\n/* @(#) $Id$ */\n\n#include \"zutil.h\"\n";
+        assert_eq!(id(zlib), notice("Zlib"));
+        // libjpeg-turbo/jsimd.h
+        let simd = "/*\n * jsimd.h\n *\n * Copyright 2009 Pierre Ossman <ossman@cendio.se> for Cendio AB\n *\n * Based on the x86 SIMD extension for IJG JPEG library,\n * Copyright (C) 1999-2006, MIYASAKA Masaru.\n * For conditions of distribution and use, see copyright notice in jsimdext.inc\n *\n */\n";
+        assert_eq!(id(simd), notice("Zlib"));
+        // libpng/png.c
+        let png = "\n/* png.c - location for general purpose libpng functions\n *\n * Copyright (c) 2018-2024 Cosmin Truta\n *\n * This code is released under the libpng license.\n * For conditions of distribution and use, see the disclaimer\n * and license in png.h\n */\n\n#include \"pngpriv.h\"\n";
+        assert_eq!(id(png), notice("libpng-2.0 AND Libpng"));
+        // fmtlib/include/fmt/base.h
+        let fmt = "// Formatting library for C++ - the base API for char/UTF-8\n//\n// Copyright (c) 2012 - present, Victor Zverovich\n// All rights reserved.\n//\n// For the license information refer to format.h.\n\n#ifndef FMT_BASE_H_\n";
+        assert_eq!(id(fmt), notice("MIT"));
+        // speex/include/speex/speexdsp_types.h (from libogg)
+        let ogg = "/* speexdsp_types.h taken from libogg */\n/********************************************************************\n *                                                                  *\n * THIS FILE IS PART OF THE OggVorbis SOFTWARE CODEC SOURCE CODE.   *\n * USE, DISTRIBUTION AND REPRODUCTION OF THIS LIBRARY SOURCE IS     *\n * GOVERNED BY A BSD-STYLE SOURCE LICENSE INCLUDED WITH THIS SOURCE *\n * IN 'COPYING'. PLEASE READ THESE TERMS BEFORE DISTRIBUTING.       *\n *                                                                  *\n ********************************************************************/\n";
+        assert_eq!(id(ogg), notice("BSD-3-Clause"));
+        // modp_b64/modp_b64/modp_b64.h
+        let modp = "/**\n * \\file\n * <PRE>\n * High performance base64 encoder / decoder\n *\n * Copyright &copy; 2005, 2006, Nick Galbreath -- nickg [at] modp [dot] com\n * All rights reserved.\n *\n * Released under bsd license.  See modp_b64.c for details.\n * </pre>\n */\n";
+        assert_eq!(id(modp), notice("BSD-3-Clause"));
     }
 
     #[test]
