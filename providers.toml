@@ -20,7 +20,7 @@ reason = "bionic-internal headers; the system C library replaces bionic"
 
 ["libc"]
 provider = "crate:atl-bionic"
-reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels), its generated headers, and include wrappers giving glibc's headers bionic's include shape"
+reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels, fdsan level), its generated headers, include wrappers giving glibc's headers bionic's include shape, and substitutes for bionic-only headers that mean the same on glibc"
 
 ["libc_headers"]
 provider = "none"

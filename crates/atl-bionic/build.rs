@@ -10,7 +10,8 @@
 //!
 //! - `OUT_DIR/capi/include/<header>`, also: include wrappers giving the host libc's headers bionic's
 //!   header shape (`atl_bridgegen::shape`), installed with the declarations, so they reach exactly the
-//!   units that see bionic's headers. Each must add no error to its host header, as C and C++.
+//!   units that see bionic's headers, and substitutes for the bionic-only headers in `SUBSTITUTES`. Each
+//!   must add no error to its host header (a substitute: compile alone), as C and C++.
 //!   `OUT_DIR/shape_gaps.txt`: what they leave different (names bionic's private files bring in).
 //!
 //! Generates twice and fails unless byte-identical.
@@ -98,6 +99,17 @@ const APIS: &[Api] = &[
             macros: &["async_safe_fatal"],
         },
     },
+    // what the native closure calls of fdsan (2026-10-31: libsfplugin_ccodec C2NodeImpl.cpp)
+    Api {
+        name: "fdsan",
+        source: "bionic/libc/include/android/fdsan.h",
+        lang: Lang::C,
+        header: Some("android/fdsan.h"),
+        functions: &["android_fdsan_set_error_level"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
 ];
 
 /// bionic's property-area implementation and the headers holding its layouts.
@@ -138,8 +150,16 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 
 /// bionic macros the host lacks and AOSP code uses without defining them, defined where bionic's headers
 /// bring them in: `__unused` (`sys/cdefs.h`; bpf's KernelUtils.h, libtimeinstate), `IS_ELF` (`elf.h`
-/// via `bits/elf_common.h`; libc_malloc_debug_backtrace MapData.cpp).
-const FORWARDED_MACROS: &[&str] = &["__unused", "IS_ELF"];
+/// via `bits/elf_common.h`; libc_malloc_debug_backtrace MapData.cpp), `GID_MAX` (`limits.h`, `UINT_MAX`:
+/// glibc's `gid_t` is the same `unsigned int`; libpackagelistparser), `__LIBC_HIDDEN__` (`sys/cdefs.h`,
+/// hidden visibility; bionic's `resolv_netid.h` as libandroid_net includes it).
+const FORWARDED_MACROS: &[&str] = &["__unused", "IS_ELF", "GID_MAX", "__LIBC_HIDDEN__"];
+
+/// bionic-only public headers AOSP code includes, generated whole (`shape::Inputs::substitutes`); each
+/// row reviewed to mean the same on glibc. `sys/limits.h` is `<limits.h>` (libandroid_net net.c);
+/// `sys/endian.h` is byte-order macros over compiler builtins, its `htonl` family the host's
+/// (libmediametrics ItemSerialize-*.cpp).
+const SUBSTITUTES: &[&str] = &["sys/endian.h", "sys/limits.h"];
 
 /// Generated files: path relative to OUT_DIR -> text.
 type Outputs = Vec<(PathBuf, String)>;
@@ -311,6 +331,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64) -> Result<ShapeOut> {
         uapi: &uapi,
         homes: HOMES,
         macros: FORWARDED_MACROS,
+        substitutes: SUBSTITUTES,
         scan: &scan,
     })?;
     shape::check_guards(derived.wrappers.keys())?;
@@ -318,7 +339,9 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64) -> Result<ShapeOut> {
         .wrappers
         .iter()
         .map(|(name, w)| {
-            let source = if bionic.contains_key(name) {
+            let source = if w.substitute {
+                format!("{BIONIC_INCLUDE}/{name}")
+            } else if bionic.contains_key(name) {
                 format!("{BIONIC_INCLUDE}/{name} and the host's <{name}>")
             } else {
                 format!("the host's <{name}>")

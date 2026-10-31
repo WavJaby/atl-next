@@ -9,6 +9,7 @@
 //!   `ENOENT` until atld's property service exists. `image` builds area files.
 //! - `android_get_device_api_level` (`ro.build.version.sdk`), the application target SDK and its setter.
 //! - libasync_safe's no-allocation formatting and logging (`async_safe`): what AOSP code built here calls.
+//! - fdsan's error level (`fdsan`); glibc checks no descriptor owner, so it never reports.
 //!
 //! Built as one shared library per process (cargo-c), so one store and one target SDK. Boundary crate:
 //! `unsafe` only in `ffi` (the C ABI shells) and `map` (the shared mapping); they call safe code.
@@ -28,6 +29,9 @@ mod generated {
     pub mod async_safe {
         include!(concat!(env!("OUT_DIR"), "/async_safe.rs"));
     }
+    pub mod fdsan {
+        include!(concat!(env!("OUT_DIR"), "/fdsan.rs"));
+    }
     /// bionic's property-area format: record layouts and constants.
     pub mod prop_format {
         include!(concat!(env!("OUT_DIR"), "/prop_area.rs"));
@@ -35,6 +39,7 @@ mod generated {
 }
 
 pub mod async_safe;
+pub mod fdsan;
 #[allow(unsafe_code)]
 mod ffi;
 pub mod image;

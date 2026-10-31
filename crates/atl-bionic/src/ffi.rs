@@ -165,6 +165,12 @@ pub extern "C" fn android_set_application_target_sdk_version(target: c_int) {
     sdk::set_target_sdk(target);
 }
 
+/// `enum android_fdsan_error_level` travels as its underlying `unsigned int`.
+#[unsafe(no_mangle)]
+pub extern "C" fn android_fdsan_set_error_level(new_level: u32) -> u32 {
+    crate::fdsan::set_error_level(new_level)
+}
+
 // libasync_safe. A format's arguments are the caller's printf contract; a null format or tag, where
 // bionic would crash, is refused (-1; `fatal` formats nothing).
 

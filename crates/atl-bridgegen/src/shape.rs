@@ -24,6 +24,15 @@
 //! files (`<elf.h>` -> `bits/elf_common.h`); host headers that use such a name as an identifier are
 //! wrapped to hide it (bionic renames those kernel fields).
 //!
+//! Substitutes (`substitutes`): bionic-only public headers (the host has none) whose content means the
+//! same on the host, generated whole -- no `#include_next`; the same includes, homes and gaps with the
+//! header itself walked as its first private file; every macro it and its private files define that the
+//! host lacks, as bionic writes it, with the bionic-only macros their bodies name (`__BIONIC_CAST`).
+//! Listed, not derived: whether a bionic macro means the same on glibc is not decidable from the headers
+//! (`sys/sysconf.h`'s `_SC_NSIG 0x9e` is a bionic `sysconf` argument). Refused when the header declares
+//! anything else no host header does (bionic-only API: `buildscript::Api` implements it) or a host
+//! header uses one of its macros as an identifier without defining it the same way.
+//!
 //! Known excess: a glibc header including `x` where bionic's does not (`sys/types.h` -> `sys/select.h`)
 //! now also gets the wrapper's additions to `x`.
 
@@ -60,6 +69,8 @@ pub struct Inputs<'a> {
     pub homes: &'a [(&'a str, &'a str)],
     /// bionic macros the host lacks, defined in the wrapper of each public bionic header bringing them in.
     pub macros: &'a [&'a str],
+    /// bionic-only public headers generated whole. Each must be a usable bionic header the host lacks.
+    pub substitutes: &'a [&'a str],
     /// Host headers outside the probes the clash scan reads (the host's kernel uapi), by include name.
     pub scan: &'a BTreeMap<String, PathBuf>,
 }
@@ -67,6 +78,8 @@ pub struct Inputs<'a> {
 /// One generated header.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Wrapper {
+    /// The host has no such header: a substitute, nothing to `#include_next`.
+    pub substitute: bool,
     /// Macros hidden around the host header (it uses them as identifiers).
     pub hidden: BTreeSet<String>,
     /// Macro definitions as bionic writes them (`NAME body`).
@@ -180,30 +193,66 @@ fn walk(inputs: &Inputs, probe: &Probe, host_has: &dyn Fn(&str) -> bool) -> Resu
 }
 
 /// The shape. Fails on an unneeded or insufficient home, or a forwarded macro the host already has, no
-/// public bionic header the host also has brings in, or bionic defines two ways.
+/// public bionic header the host also has brings in, or bionic defines two ways; on a substitute the host
+/// has, bionic lacks or that does not substitute (`substitute_macros`).
 pub fn derive(inputs: &Inputs) -> Result<Shape> {
     let host_has = |n: &str| inputs.host.get(n).is_some_and(Probe::usable);
     let host_all: BTreeSet<&String> = inputs.host.values().flat_map(visible).collect();
     let mut out: BTreeMap<String, Wrapper> = BTreeMap::new();
     let mut homes_used = BTreeSet::new();
     let mut gaps = Vec::new();
+    for s in inputs.substitutes {
+        ensure!(
+            !host_has(s),
+            "the host has <{s}>: drop it from the substitutes"
+        );
+        ensure!(
+            inputs.bionic.get(*s).is_some_and(Probe::usable),
+            "substitute <{s}>: bionic has no usable such public header"
+        );
+    }
+    let host_text = if inputs.substitutes.is_empty() {
+        HostText::default()
+    } else {
+        HostText::read(inputs)?
+    };
 
     for (name, bionic) in inputs.bionic {
-        if !bionic.usable() || !host_has(name) {
+        if !bionic.usable() {
             continue;
         }
-        let host = &inputs.host[name];
-        let host_reached = reached_names(name, host);
+        let host = inputs.host.get(name).filter(|p| p.usable());
+        if host.is_none() && !inputs.substitutes.contains(&name.as_str()) {
+            continue;
+        }
+        let host_reached = host.map_or_else(
+            || BTreeSet::from([name.as_str()]),
+            |h| reached_names(name, h),
+        );
         let walk = walk(inputs, bionic, &host_has)?;
         let mut extras: BTreeSet<String> = walk
             .includable
             .into_iter()
             .filter(|n| n != name && !host_reached.contains(n.as_str()))
             .collect();
-        let mut seen: BTreeSet<&String> = visible(host)
+        let mut seen: BTreeSet<&String> = host
+            .into_iter()
+            .flat_map(visible)
             .chain(extras.iter().flat_map(|e| visible(&inputs.host[e])))
             .collect();
-        for (label, file) in walk.private {
+        let root = bionic
+            .file
+            .as_ref()
+            .context("usable probe without a file")?;
+        // a substitute's own names are walked as a private file's: the host declares them elsewhere
+        let own = host.is_none().then(|| (name.clone(), root.clone()));
+        let files: Vec<(String, PathBuf)> = own.into_iter().chain(walk.private).collect();
+        let defines = if host.is_none() {
+            substitute_macros(inputs, name, bionic, &files, &host_all, &host_text)?
+        } else {
+            Vec::new()
+        };
+        for (label, file) in files {
             let needed: BTreeSet<&String> = bionic.files[&file]
                 .names
                 .iter()
@@ -237,7 +286,17 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             extras.insert(home.to_owned());
         }
         let includes = reduce(&extras, inputs.host);
-        if !includes.is_empty() {
+        if host.is_none() {
+            out.insert(
+                name.clone(),
+                Wrapper {
+                    substitute: true,
+                    includes,
+                    defines,
+                    ..Wrapper::default()
+                },
+            );
+        } else if !includes.is_empty() {
             out.entry(name.clone()).or_default().includes = includes;
         }
     }
@@ -272,6 +331,135 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         wrappers: out,
         gaps,
     })
+}
+
+/// What the host headers' text says, for a substitute's macros: every identifier they use, and every
+/// macro definition they write (`NAME body`, whitespace collapsed).
+#[derive(Default)]
+struct HostText {
+    idents: BTreeSet<String>,
+    defines: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl HostText {
+    /// Every header the clash scan reads (`scanned`).
+    fn read(inputs: &Inputs) -> Result<Self> {
+        let mut out = Self::default();
+        for path in scanned(inputs).values() {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            out.idents.extend(identifiers(&text).map(str::to_owned));
+            let joined = text.replace("\\\n", " ");
+            for line in joined.lines() {
+                let Some(rest) = line.trim_start().strip_prefix('#') else {
+                    continue;
+                };
+                let Some(def) = rest.trim_start().strip_prefix("define") else {
+                    continue;
+                };
+                if !def.starts_with(char::is_whitespace) {
+                    continue;
+                }
+                let def = collapse(def);
+                if let Some(name) = macro_name(&def) {
+                    out.defines
+                        .entry(name.to_owned())
+                        .or_default()
+                        .insert(def.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Defining `def` (`NAME body`) would change what a host header means: it uses the name and does
+    /// not define it exactly so itself (the kernel's `__LITTLE_ENDIAN_BITFIELD` is bionic's too).
+    fn clashes(&self, def: &str) -> bool {
+        let Some(name) = macro_name(def) else {
+            return false;
+        };
+        self.idents.contains(name)
+            && self
+                .defines
+                .get(name)
+                .is_none_or(|d| d.len() != 1 || !d.contains(&collapse(&def.replace("\\\n", " "))))
+    }
+}
+
+/// Whitespace runs as one space, trimmed.
+fn collapse(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The name of a definition `NAME body` / `NAME(args) body`.
+fn macro_name(def: &str) -> Option<&str> {
+    def.split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .filter(|n| !n.is_empty())
+}
+
+/// A substitute's macros: those `files` (the header, its private files) define that no host header
+/// does, plus the bionic-only macros their bodies name, defined in any of bionic's own files `probe`
+/// reaches (not the compiler's `limits.h`, which bionic's redefines); by name. Fails when the header
+/// provides more than macros the host lacks, or one of them clashes (`HostText::clashes`).
+fn substitute_macros(
+    inputs: &Inputs,
+    name: &str,
+    probe: &Probe,
+    files: &[(String, PathBuf)],
+    host_all: &BTreeSet<&String>,
+    host: &HostText,
+) -> Result<Vec<String>> {
+    let mut defined: BTreeMap<&str, &str> = BTreeMap::new();
+    let own = probe
+        .files
+        .iter()
+        .filter(|(f, _)| f.starts_with(inputs.bionic_include));
+    for (_, r) in own {
+        for (m, def) in &r.macros {
+            if let Some(other) = defined.insert(m, def) {
+                ensure!(
+                    other == def,
+                    "<{name}>: bionic defines {m} two ways: {other:?}, {def:?}"
+                );
+            }
+        }
+    }
+    let mut api = BTreeSet::new();
+    let mut todo = Vec::new();
+    for (_, file) in files {
+        let reached = &probe.files[file];
+        for n in reached.names.iter().filter(|n| !host_all.contains(n)) {
+            if reached.macros.contains_key(n) {
+                todo.push(n.as_str());
+            } else {
+                api.insert(n.clone());
+            }
+        }
+    }
+    let mut defs: BTreeMap<&str, &str> = BTreeMap::new();
+    while let Some(m) = todo.pop() {
+        if defs.contains_key(m) || host_all.contains(&m.to_owned()) {
+            continue;
+        }
+        let def = defined[m];
+        defs.insert(m, def);
+        todo.extend(identifiers(def).filter(|i| defined.contains_key(i)));
+    }
+    ensure!(
+        api.is_empty(),
+        "substitute <{name}> declares bionic-only API the host lacks (atl-bionic implements it as an Api, or drop the substitute): {api:?}"
+    );
+    let clashes: Vec<&str> = defs
+        .iter()
+        .filter(|(_, d)| host.clashes(d))
+        .map(|(m, _)| *m)
+        .collect();
+    ensure!(
+        clashes.is_empty(),
+        "substitute <{name}>: host headers use its macros {clashes:?} as identifiers"
+    );
+    Ok(defs.into_values().map(str::to_owned).collect())
 }
 
 /// Host headers declaring every one of `needed`, fewest files reached first.
@@ -375,42 +563,59 @@ fn scanned(inputs: &Inputs) -> BTreeMap<String, PathBuf> {
 /// `ident` occurs in C source `text` as an identifier: outside comments and string / character
 /// literals, not part of a longer identifier.
 pub fn uses_identifier(text: &str, ident: &str) -> bool {
+    identifiers(text).any(|i| i == ident)
+}
+
+/// The identifiers of C source `text`, in order: outside comments and string / character literals.
+/// Number tokens come out too (`1234`, `1u`); they never equal an identifier.
+pub fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let b = text.as_bytes();
     let word = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
     let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                i = text[i..].find('\n').map_or(b.len(), |n| i + n);
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i = text[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
-            }
-            q @ (b'"' | b'\'') => {
-                i += 1;
-                while i < b.len() && b[i] != q && b[i] != b'\n' {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
+    std::iter::from_fn(move || {
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i = text[i..].find('\n').map_or(b.len(), |n| i + n);
                 }
-                i += 1;
-            }
-            c if word(c) => {
-                let start = i;
-                while i < b.len() && word(b[i]) {
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i = text[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+                }
+                q @ (b'"' | b'\'') => {
+                    i += 1;
+                    while i < b.len() && b[i] != q && b[i] != b'\n' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
                     i += 1;
                 }
-                if &text[start..i] == ident {
-                    return true;
+                c if word(c) => {
+                    let start = i;
+                    while i < b.len() && word(b[i]) {
+                        i += 1;
+                    }
+                    return Some(&text[start..i]);
                 }
+                _ => i += 1,
             }
-            _ => i += 1,
         }
-    }
-    false
+        None
+    })
 }
 
 /// The wrapper's text. `source`: what generated text names as its origin.
 pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
     let mut out = format!("// generated by atl-bridgegen from {source}, do not edit\n");
+    if w.substitute {
+        // bionic's header whole, once, from host headers
+        let guard = guard(name);
+        writeln!(out, "#ifndef {guard}\n#define {guard}")?;
+        for i in &w.includes {
+            writeln!(out, "#include <{i}>")?;
+        }
+        print_defines(&mut out, &w.defines)?;
+        writeln!(out, "#endif")?;
+        return Ok(out);
+    }
     for m in &w.hidden {
         writeln!(out, "#pragma push_macro(\"{m}\")\n#undef {m}")?;
     }
@@ -418,13 +623,7 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
     for m in w.hidden.iter().rev() {
         writeln!(out, "#pragma pop_macro(\"{m}\")")?;
     }
-    for def in &w.defines {
-        let m = def
-            .split(|c: char| c == '(' || c.is_whitespace())
-            .next()
-            .context("empty macro definition")?;
-        writeln!(out, "#ifndef {m}\n#define {def}\n#endif")?;
-    }
+    print_defines(&mut out, &w.defines)?;
     if !w.includes.is_empty() {
         // once: the host header itself may be included again (assert.h), its additions need not
         let guard = guard(name);
@@ -435,6 +634,15 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
         writeln!(out, "#endif")?;
     }
     Ok(out)
+}
+
+/// Each definition (`NAME body`) unless the name is defined already.
+fn print_defines(out: &mut String, defines: &[String]) -> Result<()> {
+    for def in defines {
+        let m = macro_name(def).context("empty macro definition")?;
+        writeln!(out, "#ifndef {m}\n#define {def}\n#endif")?;
+    }
+    Ok(())
 }
 
 /// Include guard of a wrapper's additions: the name, every other character `_`. Injective over the
@@ -483,6 +691,7 @@ mod tests {
             hidden: ["__unused".to_owned()].into(),
             defines: vec!["__unused __attribute__((__unused__))".to_owned()],
             includes: vec!["stddef.h".to_owned()],
+            ..Wrapper::default()
         };
         let text = print("sys/x.h", &w, "test").unwrap();
         // hidden around the host header only; additions once, after it
@@ -491,6 +700,18 @@ mod tests {
             "// generated by atl-bridgegen from test, do not edit\n#pragma push_macro(\"__unused\")\n#undef __unused\n#include_next <sys/x.h>\n#pragma pop_macro(\"__unused\")\n#ifndef __unused\n#define __unused __attribute__((__unused__))\n#endif\n#ifndef __ATL_BIONIC_SHAPE_sys_x_h\n#define __ATL_BIONIC_SHAPE_sys_x_h\n#include <stddef.h>\n#endif\n"
         );
         assert!(check_guards(["a/b.h".to_owned(), "a_b.h".to_owned()].iter()).is_err());
+
+        // a substitute: no host header to include, everything once
+        let s = Wrapper {
+            substitute: true,
+            defines: vec!["_M 1".to_owned()],
+            includes: vec!["limits.h".to_owned()],
+            ..Wrapper::default()
+        };
+        assert_eq!(
+            print("sys/x.h", &s, "test").unwrap(),
+            "// generated by atl-bridgegen from test, do not edit\n#ifndef __ATL_BIONIC_SHAPE_sys_x_h\n#define __ATL_BIONIC_SHAPE_sys_x_h\n#include <limits.h>\n#ifndef _M\n#define _M 1\n#endif\n#endif\n"
+        );
     }
 
     use crate::Target;
@@ -507,7 +728,10 @@ mod tests {
     /// includes `y.h` and declares `q`, the host's in `q.h` and `z.h`), and a uapi header; its
     /// `sys/cdefs.h` defines `__mac`, which the host's `k/u.h` uses as a field name; `bits/p.h` defines
     /// `__pm(x)`. bionic's `q.h` and `z.h` exist so the host's are probed; bionic's `q.h` reaches `y.h`,
-    /// which the host's lacks.
+    /// which the host's lacks. bionic-only headers: `o.h` includes `x.h` and defines `__om` in terms of
+    /// `__oc` from its `sys/cdefs.h`; `f.h` declares a function; `c.h` defines a macro in terms of
+    /// `__mac`; `e.h` defines `__kb` as `k/u.h` does, `d.h` defines `__kd` other than `k/u.h`, which
+    /// uses both.
     fn libcs(tag: &str) -> Tmp {
         let root = std::env::temp_dir().join(format!("atl-shape-{tag}-{}", std::process::id()));
         let files: &[(&str, &str)] = &[
@@ -517,8 +741,16 @@ mod tests {
             ),
             (
                 "bionic/sys/cdefs.h",
-                "#define __mac __attribute__((unused))\n",
+                "#define __mac __attribute__((unused))\n#define __oc(v) ((v) + 1)\n",
             ),
+            (
+                "bionic/o.h",
+                "#include <sys/cdefs.h>\n#include <x.h>\nint x;\n#define __om(v) __oc(v)\n",
+            ),
+            ("bionic/f.h", "int f_only(void);\n"),
+            ("bionic/c.h", "#include <sys/cdefs.h>\n#define __cm __mac\n"),
+            ("bionic/e.h", "#define __kb\n"),
+            ("bionic/d.h", "#define __kd 2\n"),
             ("bionic/x.h", "int x;\n"),
             ("bionic/y.h", "int y;\n"),
             (
@@ -534,7 +766,10 @@ mod tests {
             ("host/y.h", "int y;\n"),
             ("host/q.h", "int q;\n"),
             ("host/z.h", "int q;\nint z;\n"),
-            ("host/k/u.h", "struct s { int __mac; };\n"),
+            (
+                "host/k/u.h",
+                "struct s { int __mac; };\n#  define  __kb\n#define __kd 1\n#if defined(__kb) && __kd\n#endif\n",
+            ),
         ];
         for (rel, text) in files {
             let path = root.join(rel);
@@ -555,15 +790,32 @@ mod tests {
     }
 
     fn derived(dir: &Tmp, homes: &[(&str, &str)]) -> Result<Shape> {
-        derived_with(dir, homes, &["__mac", "__pm"])
+        derived_with(dir, homes, &["__mac", "__pm"], &["e.h", "o.h"])
     }
 
-    fn derived_with(dir: &Tmp, homes: &[(&str, &str)], macros: &[&str]) -> Result<Shape> {
+    fn derived_with(
+        dir: &Tmp,
+        homes: &[(&str, &str)],
+        macros: &[&str],
+        substitutes: &[&str],
+    ) -> Result<Shape> {
         let include = dir.0.join("bionic");
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
         let host_t = sysroot(&[dir.0.join("host")]);
-        let public = ["q.h", "sys/cdefs.h", "w.h", "x.h", "y.h", "z.h"];
+        let public = [
+            "c.h",
+            "d.h",
+            "e.h",
+            "f.h",
+            "o.h",
+            "q.h",
+            "sys/cdefs.h",
+            "w.h",
+            "x.h",
+            "y.h",
+            "z.h",
+        ];
         let bionic = front::probe_includes(Lang::C, &bionic_t, &public)?;
         let names: Vec<String> = host_names(&bionic, &include, &uapi, homes)
             .into_iter()
@@ -578,6 +830,7 @@ mod tests {
             uapi: &uapi,
             homes,
             macros,
+            substitutes,
             scan: &scan,
         })
     }
@@ -610,10 +863,42 @@ mod tests {
         let pm = strings(&["__pm(x) ((x) + \\\n  1)"]);
         assert_eq!(with_home.wrappers["w.h"].defines, pm);
         assert_eq!(with_home.wrappers["q.h"].defines, pm);
-        assert_eq!(with_home.wrappers.len(), 4);
+        // substitute o.h: its includes and its macros with the bionic-only one they name; e.h's macro
+        // the host's k/u.h uses but defines the same way
+        assert_eq!(
+            with_home.wrappers["o.h"],
+            Wrapper {
+                substitute: true,
+                includes: strings(&["sys/cdefs.h", "x.h"]),
+                defines: strings(&["__oc(v) ((v) + 1)", "__om(v) __oc(v)"]),
+                ..Wrapper::default()
+            }
+        );
+        assert_eq!(with_home.wrappers["e.h"].defines, strings(&["__kb"]));
+        // unlisted bionic-only headers get nothing
+        assert_eq!(with_home.wrappers.len(), 6);
+        let home = &[("bits/p.h", "q.h")];
+        let forwarded = &["__mac", "__pm"];
+        // refused substitutes: bionic-only API (f.h); a macro needing __mac, a k/u.h field name (c.h);
+        // a macro k/u.h defines otherwise (d.h); one the host has (x.h); one bionic lacks
+        for (s, why) in [
+            ("f.h", "bionic-only API the host lacks"),
+            ("c.h", "[\"__mac\"] as identifiers"),
+            ("d.h", "[\"__kd\"] as identifiers"),
+            ("x.h", "the host has <x.h>"),
+            ("none.h", "bionic has no usable"),
+        ] {
+            let err = derived_with(&dir, home, forwarded, &[s])
+                .err()
+                .map(|e| e.to_string());
+            assert!(
+                err.as_ref().is_some_and(|e| e.contains(why)),
+                "{s}: {err:?}"
+            );
+        }
         // a macro the host defines, or no bionic header brings in, is refused
-        assert!(derived_with(&dir, &[("bits/p.h", "q.h")], &["q"]).is_err());
-        assert!(derived_with(&dir, &[("bits/p.h", "q.h")], &["__nowhere"]).is_err());
+        assert!(derived_with(&dir, home, &["q"], &[]).is_err());
+        assert!(derived_with(&dir, home, &["__nowhere"], &[]).is_err());
         assert!(with_home.gaps.is_empty());
 
         // without the home: reported, with both host headers declaring q (one file each, by name);
