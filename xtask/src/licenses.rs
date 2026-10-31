@@ -203,10 +203,7 @@ pub fn load(root: &Path, upstreams: &BTreeSet<String>) -> Result<Licenses> {
     let mut licenses = parse(&text, upstreams).with_context(|| format!("in {FILE}"))?;
     let deny = std::fs::read_to_string(root.join("deny.toml")).context("reading deny.toml")?;
     check_deny(&licenses, &deny).context("deny.toml against licenses.toml")?;
-    licenses.aosp_index.file = Some(crate::aosp::index_file(
-        root,
-        &sources::load(root)?.aosp,
-    )?);
+    licenses.aosp_index.file = Some(crate::aosp::index_file(root, &sources::load(root)?.aosp)?);
     Ok(licenses)
 }
 
@@ -395,7 +392,8 @@ mod tests {
         let gpl3 = "GPL-3 only `WITH`";
         assert!(err("[artifact.runtime]\nallow = [\"GPL-3.0-or-later\"]\n").contains(gpl3));
         assert!(err("[artifact.runtime]\nallow = [\"AGPL-3.0-only\"]\n").contains(gpl3));
-        let text = "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH Autoconf-exception-3.0\"]\n";
+        let text =
+            "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH Autoconf-exception-3.0\"]\n";
         assert!(err(text).contains(gpl3));
         // libgcc_s and Bison parsers: GPL-3 with an exception that frees their users
         let text = "[artifact.runtime]\nallow = [\"GPL-3.0-or-later WITH GCC-exception-3.1\", \
@@ -445,7 +443,8 @@ mod tests {
         assert!(!allows("LicenseRef-Adobe-DNG-SDK"));
         assert!(licenses.allows("qemu-bridge", "MIT").is_err());
         // FreeType's dual licence passes through its FTL arm alone; GPL-2.0-or-later is never needed
-        let text = "[artifact.runtime]\nallow = [\"FTL\", \"GPL-2.0-only WITH Linux-syscall-note\"]\n";
+        let text =
+            "[artifact.runtime]\nallow = [\"FTL\", \"GPL-2.0-only WITH Linux-syscall-note\"]\n";
         let licenses = parse(text, &upstreams()).unwrap();
         let allows = |e: &str| licenses.allows(RUNTIME, e).unwrap();
         assert!(allows("FTL OR GPL-2.0-or-later"));
@@ -525,7 +524,11 @@ mod tests {
         let mut licenses = parse(RUNTIME_MIT, &upstreams()).unwrap();
         // build/soong/licenses' shared module; a second `l` elsewhere is not the one external/x means
         licenses.aosp_index = AospIndex::of(crate::aosp::Index::of_licenses(&[
-            ("Android-Apache-2.0", "build/soong/licenses/Android.bp", &[apache]),
+            (
+                "Android-Apache-2.0",
+                "build/soong/licenses/Android.bp",
+                &[apache],
+            ),
             ("l", "external/x/Android.bp", &[mit]),
             ("l", "external/y/Android.bp", &[apache]),
         ]));
@@ -542,7 +545,8 @@ mod tests {
         let shared = kinds(&licenses);
         // system/server_configurable_flags' shape: no license module, only the shared default
         std::fs::write(tmp.join("sub/Android.bp"), "").unwrap();
-        let only_shared = "package {\n    default_applicable_licenses: [\"Android-Apache-2.0\"],\n}\n";
+        let only_shared =
+            "package {\n    default_applicable_licenses: [\"Android-Apache-2.0\"],\n}\n";
         std::fs::write(tmp.join("Android.bp"), only_shared).unwrap();
         let referenced = kinds(&licenses);
         // `l` from external/x resolves to external/x's, the nearest enclosing definition

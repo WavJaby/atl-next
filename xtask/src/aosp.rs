@@ -259,9 +259,9 @@ pub struct Definition {
     /// Its `defaults` list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     defaults: Vec<String>,
-    /// A `license` module's `license_kinds`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    license_kinds: Vec<String>,
+    /// A `license` module's `license_kinds`, empty if it lists none; None for other modules (and in an index built before kinds were recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    license_kinds: Option<Vec<String>>,
 }
 
 impl Definition {
@@ -297,14 +297,17 @@ impl Index {
     pub(crate) fn of_licenses(defs: &[(&str, &str, &[&str])]) -> Index {
         let mut modules: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
         for (name, file, kinds) in defs {
-            modules.entry((*name).to_owned()).or_default().push(Definition {
-                module_type: "license".into(),
-                project: parent_dir(file).into(),
-                file: (*file).into(),
-                namespace: None,
-                defaults: vec![],
-                license_kinds: kinds.iter().map(|k| (*k).to_owned()).collect(),
-            });
+            modules
+                .entry((*name).to_owned())
+                .or_default()
+                .push(Definition {
+                    module_type: "license".into(),
+                    project: parent_dir(file).into(),
+                    file: (*file).into(),
+                    namespace: None,
+                    defaults: vec![],
+                    license_kinds: Some(kinds.iter().map(|k| (*k).to_owned()).collect()),
+                });
         }
         Index {
             modules,
@@ -474,14 +477,14 @@ impl Index {
             0 => "no license module of that name".to_owned(),
             n => format!("{n} license modules of that name, none enclosing it"),
         })?;
-        if def.license_kinds.is_empty() {
-            // an index built before kinds were recorded reads the same
-            return Err(format!(
-                "{} declares no licence kind in the index (xtask aosp --index rebuilds it)",
-                def.file
-            ));
+        match &def.license_kinds {
+            None => Err(
+                "the AOSP index predates licence kinds (xtask aosp --index rebuilds it)".to_owned(),
+            ),
+            // e.g. harfbuzz_ng's `unused.HPND-sell-variant`, its one kind commented out: its licence is unknown, not absent
+            Some(k) if k.is_empty() => Err(format!("{} lists no licence kind", def.file)),
+            Some(k) => Ok(k),
         }
-        Ok(&def.license_kinds)
     }
 
     /// The project whose `soong_build` plugin registers a module type.
@@ -608,7 +611,7 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
                     file: file.clone(),
                     namespace: namespace.clone(),
                     defaults: m.defaults.clone(),
-                    license_kinds: m.license_kinds.clone(),
+                    license_kinds: (m.module_type == "license").then(|| m.license_kinds.clone()),
                 });
             }
         }
@@ -1082,17 +1085,40 @@ mod tests {
             ("l", "external/x/Android.bp", mit),
             ("l", "external/y/Android.bp", apache),
             ("shared", "build/soong/licenses/Android.bp", apache),
-            ("stale", "external/z/Android.bp", &[]),
+            ("empty", "external/z/Android.bp", &[]),
         ]);
         let of = |r: &str, from: &str| index.license_kinds_of(r, from);
         assert_eq!(of("l", "external/x/sub").unwrap(), mit);
         assert_eq!(of("//external/y:l", "external/x").unwrap(), apache);
         assert_eq!(of("shared", "external/x").unwrap(), apache);
         // `external/xx` is not inside `external/x`
-        assert!(of("l", "external/xx").unwrap_err().contains("none enclosing"));
-        assert!(of("nope", "external/x").unwrap_err().contains("no license module"));
-        // what an index from before kinds were recorded gives: never read as "no kinds"
-        assert!(of("stale", "external/z").unwrap_err().contains("rebuilds it"));
+        assert!(
+            of("l", "external/xx")
+                .unwrap_err()
+                .contains("none enclosing")
+        );
+        assert!(
+            of("nope", "external/x")
+                .unwrap_err()
+                .contains("no license module")
+        );
+        // harfbuzz_ng's `unused.HPND-sell-variant` shape: kinds unknown, never read as none
+        assert!(
+            of("empty", "external/z")
+                .unwrap_err()
+                .contains("lists no licence kind")
+        );
+        // an index built before kinds were recorded
+        let mut stale = index;
+        for d in stale.modules.values_mut().flatten() {
+            d.license_kinds = None;
+        }
+        assert!(
+            stale
+                .license_kinds_of("l", "external/x")
+                .unwrap_err()
+                .contains("rebuilds it")
+        );
     }
 
     #[test]
@@ -1247,7 +1273,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: ns.map(Into::into),
             defaults: vec![],
-            license_kinds: vec![],
+            license_kinds: None,
         };
         let modules = BTreeMap::from([
             (
@@ -1339,7 +1365,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: None,
             defaults: vec![],
-            license_kinds: vec![],
+            license_kinds: None,
         };
         let index = Index {
             modules: BTreeMap::from([
@@ -1379,7 +1405,7 @@ func init() {
             file: format!("{p}/Android.bp"),
             namespace: None,
             defaults: vec![],
-            license_kinds: vec![],
+            license_kinds: None,
         };
         let index = Index {
             modules: BTreeMap::from([
@@ -1416,7 +1442,7 @@ func init() {
             file: "art/Android.bp".into(),
             namespace: None,
             defaults: defaults.iter().map(|d| (*d).to_owned()).collect(),
-            license_kinds: vec![],
+            license_kinds: None,
         };
         let index = Index {
             modules: BTreeMap::from([
