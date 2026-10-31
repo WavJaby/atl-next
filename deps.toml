@@ -59,6 +59,13 @@ pkgconfig = "egl"
 scope = ["build", "runtime"]
 used_by = ["upstream:aosp"]
 
+# Mesa's EGL vendor library behind libglvnd: atl-glext's smoke test needs a real driver to resolve extensions through
+[egl-mesa]
+debian = "libegl-mesa0"
+arch = "mesa"
+scope = ["test"]
+used_by = ["crate:atl-glext"]
+
 [flex]
 debian = "flex"
 arch = "flex"
