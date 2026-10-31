@@ -7,7 +7,7 @@
 # shares the bridge's process); deny.toml's crate allow list stays within `runtime`.
 #
 # [artifact.<name>]
-#   allow          SPDX licences, each `<id>` or `<id> WITH <exception>`
+#   allow          SPDX licences, each `<id>` or `<id> WITH <exception>`; `LicenseRef-<name>` for one the SPDX list lacks
 #     runtime      the ART process, atld, our libraries and everything they link
 #     qemu-bridge  the dlopened QEMU bridge, distributed as GPL-3.0-or-later: licences combinable with GPL-3
 # [upstream.<name>]   a sources.toml upstream (`aosp`: every AOSP project, paths relative to the tree root)
@@ -17,7 +17,17 @@
 # Rows are added when a compiled set first needs them.
 
 [artifact.runtime]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+# BSD-2-Clause, BSD-3-Clause, ISC, public domain: owner decision 2026-10-31; all on the FSF list of GPL-3-compatible licences, so within a future qemu-bridge list.
+# LicenseRef-Public-Domain: a "placed in the public domain" notice is a dedication, not a licence, and the SPDX list has no id for it (CC0-1.0 / Unlicense are specific instruments those notices do not use).
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "LicenseRef-Public-Domain",
+    "MIT",
+    "Unicode-3.0",
+]
 
 [upstream.aosp.paths."external/dng_sdk/"]
 licence = "LicenseRef-Adobe-DNG-SDK"

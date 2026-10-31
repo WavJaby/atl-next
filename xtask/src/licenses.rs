@@ -130,10 +130,21 @@ fn parse_licence(entry: &str) -> Result<Licence<'_>> {
         Some((id, exc)) => (id.trim(), Some(exc.trim())),
         None => (entry.trim(), None),
     };
-    let Some(license) = spdx::license_id(id) else {
-        bail!("`{id}` is not an SPDX licence id")
-    };
-    ensure!(!license.is_deprecated(), "`{id}` is a deprecated SPDX id");
+    if let Some(name) = id.strip_prefix("LicenseRef-") {
+        // SPDX spec annex: `LicenseRef-` idstring, letters, digits, `.` and `-`; for a licence the SPDX list lacks
+        ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+            "`{id}` is not a valid LicenseRef"
+        );
+    } else {
+        let Some(license) = spdx::license_id(id) else {
+            bail!("`{id}` is not an SPDX licence id")
+        };
+        ensure!(!license.is_deprecated(), "`{id}` is a deprecated SPDX id");
+    }
     if let Some(exc) = exception {
         ensure!(
             spdx::exception_id(exc).is_some(),
@@ -307,6 +318,12 @@ mod tests {
         assert!(err("[artifact.runtime]\nallow = [\"GPL-2.0\"]\n").contains("deprecated"));
         let text = "[artifact.runtime]\nallow = [\"MIT WITH No-Such-exception\"]\n";
         assert!(err(text).contains("not an SPDX exception id"));
+        // a licence the SPDX list lacks is a LicenseRef, by the spec's idstring rule
+        let text = "[artifact.runtime]\nallow = [\"LicenseRef-Public-Domain\"]\n";
+        assert!(parse(text, &upstreams()).is_ok());
+        let text = "[artifact.runtime]\nallow = [\"LicenseRef-Public Domain\"]\n";
+        assert!(err(text).contains("not a valid LicenseRef"));
+        assert!(err("[artifact.runtime]\nallow = [\"LicenseRef-\"]\n").contains("not a valid"));
     }
 
     #[test]
