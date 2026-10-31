@@ -37,6 +37,9 @@ struct Args {
     /// Arch to emit Rust types for (one of the targets), repeatable.
     #[arg(long = "host")]
     hosts: Vec<String>,
+    /// Object-like macro to evaluate as an integer constant, repeatable (enumerators come without it).
+    #[arg(long = "macro")]
+    macros: Vec<String>,
     /// Output directory.
     #[arg(long)]
     out: PathBuf,
@@ -53,7 +56,8 @@ fn main() -> Result<()> {
         .label
         .clone()
         .unwrap_or_else(|| args.header.display().to_string());
-    let iface = atl_bridgegen::interface(&args.name, &args.header, &label, &targets)?;
+    let macros: Vec<&str> = args.macros.iter().map(String::as_str).collect();
+    let iface = atl_bridgegen::interface(&args.name, &args.header, &label, &macros, &targets)?;
     std::fs::create_dir_all(&args.out)?;
     let write = |file: String, text: &str| -> Result<()> {
         let path = args.out.join(file);

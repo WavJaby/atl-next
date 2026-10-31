@@ -4,6 +4,7 @@
 //! Output is deterministic for the same headers and targets.
 #![forbid(unsafe_code)]
 
+pub mod buildscript;
 pub mod front;
 pub mod ir;
 pub mod report;
@@ -15,17 +16,19 @@ use anyhow::Result;
 
 pub use front::Target;
 
-/// `header` (shown as `label` in generated text) as seen by every target.
+/// `header` (shown as `label` in generated text) as seen by every target, with the object-like
+/// `macros` evaluated as integer constants.
 pub fn interface(
     name: &str,
     header: &Path,
     label: &str,
+    macros: &[&str],
     targets: &[Target],
 ) -> Result<ir::Interface> {
     Ok(ir::Interface {
         name: name.to_owned(),
         header: label.to_owned(),
-        arches: front::parse(header, targets)?,
+        arches: front::parse(header, macros, targets)?,
     })
 }
 
@@ -75,7 +78,96 @@ mod tests {
             target("x86", "i686-linux-android"),
             target("arm", "armv7a-linux-androideabi"),
         ];
-        interface("t", &header, "t.h", &targets).unwrap()
+        interface("t", &header, "t.h", &[], &targets).unwrap()
+    }
+
+    /// Unions (anonymous members, unnamed field types, nested), packed/aligned attributes, enumerators
+    /// and macros; builtin types only.
+    const RECORDS: &str = "#define WIDTH 14\n#define MASK ((1 << WIDTH) - 1)\n#define BIG 3U << 9\nstruct V {\n  unsigned int kind;\n  union { unsigned long long p; unsigned int h; };\n  union { unsigned int x; struct { unsigned short lo, hi; } parts; unsigned char raw[8]; } u;\n  unsigned long long tail;\n};\nstruct P { unsigned int h; unsigned long long c; } __attribute__((packed));\nstruct A { int x; } __attribute__((aligned(16)));\nenum { NEG = -2, SMALL = 7 };\nenum big { HUGE = 0x80000000u };\n";
+
+    fn parsed_records(dir: &Tmp) -> ir::Interface {
+        let header = dir.0.join("r.h");
+        std::fs::write(&header, RECORDS).unwrap();
+        let targets = [
+            target("x86_64", "x86_64-unknown-linux-gnu"),
+            target("x86", "i686-linux-android"),
+        ];
+        interface("r", &header, "r.h", &["WIDTH", "MASK", "BIG"], &targets).unwrap()
+    }
+
+    #[test]
+    fn unions_attributes_constants() {
+        use crate::ir::RecordKind;
+        let dir = tmp("records");
+        let iface = parsed_records(&dir);
+        let x = &iface.arches["x86_64"];
+        fn layout(view: &ir::ArchView, r: &str) -> (u64, u64, Vec<(String, u64)>) {
+            let rec = &view.records[r];
+            let fields = rec
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.offset))
+                .collect();
+            (rec.size, rec.align, fields)
+        }
+        let f = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+            v.iter().map(|(n, o)| ((*n).to_owned(), *o)).collect()
+        };
+        // x86-64 SysV: the anonymous union holds a u64 -> 8-aligned at 8; `u` is 4-aligned (largest
+        // member u32), 8 bytes (raw[8]) at 16; tail at 24
+        assert_eq!(
+            layout(x, "V"),
+            (
+                32,
+                8,
+                f(&[("kind", 0), ("anon0", 8), ("u", 16), ("tail", 24)])
+            )
+        );
+        assert_eq!(x.records["V_anon0"].kind, RecordKind::Union);
+        assert_eq!(
+            layout(x, "V_u"),
+            (8, 4, f(&[("x", 0), ("parts", 0), ("raw", 0)]))
+        );
+        assert_eq!(layout(x, "V_u_parts"), (4, 2, f(&[("lo", 0), ("hi", 2)])));
+        // i386: long long is 4-aligned in structs, so everything after `kind` moves down
+        assert_eq!(
+            layout(&iface.arches["x86"], "V"),
+            (
+                28,
+                4,
+                f(&[("kind", 0), ("anon0", 4), ("u", 12), ("tail", 20)])
+            )
+        );
+        // packed: no padding, alignment 1; aligned(16) raises size and alignment
+        assert_eq!(layout(x, "P"), (12, 1, f(&[("h", 0), ("c", 4)])));
+        assert!(x.records["P"].packed);
+        assert_eq!(layout(x, "A"), (16, 16, f(&[("x", 0)])));
+        assert!(x.records["A"].aligned);
+        let c = |n: &str| (x.constants[n].ty.clone(), x.constants[n].bits);
+        let int = |signed| Ty::Int { bits: 32, signed };
+        // C: an enum whose values fit int has int enumerators; 0x80000000 forces unsigned int
+        assert_eq!(c("NEG"), (int(true), 0xffff_fffe));
+        assert_eq!(c("SMALL"), (int(true), 7));
+        assert_eq!(c("HUGE"), (int(false), 0x8000_0000));
+        // macros keep their C type: (1 << 14) - 1 is int, 3U << 9 unsigned
+        assert_eq!(c("WIDTH"), (int(true), 14));
+        assert_eq!(c("MASK"), (int(true), 16383));
+        assert_eq!(c("BIG"), (int(false), 1536));
+        let code = rust::host_module(&iface, "x86_64").unwrap();
+        assert!(code.contains("pub const NEG: i32 = -2;"), "{code}");
+        assert!(code.contains("#[repr(C, packed(1))]"), "{code}");
+        assert!(code.contains("#[repr(C, align(16))]"), "{code}");
+        assert!(code.contains("pub union V_anon0 {"), "{code}");
+    }
+
+    #[test]
+    fn unknown_macro_fails() {
+        let dir = tmp("nomacro");
+        let header = dir.0.join("r.h");
+        std::fs::write(&header, RECORDS).unwrap();
+        let targets = [target("x86_64", "x86_64-unknown-linux-gnu")];
+        let err = interface("r", &header, "r.h", &["NOT_DEFINED"], &targets).unwrap_err();
+        assert!(format!("{err:#}").contains("NOT_DEFINED"), "{err:#}");
     }
 
     fn offsets(iface: &ir::Interface, arch: &str) -> (u64, u64, Vec<u64>) {
@@ -195,6 +287,17 @@ mod tests {
         // the asserts can fail: a layout clang did not compute must not compile
         let wrong = code.replace("size_of::<S>() == 56", "size_of::<S>() == 57");
         assert_ne!(wrong, code);
+        assert!(!compiles(&wrong).status.success());
+        // unions, packed and aligned records: rustc agrees too
+        let records = rust::host_module(&parsed_records(&dir), "x86_64").unwrap();
+        let out = compiles(&records);
+        assert!(
+            out.status.success(),
+            "{}\n{records}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wrong = records.replace("offset_of!(P, c) == 4", "offset_of!(P, c) == 8");
+        assert_ne!(wrong, records);
         assert!(!compiles(&wrong).status.success());
     }
 }

@@ -613,11 +613,11 @@ internal error: panic in GenerateBuildActions for module \"test.apex\" variant \
     #[test]
     fn product_from_arch_table() {
         let arches: Arches = toml::from_str(
-            "[x86_64]\npointer_bits = 64\n[x86_64.host]\nrust = \"r\"\nmeson_cpu_family = \"m\"\n\
+            "[x86_64]\npointer_bits = 64\nkernel_arch = \"k\"\n[x86_64.host]\nrust = \"r\"\nmeson_cpu_family = \"m\"\n\
              debian = \"amd64\"\n[x86_64.guest]\nandroid_abis = [\"x86_64\"]\nclang = \"c\"\n\
-             qemu_target = \"q\"\n[arm64]\npointer_bits = 64\nsoong_arch_variant = \"armv8-a\"\n[arm64.guest]\n\
+             qemu_target = \"q\"\n[arm64]\npointer_bits = 64\nkernel_arch = \"k\"\nsoong_arch_variant = \"armv8-a\"\n[arm64.guest]\n\
              android_abis = [\"arm64-v8a\"]\nclang = \"c\"\nqemu_target = \"q\"\n\
-             [arm]\npointer_bits = 32\n[arm.guest]\nandroid_abis = [\"armeabi-v7a\"]\nclang = \"c\"\n\
+             [arm]\npointer_bits = 32\nkernel_arch = \"k\"\n[arm.guest]\nandroid_abis = [\"armeabi-v7a\"]\nclang = \"c\"\n\
              qemu_target = \"q\"\n",
         )
         .unwrap();

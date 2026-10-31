@@ -41,6 +41,9 @@ pub fn compare(iface: &Interface, a: &str, b: &str) -> Vec<RecordDiff> {
 
 fn record_differences(ra: &Record, rb: &Record, a: &str, b: &str) -> Vec<String> {
     let mut d = Vec::new();
+    if ra.kind != rb.kind {
+        d.push(format!("{:?} on {a}, {:?} on {b}", ra.kind, rb.kind));
+    }
     if ra.size != rb.size {
         d.push(format!("size {} on {a}, {} on {b}", ra.size, rb.size));
     }

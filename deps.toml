@@ -59,7 +59,7 @@ debian = "libclang-19-dev"
 # Arch's clang package ships libclang
 arch = "clang"
 scope = ["build"]
-used_by = ["crate:atl-bridgegen"]
+used_by = ["crate:atl-binder-wire", "crate:atl-bridgegen"]
 
 # AOSP's C++ assumes libc++ (libstdc++ 14 rejects libbase); the distro's, matching its clang
 [libcxx]

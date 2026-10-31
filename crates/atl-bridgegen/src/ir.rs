@@ -24,14 +24,38 @@ pub struct ArchView {
     pub records: BTreeMap<String, Record>,
     /// Functions declared by the interface's header.
     pub functions: BTreeMap<String, Signature>,
+    /// Integer constants: the header's enumerators plus the object-like macros the caller asked for,
+    /// each as clang evaluated it for this target (ioctl numbers embed sizes, so they are per arch).
+    pub constants: BTreeMap<String, Constant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Record {
+    pub kind: RecordKind,
     pub size: u64,
     pub align: u64,
-    /// Declaration order.
+    /// `__attribute__((packed))`: fields may sit below their natural alignment.
+    pub packed: bool,
+    /// `__attribute__((aligned(n)))`: alignment raised above the natural one.
+    pub aligned: bool,
+    /// Declaration order. An anonymous member (`union { ... };`) is a field named `anon<i>` whose
+    /// record is `<parent>_anon<i>`; an unnamed type of a named field is `<parent>_<field>`.
     pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    Struct,
+    Union,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Constant {
+    /// Always `Ty::Int`.
+    pub ty: Ty,
+    /// Two's-complement bits of the value, truncated to the type's width.
+    pub bits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

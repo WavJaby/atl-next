@@ -67,6 +67,7 @@ impl Step {
             Step::Spdx => spdx::check(root),
             Step::Tables => {
                 let arches = arches::load(root)?;
+                arches::check_kernel_arch(&workspace::root_dir(root)?, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

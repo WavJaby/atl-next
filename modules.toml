@@ -12,8 +12,15 @@
 # Module edges form no cycle. External crates are not listed here; deny.toml governs them.
 # Covers cargo crates only (no AOSP / ninja modules yet).
 
+# binder IPC: uapi wire types, the userspace driver core
+[binder]
+crates = ["atl-binder-wire"]
+uses = ["generators"]
+
 [generators]
 crates = ["atl-bridgegen"]
+# build-dependency of crates whose types are generated from upstream headers
+exports = ["atl-bridgegen"]
 
 [xtask]
 crates = ["xtask"]
