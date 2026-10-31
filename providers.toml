@@ -4,11 +4,10 @@
 #
 # Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree).
 #   provider  crate:<workspace crate>   our Rust crate, built with cargo-c into the prefix
-#             deps:<deps.toml row>      a system library; that row needs `pkgconfig` and `used_by` containing `upstream:aosp`
 #             upstream:<sources.toml>   a git upstream built by its own build system into <out>/upstream/<name>/prefix by `xtask native`, before the converter; xtask holds its build recipe (upstream.rs), which must list the module
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
 #   reason    why AOSP's own module is not used
-# Artifacts are not listed: they follow from the provider (cargo-c output, pkg-config, the upstream recipe's install).
+# Artifacts are not listed: they follow from the provider (cargo-c output, the upstream recipe's install).
 # `crate:` and `upstream:` modules are provided: `xtask native` builds them before the converter and hands it one entry per module (<out>/provided.json: artifact, include dirs, defines); dependents link the artifact first and get the headers as -isystem.
 # Rows are added when their provider exists, or when a build first trips over a module that must not be built.
 

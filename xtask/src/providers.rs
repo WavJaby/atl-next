@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `providers.toml`: Android.bp modules provided by our crates, system libraries or upstreams built
+//! `providers.toml`: Android.bp modules provided by our crates or upstreams built
 //! by their own build system instead of AOSP source. Column meanings live in that file's header.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::deps::Deps;
 use crate::upstream;
 
 pub const FILE: &str = "providers.toml";
@@ -64,25 +63,16 @@ pub struct Provider {
     pub reason: String,
 }
 
-/// What a provider may name: workspace crates, deps.toml rows, sources.toml git upstreams.
+/// What a provider may name: workspace crates, sources.toml git upstreams.
 pub struct Targets<'a> {
     pub crates: &'a BTreeSet<String>,
-    pub deps: &'a Deps,
     pub upstreams: BTreeSet<&'a str>,
 }
 
 impl<'a> Targets<'a> {
-    pub fn new(
-        crates: &'a BTreeSet<String>,
-        deps: &'a Deps,
-        sources: &'a crate::sources::Sources,
-    ) -> Self {
+    pub fn new(crates: &'a BTreeSet<String>, sources: &'a crate::sources::Sources) -> Self {
         let upstreams = sources.git.keys().map(String::as_str).collect();
-        Self {
-            crates,
-            deps,
-            upstreams,
-        }
+        Self { crates, upstreams }
     }
 }
 
@@ -101,26 +91,14 @@ fn parse(text: &str, targets: &Targets) -> Result<Providers> {
 }
 
 fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
-    let (crates, deps) = (targets.crates, targets.deps);
     ensure!(is_module_name(module), "not an Android.bp module name");
     ensure!(!row.reason.trim().is_empty(), "empty reason");
     if row.provider == NONE {
         return Ok(());
     }
     match row.provider.split_once(':') {
-        Some(("crate", name)) => ensure!(crates.contains(name), "no workspace crate `{name}`"),
-        Some(("deps", name)) => {
-            let Some(dep) = deps.get(name) else {
-                bail!("no deps.toml row `{name}`")
-            };
-            ensure!(
-                dep.pkgconfig.is_some(),
-                "deps.toml row `{name}` has no pkgconfig"
-            );
-            ensure!(
-                dep.used_by.iter().any(|u| u == "upstream:aosp"),
-                "deps.toml row `{name}` lacks `upstream:aosp` in used_by"
-            );
+        Some(("crate", name)) => {
+            ensure!(targets.crates.contains(name), "no workspace crate `{name}`")
         }
         Some(("upstream", name)) => {
             ensure!(
@@ -137,7 +115,7 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
             );
         }
         _ => bail!(
-            "provider `{}` is not crate:<name>, deps:<name>, upstream:<name> or {NONE}",
+            "provider `{}` is not crate:<name>, upstream:<name> or {NONE}",
             row.provider
         ),
     }
@@ -155,25 +133,11 @@ fn is_module_name(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn fixtures() -> (BTreeSet<String>, Deps) {
-        let crates = ["atl-nativeloader".to_owned()].into();
-        let deps = toml::from_str(
-            "[icu]\ndebian = \"libicu-dev\"\npkgconfig = \"icu-uc\"\nscope = [\"build\"]\n\
-             used_by = [\"upstream:aosp\"]\n\
-             [git]\ndebian = \"git\"\nscope = [\"test\"]\nused_by = [\"xtask:check\"]\n\
-             [zlib]\ndebian = \"zlib1g-dev\"\npkgconfig = \"zlib\"\nscope = [\"build\"]\n\
-             used_by = [\"xtask:check\"]\n",
-        )
-        .unwrap();
-        (crates, deps)
-    }
-
-    /// Parses with the fixtures; sources.toml git upstreams `boringssl` (has a recipe) and `qemu` (has none).
+    /// Parses with workspace crate `atl-nativeloader` and sources.toml git upstreams `boringssl` (has a recipe) and `qemu` (has none).
     fn parsed(text: &str) -> Result<Providers> {
-        let (crates, deps) = fixtures();
+        let crates = ["atl-nativeloader".to_owned()].into();
         let targets = Targets {
             crates: &crates,
-            deps: &deps,
             upstreams: ["boringssl", "qemu"].into(),
         };
         parse(text, &targets)
@@ -184,11 +148,9 @@ mod tests {
     }
 
     #[test]
-    fn crate_and_deps_providers() {
-        let text = "[libnativeloader]\nprovider = \"crate:atl-nativeloader\"\nreason = \"r\"\n\
-                    [libicuuc]\nprovider = \"deps:icu\"\nreason = \"r\"\n";
+    fn crate_providers() {
+        let text = "[libnativeloader]\nprovider = \"crate:atl-nativeloader\"\nreason = \"r\"\n";
         let providers = parsed(text).unwrap();
-        assert_eq!(providers["libicuuc"].provider, "deps:icu");
         assert_eq!(
             super::crates(&providers),
             [("libnativeloader", "atl-nativeloader")]
@@ -220,25 +182,12 @@ mod tests {
         assert!(
             err("[x]\nprovider = \"crate:gone\"\nreason = \"r\"\n").contains("no workspace crate")
         );
-        assert!(
-            err("[x]\nprovider = \"deps:gone\"\nreason = \"r\"\n").contains("no deps.toml row")
-        );
-    }
-
-    #[test]
-    fn deps_target_must_be_aosp_library() {
-        // fixture `git` has no pkgconfig; `zlib` has one but is not used by upstream:aosp
-        assert!(err("[x]\nprovider = \"deps:git\"\nreason = \"r\"\n").contains("has no pkgconfig"));
-        assert!(
-            err("[x]\nprovider = \"deps:zlib\"\nreason = \"r\"\n")
-                .contains("lacks `upstream:aosp`")
-        );
     }
 
     #[test]
     fn none_drops_the_dependency() {
         let text = "[libdl_android]\nprovider = \"none\"\nreason = \"bionic linker API\"\n\
-                    [libicuuc]\nprovider = \"deps:icu\"\nreason = \"r\"\n";
+                    [libnativeloader]\nprovider = \"crate:atl-nativeloader\"\nreason = \"r\"\n";
         let providers = parsed(text).unwrap();
         assert_eq!(super::omitted(&providers), ["libdl_android"]);
         assert!(err("[x]\nprovider = \"none\"\nreason = \"\"\n").contains("empty reason"));
@@ -247,6 +196,8 @@ mod tests {
     #[test]
     fn unknown_kind_and_empty_reason() {
         assert!(err("[x]\nprovider = \"aosp:x\"\nreason = \"r\"\n").contains("is not crate:"));
+        // removed kind (no consumer built it): a system library would need a pkg-config step writing a Provided entry
+        assert!(err("[x]\nprovider = \"deps:icu\"\nreason = \"r\"\n").contains("is not crate:"));
         assert!(
             err("[x]\nprovider = \"crate:atl-nativeloader\"\nreason = \" \"\n")
                 .contains("empty reason")

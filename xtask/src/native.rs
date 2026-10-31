@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::Provided;
-use crate::{arches, deps, fetch, patch, provided_gate, providers, sources, upstream, workspace};
+use crate::{arches, fetch, patch, provided_gate, providers, sources, upstream, workspace};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -91,11 +91,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     ensure!(status.success(), "building bp2ninja failed");
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
-    let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
-    let providers = providers::load(
-        root,
-        &providers::Targets::new(&workspace.crates, &deps, &sources),
-    )?;
+    let providers = providers::load(root, &providers::Targets::new(&workspace.crates, &sources))?;
     let omit = providers::omitted(&providers).join(",");
     patch::preflight(root, providers::upstreams(&providers))?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
