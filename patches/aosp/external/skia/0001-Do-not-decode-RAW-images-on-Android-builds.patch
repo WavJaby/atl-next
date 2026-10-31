@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 31 Oct 2026 15:56:42 +0800
+Subject: [PATCH] Do not decode RAW images on Android builds
+
+SK_CODEC_DECODES_RAW makes SkCodec.cpp reference SkRawDecoder, whose
+implementation (SkRawCodec.cpp) needs dng_sdk and piex. dng_sdk comes
+under Adobe's DNG SDK licence with a DNG-only patent grant, which may
+not share a process with GPL-3 code.
+
+Upstream-Status: Inappropriate [ATL-specific licence policy: no dng_sdk in a process that may load a GPL-3 component]
+Patch-Reason: the header defines the macro unconditionally (the #ifndef guards only a redefinition), so no -D/-U flag from the build can turn RAW decoding off; dropping SkRawCodec.cpp alone leaves SkCodec.cpp referencing SkRawDecoder
+---
+SPDX-License-Identifier: BSD-3-Clause
+ android/include/config/SkUserConfig.h | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/android/include/config/SkUserConfig.h b/android/include/config/SkUserConfig.h
+index 7dbb9a04f87f204b0afc0f61ccea7d13d3ab7217..5e850087498a657ef7e9c7c422806e4cc7fda1ad 100644
+--- a/android/include/config/SkUserConfig.h
++++ b/android/include/config/SkUserConfig.h
+@@ -39,10 +39,6 @@
+ #define SK_CODEC_DECODES_PNG_WITH_LIBPNG
+ #endif
+ 
+-#ifndef SK_CODEC_DECODES_RAW
+-#define SK_CODEC_DECODES_RAW
+-#endif
+-
+ #ifndef SK_CODEC_DECODES_WBMP
+ #define SK_CODEC_DECODES_WBMP
+ #endif
