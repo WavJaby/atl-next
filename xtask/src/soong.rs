@@ -199,11 +199,6 @@ struct Product {
     files: Vec<(String, String)>,
 }
 
-/// The product's name, i.e. its directory under <workspace>/out/aosp.
-pub fn product_name(arches: &Arches, host: &str, guest: &str) -> Result<String> {
-    Ok(product(arches, host, guest)?.name)
-}
-
 fn product(arches: &Arches, host: &str, guest: &str) -> Result<Product> {
     let arch = |name: &str| {
         arches

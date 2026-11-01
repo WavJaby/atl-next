@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on host ART, in four stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on ART -- by default the converter's own (`stage_art`), or any ART root given with --art (Soong's host ART) -- in four stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
@@ -22,17 +22,15 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::{arches, farm, soong};
+use crate::{arches, farm};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): dalvikvm<pointer_bits>, the JDK's prebuilt OS directory, the default --out.
     #[arg(long)]
     host: String,
-    /// Guest arch of the `xtask soong` product whose host ART is used; only for the default --art.
-    #[arg(long, required_unless_present = "art")]
-    guest: Option<String>,
-    /// ART host root: bin/dalvikvm<bits>, com.android.art, com.android.i18n, com.android.tzdata (default <workspace>/out/aosp/<product>/host/<soong_prebuilt_os>, as `xtask soong` builds it).
+    /// ART root: bin/dalvikvm<bits>, com.android.art, com.android.i18n, com.android.tzdata, e.g. Soong's host ART (<workspace>/out/aosp/<product>/host/<soong_prebuilt_os>, as `xtask soong` builds it).
+    /// Default: the converter's ART in --out (`xtask native` goals dalvikvm, libart, ...), staged into <out>/native-load-art as an install would lay it out (see `stage_art`).
     #[arg(long)]
     art: Option<PathBuf>,
     /// Java pipeline build directory: the ART host boot jars and its d8 (default <workspace>/out/java/build).
@@ -186,6 +184,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 struct Env {
     art: PathBuf,
+    /// A staged ART's library dir, ART runs with it as LD_LIBRARY_PATH (stage_art); None for a given --art, whose binaries find their own.
+    lib_path: Option<PathBuf>,
     dalvikvm: PathBuf,
     boot: Vec<PathBuf>,
     javac_boot: Vec<PathBuf>,
@@ -217,15 +217,6 @@ impl Env {
         })?;
         let layout = Layout::of(root)?;
         let ws = layout.workspace();
-        let art = match (&args.art, &args.guest) {
-            (Some(dir), _) => std::path::absolute(dir)?,
-            (None, Some(guest)) => ws
-                .join("out/aosp")
-                .join(soong::product_name(&arches, &args.host, guest)?)
-                .join("host")
-                .join(os),
-            (None, None) => bail!("--art or --guest is required"),
-        };
         let java_out = match &args.java_out {
             Some(dir) => std::path::absolute(dir)?,
             None => ws.join("out/java/build"),
@@ -234,11 +225,20 @@ impl Env {
             Some(dir) => std::path::absolute(dir)?,
             None => ws.join("out/native").join(&args.host),
         };
+        let (art, lib_path) = match &args.art {
+            Some(dir) => (std::path::absolute(dir)?, None),
+            None => {
+                let art = out.join("native-load-art");
+                let lib = stage_art(&out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
+                (art, Some(lib))
+            }
+        };
         let env = Env {
             dalvikvm: art
                 .join("bin")
                 .join(format!("dalvikvm{}", arch.pointer_bits)),
             art,
+            lib_path,
             boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
             d8: java_out.join("host/bin/d8"),
@@ -334,6 +334,9 @@ impl Env {
             .env("ANDROID_TZDATA_ROOT", self.art.join("com.android.tzdata"))
             .env("ANDROID_DATA", self.work.join("data"))
             .env("LD_BIND_NOW", "1");
+        if let Some(lib) = &self.lib_path {
+            cmd.env("LD_LIBRARY_PATH", lib);
+        }
         let out = cmd
             .output()
             .with_context(|| format!("running {}", self.dalvikvm.display()))?;
@@ -349,6 +352,71 @@ impl Env {
         }
         Ok(run)
     }
+}
+
+/// Where Android installs the ICU data ART's ICU opens (external/icu/icu4c/source/stubdata/Android.bp apex_icu.dat: prebuilt_etc of `icu*.dat`, sub_dir icu, in the com.android.i18n APEX).
+const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
+
+/// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
+/// - bin/dalvikvm<bits>: the converter's dalvikvm (Soong's lib64 suffix names it so).
+/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: libnativehelper dlopens libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
+/// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
+fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
+    let device = out.join("device");
+    let dalvikvm = device
+        .join("dalvikvm")
+        .join(format!("dalvikvm{pointer_bits}"));
+    ensure!(
+        dalvikvm.is_file(),
+        "no converter ART in {}: build it with `xtask native ... dalvikvm libart libjavacore libopenjdk libicu_jni`, or pass --art",
+        out.display()
+    );
+    if art.exists() {
+        std::fs::remove_dir_all(art)?;
+    }
+    let lib = art.join(if pointer_bits == 64 { "lib64" } else { "lib" });
+    let icu = art.join("com.android.i18n/etc/icu");
+    for d in [
+        &art.join("bin"),
+        &lib,
+        &icu,
+        &art.join("com.android.tzdata"),
+    ] {
+        std::fs::create_dir_all(d)?;
+    }
+    let link = |target: &Path, at: &Path| {
+        std::os::unix::fs::symlink(target, at)
+            .with_context(|| format!("linking {} -> {}", at.display(), target.display()))
+    };
+    link(
+        &dalvikvm,
+        &art.join("bin").join(format!("dalvikvm{pointer_bits}")),
+    )?;
+    link(Path::new("."), &art.join("com.android.art"))?;
+    for module in std::fs::read_dir(&device)? {
+        let module = module?.path();
+        if !module.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&module)? {
+            let f = f?.path();
+            if f.extension().is_some_and(|e| e == "so") && f.is_file() {
+                let name = f.file_name().context("a file name")?;
+                link(&f, &lib.join(name))?;
+            }
+        }
+    }
+    let mut data = 0;
+    for f in std::fs::read_dir(tree.join(ICU_DATA))? {
+        let f = f?.path();
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.starts_with("icu") && name.ends_with(".dat") {
+            link(&f, &icu.join(name))?;
+            data += 1;
+        }
+    }
+    ensure!(data > 0, "no icu*.dat in {}", tree.join(ICU_DATA).display());
+    Ok(lib)
 }
 
 fn collect(dir: &Path, ext: &str, into: &mut Vec<PathBuf>) -> Result<()> {
