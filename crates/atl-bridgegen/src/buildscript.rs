@@ -42,8 +42,30 @@ pub const DECLARATIONS: Kept<'static> = Kept {
 pub fn api_files(
     up: &Upstreams,
     api: &Api,
+    target: Target,
+    implementation: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    files_of(up, api, target, implementation, true)
+}
+
+/// `api_files` of an API declared in a header the host also has (bionic's `<pthread.h>`): the host's
+/// header defines the constants, so the printed header declares the functions only -- a second
+/// definition would turn the host's enumerators into macros.
+pub fn api_files_beside_host(
+    up: &Upstreams,
+    api: &Api,
+    target: Target,
+    implementation: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    files_of(up, api, target, implementation, false)
+}
+
+fn files_of(
+    up: &Upstreams,
+    api: &Api,
     mut target: Target,
     implementation: &str,
+    with_constants: bool,
 ) -> Result<Vec<(PathBuf, String)>> {
     target.args.extend(
         api.include_dirs
@@ -76,6 +98,7 @@ pub fn api_files(
             .keys()
             .chain(view.strings.keys())
             .map(String::as_str)
+            .filter(|_| with_constants)
             .collect();
         files.push((
             Path::new("capi/include").join(header),

@@ -364,14 +364,15 @@ var deviceCompat = []compatHeader{
 
 // libcCompat: headers of the libc provider (atl-bionic, generated from bionic's) every device-side compile needs whether or not the module depends on libc, linked from the provider's include dirs into <out>/compat/device.
 //   - android/api-level.h: the level names (`__ANDROID_API_U__`, …), android_get_device_api_level; bionic's sys/cdefs.h brings it into every unit, and libc++'s locale_base_api/android.h includes it under __ANDROID__. atl-bionic generates it include-free, so it is forced (deviceForced).
-var libcCompat = []string{"android/api-level.h"}
+//   - android/set_abort_message.h: liblog's logger_write.cpp calls android_set_abort_message under __ANDROID__ but includes its header under __BIONIC__ only, a combination bionic never builds; forced (include-free) rather than patched.
+var libcCompat = []string{"android/api-level.h", "android/set_abort_message.h"}
 
 // libcModule: the module whose provider supplies libcCompat (system_shared_libs brings it to nearly every device module, not to all).
 const libcModule = "libc"
 
 // deviceForced: the compat/device headers every device-side C and C++ compile force-includes, in order; not assembly, nothing there uses them.
 // Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with bionic's api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
-var deviceForced = []string{"android/versioning.h", "android/api-level.h"}
+var deviceForced = []string{"android/versioning.h", "android/api-level.h", "android/set_abort_message.h"}
 
 // libcxxShim: headers libc++ includes under __ANDROID__ that glibc lacks, written into <out>/compat/libcxx, searched last (-idirafter) by every device-side C++ compile, so a header the system has wins.
 //   - xlocale.h: libc++'s locale_base_api/android.h includes it for locale_t, which bionic's declares; glibc declares locale_t in <locale.h> (its own xlocale.h went in 2.26), so the shim includes that. The libc++ objects stay byte-identical with it (xtask check step libcxx).

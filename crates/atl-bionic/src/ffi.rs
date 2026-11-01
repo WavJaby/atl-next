@@ -256,6 +256,21 @@ pub extern "C" fn android_mallopt(_opcode: c_int, _arg: *mut c_void, _arg_size: 
     false
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_set_abort_message(msg: *const c_char) {
+    // SAFETY: bionic's contract, null or a NUL-terminated string
+    crate::abort::set(unsafe { c_str(msg) });
+}
+
+/// Where glibc lacks it (build.rs `IN_HOST_HEADERS`). `pthread_t` travels as bionic's `long`, glibc's
+/// `unsigned long`: one register either way.
+#[cfg(atl_bionic_api = "pthread")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_gettid_np(thread: core::ffi::c_long) -> c_int {
+    // SAFETY: bionic's contract, a live pthread_t of this process
+    unsafe { crate::thread::gettid_of(thread as usize) }
+}
+
 // android/dlext.h (libdl) and libdl_android's exported-namespace lookup, through `linker`.
 
 #[unsafe(no_mangle)]

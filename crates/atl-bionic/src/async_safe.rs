@@ -15,8 +15,7 @@
 //!   to stderr. This host has no logd, so the stderr path is the only one; the priority then has no
 //!   effect, as in bionic's fallback.
 //! - Fatal: `[prefix: ]msg` (1024 bytes) and `\n` to stderr, then logged as `libc` at fatal priority --
-//!   with no logd that is stderr again, as in bionic. bionic also sets the abort message for debuggerd,
-//!   which has no counterpart here.
+//!   with no logd that is stderr again, as in bionic; then the abort message (`crate::abort`), as bionic.
 
 use core::ffi::{c_int, c_long, c_longlong};
 
@@ -368,10 +367,11 @@ pub fn fatal<'s>(prefix: Option<&[u8]>, format: &[u8], args: &mut impl Args<'s>,
     log_fatal(out.text());
 }
 
-/// `msg` to stderr and to the log at fatal priority, as `fatal` ends.
+/// `msg` to stderr, to the log at fatal priority and as the abort message, as `fatal` ends.
 fn log_fatal(msg: &[u8]) {
     let _ = write_stderr(&[msg, b"\n"]);
     let _ = write_log(ANDROID_LOG_FATAL, FATAL_TAG, msg);
+    crate::abort::set(Some(msg));
 }
 
 /// `fatal` of a fixed text (no format).

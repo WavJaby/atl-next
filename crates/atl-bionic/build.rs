@@ -158,7 +158,60 @@ const APIS: &[Api] = &[
             types: &["android_mallopt_leak_info_t"],
         },
     },
+    // the first abort message, kept for a crash report (2026-11-01: liblog, libbase, perfetto aborters
+    // under __ANDROID__); forced into every device unit by the converter (libcCompat): liblog's
+    // logger_write.cpp calls it under __ANDROID__ but includes the header only under __BIONIC__
+    Api {
+        name: "set_abort_message",
+        source: "bionic/libc/include/android/set_abort_message.h",
+        lang: Lang::C,
+        header: Some("android/set_abort_message.h"),
+        functions: &["android_set_abort_message"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
+    // bionic's <pthread.h> (IN_HOST_HEADERS): libutils Threads.cpp Thread::getTid
+    Api {
+        name: "pthread",
+        source: "bionic/libc/include/pthread.h",
+        lang: Lang::C,
+        header: Some("atl-bionic/pthread.h"),
+        functions: &["pthread_gettid_np"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
+    // a platform header, constants only (2026-11-01: libmediautils TimeCheck.cpp through
+    // debuggerd/handler.h, DEBUGGER_SIGNAL): the signal numbers bionic reserves, `__SIGRTMIN + n`,
+    // evaluated. Its inline signal-mask filter is not printed. 35 (the debugger's) is glibc's
+    // SIGRTMIN + 1, an application signal: only sending is in the closure, no handler is installed.
+    Api {
+        name: "reserved_signals",
+        source: "bionic/libc/platform/bionic/reserved_signals.h",
+        // its macros.h is C++
+        lang: Lang::Cxx,
+        header: Some("bionic/reserved_signals.h"),
+        functions: &[],
+        macros: &["BIONIC_SIGNAL_*", "BIONIC_ENABLE_MTE"],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
 ];
+
+/// bionic API declared in a header the host also has, as (API row, host header): the row's header is
+/// `atl-bionic/<header>`, included by the shape wrapper of `<header>` (`shape::Inputs::extra`). A row is
+/// generated, and implemented (`cfg(atl_bionic_api = "<row>")`), only where the host's header with
+/// `_GNU_SOURCE` declares none of its functions; where it declares all, the host's serve, as any libc
+/// function; some but not all fails. `pthread_gettid_np`: glibc >= 2.42.
+const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h")];
+
+/// What the shape wrapper of a host header includes beyond bionic's shape (`shape::Inputs::extra`),
+/// besides `IN_HOST_HEADERS`. `asm/unistd.h`: under `__ANDROID__` without `__BIONIC__`, liblog's
+/// logger_write.cpp and libbase's threads.cpp call `syscall(__NR_gettid)` / `__NR_tgkill` after
+/// `<unistd.h>` alone (their `<syscall.h>` include is `!__ANDROID__`); bionic never builds that path
+/// (it calls `gettid()`). The kernel's `__NR_*` names only, not glibc's `SYS_*` aliases.
+const EXTRA_INCLUDES: &[(&str, &str)] = &[("unistd.h", "asm/unistd.h")];
 
 /// bionic's property-area implementation and the headers holding its layouts.
 const PROP_AREA_SOURCES: &[&str] = &[
@@ -200,8 +253,16 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// bring them in: `__unused` (`sys/cdefs.h`; bpf's KernelUtils.h, libtimeinstate), `IS_ELF` (`elf.h`
 /// via `bits/elf_common.h`; libc_malloc_debug_backtrace MapData.cpp), `GID_MAX` (`limits.h`, `UINT_MAX`:
 /// glibc's `gid_t` is the same `unsigned int`; libpackagelistparser), `__LIBC_HIDDEN__` (`sys/cdefs.h`,
-/// hidden visibility; bionic's `resolv_netid.h` as libandroid_net includes it).
-const FORWARDED_MACROS: &[&str] = &["__unused", "IS_ELF", "GID_MAX", "__LIBC_HIDDEN__"];
+/// hidden visibility; bionic's `resolv_netid.h` as libandroid_net includes it), `__RENAME_IF_FILE_OFFSET64`
+/// (`sys/cdefs.h`; androidfw under `__ANDROID__`): empty on LP64, as read here, where off_t is 64-bit
+/// on both libcs.
+const FORWARDED_MACROS: &[&str] = &[
+    "__unused",
+    "IS_ELF",
+    "GID_MAX",
+    "__LIBC_HIDDEN__",
+    "__RENAME_IF_FILE_OFFSET64",
+];
 
 /// bionic-only public headers AOSP code includes, generated whole (`shape::Inputs::substitutes`); each
 /// row reviewed to mean the same on glibc. `sys/limits.h` is `<limits.h>` (libandroid_net net.c);
@@ -220,6 +281,8 @@ struct Generated {
     wrappers: Vec<String>,
     /// Host headers the wrappers are derived from, for cargo's rerun check.
     host_inputs: BTreeSet<PathBuf>,
+    /// The `IN_HOST_HEADERS` rows generated (the host lacks their functions).
+    host_rows: Vec<&'static str>,
 }
 
 fn main() -> Result<()> {
@@ -260,6 +323,17 @@ fn main() -> Result<()> {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
     check_wrappers(&first.wrappers, &capi.join("include"))?;
+    let rows: Vec<String> = IN_HOST_HEADERS
+        .iter()
+        .map(|(n, _)| format!("\"{n}\""))
+        .collect();
+    println!(
+        "cargo::rustc-check-cfg=cfg(atl_bionic_api, values({}))",
+        rows.join(", ")
+    );
+    for row in &first.host_rows {
+        println!("cargo::rustc-cfg=atl_bionic_api=\"{row}\"");
+    }
     // the triple the wrappers are checked for, so tests compile against them as this does
     println!(
         "cargo::rustc-env=ATL_BIONIC_CLANG_TRIPLE={}",
@@ -296,12 +370,63 @@ fn bionic_target(up: &Upstreams, host: &HostArch, level: u64, cxx: Option<&Path>
     target
 }
 
+/// The host libc's view, as device compiles see it.
+fn host_target(host: &HostArch) -> Result<Target> {
+    Ok(Target {
+        arch: host.arch.clone(),
+        triple: buildscript::clang_triple_from_cargo()?,
+        args: Vec::new(),
+    })
+}
+
+/// Whether the host's `header`, with `_GNU_SOURCE`, declares `functions`: all (true), none (false); some fails.
+fn host_declares(host: &HostArch, header: &str, functions: &[&str]) -> Result<bool> {
+    let mut target = host_target(host)?;
+    target.args.push("-D_GNU_SOURCE".to_owned());
+    let probes = front::probe_includes(Lang::C, &target, &[header])?;
+    let probe = probes
+        .get(header)
+        .filter(|p| p.usable())
+        .with_context(|| format!("the host has no usable <{header}>"))?;
+    let names: BTreeSet<&String> = probe.files.values().flat_map(|r| r.names.iter()).collect();
+    let has: Vec<&str> = functions
+        .iter()
+        .copied()
+        .filter(|f| names.contains(&(*f).to_owned()))
+        .collect();
+    ensure!(
+        has.is_empty() || has.len() == functions.len(),
+        "the host's <{header}> declares {has:?} of {functions:?}: split the row"
+    );
+    Ok(!has.is_empty())
+}
+
 fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Result<Generated> {
     let mut files = Outputs::new();
     let level = future_level(up, host)?;
+    let mut extra: Vec<(&str, &str)> = EXTRA_INCLUDES.to_vec();
+    let mut host_rows = Vec::new();
     for api in APIS {
         let target = bionic_target(up, host, level, (api.lang == Lang::Cxx).then_some(libcxx));
-        files.extend(buildscript::api_files(up, api, target, "crate::ffi")?);
+        let Some(&(_, header)) = IN_HOST_HEADERS.iter().find(|(n, _)| *n == api.name) else {
+            files.extend(buildscript::api_files(up, api, target, "crate::ffi")?);
+            continue;
+        };
+        if host_declares(host, header, api.functions)? {
+            continue;
+        }
+        extra.push((
+            header,
+            api.header
+                .context("an IN_HOST_HEADERS row without a header")?,
+        ));
+        host_rows.push(api.name);
+        files.extend(buildscript::api_files_beside_host(
+            up,
+            api,
+            target,
+            "crate::ffi",
+        )?);
     }
     let iface = prop_area(up, bionic_target(up, host, level, Some(libcxx)), out)?;
     check_prop_area_shape(&iface.arches[&host.arch])?;
@@ -315,7 +440,7 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
         "timespec.rs".into(),
         atl_bridgegen::rust::layout_module(&timespec, &host.arch)?,
     ));
-    let shape = shape(up, host, level)?;
+    let shape = shape(up, host, level, &extra)?;
     for (name, text) in &shape.wrappers {
         let path = Path::new("capi/include").join(name);
         ensure!(
@@ -329,6 +454,7 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
         files,
         wrappers: shape.wrappers.into_iter().map(|(n, _)| n).collect(),
         host_inputs: shape.host_inputs,
+        host_rows,
     })
 }
 
@@ -342,7 +468,7 @@ struct ShapeOut {
     host_inputs: BTreeSet<PathBuf>,
 }
 
-fn shape(up: &Upstreams, host: &HostArch, level: u64) -> Result<ShapeOut> {
+fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) -> Result<ShapeOut> {
     let include = up.aosp(BIONIC_INCLUDE);
     let public: Vec<String> = headers_under(&include)?
         .into_iter()
@@ -358,14 +484,10 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64) -> Result<ShapeOut> {
         .iter()
         .map(|d| up.path(d))
         .collect();
-    let host_target = Target {
-        arch: host.arch.clone(),
-        triple: buildscript::clang_triple_from_cargo()?,
-        args: Vec::new(),
-    };
-    let names: Vec<String> = shape::host_names(&bionic, &include, &uapi, HOMES)
-        .into_iter()
-        .collect();
+    let host_target = host_target(host)?;
+    let mut names: BTreeSet<String> = shape::host_names(&bionic, &include, &uapi, HOMES);
+    names.extend(extra.iter().map(|(h, _)| (*h).to_owned()));
+    let names: Vec<String> = names.into_iter().collect();
     let host_probes = front::probe_includes(Lang::C, &host_target, &strs(&names))
         .context("the host's headers")?;
     let mut kernel = BTreeSet::new();
@@ -386,6 +508,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64) -> Result<ShapeOut> {
         macros: FORWARDED_MACROS,
         substitutes: SUBSTITUTES,
         scan: &scan,
+        extra,
     })?;
     shape::check_guards(derived.wrappers.keys())?;
     let wrappers = derived

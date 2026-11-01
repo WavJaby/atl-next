@@ -44,6 +44,7 @@ const STD_TYPEDEFS: &[(&str, &str)] = &[
     ("uid_t", "sys/types.h"),
     ("gid_t", "sys/types.h"),
     ("mode_t", "sys/types.h"),
+    ("pthread_t", "sys/types.h"),
     ("va_list", "stdarg.h"),
     ("FILE", "stdio.h"),
 ];

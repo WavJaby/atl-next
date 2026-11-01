@@ -221,7 +221,7 @@ cc_library { name: "libnolibc", host_supported: true, srcs: ["a.c", "b.cpp"], sy
 		if !slices.Contains(list, "-D__ANDROID__") || slices.ContainsFunc(list, func(f string) bool { return strings.Contains(f, "__BIONIC__") }) {
 			t.Errorf("device %s defines: %q", lang, list)
 		}
-		for _, h := range []string{"android/versioning.h", "android/api-level.h"} {
+		for _, h := range []string{"android/versioning.h", "android/api-level.h", "android/set_abort_message.h"} {
 			if i := slices.Index(list, h); i < 1 || list[i-1] != "-include" {
 				t.Errorf("device %s does not force %s: %q", lang, h, list)
 			}
@@ -253,11 +253,12 @@ func TestWriteCompat(t *testing.T) {
 		write(filepath.Join(tree, h.path), "tree "+h.name)
 	}
 	write(filepath.Join(gen, "android/api-level.h"), "generated")
+	write(filepath.Join(gen, "android/set_abort_message.h"), "generated abort")
 	provided := map[string]Provided{"libc": {Libs: []string{"x.so"}, Include: []string{other, gen}}}
 	if err := writeCompat(tree, out, provided); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{"android/versioning.h": "tree android/versioning.h", "android/api-level.h": "generated"}
+	want := map[string]string{"android/versioning.h": "tree android/versioning.h", "android/api-level.h": "generated", "android/set_abort_message.h": "generated abort"}
 	for _, h := range deviceForced {
 		b, err := os.ReadFile(filepath.Join(out, "compat", "device", h))
 		if err != nil || string(b) != want[h] {

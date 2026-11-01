@@ -71,6 +71,11 @@ pub struct Inputs<'a> {
     pub macros: &'a [&'a str],
     /// bionic-only public headers generated whole. Each must be a usable bionic header the host lacks.
     pub substitutes: &'a [&'a str],
+    /// Host header -> what its wrapper includes beyond bionic's shape: names AOSP code takes from the
+    /// header in a configuration bionic never builds (`__ANDROID__` without `__BIONIC__`), or bionic
+    /// API declared in a header the host also has (its generated declarations). Each must be needed:
+    /// the host has the header and its version does not already reach the include.
+    pub extra: &'a [(&'a str, &'a str)],
     /// Host headers outside the probes the clash scan reads (the host's kernel uapi), by include name.
     pub scan: &'a BTreeMap<String, PathBuf>,
 }
@@ -310,6 +315,21 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         unused.is_empty(),
         "homes no header needs any more (delete them): {unused:?}"
     );
+    for (header, inc) in inputs.extra {
+        let host = inputs
+            .host
+            .get(*header)
+            .filter(|p| p.usable())
+            .with_context(|| format!("extra include of <{header}>: the host has no such header"))?;
+        ensure!(
+            !reached_names(header, host).contains(inc),
+            "extra include of <{header}>: the host's already reaches <{inc}> (delete the row)"
+        );
+        let includes = &mut out.entry((*header).to_owned()).or_default().includes;
+        includes.push((*inc).to_owned());
+        includes.sort();
+        includes.dedup();
+    }
 
     for m in inputs.macros {
         ensure!(
@@ -799,6 +819,16 @@ mod tests {
         macros: &[&str],
         substitutes: &[&str],
     ) -> Result<Shape> {
+        derived_extra(dir, homes, macros, substitutes, &[])
+    }
+
+    fn derived_extra(
+        dir: &Tmp,
+        homes: &[(&str, &str)],
+        macros: &[&str],
+        substitutes: &[&str],
+        extra: &[(&str, &str)],
+    ) -> Result<Shape> {
         let include = dir.0.join("bionic");
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
@@ -832,6 +862,7 @@ mod tests {
             macros,
             substitutes,
             scan: &scan,
+            extra,
         })
     }
 
@@ -918,5 +949,21 @@ mod tests {
         // a home must declare the names and must be needed
         assert!(derived(&dir, &[("bits/p.h", "x.h")]).is_err());
         assert!(derived(&dir, &[("bits/p.h", "q.h"), ("bits/none.h", "q.h")]).is_err());
+
+        // extra includes: added to a wrapper with shape (w.h) or making one (z.h), sorted, once
+        let extra = |rows: &[(&str, &str)]| {
+            derived_extra(&dir, home, forwarded, &[], rows).map_err(|e| e.to_string())
+        };
+        let with_extra = extra(&[("w.h", "z.h"), ("w.h", "x.h"), ("z.h", "y.h")]).unwrap();
+        assert_eq!(
+            with_extra.wrappers["w.h"].includes,
+            strings(&["q.h", "x.h", "y.h", "z.h"])
+        );
+        assert_eq!(with_extra.wrappers["z.h"].includes, strings(&["y.h"]));
+        // refused: the host's header already reaches it (host w.h includes sys/cdefs.h); no host header
+        let e = extra(&[("w.h", "sys/cdefs.h")]).unwrap_err();
+        assert!(e.contains("already reaches <sys/cdefs.h>"), "{e}");
+        let e = extra(&[("o.h", "x.h")]).unwrap_err();
+        assert!(e.contains("the host has no such header"), "{e}");
     }
 }
