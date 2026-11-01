@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 01:49:25 +0800
+Subject: [PATCH] libartbase: no strlcpy shim where glibc has strlcpy
+
+strlcpy.h defines a static inline strlcpy for every C library but
+bionic, musl and Apple's. glibc 2.38 added strlcpy to <string.h>
+(default feature set), so with a current glibc the shim's static
+definition follows glibc's extern declaration and fails to compile.
+Skip the shim when glibc is 2.38 or newer. No change for Soong
+builds: device builds use bionic, host builds a glibc 2.17 sysroot.
+
+Upstream-Status: Pending
+Patch-Reason: the conflict is between two declarations inside the compile of ART's own header; the launcher, loader and environment cannot reach it, and hiding glibc's declaration would break every other strlcpy user
+---
+SPDX-License-Identifier: Apache-2.0
+ libartbase/base/strlcpy.h | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/libartbase/base/strlcpy.h b/libartbase/base/strlcpy.h
+index b5978c5ee8fd6de55b0eb68e17dcfddfed42cfd0..f5534619ccdf5d74f9cef5509a28a4630514431b 100644
+--- a/libartbase/base/strlcpy.h
++++ b/libartbase/base/strlcpy.h
+@@ -23,10 +23,11 @@
+ // Expose a simple implementation of strlcpy when we're not compiling against bionic. This is to
+ // make static analyzers happy not using strcpy.
+ //
+-// Bionic exposes this function, but the host glibc does not. Remove this shim when we compile
+-// against bionic on the host, also.
++// Bionic exposes this function, and so does glibc since 2.38, but the host glibc does not. Remove
++// this shim when we compile against bionic on the host, also.
+ 
+-#if !defined(__BIONIC__) && !defined(__APPLE__) && !defined(ANDROID_HOST_MUSL)
++#if !defined(__BIONIC__) && !defined(__APPLE__) && !defined(ANDROID_HOST_MUSL) && \
++    !(defined(__GLIBC__) && __GLIBC_PREREQ(2, 38))
+ 
+ static inline size_t strlcpy(char* dst, const char* src, size_t size) {
+   // Extra-lazy implementation: this is only a host shim, and we don't have to call this often.
