@@ -17,6 +17,7 @@ mod licence_gate;
 mod licenses;
 mod modules;
 mod native;
+mod native_load;
 mod none_gate;
 mod notice;
 mod par;
@@ -104,6 +105,22 @@ enum Command {
     /// file has no notice at all. An unrecognised notice is reported, never guessed. The licence
     /// gate applies the same resolution to what a build links.
     Licence(notice::Args),
+    /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).
+    Test {
+        #[command(subcommand)]
+        test: Test,
+    },
+}
+
+#[derive(Subcommand)]
+enum Test {
+    /// The converter-built libandroid_runtime on host ART: load (every symbol bound), JNI registration (startReg + gRegJNI count), native calls checked against Android semantics, one copy per library.
+    ///
+    /// Stages print pass / FAIL / measured / WARN with counts; the exit code fails on any FAIL.
+    /// The gRegJNI count is measured, not judged, until framework.jar exists: the walk aborts at the first class the test fixture (xtask/testdata/native-load) does not declare.
+    /// Duplicate libraries (libbase, liblog, libnativehelper, ICU, libc++) warn; --strict-copies fails on them, for an ART built by the converter.
+    /// The fixture (Java declarations + JNI shim in Rust) is built into <out>/native-load on every run with the Java pipeline's JDK and d8 and the repo's rustc.
+    NativeLoad(native_load::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -118,6 +135,9 @@ fn main() -> Result<ExitCode> {
         Command::Native(args) => native::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
+        Command::Test {
+            test: Test::NativeLoad(args),
+        } => native_load::run(&root, &args),
     }
 }
 
