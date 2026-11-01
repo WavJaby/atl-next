@@ -10,8 +10,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clang::diagnostic::Severity;
 use clang::source::File;
 use clang::{
-    Clang, Entity, EntityKind, EvaluationResult, Index, Linkage, TranslationUnit, Type, TypeKind,
-    Unsaved,
+    Clang, Entity, EntityKind, EvaluationResult, Index, Linkage, StorageClass, TranslationUnit,
+    Type, TypeKind, Unsaved,
 };
 
 use crate::ir::{ArchView, CInt, Constant, Field, Nullability, Record, RecordKind, Signature, Ty};
@@ -143,6 +143,10 @@ pub struct Reached {
     pub names: BTreeSet<String>,
     /// Its macro definitions as written (`NAME body`, `NAME(args) body`), by name.
     pub macros: BTreeMap<String, String>,
+    /// Functions it declares with C++ language linkage: C++ probes only, outside any linkage
+    /// specification, not `static` (internal linkage has no language linkage that matters). A C header
+    /// meant for C++ callers declares none (`__BEGIN_DECLS`); `extern "C++"` ones are deliberate.
+    pub cxx_linkage: BTreeSet<String>,
 }
 
 /// One include directive.
@@ -188,7 +192,7 @@ pub fn probe_includes(
                 refused: Some(msg),
                 files: BTreeMap::new(),
             },
-            None => probe(&tu, &path, &mut texts)?,
+            None => probe(&tu, &path, lang, &mut texts)?,
         };
         out.insert((*name).to_owned(), one);
     }
@@ -316,6 +320,7 @@ fn probe_path(lang: Lang, stem: &str) -> PathBuf {
 fn probe(
     tu: &TranslationUnit,
     main: &Path,
+    lang: Lang,
     texts: &mut BTreeMap<PathBuf, String>,
 ) -> Result<Probe> {
     let roots = included(tu, main)?;
@@ -344,7 +349,8 @@ fn probe(
         }
         out.files.insert(path, reached);
     }
-    declared(&tu.get_entity(), &mut out, texts)?;
+    // C has no linkage specifications: every function there has C linkage
+    declared(&tu.get_entity(), lang == Lang::Cxx, &mut out, texts)?;
     Ok(out)
 }
 
@@ -394,12 +400,18 @@ fn macro_text(e: &Entity, path: &Path, texts: &mut BTreeMap<PathBuf, String>) ->
 }
 
 /// Names `parent`'s children declare, into the reached file each is declared in; `extern "C"` blocks
-/// looked into. `texts`: file contents read so far, for macro definitions.
-fn declared(parent: &Entity, out: &mut Probe, texts: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+/// looked into. `cxx_linkage`: a function child gets C++ language linkage (C++ unit, `parent` outside
+/// every linkage specification). `texts`: file contents read so far, for macro definitions.
+fn declared(
+    parent: &Entity,
+    cxx_linkage: bool,
+    out: &mut Probe,
+    texts: &mut BTreeMap<PathBuf, String>,
+) -> Result<()> {
     for e in parent.get_children() {
         let kind = e.get_kind();
         if kind == EntityKind::LinkageSpec {
-            declared(&e, out, texts)?;
+            declared(&e, false, out, texts)?;
             continue;
         }
         let Some(path) = e
@@ -443,7 +455,13 @@ fn declared(parent: &Entity, out: &mut Probe, texts: &mut BTreeMap<PathBuf, Stri
                         .extend(e.get_name().map(|n| format!("{k} {n}")));
                 }
             }
-            EntityKind::FunctionDecl | EntityKind::VarDecl | EntityKind::TypedefDecl => {
+            EntityKind::FunctionDecl => {
+                reached.names.extend(e.get_name());
+                if cxx_linkage && e.get_storage_class() != Some(StorageClass::Static) {
+                    reached.cxx_linkage.extend(e.get_name());
+                }
+            }
+            EntityKind::VarDecl | EntityKind::TypedefDecl => {
                 reached.names.extend(e.get_name());
             }
             _ => {}

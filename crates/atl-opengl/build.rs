@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Generates with atl-bridgegen, for the target cargo builds for, each twice and failing unless byte-identical:
 //! - `OUT_DIR/glext.rs` from AOSP's pinned Khronos headers (`frameworks/native/opengl/include`): one exported shell per EGL / GLES extension function, forwarding to what `eglGetProcAddress` returns (bridge control 1; `crate::ffi::resolve`).
-//! - `PRIVATE`: `OUT_DIR/capi/include/private/EGL/{cache,display}.h` (cargo-c installs them) declaring exactly the libEGL private functions `crate::private` exports, and `OUT_DIR/{cache,display}.rs`, the check that each export has the header's signature.
+//! - `PRIVATE`: `OUT_DIR/capi/include/private/EGL/{cache,display}.h` (cargo-c installs them) declaring exactly the libEGL private functions `crate::private` exports, and `OUT_DIR/{cache,display,gles_cm}.rs`, the check that each export has its declaration's signature.
 //!
 //! Extension function = declared by an extension header (`EXT_HEADERS`) and by no core header (`CORE_HEADERS`). The headers decide, not the host libraries' exports: the set is the same on every host and at every build, and the host loaders (libglvnd) export exactly the core headers' functions -- measured 2026-10-31 on Debian 13: libEGL 44 symbols, libGLESv2 358, libGLESv1_CM 145, no extension function among them besides GLES 1.1's core `glPointSizePointerOES`.
 //! Headers are parsed as the converter compiles their callers: glibc host target, `ANDROID` (a Soong global define) and `__ANDROID__` (the device triple's, owner 2026-11-01) -- eglplatform.h's Android native types --, prototypes enabled.
@@ -16,8 +16,8 @@ use atl_bridgegen::{Lang, Source, Target};
 /// AOSP's Khronos headers, relative to the AOSP tree.
 const INCLUDE: &str = "frameworks/native/opengl/include";
 
-/// AOSP libEGL's private API (`frameworks/native/opengl/libs/EGL/include`) that framework code calls: only these two headers, each only its function, so declared == implemented == checked. The rest of that directory declares what nothing here implements.
-/// Callers (2026-11-01): hwui `android_graphics_HardwareRenderer.cpp` (`egl_set_cache_filename`), libandroid_runtime `com_google_android_gles_jni_EGLImpl.cpp` (`egl_get_init_count`).
+/// AOSP libEGL's / libGLESv1_CM's private API that framework code calls: only these declaring files, each only its functions, so declared == implemented == checked. The rest of `frameworks/native/opengl/libs/EGL/include` declares what nothing here implements.
+/// Callers (2026-11-01): hwui `android_graphics_HardwareRenderer.cpp` (`egl_set_cache_filename`), libandroid_runtime `com_google_android_gles_jni_EGLImpl.cpp` (`egl_get_init_count`), libandroid_runtime's GLES 1 bindings (`gl*PointerBounds`).
 const PRIVATE: &[Api] = &[
     Api {
         name: "cache",
@@ -39,6 +39,32 @@ const PRIVATE: &[Api] = &[
         macros: &[],
         // its <EGL/egl.h> (EGLDisplay, which the printed header includes again) and <cutils/compiler.h>
         include_dirs: &[INCLUDE, "system/core/libcutils/include"],
+        kept: DECLARATIONS,
+    },
+    // libGLESv1_CM's "extensions for the framework": no header declares them; AOSP's implementation file does (C linkage), and each caller repeats the same block (libandroid_runtime's glgen output: `android_opengl_GLES10.cpp`, `GLES10Ext.cpp`, `GLES11.cpp`, `GLES11Ext.cpp`, `com_google_android_gles_jni_GLImpl.cpp`).
+    // The implementation's declarations are checked: they are what AOSP's libGLESv1_CM exports.
+    Api {
+        name: "gles_cm",
+        source: "frameworks/native/opengl/libs/GLES_CM/gl.cpp",
+        lang: Lang::Cxx,
+        header: None,
+        functions: &[
+            "glColorPointerBounds",
+            "glNormalPointerBounds",
+            "glTexCoordPointerBounds",
+            "glVertexPointerBounds",
+            "glPointSizePointerOESBounds",
+            "glMatrixIndexPointerOESBounds",
+            "glWeightPointerOESBounds",
+        ],
+        macros: &[],
+        // <log/log.h>, <cutils/properties.h>, the Khronos headers, and hooks.h's <bionic/tls.h> (bionic's platform header)
+        include_dirs: &[
+            INCLUDE,
+            "system/logging/liblog/include",
+            "system/core/libcutils/include",
+            "bionic/libc/platform",
+        ],
         kept: DECLARATIONS,
     },
 ];

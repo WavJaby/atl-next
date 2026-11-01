@@ -133,6 +133,60 @@ genrule { name: "gen_map", cmd: "echo '{ local: *; };' > $(out)", out: ["gen.map
 	}
 }
 
+// Expected from cc/linker.go linkerFlags: a module's ldflags (arch_variant: target and arch blocks, defaults' too) follow the global flags and precede the version script; cc/compiler.go's escaping splits a space-only entry into words (`-z max-page-size=…`, art_hugepage_defaults).
+// lld-only entries are left out (lldOnly), everything else passes unchanged.
+func TestModuleLdflags(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_defaults {
+    name: "huge",
+    arch: { x86_64: { ldflags: ["-z max-page-size=0x200000"] }, arm64: { ldflags: ["-Wl,--arm64-only"] } },
+}
+cc_library {
+    name: "libl",
+    host_supported: true,
+    defaults: ["huge"],
+    srcs: ["l.cc"],
+    ldflags: ["-Wl,-Bsymbolic", "-Wl,-icf=all", "-Wl,--icf=safe"],
+    target: { android: { ldflags: ["-Wl,--exclude-libs=libx.a"] }, linux_glibc: { ldflags: ["-static-libgcc"] } },
+    version_script: "l.map",
+}
+`})
+	g.soong.DeviceLink = soongDeviceLink
+	for _, side := range []Side{Device, Host} {
+		if g.node("libl", side, Shared, "goal") == nil {
+			t.Fatal(g.problems)
+		}
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
+	script := "-Wl,--version-script," + filepath.Join(g.tree, "p/l.map")
+	for _, c := range []struct {
+		side    string
+		want    []string
+		without []string
+	}{
+		{"device", []string{"-Wl,-Bsymbolic", "-z", "max-page-size=0x200000", "-Wl,--exclude-libs=libx.a"}, []string{"-static-libgcc"}},
+		{"host", []string{"-Wl,-Bsymbolic", "-z", "max-page-size=0x200000", "-static-libgcc"}, []string{"-Wl,--exclude-libs=libx.a"}},
+	} {
+		mode, _ := linkEdge(t, ninja, filepath.Join(g.out, c.side, "libl/libl.so"))
+		args := shWords(t, mode)
+		from, to := slices.Index(args, "-Wl,--no-undefined"), slices.Index(args, script)
+		if from < 0 || to != len(args)-1 {
+			t.Fatalf("%s: %q: want --no-undefined, the module's ldflags, the version script last", c.side, args)
+		}
+		local := args[from+1 : to]
+		for _, f := range c.want {
+			if !slices.Contains(local, f) {
+				t.Errorf("%s: module flags %q lack %s", c.side, local, f)
+			}
+		}
+		for _, f := range append(c.without, "-Wl,--arm64-only", "-Wl,-icf=all", "-Wl,--icf=safe") {
+			if slices.Contains(args, f) {
+				t.Errorf("%s: %q has %s", c.side, args, f)
+			}
+		}
+	}
+}
+
 // The libhwui shape, compiled and linked by the converter's own edges: a whole-archived object's exported function calls an NDK symbol nothing defines (libskia SkFontMgr_android_ndk.cpp -> AFont_*); the library's version script exports only its API.
 // The undefined reference goes away only with both: the version script makes the function local, and --gc-sections (with -ffunction-sections) then drops its section.
 // Either alone leaves it (exported = a GC root; local but not collected = still linked), which --no-undefined reports.

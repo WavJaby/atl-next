@@ -379,7 +379,7 @@ func soongShellUnsafe(r rune) bool {
 	return !strings.ContainsRune("_+-=.,/", r)
 }
 
-// linkFlags: a shared library's or binary's link flags ahead of its inputs, in Soong's order: the kind's (cc/library.go sharedLinkerFlags, cc/binary.go linkerFlags) and the toolchain's global ones (Flags.Global.LdFlags: DeviceLink on the device side, --no-undefined from CommonLinkerFlags), then the module's own (Flags.Local.LdFlags: version_script, which cc/linker.go makes a dependency of the link too).
+// linkFlags: a shared library's or binary's link flags ahead of its inputs, in Soong's order: the kind's (cc/library.go sharedLinkerFlags, cc/binary.go linkerFlags) and the toolchain's global ones (Flags.Global.LdFlags: DeviceLink on the device side, --no-undefined from CommonLinkerFlags), then the module's own (Flags.Local.LdFlags, cc/linker.go linkerFlags: its ldflags, after target / arch blocks, then version_script, which it makes a dependency of the link too).
 func (g *Graph) linkFlags(n *Node) []string {
 	var out []string
 	if n.kind == Shared {
@@ -389,10 +389,26 @@ func (g *Graph) linkFlags(n *Node) []string {
 		out = append(out, g.soong.DeviceLink.Ldflags...)
 	}
 	out = append(out, "-Wl,--no-undefined")
+	for _, f := range moduleFlags(n.props, "ldflags") {
+		if !lldOnly(f) {
+			out = append(out, f)
+		}
+	}
 	if n.versionScript != "" {
 		out = append(out, "-Wl,--version-script,"+n.versionScript)
 	}
 	return out
+}
+
+// lldOnly: a module ldflags entry Soong passes to lld that ld.bfd (distro clang's linker here) rejects, and which is left out, each prefix with why leaving it out changes no behaviour. Any other flag ld.bfd rejects fails the link, naming it.
+// -icf= / --icf= (libpdfium `-Wl,-icf=all`): identical code folding, a size optimisation with no ld.bfd equivalent (only gold had one). Without it every function keeps its own address, the C++ guarantee icf=all relaxes; nothing can depend on two functions sharing one.
+func lldOnly(flag string) bool {
+	for _, p := range []string{"-Wl,-icf=", "-Wl,--icf="} {
+		if strings.HasPrefix(flag, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // linkLibs: provided shared objects, whole archives, the generated Rust staticlib, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.

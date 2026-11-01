@@ -404,6 +404,12 @@ fn pointer_notice(n: &str) -> Option<String> {
     {
         return Some("BSD-3-Clause".to_owned());
     }
+    // WebM project wording (libwebp): webp/COPYING is BSD-3-Clause; the PATENTS file it also names is a separate patent grant (Apache-style, terminated by patent litigation over the code), which adds rights and restricts none of the copyright licence's, as Adobe's FreeType grant below
+    if has(&format!(
+        "{CHROMIUM} copying file in the root of the source tree an additional intellectual property rights grant can be found in the file patents"
+    )) {
+        return Some("BSD-3-Clause".to_owned());
+    }
     // freetype/LICENSE.TXT: FTL or GPL-2.0 "(any later version can be used also)", the user's choice; Adobe's files add a patent grant to the same licence
     if has("freetype project license license.txt") {
         return Some("FTL OR GPL-2.0-or-later".to_owned());
@@ -659,6 +665,9 @@ mod tests {
         // pdfium/core/fxcrt/fx_string.cpp
         let pdfium = "// Copyright 2017 The PDFium Authors\n// Use of this source code is governed by a BSD-style license that can be\n// found in the LICENSE file.\n\n// Original code copyright 2014 Foxit Software Inc. http://www.foxitsoftware.com\n\n#include \"core/fxcrt/fx_string.h\"\n";
         assert_eq!(id(pdfium), notice("BSD-3-Clause"));
+        // webp/src/dsp/dec.c: COPYING is BSD-3-Clause, PATENTS a separate patent grant
+        let webp = "// Copyright 2010 Google Inc. All Rights Reserved.\n//\n// Use of this source code is governed by a BSD-style license\n// that can be found in the COPYING file in the root of the source\n// tree. An additional intellectual property rights grant can be found\n// in the file PATENTS. All contributing project authors may\n// be found in the AUTHORS file in the root of the source tree.\n// -----------------------------------------------------------------------------\n";
+        assert_eq!(id(webp), notice("BSD-3-Clause"));
     }
 
     #[test]

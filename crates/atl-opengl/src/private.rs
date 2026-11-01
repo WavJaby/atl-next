@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! AOSP libEGL's private API on the host EGL, exported under the Itanium-mangled names framework code links against: `private/EGL/cache.h`, `display.h` (C++ `namespace android`), and `eglBeginFrame` (global, C++ linkage, declared by its caller only).
-//! `crate::generated::{cache, display}` check those exports' signatures against AOSP's header; `eglBeginFrame` has no header to check against. This module's tests check each symbol against the mangling rules.
-//! Boundary module: `unsafe` is the exported names and one host EGL call.
+//! AOSP libGLESv1_CM's private API on the host GLES 1: the `gl*PointerBounds` functions (C linkage), forwarding as AOSP's do.
+//! `crate::generated::{cache, display, gles_cm}` check those exports' signatures against AOSP's declarations; `eglBeginFrame` has none to check against. This module's tests check each symbol against the mangling rules.
+//! Boundary module: `unsafe` is the exported names and the host EGL / GLES calls.
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -70,9 +71,77 @@ macro_rules! begin_frame {
 #[unsafe(export_name = begin_frame!())]
 pub extern "C" fn egl_begin_frame(_dpy: *mut c_void, _surface: *mut c_void) {}
 
+/// gl.h types (Khronos registry; khrplatform.h on every Android and Linux ABI): GLint / GLsizei = 32-bit signed, GLenum = 32-bit unsigned.
+type GLint = i32;
+type GLsizei = i32;
+type GLenum = u32;
+
+// GLES 1.1 core, the host libGLESv1_CM's exports (glPointSizePointerOES is core in GLES 1.1, gl.h)
+#[link(name = "GLESv1_CM")]
+unsafe extern "C" {
+    fn glColorPointer(size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+    fn glNormalPointer(ty: GLenum, stride: GLsizei, pointer: *const c_void);
+    fn glTexCoordPointer(size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+    fn glVertexPointer(size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+    fn glPointSizePointerOES(ty: GLenum, stride: GLsizei, pointer: *const c_void);
+}
+
+/// libGLESv1_CM's "extensions for the framework" (AOSP `GLES_CM/gl.cpp`): C linkage, each the plain array-pointer function with the element count the Java binding checked against the buffer appended.
+/// AOSP's bodies ignore the count and call the plain function; these do the same. The two OES_matrix_palette ones call this crate's `eglGetProcAddress` shells, as AOSP's call libGLESv1_CM's own entry points.
+#[allow(non_snake_case)]
+mod gles_cm {
+    use super::*;
+    use crate::ffi::shells::{glMatrixIndexPointerOES, glWeightPointerOES};
+
+    /// One export per function: (count ignored) -> `$plain` with the other arguments in order.
+    macro_rules! bounds {
+        ($($name:ident => $plain:path: ($($arg:ident: $ty:ty),*);)*) => {
+            $(
+                // SAFETY: a name nothing else in the process defines (AOSP's libGLESv1_CM is not built; the host's has no such symbol); the signature is gl.cpp's (checked by `crate::generated::gles_cm`)
+                #[unsafe(no_mangle)]
+                pub extern "C" fn $name($($arg: $ty,)* _count: GLsizei) {
+                    // SAFETY: the caller's arguments, unchanged, to the function AOSP forwards them to; GL keeps the pointer for later draws exactly as the plain call does
+                    unsafe { $plain($($arg),*) }
+                }
+            )*
+
+            #[cfg(test)]
+            pub(super) const NAMES: &[&str] = &[$(stringify!($name)),*];
+        };
+    }
+
+    bounds! {
+        glColorPointerBounds => glColorPointer: (size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glNormalPointerBounds => glNormalPointer: (ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glTexCoordPointerBounds => glTexCoordPointer: (size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glVertexPointerBounds => glVertexPointer: (size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glPointSizePointerOESBounds => glPointSizePointerOES: (ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glMatrixIndexPointerOESBounds => glMatrixIndexPointerOES: (size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+        glWeightPointerOESBounds => glWeightPointerOES: (size: GLint, ty: GLenum, stride: GLsizei, pointer: *const c_void);
+    }
+}
+pub use gles_cm::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gles_cm_bounds_are_the_seven_of_gl_cpp() {
+        // AOSP frameworks/native/opengl/libs/GLES_CM/gl.cpp "extensions for the framework", in its order; C linkage, so the symbol is the name
+        assert_eq!(
+            gles_cm::NAMES,
+            [
+                "glColorPointerBounds",
+                "glNormalPointerBounds",
+                "glTexCoordPointerBounds",
+                "glVertexPointerBounds",
+                "glPointSizePointerOESBounds",
+                "glMatrixIndexPointerOESBounds",
+                "glWeightPointerOESBounds",
+            ]
+        );
+    }
 
     /// Itanium C++ ABI 5.1 (mangling) of a free function: `_Z` <len><name> + parameter types at global scope, `_Z` `N` <len><ns> <len><name> `E` + parameter types in namespace `ns`.
     fn mangle(ns: Option<&str>, name: &str, params: &str) -> String {

@@ -75,7 +75,8 @@ const APIS: &[Api] = &[
     },
     // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
     // it, owner Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
-    // libvndksupport) and namespace creation / linking (libgraphicsenv)
+    // libvndksupport), namespace creation / linking (libgraphicsenv) and the linker warnings (libandroid_runtime
+    // android_app_Activity.cpp)
     Api {
         name: "libdl_android",
         source: "bionic/libdl/libdl_android.cpp",
@@ -86,6 +87,7 @@ const APIS: &[Api] = &[
             "android_get_exported_namespace",
             "android_create_namespace",
             "android_link_namespaces",
+            "android_dlwarning",
         ],
         macros: &[],
         include_dirs: &[],
@@ -637,6 +639,9 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         .context("the host's headers")?;
     let host_gnu = front::probe_includes(Lang::C, &gnu(self::host_target(host)?), &strs(&names))
         .context("the host's headers with _GNU_SOURCE")?;
+    // as device C++ includes them: the linkage they give their functions
+    let host_cxx = front::probe_includes(Lang::Cxx, &gnu(self::host_target(host)?), &strs(&names))
+        .context("the host's headers as C++")?;
     let kernel = kernel_headers(&uapi)?;
     let scan = front::resolve_includes(
         Lang::C,
@@ -662,6 +667,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         scan: &scan,
         kernel: &kernel,
         extra,
+        cxx: &host_cxx,
     })?;
     shape::check_guards(derived.wrappers.keys())?;
     let mut wrappers: Vec<(String, String)> = derived
@@ -694,6 +700,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
     let host_inputs = host_probes
         .values()
         .chain(host_gnu.values())
+        .chain(host_cxx.values())
         .flat_map(|p| p.files.keys().cloned())
         .chain(scan.into_values())
         .collect();

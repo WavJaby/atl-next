@@ -42,6 +42,10 @@ unsafe extern "C" {
         to: *mut Namespace,
         shared_libs_sonames: *const c_char,
     ) -> bool;
+    fn android_dlwarning(
+        obj: *mut c_void,
+        f: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+    );
     fn android_mallopt(opcode: c_int, arg: *mut c_void, arg_size: usize) -> bool;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn dlerror() -> *const c_char;
@@ -75,6 +79,43 @@ fn take_dlerror() -> Option<String> {
         let p = dlerror();
         (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
     }
+}
+
+/// What one `android_dlwarning` callback saw: how often it ran, and its last text (None = null).
+struct Seen {
+    calls: u32,
+    text: Option<String>,
+}
+
+unsafe extern "C" fn record(obj: *mut c_void, msg: *const c_char) {
+    // SAFETY: obj is the `Seen` the test passed; msg null or NUL-terminated for the call
+    unsafe {
+        let seen = &mut *obj.cast::<Seen>();
+        seen.calls += 1;
+        seen.text = (!msg.is_null()).then(|| CStr::from_ptr(msg).to_string_lossy().into_owned());
+    }
+}
+
+#[test]
+fn dlwarning_reports_no_warnings_once() {
+    // bionic linker_dlwarning.cpp get_dlwarning: with no warning accumulated, the callback runs once with (obj, nullptr) -- what android_app_Activity.cpp turns into a null getDlWarning()
+    let mut seen = Seen {
+        calls: 0,
+        text: Some(String::from("untouched")),
+    };
+    // SAFETY: a live object and a callback of the declared type
+    unsafe { android_dlwarning((&raw mut seen).cast(), Some(record)) };
+    assert_eq!(seen.calls, 1);
+    assert_eq!(seen.text, None);
+    // loading a library accumulates nothing on glibc: still none
+    // SAFETY: a NUL-terminated soname every glibc system has
+    let handle = unsafe { android_dlopen_ext(c"libm.so.6".as_ptr(), RTLD_NOW, std::ptr::null()) };
+    assert!(!handle.is_null());
+    // SAFETY: as above
+    unsafe { android_dlwarning((&raw mut seen).cast(), Some(record)) };
+    assert_eq!((seen.calls, seen.text), (2, None));
+    // SAFETY: the handle dlopen returned
+    assert_eq!(unsafe { dlclose(handle) }, 0);
 }
 
 #[test]

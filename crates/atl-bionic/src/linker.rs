@@ -12,6 +12,7 @@
 //! keeps bionic's argument refusals, as every library is already visible to every load.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::CString;
 
 /// A linker namespace; only `DEFAULT` exists.
 pub struct Namespace {
@@ -84,6 +85,14 @@ pub fn exported(_name: &[u8]) -> &'static Namespace {
 pub unsafe fn open(name: *const c_char, flags: c_int, _ns: &Namespace) -> *mut c_void {
     // SAFETY: the caller's contract
     unsafe { dlopen(name, flags) }
+}
+
+/// bionic `get_dlwarning` (`linker_dlwarning.cpp`): takes the process's accumulated linker warnings,
+/// cleared on read, `None` when there are none. bionic's linker adds them while loading (`add_dlwarning`,
+/// e.g. text relocations in a legacy app's library); glibc's loader keeps no such list, so there never
+/// are any.
+pub fn take_warnings() -> Option<CString> {
+    None
 }
 
 /// Fails a load with `detail` for `dlerror`: glibc owns `dlerror` and has no call to set it, so glibc's

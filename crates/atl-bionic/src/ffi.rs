@@ -458,6 +458,20 @@ pub extern "C" fn android_create_namespace(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_dlwarning(
+    obj: *mut c_void,
+    f: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+) {
+    let warnings = linker::take_warnings();
+    // bionic get_dlwarning: f(obj, nullptr) when there are none, else f(obj, text); it calls a null f, which crashes there
+    let text = warnings.as_deref().map_or(core::ptr::null(), CStr::as_ptr);
+    if let Some(f) = f {
+        // SAFETY: bionic's contract, the caller's callback and its object; `text` lives to the end of this call
+        unsafe { f(obj, text) }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn android_link_namespaces(
     namespace_from: *mut android_namespace_t,
     namespace_to: *mut android_namespace_t,
