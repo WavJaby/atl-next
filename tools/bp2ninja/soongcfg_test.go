@@ -72,7 +72,7 @@ func TestSoongConfigAvailability(t *testing.T) {
 	}
 }
 
-// archTree writes files shaped like the pinned android-16.0.0_r1 ones (an excerpt of each declaration): android/arch.go's newArch vars and arch_list.go's androidArchFeatureMap, which readDeviceArch reads, and cc/config/x86_64_device.go and arm64_device.go excerpts, which yasmTree builds on.
+// archTree writes files shaped like the pinned android-16.0.0_r1 ones (an excerpt of each declaration): android/arch.go's newArch vars and arch_list.go's androidArchFeatureMap, which readDeviceArch reads, and cc/config/x86_64_device.go and arm64_device.go excerpts.
 func archTree(t *testing.T) string {
 	tree := t.TempDir()
 	files := map[string]string{
@@ -269,56 +269,6 @@ func TestWriteCompat(t *testing.T) {
 	}
 }
 
-// yasmTree writes cc/config excerpts shaped like the pinned android-16.0.0_r1 files: the device toolchain's own YasmFlags (x86_64_device.go), the glibc host's promoted from an embedded struct through a singleton var (x86_linux_host.go), arm64 inheriting toolchainBase's "" through toolchainBionic (toolchain.go, bionic.go), and no linux_glibc arm64 factory (upstream registers LinuxMusl and LinuxBionic only).
-func yasmTree(t *testing.T) string {
-	tree := archTree(t)
-	files := map[string]string{
-		"build/soong/cc/config/toolchain.go": "package config\n\ntype toolchainBase struct{}\n\nfunc (toolchainBase) YasmFlags() string {\n\treturn \"\"\n}\n\ntype toolchain64Bit struct{}\n",
-		"build/soong/cc/config/bionic.go":    "package config\n\ntype toolchainBionic struct {\n\ttoolchainBase\n}\n",
-		"build/soong/cc/config/x86_64_device.go": "package config\n\nfunc init() {\n\tpctx.StaticVariable(\"X86_64YasmFlags\", \"-f elf64 -m amd64\")\n}\n\n" +
-			"type toolchainX86_64 struct {\n\ttoolchainBionic\n\ttoolchain64Bit\n\ttoolchainCflags string\n}\n\n" +
-			"func (t *toolchainX86_64) YasmFlags() string {\n\treturn \"${config.X86_64YasmFlags}\"\n}\n\n" +
-			"func x86_64ToolchainFactory(arch android.Arch) Toolchain {\n\treturn &toolchainX86_64{\n\t\ttoolchainCflags: \"\",\n\t}\n}\n\n" +
-			"func init() {\n\tregisterToolchainFactory(android.Android, android.X86_64, x86_64ToolchainFactory)\n}\n",
-		"build/soong/cc/config/x86_linux_host.go": "package config\n\nfunc init() {\n\tpctx.StaticVariable(\"LinuxX8664YasmFlags\", \"-f elf64 -m amd64\")\n}\n\n" +
-			"type toolchainLinux struct {\n\ttoolchainBase\n\tcFlags, ldFlags string\n}\n\ntype toolchainLinuxX8664 struct {\n\ttoolchain64Bit\n\ttoolchainLinux\n}\n\n" +
-			"func (t *toolchainLinuxX8664) YasmFlags() string {\n\treturn \"${config.LinuxX8664YasmFlags}\"\n}\n\n" +
-			"type toolchainGlibc struct{}\n\ntype toolchainLinuxGlibcX8664 struct {\n\ttoolchainLinuxX8664\n\ttoolchainGlibc\n}\n\n" +
-			"var toolchainLinuxGlibcX8664Singleton Toolchain = &toolchainLinuxGlibcX8664{}\n\n" +
-			"func linuxGlibcX8664ToolchainFactory(arch android.Arch) Toolchain {\n\treturn toolchainLinuxGlibcX8664Singleton\n}\n\n" +
-			"func init() {\n\tregisterToolchainFactory(android.Linux, android.X86_64, linuxGlibcX8664ToolchainFactory)\n}\n",
-		"build/soong/cc/config/arm64_device.go": "package config\n\ntype toolchainArm64 struct {\n\ttoolchainBionic\n\ttoolchain64Bit\n}\n\n" +
-			"func arm64ToolchainFactory(arch android.Arch) Toolchain {\n\treturn &toolchainArm64{}\n}\n\n" +
-			"func init() {\n\tregisterToolchainFactory(android.Android, android.Arm64, arm64ToolchainFactory)\n}\n",
-	}
-	for p, text := range files {
-		if err := os.WriteFile(filepath.Join(tree, p), []byte(text), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return tree
-}
-
-// Expected flags: the pctx variables' literals (x86_64_device.go:127, x86_linux_host.go:157).
-func TestYasmFlags(t *testing.T) {
-	tree := yasmTree(t)
-	flags, none, err := readYasmFlags(tree, "x86_64")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"-f", "elf64", "-m", "amd64"}
-	if !slices.Equal(flags[Device], want) || !slices.Equal(flags[Host], want) || none != [2]string{} {
-		t.Errorf("x86_64: %q, none %q", flags, none)
-	}
-	flags, none, err = readYasmFlags(tree, "arm64")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(flags[Device]) != 0 || none[Device] != "" || !strings.Contains(none[Host], "(Linux, Arm64)") {
-		t.Errorf("arm64: %q, none %q", flags, none)
-	}
-}
-
 // .asm gets the toolchain's yasm flags, the module's asflags and its own include dirs, nothing of cflags or dependencies; .S gets the global asm defines and asflags but not the module's cflags (Soong's asflags).
 func TestAsmFlags(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
@@ -332,7 +282,7 @@ cc_library {
     local_include_dirs: ["simd/nasm"],
 }
 `})
-	g.soong.Yasm[Device] = []string{"-f", "elf64"}
+	g.soong.Flags.Yasm[Device] = []string{"-f", "elf64"}
 	g.soong.Flags.As[Device] = []string{"-D__ASSEMBLY__"}
 	n := g.node("libjpeg", Device, Shared, "t")
 	if n == nil {

@@ -127,9 +127,6 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics / debug info only): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	if soong.Yasm, soong.NoYasm, err = readYasmFlags(tree, cfg.Arch); err != nil {
-		return err
-	}
 	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
 		return err
 	}

@@ -211,7 +211,7 @@ func (g *Graph) emit(tools Tools) string {
 			case ".S", ".s":
 				lang, cc = flags.asm, tools.CC
 			case ".asm":
-				if why := g.soong.NoYasm[n.side]; why != "" {
+				if why := g.soong.Flags.NoToolchain[n.side]; why != "" {
 					g.problem("%s: source %s: %s", n.mod.Name, s, why)
 				} else {
 					fmt.Fprintf(&b, "build %s: yasm %s || %s\n  flags = %s\n", esc(obj), esc(src), join(waits), shellQuote(flags.yasm))
@@ -299,7 +299,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		inc = append(inc, "-I"+g.abs(n.mod.Dir))
 	}
 	// .asm: the toolchain's format flags, the module's asflags and its own include dirs only (cc/compiler.go Local.YasmFlags): no defines, no dependencies' exports
-	yasm := slices.Concat(g.soong.Yasm[n.side], moduleFlags(p, "asflags"), inc)
+	yasm := slices.Concat(f.Yasm[n.side], moduleFlags(p, "asflags"), inc)
 	if cc {
 		inc = append(inc, n.exports...)
 	}

@@ -28,7 +28,14 @@ type GlobalFlags struct {
 	NoOverrideExt  []string // NoOverrideExternalGlobalCflags, third-party only
 	ThirdParty     ThirdParty
 	Skipped        []string // dropped by keepFlag, unique, sorted
+	// per Side: the toolchain's YasmFlags, the format flags of every .asm compile (cc/compiler.go Global.YasmFlags: `-f elf64 -m amd64` for x86_64); toolchainBase's "" on arches without .asm sources
+	Yasm [2][]string
+	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
+	NoToolchain [2]string
 }
+
+// toolchainOS: per side, the android.OsType identifier its toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
+var toolchainOS = [...]string{Device: "Android", Host: "Linux"}
 
 // keepFlag: a Soong global flag the converter passes. Dropped are the flags that never change the object's code or data, only diagnostics or DWARF:
 //   - -W* warnings and warning-errors (the converter compiles with -w -Wno-error: distro clang warns differently from AOSP's); -Wa, -Wl, -Wp are pass-throughs and kept
@@ -146,10 +153,34 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 	if err != nil {
 		return g, err
 	}
-	tc, err := ev.toolchain("Android", ident, map[string]any{"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features})
-	if err != nil {
-		return g, err
+	// android.Arch per side: Soong sets a variant and features for the Android OS only
+	archFields := [2]map[string]any{
+		Device: {"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features},
+		Host:   {"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)},
 	}
+	var tcs [2]map[string]any
+	for side := range tcs {
+		if !ev.hasToolchain(toolchainOS[side], ident) {
+			if Side(side) == Device {
+				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, toolchainOS[side], ident)
+			}
+			g.NoToolchain[side] = "Soong registers no toolchain for (" + toolchainOS[side] + ", " + ident + ")"
+			continue
+		}
+		if tcs[side], err = ev.toolchain(toolchainOS[side], ident, archFields[side]); err != nil {
+			return g, err
+		}
+		yasm, err := ev.method(tcs[side], "YasmFlags")
+		if err != nil {
+			return g, err
+		}
+		// assembler arguments, not clang flags: keepFlag does not apply
+		if yasm, err = ev.expand(yasm); err != nil {
+			return g, err
+		}
+		g.Yasm[side] = strings.Fields(yasm)
+	}
+	tc := tcs[Device]
 	method := func(name string, args ...any) ([]string, error) {
 		s, err := ev.method(tc, name, args...)
 		if err != nil {
@@ -935,6 +966,11 @@ func (e *soongEval) expand(s string) (string, error) {
 }
 
 var configRef = regexp.MustCompile(`\$\{config\.(\w+)\}`)
+
+// hasToolchain: whether an init registers a toolchain factory for (os, arch identifier).
+func (e *soongEval) hasToolchain(osName, arch string) bool {
+	return e.factory[[2]string{osName, arch}] != ""
+}
 
 // toolchain: the value registerToolchainFactory's factory for (os, arch identifier) returns, run with arch = the given android.Arch fields.
 func (e *soongEval) toolchain(osName, arch string, archFields map[string]any) (map[string]any, error) {

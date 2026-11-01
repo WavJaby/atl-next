@@ -103,6 +103,7 @@ var (
 )
 
 func init() {
+	pctx.StaticVariable("X86_64YasmFlags", "-f elf64 -m amd64")
 	pctx.StaticVariable("X86_64ToolchainCflags", "-m64")
 	pctx.VariableFunc("X86_64Cflags", func(ctx android.PackageVarContext) string {
 		flags := x86_64Cflags
@@ -128,6 +129,7 @@ type toolchainX86_64 struct {
 func (t *toolchainX86_64) ToolchainCflags() string { return t.toolchainCflags }
 func (t *toolchainX86_64) Cflags() string { return "${config.X86_64Cflags}" }
 func (t *toolchainX86_64) Cppflags() string { return "${config.X86_64Cppflags}" }
+func (t *toolchainX86_64) YasmFlags() string { return "${config.X86_64YasmFlags}" }
 
 func x86_64ToolchainFactory(arch android.Arch) Toolchain {
 	if _, ok := x86_64ArchVariantCflags[arch.ArchVariant]; !ok {
@@ -170,11 +172,130 @@ func (toolchainBase) Asflags() string {
 	return ""
 }
 
+func (toolchainBase) YasmFlags() string {
+	return ""
+}
+
+type toolchainNoCrt struct{}
+
 type toolchain64Bit struct {
 }
 
 type toolchainBionic struct {
 	toolchainBase
+}
+`
+
+// flagsLinuxHost: x86_linux_host.go's shape (the flag lists, the GCC version consts and their Split init, the prebuilt GCC root as a SourcePathVariable, toolchainLinux / toolchainGlibc embedded in the glibc type, whose Cflags joins both embedded ones' through t.<field>.Cflags(), the singleton var its factory returns); upstream registers no glibc factory for arm64.
+const flagsLinuxHost = `package config
+
+var (
+	linuxCflags = []string{
+		"-Wa,--noexecstack",
+		"-fPIC",
+		"-fno-omit-frame-pointer",
+		"-U_FORTIFY_SOURCE",
+		"-D_FORTIFY_SOURCE=3",
+		"-fstack-protector",
+		"--gcc-toolchain=${LinuxGccRoot}",
+		"-fstack-protector-strong",
+	}
+	linuxGlibcCflags = []string{
+		"--sysroot ${LinuxGccRoot}/sysroot",
+	}
+	linuxX8664Cflags = []string{
+		"-m64",
+	}
+)
+
+const (
+	linuxGccVersion   = "4.8.3"
+	linuxGlibcVersion = "2.17"
+)
+
+func init() {
+	pctx.StaticVariable("LinuxGccVersion", linuxGccVersion)
+	pctx.StaticVariable("LinuxGlibcVersion", linuxGlibcVersion)
+	if p := strings.Split(linuxGccVersion, "."); len(p) > 2 {
+		pctx.StaticVariable("ShortLinuxGccVersion", strings.Join(p[:2], "."))
+	} else {
+		pctx.StaticVariable("ShortLinuxGccVersion", linuxGccVersion)
+	}
+	pctx.SourcePathVariable("LinuxGccRoot",
+		"prebuilts/gcc/linux-x86/host/x86_64-linux-glibc${LinuxGlibcVersion}-${ShortLinuxGccVersion}")
+	pctx.StaticVariable("LinuxCflags", strings.Join(linuxCflags, " "))
+	pctx.StaticVariable("LinuxGlibcCflags", strings.Join(linuxGlibcCflags, " "))
+	pctx.StaticVariable("LinuxX8664Cflags", strings.Join(linuxX8664Cflags, " "))
+	pctx.StaticVariable("LinuxX8664YasmFlags", "-f elf64 -m amd64")
+}
+
+type toolchainLinux struct {
+	toolchainBase
+	cFlags, ldFlags string
+}
+
+type toolchainLinuxX8664 struct {
+	toolchain64Bit
+	toolchainLinux
+}
+
+func (t *toolchainLinuxX8664) Cflags() string {
+	return "${config.LinuxCflags} ${config.LinuxX8664Cflags}"
+}
+
+func (t *toolchainLinuxX8664) Cppflags() string {
+	return ""
+}
+
+func (t *toolchainLinuxX8664) YasmFlags() string {
+	return "${config.LinuxX8664YasmFlags}"
+}
+
+type toolchainGlibc struct {
+	toolchainNoCrt
+}
+
+func (toolchainGlibc) Cflags() string {
+	return "${config.LinuxGlibcCflags}"
+}
+
+type toolchainLinuxGlibcX8664 struct {
+	toolchainLinuxX8664
+	toolchainGlibc
+}
+
+func (t *toolchainLinuxGlibcX8664) Cflags() string {
+	return t.toolchainLinuxX8664.Cflags() + " " + t.toolchainGlibc.Cflags()
+}
+
+var toolchainLinuxGlibcX8664Singleton Toolchain = &toolchainLinuxGlibcX8664{}
+
+func linuxGlibcX8664ToolchainFactory(arch android.Arch) Toolchain {
+	return toolchainLinuxGlibcX8664Singleton
+}
+
+func init() {
+	registerToolchainFactory(android.Linux, android.X86_64, linuxGlibcX8664ToolchainFactory)
+}
+`
+
+// flagsArm64: an arm64 device toolchain with no flags of its own: YasmFlags is toolchainBase's "".
+const flagsArm64 = `package config
+
+type toolchainArm64 struct {
+	toolchainBionic
+	toolchain64Bit
+}
+
+func (t *toolchainArm64) Cflags() string { return "" }
+func (t *toolchainArm64) Cppflags() string { return "" }
+
+func arm64ToolchainFactory(arch android.Arch) Toolchain {
+	return &toolchainArm64{}
+}
+
+func init() {
+	registerToolchainFactory(android.Android, android.Arm64, arm64ToolchainFactory)
 }
 `
 
@@ -195,11 +316,13 @@ func IsThirdPartyPath(path string) bool {
 func flagsTree(t *testing.T, global string) string {
 	tree := t.TempDir()
 	for p, text := range map[string]string{
-		"build/soong/cc/config/global.go":        global,
-		"build/soong/cc/config/x86_64_device.go": flagsX86_64,
-		"build/soong/cc/config/toolchain.go":     flagsBase,
-		"build/soong/android/arch.go":            "package android\n\nvar (\n\tX86_64 = newArch(\"x86_64\", \"lib64\")\n)\n",
-		"build/soong/android/paths.go":           flagsPaths,
+		"build/soong/cc/config/global.go":         global,
+		"build/soong/cc/config/x86_64_device.go":  flagsX86_64,
+		"build/soong/cc/config/arm64_device.go":   flagsArm64,
+		"build/soong/cc/config/x86_linux_host.go": flagsLinuxHost,
+		"build/soong/cc/config/toolchain.go":      flagsBase,
+		"build/soong/android/arch.go":             "package android\n\nvar (\n\tArm64 = newArch(\"arm64\", \"lib64\")\n\tX86_64 = newArch(\"x86_64\", \"lib64\")\n)\n",
+		"build/soong/android/paths.go":            flagsPaths,
 	} {
 		full := filepath.Join(tree, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -270,6 +393,26 @@ func TestReadGlobalFlags(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want %q", c.name, err, c.want)
 		}
+	}
+}
+
+// Expected yasm flags: the pctx literals (X86_64YasmFlags, LinuxX8664YasmFlags), promoted from the embedded toolchainLinuxX8664 through the host singleton; arm64: toolchainBase's "" on the device side, and no (Linux, Arm64) factory.
+func TestToolchainYasm(t *testing.T) {
+	tree := flagsTree(t, flagsGlobal)
+	g, err := readGlobalFlags(tree, Config{Arch: "x86_64", PointerBits: 64}, DeviceArch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-f", "elf64", "-m", "amd64"}
+	if !slices.Equal(g.Yasm[Device], want) || !slices.Equal(g.Yasm[Host], want) || g.NoToolchain != [2]string{} {
+		t.Errorf("x86_64: %q, none %q", g.Yasm, g.NoToolchain)
+	}
+	g, err = readGlobalFlags(tree, Config{Arch: "arm64", PointerBits: 64}, DeviceArch{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Yasm[Device]) != 0 || g.NoToolchain[Device] != "" || !strings.Contains(g.NoToolchain[Host], "(Linux, Arm64)") {
+		t.Errorf("arm64: %q, none %q", g.Yasm, g.NoToolchain)
 	}
 }
 
