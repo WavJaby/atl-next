@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -298,6 +299,44 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	}
 	if g.genFiles[g.out+"/gen/device/g/genrule.sh"] != wantScript {
 		t.Error("script not recorded for writing")
+	}
+}
+
+// Soong installs a prebuilt_etc_host to $(HOST_OUT)/etc/<sub_dir>/<filename or basename>; a genrule tool's `required`
+// installs are copied to <sandbox>/tools/out/<that path>, and the command runs from the sandbox.
+func TestGenruleToolData(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"p/Android.bp": `
+cc_binary_host { name: "tool", srcs: ["t.cpp"], required: ["tool-hdrs", "tool-conf", "libother"] }
+prebuilt_etc_host { name: "tool-hdrs", srcs: ["hdrs/*.h"], sub_dir: "tool/cc_hdrs" }
+prebuilt_etc_host { name: "tool-conf", src: "c.txt", filename: "conf" }
+cc_library_host_shared { name: "libother" }
+genrule { name: "g", tools: ["tool"], cmd: "$(location tool) $(out)", out: ["o.h"] }
+genrule { name: "plain", cmd: "true", out: ["p"] }
+`,
+		"p/t.cpp": "", "p/hdrs/a.h": "", "p/hdrs/b.h": "", "p/c.txt": "",
+	})
+	n := g.genNode("g", Device, "t")
+	want := []toolFile{{"p/hdrs/a.h", "etc/tool/cc_hdrs/a.h"}, {"p/hdrs/b.h", "etc/tool/cc_hdrs/b.h"}, {"p/c.txt", "etc/conf"}}
+	if !slices.Equal(n.rule.toolData, want) {
+		t.Errorf("toolData %v, want %v", n.rule.toolData, want)
+	}
+	sb := g.out + "/gen/device/g/sbox"
+	s := g.genScript(n)
+	for _, w := range []string{
+		"ln -sf $PWD/p/hdrs/a.h " + sb + "/tools/out/etc/tool/cc_hdrs/a.h ",
+		"ln -sf $PWD/p/c.txt " + sb + "/tools/out/etc/conf ",
+		"cd " + sb + " || exit 1\n",
+	} {
+		if !strings.Contains(s, w) {
+			t.Errorf("script lacks %q:\n%s", w, s)
+		}
+	}
+	if !slices.Contains(n.rule.implicit, "p/c.txt") {
+		t.Errorf("data not a rebuild trigger: %v", n.rule.implicit)
+	}
+	if p := g.genScript(g.genNode("plain", Device, "t")); strings.Contains(p, "sbox") {
+		t.Errorf("rule without tool data got a sandbox:\n%s", p)
 	}
 }
 

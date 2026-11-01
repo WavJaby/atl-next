@@ -18,6 +18,8 @@ import (
 //     A script file instead of `bash -c`: ninja variable values cannot hold newlines.
 //   - No sandbox: paths in $(in) / $(location) are tree-relative for tree files (as Soong's, relative to the build top = cwd) and absolute for
 //     generated files and tools, which live outside the tree; $(out) / $(genDir) are absolute. Ninja creates the output directories.
+//   - Exception: a tool whose `required` modules install data runs in a symlink sandbox with that data under tools/out, as sbox
+//     lays it out (genToolData, sandboxPrelude).
 //   - Anything that cannot be built (unsupported tool, unresolved input, bad cmd) still gets its build edge, whose script prints
 //     `error: ...` and fails, so consumers see a failed genrule step, not a ninja "missing and no known rule" for every compile.
 //   - gensrcs: a genrule whose command runs once per input (gensrcsCommands).
@@ -44,6 +46,7 @@ type genRule struct {
 	inputs   []string   // $(in), as labels' files
 	implicit []string   // tool_files and script tools: rebuild triggers beside inputs, as labels' files
 	tools    []*Node    // cc tools, implicit inputs once their paths are known
+	toolData []toolFile // files the tools' `required` modules install, staged under tools/out (genToolData)
 	outs     []string
 	incs     []string // -I flags consumers get (export_include_dirs, default the gen dir)
 	deps     []string // what consumers wait for: the outputs, or one phony behind many
@@ -247,7 +250,70 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 	}
 	l.tool = tn
 	r.tools = append(r.tools, tn)
+	g.genToolData(r, tm, fail)
 	return l
+}
+
+// toolFile: one file a tool's packaging specs install, rel = its path below $(HOST_OUT) (etc/<sub_dir>/<name>).
+type toolFile struct{ src, rel string }
+
+// genToolData collects what Soong's genrule puts beside a tool from its TransitivePackagingSpecs: the files its
+// `required` modules install. sbox copies them to <sandbox>/tools/out/<rel> and runs the command from the sandbox, so a
+// tool may find them by a cwd-relative path (stats-log-api-gen: tools/out/etc/stats-log-api-gen/cc_srcs/). Only
+// prebuilt_etc_host installs data; other required types (shared libs, binaries) are reached through the tool's rpath
+// or not at all, so they are skipped. `data` is no packaging spec of a cc_binary_host (installed with tests only).
+func (g *Graph) genToolData(r *genRule, tm *Module, fail func(string, ...any)) {
+	skipNone := func(string) bool { return false }
+	for _, req := range g.flatten(tm, Host, Binary).strs("required") {
+		rm := g.lookupWith(req, Host, skipNone)
+		if rm == nil || g.baseType(rm.Type) != "prebuilt_etc_host" {
+			continue
+		}
+		p := g.flatten(rm, Host, Gen)
+		srcs := p.strs("srcs")
+		if s := p.str("src"); s != "" {
+			srcs = append(srcs, s)
+		}
+		name := p.str("filename")
+		if name != "" && len(srcs) != 1 {
+			fail("%s: filename needs exactly one src", rm.Name)
+			continue
+		}
+		for _, s := range srcs {
+			files, ok := g.resolveSrc(rm.Dir, Host, s, rm.Name)
+			if !ok {
+				fail("%s: src %s unresolved", rm.Name, s)
+			}
+			for _, f := range files {
+				base := name
+				if base == "" {
+					base = filepath.Base(f.path)
+				}
+				r.toolData = append(r.toolData, toolFile{f.path, filepath.Join("etc", p.str("sub_dir"), base)})
+				r.implicit = append(r.implicit, f.path)
+			}
+		}
+	}
+}
+
+// sandboxPrelude: the script start of a rule whose tools have data. It builds <genDir>/sbox as Soong's sandbox looks
+// to the command: the tree's top-level entries as symlinks (tree-relative paths keep working), tools/out/<rel> as
+// symlinks to the data, then cds there. A tree `tools` dir becomes a real dir of links to its entries plus `out`.
+func sandboxPrelude(sb string, data []toolFile) string {
+	q := shellEscape(sb)
+	var b strings.Builder
+	fmt.Fprintf(&b, "rm -rf %s && mkdir -p %s || exit 1\nfor e in \"$PWD\"/*; do ln -s \"$e\" %s/; done\n", q, q, q)
+	fmt.Fprintf(&b, "if [ -L %s/tools ]; then rm %s/tools && mkdir %s/tools && for e in \"$PWD\"/tools/*; do ln -s \"$e\" %s/tools/; done; fi\n", q, q, q, q)
+	for _, f := range data {
+		dst := shellEscape(filepath.Join(sb, "tools", "out", f.rel))
+		src := f.src
+		if !filepath.IsAbs(src) {
+			src = "$PWD/" + shellEscape(src)
+		}
+		fmt.Fprintf(&b, "mkdir -p \"$(dirname %s)\" && ln -sf %s %s || exit 1\n", dst, src, dst)
+	}
+	fmt.Fprintf(&b, "cd %s || exit 1\n", q)
+	return b.String()
 }
 
 // pythonTool: the one script a python_binary_host runs, tree-relative. Only a binary of a single source
@@ -459,6 +525,9 @@ func (g *Graph) genScript(n *Node) string {
 	// one in a consumer
 	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + strings.Join(mapStrings(r.outs, shellEscape), " ") +
 		"; do\n  [ -e \"$f\" ] || { echo \"error: genrule " + n.name + ": $f was not created\" >&2; exit 1; }\ndone\n"
+	if len(r.toolData) > 0 {
+		body = sandboxPrelude(filepath.Join(g.genDir(n, ""), "sbox"), r.toolData) + body
+	}
 	return body + check
 }
 
