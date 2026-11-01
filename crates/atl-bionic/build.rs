@@ -12,8 +12,9 @@
 //!
 //! - `OUT_DIR/capi/include/<header>`, also: include wrappers giving the host libc's headers bionic's
 //!   header shape (`atl_bridgegen::shape`), installed with the declarations, so they reach exactly the
-//!   units that see bionic's headers, and substitutes for the bionic-only headers in `SUBSTITUTES`. Each
-//!   must add no error to its host header (a substitute: compile alone), as C and C++.
+//!   units that see bionic's headers, substitutes for the bionic-only headers in `SUBSTITUTES`, and
+//!   forwards to bionic's kernel uapi headers the host lacks (`shape::Shape::uapi`). Each must add no
+//!   error to its host header (a substitute or forward: compile alone), as C and C++.
 //!   `OUT_DIR/shape_gaps.txt`: what they leave different (names bionic's private files bring in).
 //!
 //! Generates twice and fails unless byte-identical.
@@ -23,7 +24,7 @@
 //! `<atomic>` / `<new>`; bionic ships no C++ library, so the host toolchain's libc++ headers come first
 //! (found by clang's own search rules). Layouts there use only `uint32_t`, `char` and 32-bit atomics.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -494,14 +495,11 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
     let names: Vec<String> = names.into_iter().collect();
     let host_probes = front::probe_includes(Lang::C, &host_target, &strs(&names))
         .context("the host's headers")?;
-    let mut kernel = BTreeSet::new();
-    for dir in &uapi {
-        kernel.extend(headers_under(dir)?);
-    }
+    let kernel = kernel_headers(&uapi)?;
     let scan = front::resolve_includes(
         Lang::C,
         &host_target,
-        &strs(&kernel.into_iter().collect::<Vec<_>>()),
+        &strs(&kernel.keys().cloned().collect::<Vec<_>>()),
     )?;
     let derived = shape::derive(&shape::Inputs {
         bionic: &bionic,
@@ -512,10 +510,11 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         macros: FORWARDED_MACROS,
         substitutes: SUBSTITUTES,
         scan: &scan,
+        kernel: &kernel,
         extra,
     })?;
     shape::check_guards(derived.wrappers.keys())?;
-    let wrappers = derived
+    let mut wrappers: Vec<(String, String)> = derived
         .wrappers
         .iter()
         .map(|(name, w)| {
@@ -529,6 +528,19 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
             Ok((name.clone(), shape::print(name, w, &source)?))
         })
         .collect::<Result<_>>()?;
+    let aosp = up.aosp("");
+    for (name, file) in &derived.uapi {
+        ensure!(
+            !derived.wrappers.contains_key(name),
+            "<{name}>: both a shape wrapper and a bionic-only uapi header"
+        );
+        let source = file
+            .strip_prefix(&aosp)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        wrappers.push((name.clone(), shape::print_forward(file, &source)?));
+    }
     let host_inputs = host_probes
         .values()
         .flat_map(|p| p.files.keys().cloned())
@@ -539,6 +551,24 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         gaps: shape::print_gaps(&derived.gaps),
         host_inputs,
     })
+}
+
+/// bionic's kernel uapi headers by include name -> file, each `dir` in bionic's search order (first wins).
+/// A subdirectory holding `asm/` is an arch's tree (`uapi/asm-arm64`), an include root of its own that
+/// only its arch puts on the path (the host's is one of `dirs`): its files are not names under `dir`.
+fn kernel_headers(dirs: &[PathBuf]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut out = BTreeMap::new();
+    for dir in dirs {
+        for name in headers_under(dir)? {
+            let arch_tree = name
+                .split_once('/')
+                .is_some_and(|(top, _)| dir.join(top).join("asm").is_dir());
+            if !arch_tree {
+                out.entry(name.clone()).or_insert_with(|| dir.join(&name));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn strs(v: &[String]) -> Vec<&str> {

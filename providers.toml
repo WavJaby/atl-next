@@ -24,7 +24,7 @@ reason = "bionic-internal headers; the system C library replaces bionic"
 
 ["libc"]
 provider = "crate:atl-bionic"
-reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels, fdsan level, android_dlopen_ext and the exported-namespace lookup in one namespace, android_mallopt refusing every option), its generated headers, include wrappers giving glibc's headers bionic's include shape, and substitutes for bionic-only headers that mean the same on glibc"
+reason = "glibc is the C library; atl-bionic adds the bionic-only API (system properties, API levels, fdsan level, android_dlopen_ext and the exported-namespace lookup in one namespace, android_mallopt refusing every option), its generated headers, include wrappers giving glibc's headers bionic's include shape, substitutes for bionic-only headers that mean the same on glibc, and forwards to bionic's kernel uapi headers the distro's lack"
 
 ["libc_headers"]
 provider = "none"
@@ -32,7 +32,7 @@ reason = "bionic's libc headers would shadow glibc's"
 
 ["libc_uapi_headers"]
 provider = "none"
-reason = "bionic's copy of the kernel uapi; the distro's kernel headers replace it"
+reason = "bionic's copy of the kernel uapi; the distro's kernel headers replace it, and atl-bionic (libc row) forwards to the ones only bionic carries (Android kernel features: linux/incrementalfs.h, which libincfs-utils' map_ptr.h includes under __ANDROID__)"
 
 ["libdl"]
 provider = "none"

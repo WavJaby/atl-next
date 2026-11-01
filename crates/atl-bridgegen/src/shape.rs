@@ -33,6 +33,13 @@
 //! anything else no host header does (bionic-only API: `buildscript::Api` implements it) or a host
 //! header uses one of its macros as an identifier without defining it the same way.
 //!
+//! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's
+//! headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve is
+//! forwarded -- a generated header including bionic's file by absolute path, so depfiles (and the licence
+//! gate) name bionic's file, not a copy. Derived, never listed; a name the host resolves is never
+//! shadowed. Refused when a host header uses one of its macros as an identifier without defining it the
+//! same way, as for substitutes.
+//!
 //! Known excess: a glibc header including `x` where bionic's does not (`sys/types.h` -> `sys/select.h`)
 //! now also gets the wrapper's additions to `x`.
 
@@ -78,6 +85,9 @@ pub struct Inputs<'a> {
     pub extra: &'a [(&'a str, &'a str)],
     /// Host headers outside the probes the clash scan reads (the host's kernel uapi), by include name.
     pub scan: &'a BTreeMap<String, PathBuf>,
+    /// bionic's kernel uapi headers by include name, each the file bionic's search order finds; `scan`
+    /// is the host's resolution of the same names.
+    pub kernel: &'a BTreeMap<String, PathBuf>,
 }
 
 /// One generated header.
@@ -147,6 +157,8 @@ pub struct Shape {
     /// Private-file names no home covers: still different from bionic, reported, not failed on --
     /// a home includes a whole host header, so one is added where code needs it (`homes`).
     pub gaps: Vec<Gap>,
+    /// bionic's kernel uapi headers the host lacks, by include name -> bionic's file (`print_forward`).
+    pub uapi: BTreeMap<String, PathBuf>,
 }
 
 /// Names bionic's `header` brings in through private `file` that the wrapped host header lacks.
@@ -216,11 +228,30 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             "substitute <{s}>: bionic has no usable such public header"
         );
     }
-    let host_text = if inputs.substitutes.is_empty() {
+    let uapi: BTreeMap<String, PathBuf> = inputs
+        .kernel
+        .iter()
+        .filter(|(n, _)| !inputs.scan.contains_key(*n) && !host_has(n))
+        .map(|(n, f)| (n.clone(), f.clone()))
+        .collect();
+    let host_text = if inputs.substitutes.is_empty() && uapi.is_empty() {
         HostText::default()
     } else {
         HostText::read(inputs)?
     };
+    for (name, file) in &uapi {
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let clashes: Vec<String> = defines_in(&text)
+            .into_iter()
+            .filter(|d| host_text.clashes(d))
+            .filter_map(|d| macro_name(&d).map(str::to_owned))
+            .collect();
+        ensure!(
+            clashes.is_empty(),
+            "bionic-only uapi header <{name}>: host headers use its macros {clashes:?} as identifiers"
+        );
+    }
 
     for (name, bionic) in inputs.bionic {
         if !bionic.usable() {
@@ -350,6 +381,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
     Ok(Shape {
         wrappers: out,
         gaps,
+        uapi,
     })
 }
 
@@ -369,18 +401,7 @@ impl HostText {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             out.idents.extend(identifiers(&text).map(str::to_owned));
-            let joined = text.replace("\\\n", " ");
-            for line in joined.lines() {
-                let Some(rest) = line.trim_start().strip_prefix('#') else {
-                    continue;
-                };
-                let Some(def) = rest.trim_start().strip_prefix("define") else {
-                    continue;
-                };
-                if !def.starts_with(char::is_whitespace) {
-                    continue;
-                }
-                let def = collapse(def);
+            for def in defines_in(&text) {
                 if let Some(name) = macro_name(&def) {
                     out.defines
                         .entry(name.to_owned())
@@ -404,6 +425,19 @@ impl HostText {
                 .get(name)
                 .is_none_or(|d| d.len() != 1 || !d.contains(&collapse(&def.replace("\\\n", " "))))
     }
+}
+
+/// Every macro definition C `text` writes (`NAME body`, continuations joined, whitespace collapsed).
+fn defines_in(text: &str) -> Vec<String> {
+    let joined = text.replace("\\\n", " ");
+    joined
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix('#')?;
+            let def = rest.trim_start().strip_prefix("define")?;
+            def.starts_with(char::is_whitespace).then(|| collapse(def))
+        })
+        .collect()
 }
 
 /// Whitespace runs as one space, trimmed.
@@ -656,6 +690,18 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
     Ok(out)
 }
 
+/// The forwarding header of a bionic-only uapi header: bionic's `file` itself, by absolute path.
+pub fn print_forward(file: &Path, source: &str) -> Result<String> {
+    let path = file.to_str().context("non-UTF-8 uapi header path")?;
+    ensure!(
+        file.is_absolute() && !path.contains(['"', '\n']),
+        "uapi header path {path:?} cannot be an include"
+    );
+    Ok(format!(
+        "// generated by atl-bridgegen from {source}, do not edit\n#include \"{path}\"\n"
+    ))
+}
+
 /// Each definition (`NAME body`) unless the name is defined already.
 fn print_defines(out: &mut String, defines: &[String]) -> Result<()> {
     for def in defines {
@@ -780,6 +826,8 @@ mod tests {
             ("bionic/q.h", "#include <bits/p.h>\n"),
             ("bionic/z.h", "int z;\n"),
             ("uapi/k/u.h", "int kern;\n"),
+            ("uapi/k/v.h", "#define __kv 1\n"),
+            ("uapi/k/m.h", "#define __mac 1\n"),
             ("host/w.h", "#include <sys/cdefs.h>\nint w;\n"),
             ("host/sys/cdefs.h", "int cdefs;\n"),
             ("host/x.h", "int x;\n"),
@@ -829,6 +877,17 @@ mod tests {
         substitutes: &[&str],
         extra: &[(&str, &str)],
     ) -> Result<Shape> {
+        derived_kernel(dir, homes, macros, substitutes, extra, &["k/u.h", "k/v.h"])
+    }
+
+    fn derived_kernel(
+        dir: &Tmp,
+        homes: &[(&str, &str)],
+        macros: &[&str],
+        substitutes: &[&str],
+        extra: &[(&str, &str)],
+        kernel: &[&str],
+    ) -> Result<Shape> {
         let include = dir.0.join("bionic");
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
@@ -852,7 +911,8 @@ mod tests {
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let host = front::probe_includes(Lang::C, &host_t, &names)?;
-        let scan = front::resolve_includes(Lang::C, &host_t, &["k/u.h"])?;
+        let scan = front::resolve_includes(Lang::C, &host_t, kernel)?;
+        let kernel = front::resolve_includes(Lang::C, &sysroot(&uapi), kernel)?;
         derive(&Inputs {
             bionic: &bionic,
             host: &host,
@@ -862,6 +922,7 @@ mod tests {
             macros,
             substitutes,
             scan: &scan,
+            kernel: &kernel,
             extra,
         })
     }
@@ -965,5 +1026,24 @@ mod tests {
         assert!(e.contains("already reaches <sys/cdefs.h>"), "{e}");
         let e = extra(&[("o.h", "x.h")]).unwrap_err();
         assert!(e.contains("the host has no such header"), "{e}");
+
+        // uapi: k/v.h (host lacks) forwarded to bionic's file, k/u.h (host has) never shadowed;
+        // k/m.h refused: it defines __mac, which the host's k/u.h uses as a field name
+        assert_eq!(
+            with_home.uapi,
+            BTreeMap::from([("k/v.h".to_owned(), dir.0.join("uapi/k/v.h"))])
+        );
+        let e = derived_kernel(&dir, home, forwarded, &[], &[], &["k/u.h", "k/m.h"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("<k/m.h>: host headers use its macros [\"__mac\"]"),
+            "{e}"
+        );
+        assert_eq!(
+            print_forward(Path::new("/b/uapi/k/v.h"), "uapi/k/v.h").unwrap(),
+            "// generated by atl-bridgegen from uapi/k/v.h, do not edit\n#include \"/b/uapi/k/v.h\"\n"
+        );
+        assert!(print_forward(Path::new("k/v.h"), "x").is_err());
     }
 }
