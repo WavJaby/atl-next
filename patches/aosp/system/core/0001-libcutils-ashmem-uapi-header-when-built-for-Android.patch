@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 20:54:59 +0800
+Subject: [PATCH] libcutils: ashmem uapi header when built for Android
+
+cutils/ashmem.h includes <linux/ashmem.h> under __BIONIC__ only,
+while its callers (libandroid_runtime android_os_MemoryFile.cpp
+ASHMEM_WAS_PURGED) use the ioctl definitions under __ANDROID__. A
+device build against another C library defines __ANDROID__ but not
+__BIONIC__; it then misses them. Widen the guard to
+__BIONIC__ || __ANDROID__. No change for Soong variants: device
+builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guard is compiled inside the libcutils header, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ libcutils/include/cutils/ashmem.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libcutils/include/cutils/ashmem.h b/libcutils/include/cutils/ashmem.h
+index 1913c1e4e716c046aa6e11e181c27215ae4850de..ccccd1465c794f35239b803129827e6a556d54c4 100644
+--- a/libcutils/include/cutils/ashmem.h
++++ b/libcutils/include/cutils/ashmem.h
+@@ -18,7 +18,7 @@
+ 
+ #include <stddef.h>
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <linux/ashmem.h>
+ #endif
+ 

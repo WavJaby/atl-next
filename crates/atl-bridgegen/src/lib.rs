@@ -416,7 +416,7 @@ mod tests {
         let kept = c::Kept {
             includes: &["<stddef.h>", "<stdarg.h>"],
             macros: &["log_fatal"],
-            types: &[],
+            ..Default::default()
         };
         let text = c::header(&iface, "x86_64", &functions, &[], &kept).unwrap();
         for want in [
@@ -520,7 +520,7 @@ mod tests {
 
     /// A header in the shape of bionic's android/dlext.h and bionic/malloc.h: callers build a typedef'd
     /// anonymous struct the function takes, use one no function names, and an enum from a `"…"` include.
-    const EXT: &str = "#include <stdint.h>\n#include <stddef.h>\n#include \"kind.h\"\nstruct ns;\ntypedef struct {\n  uint64_t flags;\n  void *_Nullable addr;\n  size_t size;\n  int fd;\n  struct ns *_Nullable space;\n} info;\ntypedef struct {\n  uint8_t *buffer;\n  size_t n;\n} leak;\nenum { USE_NS = 0x200 };\nvoid *_Nullable open_ext(const char *_Nullable name, int flags, const info *_Nullable i);\nint dump(int pid, enum kind k);\n";
+    const EXT: &str = "#include <stdint.h>\n#include <stddef.h>\n#include \"kind.h\"\nstruct ns;\ntypedef struct {\n  uint64_t flags;\n  void *_Nullable addr;\n  size_t size;\n  int fd;\n  struct ns *_Nullable space;\n} info;\ntypedef struct {\n  uint8_t *buffer;\n  size_t n;\n} leak;\nstruct regs {\n  unsigned long sp;\n  int x;\n};\nenum { USE_NS = 0x200 };\nvoid *_Nullable open_ext(const char *_Nullable name, int flags, const info *_Nullable i);\nint dump(int pid, enum kind k);\n";
 
     #[test]
     fn record_definitions_with_layout_asserts() {
@@ -543,9 +543,15 @@ mod tests {
         let kept = c::Kept {
             includes: &["\"kind.h\""],
             types: &["leak"],
+            records: &["regs"],
             ..Default::default()
         };
         let text = c::header(&iface, "x86_64", &functions, &["USE_NS"], &kept).unwrap();
+        let no_record = c::Kept {
+            records: &["nope"],
+            ..Default::default()
+        };
+        assert!(c::header(&iface, "x86_64", &functions, &[], &no_record).is_err());
         // x86-64 psABI: u64 at 0, pointer at 8, size_t at 16, int at 24 (4 bytes padding), pointer at
         // 32; 40 bytes, 8-aligned
         for want in [
@@ -557,6 +563,10 @@ mod tests {
             "static_assert(sizeof(info) == 40, ",
             "_Static_assert(__builtin_offsetof(info, space) == 32, ",
             "_Static_assert(__alignof__(leak) == 8, ",
+            // a tagged record keeps its tag; unsigned long at 0, int at 8, 4 bytes tail padding
+            "struct regs {\n  unsigned long sp;\n  int x;\n};\n",
+            "static_assert(sizeof(struct regs) == 16, ",
+            "_Static_assert(__builtin_offsetof(struct regs, x) == 8, ",
             // C++ gives this enum `unsigned int`
             "#define USE_NS 512U\n",
             // the enum's underlying type
@@ -579,7 +589,7 @@ mod tests {
             };
             let back = interface("back", "printed.h", &src, &[freestanding()]).unwrap();
             let bv = &back.arches["x86_64"];
-            for r in ["info", "leak"] {
+            for r in ["info", "leak", "regs"] {
                 assert_eq!(bv.records[r], view.records[r], "{r} ({lang:?})");
             }
             assert_eq!(bv.functions["open_ext"], view.functions["open_ext"]);

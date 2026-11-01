@@ -32,6 +32,7 @@ const APIS: &[Api] = &[Api {
         includes: &["\"dump_type.h\""],
         macros: &[],
         types: &[],
+        records: &[],
     },
 }];
 

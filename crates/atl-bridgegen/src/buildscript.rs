@@ -33,6 +33,7 @@ pub const DECLARATIONS: Kept<'static> = Kept {
     includes: &[],
     macros: &[],
     types: &[],
+    records: &[],
 };
 
 /// Generated files of `api` parsed for `target` (plus the API's include dirs), paths relative to

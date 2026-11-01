@@ -40,6 +40,12 @@
 //! shadowed. Refused when a host header uses one of its macros as an identifier without defining it the
 //! same way, as for substitutes.
 //!
+//! Views: everything above is derived twice, from probes without feature macros and with `_GNU_SOURCE`
+//! (`Inputs::gnu`). clang++ predefines `_GNU_SOURCE`, so device C++ sees bionic's `__USE_GNU` sections
+//! (`sched.h` `__CPU_BITTYPE`) and C does not. An include or macro derived in one view only keeps bionic's
+//! own guard in the wrapper (`Guard`: `#if defined(__USE_GNU)`, or its negation), which both libcs
+//! define from `_GNU_SOURCE`. A home, extra include or forwarded macro must be needed in some view.
+//!
 //! Known excess: a glibc header including `x` where bionic's does not (`sys/types.h` -> `sys/select.h`)
 //! now also gets the wrapper's additions to `x`.
 
@@ -59,12 +65,47 @@ pub fn is_private(name: &str) -> bool {
     name.starts_with(PRIVATE_DIR)
 }
 
-/// What the wrappers are derived from.
-pub struct Inputs<'a> {
+/// One view's probes: both libcs' headers read with the same feature macros.
+pub struct Probes<'a> {
     /// bionic's public headers, as bionic sees them.
     pub bionic: &'a BTreeMap<String, Probe>,
     /// The host's view of every name in `host_names`.
     pub host: &'a BTreeMap<String, Probe>,
+}
+
+/// The macro both libcs define from `_GNU_SOURCE`, and bionic's headers test for their GNU sections.
+const GNU_MACRO: &str = "__USE_GNU";
+
+/// The views a wrapper item is derived in, printed as the condition around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Guard {
+    /// Both views: unconditional.
+    Always,
+    /// The `_GNU_SOURCE` view only: `#if defined(__USE_GNU)`.
+    Gnu,
+    /// The default view only: `#if !defined(__USE_GNU)`.
+    NotGnu,
+}
+
+impl Guard {
+    /// Printing order of the groups.
+    const ALL: [Guard; 3] = [Guard::Always, Guard::Gnu, Guard::NotGnu];
+
+    fn condition(self) -> Option<String> {
+        match self {
+            Guard::Always => None,
+            Guard::Gnu => Some(format!("defined({GNU_MACRO})")),
+            Guard::NotGnu => Some(format!("!defined({GNU_MACRO})")),
+        }
+    }
+}
+
+/// What the wrappers are derived from.
+pub struct Inputs<'a> {
+    /// Read without feature macros: C as AOSP compiles it.
+    pub default: Probes<'a>,
+    /// Read with `_GNU_SOURCE`: every C++ unit (clang++ predefines it).
+    pub gnu: Probes<'a>,
     /// bionic's public include directory: files under it are bionic's own.
     pub bionic_include: &'a Path,
     /// bionic's kernel uapi directories: files under them are kernel headers, not libc. bionic spells
@@ -81,7 +122,8 @@ pub struct Inputs<'a> {
     /// Host header -> what its wrapper includes beyond bionic's shape: names AOSP code takes from the
     /// header in a configuration bionic never builds (`__ANDROID__` without `__BIONIC__`), or bionic
     /// API declared in a header the host also has (its generated declarations). Each must be needed:
-    /// the host has the header and its version does not already reach the include.
+    /// the host has the header and its version does not already reach the include in some view (in
+    /// the other, the include is guarded off).
     pub extra: &'a [(&'a str, &'a str)],
     /// Host headers outside the probes the clash scan reads (the host's kernel uapi), by include name.
     pub scan: &'a BTreeMap<String, PathBuf>,
@@ -97,23 +139,31 @@ pub struct Wrapper {
     pub substitute: bool,
     /// Macros hidden around the host header (it uses them as identifiers).
     pub hidden: BTreeSet<String>,
-    /// Macro definitions as bionic writes them (`NAME body`).
-    pub defines: Vec<String>,
-    /// Headers bionic's version reaches and the host's does not.
-    pub includes: Vec<String>,
+    /// Macro definitions as bionic writes them (`NAME body`), each with the views it is derived in.
+    pub defines: Vec<(Guard, String)>,
+    /// Headers bionic's version reaches and the host's does not, each with the views.
+    pub includes: Vec<(Guard, String)>,
+}
+
+/// One view's wrapper.
+#[derive(Default)]
+struct Plain {
+    substitute: bool,
+    defines: Vec<String>,
+    includes: Vec<String>,
 }
 
 /// Every include name the host is probed for: bionic's public headers, the names bionic's own files
-/// include that could be includable, the homes.
+/// include that could be includable (in any of the views `bionic` holds), the homes.
 pub fn host_names(
-    bionic: &BTreeMap<String, Probe>,
+    bionic: &[&BTreeMap<String, Probe>],
     bionic_include: &Path,
     uapi: &[PathBuf],
     homes: &[(&str, &str)],
 ) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = bionic.keys().cloned().collect();
+    let mut out: BTreeSet<String> = bionic.iter().flat_map(|b| b.keys().cloned()).collect();
     out.extend(homes.iter().map(|(_, h)| (*h).to_owned()));
-    for probe in bionic.values() {
+    for probe in bionic.iter().flat_map(|b| b.values()) {
         for (file, reached) in &probe.files {
             if !file.starts_with(bionic_include) {
                 continue;
@@ -169,6 +219,8 @@ pub struct Gap {
     pub names: Vec<String>,
     /// Host headers declaring all of them, fewest files reached first: home candidates.
     pub homes: Vec<String>,
+    /// The views it is found in.
+    pub guard: Guard,
 }
 
 /// What a bionic header includes itself, directly or through its private files.
@@ -209,25 +261,17 @@ fn walk(inputs: &Inputs, probe: &Probe, includable: &dyn Fn(&str) -> bool) -> Re
     Ok(out)
 }
 
-/// The shape. Fails on an unneeded or insufficient home, or a forwarded macro the host already has, no
-/// public bionic header the host also has brings in, or bionic defines two ways; on a substitute the host
-/// has, bionic lacks or that does not substitute (`substitute_macros`).
+/// The shape, both views merged. Fails on a home no view needs or one insufficient where used, an extra
+/// include the host reaches in every view, a forwarded macro the host has in every view bringing it in,
+/// no public bionic header the host also has brings in, or bionic defines two ways; on a substitute the
+/// host has, bionic lacks or that does not substitute (`substitute_macros`).
 pub fn derive(inputs: &Inputs) -> Result<Shape> {
-    let host_has = |n: &str| inputs.host.get(n).is_some_and(Probe::usable);
-    let host_all: BTreeSet<&String> = inputs.host.values().flat_map(visible).collect();
-    let mut out: BTreeMap<String, Wrapper> = BTreeMap::new();
-    let mut homes_used = BTreeSet::new();
-    let mut gaps = Vec::new();
-    for s in inputs.substitutes {
-        ensure!(
-            !host_has(s),
-            "the host has <{s}>: drop it from the substitutes"
-        );
-        ensure!(
-            inputs.bionic.get(*s).is_some_and(Probe::usable),
-            "substitute <{s}>: bionic has no usable such public header"
-        );
-    }
+    let views = [&inputs.default, &inputs.gnu];
+    let host_has = |n: &str| {
+        views
+            .iter()
+            .any(|v| v.host.get(n).is_some_and(Probe::usable))
+    };
     let uapi: BTreeMap<String, PathBuf> = inputs
         .kernel
         .iter()
@@ -253,9 +297,157 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         );
     }
 
+    let d = derive_view(inputs, &inputs.default, &host_text)?;
+    let g = derive_view(inputs, &inputs.gnu, &host_text)?;
+    let unused: Vec<&str> = inputs
+        .homes
+        .iter()
+        .map(|(f, _)| *f)
+        .filter(|f| !d.homes_used.contains(*f) && !g.homes_used.contains(*f))
+        .collect();
+    ensure!(
+        unused.is_empty(),
+        "homes no header needs any more (delete them): {unused:?}"
+    );
+    for (header, inc) in inputs.extra {
+        let row = ((*header).to_owned(), (*inc).to_owned());
+        ensure!(
+            !(d.reached.contains(&row) && g.reached.contains(&row)),
+            "extra include of <{header}>: the host's already reaches <{inc}> (delete the row)"
+        );
+    }
+    for &m in inputs.macros {
+        if d.emitted.contains(m) || g.emitted.contains(m) {
+            continue;
+        }
+        ensure!(
+            !(d.host_macros.contains(m) && g.host_macros.contains(m)),
+            "the host's headers define {m}: drop it from the forwarded macros"
+        );
+        bail!("no public bionic header the host also has defines {m} or brings it in");
+    }
+
+    let mut out: BTreeMap<String, Wrapper> = BTreeMap::new();
+    let names: BTreeSet<&String> = d.wrappers.keys().chain(g.wrappers.keys()).collect();
+    let none = Plain::default();
+    for name in names {
+        let (dw, gw) = (d.wrappers.get(name), g.wrappers.get(name));
+        let substitute = dw.or(gw).is_some_and(|w| w.substitute);
+        ensure!(
+            dw.into_iter().chain(gw).all(|w| w.substitute == substitute),
+            "<{name}>: a substitute in one view only"
+        );
+        let (dw, gw) = (dw.unwrap_or(&none), gw.unwrap_or(&none));
+        out.insert(
+            name.clone(),
+            Wrapper {
+                substitute,
+                hidden: BTreeSet::new(),
+                defines: merge(&dw.defines, &gw.defines),
+                includes: merge(&dw.includes, &gw.includes),
+            },
+        );
+    }
+    // the hidden names: host headers using an emitted macro as an identifier, whichever view reaches them
+    let emitted: Vec<&str> = inputs
+        .macros
+        .iter()
+        .copied()
+        .filter(|m| d.emitted.contains(*m) || g.emitted.contains(*m))
+        .collect();
+    if !emitted.is_empty() {
+        for (name, path) in scanned(inputs) {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let idents: BTreeSet<&str> = identifiers(&text).collect();
+            for m in emitted.iter().filter(|m| idents.contains(**m)) {
+                out.entry(name.clone())
+                    .or_default()
+                    .hidden
+                    .insert((*m).to_owned());
+            }
+        }
+    }
+    Ok(Shape {
+        wrappers: out,
+        gaps: merge_gaps(d.gaps, g.gaps),
+        uapi,
+    })
+}
+
+/// Items of the default view `d` and the `_GNU_SOURCE` view `g`, each with the views it is in: `d`'s
+/// order, then `g`'s own.
+fn merge(d: &[String], g: &[String]) -> Vec<(Guard, String)> {
+    let mut out: Vec<(Guard, String)> = d
+        .iter()
+        .map(|x| {
+            let guard = if g.contains(x) {
+                Guard::Always
+            } else {
+                Guard::NotGnu
+            };
+            (guard, x.clone())
+        })
+        .collect();
+    out.extend(
+        g.iter()
+            .filter(|x| !d.contains(x))
+            .map(|x| (Guard::Gnu, x.clone())),
+    );
+    out
+}
+
+/// `merge` of the gaps (each view's are `Guard::Always`).
+fn merge_gaps(d: Vec<Gap>, g: Vec<Gap>) -> Vec<Gap> {
+    let mut out = Vec::new();
+    for mut gap in d {
+        if !g.contains(&gap) {
+            gap.guard = Guard::NotGnu;
+        }
+        out.push(gap);
+    }
+    for mut gap in g {
+        if !out.iter().any(|o| o.guard == Guard::Always && *o == gap) {
+            gap.guard = Guard::Gnu;
+            out.push(gap);
+        }
+    }
+    out
+}
+
+/// One view's shape, before the checks across views (`derive`).
+#[derive(Default)]
+struct ViewShape {
+    wrappers: BTreeMap<String, Plain>,
+    gaps: Vec<Gap>,
+    /// `Inputs::homes` rows used.
+    homes_used: BTreeSet<String>,
+    /// `Inputs::extra` rows whose include the host's header already reaches.
+    reached: BTreeSet<(String, String)>,
+    /// Forwarded macros the host's headers define.
+    host_macros: BTreeSet<String>,
+    /// Forwarded macros defined in some wrapper.
+    emitted: BTreeSet<String>,
+}
+
+/// The shape of one view's probes `p` (`derive`).
+fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<ViewShape> {
+    let host_has = |n: &str| p.host.get(n).is_some_and(Probe::usable);
+    let host_all: BTreeSet<&String> = p.host.values().flat_map(visible).collect();
+    let mut out = ViewShape::default();
+    for s in inputs.substitutes {
+        ensure!(
+            !host_has(s),
+            "the host has <{s}>: drop it from the substitutes"
+        );
+        ensure!(
+            p.bionic.get(*s).is_some_and(Probe::usable),
+            "substitute <{s}>: bionic has no usable such public header"
+        );
+    }
     // what an included name gives: the host's header, or for a substitute bionic's (generated whole), so
     // `<endian.h>` includes the `<sys/endian.h>` substitute (`betoh64`) instead of walking it as private
-    let shaped: BTreeMap<&str, &Probe> = inputs
+    let shaped: BTreeMap<&str, &Probe> = p
         .host
         .iter()
         .filter(|(_, p)| p.usable())
@@ -264,15 +456,15 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             inputs
                 .substitutes
                 .iter()
-                .filter_map(|s| inputs.bionic.get(*s).map(|p| (*s, p))),
+                .filter_map(|s| p.bionic.get(*s).map(|p| (*s, p))),
         )
         .collect();
     let includable = |n: &str| shaped.contains_key(n);
-    for (name, bionic) in inputs.bionic {
+    for (name, bionic) in p.bionic {
         if !bionic.usable() {
             continue;
         }
-        let host = inputs.host.get(name).filter(|p| p.usable());
+        let host = p.host.get(name).filter(|p| p.usable());
         if host.is_none() && !inputs.substitutes.contains(&name.as_str()) {
             continue;
         }
@@ -299,7 +491,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         let own = host.is_none().then(|| (name.clone(), root.clone()));
         let files: Vec<(String, PathBuf)> = own.into_iter().chain(walk.private).collect();
         let defines = if host.is_none() {
-            substitute_macros(inputs, name, bionic, &files, &host_all, &host_text)?
+            substitute_macros(inputs, name, bionic, &files, &host_all, host_text)?
         } else {
             Vec::new()
         };
@@ -313,16 +505,17 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
                 continue;
             }
             let Some(&(_, home)) = inputs.homes.iter().find(|(f, _)| *f == label) else {
-                gaps.push(Gap {
+                out.gaps.push(Gap {
                     header: name.clone(),
-                    homes: home_candidates(inputs.host, &needed),
+                    homes: home_candidates(p.host, &needed),
                     file: label,
                     names: needed.iter().map(|n| (*n).clone()).collect(),
+                    guard: Guard::Always,
                 });
                 continue;
             };
-            homes_used.insert(label.clone());
-            let home_probe = inputs
+            out.homes_used.insert(label.clone());
+            let home_probe = p
                 .host
                 .get(home)
                 .filter(|p| p.usable())
@@ -338,66 +531,50 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         }
         let includes = reduce(&extras, &shaped);
         if host.is_none() {
-            out.insert(
+            out.wrappers.insert(
                 name.clone(),
-                Wrapper {
+                Plain {
                     substitute: true,
                     includes,
                     defines,
-                    ..Wrapper::default()
                 },
             );
         } else if !includes.is_empty() {
-            out.entry(name.clone()).or_default().includes = includes;
+            out.wrappers.entry(name.clone()).or_default().includes = includes;
         }
     }
-    let unused: Vec<&str> = inputs
-        .homes
-        .iter()
-        .map(|(f, _)| *f)
-        .filter(|f| !homes_used.contains(*f))
-        .collect();
-    ensure!(
-        unused.is_empty(),
-        "homes no header needs any more (delete them): {unused:?}"
-    );
     for (header, inc) in inputs.extra {
-        let host = inputs
+        let host = p
             .host
             .get(*header)
             .filter(|p| p.usable())
             .with_context(|| format!("extra include of <{header}>: the host has no such header"))?;
-        ensure!(
-            !reached_names(header, host).contains(inc),
-            "extra include of <{header}>: the host's already reaches <{inc}> (delete the row)"
-        );
-        let includes = &mut out.entry((*header).to_owned()).or_default().includes;
+        if reached_names(header, host).contains(inc) {
+            out.reached
+                .insert(((*header).to_owned(), (*inc).to_owned()));
+            continue;
+        }
+        let includes = &mut out
+            .wrappers
+            .entry((*header).to_owned())
+            .or_default()
+            .includes;
         includes.push((*inc).to_owned());
         includes.sort();
         includes.dedup();
     }
 
     for m in inputs.macros {
-        ensure!(
-            !host_all.contains(&(*m).to_owned()),
-            "the host's headers define {m}: drop it from the forwarded macros"
-        );
-        for (header, def) in macro_homes(inputs, m, &host_has)? {
-            out.entry(header).or_default().defines.push(def);
+        if host_all.contains(&(*m).to_owned()) {
+            out.host_macros.insert((*m).to_owned());
+            continue;
         }
-        for (name, path) in scanned(inputs) {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            if uses_identifier(&text, m) {
-                out.entry(name).or_default().hidden.insert((*m).to_owned());
-            }
+        for (header, def) in macro_homes(inputs, p, m, &host_has)? {
+            out.emitted.insert((*m).to_owned());
+            out.wrappers.entry(header).or_default().defines.push(def);
         }
     }
-    Ok(Shape {
-        wrappers: out,
-        gaps,
-        uapi,
-    })
+    Ok(out)
 }
 
 /// What the host headers' text says, for a substitute's macros: every identifier they use, and every
@@ -545,12 +722,17 @@ fn home_candidates(host: &BTreeMap<String, Probe>, needed: &BTreeSet<&String>) -
     fits.into_iter().map(|(_, n)| n.clone()).collect()
 }
 
-/// The gaps as text, one per line: `<header> via <file>: names (homes: candidates)`.
+/// The gaps as text, one per line: `<header> via <file>: names (homes: candidates)`, then ` [if <condition>]`
+/// for a gap of one view only.
 pub fn print_gaps(gaps: &[Gap]) -> String {
     gaps.iter()
         .map(|g| {
+            let only = g
+                .guard
+                .condition()
+                .map_or_else(String::new, |c| format!(" [if {c}]"));
             format!(
-                "<{}> via {}: {} (homes: {})\n",
+                "<{}> via {}: {} (homes: {}){only}\n",
                 g.header,
                 g.file,
                 g.names.join(" "),
@@ -578,15 +760,17 @@ fn reduce(extras: &BTreeSet<String>, shaped: &BTreeMap<&str, &Probe>) -> Vec<Str
 }
 
 /// The public bionic headers (the host has them too) bringing macro `m` in -- defined in the header itself
-/// or in a private file its walk enters -- each with the definition, from the probes. An includable
-/// header that defines it is not entered: its own wrapper gets the definition.
+/// or in a private file its walk enters -- each with the definition, from one view's probes `p`; none
+/// when this view has none. An includable header that defines it is not entered: its own wrapper gets
+/// the definition.
 fn macro_homes(
     inputs: &Inputs,
+    p: &Probes,
     m: &str,
     host_has: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, String)>> {
     let mut found = Vec::new();
-    for (name, probe) in inputs.bionic {
+    for (name, probe) in p.bionic {
         if is_private(name) || !probe.usable() || !host_has(name) {
             continue;
         }
@@ -600,20 +784,18 @@ fn macro_homes(
         }
     }
     ensure!(
-        !found.is_empty(),
-        "no public bionic header the host also has defines {m} or brings it in"
-    );
-    ensure!(
         found.iter().all(|(_, d)| *d == found[0].1),
         "bionic defines {m} more than one way: {found:?}"
     );
     Ok(found)
 }
 
-/// Every host header the clash scan reads, by include name: what the host probes reach, and `scan`.
+/// Every host header the clash scan reads, by include name: what the host probes of either view reach,
+/// and `scan`.
 fn scanned(inputs: &Inputs) -> BTreeMap<String, PathBuf> {
     let mut out = inputs.scan.clone();
-    for probe in inputs.host.values() {
+    let hosts = [inputs.default.host, inputs.gnu.host];
+    for probe in hosts.iter().flat_map(|h| h.values()) {
         for inc in probe.files.values().flat_map(|r| r.includes.iter()) {
             if inc.angled {
                 out.entry(inc.name.clone())
@@ -621,7 +803,7 @@ fn scanned(inputs: &Inputs) -> BTreeMap<String, PathBuf> {
             }
         }
     }
-    for (name, probe) in inputs.host {
+    for (name, probe) in hosts.iter().flat_map(|h| h.iter()) {
         if let Some(f) = &probe.file {
             out.entry(name.clone()).or_insert_with(|| f.clone());
         }
@@ -678,9 +860,7 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
         // bionic's header whole, once, from host headers
         let guard = guard(name);
         writeln!(out, "#ifndef {guard}\n#define {guard}")?;
-        for i in &w.includes {
-            writeln!(out, "#include <{i}>")?;
-        }
+        print_includes(&mut out, &w.includes)?;
         print_defines(&mut out, &w.defines)?;
         writeln!(out, "#endif")?;
         return Ok(out);
@@ -697,9 +877,7 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
         // once: the host header itself may be included again (assert.h), its additions need not
         let guard = guard(name);
         writeln!(out, "#ifndef {guard}\n#define {guard}")?;
-        for i in &w.includes {
-            writeln!(out, "#include <{i}>")?;
-        }
+        print_includes(&mut out, &w.includes)?;
         writeln!(out, "#endif")?;
     }
     Ok(out)
@@ -718,10 +896,43 @@ pub fn print_forward(file: &Path, source: &str) -> Result<String> {
 }
 
 /// Each definition (`NAME body`) unless the name is defined already.
-fn print_defines(out: &mut String, defines: &[String]) -> Result<()> {
-    for def in defines {
+fn print_defines(out: &mut String, defines: &[(Guard, String)]) -> Result<()> {
+    print_guarded(out, defines, |out, def| {
         let m = macro_name(def).context("empty macro definition")?;
         writeln!(out, "#ifndef {m}\n#define {def}\n#endif")?;
+        Ok(())
+    })
+}
+
+fn print_includes(out: &mut String, includes: &[(Guard, String)]) -> Result<()> {
+    print_guarded(out, includes, |out, i| Ok(writeln!(out, "#include <{i}>")?))
+}
+
+/// `items` grouped by guard, unconditional ones first, each group inside its condition.
+fn print_guarded(
+    out: &mut String,
+    items: &[(Guard, String)],
+    each: impl Fn(&mut String, &str) -> Result<()>,
+) -> Result<()> {
+    for g in Guard::ALL {
+        let group: Vec<&String> = items
+            .iter()
+            .filter(|(x, _)| *x == g)
+            .map(|(_, s)| s)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let condition = g.condition();
+        if let Some(c) = &condition {
+            writeln!(out, "#if {c}")?;
+        }
+        for s in group {
+            each(out, s)?;
+        }
+        if condition.is_some() {
+            writeln!(out, "#endif")?;
+        }
     }
     Ok(())
 }
@@ -770,8 +981,8 @@ mod tests {
     fn printed_shape() {
         let w = Wrapper {
             hidden: ["__unused".to_owned()].into(),
-            defines: vec!["__unused __attribute__((__unused__))".to_owned()],
-            includes: vec!["stddef.h".to_owned()],
+            defines: always(&["__unused __attribute__((__unused__))"]),
+            includes: always(&["stddef.h"]),
             ..Wrapper::default()
         };
         let text = print("sys/x.h", &w, "test").unwrap();
@@ -785,14 +996,34 @@ mod tests {
         // a substitute: no host header to include, everything once
         let s = Wrapper {
             substitute: true,
-            defines: vec!["_M 1".to_owned()],
-            includes: vec!["limits.h".to_owned()],
+            defines: always(&["_M 1"]),
+            includes: always(&["limits.h"]),
             ..Wrapper::default()
         };
         assert_eq!(
             print("sys/x.h", &s, "test").unwrap(),
             "// generated by atl-bridgegen from test, do not edit\n#ifndef __ATL_BIONIC_SHAPE_sys_x_h\n#define __ATL_BIONIC_SHAPE_sys_x_h\n#include <limits.h>\n#ifndef _M\n#define _M 1\n#endif\n#endif\n"
         );
+
+        // one view's items inside bionic's guard, unconditional ones first
+        let v = Wrapper {
+            defines: vec![(Guard::Gnu, "_G 1".to_owned())],
+            includes: vec![
+                (Guard::NotGnu, "d.h".to_owned()),
+                (Guard::Always, "a.h".to_owned()),
+                (Guard::Gnu, "g.h".to_owned()),
+            ],
+            ..Wrapper::default()
+        };
+        assert_eq!(
+            print("x.h", &v, "test").unwrap(),
+            "// generated by atl-bridgegen from test, do not edit\n#include_next <x.h>\n#if defined(__USE_GNU)\n#ifndef _G\n#define _G 1\n#endif\n#endif\n#ifndef __ATL_BIONIC_SHAPE_x_h\n#define __ATL_BIONIC_SHAPE_x_h\n#include <a.h>\n#if defined(__USE_GNU)\n#include <g.h>\n#endif\n#if !defined(__USE_GNU)\n#include <d.h>\n#endif\n#endif\n"
+        );
+    }
+
+    /// Unguarded items.
+    fn always(v: &[&str]) -> Vec<(Guard, String)> {
+        v.iter().map(|s| (Guard::Always, (*s).to_owned())).collect()
     }
 
     use crate::Target;
@@ -812,7 +1043,8 @@ mod tests {
     /// which the host's lacks. bionic-only headers: `o.h` includes `x.h` and defines `__om` in terms of
     /// `__oc` from its `sys/cdefs.h`; `f.h` declares a function; `c.h` defines a macro in terms of
     /// `__mac`; `e.h` defines `__kb` as `k/u.h` does, `d.h` defines `__kd` other than `k/u.h`, which
-    /// uses both.
+    /// uses both. Views: bionic's `g.h` includes `x.h` and defines `__gm` with `_GNU_SOURCE`, else
+    /// includes `y.h`; the host's `z.h` includes `y.h` with `_GNU_SOURCE`.
     fn libcs(tag: &str) -> Tmp {
         let root = std::env::temp_dir().join(format!("atl-shape-{tag}-{}", std::process::id()));
         let files: &[(&str, &str)] = &[
@@ -841,6 +1073,11 @@ mod tests {
             ),
             ("bionic/q.h", "#include <bits/p.h>\n"),
             ("bionic/z.h", "int z;\n"),
+            (
+                "bionic/g.h",
+                "#include <sys/cdefs.h>\n#ifdef _GNU_SOURCE\n#include <x.h>\n#define __gm 1\n#else\n#include <y.h>\n#endif\nint g;\n",
+            ),
+            ("host/g.h", "int g;\n"),
             ("uapi/k/u.h", "int kern;\n"),
             ("uapi/k/v.h", "#define __kv 1\n"),
             ("uapi/k/m.h", "#define __mac 1\n"),
@@ -850,7 +1087,10 @@ mod tests {
             ("host/x.h", "int x;\n"),
             ("host/y.h", "int y;\n"),
             ("host/q.h", "int q;\n"),
-            ("host/z.h", "int q;\nint z;\n"),
+            (
+                "host/z.h",
+                "int q;\nint z;\n#ifdef _GNU_SOURCE\n#include <y.h>\n#endif\n",
+            ),
             (
                 "host/k/u.h",
                 "struct s { int __mac; };\n#  define  __kb\n#define __kd 1\n#if defined(__kb) && __kd\n#endif\n",
@@ -875,7 +1115,7 @@ mod tests {
     }
 
     fn derived(dir: &Tmp, homes: &[(&str, &str)]) -> Result<Shape> {
-        derived_with(dir, homes, &["__mac", "__pm"], &["e.h", "o.h"])
+        derived_with(dir, homes, &["__mac", "__pm", "__gm"], &["e.h", "o.h"])
     }
 
     fn derived_with(
@@ -909,11 +1149,16 @@ mod tests {
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
         let host_t = sysroot(&[dir.0.join("host")]);
+        let gnu = |mut t: Target| {
+            t.args.push("-D_GNU_SOURCE".to_owned());
+            t
+        };
         let public = [
             "c.h",
             "d.h",
             "e.h",
             "f.h",
+            "g.h",
             "n.h",
             "o.h",
             "q.h",
@@ -924,16 +1169,25 @@ mod tests {
             "z.h",
         ];
         let bionic = front::probe_includes(Lang::C, &bionic_t, &public)?;
-        let names: Vec<String> = host_names(&bionic, &include, &uapi, homes)
+        let bionic_gnu = front::probe_includes(Lang::C, &gnu(bionic_t), &public)?;
+        let names: Vec<String> = host_names(&[&bionic, &bionic_gnu], &include, &uapi, homes)
             .into_iter()
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let host = front::probe_includes(Lang::C, &host_t, &names)?;
+        let host_gnu =
+            front::probe_includes(Lang::C, &gnu(sysroot(&[dir.0.join("host")])), &names)?;
         let scan = front::resolve_includes(Lang::C, &host_t, kernel)?;
         let kernel = front::resolve_includes(Lang::C, &sysroot(&uapi), kernel)?;
         derive(&Inputs {
-            bionic: &bionic,
-            host: &host,
+            default: Probes {
+                bionic: &bionic,
+                host: &host,
+            },
+            gnu: Probes {
+                bionic: &bionic_gnu,
+                host: &host_gnu,
+            },
             bionic_include: &include,
             uapi: &uapi,
             homes,
@@ -957,20 +1211,20 @@ mod tests {
         // the uapi header is not shape
         assert_eq!(
             with_home.wrappers["w.h"].includes,
-            strings(&["q.h", "x.h", "y.h"])
+            always(&["q.h", "x.h", "y.h"])
         );
         assert_eq!(
             with_home.wrappers["sys/cdefs.h"].defines,
-            strings(&["__mac __attribute__((unused))"])
+            always(&["__mac __attribute__((unused))"])
         );
         assert_eq!(
             with_home.wrappers["k/u.h"].hidden,
             BTreeSet::from(["__mac".to_owned()])
         );
         // q.h needs no home: its host version declares q itself
-        assert_eq!(with_home.wrappers["q.h"].includes, strings(&["y.h"]));
+        assert_eq!(with_home.wrappers["q.h"].includes, always(&["y.h"]));
         // a private file's macro, as written, in every header whose walk enters it
-        let pm = strings(&["__pm(x) ((x) + \\\n  1)"]);
+        let pm = always(&["__pm(x) ((x) + \\\n  1)"]);
         assert_eq!(with_home.wrappers["w.h"].defines, pm);
         assert_eq!(with_home.wrappers["q.h"].defines, pm);
         // substitute o.h: its includes and its macros with the bionic-only one they name; e.h's macro
@@ -979,23 +1233,37 @@ mod tests {
             with_home.wrappers["o.h"],
             Wrapper {
                 substitute: true,
-                includes: strings(&["sys/cdefs.h", "x.h"]),
-                defines: strings(&["__oc(v) ((v) + 1)", "__om(v) __oc(v)"]),
+                includes: always(&["sys/cdefs.h", "x.h"]),
+                defines: always(&["__oc(v) ((v) + 1)", "__om(v) __oc(v)"]),
                 ..Wrapper::default()
             }
         );
-        assert_eq!(with_home.wrappers["e.h"].defines, strings(&["__kb"]));
+        assert_eq!(with_home.wrappers["e.h"].defines, always(&["__kb"]));
         // a header including a substitute includes it, not walks it as private (bionic endian.h ->
         // sys/endian.h); not substituted, o.h is walked and only its includes reach n.h
-        assert_eq!(with_home.wrappers["n.h"].includes, strings(&["o.h"]));
+        assert_eq!(with_home.wrappers["n.h"].includes, always(&["o.h"]));
         let unsubstituted =
             derived_with(&dir, &[("bits/p.h", "q.h")], &["__mac", "__pm"], &["e.h"]).unwrap();
         assert_eq!(
             unsubstituted.wrappers["n.h"].includes,
-            strings(&["sys/cdefs.h", "x.h"])
+            always(&["sys/cdefs.h", "x.h"])
+        );
+        // views: g.h's includes of one view only keep bionic's condition; __gm, which only the
+        // _GNU_SOURCE view defines, is forwarded under it
+        assert_eq!(
+            with_home.wrappers["g.h"],
+            Wrapper {
+                includes: vec![
+                    (Guard::Always, "sys/cdefs.h".to_owned()),
+                    (Guard::NotGnu, "y.h".to_owned()),
+                    (Guard::Gnu, "x.h".to_owned()),
+                ],
+                defines: vec![(Guard::Gnu, "__gm 1".to_owned())],
+                ..Wrapper::default()
+            }
         );
         // unlisted bionic-only headers get nothing
-        assert_eq!(with_home.wrappers.len(), 7);
+        assert_eq!(with_home.wrappers.len(), 8);
         let home = &[("bits/p.h", "q.h")];
         let forwarded = &["__mac", "__pm"];
         // refused substitutes: bionic-only API (f.h); a macro needing __mac, a k/u.h field name (c.h);
@@ -1023,7 +1291,7 @@ mod tests {
         // without the home: reported, with both host headers declaring q (one file each, by name);
         // p_only is declared by no host header, so it is not shape
         let without = derived(&dir, &[]).unwrap();
-        assert_eq!(without.wrappers["w.h"].includes, strings(&["x.h", "y.h"]));
+        assert_eq!(without.wrappers["w.h"].includes, always(&["x.h", "y.h"]));
         assert_eq!(
             without.gaps,
             [Gap {
@@ -1031,6 +1299,7 @@ mod tests {
                 file: "bits/p.h".into(),
                 names: strings(&["q"]),
                 homes: strings(&["q.h", "z.h"]),
+                guard: Guard::Always,
             }]
         );
 
@@ -1038,16 +1307,20 @@ mod tests {
         assert!(derived(&dir, &[("bits/p.h", "x.h")]).is_err());
         assert!(derived(&dir, &[("bits/p.h", "q.h"), ("bits/none.h", "q.h")]).is_err());
 
-        // extra includes: added to a wrapper with shape (w.h) or making one (z.h), sorted, once
+        // extra includes: added to a wrapper with shape (w.h) or making one (z.h), sorted, once; only
+        // in the view whose host header does not reach it (host z.h includes y.h with _GNU_SOURCE)
         let extra = |rows: &[(&str, &str)]| {
             derived_extra(&dir, home, forwarded, &[], rows).map_err(|e| e.to_string())
         };
         let with_extra = extra(&[("w.h", "z.h"), ("w.h", "x.h"), ("z.h", "y.h")]).unwrap();
         assert_eq!(
             with_extra.wrappers["w.h"].includes,
-            strings(&["q.h", "x.h", "y.h", "z.h"])
+            always(&["q.h", "x.h", "y.h", "z.h"])
         );
-        assert_eq!(with_extra.wrappers["z.h"].includes, strings(&["y.h"]));
+        assert_eq!(
+            with_extra.wrappers["z.h"].includes,
+            [(Guard::NotGnu, "y.h".to_owned())]
+        );
         // refused: the host's header already reaches it (host w.h includes sys/cdefs.h); no host header
         let e = extra(&[("w.h", "sys/cdefs.h")]).unwrap_err();
         assert!(e.contains("already reaches <sys/cdefs.h>"), "{e}");

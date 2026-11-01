@@ -16,6 +16,8 @@
 //!   forwards to bionic's kernel uapi headers the host lacks (`shape::Shape::uapi`). Each must add no
 //!   error to its host header (a substitute or forward: compile alone), as C and C++.
 //!   `OUT_DIR/shape_gaps.txt`: what they leave different (names bionic's private files bring in).
+//!   `OUT_DIR/capi/include/atl-bionic/uapi/<header>`: kernel uapi records code reads by layout
+//!   (`UAPI_RECORDS`), alone, layout asserted; a shape wrapper includes each.
 //!
 //! Generates twice and fails unless byte-identical.
 //!
@@ -119,6 +121,7 @@ const APIS: &[Api] = &[
             ],
             macros: &["async_safe_fatal"],
             types: &[],
+            records: &[],
         },
     },
     // what the native closure calls of fdsan (2026-10-31: libsfplugin_ccodec C2NodeImpl.cpp)
@@ -159,6 +162,7 @@ const APIS: &[Api] = &[
             includes: &[],
             macros: &[],
             types: &["android_mallopt_leak_info_t"],
+            records: &[],
         },
     },
     // the first abort message, kept for a crash report (2026-11-01: liblog, libbase, perfetto aborters
@@ -236,6 +240,29 @@ const EXTRA_INCLUDES: &[(&str, &str)] = &[
     ("sys/vfs.h", "linux/magic.h"),
 ];
 
+/// Records of a kernel uapi header, declared alone (bridgegen's C printer, layout asserted against
+/// bionic's view) in a generated header the shape wrapper of a host header includes (`shape::Inputs::extra`).
+struct UapiRecords {
+    /// Include name; the file is the host arch's own, as bionic's search order finds it (`asm-<kernel_arch>`).
+    uapi: &'static str,
+    records: &'static [&'static str],
+    host_header: &'static str,
+    /// Generated, under `capi/include`.
+    header: &'static str,
+}
+
+/// `struct pt_regs`: libmemunreachable ThreadCapture.cpp takes the stack pointer's index in the
+/// `PTRACE_GETREGSET` buffer from it after `<sys/ptrace.h>`, which reaches it on bionic through
+/// `<linux/ptrace.h>`. The record only: uapi's `PTRACE_*` macros would turn glibc's C++ `enum
+/// __ptrace_request` enumerators into numbers. An arch whose uapi names it otherwise (arm64
+/// `user_pt_regs`) fails the generation until its record is listed.
+const UAPI_RECORDS: &[UapiRecords] = &[UapiRecords {
+    uapi: "asm/ptrace.h",
+    records: &["pt_regs"],
+    host_header: "sys/ptrace.h",
+    header: "atl-bionic/uapi/asm/ptrace.h",
+}];
+
 /// bionic's property-area implementation and the headers holding its layouts.
 const PROP_AREA_SOURCES: &[&str] = &[
     "bionic/libc/system_properties/prop_area.cpp",
@@ -282,9 +309,16 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// undefined, it declares a variable of the struct, which calls its private constructor. `M_PURGE`
 /// (`malloc.h`, -101; hwui Bitmap.cpp `mallopt(M_PURGE, 0)` under `__ANDROID__`, result ignored): glibc
 /// 2.41's `mallopt` ignores an unknown option and returns 1, after consolidating the main arena's fastbins.
+/// `M_LOG_STATS` (`malloc.h`, -205; libandroid_runtime android_os_Debug.cpp `mallopt(M_LOG_STATS, 0) == 1`):
+/// the same glibc path, so `Debug.logAllocatorStats()` reports true and nothing is logged.
+/// `__CPU_BITTYPE` (`sched.h`, `__USE_GNU` only: forwarded under it; libandroid_runtime
+/// android_util_Process.cpp divides glibc's `CPU_ALLOC_SIZE` by it): `unsigned long int`, glibc's
+/// `__cpu_mask`, the element of both libcs' `cpu_set_t.__bits`.
 const FORWARDED_MACROS: &[&str] = &[
     "__unused",
     "M_PURGE",
+    "M_LOG_STATS",
+    "__CPU_BITTYPE",
     "__packed",
     "IS_ELF",
     "GID_MAX",
@@ -362,10 +396,15 @@ fn main() -> Result<()> {
     for row in &first.host_rows {
         println!("cargo::rustc-cfg=atl_bionic_api=\"{row}\"");
     }
-    // the triple the wrappers are checked for, so tests compile against them as this does
+    // the triple the wrappers are checked for, so tests compile against them as this does; the
+    // target, so tests read bionic's headers for its arch
     println!(
         "cargo::rustc-env=ATL_BIONIC_CLANG_TRIPLE={}",
         buildscript::clang_triple_from_cargo()?
+    );
+    println!(
+        "cargo::rustc-env=ATL_BIONIC_TARGET={}",
+        std::env::var("TARGET")?
     );
 
     println!("cargo::rerun-if-changed={}", arches.display());
@@ -398,6 +437,10 @@ fn bionic_target(up: &Upstreams, host: &HostArch, level: u64, cxx: Option<&Path>
     target
 }
 
+/// What selects the second view headers are read in (`shape::Inputs::gnu`): clang++ predefines it, so
+/// every device C++ unit sees both libcs' `__USE_GNU` sections.
+const GNU_VIEW: &str = "-D_GNU_SOURCE";
+
 /// The host libc's view, as device compiles see it.
 fn host_target(host: &HostArch) -> Result<Target> {
     Ok(Target {
@@ -410,7 +453,7 @@ fn host_target(host: &HostArch) -> Result<Target> {
 /// Whether the host's `header`, with `_GNU_SOURCE`, declares `functions`: all (true), none (false); some fails.
 fn host_declares(host: &HostArch, header: &str, functions: &[&str]) -> Result<bool> {
     let mut target = host_target(host)?;
-    target.args.push("-D_GNU_SOURCE".to_owned());
+    target.args.push(GNU_VIEW.to_owned());
     let probes = front::probe_includes(Lang::C, &target, &[header])?;
     let probe = probes
         .get(header)
@@ -456,6 +499,10 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
             "crate::ffi",
         )?);
     }
+    for row in UAPI_RECORDS {
+        files.push(uapi_records(up, host, level, row)?);
+        extra.push((row.host_header, row.header));
+    }
     let iface = prop_area(up, bionic_target(up, host, level, Some(libcxx)), out)?;
     check_prop_area_shape(&iface.arches[&host.arch])?;
     files.push((
@@ -486,6 +533,31 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
     })
 }
 
+/// The header declaring `row`'s records as bionic's uapi does, with their layout asserted.
+fn uapi_records(
+    up: &Upstreams,
+    host: &HostArch,
+    level: u64,
+    row: &UapiRecords,
+) -> Result<(PathBuf, String)> {
+    let target = bionic_target(up, host, level, None);
+    let file = front::resolve_include(Lang::C, &target, row.uapi)?;
+    let aosp = up.aosp("");
+    let label = file
+        .strip_prefix(&aosp)
+        .unwrap_or(&file)
+        .display()
+        .to_string();
+    let iface = atl_bridgegen::interface(row.uapi, &label, &Source::c(&file, &[]), &[target])?;
+    let kept = Kept {
+        records: row.records,
+        ..Kept::default()
+    };
+    let text = atl_bridgegen::c::header(&iface, &host.arch, &[], &[], &kept)
+        .with_context(|| format!("{label}: {:?}", row.records))?;
+    Ok((Path::new("capi/include").join(row.header), text))
+}
+
 /// The shape wrappers and what they leave different from bionic.
 struct ShapeOut {
     /// Include name -> text.
@@ -502,22 +574,28 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         .into_iter()
         .filter(|n| !shape::is_private(n))
         .collect();
-    let bionic = front::probe_includes(
-        Lang::C,
-        &bionic_target(up, host, level, None),
-        &strs(&public),
-    )
-    .context("bionic's public headers")?;
+    let gnu = |mut t: Target| {
+        t.args.push(GNU_VIEW.to_owned());
+        t
+    };
+    let bionic_t = bionic_target(up, host, level, None);
+    let bionic = front::probe_includes(Lang::C, &bionic_t, &strs(&public))
+        .context("bionic's public headers")?;
+    let bionic_gnu = front::probe_includes(Lang::C, &gnu(bionic_t), &strs(&public))
+        .context("bionic's public headers with _GNU_SOURCE")?;
     let uapi: Vec<PathBuf> = buildscript::bionic_uapi_dirs(host)
         .iter()
         .map(|d| up.path(d))
         .collect();
     let host_target = host_target(host)?;
-    let mut names: BTreeSet<String> = shape::host_names(&bionic, &include, &uapi, HOMES);
+    let mut names: BTreeSet<String> =
+        shape::host_names(&[&bionic, &bionic_gnu], &include, &uapi, HOMES);
     names.extend(extra.iter().map(|(h, _)| (*h).to_owned()));
     let names: Vec<String> = names.into_iter().collect();
     let host_probes = front::probe_includes(Lang::C, &host_target, &strs(&names))
         .context("the host's headers")?;
+    let host_gnu = front::probe_includes(Lang::C, &gnu(self::host_target(host)?), &strs(&names))
+        .context("the host's headers with _GNU_SOURCE")?;
     let kernel = kernel_headers(&uapi)?;
     let scan = front::resolve_includes(
         Lang::C,
@@ -525,8 +603,14 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         &strs(&kernel.keys().cloned().collect::<Vec<_>>()),
     )?;
     let derived = shape::derive(&shape::Inputs {
-        bionic: &bionic,
-        host: &host_probes,
+        default: shape::Probes {
+            bionic: &bionic,
+            host: &host_probes,
+        },
+        gnu: shape::Probes {
+            bionic: &bionic_gnu,
+            host: &host_gnu,
+        },
         bionic_include: &include,
         uapi: &uapi,
         homes: HOMES,
@@ -566,6 +650,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
     }
     let host_inputs = host_probes
         .values()
+        .chain(host_gnu.values())
         .flat_map(|p| p.files.keys().cloned())
         .chain(scan.into_values())
         .collect();

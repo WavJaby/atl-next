@@ -65,6 +65,9 @@ pub struct Kept<'a> {
     pub macros: &'a [&'a str],
     /// Typedefs of the interface callers use that no printed function names (`android_mallopt_leak_info_t`).
     pub types: &'a [&'a str],
+    /// Tagged records of the interface callers read by layout (`pt_regs`), printed as `struct x { … };` with
+    /// layout asserts.
+    pub records: &'a [&'a str],
 }
 
 /// The header text: `functions` and `constants` (integer or string macros, enumerators) of `arch`'s view,
@@ -114,6 +117,16 @@ pub fn header(
             .get(*t)
             .with_context(|| format!("{}: no typedef {t}", iface.header))?;
         p.typedef(t, target).with_context(|| (*t).to_owned())?;
+    }
+    for r in kept.records {
+        let text = p.definition(r, true).with_context(|| (*r).to_owned())?;
+        p.typedefs.push(Typedef {
+            name: format!("struct {r}"),
+            text,
+            target: Ty::Record {
+                name: (*r).to_owned(),
+            },
+        });
     }
     let mut defines = String::new();
     for c in constants {
@@ -333,7 +346,7 @@ impl Printer<'_> {
         if self.view.typedefs.contains_key(name) {
             // typedefs the target uses come out first
             let text = match target {
-                Ty::Record { name: record } if record == name => self.definition(name)?,
+                Ty::Record { name: record } if record == name => self.definition(name, false)?,
                 _ => format!("typedef {};", self.decl(target, false, name)?),
             };
             self.typedefs.push(Typedef {
@@ -352,33 +365,43 @@ impl Printer<'_> {
         Ok(())
     }
 
-    /// `typedef struct { fields } name;` for the anonymous record the typedef `name` names, and its
-    /// layout asserts. Attributes are not printed, so a packed or over-aligned record fails.
-    fn definition(&mut self, name: &str) -> Result<String> {
+    /// The definition of record `name` and its layout asserts: `typedef struct { fields } name;` for the
+    /// anonymous record a typedef names, `struct name { fields };` when `tagged`. Attributes are not
+    /// printed, so a packed or over-aligned record fails.
+    fn definition(&mut self, name: &str, tagged: bool) -> Result<String> {
         let view = self.view;
         let record = view
             .records
             .get(name)
-            .with_context(|| format!("typedef {name} names no record of the interface"))?;
+            .with_context(|| format!("{name} names no record of the interface"))?;
         ensure!(
             !record.packed && !record.aligned,
             "{name}: the C printer prints no record attributes (packed / aligned)"
         );
-        let mut text = format!("typedef {} {{\n", keyword(record.kind));
+        let kw = keyword(record.kind);
+        let (mut text, ty) = if tagged {
+            (format!("{kw} {name} {{\n"), format!("{kw} {name}"))
+        } else {
+            (format!("typedef {kw} {{\n"), name.to_owned())
+        };
         for f in &record.fields {
             let field = self
                 .decl(&f.ty, false, &f.name)
                 .with_context(|| format!("{name}.{}", f.name))?;
             writeln!(text, "  {field};")?;
         }
-        write!(text, "}} {name};")?;
+        if tagged {
+            text.push_str("};");
+        } else {
+            write!(text, "}} {name};")?;
+        }
         self.asserts
-            .push(format!("sizeof({name}) == {}", record.size));
+            .push(format!("sizeof({ty}) == {}", record.size));
         self.asserts
-            .push(format!("__alignof__({name}) == {}", record.align));
+            .push(format!("__alignof__({ty}) == {}", record.align));
         for f in &record.fields {
             self.asserts.push(format!(
-                "__builtin_offsetof({name}, {}) == {}",
+                "__builtin_offsetof({ty}, {}) == {}",
                 f.name, f.offset
             ));
         }
