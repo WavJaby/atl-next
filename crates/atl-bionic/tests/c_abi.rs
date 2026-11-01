@@ -27,6 +27,12 @@ unsafe extern "C" {
     fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
     fn __system_property_area_serial() -> u32;
     fn __system_property_serial(pi: *const PropInfo) -> u32;
+    fn __system_property_wait(
+        pi: *const PropInfo,
+        old_serial: u32,
+        new_serial: *mut u32,
+        relative_timeout: *const c_void,
+    ) -> bool;
     fn android_get_device_api_level() -> c_int;
     fn android_get_application_target_sdk_version() -> c_int;
     fn android_set_application_target_sdk_version(target: c_int);
@@ -113,6 +119,23 @@ fn c_callers_see_the_area() {
         );
         assert_eq!(n, 3);
         assert_eq!(__system_property_area_serial(), 3);
+
+        // a C timeout: rustix's Timespec is two i64s, the libc's on every 64-bit host
+        let ms = rustix::thread::futex::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        let ms = (&raw const ms).cast::<c_void>();
+        let mut new = 0u32;
+        let area = core::ptr::null();
+        assert!(!__system_property_wait(area, 3, &raw mut new, ms));
+        assert!(!__system_property_wait(x, 2 << 24, &raw mut new, ms));
+        assert_eq!(new, 0);
+        // the serial already moved on: true and the current one, at once
+        assert!(__system_property_wait(area, 2, &raw mut new, ms));
+        assert_eq!(new, 3);
+        // refused where bionic would crash
+        assert!(!__system_property_wait(x, 0, core::ptr::null_mut(), ms));
 
         // no property service yet: bionic's failure when its socket is missing
         assert_eq!(

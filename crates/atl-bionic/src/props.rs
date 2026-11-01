@@ -15,7 +15,8 @@ use core::cmp::Ordering;
 use core::sync::atomic::Ordering::{Acquire, Relaxed};
 use core::sync::atomic::{AtomicU32, fence};
 
-use rustix::thread::futex;
+use rustix::io::Errno;
+use rustix::thread::futex::{self, Timespec};
 
 use crate::generated::prop_format as fmt;
 use fmt::{
@@ -363,6 +364,27 @@ impl<'a> Area<'a> {
         }
         serial
     }
+
+    /// bionic `SystemProperties::Wait`: waits until the serial of `pi` (the area serial for none) is no
+    /// longer `old`, for at most `timeout` (relative; restarted after a spurious wake, as bionic's
+    /// loop does). The new serial, or none on timeout.
+    /// Deviation: a timeout the kernel refuses (`EINVAL`: nanoseconds out of range) also returns none;
+    /// bionic retries it forever, a busy loop.
+    pub fn wait(&self, pi: Option<PropInfo>, old: u32, timeout: Option<&Timespec>) -> Option<u32> {
+        let word = pi.map_or_else(|| self.serial(), |pi| self.info_serial(pi));
+        loop {
+            // shared, not private: the writer is another process. Otherwise woken, interrupted, or the
+            // value already differs (EAGAIN): look.
+            let r = futex::wait(word, futex::Flags::empty(), old, timeout);
+            if let Err(Errno::TIMEDOUT | Errno::INVAL) = r {
+                return None;
+            }
+            let new = word.load(Acquire);
+            if new != old {
+                return Some(new);
+            }
+        }
+    }
 }
 
 /// A property as a read callback sees it; offsets are into the area.
@@ -515,6 +537,42 @@ pub(crate) mod tests {
         let area = Area::new(&w).unwrap();
         let (serial, v) = value(&area, area.find(b"ro.a").unwrap());
         assert_eq!((serial & SERIAL_DIRTY, v), (SERIAL_DIRTY, b"x".to_vec()));
+    }
+
+    /// bionic's documented `__system_property_wait`: false once the timeout passes with the serial
+    /// unchanged; true and the new serial once the writer stores one and futex-wakes.
+    #[test]
+    fn wait_times_out_or_returns_the_new_serial() {
+        use std::time::{Duration, Instant};
+        let mut image = crate::image::Image::new();
+        image.add("net.c", "v").unwrap();
+        let w = words(&image.into_bytes());
+        let area = Area::new(&w).unwrap();
+        let pi = area.find(b"net.c").unwrap();
+        // 20 ms: long enough to measure, short for a test
+        let short = Timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        };
+        for target in [Some(pi), None] {
+            let word = target.map_or_else(|| area.serial(), |pi| area.info_serial(pi));
+            let old = word.load(Relaxed);
+            let start = Instant::now();
+            assert_eq!(area.wait(target, old, Some(&short)), None);
+            assert!(start.elapsed() >= Duration::from_millis(20));
+            // already changed: returns at once, without a wake
+            assert_eq!(area.wait(target, old.wrapping_add(1), None), Some(old));
+            // a writer thread bumps the serial and wakes, as bionic's Update / Add do
+            let new = old + (1 << SERIAL_LEN_SHIFT);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    word.store(new, core::sync::atomic::Ordering::Release);
+                    futex::wake(word, futex::Flags::empty(), u32::MAX).unwrap();
+                });
+                assert_eq!(area.wait(target, old, None), Some(new));
+            });
+        }
     }
 
     #[test]

@@ -7,6 +7,8 @@
 //! - `OUT_DIR/prop_area.rs`: bionic's property-area format -- record layouts, magic, version, flags --
 //!   from `prop_area.cpp` / `prop_info.cpp` and their C++ headers (bridge control 2: the reader and the
 //!   image builder take every offset from here, so a format change moves them or fails the build).
+//! - `OUT_DIR/timespec.rs`: `struct timespec`'s offsets and field sizes, checked equal in bionic's and
+//!   the host libc's view (the `__system_property_wait` timeout).
 //!
 //! - `OUT_DIR/capi/include/<header>`, also: include wrappers giving the host libc's headers bionic's
 //!   header shape (`atl_bridgegen::shape`), installed with the declarations, so they reach exactly the
@@ -46,6 +48,7 @@ const APIS: &[Api] = &[
             "__system_property_get",
             "__system_property_area_serial",
             "__system_property_serial",
+            "__system_property_wait",
         ],
         macros: &["PROP_VALUE_MAX", "PROP_NAME_MAX", "PROP_DIRNAME"],
         include_dirs: &[],
@@ -307,6 +310,11 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
         atl_bridgegen::rust::layout_module(&iface, &host.arch)?,
     ));
     files.push(("prop_area.ir.json".into(), atl_bridgegen::to_json(&iface)?));
+    let timespec = timespec(up, host, level, out)?;
+    files.push((
+        "timespec.rs".into(),
+        atl_bridgegen::rust::layout_module(&timespec, &host.arch)?,
+    ));
     let shape = shape(up, host, level)?;
     for (name, text) in &shape.wrappers {
         let path = Path::new("capi/include").join(name);
@@ -501,6 +509,57 @@ fn prop_area(up: &Upstreams, mut target: Target, out: &Path) -> Result<Interface
         &[target],
     )
 }
+
+/// `struct timespec`'s layout, the field `__system_property_wait`'s timeout is read through: evaluated in
+/// bionic's view and in the host libc's, which must agree -- bionic's header declares the parameter,
+/// glibc-built callers pass glibc's struct (Rust callers built for Android pass the `libc` crate's
+/// bionic one). The result is bionic's view, its constants named after `TIMESPEC_PROBE`'s macros.
+fn timespec(up: &Upstreams, host: &HostArch, level: u64, out: &Path) -> Result<Interface> {
+    let unit = out.join("timespec_layout.c");
+    std::fs::write(&unit, TIMESPEC_PROBE)?;
+    let src = Source::c(&unit, &["TIMESPEC_*"]);
+    let mut views = Vec::new();
+    for target in [
+        bionic_target(up, host, level, None),
+        Target {
+            arch: host.arch.clone(),
+            triple: buildscript::clang_triple_from_cargo()?,
+            args: Vec::new(),
+        },
+    ] {
+        views.push(atl_bridgegen::interface(
+            "timespec",
+            "<time.h> struct timespec",
+            &src,
+            &[target],
+        )?);
+    }
+    let bits = |i: &Interface| -> Vec<(String, u64)> {
+        i.arches[&host.arch]
+            .constants
+            .iter()
+            .map(|(n, c)| (n.clone(), c.bits))
+            .collect()
+    };
+    ensure!(
+        bits(&views[0]) == bits(&views[1]),
+        "struct timespec differs between bionic and the host libc: bionic {:?}, host {:?}",
+        bits(&views[0]),
+        bits(&views[1])
+    );
+    Ok(views.swap_remove(0))
+}
+
+/// The layout facts of `struct timespec` the timeout reader uses, as clang computes them.
+const TIMESPEC_PROBE: &str = "\
+#include <stddef.h>
+#include <time.h>
+#define TIMESPEC_SIZE sizeof(struct timespec)
+#define TIMESPEC_TV_SEC offsetof(struct timespec, tv_sec)
+#define TIMESPEC_TV_SEC_SIZE sizeof(((struct timespec *)0)->tv_sec)
+#define TIMESPEC_TV_NSEC offsetof(struct timespec, tv_nsec)
+#define TIMESPEC_TV_NSEC_SIZE sizeof(((struct timespec *)0)->tv_nsec)
+";
 
 /// The C spelling of a field type, for the shape checks below.
 fn spell(ty: &Ty) -> String {

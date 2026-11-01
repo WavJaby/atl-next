@@ -11,7 +11,8 @@ use std::ffi::CString;
 
 use crate::generated::dlext::android_dlextinfo;
 use crate::generated::libdl_android::android_namespace_t;
-use crate::generated::system_properties::{PROP_NAME_MAX, prop_info};
+use crate::generated::system_properties::{PROP_NAME_MAX, prop_info, timespec};
+use crate::generated::timespec as ts;
 use crate::props::{Area, PropInfo, VALUE_MAX, Value};
 use crate::{async_safe, dlext, linker, sdk, store};
 
@@ -151,6 +152,78 @@ pub unsafe extern "C" fn __system_property_serial(pi: *const prop_info) -> u32 {
     store::area()
         .and_then(|a| Some(a.stable_serial(record(&a, pi)?)))
         .unwrap_or(NO_SERIAL)
+}
+
+/// A signed integer field of `size` bytes, widened.
+///
+/// # Safety
+/// `p` points to `size` readable bytes.
+unsafe fn int_field(p: *const u8, size: usize) -> i64 {
+    match size {
+        // SAFETY: the caller's contract
+        4 => i64::from(unsafe { p.cast::<i32>().read_unaligned() }),
+        // SAFETY: the caller's contract; `field` leaves only 8
+        _ => unsafe { p.cast::<i64>().read_unaligned() },
+    }
+}
+
+/// `struct timespec` fields as (offset, size): clang's, the same for bionic and the host (build.rs).
+const TV_SEC: (usize, usize) = field(ts::TIMESPEC_TV_SEC, ts::TIMESPEC_TV_SEC_SIZE);
+const TV_NSEC: (usize, usize) = field(ts::TIMESPEC_TV_NSEC, ts::TIMESPEC_TV_NSEC_SIZE);
+
+const fn field(offset: u64, size: u64) -> (usize, usize) {
+    assert!((size == 4 || size == 8) && offset + size <= ts::TIMESPEC_SIZE);
+    (offset as usize, size as usize)
+}
+
+/// The C timeout as rustix's, none for null.
+///
+/// # Safety
+/// A non-null `p` points to a `struct timespec`.
+unsafe fn timeout(p: *const timespec) -> Option<rustix::thread::futex::Timespec> {
+    let p = (!p.is_null()).then_some(p.cast::<u8>())?;
+    // SAFETY: the caller's contract; both fields lie inside the struct
+    unsafe {
+        Some(rustix::thread::futex::Timespec {
+            tv_sec: int_field(p.add(TV_SEC.0), TV_SEC.1),
+            tv_nsec: int_field(p.add(TV_NSEC.0), TV_NSEC.1),
+        })
+    }
+}
+
+/// bionic `SystemProperties::Wait`. Refused (false) where bionic crashes (null `new_serial_ptr`, a
+/// pointer that is no record) and without an area (bionic returns `-1` as `bool`, true, leaving
+/// `*new_serial_ptr` unset).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __system_property_wait(
+    pi: *const prop_info,
+    old_serial: u32,
+    new_serial_ptr: *mut u32,
+    relative_timeout: *const timespec,
+) -> bool {
+    let Some(area) = store::area() else {
+        return false;
+    };
+    let pi = match pi.is_null() {
+        true => None,
+        false => match record(&area, pi) {
+            Some(pi) => Some(pi),
+            None => return false,
+        },
+    };
+    // SAFETY: bionic's contract, null or a writable uint32_t no Rust reference aliases
+    let Some(out) = (unsafe { new_serial_ptr.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: bionic's contract, null or a timespec
+    let timeout = unsafe { timeout(relative_timeout) };
+    match area.wait(pi, old_serial, timeout.as_ref()) {
+        Some(new) => {
+            *out = new;
+            true
+        }
+        None => false,
+    }
 }
 
 #[unsafe(no_mangle)]
