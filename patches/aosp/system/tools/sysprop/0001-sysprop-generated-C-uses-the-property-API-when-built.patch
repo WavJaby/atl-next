@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 18:55:02 +0800
+Subject: [PATCH] sysprop: generated C++ uses the property API when built for
+ Android
+
+CppGen emits SetProp and GetProp with the bionic __system_property_*
+path under __BIONIC__ and android::base::Get/SetProperty otherwise.
+A device build against another C library that provides the bionic
+property API defines __ANDROID__ but not __BIONIC__; the generated
+library then needs libbase, which sysprop_library links on host only,
+and fails to link. Widen the guards to __BIONIC__ || __ANDROID__. No
+change for Soong variants: device builds define both, linux_bionic
+defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are in code the generator emits, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ CppGen.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/CppGen.cpp b/CppGen.cpp
+index 58efde27c0533971355c667fffa80c0d1a2b743b..99b0f5a22ec785bb0be11c8fd63aad96f1ee9ae6 100644
+--- a/CppGen.cpp
++++ b/CppGen.cpp
+@@ -54,7 +54,7 @@ constexpr const char* kCppSourceIncludes =
+ #include <utility>
+ 
+ #include <strings.h>
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <sys/system_properties.h>
+ [[maybe_unused]] static bool SetProp(const char* key, const char* value) {
+     return __system_property_set(key, value) == 0;
+@@ -214,7 +214,7 @@ template <typename T>
+ template <typename T>
+ T GetProp(const char* key, const char* legacy = nullptr) {
+     std::string value;
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     auto pi = __system_property_find(key);
+     if (pi != nullptr) {
+         __system_property_read_callback(pi, [](void* cookie, const char*, const char* value, std::uint32_t) {
