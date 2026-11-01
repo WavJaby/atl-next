@@ -22,9 +22,9 @@ import (
 //     The rlibs' own cc dependencies (libcxx's whole_static_libs libcxxbridge05) link into that final link like any static closure member; Soong bundles them into the rlib instead, same objects.
 //   - Toolchain: the repo's rust-toolchain.toml rustc (stable), with the host's own sysroot, so std, core, alloc and proc_macro come from it; Soong's `--sysroot=/dev/null` + prebuilt std modules are not mirrored.
 //     Soong's -Z flags (stack-protector, remap-cwd-prefix, dylib-lto, link-native-libraries, tls-model, debug-info-for-profiling) need nightly; they harden or tune code, never change what compiles, so they are dropped.
-//   - Device crates build for the host triple (rustc's default target), as cc device modules do: target_os is linux, not android -- the counterpart of cc not defining __ANDROID__.
+//   - Device crates build for the host triple (rustc's default target), as cc device modules do: target_os is linux, not android. cc device compiles define __ANDROID__ (androidDefine); rustc's target_os is no define, so it stays linux.
 //     So a device crate takes the linux_glibc `target: {…}` blocks (rustOSSide), keeping device codegen flags (rustDeviceFlags) -- unlike cc, which keeps android blocks.
-//     cc device code is written against the Android userspace API, which this build provides without __ANDROID__, so android blocks stay right for it.
+//     cc device code is written against the Android userspace API, which this build provides, so android blocks stay right for it.
 //     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
 //     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
 //   - Exception, providers.toml `rust_os = "android"` (g.rustAndroid): a device crate whose Android behaviour this runtime provides (system properties, liblog) takes the android blocks

@@ -62,8 +62,6 @@ func TestSoongConfigAvailability(t *testing.T) {
 	if want := []string{"libc", "libm", "libdl"}; !slices.Equal(cfg.SystemSharedLibs, want) {
 		t.Errorf("SystemSharedLibs %q, want %q", cfg.SystemSharedLibs, want)
 	}
-	// the forced header is one of the linked ones
-	compatPath(deviceCompat, deviceForced)
 	for _, c := range []struct {
 		name, cflags, soong, bionic, want string
 	}{
@@ -203,6 +201,81 @@ cc_library {
 	}
 	if at(hf, "-mssse3") >= 0 || at(hf, "-DFEATURE") >= 0 || at(hf, "-DARCH") < 0 {
 		t.Errorf("host: %q", hf)
+	}
+}
+
+// What clang defines for Soong's device triple <arch>-linux-android<level> (owner 2026-11-01: __ANDROID__, never __BIONIC__) on every device C and C++ compile, none on host;
+// both forced headers on every device compile, a libc dependency or not; the libc++ shims only in C++.
+func TestDeviceDefinesAndForced(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library { name: "libnolibc", host_supported: true, srcs: ["a.c", "b.cpp"], system_shared_libs: [] }
+`})
+	g.soong.APILevel = "-D__ANDROID_API__=10000"
+	dev, host := g.node("libnolibc", Device, Shared, "t"), g.node("libnolibc", Host, Shared, "t")
+	if dev == nil || host == nil {
+		t.Fatal(g.problems)
+	}
+	df, hf := g.compileFlags(dev), g.compileFlags(host)
+	shim := filepath.Join(g.out, "compat", "libcxx")
+	for lang, list := range map[string][]string{"c": df.c, "cxx": df.cxx} {
+		if !slices.Contains(list, "-D__ANDROID__") || slices.ContainsFunc(list, func(f string) bool { return strings.Contains(f, "__BIONIC__") }) {
+			t.Errorf("device %s defines: %q", lang, list)
+		}
+		for _, h := range []string{"android/versioning.h", "android/api-level.h"} {
+			if i := slices.Index(list, h); i < 1 || list[i-1] != "-include" {
+				t.Errorf("device %s does not force %s: %q", lang, h, list)
+			}
+		}
+		if i := slices.Index(list, shim); (i >= 1 && list[i-1] == "-idirafter") != (lang == "cxx") {
+			t.Errorf("device %s: libc++ shim dir %q", lang, list)
+		}
+	}
+	for _, list := range [][]string{hf.c, hf.cxx} {
+		if slices.ContainsFunc(list, func(f string) bool { return strings.Contains(f, "__ANDROID") || strings.Contains(f, "compat") }) {
+			t.Errorf("host: %q", list)
+		}
+	}
+}
+
+// writeCompat: each device forced header resolves under compat/device -- the tree's versioning.h, the libc provider's api-level.h (the first include dir holding it) --, xlocale.h is the shim;
+// without the provider, or with one lacking the header, it fails rather than emit compiles that cannot find a forced header.
+func TestWriteCompat(t *testing.T) {
+	tree, out, gen, other := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	write := func(path, text string) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range append(append([]compatHeader{}, cxxCompat...), deviceCompat...) {
+		write(filepath.Join(tree, h.path), "tree "+h.name)
+	}
+	write(filepath.Join(gen, "android/api-level.h"), "generated")
+	provided := map[string]Provided{"libc": {Libs: []string{"x.so"}, Include: []string{other, gen}}}
+	if err := writeCompat(tree, out, provided); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"android/versioning.h": "tree android/versioning.h", "android/api-level.h": "generated"}
+	for _, h := range deviceForced {
+		b, err := os.ReadFile(filepath.Join(out, "compat", "device", h))
+		if err != nil || string(b) != want[h] {
+			t.Errorf("compat/device/%s: %q %v", h, b, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(out, "compat", "libcxx", "xlocale.h")); err != nil || !strings.Contains(string(b), "#include <locale.h>") {
+		t.Errorf("xlocale.h: %q %v", b, err)
+	}
+	// a second run replaces every entry
+	if err := writeCompat(tree, out, provided); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCompat(tree, out, nil); err == nil || !strings.Contains(err.Error(), "no provider for libc") {
+		t.Errorf("no provider: %v", err)
+	}
+	if err := writeCompat(tree, out, map[string]Provided{"libc": {Include: []string{other}}}); err == nil || !strings.Contains(err.Error(), "hold no android/api-level.h") {
+		t.Errorf("header missing: %v", err)
 	}
 }
 

@@ -3,7 +3,9 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -360,16 +362,91 @@ var deviceCompat = []compatHeader{
 	{"android/versioning.h", "bionic/libc/include/android/versioning.h"},
 }
 
-// deviceForced: the deviceCompat header every device-side C and C++ compile force-includes; not assembly, nothing there uses it.
-// Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with bionic's api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
-const deviceForced = "android/versioning.h"
+// libcCompat: headers of the libc provider (atl-bionic, generated from bionic's) every device-side compile needs whether or not the module depends on libc, linked from the provider's include dirs into <out>/compat/device.
+//   - android/api-level.h: the level names (`__ANDROID_API_U__`, …), android_get_device_api_level; bionic's sys/cdefs.h brings it into every unit, and libc++'s locale_base_api/android.h includes it under __ANDROID__. atl-bionic generates it include-free, so it is forced (deviceForced).
+var libcCompat = []string{"android/api-level.h"}
 
-// bionicModule: the module whose provider headers are bionic's (system_shared_libs brings it to nearly every device module).
-// bionicForced: its header bionic's sys/cdefs.h brings into every unit that sees bionic's headers (the level names, android_get_device_api_level, …); atl-bionic generates it include-free, so it can be forced.
-const (
-	bionicModule = "libc"
-	bionicForced = "android/api-level.h"
-)
+// libcModule: the module whose provider supplies libcCompat (system_shared_libs brings it to nearly every device module, not to all).
+const libcModule = "libc"
+
+// deviceForced: the compat/device headers every device-side C and C++ compile force-includes, in order; not assembly, nothing there uses them.
+// Only an include-free header may be forced: one that includes a libc header runs glibc's features.h before the source's own `#define _GNU_SOURCE` / `#undef _GNU_SOURCE`, which then has no effect (measured with bionic's api-level.h forced: libbase posix_strerror_r.cpp got GNU strerror_r; sqlite, zstd, libusbhost, bcc lost GNU declarations).
+var deviceForced = []string{"android/versioning.h", "android/api-level.h"}
+
+// libcxxShim: headers libc++ includes under __ANDROID__ that glibc lacks, written into <out>/compat/libcxx, searched last (-idirafter) by every device-side C++ compile, so a header the system has wins.
+//   - xlocale.h: libc++'s locale_base_api/android.h includes it for locale_t, which bionic's declares; glibc declares locale_t in <locale.h> (its own xlocale.h went in 2.26), so the shim includes that. The libc++ objects stay byte-identical with it (xtask check step libcxx).
+//
+//go:embed compat/xlocale.h
+var xlocaleShim string
+
+var libcxxShim = map[string]string{"xlocale.h": xlocaleShim}
+
+// libcHeaderLinks: libcCompat name -> the file in the libc provider's include dirs (provided.go Include), the first dir holding it; fails when the provider is missing or lacks one, since every device compile force-includes them.
+func libcHeaderLinks(provided map[string]Provided) (map[string]string, error) {
+	p, ok := provided[libcModule]
+	if !ok {
+		return nil, fmt.Errorf("no provider for %s (providers.toml): it supplies %v to every device compile", libcModule, libcCompat)
+	}
+	out := map[string]string{}
+	for _, name := range libcCompat {
+		for _, dir := range p.Include {
+			f := filepath.Join(dir, name)
+			if _, err := os.Stat(f); err == nil {
+				out[name] = f
+				break
+			}
+		}
+		if out[name] == "" {
+			return nil, fmt.Errorf("the %s provider's include dirs %v hold no %s", libcModule, p.Include, name)
+		}
+	}
+	return out, nil
+}
+
+// writeCompat fills <out>/compat: cxx and device link their tree headers, device also the libc provider's (libcCompat), libcxx holds the shims.
+// Every entry is replaced, so a run never keeps an earlier run's target.
+func writeCompat(tree, out string, provided map[string]Provided) error {
+	libc, err := libcHeaderLinks(provided)
+	if err != nil {
+		return err
+	}
+	links := map[string]string{}
+	for dir, set := range map[string][]compatHeader{"cxx": cxxCompat, "device": deviceCompat} {
+		for _, h := range set {
+			links[filepath.Join(dir, h.name)] = filepath.Join(tree, h.path)
+		}
+	}
+	for name, f := range libc {
+		links[filepath.Join("device", name)] = f
+	}
+	place := func(rel string) (string, error) {
+		path := filepath.Join(out, "compat", rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return "", err
+		}
+		os.Remove(path)
+		return path, nil
+	}
+	for rel, target := range links {
+		path, err := place(rel)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(target, path); err != nil {
+			return err
+		}
+	}
+	for name, text := range libcxxShim {
+		path, err := place(filepath.Join("libcxx", name))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // compatHeader: include name -> tree-relative file.
 type compatHeader struct{ name, path string }

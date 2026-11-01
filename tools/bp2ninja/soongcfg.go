@@ -456,8 +456,14 @@ func systemSharedLibs(tree string) ([]string, error) {
 	return libs, nil
 }
 
+// androidDefine: the other macro clang defines for Soong's device triple (owner 2026-11-01), on device compiles only: AOSP device code keys the Android userspace API on it, which this runtime provides.
+// __BIONIC__, which bionic's sys/cdefs.h defines, stays undefined: glibc is the C library, and libc++ keys ABI-shaping config on it (regex word class, ctype masks).
+// libc++ 19's __ANDROID__ sites leave its objects byte-identical on glibc given the xlocale.h shim (libcxxShim); xtask check step libcxx keeps that true across libc++ bumps.
+const androidDefine = "-D__ANDROID__"
+
 // apiLevel: the -D flag for __ANDROID_API__ = FutureApiLevelInt: Soong gives platform code the triple <arch>-linux-android<FutureApiLevelInt> (cc/compiler.go AddTargetFlags), from which clang defines it; a linux-gnu triple defines nothing.
-// The level names (`__ANDROID_API_U__`, …) come with atl-bionic's generated android/api-level.h, force-included where bionic's headers are visible (bionicForced).
+// The level names (`__ANDROID_API_U__`, …) come with atl-bionic's generated android/api-level.h, force-included into every device compile (deviceForced).
+// Stays even with __ANDROID__ defined: below 21 libc++'s locale_base_api/android.h pulls __posix_l_fallback.h, whose *_l definitions clash with glibc's.
 //
 // FutureApiLevelInt must equal bionic's __ANDROID_API_FUTURE__, the level api-level.h falls back to (and atl-bionic reads headers at); otherwise the two sources disagree on what platform code is and the build stops.
 func apiLevel(tree string) (string, error) {

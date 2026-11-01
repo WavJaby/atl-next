@@ -234,11 +234,11 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 	if !strings.HasPrefix(libs, "/c/lib/libatl_bionic.so -Wl,-rpath,/c/lib ") {
 		t.Errorf("liba libs %q", libs[:strings.Index(libs, "\n")])
 	}
-	// bionic's headers as system headers, its api-level.h forced; not where libc is declined
+	// bionic's headers as system headers; not where libc is declined, which still gets api-level.h, forced from compat/device (TestWriteCompat)
 	if f := flagsOf("p/a.cc.o"); !strings.Contains(f, "-isystem /c/include") || !strings.Contains(f, "-include android/api-level.h") {
 		t.Errorf("liba flags %q", f)
 	}
-	if f := flagsOf("p/n.cc.o"); strings.Contains(f, "api-level.h") || strings.Contains(f, "/c/include") {
+	if f := flagsOf("p/n.cc.o"); !strings.Contains(f, "-include android/api-level.h") || strings.Contains(f, "/c/include") {
 		t.Errorf("libnolibc flags %q", f)
 	}
 }

@@ -197,17 +197,8 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if g.java != nil {
 		ninja += g.java.ninja(g)
 	}
-	for dir, set := range map[string][]compatHeader{"cxx": cxxCompat, "device": deviceCompat} {
-		for _, h := range set {
-			link := filepath.Join(out, "compat", dir, h.name)
-			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
-				return err
-			}
-			os.Remove(link)
-			if err := os.Symlink(filepath.Join(tree, h.path), link); err != nil {
-				return err
-			}
-		}
+	if err := writeCompat(tree, out, provided); err != nil {
+		return err
 	}
 	if err := g.writeGenFiles(); err != nil {
 		return err

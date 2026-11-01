@@ -308,11 +308,11 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	cxx := append(append(append([]string{"-stdlib=libc++"}, common...), "-std="+cppstd), moduleFlags(p, "cppflags")...)
 	c := append(append(slices.Clone(common), "-std="+cstd), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
-		dev := []string{g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device"), "-include", deviceForced}
-		if seesBionic(n) {
-			dev = append(dev, "-include", bionicForced)
+		dev := []string{androidDefine, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
+		for _, h := range deviceForced {
+			dev = append(dev, "-include", h)
 		}
-		cxx = append(append(cxx, dev...), "-I"+filepath.Join(g.out, "compat", "cxx"))
+		cxx = append(append(cxx, dev...), "-I"+filepath.Join(g.out, "compat", "cxx"), "-idirafter", filepath.Join(g.out, "compat", "libcxx"))
 		c = append(c, dev...)
 	}
 	if !p.boolean("rtti", false) {
@@ -339,13 +339,6 @@ func (g *Graph) stdVersions(p *Obj) (string, string) {
 		cstd, cppstd = r.Replace(cstd), r.Replace(cppstd)
 	}
 	return cstd, cppstd
-}
-
-// seesBionic: n depends on the bionic provider directly, so its compiles have bionic's headers.
-func seesBionic(n *Node) bool {
-	return slices.ContainsFunc(slices.Concat(n.deps.headers, n.deps.shared), func(d *Node) bool {
-		return d.provided && d.name == bionicModule
-	})
 }
 
 // moduleFlags: a module's flag property as the argv Soong's command line gives clang.
