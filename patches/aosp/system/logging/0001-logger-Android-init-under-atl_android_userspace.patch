@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 02:35:38 +0800
+Subject: [PATCH] logger: Android init under atl_android_userspace
+
+ATL builds device Rust for the host triple (target_os = linux) and
+provides liblog, so logger::init must take its Android (logcat) path
+in the ATL Android-userspace build.
+
+Upstream-Status: Inappropriate [ATL-specific cfg]
+Patch-Reason: target_os is the host OS on ATL; only the source gate can tell this build apart, the converter passes the cfg
+---
+SPDX-License-Identifier: Apache-2.0
+ rust/logger.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/rust/logger.rs b/rust/logger.rs
+index ae0b18369121906d7399ca838444cbf315a91524..ebb47014a2f08aad6510967ec66a1402a31302d2 100644
+--- a/rust/logger.rs
++++ b/rust/logger.rs
+@@ -81,7 +81,7 @@ impl<'a> Config<'a> {
+ 
+ /// Initializes logging on host. Returns false if logging is already initialized.
+ /// Config values take precedence over environment variables for host logging.
+-#[cfg(not(target_os = "android"))]
++#[cfg(not(any(target_os = "android", atl_android_userspace)))]
+ pub fn init(config: Config) -> bool {
+     // Return immediately if the logger is already initialized.
+     if LOGGER_INITIALIZED.fetch_or(true, Ordering::SeqCst) {
+@@ -109,7 +109,7 @@ pub fn init(config: Config) -> bool {
+ }
+ 
+ /// Initializes logging on device. Returns false if logging is already initialized.
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ pub fn init(config: Config) -> bool {
+     // Return immediately if the logger is already initialized.
+     if LOGGER_INITIALIZED.fetch_or(true, Ordering::SeqCst) {

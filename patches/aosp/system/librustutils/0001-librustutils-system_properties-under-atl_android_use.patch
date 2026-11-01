@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 02:35:38 +0800
+Subject: [PATCH] librustutils: system_properties under atl_android_userspace
+
+ATL builds device Rust for the host triple (target_os = linux) and
+provides bionic system properties in its C library, so the module the
+ATL Android-userspace build needs is enabled by its --cfg.
+
+Upstream-Status: Inappropriate [ATL-specific cfg]
+Patch-Reason: target_os is the host OS on ATL; only the source gate can tell this build apart, the converter passes the cfg
+---
+SPDX-License-Identifier: Apache-2.0
+ lib.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib.rs b/lib.rs
+index a1beab553174229f073edc243178826f35fb1af2..647604f2d9733987fe94c250abf364df3bceee53 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -17,7 +17,7 @@
+ #[cfg(target_os = "android")]
+ pub mod sockets;
+ 
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ pub mod system_properties;
+ 
+ #[cfg(target_os = "android")]

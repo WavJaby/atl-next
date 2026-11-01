@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 02:35:39 +0800
+Subject: [PATCH] android_logger: liblog path under atl_android_userspace
+
+ATL builds device Rust for the host triple (target_os = linux) and
+provides liblog, so android_logger (and the log crate that includes it
+for default_log_impl) must write through __android_log_* in the ATL
+Android-userspace build instead of its no-op placeholder.
+
+Upstream-Status: Inappropriate [ATL-specific cfg]
+Patch-Reason: target_os is the host OS on ATL; only the source gate can tell this build apart, the converter passes the cfg
+---
+SPDX-License-Identifier: Apache-2.0
+ crates/android_logger/src/id.rs                |  2 +-
+ crates/android_logger/src/lib.rs               |  8 ++++----
+ .../android_logger/src/platform_log_writer.rs  | 18 +++++++++---------
+ 3 files changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/crates/android_logger/src/id.rs b/crates/android_logger/src/id.rs
+index 77c2b8500383c07e0d85ab99f77d3c6103ae1d9e..8b4fe9fe4568066ddbf5e4678e45147a911a271d 100644
+--- a/crates/android_logger/src/id.rs
++++ b/crates/android_logger/src/id.rs
+@@ -32,7 +32,7 @@ pub enum LogId {
+     Stats,
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ impl LogId {
+     pub(crate) const fn to_native(log_id: Option<Self>) -> Option<log_ffi::log_id_t> {
+         match log_id {
+diff --git a/crates/android_logger/src/lib.rs b/crates/android_logger/src/lib.rs
+index 0b324b69582c43929af0138f5c98fe4f1bc95498..a0bbd75f819ef3ab9a62e4b515ae911d02705fb1 100644
+--- a/crates/android_logger/src/lib.rs
++++ b/crates/android_logger/src/lib.rs
+@@ -66,7 +66,7 @@
+ #[cfg(default_log_impl)]
+ use crate as log;
+ 
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ extern crate android_log_sys as log_ffi;
+ 
+ use log::{Log, Metadata, Record};
+@@ -92,7 +92,7 @@ mod platform_log_writer;
+ mod tests;
+ 
+ /// Outputs log to Android system.
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ fn android_log(
+     buf_id: Option<log_ffi::log_id_t>,
+     prio: log_ffi::LogPriority,
+@@ -120,7 +120,7 @@ fn android_log(
+ }
+ 
+ /// Dummy output placeholder for tests.
+-#[cfg(not(target_os = "android"))]
++#[cfg(not(any(target_os = "android", atl_android_userspace)))]
+ fn android_log(_buf_id: Option<LogId>, _priority: log::Level, _tag: &CStr, _msg: &CStr) {}
+ 
+ /// Underlying android logger backend
+@@ -242,7 +242,7 @@ pub fn init_once(config: Config) {
+     }
+     // On Android, log crate is patched to default to LevelFilter::Trace rather than Off. Preserve
+     // the existing "android_logger default level is Off" behavior by explicitly setting the level.
+-    #[cfg(target_os = "android")]
++    #[cfg(any(target_os = "android", atl_android_userspace))]
+     if log_level.is_none() {
+         log::set_max_level(log::LevelFilter::Off);
+     }
+diff --git a/crates/android_logger/src/platform_log_writer.rs b/crates/android_logger/src/platform_log_writer.rs
+index 6a3da829808aa49570d97fe50070c732f892b4c4..1c3248768bafb06bdb10c15fe40d1b502cd8e297 100644
+--- a/crates/android_logger/src/platform_log_writer.rs
++++ b/crates/android_logger/src/platform_log_writer.rs
+@@ -7,7 +7,7 @@ use {
+ use super::arrays::slice_assume_init_ref;
+ use super::{LOGGING_MSG_MAX_LEN, LogId, android_log, uninit_array};
+ use log::Level;
+-#[cfg(target_os = "android")]
++#[cfg(any(target_os = "android", atl_android_userspace))]
+ use log_ffi::LogPriority;
+ use std::ffi::CStr;
+ use std::mem::MaybeUninit;
+@@ -16,13 +16,13 @@ use std::{fmt, mem, ptr};
+ /// The purpose of this "writer" is to split logged messages on whitespace when the log message
+ /// length exceeds the maximum. Without allocations.
+ pub struct PlatformLogWriter<'a> {
+-    #[cfg(target_os = "android")]
++    #[cfg(any(target_os = "android", atl_android_userspace))]
+     priority: LogPriority,
+-    #[cfg(not(target_os = "android"))]
++    #[cfg(not(any(target_os = "android", atl_android_userspace)))]
+     priority: Level,
+-    #[cfg(target_os = "android")]
++    #[cfg(any(target_os = "android", atl_android_userspace))]
+     buf_id: Option<log_ffi::log_id_t>,
+-    #[cfg(not(target_os = "android"))]
++    #[cfg(not(any(target_os = "android", atl_android_userspace)))]
+     buf_id: Option<LogId>,
+     len: usize,
+     last_newline_index: usize,
+@@ -31,7 +31,7 @@ pub struct PlatformLogWriter<'a> {
+ }
+ 
+ impl PlatformLogWriter<'_> {
+-    #[cfg(target_os = "android")]
++    #[cfg(any(target_os = "android", atl_android_userspace))]
+     pub fn new_with_priority(
+         buf_id: Option<LogId>,
+         priority: log_ffi::LogPriority,
+@@ -48,7 +48,7 @@ impl PlatformLogWriter<'_> {
+         }
+     }
+ 
+-    #[cfg(target_os = "android")]
++    #[cfg(any(target_os = "android", atl_android_userspace))]
+     pub fn new(buf_id: Option<LogId>, level: Level, tag: &CStr) -> PlatformLogWriter<'_> {
+         PlatformLogWriter::new_with_priority(
+             buf_id,
+@@ -63,7 +63,7 @@ impl PlatformLogWriter<'_> {
+         )
+     }
+ 
+-    #[cfg(not(target_os = "android"))]
++    #[cfg(not(any(target_os = "android", atl_android_userspace)))]
+     pub fn new(buf_id: Option<LogId>, level: Level, tag: &CStr) -> PlatformLogWriter<'_> {
+         #[allow(deprecated)] // created an issue #35 for this
+         PlatformLogWriter {
+@@ -209,7 +209,7 @@ pub mod tests {
+ 
+         assert_eq!(writer.tag, tag);
+         // Android uses LogPriority instead, which doesn't implement equality checks
+-        #[cfg(not(target_os = "android"))]
++        #[cfg(not(any(target_os = "android", atl_android_userspace)))]
+         assert_eq!(writer.priority, Level::Warn);
+     }
+ 
