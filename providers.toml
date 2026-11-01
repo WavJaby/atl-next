@@ -48,8 +48,8 @@ provider = "none"
 reason = "bionic dynamic linker stub; glibc's ld.so is the linker, the namespace API comes from atl-bionic (libdl_android row)"
 
 ["libapexsupport"]
-provider = "none"
-reason = "APEX support; ATL has no APEX"
+provider = "crate:atl-apexsupport"
+reason = "loading a library from an APEX's linker namespace (libbinder openDeclaredPassthroughHal under __ANDROID__), as AOSP's through atl-bionic's android_dlopen_ext; no APEX is installed, so a HAL library is not found and the load returns null"
 
 ["libasync_safe"]
 provider = "crate:atl-bionic"

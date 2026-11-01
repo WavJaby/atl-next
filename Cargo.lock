@@ -63,6 +63,15 @@ name = "atl-android-runtime"
 version = "0.0.0"
 
 [[package]]
+name = "atl-apexsupport"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bionic",
+ "atl-bridgegen",
+]
+
+[[package]]
 name = "atl-binder-wire"
 version = "0.0.0"
 dependencies = [
