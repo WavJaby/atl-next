@@ -367,6 +367,12 @@ fn classify(n: &str) -> Option<String> {
     if has("source code form is subject to the terms of the mozilla public license v 2.0") {
         found.push("MPL-2.0".to_owned());
     }
+    // Sun's fdlibm notice (external/fdlibm, FreeBSD msun): the grant sentence of the SPDX list's SunPro text; "Developed at SunSoft" is absent from some files (fdlibm.h), the grant never
+    if has(
+        "permission to use copy modify and distribute this software is freely granted provided that this notice is preserved",
+    ) {
+        found.push("SunPro".to_owned());
+    }
     // HarfBuzz's "Old MIT" licence: the SPDX list's MIT-Modern-Variant text
     if has(
         "permission is hereby granted without written agreement and without license or royalty fees to use copy modify and distribute this software and its documentation for any purpose provided that the above copyright notice and the following two paragraphs appear in all copies of this software",
@@ -757,6 +763,18 @@ mod tests {
         // frameworks/native/opengl/include/GLES3/gl3.h (abridged): C++ linkage block before the notice
         let gl3 = "#ifndef __gl3_h_\n#define __gl3_h_ 1\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n/*\n** Copyright (c) 2013-2017 The Khronos Group Inc.\n**\n** Permission is hereby granted, free of charge, to any person obtaining a\n** copy of this software and/or associated documentation files (the\n** \"Materials\"), to deal in the Materials without restriction, including\n*/\n";
         assert_eq!(id(gl3), notice("MIT-Khronos-old"));
+    }
+
+    #[test]
+    fn sun_fdlibm_notice() {
+        // external/fdlibm/e_acos.c and fdlibm.h (the latter without the SunSoft line), verbatim
+        let acos = "/* @(#)e_acos.c 1.3 95/01/18 */\n/*\n * ====================================================\n * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.\n *\n * Developed at SunSoft, a Sun Microsystems, Inc. business.\n * Permission to use, copy, modify, and distribute this\n * software is freely granted, provided that this notice \n * is preserved.\n * ====================================================\n */\n";
+        let h = "/* @(#)fdlibm.h 1.5 04/04/22 */\n/*\n * ====================================================\n * Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.\n *\n * Permission to use, copy, modify, and distribute this\n * software is freely granted, provided that this notice \n * is preserved.\n * ====================================================\n */\n";
+        assert_eq!(id(acos), notice("SunPro"));
+        assert_eq!(id(h), notice("SunPro"));
+        // ISC's grant shares the opening words and stays ISC
+        let isc = "/*\n * Permission to use, copy, modify, and distribute this software for any\n * purpose with or without fee is hereby granted.\n */\n";
+        assert_eq!(id(isc), notice("ISC"));
     }
 
     #[test]

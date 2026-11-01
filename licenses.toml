@@ -22,12 +22,15 @@
 # MIT-Khronos-old: owner decision 2026-10-31; Khronos' MIT-style permissive text granting rights to the "Materials", GPL-3-compatible.
 # SGI-B-2.0: owner decision 2026-11-01; SGI Free Software License B 2.0, X11-style permissive, on the FSF list of GPL-compatible licences.
 # MPL-2.0: owner decision 2026-11-01 (Eigen, via libinput); file-level copyleft, and we do not modify Eigen. GPL-3-compatible through MPL-2.0 section 3.3 unless a file carries the "Incompatible With Secondary Licenses" notice, which the gate reads as MPL-2.0-no-copyleft-exception, not allowed.
+# GPL-2.0-only WITH Classpath-exception-2.0: owner decision 2026-10-29 (libcore ojluni natives, libjdwp); the exception permits linking with independent modules of any licence, so it is a linking exception in the sense of the GPL-2.0-only rule. Listed when the converter first linked libcore (2026-11-02).
+# SunPro: owner decision 2026-11-02 (fdlibm, via libcore's libfdlibm); Sun's all-permissive notice (use, copy, modify, distribute if the notice is kept), GPL-3-compatible.
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "blessing",
     "FTL",
+    "GPL-2.0-only WITH Classpath-exception-2.0",
     "GPL-2.0-only WITH Linux-syscall-note",
     "ICU",
     "IJG",
@@ -41,6 +44,7 @@ allow = [
     "MIT-Modern-Variant",
     "MPL-2.0",
     "SGI-B-2.0",
+    "SunPro",
     "Unicode-3.0",
     "Zlib",
 ]
@@ -52,6 +56,10 @@ reason = "Khronos' GLES3 extension header: \"This document is licensed under the
 [upstream.aosp.paths."external/dng_sdk/"]
 licence = "LicenseRef-Adobe-DNG-SDK"
 reason = "Adobe's DNG SDK Licence Agreement with its DNG patent licence (PATENTS: rights granted \"solely to permit the reading and writing of image files that comply with the DNG Specification\"): a field-of-use restriction GPL-3 forbids, so never allowed where the GPL-3 QEMU bridge may load; the file headers only point at the agreement, which the phrase rules do not read"
+
+[upstream.aosp.paths."external/fdlibm/"]
+licence = "SunPro"
+reason = "the project's NOTICE is Sun's fdlibm grant (SPDX SunPro), and every file notice is that grant (78 of 81 read by the phrase rules at android-16.0.0_r1); k_tan.c and e_pow.c put a #pragma ident / sccsid line above it, s_signgam.c (one variable) has none; Android.bp's kind SPDX-license-identifier-BSD is no SPDX id"
 
 [upstream.aosp.paths."bionic/libc/kernel/uapi/"]
 licence = "GPL-2.0-only WITH Linux-syscall-note"
