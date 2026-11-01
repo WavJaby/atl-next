@@ -24,10 +24,10 @@ pub enum Identified {
 }
 
 pub fn identify(text: &str) -> Identified {
-    if let Some(tag) = spdx::tag_value(text, spdx::UPSTREAM_TAG_LINES) {
-        return Identified::Tagged(tag.to_owned());
-    }
     let n = normalize(&header(text));
+    if let Some(tag) = spdx::tag_value(text, spdx::UPSTREAM_TAG_LINES) {
+        return Identified::Tagged(no_secondary(tag, &n));
+    }
     let mentions = [
         "licen",
         "public domain",
@@ -48,7 +48,19 @@ pub fn identify(text: &str) -> Identified {
     // an id the SPDX list does not have (e.g. a notice saying "GPL version 2.1") is not a reading
     classify(&n)
         .filter(|id| ::spdx::Expression::parse(id).is_ok())
-        .map_or(Identified::Unrecognised, Identified::Notice)
+        .map_or(Identified::Unrecognised, |id| {
+            Identified::Notice(no_secondary(&id, &n))
+        })
+}
+
+/// MPL-2.0 Exhibit B ("Incompatible With Secondary Licenses") removes section 3.3's GPL compatibility: SPDX names that `MPL-2.0-no-copyleft-exception`, which no allow list carries.
+/// Applied to tags too, so a file tagged plain `MPL-2.0` with the Exhibit B notice is not read as the compatible form.
+fn no_secondary(id: &str, n: &str) -> String {
+    if id == "MPL-2.0" && n.contains("incompatible with secondary licenses") {
+        "MPL-2.0-no-copyleft-exception".to_owned()
+    } else {
+        id.to_owned()
+    }
 }
 
 #[derive(clap::Args)]
@@ -350,6 +362,10 @@ fn classify(n: &str) -> Option<String> {
     }
     if has("public domain") {
         found.push("LicenseRef-Public-Domain".to_owned());
+    }
+    // MPL-2.0 Exhibit A, the notice the licence prescribes, without its leading "This" (Eigen's BDCSVD.h drops it); Exhibit B is `no_secondary`'s
+    if has("source code form is subject to the terms of the mozilla public license v 2.0") {
+        found.push("MPL-2.0".to_owned());
     }
     // HarfBuzz's "Old MIT" licence: the SPDX list's MIT-Modern-Variant text
     if has(
@@ -770,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn mpl_exhibit_a_and_b() {
+        // eigen/Eigen/Core
+        let eigen = "// This file is part of Eigen, a lightweight C++ template library\n// for linear algebra.\n//\n// Copyright (C) 2008 Gael Guennebaud <gael.guennebaud@inria.fr>\n// Copyright (C) 2007-2011 Benoit Jacob <jacob.benoit.1@gmail.com>\n//\n// This Source Code Form is subject to the terms of the Mozilla\n// Public License v. 2.0. If a copy of the MPL was not distributed\n// with this file, You can obtain one at http://mozilla.org/MPL/2.0/.\n\n#ifndef EIGEN_CORE_H\n";
+        assert_eq!(id(eigen), notice("MPL-2.0"));
+        // eigen/Eigen/src/SVD/BDCSVD.h (abridged): Exhibit A without "This"
+        let bdcsvd = "// This file is part of Eigen, a lightweight C++ template library\n// for linear algebra.\n//\n// Copyright (C) 2014-2017 Gael Guennebaud <gael.guennebaud@inria.fr>\n//\n// Source Code Form is subject to the terms of the Mozilla\n// Public License v. 2.0. If a copy of the MPL was not distributed\n// with this file, You can obtain one at http://mozilla.org/MPL/2.0/.\n\n#ifndef EIGEN_BDCSVD_H\n";
+        assert_eq!(id(bdcsvd), notice("MPL-2.0"));
+        // MPL-2.0 Exhibit B, verbatim from the licence text, under Exhibit A: never the GPL-compatible form
+        let exhibit_b = "/* This Source Code Form is subject to the terms of the Mozilla Public\n * License, v. 2.0. If a copy of the MPL was not distributed with this\n * file, You can obtain one at http://mozilla.org/MPL/2.0/.\n *\n * This Source Code Form is \"Incompatible With Secondary Licenses\", as\n * defined by the Mozilla Public License, v. 2.0. */\n";
+        assert_eq!(id(exhibit_b), notice("MPL-2.0-no-copyleft-exception"));
+        let tagged = format!("// SPDX-License-Identifier: MPL-2.0\n{exhibit_b}");
+        assert_eq!(
+            id(&tagged),
+            Identified::Tagged("MPL-2.0-no-copyleft-exception".into())
+        );
+    }
+
+    #[test]
     fn no_notice_takes_the_checkout_default_or_fails_with_its_reason() {
         let bare = "#pragma once\n#define X 1\n";
         let default = Unlabelled::Licence("Apache-2.0".into());
@@ -825,6 +859,7 @@ mod tests {
             "BSD-4-Clause-UC",
             "GPL-3.0-or-later WITH Bison-exception-2.2",
             "LicenseRef-Public-Domain",
+            "MPL-2.0-no-copyleft-exception",
         ] {
             assert!(::spdx::Expression::parse(e).is_ok(), "{e}");
         }

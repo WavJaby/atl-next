@@ -21,6 +21,7 @@
 # LicenseRef-AGG-2.3, blessing: owner decision 2026-10-31; AGG 2.3's all-permissive notice (copy/use/modify/sell/distribute if the notice is kept; no SPDX id) and SQLite's public-domain blessing (SPDX `blessing`), both GPL-3-compatible.
 # MIT-Khronos-old: owner decision 2026-10-31; Khronos' MIT-style permissive text granting rights to the "Materials", GPL-3-compatible.
 # SGI-B-2.0: owner decision 2026-11-01; SGI Free Software License B 2.0, X11-style permissive, on the FSF list of GPL-compatible licences.
+# MPL-2.0: owner decision 2026-11-01 (Eigen, via libinput); file-level copyleft, and we do not modify Eigen. GPL-3-compatible through MPL-2.0 section 3.3 unless a file carries the "Incompatible With Secondary Licenses" notice, which the gate reads as MPL-2.0-no-copyleft-exception, not allowed.
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
@@ -38,6 +39,7 @@ allow = [
     "MIT",
     "MIT-Khronos-old",
     "MIT-Modern-Variant",
+    "MPL-2.0",
     "SGI-B-2.0",
     "Unicode-3.0",
     "Zlib",
@@ -281,6 +283,60 @@ reason = "no file carries a notice; cxx/Cargo.toml and each sub-crate's: license
 [upstream.aosp.paths."external/rust/android-crates-io/crates/memmap2/"]
 licence = "Apache-2.0 OR MIT"
 reason = "no file carries a notice (lib.rs's docs only name LICENSE files in examples); memmap2/Cargo.toml: license = \"MIT OR Apache-2.0\"; its Android.bp lists both kinds, which reads as several, not as the choice"
+
+# Eigen: Android.bp kinds Apache-2.0 + BSD + MPL-2.0, so no package default. Its comments: Apache-2.0 only in Eigen/src/Core/arch/Default/BFloat16.h, BSD only in CMake scripts and MINPACK-derived code; COPYING.README: "Eigen is primarily MPL2 licensed", third-party code under BSD or LGPL noted per file (none of the reached files names LGPL)
+[upstream.aosp.paths."external/eigen/Eigen/src/Core/arch/Default/Half.h"]
+licence = "MPL-2.0 AND BSD-2-Clause"
+reason = "two stacked notices the one-family rule refuses: Eigen's MPL-2.0 over Fabian Giesen's conversion routines' \"original license\", \"Redistribution and use in source and binary forms, with or without modification, are permitted\" plus the BSD disclaimer, no further conditions; read as BSD-2-Clause, the nearest SPDX text, which states at least those terms"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/Geometry/AlignedBox.h"]
+licence = "MPL-2.0 AND BSD-3-Clause"
+reason = "two stacked notices: Eigen's MPL-2.0 over the BSD-3-Clause text (\"Neither the name of Open Source Robotics Foundation ...\") of Willow Garage's AlignedBox::transform"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/Core/util/DisableStupidWarnings.h"]
+licence = "MPL-2.0"
+reason = "Eigen's own pragma header without a notice; COPYING.README: Eigen is MPL-2.0 except third-party code, which carries its own notice"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/Core/util/ReenableStupidWarnings.h"]
+licence = "MPL-2.0"
+reason = "as DisableStupidWarnings.h"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/plugins/ArrayCwiseBinaryOps.h"]
+licence = "MPL-2.0"
+reason = "Eigen's own method plugin without a notice; as DisableStupidWarnings.h"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/plugins/ArrayCwiseUnaryOps.h"]
+licence = "MPL-2.0"
+reason = "as ArrayCwiseBinaryOps.h"
+
+[upstream.aosp.paths."external/eigen/Eigen/src/plugins/ReshapedMethods.h"]
+licence = "MPL-2.0"
+reason = "as ArrayCwiseBinaryOps.h"
+
+[upstream.aosp.paths."external/eigen/unsupported/Eigen/CXX11/src/Tensor/TensorVolumePatch.h"]
+licence = "MPL-2.0"
+reason = "\"This file is part of Eigen\" with the licence line missing (its Tensor siblings carry Eigen's MPL-2.0 notice); as DisableStupidWarnings.h"
+
+# libogg: Android.bp kinds BSD + MIT + legacy_notice + legacy_unencumbered, so no package default; libogg/COPYING is Xiph's BSD-3-Clause
+[upstream.aosp.paths."external/libogg/include/ogg/config_types.h"]
+licence = "BSD-3-Clause"
+reason = "\"filled in by configure or cmake\" from config_types.h.in, no notice; libogg/COPYING"
+
+[upstream.aosp.paths."external/libogg/src/framing.c"]
+licence = "BSD-3-Clause"
+reason = "Xiph's BSD-style pointer to COPYING; the added note that its CRC code is derived from Ross Williams' public-domain code is not a licence notice the phrase rules accept"
+
+[upstream.aosp.paths."external/rust/android-crates-io/crates/ryu/"]
+licence = "Apache-2.0"
+reason = "ryu/Cargo.toml: license = \"Apache-2.0 OR BSL-1.0\"; its Android.bp takes the Apache arm (kind SPDX-license-identifier-Apache-2.0, license_text LICENSE). lib.rs carries no notice, only a remark that the Ryū paper is CC-BY-SA, which the phrase rules would read as a notice"
+
+[upstream.aosp.paths."external/flatbuffers/include/flatbuffers/base.h"]
+licence = "Apache-2.0"
+reason = "flatbuffers' own header without a notice (its siblings carry the Apache-2.0 notice); flatbuffers/LICENSE is Apache-2.0, and its Android.bp lists several licence kinds, so the project has no default"
+
+[upstream.aosp.paths."frameworks/native/libs/input/InputTransport.cpp"]
+licence = "Apache-2.0"
+reason = "AOSP code with a copyright line but no licence notice; frameworks/native's license module lists several kinds, and libs/input/Android.bp states the kinds it imports from frameworks_native_license are \"SPDX-license-identifier-Apache-2.0\" alone"
 
 [upstream.aosp.paths."hardware/libhardware/include_all/hardware/sensors-base.h"]
 licence = "Apache-2.0"
