@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:54 +0800
+Subject: [PATCH] sqlite: fdsan when built for Android
+
+The unix VFS tags the descriptors it opens with fdsan and closes them
+with the tag only under __BIONIC__ (and API level >= Q). A device
+build against another C library that provides bionic's fdsan API
+defines __ANDROID__ but not __BIONIC__: its database fds stay
+untagged. Treat __ANDROID__ like __BIONIC__ at these guards in the
+built amalgamation (sqlite-default). No change for Soong variants:
+device builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside libsqlite, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: blessing
+ dist/sqlite-autoconf-3440300/sqlite3.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/dist/sqlite-autoconf-3440300/sqlite3.c b/dist/sqlite-autoconf-3440300/sqlite3.c
+index 84b28a102f575bf56efdc6a492f68049b628c957..9a37e10784c0ddd8f5dfa036fb471e4e5bdede11 100644
+--- a/dist/sqlite-autoconf-3440300/sqlite3.c
++++ b/dist/sqlite-autoconf-3440300/sqlite3.c
+@@ -38035,7 +38035,7 @@ SQLITE_PRIVATE int sqlite3KvvfsInit(void){
+ # include <sys/mount.h>
+ #endif
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ # include <android/fdsan.h>
+ #endif
+ 
+@@ -38648,7 +38648,7 @@ static int robust_open(const char *z, int f, mode_t m){
+     osFcntl(fd, F_SETFD, osFcntl(fd, F_GETFD, 0) | FD_CLOEXEC);
+ #endif
+ 
+-#if defined(__BIONIC__) && __ANDROID_API__ >= __ANDROID_API_Q__
++#if (defined(__BIONIC__) || defined(__ANDROID__)) && __ANDROID_API__ >= __ANDROID_API_Q__
+     uint64_t tag = android_fdsan_create_owner_tag(
+         ANDROID_FDSAN_OWNER_TYPE_SQLITE, fd);
+     android_fdsan_exchange_owner_tag(fd, 0, tag);
+@@ -39233,7 +39233,7 @@ static int unixLogErrorAtLine(
+ ** and move on.
+ */
+ static void robust_close(unixFile *pFile, int h, int lineno){
+-#if defined(__BIONIC__) && __ANDROID_API__ >= __ANDROID_API_Q__
++#if (defined(__BIONIC__) || defined(__ANDROID__)) && __ANDROID_API__ >= __ANDROID_API_Q__
+   uint64_t tag = android_fdsan_create_owner_tag(
+       ANDROID_FDSAN_OWNER_TYPE_SQLITE, h);
+   if( android_fdsan_close_with_tag(h, tag) ){

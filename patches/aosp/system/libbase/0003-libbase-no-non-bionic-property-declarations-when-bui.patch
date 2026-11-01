@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:55 +0800
+Subject: [PATCH] libbase: no non-bionic property declarations when built for
+ Android
+
+properties.h declares __system_property_set, _get, _find and
+_read_callback itself whenever __BIONIC__ is undefined, for its weak
+non-bionic store. A device build against another C library that
+provides bionic's property API defines __ANDROID__ but not __BIONIC__;
+properties.cpp already drops that store there, and the C library's
+sys/system_properties.h declares the API. Treat __ANDROID__ like
+__BIONIC__ at this guard too. No change for Soong variants: device
+builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guard is compiled inside the libbase header, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ include/android-base/properties.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/android-base/properties.h b/include/android-base/properties.h
+index 4636c1c50b04b6d4b948c2c7cc3423bb40b4e432..7ce87ad11d6e6730a3b26ee8560990ebfc2cdc70 100644
+--- a/include/android-base/properties.h
++++ b/include/android-base/properties.h
+@@ -165,7 +165,7 @@ static inline int HwTimeoutMultiplier() {
+ } // namespace base
+ } // namespace android
+ 
+-#if !defined(__BIONIC__)
++#if !defined(__BIONIC__) && !defined(__ANDROID__)
+ /** Implementation detail. */
+ extern "C" int __system_property_set(const char*, const char*);
+ /** Implementation detail. */

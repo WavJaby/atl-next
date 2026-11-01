@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:54 +0800
+Subject: [PATCH] libmediautils: Bluetooth permission cache invalidation when
+ built for Android
+
+BluetoothPermissionCache watches cache_key.system_server.package_info
+with libbase CachedProperty only under __BIONIC__; elsewhere its
+cache is never invalidated. A device build against another C library
+that provides bionic's property API defines __ANDROID__ but not
+__BIONIC__, and libbase declares CachedProperty there. Treat
+__ANDROID__ like __BIONIC__ at these guards. No change for Soong
+variants: device builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside libmediautils, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ media/utils/ServiceUtilities.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/media/utils/ServiceUtilities.cpp b/media/utils/ServiceUtilities.cpp
+index 81662f1ad4e4a7a03e656e67e5b09e5a674be9b9..cf43365efb14be1563049c4df2f2fffa991db0dd 100644
+--- a/media/utils/ServiceUtilities.cpp
++++ b/media/utils/ServiceUtilities.cpp
+@@ -504,7 +504,7 @@ class BluetoothPermissionCache {
+     const String16 BLUETOOTH_PERM {"android.permission.BLUETOOTH_CONNECT"};
+     mutable std::mutex mLock;
+     // Cached property conditionally defined, since only avail on bionic. On host, don't inval cache
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     // Unlocked, but only accessed from mListenerThread
+     base::CachedProperty mCachedProperty;
+ #endif
+@@ -517,7 +517,7 @@ class BluetoothPermissionCache {
+     PermissionController mPc{};
+ public:
+     BluetoothPermissionCache()
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+             : mCachedProperty{SYSPROP_NAME},
+             mListenerThread([this]() mutable {
+                     while (true) {

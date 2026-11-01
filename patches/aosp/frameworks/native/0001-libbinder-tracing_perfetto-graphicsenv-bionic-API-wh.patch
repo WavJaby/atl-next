@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:54 +0800
+Subject: [PATCH] libbinder, tracing_perfetto, graphicsenv: bionic API when
+ built for Android
+
+MemoryHeapBase creates FORCE_MEMFD heaps, Parcel tags descriptors with
+fdsan, tracing_perfetto reads the debug.atrace.prefer_sdk property
+serial and GraphicsEnv reads ro.vndk.version only under __BIONIC__. A
+device build against another C library that provides bionic's
+property and fdsan API (memfd_create and the F_SEAL_* seals are in
+glibc) defines __ANDROID__ but not __BIONIC__: it then drops
+FORCE_MEMFD, leaves Parcel fds untagged and never sees the property.
+Treat __ANDROID__ like __BIONIC__ at these guards. No change for Soong
+variants: device builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside libbinder, libtracing_perfetto and libgraphicsenv, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/MemoryHeapBase.cpp                      | 4 ++--
+ libs/binder/Parcel.cpp                              | 4 ++--
+ libs/graphicsenv/GraphicsEnv.cpp                    | 4 ++--
+ libs/tracing_perfetto/tracing_perfetto_internal.cpp | 6 +++---
+ 4 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/libs/binder/MemoryHeapBase.cpp b/libs/binder/MemoryHeapBase.cpp
+index fc273e0367385940774da8c1c88efc3b2038a2d0..48387fe0621210c7e4a2042c5e4629fef4ec01be 100644
+--- a/libs/binder/MemoryHeapBase.cpp
++++ b/libs/binder/MemoryHeapBase.cpp
+@@ -37,7 +37,7 @@ namespace android {
+ 
+ // ---------------------------------------------------------------------------
+ 
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ static int memfd_create_region(const char* name, size_t size) {
+     int fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+     if (fd == -1) {
+@@ -69,7 +69,7 @@ MemoryHeapBase::MemoryHeapBase(size_t size, uint32_t flags, char const * name)
+     size = ((size + pagesize - 1) & ~(pagesize - 1));
+     int fd = -1;
+     if (mFlags & FORCE_MEMFD) {
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+         ALOGV("MemoryHeapBase: Attempting to force MemFD");
+         fd = memfd_create_region(name ? name : "MemoryHeapBase", size);
+         if (fd < 0 || (mapfd(fd, true, size) != NO_ERROR)) return;
+diff --git a/libs/binder/Parcel.cpp b/libs/binder/Parcel.cpp
+index 2c37624304b135c2c8077623bbe9f2a566d8c5d0..bbb162484f2fad424b5c4387b463d53ac334d155 100644
+--- a/libs/binder/Parcel.cpp
++++ b/libs/binder/Parcel.cpp
+@@ -69,7 +69,7 @@
+ typedef uintptr_t binder_uintptr_t;
+ #endif // BINDER_WITH_KERNEL_IPC
+ 
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <android/fdsan.h>
+ #endif
+ 
+@@ -117,7 +117,7 @@ constexpr size_t kMaxFds = 1024;
+ // Maximum size of a blob to transfer in-place.
+ [[maybe_unused]] static const size_t BLOB_INPLACE_LIMIT = 16 * 1024;
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ static void FdTag(int fd, const void* old_addr, const void* new_addr) {
+     if (android_fdsan_exchange_owner_tag) {
+         uint64_t old_tag = android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_PARCEL,
+diff --git a/libs/graphicsenv/GraphicsEnv.cpp b/libs/graphicsenv/GraphicsEnv.cpp
+index 03e6456ea68f1ee0b4b4a925ee82ceab88c76f76..602ae04d5144d9eb416637f27cb7b1cca33ba7dd 100644
+--- a/libs/graphicsenv/GraphicsEnv.cpp
++++ b/libs/graphicsenv/GraphicsEnv.cpp
+@@ -63,7 +63,7 @@ typedef bool (*fpANGLEFreeSystemInfoHandle)(void* handle);
+ 
+ namespace {
+ static bool isVndkEnabled() {
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     static bool isVndkEnabled = android::base::GetProperty("ro.vndk.version", "") != "";
+     return isVndkEnabled;
+ #endif
+@@ -136,7 +136,7 @@ static const char* kFormerlyVndkspLibrariesList =
+     "libz.so";
+ 
+ static std::string vndkVersionStr() {
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     return base::GetProperty("ro.vndk.version", "");
+ #endif
+     return "";
+diff --git a/libs/tracing_perfetto/tracing_perfetto_internal.cpp b/libs/tracing_perfetto/tracing_perfetto_internal.cpp
+index 447873290c870da41e3a7436d85a464b29fb873f..a0203489727a84a62d9a5afe1d7b043cfcdb4b46 100644
+--- a/libs/tracing_perfetto/tracing_perfetto_internal.cpp
++++ b/libs/tracing_perfetto/tracing_perfetto_internal.cpp
+@@ -60,7 +60,7 @@
+ #include "trace_categories.h"
+ #include "tracing_perfetto_internal.h"
+ 
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
+ #include <sys/_system_properties.h>
+ #endif
+@@ -80,7 +80,7 @@ static std::atomic_uint32_t last_prefer_seq_num = 0;
+ static std::atomic_uint64_t prefer_flags = 0;
+ 
+ static const prop_info* system_property_find(const char* name [[maybe_unused]]) {
+-  #ifdef __BIONIC__
++  #if defined(__BIONIC__) || defined(__ANDROID__)
+   return __system_property_find(name);
+   #endif
+ 
+@@ -88,7 +88,7 @@ static const prop_info* system_property_find(const char* name [[maybe_unused]])
+ }
+ 
+ static uint32_t system_property_serial(const prop_info* pi [[maybe_unused]]) {
+-  #ifdef __BIONIC__
++  #if defined(__BIONIC__) || defined(__ANDROID__)
+   return __system_property_serial(pi);
+   #endif
+ 

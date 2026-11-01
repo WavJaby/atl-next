@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:55 +0800
+Subject: [PATCH] SystemProperties JNI: include the property header when built
+ for Android
+
+android_os_SystemProperties.cpp includes sys/system_properties.h only
+under __BIONIC__ and otherwise gets the __system_property_*
+declarations from libbase's properties.h. A device build against
+another C library that provides bionic's property API defines
+__ANDROID__ but not __BIONIC__; include the header there too, so
+libbase can drop its non-bionic declarations for such builds. No
+change for Soong variants: device builds define both, host builds
+define neither.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the include guard is compiled inside libandroid_runtime, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ core/jni/android_os_SystemProperties.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/core/jni/android_os_SystemProperties.cpp b/core/jni/android_os_SystemProperties.cpp
+index e99d89098a4078c67c5f460ca2095307b4c6f26e..1adfdf468031ca91e1ec77dad94ae067e81b504e 100644
+--- a/core/jni/android_os_SystemProperties.cpp
++++ b/core/jni/android_os_SystemProperties.cpp
+@@ -32,7 +32,7 @@
+ #include <nativehelper/ScopedPrimitiveArray.h>
+ #include <nativehelper/ScopedUtfChars.h>
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ # include <sys/system_properties.h>
+ #endif
+ 

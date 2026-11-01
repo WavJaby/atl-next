@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 00:49:54 +0800
+Subject: [PATCH] libziparchive: fdsan when built for Android
+
+ZipArchive tags the descriptor it owns with fdsan and closes it with
+the tag only under __BIONIC__. A device build against another C
+library that provides bionic's fdsan API defines __ANDROID__ but not
+__BIONIC__: its archive fds stay untagged. Treat __ANDROID__ like
+__BIONIC__ at these guards. No change for Soong variants: device
+builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside libziparchive, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ zip_archive.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/zip_archive.cc b/zip_archive.cc
+index 5a0271f66f01dbe90f6772a3612d07a66f85f8ae..48608c46f6516d2de7e44f3b3b73f029ee96a528 100644
+--- a/zip_archive.cc
++++ b/zip_archive.cc
+@@ -46,7 +46,7 @@
+ #define lseek64 lseek
+ #endif
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <android/fdsan.h>
+ #endif
+ 
+@@ -148,7 +148,7 @@ constexpr size_t kPageSize = 4096;
+ #endif
+ }
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ static uint64_t GetOwnerTag(const ZipArchive* archive) {
+   return android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_ZIPARCHIVE,
+                                         reinterpret_cast<uint64_t>(archive));
+@@ -162,7 +162,7 @@ ZipArchive::ZipArchive(MappedZipFile&& map, bool assume_ownership)
+       central_directory(),
+       directory_map(),
+       num_entries(0) {
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+   if (assume_ownership) {
+     CHECK(mapped_zip.GetFileDescriptor() >= 0 || !mapped_zip.GetBasePtr());
+     android_fdsan_exchange_owner_tag(mapped_zip.GetFileDescriptor(), 0, GetOwnerTag(this));
+@@ -180,7 +180,7 @@ ZipArchive::ZipArchive(const void* address, size_t length)
+ 
+ ZipArchive::~ZipArchive() {
+   if (close_file && mapped_zip.GetFileDescriptor() >= 0) {
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     android_fdsan_close_with_tag(mapped_zip.GetFileDescriptor(), GetOwnerTag(this));
+ #else
+     close(mapped_zip.GetFileDescriptor());
