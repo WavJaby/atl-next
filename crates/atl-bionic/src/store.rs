@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! The process's property store: one area, mapped on first use.
+//! The process's property store: one area, mapped by `__system_properties_init` or on first use.
+//!
+//! bionic maps the area in `__libc_init_common` (`SystemProperties::Init`); a process here has no such
+//! hook, so the first reader maps it. A failed first use is kept (no open per lookup on a desktop without
+//! the area); an explicit `init` retries until one succeeds, as bionic's `Init` does (it sets
+//! `initialized_` only on success). After success, `init` is a no-op returning success.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::{Mutex, OnceLock};
 
 use rustix::io::Errno;
 
@@ -13,16 +20,40 @@ use crate::props::{Area, PropInfo, VALUE_MAX, value_len};
 /// the process until the broker puts the file at `PROP_DIRNAME` inside the sandbox.
 pub const AREA_ENV: &str = "ATL_PROP_AREA";
 
-static AREA: OnceLock<Option<Area<'static>>> = OnceLock::new();
+static AREA: OnceLock<Area<'static>> = OnceLock::new();
+/// A first use already tried and failed.
+static TRIED: AtomicBool = AtomicBool::new(false);
+/// Serialises mapping attempts: two would leak a mapping (never unmapped).
+static MAPPING: Mutex<()> = Mutex::new(());
 
-/// The area, or none: no file (a desktop without the sandbox), or not bionic's format. Without an area
-/// every property is unset, as on bionic before `__system_properties_init`.
+/// Maps the area unless mapped; the area, or none: no file, or not bionic's format.
+fn map() -> Option<Area<'static>> {
+    let _guard = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = AREA.get() {
+        return Some(*a);
+    }
+    let path =
+        std::env::var_os(AREA_ENV).map_or_else(|| PathBuf::from(PROP_DIRNAME), PathBuf::from);
+    let area = Area::new(crate::map::map_shared(&path).ok()?).ok()?;
+    Some(*AREA.get_or_init(|| area))
+}
+
+/// The area, or none. Without one every property is unset, as on bionic before `__system_properties_init`.
 pub fn area() -> Option<Area<'static>> {
-    *AREA.get_or_init(|| {
-        let path =
-            std::env::var_os(AREA_ENV).map_or_else(|| PathBuf::from(PROP_DIRNAME), PathBuf::from);
-        Area::new(crate::map::map_shared(&path).ok()?).ok()
-    })
+    if let Some(a) = AREA.get() {
+        return Some(*a);
+    }
+    if TRIED.load(Acquire) {
+        return None;
+    }
+    let area = map();
+    TRIED.store(true, Release);
+    area
+}
+
+/// bionic `SystemProperties::Init`: true once the area is mapped (now or before).
+pub fn init() -> bool {
+    map().is_some()
 }
 
 /// bionic `SystemProperties::Get`: the value of `name` into `out` (empty if unset), its length.

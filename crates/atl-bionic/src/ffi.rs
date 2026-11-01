@@ -48,6 +48,15 @@ fn handle(area: &Area, pi: PropInfo) -> *const prop_info {
     area.ptr(pi.offset()).cast()
 }
 
+/// bionic: 0 once the area is mapped, -1 if it cannot be; errno left as it was (`ErrnoRestorer`).
+#[unsafe(no_mangle)]
+pub extern "C" fn __system_properties_init() -> c_int {
+    let saved = errno::errno();
+    let ok = store::init();
+    errno::set_errno(saved);
+    if ok { 0 } else { -1 }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __system_property_set(name: *const c_char, value: *const c_char) -> c_int {
     // SAFETY: bionic's contract, NUL-terminated strings

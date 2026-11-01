@@ -40,6 +40,8 @@ const APIS: &[Api] = &[
         lang: Lang::C,
         header: Some("sys/system_properties.h"),
         functions: &[
+            // libselinux android_device.c selinux_android_setcon re-inits after setcon
+            "__system_properties_init",
             "__system_property_set",
             "__system_property_find",
             "__system_property_read_callback",
