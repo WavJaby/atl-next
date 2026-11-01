@@ -75,8 +75,8 @@ const APIS: &[Api] = &[
     },
     // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
     // it, owner Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
-    // libvndksupport), namespace creation / linking (libgraphicsenv) and the linker warnings (libandroid_runtime
-    // android_app_Activity.cpp)
+    // libvndksupport), namespace creation / linking (libgraphicsenv), the linker warnings (libandroid_runtime
+    // android_app_Activity.cpp) and the default search paths (libopenjdk System.c, java.library.path)
     Api {
         name: "libdl_android",
         source: "bionic/libdl/libdl_android.cpp",
@@ -88,6 +88,7 @@ const APIS: &[Api] = &[
             "android_create_namespace",
             "android_link_namespaces",
             "android_dlwarning",
+            "android_get_LD_LIBRARY_PATH",
         ],
         macros: &[],
         include_dirs: &[],
@@ -228,13 +229,13 @@ const APIS: &[Api] = &[
         include_dirs: &[],
         kept: DECLARATIONS,
     },
-    // bionic's <stdlib.h> (IN_HOST_HEADERS): libandroid_runtime AndroidRuntime.cpp setArgv0 after rewriting argv[0]
+    // bionic's <stdlib.h> (IN_HOST_HEADERS): libandroid_runtime AndroidRuntime.cpp setArgv0 after rewriting argv[0]; ART oat_file_manager.cc (app-image opt-out by process name, __ANDROID__) reads it
     Api {
         name: "progname",
         source: "bionic/libc/include/stdlib.h",
         lang: Lang::C,
         header: Some("atl-bionic/stdlib.h"),
-        functions: &["setprogname"],
+        functions: &["getprogname", "setprogname"],
         macros: &[],
         include_dirs: &[],
         kept: DECLARATIONS,
@@ -260,7 +261,7 @@ const APIS: &[Api] = &[
 /// `atl-bionic/<header>`, included by the shape wrapper of `<header>` (`shape::Inputs::extra`). A row is
 /// generated, and implemented (`cfg(atl_bionic_api = "<row>")`), only where the host's header with
 /// `_GNU_SOURCE` declares none of its functions; where it declares all, the host's serve, as any libc
-/// function; some but not all fails. `pthread_gettid_np`: glibc >= 2.42. `setprogname`: BSD, no glibc has it.
+/// function; some but not all fails. `pthread_gettid_np`: glibc >= 2.42. `setprogname` / `getprogname`: BSD, no glibc has them.
 const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h"), ("progname", "stdlib.h")];
 
 /// What the shape wrapper of a host header includes beyond bionic's shape (`shape::Inputs::extra`),
@@ -355,8 +356,11 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// `__CPU_BITTYPE` (`sched.h`, `__USE_GNU` only: forwarded under it; libandroid_runtime
 /// android_util_Process.cpp divides glibc's `CPU_ALLOC_SIZE` by it): `unsigned long int`, glibc's
 /// `__cpu_mask`, the element of both libcs' `cpu_set_t.__bits`.
+/// `TEMP_FAILURE_RETRY` (`unistd.h`; glibc defines it under `__USE_GNU` only, so the C view lacks it; libcore
+/// ojluni FileDescriptor_md.c): the same retry-on-EINTR statement expression in both libcs.
 const FORWARDED_MACROS: &[&str] = &[
     "__unused",
+    "TEMP_FAILURE_RETRY",
     "M_PURGE",
     "M_LOG_STATS",
     "__CPU_BITTYPE",

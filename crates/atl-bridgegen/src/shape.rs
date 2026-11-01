@@ -369,7 +369,8 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
     for name in cxx_linkage(inputs.cxx)? {
         out.entry(name).or_default().c_linkage = true;
     }
-    // the hidden names: host headers using an emitted macro as an identifier, whichever view reaches them
+    // the hidden names: host headers using an emitted macro as an identifier, whichever view reaches them;
+    // not one the header defines itself (glibc's TEMP_FAILURE_RETRY under __USE_GNU): hiding it would pop its own definition away
     let emitted: Vec<&str> = inputs
         .macros
         .iter()
@@ -381,7 +382,14 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let idents: BTreeSet<&str> = identifiers(&text).collect();
-            for m in emitted.iter().filter(|m| idents.contains(**m)) {
+            let defined: BTreeSet<String> = defines_in(&text)
+                .iter()
+                .filter_map(|def| macro_name(def).map(str::to_owned))
+                .collect();
+            for m in emitted
+                .iter()
+                .filter(|m| idents.contains(**m) && !defined.contains(**m))
+            {
                 out.entry(name.clone())
                     .or_default()
                     .hidden
@@ -1180,6 +1188,12 @@ mod tests {
             ("host/x.h", "int x;\n"),
             ("host/y.h", "int y;\n"),
             ("host/q.h", "int q;\n"),
+            // the host defines a forwarded macro itself in the GNU view only (glibc's TEMP_FAILURE_RETRY under __USE_GNU)
+            ("bionic/t.h", "int t;\n#define __tm(e) (e)\n"),
+            (
+                "host/t.h",
+                "int t;\n#ifdef _GNU_SOURCE\n#define __tm(e) (e)\nstatic int t_v = __tm(1);\n#endif\n",
+            ),
             (
                 "host/z.h",
                 "int q;\nint z;\n#ifdef _GNU_SOURCE\n#include <y.h>\n#endif\n",
@@ -1208,7 +1222,12 @@ mod tests {
     }
 
     fn derived(dir: &Tmp, homes: &[(&str, &str)]) -> Result<Shape> {
-        derived_with(dir, homes, &["__mac", "__pm", "__gm"], &["e.h", "o.h"])
+        derived_with(
+            dir,
+            homes,
+            &["__mac", "__pm", "__gm", "__tm"],
+            &["e.h", "o.h"],
+        )
     }
 
     fn derived_with(
@@ -1271,6 +1290,7 @@ mod tests {
             "q.h",
             "s.h",
             "sys/cdefs.h",
+            "t.h",
             "w.h",
             "x.h",
             "y.h",
@@ -1400,6 +1420,15 @@ mod tests {
             with_home.wrappers["k/u.h"].hidden,
             BTreeSet::from(["__mac".to_owned()])
         );
+        // the host's t.h defines __tm itself (GNU view): not hidden, or its definition would be popped away
+        assert!(
+            with_home
+                .wrappers
+                .get("t.h")
+                .is_none_or(|w| w.hidden.is_empty()),
+            "{:?}",
+            with_home.wrappers.get("t.h")
+        );
         // q.h needs no home: its host version declares q itself
         assert_eq!(with_home.wrappers["q.h"].includes, always(&["y.h"]));
         // a private file's macro, as written, in every header whose walk enters it
@@ -1441,8 +1470,8 @@ mod tests {
                 ..Wrapper::default()
             }
         );
-        // unlisted bionic-only headers get nothing: the 8 shape wrappers + l.h's linkage one
-        assert_eq!(with_home.wrappers.len(), 9);
+        // unlisted bionic-only headers get nothing: the 9 shape wrappers (t.h's: __tm outside the GNU view) + l.h's linkage one
+        assert_eq!(with_home.wrappers.len(), 10);
         let home = &[("bits/p.h", "q.h")];
         let forwarded = &["__mac", "__pm"];
         // refused substitutes: bionic-only API (f.h); a macro needing __mac, a k/u.h field name (c.h);

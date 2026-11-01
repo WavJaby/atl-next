@@ -43,6 +43,11 @@ const CASES: &[(&str, &str)] = &[
         "unistd.h: #include <bits/ioctl.h>, which declares ioctl",
         "#include <unistd.h>\n__typeof__(ioctl) *v = ioctl;\n",
     ),
+    // libcore ojluni FileDescriptor_md.c (C, no _GNU_SOURCE); bare, glibc leaves it undefined (an undeclared call would only warn)
+    (
+        "unistd.h: #define TEMP_FAILURE_RETRY(exp)",
+        "#include <errno.h>\n#include <unistd.h>\n#ifndef TEMP_FAILURE_RETRY\n#error\n#endif\nint f(int fd) { return TEMP_FAILURE_RETRY(close(fd)); }\n",
+    ),
     // libtimeinstate (bpf KernelUtils.h); the uapi headers name struct fields `__unused`, which bionic's
     // copies rename (libc/kernel/tools/defaults.py), so they must still compile after the definition
     (
@@ -108,6 +113,11 @@ const CASES: &[(&str, &str)] = &[
     (
         "stdlib.h: void setprogname(const char*)",
         "#include <stdlib.h>\n__typeof__(setprogname) *v = setprogname;\n",
+    ),
+    // ART oat_file_manager.cc ShouldLoadAppImage (__ANDROID__); bare, an undeclared function
+    (
+        "stdlib.h: const char* getprogname(void)",
+        "#include <stdlib.h>\nconst char* (*v)(void) = getprogname;\n",
     ),
     // libandroid_runtime android_os_Debug.cpp `mallopt(M_LOG_STATS, 0)`
     (

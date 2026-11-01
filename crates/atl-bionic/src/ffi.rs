@@ -386,14 +386,24 @@ pub unsafe extern "C" fn pthread_gettid_np(thread: core::ffi::c_long) -> c_int {
     unsafe { crate::thread::gettid_of(thread as usize) }
 }
 
+#[cfg(atl_bionic_api = "progname")]
+unsafe extern "C" {
+    /// glibc's short program name (`<errno.h>`, `_GNU_SOURCE`), exported writable; bionic's `__progname`.
+    static mut program_invocation_short_name: *const c_char;
+}
+
+/// Where glibc lacks it (build.rs `IN_HOST_HEADERS`: no glibc has it): the program name `setprogname` set, else the short name of argv[0] (glibc initialises it as bionic's libc init sets `__progname`).
+#[cfg(atl_bionic_api = "progname")]
+#[unsafe(no_mangle)]
+pub extern "C" fn getprogname() -> *const c_char {
+    // SAFETY: a read of glibc's pointer, unsynchronised as bionic reads `__progname`
+    unsafe { program_invocation_short_name }
+}
+
 /// Where glibc lacks it (build.rs `IN_HOST_HEADERS`: no glibc has it). The name points into `name`, as bionic's.
 #[cfg(atl_bionic_api = "progname")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setprogname(name: *const c_char) {
-    unsafe extern "C" {
-        /// glibc's short program name (`<errno.h>`, `_GNU_SOURCE`), exported writable.
-        static mut program_invocation_short_name: *const c_char;
-    }
     // SAFETY: bionic's contract, a NUL-terminated string that outlives the program name; null, where bionic crashes, is ignored
     let Some(path) = (unsafe { c_str(name) }) else {
         return;
@@ -455,6 +465,25 @@ pub extern "C" fn android_create_namespace(
     _parent: *mut android_namespace_t,
 ) -> *mut android_namespace_t {
     core::ptr::from_ref(linker::create()).cast_mut().cast()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_get_LD_LIBRARY_PATH(buffer: *mut c_char, buffer_size: usize) {
+    match linker::default_library_paths(buffer_size) {
+        Ok(paths) => {
+            let bytes = paths.to_bytes_with_nul();
+            // SAFETY: bionic's contract, `buffer` writable for `buffer_size` bytes, which hold `bytes` (checked)
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), buffer, bytes.len()) };
+        }
+        Err(required) => {
+            // bionic linker.cpp: async_safe_fatal, then abort
+            let msg = format!(
+                "android_get_LD_LIBRARY_PATH failed, buffer too small: buffer len {buffer_size}, required len {required}"
+            );
+            async_safe::fatal_text(b"", msg.as_bytes());
+            std::process::abort()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

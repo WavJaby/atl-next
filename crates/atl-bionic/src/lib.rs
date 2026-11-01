@@ -19,7 +19,7 @@
 //!   one it lacks.
 //! - `android_set_abort_message` (`abort`): the first message, for a crash report.
 //! - `pthread_gettid_np` (`thread`), where glibc lacks it (< 2.42).
-//! - `setprogname` (`progname`): the short name into glibc's `program_invocation_short_name`.
+//! - `setprogname` / `getprogname` (`progname`): the short name in glibc's `program_invocation_short_name`.
 //! - `<bionic/reserved_signals.h>`: bionic's reserved signal numbers, constants only.
 //! - malloc introspection (`malloc_iterate`, `malloc_disable`, `malloc_enable`, `malloc_backtrace`): glibc's heap cannot be walked: `malloc_iterate` fails (`ENOTSUP`), the rest answer as a bionic allocator without the support does (no frames).
 //! - `android_getaddrinfofornet`: single network, the host's `getaddrinfo`.

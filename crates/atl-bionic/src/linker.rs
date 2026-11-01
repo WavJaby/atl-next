@@ -87,6 +87,19 @@ pub unsafe fn open(name: *const c_char, flags: c_int, _ns: &Namespace) -> *mut c
     unsafe { dlopen(name, flags) }
 }
 
+/// bionic `do_android_get_LD_LIBRARY_PATH` (`linker.cpp`): the default namespace's configured search paths (ld.config's, or `LD_LIBRARY_PATH` as the linker parsed it at startup), `:`-joined.
+/// The one namespace here has none configured: glibc's own search (RUNPATH, `LD_LIBRARY_PATH`, ld.so.cache, system dirs) is no path list of the namespace, so the text is empty.
+/// libcore System.c takes it as `java.library.path` when `LD_LIBRARY_PATH` is unset; a launcher wanting another sets `LD_LIBRARY_PATH`, as on bionic.
+/// `Err(required)`: bionic aborts when `buffer_size` is below the paths' lengths + 1 each; with no path it writes nothing, not even a NUL, which here is written (0 paths, 1 byte).
+pub fn default_library_paths(buffer_size: usize) -> Result<&'static CStr, usize> {
+    const PATHS: &CStr = c"";
+    let required = PATHS.to_bytes_with_nul().len();
+    if buffer_size < required {
+        return Err(required);
+    }
+    Ok(PATHS)
+}
+
 /// bionic `get_dlwarning` (`linker_dlwarning.cpp`): takes the process's accumulated linker warnings,
 /// cleared on read, `None` when there are none. bionic's linker adds them while loading (`add_dlwarning`,
 /// e.g. text relocations in a legacy app's library); glibc's loader keeps no such list, so there never
@@ -103,4 +116,17 @@ pub fn fail(detail: &CStr) {
     // SAFETY: a NUL-terminated string; mode 0 is refused before glibc reads the name as a path
     let handle = unsafe { dlopen(detail.as_ptr(), 0) };
     debug_assert!(handle.is_null(), "glibc loaded with mode 0");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_library_paths;
+
+    // no configured path: the empty string, which needs its NUL (1 byte); a 0-byte buffer is bionic's "buffer too small" abort
+    #[test]
+    fn no_default_paths() {
+        assert_eq!(default_library_paths(4096), Ok(c""));
+        assert_eq!(default_library_paths(1), Ok(c""));
+        assert_eq!(default_library_paths(0), Err(1));
+    }
 }
