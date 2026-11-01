@@ -398,3 +398,39 @@ cc_library_static { name: "l2" }
 		}
 	}
 }
+
+// A cc_object in a genrule's srcs is its object file, Soong's <out>/<side>/<name>/<name + ".o"> (cc/object.go link; ART's asm_defines.s -> asm_defines.s.o),
+// copied from its one compile; a `none` generator (providers.toml) is dropped like a dropped library.
+func TestGenruleObjectSrcAndNoneGenerator(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"p/Android.bp": `
+cc_object { name: "defs.s", srcs: ["d.cc"], cflags: ["-S"] }
+cc_genrule { name: "hdr", srcs: [":defs.s"], out: ["d.h"], cmd: "cat $(in) > $(out)" }
+xsd_config { name: "xsd", srcs: ["x.xsd"] }
+cc_library_static { name: "l", srcs: ["l.cc"], generated_headers: ["hdr"], generated_sources: ["xsd"] }
+`,
+		"p/d.cc": "", "p/l.cc": "", "p/x.xsd": "",
+	})
+	g.omit = map[string]bool{"xsd": true}
+	if g.node("l", Device, Static, "goal") == nil {
+		t.Fatal(g.problems)
+	}
+	if len(g.problems) != 0 {
+		t.Errorf("problems %v", g.problems)
+	}
+	obj := g.out + "/device/defs.s/defs.s.o"
+	h := g.nodes[key{"hdr", Device, Gen}]
+	if !slices.Equal(h.rule.inputs, []string{obj}) || h.rule.broken != "" {
+		t.Errorf("inputs %v, broken %q", h.rule.inputs, h.rule.broken)
+	}
+	if !slices.ContainsFunc(h.stepDeps(), func(n *Node) bool { return n.name == "defs.s" }) {
+		t.Errorf("genrule does not wait for the cc_object")
+	}
+	if got := sortedKeys(g.dropped); !slices.Equal(got, []string{"device/l xsd"}) {
+		t.Errorf("dropped %v", got)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
+	if !strings.Contains(ninja, "build "+obj+": cp "+g.out+"/obj/device/defs.s/static/p/d.cc.o\n") {
+		t.Errorf("no copy of the object:\n%s", ninja)
+	}
+}

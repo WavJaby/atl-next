@@ -529,10 +529,19 @@ func lists(kv ...any) *Obj {
 	return o
 }
 
-// implicitFlags: addImplicitFlags, ART_TARGET_LINUX unset -> ART's Android target.
-// The device side is built from the android blocks against bionic's API, which is ART's Android target configuration; ART_TARGET_LINUX selects its non-Android Linux target (globals.h kIsTargetLinux: MemMap without ashmem), a choice for when libart is built.
+// artTargetLinux: the environment variable ART_TARGET_LINUX this build gives Soong, read by addImplicitFlags (art.go IsEnvTrue).
+// true: ART's target build for Linux without Android's platform (AOSP-maintained, globals.h kIsTargetLinux), which this runtime is: no Android kernel or init, so no reserved-address android_dlopen_ext for oat files (plain dlopen, ElfOatFile for reservations),
+// no logd (libbase StderrLogger as InitLogging's default, LogLineLowStack to stderr), no userfaultfd GC chosen from properties or the 5.16 kernel probe (concurrent copying unless -Xgc:CMC), no statsd/perfetto/apex-info consumers, no linker namespaces in dalvikvm, oat loading or libnativebridge.
+// false would be ART_TARGET_ANDROID, which needs all of those from the platform. The NativeBridge trampoline path (jni_internal.cc) is off either way under LINUX; plan Q7's patch enables it.
+const artTargetLinux = true
+
+// implicitFlags: addImplicitFlags for artTargetLinux.
 func (a *artPlugin) implicitFlags() *Obj {
-	return block(lists("cflags", []string{"-DART_TARGET", "-DART_TARGET_ANDROID"}), "target", sideBlocks[Device])
+	target := "-DART_TARGET_ANDROID"
+	if artTargetLinux {
+		target = "-DART_TARGET_LINUX"
+	}
+	return block(lists("cflags", []string{"-DART_TARGET", target}), "target", sideBlocks[Device])
 }
 
 // globalDefaults: globalFlags + deviceFlags + hostFlags (art_global_defaults) for an environment that sets none of their variables and builds with no sanitizer:

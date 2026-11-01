@@ -23,8 +23,11 @@ type SoongConfig struct {
 	ExperimentalCStd, ExperimentalCppStd string   // ExperimentalCStdVersion, ExperimentalCppStdVersion: what c_std / cpp_std "experimental" selects
 	GlobalIncludes                       []string // commonGlobalIncludes that exist in the tree (Soong skips missing ones)
 	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
-	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here.
+	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here, except AutoVarInit.
 	GlobalDefines []string
+	// CommonGlobalCflags' -ftrivial-auto-var-init (readAutoVarInit): every module, both sides. Not a choice but semantics AOSP code relies on: zero-filled locals.
+	// Measured 2026-11-02: without it ART's class linker gives java.lang.String 80 vtable slots instead of 81 (String.isBlank in Object.clone's slot) and aborts in InitWithoutImage.
+	AutoVarInit string
 	// commonGlobalAsflags' -D/-U entries (-D__ASSEMBLY__): Soong adds them to every .S/.s compile (cc/compiler.go "${config.CommonGlobalAsflags}"); same preprocessor-only rule as GlobalDefines.
 	GlobalAsDefines []string
 	APILevel        string // device-side -D__ANDROID_API__ (apiLevel)
@@ -489,8 +492,27 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 	if cfg.APILevel, err = apiLevel(tree); err != nil {
 		return cfg, err
 	}
+	if cfg.AutoVarInit, err = readAutoVarInit(path); err != nil {
+		return cfg, err
+	}
 	cfg.SystemSharedLibs, err = systemSharedLibs(tree)
 	return cfg, err
+}
+
+// autoVarInitDefault: global.go's CommonGlobalCflags VariableFunc, the branch taken when none of AUTO_ZERO_INITIALIZE / AUTO_PATTERN_INITIALIZE / AUTO_UNINITIALIZE is set (this build sets none).
+var autoVarInitDefault = regexp.MustCompile(`\}\s*else\s*\{\s*//\s*Default to zero initialization\.\s*flags = append\(flags, "(-ftrivial-auto-var-init=[a-z]+)"\)`)
+
+// readAutoVarInit: the -ftrivial-auto-var-init flag Soong gives every compile by default; fails when the default branch is no longer that statement.
+func readAutoVarInit(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	m := autoVarInitDefault.FindSubmatch(b)
+	if m == nil {
+		return "", fmt.Errorf("%s: CommonGlobalCflags' default -ftrivial-auto-var-init branch not found: re-derive soongcfg.go readAutoVarInit", path)
+	}
+	return string(m[1]), nil
 }
 
 // stringList: the strings of a `[]string{…}` literal.
@@ -540,6 +562,10 @@ func systemSharedLibs(tree string) ([]string, error) {
 // __BIONIC__, which bionic's sys/cdefs.h defines, stays undefined: glibc is the C library, and libc++ keys ABI-shaping config on it (regex word class, ctype masks).
 // libc++ 19's __ANDROID__ sites leave its objects byte-identical on glibc given the xlocale.h shim (libcxxShim); xtask check step libcxx keeps that true across libc++ bumps.
 const androidDefine = "-D__ANDROID__"
+
+// lfs64Define: bionic declares the LFS64 interfaces (stat64, lseek64, off64_t, ...) unconditionally (libc/include/sys/stat.h, unistd.h); glibc only under _LARGEFILE64_SOURCE, which adds declarations and changes no type size (off_t stays as _FILE_OFFSET_BITS says).
+// Device code written against bionic uses them without a feature macro (libopenjdk's ojluni natives; their glibc host variant passes the same define). Device compiles only; xtask check step libcxx probes libc++ with it.
+const lfs64Define = "-D_LARGEFILE64_SOURCE"
 
 // apiLevel: the -D flag for __ANDROID_API__ = FutureApiLevelInt: Soong gives platform code the triple <arch>-linux-android<FutureApiLevelInt> (cc/compiler.go AddTargetFlags), from which clang defines it; a linux-gnu triple defines nothing.
 // The level names (`__ANDROID_API_U__`, …) come with atl-bionic's generated android/api-level.h, force-included into every device compile (deviceForced).

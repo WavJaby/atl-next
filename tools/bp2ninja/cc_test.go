@@ -50,6 +50,21 @@ cc_library {
 	}
 }
 
+// export_shared_lib_headers names a dependency as shared_libs does, variant tag included (ART libart-runtime_deps: `libdexfile#impl` in both): its exports reach dependents.
+func TestReexportTaggedSharedLib(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library { name: "libdex", export_include_dirs: ["inc"] }
+cc_library { name: "librt", shared_libs: ["libdex#impl"], export_shared_lib_headers: ["libdex#impl"] }
+`})
+	n := g.node("librt", Device, Shared, "goal")
+	if n == nil {
+		t.Fatal(g.problems)
+	}
+	if want := "-I" + g.abs("p/inc"); !slices.Contains(n.exports, want) {
+		t.Errorf("exports %q lack %s", n.exports, want)
+	}
+}
+
 // Soong's static / shared properties are arch-variant (cc/library.go StaticProperties, SharedProperties): a target block's part merges into the module's own, after it, for that kind only.
 func TestFlattenKindInTarget(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `

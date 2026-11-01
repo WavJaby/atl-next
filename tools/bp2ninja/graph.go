@@ -43,6 +43,7 @@ func (n *Node) stepDeps() []*Node {
 	}
 	if n.rule != nil {
 		deps = append(deps, n.rule.tools...)
+		deps = append(deps, n.rule.objs...)
 	}
 	return deps
 }

@@ -13,8 +13,8 @@ use crate::providers::Provided;
 /// How xtask builds one upstream; keyed by its `sources.toml` name.
 pub struct Recipe {
     pub name: &'static str,
-    /// Android.bp modules the install provides; module `m` is `<prefix>/lib/<m>.so` (checked after install).
-    pub modules: &'static [&'static str],
+    /// Android.bp modules the install provides, each with its library: module `(m, lib)` is `<prefix>/lib/<lib>.so` (checked after install).
+    pub modules: &'static [(&'static str, &'static str)],
     /// CMake cache entries beyond the toolchain ones every recipe gets.
     cache: &'static [(&'static str, &'static str)],
     /// Cache entries that are also preprocessor defines of the installed headers: dependents compile with `-D<k>=<v>`, so library and users cannot disagree.
@@ -26,7 +26,12 @@ const BORINGSSL_SYMBOL_PREFIX: &str = "ATL";
 
 pub const RECIPES: &[Recipe] = &[Recipe {
     name: "boringssl",
-    modules: &["libcrypto", "libssl"],
+    // libcrypto_static: AOSP's non-FIPS static copy (libcore's JNI libraries, dex2oat: bignums, digests); here the one shared libcrypto, so a process holds one BoringSSL
+    modules: &[
+        ("libcrypto", "libcrypto"),
+        ("libcrypto_static", "libcrypto"),
+        ("libssl", "libssl"),
+    ],
     // shared: dependents link libcrypto.so / libssl.so as AOSP's device build does; tests are not ours to build
     cache: &[("BUILD_SHARED_LIBS", "ON"), ("BUILD_TESTING", "OFF")],
     shared_defines: &[("BORINGSSL_PREFIX", BORINGSSL_SYMBOL_PREFIX)],
@@ -108,8 +113,8 @@ pub fn build(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     let mut provided = BTreeMap::new();
-    for module in recipe.modules {
-        let lib = prefix.join("lib").join(format!("{module}.so"));
+    for (module, stem) in recipe.modules {
+        let lib = prefix.join("lib").join(format!("{stem}.so"));
         ensure!(
             lib.is_file(),
             "upstream {}: install has no {} for module {module}",

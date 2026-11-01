@@ -250,9 +250,14 @@ fn validate_one(module: &str, provider: &str, targets: &Targets) -> Result<()> {
                 bail!("xtask has no build recipe for upstream `{name}` (upstream.rs RECIPES)")
             };
             ensure!(
-                recipe.modules.contains(&module),
+                recipe.modules.iter().any(|(m, _)| *m == module),
                 "upstream `{name}` installs no module `{module}` (its recipe: {})",
-                recipe.modules.join(", ")
+                recipe
+                    .modules
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         Some(("system", name)) => {
@@ -340,10 +345,10 @@ mod tests {
         assert!(
             err("[x]\nprovider = \"upstream:qemu\"\nreason = \"r\"\n").contains("no build recipe")
         );
-        // the recipe installs libcrypto and libssl only
+        // the recipe installs libcrypto, libcrypto_static and libssl only
         assert!(
-            err("[libcrypto_static]\nprovider = \"upstream:boringssl\"\nreason = \"r\"\n")
-                .contains("installs no module `libcrypto_static`")
+            err("[libdecrepit]\nprovider = \"upstream:boringssl\"\nreason = \"r\"\n")
+                .contains("installs no module `libdecrepit`")
         );
     }
 

@@ -46,6 +46,7 @@ type genRule struct {
 	inputs   []string   // $(in), as labels' files
 	implicit []string   // tool_files and script tools: rebuild triggers beside inputs, as labels' files
 	tools    []*Node    // cc tools, implicit inputs once their paths are known
+	objs     []*Node    // cc_object modules srcs name; their object files (objectOut) are inputs
 	toolData []toolFile // files the tools' `required` modules install, staged under tools/out (genToolData)
 	outs     []string
 	incs     []string // -I flags consumers get (export_include_dirs, default the gen dir)
@@ -60,8 +61,12 @@ func isGenType(t string) bool {
 }
 
 // genNode builds (once) the genrule node a reference names. A reference of another type is a problem,
-// a reference no module answers to is also recorded for notFound.
+// a reference no module answers to is also recorded for notFound. A providers.toml `none` generator is dropped (nil), as node drops a library.
 func (g *Graph) genNode(ref string, side Side, from string) *Node {
+	if name := strings.TrimPrefix(ref, ":"); g.omit[name] {
+		g.dropped = addKey(g.dropped, side.String()+"/"+from+" "+name)
+		return nil
+	}
 	m := g.lookup(ref, side)
 	if m == nil {
 		// made by a module type the tree has: synth recorded why there is none
@@ -170,7 +175,9 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 			if exclude[f.path] {
 				continue
 			}
-			if f.gen == nil {
+			if f.obj != nil {
+				r.objs = append(r.objs, f.obj)
+			} else if f.gen == nil {
 				if _, err := os.Stat(g.abs(f.path)); err != nil {
 					fail("input %s does not exist", f.path)
 				}

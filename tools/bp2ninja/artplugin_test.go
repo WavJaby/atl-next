@@ -225,7 +225,8 @@ art_cc_library_static {
 	side := func(base string) []string {
 		return []string{"-Wframe-larger-than=1744", "-DART_FRAME_SIZE_LIMIT=1744", "-DART_BASE_ADDRESS=" + base, "-DART_BASE_ADDRESS_MIN_DELTA=(-0x1000000)", "-DART_BASE_ADDRESS_MAX_DELTA=0x1000000"}
 	}
-	implicit := []string{"-DART_TARGET", "-DART_TARGET_ANDROID"}
+	// art.go addImplicitFlags' IsEnvTrue("ART_TARGET_LINUX") branch
+	implicit := []string{"-DART_TARGET", "-DART_TARGET_LINUX"}
 	clang := `-DART_CLANG_PATH="prebuilts/clang/host/linux-x86/clang-rX"`
 	// defaults' target block: codegen of the side's arches, then addImplicitFlags (device only), then globalDefaults' side flags
 	defDevice := slices.Concat([]string{"-DCG_x86", "-DCG_x86_64"}, implicit, side("0xD"))

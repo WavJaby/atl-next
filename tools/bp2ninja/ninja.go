@@ -228,6 +228,14 @@ func (g *Graph) emit(tools Tools) string {
 		switch n.kind {
 		case Static:
 			fmt.Fprintf(&b, "build %s: ar %s\n", esc(n.out), join(n.objs))
+			if g.baseType(n.mod.Type) == "cc_object" {
+				// cc/object.go link: one object is copied to the module's output; several are combined with ld -r, not mirrored
+				if len(n.objs) == 1 {
+					fmt.Fprintf(&b, "build %s: cp %s\n", esc(g.objectOut(n)), esc(n.objs[0]))
+				} else {
+					fmt.Fprintf(&b, "build %s: fail\n  msg = %s\n", esc(g.objectOut(n)), shellQuote([]string{fmt.Sprintf("error: %s: cc_object output of %d objects (ld -r) is unsupported", n.mod.Name, len(n.objs))}))
+				}
+			}
 		case Shared, Binary:
 			n.rustlib, n.rustlibWhole = g.rustStaticlib(&b, n)
 			libs, inputs := g.linkLibs(n)
@@ -268,6 +276,10 @@ type langFlags struct{ c, cxx, asm, yasm []string }
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
 	common := append([]string{"-fPIC", "-O2", "-w"}, g.soong.GlobalDefines...)
+	// CommonGlobalCflags' auto-var-init, before the module's flags as Soong's (a module may opt out); "" only in tests' hand-made configs
+	if g.soong.AutoVarInit != "" {
+		common = append(common, g.soong.AutoVarInit)
+	}
 	// Soong's toolchain cflags precede the module's (cc/compiler.go), so a module's own -mno-* wins
 	if n.side == Device {
 		common = append(common, g.soong.Device.Cflags...)
@@ -322,7 +334,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	cxx = append(cxx, moduleFlags(p, "cppflags")...)
 	c := append(append(slices.Clone(common), "-std="+cstd), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
-		dev := []string{androidDefine, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
+		dev := []string{androidDefine, lfs64Define, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
 		for _, h := range deviceForced {
 			dev = append(dev, "-include", h)
 		}

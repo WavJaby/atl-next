@@ -17,7 +17,11 @@ func soongTree(t *testing.T, cflags, soongLevel, bionicLevel string) string {
 	files := map[string]string{
 		"build/soong/cc/config/global.go": "package config\n\nvar (\n\tcommonGlobalCflags = []string{\n\t\t\"-O2\",\n\t\t" + cflags + "\n\t}\n\n" +
 			"\tcommonGlobalAsflags = []string{\n\t\t\"-D__ASSEMBLY__\",\n\t\t\"-fdebug-default-version=4\",\n\t}\n)\n\n" +
-			"const (\n\tCStdVersion = \"gnu23\"\n\tCppStdVersion = \"gnu++20\"\n\tExperimentalCStdVersion = \"gnu2x\"\n\tExperimentalCppStdVersion = \"gnu++2b\"\n)\n\nfunc init() {\n\tcommonGlobalIncludes = []string{\"system/core/include\"}\n}\n",
+			"const (\n\tCStdVersion = \"gnu23\"\n\tCppStdVersion = \"gnu++20\"\n\tExperimentalCStdVersion = \"gnu2x\"\n\tExperimentalCppStdVersion = \"gnu++2b\"\n)\n\nfunc init() {\n\tcommonGlobalIncludes = []string{\"system/core/include\"}\n" +
+			// global.go:417-432's CommonGlobalCflags VariableFunc, the env branches cut to one
+			"\tpctx.VariableFunc(\"CommonGlobalCflags\", func(ctx android.PackageVarContext) string {\n\t\tflags := slices.Clone(commonGlobalCflags)\n" +
+			"\t\tif ctx.Config().IsEnvTrue(\"AUTO_PATTERN_INITIALIZE\") {\n\t\t\tflags = append(flags, \"-ftrivial-auto-var-init=pattern\")\n\t\t} else {\n" +
+			"\t\t\t// Default to zero initialization.\n\t\t\tflags = append(flags, \"-ftrivial-auto-var-init=zero\")\n\t\t}\n\t\treturn strings.Join(flags, \" \")\n\t})\n}\n",
 		"build/soong/cc/config/bionic.go": "package config\n\nvar (\n\tbionicDefaultSharedLibraries = []string{\"libc\", \"libm\", \"libdl\"}\n\n\tbionicCrtBeginStaticBinary, bionicCrtEndStaticBinary = []string{\"crtbegin_static\"}, []string{\"crtend_android\"}\n)\n",
 		"build/soong/android/config.go":   "package android\n\nconst FutureApiLevelInt = " + soongLevel + "\n",
 		"bionic/libc/include/android/api-level.h": "#pragma once\n#define __ANDROID_API_FUTURE__ " + bionicLevel + "\n#ifndef __ANDROID_API__\n" +
@@ -61,6 +65,18 @@ func TestSoongConfigAvailability(t *testing.T) {
 	}
 	if want := []string{"libc", "libm", "libdl"}; !slices.Equal(cfg.SystemSharedLibs, want) {
 		t.Errorf("SystemSharedLibs %q, want %q", cfg.SystemSharedLibs, want)
+	}
+	// the default branch's flag, not the env branch's pattern
+	if cfg.AutoVarInit != "-ftrivial-auto-var-init=zero" {
+		t.Errorf("AutoVarInit %q", cfg.AutoVarInit)
+	}
+	// a global.go without that branch: re-derive, never a silent default
+	noBranch := filepath.Join(t.TempDir(), "global.go")
+	if err := os.WriteFile(noBranch, []byte("package config\n\nfunc init() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAutoVarInit(noBranch); err == nil || !strings.Contains(err.Error(), "re-derive") {
+		t.Errorf("no default branch: err %v", err)
 	}
 	for _, c := range []struct {
 		name, cflags, soong, bionic, want string

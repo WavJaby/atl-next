@@ -71,6 +71,19 @@ reason = "Zygote's seccomp policy; only the Zygote JNI uses it (excluded from li
 provider = "crate:atl-vndksupport"
 reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace, so AOSP's fallback dlopen/dlclose is the whole behaviour"
 
+# ART built as its Linux target (ART_TARGET_LINUX, bp2ninja artplugin.go artTargetLinux)
+["apex-info-list-tinyxml"]
+provider = "none"
+reason = "xsd parser of /apex/apex-info-list.xml (APEX boot versions); libart's only reader, runtime.cc, includes it under ART_TARGET_ANDROID; no APEX is mounted here"
+
+["art-apex-cache-info"]
+provider = "none"
+reason = "xsd parser of odrefresh's cache-info.xml; libart includes it (mark_compact.cc) only under ART_TARGET_ANDROID; odrefresh/artd do not run here (no boot-time dexopt)"
+
+["heapprofd_client_api"]
+provider = "none"
+reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsampler.cc AHeapProfile_*/AHeapInfo_*) only under ART_TARGET_ANDROID, and no perfetto traced runs here"
+
 # GL and Vulkan loaders: the host's (libglvnd dispatching to Mesa, the Khronos Vulkan loader), owner decision 2026-10-31.
 # Headers stay AOSP's (gl_headers, vulkan_headers, through the tree modules' export_header_lib_headers): the Khronos registry headers the pinned AOSP code is written against (hwui uses EGL_TELEMETRY_HINT_ANDROID, absent from Debian 13's 2021 eglext.h); the Khronos ABI only grows, so they declare the host library correctly.
 # AOSP's libEGL_getProcAddress is a static helper of AOSP's libEGL alone: no row, nothing else links it.
@@ -130,6 +143,10 @@ srcs = ["src/codec/SkRawCodec.cpp"]
 ["libcrypto"]
 provider = "upstream:boringssl"
 reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0"
+
+["libcrypto_static"]
+provider = "upstream:boringssl"
+reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0. Linked as the shared libcrypto (one BoringSSL per process), where AOSP links its non-FIPS static copy into libcore's JNI libraries and dex2oat"
 
 ["libssl"]
 provider = "upstream:boringssl"

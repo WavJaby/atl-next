@@ -100,6 +100,8 @@ fn compare(i: &Inputs, work: &Path) -> Result<Diff> {
         STD.into(),
         "-O2".into(),
         "-fPIC".into(),
+        // every device compile's (bp2ninja lfs64Define): declarations only, in both runs
+        "-D_LARGEFILE64_SOURCE".into(),
     ];
     match i.libcxx {
         Some(dir) => base.extend([

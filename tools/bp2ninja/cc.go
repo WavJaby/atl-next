@@ -664,17 +664,28 @@ func dedupSrcs(files []srcFile, exclude []string) []srcFile {
 }
 
 // srcFile is one file a `srcs`-style entry names: tree-relative, or absolute under the build dir when a
-// genrule (gen) produces it. root is the import root aidl and proto sources need.
+// genrule (gen) or a cc_object (obj: its object file, objectOut) produces it. root is the import root aidl and proto sources need.
 type srcFile struct {
 	path, root string
 	gen        *Node
+	obj        *Node
 }
 
 // isRef: a srcs entry naming a module (`:name`, `//dir:name`) rather than a path.
 func isRef(s string) bool { return strings.HasPrefix(s, ":") || strings.HasPrefix(s, "//") }
 
+// objectOut: a cc_object node's own output, Soong's PathForModuleOut(<name>, + ".o" unless the name ends in it) (cc/object.go link), which `:name` in a genrule's srcs names;
+// its static archive (n.out) is what cc modules link whole.
+func (g *Graph) objectOut(n *Node) string {
+	name := n.name
+	if !strings.HasSuffix(name, ".o") {
+		name += ".o"
+	}
+	return filepath.Join(g.out, n.side.String(), n.name, name)
+}
+
 // resolveSrc expands one entry of srcs / tool_files written in dir: a path or glob, `:name` or
-// `//dir:name` naming a filegroup (its srcs, recursively) or a genrule (its outputs). ok=false: a
+// `//dir:name` naming a filegroup (its srcs, recursively), a genrule (its outputs) or a cc_object (its object file). ok=false: a
 // reference no known module of those types answers to (problem recorded).
 func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFile, ok bool) {
 	if !isRef(s) {
@@ -685,8 +696,18 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 	}
 	m := g.lookup(s, side)
 	switch {
+	case m != nil && g.baseType(m.Type) == "cc_object":
+		o := g.node(s, side, Static, from)
+		if o == nil {
+			return nil, false
+		}
+		return []srcFile{{path: g.objectOut(o), obj: o}}, true
 	case m != nil && isGenType(g.baseType(m.Type)):
 		gn := g.genNode(s, side, from)
+		// providers.toml none: dropped
+		if gn == nil {
+			return nil, true
+		}
 		for _, o := range gn.rule.outs {
 			files = append(files, srcFile{path: o, root: g.genDir(gn, ""), gen: gn})
 		}
@@ -772,6 +793,10 @@ func (g *Graph) exportsOf(n *Node) []string {
 	reexport := map[string]bool{}
 	for _, l := range []string{"export_header_lib_headers", "export_static_lib_headers", "export_shared_lib_headers"} {
 		for _, r := range n.props.strs(l) {
+			// `libdexfile#impl` re-exports what shared_libs `libdexfile#impl` names: the module, whichever variant tag (lookup drops it too)
+			if i := strings.IndexByte(r, '#'); i >= 0 {
+				r = r[:i]
+			}
 			reexport[r] = true
 		}
 	}
