@@ -40,6 +40,12 @@ pub struct Args {
     /// Archiver (deps.toml row `llvm`).
     #[arg(long, default_value = "llvm-ar-19")]
     ar: String,
+    /// Compiler cache run in front of every C/C++ compile (deps.toml row `sccache`); its cache `<workspace>/cache/sccache` is shared by every out dir and checkout.
+    #[arg(long, default_value = "sccache")]
+    compiler_cache: String,
+    /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
+    #[arg(long)]
+    no_compiler_cache: bool,
     /// Before building, convert again and again: pin and fetch the AOSP projects behind the modules and
     /// tree paths the converter reports missing (`missing.txt`, `missing-paths.txt`), until a round finds nothing new to fetch. Ninja
     /// runs once, after that.
@@ -65,6 +71,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let layout = Layout::of(root)?;
     let ws = layout.workspace();
+    let cache = CompilerCache::of(args, ws);
     // regenerated every round: --fetch-missing adds projects between rounds
     let aosp_tree = || -> Result<std::path::PathBuf> {
         let sources = sources::load(root)?;
@@ -246,6 +253,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-srcs")
             .arg(&srcs_file)
             .args(&aconfig)
+            .args(cache.iter().flat_map(CompilerCache::converter_args))
             .args(&args.goals)
             .status()
             .context("running bp2ninja")?;
@@ -294,10 +302,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         break;
     }
+    if let Some(c) = &cache {
+        c.start()?;
+    }
     let log = out.join("ninja.log");
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
         .arg(&out)
+        .envs(cache.iter().flat_map(CompilerCache::env))
         .stdout(std::fs::File::create(&log)?)
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
@@ -354,6 +366,76 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     table_check(&table);
     Ok(ExitCode::FAILURE)
+}
+
+/// Size limit of the compiler cache (sccache evicts least recently used entries past it).
+/// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries): 2 GB keeps ~25 such generations (main + task branches whose flags, pins or patches differ) and leaves room for the goal closure to grow several-fold before this needs a new measurement.
+const CACHE_SIZE: &str = "2G";
+
+/// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
+/// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task-copy farm hits wherever the text is equal (measured with sccache 0.10).
+/// Direct mode, sccache's default, keys on the include paths, which name the out dir (`-I<out>/compat/device`, `-isystem <out>/gen/...`): measured 21% hits in a second out dir, every cross-out-dir lookup a miss. Do not drop the setting.
+/// It writes the depfile from its own preprocessor run, so `deps = gcc` sees this out dir's headers on a hit too. Compiles with debug info run uncached (bp2ninja `debugInfo`): a hit would carry the filling out dir's paths in DWARF.
+/// The one remaining difference from an uncached build: two sources with equal preprocessed text (empty `*_neon.cc` on x86, trivial generated AIDL/pbzero units) share an entry, so the local `STT_FILE` symbol may name the other source's basename; code, data and relocations are equal.
+/// Its server is this cache's own: a socket inside the cache dir, so a user's own sccache server (another dir, another size) is never the one answering.
+#[derive(Debug, PartialEq)]
+struct CompilerCache {
+    launcher: String,
+    dir: PathBuf,
+}
+
+impl CompilerCache {
+    /// None with `--no-compiler-cache`.
+    fn of(args: &Args, workspace: &Path) -> Option<Self> {
+        (!args.no_compiler_cache).then(|| Self {
+            launcher: args.compiler_cache.clone(),
+            dir: workspace.join("cache").join("sccache"),
+        })
+    }
+
+    fn converter_args(&self) -> [&str; 2] {
+        ["-launcher", &self.launcher]
+    }
+
+    /// The environment of every sccache client ninja runs; the first one starts the server with it.
+    fn env(&self) -> [(&'static str, std::ffi::OsString); 4] {
+        [
+            ("SCCACHE_DIRECT", "false".into()),
+            ("SCCACHE_DIR", self.dir.clone().into()),
+            ("SCCACHE_CACHE_SIZE", CACHE_SIZE.into()),
+            ("SCCACHE_SERVER_UDS", self.dir.join("server.sock").into()),
+        ]
+    }
+
+    /// Starts the server before ninja: sccache has no fallback to a plain compile when its server cannot start or its dir is unwritable (measured: every compile fails), so that fails here, once, naming the way out.
+    fn start(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating the compiler cache {}", self.dir.display()))?;
+        for arg in ["--start-server", "--show-stats"] {
+            let out = Command::new(&self.launcher)
+                .arg(arg)
+                .envs(self.env())
+                .output()
+                .with_context(|| {
+                    format!(
+                        "running {} {arg} (deps.toml row sccache; --no-compiler-cache builds without it)",
+                        self.launcher
+                    )
+                })?;
+            ensure!(
+                out.status.success(),
+                "{} {arg} failed (--no-compiler-cache builds without it): {}",
+                self.launcher,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        println!(
+            "native: compiler cache {} in {} (limit {CACHE_SIZE})",
+            self.launcher,
+            self.dir.display()
+        );
+        Ok(())
+    }
 }
 
 /// Prints the table check's problems; true when there are none.
@@ -720,6 +802,34 @@ nope
         );
         // nothing missing -> nothing to do
         assert_eq!(run("\n", "\n", problems, &pinned), Default::default());
+    }
+
+    /// The converter gets `-launcher` only while the cache is on; `--no-compiler-cache` drops it and the clients' environment with it (the converter's ninja test shows the cc rule then runs the compiler directly).
+    #[test]
+    fn no_compiler_cache_flag() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            native: Args,
+        }
+        let parse = |extra: &[&str]| {
+            let argv = [&["native", "--host", "x86_64"], extra, &["libfoo"]].concat();
+            <Cli as clap::Parser>::try_parse_from(argv).unwrap().native
+        };
+        let ws = Path::new("/ws");
+        let on = CompilerCache::of(&parse(&[]), ws).expect("on by default");
+        assert_eq!(on.converter_args(), ["-launcher", "sccache"]);
+        assert_eq!(on.dir, Path::new("/ws/cache/sccache"));
+        let env: BTreeMap<_, _> = on.env().into_iter().collect();
+        assert_eq!(env["SCCACHE_DIR"], "/ws/cache/sccache");
+        assert_eq!(env["SCCACHE_DIRECT"], "false");
+        assert_eq!(env["SCCACHE_SERVER_UDS"], "/ws/cache/sccache/server.sock");
+        let other = CompilerCache::of(&parse(&["--compiler-cache", "/opt/sccache"]), ws).unwrap();
+        assert_eq!(other.converter_args(), ["-launcher", "/opt/sccache"]);
+        assert_eq!(
+            CompilerCache::of(&parse(&["--no-compiler-cache"]), ws),
+            None
+        );
     }
 
     #[test]

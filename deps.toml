@@ -161,6 +161,13 @@ arch = "python"
 scope = ["build"]
 used_by = ["upstream:qemu"]
 
+# xtask native's compiler cache (CompilerCache in native.rs): C/C++ compiles of the converter's builds, shared by every out dir
+[sccache]
+debian = "sccache"
+arch = "sccache"
+scope = ["build"]
+used_by = ["xtask:native"]
+
 [vulkan]
 debian = "libvulkan-dev"
 arch = "vulkan-icd-loader"

@@ -40,6 +40,7 @@ func main() {
 	bison := flag.String("bison", "bison", "parser generator for .yy/.y sources")
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
+	launcher := flag.String("launcher", "", "compiler cache run in front of every C/C++ compile (sccache); empty = compile directly")
 	rustc := flag.String("rustc", "rustc", "Rust compiler of Rust modules (rust.go), with its own sysroot")
 	rustVersion := flag.String("rust-version", "", "-rustc's version x.y.z (Soong's ANDROID_RUST_VERSION)")
 	libclang := flag.String("libclang", "", "directory of -cc's libclang.so, which rust_bindgen's bindgen loads (LIBCLANG_PATH)")
@@ -83,7 +84,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}

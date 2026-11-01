@@ -3,7 +3,10 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -31,6 +34,45 @@ func TestModuleFlagsMatchSoong(t *testing.T) {
 		ours := shellQuote(moduleFlags(objOf("cflags", []string{c.flag}), "cflags"))
 		if got, want := shWords(t, ours), shWords(t, c.soong); !slices.Equal(got, want) {
 			t.Errorf("%q: argv %q (ninja %q), Soong's %q (ninja %q)", c.flag, got, ours, want, c.soong)
+		}
+	}
+}
+
+// -launcher: ninja's own expansion of a cc edge runs the launcher with the compiler as its first argument; without it the compiler runs directly (xtask native --no-compiler-cache).
+// A compile with debug info (libdbg's -g) runs directly either way (debugInfo).
+func TestLauncherPrefixesCompiles(t *testing.T) {
+	for _, launcher := range []string{"/opt/cache/sccache", ""} {
+		g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_static { name: "libs", srcs: ["s.cc", "c.c"], static_libs: ["libdbg"] }
+cc_library_static { name: "libdbg", srcs: ["d.cc"], cflags: ["-g"] }
+`})
+		if g.node("libs", Device, Static, "goal") == nil {
+			t.Fatal(g.problems)
+		}
+		ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Launcher: launcher})
+		if err := os.WriteFile(filepath.Join(g.out, "build.ninja"), []byte(ninja), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		objs := regexp.MustCompile(`(?m)^build (\S+\.o): cc `).FindAllStringSubmatch(ninja, -1)
+		if len(objs) != 3 {
+			t.Fatalf("launcher %q: %d cc edges, want 3", launcher, len(objs))
+		}
+		for _, m := range objs {
+			out, err := exec.Command("ninja", "-C", g.out, "-t", "commands", "-s", m[1]).Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			argv := strings.Fields(string(out))
+			want := []string{launcher, "c++"}
+			if strings.HasSuffix(m[1], ".c.o") {
+				want[1] = "cc"
+			}
+			if launcher == "" || strings.HasSuffix(m[1], "d.cc.o") {
+				want = want[1:]
+			}
+			if !slices.Equal(argv[:len(want)], want) {
+				t.Errorf("launcher %q: %s runs %q, want %q first", launcher, m[1], argv, want)
+			}
 		}
 	}
 }
