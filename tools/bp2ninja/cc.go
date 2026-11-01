@@ -348,10 +348,10 @@ func kindOf(t string, want Kind) (Kind, bool) {
 
 // cxxCompat: bionic headers AOSP code relies on and glibc lacks or differs in, put first on the C++ include path of device-side modules (never C: stdatomic.h's C branch needs bionic's bits/), linked unchanged into <out>/compat/cxx.
 //   - stdatomic.h: in C++ bionic maps it onto <atomic>; clang's is incompatible with <atomic> before C++23 (liblog, libbinder, libutils' LightRefBase.h include it from C++).
-//   - linux/ashmem.h: Android's ashmem uapi, absent from distro kernel headers (libcutils ashmem-dev.cpp; at run time a mainline kernel takes its memfd path).
+//
+// Kernel uapi headers only bionic carries (linux/ashmem.h, ...) are not here: the libc provider (atl-bionic) forwards them.
 var cxxCompat = []compatHeader{
 	{"stdatomic.h", "bionic/libc/include/stdatomic.h"},
-	{"linux/ashmem.h", "bionic/libc/kernel/uapi/linux/ashmem.h"},
 }
 
 // deviceCompat: bionic headers on the include path of every device-side C and C++ compile, linked unchanged into <out>/compat/device.

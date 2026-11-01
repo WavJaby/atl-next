@@ -96,6 +96,16 @@ const CASES: &[(&str, &str)] = &[
         "malloc.h: #define M_PURGE (-101)",
         "#include <malloc.h>\nint v[M_PURGE == -101 ? 1 : -1];\n",
     ),
+    // libandroid_runtime NativeLibraryHelper.cpp; 0xEF53 is ext2/3/4's on-disk superblock magic (kernel ext4.h EXT4_SUPER_MAGIC)
+    (
+        "sys/statfs.h: #include <sys/vfs.h>, which includes <linux/magic.h>",
+        "#include <sys/statfs.h>\nint v[EXT4_SUPER_MAGIC == 0xEF53 ? 1 : -1];\n",
+    ),
+    // libandroid_runtime AndroidRuntime.cpp setArgv0; bare, an undeclared function
+    (
+        "stdlib.h: void setprogname(const char*)",
+        "#include <stdlib.h>\n__typeof__(setprogname) *v = setprogname;\n",
+    ),
 ];
 
 fn target(args: Vec<String>) -> Target {

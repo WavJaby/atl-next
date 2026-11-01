@@ -280,6 +280,23 @@ pub unsafe extern "C" fn pthread_gettid_np(thread: core::ffi::c_long) -> c_int {
     unsafe { crate::thread::gettid_of(thread as usize) }
 }
 
+/// Where glibc lacks it (build.rs `IN_HOST_HEADERS`: no glibc has it). The name points into `name`, as bionic's.
+#[cfg(atl_bionic_api = "progname")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setprogname(name: *const c_char) {
+    unsafe extern "C" {
+        /// glibc's short program name (`<errno.h>`, `_GNU_SOURCE`), exported writable.
+        static mut program_invocation_short_name: *const c_char;
+    }
+    // SAFETY: bionic's contract, a NUL-terminated string that outlives the program name; null, where bionic crashes, is ignored
+    let Some(path) = (unsafe { c_str(name) }) else {
+        return;
+    };
+    let offset = crate::progname::short_name_offset(path);
+    // SAFETY: offset <= path.len(), inside `name`'s string or at its NUL; glibc's variable is a plain pointer, written unsynchronised as bionic writes `__progname`
+    unsafe { program_invocation_short_name = name.add(offset) };
+}
+
 // android/dlext.h (libdl) and libdl_android's exported-namespace lookup, through `linker`.
 
 #[unsafe(no_mangle)]

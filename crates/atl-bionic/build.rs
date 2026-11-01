@@ -185,6 +185,17 @@ const APIS: &[Api] = &[
         include_dirs: &[],
         kept: DECLARATIONS,
     },
+    // bionic's <stdlib.h> (IN_HOST_HEADERS): libandroid_runtime AndroidRuntime.cpp setArgv0 after rewriting argv[0]
+    Api {
+        name: "progname",
+        source: "bionic/libc/include/stdlib.h",
+        lang: Lang::C,
+        header: Some("atl-bionic/stdlib.h"),
+        functions: &["setprogname"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
     // a platform header, constants only (2026-11-01: libmediautils TimeCheck.cpp through
     // debuggerd/handler.h, DEBUGGER_SIGNAL): the signal numbers bionic reserves, `__SIGRTMIN + n`,
     // evaluated. Its inline signal-mask filter is not printed. 35 (the debugger's) is glibc's
@@ -206,8 +217,8 @@ const APIS: &[Api] = &[
 /// `atl-bionic/<header>`, included by the shape wrapper of `<header>` (`shape::Inputs::extra`). A row is
 /// generated, and implemented (`cfg(atl_bionic_api = "<row>")`), only where the host's header with
 /// `_GNU_SOURCE` declares none of its functions; where it declares all, the host's serve, as any libc
-/// function; some but not all fails. `pthread_gettid_np`: glibc >= 2.42.
-const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h")];
+/// function; some but not all fails. `pthread_gettid_np`: glibc >= 2.42. `setprogname`: BSD, no glibc has it.
+const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h"), ("progname", "stdlib.h")];
 
 /// What the shape wrapper of a host header includes beyond bionic's shape (`shape::Inputs::extra`),
 /// besides `IN_HOST_HEADERS`. `asm/unistd.h`: under `__ANDROID__` without `__BIONIC__`, liblog's
@@ -218,8 +229,12 @@ const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h")];
 /// uapi include), so it brings `O_CLOEXEC` and the other `O_*` flags; libmemunreachable LeakPipe.h ->
 /// ScopedPipe.h calls `pipe2(fd, O_CLOEXEC)` after `<sys/socket.h>` alone. glibc's home for those flags is
 /// `<fcntl.h>`; uapi `<asm/fcntl.h>` itself would redefine glibc's `struct flock`.
-const EXTRA_INCLUDES: &[(&str, &str)] =
-    &[("unistd.h", "asm/unistd.h"), ("sys/socket.h", "fcntl.h")];
+/// `linux/magic.h`: bionic's `<sys/vfs.h>` (and `<sys/statfs.h>` through it) includes it, a kernel uapi include the shape walk does not derive; libandroid_runtime NativeLibraryHelper.cpp compares `statfs.f_type` with `EXT4_SUPER_MAGIC` after `<sys/statfs.h>` alone. Macros only, so glibc's header followed by it compiles.
+const EXTRA_INCLUDES: &[(&str, &str)] = &[
+    ("unistd.h", "asm/unistd.h"),
+    ("sys/socket.h", "fcntl.h"),
+    ("sys/vfs.h", "linux/magic.h"),
+];
 
 /// bionic's property-area implementation and the headers holding its layouts.
 const PROP_AREA_SOURCES: &[&str] = &[

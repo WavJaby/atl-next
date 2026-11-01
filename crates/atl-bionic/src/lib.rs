@@ -18,6 +18,7 @@
 //!   one it lacks.
 //! - `android_set_abort_message` (`abort`): the first message, for a crash report.
 //! - `pthread_gettid_np` (`thread`), where glibc lacks it (< 2.42).
+//! - `setprogname` (`progname`): the short name into glibc's `program_invocation_short_name`.
 //! - `<bionic/reserved_signals.h>`: bionic's reserved signal numbers, constants only.
 //!
 //! Built as one shared library per process (cargo-c), so one store, one target SDK, one abort message.
@@ -56,6 +57,11 @@ mod generated {
     pub mod pthread {
         include!(concat!(env!("OUT_DIR"), "/pthread.rs"));
     }
+    /// Generated only where the host's `<stdlib.h>` lacks `setprogname` (build.rs `IN_HOST_HEADERS`).
+    #[cfg(atl_bionic_api = "progname")]
+    pub mod progname {
+        include!(concat!(env!("OUT_DIR"), "/progname.rs"));
+    }
     pub mod reserved_signals {
         include!(concat!(env!("OUT_DIR"), "/reserved_signals.rs"));
     }
@@ -80,6 +86,8 @@ pub mod image;
 mod linker;
 #[allow(unsafe_code)]
 mod map;
+#[cfg_attr(not(atl_bionic_api = "progname"), allow(dead_code))]
+mod progname;
 pub mod props;
 pub mod sdk;
 mod store;
