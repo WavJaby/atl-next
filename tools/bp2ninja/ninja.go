@@ -448,7 +448,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		}
 	}
 	libs = append(libs, "-Wl,--end-group")
-	var provided []string
+	var provided, providedRpath []string
 	// several provided modules may share an artifact (libEGL and libGLESv2: atl-opengl), linked once
 	seenLib := map[string]bool{}
 	for _, d := range sharedOrder {
@@ -458,7 +458,8 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		for _, l := range d.libs {
 			if !seenLib[l] {
 				seenLib[l] = true
-				provided = append(provided, l, "-Wl,-rpath,"+filepath.Dir(l))
+				provided = append(provided, l)
+				providedRpath = append(providedRpath, "-Wl,-rpath,"+filepath.Dir(l))
 				inputs = append(inputs, l)
 			}
 		}
@@ -472,6 +473,10 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 			inputs = append(inputs, d.out)
 		}
 	}
+	// provided dirs search after the tree's: a system provider's dir (/usr/lib/<triple>) holds distro builds
+	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every
+	// one of them at load time (libselinux: distro lacks AOSP's LIBSELINUX_R version node -> load fails)
+	libs = append(libs, providedRpath...)
 	// glibc's split of bionic's libc; bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) is
 	// glibc's libresolv, needed only where used
 	libs = append(libs, "-stdlib=libc++", "-lpthread", "-ldl", "-lrt", "-lm",

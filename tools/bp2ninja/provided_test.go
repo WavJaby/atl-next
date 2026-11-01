@@ -46,7 +46,7 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 			if n.name == goal {
 				flags = g.compileFlags(n).cxx
 				// first although libuser names libother before it
-				if l, _ := g.linkLibs(n); !slices.Equal(l[:2], []string{lib, "-Wl,-rpath,/prefix/lib"}) {
+				if l, _ := g.linkLibs(n); l[0] != lib || !slices.Contains(l, "-Wl,-rpath,/prefix/lib") {
 					t.Errorf("%s: link libs %q", goal, l)
 				}
 			}
@@ -83,9 +83,16 @@ cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "li
 			continue
 		}
 		l, inputs := g.linkLibs(n)
-		want := []string{"/usr/lib/libEGL.so", "-Wl,-rpath,/usr/lib", ext, "-Wl,-rpath,/crates/lib", "/usr/lib/libGLESv2.so", "-Wl,-rpath,/usr/lib"}
+		want := []string{"/usr/lib/libEGL.so", ext, "/usr/lib/libGLESv2.so"}
 		if !slices.Equal(l[:len(want)], want) {
 			t.Errorf("link libs %q", l)
+		}
+		// the tree's rpath before the providers': a distro dir must not shadow a library the tree builds (libz, libselinux)
+		tree := slices.IndexFunc(l, func(s string) bool {
+			return strings.HasPrefix(s, "-Wl,-rpath,") && s != "-Wl,-rpath,/usr/lib" && s != "-Wl,-rpath,/crates/lib"
+		})
+		if sys, crate := slices.Index(l, "-Wl,-rpath,/usr/lib"), slices.Index(l, "-Wl,-rpath,/crates/lib"); tree < 0 || sys < tree || crate < tree {
+			t.Errorf("rpath order %q", l)
 		}
 		if c := slices.Index(inputs, ext); c < 0 || slices.Index(inputs[c+1:], ext) >= 0 {
 			t.Errorf("%s not linked exactly once: %q", ext, inputs)
@@ -134,7 +141,7 @@ cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
 		l, _ := g.linkLibs(n)
 		switch n.name {
 		case "librt":
-			if !slices.Equal(l[:2], []string{lib, "-Wl,-rpath,/crates/lib"}) {
+			if l[0] != lib || !slices.Contains(l, "-Wl,-rpath,/crates/lib") {
 				t.Errorf("librt link libs %q", l)
 			}
 		case "libsk":
@@ -231,7 +238,7 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 	}
 	libs := ninja[strings.Index(ninja, "liba.so: link"):]
 	libs = libs[strings.Index(libs, "libs = ")+len("libs = "):]
-	if !strings.HasPrefix(libs, "/c/lib/libatl_bionic.so -Wl,-rpath,/c/lib ") {
+	if !strings.HasPrefix(libs, "/c/lib/libatl_bionic.so ") || !strings.Contains(libs, " -Wl,-rpath,/c/lib ") {
 		t.Errorf("liba libs %q", libs[:strings.Index(libs, "\n")])
 	}
 	// bionic's headers as system headers; not where libc is declined, which still gets api-level.h, forced from compat/device (TestWriteCompat)
