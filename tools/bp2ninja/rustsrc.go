@@ -15,9 +15,8 @@ import (
 //     A crate whose srcs names a provider (`srcs: ["lib.rs", ":x_bindgen"]`) takes the source variant alone: a Kind Gen node, no rustc step, its outputs copied into that crate's OUT_DIR (rust.go).
 //     Both nodes write the same edges, emitted once.
 //   - A provider is one rustSourceProviders row: the crates it adds (SourceProviderDeps) and its generation (GenerateSource). Its module's srcs are not read.
-//   - Rows: rust_protobuf[_host] (protobuf.go), rust_bindgen[_host] (bindgen.go). What each later one adds:
+//   - Rows: rust_protobuf[_host] (protobuf.go), rust_bindgen[_host] (bindgen.go), the aidl_interface rust backend (aidl_rust_source_provider.go; a module synthAidl makes, type aidlRustType). What a later one adds:
 //     rust_aconfig_library: `aconfig create-rust-lib` over an aconfig_declarations cache (aconfig.go's graph) and its storage crates as rustlibs.
-//     aidl_interface's rust backend: `aidl --lang=rust` over the interface's sources (aidliface.go), a generated mod file of the packages, libbinder_rs.
 
 // rustSource: what a provider generated for its node.
 type rustSource struct {
@@ -28,8 +27,8 @@ type rustSource struct {
 
 // rustSourceProvider is one provider module type (Soong's SourceProvider).
 type rustSourceProvider interface {
-	// crates: rustlibs it adds to its module's (SourceProviderDeps)
-	crates() []string
+	// deps: the rustlibs and proc_macros it adds to its module's (SourceProviderDeps)
+	deps(n *Node) (crates, procMacros []string)
 	// gen writes n's generation steps on n.edges (GenerateSource); n's cc libraries (whole_static_libs, static_libs, shared_libs) are resolved by then, in an rlib also its crates. fail marks the node broken.
 	gen(g *Graph, n *Node, fail func(string, ...any)) rustSource
 }
@@ -38,6 +37,7 @@ type rustSourceProvider interface {
 var rustSourceProviders = map[string]rustSourceProvider{
 	"rust_protobuf": rustProtobuf{}, "rust_protobuf_host": rustProtobuf{},
 	"rust_bindgen": rustBindgen{}, "rust_bindgen_host": rustBindgen{},
+	aidlRustType: rustAidl{},
 }
 
 // rustProtobuf: rust_protobuf[_host].
@@ -46,7 +46,7 @@ type rustProtobuf struct{}
 // rustProtobufPlugin: the protoc plugin rust_protobuf runs (protobuf.go HostToolPath "protoc-gen-rust"), a rust_binary_host of external/rust/android-crates-io/crates/protobuf-codegen built like any host tool.
 const rustProtobufPlugin = "protoc-gen-rust"
 
-func (rustProtobuf) crates() []string { return []string{"libprotobuf"} }
+func (rustProtobuf) deps(*Node) ([]string, []string) { return []string{"libprotobuf"}, nil }
 
 // gen: protobuf.go GenerateSource. Each x.proto -> x.rs by `aprotoc --rust_out=:<dir>` with protoc-gen-rust, and the crate root mod_<source_stem>.rs (genModFileContents):
 // `pub mod x;` per proto in protos order, then `pub use <crate>::*;` per rust_protobuf module of rustlibs (collectIncludedProtos), so their messages resolve from ours.
@@ -136,7 +136,7 @@ const rustBindgenTool = "bindgen"
 // rustBionicLibs: rust/compiler.go bionicDeps, the cc libraries bindgen.go SourceProviderDeps adds on a bionic toolchain (device) unless no_stdlibs: bionic's headers reach clang through their exports.
 var rustBionicLibs = []string{"liblog", "libc", "libm", "libdl"}
 
-func (rustBindgen) crates() []string { return nil }
+func (rustBindgen) deps(*Node) ([]string, []string) { return nil, nil }
 
 // gen: bindgen.go GenerateSource. `bindgen <bindgen_flags> <flag files' words> <wrapper_src> -o <source_stem>.rs -- <clang flags>`, with clang's depfile.
 //   - Clang flags: the cc compile's of the same side (compileFlags: global defines, device toolchain cflags, API level and forced bionic headers, cflags, cppflags, local_include_dirs, the exports of
@@ -204,4 +204,97 @@ func (rustBindgen) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource 
 			{"flags", shellQuote(moduleFlags(p, "bindgen_flags"))}, {"flagfiles", shellQuote(flagFiles)}, {"cflags", shellQuote(cflags)},
 		}})
 	return rustSource{outs: []string{out}}
+}
+
+// rustAidl: an aidl_interface's `<iface>[-V<n>]-rust` (aidl_interface_backends.go addRustLibrary), a module synthAidl makes with its aidlSpec; Soong's `-rust-source` aidl_gen_rule is this node's own generation.
+type rustAidl struct{}
+
+// aidlRustType: the type of the module synthAidl makes for a rust backend (Soong's wrapLibraryFactory(aidlRustLibraryFactory), a source provider module no Android.bp can name).
+const aidlRustType = "rust_aidl_interface_backend"
+
+// deps: aidl_rust_source_provider.go SourceProviderDeps: libbinder_rs, the imports' rust backends (getImportsWithVersion), libstatic_assertions; proc macro libasync_trait.
+func (rustAidl) deps(n *Node) ([]string, []string) {
+	return slices.Concat([]string{"libbinder_rs"}, n.mod.aidl.imports, []string{"libstatic_assertions"}), []string{"libasync_trait"}
+}
+
+// gen: aidl_gen_rule.go (lang rust) + aidl_rust_source_provider.go GenerateSource. Each x.aidl -> <rel>.rs (rel: the path below its import root) by `aidl --lang=rust --ninja`, flags as the cpp backends (aidlSpec.flags);
+// then the crate root <source_stem>.rs, aidl_rust_glue.py's layout: `pub mod aidl` mirroring the package dirs, one module per file, and `pub mod mangled` re-exporting each file's mangled names plus `pub(crate) use <import crate>::mangled::*;`.
+//   - The glue script copies each file's text into its `pub mod <stem> { … }`; here the module is `#[path = "<abs>"] pub mod <stem>;`, same module contents (inner attributes included), and the root is written at conversion time, the .rs files are rustc's implicit inputs.
+func (rustAidl) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
+	s := n.mod.aidl
+	dir := g.genDir(n, "")
+	tools := []edgeTool{{"aidl", g.hostTool("aidl", n)}}
+	src := rustSource{outs: []string{filepath.Join(dir, n.props.str("source_stem")+".rs")}}
+	root := &aidlRustMod{nested: map[string]*aidlRustMod{}}
+	for _, f := range s.srcs {
+		if f.gen != nil {
+			g.useGen(n, f.gen)
+		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")
+		out := filepath.Join(dir, rel+".rs")
+		flags, implicit := s.flags(g, f)
+		n.edges = append(n.edges, genEdge{rule: "aidl_rust", outs: []string{out}, in: g.abs(f.path), implicit: implicit, tools: tools, vars: [][2]string{
+			{"flags", shellQuote(flags)}, {"outdir", esc(dir)}, {"dep", esc(out + ".d")},
+		}})
+		src.outs = append(src.outs, out)
+		parts := strings.Split(rel, "/")
+		m := root
+		for _, p := range parts[:len(parts)-1] {
+			m = m.child(p)
+		}
+		m.files = append(m.files, [2]string{parts[len(parts)-1], out})
+	}
+	b := &strings.Builder{}
+	fmt.Fprintf(b, "// generated by bp2ninja from the aidl sources of %s, do not edit\n", n.mod.Name)
+	b.WriteString("#![allow(non_snake_case)]\n#![allow(missing_docs)]\n#[deprecated(note = \"Please access via libbinder_rs binder::\")]\npub use binder;\n")
+	b.WriteString("pub mod aidl {\n")
+	root.emit(b, "  ")
+	b.WriteString("}\npub mod mangled {\n")
+	root.emitMangled(b, "super::aidl")
+	for _, c := range s.mangled {
+		fmt.Fprintf(b, "  pub(crate) use %s::mangled::*;\n", c)
+	}
+	b.WriteString("}\n")
+	g.genFile(src.outs[0], b.String())
+	return src
+}
+
+// aidlRustMod: one package dir of the glue's module tree (aidl_rust_glue.py RustModule): its files (stem, path) and sub-packages, both in source order.
+type aidlRustMod struct {
+	files  [][2]string
+	nested map[string]*aidlRustMod
+	order  []string
+}
+
+func (m *aidlRustMod) child(name string) *aidlRustMod {
+	if c, ok := m.nested[name]; ok {
+		return c
+	}
+	c := &aidlRustMod{nested: map[string]*aidlRustMod{}}
+	m.nested[name] = c
+	m.order = append(m.order, name)
+	return c
+}
+
+// emit: RustModule.emit, files first, then sub-packages.
+func (m *aidlRustMod) emit(b *strings.Builder, indent string) {
+	for _, f := range m.files {
+		// a Rust string literal: only \ and " need escaping (Go's %q writes \u escapes Rust reads differently)
+		fmt.Fprintf(b, "%s#[path = \"%s\"]\n%spub mod %s;\n", indent, strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(f[1]), indent, f[0])
+	}
+	for _, name := range m.order {
+		fmt.Fprintf(b, "%spub mod %s {\n", indent, name)
+		m.nested[name].emit(b, indent+"  ")
+		fmt.Fprintf(b, "%s}\n", indent)
+	}
+}
+
+// emitMangled: RustModule.emit_mangled, one flat list at the mangled module's indent.
+func (m *aidlRustMod) emitMangled(b *strings.Builder, prefix string) {
+	for _, f := range m.files {
+		fmt.Fprintf(b, "  pub use %s::%s::mangled::*;\n", prefix, f[0])
+	}
+	for _, name := range m.order {
+		m.nested[name].emitMangled(b, prefix+"::"+name)
+	}
 }

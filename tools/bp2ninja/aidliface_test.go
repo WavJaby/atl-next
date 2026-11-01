@@ -342,9 +342,8 @@ func TestAidlBackendOptions(t *testing.T) {
 func TestAidlBackendRefusals(t *testing.T) {
 	g := aidlGraph(t)
 	for ref, want := range map[string]string{
-		// backends other than cpp / ndk are not built
+		// backends other than cpp / ndk / rust are not built
 		"app-V1-java":         "app-V1-java: aidl_interface backend java is unsupported",
-		"app-V2-rust":         "app-V2-rust: aidl_interface backend rust is unsupported",
 		"app-cpp-analyzer":    "app-cpp-analyzer: aidl_interface backend cpp-analyzer is unsupported",
 		"app-V1-ndk_platform": "app-V1-ndk_platform: aidl_interface backend ndk_platform is unsupported",
 		// addLibrary names: a stable interface has only versioned backends, an unstable one only the unversioned

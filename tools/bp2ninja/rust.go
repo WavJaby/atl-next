@@ -30,7 +30,7 @@ import (
 //   - Exception, providers.toml `rust_os = "android"` (g.rustAndroid): a device crate whose Android behaviour this runtime provides (system properties, liblog) takes the android blocks
 //     and gets `--cfg atl_android_userspace` (rustAndroidCfg), which a patch to its source adds to exactly the `target_os = "android"` gates it needs; its host variant is untouched.
 //   - Lints: `--cap-lints allow` for every crate, as cc's -w: a newer rustc warns differently, errors are what this build measures (Soong caps only external/ and prebuilts/).
-//   - Source providers (rust_protobuf, rust_bindgen): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
+//   - Source providers (rust_protobuf, rust_bindgen, aidl_interface rust backends): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
 //   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
 
 // rustOSSide: the side whose OS blocks a Rust module takes on side (flatten): rustc compiles for linux_glibc, so Host, but Device for a device variant of a rust_os = "android" row.
@@ -260,15 +260,15 @@ func (g *Graph) rustNode(n *Node) {
 			r.externs = append(r.externs, rustExtern{name, d})
 		}
 	}
-	var spCrates []string
+	var spCrates, spMacros []string
 	if sp != nil {
-		spCrates = sp.crates()
+		spCrates, spMacros = sp.deps(n)
 	}
 	for _, ref := range slices.Concat(p.strs("rustlibs"), p.strs("rlibs"), spCrates) {
 		crate(ref, n.side, Rlib)
 	}
 	// proc macros run in the compiler: host crates whatever the side
-	for _, ref := range p.strs("proc_macros") {
+	for _, ref := range slices.Concat(p.strs("proc_macros"), spMacros) {
 		crate(ref, Host, ProcMacro)
 	}
 	n.deps.crates = uniqueNodes(n.deps.crates)

@@ -7,7 +7,7 @@ import "sort"
 // Modules a module type's load hook creates, defined in no Android.bp: lookup falls back to synth for a name no module answers to, and for a
 // hidl_interface (named like its cc library). One synthesizer per module type, each returning nil without a problem when ref is none of its names
 // and nil with one when it is but cannot be built; the result is memoized per ref and side.
-//   - aidl_interface: `<iface>[-V<n>]-<cpp|ndk>` cc libraries (aidliface.go).
+//   - aidl_interface: `<iface>[-V<n>]-<cpp|ndk>` cc libraries, `<iface>[-V<n>]-rust` Rust libraries (aidliface.go).
 //   - hidl_interface: the cc library `<pkg>@<ver>`, genrules `<pkg>@<ver>_genc++[_headers]`, filegroup `<pkg>@<ver>_hal` (hidliface.go).
 //   - sysprop_library: the cc library `lib<name>` (sysprop.go).
 //

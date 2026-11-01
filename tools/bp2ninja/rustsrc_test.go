@@ -305,3 +305,124 @@ func TestRustProviderInSrcs(t *testing.T) {
 		t.Errorf("libprotosrc %+v", n.rust)
 	}
 }
+
+// Expected values come from system/tools/aidl/build: aidl_interface_backends.go addRustLibrary (`<iface>-V<n>-rust`, crate_name = fixRustName(iface), source_stem = fixRustName(versioned name),
+// rustlibs = additional_rustlibs), aidl_gen_rule.go (`aidl --lang=rust` per source, out = rel path .rs, flags without -t, --mockall after it), aidl_rust_source_provider.go
+// (SourceProviderDeps: libbinder_rs, imports' -rust, libstatic_assertions; proc macro libasync_trait) and aidl_rust_glue.py (the root's text); never from the code under test.
+const rustAidlTree = `
+cc_binary_host { name: "aidl", srcs: ["aidl.cc"] }
+rust_library { name: "libbinder_rs", crate_name: "binder", srcs: ["b.rs"] }
+rust_library { name: "libstatic_assertions", crate_name: "static_assertions", srcs: ["s.rs"] }
+rust_proc_macro { name: "libasync_trait", crate_name: "async_trait", srcs: ["a.rs"] }
+rust_library { name: "libextra", crate_name: "extra", srcs: ["e.rs"] }
+aidl_interface {
+    name: "base.iface",
+    local_include_dir: "base",
+    srcs: ["base/com/base/IBase.aidl"],
+    versions_with_info: [{ version: "1", imports: [] }],
+}
+aidl_interface {
+    name: "top",
+    local_include_dir: "aidl",
+    srcs: ["aidl/com/top/ITop.aidl", "aidl/com/top/sub/Data.aidl", "aidl/Root.aidl"],
+    imports: ["base.iface"],
+    stability: "vintf",
+    backend: { rust: { gen_mockall: true, additional_rustlibs: ["libextra"], min_sdk_version: "33" } },
+}
+aidl_interface { name: "off", unstable: true, srcs: ["o/IOff.aidl"], backend: { rust: { enabled: false } } }
+rust_library { name: "libuser", crate_name: "user", srcs: ["u.rs"], rustlibs: ["top-V1-rust"] }
+`
+
+func TestAidlRustBackend(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": rustAidlTree, "p/aidl_api/base.iface/1/com/base/IBase.aidl": "", "p/aidl_api/base.iface/1/.hash": "hash-b1\n"})
+	user := g.node("libuser", Device, Rlib, "goal")
+	if user == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	n := g.nodes[key{"top-V1-rust", Device, Rlib}]
+	if n == nil || n.rust.broken != "" {
+		t.Fatalf("top-V1-rust %+v", n)
+	}
+	// the crate is named after the interface, whatever the version: libuser's extern is `top`
+	if n.rust.crateName != "top" || len(user.rust.externs) != 1 || user.rust.externs[0].name != "top" {
+		t.Errorf("crate %q, user externs %+v", n.rust.crateName, user.rust.externs)
+	}
+	// additional_rustlibs first (the module's rustlibs), then SourceProviderDeps; the import's next version (top is the next version itself, getImportWithVersion)
+	if got := depNames(n.deps.crates); !slices.Equal(got, []string{"libextra", "libbinder_rs", "base.iface-V2-rust", "libstatic_assertions", "libasync_trait"}) {
+		t.Errorf("crates %v", got)
+	}
+	gd := filepath.Join(g.out, "gen", "device", "top-V1-rust")
+	root := filepath.Join(gd, "top_V1.rs")
+	outs := []string{filepath.Join(gd, "com/top/ITop.rs"), filepath.Join(gd, "com/top/sub/Data.rs"), filepath.Join(gd, "Root.rs")}
+	if !slices.Equal(n.rust.source.outs, append([]string{root}, outs...)) || n.rust.root != root {
+		t.Errorf("outs %v root %s", n.rust.source.outs, n.rust.root)
+	}
+	// one aidl step per source: no versions -> --version 1, no .hash -> notfrozen; no -t; --mockall; the import's sources as -I, own root as -N
+	wantFlags := "-Weverything -Wno-missing-permission-annotation --structured --version 1 --hash notfrozen --mockall --stability vintf --min_sdk_version 33 -I" + g.abs("p/base") + " -N" + g.abs("p/aidl")
+	tool := g.nodes[key{"aidl", Host, Binary}]
+	srcs := []string{"p/aidl/com/top/ITop.aidl", "p/aidl/com/top/sub/Data.aidl", "p/aidl/Root.aidl"}
+	if len(n.edges) != len(srcs) || tool == nil {
+		t.Fatalf("edges %+v", n.edges)
+	}
+	for i, e := range n.edges {
+		want := map[string]string{"flags": wantFlags, "outdir": gd, "dep": outs[i] + ".d"}
+		if e.rule != "aidl_rust" || e.in != g.abs(srcs[i]) || !slices.Equal(e.outs, outs[i:i+1]) || !slices.Equal(e.tools, []edgeTool{{"aidl", tool}}) || !maps.Equal(edgeVars(e), want) {
+			t.Errorf("edge %d %+v, vars %v", i, e, edgeVars(e))
+		}
+	}
+	// the root: aidl_rust_glue.py's output for these inputs, each `pub mod X { <text> }` as a #[path] module
+	if err := g.writeGenFiles(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		"#![allow(non_snake_case)]",
+		"#![allow(missing_docs)]",
+		`#[deprecated(note = "Please access via libbinder_rs binder::")]`,
+		"pub use binder;",
+		"pub mod aidl {",
+		`  #[path = "` + outs[2] + `"]`,
+		"  pub mod Root;",
+		"  pub mod com {",
+		"    pub mod top {",
+		`      #[path = "` + outs[0] + `"]`,
+		"      pub mod ITop;",
+		"      pub mod sub {",
+		`        #[path = "` + outs[1] + `"]`,
+		"        pub mod Data;",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+		"pub mod mangled {",
+		"  pub use super::aidl::Root::mangled::*;",
+		"  pub use super::aidl::com::top::ITop::mangled::*;",
+		"  pub use super::aidl::com::top::sub::Data::mangled::*;",
+		"  pub(crate) use base_iface::mangled::*;",
+		"}",
+	}, "\n")
+	if lines := strings.SplitN(strings.TrimSpace(string(body)), "\n", 2); len(lines) != 2 || lines[1] != want {
+		t.Errorf("root %s", body)
+	}
+	// the frozen import's version: its aidl_api sources, hash read
+	base := g.nodes[key{"base.iface-V2-rust", Device, Rlib}]
+	if base == nil || len(base.edges) != 1 || !strings.Contains(edgeVars(base.edges[0])["flags"], "--version 2 --hash notfrozen") {
+		t.Errorf("base %+v", base)
+	}
+	if b1 := g.node("base.iface-V1-rust", Device, Rlib, "t"); b1 == nil || !strings.Contains(edgeVars(b1.edges[0])["flags"], "--version 1 --hash hash-b1") {
+		t.Errorf("base V1 %+v", b1)
+	}
+	// rustc compiles the root with the generated modules as implicit inputs
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc"})
+	rustc := ninjaEdgeVars(ninja, filepath.Join(g.out, "device/top-V1-rust/libtop.rlib"))
+	if rustc == nil || !strings.Contains(rustc[""], ": rustc "+root+" | "+strings.Join(outs, " ")) {
+		t.Errorf("rustc step %v", rustc)
+	}
+	// backend.rust.enabled: false: no module, one problem
+	if m := g.lookup("off-rust", Device); m != nil || !g.hasProblem("off-rust: backend.rust.enabled is false") {
+		t.Errorf("disabled rust backend: %v, problems %v", m, g.problems)
+	}
+}

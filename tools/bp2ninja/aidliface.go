@@ -12,7 +12,9 @@ import (
 	"strings"
 )
 
-// aidl_interface backends: Soong creates `<iface>[-V<n>]-<lang>` cc libraries in the interface's load hook, no Android.bp defines them.
+// aidl_interface backends: Soong creates `<iface>[-V<n>]-<lang>` cc libraries (cpp, ndk) and Rust libraries (rust) in the interface's load hook, no Android.bp defines them.
+//   - rust (addRustLibrary): a source-provider rlib (rustsrc.go rustAidl, type aidlRustType) generating its own sources with the same aidl flags as the cc backends but no -t / --log; crate_name = the interface
+//     name, crate root = the versioned name (fixRustName), rustlibs = backend.rust.additional_rustlibs + the provider's.
 // Spec: system/tools/aidl/build/{aidl_interface.go, aidl_interface_backends.go, aidl_gen_rule.go}. lookup falls back to synth (synth.go), which
 // calls synthAidl to make the Module; its sources go through the extension table (gensrc.go genAidl) like any cc module's, with per-interface flags.
 //   - Names (addLibrary): the next version (latest frozen + 1, "1" with no versions) and every frozen version are `<iface>-V<v>-<lang>`; an
@@ -30,7 +32,7 @@ import (
 //   - RELEASE_AIDL_USE_UNFROZEN is false in the pinned release chain (flag_values: ap2a, ap3a false, no later config sets it), so an unfrozen
 //     version of a frozen interface gets --previous_api_dir / --previous_hash.
 //   - `headers` (aidl_library modules) are -I dirs after include_dirs (aidl_api.go getDeps).
-//   - Not built, one problem each: java, rust, cpp-analyzer, ndk_platform backends; a backend with enabled: false; a
+//   - Not built, one problem each: java, cpp-analyzer, ndk_platform backends; a backend with enabled: false; a
 //     host backend of an interface without host_supported; the next version of a `frozen: true` interface (Soong rejects its users); a
 //     version the interface does not have. Soong's -Wall -Werror cflags, ldflags, tidy, sdk_version/stl are dropped (this build uses -w -Wno-error).
 
@@ -241,19 +243,23 @@ func (g *Graph) aidlSources(i *aidlIface, version string) []srcFile {
 
 // aidlSpec is how one backend's sources are generated: the part of the aidl command line that is per interface and version.
 type aidlSpec struct {
-	lang       string // cpp | ndk
-	name       string // interface name (aidl_api/<name>)
-	dir        string // its module dir
-	version    string // "" = unversioned
-	unstable   bool
-	warnings   []string // -W flags of the unfrozen version
-	trace, log bool
-	stability  string
-	minSdk     string
-	roots      []string // own source roots (-N)
-	includes   []string // tree-relative import roots and include_dirs (-I)
-	prevVer    string   // previous frozen version when this one is unfrozen, "" = none
-	srcs       []srcFile
+	lang                string // cpp | ndk | rust
+	name                string // interface name (aidl_api/<name>)
+	dir                 string // its module dir
+	version             string // "" = unversioned
+	unstable            bool
+	warnings            []string // -W flags of the unfrozen version
+	trace, log, mockall bool
+	// the imports' backends of the same lang (addLanguageLibraries / rust SourceProviderDeps)
+	imports []string
+	// rust: the imports' crate names, whose `mangled` modules the crate root re-exports (aidl_rust_source_provider.go importFlags)
+	mangled   []string
+	stability string
+	minSdk    string
+	roots     []string // own source roots (-N)
+	includes  []string // tree-relative import roots and include_dirs (-I)
+	prevVer   string   // previous frozen version when this one is unfrozen, "" = none
+	srcs      []srcFile
 	// the missing previous .hash is one problem, not one per source
 	prevReported bool
 }
@@ -277,7 +283,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	if i == nil {
 		return nil
 	}
-	if lang != "cpp" && lang != "ndk" {
+	if lang != "cpp" && lang != "ndk" && lang != "rust" {
 		g.problem("%s: aidl_interface backend %s is unsupported", ref, lang)
 		return nil
 	}
@@ -310,6 +316,10 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	}
 	spec := &aidlSpec{lang: lang, name: name, dir: i.mod.Dir, version: ver, unstable: i.unstable, srcs: srcs,
 		trace: be.boolean("gen_trace", true), log: be.boolean("gen_log", false), stability: p.str("stability"), minSdk: "current"}
+	if lang == "rust" {
+		// addRustLibrary's aidl_gen_rule sets neither GenTrace (b/236880829) nor GenLog; GenMockall from backend.rust.gen_mockall
+		spec.trace, spec.log, spec.mockall = false, false, be.boolean("gen_mockall", false)
+	}
 	if v := be.str("min_sdk_version"); v != "" {
 		spec.minSdk = v
 	} else if v := p.str("min_sdk_version"); v != "" {
@@ -336,6 +346,19 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		spec.includes = appendMissing(spec.includes, g.aidlLibraryDirs(h, side, ref, map[string]bool{}))
 	}
 
+	for _, r := range g.resolveImports(i, ver) {
+		spec.imports = append(spec.imports, r.iface.versionedName(r.version)+"-"+lang)
+		spec.mangled = append(spec.mangled, fixRustName(r.iface.mod.Name))
+	}
+	if lang == "rust" {
+		// addRustLibrary: crate named after the interface, root after its version; rustlibs = additional_rustlibs, the rest is the provider's (rustAidl.deps)
+		props := newObj()
+		props.set("crate_name", fixRustName(name))
+		props.set("source_stem", fixRustName(i.versionedName(ver)))
+		props.set("rustlibs", strVals(be.strs("additional_rustlibs")))
+		return &Module{Type: aidlRustType, Name: ref, Dir: i.mod.Dir, Props: props, aidl: spec}
+	}
+
 	// addCppLibrary: dependencies and exports
 	export, shared := []string{"libbinder_ndk"}, be.strs("additional_shared_libraries")
 	if lang == "cpp" {
@@ -344,10 +367,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 			shared = append(shared, "libcutils")
 		}
 	}
-	var imports []string
-	for _, r := range g.resolveImports(i, ver) {
-		imports = append(imports, r.iface.versionedName(r.version)+"-"+lang)
-	}
+	imports := spec.imports
 	cflags := be.strs("cflags")
 	if lang == "ndk" {
 		cflags = append(cflags, "-DBINDER_STABILITY_SUPPORT")
@@ -361,6 +381,9 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	props.set("aidl", a)
 	return &Module{Type: "cc_library", Name: ref, Dir: i.mod.Dir, Props: props, aidl: spec}
 }
+
+// fixRustName: aidl_utils.go's function of the same name, `-` and `.` -> `_`.
+func fixRustName(name string) string { return strings.NewReplacer("-", "_", ".", "_").Replace(name) }
 
 // aidlLibraryDirs: the import dirs of an aidl_library (build/soong/aidl_library): <module dir>/strip_import_prefix, then those of its aidl_library
 // deps. Its srcs / hdrs files are found through these dirs and the depfile, so they are not listed as inputs.
@@ -419,6 +442,9 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 	}
 	if s.trace {
 		flags = append(flags, "-t")
+	}
+	if s.mockall {
+		flags = append(flags, "--mockall")
 	}
 	if s.stability != "" {
 		flags = append(flags, "--stability", s.stability)

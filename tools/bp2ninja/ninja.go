@@ -94,6 +94,11 @@ rule aidl
   depfile = $dep
   deps = gcc
   description = aidl $in
+rule aidl_rust
+  command = $aidl --lang=rust $flags --ninja -d $dep -o $outdir $in
+  depfile = $dep
+  deps = gcc
+  description = aidl rust $in
 rule protoc
   command = $aprotoc --cpp_out=$params:$outdir --dependency_out=$dep -I $base $flags $in
   depfile = $dep
