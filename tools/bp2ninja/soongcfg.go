@@ -36,6 +36,67 @@ type SoongConfig struct {
 	SystemSharedLibs []string
 	Device           DeviceArch      // readDeviceArch
 	RustFeatures     RustFeatureGate // readRustFeatureGate
+	DeviceLink       DeviceLink      // readDeviceLink
+}
+
+// DeviceLink: the part of Soong's device (bionic toolchain) defaults that decides what a shared library or binary exports and what its link may drop; host (linux_glibc) modules get none of it, as in Soong.
+// Only that part: the rest of deviceGlobalCflags / deviceGlobalLdflags is hardening, warnings or lld-only (--icf=safe; distro clang links with GNU ld here).
+// Together with version_script it is what makes a library's unexported dead code disappear: local: * hides a symbol, -ffunction-sections puts it in its own section, --gc-sections drops the section with its undefined references (libhwui's whole-archived libskia SkFontMgr_android_ndk.cpp -> AFont_*).
+type DeviceLink struct {
+	// global.go deviceGlobalCflags' -f*-sections: one section per function / data object, the unit --gc-sections drops
+	Cflags []string
+	// global.go deviceGlobalCppflags' -fvisibility* (-fvisibility-inlines-hidden): inline functions are not exported
+	Cppflags []string
+	// global.go deviceGlobalLdflags' -Wl,--exclude-libs,* (archive members' symbols are not exported), then gcSections, which Soong adds for bionic shared libraries and dynamic binaries (cc/library.go, cc/binary.go: `if toolchain.Bionic()`)
+	Ldflags []string
+}
+
+// gcSections: the literal Soong's cc/library.go and cc/binary.go give a bionic link; readDeviceLink fails when either file stops passing it, since DeviceLink's dead-code dropping rests on it.
+const gcSections = "-Wl,--gc-sections"
+
+// readDeviceLink: DeviceLink from the pinned Soong (global.go's lists, the gcSections literal in library.go and binary.go).
+func readDeviceLink(tree string) (DeviceLink, error) {
+	var d DeviceLink
+	path := filepath.Join(tree, "build/soong/cc/config/global.go")
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return d, err
+	}
+	specs := valueSpecs(f)
+	pick := func(name string, keep func(string) bool) ([]string, error) {
+		list, ok := stringList(specs[name])
+		if !ok {
+			return nil, fmt.Errorf("%s: %s not found (or not a string list)", path, name)
+		}
+		return slices.DeleteFunc(list, func(s string) bool { return !keep(s) }), nil
+	}
+	if d.Cflags, err = pick("deviceGlobalCflags", func(s string) bool { return strings.HasPrefix(s, "-f") && strings.HasSuffix(s, "-sections") }); err != nil {
+		return d, err
+	}
+	if d.Cppflags, err = pick("deviceGlobalCppflags", func(s string) bool { return strings.HasPrefix(s, "-fvisibility") }); err != nil {
+		return d, err
+	}
+	if d.Ldflags, err = pick("deviceGlobalLdflags", func(s string) bool { return strings.HasPrefix(s, "-Wl,--exclude-libs,") }); err != nil {
+		return d, err
+	}
+	for _, rel := range []string{"build/soong/cc/library.go", "build/soong/cc/binary.go"} {
+		src, err := parser.ParseFile(token.NewFileSet(), filepath.Join(tree, rel), nil, 0)
+		if err != nil {
+			return d, err
+		}
+		found := false
+		ast.Inspect(src, func(n ast.Node) bool {
+			if l, ok := n.(*ast.BasicLit); ok && goString(l) == gcSections {
+				found = true
+			}
+			return !found
+		})
+		if !found {
+			return d, fmt.Errorf("%s: no %q literal: Soong no longer garbage-collects bionic links, DeviceLink assumes it does", filepath.Join(tree, rel), gcSections)
+		}
+	}
+	d.Ldflags = append(d.Ldflags, gcSections)
+	return d, nil
 }
 
 // DeviceArch: the ISA Soong's device toolchain targets for the arch and its arches.toml variant (android/arch.go decodeArch, cc/config/<arch>_device.go <arch>ToolchainFactory).

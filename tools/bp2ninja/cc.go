@@ -101,6 +101,8 @@ type Node struct {
 	// final cc links: the generated staticlib holding the link's Rust (rust.go rustStaticlib), "" = none; whole: linked whole
 	rustlib      string
 	rustlibWhole bool
+	// shared libraries and binaries: the version_script file (absolute), "" = none; versionScript resolves it
+	versionScript string
 }
 
 // genClosure: generated files n and its dependencies produce; n's compiles wait for them (headers).
@@ -585,9 +587,28 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if aconfig {
 		g.addGen(n, g.ccAconfigGen(n), true)
 	}
+	n.versionScript = g.versionScript(n)
 	n.exports = g.exportsOf(n)
 	g.order = append(g.order, n)
 	return n
+}
+
+// versionScript: the file a shared library's or binary's link takes as -Wl,--version-script (cc/linker.go linkerFlags: version_script, after target / arch blocks; a path or a `:genrule` output), "" = none.
+// Not on archives: Soong reads it in the linker, which a static library has none of. Vendor / product variants, the only other source of one, are never built here.
+func (g *Graph) versionScript(n *Node) string {
+	v := n.props.str("version_script")
+	if v == "" || n.kind != Shared && n.kind != Binary {
+		return ""
+	}
+	files, ok := g.resolveSrc(n.mod.Dir, n.side, v, n.mod.Name)
+	if !ok {
+		return ""
+	}
+	if len(files) != 1 {
+		g.problem("%s: version_script %s names %d files, want 1", n.mod.Name, v, len(files))
+		return ""
+	}
+	return g.abs(files[0].path)
 }
 
 func uniqueNodes(list []*Node) []*Node {

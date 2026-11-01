@@ -231,11 +231,11 @@ func (g *Graph) emit(tools Tools) string {
 		case Shared, Binary:
 			n.rustlib, n.rustlibWhole = g.rustStaticlib(&b, n)
 			libs, inputs := g.linkLibs(n)
-			mode := "-Wl,--no-undefined"
-			if n.kind == Shared {
-				mode = "-shared -Wl,-soname," + n.name + ".so -Wl,--no-undefined"
+			mode := g.linkFlags(n)
+			if n.versionScript != "" {
+				inputs = append(inputs, n.versionScript)
 			}
-			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(n.out), join(n.objs), join(inputs), mode, shellQuote(libs))
+			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(n.out), join(n.objs), join(inputs), shellQuote(mode), shellQuote(libs))
 		}
 	}
 	var defaults []string
@@ -275,6 +275,10 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	// .S/.s: Soong's asflags take the global common flags and none of the module's cflags (cc/builder.go transformSourceToObj)
 	asm := append(slices.Clone(common), "-Wno-error")
 	asm = append(append(asm, g.soong.GlobalAsDefines...), moduleFlags(p, "asflags")...)
+	// Soong's device global cflags precede the module's too (cc/compiler.go "${config.DeviceGlobalCflags}"), so a module's -fno-function-sections wins
+	if n.side == Device {
+		common = append(common, g.soong.DeviceLink.Cflags...)
+	}
 	common = append(common, moduleFlags(p, "cflags")...)
 	common = append(common, n.genCflags...)
 	common = append(common, "-Wno-error")
@@ -310,7 +314,12 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	inc = dedup(inc)
 	cstd, cppstd := g.stdVersions(p)
 	// Soong's -std heads the language's local flags, after the module's cflags (cc/builder.go: localCFlags, then localConlyFlags / localCppFlags), so it wins over a -std in cflags (camera_metadata's -std=c11 builds as gnu23, which declares dprintf)
-	cxx := append(append(append([]string{"-stdlib=libc++"}, common...), "-std="+cppstd), moduleFlags(p, "cppflags")...)
+	cxx := append(append([]string{"-stdlib=libc++"}, common...), "-std="+cppstd)
+	// device global cppflags precede the module's cppflags (cc/compiler.go "${config.DeviceGlobalCppflags}")
+	if n.side == Device {
+		cxx = append(cxx, g.soong.DeviceLink.Cppflags...)
+	}
+	cxx = append(cxx, moduleFlags(p, "cppflags")...)
 	c := append(append(slices.Clone(common), "-std="+cstd), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
 		dev := []string{androidDefine, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
@@ -368,6 +377,22 @@ func soongShellUnsafe(r rune) bool {
 		return false
 	}
 	return !strings.ContainsRune("_+-=.,/", r)
+}
+
+// linkFlags: a shared library's or binary's link flags ahead of its inputs, in Soong's order: the kind's (cc/library.go sharedLinkerFlags, cc/binary.go linkerFlags) and the toolchain's global ones (Flags.Global.LdFlags: DeviceLink on the device side, --no-undefined from CommonLinkerFlags), then the module's own (Flags.Local.LdFlags: version_script, which cc/linker.go makes a dependency of the link too).
+func (g *Graph) linkFlags(n *Node) []string {
+	var out []string
+	if n.kind == Shared {
+		out = append(out, "-shared", "-Wl,-soname,"+n.name+".so")
+	}
+	if n.side == Device {
+		out = append(out, g.soong.DeviceLink.Ldflags...)
+	}
+	out = append(out, "-Wl,--no-undefined")
+	if n.versionScript != "" {
+		out = append(out, "-Wl,--version-script,"+n.versionScript)
+	}
+	return out
 }
 
 // linkLibs: provided shared objects, whole archives, the generated Rust staticlib, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
