@@ -375,7 +375,7 @@ fn log_fatal(msg: &[u8]) {
 }
 
 /// `fatal` of a fixed text (no format).
-fn fatal_text(prefix: &[u8], what: &[u8]) {
+pub(crate) fn fatal_text(prefix: &[u8], what: &[u8]) {
     let mut buf = [0u8; MESSAGE_MAX];
     let mut out = Buffer::new(&mut buf);
     out.send(prefix);

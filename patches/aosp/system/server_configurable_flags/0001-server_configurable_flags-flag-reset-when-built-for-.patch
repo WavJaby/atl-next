@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 23:27:12 +0800
+Subject: [PATCH] server_configurable_flags: flag reset when built for Android
+
+ServerConfigurableFlagsReset resets the persist.device_config.* flags
+only under __BIONIC__; elsewhere it logs that reset is unavailable. A
+device build against another C library that provides bionic's
+property API defines __ANDROID__ but not __BIONIC__. Treat
+__ANDROID__ like __BIONIC__ at these guards. No change for Soong
+variants: device builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside the library source, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ libflags/server_configurable_flags.cc | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/libflags/server_configurable_flags.cc b/libflags/server_configurable_flags.cc
+index f8bcdf3d2116c49202653a770c9a4be573a5daf5..379133ba46b5963188980cd88bd8b5639680e96a 100644
+--- a/libflags/server_configurable_flags.cc
++++ b/libflags/server_configurable_flags.cc
+@@ -18,7 +18,7 @@
+ #include "server_configurable_flags/get_flags.h"
+ #include "server_configurable_flags/get_cflags.h"
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <cutils/properties.h>
+ #endif  // __BIONIC__
+ #include <cctype>
+@@ -62,7 +62,7 @@ static bool ValidateExperimentSegment(const std::string& segment) {
+          *segment.rbegin() != '.';
+ }
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ static void ResetFlag(const char* key, const char* value, void* cookie) {
+   if (strcmp(ATTEMPTED_BOOT_COUNT_PROPERTY, key) &&
+       android::base::StartsWith(key, SYSTEM_PROPERTY_PREFIX) && strlen(value) > 0 &&
+@@ -98,7 +98,7 @@ static void ResetAllFlags() {
+ 
+ void ServerConfigurableFlagsReset(ResetMode reset_mode) {
+   LOG(INFO) << __FUNCTION__ << " reset_mode value: " << reset_mode;
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+   if (reset_mode == BOOT_FAILURE) {
+     int fail_count = android::base::GetIntProperty(ATTEMPTED_BOOT_COUNT_PROPERTY, 0);
+     if (fail_count < ATTEMPTED_BOOT_COUNT_THRESHOLD) {

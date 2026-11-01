@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 23:25:30 +0800
+Subject: [PATCH] libcutils: bionic property serial and fdsan when built for
+ Android
+
+trace-dev polls the debug.atrace.tags.enableflags serial, and
+native_handle tags its descriptors with fdsan, only under __BIONIC__;
+otherwise trace-dev never reloads its tags and native_handle uses
+local stubs. A device build against another C library that provides
+bionic's property and fdsan API defines __ANDROID__ but not
+__BIONIC__. Treat __ANDROID__ like __BIONIC__ at these guards. No
+change for Soong variants: device builds define both, linux_bionic
+defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside libcutils sources, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ libcutils/native_handle.cpp | 4 ++--
+ libcutils/trace-dev.cpp     | 2 +-
+ libcutils/trace-dev.inc     | 6 +++---
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/libcutils/native_handle.cpp b/libcutils/native_handle.cpp
+index b85c93b81c2b30771d539d3735379a71494f3b46..c0d28678c111b3b173a298ebff04653e1a10c95d 100644
+--- a/libcutils/native_handle.cpp
++++ b/libcutils/native_handle.cpp
+@@ -23,13 +23,13 @@
+ #include <unistd.h>
+ 
+ // Needs to come after stdlib includes to capture the __BIONIC__ definition
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <android/fdsan.h>
+ #endif
+ 
+ namespace {
+ 
+-#if !defined(__BIONIC__)
++#if !defined(__BIONIC__) && !defined(__ANDROID__)
+ // fdsan stubs when not linked against bionic
+ #define ANDROID_FDSAN_OWNER_TYPE_NATIVE_HANDLE 0
+ 
+diff --git a/libcutils/trace-dev.cpp b/libcutils/trace-dev.cpp
+index 1827e32101cdf808a00c3ae4f3bf9cc4db886a23..40265cb503a3bfa096b5e02b2fcd57ba18759afa 100644
+--- a/libcutils/trace-dev.cpp
++++ b/libcutils/trace-dev.cpp
+@@ -54,7 +54,7 @@ static void atrace_seq_number_changed(uint32_t prev_seq_no, uint32_t seq_no) {
+     }
+ 
+     if (CC_UNLIKELY(prev_seq_no == kSeqNoNotInit)) {
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+         const prop_info* new_pi = __system_property_find("debug.atrace.tags.enableflags");
+         if (new_pi) atrace_property_info = new_pi;
+ #endif
+diff --git a/libcutils/trace-dev.inc b/libcutils/trace-dev.inc
+index c911b4f8206209f494c69ca4493778ab4c1e1e46..6a5409a0309d7018f709a54d908faa7092e1490d 100644
+--- a/libcutils/trace-dev.inc
++++ b/libcutils/trace-dev.inc
+@@ -35,7 +35,7 @@
+ #include <log/log.h>
+ #include <log/log_properties.h>
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -60,7 +60,7 @@ static pthread_mutex_t   atrace_tags_mutex    = PTHREAD_MUTEX_INITIALIZER;
+  **/
+ static _Atomic(uint32_t) last_sequence_number = kSeqNoNotInit;
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ // All zero prop_info that has a sequence number of 0. This is easier than
+ // depending on implementation details of the property implementation.
+ //
+@@ -77,7 +77,7 @@ static const prop_info* atrace_property_info = reinterpret_cast<const prop_info*
+ static void atrace_seq_number_changed(uint32_t prev_seq_no, uint32_t seq_no);
+ 
+ void atrace_init() {
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+     uint32_t seq_no = __system_property_serial(atrace_property_info);  // Acquire semantics.
+ #else
+     uint32_t seq_no = 0;

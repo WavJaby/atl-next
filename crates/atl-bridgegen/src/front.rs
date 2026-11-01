@@ -348,6 +348,20 @@ fn probe(
     Ok(out)
 }
 
+/// A declaration carrying `__attribute__((weak))` spelled in it (bionic writes `__attribute__((__weak__))` after
+/// `__INTRODUCED_IN`); libclang exposes the attribute only as an unexposed one, so its tokens tell. A weak attribute
+/// hidden in a macro is not seen.
+fn is_weak(decl: &Entity) -> bool {
+    decl.get_children().iter().any(|a| {
+        a.get_kind() == EntityKind::UnexposedAttr
+            && a.get_range().is_some_and(|r| {
+                r.tokenize()
+                    .iter()
+                    .any(|t| matches!(t.get_spelling().as_str(), "weak" | "__weak__"))
+            })
+    })
+}
+
 /// `<name>`, not `"name"`: the directive's own tokens.
 fn is_angled(directive: &Entity) -> bool {
     directive
@@ -509,6 +523,7 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
         triple: t.triple.clone(),
         records: BTreeMap::new(),
         functions: BTreeMap::new(),
+        weak: BTreeSet::new(),
         constants: BTreeMap::new(),
         strings: BTreeMap::new(),
         typedefs: BTreeMap::new(),
@@ -612,6 +627,9 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
             EntityKind::FunctionDecl if e.get_linkage() != Some(Linkage::Internal) => {
                 let name = e.get_name().context("unnamed function")?;
                 let t = e.get_type().with_context(|| format!("{name}: no type"))?;
+                if is_weak(&e) {
+                    view.weak.insert(name.clone());
+                }
                 view.functions.insert(
                     name.clone(),
                     signature(&t, owned).with_context(|| name.clone())?,

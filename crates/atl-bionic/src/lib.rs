@@ -9,7 +9,8 @@
 //!   `ENOENT` until atld's property service exists. `image` builds area files.
 //! - `android_get_device_api_level` (`ro.build.version.sdk`), the application target SDK and its setter.
 //! - libasync_safe's no-allocation formatting and logging (`async_safe`): what AOSP code built here calls.
-//! - fdsan's error level (`fdsan`); glibc checks no descriptor owner, so it never reports.
+//! - fdsan (`fdsan`): the fd -> owner tag table, its exchange / close checks and the error level, which
+//!   starts disabled (glibc's own `close` clears no tag).
 //!
 //! - `android_dlopen_ext` (`dlext`: the extended flags taken), `android_get_exported_namespace`,
 //!   `android_create_namespace` and `android_link_namespaces`, all through `linker`, the one place
@@ -20,7 +21,7 @@
 //! - `pthread_gettid_np` (`thread`), where glibc lacks it (< 2.42).
 //! - `setprogname` (`progname`): the short name into glibc's `program_invocation_short_name`.
 //! - `<bionic/reserved_signals.h>`: bionic's reserved signal numbers, constants only.
-//! - malloc introspection (`malloc_iterate`, `malloc_disable`, `malloc_enable`, `malloc_backtrace`): glibc's heap cannot be walked, so each answers as a bionic allocator without the support does (no chunks, no frames).
+//! - malloc introspection (`malloc_iterate`, `malloc_disable`, `malloc_enable`, `malloc_backtrace`): glibc's heap cannot be walked: `malloc_iterate` fails (`ENOTSUP`), the rest answer as a bionic allocator without the support does (no frames).
 //! - `android_getaddrinfofornet`: single network, the host's `getaddrinfo`.
 //!
 //! Built as one shared library per process (cargo-c), so one store, one target SDK, one abort message.

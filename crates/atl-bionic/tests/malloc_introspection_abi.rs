@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! bionic's malloc introspection as libmemunreachable calls it (its bionic.h declarations). Expected values: bionic's allocators
-//! without heap-walk support -- malloc_common.cpp `__sanitizer_malloc_iterate` (HWASan: returns 0, calls nothing; disable and
-//! enable empty) and malloc_common_dynamic.cpp `malloc_backtrace` without malloc debug (returns 0) -- never this crate's.
+//! without heap-walk support -- disable and enable empty (HWASan's), malloc_common_dynamic.cpp `malloc_backtrace` without malloc
+//! debug (returns 0) -- and, for `malloc_iterate`, the owner's decision (2026-11-01): fail with -1 / `ENOTSUP` (Linux 95), where
+//! HWASan's returns 0, so a caller cannot read "no chunk" as "no allocation". Never this crate's own output.
 
 use std::ffi::{c_int, c_void};
 
@@ -28,19 +29,20 @@ unsafe extern "C" fn count(_base: usize, _size: usize, arg: *mut c_void) {
 }
 
 #[test]
-fn iterate_reports_no_chunk() {
+fn iterate_fails() {
     // a live allocation inside the walked range: bionic's supported allocators would report it
     let chunk = Box::new([0u8; 64]);
     let addr = chunk.as_ptr() as usize;
     let mut calls = 0usize;
     // SAFETY: libmemunreachable's sequence: disable, iterate a range, enable; the callback reads only its counter
-    let rc = unsafe {
+    let (rc, errno) = unsafe {
         malloc_disable();
         let rc = malloc_iterate(addr & !0xfff, 0x10000, Some(count), (&raw mut calls).cast());
+        let errno = std::io::Error::last_os_error().raw_os_error();
         malloc_enable();
-        rc
+        (rc, errno)
     };
-    assert_eq!(rc, 0);
+    assert_eq!((rc, errno), (-1, Some(95)));
     assert_eq!(calls, 0, "no heap walk on glibc");
     drop(chunk);
     // allocation still works after enable

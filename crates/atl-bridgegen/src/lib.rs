@@ -320,8 +320,8 @@ mod tests {
 
     /// An API header in the shape of bionic's: an opaque typedef, a forward-declared struct, callbacks,
     /// standard typedefs, integer and string macros, `long` next to `long long`.
-    const API: &str = "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\ntypedef struct item item;\nstruct timespec;\n#define LIMIT 92\n#define NAME \"/dev/x\"\n#define BIG 3000000000U\n#define NEG (-3)\nint set(const char *name, const char *value);\nconst item *find(const char *name);\nvoid visit(const item *it, void (*cb)(void *cookie, const char *name, uint32_t serial), void *cookie);\nbool wait_for(const item *it, uint32_t old, uint32_t *new_serial, const struct timespec *timeout);\nlong count(unsigned long n, long long m, size_t s, char c, signed char sc);\nint none(void);\n";
-    const API_FUNCTIONS: &[&str] = &["set", "find", "visit", "wait_for", "count", "none"];
+    const API: &str = "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\ntypedef struct item item;\nstruct timespec;\n#define LIMIT 92\n#define NAME \"/dev/x\"\n#define BIG 3000000000U\n#define NEG (-3)\nint set(const char *name, const char *value);\nconst item *find(const char *name);\nvoid visit(const item *it, void (*cb)(void *cookie, const char *name, uint32_t serial), void *cookie);\nbool wait_for(const item *it, uint32_t old, uint32_t *new_serial, const struct timespec *timeout);\nlong count(unsigned long n, long long m, size_t s, char c, signed char sc);\nint none(void);\nint newer(int fd) __attribute__((__deprecated__)) __attribute__((__weak__));\n";
+    const API_FUNCTIONS: &[&str] = &["set", "find", "visit", "wait_for", "count", "none", "newer"];
     const API_MACROS: &[&str] = &["LIMIT", "NAME", "BIG", "NEG"];
 
     /// clang's own freestanding stdint/stdbool/stddef: no sysroot needed.
@@ -352,6 +352,8 @@ mod tests {
         let view = &iface.arches["x86_64"];
         assert_eq!(view.includes, ["<stdint.h>", "<stdbool.h>", "<stddef.h>"]);
         assert_eq!(view.strings["NAME"], "/dev/x");
+        // weak only where spelled: another attribute on the same declaration is not taken for it
+        assert_eq!(view.weak, ["newer".to_owned()].into());
         let text = c::header(
             &iface,
             "x86_64",
@@ -368,6 +370,7 @@ mod tests {
             "#define NAME \"/dev/x\"\n",
             "const item * find(const char *);\n",
             "int none(void);\n",
+            "int newer(int) __attribute__((__weak__));\n",
         ] {
             assert!(text.contains(want), "{want:?} missing:\n{text}");
         }
@@ -386,6 +389,7 @@ mod tests {
             for f in API_FUNCTIONS {
                 assert_eq!(bv.functions[*f], view.functions[*f], "{f} ({lang:?})");
             }
+            assert_eq!(bv.weak, view.weak, "{lang:?}");
             assert_eq!(bv.constants, view.constants, "{lang:?}");
             assert_eq!(bv.strings, view.strings, "{lang:?}");
         }

@@ -835,7 +835,7 @@ fn patched_files(patches: &[(String, String)]) -> Result<BTreeSet<String>> {
 }
 
 /// The licence text of AOSP project `project` (tree path) for patches touching `files`: the `license_text` files of the Soong `license` modules covering each file's package (`aosp::package_texts`, the licence gate's package resolution).
-/// Every file must take the same set of texts, else no one text describes the patches; one text is copied as is, several are concatenated in tree-path order, a blank line between.
+/// The texts of all patched files together (files of one project may sit in packages with different texts, e.g. system/logging `rust/` and `liblog/`): one text is copied as is, several are concatenated in tree-path order, a blank line between.
 /// Texts and other projects' blueprints are read where the layout resolves their checkout (pin + patches, a task copy when there is one), as the gate reads package blueprints.
 fn soong_licence(
     u: &Up,
@@ -855,36 +855,23 @@ fn soong_licence(
             Err(e) => Err(e).with_context(|| path.display().to_string()),
         }
     };
-    // set of text paths -> the files taking it
-    let mut sets: BTreeMap<Vec<PathBuf>, Vec<&str>> = BTreeMap::new();
+    ensure!(!files.is_empty(), "the patches touch no files");
+    // text path -> text, every patched file's package texts
     let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut by_dir: BTreeMap<&Path, Vec<PathBuf>> = BTreeMap::new();
+    let mut dirs: BTreeSet<&Path> = BTreeSet::new();
     for file in files {
         let at = Path::new(file).parent().unwrap_or(Path::new(""));
-        if !by_dir.contains_key(at) {
+        if dirs.insert(at) {
             let got = aosp::package_texts(&u.checkout, project, at, index, &read)
                 .with_context(|| {
                     format!("reading the Android.bp files of {}", u.checkout.display())
                 })?
                 .map_err(|why| anyhow::anyhow!("{file}: {why}"))?;
-            by_dir.insert(at, got.keys().cloned().collect());
             texts.extend(got);
         }
-        sets.entry(by_dir[at].clone()).or_default().push(file);
     }
-    ensure!(!sets.is_empty(), "the patches touch no files");
-    if sets.len() > 1 {
-        let each: Vec<String> = sets
-            .iter()
-            .map(|(set, files)| format!("[{}] for {}", show(set), files.join(", ")))
-            .collect();
-        bail!(
-            "patched files take different licence texts: {}",
-            each.join("; ")
-        );
-    }
-    let (set, _) = sets.pop_first().context("one set")?;
-    let body: Vec<&str> = set.iter().map(|p| texts[p].as_str()).collect();
+    let set: Vec<PathBuf> = texts.keys().cloned().collect();
+    let body: Vec<&str> = texts.values().map(String::as_str).collect();
     let text = match body.as_slice() {
         [one] => (*one).to_owned(),
         many => many
@@ -1689,11 +1676,16 @@ mod tests {
             derive(&["both/y.c"]).unwrap().1,
             "apache text\n\nlib notice\n"
         );
-        let refused = [
+        // files in packages with different texts: all of them, as one package with both
+        assert_eq!(
+            derive(&["lib/a.c", "ref/x.c"]).unwrap(),
             (
-                derive(&["lib/a.c", "ref/x.c"]),
-                "patched files take different licence texts: [build/soong/licenses/LICENSE] for ref/x.c; [system/core/lib/NOTICE] for lib/a.c",
-            ),
+                "Soong license_text build/soong/licenses/LICENSE + system/core/lib/NOTICE"
+                    .to_owned(),
+                "apache text\n\nlib notice\n".to_owned()
+            )
+        );
+        let refused = [
             (
                 derive(&["a.c"]),
                 "a.c: no Android.bp from system/core up to system/core declares a licence",

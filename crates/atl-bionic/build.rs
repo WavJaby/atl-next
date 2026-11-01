@@ -124,13 +124,20 @@ const APIS: &[Api] = &[
             records: &[],
         },
     },
-    // what the native closure calls of fdsan (2026-10-31: libsfplugin_ccodec C2NodeImpl.cpp)
+    // what the native closure calls of fdsan (2026-10-31: libsfplugin_ccodec C2NodeImpl.cpp; 2026-11-01:
+    // libbase unique_fd.h DefaultCloser, libcutils native_handle.cpp, both under __ANDROID__)
     Api {
         name: "fdsan",
         source: "bionic/libc/include/android/fdsan.h",
         lang: Lang::C,
         header: Some("android/fdsan.h"),
-        functions: &["android_fdsan_set_error_level"],
+        functions: &[
+            "android_fdsan_set_error_level",
+            "android_fdsan_create_owner_tag",
+            "android_fdsan_exchange_owner_tag",
+            "android_fdsan_close_with_tag",
+            "android_fdsan_get_owner_tag",
+        ],
         macros: &[],
         include_dirs: &[],
         kept: DECLARATIONS,
@@ -197,8 +204,7 @@ const APIS: &[Api] = &[
         kept: DECLARATIONS,
     },
     // the first abort message, kept for a crash report (2026-11-01: liblog, libbase, perfetto aborters
-    // under __ANDROID__); forced into every device unit by the converter (libcCompat): liblog's
-    // logger_write.cpp calls it under __ANDROID__ but includes the header only under __BIONIC__
+    // under __ANDROID__)
     Api {
         name: "set_abort_message",
         source: "bionic/libc/include/android/set_abort_message.h",
@@ -362,8 +368,10 @@ const FORWARDED_MACROS: &[&str] = &[
 /// bionic-only public headers AOSP code includes, generated whole (`shape::Inputs::substitutes`); each
 /// row reviewed to mean the same on glibc. `sys/limits.h` is `<limits.h>` (libandroid_net net.c);
 /// `sys/endian.h` is byte-order macros over compiler builtins, its `htonl` family the host's
-/// (libmediametrics ItemSerialize-*.cpp).
-const SUBSTITUTES: &[&str] = &["sys/endian.h", "sys/limits.h"];
+/// (libmediametrics ItemSerialize-*.cpp). `sys/_system_properties.h`, bionic's private property header,
+/// is now only `#include <sys/system_properties.h>`, the generated declarations (frameworks/native
+/// tracing_perfetto_internal.cpp: `__system_property_find` / `__system_property_serial`).
+const SUBSTITUTES: &[&str] = &["sys/_system_properties.h", "sys/endian.h", "sys/limits.h"];
 
 /// Generated files: path relative to OUT_DIR -> text.
 type Outputs = Vec<(PathBuf, String)>;
@@ -635,6 +643,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         &host_target,
         &strs(&kernel.keys().cloned().collect::<Vec<_>>()),
     )?;
+    let declared: Vec<&str> = APIS.iter().filter_map(|a| a.header).collect();
     let derived = shape::derive(&shape::Inputs {
         default: shape::Probes {
             bionic: &bionic,
@@ -649,6 +658,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         homes: HOMES,
         macros: FORWARDED_MACROS,
         substitutes: SUBSTITUTES,
+        declared: &declared,
         scan: &scan,
         kernel: &kernel,
         extra,

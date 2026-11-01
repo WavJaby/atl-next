@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 23:26:13 +0800
+Subject: [PATCH] liblog: abort message when built for Android
+
+logger_write.cpp calls android_set_abort_message from the default
+aborter under __ANDROID__, but includes its header, and records a
+fatal log message as the abort message, only under __BIONIC__. A
+device build against another C library that provides bionic's
+android_set_abort_message defines __ANDROID__ but not __BIONIC__: the
+aborter then calls an undeclared function and fatal messages never
+reach a crash report. Treat __ANDROID__ like __BIONIC__ at these
+guards. No change for Soong variants: device builds define both,
+linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside liblog, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ liblog/logger_write.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/liblog/logger_write.cpp b/liblog/logger_write.cpp
+index 3c6ccd0f67b73a98dde89fbad298e609fc04a725..4f596043795475c1f68b8c0aa8f9860b7957ba5e 100644
+--- a/liblog/logger_write.cpp
++++ b/liblog/logger_write.cpp
+@@ -25,7 +25,7 @@
+ #include <string.h>
+ #include <sys/time.h>
+ 
+-#ifdef __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <android/set_abort_message.h>
+ #endif
+ 
+@@ -373,7 +373,7 @@ void __android_log_write_log_message(__android_log_message* log_message) {
+     log_message->tag = GetDefaultTag().c_str();
+   }
+ 
+-#if __BIONIC__
++#if defined(__BIONIC__) || defined(__ANDROID__)
+   if (log_message->priority == ANDROID_LOG_FATAL) {
+     android_set_abort_message(log_message->message);
+   }

@@ -109,7 +109,13 @@ pub fn header(
             Some(ns) => scoped.entry(ns).or_default(),
             None => &mut decls,
         };
-        writeln!(into, "{text};")?;
+        // weak as bionic declares it: callers test the address, which -Wpointer-bool-conversion flags on a strong one
+        let weak = if view.weak.contains(*f) {
+            " __attribute__((__weak__))"
+        } else {
+            ""
+        };
+        writeln!(into, "{text}{weak};")?;
     }
     for t in kept.types {
         let target = view

@@ -6,6 +6,7 @@
 //! `PROP_VALUE_MAX` bytes); null where bionic would crash is refused instead.
 
 use core::ffi::{CStr, VaList, c_char, c_int, c_void};
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::Acquire;
 use std::ffi::CString;
 
@@ -22,6 +23,8 @@ type ForeachCallback = Option<unsafe extern "C" fn(*const prop_info, *mut c_void
 
 /// bionic returns `-1` as `uint32_t` from the serial queries on error.
 const NO_SERIAL: u32 = u32::MAX;
+/// Offset of `prop_info.serial` (bionic's layout, generated).
+const PROP_INFO_SERIAL: usize = crate::generated::prop_format::prop_info::serial;
 
 /// The bytes of a C string; none for null.
 ///
@@ -157,11 +160,21 @@ pub extern "C" fn __system_property_area_serial() -> u32 {
     store::area().map_or(NO_SERIAL, |a| a.serial().load(Acquire))
 }
 
+/// bionic `SystemProperties::Serial` reads `pi->serial` of any `prop_info`, also one outside the area:
+/// libcutils trace-dev.inc polls a zeroed 96-byte stand-in (`empty_pi`, serial 0) until the property it
+/// stands for exists, and must see 0 there, not this crate's error value, which equals its "not
+/// initialised" sentinel. Such a record has no writer, so its serial is read once, without the dirty wait.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __system_property_serial(pi: *const prop_info) -> u32 {
-    store::area()
-        .and_then(|a| Some(a.stable_serial(record(&a, pi)?)))
-        .unwrap_or(NO_SERIAL)
+    if pi.is_null() {
+        return NO_SERIAL;
+    }
+    if let Some(s) = store::area().and_then(|a| Some(a.stable_serial(record(&a, pi)?))) {
+        return s;
+    }
+    // SAFETY: bionic's contract: `pi` is a `prop_info`, whose serial is an aligned 32-bit atomic at this offset
+    let serial = unsafe { &*pi.cast::<u8>().add(PROP_INFO_SERIAL).cast::<AtomicU32>() };
+    serial.load(Acquire)
 }
 
 /// A signed integer field of `size` bytes, widened.
@@ -257,6 +270,39 @@ pub extern "C" fn android_fdsan_set_error_level(new_level: u32) -> u32 {
     crate::fdsan::set_error_level(new_level)
 }
 
+/// `enum android_fdsan_owner_type` travels as its underlying `unsigned int`.
+#[unsafe(no_mangle)]
+pub extern "C" fn android_fdsan_create_owner_tag(owner_type: u32, tag: u64) -> u64 {
+    crate::fdsan::create_owner_tag(owner_type, tag)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn android_fdsan_exchange_owner_tag(fd: c_int, expected_tag: u64, new_tag: u64) {
+    crate::fdsan::exchange_owner_tag(fd, expected_tag, new_tag);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn android_fdsan_get_owner_tag(fd: c_int) -> u64 {
+    crate::fdsan::get_owner_tag(fd)
+}
+
+unsafe extern "C" {
+    /// The host libc's `close`.
+    #[link_name = "close"]
+    fn libc_close(fd: c_int) -> c_int;
+}
+
+/// `close`'s result, errno as `close` left it (bionic's).
+#[unsafe(no_mangle)]
+pub extern "C" fn android_fdsan_close_with_tag(fd: c_int, tag: u64) -> c_int {
+    let (rc, _) = crate::fdsan::close_with_tag(fd, tag, |fd| {
+        // SAFETY: closing a descriptor touches no memory; that the caller owns it is bionic's contract
+        let rc = unsafe { libc_close(fd) };
+        (rc, errno::errno().0)
+    });
+    rc
+}
+
 /// bionic/malloc.h. glibc's allocator has none of bionic's options (allocation limit, leak info,
 /// GWP-ASan, heapprofd, zygote profiling), so every opcode gets what bionic gives one it does not handle
 /// (`HeapprofdMallopt`, malloc_heapprofd.cpp): `errno = ENOTSUP`, false.
@@ -268,9 +314,9 @@ pub extern "C" fn android_mallopt(_opcode: c_int, _arg: *mut c_void, _arg_size: 
 
 // bionic's malloc introspection (malloc_common.cpp, malloc_common_dynamic.cpp), for libmemunreachable. glibc's allocator offers
 // no heap walk and no way to stop other threads' allocations, so each answers as bionic's allocators without the support do:
-// HWASan's (`__sanitizer_malloc_iterate` returns 0 and calls nothing, disable / enable do nothing) and malloc_backtrace without
-// malloc debug (0 frames). bionic defines no error value for these. With no chunk reported, libmemunreachable finds nothing to
-// classify, so it reports no leak rather than failing.
+// disable / enable do nothing (as HWASan's), malloc_backtrace has 0 frames (as without malloc debug).
+// Deviation, malloc_iterate: it fails, -1 with errno ENOTSUP, where HWASan's returns 0 and calls nothing. A walk that reports no
+// chunk reads as "no allocation, so no leak" to libmemunreachable; a failure lets its caller say the heap could not be walked.
 
 #[unsafe(no_mangle)]
 pub extern "C" fn malloc_disable() {}
@@ -285,7 +331,8 @@ pub extern "C" fn malloc_iterate(
     _callback: Option<unsafe extern "C" fn(usize, usize, *mut c_void)>,
     _arg: *mut c_void,
 ) -> c_int {
-    0
+    errno::set_errno(errno::Errno(rustix::io::Errno::NOTSUP.raw_os_error()));
+    -1
 }
 
 #[unsafe(no_mangle)]

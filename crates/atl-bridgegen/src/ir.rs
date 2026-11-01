@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The C-ABI IR: one view per arch, every size/align/offset as clang computed it for that arch.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -24,6 +24,9 @@ pub struct ArchView {
     pub records: BTreeMap<String, Record>,
     /// Functions declared by the interface's header.
     pub functions: BTreeMap<String, Signature>,
+    /// Those of `functions` declared weak: bionic marks API newer than a caller's minimum level so, and
+    /// callers test the function's address before calling it (libbase unique_fd.h and fdsan).
+    pub weak: BTreeSet<String>,
     /// Integer constants: the header's enumerators, its `const` integer variables (C++ `constexpr`;
     /// a class member as `<record>::<name>`), plus the object-like macros the caller asked for, each as
     /// clang evaluated it for this target (ioctl numbers embed sizes, so they are per arch).

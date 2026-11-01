@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 23:28:27 +0800
+Subject: [PATCH] libmemunreachable: fail when the heap cannot be walked
+
+CollectAllocations ignores malloc_iterate's return value and walks
+only mappings named by a known allocator. When the allocator cannot
+iterate its heap, or names no mapping libmemunreachable recognises,
+no allocation is collected and GetUnreachableMemory reports "0 bytes
+in 0 unreachable allocations", indistinguishable from a process
+without leaks. Fail with a logged error instead, in both cases.
+
+Upstream-Status: Pending
+Patch-Reason: the result is decided inside libmemunreachable; the allocator can only report that it cannot iterate (malloc_iterate returns -1 / ENOTSUP on glibc), which this code then drops
+---
+SPDX-License-Identifier: Apache-2.0
+ MemUnreachable.cpp | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/MemUnreachable.cpp b/MemUnreachable.cpp
+index 4a0b197d9f60f3fb4dfaf29418fb97ffde50584a..cf9f4a451e4d49c7d345059f39ef911ea9a88f09 100644
+--- a/MemUnreachable.cpp
++++ b/MemUnreachable.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include <errno.h>
+ #include <inttypes.h>
+ #include <string.h>
+ 
+@@ -74,14 +75,21 @@ class MemUnreachable {
+   HeapWalker heap_walker_;
+ };
+ 
+-static void HeapIterate(const Mapping& heap_mapping,
++static bool HeapIterate(const Mapping& heap_mapping,
+                         const std::function<void(uintptr_t, size_t)>& func) {
+-  malloc_iterate(heap_mapping.begin, heap_mapping.end - heap_mapping.begin,
+-                 [](uintptr_t base, size_t size, void* arg) {
+-                   auto f = reinterpret_cast<const std::function<void(uintptr_t, size_t)>*>(arg);
+-                   (*f)(base, size);
+-                 },
+-                 const_cast<void*>(reinterpret_cast<const void*>(&func)));
++  int ret = malloc_iterate(
++      heap_mapping.begin, heap_mapping.end - heap_mapping.begin,
++      [](uintptr_t base, size_t size, void* arg) {
++        auto f = reinterpret_cast<const std::function<void(uintptr_t, size_t)>*>(arg);
++        (*f)(base, size);
++      },
++      const_cast<void*>(reinterpret_cast<const void*>(&func)));
++  if (ret != 0) {
++    MEM_ALOGE("malloc_iterate failed on heap mapping %" PRIxPTR "-%" PRIxPTR " %s: errno %d",
++              heap_mapping.begin, heap_mapping.end, heap_mapping.name, errno);
++    return false;
++  }
++  return true;
+ }
+ 
+ bool MemUnreachable::CollectAllocations(const allocator::vector<ThreadInfo>& threads,
+@@ -101,10 +109,18 @@ bool MemUnreachable::CollectAllocations(const allocator::vector<ThreadInfo>& thr
+     return false;
+   }
+ 
++  // Without a heap mapping to walk, every allocation would go unseen and report as "no leaks".
++  if (heap_mappings.empty()) {
++    MEM_ALOGE("no malloc heap mapping found in process %d", pid_);
++    return false;
++  }
++
+   for (auto it = heap_mappings.begin(); it != heap_mappings.end(); it++) {
+     MEM_ALOGV("Heap mapping %" PRIxPTR "-%" PRIxPTR " %s", it->begin, it->end, it->name);
+-    HeapIterate(*it,
+-                [&](uintptr_t base, size_t size) { heap_walker_.Allocation(base, base + size); });
++    auto walk = [&](uintptr_t base, size_t size) { heap_walker_.Allocation(base, base + size); };
++    if (!HeapIterate(*it, walk)) {
++      return false;
++    }
+   }
+ 
+   for (auto it = anon_mappings.begin(); it != anon_mappings.end(); it++) {

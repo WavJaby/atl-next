@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 23:24:57 +0800
+Subject: [PATCH] libbase: bionic property store and fdsan when built for
+ Android
+
+properties.cpp defines a weak in-process property store whenever
+__BIONIC__ is undefined, and unique_fd.h tags descriptors with fdsan
+only under __BIONIC__. A device build against another C library that
+provides bionic's property and fdsan API defines __ANDROID__ but not
+__BIONIC__: it then gets the fake store, whose weak definitions lose
+to the real ones only by link order, and untagged unique_fds. Treat
+__ANDROID__ like __BIONIC__ at these guards. properties.h keeps its
+non-bionic declarations, which match bionic's: callers rely on them.
+No change for Soong variants: device builds define both, linux_bionic
+defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside the libbase header and source, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ include/android-base/unique_fd.h | 4 ++--
+ properties.cpp                   | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/android-base/unique_fd.h b/include/android-base/unique_fd.h
+index 1ffe02f6a64cb3289c47555688bacc47bb7ba171..cc81a70e3d5677c291ba01fcd80b7d99f7e223f5 100644
+--- a/include/android-base/unique_fd.h
++++ b/include/android-base/unique_fd.h
+@@ -29,7 +29,7 @@
+ // Including other headers from libbase frequently results in inclusion of
+ // android-base/macros.h, which causes macro collisions.
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <android/fdsan.h>
+ #endif
+ #if !defined(_WIN32) && !defined(__TRUSTY__)
+@@ -151,7 +151,7 @@ class unique_fd_impl final {
+ // The actual details of closing are factored out to support unusual cases.
+ // Almost everyone will want this DefaultCloser, which handles fdsan on bionic.
+ struct DefaultCloser {
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+   static void Tag(int fd, void* old_addr, void* new_addr) {
+     if (android_fdsan_exchange_owner_tag) {
+       uint64_t old_tag = android_fdsan_create_owner_tag(ANDROID_FDSAN_OWNER_TYPE_UNIQUE_FD,
+diff --git a/properties.cpp b/properties.cpp
+index 480225a7adc922e5b1fb2f6ddd4b5bb613ff6cb2..0345a4956055ee0409c1f5e3f6f67ce654e54f85 100644
+--- a/properties.cpp
++++ b/properties.cpp
+@@ -31,7 +31,7 @@
+ #include <android-base/strings.h>
+ #include <android-base/thread_annotations.h>
+ 
+-#if !defined(__BIONIC__)
++#if !defined(__BIONIC__) && !defined(__ANDROID__)
+ 
+ // Here lies a rudimentary implementation of system properties for non-Bionic
+ // platforms. We are using weak symbols here because we want to allow

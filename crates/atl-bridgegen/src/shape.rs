@@ -31,7 +31,10 @@
 //! Listed, not derived: whether a bionic macro means the same on glibc is not decidable from the headers
 //! (`sys/sysconf.h`'s `_SC_NSIG 0x9e` is a bionic `sysconf` argument). Refused when the header declares
 //! anything else no host header does (bionic-only API: `buildscript::Api` implements it) or a host
-//! header uses one of its macros as an identifier without defining it the same way.
+//! header uses one of its macros as an identifier without defining it the same way. A substitute may
+//! include a bionic header whose declarations are generated (`declared`, an `Api` row's header) as it
+//! includes a host header (bionic's `sys/_system_properties.h` is `#include <sys/system_properties.h>`);
+//! only substitutes do: every other wrapper keeps bionic's shape of the host's headers.
 //!
 //! Kernel uapi headers only bionic carries (`kernel`; Android kernel features a desktop distro's
 //! headers lack: `linux/incrementalfs.h`, `linux/ashmem.h`): every one the host does not resolve is
@@ -119,6 +122,9 @@ pub struct Inputs<'a> {
     pub macros: &'a [&'a str],
     /// bionic-only public headers generated whole. Each must be a usable bionic header the host lacks.
     pub substitutes: &'a [&'a str],
+    /// bionic public headers whose declarations atl-bionic generates (`buildscript::Api::header`), by
+    /// include name: what a substitute may include besides host headers and substitutes.
+    pub declared: &'a [&'a str],
     /// Host header -> what its wrapper includes beyond bionic's shape: names AOSP code takes from the
     /// header in a configuration bionic never builds (`__ANDROID__` without `__BIONIC__`), or bionic
     /// API declared in a header the host also has (its generated declarations). Each must be needed:
@@ -459,7 +465,17 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
                 .filter_map(|s| p.bionic.get(*s).map(|p| (*s, p))),
         )
         .collect();
-    let includable = |n: &str| shaped.contains_key(n);
+    // a substitute also takes the generated declaration headers (`Inputs::declared`) as given
+    let for_substitutes: BTreeMap<&str, &Probe> = shaped
+        .iter()
+        .map(|(n, p)| (*n, *p))
+        .chain(
+            inputs
+                .declared
+                .iter()
+                .filter_map(|d| p.bionic.get(*d).map(|p| (*d, p))),
+        )
+        .collect();
     for (name, bionic) in p.bionic {
         if !bionic.usable() {
             continue;
@@ -468,11 +484,16 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
         if host.is_none() && !inputs.substitutes.contains(&name.as_str()) {
             continue;
         }
+        let shaped = if host.is_none() {
+            &for_substitutes
+        } else {
+            &shaped
+        };
         let host_reached = host.map_or_else(
             || BTreeSet::from([name.as_str()]),
             |h| reached_names(name, h),
         );
-        let walk = walk(inputs, bionic, &includable)?;
+        let walk = walk(inputs, bionic, &|n: &str| shaped.contains_key(n))?;
         let mut extras: BTreeSet<String> = walk
             .includable
             .into_iter()
@@ -529,7 +550,7 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
             seen.extend(declared);
             extras.insert(home.to_owned());
         }
-        let includes = reduce(&extras, &shaped);
+        let includes = reduce(&extras, shaped);
         if host.is_none() {
             out.wrappers.insert(
                 name.clone(),
@@ -1041,7 +1062,7 @@ mod tests {
     /// `sys/cdefs.h` defines `__mac`, which the host's `k/u.h` uses as a field name; `bits/p.h` defines
     /// `__pm(x)`. bionic's `q.h` and `z.h` exist so the host's are probed; bionic's `q.h` reaches `y.h`,
     /// which the host's lacks. bionic-only headers: `o.h` includes `x.h` and defines `__om` in terms of
-    /// `__oc` from its `sys/cdefs.h`; `f.h` declares a function; `c.h` defines a macro in terms of
+    /// `__oc` from its `sys/cdefs.h`; `f.h` declares a function, `s.h` only includes `f.h`; `c.h` defines a macro in terms of
     /// `__mac`; `e.h` defines `__kb` as `k/u.h` does, `d.h` defines `__kd` other than `k/u.h`, which
     /// uses both. Views: bionic's `g.h` includes `x.h` and defines `__gm` with `_GNU_SOURCE`, else
     /// includes `y.h`; the host's `z.h` includes `y.h` with `_GNU_SOURCE`.
@@ -1062,6 +1083,7 @@ mod tests {
             ),
             ("bionic/n.h", "#include <o.h>\n"),
             ("bionic/f.h", "int f_only(void);\n"),
+            ("bionic/s.h", "#include <f.h>\n"),
             ("bionic/c.h", "#include <sys/cdefs.h>\n#define __cm __mac\n"),
             ("bionic/e.h", "#define __kb\n"),
             ("bionic/d.h", "#define __kd 2\n"),
@@ -1145,6 +1167,18 @@ mod tests {
         extra: &[(&str, &str)],
         kernel: &[&str],
     ) -> Result<Shape> {
+        derived_declared(dir, homes, macros, substitutes, extra, kernel, &[])
+    }
+
+    fn derived_declared(
+        dir: &Tmp,
+        homes: &[(&str, &str)],
+        macros: &[&str],
+        substitutes: &[&str],
+        extra: &[(&str, &str)],
+        kernel: &[&str],
+        declared: &[&str],
+    ) -> Result<Shape> {
         let include = dir.0.join("bionic");
         let uapi = [dir.0.join("uapi")];
         let bionic_t = sysroot(&[include.clone(), uapi[0].clone()]);
@@ -1162,6 +1196,7 @@ mod tests {
             "n.h",
             "o.h",
             "q.h",
+            "s.h",
             "sys/cdefs.h",
             "w.h",
             "x.h",
@@ -1193,10 +1228,42 @@ mod tests {
             homes,
             macros,
             substitutes,
+            declared,
             scan: &scan,
             kernel: &kernel,
             extra,
         })
+    }
+
+    /// A substitute including a generated declaration header (bionic sys/_system_properties.h ->
+    /// sys/system_properties.h): refused as bionic-only API unless that header is `declared`, then
+    /// included; no other wrapper includes a declared header.
+    #[test]
+    fn substitute_includes_declared() {
+        let dir = libcs("declared");
+        let home = &[("bits/p.h", "q.h")];
+        let forwarded = &["__mac", "__pm"];
+        let refused = derived_with(&dir, home, forwarded, &["s.h"]).unwrap_err();
+        assert!(refused.to_string().contains("bionic-only API"), "{refused}");
+        let kernel = &["k/u.h", "k/v.h"];
+        let s = derived_declared(&dir, home, forwarded, &["s.h"], &[], kernel, &["f.h"]).unwrap();
+        assert_eq!(
+            s.wrappers["s.h"],
+            Wrapper {
+                substitute: true,
+                includes: always(&["f.h"]),
+                ..Wrapper::default()
+            }
+        );
+        let without = derived_with(&dir, home, forwarded, &[]).unwrap();
+        assert_eq!(
+            s.wrappers.len(),
+            without.wrappers.len() + 1,
+            "only the substitute is added"
+        );
+        for (name, w) in &without.wrappers {
+            assert_eq!(&s.wrappers[name], w, "{name}");
+        }
     }
 
     fn strings(v: &[&str]) -> Vec<String> {
