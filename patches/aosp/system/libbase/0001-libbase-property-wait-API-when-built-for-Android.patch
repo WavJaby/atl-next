@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 17:42:20 +0800
+Subject: [PATCH] libbase: property wait API when built for Android
+
+WaitForProperty, WaitForPropertyCreation and CachedProperty are
+declared and defined under __BIONIC__ only, while their callers
+(libhwbinder Utils.cpp) use them under __ANDROID__. A device build
+against another C library that provides the bionic property API
+defines __ANDROID__ but not __BIONIC__; it then fails to find them.
+Widen the guards to __BIONIC__ || __ANDROID__. No change for Soong
+variants: device builds define both, linux_bionic defines __BIONIC__.
+
+Upstream-Status: Inappropriate [no Soong variant defines __ANDROID__ without __BIONIC__]
+Patch-Reason: the guards are compiled inside the libbase header and source, out of reach of the launcher, loader and environment; defining __BIONIC__ instead would change the libc++ ABI on glibc
+---
+SPDX-License-Identifier: Apache-2.0
+ include/android-base/properties.h | 6 +++---
+ properties.cpp                    | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/include/android-base/properties.h b/include/android-base/properties.h
+index 067fbf4bf260fe7de1a3236827283c5c18d0342e..4636c1c50b04b6d4b948c2c7cc3423bb40b4e432 100644
+--- a/include/android-base/properties.h
++++ b/include/android-base/properties.h
+@@ -58,7 +58,7 @@ bool SetProperty(const std::string& key, const std::string& value);
+ // Waits for the system property `key` to have the value `expected_value`.
+ // Times out after `relative_timeout`.
+ // Returns true on success, false on timeout.
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ bool WaitForProperty(const std::string& key, const std::string& expected_value,
+                      std::chrono::milliseconds relative_timeout = std::chrono::milliseconds::max());
+ #endif
+@@ -66,12 +66,12 @@ bool WaitForProperty(const std::string& key, const std::string& expected_value,
+ // Waits for the system property `key` to be created.
+ // Times out after `relative_timeout`.
+ // Returns true on success, false on timeout.
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ bool WaitForPropertyCreation(const std::string& key, std::chrono::milliseconds relative_timeout =
+                                                          std::chrono::milliseconds::max());
+ #endif
+ 
+-#if defined(__BIONIC__) && __cplusplus >= 201703L
++#if (defined(__BIONIC__) || defined(__ANDROID__)) && __cplusplus >= 201703L
+ // Cached system property lookup. For code that needs to read the same property multiple times,
+ // this class helps optimize those lookups.
+ class CachedProperty {
+diff --git a/properties.cpp b/properties.cpp
+index e217c9ed4e86153172434c8fab73f28edf148173..480225a7adc922e5b1fb2f6ddd4b5bb613ff6cb2 100644
+--- a/properties.cpp
++++ b/properties.cpp
+@@ -16,7 +16,7 @@
+ 
+ #include "android-base/properties.h"
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -178,7 +178,7 @@ bool SetProperty(const std::string& key, const std::string& value) {
+   return (__system_property_set(key.c_str(), value.c_str()) == 0);
+ }
+ 
+-#if defined(__BIONIC__)
++#if defined(__BIONIC__) || defined(__ANDROID__)
+ 
+ struct WaitForPropertyData {
+   bool done;
