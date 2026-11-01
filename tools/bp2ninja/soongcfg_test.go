@@ -17,7 +17,7 @@ func soongTree(t *testing.T, cflags, soongLevel, bionicLevel string) string {
 	files := map[string]string{
 		"build/soong/cc/config/global.go": "package config\n\nvar (\n\tcommonGlobalCflags = []string{\n\t\t\"-O2\",\n\t\t" + cflags + "\n\t}\n\n" +
 			"\tcommonGlobalAsflags = []string{\n\t\t\"-D__ASSEMBLY__\",\n\t\t\"-fdebug-default-version=4\",\n\t}\n)\n\n" +
-			"const (\n\tCStdVersion = \"gnu23\"\n\tCppStdVersion = \"gnu++20\"\n)\n\nfunc init() {\n\tcommonGlobalIncludes = []string{\"system/core/include\"}\n}\n",
+			"const (\n\tCStdVersion = \"gnu23\"\n\tCppStdVersion = \"gnu++20\"\n\tExperimentalCStdVersion = \"gnu2x\"\n\tExperimentalCppStdVersion = \"gnu++2b\"\n)\n\nfunc init() {\n\tcommonGlobalIncludes = []string{\"system/core/include\"}\n}\n",
 		"build/soong/cc/config/bionic.go": "package config\n\nvar (\n\tbionicDefaultSharedLibraries = []string{\"libc\", \"libm\", \"libdl\"}\n\n\tbionicCrtBeginStaticBinary, bionicCrtEndStaticBinary = []string{\"crtbegin_static\"}, []string{\"crtend_android\"}\n)\n",
 		"build/soong/android/config.go":   "package android\n\nconst FutureApiLevelInt = " + soongLevel + "\n",
 		"bionic/libc/include/android/api-level.h": "#pragma once\n#define __ANDROID_API_FUTURE__ " + bionicLevel + "\n#ifndef __ANDROID_API__\n" +
@@ -43,7 +43,7 @@ func TestSoongConfigAvailability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.CStd != "gnu23" || cfg.CppStd != "gnu++20" || len(cfg.GlobalIncludes) != 1 {
+	if cfg.CStd != "gnu23" || cfg.CppStd != "gnu++20" || cfg.ExperimentalCStd != "gnu2x" || cfg.ExperimentalCppStd != "gnu++2b" || len(cfg.GlobalIncludes) != 1 {
 		t.Fatalf("config %+v", cfg)
 	}
 	// only the preprocessor flags, in Soong's order
@@ -136,6 +136,44 @@ func TestDeviceArch(t *testing.T) {
 		if _, err := readDeviceArch(tree, Config{Arch: c.arch, ArchVariant: c.variant}); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s/%q: err %v, want %q", c.arch, c.variant, err, c.want)
 		}
+	}
+}
+
+// Expected values from Soong's cc/compiler.go: the -std comes after the module's cflags (builder.go joins localCFlags, then localConlyFlags / localCppFlags, each headed by its -std), so the last -std a C compile sees is Soong's, not a -std in cflags (camera_metadata's -std=c11);
+// "experimental" selects the Experimental*Version constants; gnu_extensions: false replaces gnu with c (gnuToCReplacer).
+func TestStdFlags(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library { name: "libcm", srcs: ["a.c"], cflags: ["-std=c11"], conlyflags: ["-DCONLY"] }
+cc_library { name: "libexp", srcs: ["a.c"], c_std: "experimental", cpp_std: "experimental" }
+cc_library { name: "libstrict", srcs: ["a.c"], cpp_std: "gnu++17", gnu_extensions: false }
+`})
+	g.soong.CStd, g.soong.CppStd, g.soong.ExperimentalCStd, g.soong.ExperimentalCppStd = "gnu23", "gnu++20", "gnu2x", "gnu++2b"
+	flags := func(name string) langFlags {
+		n := g.node(name, Device, Shared, "t")
+		if n == nil {
+			t.Fatal(g.problems)
+		}
+		return g.compileFlags(n)
+	}
+	// the last -std in the argv is the one clang uses
+	last := func(list []string) string {
+		s := ""
+		for _, f := range list {
+			if strings.HasPrefix(f, "-std=") {
+				s = f
+			}
+		}
+		return s
+	}
+	cm := flags("libcm")
+	if last(cm.c) != "-std=gnu23" || slices.Index(cm.c, "-std=gnu23") > slices.Index(cm.c, "-DCONLY") {
+		t.Errorf("libcm c %q", cm.c)
+	}
+	if f := flags("libexp"); last(f.c) != "-std=gnu2x" || last(f.cxx) != "-std=gnu++2b" {
+		t.Errorf("libexp c %q cxx %q", last(f.c), last(f.cxx))
+	}
+	if f := flags("libstrict"); last(f.c) != "-std=c23" || last(f.cxx) != "-std=c++17" {
+		t.Errorf("libstrict c %q cxx %q", last(f.c), last(f.cxx))
 	}
 }
 

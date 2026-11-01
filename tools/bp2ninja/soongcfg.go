@@ -19,8 +19,9 @@ import (
 // SoongConfig: the global C/C++ settings Soong applies to every module, read from the pinned tree's
 // build/soong/cc/config/global.go so an AOSP upgrade brings its own values, never a copy that drifts.
 type SoongConfig struct {
-	CStd, CppStd   string   // CStdVersion, CppStdVersion
-	GlobalIncludes []string // commonGlobalIncludes that exist in the tree (Soong skips missing ones)
+	CStd, CppStd                         string   // CStdVersion, CppStdVersion
+	ExperimentalCStd, ExperimentalCppStd string   // ExperimentalCStdVersion, ExperimentalCppStdVersion: what c_std / cpp_std "experimental" selects
+	GlobalIncludes                       []string // commonGlobalIncludes that exist in the tree (Soong skips missing ones)
 	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
 	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here.
 	GlobalDefines []string
@@ -367,6 +368,10 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 						cfg.CStd = str(x.Values[i])
 					case "CppStdVersion":
 						cfg.CppStd = str(x.Values[i])
+					case "ExperimentalCStdVersion":
+						cfg.ExperimentalCStd = str(x.Values[i])
+					case "ExperimentalCppStdVersion":
+						cfg.ExperimentalCppStd = str(x.Values[i])
 					case "commonGlobalCflags":
 						cflags, _ = stringList(x.Values[i])
 					case "commonGlobalAsflags":
@@ -391,8 +396,8 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 		}
 		return true
 	})
-	if cfg.CStd == "" || cfg.CppStd == "" {
-		return cfg, fmt.Errorf("%s: CStdVersion/CppStdVersion not found", path)
+	if cfg.CStd == "" || cfg.CppStd == "" || cfg.ExperimentalCStd == "" || cfg.ExperimentalCppStd == "" {
+		return cfg, fmt.Errorf("%s: CStdVersion/CppStdVersion/ExperimentalCStdVersion/ExperimentalCppStdVersion not found", path)
 	}
 	defines := func(list []string) []string {
 		return slices.DeleteFunc(list, func(f string) bool { return !strings.HasPrefix(f, "-D") && !strings.HasPrefix(f, "-U") })

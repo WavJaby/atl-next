@@ -303,16 +303,10 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		inc = append(inc, "-I"+g.abs(d))
 	}
 	inc = dedup(inc)
-	cstd := p.str("c_std")
-	if cstd == "" || cstd == "experimental" {
-		cstd = g.soong.CStd
-	}
-	cppstd := p.str("cpp_std")
-	if cppstd == "" || cppstd == "experimental" {
-		cppstd = g.soong.CppStd
-	}
-	cxx := append(append([]string{"-std=" + cppstd, "-stdlib=libc++"}, common...), moduleFlags(p, "cppflags")...)
-	c := append(append([]string{"-std=" + cstd}, common...), moduleFlags(p, "conlyflags")...)
+	cstd, cppstd := g.stdVersions(p)
+	// Soong's -std heads the language's local flags, after the module's cflags (cc/builder.go: localCFlags, then localConlyFlags / localCppFlags), so it wins over a -std in cflags (camera_metadata's -std=c11 builds as gnu23, which declares dprintf)
+	cxx := append(append(append([]string{"-stdlib=libc++"}, common...), "-std="+cppstd), moduleFlags(p, "cppflags")...)
+	c := append(append(slices.Clone(common), "-std="+cstd), moduleFlags(p, "conlyflags")...)
 	if n.side == Device {
 		dev := []string{g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device"), "-include", deviceForced}
 		if seesBionic(n) {
@@ -325,6 +319,26 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 		cxx = append(cxx, "-fno-rtti")
 	}
 	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...), yasm}
+}
+
+// stdVersions: the C and C++ -std values Soong gives a module (cc/compiler.go parseCStd, parseCppStd, maybeReplaceGnuToC): c_std / cpp_std, "" = the default, "experimental" = the experimental version; gnu_extensions: false turns gnu into c.
+func (g *Graph) stdVersions(p *Obj) (string, string) {
+	pick := func(v, def, exp string) string {
+		switch v {
+		case "":
+			return def
+		case "experimental":
+			return exp
+		}
+		return v
+	}
+	cstd := pick(p.str("c_std"), g.soong.CStd, g.soong.ExperimentalCStd)
+	cppstd := pick(p.str("cpp_std"), g.soong.CppStd, g.soong.ExperimentalCppStd)
+	if !p.boolean("gnu_extensions", true) {
+		r := strings.NewReplacer("gnu", "c")
+		cstd, cppstd = r.Replace(cstd), r.Replace(cppstd)
+	}
+	return cstd, cppstd
 }
 
 // seesBionic: n depends on the bionic provider directly, so its compiles have bionic's headers.
