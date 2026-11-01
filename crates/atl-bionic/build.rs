@@ -214,7 +214,12 @@ const IN_HOST_HEADERS: &[(&str, &str)] = &[("pthread", "pthread.h")];
 /// logger_write.cpp and libbase's threads.cpp call `syscall(__NR_gettid)` / `__NR_tgkill` after
 /// `<unistd.h>` alone (their `<syscall.h>` include is `!__ANDROID__`); bionic never builds that path
 /// (it calls `gettid()`). The kernel's `__NR_*` names only, not glibc's `SYS_*` aliases.
-const EXTRA_INCLUDES: &[(&str, &str)] = &[("unistd.h", "asm/unistd.h")];
+/// `fcntl.h`: bionic's `<sys/socket.h>` includes kernel uapi `<asm/fcntl.h>` (the shape walk derives no
+/// uapi include), so it brings `O_CLOEXEC` and the other `O_*` flags; libmemunreachable LeakPipe.h ->
+/// ScopedPipe.h calls `pipe2(fd, O_CLOEXEC)` after `<sys/socket.h>` alone. glibc's home for those flags is
+/// `<fcntl.h>`; uapi `<asm/fcntl.h>` itself would redefine glibc's `struct flock`.
+const EXTRA_INCLUDES: &[(&str, &str)] =
+    &[("unistd.h", "asm/unistd.h"), ("sys/socket.h", "fcntl.h")];
 
 /// bionic's property-area implementation and the headers holding its layouts.
 const PROP_AREA_SOURCES: &[&str] = &[
@@ -259,9 +264,12 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// hidden visibility; bionic's `resolv_netid.h` as libandroid_net includes it), `__RENAME_IF_FILE_OFFSET64`
 /// (`sys/cdefs.h`; androidfw under `__ANDROID__`): empty on LP64, as read here, where off_t is 64-bit
 /// on both libcs. `__packed` (`sys/cdefs.h`; libmedia mediascanner.h `struct MediaAlbumArt {…} __packed;`):
-/// undefined, it declares a variable of the struct, which calls its private constructor.
+/// undefined, it declares a variable of the struct, which calls its private constructor. `M_PURGE`
+/// (`malloc.h`, -101; hwui Bitmap.cpp `mallopt(M_PURGE, 0)` under `__ANDROID__`, result ignored): glibc
+/// 2.41's `mallopt` ignores an unknown option and returns 1, after consolidating the main arena's fastbins.
 const FORWARDED_MACROS: &[&str] = &[
     "__unused",
+    "M_PURGE",
     "__packed",
     "IS_ELF",
     "GID_MAX",

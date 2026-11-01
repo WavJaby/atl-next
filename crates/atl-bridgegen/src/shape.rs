@@ -10,7 +10,7 @@
 //!
 //! What bionic's header includes is read from bionic's own files only: the header and the private files
 //! (`bits/`, bionic-only headers) it reaches, stopping at includable names (angled, outside `bits/` and
-//! the kernel uapi, which the host has). Direct includes suffice: an includable header's own wrapper
+//! the kernel uapi, which the host has or a substitute generates). Direct includes suffice: an includable header's own wrapper
 //! gives its shape, and glibc's internal `#include <x>` reaches the wrappers too. Includable names the
 //! host's version already reaches are dropped.
 //!
@@ -182,8 +182,8 @@ struct Walk {
 /// From `probe`'s header through bionic's own private files (`bits/`, headers the host lacks): the
 /// includable names they include, and those private files. Not entered: includable headers -- their
 /// own wrappers give their shape, and glibc's includes of them reach the wrappers too -- the kernel
-/// uapi, the compiler's headers.
-fn walk(inputs: &Inputs, probe: &Probe, host_has: &dyn Fn(&str) -> bool) -> Result<Walk> {
+/// uapi, the compiler's headers. `includable`: the names a wrapper may include (the host's; substitutes).
+fn walk(inputs: &Inputs, probe: &Probe, includable: &dyn Fn(&str) -> bool) -> Result<Walk> {
     let root = probe.file.as_ref().context("walk of an unusable probe")?;
     let mut todo = vec![root];
     let mut visited = BTreeSet::from([root]);
@@ -197,7 +197,7 @@ fn walk(inputs: &Inputs, probe: &Probe, host_has: &dyn Fn(&str) -> bool) -> Resu
             if inc.angled
                 && !is_private(&inc.name)
                 && !under(&inc.file, inputs.uapi)
-                && host_has(&inc.name)
+                && includable(&inc.name)
             {
                 out.includable.insert(inc.name.clone());
             } else if inc.file.starts_with(inputs.bionic_include) && visited.insert(&inc.file) {
@@ -253,6 +253,21 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         );
     }
 
+    // what an included name gives: the host's header, or for a substitute bionic's (generated whole), so
+    // `<endian.h>` includes the `<sys/endian.h>` substitute (`betoh64`) instead of walking it as private
+    let shaped: BTreeMap<&str, &Probe> = inputs
+        .host
+        .iter()
+        .filter(|(_, p)| p.usable())
+        .map(|(n, p)| (n.as_str(), p))
+        .chain(
+            inputs
+                .substitutes
+                .iter()
+                .filter_map(|s| inputs.bionic.get(*s).map(|p| (*s, p))),
+        )
+        .collect();
+    let includable = |n: &str| shaped.contains_key(n);
     for (name, bionic) in inputs.bionic {
         if !bionic.usable() {
             continue;
@@ -265,7 +280,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             || BTreeSet::from([name.as_str()]),
             |h| reached_names(name, h),
         );
-        let walk = walk(inputs, bionic, &host_has)?;
+        let walk = walk(inputs, bionic, &includable)?;
         let mut extras: BTreeSet<String> = walk
             .includable
             .into_iter()
@@ -274,7 +289,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
         let mut seen: BTreeSet<&String> = host
             .into_iter()
             .flat_map(visible)
-            .chain(extras.iter().flat_map(|e| visible(&inputs.host[e])))
+            .chain(extras.iter().flat_map(|e| visible(shaped[e.as_str()])))
             .collect();
         let root = bionic
             .file
@@ -321,7 +336,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             seen.extend(declared);
             extras.insert(home.to_owned());
         }
-        let includes = reduce(&extras, inputs.host);
+        let includes = reduce(&extras, &shaped);
         if host.is_none() {
             out.insert(
                 name.clone(),
@@ -546,10 +561,10 @@ pub fn print_gaps(gaps: &[Gap]) -> String {
 }
 
 /// `extras` without those another of them already reaches on the host (two reaching each other stay).
-fn reduce(extras: &BTreeSet<String>, host: &BTreeMap<String, Probe>) -> Vec<String> {
+fn reduce(extras: &BTreeSet<String>, shaped: &BTreeMap<&str, &Probe>) -> Vec<String> {
     let reach: BTreeMap<&str, BTreeSet<&str>> = extras
         .iter()
-        .map(|e| (e.as_str(), reached_names(e, &host[e])))
+        .map(|e| (e.as_str(), reached_names(e, shaped[e.as_str()])))
         .collect();
     extras
         .iter()
@@ -813,6 +828,7 @@ mod tests {
                 "bionic/o.h",
                 "#include <sys/cdefs.h>\n#include <x.h>\nint x;\n#define __om(v) __oc(v)\n",
             ),
+            ("bionic/n.h", "#include <o.h>\n"),
             ("bionic/f.h", "int f_only(void);\n"),
             ("bionic/c.h", "#include <sys/cdefs.h>\n#define __cm __mac\n"),
             ("bionic/e.h", "#define __kb\n"),
@@ -829,6 +845,7 @@ mod tests {
             ("uapi/k/v.h", "#define __kv 1\n"),
             ("uapi/k/m.h", "#define __mac 1\n"),
             ("host/w.h", "#include <sys/cdefs.h>\nint w;\n"),
+            ("host/n.h", "int n;\n"),
             ("host/sys/cdefs.h", "int cdefs;\n"),
             ("host/x.h", "int x;\n"),
             ("host/y.h", "int y;\n"),
@@ -897,6 +914,7 @@ mod tests {
             "d.h",
             "e.h",
             "f.h",
+            "n.h",
             "o.h",
             "q.h",
             "sys/cdefs.h",
@@ -967,8 +985,17 @@ mod tests {
             }
         );
         assert_eq!(with_home.wrappers["e.h"].defines, strings(&["__kb"]));
+        // a header including a substitute includes it, not walks it as private (bionic endian.h ->
+        // sys/endian.h); not substituted, o.h is walked and only its includes reach n.h
+        assert_eq!(with_home.wrappers["n.h"].includes, strings(&["o.h"]));
+        let unsubstituted =
+            derived_with(&dir, &[("bits/p.h", "q.h")], &["__mac", "__pm"], &["e.h"]).unwrap();
+        assert_eq!(
+            unsubstituted.wrappers["n.h"].includes,
+            strings(&["sys/cdefs.h", "x.h"])
+        );
         // unlisted bionic-only headers get nothing
-        assert_eq!(with_home.wrappers.len(), 6);
+        assert_eq!(with_home.wrappers.len(), 7);
         let home = &[("bits/p.h", "q.h")];
         let forwarded = &["__mac", "__pm"];
         // refused substitutes: bionic-only API (f.h); a macro needing __mac, a k/u.h field name (c.h);

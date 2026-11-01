@@ -81,6 +81,21 @@ const CASES: &[(&str, &str)] = &[
         "sys/endian.h: #define htonq(x) __swap64(x), __swap64 -> __builtin_bswap64",
         "#include <sys/endian.h>\nint v[htonq(1) == 0x0100000000000000 ? 1 : -1];\n",
     ),
+    // libmediadrm DrmUtils.h, libmediandk; bare, an undeclared function (glibc names it be64toh)
+    (
+        "endian.h: #include <sys/endian.h>, which defines betoh64(x) __swap64(x)",
+        "#include <endian.h>\nint v[betoh64(1) == 0x0100000000000000 ? 1 : -1];\n",
+    ),
+    // libmemunreachable ScopedPipe.h via LeakPipe.h; value from bionic's uapi asm-generic/fcntl.h
+    (
+        "sys/socket.h: #include <asm/fcntl.h>, which defines O_CLOEXEC 02000000",
+        "#include <sys/socket.h>\nint v[O_CLOEXEC == 02000000 ? 1 : -1];\n",
+    ),
+    // hwui Bitmap.cpp `mallopt(M_PURGE, 0)`
+    (
+        "malloc.h: #define M_PURGE (-101)",
+        "#include <malloc.h>\nint v[M_PURGE == -101 ? 1 : -1];\n",
+    ),
 ];
 
 fn target(args: Vec<String>) -> Target {

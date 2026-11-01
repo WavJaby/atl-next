@@ -444,6 +444,9 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 			inputs = append(inputs, d.out)
 		}
 	}
-	libs = append(libs, "-stdlib=libc++", "-lpthread", "-ldl", "-lrt", "-lm")
+	// glibc's split of bionic's libc; bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) is
+	// glibc's libresolv, needed only where used
+	libs = append(libs, "-stdlib=libc++", "-lpthread", "-ldl", "-lrt", "-lm",
+		"-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state")
 	return libs, inputs
 }
