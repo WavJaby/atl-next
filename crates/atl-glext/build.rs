@@ -2,7 +2,7 @@
 //! Generates `OUT_DIR/glext.rs` with atl-bridgegen from AOSP's pinned Khronos headers (`frameworks/native/opengl/include`), for the target cargo builds for: one exported shell per EGL / GLES extension function, forwarding to what `eglGetProcAddress` returns (bridge control 1; `crate::ffi::resolve`). Generates twice and fails unless byte-identical.
 //!
 //! Extension function = declared by an extension header (`EXT_HEADERS`) and by no core header (`CORE_HEADERS`). The headers decide, not the host libraries' exports: the set is the same on every host and at every build, and the host loaders (libglvnd) export exactly the core headers' functions -- measured 2026-10-31 on Debian 13: libEGL 44 symbols, libGLESv2 358, libGLESv1_CM 145, no extension function among them besides GLES 1.1's core `glPointSizePointerOES`.
-//! Headers are parsed as the converter compiles their callers: glibc host target, no `__ANDROID__` (eglplatform.h's `__unix__` native types), prototypes enabled.
+//! Headers are parsed as the converter compiles their callers: glibc host target, `ANDROID` (a Soong global define) and `__ANDROID__` (the device triple's, owner 2026-11-01) -- eglplatform.h's Android native types --, prototypes enabled.
 
 use std::path::PathBuf;
 
@@ -78,6 +78,8 @@ fn main() -> Result<()> {
         triple: buildscript::clang_triple_from_cargo()?,
         args: vec![
             format!("-I{}", include.display()),
+            "-DANDROID".to_owned(),
+            "-D__ANDROID__".to_owned(),
             "-DEGL_EGLEXT_PROTOTYPES".to_owned(),
             "-DGL_GLEXT_PROTOTYPES".to_owned(),
         ],
