@@ -80,7 +80,7 @@ func TestRustCrateFlags(t *testing.T) {
 		t.Errorf("tool flags %q", f)
 	}
 	// the genrule runs the binary rustc writes
-	if s := g.genFiles[filepath.Join(out, "gen/device/bridge_h/genrule.sh")]; !strings.HasPrefix(s, filepath.Join(out, "host/tool/tool")+" --header > ") {
+	if s := g.genFiles[filepath.Join(out, "gen/device/bridge_h/genrule.sh")]; !strings.Contains(s, "\n"+filepath.Join(out, "host/tool/tool")+" --header > ") {
 		t.Errorf("genrule script %q", s)
 	}
 }

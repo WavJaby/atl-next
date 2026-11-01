@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 1 Nov 2026 22:16:05 +0800
+Subject: [PATCH] SensorManager JNI: include <arpa/inet.h> for htonl
+
+toUint64 calls htonl, which the file gets only through bionic headers
+including <netinet/in.h> transitively (sys/endian.h). POSIX declares
+htonl in <arpa/inet.h>; glibc headers have no such transitive include.
+
+Upstream-Status: Pending
+Patch-Reason: the file relies on a bionic-only transitive include; the glibc header shape cannot add it (a sys/endian.h -> netinet/in.h row fails the compile-alone check) and a redeclaration of htonl clashes with glibc's noexcept one
+---
+SPDX-License-Identifier: Apache-2.0
+ core/jni/android_hardware_SensorManager.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/core/jni/android_hardware_SensorManager.cpp b/core/jni/android_hardware_SensorManager.cpp
+index 2864a5718f338a1fe0727a06d21b807bc1c8e2d3..c06fb104a9cc635c402827c5940b2b478348d7aa 100644
+--- a/core/jni/android_hardware_SensorManager.cpp
++++ b/core/jni/android_hardware_SensorManager.cpp
+@@ -34,6 +34,7 @@
+ #include <utils/Looper.h>
+ #include <utils/Vector.h>
+ 
++#include <arpa/inet.h>
+ #include <map>
+ 
+ namespace {

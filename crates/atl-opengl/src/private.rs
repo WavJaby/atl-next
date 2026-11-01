@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! AOSP libEGL's private API (`private/EGL/cache.h`, `display.h`, declared in C++ `namespace android`) on the host EGL, exported under the Itanium-mangled names framework code links against.
-//! `crate::generated::{cache, display}` check each export's signature against AOSP's header; this module's tests check each symbol against the mangling rules.
+//! AOSP libEGL's private API on the host EGL, exported under the Itanium-mangled names framework code links against: `private/EGL/cache.h`, `display.h` (C++ `namespace android`), and `eglBeginFrame` (global, C++ linkage, declared by its caller only).
+//! `crate::generated::{cache, display}` check those exports' signatures against AOSP's header; `eglBeginFrame` has no header to check against. This module's tests check each symbol against the mangling rules.
 //! Boundary module: `unsafe` is the exported names and one host EGL call.
 
 use core::ffi::{c_char, c_int, c_void};
@@ -56,14 +56,31 @@ exports! {
     }
 }
 
+/// `eglBeginFrame` mangled: a global-scope function with C++ linkage. hwui `renderthread/EglManager.cpp` declares it itself, outside any `extern "C"`, as `EGLAPI void EGLAPIENTRY eglBeginFrame(EGLDisplay dpy, EGLSurface surface)`; AOSP's `eglApi.cpp` defines it the same way, so libEGL exports the mangled name.
+/// A macro so the attribute and the test read one literal.
+macro_rules! begin_frame {
+    () => {
+        "_Z13eglBeginFramePvS_"
+    };
+}
+
+/// No-op. AOSP's (`eglApi.cpp` -> `egl_platform_entries.cpp` `eglBeginFrameImpl`) emits a systrace slice (`ATRACE_CALL`), sets the thread's EGL error to EGL_SUCCESS, then to EGL_BAD_DISPLAY / EGL_NOT_INITIALIZED or EGL_BAD_SURFACE for a bad handle; it draws, swaps and returns nothing.
+/// Known difference: the thread's EGL error is left as it was. hwui calls it from `EglManager::beginFrame` and reads no EGL error after it.
+// SAFETY: a name nothing else in the process defines (AOSP's libEGL is not built; the host's exports only C names); the signature is hwui's declaration (both handles `void*` in egl.h), and a free C++ function's ABI is the C one
+#[unsafe(export_name = begin_frame!())]
+pub extern "C" fn egl_begin_frame(_dpy: *mut c_void, _surface: *mut c_void) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Itanium C++ ABI 5.1 (mangling) of a function in `namespace android`: `_Z` `N` <len>`android` <len><name> `E` + parameter types.
-    fn mangle(name: &str, params: &str) -> String {
+    /// Itanium C++ ABI 5.1 (mangling) of a free function: `_Z` <len><name> + parameter types at global scope, `_Z` `N` <len><ns> <len><name> `E` + parameter types in namespace `ns`.
+    fn mangle(ns: Option<&str>, name: &str, params: &str) -> String {
         let source = |s: &str| format!("{}{s}", s.len());
-        format!("_ZN{}{}E{params}", source("android"), source(name))
+        match ns {
+            Some(ns) => format!("_ZN{}{}E{params}", source(ns), source(name)),
+            None => format!("_Z{}{params}", source(name)),
+        }
     }
 
     #[test]
@@ -76,8 +93,14 @@ mod tests {
         };
         assert_eq!(SYMBOLS.len(), 2);
         for (name, symbol) in SYMBOLS {
-            assert_eq!(&mangle(name, params(name)), symbol, "{name}");
+            assert_eq!(
+                &mangle(Some("android"), name, params(name)),
+                symbol,
+                "{name}"
+            );
         }
+        // (EGLDisplay, EGLSurface) = (void*, void*): the first `Pv` is substitution candidate 0 (5.1.10; builtin `v` is none), so the second is `S_`
+        assert_eq!(mangle(None, "eglBeginFrame", "PvS_"), begin_frame!());
     }
 
     #[test]

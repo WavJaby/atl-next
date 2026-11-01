@@ -165,6 +165,37 @@ const APIS: &[Api] = &[
             records: &[],
         },
     },
+    // bionic's malloc introspection, declared by its one caller (2026-11-01: libmemunreachable bionic.h, C++ so `()` is `(void)`).
+    // No header printed: libmemunreachable includes its own declaration.
+    Api {
+        name: "malloc_introspection",
+        source: "system/memory/libmemunreachable/bionic.h",
+        lang: Lang::Cxx,
+        header: None,
+        functions: &[
+            "malloc_disable",
+            "malloc_enable",
+            "malloc_iterate",
+            "malloc_backtrace",
+        ],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
+    // the per-network resolver entry netd and libandroid_net call (libc.map.txt `# apex`; 2026-11-01: libandroid_net net.c
+    // android_getaddrinfofornetwork). No header printed: net.c includes bionic's own `resolv_netid.h` (its include_dirs name
+    // `bionic/libc/dns/include`), so a printed one would be a second copy on the include path. Its other `*fornet` /
+    // `*fornetcontext` functions have no caller in the closure; net.c's `android_res_*` call libnetd_client, not bionic.
+    Api {
+        name: "resolv_netid",
+        source: "bionic/libc/dns/include/resolv_netid.h",
+        lang: Lang::C,
+        header: None,
+        functions: &["android_getaddrinfofornet"],
+        macros: &[],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
     // the first abort message, kept for a crash report (2026-11-01: liblog, libbase, perfetto aborters
     // under __ANDROID__); forced into every device unit by the converter (libcCompat): liblog's
     // logger_write.cpp calls it under __ANDROID__ but includes the header only under __BIONIC__
@@ -288,7 +319,9 @@ const INPUT_DIRS: &[&str] = &[
     "bionic/libc/system_properties",
     "bionic/libc/async_safe/include",
     "bionic/libdl",
+    "bionic/libc/dns/include",
     "system/logging/liblog/include",
+    "system/memory/libmemunreachable",
 ];
 
 /// bionic's public headers, relative to the AOSP tree.

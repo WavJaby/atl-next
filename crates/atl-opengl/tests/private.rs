@@ -33,6 +33,22 @@ unsafe extern "C" {
     fn egl_get_init_count(dpy: Display) -> c_int;
 }
 
+// hwui renderthread/EglManager.cpp: global scope, C++ linkage; Itanium mangling of eglBeginFrame(void*, void*)
+unsafe extern "C" {
+    #[link_name = "_Z13eglBeginFramePvS_"]
+    fn eglBeginFrame(dpy: Display, surface: *mut c_void);
+}
+
+#[test]
+fn begin_frame_accepts_any_handles() {
+    // AOSP validates both handles and only sets the EGL error on bad ones; hwui passes its display and current surface
+    // SAFETY: the export ignores its arguments
+    unsafe {
+        eglBeginFrame(null_mut(), null_mut());
+        eglBeginFrame(0x1234 as Display, 0x5678 as *mut c_void);
+    }
+}
+
 #[test]
 fn init_count_follows_initialize_and_terminate() {
     // SAFETY: EGL calls with the display EGL returned, in the order the spec allows

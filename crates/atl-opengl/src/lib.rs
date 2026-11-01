@@ -6,7 +6,7 @@
 //! The lookup is per process: EGL 1.5 §3.10 makes the returned pointers context-independent, valid for every display and context.
 //! No core function is defined, so lookups of the host's own symbols are unaffected.
 //!
-//! libEGL's private API (`private`): the two `namespace android` functions framework code calls (`egl_set_cache_filename`, `egl_get_init_count`), with the headers declaring them (build.rs).
+//! libEGL's private API (`private`): the two `namespace android` functions framework code calls (`egl_set_cache_filename`, `egl_get_init_count`), with the headers declaring them (build.rs), and hwui's systrace frame marker `eglBeginFrame` (no-op; no header declares it).
 //!
 //! Boundary crate: `unsafe` only in `ffi` and `private`.
 #![deny(unsafe_code)]

@@ -521,14 +521,18 @@ func (g *Graph) genScript(n *Node) string {
 	if msg != "" {
 		return "echo " + shellEscape(fmt.Sprintf("error: genrule %s: %s", n.name, msg)) + " >&2\nexit 1\n"
 	}
+	outs := strings.Join(mapStrings(r.outs, shellEscape), " ")
+	// Soong's command never sees a previous run's outputs: sbox runs it in a fresh sandbox and clears the output dir before copying
+	// back (cmd/sbox/sbox.go runCommand -> clearOutputDirectory). Without this, `>> $(out)` commands append to a reused out dir's file.
+	clear := "rm -f -- " + outs + " || exit 1\n"
 	// sbox validates the outputs after the command (validateOutputFiles); ninja would only notice a missing
 	// one in a consumer
-	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + strings.Join(mapStrings(r.outs, shellEscape), " ") +
+	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + outs +
 		"; do\n  [ -e \"$f\" ] || { echo \"error: genrule " + n.name + ": $f was not created\" >&2; exit 1; }\ndone\n"
 	if len(r.toolData) > 0 {
 		body = sandboxPrelude(filepath.Join(g.genDir(n, ""), "sbox"), r.toolData) + body
 	}
-	return body + check
+	return clear + body + check
 }
 
 // emitGen writes the build edge of one genrule node and records its script for the caller to write.

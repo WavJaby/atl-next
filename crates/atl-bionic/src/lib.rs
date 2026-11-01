@@ -20,6 +20,8 @@
 //! - `pthread_gettid_np` (`thread`), where glibc lacks it (< 2.42).
 //! - `setprogname` (`progname`): the short name into glibc's `program_invocation_short_name`.
 //! - `<bionic/reserved_signals.h>`: bionic's reserved signal numbers, constants only.
+//! - malloc introspection (`malloc_iterate`, `malloc_disable`, `malloc_enable`, `malloc_backtrace`): glibc's heap cannot be walked, so each answers as a bionic allocator without the support does (no chunks, no frames).
+//! - `android_getaddrinfofornet`: single network, the host's `getaddrinfo`.
 //!
 //! Built as one shared library per process (cargo-c), so one store, one target SDK, one abort message.
 //! Boundary crate: `unsafe` only in `ffi` (the C ABI shells), `map` (the shared mapping), `linker`
@@ -48,6 +50,12 @@ mod generated {
     }
     pub mod malloc {
         include!(concat!(env!("OUT_DIR"), "/malloc.rs"));
+    }
+    pub mod malloc_introspection {
+        include!(concat!(env!("OUT_DIR"), "/malloc_introspection.rs"));
+    }
+    pub mod resolv_netid {
+        include!(concat!(env!("OUT_DIR"), "/resolv_netid.rs"));
     }
     pub mod set_abort_message {
         include!(concat!(env!("OUT_DIR"), "/set_abort_message.rs"));

@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -283,8 +284,8 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	})
 	n := g.genNode("g", Device, "t")
 	out := g.out + "/gen/device/g/o.txt"
-	// the command, then Soong's check that every declared output exists
-	wantScript := "cp p/in.txt " + out + "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + out +
+	// the declared outputs removed (sbox's fresh sandbox), the command, then Soong's check that every declared output exists
+	wantScript := "rm -f -- " + out + " || exit 1\ncp p/in.txt " + out + "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + out +
 		"; do\n  [ -e \"$f\" ] || { echo \"error: genrule g: $f was not created\" >&2; exit 1; }\ndone\n"
 	if got := g.genScript(n); got != wantScript {
 		t.Errorf("script %q, want %q", got, wantScript)
@@ -299,6 +300,37 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	}
 	if g.genFiles[g.out+"/gen/device/g/genrule.sh"] != wantScript {
 		t.Error("script not recorded for writing")
+	}
+}
+
+// sbox runs every command in a fresh sandbox (cmd/sbox/sbox.go), so an appending command run twice in the same out dir leaves one
+// run's output, as on a clean build: "x\n", the command's own output once.
+func TestGenruleRerunStartsFromNoOutputs(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"p/Android.bp": `genrule { name: "g", cmd: "echo x >> $(out)", out: ["o.txt"] }`,
+	})
+	n := g.genNode("g", Device, "t")
+	out := g.out + "/gen/device/g/o.txt"
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "genrule.sh")
+	if err := os.WriteFile(script, []byte(g.genScript(n)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for run := 1; run <= 2; run++ {
+		cmd := exec.Command("bash", script)
+		cmd.Dir = g.tree
+		if b, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("run %d: %v\n%s", run, err, b)
+		}
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "x\n" {
+		t.Errorf("output after two runs %q, want %q", got, "x\n")
 	}
 }
 

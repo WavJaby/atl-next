@@ -11,6 +11,7 @@ use std::ffi::CString;
 
 use crate::generated::dlext::android_dlextinfo;
 use crate::generated::libdl_android::android_namespace_t;
+use crate::generated::resolv_netid::addrinfo;
 use crate::generated::system_properties::{PROP_NAME_MAX, prop_info, timespec};
 use crate::generated::timespec as ts;
 use crate::props::{Area, PropInfo, VALUE_MAX, Value};
@@ -263,6 +264,64 @@ pub extern "C" fn android_fdsan_set_error_level(new_level: u32) -> u32 {
 pub extern "C" fn android_mallopt(_opcode: c_int, _arg: *mut c_void, _arg_size: usize) -> bool {
     errno::set_errno(errno::Errno(rustix::io::Errno::NOTSUP.raw_os_error()));
     false
+}
+
+// bionic's malloc introspection (malloc_common.cpp, malloc_common_dynamic.cpp), for libmemunreachable. glibc's allocator offers
+// no heap walk and no way to stop other threads' allocations, so each answers as bionic's allocators without the support do:
+// HWASan's (`__sanitizer_malloc_iterate` returns 0 and calls nothing, disable / enable do nothing) and malloc_backtrace without
+// malloc debug (0 frames). bionic defines no error value for these. With no chunk reported, libmemunreachable finds nothing to
+// classify, so it reports no leak rather than failing.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn malloc_disable() {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn malloc_enable() {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn malloc_iterate(
+    _base: usize,
+    _size: usize,
+    _callback: Option<unsafe extern "C" fn(usize, usize, *mut c_void)>,
+    _arg: *mut c_void,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn malloc_backtrace(
+    _pointer: *mut c_void,
+    _frames: *mut u64,
+    _frame_count: usize,
+) -> isize {
+    0
+}
+
+/// bionic's netd resolver entry (resolv_netid.h). Single-network semantics: one network exists, so `netid` and `mark` are
+/// ignored and the call is the host's `getaddrinfo` with the same arguments and result, as bionic's own `getaddrinfo` is this
+/// function with `NETID_UNSET` / `MARK_UNSET` (getaddrinfo.c). Multi-network support plugs in here, through the platform
+/// layer's network service: this is the one place to extend.
+/// Callers are compiled against the host libc's `<netdb.h>`, so `struct addrinfo` and the `EAI_*` results are the host's on
+/// both sides; only pointers pass through.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn android_getaddrinfofornet(
+    node: *const c_char,
+    service: *const c_char,
+    hints: *const addrinfo,
+    _netid: core::ffi::c_uint,
+    _mark: core::ffi::c_uint,
+    res: *mut *mut addrinfo,
+) -> c_int {
+    unsafe extern "C" {
+        fn getaddrinfo(
+            node: *const c_char,
+            service: *const c_char,
+            hints: *const addrinfo,
+            res: *mut *mut addrinfo,
+        ) -> c_int;
+    }
+    // SAFETY: the caller's arguments under getaddrinfo's own contract, unchanged (the same pointers bionic forwards)
+    unsafe { getaddrinfo(node, service, hints, res) }
 }
 
 #[unsafe(no_mangle)]
