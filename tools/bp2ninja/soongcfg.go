@@ -37,10 +37,29 @@ type SoongConfig struct {
 	Device           DeviceArch      // readDeviceArch
 	RustFeatures     RustFeatureGate // readRustFeatureGate
 	DeviceLink       DeviceLink      // readDeviceLink
+	Lldflags         []string        // readLldflags
+}
+
+// readLldflags: global.go commonGlobalLldflags, which Soong gives every link on both sides (cc/linker.go CommonLinkerFlags -> ${config.DeviceGlobalLldflags} / ${config.HostGlobalLldflags}, both built from it): the linker choice (-fuse-ld=lld) and lld's global flags (--icf=safe, --no-demangle).
+// Fails when the list selects no linker: the converter's links take theirs from it, and xtask's licence gate parses lld's --trace format.
+func readLldflags(tree string) ([]string, error) {
+	path := filepath.Join(tree, "build/soong/cc/config/global.go")
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	list, ok := stringList(valueSpecs(f)["commonGlobalLldflags"])
+	if !ok {
+		return nil, fmt.Errorf("%s: commonGlobalLldflags not found (or not a string list)", path)
+	}
+	if !slices.Contains(list, "-fuse-ld=lld") {
+		return nil, fmt.Errorf("%s: commonGlobalLldflags %q lacks -fuse-ld=lld: Soong no longer links with lld, the converter assumes it does", path, list)
+	}
+	return list, nil
 }
 
 // DeviceLink: the part of Soong's device (bionic toolchain) defaults that decides what a shared library or binary exports and what its link may drop; host (linux_glibc) modules get none of it, as in Soong.
-// Only that part: the rest of deviceGlobalCflags / deviceGlobalLdflags is hardening, warnings or lld-only (--icf=safe; distro clang links with GNU ld here).
+// Only that part: the rest of deviceGlobalCflags / deviceGlobalLdflags is hardening or warnings; the lld flags both sides share are SoongConfig.Lldflags.
 // Together with version_script it is what makes a library's unexported dead code disappear: local: * hides a symbol, -ffunction-sections puts it in its own section, --gc-sections drops the section with its undefined references (libhwui's whole-archived libskia SkFontMgr_android_ndk.cpp -> AFont_*).
 type DeviceLink struct {
 	// global.go deviceGlobalCflags' -f*-sections: one section per function / data object, the unit --gc-sections drops

@@ -35,13 +35,14 @@ pub struct Cause {
 }
 
 /// lld's line per undefined symbol; the `>>> referenced by` lines after it are not causes.
+/// lld (bp2ninja links with it, as Soong does) writes every error as `ld.lld: error: …`, so its other errors are `error:` lines like a compiler's.
 const UNDEFINED: &str = "error: undefined symbol: ";
-/// GNU ld's (clang's default linker on Debian): `<obj>: in function `f': … undefined reference to `sym'`.
-const UNDEFINED_REF: &str = "undefined reference to `";
-/// GNU ld's other errors, which carry no `error:`; the key starts at the phrase.
-const LD_ERRORS: &[&str] = &["multiple definition of `", "ld: cannot find "];
-/// Summary lines after the real errors: clang's driver line after any link error (the cause is the linker's own lines), rustc's count.
-const SUMMARIES: &[&str] = &["linker command failed", "error: aborting due to "];
+/// Summary lines after the real errors: clang's driver line after any link error (the cause is the linker's own lines), lld's error-limit line, rustc's count.
+const SUMMARIES: &[&str] = &[
+    "linker command failed",
+    "error: too many errors emitted",
+    "error: aborting due to ",
+];
 /// rustc's coded errors (`error[E0554]: …`), which carry no `error:`.
 const RUSTC_ERROR: &str = "error[E";
 
@@ -119,14 +120,7 @@ fn add_step(f: &mut Failed, out: &[&str], prefixes: &[&str]) {
         if let Some((_, sym)) = l.split_once(UNDEFINED) {
             f.undefined.insert(sym.trim().to_owned());
             undefined = true;
-        } else if let Some((_, rest)) = l.split_once(UNDEFINED_REF) {
-            f.undefined
-                .insert(rest.rsplit_once('\'').map_or(rest, |(s, _)| s).to_owned());
-            undefined = true;
-        } else if l.contains("error:")
-            || l.contains(RUSTC_ERROR)
-            || LD_ERRORS.iter().any(|p| l.contains(p))
-        {
+        } else if l.contains("error:") || l.contains(RUSTC_ERROR) {
             errors.push(l.trim());
         }
     }
@@ -143,7 +137,6 @@ fn add_step(f: &mut Failed, out: &[&str], prefixes: &[&str]) {
         // `file:line:col: error: msg` and `file: error: msg` -> `error: msg`: one message in many files is one cause
         let key = ["error:", RUSTC_ERROR]
             .into_iter()
-            .chain(LD_ERRORS.iter().copied())
             .find_map(|p| line.find(p))
             .map_or(line.as_str(), |i| &line[i..])
             .to_owned();
@@ -453,28 +446,33 @@ ninja: build stopped: subcommands failed.
         );
     }
 
-    /// GNU ld's wording, as in the libz link of 2026-10-31 (`--no-undefined`, Debian's default linker).
+    /// lld 19.1.7's own lines (Debian lld-19, measured with clang-19 -fuse-ld=lld): an unknown option, a missing library, a version script naming an undefined symbol, a duplicate with its `>>>` detail, and the error-limit line; clang's driver line closes the step.
+    /// The linker's errors are the causes, not the two summary lines.
     #[test]
-    fn gnu_ld_causes() {
+    fn lld_causes() {
         let log = "\
 FAILED: /o/device/libz/libz.so
-clang++ -shared -o /o/device/libz/libz.so
-/usr/bin/ld: /o/obj/device/libz/shared/adler32.c.o: in function `adler32_z':
-adler32.c:(.text+0xea): undefined reference to `cpu_check_features'
-/usr/bin/ld: /o/obj/device/libz/shared/b.o:(.bss+0x0): multiple definition of `x'; /o/obj/device/libz/shared/a.o:(.bss+0x0): first defined here
-/usr/bin/ld: cannot find -lfoo: No such file or directory
-clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+clang++ -fuse-ld=lld -shared -o /o/device/libz/libz.so
+ld.lld: error: unknown argument '--frob'
+ld.lld: error: unable to find library -lnosuch
+ld.lld: error: version script assignment of 'global' to symbol 'nosuch' failed: symbol not defined
+ld.lld: error: duplicate symbol: x
+>>> defined at a.c
+>>>            /o/obj/device/libz/shared/a.o:(x)
+>>> defined at b.c
+>>>            /o/obj/device/libz/shared/b.o:(.data+0x0)
+ld.lld: error: too many errors emitted, stopping now (use --error-limit=0 to see all errors)
+clang-19: error: linker command failed with exit code 1 (use -v to see invocation)
 ";
         let f = &failures(log, &["/o/"])["device/libz"];
+        assert!(f.undefined.is_empty());
         assert_eq!(
-            f.undefined,
-            BTreeSet::from(["cpu_check_features".to_owned()])
-        );
-        assert_eq!(
-            f.errors.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+            f.errors.iter().map(|c| c.line.as_str()).collect::<Vec<_>>(),
             [
-                "multiple definition of `x'; obj/device/libz/shared/a.o:(.bss+0x0): first defined here",
-                "ld: cannot find -lfoo: No such file or directory"
+                "ld.lld: error: unknown argument '--frob'",
+                "ld.lld: error: unable to find library -lnosuch",
+                "ld.lld: error: version script assignment of 'global' to symbol 'nosuch' failed: symbol not defined",
+                "ld.lld: error: duplicate symbol: x",
             ]
         );
     }

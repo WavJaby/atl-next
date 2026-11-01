@@ -129,6 +129,7 @@ pkgconfig = "libelf"
 scope = ["build", "runtime"]
 used_by = ["upstream:aosp"]
 
+# the converter's linker: Soong's commonGlobalLldflags -fuse-ld=lld, which the `clang` row's clang resolves to its own ld.lld
 [lld]
 debian = "lld-19"
 arch = "lld"

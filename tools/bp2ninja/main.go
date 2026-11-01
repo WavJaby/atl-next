@@ -118,6 +118,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.DeviceLink, err = readDeviceLink(tree); err != nil {
 		return err
 	}
+	if soong.Lldflags, err = readLldflags(tree); err != nil {
+		return err
+	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The licence gate after `xtask native`'s build (CLAUDE.md licence rules): every file that reaches a shipped artifact carries a licence licenses.toml allows in it.
 //! - Shipped artifacts: the device-side link outputs ninja produced (`ninja -t targets rule link`, under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
-//! - Reached files, per artifact: the objects its link loaded, from `<artifact>.trace` (bp2ninja's link rule runs ld with `-t -t`: each object on the command line and each archive member loaded -- those symbol resolution pulled in, every member of a `--whole-archive`); a member is mapped back to its object through the archive's ninja edge (`ninja -t query`). Members are named by file name, so where two objects of one archive share one, both count.
+//! - Reached files, per artifact: the objects its link loaded, from `<artifact>.trace` (bp2ninja's link rule runs lld with `--trace`: each object on the command line and each archive member loaded -- those symbol resolution pulled in, every member of a `--whole-archive`); a member is mapped back to its object through the archive's ninja edge (`ninja -t query`). Members are named by file name, so where two objects of one archive share one, both count.
 //!   An archive whose members are none of its inputs but which has a depfile record was compiled whole by its own edge (rustc's generated staticlib): the archive is the object, whichever of its codegen units ld loaded.
 //!   Then each object's source and headers, from its depfile (`ninja -t deps`); a depfile entry with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
 //! - A file's licence: `notice::resolve` with the `[upstream.<key>]` of the checkout holding it; AOSP projects share key `aosp`, their paths relative to the tree root (`external/dng_sdk/...`).
@@ -246,12 +246,12 @@ struct Loaded {
     members: Vec<(PathBuf, String)>,
 }
 
-/// GNU ld `-t -t` output: one input per line, `(archive)member` for each archive member it loaded; archives and shared objects themselves are listed too and skipped.
+/// lld `--trace` output: one loaded input per line, `archive(member)` for each archive member it loaded (archives themselves are not listed); shared objects are listed too and skipped.
 fn parse_trace(text: &str) -> Loaded {
     let mut loaded = Loaded::default();
     for line in lines(text) {
-        if let Some(rest) = line.strip_prefix('(')
-            && let Some((archive, member)) = rest.split_once(')')
+        if let Some(rest) = line.strip_suffix(')')
+            && let Some((archive, member)) = rest.rsplit_once('(')
         {
             loaded.members.push((archive.into(), member.to_owned()));
         } else if line.ends_with(".o") {
@@ -378,7 +378,7 @@ mod tests {
             &format!(
                 "rule cc\n  command = clang-19 -fPIC -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
                  rule ar\n  command = rm -f $out && llvm-ar-19 crsD $out $in\n\
-                 rule link\n  command = clang-19 -shared -o $out $in -Wl,-t,-t >$out.trace\n\
+                 rule link\n  command = clang-19 -fuse-ld=lld -shared -o $out $in -Wl,--trace >$out.trace\n\
                  build {m}: cc {ms}\nbuild {u}: cc {us}\nbuild {x}: cc {xs}\n\
                  build {a}: ar {u} {x}\nbuild {l}: link {m} {a}\n",
                 m = o("main"),
@@ -470,7 +470,7 @@ mod tests {
             &format!(
                 "rule cc\n  command = clang++-19 -fPIC -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
                  rule rustc\n  command = rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' \"$$line\" $crates > $out.d\n  depfile = $out.d\n  deps = gcc\n\
-                 rule link\n  command = clang++-19 -shared -o $out $in -Wl,-t,-t >$out.trace\n\
+                 rule link\n  command = clang++-19 -fuse-ld=lld -shared -o $out $in -Wl,--trace >$out.trace\n\
                  build {m}: cc {ms}\n\
                  build {d}: rustc {ds}\n  flags = --crate-type=rlib --crate-name=dep -C panic=abort --edition=2021\n\
                  build {s}: rustc {rs} | {d}\n  flags = --crate-type=staticlib --crate-name=generated_rust_staticlib -C panic=abort --edition=2021\n  libs = --extern dep={d} -L dependency={dd}\n  crates = {d}\n\
@@ -500,8 +500,9 @@ mod tests {
 
     #[test]
     fn trace_lists_loaded_objects_and_members() {
-        // ld -t -t of `clang++ -o m m.o lib.a` where m.o needs a() from lib.a(a.o) but nothing from b.o (binutils 2.44, measured)
-        let text = "/lib/x86_64-linux-gnu/Scrt1.o\nm.o\nlib.a\n(lib.a)a.o\n/lib/x86_64-linux-gnu/libc.so.6\n";
+        // lld --trace of `clang++ -fuse-ld=lld -o m m.o lib.a` where m.o needs a() from lib.a(a.o) but nothing from b.o (lld 19.1.7, measured)
+        let text =
+            "/lib/x86_64-linux-gnu/Scrt1.o\nm.o\nlib.a(a.o)\n/lib/x86_64-linux-gnu/libc.so.6\n";
         assert_eq!(
             parse_trace(text),
             Loaded {
