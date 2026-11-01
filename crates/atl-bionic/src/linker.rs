@@ -88,8 +88,8 @@ pub unsafe fn open(name: *const c_char, flags: c_int, _ns: &Namespace) -> *mut c
 }
 
 /// bionic `do_android_get_LD_LIBRARY_PATH` (`linker.cpp`): the default namespace's configured search paths (ld.config's, or `LD_LIBRARY_PATH` as the linker parsed it at startup), `:`-joined.
-/// The one namespace here has none configured: glibc's own search (RUNPATH, `LD_LIBRARY_PATH`, ld.so.cache, system dirs) is no path list of the namespace, so the text is empty.
-/// libcore System.c takes it as `java.library.path` when `LD_LIBRARY_PATH` is unset; a launcher wanting another sets `LD_LIBRARY_PATH`, as on bionic.
+/// The one namespace here has none configured: glibc's own search (RUNPATH, `LD_LIBRARY_PATH`, ld.so.cache, system dirs) is no path list of the namespace, so the text is empty (owner 2026-11-02).
+/// libcore System.c takes it as `java.library.path` when `LD_LIBRARY_PATH` is unset: the real value is the launcher's to decide (an app's native lib dirs), set through `LD_LIBRARY_PATH` as on bionic, not here.
 /// `Err(required)`: bionic aborts when `buffer_size` is below the paths' lengths + 1 each; with no path it writes nothing, not even a NUL, which here is written (0 paths, 1 byte).
 pub fn default_library_paths(buffer_size: usize) -> Result<&'static CStr, usize> {
     const PATHS: &CStr = c"";
