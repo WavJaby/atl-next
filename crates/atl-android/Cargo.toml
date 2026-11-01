@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-android"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# cargo-c builds with it; nothing is gated on it
+capi = []
+
+[dependencies]
+roxmltree.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+# cargo-c: the shared library dependents link for the NDK's libandroid. No header: dependents include the NDK's own (build.rs).
+[package.metadata.capi.header]
+generation = false
+
+[lints]
+workspace = true

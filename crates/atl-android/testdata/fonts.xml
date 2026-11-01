@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- In the shape of AOSP's frameworks/base/data/fonts/fonts.xml (android-16 pin): the element and attribute forms it uses (axes, an alias, lang, fallbackFor, postScriptName, index, names on their own line), fonts named as there. -->
+<familyset version="23">
+    <family name="sans-serif">
+        <font weight="100" style="normal">Roboto-Regular.ttf
+          <axis tag="ital" stylevalue="0" />
+          <axis tag="wdth" stylevalue="100" />
+          <axis tag="wght" stylevalue="100" />
+        </font>
+        <font weight="700" style="italic">Roboto-Regular.ttf
+          <axis tag="ital" stylevalue="1" />
+          <axis tag="wdth" stylevalue="100" />
+          <axis tag="wght" stylevalue="700" />
+        </font>
+   </family>
+    <alias name="sans-serif-thin" to="sans-serif" weight="100" />
+    <family lang="und-Ethi">
+        <font weight="400" style="normal" postScriptName="NotoSansEthiopic-Regular">
+            NotoSansEthiopic-VF.ttf
+            <axis tag="wght" stylevalue="400"/>
+        </font>
+        <font weight="700" style="normal" fallbackFor="serif"
+              postScriptName="NotoSerifEthiopic-Regular">NotoSerifEthiopic-VF.ttf
+            <axis tag="wght" stylevalue="700"/>
+        </font>
+    </family>
+    <family>
+        <font weight="400" style="normal">NotoSansSymbols-Regular-Subsetted.ttf</font>
+    </family>
+    <family lang="zh-Hans">
+        <font weight="400" style="normal" index="2" postScriptName="NotoSansCJKJP-Regular">
+            NotoSansCJK-Regular.ttc
+            <axis tag="wght" stylevalue="400"/>
+        </font>
+    </family>
+</familyset>

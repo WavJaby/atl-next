@@ -52,6 +52,12 @@ crates = ["atl-opengl"]
 exports = ["atl-opengl"]
 uses = ["generators"]
 
+# the NDK's libandroid, ATL's own: one implementation for apps and the AOSP framework code built here (system fonts first)
+[ndk]
+crates = ["atl-android"]
+exports = ["atl-android"]
+uses = ["generators"]
+
 [generators]
 crates = ["atl-bridgegen"]
 # build-dependency of crates whose types are generated from upstream headers
