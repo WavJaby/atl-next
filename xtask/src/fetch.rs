@@ -952,6 +952,48 @@ mod tests {
         );
     }
 
+    /// A patch merged, then deleted in the repo's history (as on origin/main): its commit on src/'s
+    /// patch branch is no lost work, so drift names fetch and fetch puts the checkout back at the pin.
+    #[test]
+    fn fetch_drops_patches_retired_on_main() {
+        let f = Fixture::new("fetch-retire");
+        let c = f.checkout("v1");
+        let u = f.fetched(&c, "ws");
+        let ws = f.layout("ws", None);
+        patch_commit(&u, TRAILED);
+        export_ok(&u);
+        f.commit_repo("patches", "add the patch");
+        std::fs::remove_dir_all(f.root.join("patches/up")).unwrap();
+        f.commit_repo("patches", "retire the patch");
+        assert!(
+            drift_of(&u)
+                .iter()
+                .any(|p| p.contains("holds patches retired from patches/up: cargo xtask fetch")),
+            "{:?}",
+            drift_of(&u)
+        );
+        let row = sync(&ctx(&f, &ws, false), &c).unwrap();
+        assert_eq!(
+            row.patches.as_deref(),
+            Some("drop the retired patches: back to the pin")
+        );
+        let row = sync(&ctx(&f, &ws, true), &c).unwrap();
+        assert_eq!(
+            row.patches.as_deref(),
+            Some("dropped the retired patches; at the pin")
+        );
+        assert_eq!(head(&u), c.commit);
+        assert!(!on_patch_branch(&u));
+        assert_eq!(drift_of(&u), Vec::<String>::new());
+        // a commit nothing retired is still refused (fetch_refuses_to_drop_unexported_commits)
+        patch_commit(
+            &u,
+            "fix b\n\nUpstream-Status: Pending\nPatch-Reason: test\n",
+        );
+        let e = sync_err(&ctx(&f, &ws, true), &c);
+        assert!(e.contains("xtask patch --export up"), "{e}");
+    }
+
     #[test]
     fn pin_bump_reapplies_or_restores() {
         let f = Fixture::new("fetch-bump");

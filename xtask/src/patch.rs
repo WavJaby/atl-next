@@ -62,6 +62,8 @@ pub struct Up<'a> {
     untracked: BTreeSet<String>,
     /// Where the other checkouts are: an AOSP licence text may sit in another project (`soong_licence`).
     layout: Layout,
+    /// The repo checkout, whose history `retired` reads.
+    root: PathBuf,
 }
 
 impl<'a> Up<'a> {
@@ -71,6 +73,7 @@ impl<'a> Up<'a> {
         Up {
             c,
             layout: layout.clone(),
+            root: root.to_path_buf(),
             branch: match &l.task {
                 Some(t) => format!("{BRANCH}-{t}"),
                 None => BRANCH.to_owned(),
@@ -114,6 +117,53 @@ impl<'a> Up<'a> {
     fn has_branch(&self) -> Result<bool> {
         has_branch(&self.checkout, &self.branch)
     }
+
+    /// Patch texts the repo checkout's history deleted from patches/<upstream>/: retired on purpose and
+    /// kept by that history, so a patch branch commit holding one loses no work when fetch drops it --
+    /// how a patch deleted on origin/main leaves src/.
+    fn retired(&self) -> Result<BTreeSet<String>> {
+        let rel = Path::new("patches").join(&self.c.dir).display().to_string();
+        let log = git_raw(
+            &self.root,
+            &[
+                "log",
+                "--diff-filter=D",
+                "--name-only",
+                "--format=%x00%H",
+                "HEAD",
+                "--",
+                &rel,
+            ],
+        )?;
+        let mut out = BTreeSet::new();
+        for entry in log.split('\0') {
+            let mut lines = entry.lines().filter(|l| !l.is_empty());
+            let Some(commit) = lines.next() else {
+                continue;
+            };
+            for file in lines.filter(|f| f.ends_with(".patch")) {
+                out.insert(git_raw(
+                    &self.root,
+                    &["show", &format!("{commit}^:{file}")],
+                )?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Commits of `branch` neither in `stored` nor retired (`Up::retired`): what dropping the branch would lose.
+fn lost(u: &Up, branch: &[(String, String)], stored: &[(String, String)]) -> Result<Vec<String>> {
+    let names = unexported(branch, stored);
+    if names.is_empty() {
+        return Ok(names);
+    }
+    let retired = u.retired()?;
+    Ok(branch
+        .iter()
+        .filter(|(n, t)| names.contains(n) && !retired.contains(t))
+        .map(|(n, _)| n.clone())
+        .collect())
 }
 
 /// Every checkout of `all` as `layout` places it, with the untracked files `declared` for it.
@@ -368,11 +418,19 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
                     u.name(),
                     u.branch
                 )),
-                Ok(_) => problems.push(format!(
-                    "{} differs from patches/{1}: xtask patch --export {1}",
-                    u.branch,
-                    u.name()
-                )),
+                Ok(branch) => match lost(u, &branch, &stored) {
+                    Ok(l) if l.is_empty() => problems.push(format!(
+                        "{} holds patches retired from patches/{}: {FETCH}",
+                        u.branch,
+                        u.name()
+                    )),
+                    Ok(_) => problems.push(format!(
+                        "{} differs from patches/{1}: xtask patch --export {1}",
+                        u.branch,
+                        u.name()
+                    )),
+                    Err(e) => problems.push(format!("{e:#}")),
+                },
                 Err(e) => problems.push(format!("{e:#}")),
             },
         }
@@ -430,7 +488,7 @@ pub fn settle(
                 u.branch
             )
         })?;
-        let lost = unexported(&branch, &stored);
+        let lost = lost(u, &branch, &stored)?;
         if !lost.is_empty() {
             let how = if b == pin {
                 format!("xtask patch --export {}", u.name())
@@ -454,6 +512,14 @@ pub fn settle(
         }
     }
     ensure!(!is_dirty(dir)?, "uncommitted changes: patches not applied");
+    if stored.is_empty() {
+        // every commit of the branch was retired: back to the bare pin, as an upstream without patches
+        if !execute {
+            return Ok(Some("drop the retired patches: back to the pin".to_owned()));
+        }
+        drop_branch(u)?;
+        return Ok(Some("dropped the retired patches; at the pin".to_owned()));
+    }
     if !execute {
         return Ok(Some(format!("apply {n} patches")));
     }
@@ -462,6 +528,20 @@ pub fn settle(
     )?;
     rebuild(u, &stored, ident)?;
     Ok(Some(format!("applied {n} patches")))
+}
+
+/// The checkout detached at the pin, its patch branch and base gone: an upstream without patches.
+fn drop_branch(u: &Up) -> Result<()> {
+    let dir = &u.checkout;
+    let pin = u.c.commit.as_str();
+    if git(Some(dir), &["cat-file", "-e", &format!("{pin}^{{commit}}")]).is_err() {
+        fetch::verify_tag(u.c)?;
+        fetch::fetch_pin(u.c, dir)?;
+    }
+    git(Some(dir), &["checkout", "-q", "--detach", pin])?;
+    git(Some(dir), &["branch", "-q", "-D", &u.branch])?;
+    git(Some(dir), &["update-ref", "-d", BASE_REF])?;
+    Ok(())
 }
 
 /// patch branch := pin + `stored` (git am). On failure the checkout's branch, HEAD and base go back
@@ -622,7 +702,7 @@ fn done(u: &Up, layout: &Layout, licenses: &Licenses) -> Result<String> {
     );
     if u.has_branch()? {
         let b = base(u)?.with_context(|| no_base(u))?;
-        let lost = unexported(&branch_patches(u, &b, licenses)?, &u.stored()?);
+        let lost = lost(u, &branch_patches(u, &b, licenses)?, &u.stored()?)?;
         ensure!(
             lost.is_empty(),
             "{} holds {} commits not in patches/{} ({}): xtask patch --export {}",
@@ -1147,6 +1227,23 @@ pub mod fixture {
             let _ = std::fs::remove_dir_all(&root);
             let upstream = root.join("upstream");
             std::fs::create_dir_all(&upstream).unwrap();
+            // the repo checkout: a git repo with history, as `Up::retired` reads it
+            git(Some(&root), &["init", "-q"]).unwrap();
+            git(
+                Some(&root),
+                &[
+                    IDENT[0],
+                    IDENT[1],
+                    IDENT[2],
+                    IDENT[3],
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "repo",
+                ],
+            )
+            .unwrap();
             let f = Fixture { root, upstream };
             f.up(&["init", "-q"]);
             std::fs::write(
@@ -1157,6 +1254,18 @@ pub mod fixture {
             f.write("LICENSE", LICENCE);
             f.release("one", "v1");
             f
+        }
+
+        /// Commit everything under `<root>/<path>` in the repo checkout (deletions included) as `msg`.
+        pub fn commit_repo(&self, path: &str, msg: &str) {
+            git(Some(&self.root), &["add", "-A", "--", path]).unwrap();
+            git(
+                Some(&self.root),
+                &[
+                    IDENT[0], IDENT[1], IDENT[2], IDENT[3], "commit", "-q", "-m", msg,
+                ],
+            )
+            .unwrap();
         }
 
         /// Delete a file of the upstream (committed by the next `release`).
