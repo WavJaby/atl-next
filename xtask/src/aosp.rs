@@ -442,15 +442,22 @@ impl Index {
         seen
     }
 
-    /// `license_kinds` of the `license` module a `licenses` entry in blueprint directory `from` (tree path) names, found as Soong's licensesPropertyGatherer does: `//dir:name` as written; else `name` in the nearest of `from` and its ancestors defining it; else the one definition anywhere.
+    /// `license_kinds` of the `license` module a `licenses` entry in blueprint directory `from` (tree path) names (`license_of`).
     pub fn license_kinds_of(&self, reference: &str, from: &str) -> Result<&[String], String> {
-        let (dir, name) = match reference.strip_prefix("//") {
-            Some(r) => r
-                .split_once(':')
-                .map(|(d, n)| (Some(d), n))
-                .ok_or("not a module reference")?,
-            None => (None, reference),
-        };
+        let def = self.license_of(reference, from)?;
+        match &def.license_kinds {
+            None => Err(
+                "the AOSP index predates licence kinds (xtask aosp --index rebuilds it)".to_owned(),
+            ),
+            // e.g. harfbuzz_ng's `unused.HPND-sell-variant`, its one kind commented out: its licence is unknown, not absent
+            Some(k) if k.is_empty() => Err(format!("{} lists no licence kind", def.file)),
+            Some(k) => Ok(k),
+        }
+    }
+
+    /// The `license` module a `licenses` entry in blueprint directory `from` (tree path) names, found as Soong's licensesPropertyGatherer does: `//dir:name` as written; else `name` in the nearest of `from` and its ancestors defining it; else the one definition anywhere.
+    fn license_of(&self, reference: &str, from: &str) -> Result<&Definition, String> {
+        let (dir, name) = split_reference(reference)?;
         let defs: Vec<&Definition> = self
             .modules
             .get(name)
@@ -462,7 +469,7 @@ impl Index {
             let at = parent_dir(&d.file);
             at.is_empty() || from == at || from.starts_with(&format!("{at}/"))
         };
-        let def = match dir {
+        match dir {
             Some(dir) => defs.iter().find(|d| parent_dir(&d.file) == dir),
             None => defs
                 .iter()
@@ -473,18 +480,11 @@ impl Index {
                     _ => None,
                 }),
         }
+        .copied()
         .ok_or_else(|| match defs.len() {
             0 => "no license module of that name".to_owned(),
             n => format!("{n} license modules of that name, none enclosing it"),
-        })?;
-        match &def.license_kinds {
-            None => Err(
-                "the AOSP index predates licence kinds (xtask aosp --index rebuilds it)".to_owned(),
-            ),
-            // e.g. harfbuzz_ng's `unused.HPND-sell-variant`, its one kind commented out: its licence is unknown, not absent
-            Some(k) if k.is_empty() => Err(format!("{} lists no licence kind", def.file)),
-            Some(k) => Ok(k),
-        }
+        })
     }
 
     /// The project whose `soong_build` plugin registers a module type.
@@ -669,19 +669,23 @@ fn build_index(sources: &Sources, manifest: &Manifest, base: &Path, jobs: usize)
     Ok(())
 }
 
-/// The Soong package holding directory `at` (inside the checkout `dir` of AOSP project `project`, a tree path) and the licence kinds its blueprint files declare: those of its `license` modules plus those of every `license` module its `licenses` / `default_applicable_licenses` entries name, wherever defined (`build/soong/licenses`' `Android-Apache-2.0`); `build = [...]` files followed.
-/// The package is the nearest of `at` and its ancestors up to `dir` with an `Android.bp` declaring any licence: Soong gives a module its package's default, and one project may hold hundreds of packages under different licences (external/rust/android-crates-io: a crate each).
-/// Returns the package's tree path; inner `Err`: no package declares a licence, or a reference the index cannot resolve to one `license` module with kinds.
-pub fn package_kinds(
-    dir: &Path,
-    project: &Path,
-    at: &Path,
-    index: &Index,
-) -> Result<Result<(PathBuf, BTreeSet<String>), String>> {
+/// A Soong package and the licences its blueprint files declare, references unresolved.
+struct Package {
+    /// Tree path of the package directory.
+    tree: PathBuf,
+    /// Its own `license` modules.
+    own: Vec<BpModule>,
+    /// `licenses` / `default_applicable_licenses` entries of its modules: `license` modules defined wherever (`build/soong/licenses`' `Android-Apache-2.0`).
+    refs: BTreeSet<String>,
+}
+
+/// The Soong package holding directory `at` (inside the checkout `dir` of AOSP project `project`, a tree path): the nearest of `at` and its ancestors up to `dir` whose `Android.bp` (+ its `build = [...]` files) declares a licence -- a `license` module with kinds, or a licence reference.
+/// Soong gives a module its package's default, and one project may hold hundreds of packages under different licences (external/rust/android-crates-io: a crate each). Inner `Err`: no package declares a licence.
+fn package(dir: &Path, project: &Path, at: &Path) -> Result<Result<Package, String>> {
     let mut pkg = dir.join(at);
     loop {
         let mut bps = vec![pkg.join("Android.bp")];
-        let mut kinds = BTreeSet::new();
+        let mut own = Vec::new();
         let mut refs = BTreeSet::new();
         while let Some(bp) = bps.pop() {
             let Ok(bytes) = std::fs::read(&bp) else {
@@ -695,35 +699,150 @@ pub fn package_kinds(
                     .map(|f| pkg.join(f))
                     .filter(|f| f.is_file() && !f.ends_with("Android.bp")),
             );
-            for m in parsed.modules {
+            for mut m in parsed.modules {
+                refs.extend(std::mem::take(&mut m.licenses));
                 if m.module_type == "license" {
-                    kinds.extend(m.license_kinds);
+                    own.push(m);
                 }
-                refs.extend(m.licenses);
             }
         }
         let tree = match pkg.strip_prefix(dir) {
             Ok(rel) if !rel.as_os_str().is_empty() => project.join(rel),
             _ => project.to_path_buf(),
         };
-        if !kinds.is_empty() || !refs.is_empty() {
-            let from = tree.display().to_string();
-            for name in &refs {
-                match index.license_kinds_of(name, &from) {
-                    Ok(k) => kinds.extend(k.iter().cloned()),
-                    Err(e) => return Ok(Err(format!("licence {name} (from {from}): {e}"))),
-                }
-            }
-            return Ok(Ok((tree, kinds)));
+        if own.iter().any(|m| !m.license_kinds.is_empty()) || !refs.is_empty() {
+            return Ok(Ok(Package { tree, own, refs }));
         }
         if pkg == dir || !pkg.pop() || !pkg.starts_with(dir) {
             return Ok(Err(format!(
                 "no Android.bp from {} up to {} declares a licence",
-                project.join(at).display(),
+                lexical(&project.join(at)).display(),
                 project.display()
             )));
         }
     }
+}
+
+/// The Soong package holding directory `at` (`package`) and its licence kinds: those of its `license` modules plus those of every `license` module it references (`Index::license_of`).
+/// Returns the package's tree path; inner `Err`: no package declares a licence, or a reference the index cannot resolve to one `license` module with kinds.
+pub fn package_kinds(
+    dir: &Path,
+    project: &Path,
+    at: &Path,
+    index: &Index,
+) -> Result<Result<(PathBuf, BTreeSet<String>), String>> {
+    let p = match package(dir, project, at)? {
+        Ok(p) => p,
+        Err(why) => return Ok(Err(why)),
+    };
+    let mut kinds: BTreeSet<String> = p
+        .own
+        .iter()
+        .flat_map(|m| m.license_kinds.iter().cloned())
+        .collect();
+    let from = p.tree.display().to_string();
+    for name in &p.refs {
+        match index.license_kinds_of(name, &from) {
+            Ok(k) => kinds.extend(k.iter().cloned()),
+            Err(e) => return Ok(Err(format!("licence {name} (from {from}): {e}"))),
+        }
+    }
+    Ok(Ok((p.tree, kinds)))
+}
+
+/// The licence texts of the Soong package holding directory `at` (`package`): the `license_text` files of every `license` module applying to it, own and referenced (resolved as `package_kinds` resolves them), by tree path.
+/// `read` returns a file of the AOSP tree by tree path, None when absent: a referenced module's blueprint and texts may sit in another project (`Android-Apache-2.0` -> build/soong/licenses/LICENSE). A referenced module's `license_text` is read from its blueprint, not the index, which records only kinds.
+/// Inner `Err`: no package declares a licence, a reference does not resolve, a `license` module lists no `license_text` (its text would be missing from the copy) or names a module, or a listed file is absent.
+pub fn package_texts(
+    dir: &Path,
+    project: &Path,
+    at: &Path,
+    index: &Index,
+    read: &dyn Fn(&Path) -> Result<Option<String>>,
+) -> Result<Result<BTreeMap<PathBuf, String>, String>> {
+    let p = match package(dir, project, at)? {
+        Ok(p) => p,
+        Err(why) => return Ok(Err(why)),
+    };
+    let from = p.tree.display().to_string();
+    // (directory its texts are relative to, `<name> in <blueprint dir>` for messages, its license_text)
+    let mut modules: Vec<(PathBuf, String, Vec<String>)> = p
+        .own
+        .into_iter()
+        .map(|m| {
+            let what = format!("{} in {from}", m.name.as_deref().unwrap_or("(unnamed)"));
+            (p.tree.clone(), what, m.license_text)
+        })
+        .collect();
+    for reference in &p.refs {
+        let def = match index.license_of(reference, &from) {
+            Ok(d) => d,
+            Err(e) => return Ok(Err(format!("licence {reference} (from {from}): {e}"))),
+        };
+        let what = format!("{reference} in {}", def.file);
+        let Some(bp) = read(Path::new(&def.file))? else {
+            return Ok(Err(format!("license module {what}: blueprint absent")));
+        };
+        let name = split_reference(reference).map_or(reference.as_str(), |(_, n)| n);
+        let Some(m) = parse_bp(&bp)
+            .modules
+            .into_iter()
+            .find(|m| m.module_type == "license" && m.name.as_deref() == Some(name))
+        else {
+            return Ok(Err(format!("license module {what}: not in that blueprint")));
+        };
+        modules.push((PathBuf::from(parent_dir(&def.file)), what, m.license_text));
+    }
+    let mut texts = BTreeMap::new();
+    for (base, what, list) in modules {
+        if list.is_empty() {
+            return Ok(Err(format!("license module {what} lists no license_text")));
+        }
+        for t in list {
+            if t.starts_with(':') {
+                return Ok(Err(format!(
+                    "license module {what}: license_text {t} names a module, not a file"
+                )));
+            }
+            let path = lexical(&base.join(&t));
+            match read(&path)? {
+                Some(text) => texts.insert(path, text),
+                None => {
+                    return Ok(Err(format!(
+                        "license module {what}: license_text {} absent",
+                        path.display()
+                    )));
+                }
+            };
+        }
+    }
+    Ok(Ok(texts))
+}
+
+/// A `licenses` entry as (`//dir` part, module name): `//dir:name` or `name`.
+fn split_reference(reference: &str) -> Result<(Option<&str>, &str), String> {
+    match reference.strip_prefix("//") {
+        Some(r) => r
+            .split_once(':')
+            .map(|(d, n)| (Some(d), n))
+            .ok_or_else(|| "not a module reference".to_owned()),
+        None => Ok((None, reference)),
+    }
+}
+
+/// `p` with `.` and `dir/..` folded away, without touching the filesystem (a tree path, not a host path).
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// TARGET_RELEASE of the pinned tag: AOSP release builds use the release config named by the build
@@ -965,6 +1084,8 @@ struct BpModule {
     defaults: Vec<String>,
     /// `license_kinds: [...]` of a `license` module.
     license_kinds: Vec<String>,
+    /// `license_text: [...]` of a `license` module: its licence text files, relative to its directory.
+    license_text: Vec<String>,
     /// `licenses: [...]` of a module, `default_applicable_licenses: [...]` of `package`: the `license` modules that apply.
     licenses: Vec<String>,
 }
@@ -1046,6 +1167,7 @@ fn parse_bp(text: &str) -> BpFile {
                             | "srcs"
                             | "defaults"
                             | "license_kinds"
+                            | "license_text"
                             | "licenses"
                             | "default_applicable_licenses"
                     ) =>
@@ -1058,6 +1180,7 @@ fn parse_bp(text: &str) -> BpFile {
                         "srcs" => m.srcs = list,
                         "defaults" => m.defaults = list,
                         "license_kinds" => m.license_kinds = list,
+                        "license_text" => m.license_text = list,
                         "licenses" | "default_applicable_licenses" => m.licenses.extend(list),
                         _ => m.plugin_for = list,
                     }

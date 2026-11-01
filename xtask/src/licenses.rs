@@ -48,7 +48,7 @@ impl AospIndex {
         }
     }
 
-    fn get(&self) -> Result<&crate::aosp::Index, &str> {
+    pub(crate) fn get(&self) -> Result<&crate::aosp::Index, &str> {
         self.loaded
             .get_or_init(|| {
                 let file = self.file.as_ref().ok_or("no AOSP module index is known")?;

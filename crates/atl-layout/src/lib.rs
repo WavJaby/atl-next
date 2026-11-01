@@ -14,6 +14,7 @@ pub const MAIN: &str = "main";
 const SHARED: &str = "src";
 const TASKS: &str = "src-wt";
 
+#[derive(Clone)]
 pub struct Layout {
     workspace: PathBuf,
     src: PathBuf,

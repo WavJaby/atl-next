@@ -27,8 +27,8 @@ const BASE_REF: &str = "refs/worktree/atl/base";
 const TRAILERS: [&str; 2] = ["Upstream-Status", "Patch-Reason"];
 /// Untracked files named in a drift message; the rest are counted.
 const STRAYS_SHOWN: usize = 3;
-/// `patches/<upstream>/LICENSE` is a copy of the first of these at the top of the upstream at its pin, written by `--export` and compared by the drift test.
-/// AOSP projects ship no LICENSE: their licence text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names.
+/// `patches/<upstream>/LICENSE` (`upstream_licence`, written by `--export`, compared by the drift test) is a copy of the first of these at the top of the upstream at its pin.
+/// Many AOSP projects' top-level text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names. An AOSP project with none of them takes the `license_text` of the Soong packages its patches touch (owner, 2026-11-01).
 const LICENCE_FILES: [&str; 3] = ["LICENSE", "COPYING", "NOTICE"];
 const LICENCE_COPY: &str = "LICENSE";
 /// The fix for patches/ ahead of a checkout: the normal state on main between merging a patch change and the next fetch.
@@ -36,7 +36,7 @@ const FETCH: &str = "cargo xtask fetch --execute (the step after merging a chang
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one, with LICENSE = the upstream's LICENSE, COPYING or NOTICE at the pin (first found). Refused with no commits past the pin.
+    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one, with LICENSE = the upstream's LICENSE, COPYING or NOTICE at the pin (first found); an AOSP project with none gets the license_text files of the Soong `license` modules covering every patched file, which must be one set (several texts concatenated in tree-path order). Refused with no commits past the pin.
     #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with_all = ["rebase", "edit", "done"])]
     export: Vec<String>,
     /// Move the patch branch of these upstreams from their old base onto the current pin (after a bump).
@@ -60,6 +60,8 @@ pub struct Up<'a> {
     task: Option<String>,
     /// Untracked files xtask itself puts there (`declared`), paths inside the checkout.
     untracked: BTreeSet<String>,
+    /// Where the other checkouts are: an AOSP licence text may sit in another project (`soong_licence`).
+    layout: Layout,
 }
 
 impl<'a> Up<'a> {
@@ -68,6 +70,7 @@ impl<'a> Up<'a> {
         let l = layout.locate(&c.dir);
         Up {
             c,
+            layout: layout.clone(),
             branch: match &l.task {
                 Some(t) => format!("{BRANCH}-{t}"),
                 None => BRANCH.to_owned(),
@@ -347,7 +350,7 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
     }
     let stored = stored(&u.patches)?;
     if !stored.is_empty()
-        && let Some(p) = licence_problem(u)?
+        && let Some(p) = licence_problem(u, &stored, licenses)?
     {
         problems.push(p);
     }
@@ -668,7 +671,7 @@ fn export(u: &Up, licenses: &Licenses) -> Result<String> {
         u.branch,
         u.name()
     );
-    let (licence_file, licence) = upstream_licence(u)?;
+    let (licence_file, licence) = upstream_licence(u, &patches, licenses)?;
     std::fs::create_dir_all(&u.patches)?;
     for (name, _) in stored(&u.patches)? {
         std::fs::remove_file(u.patches.join(name))?;
@@ -678,13 +681,18 @@ fn export(u: &Up, licenses: &Licenses) -> Result<String> {
     }
     std::fs::write(u.patches.join(LICENCE_COPY), licence)?;
     Ok(format!(
-        "exported {} patches, {LICENCE_COPY} = {licence_file} at the pin",
+        "exported {} patches, {LICENCE_COPY} = {licence_file}",
         patches.len()
     ))
 }
 
-/// The upstream's licence text: the first of `LICENCE_FILES` that is a regular file at the pin (a symlink's blob is its target path, a tree no text), with its name.
-fn upstream_licence(u: &Up) -> Result<(&'static str, String)> {
+/// The licence text `patches/<upstream>/LICENSE` holds for `patches`, with where it came from: the first of `LICENCE_FILES` that is a regular file at the pin (a symlink's blob is its target path, a tree no text);
+/// else, for an AOSP project, the Soong licence texts of the files the patches touch (`soong_licence`).
+fn upstream_licence(
+    u: &Up,
+    patches: &[(String, String)],
+    licenses: &Licenses,
+) -> Result<(String, String)> {
     for name in LICENCE_FILES {
         // `<mode> <type> <blob>\t<name>`, empty when absent
         let entry = git(Some(&u.checkout), &["ls-tree", &u.c.commit, "--", name])?;
@@ -692,20 +700,143 @@ fn upstream_licence(u: &Up) -> Result<(&'static str, String)> {
         if let (Some(mode), Some(_), Some(blob)) = (f.next(), f.next(), f.next())
             && mode.starts_with("100")
         {
-            return Ok((name, git_raw(&u.checkout, &["cat-file", "blob", blob])?));
+            let text = git_raw(&u.checkout, &["cat-file", "blob", blob])?;
+            return Ok((format!("{name} at the pin"), text));
         }
     }
-    bail!(
-        "{} has none of {} at the pin: no licence text for patches/{}/{LICENCE_COPY}",
-        u.name(),
-        LICENCE_FILES.join(", "),
-        u.name()
-    )
+    let none = || {
+        format!(
+            "{} has none of {} at the pin",
+            u.name(),
+            LICENCE_FILES.join(", ")
+        )
+    };
+    let Pin::Aosp(project) = &u.c.pin else {
+        bail!(
+            "{}: no licence text for patches/{}/{LICENCE_COPY}",
+            none(),
+            u.name()
+        );
+    };
+    soong_licence(u, Path::new(project), &patched_files(patches)?, licenses)
+        .with_context(|| format!("{}, and no Soong licence text", none()))
 }
 
-/// What keeps `patches/<upstream>/LICENSE` from being the upstream's licence text at the pin.
-fn licence_problem(u: &Up) -> Result<Option<String>> {
-    let (name, want) = upstream_licence(u)?;
+/// Files a set of patches touches (both sides of a rename), from their `diff --git a/<x> b/<y>` lines.
+fn patched_files(patches: &[(String, String)]) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for (name, text) in patches {
+        for line in text.lines() {
+            let Some(pair) = line.strip_prefix("diff --git ") else {
+                continue;
+            };
+            // git quotes a path with unusual bytes (`"a/q\tx"`): unsupported rather than skipped
+            let pair = pair
+                .strip_prefix("a/")
+                .filter(|p| !p.contains('"'))
+                .with_context(|| format!("{name}: unsupported path in `{line}`"))?;
+            // `x b/y`: a path holding " b/" splits ambiguously unless both sides agree (no rename)
+            let splits: Vec<(&str, &str)> = pair
+                .match_indices(" b/")
+                .map(|(i, _)| (&pair[..i], &pair[i + 3..]))
+                .collect();
+            let (a, b) = match splits.as_slice() {
+                [one] => *one,
+                many => *many
+                    .iter()
+                    .find(|(a, b)| a == b)
+                    .with_context(|| format!("{name}: cannot split `{line}`"))?,
+            };
+            out.insert(a.to_owned());
+            out.insert(b.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// The licence text of AOSP project `project` (tree path) for patches touching `files`: the `license_text` files of the Soong `license` modules covering each file's package (`aosp::package_texts`, the licence gate's package resolution).
+/// Every file must take the same set of texts, else no one text describes the patches; one text is copied as is, several are concatenated in tree-path order, a blank line between.
+/// Texts and other projects' blueprints are read where the layout resolves their checkout (pin + patches, a task copy when there is one), as the gate reads package blueprints.
+fn soong_licence(
+    u: &Up,
+    project: &Path,
+    files: &BTreeSet<String>,
+    licenses: &Licenses,
+) -> Result<(String, String)> {
+    let index = licenses
+        .aosp_index
+        .get()
+        .map_err(|why| anyhow::anyhow!("{why}"))?;
+    let read = |tree: &Path| -> Result<Option<String>> {
+        let path = u.layout.locate(&Path::new("aosp").join(tree)).dir;
+        match std::fs::read_to_string(&path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| path.display().to_string()),
+        }
+    };
+    // set of text paths -> the files taking it
+    let mut sets: BTreeMap<Vec<PathBuf>, Vec<&str>> = BTreeMap::new();
+    let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut by_dir: BTreeMap<&Path, Vec<PathBuf>> = BTreeMap::new();
+    for file in files {
+        let at = Path::new(file).parent().unwrap_or(Path::new(""));
+        if !by_dir.contains_key(at) {
+            let got = aosp::package_texts(&u.checkout, project, at, index, &read)
+                .with_context(|| {
+                    format!("reading the Android.bp files of {}", u.checkout.display())
+                })?
+                .map_err(|why| anyhow::anyhow!("{file}: {why}"))?;
+            by_dir.insert(at, got.keys().cloned().collect());
+            texts.extend(got);
+        }
+        sets.entry(by_dir[at].clone()).or_default().push(file);
+    }
+    ensure!(!sets.is_empty(), "the patches touch no files");
+    if sets.len() > 1 {
+        let each: Vec<String> = sets
+            .iter()
+            .map(|(set, files)| format!("[{}] for {}", show(set), files.join(", ")))
+            .collect();
+        bail!(
+            "patched files take different licence texts: {}",
+            each.join("; ")
+        );
+    }
+    let (set, _) = sets.pop_first().context("one set")?;
+    let body: Vec<&str> = set.iter().map(|p| texts[p].as_str()).collect();
+    let text = match body.as_slice() {
+        [one] => (*one).to_owned(),
+        many => many
+            .iter()
+            .map(|t| {
+                if t.ends_with('\n') {
+                    (*t).to_owned()
+                } else {
+                    format!("{t}\n")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    Ok((format!("Soong license_text {}", show(&set)), text))
+}
+
+fn show(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// What keeps `patches/<upstream>/LICENSE` from being the licence text `upstream_licence` derives for the stored patches.
+fn licence_problem(
+    u: &Up,
+    stored: &[(String, String)],
+    licenses: &Licenses,
+) -> Result<Option<String>> {
+    let (name, want) = upstream_licence(u, stored, licenses)?;
     let path = u.patches.join(LICENCE_COPY);
     let fix = format!("xtask patch --export {}", u.name());
     Ok(match std::fs::read_to_string(&path) {
@@ -714,7 +845,7 @@ fn licence_problem(u: &Up) -> Result<Option<String>> {
             u.name()
         )),
         Ok(have) if have != want => Some(format!(
-            "patches/{}/{LICENCE_COPY} is not {name} at the pin: {fix}",
+            "patches/{}/{LICENCE_COPY} is not {name}: {fix}",
             u.name()
         )),
         Ok(_) => None,
@@ -1064,6 +1195,16 @@ pub mod fixture {
             }
         }
 
+        /// The upstream as AOSP project `project` (tree path): `aosp/<project>`, licence key `aosp`.
+        pub fn aosp_checkout(&self, tag: &str, project: &str) -> Checkout {
+            Checkout {
+                dir: Path::new("aosp").join(project),
+                pin: Pin::Aosp(project.into()),
+                licence_key: "aosp".into(),
+                ..self.checkout(tag)
+            }
+        }
+
         /// Workspace `<root>/<ws>` as a repo checkout on `branch` sees it (None = main).
         pub fn layout(&self, ws: &str, branch: Option<&str>) -> Layout {
             Layout::new(&self.root.join(ws), branch)
@@ -1342,6 +1483,178 @@ mod tests {
             "{e}"
         );
         assert!(!u3.patches.exists());
+    }
+
+    /// An AOSP project without a top-level licence text: `LICENSE` = the `license_text` of the Soong packages its patches touch.
+    #[test]
+    fn aosp_licence_from_soong_packages() {
+        let f = Fixture::new("soong-licence");
+        let apache = "SPDX-license-identifier-Apache-2.0";
+        let license = |name: &str, text: &str| {
+            format!(
+                "license {{\n    name: \"{name}\",\n    license_kinds: [\"{apache}\"],\n    license_text: [{text}],\n}}\n"
+            )
+        };
+        let package =
+            |refs: &str| format!("package {{\n    default_applicable_licenses: [{refs}],\n}}\n");
+        // system/core's shape: no top-level text, a package with its own NOTICE
+        f.remove("LICENSE");
+        std::fs::create_dir_all(f.root.join("upstream/lib")).unwrap();
+        f.write(
+            "lib/Android.bp",
+            &(package("\"lib_l\"") + &license("lib_l", "\"NOTICE\"")),
+        );
+        f.write("lib/NOTICE", "lib notice\n");
+        f.write("lib/a.c", "int a;\n");
+        // system/logging's: only the shared default, its text in another project
+        std::fs::create_dir_all(f.root.join("upstream/ref")).unwrap();
+        f.write("ref/Android.bp", &package("\"Android-Apache-2.0\""));
+        f.write("ref/x.c", "int x;\n");
+        // own text + shared one: both, in tree-path order
+        std::fs::create_dir_all(f.root.join("upstream/both")).unwrap();
+        f.write(
+            "both/Android.bp",
+            &(package("\"Android-Apache-2.0\", \"both_l\"")
+                + &license("both_l", "\"../lib/NOTICE\"")),
+        );
+        f.write("both/y.c", "int y;\n");
+        // a license module naming a file that is not there, and one naming none
+        std::fs::create_dir_all(f.root.join("upstream/gone")).unwrap();
+        f.write("gone/Android.bp", &license("gone_l", "\"MISSING\""));
+        f.write("gone/z.c", "int z;\n");
+        std::fs::create_dir_all(f.root.join("upstream/bare")).unwrap();
+        f.write("bare/Android.bp", &license("bare_l", ""));
+        f.write("bare/w.c", "int w;\n");
+        f.release("aosp", "v2");
+        let c = f.aosp_checkout("v2", "system/core");
+        let u = f.fetched(&c, "ws");
+        // build/soong, another project of the tree
+        let soong = f.root.join("ws/src/aosp/build/soong/licenses");
+        std::fs::create_dir_all(&soong).unwrap();
+        std::fs::write(
+            soong.join("Android.bp"),
+            license("Android-Apache-2.0", "\"LICENSE\""),
+        )
+        .unwrap();
+        std::fs::write(soong.join("LICENSE"), "apache text").unwrap();
+        let mut l = licenses();
+        l.aosp_index = licenses::AospIndex::of(aosp::Index::of_licenses(&[
+            (
+                "Android-Apache-2.0",
+                "build/soong/licenses/Android.bp",
+                &[apache],
+            ),
+            ("lib_l", "system/core/lib/Android.bp", &[apache]),
+            ("both_l", "system/core/both/Android.bp", &[apache]),
+        ]));
+        let touching = |files: &[&str]| -> Vec<(String, String)> {
+            files
+                .iter()
+                .map(|p| {
+                    (
+                        format!("{p}.patch"),
+                        format!("x\n---\ndiff --git a/{p} b/{p}\n"),
+                    )
+                })
+                .collect()
+        };
+        let derive = |files: &[&str]| {
+            upstream_licence(&u, &touching(files), &l).map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(
+            derive(&["lib/a.c"]).unwrap(),
+            (
+                "Soong license_text system/core/lib/NOTICE".to_owned(),
+                "lib notice\n".to_owned()
+            )
+        );
+        assert_eq!(
+            derive(&["ref/x.c"]).unwrap(),
+            (
+                "Soong license_text build/soong/licenses/LICENSE".to_owned(),
+                "apache text".to_owned()
+            )
+        );
+        // a text lacking its final newline gets one before the blank line
+        assert_eq!(
+            derive(&["both/y.c"]).unwrap().1,
+            "apache text\n\nlib notice\n"
+        );
+        let refused = [
+            (
+                derive(&["lib/a.c", "ref/x.c"]),
+                "patched files take different licence texts: [build/soong/licenses/LICENSE] for ref/x.c; [system/core/lib/NOTICE] for lib/a.c",
+            ),
+            (
+                derive(&["a.c"]),
+                "a.c: no Android.bp from system/core up to system/core declares a licence",
+            ),
+            (
+                derive(&["gone/z.c"]),
+                "gone/z.c: license module gone_l in system/core/gone: license_text system/core/gone/MISSING absent",
+            ),
+            (
+                derive(&["bare/w.c"]),
+                "bare/w.c: license module bare_l in system/core/bare lists no license_text",
+            ),
+        ];
+        for (got, want) in refused {
+            let e = got.unwrap_err();
+            assert!(
+                e.contains("aosp/system/core has none of LICENSE, COPYING, NOTICE at the pin, and no Soong licence text")
+                    && e.contains(want),
+                "{e}"
+            );
+        }
+
+        // export writes it, the drift test derives the same and catches a hand edit
+        let d = &u.checkout;
+        git(Some(d), &["switch", "-q", "-c", &u.branch, &c.commit]).unwrap();
+        std::fs::write(d.join("ref/x.c"), "int x, more;\n").unwrap();
+        git(
+            Some(d),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-am",
+                TRAILED,
+            ],
+        )
+        .unwrap();
+        let out = export(&u, &l).unwrap();
+        assert!(
+            out.contains("LICENSE = Soong license_text build/soong/licenses/LICENSE"),
+            "{out}"
+        );
+        let copy = u.patches.join(LICENCE_COPY);
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "apache text");
+        assert_eq!(drift(&u, &l).unwrap().unwrap(), Vec::<String>::new());
+        std::fs::write(&copy, "edited\n").unwrap();
+        assert_eq!(
+            drift(&u, &l).unwrap().unwrap(),
+            [
+                "patches/aosp/system/core/LICENSE is not Soong license_text build/soong/licenses/LICENSE: xtask patch --export aosp/system/core"
+            ]
+        );
+    }
+
+    #[test]
+    fn patched_files_of_diff_headers() {
+        let p = |text: &str| patched_files(&[("p".into(), text.into())]);
+        assert_eq!(
+            p("diff --git a/x/a b/x/a\ndiff --git a/old b/new\n").unwrap(),
+            ["new", "old", "x/a"].map(String::from).into()
+        );
+        // " b/" inside the path: the split whose sides agree
+        assert_eq!(
+            p("diff --git a/d b/e b/d b/e\n").unwrap(),
+            ["d b/e"].map(String::from).into()
+        );
+        assert!(p("diff --git \"a/q\\tx\" \"b/q\\tx\"\n").is_err());
     }
 
     #[test]
