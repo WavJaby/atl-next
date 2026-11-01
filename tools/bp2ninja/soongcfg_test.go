@@ -50,15 +50,6 @@ func TestSoongConfigAvailability(t *testing.T) {
 	if cfg.CStd != "gnu23" || cfg.CppStd != "gnu++20" || cfg.ExperimentalCStd != "gnu2x" || cfg.ExperimentalCppStd != "gnu++2b" || len(cfg.GlobalIncludes) != 1 {
 		t.Fatalf("config %+v", cfg)
 	}
-	// only the preprocessor flags, in Soong's order
-	defines := []string{"-DANDROID", "-DNDEBUG", "-UDEBUG", "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"}
-	if !slices.Equal(cfg.GlobalDefines, defines) {
-		t.Errorf("GlobalDefines %q, want %q", cfg.GlobalDefines, defines)
-	}
-	// global.go:154-159: the define, not the debug-info flag
-	if want := []string{"-D__ASSEMBLY__"}; !slices.Equal(cfg.GlobalAsDefines, want) {
-		t.Errorf("GlobalAsDefines %q, want %q", cfg.GlobalAsDefines, want)
-	}
 	// the triple's level only: level names come with the generated api-level.h
 	if cfg.APILevel != "-D__ANDROID_API__=10000" {
 		t.Errorf("APILevel %q", cfg.APILevel)
@@ -66,23 +57,10 @@ func TestSoongConfigAvailability(t *testing.T) {
 	if want := []string{"libc", "libm", "libdl"}; !slices.Equal(cfg.SystemSharedLibs, want) {
 		t.Errorf("SystemSharedLibs %q, want %q", cfg.SystemSharedLibs, want)
 	}
-	// the default branch's flag, not the env branch's pattern
-	if cfg.AutoVarInit != "-ftrivial-auto-var-init=zero" {
-		t.Errorf("AutoVarInit %q", cfg.AutoVarInit)
-	}
-	// a global.go without that branch: re-derive, never a silent default
-	noBranch := filepath.Join(t.TempDir(), "global.go")
-	if err := os.WriteFile(noBranch, []byte("package config\n\nfunc init() {}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readAutoVarInit(noBranch); err == nil || !strings.Contains(err.Error(), "re-derive") {
-		t.Errorf("no default branch: err %v", err)
-	}
+	// the weak-mode define and the global flags: TestReadGlobalFlags
 	for _, c := range []struct {
 		name, cflags, soong, bionic, want string
 	}{
-		// Soong stops passing the weak-mode define: bionic's guard would hide every API introduced after level 0
-		{"no weak define", `"-DANDROID",`, "10000", "10000", "lacks -D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"},
 		// platform code's level and api-level.h's default part ways
 		{"levels differ", weak, "10000", "10001", "differ or are missing"},
 		{"bionic level missing", weak, "10000", "", "differ or are missing"},
@@ -94,7 +72,7 @@ func TestSoongConfigAvailability(t *testing.T) {
 	}
 }
 
-// archTree writes the three files readDeviceArch reads, shaped like the pinned android-16.0.0_r1 ones (an excerpt of each declaration): android/arch.go's newArch vars, arch_list.go's androidArchFeatureMap, cc/config/x86_64_device.go and arm64_device.go (the latter without a feature map, as upstream).
+// archTree writes files shaped like the pinned android-16.0.0_r1 ones (an excerpt of each declaration): android/arch.go's newArch vars and arch_list.go's androidArchFeatureMap, which readDeviceArch reads, and cc/config/x86_64_device.go and arm64_device.go excerpts, which yasmTree builds on.
 func archTree(t *testing.T) string {
 	tree := t.TempDir()
 	files := map[string]string{
@@ -118,33 +96,28 @@ func archTree(t *testing.T) string {
 	return tree
 }
 
-// Expected flags: Soong's x86_64ToolchainFactory = the variant's cflags, then each feature's, in androidArchFeatureMap order; avx2 has no entry in the feature cflags (upstream comments it out), so it adds nothing.
+// Expected: androidArchFeatureMap's features for the variant, in its order; blocks = the variant (`-` -> `_`), then the features. The ISA flags they select: TestReadGlobalFlags.
 func TestDeviceArch(t *testing.T) {
 	tree := archTree(t)
 	for _, c := range []struct {
 		arch, variant string
 		features      []string
-		cflags        []string
 		blocks        []string
 	}{
-		{"x86_64", "", []string{"ssse3", "sse4", "sse4_1", "sse4_2", "popcnt"}, []string{"-march=x86-64", "-mssse3", "-msse4", "-msse4.1", "-msse4.2", "-mpopcnt"}, []string{"ssse3", "sse4", "sse4_1", "sse4_2", "popcnt"}},
-		{"x86_64", "haswell", []string{"ssse3", "avx2"}, []string{"-march=core-avx2", "-mssse3"}, []string{"haswell", "ssse3", "avx2"}},
-		// no features for the variant, no feature map: the variant's flags only; the block name is the variant with `-` -> `_`
-		{"arm64", "armv8-a", nil, []string{"-march=armv8-a"}, []string{"armv8_a"}},
-		{"arm64", "armv9-a", []string{"dotprod"}, []string{"-march=armv9-a"}, []string{"armv9_a", "dotprod"}},
+		{"x86_64", "", []string{"ssse3", "sse4", "sse4_1", "sse4_2", "popcnt"}, []string{"ssse3", "sse4", "sse4_1", "sse4_2", "popcnt"}},
+		{"x86_64", "haswell", []string{"ssse3", "avx2"}, []string{"haswell", "ssse3", "avx2"}},
+		{"arm64", "armv8-a", nil, []string{"armv8_a"}},
+		{"arm64", "armv9-a", []string{"dotprod"}, []string{"armv9_a", "dotprod"}},
 	} {
 		d, err := readDeviceArch(tree, Config{Arch: c.arch, PointerBits: 64, ArchVariant: c.variant})
 		if err != nil {
 			t.Fatalf("%s/%s: %v", c.arch, c.variant, err)
 		}
-		if !slices.Equal(d.Features, c.features) || !slices.Equal(d.Cflags, c.cflags) || !slices.Equal(d.blocks(), c.blocks) {
+		if !slices.Equal(d.Features, c.features) || !slices.Equal(d.blocks(), c.blocks) {
 			t.Errorf("%s/%q: %+v blocks %q", c.arch, c.variant, d, d.blocks())
 		}
 	}
-	// Soong's factories panic on an unknown variant; arm64 has no baseline
 	for _, c := range []struct{ arch, variant, want string }{
-		{"x86_64", "nehalem", `unknown x86_64 arch variant "nehalem"`},
-		{"arm64", "", `unknown arm64 arch variant ""`},
 		{"mips", "", `no newArch("mips")`},
 	} {
 		if _, err := readDeviceArch(tree, Config{Arch: c.arch, ArchVariant: c.variant}); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -202,7 +175,8 @@ cc_library {
     arch: { x86_64: { cflags: ["-DARCH"], ssse3: { cflags: ["-DFEATURE"] }, avx2: { cflags: ["-DAVX2"] } } },
 }
 `})
-	g.soong.Device = DeviceArch{Features: []string{"ssse3"}, Cflags: []string{"-march=x86-64", "-mssse3"}}
+	g.soong.Device = DeviceArch{Features: []string{"ssse3"}}
+	g.soong.Flags.Tail[Device] = []string{"-march=x86-64", "-mssse3"}
 	dev, host := g.node("libz", Device, Shared, "t"), g.node("libz", Host, Shared, "t")
 	if dev == nil || host == nil {
 		t.Fatal(g.problems)
@@ -359,7 +333,7 @@ cc_library {
 }
 `})
 	g.soong.Yasm[Device] = []string{"-f", "elf64"}
-	g.soong.GlobalAsDefines = []string{"-D__ASSEMBLY__"}
+	g.soong.Flags.As[Device] = []string{"-D__ASSEMBLY__"}
 	n := g.node("libjpeg", Device, Shared, "t")
 	if n == nil {
 		t.Fatal(g.problems)

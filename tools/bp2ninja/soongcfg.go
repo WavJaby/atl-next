@@ -22,15 +22,10 @@ type SoongConfig struct {
 	CStd, CppStd                         string   // CStdVersion, CppStdVersion
 	ExperimentalCStd, ExperimentalCppStd string   // ExperimentalCStdVersion, ExperimentalCppStdVersion: what c_std / cpp_std "experimental" selects
 	GlobalIncludes                       []string // commonGlobalIncludes that exist in the tree (Soong skips missing ones)
-	// commonGlobalCflags' -D/-U entries, in order: Soong gives them to every module, device and host (cc/compiler.go "${config.CommonGlobalCflags}"), ahead of the module's own flags.
-	// Only the preprocessor part: they decide which code compiles (-DANDROID selects skia's SK_BUILD_FOR_ANDROID); its warning and codegen flags are distro-clang choices here, except AutoVarInit.
-	GlobalDefines []string
-	// CommonGlobalCflags' -ftrivial-auto-var-init (readAutoVarInit): every module, both sides. Not a choice but semantics AOSP code relies on: zero-filled locals.
-	// Measured 2026-11-02: without it ART's class linker gives java.lang.String 80 vtable slots instead of 81 (String.isBlank in Object.clone's slot) and aborts in InitWithoutImage.
-	AutoVarInit string
-	// commonGlobalAsflags' -D/-U entries (-D__ASSEMBLY__): Soong adds them to every .S/.s compile (cc/compiler.go "${config.CommonGlobalAsflags}"); same preprocessor-only rule as GlobalDefines.
-	GlobalAsDefines []string
-	APILevel        string // device-side -D__ANDROID_API__ (apiLevel)
+	// Soong's global and device-toolchain compile flags, evaluated from its source (readGlobalFlags). Semantics AOSP code relies on, not choices: without CommonGlobalCflags' -ftrivial-auto-var-init=zero
+	// ART's class linker gives java.lang.String 80 vtable slots instead of 81 (String.isBlank in Object.clone's slot) and aborts in InitWithoutImage (measured 2026-11-02).
+	Flags    GlobalFlags
+	APILevel string // device-side -D__ANDROID_API__ (apiLevel)
 	// per Side: the toolchain's YasmFlags, the format flags of every .asm compile (readYasmFlags)
 	Yasm [2][]string
 	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
@@ -61,14 +56,10 @@ func readLldflags(tree string) ([]string, error) {
 	return list, nil
 }
 
-// DeviceLink: the part of Soong's device (bionic toolchain) defaults that decides what a shared library or binary exports and what its link may drop; host (linux_glibc) modules get none of it, as in Soong.
-// Only that part: the rest of deviceGlobalCflags / deviceGlobalLdflags is hardening or warnings; the lld flags both sides share are SoongConfig.Lldflags.
-// Together with version_script it is what makes a library's unexported dead code disappear: local: * hides a symbol, -ffunction-sections puts it in its own section, --gc-sections drops the section with its undefined references (libhwui's whole-archived libskia SkFontMgr_android_ndk.cpp -> AFont_*).
+// DeviceLink: the part of Soong's device (bionic toolchain) link defaults that decides what a shared library or binary exports and what its link may drop; host (linux_glibc) modules get none of it, as in Soong.
+// Only that part: the rest of deviceGlobalLdflags is hardening; the lld flags both sides share are SoongConfig.Lldflags.
+// Together with version_script and GlobalFlags' -ffunction-sections it is what makes a library's unexported dead code disappear: local: * hides a symbol, -ffunction-sections puts it in its own section, --gc-sections drops the section with its undefined references (libhwui's whole-archived libskia SkFontMgr_android_ndk.cpp -> AFont_*).
 type DeviceLink struct {
-	// global.go deviceGlobalCflags' -f*-sections: one section per function / data object, the unit --gc-sections drops
-	Cflags []string
-	// global.go deviceGlobalCppflags' -fvisibility* (-fvisibility-inlines-hidden): inline functions are not exported
-	Cppflags []string
 	// global.go deviceGlobalLdflags' -Wl,--exclude-libs,* (archive members' symbols are not exported), then gcSections, which Soong adds for bionic shared libraries and dynamic binaries (cc/library.go, cc/binary.go: `if toolchain.Bionic()`)
 	Ldflags []string
 }
@@ -91,12 +82,6 @@ func readDeviceLink(tree string) (DeviceLink, error) {
 			return nil, fmt.Errorf("%s: %s not found (or not a string list)", path, name)
 		}
 		return slices.DeleteFunc(list, func(s string) bool { return !keep(s) }), nil
-	}
-	if d.Cflags, err = pick("deviceGlobalCflags", func(s string) bool { return strings.HasPrefix(s, "-f") && strings.HasSuffix(s, "-sections") }); err != nil {
-		return d, err
-	}
-	if d.Cppflags, err = pick("deviceGlobalCppflags", func(s string) bool { return strings.HasPrefix(s, "-fvisibility") }); err != nil {
-		return d, err
 	}
 	if d.Ldflags, err = pick("deviceGlobalLdflags", func(s string) bool { return strings.HasPrefix(s, "-Wl,--exclude-libs,") }); err != nil {
 		return d, err
@@ -121,15 +106,12 @@ func readDeviceLink(tree string) (DeviceLink, error) {
 	return d, nil
 }
 
-// DeviceArch: the ISA Soong's device toolchain targets for the arch and its arches.toml variant (android/arch.go decodeArch, cc/config/<arch>_device.go <arch>ToolchainFactory).
-// Device-side sources rely on it: libz's android_x86_64 block defines ADLER32_SIMD_SSSE3 because Android's x86_64 ABI includes SSSE3, and its intrinsics need -mssse3.
+// DeviceArch: the arch variant and features Soong's device side builds for (android/arch.go decodeArch): they select Android.bp arch blocks (blocks) and, through the toolchain factory, the ISA flags (GlobalFlags.Tail).
+// Device-side sources rely on both: libz's android_x86_64 block defines ADLER32_SIMD_SSSE3 because Android's x86_64 ABI includes SSSE3, and its intrinsics need -mssse3.
 // Host-side modules get none: Soong sets arch features for the Android OS only.
 type DeviceArch struct {
 	Variant  string
 	Features []string // android/arch_list.go androidArchFeatureMap[arch][variant]
-	// <arch>ArchVariantCflags[variant] + <arch>ArchFeatureCflags[feature] per feature: the ISA part of the toolchain cflags.
-	// riscv64's -march sits in riscv64Cflags with non-ISA flags instead; it is read when riscv64 hosts are built (plan S5 phase 6).
-	Cflags []string
 }
 
 // blocks: the `arch: { <arch>: { … } }` sub-blocks Soong applies after the arch's own (android/arch.go archPropertiesValues): the variant (`-`, `.` -> `_`), then each feature.
@@ -141,7 +123,7 @@ func (d DeviceArch) blocks() []string {
 	return append(out, d.Features...)
 }
 
-// readDeviceArch: DeviceArch for cfg from the pinned Soong; fails where Soong's toolchain factory would panic (an unknown variant).
+// readDeviceArch: DeviceArch for cfg from the pinned Soong. An unknown variant fails in readGlobalFlags, where Soong's toolchain factory panics.
 func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 	d := DeviceArch{Variant: cfg.ArchVariant}
 	parse := func(rel string) (*ast.File, error) {
@@ -165,27 +147,6 @@ func readDeviceArch(tree string, cfg Config) (DeviceArch, error) {
 		}
 	} else {
 		return d, fmt.Errorf("build/soong/android/arch_list.go: androidArchFeatureMap not found")
-	}
-	rel := "build/soong/cc/config/" + cfg.Arch + "_device.go"
-	dev, err := parse(rel)
-	if err != nil {
-		return d, err
-	}
-	specs := valueSpecs(dev)
-	v, ok := specs[cfg.Arch+"ArchVariantCflags"]
-	if !ok {
-		return d, fmt.Errorf("%s: %sArchVariantCflags not found", rel, cfg.Arch)
-	}
-	variants := stringMap(v)
-	vflags, ok := variants[cfg.ArchVariant]
-	if !ok && (cfg.ArchVariant != "" || len(variants) > 0) {
-		return d, fmt.Errorf("%s: unknown %s arch variant %q", rel, cfg.Arch, cfg.ArchVariant)
-	}
-	d.Cflags = vflags
-	// absent for arches whose features select no flags (arm64)
-	features := stringMap(specs[cfg.Arch+"ArchFeatureCflags"])
-	for _, f := range d.Features {
-		d.Cflags = append(d.Cflags, features[f]...)
 	}
 	return d, nil
 }
@@ -417,7 +378,7 @@ func stringMap(e ast.Expr) map[string][]string {
 
 // weakAvailability: Soong's global define (commonGlobalCflags) that puts bionic's versioning.h in weak mode: __INTRODUCED_IN becomes a plain availability attribute and __BIONIC_AVAILABILITY_GUARD is 1, so every declaration stays visible.
 // Without it the guard reads __ANDROID_MIN_SDK_VERSION__, which only an android target triple defines, and hides every API introduced after level 0.
-// readSoongConfig fails when the pinned Soong no longer passes it: deviceCompat's semantics would then differ from a platform build.
+// readGlobalFlags fails when the pinned Soong no longer passes it: deviceCompat's semantics would then differ from a platform build.
 const weakAvailability = "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"
 
 // futureLevel: api-level.h's `#define __ANDROID_API_FUTURE__ <n>`.
@@ -433,7 +394,6 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 		return SoongConfig{}, err
 	}
 	var cfg SoongConfig
-	var cflags, asflags []string
 	str := func(e ast.Expr) string {
 		if l, ok := e.(*ast.BasicLit); ok && l.Kind == token.STRING {
 			s, _ := strconv.Unquote(l.Value)
@@ -455,10 +415,6 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 						cfg.ExperimentalCStd = str(x.Values[i])
 					case "ExperimentalCppStdVersion":
 						cfg.ExperimentalCppStd = str(x.Values[i])
-					case "commonGlobalCflags":
-						cflags, _ = stringList(x.Values[i])
-					case "commonGlobalAsflags":
-						asflags, _ = stringList(x.Values[i])
 					}
 				}
 			}
@@ -482,37 +438,11 @@ func readSoongConfig(tree string) (SoongConfig, error) {
 	if cfg.CStd == "" || cfg.CppStd == "" || cfg.ExperimentalCStd == "" || cfg.ExperimentalCppStd == "" {
 		return cfg, fmt.Errorf("%s: CStdVersion/CppStdVersion/ExperimentalCStdVersion/ExperimentalCppStdVersion not found", path)
 	}
-	defines := func(list []string) []string {
-		return slices.DeleteFunc(list, func(f string) bool { return !strings.HasPrefix(f, "-D") && !strings.HasPrefix(f, "-U") })
-	}
-	cfg.GlobalDefines, cfg.GlobalAsDefines = defines(cflags), defines(asflags)
-	if !slices.Contains(cfg.GlobalDefines, weakAvailability) {
-		return cfg, fmt.Errorf("%s: commonGlobalCflags lacks %s (deviceCompat assumes it)", path, weakAvailability)
-	}
 	if cfg.APILevel, err = apiLevel(tree); err != nil {
-		return cfg, err
-	}
-	if cfg.AutoVarInit, err = readAutoVarInit(path); err != nil {
 		return cfg, err
 	}
 	cfg.SystemSharedLibs, err = systemSharedLibs(tree)
 	return cfg, err
-}
-
-// autoVarInitDefault: global.go's CommonGlobalCflags VariableFunc, the branch taken when none of AUTO_ZERO_INITIALIZE / AUTO_PATTERN_INITIALIZE / AUTO_UNINITIALIZE is set (this build sets none).
-var autoVarInitDefault = regexp.MustCompile(`\}\s*else\s*\{\s*//\s*Default to zero initialization\.\s*flags = append\(flags, "(-ftrivial-auto-var-init=[a-z]+)"\)`)
-
-// readAutoVarInit: the -ftrivial-auto-var-init flag Soong gives every compile by default; fails when the default branch is no longer that statement.
-func readAutoVarInit(path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	m := autoVarInitDefault.FindSubmatch(b)
-	if m == nil {
-		return "", fmt.Errorf("%s: CommonGlobalCflags' default -ftrivial-auto-var-init branch not found: re-derive soongcfg.go readAutoVarInit", path)
-	}
-	return string(m[1]), nil
 }
 
 // stringList: the strings of a `[]string{…}` literal.

@@ -269,31 +269,18 @@ func debugInfo(flags []string) bool {
 
 type langFlags struct{ c, cxx, asm, yasm []string }
 
-// compileFlags: Soong's language defaults and global defines (read from its global.go), on the device side its toolchain's ISA flags (DeviceArch), the module's flags, then include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes).
+// compileFlags: Soong's command lines (cc/builder.go) -- its global and toolchain flags (GlobalFlags, evaluated from its source), the module's flags, include paths in Soong's order (local, global, own exports, dependencies' exports, Soong's global includes), then the no-override flags.
+// The global flags precede the module's, so a module's own -fexceptions, -fno-function-sections or -mno-* wins, as in Soong.
 // yasm is the whole argv of a .asm compile; the others go to the cc rule.
-// -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures.
+// -w -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures (keepFlag drops Soong's warning flags for the same reason).
 // libc++: AOSP's C++ assumes it (libstdc++ 14 rejects libbase's non-const set comparator).
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
-	common := append([]string{"-fPIC", "-O2", "-w"}, g.soong.GlobalDefines...)
-	// CommonGlobalCflags' auto-var-init, before the module's flags as Soong's (a module may opt out); "" only in tests' hand-made configs
-	if g.soong.AutoVarInit != "" {
-		common = append(common, g.soong.AutoVarInit)
-	}
-	// Soong's toolchain cflags precede the module's (cc/compiler.go), so a module's own -mno-* wins
-	if n.side == Device {
-		common = append(common, g.soong.Device.Cflags...)
-	}
-	// .S/.s: Soong's asflags take the global common flags and none of the module's cflags (cc/builder.go transformSourceToObj)
-	asm := append(slices.Clone(common), "-Wno-error")
-	asm = append(append(asm, g.soong.GlobalAsDefines...), moduleFlags(p, "asflags")...)
-	// Soong's device global cflags precede the module's too (cc/compiler.go "${config.DeviceGlobalCflags}"), so a module's -fno-function-sections wins
-	if n.side == Device {
-		common = append(common, g.soong.DeviceLink.Cflags...)
-	}
-	common = append(common, moduleFlags(p, "cflags")...)
-	common = append(common, n.genCflags...)
-	common = append(common, "-Wno-error")
+	f := &g.soong.Flags
+	global := append([]string{"-fPIC", "-w"}, f.common(n.side, n.mod.Dir)...)
+	// .S/.s: global common + asflags, none of the module's cflags (cc/builder.go transformSourceToObj)
+	asm := slices.Concat(global, f.As[n.side], []string{"-Wno-error"}, moduleFlags(p, "asflags"))
+	common := slices.Concat(moduleFlags(p, "cflags"), n.genCflags, []string{"-Wno-error"})
 	var inc []string
 	for _, d := range p.strs("local_include_dirs") {
 		inc = append(inc, "-I"+g.abs(filepath.Join(n.mod.Dir, d)))
@@ -326,13 +313,8 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	inc = dedup(inc)
 	cstd, cppstd := g.stdVersions(p)
 	// Soong's -std heads the language's local flags, after the module's cflags (cc/builder.go: localCFlags, then localConlyFlags / localCppFlags), so it wins over a -std in cflags (camera_metadata's -std=c11 builds as gnu23, which declares dprintf)
-	cxx := append(append([]string{"-stdlib=libc++"}, common...), "-std="+cppstd)
-	// device global cppflags precede the module's cppflags (cc/compiler.go "${config.DeviceGlobalCppflags}")
-	if n.side == Device {
-		cxx = append(cxx, g.soong.DeviceLink.Cppflags...)
-	}
-	cxx = append(cxx, moduleFlags(p, "cppflags")...)
-	c := append(append(slices.Clone(common), "-std="+cstd), moduleFlags(p, "conlyflags")...)
+	cxx := slices.Concat([]string{"-stdlib=libc++"}, global, f.Cpp[n.side], common, []string{"-std=" + cppstd}, moduleFlags(p, "cppflags"))
+	c := slices.Concat(global, f.Conly[n.side], common, []string{"-std=" + cstd}, moduleFlags(p, "conlyflags"))
 	if n.side == Device {
 		dev := []string{androidDefine, lfs64Define, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
 		for _, h := range deviceForced {
@@ -344,7 +326,8 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	if !p.boolean("rtti", false) {
 		cxx = append(cxx, "-fno-rtti")
 	}
-	return langFlags{append(c, inc...), append(cxx, inc...), append(asm, inc...), yasm}
+	tail := f.noOverride(n.mod.Dir)
+	return langFlags{slices.Concat(c, inc, tail), slices.Concat(cxx, inc, tail), append(asm, inc...), yasm}
 }
 
 // stdVersions: the C and C++ -std values Soong gives a module (cc/compiler.go parseCStd, parseCppStd, maybeReplaceGnuToC): c_std / cpp_std, "" = the default, "experimental" = the experimental version; gnu_extensions: false turns gnu into c.

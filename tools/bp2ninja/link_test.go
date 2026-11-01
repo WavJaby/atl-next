@@ -12,10 +12,8 @@ import (
 	"testing"
 )
 
-// soongDeviceLink: what readDeviceLink takes from the pinned android-16.0.0_r1 Soong (build/soong 533c3c2): cc/config/global.go deviceGlobalCflags (lines 162-178) -> its two -f*-sections, deviceGlobalCppflags (186-188), deviceGlobalLdflags (191-204) -> its four --exclude-libs, then library.go:502 / binary.go:278,316's --gc-sections.
+// soongDeviceLink: what readDeviceLink takes from the pinned android-16.0.0_r1 Soong (build/soong 533c3c2): cc/config/global.go deviceGlobalLdflags (191-204) -> its four --exclude-libs, then library.go:502 / binary.go:278,316's --gc-sections.
 var soongDeviceLink = DeviceLink{
-	Cflags:   []string{"-ffunction-sections", "-fdata-sections"},
-	Cppflags: []string{"-fvisibility-inlines-hidden"},
 	Ldflags: []string{"-Wl,--exclude-libs,libgcc.a", "-Wl,--exclude-libs,libgcc_stripped.a", "-Wl,--exclude-libs,libunwind_llvm.a",
 		"-Wl,--exclude-libs,libunwind.a", "-Wl,--gc-sections"},
 }
@@ -68,15 +66,8 @@ func TestReadDeviceLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []struct {
-		name      string
-		got, want []string
-	}{
-		{"Cflags", d.Cflags, soongDeviceLink.Cflags}, {"Cppflags", d.Cppflags, soongDeviceLink.Cppflags}, {"Ldflags", d.Ldflags, soongDeviceLink.Ldflags},
-	} {
-		if !slices.Equal(c.got, c.want) {
-			t.Errorf("%s %q, want %q", c.name, c.got, c.want)
-		}
+	if !slices.Equal(d.Ldflags, soongDeviceLink.Ldflags) {
+		t.Errorf("Ldflags %q, want %q", d.Ldflags, soongDeviceLink.Ldflags)
 	}
 	// Soong stops garbage-collecting binaries: the assumption is gone, the converter stops
 	if _, err := readDeviceLink(linkTree(t, "func g() []string { return []string{\"-pie\"} }\n", pinnedLld)); err == nil || !strings.Contains(err.Error(), "binary.go: no") {
@@ -146,16 +137,6 @@ genrule { name: "gen_map", cmd: "echo '{ local: *; };' > $(out)", out: ["gen.map
 	// an archive has no linker, so neither the property nor the flags
 	if n := g.nodes[key{"libv", Device, Static}]; n.versionScript != "" {
 		t.Errorf("static libv: version script %q", n.versionScript)
-	}
-	// device compiles take the section and visibility flags ahead of the module's own; host ones do not
-	dev, host := g.compileFlags(g.nodes[key{"libv", Device, Shared}]), g.compileFlags(g.nodes[key{"libv", Host, Shared}])
-	for _, f := range append(slices.Clone(soongDeviceLink.Cflags), soongDeviceLink.Cppflags...) {
-		if !slices.Contains(dev.cxx, f) || slices.Contains(host.cxx, f) {
-			t.Errorf("%s: device cxx %v / host cxx %v", f, slices.Contains(dev.cxx, f), slices.Contains(host.cxx, f))
-		}
-	}
-	if slices.Contains(dev.c, soongDeviceLink.Cppflags[0]) {
-		t.Errorf("C compile takes the C++ flag %s", soongDeviceLink.Cppflags[0])
 	}
 }
 
