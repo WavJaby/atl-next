@@ -130,7 +130,7 @@ fn records_used(view: &ArchView, ty: &Ty, out: &mut BTreeSet<String>) {
 /// Constants, opaque types, and the records `functions` and the typedefs `types` use, of `arch`'s view
 /// (`types`: what the printed C header defines besides, so both sides check the same layouts); and for
 /// each of `functions` a check that `<implementation>::<function>` has the header's signature exactly:
-/// a fn item coerces to the header's fn-pointer type only then.
+/// a fn item coerces to the header's fn-pointer type only then. A C++ namespace is a module of the same path (`android::f` -> `<implementation>::android::f`).
 pub fn api_module(
     iface: &Interface,
     arch: &str,
@@ -170,7 +170,12 @@ pub fn api_module(
             .get(*f)
             .with_context(|| format!("{}: no function {f}", iface.header))?;
         let ty = fn_ty(sig, &mut opaque).with_context(|| (*f).to_owned())?;
-        writeln!(out, "const _: {ty} = {implementation}::{};", ident(f))?;
+        let path: Vec<String> = f.split("::").map(ident).collect();
+        writeln!(
+            out,
+            "const _: {ty} = {implementation}::{};",
+            path.join("::")
+        )?;
         // `usize` / `isize` stand for these typedefs only where their width is the pointer's
         let mut sized = BTreeSet::new();
         for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {

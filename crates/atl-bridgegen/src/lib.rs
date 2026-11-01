@@ -463,6 +463,61 @@ mod tests {
         assert!(!rustc(&dir, &format!("{checks}{wrong}")).status.success());
     }
 
+    /// A C++ header in the shape of AOSP libEGL's private/EGL/display.h: functions in (nested) named namespaces next to one at file scope, and one in an anonymous namespace (internal linkage).
+    const NAMESPACED: &str = "namespace outer {\nint f(const char *name);\nnamespace inner {\nvoid g(void *p);\n}\n}\nnamespace {\nint hidden(void);\n}\nint plain(void);\n";
+
+    #[test]
+    fn namespaced_functions_keep_cxx_linkage() {
+        let dir = tmp("cxxns");
+        let header = dir.0.join("ns.h");
+        std::fs::write(&header, NAMESPACED).unwrap();
+        let src = Source {
+            path: &header,
+            lang: Lang::Cxx,
+            also: &[],
+            macros: &[],
+        };
+        let iface = interface("ns", "ns.h", &src, &[freestanding()]).unwrap();
+        let view = &iface.arches["x86_64"];
+        let keys: Vec<&str> = view.functions.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["outer::f", "outer::inner::g", "plain"]);
+        let functions = ["outer::f", "outer::inner::g", "plain"];
+        let text = c::header(&iface, "x86_64", &functions, &[], &c::Kept::default()).unwrap();
+        for want in [
+            "extern \"C\" {\n#endif\n\nint plain(void);\n",
+            // after the extern "C" block: C++ linkage
+            "}\n#endif\n\nnamespace outer {\nint f(const char *);\n}\n\nnamespace outer::inner {\nvoid g(void *);\n}\n",
+        ] {
+            assert!(text.contains(want), "{want:?} missing:\n{text}");
+        }
+        let only = c::header(&iface, "x86_64", &["outer::f"], &[], &c::Kept::default()).unwrap();
+        assert!(
+            !only.contains("extern"),
+            "no C part, no extern \"C\" block:\n{only}"
+        );
+        // read back: the same functions under the same qualified names
+        let printed = dir.0.join("printed.h");
+        std::fs::write(&printed, &text).unwrap();
+        let src = Source {
+            path: &printed,
+            lang: Lang::Cxx,
+            also: &[],
+            macros: &[],
+        };
+        let back = interface("back", "printed.h", &src, &[freestanding()]).unwrap();
+        assert_eq!(back.arches["x86_64"].functions, view.functions);
+
+        // a namespace is a module path on the Rust side
+        let checks = rust::api_module(&iface, "x86_64", &functions, &[], "imp").unwrap();
+        let imp = "mod imp {\n  pub mod outer {\n    pub extern \"C\" fn f(_: *const i8) -> i32 { 0 }\n    pub mod inner {\n      pub extern \"C\" fn g(_: *mut core::ffi::c_void) {}\n    }\n  }\n  pub extern \"C\" fn plain() -> i32 { 0 }\n}\n";
+        let out = rustc(&dir, &format!("{checks}{imp}"));
+        assert!(
+            out.status.success(),
+            "{}\n{checks}{imp}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A header in the shape of bionic's android/dlext.h and bionic/malloc.h: callers build a typedef'd
     /// anonymous struct the function takes, use one no function names, and an enum from a `"…"` include.
     const EXT: &str = "#include <stdint.h>\n#include <stddef.h>\n#include \"kind.h\"\nstruct ns;\ntypedef struct {\n  uint64_t flags;\n  void *_Nullable addr;\n  size_t size;\n  int fd;\n  struct ns *_Nullable space;\n} info;\ntypedef struct {\n  uint8_t *buffer;\n  size_t n;\n} leak;\nenum { USE_NS = 0x200 };\nvoid *_Nullable open_ext(const char *_Nullable name, int flags, const info *_Nullable i);\nint dump(int pid, enum kind k);\n";

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Generates `OUT_DIR/glext.rs` with atl-bridgegen from AOSP's pinned Khronos headers (`frameworks/native/opengl/include`), for the target cargo builds for: one exported shell per EGL / GLES extension function, forwarding to what `eglGetProcAddress` returns (bridge control 1; `crate::ffi::resolve`). Generates twice and fails unless byte-identical.
+//! Generates with atl-bridgegen, for the target cargo builds for, each twice and failing unless byte-identical:
+//! - `OUT_DIR/glext.rs` from AOSP's pinned Khronos headers (`frameworks/native/opengl/include`): one exported shell per EGL / GLES extension function, forwarding to what `eglGetProcAddress` returns (bridge control 1; `crate::ffi::resolve`).
+//! - `PRIVATE`: `OUT_DIR/capi/include/private/EGL/{cache,display}.h` (cargo-c installs them) declaring exactly the libEGL private functions `crate::private` exports, and `OUT_DIR/{cache,display}.rs`, the check that each export has the header's signature.
 //!
 //! Extension function = declared by an extension header (`EXT_HEADERS`) and by no core header (`CORE_HEADERS`). The headers decide, not the host libraries' exports: the set is the same on every host and at every build, and the host loaders (libglvnd) export exactly the core headers' functions -- measured 2026-10-31 on Debian 13: libEGL 44 symbols, libGLESv2 358, libGLESv1_CM 145, no extension function among them besides GLES 1.1's core `glPointSizePointerOES`.
 //! Headers are parsed as the converter compiles their callers: glibc host target, `ANDROID` (a Soong global define) and `__ANDROID__` (the device triple's, owner 2026-11-01) -- eglplatform.h's Android native types --, prototypes enabled.
@@ -7,12 +9,39 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use atl_bridgegen::buildscript::{self, Upstreams};
+use atl_bridgegen::buildscript::{self, Api, DECLARATIONS, Upstreams};
 use atl_bridgegen::ir::Ty;
 use atl_bridgegen::{Lang, Source, Target};
 
 /// AOSP's Khronos headers, relative to the AOSP tree.
 const INCLUDE: &str = "frameworks/native/opengl/include";
+
+/// AOSP libEGL's private API (`frameworks/native/opengl/libs/EGL/include`) that framework code calls: only these two headers, each only its function, so declared == implemented == checked. The rest of that directory declares what nothing here implements.
+/// Callers (2026-11-01): hwui `android_graphics_HardwareRenderer.cpp` (`egl_set_cache_filename`), libandroid_runtime `com_google_android_gles_jni_EGLImpl.cpp` (`egl_get_init_count`).
+const PRIVATE: &[Api] = &[
+    Api {
+        name: "cache",
+        source: "frameworks/native/opengl/libs/EGL/include/private/EGL/cache.h",
+        lang: Lang::Cxx,
+        header: Some("private/EGL/cache.h"),
+        functions: &["android::egl_set_cache_filename"],
+        macros: &[],
+        // its <cutils/compiler.h> (ANDROID_API)
+        include_dirs: &["system/core/libcutils/include"],
+        kept: DECLARATIONS,
+    },
+    Api {
+        name: "display",
+        source: "frameworks/native/opengl/libs/EGL/include/private/EGL/display.h",
+        lang: Lang::Cxx,
+        header: Some("private/EGL/display.h"),
+        functions: &["android::egl_get_init_count"],
+        macros: &[],
+        // its <EGL/egl.h> (EGLDisplay, which the printed header includes again) and <cutils/compiler.h>
+        include_dirs: &[INCLUDE, "system/core/libcutils/include"],
+        kept: DECLARATIONS,
+    },
+];
 
 /// Core API headers: what the host libEGL / libGLESv1_CM / libGLESv2 export (GLES 3.x core is libGLESv2's).
 const CORE_HEADERS: &[&str] = &[
@@ -124,6 +153,9 @@ fn main() -> Result<()> {
         for path in up.rerun_paths(&rel(h)) {
             println!("cargo::rerun-if-changed={}", path.display());
         }
+    }
+    for path in buildscript::api_crate(PRIVATE, "crate::private")? {
+        println!("cargo::rerun-if-changed={}", path.display());
     }
     Ok(())
 }

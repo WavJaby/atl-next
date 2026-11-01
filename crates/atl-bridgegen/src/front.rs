@@ -543,7 +543,7 @@ fn includes(tu: &TranslationUnit, path: &Path) -> Result<Vec<String>> {
         .collect()
 }
 
-/// The interface's declarations among `parent`'s children; `extern "C"` blocks are looked into.
+/// The interface's declarations among `parent`'s children; `extern "C"` blocks are looked into, named namespaces for their functions only (`namespaced_functions`).
 fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
     for e in parent.get_children() {
         if e.get_kind() == EntityKind::LinkageSpec {
@@ -551,6 +551,10 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
             continue;
         }
         if !owned.owns(&e) {
+            continue;
+        }
+        if e.get_kind() == EntityKind::Namespace {
+            namespaced_functions(&e, "", owned, view)?;
             continue;
         }
         match e.get_kind() {
@@ -616,6 +620,41 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
             EntityKind::VarDecl => {
                 if let Some((name, value)) = var_constant(&e, owned)? {
                     insert_value(view, name, value)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Functions of the named namespace `ns` (nested in `outer`, `a::`), keyed by qualified name (`android::egl_get_init_count`): C++ linkage, so printers keep the namespace and exports carry the mangled name.
+/// Only functions: no consumer reads a namespaced record, typedef or constant yet. Anonymous namespaces give internal linkage, never interface.
+fn namespaced_functions(
+    ns: &Entity,
+    outer: &str,
+    owned: &Owned,
+    view: &mut ArchView,
+) -> Result<()> {
+    let Some(name) = ns.get_name() else {
+        return Ok(());
+    };
+    let scope = format!("{outer}{name}::");
+    for e in ns.get_children() {
+        if !owned.owns(&e) {
+            continue;
+        }
+        match e.get_kind() {
+            EntityKind::Namespace => namespaced_functions(&e, &scope, owned, view)?,
+            EntityKind::FunctionDecl if e.get_linkage() != Some(Linkage::Internal) => {
+                let name = format!("{scope}{}", e.get_name().context("unnamed function")?);
+                let t = e.get_type().with_context(|| format!("{name}: no type"))?;
+                let sig = signature(&t, owned).with_context(|| name.clone())?;
+                // one key per name: an overload set would need the signature in the key
+                if let Some(old) = view.functions.insert(name.clone(), sig.clone())
+                    && old != sig
+                {
+                    bail!("{name}: overloaded; the IR keys functions by name");
                 }
             }
             _ => {}

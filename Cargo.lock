@@ -118,18 +118,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "atl-glext"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "atl-bridgegen",
-]
-
-[[package]]
 name = "atl-layout"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+]
+
+[[package]]
+name = "atl-opengl"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
 ]
 
 [[package]]

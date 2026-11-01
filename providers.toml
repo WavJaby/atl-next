@@ -74,21 +74,22 @@ reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace
 # GL and Vulkan loaders: the host's (libglvnd dispatching to Mesa, the Khronos Vulkan loader), owner decision 2026-10-31.
 # Headers stay AOSP's (gl_headers, vulkan_headers, through the tree modules' export_header_lib_headers): the Khronos registry headers the pinned AOSP code is written against (hwui uses EGL_TELEMETRY_HINT_ANDROID, absent from Debian 13's 2021 eglext.h); the Khronos ABI only grows, so they declare the host library correctly.
 # AOSP's libEGL_getProcAddress is a static helper of AOSP's libEGL alone: no row, nothing else links it.
-# Extension functions: AOSP's libEGL exports them as symbols, which AOSP code calls directly (eglCreateImageKHR, glEGLImageTargetTexture2DOES, ...); the host loaders (libglvnd) export only the core API and hand extensions out through eglGetProcAddress. atl-glext exports them, each resolved through eglGetProcAddress (owner decision 2026-10-31), so every GL row links it after the host library.
+# Extension functions: AOSP's libEGL exports them as symbols, which AOSP code calls directly (eglCreateImageKHR, glEGLImageTargetTexture2DOES, ...); the host loaders (libglvnd) export only the core API and hand extensions out through eglGetProcAddress. atl-opengl exports them, each resolved through eglGetProcAddress (owner decision 2026-10-31), so every GL row links it after the host library.
+# libEGL's private API (private/EGL/cache.h, display.h; `android::egl_set_cache_filename`, `android::egl_get_init_count`), which hwui and libandroid_runtime call: atl-opengl exports both and installs their headers (owner decision 2026-11-01).
 ["libEGL"]
-provider = ["system:egl", "crate:atl-glext"]
+provider = ["system:egl", "crate:atl-opengl"]
 reason = "AOSP's GL loaders keep their dispatch tables in bionic's TLS_SLOT_OPENGL_API via __get_tls() (opengl/libs/hooks.h, bionic/tls.h), which on glibc is glibc's own thread block; it loads drivers only as Android EGL HALs. The host libEGL loads the desktop's driver"
 
 ["libGLESv1_CM"]
-provider = ["system:glesv1-cm", "crate:atl-glext"]
+provider = ["system:glesv1-cm", "crate:atl-opengl"]
 reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES_CM/gl.cpp) into AOSP's libEGL; the host's GLESv1_CM dispatches into the host libEGL"
 
 ["libGLESv2"]
-provider = ["system:glesv2", "crate:atl-glext"]
+provider = ["system:glesv2", "crate:atl-opengl"]
 reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES2/gl2.cpp) into AOSP's libEGL; the host's GLESv2 dispatches into the host libEGL"
 
 ["libGLESv3"]
-provider = ["system:glesv2", "crate:atl-glext"]
+provider = ["system:glesv2", "crate:atl-opengl"]
 reason = "AOSP's libGLESv3 is libGLESv2's sources under a second name (same TLS dispatch); on the desktop libGLESv2 carries the ES 3.x entry points (glesv2.pc: OpenGL ES v2/v3)"
 
 ["libvulkan"]

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The exports as AOSP code calls them, on the host's EGL with no window system: a surfaceless Mesa display (EGL_MESA_platform_surfaceless), a GLES 2 context current without a surface (EGL_KHR_surfaceless_context).
+//! The extension exports as AOSP code calls them, on the host's EGL with no window system: a surfaceless Mesa display (EGL_MESA_platform_surfaceless), a GLES 2 context current without a surface (EGL_KHR_surfaceless_context).
 //! Needs the host's EGL vendor library (Mesa's, software rendering suffices). Ground truth for the full API is dEQP (EGL, GLES); this checks the forwarding.
 //! Constants are the Khronos registry's, as AOSP's pinned eglext.h / gl2.h define them.
 
@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_uint, c_void};
 use std::ptr::{null, null_mut};
 
 // the exports live in the crate; nothing else of it is named here
-use atl_glext as _;
+use atl_opengl as _;
 
 type Display = *mut c_void;
 type Handle = *mut c_void;

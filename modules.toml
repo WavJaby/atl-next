@@ -46,10 +46,10 @@ crates = ["atl-debuggerd-client"]
 exports = ["atl-debuggerd-client"]
 uses = ["generators"]
 
-# EGL / GLES extension entry points as symbols, linked next to the host GL loaders (providers.toml)
-[glext]
-crates = ["atl-glext"]
-exports = ["atl-glext"]
+# AOSP libEGL / libGLES* surface on the host GL loaders, linked next to them (providers.toml): extension entry points as symbols, libEGL's private API
+[opengl]
+crates = ["atl-opengl"]
+exports = ["atl-opengl"]
 uses = ["generators"]
 
 [generators]

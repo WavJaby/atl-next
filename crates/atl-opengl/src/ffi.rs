@@ -43,7 +43,7 @@ pub(crate) unsafe fn resolve<F: Copy>(name: &CStr) -> Option<F> {
 pub(crate) fn unsupported(name: &CStr) -> ! {
     let _ = writeln!(
         std::io::stderr(),
-        "atl-glext: {} called, but the host EGL/GLES driver does not implement it (eglGetProcAddress returned NULL)",
+        "atl-opengl: {} called, but the host EGL/GLES driver does not implement it (eglGetProcAddress returned NULL)",
         name.to_string_lossy()
     );
     std::process::abort()

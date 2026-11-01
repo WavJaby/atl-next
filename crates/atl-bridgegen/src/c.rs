@@ -11,17 +11,21 @@
 //! printed with its definition -- callers build it -- followed by static asserts of clang's size, alignment
 //! and offsets in the source's view: field types are printed by name (`off64_t`), so a host typedef of
 //! another width fails the caller's compile instead of shifting a field.
+//!
+//! Linkage: a function the source declares at file scope is printed `extern "C"`, whatever the source's language (the exports are C symbols); one it declares in a namespace (`android::egl_get_init_count`) keeps the namespace and C++ linkage, printed after the `extern "C"` block, so its callers link against the mangled name the source's callers expect.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::ir::{ArchView, Constant, Interface, Nullability, RecordKind, Ty};
 
-/// Standard C / POSIX typedef names and the header that declares each; the printer includes these
+/// Standard C / POSIX / Khronos typedef names and the header that declares each; the printer includes these
 /// instead of the source's own includes. A typedef from outside the interface that is not listed fails.
 const STD_TYPEDEFS: &[(&str, &str)] = &[
+    // AOSP libEGL's private/EGL/display.h
+    ("EGLDisplay", "EGL/egl.h"),
     ("size_t", "stddef.h"),
     ("ptrdiff_t", "stddef.h"),
     ("wchar_t", "stddef.h"),
@@ -84,15 +88,25 @@ pub fn header(
         asserts: Vec::new(),
     };
     let mut decls = String::new();
+    // namespace -> its functions' declarations, C++ linkage (front `namespaced_functions`)
+    let mut scoped: BTreeMap<&str, String> = BTreeMap::new();
     for f in functions {
         let sig = view
             .functions
             .get(*f)
             .with_context(|| format!("{}: no function {f}", iface.header))?;
+        let (ns, name) = match f.rsplit_once("::") {
+            Some((ns, name)) => (Some(ns), name),
+            None => (None, *f),
+        };
         let text = p
-            .decl(&Ty::Function(Box::new(sig.clone())), false, f)
+            .decl(&Ty::Function(Box::new(sig.clone())), false, name)
             .with_context(|| (*f).to_owned())?;
-        writeln!(decls, "{text};")?;
+        let into = match ns {
+            Some(ns) => scoped.entry(ns).or_default(),
+            None => &mut decls,
+        };
+        writeln!(into, "{text};")?;
     }
     for t in kept.types {
         let target = view
@@ -149,7 +163,8 @@ pub fn header(
             writeln!(out, "#include {i}")?;
         }
     }
-    out.push_str("\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n");
+    // the extern "C" block; `out` again below
+    let (head, mut out) = (out, String::new());
     // `typedef struct x x;` declares `struct x` itself
     let typedef_records: BTreeSet<&str> = p
         .typedefs
@@ -198,7 +213,18 @@ pub fn header(
         out.push('\n');
         out.push_str(&decls);
     }
-    out.push_str("\n#ifdef __cplusplus\n}\n#endif\n");
+    let (block, mut out) = (out, head);
+    // a header of namespaced functions only has no C part
+    if !block.is_empty() || scoped.is_empty() {
+        write!(
+            out,
+            "\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n{block}\n#ifdef __cplusplus\n}}\n#endif\n"
+        )?;
+    }
+    // C++ only, as its source: a C includer fails here rather than link against a mangled name
+    for (ns, text) in scoped {
+        write!(out, "\nnamespace {ns} {{\n{text}}}\n")?;
+    }
     Ok(out)
 }
 
