@@ -46,6 +46,12 @@ const CASES: &[(&str, &str)] = &[
         "sys/cdefs.h: #define __unused __attribute__((__unused__))",
         "#include <sys/types.h>\n#include <linux/sysctl.h>\n#include <linux/icmp.h>\nstatic int v __unused;\n",
     ),
+    // libmedia mediascanner.h `struct MediaAlbumArt {…} __packed;`; bare, `__packed` declares a
+    // variable of the unpacked struct (8 bytes: `i` aligned to 4), so the size check fails
+    (
+        "sys/cdefs.h: #define __packed __attribute__((__packed__))",
+        "#include <sys/types.h>\nstruct s { char c; int i; } __packed;\nint v[sizeof(struct s) == 5 ? 1 : -1];\n",
+    ),
     // libc_malloc_debug_backtrace MapData.cpp; bare, the call is an undeclared function
     (
         "elf.h: #include <bits/elf_common.h>, which defines IS_ELF(ehdr)",

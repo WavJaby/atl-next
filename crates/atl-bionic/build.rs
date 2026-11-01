@@ -257,9 +257,11 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// glibc's `gid_t` is the same `unsigned int`; libpackagelistparser), `__LIBC_HIDDEN__` (`sys/cdefs.h`,
 /// hidden visibility; bionic's `resolv_netid.h` as libandroid_net includes it), `__RENAME_IF_FILE_OFFSET64`
 /// (`sys/cdefs.h`; androidfw under `__ANDROID__`): empty on LP64, as read here, where off_t is 64-bit
-/// on both libcs.
+/// on both libcs. `__packed` (`sys/cdefs.h`; libmedia mediascanner.h `struct MediaAlbumArt {…} __packed;`):
+/// undefined, it declares a variable of the struct, which calls its private constructor.
 const FORWARDED_MACROS: &[&str] = &[
     "__unused",
+    "__packed",
     "IS_ELF",
     "GID_MAX",
     "__LIBC_HIDDEN__",
