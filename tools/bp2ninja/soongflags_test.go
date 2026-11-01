@@ -338,6 +338,7 @@ func flagsTree(t *testing.T, global string) string {
 // Expected by hand from Soong's semantics on the fixture, this build's environment (no env var, no product: else / default branches, NoBionicPageSizeMacro false, GOOS linux), and keepFlag:
 // device Common = InstructionSetFlags("") "" + X86_64Cflags' -D (its -Werror dropped) + CommonGlobalCflags (its -W, -fcolor-diagnostics, -gz, -g, -fdebug-prefix-map dropped; auto-var-init's default zero) + DeviceGlobalCflags' kept two;
 // Tail = -m64 + the variant's -march + each feature's flag in feature order.
+// host Common = the glibc toolchain's Cflags (toolchainLinuxX8664's LinuxCflags + LinuxX8664Cflags, then toolchainGlibc's) minus --gcc-toolchain and --sysroot with its path (toolchainLocation), then the same globals; LinuxGccRoot's version part 4.8 = linuxGccVersion's first two fields.
 func TestReadGlobalFlags(t *testing.T) {
 	tree := flagsTree(t, flagsGlobal)
 	g, err := readGlobalFlags(tree, Config{Arch: "x86_64", PointerBits: 64}, DeviceArch{Features: []string{"ssse3", "popcnt"}})
@@ -345,21 +346,24 @@ func TestReadGlobalFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	common := []string{"-O2", "-DANDROID", "-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__", "-fno-exceptions", "-ftrivial-auto-var-init=zero"}
+	hostTC := []string{"-Wa,--noexecstack", "-fPIC", "-fno-omit-frame-pointer", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3", "-fstack-protector", "-fstack-protector-strong", "-m64"}
+	gccRoot := filepath.Join(tree, "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8")
 	for _, c := range []struct {
 		name      string
 		got, want []string
 	}{
 		{"device head", g.Head[Device], slices.Concat([]string{"-D__BIONIC_DEPRECATED_PAGE_SIZE_MACRO"}, common, []string{"-ffunction-sections", "-Wa,--noexecstack"})},
-		{"host head", g.Head[Host], common},
+		{"host head", g.Head[Host], slices.Concat(hostTC, common)},
 		{"device tail", g.Tail[Device], []string{"-m64", "-march=x86-64", "-mssse3", "-mpopcnt"}},
 		{"host tail", g.Tail[Host], nil},
 		{"device cpp", g.Cpp[Device], []string{"-D_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS", "-fvisibility-inlines-hidden"}},
 		{"host cpp", g.Cpp[Host], []string{"-D_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS"}},
 		{"device as", g.As[Device], []string{"-D__ASSEMBLY__"}},
+		{"host as", g.As[Host], []string{"-D__ASSEMBLY__"}},
 		{"external", g.External, nil},
 		{"no override", g.NoOverride, nil},
 		{"no override external", g.NoOverrideExt, []string{"-fcommon"}},
-		{"skipped", g.Skipped, []string{"-Wall", "-Werror=bool-operation", "-Werror=implicit-function-declaration", "-Werror=return-type", "-Wimplicit-fallthrough",
+		{"skipped", g.Skipped, []string{"--gcc-toolchain=" + gccRoot, "--sysroot " + gccRoot + "/sysroot", "-Wall", "-Werror=bool-operation", "-Werror=implicit-function-declaration", "-Werror=return-type", "-Wimplicit-fallthrough",
 			"-Wno-enum-compare", "-Wno-unused", "-fcolor-diagnostics", "-fdebug-default-version=4", "-fdebug-prefix-map=/proc/self/cwd=", "-g", "-gz=zstd"}},
 	} {
 		if !slices.Equal(c.got, c.want) {
@@ -388,6 +392,7 @@ func TestReadGlobalFlags(t *testing.T) {
 		{"unknown config method", strings.Replace(flagsGlobal, `IsEnvTrue("AUTO_ZERO_INITIALIZE")`, `ReleaseFoo()`, 1), "", "Config().ReleaseFoo: no known value"},
 		{"no weak define", strings.Replace(flagsGlobal, `"-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__",`, "", 1), "", "lacks -D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__"},
 		{"unregistered variable", strings.Replace(flagsGlobal, `pctx.StaticVariable("ExternalCflags"`, `pctx.StaticVariable("OtherCflags"`, 1), "", "${config.ExternalCflags} is registered by no"},
+		{"other package's variable", strings.Replace(flagsGlobal, `"-fno-exceptions",`, `"-fno-exceptions", "-I${android.Foo}",`, 1), "", "keeps a reference this evaluator cannot resolve"},
 	} {
 		_, err := readGlobalFlags(flagsTree(t, c.global), Config{Arch: "x86_64", PointerBits: 64, ArchVariant: c.variant}, DeviceArch{Variant: c.variant})
 		if err == nil || !strings.Contains(err.Error(), c.want) {

@@ -18,8 +18,8 @@ import (
 
 // GlobalFlags: the compile flags Soong gives every C/C++/asm compile before and after the module's own (cc/compiler.go compilerFlags, cc/builder.go), per side, evaluated from the pinned build/soong/cc/config package by soongEval.
 // Soong's command lines (builder.go): C = Common + Conly + module + NoOverride; C++ = Common + Cpp + module + NoOverride; asm = Common + As + module. Common is [instruction set, tc.Cflags, CommonGlobalCflags, <Hod>GlobalCflags, ExternalCflags if third-party, tc.ToolchainCflags].
-// The device side takes the bionic toolchain for (Android, arch); the host side the global lists only (Soong's linux_glibc toolchain flags are not applied: host modules are build tools).
-// Every flag passes keepFlag; what it drops is in Skipped.
+// The device side takes the bionic toolchain for (Android, arch), the host side the linux_glibc one for (Linux, arch) (-fstack-protector-strong, -D_FORTIFY_SOURCE=3, -fno-omit-frame-pointer, -m64, ...).
+// Every flag passes toolchainLocation and keepFlag; what they drop is in Skipped.
 type GlobalFlags struct {
 	Head, Tail     [2][]string // Common up to <Hod>GlobalCflags, and tc.ToolchainCflags: ExternalCflags goes between them
 	External       []string    // ExternalCflags, for third-party module dirs (ThirdParty)
@@ -27,7 +27,7 @@ type GlobalFlags struct {
 	NoOverride     []string // NoOverrideGlobalCflags + NoOverride64GlobalCflags (64-bit arches)
 	NoOverrideExt  []string // NoOverrideExternalGlobalCflags, third-party only
 	ThirdParty     ThirdParty
-	Skipped        []string // dropped by keepFlag, unique, sorted
+	Skipped        []string // dropped by toolchainLocation (with its argument) or keepFlag, unique, sorted
 	// per Side: the toolchain's YasmFlags, the format flags of every .asm compile (cc/compiler.go Global.YasmFlags: `-f elf64 -m amd64` for x86_64); toolchainBase's "" on arches without .asm sources
 	Yasm [2][]string
 	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
@@ -53,6 +53,20 @@ func keepFlag(f string) bool {
 		return false
 	}
 	return true
+}
+
+// toolchainLocation: how many argv words a Soong toolchain flag naming its prebuilt toolchain spans (0 = not one): --gcc-toolchain=<dir> and --sysroot <dir> (also --sysroot=<dir>, --gcc-toolchain <dir>).
+// linux_glibc points clang at prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 (GCC 4.8 runtime, glibc 2.17 sysroot), the companion of Soong's prebuilt clang (pinned only for the Soong spike, which builds with both).
+// The converter's toolchain is the distro clang with the build machine's glibc, libc++ and GCC runtime, compile and link alike; 2.17 headers would compile against one C library and link another (and the distro libc++, built on the host's).
+// A toolchain choice, like the compiler itself, not a flag AOSP code relies on; dropped with its argument and listed in Skipped.
+func toolchainLocation(f string) int {
+	switch {
+	case f == "--sysroot", f == "--gcc-toolchain":
+		return 2
+	case strings.HasPrefix(f, "--sysroot="), strings.HasPrefix(f, "--gcc-toolchain="):
+		return 1
+	}
+	return 0
 }
 
 // common: the side's Global.CommonFlags for a module in dir.
@@ -129,7 +143,7 @@ func readThirdParty(tree string) (ThirdParty, error) {
 // readGlobalFlags: GlobalFlags for the device arch cfg (its arches.toml variant and Soong's feature list for it, DeviceArch).
 func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, error) {
 	var g GlobalFlags
-	ev, err := newSoongEval(filepath.Join(tree, "build/soong/cc/config"))
+	ev, err := newSoongEval(tree)
 	if err != nil {
 		return g, err
 	}
@@ -140,8 +154,13 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 			return nil, err
 		}
 		var out []string
-		for _, f := range strings.Fields(s) {
-			if keepFlag(f) {
+		fields := strings.Fields(s)
+		for i := 0; i < len(fields); i++ {
+			f := fields[i]
+			if n := toolchainLocation(f); n > 0 {
+				skipped[strings.Join(fields[i:min(i+n, len(fields))], " ")] = true
+				i += n - 1
+			} else if keepFlag(f) {
 				out = append(out, f)
 			} else {
 				skipped[f] = true
@@ -157,36 +176,6 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 	archFields := [2]map[string]any{
 		Device: {"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features},
 		Host:   {"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)},
-	}
-	var tcs [2]map[string]any
-	for side := range tcs {
-		if !ev.hasToolchain(toolchainOS[side], ident) {
-			if Side(side) == Device {
-				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, toolchainOS[side], ident)
-			}
-			g.NoToolchain[side] = "Soong registers no toolchain for (" + toolchainOS[side] + ", " + ident + ")"
-			continue
-		}
-		if tcs[side], err = ev.toolchain(toolchainOS[side], ident, archFields[side]); err != nil {
-			return g, err
-		}
-		yasm, err := ev.method(tcs[side], "YasmFlags")
-		if err != nil {
-			return g, err
-		}
-		// assembler arguments, not clang flags: keepFlag does not apply
-		if yasm, err = ev.expand(yasm); err != nil {
-			return g, err
-		}
-		g.Yasm[side] = strings.Fields(yasm)
-	}
-	tc := tcs[Device]
-	method := func(name string, args ...any) ([]string, error) {
-		s, err := ev.method(tc, name, args...)
-		if err != nil {
-			return nil, err
-		}
-		return get(s)
 	}
 	type part struct {
 		dst  *[]string
@@ -208,29 +197,58 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 			}
 		}
 	}
-	// the device toolchain around the global lists (compiler.go: instruction set first, tc.Cflags before CommonGlobalCflags, tc.ToolchainCflags last; tc.Cppflags after the global C++ lists, tc.Asflags before CommonGlobalAsflags)
-	isa, err := method("InstructionSetFlags", "")
-	if err != nil {
-		return g, err
+	// each side's toolchain around the global lists (compiler.go: instruction set first, tc.Cflags before CommonGlobalCflags, tc.ToolchainCflags last; tc.Cppflags after the global C++ lists, tc.Asflags before CommonGlobalAsflags)
+	for side := range archFields {
+		if !ev.hasToolchain(toolchainOS[side], ident) {
+			if Side(side) == Device {
+				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, toolchainOS[side], ident)
+			}
+			g.NoToolchain[side] = "Soong registers no toolchain for (" + toolchainOS[side] + ", " + ident + ")"
+			continue
+		}
+		tc, err := ev.toolchain(toolchainOS[side], ident, archFields[side])
+		if err != nil {
+			return g, err
+		}
+		method := func(name string, args ...any) ([]string, error) {
+			s, err := ev.method(tc, name, args...)
+			if err != nil {
+				return nil, err
+			}
+			return get(s)
+		}
+		isa, err := method("InstructionSetFlags", "")
+		if err != nil {
+			return g, err
+		}
+		cflags, err := method("Cflags")
+		if err != nil {
+			return g, err
+		}
+		g.Head[side] = slices.Concat(isa, cflags, g.Head[side])
+		if g.Tail[side], err = method("ToolchainCflags"); err != nil {
+			return g, err
+		}
+		cpp, err := method("Cppflags")
+		if err != nil {
+			return g, err
+		}
+		g.Cpp[side] = append(g.Cpp[side], cpp...)
+		as, err := method("Asflags")
+		if err != nil {
+			return g, err
+		}
+		g.As[side] = append(as, g.As[side]...)
+		yasm, err := ev.method(tc, "YasmFlags")
+		if err != nil {
+			return g, err
+		}
+		// assembler arguments, not clang flags: keepFlag does not apply
+		if yasm, err = ev.expand(yasm); err != nil {
+			return g, err
+		}
+		g.Yasm[side] = strings.Fields(yasm)
 	}
-	cflags, err := method("Cflags")
-	if err != nil {
-		return g, err
-	}
-	g.Head[Device] = slices.Concat(isa, cflags, g.Head[Device])
-	if g.Tail[Device], err = method("ToolchainCflags"); err != nil {
-		return g, err
-	}
-	cpp, err := method("Cppflags")
-	if err != nil {
-		return g, err
-	}
-	g.Cpp[Device] = append(g.Cpp[Device], cpp...)
-	as, err := method("Asflags")
-	if err != nil {
-		return g, err
-	}
-	g.As[Device] = append(as, g.As[Device]...)
 	if g.External, err = get("${config.ExternalCflags}"); err != nil {
 		return g, err
 	}
@@ -262,12 +280,13 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 // The build's environment: no Soong environment variable is set (IsEnvTrue / IsEnvFalse false, Getenv ""), product config methods take their unset default (configDefaults), runtime.GOOS is linux.
 // Anything else it meets where a value is needed fails, naming the construct: a Soong change is re-derived, never guessed.
 type soongEval struct {
+	tree     string // the AOSP tree: pctx.SourcePathVariable paths are relative to it
 	dir      string
 	vars     map[string]any // package vars, evaluated; error values = could not be evaluated (fails only when read)
 	funcs    map[string]*ast.FuncDecl
 	methods  map[string]map[string]*ast.FuncDecl // receiver type -> method
 	embeds   map[string][]string
-	statics  map[string]any // pctx.StaticVariable
+	statics  map[string]any // pctx.StaticVariable; pctx.SourcePathVariable as its absolute path
 	varFuncs map[string]*ast.FuncLit
 	factory  map[[2]string]string // (os, arch) -> registerToolchainFactory's function
 }
@@ -281,8 +300,9 @@ var configDefaults = map[string]any{
 	"NoBionicPageSizeMacro": false,
 }
 
-func newSoongEval(dir string) (*soongEval, error) {
-	e := &soongEval{dir: dir, vars: map[string]any{}, funcs: map[string]*ast.FuncDecl{}, methods: map[string]map[string]*ast.FuncDecl{}, embeds: map[string][]string{},
+func newSoongEval(tree string) (*soongEval, error) {
+	dir := filepath.Join(tree, "build/soong/cc/config")
+	e := &soongEval{tree: tree, dir: dir, vars: map[string]any{}, funcs: map[string]*ast.FuncDecl{}, methods: map[string]map[string]*ast.FuncDecl{}, embeds: map[string][]string{},
 		statics: map[string]any{}, varFuncs: map[string]*ast.FuncLit{}, factory: map[[2]string]string{}}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -556,10 +576,13 @@ func (e *soongEval) exec(list []ast.Stmt, fr *frame) (ret any, returned bool, er
 func (e *soongEval) eval(x ast.Expr, fr *frame) (any, error) {
 	switch x := x.(type) {
 	case *ast.BasicLit:
-		if x.Kind != token.STRING {
-			return nil, e.fail(x, "literal %s", x.Value)
+		switch x.Kind {
+		case token.STRING:
+			return strconv.Unquote(x.Value)
+		case token.INT:
+			return strconv.Atoi(x.Value)
 		}
-		return strconv.Unquote(x.Value)
+		return nil, e.fail(x, "literal %s", x.Value)
 	case *ast.ParenExpr:
 		return e.eval(x.X, fr)
 	case *ast.Ident:
@@ -631,6 +654,13 @@ func (e *soongEval) eval(x ast.Expr, fr *frame) (any, error) {
 			if rb, ok := r.(bool); ok {
 				return rb, nil
 			}
+		case token.LSS, token.GTR, token.LEQ, token.GEQ:
+			li, lok := l.(int)
+			ri, rok := r.(int)
+			if !lok || !rok {
+				return nil, e.fail(x, "%s on %T, %T", x.Op, l, r)
+			}
+			return map[token.Token]bool{token.LSS: li < ri, token.GTR: li > ri, token.LEQ: li <= ri, token.GEQ: li >= ri}[x.Op], nil
 		}
 		return nil, e.fail(x, "binary %s", x.Op)
 	case *ast.CompositeLit:
@@ -698,9 +728,44 @@ func (e *soongEval) eval(x ast.Expr, fr *frame) (any, error) {
 		}
 		f, ok := s[x.Sel.Name]
 		if !ok {
+			// an embedded struct the literal leaves unset: its zero value, which keeps its type for method calls (t.toolchainLinuxX8664.Cflags())
+			if typ, _ := s[structType].(string); slices.Contains(e.embeds[typ], x.Sel.Name) {
+				return map[string]any{structType: x.Sel.Name}, nil
+			}
 			return nil, e.fail(x, "no field %s", x.Sel.Name)
 		}
 		return f, nil
+	case *ast.SliceExpr:
+		v, err := e.eval(x.X, fr)
+		if err != nil {
+			return nil, err
+		}
+		l, ok := strs(v)
+		if !ok || x.Slice3 {
+			return nil, e.fail(x, "slice of %T", v)
+		}
+		lo, hi := 0, len(l)
+		for _, b := range []struct {
+			x   ast.Expr
+			dst *int
+		}{{x.Low, &lo}, {x.High, &hi}} {
+			if b.x == nil {
+				continue
+			}
+			i, err := e.eval(b.x, fr)
+			if err != nil {
+				return nil, err
+			}
+			n, ok := i.(int)
+			if !ok {
+				return nil, e.fail(x, "slice index %T", i)
+			}
+			*b.dst = n
+		}
+		if lo < 0 || lo > hi || hi > len(l) {
+			return nil, e.fail(x, "slice [%d:%d] of %d elements (Go would panic)", lo, hi, len(l))
+		}
+		return l[lo:hi], nil
 	case *ast.CallExpr:
 		return e.call(x, fr)
 	}
@@ -805,6 +870,19 @@ func (e *soongEval) call(c *ast.CallExpr, fr *frame) (any, error) {
 				}
 			}
 			return out, nil
+		case "len":
+			args, err := e.args(c, fr)
+			if err != nil {
+				return nil, err
+			}
+			if s, ok := args[0].(string); ok {
+				return len(s), nil
+			}
+			l, ok := strs(args[0])
+			if !ok {
+				return nil, e.fail(c, "len(%T)", args[0])
+			}
+			return len(l), nil
 		case "panic":
 			return nil, e.fail(c, "the evaluated code panics (Soong would stop here)")
 		case "registerToolchainFactory":
@@ -840,6 +918,17 @@ func (e *soongEval) call(c *ast.CallExpr, fr *frame) (any, error) {
 				return nil, e.fail(c, "strings.Join(%T, %T)", args[0], args[1])
 			}
 			return strings.Join(l, sep), nil
+		case pkg != nil && pkg.Name == "strings" && fn.Sel.Name == "Split":
+			args, err := e.args(c, fr)
+			if err != nil {
+				return nil, err
+			}
+			s, ok := args[0].(string)
+			sep, sok := args[1].(string)
+			if !ok || !sok {
+				return nil, e.fail(c, "strings.Split(%T, %T)", args[0], args[1])
+			}
+			return strings.Split(s, sep), nil
 		case pkg != nil && pkg.Name == "slices" && fn.Sel.Name == "Clone":
 			args, err := e.args(c, fr)
 			if err != nil {
@@ -862,6 +951,18 @@ func (e *soongEval) call(c *ast.CallExpr, fr *frame) (any, error) {
 					return nil, e.fail(c, "pctx.StaticVariable name %T", args[0])
 				}
 				e.statics[name] = args[1]
+			case "SourcePathVariable":
+				// a tree-relative path Soong resolves against the source root; its value may reference other variables, expanded when read
+				args, err := e.args(c, fr)
+				if err != nil {
+					return nil, err
+				}
+				name, ok := args[0].(string)
+				path, pok := args[1].(string)
+				if !ok || !pok {
+					return nil, e.fail(c, "pctx.SourcePathVariable(%T, %T)", args[0], args[1])
+				}
+				e.statics[name] = filepath.Join(e.tree, path)
 			case "VariableFunc":
 				name, err := e.eval(c.Args[0], fr)
 				if err != nil {
@@ -884,6 +985,18 @@ func (e *soongEval) call(c *ast.CallExpr, fr *frame) (any, error) {
 					return nil, e.fail(c, "Config().%s: no known value for this build (soongflags.go configDefaults)", fn.Sel.Name)
 				}
 				return v, nil
+			}
+		}
+		// <struct value>.<method>(...): a toolchain method calling one of an embedded struct's (t.toolchainGlibc.Cflags())
+		if pkg == nil || fr.locals[pkg.Name] != nil {
+			if recv, err := e.eval(fn.X, fr); err == nil {
+				if s, ok := recv.(map[string]any); ok && s[structType] != nil {
+					args, err := e.args(c, fr)
+					if err != nil {
+						return nil, err
+					}
+					return e.method(s, fn.Sel.Name, args...)
+				}
 			}
 		}
 	}
@@ -948,7 +1061,7 @@ func (e *soongEval) expand(s string) (string, error) {
 				return ""
 			}
 		} else {
-			err = fmt.Errorf("%s: ${config.%s} is registered by no pctx.StaticVariable / VariableFunc", e.dir, name)
+			err = fmt.Errorf("%s: ${config.%s} is registered by no pctx.StaticVariable / SourcePathVariable / VariableFunc", e.dir, name)
 			return ""
 		}
 		str, ok := v.(string)
@@ -962,10 +1075,15 @@ func (e *soongEval) expand(s string) (string, error) {
 		}
 		return sub
 	})
+	// another package's variable (${android.X}) or a ninja rule variable: no value this evaluator knows, never passed on as text
+	if err == nil && strings.Contains(out, "$") {
+		err = fmt.Errorf("%s: %q keeps a reference this evaluator cannot resolve", e.dir, out)
+	}
 	return out, err
 }
 
-var configRef = regexp.MustCompile(`\$\{config\.(\w+)\}`)
+// configRef: a reference to a cc/config pctx variable: `${config.X}` from a toolchain method or another package, `${X}` inside the package's own variables (x86_linux_host.go's `--gcc-toolchain=${LinuxGccRoot}`).
+var configRef = regexp.MustCompile(`\$\{(?:config\.)?(\w+)\}`)
 
 // hasToolchain: whether an init registers a toolchain factory for (os, arch identifier).
 func (e *soongEval) hasToolchain(osName, arch string) bool {

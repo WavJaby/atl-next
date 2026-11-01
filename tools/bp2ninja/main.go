@@ -125,8 +125,8 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.Flags, err = readGlobalFlags(tree, cfg, soong.Device); err != nil {
 		return err
 	}
-	// not passed (keepFlag): reported on every run, so a change in what is dropped shows
-	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics / debug info only): %s\n", strings.Join(soong.Flags.Skipped, " "))
+	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
+	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
 	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
 		return err
 	}
