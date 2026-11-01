@@ -12,6 +12,7 @@ mod deps;
 mod farm;
 mod fetch;
 mod git;
+mod libcxx_gate;
 mod licence_gate;
 mod licenses;
 mod modules;

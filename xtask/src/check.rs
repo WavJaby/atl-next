@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::{
-    arches, converter, deps, licenses, modules, patch, providers, prune, sources, spdx, workspace,
+    arches, converter, deps, libcxx_gate, licenses, modules, patch, providers, prune, sources,
+    spdx, workspace,
 };
 use atl_layout::Layout;
 
@@ -39,9 +40,11 @@ enum Step {
     Test,
     /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
     Converter,
+    /// the distro libc++ headers: -D__ANDROID__ (device compiles) changes no macro beyond the expected and no object byte
+    Libcxx,
 }
 
-const ALL: [Step; 9] = [
+const ALL: [Step; 10] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -51,6 +54,7 @@ const ALL: [Step; 9] = [
     Step::Deny,
     Step::Test,
     Step::Converter,
+    Step::Libcxx,
 ];
 
 impl Step {
@@ -65,6 +69,7 @@ impl Step {
             Step::Deny => "deny",
             Step::Test => "test",
             Step::Converter => "converter",
+            Step::Libcxx => "libcxx",
         }
     }
 
@@ -136,6 +141,7 @@ impl Step {
             }
             Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
             Step::Converter => converter::check(root),
+            Step::Libcxx => libcxx_gate::check(root),
         }
     }
 }

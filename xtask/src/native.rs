@@ -35,7 +35,7 @@ pub struct Args {
     #[arg(long, default_value = "clang-19")]
     cc: String,
     /// C++ compiler and link driver (deps.toml row `clang`).
-    #[arg(long, default_value = "clang++-19")]
+    #[arg(long, default_value = crate::libcxx_gate::CXX)]
     cxx: String,
     /// Archiver (deps.toml row `llvm`).
     #[arg(long, default_value = "llvm-ar-19")]
