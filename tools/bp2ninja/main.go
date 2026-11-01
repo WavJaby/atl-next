@@ -13,6 +13,7 @@
 // -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values.
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools, and -metalava where
 // API stubs are built; with them, a goal that names a Java module builds as one. -measure writes <out>/measure.txt (measure.go) instead of a build.
+// -device-cxx-flags <dir> (no goals) writes <out>/compat and prints the C++ command line every device compile in <dir> shares (probeCxxFlags), for xtask check step libcxx, instead of a build.
 //
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
 // module references behind the "not found" problems) and <out>/missing-paths.txt (tree directories named by path that do not
@@ -21,6 +22,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -56,8 +58,9 @@ func main() {
 	aconfig := flag.String("aconfig", "", "aconfig binary (aconfig flag libraries; Java goals)")
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values; given with -aconfig")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
+	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
 	flag.Parse()
-	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || flag.NArg() == 0 {
+	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || (flag.NArg() == 0) == (*cxxProbe == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -88,6 +91,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}
+	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
+	if *cxxProbe != "" {
+		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxxProbe); err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	partial, err := readJSON[Partial](*srcsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
@@ -97,10 +109,53 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
+}
+
+// loadSoong: SoongConfig for cfg, every part read from the pinned tree.
+func loadSoong(tree string, cfg Config) (SoongConfig, error) {
+	soong, err := readSoongConfig(tree)
+	if err != nil {
+		return soong, err
+	}
+	if soong.Device, err = readDeviceArch(tree, cfg); err != nil {
+		return soong, err
+	}
+	if soong.Flags, err = readGlobalFlags(tree, cfg, soong.Device); err != nil {
+		return soong, err
+	}
+	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
+		return soong, err
+	}
+	if soong.DeviceLink, err = readDeviceLink(tree); err != nil {
+		return soong, err
+	}
+	soong.Lldflags, err = readLldflags(tree)
+	return soong, err
+}
+
+// deviceCxxFlags: -device-cxx-flags. Writes <out>/compat, as a build would, and prints {"argv": probeCxxFlags(dir), "android": androidDefine}: the probe's command line and the define xtask check step libcxx toggles in it.
+func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, dir string) error {
+	soong, err := loadSoong(tree, cfg)
+	if err != nil {
+		return err
+	}
+	if err := writeCompat(tree, out, provided); err != nil {
+		return err
+	}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, nodes: map[key]*Node{}}
+	b, err := json.Marshal(struct {
+		Argv    []string `json:"argv"`
+		Android string   `json:"android"`
+	}{g.probeCxxFlags(dir), androidDefine})
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
 }
 
 // javaSetup: the Java tools (read only when given), the aconfig tool and the release config.
@@ -115,27 +170,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err != nil {
 		return err
 	}
-	soong, err := readSoongConfig(tree)
+	soong, err := loadSoong(tree, cfg)
 	if err != nil {
-		return err
-	}
-	if soong.Device, err = readDeviceArch(tree, cfg); err != nil {
-		return err
-	}
-	if soong.Flags, err = readGlobalFlags(tree, cfg, soong.Device); err != nil {
 		return err
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	if soong.RustFeatures, err = readRustFeatureGate(tree); err != nil {
-		return err
-	}
-	if soong.DeviceLink, err = readDeviceLink(tree); err != nil {
-		return err
-	}
-	if soong.Lldflags, err = readLldflags(tree); err != nil {
-		return err
-	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, stand: stand, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}

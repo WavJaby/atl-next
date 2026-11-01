@@ -59,6 +59,31 @@ pub fn load(root: &Path) -> Result<Arches> {
     parse(&text).with_context(|| format!("in {FILE}"))
 }
 
+/// The row of the machine xtask runs on: the `[host]` row whose `rust` triple is rustc's host (`rustc -vV` in `root`, so rust-toolchain.toml's rustc).
+pub fn build_machine<'a>(root: &Path, arches: &'a Arches) -> Result<(&'a str, &'a Arch)> {
+    let out = std::process::Command::new("rustc")
+        .arg("-vV")
+        .current_dir(root)
+        .output()
+        .context("running rustc -vV")?;
+    ensure!(out.status.success(), "rustc -vV failed");
+    let text = String::from_utf8(out.stdout)?;
+    let triple = text
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .with_context(|| format!("rustc -vV printed no host line: {text:?}"))?;
+    host_row(arches, triple)
+}
+
+/// The `[host]` row whose `rust` triple is `triple`.
+fn host_row<'a>(arches: &'a Arches, triple: &str) -> Result<(&'a str, &'a Arch)> {
+    arches
+        .iter()
+        .find(|(_, a)| a.host.as_ref().is_some_and(|h| h.rust == triple))
+        .map(|(name, a)| (name.as_str(), a))
+        .with_context(|| format!("no {FILE} [host] row has rust = {triple:?}"))
+}
+
 fn parse(text: &str) -> Result<Arches> {
     let arches: Arches = toml::from_str(text)?;
     validate(&arches)?;
@@ -193,7 +218,21 @@ fn linux_prebuilt_os(config_go: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{kernel_arch_matches, linux_prebuilt_os, parse};
+    use super::{host_row, kernel_arch_matches, linux_prebuilt_os, parse};
+
+    #[test]
+    fn host_row_by_rust_triple() {
+        let host = |t: &str| format!("rust = \"{t}\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\n");
+        let arches = parse(&format!(
+            "[a]\npointer_bits = 64\n{K}[a.host]\n{}\n[b]\npointer_bits = 64\n{K}[b.host]\n{}\n[c]\npointer_bits = 32\n{K}[c.guest]\n{GUEST}",
+            host("ta"),
+            host("tb")
+        ))
+        .unwrap();
+        assert_eq!(host_row(&arches, "tb").unwrap().0, "b");
+        // a guest-only row or an unknown triple: no row
+        assert!(host_row(&arches, "tc").is_err());
+    }
 
     #[test]
     fn prebuilt_os_from_soong() {

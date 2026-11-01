@@ -1,33 +1,30 @@
 // SPDX-License-Identifier: MIT
 //! Step `libcxx` of `xtask check`: device compiles define `__ANDROID__` (bp2ninja `androidDefine`) against the distro's libc++ headers, while its shared library was built without it.
 //! That is sound only while libc++'s `__ANDROID__` sites change no ABI: libc++ 19 keys ABI-shaping config (ctype masks, regex word class) on `__BIONIC__` / `__GLIBC__`, and `__ANDROID__` only selects `locale_base_api/android.h`, which needs the `xlocale.h` shim (bp2ninja `libcxxShim`).
-//! A libc++ bump could make `__ANDROID__` ABI-relevant, so this compiles one probe unit twice -- the device build's libc++-visible inputs, with and without `-D__ANDROID__` -- and fails when the `-dM` macro sets differ beyond `ALLOWED` or the `-O2` objects differ in any byte.
-//! Both runs force-include bionic's `android/versioning.h` + `android/api-level.h` from the pinned tree, as every device compile does (api-level.h also sets `__ANDROID_API__` to bionic's future level, which keeps libc++ off its pre-21 `__posix_l_fallback.h`), and search the shim dir last.
+//! A libc++ bump could make `__ANDROID__` ABI-relevant, so this compiles one probe unit twice -- with and without `-D__ANDROID__` -- and fails when the `-dM` macro sets differ beyond `ALLOWED` or the objects differ in any byte.
+//! The command line is the converter's own (`bp2ninja -device-cxx-flags`, its `probeCxxFlags`): what every device C++ compile in `PROBE_DIR` gets -- Soong's global and toolchain flags evaluated from the pinned tree, the default -std, the device defines and forced headers, the compat dirs it writes with the xlocale.h shim -- so the gate measures the configuration `xtask native` builds, for the build machine's arches.toml row.
+//! The libc provider's headers (atl-bionic's in a build, generated from bionic's) are bionic's `libc/include` here: the probe needs only `android/api-level.h`, whose level (bionic's future one) keeps libc++ off its pre-21 `__posix_l_fallback.h`.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
+use crate::{aosp, arches, converter, farm, sources};
+
 /// The C++ compiler device compiles use (`xtask native --cxx` default).
 pub const CXX: &str = "clang++-19";
 
-/// The shim bp2ninja embeds, relative to the checkout.
-const SHIM: &str = "tools/bp2ninja/compat/xlocale.h";
+/// The tree dir whose device C++ command line the probe takes: libart's, the device build's main libc++ user (a platform dir: no ExternalCflags).
+const PROBE_DIR: &str = "art/runtime";
 
-/// Forced into every device compile (bp2ninja `deviceForced`), from the tree: bionic's own, of which atl-bionic's api-level.h is generated.
-const FORCED: &[&str] = &["android/versioning.h", "android/api-level.h"];
-
-/// Where `FORCED` sits in the tree.
-const BIONIC_INCLUDE: &str = "aosp/bionic/libc/include";
+/// The libc provider's include dir stand-in, in the tree.
+const BIONIC_INCLUDE: &str = "bionic/libc/include";
 
 /// What `-D__ANDROID__` may add to the macro set: itself, and the include guard of the header it selects (libc++ 19 `__locale_dir/locale_base_api.h:16`). The shim is `#pragma once`, no macro.
 const ALLOWED: &[&str] = &["__ANDROID__", "_LIBCPP___LOCALE_LOCALE_BASE_API_ANDROID_H"];
-
-/// The -std device C++ compiles get (Soong's CppStdVersion at the pin, which bp2ninja reads from the tree); the probe only needs libc++'s C++20 paths compiled.
-const STD: &str = "-std=gnu++20";
 
 /// Every header the measurement of 2026-11-01 covered, each used with external linkage so -O2 keeps code that depends on its layout.
 const PROBE: &str = r#"#include <condition_variable>
@@ -70,12 +67,10 @@ void probe_print(const std::wstring& s) { std::wcout << s << std::endl; }
 /// One comparison's inputs.
 struct Inputs<'a> {
     cxx: &'a str,
-    /// libc++'s header dir; None = the compiler's own (`-stdlib=libc++`), as device compiles.
-    libcxx: Option<&'a Path>,
-    /// Include name -> file, in order.
-    forced: &'a [(&'a str, PathBuf)],
-    /// Searched last (`-idirafter`), as bp2ninja's compat/libcxx.
-    shim_dir: &'a Path,
+    /// The compile's flags, `android` among them once.
+    argv: &'a [String],
+    /// The define the runs differ by: present in one, removed in the other.
+    android: &'a str,
     probe: &'a str,
 }
 
@@ -94,48 +89,34 @@ fn compare(i: &Inputs, work: &Path) -> Result<Diff> {
     std::fs::create_dir_all(work)?;
     let src = work.join("probe.cpp");
     std::fs::write(&src, i.probe)?;
-    let mut base: Vec<String> = vec![
-        "-x".into(),
-        "c++".into(),
-        STD.into(),
-        "-O2".into(),
-        "-fPIC".into(),
-        // every device compile's (bp2ninja lfs64Define): declarations only, in both runs
-        "-D_LARGEFILE64_SOURCE".into(),
-    ];
-    match i.libcxx {
-        Some(dir) => base.extend([
-            "-nostdinc++".into(),
-            "-isystem".into(),
-            dir.display().to_string(),
-        ]),
-        None => base.push("-stdlib=libc++".into()),
-    }
-    // as bp2ninja's compat/device: on the include path by name (libc++'s android.h includes <android/api-level.h>), and forced
-    let device = work.join("device");
-    for (name, file) in i.forced {
-        let to = device.join(name);
-        std::fs::create_dir_all(to.parent().context("forced header without a dir")?)?;
-        std::fs::copy(file, &to).with_context(|| format!("copying {}", file.display()))?;
-    }
-    base.extend(["-I".into(), device.display().to_string()]);
-    for (name, _) in i.forced {
-        base.extend(["-include".into(), (*name).to_owned()]);
-    }
-    base.extend(["-idirafter".into(), i.shim_dir.display().to_string()]);
+    let at: Vec<usize> = (0..i.argv.len())
+        .filter(|&k| i.argv[k] == i.android)
+        .collect();
+    ensure!(
+        at.len() == 1,
+        "{} appears {} times in the probe's command line, not once: {:?}",
+        i.android,
+        at.len(),
+        i.argv
+    );
     let run = |android: bool, out: &[&str]| -> Result<Vec<u8>> {
         let mut cmd = Command::new(i.cxx);
-        cmd.args(&base);
-        if android {
-            cmd.arg("-D__ANDROID__");
-        }
+        cmd.args(["-x", "c++"]);
+        cmd.args(
+            i.argv
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| android || k != at[0])
+                .map(|(_, a)| a),
+        );
         cmd.args(out).arg(&src);
         let o = cmd.output().with_context(|| format!("running {}", i.cxx))?;
         if !o.status.success() {
             bail!(
-                "{} {}{} failed: {}",
+                "{} ({} {}) {} failed: {}",
                 i.cxx,
-                if android { "-D__ANDROID__ " } else { "" },
+                if android { "with" } else { "without" },
+                i.android,
                 out.join(" "),
                 String::from_utf8_lossy(&o.stderr)
             );
@@ -207,39 +188,85 @@ fn judge(d: &Diff) -> Result<Vec<&str>> {
         .collect())
 }
 
-/// The step: the distro libc++ as device compiles see it.
+/// What `bp2ninja -device-cxx-flags` prints.
+#[derive(serde::Deserialize)]
+struct ProbeFlags {
+    argv: Vec<String>,
+    android: String,
+}
+
+/// The step: the distro libc++ as device compiles of the build machine's arch see it.
 pub fn check(root: &Path) -> Result<()> {
     let layout = Layout::of(root)?;
-    let forced: Vec<(&str, PathBuf)> = FORCED
-        .iter()
-        .map(|f| {
-            let path = layout.locate(&Path::new(BIONIC_INCLUDE).join(f)).dir;
-            ensure!(
-                path.is_file(),
-                "{} is not fetched (cargo xtask fetch --execute)",
-                path.display()
-            );
-            Ok((*f, path))
-        })
-        .collect::<Result<_>>()?;
+    let arches = arches::load(root)?;
+    let (name, arch) = arches::build_machine(root, &arches)?;
+    let sources = sources::load(root)?;
+    let manifest = aosp::load(root, &sources.aosp)?;
+    let tree = farm::aosp_tree(&layout, &sources.checkouts(None), manifest.as_ref())?;
+    let libc = tree.join(BIONIC_INCLUDE);
+    ensure!(
+        libc.join("android/api-level.h").is_file(),
+        "{} is not fetched (cargo xtask fetch --execute)",
+        libc.display()
+    );
+    // the converter as step converter builds it, under this checkout's target dir
+    let tools = root.join("target").join("bp2ninja");
+    let go_work = converter::go_work(root, &layout, &tools)?;
+    let bin = tools.join("bp2ninja");
+    converter::go(
+        root,
+        &go_work,
+        &["build", "-o", &bin.display().to_string(), "."],
+    )
+    .context("building bp2ninja")?;
     let work = root.join("target").join("libcxx-gate");
-    let shim_dir = work.join("shim");
-    std::fs::create_dir_all(&shim_dir)?;
-    std::fs::copy(root.join(SHIM), shim_dir.join("xlocale.h"))
-        .with_context(|| format!("copying {SHIM}"))?;
+    std::fs::create_dir_all(&work)?;
+    let provided = work.join("provided.json");
+    std::fs::write(
+        &provided,
+        serde_json::json!({"libc": {"libs": [], "include": [libc.display().to_string()], "defines": []}})
+            .to_string(),
+    )?;
+    let o = Command::new(&bin)
+        .arg("-tree")
+        .arg(&tree)
+        .arg("-out")
+        .arg(&work)
+        .args([
+            "-arch",
+            name,
+            "-pointer-bits",
+            &arch.pointer_bits.to_string(),
+            "-arch-variant",
+            arch.soong_arch_variant.as_deref().unwrap_or_default(),
+            "-device-cxx-flags",
+            PROBE_DIR,
+        ])
+        .arg("-provided")
+        .arg(&provided)
+        .output()
+        .context("running bp2ninja -device-cxx-flags")?;
+    ensure!(
+        o.status.success(),
+        "bp2ninja -device-cxx-flags failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let flags: ProbeFlags =
+        serde_json::from_slice(&o.stdout).context("parsing bp2ninja -device-cxx-flags output")?;
     let d = compare(
         &Inputs {
             cxx: CXX,
-            libcxx: None,
-            forced: &forced,
-            shim_dir: &shim_dir,
+            argv: &flags.argv,
+            android: &flags.android,
             probe: PROBE,
         },
         &work,
     )?;
     let seen = judge(&d)?;
     eprintln!(
-        "libcxx: {CXX} -stdlib=libc++ with -D__ANDROID__: macros differ only by {seen:?}, {}-byte probe objects identical",
+        "libcxx: {CXX} with {name}'s device C++ flags ({} args, {PROBE_DIR}) +/- {}: macros differ only by {seen:?}, {}-byte probe objects identical",
+        flags.argv.len() - 1,
+        flags.android,
         d.object_len
     );
     Ok(())
@@ -248,6 +275,7 @@ pub fn check(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A fake libc++: one header `<fake>` the probe includes, shaped by `body`.
     fn fake(name: &str, body: &str) -> (PathBuf, Diff) {
@@ -256,21 +284,51 @@ mod tests {
         let inc = work.join("v1");
         std::fs::create_dir_all(&inc).unwrap();
         std::fs::write(inc.join("fake"), body).unwrap();
-        let shim = work.join("shim");
-        std::fs::create_dir_all(&shim).unwrap();
-        let probe = "#include <fake>\nint probe_size() { return probe_layout(); }\n";
         let d = compare(
             &Inputs {
                 cxx: CXX,
-                libcxx: Some(&inc),
-                forced: &[],
-                shim_dir: &shim,
-                probe,
+                argv: &fake_argv(&inc, &[ANDROID]),
+                android: ANDROID,
+                probe: FAKE_PROBE,
             },
             &work.join("out"),
         )
         .unwrap();
         (work, d)
+    }
+
+    const ANDROID: &str = "-D__ANDROID__";
+    const FAKE_PROBE: &str = "#include <fake>\nint probe_size() { return probe_layout(); }\n";
+
+    /// A command line on the fake libc++ in `inc`, with `extra` at its end.
+    fn fake_argv(inc: &Path, extra: &[&str]) -> Vec<String> {
+        let mut argv: Vec<String> = ["-nostdinc++", "-isystem"].map(str::to_owned).into();
+        argv.push(inc.display().to_string());
+        argv.extend(["-O2", "-fPIC"].map(str::to_owned));
+        argv.extend(extra.iter().map(|s| (*s).to_owned()));
+        argv
+    }
+
+    #[test]
+    fn define_not_once_fails() {
+        // the define the runs differ by must be in the command line exactly once: absent, both runs would be the same compile
+        let work = std::env::temp_dir().join(format!("xtask-libcxx-once-{}", std::process::id()));
+        let inc = work.join("v1");
+        for extra in [&[][..], &[ANDROID, ANDROID][..]] {
+            let e = compare(
+                &Inputs {
+                    cxx: CXX,
+                    argv: &fake_argv(&inc, extra),
+                    android: ANDROID,
+                    probe: FAKE_PROBE,
+                },
+                &work,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(&format!("appears {} times", extra.len())), "{e}");
+        }
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

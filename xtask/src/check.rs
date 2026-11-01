@@ -40,7 +40,7 @@ enum Step {
     Test,
     /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
     Converter,
-    /// the distro libc++ headers: -D__ANDROID__ (device compiles) changes no macro beyond the expected and no object byte
+    /// the distro libc++ headers under the converter's device C++ flags: -D__ANDROID__ changes no macro beyond the expected and no object byte
     Libcxx,
 }
 

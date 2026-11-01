@@ -421,6 +421,20 @@ func TestToolchainYasm(t *testing.T) {
 	}
 }
 
+// probeCxxFlags = compileFlags' C++ argv for a module with nothing of its own: only the shared parts, in compileFlags' order, -D__ANDROID__ once (xtask check step libcxx drops it for its other run).
+func TestProbeCxxFlags(t *testing.T) {
+	g := graphFor(t, nil)
+	g.soong.Flags = GlobalFlags{Head: [2][]string{Device: {"-O2"}}, Tail: [2][]string{Device: {"-m64"}}, Cpp: [2][]string{Device: {"-fvisibility-inlines-hidden"}}, NoOverride: []string{"-fno-x"}}
+	g.soong.CppStd, g.soong.APILevel = "gnu++20", "-D__ANDROID_API__=10000"
+	compat := filepath.Join(g.out, "compat")
+	want := []string{"-stdlib=libc++", "-fPIC", "-w", "-O2", "-m64", "-fvisibility-inlines-hidden", "-Wno-error", "-std=gnu++20",
+		androidDefine, lfs64Define, "-D__ANDROID_API__=10000", "-I" + filepath.Join(compat, "device"), "-include", "android/versioning.h", "-include", "android/api-level.h",
+		"-I" + filepath.Join(compat, "cxx"), "-idirafter", filepath.Join(compat, "libcxx"), "-fno-rtti", "-I" + g.abs("art/runtime"), "-fno-x"}
+	if got := g.probeCxxFlags("art/runtime"); !slices.Equal(got, want) {
+		t.Errorf("probe argv\n %q\nwant\n %q", got, want)
+	}
+}
+
 // Soong's command-line order (cc/builder.go): global flags, then the language's global list, the module's flags, includes, no-override last; asm without the module's cflags or the no-override flags.
 func TestGlobalFlagsOrder(t *testing.T) {
 	g := graphFor(t, map[string]string{"external/z/Android.bp": `cc_library { name: "libz", srcs: ["a.c", "b.cpp", "c.S"], cflags: ["-fno-function-sections"], cppflags: ["-fexceptions"] }`})

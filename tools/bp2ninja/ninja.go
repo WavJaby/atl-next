@@ -330,6 +330,13 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	return langFlags{slices.Concat(c, inc, tail), slices.Concat(cxx, inc, tail), append(asm, inc...), yasm}
 }
 
+// probeCxxFlags: the C++ argv compileFlags gives a device module in dir that has nothing of its own (no properties, sources or dependencies): what every device C++ compile there shares -- Soong's global and toolchain flags, the default -std, the device defines and forced headers, the compat dirs, the no-override flags.
+// xtask check step libcxx compiles its probe with exactly this (-device-cxx-flags), so it measures the configuration the build uses.
+func (g *Graph) probeCxxFlags(dir string) []string {
+	n := &Node{key: key{name: "probe", side: Device, kind: Static}, mod: &Module{Name: "probe", Dir: dir}}
+	return g.compileFlags(n).cxx
+}
+
 // stdVersions: the C and C++ -std values Soong gives a module (cc/compiler.go parseCStd, parseCppStd, maybeReplaceGnuToC): c_std / cpp_std, "" = the default, "experimental" = the experimental version; gnu_extensions: false turns gnu into c.
 func (g *Graph) stdVersions(p *Obj) (string, string) {
 	pick := func(v, def, exp string) string {
