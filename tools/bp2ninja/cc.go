@@ -71,7 +71,8 @@ type Node struct {
 	props *Obj     // after defaults, target/arch/multilib and kind blocks
 	srcs  []string // compiled sources: plain ones and the outputs of generators
 	// crates: a Rust node's rustlibs and proc_macros (rust.go); a cc node's rlibs are in whole / static
-	deps struct{ whole, static, shared, headers, crates []*Node }
+	// runtime: runtime_libs, which no step waits for (stepDeps): a library loads them at run time, and they may name it back (libart -> libjavacore -> libart)
+	deps struct{ whole, static, shared, headers, crates, runtime []*Node }
 	// libraries a source generator added to deps (protobuf runtime): their exports travel on, as export_*_lib_headers would
 	reexport []*Node
 	// exported include flags, transitive through export_*_lib_headers
@@ -132,6 +133,8 @@ type Graph struct {
 	droppedSrcs map[string]bool
 	// providers.toml `rust_os = "android"` rows: device Rust modules compiled as Android userspace (rust.go rustOSSide)
 	rustAndroid map[string]bool
+	// providers.toml `module:` rows: module -> the tree module built in its place (node), whose output name must be the module's (outName)
+	stand map[string]string
 	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)
 	baseTypes map[string]string
 	mods      [2]map[string][]*Module
@@ -481,6 +484,15 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	if p, ok := g.provided[name]; ok {
 		return g.providedNode(name, side, p)
 	}
+	// providers.toml `module:`: the tree module that installs under this name stands in for it; anything else under the name would be a different library
+	if alt, ok := g.stand[name]; ok {
+		n := g.node(alt, side, want, from)
+		if n != nil && g.outName(n) != name {
+			g.problem("providers.toml: %s: module:%s installs as %s, not %s (its stem / suffix)", name, alt, g.outName(n), name)
+			return nil
+		}
+		return n
+	}
 	m := g.lookup(ref, side)
 	if m == nil {
 		// made by a module type the tree has: lookup recorded why there is none, and the name is nothing to fetch
@@ -551,6 +563,15 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		n.deps.shared = append(n.deps.shared, dep(system, Shared)...)
 	}
 	n.deps.shared = uniqueNodes(append(provided, n.deps.shared...))
+	// Soong's runtime_libs (cc/linker.go linkerDeps, minus exclude_runtime_libs; cc.go: shared variant, runtimeDepTag = installed with the module, never linked): built, and found at run time through linkLibs' rpath
+	for _, r := range n.props.strs("runtime_libs") {
+		if slices.Contains(n.props.strs("exclude_runtime_libs"), r) {
+			continue
+		}
+		if d := g.node(r, side, Shared, m.Name); d != nil {
+			n.deps.runtime = append(n.deps.runtime, d)
+		}
+	}
 	n.deps.headers = dep(n.props.strs("header_libs"), Headers)
 	exported := map[string]bool{}
 	for _, r := range n.props.strs("export_generated_headers") {

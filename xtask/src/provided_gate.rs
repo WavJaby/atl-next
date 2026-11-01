@@ -95,7 +95,8 @@ pub fn exported(lib: &Path) -> Result<Exported> {
     })
 }
 
-/// The converter's link outputs under `<out>/device`: `<module>/<module>.so` and `<module>/<module>`.
+/// The converter's link outputs under `<out>/device/<module>/`: `<name>.so` and the executable `<name>`, name = Soong's stem + suffix (bp2ninja outName: libartpalette_fake/libartpalette-system.so, dalvikvm/dalvikvm64).
+/// Everything else there has an extension (archives, link traces) or is no ELF file (read_elf skips it).
 fn artifacts(device: &Path) -> Result<Vec<(PathBuf, bool)>> {
     let mut out = Vec::new();
     let Ok(dirs) = std::fs::read_dir(device) else {
@@ -103,15 +104,21 @@ fn artifacts(device: &Path) -> Result<Vec<(PathBuf, bool)>> {
     };
     for dir in dirs {
         let dir = dir?.path();
-        let Some(module) = dir.file_name().and_then(|n| n.to_str()) else {
+        if !dir.is_dir() {
             continue;
-        };
-        for (path, executable) in [
-            (dir.join(format!("{module}.so")), false),
-            (dir.join(module), true),
-        ] {
-            if path.is_file() {
-                out.push((path, executable));
+        }
+        for file in std::fs::read_dir(&dir)? {
+            let path = file?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !path.is_file() {
+                continue;
+            }
+            if name.ends_with(".so") {
+                out.push((path, false));
+            } else if !name.contains('.') {
+                out.push((path, true));
             }
         }
     }

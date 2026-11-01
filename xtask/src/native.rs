@@ -111,6 +111,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let omit = providers::omitted(&providers).join(",");
     let rust_android = providers::rust_android(&providers).join(",");
+    let stand_in = providers::stand_ins(&providers)
+        .iter()
+        .map(|(module, alt)| format!("{module}={alt}"))
+        .collect::<Vec<_>>()
+        .join(",");
     patch::preflight(root, providers::upstreams(&providers))?;
     // the tree first matches sources.toml: a pinned project absent or cut off mid-clone would never be
     // fetched by the loop, which only adds unpinned ones
@@ -150,11 +155,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         upstreams.extend(upstream::build(&src, &out, recipe, &toolchain)?);
     }
     let mut provided = BTreeMap::new();
-    // rust_os rows have no provider: the tree builds them
-    for (module, row) in providers
-        .iter()
-        .filter(|(_, row)| !row.is_none() && !row.provider.is_empty())
-    {
+    // rust_os rows have no provider and module: rows a tree one: the tree builds them (-stand-in)
+    let stood: BTreeSet<&str> = providers::stand_ins(&providers)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    for (module, row) in providers.iter().filter(|(m, row)| {
+        !row.is_none() && !row.provider.is_empty() && !stood.contains(m.as_str())
+    }) {
         let parts = row
             .provider
             .iter()
@@ -241,6 +249,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &omit,
                 "-rust-android",
                 &rust_android,
+                "-stand-in",
+                &stand_in,
                 "-rust-version",
                 &rust.version,
             ])

@@ -164,9 +164,9 @@ func (g *Graph) emit(tools Tools) string {
 		case Static:
 			n.out = filepath.Join(base, n.name+".a")
 		case Shared:
-			n.out = filepath.Join(base, n.name+".so")
+			n.out = filepath.Join(base, g.outName(n)+".so")
 		case Binary:
-			n.out = filepath.Join(base, n.name)
+			n.out = filepath.Join(base, g.outName(n))
 		}
 	}
 	// genrules: tools' paths are known now (a Rust source variant's steps are its edges)
@@ -391,12 +391,22 @@ func soongShellUnsafe(r rune) bool {
 	return !strings.ContainsRune("_+-=.,/", r)
 }
 
+// outName: a shared library's or binary's file name, Soong's stem + suffix (cc/library.go getLibNameHelper, cc/binary.go getStem: stem, else the module name, then suffix; both after target / multilib blocks, so dalvikvm's lib64 suffix gives dalvikvm64).
+// The soname follows it: libartpalette_fake builds as libartpalette-system.so, the name libartpalette dlopens.
+func (g *Graph) outName(n *Node) string {
+	stem := n.props.str("stem")
+	if stem == "" {
+		stem = n.mod.Name
+	}
+	return stem + n.props.str("suffix")
+}
+
 // linkFlags: a shared library's or binary's link flags ahead of its inputs, in Soong's order: the kind's (cc/library.go sharedLinkerFlags, cc/binary.go linkerFlags) and the toolchain's global ones (Flags.Global.LdFlags: DeviceLink on the device side, Lldflags, --no-undefined from CommonLinkerFlags), then the module's own (Flags.Local.LdFlags, cc/linker.go linkerFlags: its ldflags, after target / arch blocks, then version_script, which it makes a dependency of the link too).
 // Not taken: linkerFlags' device-side --pack-dyn-relocs=android+relr. The loader is glibc's ld.so, not bionic's linker (measured, glibc 2.41 + lld 19): `android` packing moves relocations to DT_ANDROID_RELA, which glibc ignores -> pointers left unrelocated, segfault; `relr` -> "DT_RELR without GLIBC_ABI_DT_RELR dependency", a version need lld adds only for -z pack-relative-relocs. Unpacked relocations are what Soong's own pack_relocations: false gives (--pack-dyn-relocs=none): bigger, same behaviour.
 func (g *Graph) linkFlags(n *Node) []string {
 	var out []string
 	if n.kind == Shared {
-		out = append(out, "-shared", "-Wl,-soname,"+n.name+".so")
+		out = append(out, "-shared", "-Wl,-soname,"+g.outName(n)+".so")
 	}
 	if n.side == Device {
 		out = append(out, g.soong.DeviceLink.Ldflags...)
@@ -485,6 +495,20 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 			inputs = append(inputs, d.out)
 		}
 	}
+	// runtime_libs of n and of what it links whole or static (cc.go): where Soong installs them beside the module, the build tree has their own dirs; glibc's dlopen searches the caller's DT_RUNPATH, so libartpalette finds libartpalette-system
+	runtime := slices.Clone(n.deps.runtime)
+	for _, d := range closure {
+		runtime = append(runtime, d.deps.runtime...)
+	}
+	for _, d := range runtime {
+		if !d.provided {
+			libs = appendNew(libs, "-Wl,-rpath,"+filepath.Dir(d.out))
+			continue
+		}
+		for _, l := range d.libs {
+			providedRpath = appendNew(providedRpath, "-Wl,-rpath,"+filepath.Dir(l))
+		}
+	}
 	// provided dirs search after the tree's: a system provider's dir (/usr/lib/<triple>) holds distro builds
 	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every
 	// one of them at load time (libselinux: distro lacks AOSP's LIBSELINUX_R version node -> load fails)
@@ -494,4 +518,12 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	libs = append(libs, "-stdlib=libc++", "-lpthread", "-ldl", "-lrt", "-lm",
 		"-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state")
 	return libs, inputs
+}
+
+// appendNew: list + s, unless list holds s already.
+func appendNew(list []string, s string) []string {
+	if slices.Contains(list, s) {
+		return list
+	}
+	return append(list, s)
 }

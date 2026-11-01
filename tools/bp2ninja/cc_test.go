@@ -3,9 +3,60 @@
 package main
 
 import (
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
+
+// The libartpalette shape (art/libartpalette/Android.bp): the android block's runtime_libs names libartpalette-system, which providers.toml's `module:` row stands libartpalette_fake (stem libartpalette-system) in for; dalvikvm's lib64 suffix.
+// Soong: stem + suffix name the output (and so the soname); a runtime lib is built but never linked, and found through the dependent's rpath (the build tree's stand-in for installing it beside it).
+func TestStemSuffixRuntimeLibs(t *testing.T) {
+	const bp = `
+cc_library { name: "libpal", srcs: ["p.cc"], target: { android: { runtime_libs: ["libpal-system", "libgone"], exclude_runtime_libs: ["libgone"] } } }
+cc_library { name: "libpal_fake", srcs: ["f.cc"], stem: "libpal-system" }
+cc_library { name: "libplain", srcs: ["w.cc"] }
+cc_binary { name: "vm", srcs: ["v.cc"], shared_libs: ["libpal"], multilib: { lib32: { suffix: "32" }, lib64: { suffix: "64" } } }
+`
+	g := graphFor(t, map[string]string{"p/Android.bp": bp})
+	g.stand = map[string]string{"libpal-system": "libpal_fake"}
+	if g.node("vm", Device, Shared, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
+	fake := filepath.Join(g.out, "device/libpal_fake/libpal-system.so")
+	for _, want := range []string{
+		"build " + filepath.Join(g.out, "device/vm/vm64") + ": link ",
+		"build " + fake + ": link ",
+		"-Wl,-soname,libpal-system.so",
+	} {
+		if !strings.Contains(ninja, want) {
+			t.Errorf("ninja lacks %q", want)
+		}
+	}
+	for _, n := range g.order {
+		if n.name != "libpal" || n.kind != Shared {
+			continue
+		}
+		libs, inputs := g.linkLibs(n)
+		if slices.Contains(libs, fake) || slices.Contains(inputs, fake) {
+			t.Errorf("runtime lib linked: %q", libs)
+		}
+		if !slices.Contains(libs, "-Wl,-rpath,"+filepath.Dir(fake)) {
+			t.Errorf("no rpath to the runtime lib: %q", libs)
+		}
+	}
+
+	// a stand-in that installs under another name is refused
+	g = graphFor(t, map[string]string{"p/Android.bp": bp})
+	g.stand = map[string]string{"libpal-system": "libplain"}
+	g.node("libpal", Device, Shared, "goal")
+	if !slices.ContainsFunc(g.problems, func(p string) bool {
+		return strings.Contains(p, "module:libplain installs as libplain, not libpal-system")
+	}) {
+		t.Errorf("wrong stand-in accepted: %v", g.problems)
+	}
+}
 
 // Expected orders: Soong's android/arch.go -- setOSProperties (host, linux, host_linux, bionic, glibc, <os>, not_windows for host classes, android64/32 for devices), then getArchProperties (arch.<arch>, its variant and features, multilib, linux_<arch>, bionic_<arch>, <os>_<arch>, glibc_<arch>).
 // The libz shape: arch's -DCPU_NO_SIMD, then android_x86_64's -UCPU_NO_SIMD, so the device side builds its SIMD code.

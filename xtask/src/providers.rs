@@ -63,6 +63,11 @@ pub fn systems(providers: &Providers) -> Vec<(&str, &str)> {
     of_kind(providers, "system")
 }
 
+/// Modules another tree module stands in for (`module:<module>`): (module, stand-in), the converter's `-stand-in` pairs (bp2ninja cc.go node checks the stand-in exists and installs under the module's name).
+pub fn stand_ins(providers: &Providers) -> Vec<(&str, &str)> {
+    of_kind(providers, "module")
+}
+
 /// One module provided outside the tree (`crate:`, `upstream:` and `system:` providers), as `xtask native` hands it to the converter in `<out>/provided.json` (bp2ninja provided.go `Provided`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Provided {
@@ -224,6 +229,13 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
         !row.provider.is_empty(),
         "empty provider list (a row without one needs rust_os)"
     );
+    // another tree module is the whole library: nothing to join it with, no sources of the replaced module left
+    if row.provider.iter().any(|p| p.starts_with("module:")) {
+        ensure!(
+            row.provider.len() == 1 && row.srcs.is_empty(),
+            "a module: provider is the row's only provider, without srcs"
+        );
+    }
     let mut seen = BTreeSet::new();
     for p in &row.provider {
         ensure!(seen.insert(p), "provider `{p}` listed twice");
@@ -273,8 +285,15 @@ fn validate_one(module: &str, provider: &str, targets: &Targets) -> Result<()> {
                 "deps.toml row `{name}` lacks `upstream:aosp` in used_by"
             );
         }
+        // that the module exists and installs under `module`'s name needs the tree: the converter checks it
+        Some(("module", name)) => {
+            ensure!(
+                is_module_name(name) && name != module,
+                "module:`{name}` is not another Android.bp module name"
+            )
+        }
         _ => bail!(
-            "provider `{provider}` is not crate:<name>, upstream:<name>, system:<name> or {NONE}"
+            "provider `{provider}` is not crate:<name>, upstream:<name>, system:<name>, module:<name> or {NONE}"
         ),
     }
     Ok(())
@@ -370,6 +389,26 @@ mod tests {
         assert!(
             err("[x]\nprovider = \"system:zlib\"\nreason = \"r\"\n")
                 .contains("lacks `upstream:aosp`")
+        );
+    }
+
+    #[test]
+    fn module_providers() {
+        let text =
+            "[libartpalette-system]\nprovider = \"module:libartpalette_fake\"\nreason = \"r\"\n";
+        let providers = parsed(text).unwrap();
+        assert_eq!(
+            stand_ins(&providers),
+            [("libartpalette-system", "libartpalette_fake")]
+        );
+        assert!(err("[x]\nprovider = \"module:x\"\nreason = \"r\"\n").contains("not another"));
+        assert!(
+            err("[x]\nprovider = [\"module:y\", \"crate:atl-nativeloader\"]\nreason = \"r\"\n")
+                .contains("only provider")
+        );
+        assert!(
+            err("[x]\nprovider = \"module:y\"\nsrcs = [\"a.cc\"]\nreason = \"r\"\n")
+                .contains("only provider")
         );
     }
 

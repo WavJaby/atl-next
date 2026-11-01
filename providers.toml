@@ -2,10 +2,11 @@
 # Android.bp modules of the host build that are not built from AOSP source as their Android.bp says: who provides them instead, or (`rust_os`) the OS a device Rust crate is built for. Unlisted modules are built from AOSP source by the converter.
 # Guest-side libraries (guest bionic, thunks) are the bridge's concern, not this table's.
 #
-# Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree).
+# Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree; a `module:` row's key may be absent, its stand-in's installed name must equal it).
 #   provider  crate:<workspace crate>   our Rust crate, built with cargo-c into the prefix
 #             upstream:<sources.toml>   a git upstream built by its own build system into <out>/upstream/<name>/prefix by `xtask native`, before the converter; xtask holds its build recipe (upstream.rs), which must list the module
 #             system:<deps.toml row>    a host system library, linked as installed; the row needs `pkgconfig` and `used_by` containing `upstream:aosp`. `xtask native` resolves it with pkg-config (system.rs): its one `-l` library found in its `-L` dirs then its `libdir` (`lib<name>.so`), its `-I` dirs, its `-D` defines; anything else fails the run
+#             module:<Android.bp module> another tree module, built wherever this one is named; the only provider, no `srcs`. The converter fails unless it exists and installs under this row's key (its stem + suffix)
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
 #             [<provider>, ...]         several (not `none`), linked in this order: the module's API split between them (a host library and our crate adding what it lacks)
 #   reason    why AOSP's own module is not used (on a `rust_os` row: why the crate needs its Android behaviour here)
@@ -83,6 +84,10 @@ reason = "xsd parser of odrefresh's cache-info.xml; libart includes it (mark_com
 ["heapprofd_client_api"]
 provider = "none"
 reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsampler.cc AHeapProfile_*/AHeapInfo_*) only under ART_TARGET_ANDROID, and no perfetto traced runs here"
+
+["libartpalette-system"]
+provider = "module:libartpalette_fake"
+reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (owner 2026-11-02)"
 
 # GL and Vulkan loaders: the host's (libglvnd dispatching to Mesa, the Khronos Vulkan loader), owner decision 2026-10-31.
 # Headers stay AOSP's (gl_headers, vulkan_headers, through the tree modules' export_header_lib_headers): the Khronos registry headers the pinned AOSP code is written against (hwui uses EGL_TELEMETRY_HINT_ANDROID, absent from Debian 13's 2021 eglext.h); the Khronos ABI only grows, so they declare the host library correctly.

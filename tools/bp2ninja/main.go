@@ -48,6 +48,7 @@ func main() {
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
+	standIn := flag.String("stand-in", "", "comma-separated module=tree-module pairs: the tree module is built wherever the module is named, and must install under its name (stem + suffix) (providers.toml `module:`)")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
@@ -70,6 +71,18 @@ func main() {
 		return out
 	}
 	omitted, android := set(*omit), set(*rustAndroid)
+	stand := map[string]string{}
+	for _, pair := range strings.Split(*standIn, ",") {
+		if pair == "" {
+			continue
+		}
+		m, alt, ok := strings.Cut(pair, "=")
+		if !ok || m == "" || alt == "" {
+			fmt.Fprintf(os.Stderr, "bp2ninja: -stand-in: %q is not module=tree-module\n", pair)
+			os.Exit(2)
+		}
+		stand[m] = alt
+	}
 	provided, err := readJSON[Provided](*providedFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
@@ -84,7 +97,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, flag.Args()); err != nil {
+	if err := run(*tree, *out, Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -97,7 +110,7 @@ type javaSetup struct {
 	measure          bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, stand map[string]string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -121,7 +134,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if soong.Lldflags, err = readLldflags(tree); err != nil {
 		return err
 	}
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, stand: stand, nodes: map[key]*Node{}}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName}
 		mods, problems := ev.modules(files)
@@ -152,6 +165,10 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		names = append(names, m)
 	}
 	names = append(names, sortedKeys(rustAndroid)...)
+	// a `module:` row's key may be absent (libartpalette-system: system/libartpalette is not fetched); its stand-in must exist, and node checks it installs under the key
+	for _, alt := range stand {
+		names = append(names, alt)
+	}
 	for _, m := range names {
 		if len(g.mods[Device][m])+len(g.mods[Host][m]) == 0 {
 			g.problem("providers.toml: %s names no module in the tree", m)
