@@ -20,6 +20,7 @@
 # GPL-2.0-only WITH Linux-syscall-note: owner decision 2026-10-31; the note frees programs that use the kernel through system calls, i.e. include its uapi headers, so it is a linking exception in the sense of the GPL-2.0-only rule.
 # LicenseRef-AGG-2.3, blessing: owner decision 2026-10-31; AGG 2.3's all-permissive notice (copy/use/modify/sell/distribute if the notice is kept; no SPDX id) and SQLite's public-domain blessing (SPDX `blessing`), both GPL-3-compatible.
 # MIT-Khronos-old: owner decision 2026-10-31; Khronos' MIT-style permissive text granting rights to the "Materials", GPL-3-compatible.
+# SGI-B-2.0: owner decision 2026-11-01; SGI Free Software License B 2.0, X11-style permissive, on the FSF list of GPL-compatible licences.
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
@@ -37,9 +38,14 @@ allow = [
     "MIT",
     "MIT-Khronos-old",
     "MIT-Modern-Variant",
+    "SGI-B-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
+
+[upstream.aosp.paths."frameworks/native/opengl/include/GLES3/gl3ext.h"]
+licence = "SGI-B-2.0"
+reason = "Khronos' GLES3 extension header: \"This document is licensed under the SGI Free Software B License Version 2.0\" (lines 7-8); a pointer notice the phrase rules do not read"
 
 [upstream.aosp.paths."external/dng_sdk/"]
 licence = "LicenseRef-Adobe-DNG-SDK"
