@@ -612,7 +612,7 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<bool> {
     Ok(report.violations.is_empty())
 }
 
-/// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file.
+/// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.
 fn licence_gate(
     root: &Path,
     layout: &Layout,
@@ -624,12 +624,13 @@ fn licence_gate(
     let roots = licence_gate::roots(layout, &sources.checkouts(None));
     let report = licence_gate::check(&std::fs::canonicalize(out)?, &roots, &licenses)?;
     println!(
-        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} members of libraries built outside ninja; {} licences denied, {} files unresolved",
+        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} members of libraries built outside ninja, {} stale artifacts; {} licences denied, {} files unresolved",
         report.artifacts,
         report.checked,
         report.generated,
         report.system,
         report.outside,
+        report.stale.len(),
         report.denied.len(),
         report.unresolved.len()
     );
@@ -650,6 +651,9 @@ fn licence_gate(
         .take(shown(report.unresolved.len()))
     {
         println!("native:   licence: unresolved {u}");
+    }
+    for s in report.stale.iter().take(shown(report.stale.len())) {
+        println!("native:   licence: stale {s} (its link did not run in this build: not checked)");
     }
     Ok(report.ok())
 }

@@ -8,6 +8,7 @@
 //!
 //! Not checked, only counted: files generated into `<out>` (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed); members of archives built outside ninja (providers.toml upstreams, by their own build); system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
 //! A file anywhere else fails: nothing passes because the gate cannot place it.
+//! Stale artifacts fail unread: after a failed build an artifact whose relink did not run is an earlier link's, and its trace may name archive members the current graph lacks (`relinked`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,32 +44,48 @@ pub struct Report {
     pub denied: BTreeMap<String, BTreeMap<String, String>>,
     /// Files with no licence the rules can name, or that the gate cannot place.
     pub unresolved: Vec<String>,
+    /// Link outputs ninja would link again (their link or one of its inputs failed): file and trace are an earlier link's, the trace may name members their archives no longer have, so neither is read. Never a pass.
+    pub stale: Vec<String>,
 }
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.denied.is_empty() && self.unresolved.is_empty()
+        self.denied.is_empty() && self.unresolved.is_empty() && self.stale.is_empty()
     }
 }
 
-/// Runs the gate over the build directory `out` (canonical).
+/// Runs the gate over the build directory `out` (canonical). It runs after failed builds too, to report them: a state the build left behind is a report line, never an error.
 pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> {
     let device = out.join("device");
-    let artifacts: Vec<PathBuf> = lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
+    let mut artifacts: Vec<PathBuf> = lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
         .map(PathBuf::from)
         .filter(|p| p.starts_with(&device) && p.is_file())
         .collect();
-    let mut report = Report {
-        artifacts: artifacts.len(),
-        ..Report::default()
-    };
+    let stale = relinked(out, &artifacts);
+    let mut report = Report::default();
+    artifacts.retain(|a| {
+        let keep = !stale.contains(a);
+        if !keep {
+            report.stale.push(a.display().to_string());
+        }
+        keep
+    });
+    report.artifacts = artifacts.len();
     // object -> first artifact loading it
     let mut objects: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     let mut members: Vec<(PathBuf, String, &Path)> = Vec::new();
     for artifact in &artifacts {
         let trace = trace_of(artifact);
-        let text = std::fs::read_to_string(&trace)
-            .with_context(|| format!("reading {} (linked without a trace?)", trace.display()))?;
+        let text = match std::fs::read_to_string(&trace) {
+            Ok(t) => t,
+            Err(e) => {
+                report.unresolved.push(format!(
+                    "{}: {e} (linked without a trace?)",
+                    trace.display()
+                ));
+                continue;
+            }
+        };
         let loaded = parse_trace(&text);
         for o in loaded.objects {
             objects.entry(o).or_insert(artifact);
@@ -113,10 +130,11 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
             // compiled whole by its own edge (rustc's staticlib): its members are codegen units, its depfile says what they are made of
             objects.entry(archive.clone()).or_insert(artifact);
         } else {
-            anyhow::bail!(
-                "{}: member {member} is none of its ninja inputs",
-                archive.display()
-            );
+            report.unresolved.push(format!(
+                "{}: member {member} is none of its ninja inputs (in {})",
+                archive.display(),
+                artifact.display()
+            ));
         }
     }
     // file -> first artifact reaching it
@@ -183,6 +201,30 @@ fn trace_of(artifact: &Path) -> PathBuf {
     let mut name = artifact.as_os_str().to_owned();
     name.push(".trace");
     PathBuf::from(name)
+}
+
+/// The artifacts whose link edge ninja would run (dry run, `-k 0`: past edges that would fail): those a failed build left as an earlier link's output.
+/// Read from the dry run's `[i/n] link <out>` lines, bp2ninja's link rule description. A dry run that cannot start leaves every artifact stale: what it would have told is unknown.
+fn relinked(out: &Path, artifacts: &[PathBuf]) -> BTreeSet<PathBuf> {
+    if artifacts.is_empty() {
+        return BTreeSet::new();
+    }
+    // its exit status is not read: a dry run fails where a missing input has no rule, and still prints every edge it would run
+    let Ok(output) = Command::new("ninja")
+        .arg("-C")
+        .arg(out)
+        .args(["-n", "-k", "0"])
+        .args(artifacts)
+        .output()
+    else {
+        return artifacts.iter().cloned().collect();
+    };
+    lines(&String::from_utf8_lossy(&output.stdout))
+        .filter_map(|l| {
+            let (_, rest) = l.split_once("] link ")?;
+            l.starts_with('[').then(|| PathBuf::from(rest))
+        })
+        .collect()
 }
 
 fn ninja(out: &Path, args: &[&str]) -> Result<String> {
@@ -404,6 +446,65 @@ mod tests {
         assert_eq!(report.checked, 3);
         assert_eq!(report.unresolved.len(), 1, "{:?}", report.unresolved);
         assert!(report.unresolved[0].contains("stray.h: in no checkout"));
+        assert!(!report.ok());
+    }
+
+    /// After a failed build: libt.so linked once from main.o + libz.a(used.o); then libz.a's input is renamed (used.o -> renamed.o) and main.c breaks, so its relink never runs.
+    /// libt.so and its trace stay from the first link and name libz.a(used.o), a member no longer among libz.a's ninja inputs: the gate must report libt.so stale and read neither, not fail.
+    #[test]
+    fn gate_reports_a_stale_artifact() {
+        let tmp = std::env::temp_dir().join(format!("xtask-licence-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, out) = (tmp.join("src"), tmp.join("out"));
+        for d in [&src, &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let write = |p: &Path, s: &str| std::fs::write(p, s).unwrap();
+        write(
+            &src.join("main.c"),
+            "// SPDX-License-Identifier: MIT\nint used(void);\nint entry(void) { return used(); }\n",
+        );
+        for n in ["used", "renamed"] {
+            write(
+                &src.join(format!("{n}.c")),
+                "// SPDX-License-Identifier: MIT\nint used(void) { return 1; }\n",
+            );
+        }
+        let lib = out.join("device/libt/libt.so");
+        let ninja = |member: &str| {
+            format!(
+                "rule cc\n  command = clang-19 -fPIC -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
+                 rule ar\n  command = rm -f $out && llvm-ar-19 crsD $out $in\n\
+                 rule link\n  command = clang-19 -fuse-ld=lld -shared -o $out $in -Wl,--trace >$out.trace\n  description = link $out\n\
+                 build {o}/main.o: cc {s}/main.c\nbuild {o}/{member}.o: cc {s}/{member}.c\n\
+                 build {o}/libz.a: ar {o}/{member}.o\nbuild {l}: link {o}/main.o {o}/libz.a\n",
+                o = out.display(),
+                s = src.display(),
+                l = lib.display(),
+            )
+        };
+        write(&out.join("build.ninja"), &ninja("used"));
+        let report = build_and_check(&src, &out);
+        assert!(report.ok() && report.artifacts == 1, "{report:?}");
+        write(&out.join("build.ninja"), &ninja("renamed"));
+        write(&src.join("main.c"), "int broken(\n");
+        let failed = Command::new("ninja").arg("-C").arg(&out).output().unwrap();
+        assert!(!failed.status.success() && lib.is_file());
+        let roots = [Root {
+            dir: std::fs::canonicalize(&src).unwrap(),
+            key: "aosp".into(),
+            prefix: PathBuf::new(),
+        }];
+        let licenses = licenses::parse(
+            "[artifact.runtime]\nallow = [\"MIT\"]\n",
+            &["aosp".to_owned()].into(),
+        )
+        .unwrap();
+        let report = check(&std::fs::canonicalize(&out).unwrap(), &roots, &licenses);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let report = report.expect("the gate reports a stale artifact, it does not fail");
+        assert_eq!(report.stale, [lib.display().to_string()]);
+        assert_eq!((report.artifacts, report.checked), (0, 0));
         assert!(!report.ok());
     }
 
