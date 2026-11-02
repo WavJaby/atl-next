@@ -67,11 +67,6 @@ reason = "bionic linker namespace API; atl-bionic implements what the closure ca
 ["libseccomp_policy"]
 provider = "none"
 reason = "Zygote's seccomp policy; only the Zygote JNI uses it (excluded from libandroid_runtime by its srcs row); app sandboxing incl. seccomp is the broker's job (plan Q5), so it would be a second implementation"
-
-["libvndksupport"]
-provider = "crate:atl-vndksupport"
-reason = "vendor SP-HAL loading through linker namespaces; ATL has one namespace, so AOSP's fallback dlopen/dlclose is the whole behaviour"
-
 # ART built as its Linux target (ART_TARGET_LINUX, bp2ninja artplugin.go artTargetLinux)
 ["apex-info-list-tinyxml"]
 provider = "none"
