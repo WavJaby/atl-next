@@ -272,13 +272,8 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 		r.implicit = append(r.implicit, p)
 		return l
 	case bt == "java_binary_host" && g.java != nil:
-		// its installed wrapper (javaBinary), which runs the jar beside it; metalava is the given jar (J1: the Soong-built one), not built
-		p := ""
-		if tm.Name == "metalava" {
-			p = g.metalavaTool()
-		} else {
-			p = g.jtool(tm.Name, n.name)
-		}
+		// its installed wrapper (javaBinary), which runs the jar beside it
+		p := g.jtool(tm.Name, n.name)
 		l.files = []string{p}
 		r.implicit = append(r.implicit, p)
 		return l

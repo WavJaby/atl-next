@@ -419,9 +419,10 @@ func (g *Graph) apiLibrary(n *jNode) {
 		}
 	}
 	srcjar := filepath.Join(md, n.name+"-stubs.srcjar")
-	implicit = append(append(implicit, all...), j.tools.Metalava)
+	metalava := g.jtoolJar("metalava", n.name)
+	implicit = append(append(implicit, all...), metalava)
 	j.edge("metalava_text", []string{srcjar}, files, implicit, nil, [][2]string{
-		{"args", strings.Join(args, " ")}, {"stubsdir", esc(stubsDir)}, {"home", esc(filepath.Join(md, "home"))},
+		{"args", strings.Join(args, " ")}, {"stubsdir", esc(stubsDir)}, {"home", esc(filepath.Join(md, "home"))}, {"metalava", esc(metalava)},
 	})
 	// javac (getStubsJavaVersion = 1.8): system modules' and bootclasspath jars form the bootclasspath
 	stubsJar := filepath.Join(md, "stubs.jar")
@@ -554,11 +555,8 @@ func (g *Graph) droidstubs(n *jNode) {
 			tail = append(tail, strings.ReplaceAll(f, "$", "$$"))
 		}
 	}
-	if j.tools.Metalava == "" {
-		g.problem("%s: no metalava.jar given (-metalava)", n.name)
-	} else {
-		implicit = append(implicit, j.tools.Metalava)
-	}
+	metalava := g.jtoolJar("metalava", n.name)
+	implicit = append(implicit, metalava)
 	n.srcjar = filepath.Join(ev, n.name+"-stubs.srcjar")
 	rel := make([]string, len(java))
 	for i, f := range java {
@@ -568,6 +566,7 @@ func (g *Graph) droidstubs(n *jNode) {
 		{"pre", strings.Join(args, " ")}, {"post", strings.Join(tail, " ")}, {"stubsdir", esc(stubsDir)},
 		{"home", esc(filepath.Join(ev, "home"))}, {"srcjardir", esc(filepath.Join(ev, "srcjars"))}, {"srcjars", join(srcjars)},
 		{"sbox", esc(filepath.Join(ev, "sbox"))}, {"sources", strings.Join(rel, " ")}, {"extra", strings.Join(mapStrings(extra, esc), " ")},
+		{"metalava", esc(metalava)},
 	})
 }
 
@@ -588,8 +587,7 @@ func (g *Graph) sboxRel(abs string) string {
 // next to libcore's API files turns hidden references into errors).
 func (j *javaGraph) stubsRules(g *Graph, unpack string) string {
 	vm := strings.ReplaceAll(strings.Join(j.cfg.JavacVmFlags, " ")+" "+j.cfg.MetalavaAddOpen, "-J", "")
-	return fmt.Sprintf(`metalava = %s
-outroot = %s
+	return fmt.Sprintf(`outroot = %s
 rule metalava
   command = rm -rf $stubsdir $home $srcjardir $sbox && mkdir -p $stubsdir $home $srcjardir $sbox && %s && for r in $$(cat $out.rsp) $extra; do case $$r in out/*) s=$outroot/$${r#out/};; *) s=$root/$$r;; esac; mkdir -p $sbox/$$(dirname $$r) && { ln -f $$s $sbox/$$r 2>/dev/null || cp $$s $sbox/$$r; } || exit 1; done && cd $sbox && ANDROID_PREFS_ROOT=$home $jdk/bin/java %s -jar $metalava $pre @$out.rsp @$srcjardir/list $post && $soongzip -write_if_changed -jar -o $out -C $stubsdir -D $stubsdir && rm -rf $srcjardir $sbox
   rspfile = $out.rsp
@@ -603,5 +601,5 @@ rule metalava_text
 rule mergezips
   command = $mergezips $out $in
   description = merge $out
-`, esc(j.tools.Metalava), esc(g.out), unpack, vm, vm)
+`, esc(g.out), unpack, vm, vm)
 }

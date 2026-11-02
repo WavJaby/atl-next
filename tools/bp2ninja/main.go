@@ -11,8 +11,8 @@
 // without the sources its row lists, linking the row's provider (if any) first for their symbols. A device Rust module in -rust-android takes its android target blocks and --cfg atl_android_userspace (rust.go).
 //
 // -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values; -release also writes <out>/gen/build.prop (buildprop.go).
-// Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools, and -metalava where
-// API stubs are built; with them, a goal that names a Java module builds as one. -measure writes <out>/measure.txt (measure.go) instead of a build.
+// Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools; with them, a
+// goal that names a Java module builds as one (its host variant for a host-only type). Host Java tools, metalava included, are built from the tree. -measure writes <out>/measure.txt (measure.go) instead of a build.
 // -device-cxx-flags <dir> (no goals) writes <out>/compat and prints the C++ command line every device compile in <dir> shares (probeCxxFlags), for xtask check step libcxx, instead of a build.
 //
 // Writes <out>/build.ninja, <out>/problems.txt (missing modules, unsupported module types and properties), <out>/missing.txt (the
@@ -54,7 +54,6 @@ func main() {
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
-	flag.StringVar(&jt.Metalava, "metalava", "", "Java goals: metalava.jar droidstubs run")
 	aconfig := flag.String("aconfig", "", "aconfig binary (aconfig flag libraries; Java goals)")
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values; given with -aconfig")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
@@ -257,7 +256,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	for _, goal := range goals {
 		if g.java != nil {
 			if m := g.lookupJava(goal, Device); m != nil && g.isJava(m.Type) {
-				if n := g.jnode(goal, Device, "goal"); n != nil {
+				// a Java goal builds its device variant; a host-only type (metalava's java_binary_host) its host one
+				side := Device
+				if javaHostOnly(g.baseType(m.Type)) {
+					side = Host
+				}
+				if n := g.jnode(goal, side, "goal"); n != nil {
 					g.java.outs = append(g.java.outs, n.output()...)
 				}
 				continue

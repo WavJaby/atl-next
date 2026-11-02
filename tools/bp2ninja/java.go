@@ -27,9 +27,10 @@ import (
 //   - Not supported, reported as problems: errorprone, jacoco, lint, hiddenapi, dexpreopt, R8 (optimize), services, kapt.
 
 // JavaTools are the host programs and directories the Java rules run, given by the caller (all absolute). Soong's equivalents:
-// ANDROID_JAVA_HOME, the soong_zip / merge_zips / zip2zip / zipalign host tools, metalava.jar. aconfig and the release config are the Graph's (aconfig.go).
+// ANDROID_JAVA_HOME, the soong_zip / merge_zips / zip2zip / zipalign host tools. aconfig and the release config are the Graph's (aconfig.go);
+// metalava is built from tools/metalava (J1) like any host Java tool.
 type JavaTools struct {
-	JDK, BuildTools, Metalava string
+	JDK, BuildTools string
 }
 
 type jKey struct {
@@ -80,8 +81,6 @@ type javaGraph struct {
 	outs  []string
 	// java_sdk_library components synthesised so far (stubs.go), by name + side
 	synth map[string]*Module
-	// metalavaTool's install edges are written
-	metalavaInstalled bool
 	// the SDK's preprocessed aidl files by name (sdkaidl.go), "" = not buildable
 	sdkAidl map[string]string
 }
@@ -94,6 +93,9 @@ var javaTypes = map[string]bool{
 }
 
 func (g *Graph) isJava(t string) bool { return javaTypes[g.baseType(t)] }
+
+// javaHostOnly: Java types Soong registers host-only (java_*_host, java_plugin: InitJavaModule with android.HostSupported).
+func javaHostOnly(t string) bool { return strings.HasSuffix(t, "_host") || t == "java_plugin" }
 
 // lookupJava finds a module by reference for the Java side. Prebuilts and imports lose to a source module of the same name but,
 // unlike for cc, stand when they are the only definition (java_import of a prebuilt jar is a real dependency). Components a
@@ -1002,20 +1004,6 @@ func (g *Graph) javaBinary(n *jNode, stem string) {
 	bin := filepath.Join(g.out, "host", "bin", n.name)
 	j.edge("installexec", []string{bin}, []string{g.abs(w)}, []string{jarOut}, nil, nil)
 	n.tool = bin
-}
-
-// metalavaTool: metalava as a runnable tool for genrules, the -metalava jar (J1: Soong's build of it until metalava is built here) installed
-// as host/framework/metalava.jar with jar-wrapper.sh as host/bin/metalava, as javaBinary lays out a java_binary_host.
-func (g *Graph) metalavaTool() string {
-	j := g.java
-	bin := filepath.Join(g.out, "host", "bin", "metalava")
-	if !j.metalavaInstalled {
-		j.metalavaInstalled = true
-		jar := filepath.Join(g.out, "host", "framework", "metalava.jar")
-		j.edge("cp", []string{jar}, []string{j.tools.Metalava}, nil, nil, nil)
-		j.edge("installexec", []string{bin}, []string{g.abs("build/soong/scripts/jar-wrapper.sh")}, []string{jar}, nil, nil)
-	}
-	return bin
 }
 
 // jtoolJar: the jar of a host Java tool, for rules that run `java -jar` themselves (jarjar).
