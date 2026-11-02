@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! JNI shim of `xtask test native-load`: lets NativeLoad.java call libandroid_runtime's registration entry points; compiled by xtask with plain `rustc` at test time, never shipped.
+//! JNI shim of `xtask test native-load`: lets NativeLoad.java call libandroid_runtime's registration entry points, and plays a library loaded after ART that installs its own SIGSEGV handler (stage 5); built by xtask with cargo at test time, never shipped.
 //! `startReg` is `android::AndroidRuntime::startReg(JNIEnv*)`, a static member; the register_* functions are free `int f(JNIEnv*)`.
 //! Itanium C++ ABI: both take and return exactly as a C function would -> callable as `extern "C"`, no C++ needed. Only the mangled name is C++.
 //! register_* are hidden (absent from .dynsym): xtask reads their vaddrs from .symtab; runtime address = vaddr + (runtime startReg - startReg's vaddr), one load bias per object.
 #![allow(non_snake_case)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 type JniEnv = *mut c_void;
 type RegFn = unsafe extern "C" fn(JniEnv) -> c_int;
@@ -87,4 +88,44 @@ pub extern "C" fn Java_NativeLoad_callSlot(
         Some(f) => unsafe { f(env) },
         None => -101,
     }
+}
+
+// ---- stage 5: a later library's own SIGSEGV handler, as game engines and crash reporters install one
+
+/// The status the handler ends the process with; set by `installSegv` (xtask picks it).
+static EXIT_STATUS: AtomicI32 = AtomicI32::new(0);
+
+/// Ends the process with [`EXIT_STATUS`]: only async-signal-safe calls.
+extern "C" fn on_segv(_sig: c_int, _info: *mut libc::siginfo_t, _ucontext: *mut c_void) {
+    // SAFETY: _exit is async-signal-safe and ends the process
+    unsafe { libc::_exit(EXIT_STATUS.load(Ordering::Relaxed)) }
+}
+
+/// `static native int installSegv(int exitStatus)`: `sigaction(SIGSEGV)` called directly, as the library would; its return value.
+/// The call binds by the process's global lookup: to libsigchain when the executable links it first (it then chains this handler behind ART's), else to libc (it replaces ART's).
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_NativeLoad_installSegv(
+    _env: JniEnv,
+    _class: *mut c_void,
+    exit_status: c_int,
+) -> c_int {
+    EXIT_STATUS.store(exit_status, Ordering::Relaxed);
+    // SAFETY: all-zero is a valid `struct sigaction` (no handler, empty flags)
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_segv as *const () as usize;
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+    // SAFETY: sa is initialised; on_segv has the SA_SIGINFO signature; the old action is not asked for
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut())
+    }
+}
+
+/// `static native void nativeFault()`: a SIGSEGV outside ART's generated code, which ART's fault handler declines.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_NativeLoad_nativeFault(_env: JniEnv, _class: *mut c_void) {
+    // an address in the never-mapped first page
+    let p = std::ptr::without_provenance_mut::<c_int>(16);
+    // SAFETY: deliberately faults: the point of the call; the handler ends the process
+    unsafe { p.write_volatile(1) }
 }

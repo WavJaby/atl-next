@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The executable links the converter's libsigchain (build.rs `SIGCHAIN_DIR`), which only `xtask native` has built: plain workspace builds and tests skip it and take the library.
+[[bin]]
+name = "atl-app-launcher"
+required-features = ["sigchain"]
+
+[features]
+sigchain = []
+
 [dependencies]
 anyhow.workspace = true
 atl-bionic = { path = "../atl-bionic" }

@@ -3,6 +3,7 @@
 // Every result is one stdout line `nlt <key> <value>`, flushed at once: a register_* call may abort the process, and the lines before it are the measurement.
 // Modes: load <lib> | startreg <lib> <shim> | walk <lib> <shim> <startReg vaddr> <gRegJNI slot vaddr>... | call <lib> <shim> <startReg vaddr> <function vaddr>...; vaddrs in hex, from the library's .symtab.
 // walk calls through each slot as relocated at run time and stops at the first negative return, as register_jni_procs does; call registers the given functions, then runs the native calls.
+// chain <shim> <exit status> <rounds>: the shim installs its own SIGSEGV handler with sigaction, then `rounds` null derefs in read (JIT-compiled: implicit null checks fault), then a native fault the shim's handler ends the process on.
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -12,10 +13,16 @@ import java.util.Set;
 public class NativeLoad {
     static final String TAG = "nlt";
 
-    // libnlt_shim (shim.rs)
+    // libnlt_shim (shim/src/lib.rs)
     static native int startReg();
     static native int call(long startRegVaddr, long vaddr);
     static native int callSlot(long startRegVaddr, long slotVaddr);
+    static native int installSegv(int exitStatus);
+    static native void nativeFault();
+
+    static class Box {
+        int v;
+    }
 
     static void out(String key, Object value) {
         System.out.println("nlt " + key + " " + value);
@@ -42,6 +49,10 @@ public class NativeLoad {
             maps();
             return;
         }
+        if (mode.equals("chain")) {
+            chain(Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+            return;
+        }
         if (!load(a[2])) {
             System.exit(1);
         }
@@ -63,6 +74,25 @@ public class NativeLoad {
         if (mode.equals("call")) {
             calls();
         }
+    }
+
+    static int read(Box b) {
+        return b.v;
+    }
+
+    static void chain(int exitStatus, int rounds) {
+        out("sigaction", installSegv(exitStatus));
+        int npe = 0;
+        for (int i = 0; i < rounds; i++) {
+            try {
+                read(null);
+            } catch (NullPointerException e) {
+                npe++;
+            }
+        }
+        out("npe", npe);
+        nativeFault();
+        out("fault", "survived");
     }
 
     // mapped files after the load: one line per distinct path

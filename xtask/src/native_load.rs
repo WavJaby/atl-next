@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in four stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in five stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
@@ -8,10 +8,12 @@
 //!    isLoggable defaults to INFO (Log.isLoggable docs; liblog __android_log_is_loggable), println_native returns liblog __android_log_buf_write's 1 for INFO and -EPERM (-1) for VERBOSE, which liblog drops before any logger under the minimum priority INFO every run sets (`ANDROID_LOG_TAGS=*:i`; without it buf_write's default is VERBOSE and Log.v is written, as on Android);
 //!    the INFO message reaches stderr as the launcher's logger writes it (`<L> liblog/<tag>: <text>`), the VERBOSE one nowhere: the logger receives only what liblog let through.
 //! 4. copies: each library of [`SINGLE_COPY`] mapped once after the load (/proc/self/maps). A warning by default; `--strict-copies` makes it a failure.
+//! 5. chain: a library loaded after ART calls `sigaction(SIGSEGV)` itself, as game engines and crash reporters do; the launcher links libsigchain first, so that call binds to libsigchain and is chained behind ART's fault handler.
+//!    Pass: null derefs in JIT-compiled code still become NPEs, and a native fault ART declines reaches the library's handler. Bound to libc instead, the handler replaces ART's and the first implicit null check ends the process in it.
 //!
-//! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8;
-//! shim.rs, a JNI cdylib built with plain rustc, calls the C++ entry points (hidden register_* by .symtab vaddr). Built into <out>/native-load, never shipped.
-//! atl-app-launcher and atl-property-service are built with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
+//! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
+//! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
+//! atl-app-launcher is linked against the converter's libsigchain as `xtask native` links it (`native::build_launcher`), atl-property-service built plainly, both with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
 //! `--self-test` feeds the guards broken inputs and fails unless each fires: the load guard (a non-ELF file, a library with an undefined symbol), the launcher's (no property area); the result checks are unit tests.
 
 use std::collections::BTreeMap;
@@ -24,7 +26,7 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::{arches, farm};
+use crate::{arches, farm, native};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -88,6 +90,19 @@ const SINGLE_COPY: [&str; 7] = [
     "libicui18n",
     "libicu",
     "libc++",
+];
+
+/// Stage 5's VM options: JIT on, every method compiled at its first call (optimize threshold 0), each one logged (`-verbose:jit`, `JIT added` lines).
+/// Compiled code checks null implicitly (a SIGSEGV ART's fault handler turns into an NPE); the interpreter checks explicitly and never faults, so interpreted the stage would pass on a libc-bound launcher too (measured 2026-11-02).
+const CHAIN_VM: [&str; 3] = ["-Xusejit:true", "-Xjitthreshold:0", "-verbose:jit"];
+/// The status the shim's handler ends the process with: none of the launcher's own (0, 1 for its errors) and no `128 + signal`.
+const CHAIN_EXIT: i32 = 77;
+/// Null derefs in compiled code, each a SIGSEGV sigchain must hand to ART's handler: more than one, so a handler that works only once also fails.
+const CHAIN_ROUNDS: u32 = 100;
+/// The driver methods the faulting null check may be compiled into (`read`, or `chain` inlining it), as ART's PrettyMethod prints them in the `JIT added` line (art jit_code_cache.cc).
+const CHAIN_JIT: [&str; 2] = [
+    "int NativeLoad.read(NativeLoad$Box)",
+    "void NativeLoad.chain(int, int)",
 ];
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -182,6 +197,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             report.warn("copies", detail);
         }
     }
+
+    // 5
+    let chain_args = [
+        fixture.shim.display().to_string(),
+        CHAIN_EXIT.to_string(),
+        CHAIN_ROUNDS.to_string(),
+    ];
+    let chain = env.launch(&fixture, &fixture.area.1, &CHAIN_VM, "chain", &chain_args)?;
+    match chain_result(&chain) {
+        Ok(s) => report.pass("chain", s),
+        Err(e) => report.fail("chain", e),
+    }
     Ok(report.finish())
 }
 
@@ -201,6 +228,8 @@ struct Env {
     jdk: PathBuf,
     runtime: PathBuf,
     work: PathBuf,
+    /// The build directory's cargo target dir: launcher, property service, shim.
+    cargo: PathBuf,
     verbose: bool,
 }
 
@@ -211,12 +240,11 @@ struct Fixture {
     area: (String, String),
 }
 
-/// The workspace binaries an app process starts with, built by cargo into <out>/cargo.
-const LAUNCHER: &str = "atl-app-launcher";
+/// The property service binary, built by cargo into <out>/cargo (the launcher: `native::build_launcher`).
 const PROPERTY_SERVICE: &str = "atl-property-service";
 /// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
 const BUILD_PROP: &str = "gen/build.prop";
-/// The launcher's refusal without a property area (atl-app-launcher main.rs).
+/// The launcher's refusal without a property area (atl-app-launcher lib.rs).
 const NO_AREA: &str = "no system property area";
 
 impl Env {
@@ -245,12 +273,11 @@ impl Env {
         };
         let art = out.join("native-load-art");
         let lib_path = stage_art(&out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
-        let bin = build_binaries(root, &out)?;
         let env = Env {
             art,
             lib_path,
-            launcher: bin.join(LAUNCHER),
-            property_service: bin.join(PROPERTY_SERVICE),
+            launcher: native::build_launcher(root, &out)?,
+            property_service: build_property_service(root, &out.join("cargo"))?,
             build_prop: out.join(BUILD_PROP),
             boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
@@ -258,6 +285,7 @@ impl Env {
             jdk: farm::shared_tree(&layout).join(JDK).join(os),
             runtime: out.join(RUNTIME),
             work: out.join("native-load"),
+            cargo: out.join("cargo"),
             verbose: args.verbose,
         };
         for p in [&env.build_prop, &env.d8, &env.jdk, &env.runtime]
@@ -321,8 +349,7 @@ impl Env {
             d8.arg("--lib").arg(lib);
         }
         exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
-        let shim = self.work.join("libnlt_shim.so");
-        rustc(root, &fixture.join("shim.rs"), &shim, &[])?;
+        let shim = build_shim(root, &self.cargo)?;
         // the broker's step: the default property area, its variable printed as NAME=path
         let printed = output(
             Command::new(&self.property_service)
@@ -346,16 +373,24 @@ impl Env {
 
     /// NativeLoad.java `mode args`, started by the launcher over the fixture's property area.
     fn art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
-        self.launch(fixture, &fixture.area.1, mode, args)
+        self.launch(fixture, &fixture.area.1, &[], mode, args)
     }
 
-    /// `art` with the property-area variable set to `area`.
-    fn launch(&self, fixture: &Fixture, area: &str, mode: &str, args: &[String]) -> Result<ArtRun> {
+    /// `art` with the property-area variable set to `area` and the extra VM options `vm`.
+    fn launch(
+        &self,
+        fixture: &Fixture,
+        area: &str,
+        vm: &[&str],
+        mode: &str,
+        args: &[String],
+    ) -> Result<ArtRun> {
         let boot = join_paths(&self.boot);
         let mut cmd = Command::new(&self.launcher);
         cmd.arg(format!("-Xbootclasspath:{boot}"))
             .arg(format!("-Xbootclasspath-locations:{boot}"))
             .arg("-Xnoimage-dex2oat")
+            .args(vm)
             .arg("-cp")
             .arg(&fixture.dex)
             .arg("NativeLoad")
@@ -376,6 +411,7 @@ impl Env {
             .with_context(|| format!("running {}", self.launcher.display()))?;
         let run = ArtRun {
             ok: out.status.success(),
+            code: out.status.code(),
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -480,34 +516,35 @@ fn output(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// [`LAUNCHER`] and [`PROPERTY_SERVICE`], release, in the build directory's cargo target dir (cargo's own staleness check: a no-op when current); their directory.
-fn build_binaries(root: &Path, out: &Path) -> Result<PathBuf> {
-    let target = out.join("cargo");
+/// [`PROPERTY_SERVICE`], release, in the cargo target dir `target` (cargo's own staleness check: a no-op when current); its path.
+fn build_property_service(root: &Path, target: &Path) -> Result<PathBuf> {
     exec(
         crate::cargo_command()
             .current_dir(root)
-            .args([
-                "build",
-                "--release",
-                "--locked",
-                "-p",
-                LAUNCHER,
-                "-p",
-                PROPERTY_SERVICE,
-            ])
+            .args(["build", "--release", "--locked", "-p", PROPERTY_SERVICE])
             .arg("--target-dir")
-            .arg(&target),
-        "cargo build (launcher, property service)",
+            .arg(target),
+        "cargo build (property service)",
     )?;
-    let bin = target.join("release");
-    for b in [LAUNCHER, PROPERTY_SERVICE] {
-        ensure!(
-            bin.join(b).is_file(),
-            "{} missing after cargo build",
-            bin.join(b).display()
-        );
-    }
+    let bin = target.join("release").join(PROPERTY_SERVICE);
+    ensure!(bin.is_file(), "{} missing after cargo build", bin.display());
     Ok(bin)
+}
+
+/// The fixture's JNI shim (its own cargo package, `<FIXTURE>/shim`), release, in the cargo target dir `target`; its path.
+fn build_shim(root: &Path, target: &Path) -> Result<PathBuf> {
+    exec(
+        crate::cargo_command()
+            .current_dir(root)
+            .args(["build", "--release", "--locked", "--manifest-path"])
+            .arg(root.join(FIXTURE).join("shim/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(target),
+        "cargo build (shim)",
+    )?;
+    let lib = target.join("release/libnlt_shim.so");
+    ensure!(lib.is_file(), "{} missing after cargo build", lib.display());
+    Ok(lib)
 }
 
 /// A host cdylib from one Rust file, with the repo's pinned toolchain (rustup reads rust-toolchain.toml in `root`).
@@ -671,6 +708,8 @@ fn register_symbol(name: &str) -> String {
 
 struct ArtRun {
     ok: bool,
+    /// The exit status; None when a signal ended the process.
+    code: Option<i32>,
     status: String,
     stdout: String,
     stderr: String,
@@ -913,6 +952,7 @@ fn self_test(root: &Path, env: &Env, fixture: &Fixture) -> Result<ExitCode> {
     let run = env.launch(
         fixture,
         &missing.display().to_string(),
+        &[],
         "load",
         &[env.runtime.display().to_string()],
     )?;
@@ -921,6 +961,47 @@ fn self_test(root: &Path, env: &Env, fixture: &Fixture) -> Result<ExitCode> {
         Err(e) => report.fail("self-test", e),
     }
     Ok(report.finish())
+}
+
+/// Stage 5: every null deref an NPE with the shim's handler installed, the faulting code JIT-compiled (else nothing faulted and the stage proves nothing), then the native fault ended the process in the shim's handler.
+fn chain_result(run: &ArtRun) -> Result<String, String> {
+    if run.value("sigaction") != Some("0") {
+        return Err(format!(
+            "the shim's sigaction(SIGSEGV) did not return 0: {}",
+            run.failure()
+        ));
+    }
+    let in_handler = run.code == Some(CHAIN_EXIT);
+    let want = CHAIN_ROUNDS.to_string();
+    match run.value("npe") {
+        Some(n) if n == want => {}
+        Some(n) => return Err(format!("{n} of {CHAIN_ROUNDS} null derefs became NPEs")),
+        None if in_handler => {
+            return Err(format!(
+                "the shim's SIGSEGV handler replaced ART's fault handler: the first implicit null check ended the process in it (exit {CHAIN_EXIT}), no NPE; sigaction bound past libsigchain"
+            ));
+        }
+        None => return Err(format!("no NPE count: {}", run.failure())),
+    }
+    let jit = run
+        .stderr
+        .lines()
+        .filter(|l| l.contains("JIT added"))
+        .find_map(|l| CHAIN_JIT.iter().find(|m| l.contains(*m)));
+    let Some(method) = jit else {
+        return Err(format!(
+            "none of {CHAIN_JIT:?} JIT-compiled: the null checks ran interpreted and never faulted, so chaining was not exercised"
+        ));
+    };
+    if run.value("fault").is_some() || !in_handler {
+        return Err(format!(
+            "the native fault did not reach the shim's handler (exit {CHAIN_EXIT} expected): {}",
+            run.status
+        ));
+    }
+    Ok(format!(
+        "{CHAIN_ROUNDS} null derefs in JIT code ({method}) -> NPEs under the shim's own sigaction(SIGSEGV); the native fault reached its handler (exit {CHAIN_EXIT})"
+    ))
 }
 
 /// The launcher refused to start: failed, its refusal on stderr, the fixture never ran.
@@ -944,6 +1025,7 @@ mod tests {
     fn run(stdout: &str, ok: bool) -> ArtRun {
         ArtRun {
             ok,
+            code: ok.then_some(0),
             status: if ok {
                 "exit status: 0"
             } else {
@@ -953,6 +1035,46 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: "x F nlt: Unable to find class android/util/MemoryIntArray\n".to_owned(),
         }
+    }
+
+    /// A chain-mode run: stdout lines, the `JIT added` method if any, the exit status.
+    fn chain_run(stdout: &str, jit: Option<&str>, code: i32) -> ArtRun {
+        let stderr = jit.map_or(String::new(), |m| {
+            format!("I atl-app-launcher: jit_code_cache.cc:836 JIT added (kind=Optimized) {m}@0x1 ccache_size=1KB\n")
+        });
+        ArtRun {
+            ok: code == 0,
+            code: Some(code),
+            status: format!("exit status: {code}"),
+            stdout: stdout.to_owned(),
+            stderr,
+        }
+    }
+
+    #[test]
+    fn chain_check() {
+        let read = Some(CHAIN_JIT[0]);
+        let npe = format!("nlt sigaction 0\nnlt npe {CHAIN_ROUNDS}\n");
+        // chained: every NPE, then the shim's handler ended the process
+        assert!(chain_result(&chain_run(&npe, read, CHAIN_EXIT)).is_ok());
+        assert!(chain_result(&chain_run(&npe, Some(CHAIN_JIT[1]), CHAIN_EXIT)).is_ok());
+        // libc-bound: the handler took the first implicit null check
+        let e = chain_result(&chain_run("nlt sigaction 0\n", read, CHAIN_EXIT)).unwrap_err();
+        assert!(e.contains("replaced ART's fault handler"), "{e}");
+        // interpreted: nothing faulted, so nothing was tested
+        let e = chain_result(&chain_run(&npe, None, CHAIN_EXIT)).unwrap_err();
+        assert!(e.contains("never faulted"), "{e}");
+        // the native fault never reached the shim (sigchain dropped it, or ART's handler aborted)
+        let e = chain_result(&chain_run(&npe, read, 134)).unwrap_err();
+        assert!(e.contains("did not reach the shim's handler"), "{e}");
+        let survived = format!("{npe}nlt fault survived\n");
+        assert!(chain_result(&chain_run(&survived, read, 0)).is_err());
+        // some NPEs lost
+        assert!(
+            chain_result(&chain_run("nlt sigaction 0\nnlt npe 1\n", read, CHAIN_EXIT)).is_err()
+        );
+        // sigaction itself failed
+        assert!(chain_result(&chain_run("nlt sigaction -1\n", read, 1)).is_err());
     }
 
     #[test]

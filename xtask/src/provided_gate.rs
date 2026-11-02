@@ -75,6 +75,13 @@ fn read_elf(path: &Path, executable: bool) -> Result<Option<Elf>> {
     }))
 }
 
+/// The 64-bit ELF file `path`'s DT_NEEDED entries, in order.
+pub fn needed(path: &Path) -> Result<Vec<String>> {
+    Ok(read_elf(path, true)?
+        .with_context(|| format!("{}: not a 64-bit ELF", path.display()))?
+        .needed)
+}
+
 /// Section-boundary symbols the linker defines in every output it links and exports where no version script hides them (BoringSSL's CMake-linked libraries do; cargo-c's do not): each object's own, never an API, so never a competing definition.
 const LINKER_DEFINED: &[&str] = &["_end", "_edata", "__bss_start"];
 

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# JNI shim of `xtask test native-load`: a cargo package (not a workspace member) only for the `libc` crate's per-arch `struct sigaction`; built by xtask at test time, never shipped.
+[package]
+name = "nlt-shim"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "nlt_shim"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2.191"
+
+# its own workspace: the repo's does not list testdata
+[workspace]
