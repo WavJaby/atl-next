@@ -14,7 +14,7 @@ import (
 
 func TestAapt2Path(t *testing.T) {
 	for in, want := range map[string]string{
-		"r/res/anim-ldrtl/activity_close_enter.xml":  "r/res/anim-ldrtl_activity_close_enter.xml.flat",
+		"r/res/anim-ldrtl/activity_close_enter.xml":   "r/res/anim-ldrtl_activity_close_enter.xml.flat",
 		"r/res/values/strings.xml":                    "r/res/values_strings.arsc.flat",
 		"r/res/values-en-rCA/strings.xml":             "r/res/values-en-rCA_strings.arsc.flat",
 		"r/res/flag(a.b.c)/values/strings.xml":        "r/res/values_strings.(a.b.c).arsc.flat",

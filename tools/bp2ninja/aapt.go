@@ -20,7 +20,10 @@ import (
 //     --target-sdk-version (the SDK's effective level), --version-code (platform SDK), --version-name (framework-res: the platform version
 //     name, RELEASE_PLATFORM_VERSION; else the platform SDK), --no-static-lib-packages, --java, then @res.list (pathToAapt2Path order),
 //     -R each resource zip's flata, --feature-flags; soong_zip -jar of the --java dir is the srcjar.
-//   - Dropped: manifest_fixer (it edits uses-sdk / extractNativeLibs, which reach the apk, not the generated Java), the asset-dir hash
+//   - manifest_fixer is not run: the condition is that it edits only uses-sdk / extractNativeLibs / uses-library / placeholder versions
+//     (android_manifest.go ManifestFixer args), which reach the apk, not R.java / Manifest.java; framework-res's R.srcjar measured
+//     byte-identical to Soong's. Re-check if ManifestFixer gains an argument that adds permissions or resources.
+//   - Dropped: the asset-dir hash
 //     comment, product characteristics (-c / --product: the apk's configs), overlays and RROs (this product has none), the apk, R.txt,
 //     proguard options and every app-level step after link.
 

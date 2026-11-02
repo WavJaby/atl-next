@@ -22,8 +22,9 @@ import (
 //     which is what this build's runtime jars are); `uncompress_dex: false` opts out.
 //   - A genrule named in libs / static_libs whose command cannot run is dropped from the jars with a problem, not failed downstream
 //     (notices-for-stubs-jar: NOTICE files for API stubs jars, needs gen_notice).
-//   - Not supported, reported as problems: .aidl/.proto/.logtags/.kt/.sysprop sources, errorprone, jacoco, lint, hiddenapi, dexpreopt,
-//     R8 (optimize), javac sharding, services, kotlin.
+//   - Generated sources: javagen.go (.aidl, .logtags, .proto), kotlin.go (.kt), jarjar.go (jarjar_rules, inherited rename rules), aapt.go
+//     (an android_app's R sources); javac sharding needs Turbine, so javac runs once.
+//   - Not supported, reported as problems: errorprone, jacoco, lint, hiddenapi, dexpreopt, R8 (optimize), services, kapt.
 
 // JavaTools are the host programs and directories the Java rules run, given by the caller (all absolute). Soong's equivalents:
 // ANDROID_JAVA_HOME, the soong_zip / merge_zips / zip2zip / zipalign host tools, metalava.jar. aconfig and the release config are the Graph's (aconfig.go).
@@ -715,6 +716,11 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	var localImpl []string
 	// compile: jarjar rename rules inherited from dependencies (jarjar.go), applied to each compiled jar (repackageFlagsIfNecessary)
 	repackage := g.repackageRules(n, srcs, s)
+	if p.boolean("headers_only", false) {
+		// base.go compile: headers_only compiles header classes with Turbine (Soong rejects it with Turbine off) and nothing else
+		g.turbineHeaders(n, java, src.kt, srcjars, waits, flags, ver, d, jar, repackage)
+		return
+	}
 	if len(src.kt) > 0 {
 		// kotlinc first over every .java and .kt source (it reads the java ones only to resolve types), then javac against its header jar
 		if len(d.processorPath) > 0 {
@@ -1257,8 +1263,9 @@ func (j *javaGraph) header(g *Graph) string {
 	tools := j.tools
 	bt := func(t string) string { return esc(filepath.Join(tools.BuildTools, t)) }
 	javacVm := "-J-Xmx" + c.JavacHeapSize + " " + strings.Join(c.JavacVmFlags, " ")
-	// unzip exits 11 when nothing matches and 1 for an empty zip (a srcjar of aidl parcelable declarations only): both are no sources
-	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' -d $srcjardir || [ $$? -eq 11 ] || [ $$(unzip -Z1 $$j 2>/dev/null | wc -l) -eq 0 ]; done) && find $srcjardir -name '*.java' | sort > $srcjardir/list`
+	// only srcjars holding .java files are unpacked: unzip fails on an empty zip (aidl parcelable declarations generate no source) and when no
+	// entry matches
+	unpack := `(for j in $srcjars; do if unzip -Z1 $$j 2>/dev/null | grep -q '\.java$$'; then unzip -qo $$j '*.java' -d $srcjardir || exit 1; fi; done) && find $srcjardir -name '*.java' | sort > $srcjardir/list`
 	var b strings.Builder
 	fmt.Fprintf(&b, "jdk = %s\nsoongzip = %s\nmergezips = %s\nzip2zip = %s\nzipalign = %s\n", esc(tools.JDK), bt("soong_zip"),
 		bt("merge_zips"), bt("zip2zip"), bt("zipalign"))
@@ -1302,6 +1309,7 @@ rule installexec
 	b.WriteString(javaGenRules)
 	b.WriteString(syspropJavaRule)
 	b.WriteString(sdkAidlRules)
+	b.WriteString(j.turbineRule())
 	b.WriteString(j.kotlincRule(g))
 	return b.String()
 }
