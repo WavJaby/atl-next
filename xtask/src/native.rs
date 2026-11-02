@@ -2,7 +2,7 @@
 //! `xtask native`: AOSP native modules built for this Linux host by our Blueprint converter (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned `build/blueprint` (converter.rs),
 //! builds the providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`,
 //! summarises the failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml rows the converter finds wrong, and `none` rows a still-built module needs (none_gate.rs). Either fails the run.
-//! After a clean build whose closure has libsigchain it links atl-app-launcher's executable against it (`build_launcher`).
+//! After a clean build it builds the workspace packages that link converter modules the graph holds (packages.rs: the launcher against libsigchain, atl-aidl against libbinder_rs).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
-    arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, patch, provided_gate,
-    providers, sources, system, triage, upstream, workspace,
+    arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages, patch,
+    provided_gate, providers, sources, system, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -320,14 +320,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_context(|| format!("parsing {}", graph_file.display()))?;
     if status.success() {
         println!("native: built -> {}", out.display());
-        // the launcher's one link input from the tree; goal sets without it (no ART) build no launcher
-        let has_sigchain = graph.deps.contains_key(SIGCHAIN)
-            || graph.deps.values().flatten().any(|m| m == SIGCHAIN);
-        if has_sigchain {
-            println!(
-                "native: launcher -> {}",
-                build_launcher(root, &out)?.display()
-            );
+        for built in packages::build(root, &out)? {
+            for bin in built.bins {
+                println!("native: package {} -> {}", built.package, bin.display());
+            }
         }
         return Ok(if gate_ok && table_check(&table) {
             ExitCode::SUCCESS
@@ -566,36 +562,6 @@ fn build_crates<'a>(
         );
     }
     Ok(built)
-}
-
-/// The converter module the launcher executable links (atl-app-launcher build.rs), as graph.json names it.
-const SIGCHAIN: &str = "device/libsigchain";
-/// The launcher package and executable.
-const LAUNCHER: &str = "atl-app-launcher";
-
-/// atl-app-launcher's executable linked against `out`'s libsigchain (crate feature `sigchain`), release, in `<out>/cargo` (cargo's staleness check: a no-op when current); its path.
-/// Then checked: libsigchain leads its DT_NEEDED, so ld.so's breadth-first global lookup finds libsigchain's `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
-pub fn build_launcher(root: &Path, out: &Path) -> Result<PathBuf> {
-    let dir = out.join(SIGCHAIN);
-    let target = out.join("cargo");
-    let status = crate::cargo_command()
-        .current_dir(root)
-        .args(["build", "--release", "--locked", "-p", LAUNCHER])
-        .args(["--features", "sigchain", "--bin", LAUNCHER])
-        .arg("--target-dir")
-        .arg(&target)
-        .env("ATL_SIGCHAIN_DIR", &dir)
-        .status()
-        .context("running cargo build (launcher)")?;
-    ensure!(status.success(), "building {LAUNCHER} failed");
-    let bin = target.join("release").join(LAUNCHER);
-    let needed = provided_gate::needed(&bin)?;
-    ensure!(
-        needed.first().map(String::as_str) == Some("libsigchain.so"),
-        "{}: DT_NEEDED {needed:?} does not start with libsigchain.so",
-        bin.display()
-    );
-    Ok(bin)
 }
 
 /// A provided entry's libraries, for progress lines.

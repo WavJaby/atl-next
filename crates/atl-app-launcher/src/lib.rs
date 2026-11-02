@@ -8,7 +8,7 @@
 //! 4. `android_set_application_target_sdk_version` (bionic's compat checks); ART calls it from VMRuntime.setTargetSdkVersion only under ART_TARGET_ANDROID.
 //! 5. `main(String[])` of the class, then detach + DestroyJavaVM and `_exit` with dalvikvm's status.
 //!
-//! The library holds all of it; the executable (`src/main.rs`, feature `sigchain`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
+//! The library holds all of it; the executable (`src/main.rs`, feature `converter`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
 //! so `sigaction` / `signal` of every library loaded later bind to libsigchain and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds it (build.rs says how).
 //! Boundary crate (JNI, `dlopen`): `unsafe` only in `ffi`.
 #![deny(unsafe_code)]

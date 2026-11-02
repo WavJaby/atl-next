@@ -2,12 +2,13 @@
 //! C-ABI interface description: a header (or a C++ source and the headers holding its types) parsed by
 //! libclang once per target arch -> the IR (every layout number is clang's) -> generated Rust types
 //! with layout asserts, signature checks, layout constants, C declarations, and the ABI-identity report.
-//! Also include wrappers giving one libc's headers another's header shape (`shape`).
+//! Also include wrappers giving one libc's headers another's header shape (`shape`), and build scripts' access to the Blueprint converter's output (`converter`: linking its artifacts, its AIDL Rust stubs).
 //! Output is deterministic for the same sources and targets.
 #![forbid(unsafe_code)]
 
 pub mod buildscript;
 pub mod c;
+pub mod converter;
 pub mod front;
 pub mod ir;
 pub mod report;

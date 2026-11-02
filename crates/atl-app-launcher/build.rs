@@ -3,7 +3,7 @@
 //! the records and constants the launcher uses with clang's layout asserted, and per function it calls the header's fn-pointer type (`import_module`), so a header change fails the build, not a run.
 //! The functions are looked up at run time (`crate::ffi`): the ART libraries are the converter's build output, not inputs of a cargo build.
 //! Host headers (glibc's dlfcn.h, the JNI and liblog headers the converter compiles against) are parsed for the host triple; bionic's API in bionic's view, as atl-bionic's build.rs parses it.
-//! With feature `sigchain` (the executable) it also links the converter's libsigchain from `$ATL_SIGCHAIN_DIR` (`xtask native` sets it): `-lsigchain` + RUNPATH, as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`).
+//! With feature `converter` (the executable; `xtask native` builds it so) it also links the converter's libsigchain (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs): `-lsigchain` + RUNPATH, as the converter links dalvikvm's device variant (art/dalvikvm Android.bp `target.android.shared_libs`).
 //! `rustc-link-lib` of this package goes before std's `-lc` on the link line, so libsigchain precedes libc in DT_NEEDED and wins the global lookup of `sigaction` / `signal`; a `link-arg` would land after `-lc` and lose it.
 
 use std::path::PathBuf;
@@ -268,29 +268,11 @@ fn main() -> Result<()> {
     for path in rerun {
         println!("cargo::rerun-if-changed={}", path.display());
     }
-    if std::env::var_os("CARGO_FEATURE_SIGCHAIN").is_some() {
-        link_sigchain()?;
+    if std::env::var_os("CARGO_FEATURE_CONVERTER").is_some() {
+        let (_, lines) = atl_bridgegen::converter::link_package(&manifest)?;
+        for l in lines {
+            println!("{l}");
+        }
     }
-    Ok(())
-}
-
-/// The directory of the converter's `libsigchain.so` (`<native out>/device/libsigchain`), set by `xtask native`.
-const SIGCHAIN_DIR: &str = "ATL_SIGCHAIN_DIR";
-
-fn link_sigchain() -> Result<()> {
-    println!("cargo::rerun-if-env-changed={SIGCHAIN_DIR}");
-    let dir = PathBuf::from(std::env::var_os(SIGCHAIN_DIR).with_context(|| {
-        format!("feature sigchain needs ${SIGCHAIN_DIR}: the executable is built by `xtask native`")
-    })?);
-    let lib = dir.join("libsigchain.so");
-    ensure!(lib.is_file(), "{} missing", lib.display());
-    println!("cargo::rerun-if-changed={}", lib.display());
-    println!("cargo::rustc-link-search=native={}", dir.display());
-    println!("cargo::rustc-link-lib=dylib=sigchain");
-    // RUNPATH, not RPATH: LD_LIBRARY_PATH still overrides it, as for the converter's links
-    println!(
-        "cargo::rustc-link-arg-bins=-Wl,--enable-new-dtags,-rpath,{}",
-        dir.display()
-    );
     Ok(())
 }

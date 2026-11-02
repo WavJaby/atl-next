@@ -20,7 +20,7 @@
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
-//! atl-app-launcher is linked against the converter's libsigchain as `xtask native` links it (`native::build_launcher`), atl-property-service built plainly, both with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
+//! atl-app-launcher is linked against the converter's libsigchain as `xtask native` links it (packages.rs), atl-property-service built plainly, both with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
 //! `--self-test` feeds the guards broken inputs and fails unless each fires: the load guard (a non-ELF file, a library with an undefined symbol), the launcher's (no property area); the result checks are unit tests.
 
 use std::collections::BTreeMap;
@@ -33,7 +33,7 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::{arches, farm, native};
+use crate::{arches, farm, packages};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -281,8 +281,10 @@ struct Fixture {
     area: (String, String),
 }
 
-/// The property service binary, built by cargo into <out>/cargo (the launcher: `native::build_launcher`).
+/// The property service binary, built by cargo into <out>/cargo (the launcher: packages.rs).
 const PROPERTY_SERVICE: &str = "atl-property-service";
+/// The launcher package and its executable.
+const LAUNCHER: &str = "atl-app-launcher";
 /// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
 const BUILD_PROP: &str = "gen/build.prop";
 /// The launcher's refusal without a property area (atl-app-launcher lib.rs).
@@ -317,7 +319,7 @@ impl Env {
         let env = Env {
             art,
             lib_path,
-            launcher: native::build_launcher(root, &out)?,
+            launcher: packages::bin(root, &out, LAUNCHER, LAUNCHER)?,
             property_service: build_property_service(root, &out.join("cargo"))?,
             build_prop: out.join(BUILD_PROP),
             boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),

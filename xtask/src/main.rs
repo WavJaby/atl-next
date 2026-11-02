@@ -20,6 +20,7 @@ mod native;
 mod native_load;
 mod none_gate;
 mod notice;
+mod packages;
 mod par;
 mod patch;
 mod provided_gate;
