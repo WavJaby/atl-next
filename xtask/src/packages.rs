@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Workspace packages built after the converter (`xtask native`, `xtask test native-load`): a package naming converter modules in its Cargo.toml (`[package.metadata.atl] converter`, graph.json module directories) is built with its feature `converter` once the build's graph.json `artifacts` hold every one of them; its build script links them from `$ATL_NATIVE_OUT` (atl-bridgegen converter.rs).
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
+//! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
 
 use std::collections::BTreeMap;
@@ -196,37 +197,44 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
         .context("the build machine's row is a [host] row")?
         .rust;
     let target = out.join("cargo");
-    let mut cmd = crate::cargo_command();
-    cmd.current_dir(root)
-        .args(["build", "--release", "--locked"])
-        .arg("--target-dir")
-        .arg(&target);
-    for p in &selected {
-        cmd.args([
-            "-p",
-            &p.name,
-            "--features",
-            &format!("{}/{FEATURE}", p.name),
-        ]);
-    }
-    let status = cmd
-        .args(["--config", "profile.release.panic=\"abort\""])
-        .args([
-            "--config",
-            &format!("target.{triple}.linker={:?}", graph.link_driver),
-        ])
-        .env(NATIVE_OUT, out)
+    let names = selected
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // one cargo invocation shape for the build and the lint, so clippy sees the code as built (feature on, the converter's rlibs found)
+    let cargo = |sub: &str| {
+        let mut cmd = crate::cargo_command();
+        cmd.current_dir(root)
+            .args([sub, "--release", "--locked"])
+            .arg("--target-dir")
+            .arg(&target);
+        for p in &selected {
+            cmd.args([
+                "-p",
+                &p.name,
+                "--features",
+                &format!("{}/{FEATURE}", p.name),
+            ]);
+        }
+        cmd.args(["--config", "profile.release.panic=\"abort\""])
+            .args([
+                "--config",
+                &format!("target.{triple}.linker={:?}", graph.link_driver),
+            ])
+            .env(NATIVE_OUT, out);
+        cmd
+    };
+    let status = cargo("build")
         .status()
         .context("running cargo build (converter packages)")?;
-    ensure!(
-        status.success(),
-        "building {} failed",
-        selected
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    ensure!(status.success(), "building {names} failed");
+    // the code behind feature `converter` is linted here, where it is built (`xtask check` step clippy runs without the feature); tests stay with `xtask check`
+    let status = cargo("clippy")
+        .args(["--lib", "--bins", "--", "-D", "warnings"])
+        .status()
+        .context("running cargo clippy (converter packages)")?;
+    ensure!(status.success(), "clippy on {names} failed");
     let mut built = Vec::new();
     for p in selected {
         let leading = leading_needed(p, &graph)?;

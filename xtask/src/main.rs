@@ -22,6 +22,7 @@ mod none_gate;
 mod notice;
 mod packages;
 mod par;
+mod parcel;
 mod patch;
 mod provided_gate;
 mod providers;
@@ -122,6 +123,8 @@ enum Test {
     /// Duplicate libraries (libbase, liblog, libnativehelper, ICU, libc++) warn; --strict-copies fails on them, for an ART built by the converter.
     /// The fixture (Java declarations + JNI shim in Rust) is built into <out>/native-load on every run with the Java pipeline's JDK and d8 and the repo's rustc.
     NativeLoad(native_load::Args),
+    /// atl-aidl-probe on the converter's binder: an AIDL parcelable round-trips through AOSP's C++ Parcel, and its size check fires on a wrong size.
+    Parcel(parcel::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -139,6 +142,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::NativeLoad(args),
         } => native_load::run(&root, &args),
+        Command::Test {
+            test: Test::Parcel(args),
+        } => parcel::run(&root, &args),
     }
 }
 
