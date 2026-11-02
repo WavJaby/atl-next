@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 22:16:47 +0800
+Subject: [PATCH] servicemanager: access by binder uid when built without
+ SELinux policy
+
+A device build of servicemanager (__ANDROID__) for a host without
+Android's SELinux policy cannot run Access as it is: the constructor
+CHECK-aborts when selinux_status_open or getcon fail, getPidcon
+CHECK-aborts when called inside a transaction, and every lookup is
+denied because no service_contexts exists. The non-__ANDROID__ branch
+avoids SELinux but returns a default CallingContext, uid 0, which would
+let an app add services.
+
+Under ATL_NO_SELINUX, take the non-__ANDROID__ access decisions but keep
+the caller's uid and pid from IPCThreadState, with an empty sid; the
+uid checks in ServiceManager (addService refuses app uids) still apply.
+
+Upstream-Status: Inappropriate [ATL-specific: no Soong variant builds servicemanager without SELinux]
+Patch-Reason: Access is compiled into servicemanager; the launcher, loader or environment cannot reach it: the constructor aborts before any request on a host without selinuxfs or SELinux contexts, getPidcon aborts inside a transaction, and without service_contexts every lookup is denied; faking SELinux in the environment would mean shipping an Android policy and a kernel LSM the host lacks
+---
+SPDX-License-Identifier: Apache-2.0
+ cmds/servicemanager/Access.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/cmds/servicemanager/Access.cpp b/cmds/servicemanager/Access.cpp
+index 6e2abf65e2b0c61251e92b77f75e57584ac5912f..336c1a7dbca02601f10fde66708d3fd8371611f6 100644
+--- a/cmds/servicemanager/Access.cpp
++++ b/cmds/servicemanager/Access.cpp
+@@ -32,7 +32,10 @@ constexpr bool kIsVendor = true;
+ constexpr bool kIsVendor = false;
+ #endif
+ 
+-#ifdef __ANDROID__
++// ATL_NO_SELINUX: a device build for a host without Android's SELinux policy. Access is then
++// decided as without __ANDROID__, but the caller keeps its binder uid and pid (ServiceManager
++// refuses addService from app uids by uid alone).
++#if defined(__ANDROID__) && !defined(ATL_NO_SELINUX)
+ static std::string getPidcon(pid_t pid) {
+     CHECK_EQ(nullptr, IPCThreadState::self()->getServingStackPointer())
+             << "Did not get context from PID " << pid
+@@ -91,7 +94,7 @@ std::string Access::CallingContext::toDebugString() const {
+ }
+ 
+ Access::Access() {
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) && !defined(ATL_NO_SELINUX)
+     union selinux_callback cb;
+ 
+     cb.func_audit = auditCallback;
+@@ -120,7 +123,11 @@ Access::CallingContext Access::getCallingContext() {
+     return CallingContext {
+         .debugPid = callingPid,
+         .uid = ipc->getCallingUid(),
++#ifdef ATL_NO_SELINUX
++        .sid = callingSid ? std::string(callingSid) : std::string(),
++#else
+         .sid = callingSid ? std::string(callingSid) : getPidcon(callingPid),
++#endif
+     };
+ #else
+     return CallingContext();
+@@ -141,7 +148,7 @@ bool Access::canList(const CallingContext& ctx) {
+ 
+ bool Access::actionAllowed(const CallingContext& sctx, const char* tctx, const char* perm,
+         const std::string& tname) {
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) && !defined(ATL_NO_SELINUX)
+     const char* tclass = "service_manager";
+ 
+     AuditCallbackData data = {
+@@ -162,7 +169,7 @@ bool Access::actionAllowed(const CallingContext& sctx, const char* tctx, const c
+ }
+ 
+ bool Access::actionAllowedFromLookup(const CallingContext& sctx, const std::string& name, const char *perm) {
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) && !defined(ATL_NO_SELINUX)
+     char *tctx = nullptr;
+     if (selabel_lookup(getSehandle(), &tctx, name.c_str(), SELABEL_CTX_ANDROID_SERVICE) != 0) {
+         LOG(ERROR) << "SELinux: No match for " << name << " in service_contexts.\n";

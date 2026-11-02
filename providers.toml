@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Android.bp modules of the host build that are not built from AOSP source as their Android.bp says: who provides them instead, or (`rust_os`) the OS a device Rust crate is built for. Unlisted modules are built from AOSP source by the converter.
+# Android.bp modules of the host build that are not built from AOSP source as their Android.bp says: who provides them instead, or (`rust_os`) the OS a device Rust crate is built for, or (`defines`) the macros a patched module is compiled with. Unlisted modules are built from AOSP source by the converter.
 # Guest-side libraries (guest bionic, thunks) are the bridge's concern, not this table's.
 #
 # Row key: Android.bp module name (the converter fails on a key that names no module in the fetched tree; a `module:` row's key may be absent, its stand-in's installed name must equal it).
@@ -9,9 +9,11 @@
 #             module:<Android.bp module> another tree module, built wherever this one is named; the only provider, no `srcs`. The converter fails unless it exists and installs under this row's key (its stem + suffix)
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
 #             [<provider>, ...]         several (not `none`), linked in this order: the module's API split between them (a host library and our crate adding what it lacks)
-#   reason    why AOSP's own module is not used (on a `rust_os` row: why the crate needs its Android behaviour here)
+#   reason    why AOSP's own module is not used (on a `rust_os` row: why the crate needs its Android behaviour here; on a `defines` row: what the macros switch and why)
 #   rust_os   instead of `provider` and `srcs`: "android", the only value; the tree builds the module, its device variant taking the Android.bp `target` blocks of android (not linux_glibc, every other Rust crate's: rustc compiles for the host triple) and `--cfg atl_android_userspace`,
 #             which the crate's patch in patches/aosp adds to exactly the `target_os = "android"` gates whose Android behaviour this runtime provides (system properties from atl-bionic, liblog). The converter fails unless the module is a Rust module with a device variant.
+#   defines   instead of `provider` and `srcs`: macros (`NAME` or `NAME=VALUE`) the module's device C/C++ compiles get as -D, after the device defines; the tree builds it otherwise as its Android.bp says. Each must be read by an added line of a patch under patches/ (`xtask check` step tables fails otherwise),
+#             which switches exactly the code whose Android behaviour this host cannot have. The converter fails unless the module is a C/C++ module with a device variant.
 #   srcs      optional: only these sources of the module (paths relative to its directory, as its Android.bp writes them; no globs) are replaced, the rest is still built from AOSP source. `none` drops them; any other provider is linked into the module first, for their symbols.
 #             The converter fails when a listed file is not one of the module's sources at the pin (where the goals build it; elsewhere, when the file does not exist).
 # Artifacts are not listed: they follow from the provider (cargo-c output, the upstream recipe's install, pkg-config).
@@ -155,3 +157,8 @@ reason = "logger::init writes to logcat through android_logger on Android, to st
 ["libandroid_logger"]
 rust_os = "android"
 reason = "android_logger, liblogger's Android backend: its __android_log_* calls are gated on target_os = \"android\", a no-op elsewhere"
+
+# C/C++ modules compiled with macros their patch reads
+["servicemanager"]
+defines = ["ATL_NO_SELINUX"]
+reason = "AOSP's servicemanager is the context manager (owner 2026-11-02, binder Q3); the host has no Android SELinux policy, so Access (patches/aosp/frameworks/native 0002) decides by the binder caller's uid as the non-__ANDROID__ build does, instead of aborting on selinux_status_open / getcon / getPidcon or denying every lookup without service_contexts; the uid it keeps makes ServiceManager refuse addService from app uids"
