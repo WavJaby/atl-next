@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 00:34:11 +0800
+Subject: [PATCH] aidl: Rust backend for framework AIDL: Java-only types,
+ permission hook
+
+--rust_java_type NAME=RUST_TYPE lets the Rust backend accept the Java-only
+builtin NAME (Map, CharSequence, FileDescriptor, non-generic List) and
+spell it RUST_TYPE; the caller supplies a Rust type that reads and writes
+the Java backend bytes.
+
+@EnforcePermission no longer fails Rust server stubs with compile_error!.
+Like the Java backend's PermissionEnforcer, a fail-closed hook: an
+interface with such methods gets EnforcePermission (Single / AllOf /
+AnyOf, as parsed) and a required enforce_permission(method, permission)
+on IFoo and IFooAsyncServer; the transaction calls it before reading
+arguments and returns its Status without running the method on Err.
+Wrappers forward it; the proxy, which serves nothing, denies.
+
+Upstream-Status: Inappropriate [ATL host tool: Rust services implement framework AIDL]
+Patch-Reason: aidl rejects these types for non-Java backends in its type check (aidl_language.cpp LanguageSpecificCheckValid) and refuses permission-annotated Rust server methods in its code generation (generate_rust.cpp GenerateServerTransaction); no build config, environment or preprocessed declaration reaches either
+---
+SPDX-License-Identifier: Apache-2.0
+ aidl_language.cpp |  3 +++
+ aidl_to_rust.cpp  |  6 +++++-
+ generate_rust.cpp | 44 ++++++++++++++++++++++++++++++++++++++++++--
+ options.cpp       | 24 ++++++++++++++++++++++++
+ options.h         |  7 +++++++
+ 5 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/aidl_language.cpp b/aidl_language.cpp
+index 073622cd79b7e89f6a7b57731f4438566e0c2b62..b72f88092e0c9f931d6ae20d37ba776a428f560a 100644
+--- a/aidl_language.cpp
++++ b/aidl_language.cpp
+@@ -1521,6 +1521,9 @@ bool AidlStructuredParcelable::CheckValid(const AidlTypenames& typenames) const
+ 
+ // TODO: we should treat every backend all the same in future.
+ bool AidlTypeSpecifier::LanguageSpecificCheckValid(Options::Language lang) const {
++  if (lang == Options::Language::RUST && Options::RustJavaOnlyType(GetName(), IsGeneric())) {
++    return true;
++  }
+   if (this->GetName() == "FileDescriptor" &&
+       (lang == Options::Language::NDK || lang == Options::Language::RUST)) {
+     AIDL_ERROR(this) << "FileDescriptor isn't supported by the "
+diff --git a/aidl_to_rust.cpp b/aidl_to_rust.cpp
+index f4e6bfcf6b600b6e3a863ef6c63aa02cba4bd325..471a498808767498c1b81e819f33c03e2292aa22 100644
+--- a/aidl_to_rust.cpp
++++ b/aidl_to_rust.cpp
+@@ -134,6 +134,9 @@ bool AutoConstructor(const AidlTypeSpecifier& type, const AidlTypenames& typenam
+ 
+ std::string GetRustName(const AidlTypeSpecifier& type, const AidlTypenames& typenames,
+                         StorageMode mode, bool is_vintf_stability) {
++  if (auto java_only = Options::RustJavaOnlyType(type.GetName(), type.IsGeneric())) {
++    return *java_only;
++  }
+   // map from AIDL built-in type name to the corresponding Rust type name
+   static map<string, string> m = {
+       {"void", "()"},
+@@ -245,7 +248,8 @@ std::string RustNameOf(const AidlTypeSpecifier& type, const AidlTypenames& typen
+                        StorageMode mode, Lifetime lifetime, bool is_vintf_stability,
+                        std::vector<std::string>& lifetimes) {
+   std::string rust_name;
+-  if (type.IsArray() || typenames.IsList(type)) {
++  const bool java_only = Options::RustJavaOnlyType(type.GetName(), type.IsGeneric()) != nullptr;
++  if (type.IsArray() || (typenames.IsList(type) && !java_only)) {
+     const auto& element_type = type.IsGeneric() ? (*type.GetTypeParameters().at(0)) : type;
+     StorageMode element_mode;
+     if (type.IsFixedSizeArray() && mode == StorageMode::PARCELABLE_FIELD) {
+diff --git a/generate_rust.cpp b/generate_rust.cpp
+index 99564b0b012772a90420fc179bd0c87d67165097..d5ebf973bcac01592080eed7e28da9ca434b6217 100644
+--- a/generate_rust.cpp
++++ b/generate_rust.cpp
+@@ -448,6 +448,26 @@ void GenerateClientMethod(CodeWriter& out, const AidlInterface& iface, const Aid
+   out << "}\n";
+ }
+ 
++// @EnforcePermission as a fail-closed hook (the Java backend's PermissionEnforcer): every IFoo
++// implementation must provide it (a proxy, serving nothing, denies); a transaction runs its method
++// only when it returns Ok.
++const char* kEnforceHook =
++    "fn r#enforce_permission(&self, method: &str, permission: EnforcePermission<'_>) -> "
++    "binder::Result<()>";
++bool HasEnforce(const AidlInterface& iface) {
++  for (const auto& m : iface.GetMethods())
++    if (m->GetType().EnforceExpression()) return true;
++  return iface.EnforceExpression() != nullptr;
++}
++struct RustPermission {
++  std::string List(const std::vector<std::string>& p) const {
++    return "(&[\"" + Join(p, "\", \"") + "\"])";
++  }
++  std::string operator()(const std::string& p) const { return "Single(\"" + p + "\")"; }
++  std::string operator()(const perm::AllOf& q) const { return "AllOf" + List(q.operands); }
++  std::string operator()(const perm::AnyOf& q) const { return "AnyOf" + List(q.operands); }
++};
++
+ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
+                                const AidlMethod& method, const AidlTypenames& typenames) {
+   out << "transactions::r#" << method.GetName() << " => {\n";
+@@ -460,8 +480,14 @@ void GenerateServerTransaction(CodeWriter& out, const AidlInterface& interface,
+     out.Indent();
+   }
+ 
+-  if (interface.EnforceExpression() || method.GetType().EnforceExpression()) {
+-    out << "compile_error!(\"Permission checks not support for the Rust backend\");\n";
++  // the interface's expression wins over the method's, as the Java backend's GeneratePermissionMethod
++  auto expr = interface.EnforceExpression();
++  if (!expr) expr = method.GetType().EnforceExpression();
++  if (expr) {
++    out << "if let Err(_aidl_status) = _aidl_service.r#enforce_permission(\"" << method.GetName()
++        << "\", EnforcePermission::" << std::visit(RustPermission(), *expr) << ") {\n"
++        << (method.IsOneway() ? "" : "  _aidl_reply.write(&_aidl_status)?;\n")
++        << "  return Ok(());\n}\n";
+   }
+ 
+   string args;
+@@ -547,6 +573,8 @@ void GenerateServerItems(CodeWriter& out, const AidlInterface* iface,
+   // Forward all IFoo functions from Binder to the inner object
+   out << "impl " << trait_name << " for binder::binder_impl::Binder<" << server_name << "> {\n";
+   out.Indent();
++  if (HasEnforce(*iface))
++    out << kEnforceHook << " { self.0.r#enforce_permission(method, permission) }\n";
+   for (const auto& method : iface->GetMethods()) {
+     string args;
+     for (const std::unique_ptr<AidlArgument>& arg : method->GetArguments()) {
+@@ -666,6 +694,11 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+   *code_writer << "}\n";
+   code_writer->Dedent();
+   *code_writer << "}\n";
++  const bool enforce = HasEnforce(*iface);
++  if (enforce) {
++    *code_writer << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum EnforcePermission<'a> { "
++                    "Single(&'a str), AllOf(&'a [&'a str]), AnyOf(&'a [&'a str]) }\n";
++  }
+ 
+   // Emit the trait.
+   GenerateDeprecated(*code_writer, *iface);
+@@ -674,6 +707,7 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+   }
+   *code_writer << "pub trait " << trait_name << ": binder::Interface + Send {\n";
+   code_writer->Indent();
++  if (enforce) *code_writer << kEnforceHook << ";\n";
+   *code_writer << "fn get_descriptor() -> &'static str where Self: Sized { \""
+                << iface->GetDescriptor() << "\" }\n";
+ 
+@@ -757,6 +791,7 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+   *code_writer << "#[::async_trait::async_trait]\n";
+   *code_writer << "pub trait " << trait_name_async_server << ": binder::Interface + Send {\n";
+   code_writer->Indent();
++  if (enforce) *code_writer << kEnforceHook << ";\n";
+   *code_writer << "fn get_descriptor() -> &'static str where Self: Sized { \""
+                << iface->GetDescriptor() << "\" }\n";
+ 
+@@ -811,6 +846,8 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+   code_writer->Dedent();
+   *code_writer << "{\n";
+   code_writer->Indent();
++  if (enforce)
++    *code_writer << kEnforceHook << " { self._inner.r#enforce_permission(method, permission) }\n";
+   for (const auto& method : iface->GetMethods()) {
+     // Generate the method
+     if (method->IsUserDefined()) {
+@@ -977,6 +1014,9 @@ void GenerateRustInterface(CodeWriter* code_writer, const AidlInterface* iface,
+   // Generate the client-side methods
+   *code_writer << "impl " << trait_name << " for " << client_name << " {\n";
+   code_writer->Indent();
++  if (enforce)
++    *code_writer << kEnforceHook << " { let _ = (method, permission); "
++                 << "Err(binder::Status::new_exception(binder::ExceptionCode::SECURITY, None)) }\n";
+   for (const auto& method : iface->GetMethods()) {
+     GenerateClientMethod(*code_writer, *iface, *method, typenames, options, MethodKind::NORMAL);
+   }
+diff --git a/options.cpp b/options.cpp
+index 9f0489ae93995acdba4192ace8bcf76b4cb28b3d..25709095e4668733c4f4d57c625b218eadf07b48 100644
+--- a/options.cpp
++++ b/options.cpp
+@@ -144,6 +144,8 @@ string Options::GetUsage() const {
+        << "          Set the interface hash to HASH." << endl
+        << "  --previous_hash=HASH" << endl
+        << "          Set the interface previous version's hash to HASH." << endl
++       << "  --rust_java_type=NAME=RUST_TYPE" << endl
++       << "          Rust: accept Java-only builtin NAME, spelled RUST_TYPE." << endl
+        << "  --log" << endl
+        << "          Information about the transaction, e.g., method name, argument" << endl
+        << "          values, execution time, etc., is provided via callback." << endl
+@@ -289,6 +291,17 @@ static std::string ToCanonicalDirectory(const std::string& optarg) {
+   return dir;
+ }
+ 
++std::map<string, string>& Options::RustJavaOnlyTypes() {
++  static std::map<string, string> types;
++  return types;
++}
++
++const string* Options::RustJavaOnlyType(const string& name, bool is_generic) {
++  auto it = RustJavaOnlyTypes().find(name);
++  if (it == RustJavaOnlyTypes().end() || (name == "List" && is_generic)) return nullptr;
++  return &it->second;
++}
++
+ Options Options::PlusImportDir(const std::string& import_dir) const {
+   Options copy(*this);
+   copy.import_dirs_.insert(ToCanonicalDirectory(import_dir));
+@@ -318,6 +331,7 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
+         {"include", required_argument, 0, 'I'},
+         {"next_include", required_argument, 0, 'N'},
+         {"preprocessed", required_argument, 0, 'p'},
++        {"rust_java_type", required_argument, 0, 'R'},
+         {"dep", required_argument, 0, 'd'},
+         {"out", required_argument, 0, 'o'},
+         {"header_out", required_argument, 0, 'h'},
+@@ -408,6 +422,16 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
+       case 'p':
+         preprocessed_files_.emplace_back(Trim(optarg));
+         break;
++      case 'R': {
++        const string arg = Trim(optarg);
++        const auto eq = arg.find('=');
++        if (eq == string::npos || eq == 0 || eq + 1 == arg.size()) {
++          error_message_ << "--rust_java_type takes NAME=RUST_TYPE, got " << arg << endl;
++          return;
++        }
++        RustJavaOnlyTypes()[arg.substr(0, eq)] = arg.substr(eq + 1);
++        break;
++      }
+       case 'd':
+         dependency_file_ = Trim(optarg);
+         break;
+diff --git a/options.h b/options.h
+index 0e8094b4f2449ecc4fbb65c5f40871d38ea94630..288ea3628317edbe9977549479a4f44a6e237720 100644
+--- a/options.h
++++ b/options.h
+@@ -15,6 +15,7 @@
+ 
+ #pragma once
+ 
++#include <map>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -168,6 +169,12 @@ class Options final {
+ 
+   const vector<string>& PreprocessedFiles() const { return preprocessed_files_; }
+ 
++  // --rust_java_type NAME=RUST_TYPE: Java-only builtin NAME (Map, CharSequence, FileDescriptor,
++  // non-generic List) is accepted by the Rust backend and spelled RUST_TYPE. Process-wide: type
++  // checks and the Rust name mapping have no Options at hand.
++  static std::map<string, string>& RustJavaOnlyTypes();
++  // RUST_TYPE configured for a type named `name`, or nullptr; a generic List is not Java-only.
++  static const string* RustJavaOnlyType(const string& name, bool is_generic);
+   string DependencyFile() const {
+     return dependency_file_;
+   }
