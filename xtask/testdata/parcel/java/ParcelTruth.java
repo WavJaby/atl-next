@@ -23,6 +23,9 @@ import android.os.Parcel;
 import android.os.Parcelable;
 import android.window.ActivityWindowInfo;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 public class ParcelTruth {
@@ -69,6 +72,12 @@ public class ParcelTruth {
                 "com.example.referrer", null, 2, null, null, null, null, null, true, null, null, null, null, false, null, null,
                 new ActivityWindowInfo()));
         check("ClientTransaction", transaction, ClientTransaction.CREATOR);
+        // IPackageManager.notifyDexLoad's classLoaderContextMap: dex path -> class loader context, a null value included
+        HashMap<String, String> contexts = new HashMap<>();
+        contexts.put("/data/app/com.example.app/base.apk", "PCL[]");
+        contexts.put("/data/app/com.example.app/split.apk", null);
+        checkMap("Map", contexts);
+        checkMap("Map:null", null);
 
         selfTests(config, intent);
         System.out.println("pt summary " + failures + " failed");
@@ -234,6 +243,31 @@ public class ParcelTruth {
         }
         boolean ok = Arrays.equals(java, again);
         result(ok, name, ok ? java.length + " bytes, java -> rust -> java byte-equal" : "java re-encodes rust's bytes differently at byte " + firstDiff(java, again));
+    }
+
+    /// java.util.Map, the Java-only builtin, as Parcel.writeMap writes it; Java reads Rust's bytes back with readHashMap.
+    static void checkMap(String name, Map<String, String> m) {
+        Parcel parcel = Parcel.obtain();
+        parcel.writeMap(m);
+        byte[] java = parcel.marshall();
+        parcel.recycle();
+        byte[] rust = roundTrip("java.util.Map", java, MODE_PLAIN);
+        if (rust == null) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        if (!Arrays.equals(java, rust)) {
+            result(false, name, "rust bytes differ from java's at byte " + firstDiff(java, rust) + " (" + rust.length + " vs " + java.length + ")");
+            return;
+        }
+        Parcel in = Parcel.obtain();
+        in.unmarshall(rust, 0, rust.length);
+        in.setDataPosition(0);
+        HashMap back = in.readHashMap(null);
+        boolean consumed = in.dataPosition() == rust.length;
+        in.recycle();
+        boolean ok = consumed && Objects.equals(m, back);
+        result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's map back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
     }
 
     static void selfTests(Configuration config, Intent intent) {

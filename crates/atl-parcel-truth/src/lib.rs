@@ -20,6 +20,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, PackageInfo, ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
+use atl_parcelables::java::util::Map;
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
 
@@ -71,7 +72,29 @@ fn round_trip_as<T: UnstructuredParcelable>(input: &[u8], mode: i32) -> Result<V
     let mut out = Parcel::new();
     v.write_to_parcel(&mut out.borrowed())
         .map_err(|e| format!("encode refused: {e:?}"))?;
-    let mut bytes = marshal(&out)?;
+    finish(&out, mode)
+}
+
+/// java.util.Map as Parcel.writeMap writes it (no parcelable null flag: null is size -1), so through its Option form.
+fn round_trip_map(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
+    let p = unmarshal(input)?;
+    let v: Option<Map> = p.read().map_err(|e| format!("decode refused: {e:?}"))?;
+    if p.get_data_position() != p.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            p.get_data_position(),
+            p.get_data_size()
+        ));
+    }
+    let mut out = Parcel::new();
+    out.write(&v)
+        .map_err(|e| format!("encode refused: {e:?}"))?;
+    finish(&out, mode)
+}
+
+/// The re-encoded bytes, corrupted in MODE_CORRUPT.
+fn finish(out: &Parcel, mode: i32) -> Result<Vec<u8>, String> {
+    let mut bytes = marshal(out)?;
     if mode == MODE_CORRUPT {
         if let Some(b) = bytes.first_mut() {
             *b ^= 1;
@@ -97,6 +120,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_as::<ClientTransaction>(input, mode)
         }
         "android.app.ContentProviderHolder" => round_trip_as::<ContentProviderHolder>(input, mode),
+        "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }
 }

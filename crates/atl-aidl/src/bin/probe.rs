@@ -82,14 +82,17 @@ impl ISerialManager for Serial {
     fn r#unimplemented(&self, _method: &'static str) -> Status {
         binder::StatusCode::UNKNOWN_TRANSACTION.into()
     }
-    fn r#getSerialPorts(&self) -> binder::Result<Vec<String>> {
+    fn r#getSerialPorts(&self) -> binder::Result<Option<Vec<Option<String>>>> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(vec![PORT.to_owned()])
+        Ok(Some(vec![Some(PORT.to_owned())]))
     }
 }
 
+/// The ports a reply carries (aidl --rust_java_nullability: the list and each String nullable).
+type Ports = Option<Vec<Option<String>>>;
+
 /// One getSerialPorts transaction through the local binder's on_transact: the reply's Status, its ports when ok, whether the body ran.
-fn call(allow: bool) -> Result<(Status, Option<Vec<String>>, bool)> {
+fn call(allow: bool) -> Result<(Status, Option<Ports>, bool)> {
     let ran = Arc::new(AtomicBool::new(false));
     let service = BnSerialManager::new_binder(
         Serial {
@@ -118,7 +121,7 @@ fn enforce() -> Result<()> {
     );
     let (status, ports, ran) = call(true)?;
     ensure!(
-        status.is_ok() && ran && ports.as_deref() == Some(&[PORT.to_owned()][..]),
+        status.is_ok() && ran && ports == Some(Some(vec![Some(PORT.to_owned())])),
         "allowing hook: reply {status:?}, ports {ports:?}, body ran = {ran} (want ok, [{PORT}], run)"
     );
     Ok(())
@@ -126,7 +129,7 @@ fn enforce() -> Result<()> {
 
 fn round_trip(want: i32) -> Result<()> {
     let sent = ServiceDebugInfo {
-        name: NAME.to_owned(),
+        name: Some(NAME.to_owned()),
         // any value; distinct from the default 0 so a dropped field shows
         debugPid: 4242,
     };

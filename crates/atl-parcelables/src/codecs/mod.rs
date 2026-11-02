@@ -25,3 +25,9 @@ pub mod android {
         }
     }
 }
+
+pub mod java {
+    pub mod util {
+        pub mod Map;
+    }
+}

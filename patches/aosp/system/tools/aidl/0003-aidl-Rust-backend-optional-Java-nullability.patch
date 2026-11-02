@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 04:42:53 +0800
+Subject: [PATCH] aidl: Rust backend: optional Java nullability
+
+--rust_java_nullability makes every object type nullable, as the Java
+backend treats it: String, arrays, lists, parcelables (Java-only ones
+included), IBinder and interfaces. Primitives, enums and
+ParcelableHolder stay non-null. Implemented as
+AidlTypeSpecifier::IsNullable, which every backend query and check of
+a type already goes through.
+
+Upstream-Status: Inappropriate [ATL host tool: Rust services serve framework AIDL to Java callers]
+Patch-Reason: Java AIDL passes and returns null for any object (ActivityManagerService bindApplication sends null ComponentName, Bundle, interfaces, ...); the Rust backend makes them non-null without @nullable, which framework AIDL never declares, so a null fails with UNEXPECTED_NULL and a Rust server cannot send one; no build config or preprocessed declaration changes a type's nullability
+---
+SPDX-License-Identifier: Apache-2.0
+ aidl_language.cpp |  8 ++++++++
+ aidl_language.h   |  3 +++
+ aidl_to_rust.cpp  |  5 ++++-
+ options.cpp       | 11 +++++++++++
+ options.h         |  3 +++
+ 5 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/aidl_language.cpp b/aidl_language.cpp
+index b72f88092e0c9f931d6ae20d37ba776a428f560a..3fd1189f0b51def6ace504b7fab83d6ff7f5229e 100644
+--- a/aidl_language.cpp
++++ b/aidl_language.cpp
+@@ -712,6 +712,14 @@ const AidlDefinedType* AidlTypeSpecifier::GetDefinedType() const {
+   return defined_type_;
+ }
+ 
++bool AidlTypeSpecifier::IsNullable() const {
++  if (AidlAnnotatable::IsNullable()) return true;
++  if (!Options::RustJavaNullability()) return false;
++  if (IsArray()) return true;
++  if (AidlTypenames::IsPrimitiveTypename(GetName()) || GetName() == "ParcelableHolder") return false;
++  return defined_type_ == nullptr || defined_type_->AsEnumDeclaration() == nullptr;
++}
++
+ bool AidlTypeSpecifier::CheckValid(const AidlTypenames& typenames) const {
+   if (!AidlAnnotatable::CheckValid(typenames)) {
+     return false;
+diff --git a/aidl_language.h b/aidl_language.h
+index 5a724c575102c90b0405598b10713fbb3f739fb8..a8ed2b9e726146f31a07cd2dedbd9d21215347d0 100644
+--- a/aidl_language.h
++++ b/aidl_language.h
+@@ -455,6 +455,9 @@ class AidlTypeSpecifier final : public AidlAnnotatable,
+ 
+   bool IsResolved() const { return fully_qualified_name_ != ""; }
+ 
++  // @nullable, or (--rust_java_nullability) any object type, as the Java backend treats them.
++  bool IsNullable() const;
++
+   bool IsArray() const { return array_.has_value(); }
+   bool IsDynamicArray() const {
+     return array_.has_value() && std::get_if<DynamicArray>(&*array_) != nullptr;
+diff --git a/aidl_to_rust.cpp b/aidl_to_rust.cpp
+index 471a498808767498c1b81e819f33c03e2292aa22..413e289a134b3aa93d96fcac7619e0f8b113f7c3 100644
+--- a/aidl_to_rust.cpp
++++ b/aidl_to_rust.cpp
+@@ -327,7 +327,10 @@ StorageMode ArgumentStorageMode(const AidlArgument& arg, const AidlTypenames& ty
+ 
+   const bool isEnum = definedType && definedType->AsEnumDeclaration() != nullptr;
+   const bool isPrimitive = AidlTypenames::IsPrimitiveTypename(typeName);
+-  if (typeName == "String" || arg.GetType().IsDynamicArray() || typenames.IsList(arg.GetType())) {
++  // a Java-only List is a parcelable-like type (--rust_java_type), not a slice
++  const bool list = typenames.IsList(arg.GetType()) &&
++                    !Options::RustJavaOnlyType(typeName, arg.GetType().IsGeneric());
++  if (typeName == "String" || arg.GetType().IsDynamicArray() || list) {
+     return StorageMode::UNSIZED_ARGUMENT;
+   } else if (!(isPrimitive || isEnum) || arg.GetType().IsFixedSizeArray()) {
+     return StorageMode::IN_ARGUMENT;
+diff --git a/options.cpp b/options.cpp
+index d1a958ed6a4b652269e8213fe6c09162451d1c3a..2b58e79b5ed4e37838d579e3f57875a19babc9da 100644
+--- a/options.cpp
++++ b/options.cpp
+@@ -148,6 +148,8 @@ string Options::GetUsage() const {
+        << "          Rust: accept Java-only builtin NAME, spelled RUST_TYPE." << endl
+        << "  --rust_unimplemented_hook" << endl
+        << "          Rust: methods default to a required unimplemented(method) hook." << endl
++       << "  --rust_java_nullability" << endl
++       << "          Rust: every object type is nullable, as in Java." << endl
+        << "  --log" << endl
+        << "          Information about the transaction, e.g., method name, argument" << endl
+        << "          values, execution time, etc., is provided via callback." << endl
+@@ -298,6 +300,11 @@ std::map<string, string>& Options::RustJavaOnlyTypes() {
+   return types;
+ }
+ 
++bool& Options::RustJavaNullability() {
++  static bool on = false;
++  return on;
++}
++
+ const string* Options::RustJavaOnlyType(const string& name, bool is_generic) {
+   auto it = RustJavaOnlyTypes().find(name);
+   if (it == RustJavaOnlyTypes().end() || (name == "List" && is_generic)) return nullptr;
+@@ -335,6 +342,7 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
+         {"preprocessed", required_argument, 0, 'p'},
+         {"rust_java_type", required_argument, 0, 'R'},
+         {"rust_unimplemented_hook", no_argument, 0, 'U'},
++        {"rust_java_nullability", no_argument, 0, 'J'},
+         {"dep", required_argument, 0, 'd'},
+         {"out", required_argument, 0, 'o'},
+         {"header_out", required_argument, 0, 'h'},
+@@ -486,6 +494,9 @@ Options::Options(int argc, const char* const raw_argv[], Options::Language defau
+       case 'U':
+         rust_unimplemented_hook_ = true;
+         break;
++      case 'J':
++        RustJavaNullability() = true;
++        break;
+       case 't':
+         gen_traces_ = true;
+         break;
+diff --git a/options.h b/options.h
+index 3a6aa6998b659c9963845c46ea88af01c9dd4dd8..db3fcca6ca7939261d3e0d5bf715c7970f75135c 100644
+--- a/options.h
++++ b/options.h
+@@ -175,6 +175,9 @@ class Options final {
+   static std::map<string, string>& RustJavaOnlyTypes();
+   // RUST_TYPE configured for a type named `name`, or nullptr; a generic List is not Java-only.
+   static const string* RustJavaOnlyType(const string& name, bool is_generic);
++  // --rust_java_nullability: every object type is nullable, as in the Java backend. Process-wide:
++  // AidlTypeSpecifier::IsNullable has no Options at hand.
++  static bool& RustJavaNullability();
+   string DependencyFile() const {
+     return dependency_file_;
+   }

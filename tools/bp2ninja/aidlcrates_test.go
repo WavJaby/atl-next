@@ -55,8 +55,8 @@ func TestAidlCrates(t *testing.T) {
 	if want := []string{"inc/a/IFoo.aidl", "inc/b/Baz.aidl", "inc/a/Bar.aidl"}; !slices.Equal(paths, want) {
 		t.Errorf("closure %v, want %v (Unused and the parcelable files not compiled)", paths, want)
 	}
-	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || len(m.aidl.preprocessed) != 1 || !m.aidl.unimplementedHook {
-		t.Errorf("rustlibs %v, java types %v, preprocessed %v, unimplemented hook %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.unimplementedHook)
+	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || len(m.aidl.preprocessed) != 1 || !m.aidl.rustServed {
+		t.Errorf("rustlibs %v, java types %v, preprocessed %v, unimplemented hook %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.rustServed)
 	}
 	pre := g.genFiles[m.aidl.preprocessed[0]]
 	for _, want := range []string{"parcelable a.P rust_type \"p::a::P\";", "parcelable b.L<T> rust_type \"p::b::L\";", "parcelable c.type.Q rust_type \"p::c::r#type::Q\";", "parcelable a.Outer.Inner rust_type \"p::a::Outer_Inner\";", "parcelable a.Option rust_type \"p::a::Option_\";"} {
