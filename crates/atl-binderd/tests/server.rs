@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The socket server end to end: a server thread, clients speaking `proto` over real SEQPACKET socketpairs. Expected values from the protocol (proto module doc) and the uapi, never from the server.
-#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions; a failure is the test failing")]
+#![allow(
+    clippy::unwrap_used,
+    reason = "test helpers outside #[test] functions; a failure is the test failing"
+)]
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::thread::JoinHandle;

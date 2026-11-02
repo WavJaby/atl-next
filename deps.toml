@@ -22,6 +22,13 @@ arch = "bison"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# `xtask test binder` runs servicemanager in a mount namespace whose /system and /vendor hold the test layout (empty VINTF manifests); the broker's sandbox later (plan Q5)
+[bubblewrap]
+debian = "bubblewrap"
+arch = "bubblewrap"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 # builds providers.toml `crate:` providers as C shared libraries, with their headers
 [cargo-c]
 cargo = "cargo-c"

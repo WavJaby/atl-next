@@ -63,4 +63,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-uses = ["layout"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will
+uses = ["layout", "binder"]

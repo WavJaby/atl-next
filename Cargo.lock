@@ -534,10 +534,12 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-binderd",
  "atl-layout",
  "clap",
  "object",
  "roxmltree",
+ "rustix",
  "serde",
  "serde_json",
  "spdx",

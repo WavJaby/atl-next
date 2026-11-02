@@ -44,6 +44,27 @@ pub fn encode_register(uid: u32, host_pid: i32, context_manager: bool) -> Vec<u8
     v
 }
 
+/// The admin side (broker, test harness): registers the process whose control connection is `control` and waits for binderd's answer.
+pub fn register(
+    admin: BorrowedFd<'_>,
+    control: BorrowedFd<'_>,
+    uid: u32,
+    host_pid: i32,
+    context_manager: bool,
+) -> Result<(), SysErrno> {
+    proto::send(
+        admin,
+        &encode_register(uid, host_pid, context_manager),
+        &[control],
+    )?;
+    let (msg, _) = proto::recv(admin)?.ok_or(SysErrno::PIPE)?;
+    match Reply::decode(&msg) {
+        Ok(Reply::Status(0)) => Ok(()),
+        Ok(Reply::Status(e)) if e < 0 => Err(SysErrno::from_raw_os_error(-e)),
+        _ => Err(SysErrno::PROTO),
+    }
+}
+
 fn decode_register(b: &[u8]) -> Option<(u32, i32, bool)> {
     if b.len() != 12 {
         return None;

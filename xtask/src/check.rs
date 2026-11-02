@@ -32,6 +32,8 @@ enum Step {
     Modules,
     /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
     Drift,
+    /// libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0003), in the tree this checkout builds
+    Seam,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -44,12 +46,13 @@ enum Step {
     Libcxx,
 }
 
-const ALL: [Step; 10] = [
+const ALL: [Step; 11] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
     Step::Modules,
     Step::Drift,
+    Step::Seam,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -65,6 +68,7 @@ impl Step {
             Step::Tables => "tables",
             Step::Modules => "modules",
             Step::Drift => "drift",
+            Step::Seam => "seam",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -121,6 +125,7 @@ impl Step {
                 Ok(())
             }
             Step::Drift => patch::check(root),
+            Step::Seam => crate::binder::seam_check(root),
             Step::Clippy => cargo(
                 root,
                 &[
