@@ -38,14 +38,18 @@ struct Args {
     /// The startSeq of the expected start of this package as its uid.
     #[arg(long)]
     start_seq: i64,
+    /// Its manifest's versionCode, minSdkVersion and targetSdkVersion (the caller reads them from the APK).
+    #[arg(long)]
+    version_code: i64,
+    #[arg(long)]
+    min_sdk: i32,
+    #[arg(long)]
+    target_sdk: i32,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
 const ACTIVITY: &str = "activity";
 const PACKAGE: &str = "package";
-/// The package's SDK levels and version until the APK parser gives them: the API level M2 targets (34) for both, version 1.
-const SDK: i32 = 34;
-const VERSION: i64 = 1;
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -54,10 +58,10 @@ fn main() -> Result<()> {
         uid: a.uid,
         source_dir: a.apk,
         data_dir: a.data,
-        version_code: VERSION,
+        version_code: a.version_code,
         version_name: None,
-        min_sdk: SDK,
-        target_sdk: SDK,
+        min_sdk: a.min_sdk,
+        target_sdk: a.target_sdk,
         launch_activity: a.activity,
     }]));
     let pending = vec![PendingStart {

@@ -23,6 +23,9 @@ const APP: &str = "com.example.atltest";
 const APP_UID: u32 = 10_123;
 const ACTIVITY: &str = "com.example.atltest.Main";
 const START_SEQ: &str = "7";
+/// Its manifest values: versionCode 1, min and target SDK 34 (any; the client checks only what it is told here).
+const VERSION_CODE: &str = "1";
+const SDK: &str = "34";
 /// Android uids (android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
 const AID_SHELL: u32 = 2000;
@@ -139,6 +142,12 @@ pub fn stage(
         ACTIVITY,
         "--start-seq",
         START_SEQ,
+        "--version-code",
+        VERSION_CODE,
+        "--min-sdk",
+        SDK,
+        "--target-sdk",
+        SDK,
     ])
     .envs(env.iter().cloned())
     .stdin(Stdio::null())

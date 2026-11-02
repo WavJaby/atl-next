@@ -18,10 +18,22 @@ crates = ["atl-bionic"]
 exports = ["atl-bionic"]
 uses = ["generators"]
 
-# the system property service: the default property set as a bionic property area, written through bionic's image builder; a binary in the broker's place until atld hosts it
+# the system property service: the default property set as a bionic property area, written through bionic's image builder; atld writes the area through it, the binary serves test harnesses
 [property-service]
 crates = ["atl-property-service"]
+exports = ["atl-property-service"]
 uses = ["bionic"]
+
+# the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd
+[broker]
+crates = ["atl-broker"]
+exports = ["atl-broker"]
+uses = ["binder"]
+
+# M2 wiring: binderd, servicemanager, the services and the app, each a process started through the broker
+[atld]
+crates = ["atld"]
+uses = ["binder", "broker", "property-service"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names
 [launcher]

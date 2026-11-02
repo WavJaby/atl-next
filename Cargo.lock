@@ -133,6 +133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-broker"
+version = "0.0.0"
+dependencies = [
+ "atl-binderd",
+ "rustix",
+ "serde_json",
+]
+
+[[package]]
 name = "atl-layout"
 version = "0.0.0"
 dependencies = [
@@ -177,6 +186,18 @@ dependencies = [
  "atl-aidl",
  "atl-bridgegen",
  "clap",
+]
+
+[[package]]
+name = "atld"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-binderd",
+ "atl-broker",
+ "atl-property-service",
+ "clap",
+ "rustix",
 ]
 
 [[package]]

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atld"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+atl-binderd = { path = "../atl-binderd" }
+atl-broker = { path = "../atl-broker" }
+atl-property-service = { path = "../atl-property-service" }
+clap.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true
