@@ -7,6 +7,7 @@
 //! - `layout_module`: size, alignment and field offsets as constants, for code that reads a layout in
 //!   shared memory through atomics rather than through a Rust type.
 //! - `resolver_module`: exported shells with the header's signatures that forward to an implementation looked up by name at run time.
+//! - `import_module`: `api_module`'s types with the header's fn-pointer type per function, for a caller that looks the functions up itself.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -138,6 +139,36 @@ pub fn api_module(
     types: &[&str],
     implementation: &str,
 ) -> Result<String> {
+    functions_module(iface, arch, functions, types, &|f, ty| {
+        let path: Vec<String> = f.split("::").map(ident).collect();
+        format!("const _: {ty} = {implementation}::{};", path.join("::"))
+    })
+}
+
+/// `api_module` for an API we call through pointers looked up at run time (`dlsym`), not implement: for each of `functions` (C names) a type alias of that name, the header's fn-pointer type, instead of the implementation check.
+/// Nothing is exported: unlike `resolver_module`'s shells, no symbol of the importing object can interpose on the library's.
+pub fn import_module(
+    iface: &Interface,
+    arch: &str,
+    functions: &[&str],
+    types: &[&str],
+) -> Result<String> {
+    functions_module(iface, arch, functions, types, &|f, ty| {
+        format!(
+            "#[allow(non_camel_case_types)]\npub type {} = {ty};",
+            ident(f)
+        )
+    })
+}
+
+/// Constants, opaque types, the records `functions` and the typedefs `types` use, and per function `item(name, fn-pointer type)`.
+fn functions_module(
+    iface: &Interface,
+    arch: &str,
+    functions: &[&str],
+    types: &[&str],
+    item: &dyn Fn(&str, &str) -> String,
+) -> Result<String> {
     let view = view(iface, arch)?;
     let mut out = banner(iface, arch, view);
     let mut opaque = BTreeSet::new();
@@ -170,12 +201,7 @@ pub fn api_module(
             .get(*f)
             .with_context(|| format!("{}: no function {f}", iface.header))?;
         let ty = fn_ty(sig, &mut opaque).with_context(|| (*f).to_owned())?;
-        let path: Vec<String> = f.split("::").map(ident).collect();
-        writeln!(
-            out,
-            "const _: {ty} = {implementation}::{};",
-            path.join("::")
-        )?;
+        writeln!(out, "{}", item(f, &ty))?;
         // `usize` / `isize` stand for these typedefs only where their width is the pointer's
         let mut sized = BTreeSet::new();
         for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {

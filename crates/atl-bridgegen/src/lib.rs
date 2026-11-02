@@ -705,6 +705,36 @@ mod tests {
         assert!(rust::resolver_module(&iface, "x86_64", &["say"], "r::resolve", &on_null).is_err());
     }
 
+    /// Imports: one fn-pointer type alias per function, named as the function, nothing exported; an array parameter without a size (`char *const argv[]`) is its adjusted pointer, as one with a size.
+    #[test]
+    fn import_types_compile() {
+        let dir = tmp("import");
+        let header = dir.0.join("x.h");
+        std::fs::write(
+            &header,
+            "struct R { int x; };\nint run(char *const argv[]);\nint get(const struct R *r);\nint say(const char *fmt, ...);\n",
+        )
+        .unwrap();
+        let targets = [target("x86_64", "x86_64-unknown-linux-gnu")];
+        let iface = interface("x", "x.h", &Source::c(&header, &[]), &targets).unwrap();
+        let code = rust::import_module(&iface, "x86_64", &["run", "get", "say"], &[]).unwrap();
+        for want in [
+            "pub type run = unsafe extern \"C\" fn(*const *mut i8) -> i32;",
+            "pub type get = unsafe extern \"C\" fn(*const R) -> i32;",
+            "pub type say = unsafe extern \"C\" fn(*const i8, ...) -> i32;",
+            "pub struct R {",
+        ] {
+            assert!(code.contains(want), "{want:?} missing:\n{code}");
+        }
+        assert!(!code.contains("no_mangle"), "{code}");
+        let out = rustc(&dir, &code);
+        assert!(
+            out.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A C++ source whose types live in a header it includes: classes, `static constexpr` members,
     /// `constexpr` globals, `extern "C"` declarations; internal functions are not interface.
     #[test]
