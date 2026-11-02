@@ -243,13 +243,13 @@ func (g *Graph) aidlSources(i *aidlIface, version string) []srcFile {
 
 // aidlSpec is how one backend's sources are generated: the part of the aidl command line that is per interface and version.
 type aidlSpec struct {
-	lang                string // cpp | ndk | rust
-	name                string // interface name (aidl_api/<name>)
-	dir                 string // its module dir
-	version             string // "" = unversioned
-	unstable            bool
-	warnings            []string // -W flags of the unfrozen version
-	trace, log, mockall bool
+	lang                     string // cpp | ndk | rust
+	name                     string // interface name (aidl_api/<name>)
+	dir                      string // its module dir
+	version                  string // "" = unversioned
+	unstable                 bool
+	warnings                 []string // -W flags of the unfrozen version
+	trace, log, mockall, rpc bool
 	// the imports' backends of the same lang (addLanguageLibraries / rust SourceProviderDeps)
 	imports []string
 	// rust: the imports' crate names, whose `mangled` modules the crate root re-exports (aidl_rust_source_provider.go importFlags)
@@ -283,7 +283,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	if i == nil {
 		return nil
 	}
-	if lang != "cpp" && lang != "ndk" && lang != "rust" {
+	if lang != "cpp" && lang != "ndk" && lang != "rust" && lang != "java" {
 		g.problem("%s: aidl_interface backend %s is unsupported", ref, lang)
 		return nil
 	}
@@ -325,6 +325,14 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	} else if v := p.str("min_sdk_version"); v != "" {
 		spec.minSdk = v
 	}
+	if lang == "java" {
+		// genTrace: on by default only with platform_apis; no gen_log; gen_rpc; platform_apis -> --min_sdk_version platform_apis
+		platform := be.boolean("platform_apis", false)
+		spec.trace, spec.log, spec.rpc = be.boolean("gen_trace", platform), false, be.boolean("gen_rpc", false)
+		if platform {
+			spec.minSdk = "platform_apis"
+		}
+	}
 	// flagsForAidlGenRule: only the unfrozen version, and only while the interface is not marked frozen
 	if ver == next && !i.frozen {
 		spec.warnings = append([]string{"-Weverything", "-Wno-missing-permission-annotation"}, p.strs("flags")...)
@@ -349,6 +357,26 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	for _, r := range g.resolveImports(i, ver) {
 		spec.imports = append(spec.imports, r.iface.versionedName(r.version)+"-"+lang)
 		spec.mangled = append(spec.mangled, fixRustName(r.iface.mod.Name))
+	}
+	if lang == "java" {
+		// addJavaLibrary: an installable java_library compiling the generated sources; sdk_version system_current unless platform_apis;
+		// static_libs = additional_libs, then the imports' java libraries (aidl_interface.go addLanguageLibraries)
+		props := newObj()
+		sdk := be.str("sdk_version")
+		if sdk == "" && !be.boolean("platform_apis", false) {
+			sdk = "system_current"
+		}
+		if sdk != "" {
+			props.set("sdk_version", sdk)
+		}
+		if v := be.str("min_sdk_version"); v != "" {
+			props.set("min_sdk_version", v)
+		} else if v := p.str("min_sdk_version"); v != "" {
+			props.set("min_sdk_version", v)
+		}
+		props.set("static_libs", strVals(slices.Concat(be.strs("additional_libs"), spec.imports)))
+		props.set("installable", true)
+		return &Module{Type: "java_library", Name: ref, Dir: i.mod.Dir, Props: props, aidl: spec}
 	}
 	if lang == "rust" {
 		// addRustLibrary: crate named after the interface, root after its version; rustlibs = additional_rustlibs, the rest is the provider's (rustAidl.deps)
@@ -439,6 +467,9 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 			implicit = append(implicit, g.abs(filepath.Join(f.root, ".hash")))
 		}
 		flags = append(flags, "--structured", "--version", version, "--hash", hash)
+	}
+	if s.rpc {
+		flags = append(flags, "--rpc")
 	}
 	if s.trace {
 		flags = append(flags, "-t")

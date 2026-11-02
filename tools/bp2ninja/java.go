@@ -56,6 +56,8 @@ type jNode struct {
 	sysJars []string
 	// java_plugin
 	processor string
+	// aidl.export_include_dirs (tree-relative): dependents' aidl -I (JavaInfo.AidlIncludeDirs)
+	aidlExport []string
 	// exported_plugins
 	expPluginJars, expProcessors []string
 	// droiddoc_exported_dir
@@ -81,7 +83,7 @@ type javaGraph struct {
 var javaTypes = map[string]bool{
 	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true,
 	"java_import": true, "java_import_host": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
-	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true,
+	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true,
 }
 
 func (g *Graph) isJava(t string) bool { return javaTypes[g.baseType(t)] }
@@ -193,6 +195,8 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 		g.exportedDir(n)
 	case "java_aconfig_library":
 		g.aconfigJavaLib(n)
+	case syspropType:
+		g.syspropJava(n)
 	case "java_sdk_library":
 		// the library itself is its .impl; its stubs are separate modules (sdklib.go)
 		g.javaLib(n)
@@ -323,6 +327,9 @@ type sdkDep struct {
 	classpath    []string // sdkLib modules
 	sysModules   string
 	prebuiltJars []string // useFiles: tree-relative jars (numbered SDKs)
+	// aidl: the SDK's preprocessed aidl file (-p) -- tree-relative for a numbered SDK; for a module SDK the framework.aidl Soong's sdk
+	// singleton extracts from the stubs (sdkFrameworkAidl), which is not built here
+	aidl, aidlGen string
 }
 
 // decodeSdk is decodeSdkDep (sdk.go) for this build: SDK modules from source (no unbundled prebuilts), numbered levels from prebuilts/sdk.
@@ -330,10 +337,16 @@ func (g *Graph) decodeSdk(n *jNode, s sdkSpec) (sdkDep, error) {
 	p := n.props
 	if s.level != "" {
 		dir := filepath.Join("prebuilts/sdk", s.level, s.kind)
-		return sdkDep{prebuiltJars: []string{filepath.Join(dir, "android.jar"), "prebuilts/sdk/tools/core-lambda-stubs.jar"}}, nil
+		// "There's no aidl for other SDKs yet": always the public one
+		return sdkDep{prebuiltJars: []string{filepath.Join(dir, "android.jar"), "prebuilts/sdk/tools/core-lambda-stubs.jar"},
+			aidl: filepath.Join("prebuilts/sdk", s.level, "public", "framework.aidl")}, nil
 	}
 	toModule := func(lib, sysKind string) sdkDep {
-		return sdkDep{boot: []string{lib, "core-lambda-stubs"}, java9: []string{lib}, sysModules: "core-" + sysKind + "-stubs-system-modules"}
+		aidl := "framework.aidl"
+		if s.kind == "module" {
+			aidl = "framework_non_updatable.aidl"
+		}
+		return sdkDep{boot: []string{lib, "core-lambda-stubs"}, java9: []string{lib}, sysModules: "core-" + sysKind + "-stubs-system-modules", aidlGen: aidl}
 	}
 	switch s.kind {
 	case "private":
@@ -357,10 +370,11 @@ func (g *Graph) decodeSdk(n *jNode, s sdkSpec) (sdkDep, error) {
 		return toModule("android_system_stubs_current", "public"), nil
 	case "test":
 		return toModule("android_test_stubs_current", "public"), nil
+	// system modules kind (systemModuleKind): SdkKind.String, system-server using module-lib's
 	case "module":
-		return toModule("android_module_lib_stubs_current", "module_lib"), nil
+		return toModule("android_module_lib_stubs_current", "module-lib"), nil
 	case "system_server":
-		return toModule("android_system_server_stubs_current", "system_server"), nil
+		return toModule("android_system_server_stubs_current", "module-lib"), nil
 	case "core":
 		return sdkDep{boot: []string{"core.current.stubs", "core-lambda-stubs"}, sysModules: "core-public-stubs-system-modules"}, nil
 	}
@@ -374,6 +388,10 @@ type javaDeps struct {
 	sys                                  *jNode
 	staticImpl, staticRes                []string
 	srcJars                              []string
+	// aidl: libs' and static_libs' exported include dirs (tree-relative), the SDK's preprocessed file (absolute; "" = none), and the
+	// generated one a module SDK would need instead (not built)
+	aidlIncludes            []string
+	aidlPreprocess, aidlGen string
 }
 
 // collectJavaDeps resolves n's sdk, libs, static_libs and plugins in Soong's dependency order (deps(): sdk deps, libs, static_libs,
@@ -415,6 +433,10 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 		if sd.sysModules != "" {
 			d.sys = dep(sd.sysModules, Device)
 		}
+		if sd.aidl != "" {
+			d.aidlPreprocess = g.abs(sd.aidl)
+		}
+		d.aidlGen = sd.aidlGen
 	}
 	addPlugins := func(jars, classes []string) {
 		d.processorPath = append(d.processorPath, jars...)
@@ -428,6 +450,7 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 			}
 			d.classpath = append(d.classpath, l.header)
 			d.dexClasspath = append(d.dexClasspath, l.header)
+			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
 			addPlugins(l.expPluginJars, l.expProcessors)
 		}
 	}
@@ -440,6 +463,7 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 			d.classpath = append(d.classpath, l.header)
 			d.staticImpl = append(d.staticImpl, l.impl...)
 			d.staticRes = append(d.staticRes, l.res...)
+			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
 			addPlugins(l.expPluginJars, l.expProcessors)
 			statics = append(statics, l)
 		}
@@ -475,43 +499,58 @@ func dedupKeep(in []string) []string {
 	return out
 }
 
-// javaSrcs expands n's srcs (plus extra) into java files and srcjars; generated inputs are absolute, others tree-relative.
-func (g *Graph) javaSrcs(n *jNode, srcs []string) (java, srcjars, waits []string) {
+// jSrcs: a module's sources by kind (base.go compile: srcFiles after genSources). Paths of generated inputs are absolute, others tree-relative.
+type jSrcs struct {
+	java, kt, srcjars, waits []string
+	// sources a generator turns into java / srcjars (javagen.go), in source order per kind
+	gen map[string][]srcFile
+}
+
+// javaSrcs expands srcs into sources by kind. Extensions no step consumes (package.html, …) are dropped as Soong drops them: compile filters
+// srcFiles by extension (.java, .kt, .srcjar after genSources).
+func (g *Graph) javaSrcs(n *jNode, srcs []string) jSrcs {
 	exclude := map[string]bool{}
 	for _, e := range g.globs(n.mod.Dir, n.props.strs("exclude_srcs")) {
 		exclude[e] = true
 	}
-	add := func(path string) {
-		switch filepath.Ext(path) {
+	s := jSrcs{gen: map[string][]srcFile{}}
+	add := func(f srcFile) {
+		switch ext := filepath.Ext(f.path); ext {
 		case ".java":
-			java = append(java, path)
+			s.java = append(s.java, f.path)
+		case ".kt":
+			s.kt = append(s.kt, f.path)
 		case ".srcjar":
-			srcjars = append(srcjars, path)
+			s.srcjars = append(s.srcjars, f.path)
 		default:
-			g.problem("%s: source %s of an unsupported kind", n.name, path)
+			if javaGens[ext] != nil {
+				s.gen[ext] = append(s.gen[ext], f)
+			}
 		}
 	}
-	for _, s := range srcs {
-		if isRef(s) {
-			if js, ok := g.javaSrcRef(n, s); ok {
+	for _, src := range srcs {
+		if isRef(src) {
+			if js, ok := g.javaSrcRef(n, src); ok {
 				for _, f := range js {
-					add(f)
+					add(srcFile{path: f})
 				}
 				continue
 			}
 		}
-		files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.name)
+		files, _ := g.resolveSrc(n.mod.Dir, n.side, src, n.name)
 		for _, f := range files {
 			if exclude[f.path] {
 				continue
 			}
 			if f.gen != nil {
-				waits = append(waits, f.gen.rule.deps...)
+				s.waits = append(s.waits, f.gen.rule.deps...)
 			}
-			add(f.path)
+			add(f)
 		}
 	}
-	return dedupKeep(java), dedupKeep(srcjars), dedupKeep(waits)
+	// base.go: uniqueJavaFiles then uniqueKtFiles, one set across both
+	s.java, s.kt, s.srcjars, s.waits = dedupKeep(s.java), dedupKeep(s.kt), dedupKeep(s.srcjars), dedupKeep(s.waits)
+	return s
 }
 
 // javaSrcRef resolves a srcs reference to a Java module producing sources (droidstubs, a java_sdk_library's stubs source tag).
@@ -555,7 +594,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		g.problem("%s: cannot depend directly on java_sdk_library %s", n.name, n.mod.Name)
 		return
 	}
-	for _, k := range []string{"kotlincflags", "javac_shard_size", "services"} {
+	// javac_shard_size shards javac only with Turbine (base.go enableSharding), which is off
+	for _, k := range []string{"services"} {
 		if p.get(k) != nil {
 			g.problem("%s: %s is unsupported", n.name, k)
 		}
@@ -571,9 +611,17 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 			ver = 21
 		}
 	}
+	srcs := p.strs("srcs")
+	if ver.modules() {
+		srcs = append(srcs, p.obj("openjdk9").strs("srcs")...)
+	}
+	g.implicitJavaLibs(n, srcs)
 	d, _ := g.collectJavaDeps(n, s)
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
+	}
+	for _, dir := range p.obj("aidl").strs("export_include_dirs") {
+		n.aidlExport = append(n.aidlExport, filepath.Join(n.mod.Dir, dir))
 	}
 	for _, r := range p.strs("exported_plugins") {
 		if pl := g.jnode(r, Host, n.name); pl != nil {
@@ -583,11 +631,23 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 			}
 		}
 	}
-	srcs := p.strs("srcs")
-	if ver.modules() {
-		srcs = append(srcs, p.obj("openjdk9").strs("srcs")...)
+	src := g.javaSrcs(n, srcs)
+	if n.mod.aidl != nil {
+		// an aidl_interface's java backend (aidliface.go): its sources are the interface version's
+		src.gen[".aidl"] = n.mod.aidl.srcs
 	}
-	java, srcjars, waits := g.javaSrcs(n, srcs)
+	java, srcjars, waits := src.java, src.srcjars, src.waits
+	// genSources: logtags java in place (here: after the module's own), then proto and aidl srcjars after its own .srcjar sources
+	for _, ext := range genOrder {
+		if files := src.gen[ext]; len(files) > 0 {
+			if ext == ".aidl" && d.aidlGen != "" && n.mod.aidl == nil {
+				g.problem("%s: aidl sources against sdk_version %q need the SDK's %s (sdkparcelables over the stubs), which is not built", n.name, p.str("sdk_version"), d.aidlGen)
+			}
+			gj, gs := javaGens[ext](g, n, files, d)
+			java = append(java, gj...)
+			srcjars = append(srcjars, gs...)
+		}
+	}
 	srcjars = append(srcjars, extraSrcJars...)
 	stem := p.str("stem")
 	if stem == "" {
@@ -611,6 +671,16 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		}
 	}
 	var localImpl []string
+	if len(src.kt) > 0 {
+		// kotlinc first over every .java and .kt source (it reads the java ones only to resolve types), then javac against its header jar
+		if len(d.processorPath) > 0 {
+			g.problem("%s: annotation processors on Kotlin sources need kapt, which is unsupported", n.name)
+		}
+		kt, kh := filepath.Join(n.dir, "kotlin", jar), filepath.Join(n.dir, "kotlin_headers", jar)
+		g.kotlinc(n, kt, kh, java, src.kt, srcjars, waits, ver, d)
+		localImpl = append(localImpl, kt)
+		d.classpath = append([]string{kh}, d.classpath...)
+	}
 	if len(java)+len(srcjars) > 0 {
 		classes := out("javac")
 		g.javac(n, classes, java, srcjars, waits, flags, ver, d)
@@ -1143,5 +1213,8 @@ rule installexec
 `, unpack, javacVm, strings.Join(c.CommonJdkFlags, " "), strings.Join(c.D8Flags, " "), strings.Join(c.JavaVmFlags, " "), c.JlinkVersion)
 	b.WriteString(j.stubsRules(g, unpack))
 	b.WriteString(aconfigJavaRule)
+	b.WriteString(javaGenRules)
+	b.WriteString(syspropJavaRule)
+	b.WriteString(j.kotlincRule(g))
 	return b.String()
 }

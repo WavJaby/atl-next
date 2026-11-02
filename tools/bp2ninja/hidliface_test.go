@@ -21,11 +21,11 @@ func TestParseHidlRef(t *testing.T) {
 		"android.hidl.base@1.0_genc++":                   {"android.hidl.base@1.0", hidlSources},
 		"android.hidl.base@1.0_genc++_headers":           {"android.hidl.base@1.0", hidlHeaders},
 		":android.hidl.base@1.0_hal":                     {"android.hidl.base@1.0", hidlHal},
-		"android.hidl.base-V1.0-java":                    {"android.hidl.base@1.0", hidlOther},
-		"android.hidl.base-V1.0-java-shallow":            {"android.hidl.base@1.0", hidlOther},
-		"android.hidl.base-V1.0-java_gen_java":           {"android.hidl.base@1.0", hidlOther},
-		"android.hidl.base-V1.0-java-constants":          {"android.hidl.base@1.0", hidlOther},
-		"android.hidl.base-V1.0-java-constants_gen_java": {"android.hidl.base@1.0", hidlOther},
+		"android.hidl.base-V1.0-java":                    {"android.hidl.base@1.0", "-java"},
+		"android.hidl.base-V1.0-java-shallow":            {"android.hidl.base@1.0", "-java-shallow"},
+		"android.hidl.base-V1.0-java_gen_java":           {"android.hidl.base@1.0", "-java_gen_java"},
+		"android.hidl.base-V1.0-java-constants":          {"android.hidl.base@1.0", "-java-constants"},
+		"android.hidl.base-V1.0-java-constants_gen_java": {"android.hidl.base@1.0", "-java-constants_gen_java"},
 		"android.hidl.base@1.0-hidl-lint":                {"android.hidl.base@1.0", hidlOther},
 		"android.hidl.base@1.0-inheritance-hierarchy":    {"android.hidl.base@1.0", hidlOther},
 	} {
@@ -302,10 +302,11 @@ func TestHidlFilegroup(t *testing.T) {
 func TestHidlRefusals(t *testing.T) {
 	g := hidlGraph(t)
 	for ref, want := range map[string]string{
-		// other modules the load hook creates are not built
-		"android.hidl.foo-V1.0-java":                 "only the C++ modules of hidl_interface android.hidl.foo@1.0 are built",
-		"android.hidl.foo@1.0-hidl-lint":             "only the C++ modules of hidl_interface android.hidl.foo@1.0 are built",
-		"android.hidl.foo@1.0-inheritance-hierarchy": "only the C++ modules of hidl_interface android.hidl.foo@1.0 are built",
+		// lint and inheritance-hierarchy modules are not built
+		"android.hidl.foo@1.0-hidl-lint":             "lint and inheritance-hierarchy modules of hidl_interface android.hidl.foo@1.0 are not built",
+		"android.hidl.foo@1.0-inheritance-hierarchy": "lint and inheritance-hierarchy modules of hidl_interface android.hidl.foo@1.0 are not built",
+		// gen_java_constants defaults to false (hidlInterfaceMutator shouldGenerateJavaConstants)
+		"android.hidl.foo-V1.0-java-constants": "android.hidl.foo-V1.0-java-constants: hidl_interface android.hidl.foo@1.0 does not generate it",
 		// hidlInterfaceMutator's PropertyErrorf cases
 		"android.hidl.noroot@1.0":    "android.hidl.noroot@1.0: no hidl_package_root android.hidl.noroot",
 		"android.hidl.wrongroot@1.0": `android.hidl.wrongroot@1.0: root "vendor.y" must be a prefix of the name`,

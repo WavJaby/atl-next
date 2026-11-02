@@ -23,14 +23,17 @@ import (
 //   - `<fq>_hal`: filegroup of srcs.
 //   - hidl-gen options: `-r<root>:<path>` of the interface's root and of every `interfaces` entry (hidl_package_root: path default its own dir), `-F` for
 //     the root's require_frozen; the root's current.txt (use_current: must exist) is an input. hidl-gen runs from the tree root with `-p .`.
-//   - Not built, one problem each: the java, java-shallow, java-constants, lint and inheritance-hierarchy modules.
+//   - Java (gen_java, default on; gen_java_constants): `<pkg>-V<ver>-java_gen_java` runs `hidl-gen -L java` into srcs.srcjar,
+//     `-java-constants_gen_java` `-L java-constants` into <pkg path>/V<maj>_<min>/Constants.java; the java_library modules around them are hidlJavaLibrary.
+//     Dropped: their min_sdk_version (hidl_interface.go's per-package table), which only reaches their own dex jars.
+//   - Not built, one problem each: the lint and inheritance-hierarchy modules.
 //   - Dropped: Soong's `rm -rf ${genDir}` (the gen dir holds the rule's script) and `-d ${out}.d` (the genrule rule has no depfile: edits to an imported
 //     package do not rebuild), Soong's -Wall -Werror flags of hidl-module-defaults (this build uses -w), min_sdk_version, double_loadable, apex_available.
 
 var (
 	hidlFqRe = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z_0-9]*(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*)@([0-9]+)\.([0-9]+)$`)
 	// fqName.go javaName & co: sanitizedString is `<pkg>-V<maj>.<min>`
-	hidlJavaRe = regexp.MustCompile(`^(.+)-V([0-9]+\.[0-9]+)-java(?:-shallow|_gen_java|-constants(?:_gen_java)?)?$`)
+	hidlJavaRe = regexp.MustCompile(`^(.+)-V([0-9]+\.[0-9]+)(-java(?:-shallow|_gen_java|-constants(?:_gen_java)?)?)$`)
 	// properties.go coreDependencyPackageNames: packages in libhidlbase
 	hidlCorePackages = []string{"android.hidl.base@", "android.hidl.manager@"}
 )
@@ -41,7 +44,13 @@ const (
 	hidlSources = "_genc++"
 	hidlHeaders = "_genc++_headers"
 	hidlHal     = "_hal"
-	// not built: java, lint, inheritance-hierarchy modules
+	// java: fqName.go javaName & co, below `<pkg>-V<maj>.<min>`
+	hidlJava             = "-java"
+	hidlJavaShallow      = "-java-shallow"
+	hidlJavaGen          = "-java_gen_java"
+	hidlJavaConstants    = "-java-constants"
+	hidlJavaConstantsGen = "-java-constants_gen_java"
+	// not built: lint, inheritance-hierarchy modules
 	hidlOther = "other"
 )
 
@@ -76,7 +85,7 @@ func (f hidlFq) core() bool {
 func parseHidlRef(ref string) (fq, kind string, ok bool) {
 	ref = strings.TrimPrefix(ref, ":")
 	if m := hidlJavaRe.FindStringSubmatch(ref); m != nil {
-		return m[1] + "@" + m[2], hidlOther, true
+		return m[1] + "@" + m[2], m[3], true
 	}
 	for _, s := range []string{"-hidl-lint", "-inheritance-hierarchy"} {
 		if base, found := strings.CutSuffix(ref, s); found {
@@ -267,12 +276,51 @@ func (g *Graph) synthHidl(ref string, side Side) *Module {
 		props := newObj()
 		props.set("srcs", strVals(m.Props.strs("srcs")))
 		return &Module{Type: "filegroup", Name: ref, Dir: m.Dir, Props: props}
+	case hidlJavaGen:
+		return &Module{Type: "genrule", Name: ref, Dir: m.Dir, Props: newObj(), hidl: &hidlGen{h: h, lang: "java"}}
+	case hidlJavaConstantsGen:
+		return &Module{Type: "genrule", Name: ref, Dir: m.Dir, Props: newObj(), hidl: &hidlGen{h: h, lang: "java-constants"}}
+	case hidlJava, hidlJavaShallow, hidlJavaConstants:
+		if kind != hidlJavaConstants && !m.Props.boolean("gen_java", true) || kind == hidlJavaConstants && !m.Props.boolean("gen_java_constants", false) {
+			g.problem("%s: hidl_interface %s does not generate it (gen_java / gen_java_constants)", ref, fq)
+			return nil
+		}
+		return g.hidlJavaLibrary(h, ref, kind)
 	case hidlOther:
-		g.problem("%s: only the C++ modules of hidl_interface %s are built", ref, fq)
+		g.problem("%s: lint and inheritance-hierarchy modules of hidl_interface %s are not built", ref, fq)
 		return nil
 	}
 	// hidlLib: the interface's own name, lookup finds the hidl_interface and calls hidlLibrary
 	return nil
+}
+
+// hidlJavaLibrary: a java_library of the interface (hidlInterfaceMutator): srcs the `_gen_java` genrule's output, sdk_version core_current.
+// `-java` takes the `interfaces`' `-java` libraries as static_libs, `-java-shallow` as libs, both with libs hwbinder.stubs and installable;
+// `-java-constants` has neither.
+func (g *Graph) hidlJavaLibrary(h *hidlIface, ref, kind string) *Module {
+	name := strings.TrimPrefix(ref, ":")
+	base := strings.TrimSuffix(name, kind)
+	var deps []string
+	for _, d := range h.deps {
+		fq, _ := parseHidlFq(d)
+		deps = append(deps, fq.pkg+"-V"+fq.major+"."+fq.minor+hidlJava)
+	}
+	props := newObj()
+	props.set("sdk_version", "core_current")
+	switch kind {
+	case hidlJava:
+		props.set("srcs", strVals([]string{":" + base + hidlJavaGen}))
+		props.set("static_libs", strVals(deps))
+		props.set("libs", strVals([]string{"hwbinder.stubs"}))
+		props.set("installable", true)
+	case hidlJavaShallow:
+		props.set("srcs", strVals([]string{":" + base + hidlJavaGen}))
+		props.set("libs", strVals(append([]string{"hwbinder.stubs"}, deps...)))
+		props.set("installable", true)
+	case hidlJavaConstants:
+		props.set("srcs", strVals([]string{":" + base + hidlJavaConstantsGen}))
+	}
+	return &Module{Type: "java_library", Name: name, Dir: h.mod.Dir, Props: props}
 }
 
 // hidlLibrary: the cc_library of the hidl_interface m (hidlInterfaceMutator's cc.LibraryFactory call); lookup returns it for m's own name.
@@ -324,13 +372,27 @@ func (g *Graph) hidlRule(n *Node) *genRule {
 	if h.current != "" {
 		r.implicit = append(r.implicit, h.current)
 	}
-	cmd := []string{"$(location hidl-gen)", "-R", "-p", ".", "-o", "$(genDir)", "-L", spec.lang}
+	// java: hidlSrcJarRule, into <genDir>/srcs zipped to srcs.srcjar; java-constants: <sanitized dir>Constants.java
+	outDir := "$(genDir)"
+	if spec.lang == "java" {
+		outDir = "$(genDir)/srcs"
+	}
+	cmd := []string{"$(location hidl-gen)", "-R", "-p", ".", "-o", outDir, "-L", spec.lang}
 	for _, o := range g.hidlOptions(h, n.side) {
 		cmd = append(cmd, shellEscape(o))
 	}
 	r.cmd = strings.Join(append(cmd, shellEscape(h.fq.String())), " ")
-	for _, o := range h.outputs(spec.headers) {
-		r.outs = append(r.outs, filepath.Join(genDir, o))
+	switch spec.lang {
+	case "java":
+		zip := shellEscape(filepath.Join(g.java.tools.BuildTools, "soong_zip"))
+		r.cmd = "rm -rf $(genDir)/srcs && " + r.cmd + " && " + zip + " -o $(genDir)/srcs.srcjar -C $(genDir)/srcs -D $(genDir)/srcs"
+		r.outs = []string{filepath.Join(genDir, "srcs.srcjar")}
+	case "java-constants":
+		r.outs = []string{filepath.Join(genDir, strings.ReplaceAll(h.fq.pkg, ".", "/"), "V"+h.fq.major+"_"+h.fq.minor, "Constants.java")}
+	default:
+		for _, o := range h.outputs(spec.headers) {
+			r.outs = append(r.outs, filepath.Join(genDir, o))
+		}
 	}
 	r.incs = []string{"-I" + genDir}
 	r.consumerDeps(genDir)

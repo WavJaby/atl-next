@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -237,15 +238,17 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 	}
 	bt := g.baseType(tm.Type)
 	if bt == "python_binary_host" {
-		file, why := pythonTool(g, tm)
+		files, why := pythonTool(g, tm)
 		if why != "" {
 			return bad("tool %s is a python_binary_host %s (unsupported)", ref, why)
 		}
-		if _, err := os.Stat(g.abs(file)); err != nil {
-			return bad("tool %s: script %s does not exist", ref, file)
+		for _, f := range files {
+			if _, err := os.Stat(g.abs(f)); err != nil {
+				return bad("tool %s: script %s does not exist", ref, f)
+			}
 		}
-		l.files, l.interp = []string{file}, "python3"
-		r.implicit = append(r.implicit, file)
+		l.files, l.interp = files[:1], "python3"
+		r.implicit = append(r.implicit, files...)
 		return l
 	}
 	if k, ok := kindOf(bt, Binary); !ok || k != Binary {
@@ -323,13 +326,14 @@ func sandboxPrelude(sb string, data []toolFile) string {
 	return b.String()
 }
 
-// pythonTool: the one script a python_binary_host runs, tree-relative. Only a binary of a single source
-// file without libs or data is run as is (`python3 main.py`); Soong packages the others into a par with
-// their library tree, which is not rebuilt here. why says what disqualifies the module.
-func pythonTool(g *Graph, m *Module) (file, why string) {
+// pythonTool: the script a python_binary_host runs and the sources it imports, tree-relative, main first. Run as is (`python3 main.py`) when
+// there are no libs, data or pkg_path and every source sits beside main: the par Soong builds puts them at its top level, which is the script's
+// own directory on sys.path (python.go getPkgPath, binary.go getPyMainFile: main defaults to <name>.py). Soong packages the others with their
+// library tree, which is not rebuilt here. why says what disqualifies the module.
+func pythonTool(g *Graph, m *Module) (files []string, why string) {
 	p := g.flatten(m, Host, Gen)
-	if len(p.strs("libs")) > 0 || len(p.strs("data")) > 0 {
-		return "", "with libs or data"
+	if len(p.strs("libs")) > 0 || len(p.strs("data")) > 0 || p.str("pkg_path") != "" {
+		return nil, "with libs, data or pkg_path"
 	}
 	srcs := g.globs(m.Dir, p.strs("srcs"))
 	main := ""
@@ -338,11 +342,26 @@ func pythonTool(g *Graph, m *Module) (file, why string) {
 	}
 	switch {
 	case len(srcs) == 0 && main != "":
-		return main, ""
+		return []string{main}, ""
 	case len(srcs) == 1 && (main == "" || main == srcs[0]):
-		return srcs[0], ""
+		return srcs, ""
 	}
-	return "", fmt.Sprintf("with %d sources", len(srcs))
+	if main == "" {
+		main = filepath.Join(m.Dir, m.Name+".py")
+	}
+	if !slices.Contains(srcs, main) {
+		return nil, fmt.Sprintf("whose main %s is not in its %d sources", main, len(srcs))
+	}
+	files = []string{main}
+	for _, s := range srcs {
+		if filepath.Dir(s) != filepath.Dir(main) {
+			return nil, fmt.Sprintf("with source %s outside main's directory", s)
+		}
+		if s != main {
+			files = append(files, s)
+		}
+	}
+	return files, ""
 }
 
 // genExpander substitutes Soong's cmd variables (genrule.go: the Expand callback of

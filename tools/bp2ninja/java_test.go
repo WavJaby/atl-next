@@ -85,11 +85,15 @@ func TestDecodeSdk(t *testing.T) {
 		{"none", "none", sdkDep{}},
 		{"core_platform", "", sdkDep{sysModules: "stable-core-platform-api-stubs-system-modules", boot: []string{"stable.core.platform.api.stubs", "core-lambda-stubs"}}},
 		{"core_current", "", sdkDep{boot: []string{"core.current.stubs", "core-lambda-stubs"}, sysModules: "core-public-stubs-system-modules"}},
-		{"current", "", sdkDep{boot: []string{"android_stubs_current", "core-lambda-stubs"}, java9: []string{"android_stubs_current"}, sysModules: "core-public-stubs-system-modules"}},
-		{"system_current", "", sdkDep{boot: []string{"android_system_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_stubs_current"}, sysModules: "core-public-stubs-system-modules"}},
-		{"module_current", "", sdkDep{boot: []string{"android_module_lib_stubs_current", "core-lambda-stubs"}, java9: []string{"android_module_lib_stubs_current"}, sysModules: "core-module_lib-stubs-system-modules"}},
+		// toModule: aidl = sdkFrameworkAidlPath (framework.aidl), module-lib's nonUpdatableFrameworkAidlPath; system modules
+		// core-<SdkKind.String()>-stubs-system-modules, system and test using public's (systemModuleKind)
+		{"current", "", sdkDep{boot: []string{"android_stubs_current", "core-lambda-stubs"}, java9: []string{"android_stubs_current"}, sysModules: "core-public-stubs-system-modules", aidlGen: "framework.aidl"}},
+		{"system_current", "", sdkDep{boot: []string{"android_system_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_stubs_current"}, sysModules: "core-public-stubs-system-modules", aidlGen: "framework.aidl"}},
+		{"module_current", "", sdkDep{boot: []string{"android_module_lib_stubs_current", "core-lambda-stubs"}, java9: []string{"android_module_lib_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework_non_updatable.aidl"}},
+		{"system_server_current", "", sdkDep{boot: []string{"android_system_server_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_server_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework.aidl"}},
 		{"", "", sdkDep{sysModules: "legacy-core-platform-api-stubs-system-modules", boot: []string{"legacy.core.platform.api.stubs", "core-lambda-stubs"}, classpath: []string{"ext", "framework"}}},
-		{"30", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/30/public/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}}},
+		// useFiles: <level>/<kind>/android.jar, the aidl always <level>/public/framework.aidl
+		{"system_30", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/30/system/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/30/public/framework.aidl"}},
 	}
 	for _, c := range cases {
 		p := objOf("sdk_version", c.sdk)
@@ -150,7 +154,7 @@ func javaTestGraph(t *testing.T, files map[string]string, flags map[string]strin
 		g.mods[side], _ = (&evaluator{cfg: cfg, os: osName}).modules(parsed)
 	}
 	fl := map[string]string{"RELEASE_TARGET_JAVA_21": "true", "RELEASE_PLATFORM_VERSION_CODENAME": "REL", "RELEASE_PLATFORM_SDK_VERSION": "36",
-		"RELEASE_USE_DEX_V41": ""}
+		"RELEASE_USE_DEX_V41": "", "RELEASE_KOTLIN_LANG_VERSION": "1.9"}
 	for k, v := range flags {
 		fl[k] = v
 	}

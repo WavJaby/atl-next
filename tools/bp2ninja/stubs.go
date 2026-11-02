@@ -466,7 +466,13 @@ func (g *Graph) droidstubs(n *jNode) {
 		ver = parseJavaVersion(v)
 	}
 	d, _ := g.collectJavaDeps(n, s)
-	java, srcjars, waits := g.javaSrcs(n, p.strs("srcs"))
+	src := g.javaSrcs(n, p.strs("srcs"))
+	java, srcjars, waits := append(src.java, src.kt...), src.srcjars, src.waits
+	for _, ext := range genOrder {
+		if files := src.gen[ext]; len(files) > 0 {
+			g.problem("%s: droidstubs: %d %s sources not generated (unsupported)", n.name, len(files), ext)
+		}
+	}
 	cp := append(append([]string{}, d.boot...), d.classpath...)
 	var implicit []string
 	implicit = append(append(implicit, cp...), srcjars...)

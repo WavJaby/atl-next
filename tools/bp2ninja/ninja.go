@@ -145,6 +145,24 @@ rule fail
   description = fail $out
 `
 
+// nodeOut: the file a node builds ("" for kinds without one: generated sources, objects). Fixed by the node's module, side, kind and
+// properties, so Java edges may name a host tool before emit (javagen.go jhost).
+func (g *Graph) nodeOut(n *Node) string {
+	if n.rust != nil {
+		return g.rustOut(n)
+	}
+	base := filepath.Join(g.out, n.side.String(), n.name)
+	switch n.kind {
+	case Static:
+		return filepath.Join(base, n.name+".a")
+	case Shared:
+		return filepath.Join(base, g.outName(n)+".so")
+	case Binary:
+		return filepath.Join(base, g.outName(n))
+	}
+	return ""
+}
+
 // emit writes the ninja file for every node.
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
@@ -155,18 +173,8 @@ func (g *Graph) emit(tools Tools) string {
 	b.WriteString(g.acfg.ninja())
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
-		base := filepath.Join(g.out, n.side.String(), n.name)
-		if n.rust != nil {
-			n.out = g.rustOut(n)
-			continue
-		}
-		switch n.kind {
-		case Static:
-			n.out = filepath.Join(base, n.name+".a")
-		case Shared:
-			n.out = filepath.Join(base, g.outName(n)+".so")
-		case Binary:
-			n.out = filepath.Join(base, g.outName(n))
+		if out := g.nodeOut(n); out != "" {
+			n.out = out
 		}
 	}
 	// genrules: tools' paths are known now (a Rust source variant's steps are its edges)

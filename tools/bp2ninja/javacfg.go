@@ -13,7 +13,7 @@ import (
 	"strconv"
 )
 
-// JavaConfig: the global Java tool flags Soong applies, read from the pinned tree's build/soong/java/config/{config,droidstubs}.go
+// JavaConfig: the global Java tool flags Soong applies, read from the pinned tree's build/soong/java/config/{config,droidstubs,kotlin}.go
 // (as SoongConfig reads cc's global.go), so an AOSP upgrade brings its own values. Each field is the expansion of the named Soong
 // variable: a string slice literal, `strings.Join([]string{…}, " ")`, or `strings.Join(append([]string{…}, list...), " ")`.
 type JavaConfig struct {
@@ -27,12 +27,15 @@ type JavaConfig struct {
 	MetalavaAnnoW   []string // metalavaAnnotationsWarningsFlags
 	MetalavaAddOpen string   // MetalavaAddOpens
 	JlinkVersion    string   // java.base module version: the JDK's own major version (system_modules.go: must match the jlink consuming it)
+	// kotlin.go: KotlincCmd and KotlinAbiGenPluginJar (tree paths), KotlincGlobalFlags, KotlincSuppressJDK9Warnings
+	Kotlinc, KotlinAbiGen          string
+	KotlincGlobal, KotlincJdk9Opts []string
 }
 
 func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 	lists := map[string][]string{}
 	strs := map[string]string{}
-	for _, f := range []string{"build/soong/java/config/config.go", "build/soong/java/config/droidstubs.go"} {
+	for _, f := range []string{"build/soong/java/config/config.go", "build/soong/java/config/droidstubs.go", "build/soong/java/config/kotlin.go"} {
 		if err := goConstants(filepath.Join(tree, f), lists, strs); err != nil {
 			return JavaConfig{}, err
 		}
@@ -47,10 +50,16 @@ func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 		MetalavaAnno:    lists["metalavaAnnotationsFlags"],
 		MetalavaAnnoW:   lists["metalavaAnnotationsWarningsFlags"],
 		MetalavaAddOpen: strs["MetalavaAddOpens"],
+		Kotlinc:         strs["KotlincCmd"],
+		KotlinAbiGen:    strs["KotlinAbiGenPluginJar"],
+		KotlincGlobal:   lists["KotlincGlobalFlags"],
+		KotlincJdk9Opts: lists["KotlincSuppressJDK9Warnings"],
 	}
+	_, global := lists["KotlincGlobalFlags"]
 	for name, v := range map[string]bool{"CommonJdkFlags": len(c.CommonJdkFlags) > 0, "JavacHeapSize": c.JavacHeapSize != "",
 		"javacVmFlagsList": len(c.JavacVmFlags) > 0, "javaVmFlagsList": len(c.JavaVmFlags) > 0, "D8Flags": len(c.D8Flags) > 0,
-		"metalavaFlags": len(c.MetalavaFlags) > 0, "MetalavaAddOpens": c.MetalavaAddOpen != ""} {
+		"metalavaFlags": len(c.MetalavaFlags) > 0, "MetalavaAddOpens": c.MetalavaAddOpen != "", "KotlincCmd": c.Kotlinc != "",
+		"KotlinAbiGenPluginJar": c.KotlinAbiGen != "", "KotlincGlobalFlags": global, "KotlincSuppressJDK9Warnings": len(c.KotlincJdk9Opts) > 0} {
 		if !v {
 			return c, fmt.Errorf("build/soong/java/config: %s not found", name)
 		}
@@ -68,7 +77,7 @@ func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 }
 
 // goConstants collects string-slice and string values from one Go file: `var x = []string{…}`, `x = "…"`, and
-// `pctx.StaticVariable("Name", <expr>)`. Slices are stored as their elements; a joined string (strings.Join) also as a slice,
+// `pctx.StaticVariable("Name", <expr>)` / `pctx.SourcePathVariable` (a tree path). Slices are stored as their elements; a joined string (strings.Join) also as a slice,
 // split on the join separator " ", which is how Soong's flags are joined and later split by the shell.
 func goConstants(path string, lists map[string][]string, strs map[string]string) error {
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
@@ -149,7 +158,7 @@ func goConstants(path string, lists map[string][]string, strs map[string]string)
 				}
 			}
 		case *ast.CallExpr:
-			if callName(x) == "pctx.StaticVariable" && len(x.Args) == 2 {
+			if c := callName(x); (c == "pctx.StaticVariable" || c == "pctx.SourcePathVariable") && len(x.Args) == 2 {
 				if lit, ok := x.Args[0].(*ast.BasicLit); ok {
 					if name, err := strconv.Unquote(lit.Value); err == nil {
 						record(name, x.Args[1])
