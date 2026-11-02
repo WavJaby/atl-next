@@ -200,12 +200,9 @@ impl Process {
             region.map(|r| (r.base() as u64, r.len() as u64)),
             read_mem,
         );
-        let fds = out
-            .fds
-            .iter()
-            .map(|fd| dup_fd(*fd))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(fail)?;
+        // An fd that does not dup (the kernel's fget fails: invalid fd) is not an ioctl error: binder_translate_fd's -EBADF fails that transaction with BR_FAILED_REPLY and stops the write stream (binder_transaction err_translate_failed, binder_thread_write's return_error check), ioctl returning 0.
+        // Passing only the fds before it gets the same from binderd: that object finds no fd token (Reject::MissingFd); the objects after it are never reached.
+        let fds: Vec<OwnedFd> = out.fds.iter().map_while(|fd| dup_fd(*fd).ok()).collect();
         let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(AsFd::as_fd).collect();
         let req = Request::WriteRead {
             read_size: read_buf.len() as u64,
@@ -263,5 +260,88 @@ impl Process {
         }
         read_buf[..r.returns.len()].copy_from_slice(&r.returns);
         Ok((write_consumed, r.returns.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use atl_binder_wire::uapi::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+    use atl_binder_wire::{
+        Command, CommandWriter, Object, Return, TransactionData, decode_returns,
+    };
+    use atl_binderd::Reject;
+    use atl_binderd::server::{Server, register};
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+
+    use super::*;
+
+    /// libbinder's region (ProcessState.cpp BINDER_VM_SIZE, 4 KiB pages) and read buffer (IPCThreadState mIn, 256).
+    const REGION: usize = (1 << 20) - 2 * 4096;
+    const READ: usize = 256;
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair")
+    }
+
+    fn connect(admin: &OwnedFd, uid: u32, cm: bool) -> Process {
+        let (ours, theirs) = pair();
+        register(admin.as_fd(), theirs.as_fd(), uid, 1, cm).expect("register");
+        let p = Process::connect(ours).expect("connect");
+        p.mmap(REGION).expect("mmap");
+        p
+    }
+
+    /// An fd that does not dup fails the transaction as the kernel does (binder_translate_fd -EBADF -> BR_FAILED_REPLY): the ioctl succeeds with the write stream consumed, the read returns BR_FAILED_REPLY, binderd counts the missing fd.
+    #[test]
+    fn invalid_fd_fails_transaction() {
+        let (admin, theirs) = pair();
+        let server = std::thread::spawn(move || {
+            let mut s = Server::new(theirs);
+            s.run().expect("run");
+            s
+        });
+        let sm = connect(&admin, 1000, true);
+        // the target accepts fds, so the transaction reaches the fd translation
+        sm.set_context_mgr(0, 0, FLAT_BINDER_FLAG_ACCEPTS_FDS)
+            .expect("context manager");
+        let app = connect(&admin, 10001, false);
+        let mut data = vec![0u8; 24];
+        Object::Fd { fd: 5, cookie: 0 }.write(&mut data, 0);
+        let offsets = 0u64.to_ne_bytes().to_vec();
+        let mut w = CommandWriter::new();
+        w.push(&Command::Transaction(
+            TransactionData {
+                data_size: 24,
+                offsets_size: 8,
+                buffer: 0x1000,
+                offsets: 0x2000,
+                ..Default::default()
+            }
+            .with_handle(0),
+        ));
+        let mut read_mem = |ptr: u64, len: usize| -> Vec<u8> {
+            match ptr {
+                0x1000 => data[..len].to_vec(),
+                0x2000 => offsets[..len].to_vec(),
+                _ => panic!("read of {ptr:#x}"),
+            }
+        };
+        let mut dup_fd = |_: i32| -> Result<OwnedFd, Errno> { Err(Errno::BADF) };
+        let mut read_buf = [0u8; READ];
+        let (wc, rc) = app
+            .write_read(&w.0, &mut read_buf, &mut read_mem, &mut dup_fd)
+            .expect("the ioctl itself succeeds");
+        assert_eq!(wc, w.0.len());
+        let rets = decode_returns(&read_buf[..rc]).expect("BR stream");
+        assert!(rets.contains(&Return::FailedReply), "{rets:?}");
+        drop((sm, app, admin));
+        let s = server.join().expect("server thread");
+        assert_eq!(s.core().rejects()[&Reject::MissingFd], 1);
     }
 }

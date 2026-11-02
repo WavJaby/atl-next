@@ -16,6 +16,10 @@ rustix.workspace = true
 # cargo-c builds with it; nothing is gated on it
 capi = []
 
+[dev-dependencies]
+# a real binderd behind the driver's protocol
+atl-binderd = { path = "../atl-binderd" }
+
 [build-dependencies]
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }

@@ -86,6 +86,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-binder-wire",
+ "atl-binderd",
  "atl-bridgegen",
  "errno",
  "rustix",

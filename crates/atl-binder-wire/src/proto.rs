@@ -291,43 +291,47 @@ impl Reply {
     }
 }
 
-/// Sends `msg` with `fds` on `sock` (fragmented, see the module doc), retrying on EINTR. More than `MAX_FDS` fds: `EINVAL`.
+/// `msg` split into its fragments (module doc): the first starts with the u64 total length; fds go with the first.
+pub fn fragments(msg: &[u8]) -> Vec<Vec<u8>> {
+    let first = msg.len().min(FRAGMENT - 8);
+    let mut head = (msg.len() as u64).to_ne_bytes().to_vec();
+    head.extend_from_slice(&msg[..first]);
+    let mut v = vec![head];
+    v.extend(msg[first..].chunks(FRAGMENT).map(<[u8]>::to_vec));
+    v
+}
+
+/// Sends `msg` with `fds` on `sock` (fragmented, see the module doc), blocking, retrying on EINTR. More than `MAX_FDS` fds: `EINVAL`.
 pub fn send(sock: BorrowedFd<'_>, msg: &[u8], fds: &[BorrowedFd<'_>]) -> Result<(), Errno> {
     if fds.len() > MAX_FDS {
         return Err(Errno::INVAL);
     }
-    let total = (msg.len() as u64).to_ne_bytes();
-    let first = msg.len().min(FRAGMENT - total.len());
+    for (i, f) in fragments(msg).iter().enumerate() {
+        send_fragment(sock, f, if i == 0 { fds } else { &[] }, false)?;
+    }
+    Ok(())
+}
+
+/// Sends one fragment with `fds`, retrying on EINTR; `nonblocking`: `EAGAIN` instead of waiting for socket buffer space. A SEQPACKET send is all or nothing.
+pub fn send_fragment(
+    sock: BorrowedFd<'_>,
+    frag: &[u8],
+    fds: &[BorrowedFd<'_>],
+    nonblocking: bool,
+) -> Result<(), Errno> {
     let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
         return Err(Errno::INVAL);
     }
-    send_all(
-        sock,
-        &[IoSlice::new(&total), IoSlice::new(&msg[..first])],
-        &mut control,
-    )?;
-    for chunk in msg[first..].chunks(FRAGMENT) {
-        send_all(
-            sock,
-            &[IoSlice::new(chunk)],
-            &mut SendAncillaryBuffer::default(),
-        )?;
-    }
-    Ok(())
-}
-
-fn send_all(
-    sock: BorrowedFd<'_>,
-    iov: &[IoSlice<'_>],
-    control: &mut SendAncillaryBuffer<'_, '_, '_>,
-) -> Result<(), Errno> {
-    let want: usize = iov.iter().map(|s| s.len()).sum();
+    let flags = if nonblocking {
+        SendFlags::NOSIGNAL | SendFlags::DONTWAIT
+    } else {
+        SendFlags::NOSIGNAL
+    };
     loop {
-        match sendmsg(sock, iov, control, SendFlags::NOSIGNAL) {
-            // a SEQPACKET send is all or nothing
-            Ok(n) if n == want => return Ok(()),
+        match sendmsg(sock, &[IoSlice::new(frag)], &mut control, flags) {
+            Ok(n) if n == frag.len() => return Ok(()),
             Ok(_) => return Err(Errno::MSGSIZE),
             Err(Errno::INTR) => continue,
             Err(e) => return Err(e),
@@ -340,10 +344,41 @@ pub type Message = (Vec<u8>, Vec<OwnedFd>);
 
 /// The next message on `sock` and its fds (close-on-exec), or `None` at end of stream (the peer closed), retrying on EINTR. A fragment that does not fit, truncated fds or a length past `MAX_MESSAGE`: `EPROTO`.
 pub fn recv(sock: BorrowedFd<'_>) -> Result<Option<Message>, Errno> {
+    let mut a = Assembler::default();
+    loop {
+        let Some((frag, fds)) = recv_fragment(sock, false)? else {
+            return if a.is_empty() {
+                Ok(None)
+            } else {
+                Err(Errno::PROTO)
+            };
+        };
+        if let Some(m) = a.push(&frag, fds)? {
+            return Ok(Some(m));
+        }
+    }
+}
+
+/// One fragment and its fds (close-on-exec), or `None` at end of stream, retrying on EINTR; `nonblocking`: `EAGAIN` when none is queued. A fragment that does not fit or truncated fds: `EPROTO`.
+pub fn recv_fragment(sock: BorrowedFd<'_>, nonblocking: bool) -> Result<Option<Message>, Errno> {
     let mut buf = vec![0u8; FRAGMENT];
     let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
-    let n = recv_one(sock, &mut buf, &mut control)?;
+    let flags = if nonblocking {
+        RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT
+    } else {
+        RecvFlags::CMSG_CLOEXEC
+    };
+    let n = loop {
+        match recvmsg(sock, &mut [IoSliceMut::new(&mut buf)], &mut control, flags) {
+            Ok(r) if r.flags.intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC) => {
+                return Err(Errno::PROTO);
+            }
+            Ok(r) => break r.bytes,
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    };
     let mut fds = Vec::new();
     for m in control.drain() {
         if let RecvAncillaryMessage::ScmRights(rights) = m {
@@ -353,47 +388,52 @@ pub fn recv(sock: BorrowedFd<'_>) -> Result<Option<Message>, Errno> {
     if n == 0 {
         return Ok(None);
     }
-    if n < 8 {
-        return Err(Errno::PROTO);
-    }
-    let total = u64::from_ne_bytes(buf[..8].try_into().map_err(|_| Errno::PROTO)?);
-    if total > MAX_MESSAGE {
-        return Err(Errno::PROTO);
-    }
-    let total = usize::try_from(total).map_err(|_| Errno::PROTO)?;
-    let mut msg = Vec::with_capacity(total);
-    msg.extend_from_slice(&buf[8..n]);
-    while msg.len() < total {
-        let n = recv_one(sock, &mut buf, &mut RecvAncillaryBuffer::default())?;
-        if n == 0 {
-            return Err(Errno::PROTO);
-        }
-        msg.extend_from_slice(&buf[..n]);
-    }
-    if msg.len() != total {
-        return Err(Errno::PROTO);
-    }
-    Ok(Some((msg, fds)))
+    buf.truncate(n);
+    Ok(Some((buf, fds)))
 }
 
-fn recv_one(
-    sock: BorrowedFd<'_>,
-    buf: &mut [u8],
-    control: &mut RecvAncillaryBuffer<'_>,
-) -> Result<usize, Errno> {
-    loop {
-        match recvmsg(
-            sock,
-            &mut [IoSliceMut::new(buf)],
-            control,
-            RecvFlags::CMSG_CLOEXEC,
-        ) {
-            Ok(r) if r.flags.intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC) => {
-                return Err(Errno::PROTO);
+/// Reassembles a message from its fragments, one `push` per fragment received. Memory held = bytes received so far, never the claimed length (at most `MAX_MESSAGE`).
+#[derive(Default)]
+pub struct Assembler {
+    /// Claimed total length and the bytes so far; `None` between messages.
+    msg: Option<(usize, Vec<u8>)>,
+    fds: Vec<OwnedFd>,
+}
+
+impl Assembler {
+    /// Between messages: no fragment of a partial one held.
+    pub fn is_empty(&self) -> bool {
+        self.msg.is_none()
+    }
+
+    /// Takes the next fragment: the message once complete. A first fragment shorter than the length prefix, a length past `MAX_MESSAGE`, fds on a later fragment or bytes past the length: `EPROTO`.
+    pub fn push(&mut self, frag: &[u8], fds: Vec<OwnedFd>) -> Result<Option<Message>, Errno> {
+        let (total, msg) = match &mut self.msg {
+            Some(m) if fds.is_empty() => {
+                m.1.extend_from_slice(frag);
+                m
             }
-            Ok(r) => return Ok(r.bytes),
-            Err(Errno::INTR) => continue,
-            Err(e) => return Err(e),
+            Some(_) => return Err(Errno::PROTO),
+            None => {
+                let (len, rest) = frag.split_first_chunk::<8>().ok_or(Errno::PROTO)?;
+                let total = u64::from_ne_bytes(*len);
+                if total > MAX_MESSAGE {
+                    return Err(Errno::PROTO);
+                }
+                self.fds = fds;
+                self.msg.insert((
+                    usize::try_from(total).map_err(|_| Errno::PROTO)?,
+                    rest.to_vec(),
+                ))
+            }
+        };
+        match msg.len().cmp(&*total) {
+            std::cmp::Ordering::Less => Ok(None),
+            std::cmp::Ordering::Greater => Err(Errno::PROTO),
+            std::cmp::Ordering::Equal => {
+                let (_, msg) = self.msg.take().expect("set above");
+                Ok(Some((msg, std::mem::take(&mut self.fds))))
+            }
         }
     }
 }
@@ -502,12 +542,7 @@ mod tests {
     fn oversized_refused() {
         let (a, b) = pair();
         let len = (MAX_MESSAGE + 1).to_ne_bytes();
-        send_all(
-            a.as_fd(),
-            &[IoSlice::new(&len)],
-            &mut SendAncillaryBuffer::default(),
-        )
-        .expect("send");
+        send_fragment(a.as_fd(), &len, &[], false).expect("send");
         assert!(matches!(recv(b.as_fd()), Err(Errno::PROTO)));
         assert_eq!(
             send(a.as_fd(), &[], &vec![a.as_fd(); MAX_FDS + 1]),

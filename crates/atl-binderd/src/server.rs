@@ -4,12 +4,15 @@
 //! Processes are registered over the admin connection (the broker's; in tests the harness): `register` message = tag + whether it may be the context manager, with the process's control connection as its one fd. binderd exits when the admin connection closes.
 //! Connection EOF: a thread connection = `BINDER_THREAD_EXIT`; the control connection = process death (`Binderd::process_exit`), its thread connections dropped.
 //! Every request binderd refuses at the protocol level is counted (`Fault`), as the core counts its rejections.
-//! Known limit (M2): sockets are blocking; a client that stops mid-message or never reads its replies stalls binderd. Untrusted apps need non-blocking connections with per-connection buffers before the broker spawns them.
+//!
+//! Every peer is untrusted, so no socket call blocks: fragments are received and sent with `MSG_DONTWAIT`, each connection has its own reassembly buffer (`proto::Assembler`, at most `MAX_MESSAGE`) and output queue (at most `MAX_QUEUED` messages).
+//! Per poll round each ready connection first flushes what its socket takes, then reads up to one whole message, which runs through the core synchronously; a connection stopped mid-message or not reading only holds its own buffers.
+//! A connection past its output bound is counted (`Fault::Overflow`) and its process dropped, as if it had crashed (`Server::kill`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use atl_binder_wire::proto::{self, Reply, Request, VERSION, WriteReadReply};
+use atl_binder_wire::proto::{self, Assembler, Reply, Request, VERSION, WriteReadReply};
 use atl_binder_wire::uapi::BINDER_CURRENT_PROTOCOL_VERSION;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno as SysErrno;
@@ -18,6 +21,9 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use crate::{
     Binderd, Errno, Outcome, PidNs, ProcId, ProcSpec, Read, ReadOut, Tag, ThreadId, WriteRead,
 };
+
+/// Messages a connection may have queued beyond its socket buffer. A peer has at most one request outstanding (a driver call waits for its reply; the control connection is held under a lock per call; the broker's `register` waits too), so a legitimate backlog is: a stale `Wake` not yet flushed + the reply to its current request + the one `Wake` that request re-arms = 3. More means the peer sends requests without reading replies.
+pub const MAX_QUEUED: usize = 3;
 
 /// Protocol-level refusals, counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +40,8 @@ pub enum Fault {
     UnsupportedIoctl,
     /// A malformed admin registration.
     BadRegistration,
+    /// More than `MAX_QUEUED` replies waiting for a peer that does not read: its process is dropped.
+    Overflow,
 }
 
 /// Admin registration: uid, host pid, context-manager flag; the control connection is its fd.
@@ -77,6 +85,7 @@ fn decode_register(b: &[u8]) -> Option<(u32, i32, bool)> {
 struct ConnId(u64);
 
 enum Kind {
+    Admin,
     Control {
         proc: ProcId,
         hello: bool,
@@ -91,14 +100,22 @@ enum Kind {
     },
 }
 
+/// A message being sent: its fragments not yet taken by the socket; its fds ride on the first.
+struct Outgoing {
+    frags: VecDeque<Vec<u8>>,
+    fds: Vec<OwnedFd>,
+}
+
 struct Conn {
     fd: OwnedFd,
     kind: Kind,
+    rx: Assembler,
+    tx: VecDeque<Outgoing>,
 }
 
 pub struct Server {
     core: Binderd<OwnedFd>,
-    admin: Option<OwnedFd>,
+    admin: Option<ConnId>,
     conns: BTreeMap<ConnId, Conn>,
     by_thread: BTreeMap<ThreadId, ConnId>,
     next: u64,
@@ -117,14 +134,16 @@ fn errno_of(e: Errno) -> i32 {
 
 impl Server {
     pub fn new(admin: OwnedFd) -> Self {
-        Self {
+        let mut s = Self {
             core: Binderd::new(),
-            admin: Some(admin),
+            admin: None,
             conns: BTreeMap::new(),
             by_thread: BTreeMap::new(),
             next: 0,
             faults: BTreeMap::new(),
-        }
+        };
+        s.admin = Some(s.add_conn(admin, Kind::Admin));
+        s
     }
 
     pub fn core(&self) -> &Binderd<OwnedFd> {
@@ -145,7 +164,15 @@ impl Server {
         if let Kind::Thread { thread, .. } = kind {
             self.by_thread.insert(thread, id);
         }
-        self.conns.insert(id, Conn { fd, kind });
+        self.conns.insert(
+            id,
+            Conn {
+                fd,
+                kind,
+                rx: Assembler::default(),
+                tx: VecDeque::new(),
+            },
+        );
         id
     }
 
@@ -153,13 +180,18 @@ impl Server {
     pub fn run(&mut self) -> Result<(), SysErrno> {
         while self.admin.is_some() {
             let ids: Vec<ConnId> = self.conns.keys().copied().collect();
-            let ready: Vec<(Option<ConnId>, bool)> = {
-                let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(ids.len() + 1);
-                let admin = self.admin.as_ref().expect("checked");
-                fds.push(PollFd::new(admin, PollFlags::IN));
-                for id in &ids {
-                    fds.push(PollFd::new(&self.conns[id].fd, PollFlags::IN));
-                }
+            let ready: Vec<(ConnId, PollFlags)> = {
+                let mut fds: Vec<PollFd<'_>> = ids
+                    .iter()
+                    .map(|id| {
+                        let c = &self.conns[id];
+                        let mut want = PollFlags::IN;
+                        if !c.tx.is_empty() {
+                            want |= PollFlags::OUT;
+                        }
+                        PollFd::new(&c.fd, want)
+                    })
+                    .collect();
                 loop {
                     match poll(&mut fds, None) {
                         Ok(_) => break,
@@ -168,48 +200,75 @@ impl Server {
                     }
                 }
                 fds.iter()
-                    .enumerate()
-                    .filter(|(_, f)| !f.revents().is_empty())
-                    .map(|(i, f)| {
-                        let hup = f.revents().intersects(PollFlags::HUP | PollFlags::ERR)
-                            && !f.revents().contains(PollFlags::IN);
-                        ((i > 0).then(|| ids[i - 1]), hup)
-                    })
+                    .zip(&ids)
+                    .filter(|(f, _)| !f.revents().is_empty())
+                    .map(|(f, id)| (*id, f.revents()))
                     .collect()
             };
-            for (id, _hup) in ready {
-                match id {
-                    None => self.admin_event(),
-                    Some(id) => self.conn_event(id),
+            for (id, ev) in ready {
+                if ev.intersects(PollFlags::OUT | PollFlags::ERR | PollFlags::HUP) {
+                    self.flush(id);
+                }
+                if ev.intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP) {
+                    self.receive(id);
                 }
             }
         }
         Ok(())
     }
 
-    fn admin_event(&mut self) {
-        let Some(admin) = self.admin.as_ref() else {
-            return;
-        };
-        match proto::recv(admin.as_fd()) {
-            Ok(None) | Err(_) => self.admin = None,
-            Ok(Some((msg, mut fds))) => {
-                let status = match (decode_register(&msg), fds.len()) {
-                    (Some((uid, host_pid, cm)), 1) => {
-                        self.register(fds.remove(0), uid, host_pid, cm);
-                        0
-                    }
-                    _ => {
-                        self.fault(Fault::BadRegistration);
-                        -SysErrno::INVAL.raw_os_error()
-                    }
-                };
-                let admin = self.admin.as_ref().expect("checked");
-                if proto::send(admin.as_fd(), &Reply::Status(status).encode(), &[]).is_err() {
-                    self.admin = None;
+    /// Reads fragments until one message is whole (then handles it) or none is queued. EOF or a socket / framing error drops the connection.
+    fn receive(&mut self, id: ConnId) {
+        loop {
+            let Some(c) = self.conns.get_mut(&id) else {
+                return;
+            };
+            let got = match proto::recv_fragment(c.fd.as_fd(), true) {
+                Err(SysErrno::AGAIN) => return,
+                Err(_) => Err(()),
+                Ok(None) if c.rx.is_empty() => return self.drop_conn(id),
+                Ok(None) => Err(()),
+                Ok(Some((frag, fds))) => c.rx.push(&frag, fds).map_err(|_| ()),
+            };
+            match got {
+                Err(()) => {
+                    self.fault(Fault::Malformed);
+                    return self.drop_conn(id);
                 }
+                Ok(None) => continue,
+                Ok(Some((msg, fds))) => return self.message(id, &msg, fds),
             }
         }
+    }
+
+    fn message(&mut self, id: ConnId, msg: &[u8], fds: Vec<OwnedFd>) {
+        if matches!(self.conns[&id].kind, Kind::Admin) {
+            return self.admin_message(id, msg, fds);
+        }
+        let Ok(req) = Request::decode(msg) else {
+            self.fault(Fault::Malformed);
+            return self.send(id, &Reply::Status(-SysErrno::PROTO.raw_os_error()), vec![]);
+        };
+        match self.conns[&id].kind {
+            Kind::Control { proc, hello } => self.control(id, proc, hello, req),
+            Kind::Thread { thread, .. } => self.thread(id, thread, req, fds),
+            Kind::Admin => {}
+        }
+        self.finish();
+    }
+
+    fn admin_message(&mut self, id: ConnId, msg: &[u8], mut fds: Vec<OwnedFd>) {
+        let status = match (decode_register(msg), fds.len()) {
+            (Some((uid, host_pid, cm)), 1) => {
+                self.register(fds.remove(0), uid, host_pid, cm);
+                0
+            }
+            _ => {
+                self.fault(Fault::BadRegistration);
+                -SysErrno::INVAL.raw_os_error()
+            }
+        };
+        self.send(id, &Reply::Status(status), vec![]);
     }
 
     /// A process whose control connection is `control`, tagged as the host's pid namespace sees it (sandbox pid namespaces come with the broker).
@@ -225,36 +284,59 @@ impl Server {
         self.add_conn(control, Kind::Control { proc, hello: false });
     }
 
-    fn send(&mut self, id: ConnId, reply: &Reply, fds: &[BorrowedFd<'_>]) {
-        let Some(c) = self.conns.get(&id) else {
+    /// Queues `reply` and sends what the socket takes now; past `MAX_QUEUED` the connection is dropped.
+    fn send(&mut self, id: ConnId, reply: &Reply, fds: Vec<OwnedFd>) {
+        let Some(c) = self.conns.get_mut(&id) else {
             return;
         };
-        if proto::send(c.fd.as_fd(), &reply.encode(), fds).is_err() {
-            self.drop_conn(id);
+        c.tx.push_back(Outgoing {
+            frags: proto::fragments(&reply.encode()).into(),
+            fds,
+        });
+        self.flush(id);
+        if self.conns.get(&id).is_some_and(|c| c.tx.len() > MAX_QUEUED) {
+            self.fault(Fault::Overflow);
+            self.kill(id);
         }
     }
 
-    fn conn_event(&mut self, id: ConnId) {
-        let Some(c) = self.conns.get(&id) else {
-            return;
+    /// Drops the process `id` belongs to, via its control connection (a thread connection alone would only be `BINDER_THREAD_EXIT`); the admin connection: binderd stops.
+    fn kill(&mut self, id: ConnId) {
+        let control = match self.conns.get(&id).map(|c| &c.kind) {
+            Some(Kind::Thread { proc, .. }) => self
+                .conns
+                .iter()
+                .find(|(_, c)| matches!(c.kind, Kind::Control { proc: p, .. } if p == *proc))
+                .map(|(cid, _)| *cid),
+            _ => None,
         };
-        let (msg, fds) = match proto::recv(c.fd.as_fd()) {
-            Ok(Some(m)) => m,
-            Ok(None) => return self.drop_conn(id),
-            Err(_) => {
-                self.fault(Fault::Malformed);
-                return self.drop_conn(id);
+        self.drop_conn(control.unwrap_or(id));
+        self.drop_conn(id);
+    }
+
+    /// Sends queued fragments until the socket buffer is full; a send error drops the connection.
+    fn flush(&mut self, id: ConnId) {
+        loop {
+            let Some(Conn { fd, tx, .. }) = self.conns.get_mut(&id) else {
+                return;
+            };
+            let Some(out) = tx.front_mut() else {
+                return;
+            };
+            let Some(frag) = out.frags.front() else {
+                tx.pop_front();
+                continue;
+            };
+            let fds: Vec<BorrowedFd<'_>> = out.fds.iter().map(AsFd::as_fd).collect();
+            match proto::send_fragment(fd.as_fd(), frag, &fds, true) {
+                Ok(()) => {
+                    out.frags.pop_front();
+                    out.fds.clear();
+                }
+                Err(SysErrno::AGAIN) => return,
+                Err(_) => return self.drop_conn(id),
             }
-        };
-        let Ok(req) = Request::decode(&msg) else {
-            self.fault(Fault::Malformed);
-            return self.send(id, &Reply::Status(-SysErrno::PROTO.raw_os_error()), &[]);
-        };
-        match self.conns[&id].kind {
-            Kind::Control { proc, hello } => self.control(id, proc, hello, req),
-            Kind::Thread { thread, .. } => self.thread(id, thread, req, fds),
         }
-        self.finish();
     }
 
     fn control(&mut self, id: ConnId, proc: ProcId, hello: bool, req: Request) {
@@ -309,7 +391,7 @@ impl Server {
                                 pending: None,
                             },
                         );
-                        return self.send(id, &Reply::Status(0), &[theirs.as_fd()]);
+                        return self.send(id, &Reply::Status(0), vec![theirs]);
                     }
                     (Err(e), _) => Reply::Status(-e.raw_os_error()),
                     (_, None) => Reply::Status(-SysErrno::INVAL.raw_os_error()),
@@ -320,7 +402,7 @@ impl Server {
                 Reply::Status(-SysErrno::INVAL.raw_os_error())
             }
         };
-        self.send(id, &reply, &[]);
+        self.send(id, &reply, vec![]);
     }
 
     fn thread(&mut self, id: ConnId, thread: ThreadId, req: Request, fds: Vec<OwnedFd>) {
@@ -355,7 +437,7 @@ impl Server {
                             write_consumed: e.write_consumed as u64,
                             ..Default::default()
                         };
-                        self.send(id, &Reply::WriteRead(r), &[]);
+                        self.send(id, &Reply::WriteRead(r), vec![]);
                     }
                     Ok(Outcome {
                         write_consumed,
@@ -383,11 +465,11 @@ impl Server {
                 {
                     *poll = true;
                 }
-                self.send(id, &Reply::Status(0), &[]);
+                self.send(id, &Reply::Status(0), vec![]);
             }
             _ => {
                 self.fault(Fault::WrongConnection);
-                self.send(id, &Reply::Status(-SysErrno::INVAL.raw_os_error()), &[]);
+                self.send(id, &Reply::Status(-SysErrno::INVAL.raw_os_error()), vec![]);
             }
         }
     }
@@ -410,8 +492,7 @@ impl Server {
                 fds.push(f.fd);
             }
         }
-        let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(AsFd::as_fd).collect();
-        self.send(id, &Reply::WriteRead(r), &borrowed);
+        self.send(id, &Reply::WriteRead(r), fds);
     }
 
     /// After every event: replies for reads that completed, then poll wakeups (proto module doc).
@@ -452,7 +533,7 @@ impl Server {
             {
                 *wake_outstanding = true;
             }
-            self.send(id, &Reply::Wake, &[]);
+            self.send(id, &Reply::Wake, vec![]);
         }
     }
 
@@ -461,6 +542,7 @@ impl Server {
             return;
         };
         match c.kind {
+            Kind::Admin => self.admin = None,
             Kind::Thread { thread, .. } => {
                 self.by_thread.remove(&thread);
                 self.core.thread_exit(thread);
