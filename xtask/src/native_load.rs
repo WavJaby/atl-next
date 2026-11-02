@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in six stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in seven stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
@@ -13,6 +13,10 @@
 //! 6. crash: native code raises SIGABRT (where a registration's LOG_ALWAYS_FATAL ends); the process must die of SIGABRT, as debuggerd's handler resends it on Android.
 //!    ART's unexpected-signal handler (device variant, `ANDROID_ROOT != /system`) calls the previous action at its end: the launcher's crash handler. Without one that is a null pointer: the jump to 0 faults, and the process ends by SIGSEGV or ART's `_exit(1)` on the reentry (measured 2026-11-02: registration aborts SIGSEGV, this stage exit 1).
 //!    `raise`, not `abort`: glibc's abort re-raises with SIG_DFL itself once a handler returns, so it would pass a handler that never resends.
+//! 7. overflow: unbounded Java recursion on the main thread, then on a thread ART created; each must end in a caught StackOverflowError and the process exit 0.
+//!    JIT-compiled code checks the stack implicitly: a probe `ART_STACK_OVERFLOW_GAP` (8 KiB, art.go) below sp hits the guard page, a SIGSEGV ART's fault handler turns into the error.
+//!    Only the main thread has an alternate signal stack (the launcher's); on Android bionic gives every thread one, and ART's device variant (thread_android.cc) sets none up. Threads ART creates on glibc have none, so the kernel's signal frame and ART's handler run in the gap above the probe, which suffices (measured 2026-11-02, x86_64, gdb: SS_DISABLE on the new thread, fault at sp - 0x2000, all handled).
+//!    The stage guards that: a larger signal frame or handler would kill the process here first.
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -107,6 +111,10 @@ const CHAIN_JIT: [&str; 2] = [
     "int NativeLoad.read(NativeLoad$Box)",
     "void NativeLoad.chain(int, int)",
 ];
+/// Stack overflows per thread in stage 7: the main thread's rounds also warm the JIT (CHAIN_VM), so the new thread runs `recurse` compiled; more than one, so a handler that works only once also fails.
+const OVERFLOW_ROUNDS: u32 = 3;
+/// The recursing method, as ART's PrettyMethod prints it in the `JIT added` line: compiled, its stack check faults (interpreted, ART may check explicitly and never fault).
+const OVERFLOW_JIT: &str = "void NativeLoad.recurse()";
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let env = Env::new(root, args)?;
@@ -218,6 +226,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     match crash_result(&crash) {
         Ok(s) => report.pass("crash", s),
         Err(e) => report.fail("crash", e),
+    }
+
+    // 7
+    let overflow = env.launch(
+        &fixture,
+        &fixture.area.1,
+        &CHAIN_VM,
+        "overflow",
+        &[OVERFLOW_ROUNDS.to_string()],
+    )?;
+    match overflow_result(&overflow) {
+        Ok(s) => report.pass("overflow", s),
+        Err(e) => report.fail("overflow", e),
     }
     Ok(report.finish())
 }
@@ -1044,6 +1065,47 @@ fn crash_result(run: &ArtRun) -> Result<String, String> {
     }
 }
 
+/// Stage 7: every overflow caught on both threads (depths as printed, `nlt soe-main` / `nlt soe-thread`), `recurse` JIT-compiled (else the stack check may never have faulted), then a normal exit.
+fn overflow_result(run: &ArtRun) -> Result<String, String> {
+    let rounds = OVERFLOW_ROUNDS as usize;
+    let main = run.values("soe-main");
+    if main.len() != rounds {
+        return Err(format!(
+            "main thread: {} of {OVERFLOW_ROUNDS} overflows caught: {}",
+            main.len(),
+            run.failure()
+        ));
+    }
+    let thread = run.values("soe-thread");
+    if thread.len() != rounds {
+        return Err(format!(
+            "new thread: {} of {OVERFLOW_ROUNDS} overflows caught, the main thread's all were: {} (a thread without an alternate signal stack cannot run ART's fault handler)",
+            thread.len(),
+            run.failure()
+        ));
+    }
+    if !run
+        .stderr
+        .lines()
+        .any(|l| l.contains("JIT added") && l.contains(OVERFLOW_JIT))
+    {
+        return Err(format!(
+            "{OVERFLOW_JIT} not JIT-compiled: the stack checks may have been explicit, so the fault handler was not exercised"
+        ));
+    }
+    if !run.ok || run.value("overflow") != Some("done") {
+        return Err(format!(
+            "every overflow caught, then no normal exit: {}",
+            run.failure()
+        ));
+    }
+    Ok(format!(
+        "{OVERFLOW_ROUNDS} StackOverflowErrors caught in JIT code on the main thread (depth {}) and on a new thread (depth {}); exit 0",
+        main.join("/"),
+        thread.join("/")
+    ))
+}
+
 /// The launcher refused to start: failed, its refusal on stderr, the fixture never ran.
 fn area_refused(run: &ArtRun) -> Result<String, String> {
     if run.ok || run.value("loaded").is_some() {
@@ -1121,6 +1183,32 @@ mod tests {
         let e = crash_result(&crash_run(&survived, None)).unwrap_err();
         assert!(e.contains("survived"), "{e}");
         assert!(crash_result(&crash_run("", Some(SIGABRT))).is_err());
+    }
+
+    #[test]
+    fn overflow_check() {
+        let lines = |key: &str, n: u32| -> String {
+            (0..n)
+                .map(|i| format!("nlt {key} {}\n", 1000 + i))
+                .collect()
+        };
+        let main = lines("soe-main", OVERFLOW_ROUNDS);
+        let both = format!("{main}{}", lines("soe-thread", OVERFLOW_ROUNDS));
+        let done = format!("{both}nlt overflow done\n");
+        let jit = Some(OVERFLOW_JIT);
+        assert!(overflow_result(&chain_run(&done, jit, 0)).is_ok());
+        // no alternate stack on the new thread: its first overflow kills the process
+        let e = overflow_result(&crash_run(&main, Some(SIGSEGV))).unwrap_err();
+        assert!(e.starts_with("new thread: 0 of"), "{e}");
+        // one overflow handled, the next not
+        let once = format!("{main}{}", lines("soe-thread", 1));
+        assert!(overflow_result(&crash_run(&once, Some(SIGSEGV))).is_err());
+        assert!(overflow_result(&crash_run("", Some(SIGSEGV))).is_err());
+        // interpreted: maybe never faulted
+        let e = overflow_result(&chain_run(&done, None, 0)).unwrap_err();
+        assert!(e.contains("not JIT-compiled"), "{e}");
+        // every overflow caught, then a bad exit
+        assert!(overflow_result(&chain_run(&both, jit, 1)).is_err());
     }
 
     #[test]

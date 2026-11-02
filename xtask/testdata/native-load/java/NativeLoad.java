@@ -5,6 +5,7 @@
 // walk calls through each slot as relocated at run time and stops at the first negative return, as register_jni_procs does; call registers the given functions, then runs the native calls.
 // chain <shim> <exit status> <rounds>: the shim installs its own SIGSEGV handler with sigaction, then `rounds` null derefs in read (JIT-compiled: implicit null checks fault), then a native fault the shim's handler ends the process on.
 // crash <shim>: the shim raises SIGABRT in native code; the process must die of it (prints the number first).
+// overflow <rounds>: unbounded recursion in recurse, `rounds` times on the main thread (warms the JIT: compiled code checks the stack implicitly, a SIGSEGV on the guard page), then `rounds` times on a new thread; each catches StackOverflowError, prints its depth, and the process exits normally.
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -45,6 +46,10 @@ public class NativeLoad {
 
     public static void main(String[] a) throws Exception {
         String mode = a[0];
+        if (mode.equals("overflow")) {
+            overflow(Integer.parseInt(a[1]));
+            return;
+        }
         if (!load(a[1])) {
             System.exit(1);
         }
@@ -102,6 +107,37 @@ public class NativeLoad {
         out("npe", npe);
         nativeFault();
         out("fault", "survived");
+    }
+
+    static int depth;
+
+    static void recurse() {
+        depth++;
+        recurse();
+    }
+
+    // `rounds` overflows on the calling thread, each `nlt <key> <depth>`
+    static void overflows(String key, int rounds) {
+        for (int i = 0; i < rounds; i++) {
+            depth = 0;
+            try {
+                recurse();
+            } catch (StackOverflowError e) {
+                out(key, depth);
+            }
+        }
+    }
+
+    static void overflow(final int rounds) throws InterruptedException {
+        overflows("soe-main", rounds);
+        Thread t = new Thread(new Runnable() {
+            public void run() {
+                overflows("soe-thread", rounds);
+            }
+        }, "overflow");
+        t.start();
+        t.join();
+        out("overflow", "done");
     }
 
     // mapped files after the load: one line per distinct path
