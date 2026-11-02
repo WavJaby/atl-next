@@ -63,15 +63,6 @@ name = "atl-android-runtime"
 version = "0.0.0"
 
 [[package]]
-name = "atl-apexsupport"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "atl-bionic",
- "atl-bridgegen",
-]
-
-[[package]]
 name = "atl-app-launcher"
 version = "0.0.0"
 dependencies = [

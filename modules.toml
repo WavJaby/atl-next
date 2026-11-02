@@ -38,12 +38,6 @@ crates = ["atl-binder-wire", "atl-binderd"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
-# libapexsupport for source-built AOSP code (loading from an APEX namespace through bionic's android_dlopen_ext, as AOSP's); uses bionic only in tests (its C ABI is resolved from libc's provider at run time)
-[apexsupport]
-crates = ["atl-apexsupport"]
-exports = ["atl-apexsupport"]
-uses = ["generators", "bionic"]
-
 # libdebuggerd_client for source-built AOSP code: dump requests fail as without tombstoned
 [debuggerd]
 crates = ["atl-debuggerd-client"]
