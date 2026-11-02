@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 2 Nov 2026 23:15:45 +0800
+Subject: [PATCH] libbinder: binder driver I/O through BinderDriver.h
+
+Every open, ioctl, mmap, munmap and close libbinder makes on the binder
+driver (ProcessState, IPCThreadState) calls a binder_driver_* function
+declared in BinderDriver.h, and setupPolling asks binder_driver_poll_fd
+for the fd to poll. New library libbinder_driver implements them as
+the system calls themselves, so kernel builds behave as before; a host
+without the kernel driver provides libbinder_driver from a userspace
+driver.
+
+Upstream-Status: Inappropriate [ATL-specific: Android always has the kernel binder driver]
+Patch-Reason: libbinder's driver I/O is compiled into libbinder; the launcher, loader or environment can only reach it by intercepting system calls: ld --wrap of ioctl/open/mmap/close also catches Parcel's own fd mmap/close, seccomp user-notify needs ptrace-class process_vm_* access (Yama 1 on WSL) and cannot give each process its own mapped region, and CUSE is root-only, has no mmap and costs 3-4 round trips per ioctl
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/Android.bp         | 25 +++++++++++++++++++++++++
+ libs/binder/BinderDriver.cpp   | 34 ++++++++++++++++++++++++++++++++++
+ libs/binder/BinderDriver.h     | 25 +++++++++++++++++++++++++
+ libs/binder/IPCThreadState.cpp | 15 ++++++++-------
+ libs/binder/ProcessState.cpp   | 32 +++++++++++++++++---------------
+ 5 files changed, 109 insertions(+), 22 deletions(-)
+ create mode 100644 libs/binder/BinderDriver.cpp
+ create mode 100644 libs/binder/BinderDriver.h
+
+diff --git a/libs/binder/Android.bp b/libs/binder/Android.bp
+index a3499c196327ddf8e291ff1f02166dce4291135b..b9092e1379f3a808a85428dc7003098b7a6fdd5f 100644
+--- a/libs/binder/Android.bp
++++ b/libs/binder/Android.bp
+@@ -520,6 +520,9 @@ cc_defaults {
+         "libbinder_addservice_cache_flag",
+         "libbinder_remove_cache_static_list_flag",
+     ],
++    shared_libs: [
++        "libbinder_driver",
++    ],
+     srcs: [
+         "BufferedTextOutput.cpp",
+         "BackendUnifiedServiceManager.cpp",
+@@ -567,6 +570,28 @@ cc_defaults {
+     ],
+ }
+ 
++// The binder driver I/O of libbinder_kernel_defaults (BinderDriver.h): the kernel driver's system
++// calls, or a userspace driver providing the same functions.
++cc_library {
++    name: "libbinder_driver",
++    host_supported: true,
++    vendor_available: true,
++    recovery_available: true,
++    double_loadable: true,
++    native_bridge_supported: true,
++    srcs: [
++        "BinderDriver.cpp",
++    ],
++    cflags: [
++        "-Wall",
++        "-Werror",
++    ],
++    apex_available: [
++        "//apex_available:platform",
++        "//apex_available:anyapex",
++    ],
++}
++
+ cc_library {
+     name: "libbinder",
+     defaults: [
+diff --git a/libs/binder/BinderDriver.cpp b/libs/binder/BinderDriver.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..39dbaacc2d10845d4bea90bbe99aeedc8157cc72
+--- /dev/null
++++ b/libs/binder/BinderDriver.cpp
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: Apache-2.0
++
++#include "BinderDriver.h"
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++// The kernel binder driver: each call is the system call itself.
++
++int binder_driver_open(const char* path, int flags) {
++    return open(path, flags);
++}
++
++int binder_driver_ioctl(int fd, unsigned long request, void* arg) {
++    return ioctl(fd, request, arg);
++}
++
++void* binder_driver_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
++    return mmap(addr, length, prot, flags, fd, offset);
++}
++
++int binder_driver_munmap(void* addr, size_t length) {
++    return munmap(addr, length);
++}
++
++int binder_driver_close(int fd) {
++    return close(fd);
++}
++
++int binder_driver_poll_fd(int fd) {
++    return fd;
++}
+diff --git a/libs/binder/BinderDriver.h b/libs/binder/BinderDriver.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..783c56ce1384553667f21757f1b45dde14648247
+--- /dev/null
++++ b/libs/binder/BinderDriver.h
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// All of libbinder's binder driver I/O (BINDER_WITH_KERNEL_IPC) goes through these, with the
++// semantics of open(2), ioctl(2), mmap(2), munmap(2) and close(2) on the driver. libbinder_driver
++// implements them as those calls on the kernel driver; a userspace driver may provide them instead.
++int binder_driver_open(const char* path, int flags);
++int binder_driver_ioctl(int fd, unsigned long request, void* arg);
++void* binder_driver_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
++int binder_driver_munmap(void* addr, size_t length);
++int binder_driver_close(int fd);
++// The fd a polling thread (IPCThreadState::setupPolling) waits on for readability: the driver fd
++// itself for the kernel driver.
++int binder_driver_poll_fd(int fd);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/libs/binder/IPCThreadState.cpp b/libs/binder/IPCThreadState.cpp
+index 1c1b6f30a428d46fa26d541de4a361d9440dee30..f63f92348d5425b1d503649ce8da4fa47c197eca 100644
+--- a/libs/binder/IPCThreadState.cpp
++++ b/libs/binder/IPCThreadState.cpp
+@@ -35,6 +35,7 @@
+ #include <sys/resource.h>
+ #include <unistd.h>
+ 
++#include "BinderDriver.h"
+ #include "Utils.h"
+ #include "binder_module.h"
+ 
+@@ -837,7 +838,7 @@ status_t IPCThreadState::setupPolling(int* fd)
+ 
+     mOut.writeInt32(BC_ENTER_LOOPER);
+     flushCommands();
+-    *fd = mProcess->mDriverFD;
++    *fd = binder_driver_poll_fd(mProcess->mDriverFD);
+     mProcess->mCurrentThreads++;
+     return 0;
+ }
+@@ -861,7 +862,7 @@ void IPCThreadState::stopProcess(bool /*immediate*/)
+     (void)flushCommands();
+     int fd = mProcess->mDriverFD;
+     mProcess->mDriverFD = -1;
+-    close(fd);
++    binder_driver_close(fd);
+     //kill(getpid(), SIGKILL);
+ }
+ 
+@@ -1234,7 +1235,7 @@ status_t IPCThreadState::talkWithDriver(bool doReceive)
+             ALOGI("%s", message.c_str());
+         }
+ #if defined(BINDER_WITH_KERNEL_IPC)
+-        if (ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr) >= 0)
++        if (binder_driver_ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr) >= 0)
+             err = NO_ERROR;
+         else
+             err = -errno;
+@@ -1631,7 +1632,7 @@ void IPCThreadState::threadDestructor(void *st)
+                 self->flushCommands();
+ #if defined(BINDER_WITH_KERNEL_IPC)
+         if (self->mProcess->mDriverFD >= 0) {
+-            ioctl(self->mProcess->mDriverFD, BINDER_THREAD_EXIT, 0);
++            binder_driver_ioctl(self->mProcess->mDriverFD, BINDER_THREAD_EXIT, 0);
+         }
+ #endif
+                 delete self;
+@@ -1646,7 +1647,7 @@ status_t IPCThreadState::getProcessFreezeInfo(pid_t pid, uint32_t *sync_received
+     info.pid = pid;
+ 
+ #if defined(BINDER_WITH_KERNEL_IPC)
+-    if (ioctl(self()->mProcess->mDriverFD, BINDER_GET_FROZEN_INFO, &info) < 0)
++    if (binder_driver_ioctl(self()->mProcess->mDriverFD, BINDER_GET_FROZEN_INFO, &info) < 0)
+         ret = -errno;
+ #endif
+     *sync_received = info.sync_recv;
+@@ -1665,7 +1666,7 @@ status_t IPCThreadState::freeze(pid_t pid, bool enable, uint32_t timeout_ms) {
+ 
+ 
+ #if defined(BINDER_WITH_KERNEL_IPC)
+-    if (ioctl(self()->mProcess->mDriverFD, BINDER_FREEZE, &info) < 0)
++    if (binder_driver_ioctl(self()->mProcess->mDriverFD, BINDER_FREEZE, &info) < 0)
+         ret = -errno;
+ #endif
+ 
+@@ -1683,7 +1684,7 @@ void IPCThreadState::logExtendedError() {
+         return;
+ 
+ #if defined(BINDER_WITH_KERNEL_IPC)
+-    if (ioctl(self()->mProcess->mDriverFD, BINDER_GET_EXTENDED_ERROR, &ee) < 0) {
++    if (binder_driver_ioctl(self()->mProcess->mDriverFD, BINDER_GET_EXTENDED_ERROR, &ee) < 0) {
+         ALOGE("Failed to get extended error: %s", strerror(errno));
+         return;
+     }
+diff --git a/libs/binder/ProcessState.cpp b/libs/binder/ProcessState.cpp
+index 0bec37999b55a5be51ec7422df1e723b6fb82860..f23f466c6936ee3fe44d0a65acff0adfd855d06e 100644
+--- a/libs/binder/ProcessState.cpp
++++ b/libs/binder/ProcessState.cpp
+@@ -28,6 +28,7 @@
+ #include <utils/String8.h>
+ #include <utils/Thread.h>
+ 
++#include "BinderDriver.h"
+ #include "Static.h"
+ #include "Utils.h"
+ #include "binder_module.h"
+@@ -205,7 +206,7 @@ void ProcessState::childPostFork() {
+         gProcess->mForked = true;
+ 
+         // "O_CLOFORK"
+-        close(gProcess->mDriverFD);
++        binder_driver_close(gProcess->mDriverFD);
+         gProcess->mDriverFD = -1;
+     }
+     gProcessMutex.unlock();
+@@ -233,14 +234,14 @@ bool ProcessState::becomeContextManager()
+         .flags = FLAT_BINDER_FLAG_TXN_SECURITY_CTX,
+     };
+ 
+-    int result = ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR_EXT, &obj);
++    int result = binder_driver_ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR_EXT, &obj);
+ 
+     // fallback to original method
+     if (result != 0) {
+         android_errorWriteLog(0x534e4554, "121035042");
+ 
+         int unused = 0;
+-        result = ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR, &unused);
++        result = binder_driver_ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR, &unused);
+     }
+ 
+     if (result == -1) {
+@@ -264,7 +265,7 @@ ssize_t ProcessState::getKernelReferences(size_t buf_count, uintptr_t* buf)
+     size_t count = 0;
+ 
+     do {
+-        status_t result = ioctl(mDriverFD, BINDER_GET_NODE_DEBUG_INFO, &info);
++        status_t result = binder_driver_ioctl(mDriverFD, BINDER_GET_NODE_DEBUG_INFO, &info);
+         if (result < 0) {
+             return -1;
+         }
+@@ -293,7 +294,7 @@ ssize_t ProcessState::getStrongRefCountForNode(const sp<BpBinder>& binder) {
+ 
+     info.handle = binder->getPrivateAccessor().binderHandle();
+ 
+-    status_t result = ioctl(mDriverFD, BINDER_GET_NODE_INFO_FOR_REF, &info);
++    status_t result = binder_driver_ioctl(mDriverFD, BINDER_GET_NODE_INFO_FOR_REF, &info);
+ 
+     if (result != OK) {
+         static bool logged = false;
+@@ -446,7 +447,7 @@ status_t ProcessState::setThreadPoolMaxThreadCount(size_t maxThreads) {
+     LOG_ALWAYS_FATAL_IF(mThreadPoolStarted && maxThreads < mMaxThreads,
+            "Binder threadpool cannot be shrunk after starting");
+     status_t result = NO_ERROR;
+-    if (ioctl(mDriverFD, BINDER_SET_MAX_THREADS, &maxThreads) != -1) {
++    if (binder_driver_ioctl(mDriverFD, BINDER_SET_MAX_THREADS, &maxThreads) != -1) {
+         mMaxThreads = maxThreads;
+     } else {
+         result = -errno;
+@@ -540,7 +541,8 @@ bool ProcessState::isDriverFeatureEnabled(const DriverFeature feature) {
+ 
+ status_t ProcessState::enableOnewaySpamDetection(bool enable) {
+     uint32_t enableDetection = enable ? 1 : 0;
+-    if (ioctl(mDriverFD, BINDER_ENABLE_ONEWAY_SPAM_DETECTION, &enableDetection) == -1) {
++    if (binder_driver_ioctl(mDriverFD, BINDER_ENABLE_ONEWAY_SPAM_DETECTION, &enableDetection) ==
++        -1) {
+         ALOGI("Binder ioctl to enable oneway spam detection failed: %s", strerror(errno));
+         return -errno;
+     }
+@@ -556,13 +558,13 @@ String8 ProcessState::getDriverName() {
+ }
+ 
+ static unique_fd open_driver(const char* driver, String8* error) {
+-    auto fd = unique_fd(open(driver, O_RDWR | O_CLOEXEC));
++    auto fd = unique_fd(binder_driver_open(driver, O_RDWR | O_CLOEXEC));
+     if (!fd.ok()) {
+         error->appendFormat("%d (%s) Opening '%s' failed", errno, strerror(errno), driver);
+         return {};
+     }
+     int vers = 0;
+-    int result = ioctl(fd.get(), BINDER_VERSION, &vers);
++    int result = binder_driver_ioctl(fd.get(), BINDER_VERSION, &vers);
+     if (result == -1) {
+         error->appendFormat("%d (%s) Binder ioctl to obtain version failed", errno,
+                             strerror(errno));
+@@ -575,12 +577,12 @@ static unique_fd open_driver(const char* driver, String8* error) {
+         return {};
+     }
+     size_t maxThreads = DEFAULT_MAX_BINDER_THREADS;
+-    result = ioctl(fd.get(), BINDER_SET_MAX_THREADS, &maxThreads);
++    result = binder_driver_ioctl(fd.get(), BINDER_SET_MAX_THREADS, &maxThreads);
+     if (result == -1) {
+         ALOGE("Binder ioctl to set max threads failed: %s", strerror(errno));
+     }
+     uint32_t enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
+-    result = ioctl(fd.get(), BINDER_ENABLE_ONEWAY_SPAM_DETECTION, &enable);
++    result = binder_driver_ioctl(fd.get(), BINDER_ENABLE_ONEWAY_SPAM_DETECTION, &enable);
+     if (result == -1) {
+         ALOGE_IF(ProcessState::isDriverFeatureEnabled(
+                      ProcessState::DriverFeature::ONEWAY_SPAM_DETECTION),
+@@ -607,8 +609,8 @@ ProcessState::ProcessState(const char* driver)
+ 
+     if (opened.ok()) {
+         // mmap the binder, providing a chunk of virtual address space to receive transactions.
+-        mVMStart = mmap(nullptr, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE,
+-                        opened.get(), 0);
++        mVMStart = binder_driver_mmap(nullptr, BINDER_VM_SIZE, PROT_READ,
++                                      MAP_PRIVATE | MAP_NORESERVE, opened.get(), 0);
+         if (mVMStart == MAP_FAILED) {
+             // *sigh*
+             ALOGE("Using %s failed: unable to mmap transaction memory.", driver);
+@@ -632,9 +634,9 @@ ProcessState::~ProcessState()
+ {
+     if (mDriverFD >= 0) {
+         if (mVMStart != MAP_FAILED) {
+-            munmap(mVMStart, BINDER_VM_SIZE);
++            binder_driver_munmap(mVMStart, BINDER_VM_SIZE);
+         }
+-        close(mDriverFD);
++        binder_driver_close(mDriverFD);
+     }
+     mDriverFD = -1;
+ }

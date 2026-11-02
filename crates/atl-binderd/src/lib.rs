@@ -17,6 +17,7 @@
 
 mod alloc;
 mod lifecycle;
+pub mod server;
 mod transact;
 
 #[cfg(test)]
@@ -82,8 +83,6 @@ impl Tag {
 #[derive(Debug, Clone, Copy)]
 pub struct ProcSpec {
     pub tag: Tag,
-    /// The size the process mapped (capped at `MAX_REGION_SIZE` as the kernel caps the mapping).
-    pub region_size: u64,
     /// Only atld's ServiceManager may become the context manager; replaces the kernel's SELinux check.
     pub may_be_context_manager: bool,
 }
@@ -148,6 +147,15 @@ pub enum Reject {
     ContextManagerBusy,
     /// A request on a thread already blocked in a read.
     ThreadBusy,
+    /// A second region mapping (`-EBUSY`).
+    AlreadyMapped,
+}
+
+/// Inputs accepted without their kernel effect, counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ignored {
+    /// A node flagged `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (servicemanager's `becomeContextManager`): no SELinux contexts exist, so its transactions arrive as plain `BR_TRANSACTION`, never `BR_TRANSACTION_SEC_CTX`.
+    TxnSecurityCtx,
 }
 
 /// One `BINDER_WRITE_READ` request.
@@ -234,6 +242,8 @@ struct Proc {
     tag: Tag,
     may_be_context_manager: bool,
     alloc: Alloc,
+    /// `map_region` ran: a second mapping is refused as the kernel refuses one.
+    mapped: bool,
     threads: BTreeSet<ThreadId>,
     /// Threads blocked waiting for process work, most recent first (kernel `list_add` at the head,
     /// `binder_select_thread_ilocked` takes the first, binder.c:607-619).
@@ -355,6 +365,7 @@ pub struct Binderd<F> {
     woken: VecDeque<ThreadId>,
     completed: Vec<(ThreadId, ReadOut<F>)>,
     rejects: BTreeMap<Reject, u64>,
+    ignored: BTreeMap<Ignored, u64>,
 }
 
 impl<F> Default for Binderd<F> {
@@ -376,6 +387,7 @@ impl<F> Binderd<F> {
             woken: VecDeque::new(),
             completed: Vec::new(),
             rejects: BTreeMap::new(),
+            ignored: BTreeMap::new(),
         }
     }
 
@@ -390,6 +402,11 @@ impl<F> Binderd<F> {
         &self.rejects
     }
 
+    /// Counted inputs accepted without their kernel effect.
+    pub fn ignored(&self) -> &BTreeMap<Ignored, u64> {
+        &self.ignored
+    }
+
     fn reject(&mut self, r: Reject) {
         *self.rejects.entry(r).or_default() += 1;
     }
@@ -401,7 +418,9 @@ impl<F> Binderd<F> {
             Proc {
                 tag: spec.tag,
                 may_be_context_manager: spec.may_be_context_manager,
-                alloc: Alloc::new(spec.region_size),
+                // nothing to allocate from until the process maps its region (`map_region`)
+                alloc: Alloc::new(0),
+                mapped: false,
                 threads: BTreeSet::new(),
                 waiting: VecDeque::new(),
                 todo: VecDeque::new(),
@@ -437,10 +456,22 @@ impl<F> Binderd<F> {
         Some(id)
     }
 
+    /// The process mapped its buffer region of `size` bytes (`binder_alloc_mmap_handler`, binder_alloc.c:822-870): capped at `MAX_REGION_SIZE`; a second mapping fails `-EBUSY` (`:840`).
+    /// Until then every buffer allocation for it fails (`NoSpace`).
+    pub fn map_region(&mut self, proc: ProcId, size: u64) -> Result<(), Errno> {
+        let p = self.procs.get_mut(&proc).ok_or(Errno::Inval)?;
+        if p.mapped {
+            self.reject(Reject::AlreadyMapped);
+            return Err(Errno::Busy);
+        }
+        p.alloc = Alloc::new(size);
+        p.mapped = true;
+        Ok(())
+    }
+
     /// `BINDER_SET_MAX_THREADS`.
-    pub fn set_max_threads(&mut self, thread: ThreadId, max: u32) -> Result<(), Errno> {
-        let proc = self.threads.get(&thread).ok_or(Errno::Inval)?.proc;
-        self.proc_mut(proc).max_threads = max;
+    pub fn set_max_threads(&mut self, proc: ProcId, max: u32) -> Result<(), Errno> {
+        self.procs.get_mut(&proc).ok_or(Errno::Inval)?.max_threads = max;
         Ok(())
     }
 
@@ -448,12 +479,14 @@ impl<F> Binderd<F> {
     /// `binder_ioctl_set_ctx_mgr`, binder.c:5428).
     pub fn set_context_manager(
         &mut self,
-        thread: ThreadId,
+        proc: ProcId,
         ptr: Uptr,
         cookie: Uptr,
         flags: u32,
     ) -> Result<(), Errno> {
-        let proc = self.threads.get(&thread).ok_or(Errno::Inval)?.proc;
+        if !self.procs.contains_key(&proc) {
+            return Err(Errno::Inval);
+        }
         if self.context_manager.is_some() {
             self.reject(Reject::ContextManagerBusy);
             return Err(Errno::Busy);
@@ -548,6 +581,10 @@ impl<F> Binderd<F> {
     }
 
     fn new_node(&mut self, proc: ProcId, ptr: Uptr, cookie: Uptr, flags: u32) -> NodeId {
+        // the kernel then delivers transactions to this node as BR_TRANSACTION_SEC_CTX with the sender's SELinux context (binder_new_node, binder_transaction); there is none here, so plain BR_TRANSACTION (receivers take a null context: IPCThreadState.cpp `tr_secctx.secctx = 0`)
+        if flags & uapi::FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0 {
+            *self.ignored.entry(Ignored::TxnSecurityCtx).or_default() += 1;
+        }
         let id = NodeId(self.id());
         self.nodes.insert(
             id,
@@ -651,14 +688,20 @@ impl<F> Binderd<F> {
     }
 
     /// The read, or `None` where the kernel would sleep.
+    /// Whether a read on `thread` would return now: `binder_has_work_ilocked` (binder.c:550) with `wait_for_proc_work` = available for process work, as `binder_poll` decides readability. Deferred work alone does not count. False for an unknown thread.
+    pub fn has_work(&self, thread: ThreadId) -> bool {
+        let Some(th) = self.threads.get(&thread) else {
+            return false;
+        };
+        th.process_todo
+            || th.need_return
+            || (self.available_for_proc_work(thread) && !self.proc(th.proc).todo.is_empty())
+    }
+
     fn thread_read(&mut self, t: ThreadId, read_size: usize) -> Option<ReadOut<F>> {
         let proc_work = self.available_for_proc_work(t);
         let p = self.threads[&t].proc;
-        // binder_has_work_ilocked (binder.c:550): deferred work alone does not end the wait
-        let th = &self.threads[&t];
-        let has_work =
-            th.process_todo || th.need_return || (proc_work && !self.proc(p).todo.is_empty());
-        if !has_work {
+        if !self.has_work(t) {
             return None;
         }
         let mut out = ReadOut {

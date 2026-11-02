@@ -47,21 +47,20 @@ fn world_with(sm_region: u64, sm_flags: u32) -> World {
     let mut d = D::new();
     let sm = d.add_proc(ProcSpec {
         tag: tag(1000, 100, PidNs::Host),
-        region_size: sm_region,
         may_be_context_manager: true,
     });
     let a = d.add_proc(ProcSpec {
         tag: tag(10001, 200, PidNs::Sandbox { id: 1, pid: 2 }),
-        region_size: REGION,
         may_be_context_manager: false,
     });
     let b = d.add_proc(ProcSpec {
         tag: tag(10002, 300, PidNs::Sandbox { id: 2, pid: 2 }),
-        region_size: REGION,
         may_be_context_manager: false,
     });
-    let s = d.add_thread(sm).unwrap();
-    d.set_context_manager(s, SM_PTR, SM_COOKIE, sm_flags)
+    d.map_region(sm, sm_region).unwrap();
+    d.map_region(a, REGION).unwrap();
+    d.map_region(b, REGION).unwrap();
+    d.set_context_manager(sm, SM_PTR, SM_COOKIE, sm_flags)
         .unwrap();
     World { d, sm, a, b }
 }
@@ -191,18 +190,15 @@ fn txn_of(r: &Return) -> TransactionData {
 #[test]
 fn context_manager_only_for_atld() {
     let mut w = world();
-    let t = w.d.add_thread(w.a).unwrap();
     // one manager exists: EBUSY, checked first (binder.c:5436-5440)
-    assert_eq!(w.d.set_context_manager(t, 1, 1, 0), Err(Errno::Busy));
+    assert_eq!(w.d.set_context_manager(w.a, 1, 1, 0), Err(Errno::Busy));
     // an app before any manager: EPERM (our policy in place of the kernel's SELinux hook)
     let mut fresh = D::new();
     let app = fresh.add_proc(ProcSpec {
         tag: tag(10001, 200, PidNs::Host),
-        region_size: REGION,
         may_be_context_manager: false,
     });
-    let at = fresh.add_thread(app).unwrap();
-    assert_eq!(fresh.set_context_manager(at, 1, 1, 0), Err(Errno::Perm));
+    assert_eq!(fresh.set_context_manager(app, 1, 1, 0), Err(Errno::Perm));
     assert_eq!(fresh.rejects()[&Reject::ContextManagerDenied], 1);
     assert_eq!(w.d.rejects()[&Reject::ContextManagerBusy], 1);
 }
@@ -1035,7 +1031,7 @@ fn spawn_looper_requests() {
     let mut w = world();
     let s = w.d.add_thread(w.sm).unwrap();
     // libbinder's default pool: 15 (ProcessState.cpp:48)
-    w.d.set_max_threads(s, 15).unwrap();
+    w.d.set_max_threads(w.sm, 15).unwrap();
     let o = wr(&mut w.d, s, &[Command::EnterLooper], &[], vec![]);
     assert_eq!(done(&o.read), vec![Return::SpawnLooper]);
     // the request is outstanding: no second one
@@ -1162,4 +1158,92 @@ fn sender_pid_follows_pid_namespaces() {
     assert_eq!(host.pid_seen_by(&a), 0);
     assert_eq!(a2.pid_seen_by(&a), 3);
     assert_eq!(b.pid_seen_by(&a), 0);
+}
+
+/// A region is mapped once (`-EBUSY` after, binder_alloc_mmap_handler); before the mapping nothing can be delivered to the process, so a call to it fails like a full region.
+#[test]
+fn region_mapped_once_and_needed() {
+    let mut w = world();
+    assert_eq!(w.d.map_region(w.a, REGION), Err(Errno::Busy));
+    assert_eq!(w.d.rejects()[&Reject::AlreadyMapped], 1);
+    let mut d = D::new();
+    let sm = d.add_proc(ProcSpec {
+        tag: tag(1000, 100, PidNs::Host),
+        may_be_context_manager: true,
+    });
+    let app = d.add_proc(ProcSpec {
+        tag: tag(10001, 200, PidNs::Host),
+        may_be_context_manager: false,
+    });
+    d.map_region(app, REGION).unwrap();
+    d.set_context_manager(sm, SM_PTR, SM_COOKIE, 0).unwrap();
+    let _s = waiting_looper(&mut d, sm);
+    let a = thread(&mut d, app, false);
+    let o = wr(
+        &mut d,
+        a,
+        &[Command::Transaction(call(0, 1, 0, 8, 0))],
+        &[0; 8],
+        vec![],
+    );
+    assert_eq!(done(&o.read), vec![Return::Noop, Return::FailedReply]);
+    assert_eq!(d.rejects()[&Reject::NoSpace], 1);
+}
+
+/// servicemanager's `becomeContextManager` flags its node `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (ProcessState.cpp:232): accepted, counted, and its calls still arrive as plain BR_TRANSACTION.
+#[test]
+fn security_ctx_flag_ignored_and_counted() {
+    let mut w = world_with(REGION, FLAT_BINDER_FLAG_TXN_SECURITY_CTX);
+    assert_eq!(w.d.ignored()[&Ignored::TxnSecurityCtx], 1);
+    let _s = waiting_looper(&mut w.d, w.sm);
+    let a = thread(&mut w.d, w.a, false);
+    let _ = wr(
+        &mut w.d,
+        a,
+        &[Command::Transaction(call(0, 1, 0, 8, 0))],
+        &[0; 8],
+        vec![],
+    );
+    let out = completed(&mut w.d, _s);
+    assert!(
+        matches!(rets(&out)[1], Return::Transaction(_)),
+        "{:?}",
+        rets(&out)
+    );
+}
+
+/// Poll readability (`binder_poll` -> `binder_has_work_ilocked`): a new thread is readable once (`looper_need_return`); a looper with no work is not; process work makes an idle looper readable; a non-looper is not woken by process work.
+#[test]
+fn has_work_is_poll_readability() {
+    let mut w = world();
+    let s = w.d.add_thread(w.sm).unwrap();
+    assert!(w.d.has_work(s));
+    // setupPolling: BC_ENTER_LOOPER, write only
+    w0(&mut w.d, s, &[Command::EnterLooper]);
+    assert!(!w.d.has_work(s));
+    let other = w.d.add_thread(w.sm).unwrap();
+    w0(&mut w.d, other, &[]);
+    let a = thread(&mut w.d, w.a, false);
+    let _ = wr(
+        &mut w.d,
+        a,
+        &[Command::Transaction(call(0, 1, 0, 8, 0))],
+        &[0; 8],
+        vec![],
+    );
+    assert!(w.d.has_work(s));
+    assert!(!w.d.has_work(other));
+    let o =
+        w.d.write_read(
+            s,
+            WriteRead {
+                commands: &[],
+                payload: &[],
+                read_size: READ,
+                fds: vec![],
+            },
+        )
+        .unwrap();
+    assert!(matches!(done(&o.read)[1], Return::Transaction(_)));
+    assert!(!w.d.has_work(s));
 }

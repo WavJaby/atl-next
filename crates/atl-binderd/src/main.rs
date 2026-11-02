@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT
+//! atl-binderd: binderd as its own process, for tests until atld hosts it. Its stdin is the admin connection (a SOCK_SEQPACKET socket): the harness registers each process there (`server::encode_register` + the process's control connection as fd).
+//! Exits when stdin closes, printing on stderr one `binderd: <counter> <n>` line per nonzero counter (core rejections, ignored inputs, protocol faults).
+#![forbid(unsafe_code)]
+
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::process::ExitCode;
+
+use atl_binderd::server::Server;
+
+fn main() -> ExitCode {
+    let admin = match rustix::io::fcntl_dupfd_cloexec(std::io::stdin().as_fd(), 3) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "binderd: stdin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut server = Server::new(admin);
+    let result = server.run();
+    let mut err = std::io::stderr().lock();
+    for (k, n) in server.core().rejects() {
+        let _ = writeln!(err, "binderd: reject {k:?} {n}");
+    }
+    for (k, n) in server.core().ignored() {
+        let _ = writeln!(err, "binderd: ignored {k:?} {n}");
+    }
+    for (k, n) in server.faults() {
+        let _ = writeln!(err, "binderd: fault {k:?} {n}");
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "binderd: poll: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

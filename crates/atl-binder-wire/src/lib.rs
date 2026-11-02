@@ -5,7 +5,11 @@
 //! Every offset and size comes from the generated types; values are native-endian, as the ioctl ABI.
 //! Hosts are 64-bit only (arches.toml), so `binder_uintptr_t`/`binder_size_t` are `u64`; the typed
 //! constants below fail to compile otherwise.
+//! `proto`: the app <-> binderd socket protocol that carries these streams; `shim`: the client side's pointer <-> offset rewriting of them.
 #![forbid(unsafe_code)]
+
+pub mod proto;
+pub mod shim;
 
 /// The generated uapi: `#[repr(C)]` records with rustc-vs-clang layout asserts, and every enumerator.
 #[allow(

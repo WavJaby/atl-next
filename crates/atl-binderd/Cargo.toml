@@ -12,3 +12,6 @@ atl-binder-wire = { path = "../atl-binder-wire" }
 
 [lints]
 workspace = true
+
+[dependencies.rustix]
+workspace = true

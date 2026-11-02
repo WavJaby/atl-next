@@ -81,11 +81,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-binder-driver"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-binder-wire",
+ "atl-bridgegen",
+ "errno",
+ "rustix",
+]
+
+[[package]]
 name = "atl-binder-wire"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
+ "rustix",
 ]
 
 [[package]]
@@ -93,6 +105,7 @@ name = "atl-binderd"
 version = "0.0.0"
 dependencies = [
  "atl-binder-wire",
+ "rustix",
 ]
 
 [[package]]
