@@ -24,6 +24,9 @@ pub mod android {
             pub mod Configuration;
         }
     }
+    pub mod os {
+        pub mod Bundle;
+    }
 }
 
 pub mod java {

@@ -18,6 +18,7 @@ import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.LocaleList;
 import android.os.Parcel;
 import android.os.Parcelable;
@@ -78,6 +79,8 @@ public class ParcelTruth {
         contexts.put("/data/app/com.example.app/split.apk", null);
         checkMap("Map", contexts);
         checkMap("Map:null", null);
+        // IApplicationThread.bindApplication's coreSettings: the empty Bundle M2 sends
+        check("Bundle", new Bundle(), Bundle.CREATOR);
 
         selfTests(config, intent);
         System.out.println("pt summary " + failures + " failed");

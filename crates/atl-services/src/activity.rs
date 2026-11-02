@@ -19,6 +19,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
+use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::parts::{
     ActivityWindowInfo, ComponentInfo, ComponentName, LaunchActivityItem, PackageItemInfo,
@@ -251,7 +252,8 @@ impl IActivityManager for ActivityManager {
         };
         let info = package::application_info(p);
         // what attachApplicationLocked passes for a plain app start (no instrumentation, profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
-        // an empty provider list (no providers of its own yet), no disabled compat changes
+        // an empty provider list (no providers of its own yet), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
+        // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); no settings are mirrored into it yet
         thread.r#bindApplication(
             Some(p.process_name()),
             Some(&info),
@@ -272,7 +274,7 @@ impl IActivityManager for ActivityManager {
             Some(&Configuration::default()),
             Some(&CompatibilityInfo::default()),
             None,
-            None,
+            Some(&Bundle),
             Some(BUILD_UNKNOWN),
             None,
             None,

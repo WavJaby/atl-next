@@ -20,6 +20,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, PackageInfo, ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
+use atl_parcelables::android::os::Bundle;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
@@ -116,6 +117,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.res.Configuration" => round_trip_as::<Configuration>(input, mode),
         "android.content.res.CompatibilityInfo" => round_trip_as::<CompatibilityInfo>(input, mode),
         "android.content.Intent" => round_trip_as::<Intent>(input, mode),
+        "android.os.Bundle" => round_trip_as::<Bundle>(input, mode),
         "android.app.servertransaction.ClientTransaction" => {
             round_trip_as::<ClientTransaction>(input, mode)
         }
