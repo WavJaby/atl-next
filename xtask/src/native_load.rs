@@ -3,13 +3,13 @@
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
-//!    Without framework.jar the walk aborts at the first class the fixture lacks: a measured count, never a failure. Then register_android_os_SystemClock / _util_Log / _util_EventLog alone: each must return >= 0.
+//!    framework.jar (the converter's framework-minus-apex) is on the boot classpath; the walk stops at the first entry that fails or aborts: a measured count, never a failure. Then register_android_os_SystemClock / _util_Log / _util_EventLog alone: each must return >= 0.
 //! 3. call: natives checked against Android semantics -- uptimeMillis is CLOCK_MONOTONIC in ms (android_os_SystemClock.cpp; bracketed by System.nanoTime, also CLOCK_MONOTONIC in ART),
 //!    isLoggable defaults to INFO (Log.isLoggable docs; liblog __android_log_is_loggable), println_native returns liblog __android_log_buf_write's 1 for INFO and -EPERM (-1) for VERBOSE, which liblog drops before any logger under the minimum priority INFO every run sets (`ANDROID_LOG_TAGS=*:i`; without it buf_write's default is VERBOSE and Log.v is written, as on Android);
 //!    the INFO message reaches stderr as the launcher's logger writes it (`<L> liblog/<tag>: <text>`), the VERBOSE one nowhere: the logger receives only what liblog let through.
 //! 4. copies: each library of [`SINGLE_COPY`] mapped once after the load (/proc/self/maps). A warning by default; `--strict-copies` makes it a failure.
 //!
-//! Fixture (xtask/testdata/native-load): NativeLoad.java (driver) + test-only declarations of exactly the classes and natives gRegJNI's first entries bind, compiled with the Java pipeline's JDK and d8;
+//! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8;
 //! shim.rs, a JNI cdylib built with plain rustc, calls the C++ entry points (hidden register_* by .symtab vaddr). Built into <out>/native-load, never shipped.
 //! atl-app-launcher and atl-property-service are built with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
 //! `--self-test` feeds the guards broken inputs and fails unless each fires: the load guard (a non-ELF file, a library with an undefined symbol), the launcher's (no property area); the result checks are unit tests.
@@ -35,7 +35,7 @@ pub struct Args {
     /// Default: the converter's ART in --out (`xtask native` goals dalvikvm, libart, ...), staged into <out>/native-load-art as an install would lay it out (see `stage_art`).
     #[arg(long)]
     art: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars and its d8 (default <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Native build directory holding libandroid_runtime (default <workspace>/out/native/<host>, as `xtask native`); the fixture is built into its native-load/.
@@ -52,16 +52,19 @@ pub struct Args {
     verbose: bool,
 }
 
-/// The ART host boot classpath (core-oj, core-libart, core-icu4j hostdex), as the Java pipeline lays it out under --java-out.
-const BOOT_JARS: [&str; 3] = [
+/// The boot classpath: the ART host boot jars (core-oj, core-libart, core-icu4j hostdex), then framework.jar (framework-minus-apex's dex
+/// jar, stem framework), as the Java pipeline lays them out under --java-out.
+const BOOT_JARS: [&str; 4] = [
     "device/core-oj/aligned/core-oj.jar",
     "device/core-libart/aligned/core-libart.jar",
     "device/core-icu4j-host/dex-withres-aligned/core-icu4j.jar",
+    "device/framework-minus-apex/aligned/framework.jar",
 ];
 /// Their class jars: javac's bootclasspath and d8's --lib.
-const JAVAC_BOOT: [&str; 2] = [
+const JAVAC_BOOT: [&str; 3] = [
     "device/core-oj/javac/core-oj.jar",
     "device/core-libart/javac/core-libart.jar",
+    "device/framework-minus-apex/javac-header/framework.jar",
 ];
 /// Soong's JDK (build/soong/java/config: prebuilts/jdk/jdk21), under the host's soong_prebuilt_os.
 const JDK: &str = "prebuilts/jdk/jdk21";
