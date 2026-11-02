@@ -10,7 +10,7 @@
 // Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles. A module in the -srcs file is built
 // without the sources its row lists, linking the row's provider (if any) first for their symbols. A device Rust module in -rust-android takes its android target blocks and --cfg atl_android_userspace (rust.go).
 //
-// -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values.
+// -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values; -release also writes <out>/gen/build.prop (buildprop.go).
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools, and -metalava where
 // API stubs are built; with them, a goal that names a Java module builds as one. -measure writes <out>/measure.txt (measure.go) instead of a build.
 // -device-cxx-flags <dir> (no goals) writes <out>/compat and prints the C++ command line every device compile in <dir> shares (probeCxxFlags), for xtask check step libcxx, instead of a build.
@@ -224,6 +224,15 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		if g.release, err = readRelease(tree, js.release); err != nil {
 			return err
 		}
+		id, err := readBuildID(tree)
+		if err != nil {
+			return err
+		}
+		prop, err := buildProp(g.release, id)
+		if err != nil {
+			return err
+		}
+		g.genFile(filepath.Join(out, buildPropFile), prop)
 		g.acfg = &aconfigGraph{tool: js.aconfig, decls: map[string]*aconfigDecl{}}
 	}
 	// Java tools given: Java goals are built (java.go)
