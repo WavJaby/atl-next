@@ -21,6 +21,34 @@ type graphFile struct {
 	// `none` module directory -> tree directories its headers would reach dependents from: export_include_dirs, export_system_include_dirs, and those of the header libraries it re-exports.
 	// For the caller's none gate: a compile failing to find a header these hold, in a module that dropped the module, shows the row hides a user still built.
 	NoneExports map[string][]string `json:"none_exports"`
+	// module directory -> what a build outside the converter takes of it: cargo packages `xtask native` builds after ninja (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs).
+	// Rust libraries, shared libraries and binaries the emitted graph builds (broken crates and provided modules aside); the shared node of a module with both.
+	Artifacts map[string]artifact `json:"artifacts"`
+	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (-stdlib=libc++), so an outside build links with it too
+	LinkDriver string `json:"link_driver"`
+}
+
+// artifact: one linkable output, as the converter's own links take it.
+type artifact struct {
+	Kind string `json:"kind"` // rlib | shared | binary (Kind.String)
+	Out  string `json:"out"`
+	// rlib only: its crate name, the -L dependency= dirs of its crate closure (crateDirs), the cc link driver arguments a final link of it needs (rustCcLibs; none without cc libraries) and their dirs (rustLinkDirs: -L native=)
+	Crate  string   `json:"crate,omitempty"`
+	Search []string `json:"search,omitempty"`
+	Link   []string `json:"link,omitempty"`
+	Native []string `json:"native,omitempty"`
+}
+
+// artifactOf: n's graph.json artifact; ok=false for kinds no outside build links (archives, headers, generators, proc macros) and for crates that cannot compile.
+func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
+	switch {
+	case n.kind == Rlib && n.rust.broken == "":
+		link, _ := g.rustCcLibs(n)
+		return artifact{Kind: n.kind.String(), Out: n.out, Crate: n.rust.crateName, Search: crateDirs([]*Node{n}), Link: link, Native: rustLinkDirs(link)}, true
+	case n.kind == Shared || n.kind == Binary:
+		return artifact{Kind: n.kind.String(), Out: n.out}, n.out != ""
+	}
+	return artifact{}, false
 }
 
 func (n *Node) dir() string { return n.side.String() + "/" + n.name }
@@ -83,9 +111,9 @@ func (g *Graph) noneExports(name string, side Side) []string {
 	return append([]string{}, sortedKeys(dirs)...)
 }
 
-// graphJSON: graph.json for the emitted nodes and the goal nodes found.
-func (g *Graph) graphJSON(goals []*Node) ([]byte, error) {
-	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}}
+// graphJSON: graph.json for the emitted nodes and the goal nodes found; linkDriver: the cc link driver the build links with (Tools.CXX).
+func (g *Graph) graphJSON(goals []*Node, linkDriver string) ([]byte, error) {
+	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}, Artifacts: map[string]artifact{}, LinkDriver: linkDriver}
 	for _, e := range sortedKeys(g.dropped) {
 		dir, name, _ := strings.Cut(e, " ")
 		f.Dropped[dir] = append(f.Dropped[dir], name)
@@ -113,6 +141,9 @@ func (g *Graph) graphJSON(goals []*Node) ([]byte, error) {
 			}
 		}
 		f.Deps[n.dir()] = sortedKeys(set)
+		if a, ok := g.artifactOf(n); ok {
+			f.Artifacts[n.dir()] = a
+		}
 	}
 	return json.MarshalIndent(f, "", " ")
 }

@@ -516,18 +516,25 @@ func rustLibFlags(externs []rustExtern) (flags, inputs, linked []string) {
 		flags = append(flags, "--extern", e.name+"="+e.dep.out)
 		roots = append(roots, e.dep)
 	}
-	dirs := map[string]bool{}
 	for _, d := range crateClosure(roots) {
 		inputs = append(inputs, d.out)
 		if d.kind != ProcMacro {
 			linked = append(linked, d.out)
 		}
-		if dir := filepath.Dir(d.out); !dirs[dir] {
-			dirs[dir] = true
-			flags = append(flags, "-L", "dependency="+dir)
-		}
+	}
+	for _, dir := range crateDirs(roots) {
+		flags = append(flags, "-L", "dependency="+dir)
 	}
 	return flags, inputs, linked
+}
+
+// crateDirs: the directories of the crates roots need (crateClosure), each once, in closure order: rustc's -L dependency= search path for them.
+func crateDirs(roots []*Node) []string {
+	var dirs []string
+	for _, d := range crateClosure(roots) {
+		dirs = appendNew(dirs, filepath.Dir(d.out))
+	}
+	return dirs
 }
 
 // emitRust writes the steps of one Rust node: OUT_DIR copies of its generated sources, then rustc; a broken crate's step fails with the reason.
@@ -564,19 +571,40 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 		shellQuote(g.rustEnv(n, tools.RustVersion)), shellQuote(flags), shellQuote(libs), shellQuote(linked))
 }
 
-// rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), and the cc libraries its crates need (whole archives, the static closure, shared libraries) as link args.
+// rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), the cc libraries its crates need (rustCcLibs) as link args, and their dirs as -L (rustLinkDirs).
 func (g *Graph) rustLinkArgs(n *Node, linker string) (flags, inputs []string) {
 	flags = []string{"-C", "linker=" + linker}
-	var closure []*Node
-	staticClosure(n, map[*Node]bool{}, &closure)
-	if !slices.ContainsFunc(closure, func(d *Node) bool { return d.rust == nil }) && len(n.deps.shared) == 0 {
-		return flags, nil
-	}
-	libs, inputs := g.linkLibs(n)
+	libs, inputs := g.rustCcLibs(n)
 	for _, l := range libs {
 		flags = append(flags, "-C", "link-arg="+l)
 	}
+	for _, d := range rustLinkDirs(libs) {
+		flags = append(flags, "-L", d)
+	}
 	return flags, inputs
+}
+
+// rustLinkDirs: the dirs of the library files among rustCcLibs' arguments, each once: rustc's -L for the crates' `#[link(name = ...)]` (android_log_sys's `log` -> liblog.so), as Soong passes each cc dependency's dir (rust/builder.go linkDirs).
+func rustLinkDirs(libs []string) []string {
+	var dirs []string
+	for _, l := range libs {
+		if filepath.IsAbs(l) {
+			dirs = appendNew(dirs, filepath.Dir(l))
+		}
+	}
+	return dirs
+}
+
+// rustCcLibs: the cc libraries (whole archives, the static closure, shared libraries) a final link of Rust node n needs, as linker arguments of the cc link driver; none when neither n nor a crate it links names a cc library.
+// A crate deep in the closure counts (libbinder_rs -> libbinder_ndk_sys's shared libbinder_ndk), as linkLibs takes every closure member's shared libraries.
+// Also what graph.json gives a cargo package linking rlib n (graph.go artifact.Link).
+func (g *Graph) rustCcLibs(n *Node) (libs, inputs []string) {
+	var closure []*Node
+	staticClosure(n, map[*Node]bool{}, &closure)
+	if !slices.ContainsFunc(append([]*Node{n}, closure...), func(d *Node) bool { return d.rust == nil || len(d.deps.shared) > 0 }) {
+		return nil, nil
+	}
+	return g.linkLibs(n)
 }
 
 // rustStaticlib: the generated staticlib of a final cc link (cc/builder.go GenerateRustStaticlib): its path, the edges building it, and whether it links whole

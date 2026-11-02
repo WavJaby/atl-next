@@ -25,7 +25,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 		t.Fatal(g.problems)
 	}
 	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
-	b, err := g.graphJSON([]*Node{goal})
+	b, err := g.graphJSON([]*Node{goal}, "c++")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +60,54 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 	}
 }
 
+// artifacts: what a cargo package links of the graph, as the converter's own links take it: an rlib with its crate name, crate dirs and its cc libraries' link arguments (rust_test.go rustGraph:
+// libffi carries libcc whole, libdep only a proc macro, so no link arguments); shared libraries and binaries by output; never archives, proc macros or generators.
+func TestGraphJSONArtifacts(t *testing.T) {
+	g, _ := rustGraph(t)
+	goal := g.node("libuser", Device, Shared, "goal")
+	b, err := g.graphJSON([]*Node{goal}, "c++")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f graphFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.LinkDriver != "c++" {
+		t.Errorf("link driver %q", f.LinkDriver)
+	}
+	out := func(p string) string { return filepath.Join(g.out, p) }
+	ffi := f.Artifacts["device/libffi"]
+	if ffi.Kind != "rlib" || ffi.Out != out("device/libffi/libffi.rlib") || ffi.Crate != "ffi" {
+		t.Errorf("libffi %+v", ffi)
+	}
+	// its own dir first, then the closure's: crateClosure order, the proc macro's dir included (rustc loads it with libdep's metadata)
+	if !slices.Equal(ffi.Search, []string{out("device/libffi"), out("device/libdep"), out("host/libmac")}) {
+		t.Errorf("libffi search %q", ffi.Search)
+	}
+	// the cc library the rlib names whole, linked as a final link of libffi would (linkLibs: a static closure member in the group)
+	if !slices.Contains(ffi.Link, out("device/libcc/libcc.a")) || !containsSeq(ffi.Link, []string{"-Wl,--start-group"}) {
+		t.Errorf("libffi link %q", ffi.Link)
+	}
+	if !slices.Equal(ffi.Native, []string{out("device/libcc")}) {
+		t.Errorf("libffi native %q", ffi.Native)
+	}
+	if dep := f.Artifacts["device/libdep"]; dep.Kind != "rlib" || dep.Crate != "dep" || len(dep.Link) != 0 {
+		t.Errorf("libdep %+v", dep)
+	}
+	if u := f.Artifacts["device/libuser"]; u.Kind != "shared" || u.Out != out("device/libuser/libuser.so") || u.Crate != "" || u.Search != nil {
+		t.Errorf("libuser %+v", u)
+	}
+	if tool := f.Artifacts["host/tool"]; tool.Kind != "binary" || tool.Out != out("host/tool/tool") {
+		t.Errorf("tool %+v", tool)
+	}
+	for _, none := range []string{"device/libcc", "host/libmac", "device/bridge_h"} {
+		if a, ok := f.Artifacts[none]; ok {
+			t.Errorf("%s: artifact %+v", none, a)
+		}
+	}
+}
+
 // providers.toml `none` modules: each dropped edge by module directory, and the directories the omitted module's headers would come from (re-exported header libraries followed), without the omitted module's own lookups counting as the build's problems.
 func TestGraphJSONDroppedNone(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
@@ -73,7 +121,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], shared_libs: ["libuser"], static_l
 	if goal == nil {
 		t.Fatal(g.problems)
 	}
-	b, err := g.graphJSON([]*Node{goal})
+	b, err := g.graphJSON([]*Node{goal}, "c++")
 	if err != nil {
 		t.Fatal(err)
 	}

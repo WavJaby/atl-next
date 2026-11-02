@@ -127,6 +127,30 @@ func TestRustStaticlibInFinalLink(t *testing.T) {
 	}
 }
 
+// A shared library a crate deep in the closure names reaches the final link of a binary that names only the top crate (libbinder_rs -> libbinder_ndk_sys -> libbinder_ndk): Soong links every crate's shared_libs.
+func TestRustSharedLibThroughCrates(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_shared { name: "libndk", srcs: ["n.cc"] }
+rust_library { name: "libsys", crate_name: "sys", srcs: ["sys.rs"], shared_libs: ["libndk"] }
+rust_library { name: "libtop", crate_name: "top", srcs: ["top.rs"], rustlibs: ["libsys"] }
+rust_binary { name: "app", srcs: ["main.rs"], rustlibs: ["libtop"] }
+`})
+	app := g.node("app", Device, Binary, "goal")
+	if app == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc", RustVersion: "1.2.3"})
+	ndk := filepath.Join(g.out, "device/libndk/libndk.so")
+	// and its dir as -L, where rustc finds a crate's #[link(name = "ndk")] (rust/builder.go linkDirs)
+	if f := shWords(t, ninjaEdgeVars(ninja, filepath.Join(g.out, "device/app/app"))["flags"]); !containsSeq(f, []string{"-C", "link-arg=" + ndk}) || !containsSeq(f, []string{"-L", filepath.Dir(ndk)}) {
+		t.Errorf("app flags %q lack libndk or its dir", f)
+	}
+	top := g.nodes[key{"libtop", Device, Rlib}]
+	if libs, _ := g.rustCcLibs(top); !slices.Contains(libs, ndk) {
+		t.Errorf("libtop cc libs %q lack libndk", libs)
+	}
+}
+
 // rust/builder.go: generated srcs are copied into the module's OUT_DIR, which the crate reads through env!("OUT_DIR"); without any, OUT_DIR=out. The plain source stays the crate root.
 func TestRustGeneratedSources(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
