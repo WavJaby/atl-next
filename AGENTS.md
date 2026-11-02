@@ -15,6 +15,17 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 - Every column is either checked by a script against its real source or derived and not stored. Adding a column adds its check in the same change. Cross-references are typed and checked to exist; a reason a script must enforce is a field, not a comment.
 - Rows are added when a consumer first needs them. Tools that rewrite a table use `toml_edit`, keeping comments and order.
 
+## AOSP's own code first
+
+- For an AOSP component that does not work as-is on Linux, take the first rung that works; the change (commit, `providers.toml` reason or patch `Patch-Reason:`) states why the rungs above it do not:
+  1. build the original source as-is, adapting only build config;
+  2. the environment supplies what it reads (files, config, env vars, sandbox layout: `fonts.xml`, the property area);
+  3. supply missing definitions/functions so it compiles and links (`atl-bionic`: bionic-only API glibc lacks);
+  4. a small patch (below);
+  5. replace individual files in Rust (`providers.toml` `srcs`);
+  6. a new Rust component where Android relies on a kernel, HAL or system daemon Linux lacks (binderd, launcher, property service, platform layer).
+- A Rust reimplementation of AOSP code with the same behaviour is a second copy to maintain: not written, and an existing one is replaced by the AOSP source.
+
 ## Upstream patches
 
 - Each upstream has one checkout per repo checkout: its task copy `src-wt/<task>/<upstream>` if it exists, else the shared `src/<upstream>`. One resolver places every upstream path, crate `atl-layout` (`Layout::locate`): xtask uses it directly, build scripts through `atl_bridgegen::buildscript::Upstreams`, whose `rerun_paths` also make cargo rerun when a task copy appears or goes. Never join `src/` by hand.
