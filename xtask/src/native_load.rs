@@ -2,8 +2,8 @@
 //! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in seven stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
-//! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
-//!    framework.jar (the converter's framework-minus-apex) is on the boot classpath; the walk stops at the first entry that fails or aborts: a measured count, never a failure. Then register_android_os_SystemClock / _util_Log / _util_EventLog alone: each must return >= 0.
+//! 2. register: `AndroidRuntime::startReg` must return 0, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) must register every entry.
+//!    framework.jar (the converter's framework-minus-apex) is on the boot classpath. "Every" = the `REG_JNI(` entries of the pinned AndroidRuntime.cpp, which must also equal the slots read from the library's relocations; a mismatch fails. Then register_android_os_SystemClock / _util_Log / _util_EventLog alone: each must return >= 0.
 //! 3. call: natives checked against Android semantics -- uptimeMillis is CLOCK_MONOTONIC in ms (android_os_SystemClock.cpp; bracketed by System.nanoTime, also CLOCK_MONOTONIC in ART),
 //!    isLoggable defaults to INFO (Log.isLoggable docs; liblog __android_log_is_loggable), println_native returns liblog __android_log_buf_write's 1 for INFO and -EPERM (-1) for VERBOSE, which liblog drops before any logger under the minimum priority INFO every run sets (`ANDROID_LOG_TAGS=*:i`; without it buf_write's default is VERBOSE and Log.v is written, as on Android);
 //!    the INFO message reaches stderr as the launcher's logger writes it (`<L> liblog/<tag>: <text>`), the VERBOSE one nowhere: the logger receives only what liblog let through.
@@ -82,6 +82,8 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// `android::AndroidRuntime::startReg(JNIEnv*)` and `android::gRegJNI` (internal linkage), Itanium-mangled.
 const START_REG: &str = "_ZN7android14AndroidRuntime8startRegEP7_JNIEnv";
 const REG_JNI: &str = "_ZN7androidL7gRegJNIE";
+/// gRegJNI's definition, in the pinned AOSP tree: its `REG_JNI(` lines are the entry count stage 2 requires.
+const ANDROID_RUNTIME_CPP: &str = "frameworks/base/core/jni/AndroidRuntime.cpp";
 /// Registered alone in stage 2 (the classes stage 3 calls into, plus EventLog).
 const ALONE: [&str; 3] = [
     "register_android_os_SystemClock",
@@ -155,8 +157,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .collect();
     let walk = env.art(&fixture, "walk", &walk_args)?;
     let names: Vec<&str> = elf.reg_jni.iter().map(|(_, n)| n.as_str()).collect();
-    report.measured("startReg", start_reg_result(&start));
-    report.measured("gRegJNI", walk_result(&walk, &names));
+    match start_reg_result(&start) {
+        Ok(s) => report.pass("startReg", s),
+        Err(e) => report.fail("startReg", e),
+    }
+    match walk_result(&walk, &names, env.reg_jni_entries) {
+        Ok(s) => report.pass("gRegJNI", s),
+        Err(e) => report.fail("gRegJNI", e),
+    }
 
     let mut call_args: Vec<String> = base.to_vec();
     call_args.push(format!("{:x}", elf.start_reg));
@@ -258,6 +266,8 @@ struct Env {
     d8: PathBuf,
     jdk: PathBuf,
     runtime: PathBuf,
+    /// gRegJNI's entry count in the pinned source ([`reg_jni_entries`]).
+    reg_jni_entries: usize,
     work: PathBuf,
     /// The build directory's cargo target dir: launcher, property service, shim.
     cargo: PathBuf,
@@ -315,6 +325,12 @@ impl Env {
             d8: java_out.join("host/bin/d8"),
             jdk: farm::shared_tree(&layout).join(JDK).join(os),
             runtime: out.join(RUNTIME),
+            reg_jni_entries: {
+                let cpp = farm::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
+                let src = std::fs::read_to_string(&cpp)
+                    .with_context(|| format!("reading {}", cpp.display()))?;
+                reg_jni_entries(&src).with_context(|| cpp.display().to_string())?
+            },
             work: out.join("native-load"),
             cargo: out.join("cargo"),
             verbose: args.verbose,
@@ -790,15 +806,39 @@ fn load_result(run: &ArtRun) -> Result<Vec<String>, String> {
     Ok(run.values("map").into_iter().map(str::to_owned).collect())
 }
 
-fn start_reg_result(run: &ArtRun) -> String {
+/// gRegJNI's entries in AndroidRuntime.cpp: the `REG_JNI(` lines between `gRegJNI[] = {` and its closing `};` (the two `#define REG_JNI` lines precede it).
+fn reg_jni_entries(src: &str) -> Result<usize> {
+    let (_, body) = src
+        .split_once("gRegJNI[] = {")
+        .context("no `gRegJNI[] = {`")?;
+    let (body, _) = body
+        .split_once("\n};")
+        .context("gRegJNI: no closing `};`")?;
+    let n = body
+        .lines()
+        .filter(|l| l.trim_start().starts_with("REG_JNI("))
+        .count();
+    ensure!(n > 0, "gRegJNI: no REG_JNI( entries");
+    Ok(n)
+}
+
+/// Stage 2: startReg returns 0 (AndroidRuntime.cpp: `return 0` once register_jni_procs succeeds, -1 otherwise).
+fn start_reg_result(run: &ArtRun) -> Result<String, String> {
     match run.value("startreg") {
-        Some(rc) => format!("returned {rc}"),
-        None => format!("aborted: {}", run.failure()),
+        Some("0") => Ok("returned 0".to_owned()),
+        Some(rc) => Err(format!("returned {rc}, expected 0")),
+        None => Err(format!("aborted: {}", run.failure())),
     }
 }
 
-/// Stage 2 walk: `k/n registered`, then the entry that failed and why.
-fn walk_result(run: &ArtRun, names: &[&str]) -> String {
+/// Stage 2 walk: every entry registers, and the slots read from the relocations (`names`) number the source's `expected` entries.
+fn walk_result(run: &ArtRun, names: &[&str], expected: usize) -> Result<String, String> {
+    if names.len() != expected {
+        return Err(format!(
+            "{} relocated slots, but {ANDROID_RUNTIME_CPP} has {expected} REG_JNI entries",
+            names.len()
+        ));
+    }
     let ok = run
         .values("ret")
         .iter()
@@ -817,8 +857,9 @@ fn walk_result(run: &ArtRun, names: &[&str]) -> String {
             None => format!("aborted: {}", run.failure()),
         };
         s.push_str(&format!("; entry {} {name} {why}", ok + 1));
+        return Err(s);
     }
-    s
+    Ok(format!("{s} (= {ANDROID_RUNTIME_CPP}'s REG_JNI entries)"))
 }
 
 /// Stage 2 alone: every listed registration returned >= 0.
@@ -920,9 +961,6 @@ impl Report {
     }
     fn pass(&mut self, stage: &str, detail: String) {
         self.line(stage, "pass", &detail);
-    }
-    fn measured(&mut self, stage: &str, detail: String) {
-        self.line(stage, "measured", &detail);
     }
     fn warn(&mut self, stage: &str, detail: String) {
         self.line(stage, "WARN", &detail);
@@ -1256,14 +1294,40 @@ mod tests {
             "nlt reg 0\nnlt ret 0 0\nnlt reg 1\nnlt ret 1 0\nnlt reg 2\n",
             false,
         );
-        let s = walk_result(&r, &["a", "b", "register_x", "d"]);
+        // short walk: aborted at entry 3
+        let s = walk_result(&r, &["a", "b", "register_x", "d"], 4).unwrap_err();
         assert!(
             s.starts_with("2/4 registered; entry 3 register_x aborted"),
             "{s}"
         );
         assert!(s.contains("MemoryIntArray"), "{s}");
         let neg = run("nlt ret 0 0\nnlt ret 1 -1\n", true);
-        assert!(walk_result(&neg, &["a", "b"]).contains("entry 2 b returned -1"));
+        let e = walk_result(&neg, &["a", "b"], 2).unwrap_err();
+        assert!(e.contains("entry 2 b returned -1"), "{e}");
+        let all = run("nlt ret 0 0\nnlt ret 1 0\n", true);
+        assert!(walk_result(&all, &["a", "b"], 2).is_ok());
+        // relocated slots (2) vs source entries (3): fails even with every slot registered
+        let e = walk_result(&all, &["a", "b"], 3).unwrap_err();
+        assert!(
+            e.contains("2 relocated slots") && e.contains("has 3"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn start_reg_must_return_zero() {
+        assert!(start_reg_result(&run("nlt startreg 0\n", true)).is_ok());
+        let e = start_reg_result(&run("nlt startreg -1\n", true)).unwrap_err();
+        assert!(e.contains("returned -1"), "{e}");
+        assert!(start_reg_result(&run("", false)).is_err());
+    }
+
+    #[test]
+    fn reg_jni_entries_counts_the_table_only() {
+        // shape of AndroidRuntime.cpp: the two #define lines and a comment outside/inside the table are not entries
+        let src = "#define REG_JNI(name) { name }\n#define REG_JNI(name) { name, #name }\nstatic const RegJNIRec gRegJNI[] = {\n        REG_JNI(a),\n        // c\n        REG_JNI(b),\n};\nREG_JNI(after)\n";
+        assert_eq!(reg_jni_entries(src).unwrap(), 2);
+        assert!(reg_jni_entries("gRegJNI[] = {\n};\n").is_err());
     }
 
     #[test]
