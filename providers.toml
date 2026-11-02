@@ -61,6 +61,7 @@ reason = "bionic linker namespace API; atl-bionic implements what the closure ca
 ["libseccomp_policy"]
 provider = "none"
 reason = "Zygote's seccomp policy; only the Zygote JNI uses it (excluded from libandroid_runtime by its srcs row); app sandboxing incl. seccomp is the broker's job (plan Q5), so it would be a second implementation"
+
 # ART built as its Linux target (ART_TARGET_LINUX, bp2ninja artplugin.go artTargetLinux)
 ["art-apex-cache-info"]
 provider = "none"
@@ -157,4 +158,4 @@ reason = "android_logger, liblogger's Android backend: its __android_log_* calls
 # C/C++ modules compiled with macros their patch reads
 ["servicemanager"]
 defines = ["ATL_NO_SELINUX"]
-reason = "AOSP's servicemanager is the context manager (owner 2026-11-02, binder Q3); the host has no Android SELinux policy, so Access (patches/aosp/frameworks/native 0002) decides by the binder caller's uid as the non-__ANDROID__ build does, instead of aborting on selinux_status_open / getcon / getPidcon or denying every lookup without service_contexts; the uid it keeps makes ServiceManager refuse addService from app uids"
+reason = "AOSP's servicemanager is the context manager (owner 2026-11-02, binder Q3); the host has no Android SELinux policy, so Access (patches/aosp/frameworks/native 0002) decides by the binder caller's uid as the non-__ANDROID__ build does, instead of aborting on selinux_status_open / getcon / getPidcon or denying every lookup without service_contexts; the uid it keeps makes ServiceManager refuse addService from app uids. Rung 4 because: as-is (1) aborts at startup; the environment (2) would have to ship an Android SELinux policy and a kernel LSM the host lacks; a substitute libselinux (3) cannot pass getPidcon's CHECK inside a transaction, which is servicemanager's own code"
