@@ -137,10 +137,12 @@ type Graph struct {
 	stand map[string]string
 	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)
 	baseTypes map[string]string
-	mods      [2]map[string][]*Module
-	nodes     map[key]*Node
-	order     []*Node
-	problems  []string
+	// soong_config_module_type definitions by name (soongconfig.go)
+	soongConfigTypes map[string]*soongConfigType
+	mods             [2]map[string][]*Module
+	nodes            map[key]*Node
+	order            []*Node
+	problems         []string
 	// references no module of the tree answers to (see notFound)
 	missing map[string]bool
 	// tree-relative directories modules name by path (include_dirs) that do not exist
@@ -268,7 +270,7 @@ func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj
 		}
 		acc = merge(acc, g.resolveDefaults(dm, side, seen))
 	}
-	return merge(acc, m.Props)
+	return merge(acc, g.soongConfigProps(m))
 }
 
 // flatten applies the blocks of one side, arch and kind onto the base properties, in Soong's order: soong_config_variables (a load hook), OS blocks (os mutator), `arch` with its variant and feature sub-blocks, `multilib`, OS+arch blocks (arch mutator), `static`/`shared` (link mutator).
@@ -279,20 +281,9 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	// `static` / `shared` stay in base: arch and target blocks may hold them too (Soong's StaticProperties / SharedProperties are arch-variant; ART's codegen hook writes target.android.static), each merged into the module's own
 	for _, k := range p.keys {
 		switch k {
-		case "target", "arch", "multilib", "defaults", "soong_config_variables":
+		case "target", "arch", "multilib", "defaults":
 		default:
 			base.set(k, p.m[k])
-		}
-	}
-	// soong_config_variables: no Soong config variable (nor the release flags some map to) is set for
-	// this build yet, so each variable's conditions_default applies
-	if sv := p.obj("soong_config_variables"); sv != nil {
-		for _, v := range sv.keys {
-			if o := sv.obj(v); o != nil {
-				if d := o.obj("conditions_default"); d != nil {
-					base = merge(base, d)
-				}
-			}
 		}
 	}
 	target := func(blocks []string) {

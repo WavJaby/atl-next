@@ -205,10 +205,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 	}
 	g.baseTypes = map[string]string{}
+	g.soongConfigTypes = map[string]*soongConfigType{}
 	for _, list := range g.mods[Device] {
 		for _, m := range list {
 			if m.Type == "soong_config_module_type" {
 				g.baseTypes[m.Name] = m.Props.str("module_type")
+				g.soongConfigTypes[m.Name] = readSoongConfigType(m)
 			}
 		}
 	}

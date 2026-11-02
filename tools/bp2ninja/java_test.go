@@ -91,7 +91,8 @@ func TestDecodeSdk(t *testing.T) {
 		{"system_current", "", sdkDep{boot: []string{"android_system_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_stubs_current"}, sysModules: "core-public-stubs-system-modules", aidlGen: "framework.aidl"}},
 		{"module_current", "", sdkDep{boot: []string{"android_module_lib_stubs_current", "core-lambda-stubs"}, java9: []string{"android_module_lib_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework_non_updatable.aidl"}},
 		{"system_server_current", "", sdkDep{boot: []string{"android_system_server_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_server_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework.aidl"}},
-		{"", "", sdkDep{sysModules: "legacy-core-platform-api-stubs-system-modules", boot: []string{"legacy.core.platform.api.stubs", "core-lambda-stubs"}, classpath: []string{"ext", "framework"}}},
+		// private: corePlatformSystemModules (stable off the legacy list) plus the framework libraries
+		{"", "", sdkDep{sysModules: "stable-core-platform-api-stubs-system-modules", boot: []string{"stable.core.platform.api.stubs", "core-lambda-stubs"}, classpath: []string{"ext", "framework"}}},
 		// useFiles: <level>/<kind>/android.jar, the aidl always <level>/public/framework.aidl; Java >= 9 (level 30 -> 9) adds prebuilt_apis'
 		// sdk_<systemModuleKind>_<level>_system_modules, public up to level 31, module-lib for system_server after it
 		{"system_30", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/30/system/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/30/public/framework.aidl",
@@ -112,6 +113,14 @@ func TestDecodeSdk(t *testing.T) {
 	}
 	if _, err := g.decodeSdk(n(objOf("sdk_version", "none")), parseSdk("none")); err == nil {
 		t.Errorf(`sdk_version "none" without system_modules must be an error`)
+	}
+	// a module on legacyCorePlatformApiModules (framework-minus-apex is) gets the legacy core platform API, core_platform and private alike
+	lg := &Graph{java: &javaGraph{cfg: JavaConfig{LegacyCorePlatform: map[string]bool{"fw": true}}}}
+	for _, sdk := range []string{"core_platform", ""} {
+		d, _ := lg.decodeSdk(&jNode{jKey: jKey{name: "fw"}, props: objOf("sdk_version", sdk)}, parseSdk(sdk))
+		if d.sysModules != "legacy-core-platform-api-stubs-system-modules" || d.boot[0] != "legacy.core.platform.api.stubs" {
+			t.Errorf("legacy %q: %+v", sdk, d)
+		}
 	}
 }
 

@@ -223,7 +223,7 @@ func genAidl(g *Graph, n *Node, f srcFile, peers []srcFile) genOut {
 		if lang == "ndk" {
 			prefix = "aidl"
 		}
-		flags, implicit = s.flags(g, f)
+		flags, implicit = s.flags(g, f, g.abs)
 	} else {
 		a := n.props.obj("aidl")
 		flags = append(flags, a.strs("flags")...)

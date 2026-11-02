@@ -452,8 +452,9 @@ func (g *Graph) readHash(rel string) (string, bool) {
 
 // flags: the aidl command line (besides --lang, -h, -o) for source f and the files it also depends on (.hash). Order of
 // generateBuildActionsForSingleAidl: warnings, --structured --version --hash, -t, --stability, --min_sdk_version, previous version, --log; then
-// aidl's own import roots as aidl_gen_rule.go: -I include dirs and imported sources, -N own roots.
-func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
+// aidl's own import roots as aidl_gen_rule.go: -I include dirs and imported sources, -N own roots. path renders a tree path on the command
+// line: g.abs for edges run from the build dir, as is for those run from the tree root.
+func (s *aidlSpec) flags(g *Graph, f srcFile, path func(string) string) (flags, implicit []string) {
 	flags = append(flags, s.warnings...)
 	hasHash := false
 	if !s.unstable {
@@ -488,7 +489,7 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 	if s.prevVer != "" && !hasHash {
 		prev := filepath.Join(s.dir, "aidl_api", s.name, s.prevVer)
 		if h, ok := g.readHash(filepath.Join(prev, ".hash")); ok {
-			flags = append(flags, "--previous_api_dir="+g.abs(prev), "--previous_hash", h)
+			flags = append(flags, "--previous_api_dir="+path(prev), "--previous_hash", h)
 			implicit = append(implicit, g.abs(filepath.Join(prev, ".hash")))
 		} else if !s.prevReported {
 			s.prevReported = true
@@ -499,16 +500,16 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 		flags = append(flags, "--log")
 	}
 	for _, r := range s.includes {
-		flags = append(flags, "-I"+g.abs(r))
+		flags = append(flags, "-I"+path(r))
 	}
 	for _, r := range s.roots {
-		flags = append(flags, "-N"+g.abs(r))
+		flags = append(flags, "-N"+path(r))
 	}
 	return flags, implicit
 }
 
 // aidlPreprocessed is aidl_interface.go buildPreprocessed: the types of one interface version, `aidl --preprocess <out> [--structured]
-// [--stability s] -p<imports' preprocessed> -I<own source roots, include_dirs, include_dirs> <srcs>`, into
+// [--stability s] -p<imports' preprocessed> -I<own source roots, include_dirs, headers' dirs, include_dirs> <srcs>`, into
 // <out>/aidl/<iface>/<version>/preprocessed.aidl; an importer's aidl runs read it with -p (getDeps). "" when the version has no sources.
 func (g *Graph) aidlPreprocessed(i *aidlIface, ver string) string {
 	k := i.side.String() + "/" + i.mod.Name + "/" + ver
@@ -545,7 +546,11 @@ func (g *Graph) aidlPreprocessed(i *aidlIface, ver string) string {
 	for _, f := range srcs {
 		imports = appendMissing(imports, []string{f.root})
 	}
+	// getDeps for the interface itself: its include_dirs, then its headers' (aidl_library) dirs; buildPreprocessed adds include_dirs again
 	imports = append(imports, i.props.strs("include_dirs")...)
+	for _, h := range i.props.strs("headers") {
+		imports = append(imports, g.aidlLibraryDirs(h, i.side, i.mod.Name, map[string]bool{})...)
+	}
 	imports = append(imports, i.props.strs("include_dirs")...)
 	for _, d := range imports {
 		flags = append(flags, "-I"+g.abs(d))
@@ -582,15 +587,16 @@ func (g *Graph) aidlJavaRule(n *Node) *genRule {
 	r.labels = []genLabel{g.genTool(n, r, "aidl", fail)}
 	var cmds []string
 	for _, f := range s.srcs {
-		flags, implicit := s.flags(g, f)
+		// tree-relative from the genrule's cwd (the tree root), as Soong's: aidl writes the source path into the generated code
+		flags, implicit := s.flags(g, f, func(p string) string { return p })
 		r.inputs = append(r.inputs, f.path)
 		r.implicit = appendMissing(r.implicit, implicit)
 		cmd := []string{"$(location aidl)", "--lang=java"}
 		for _, fl := range flags {
 			cmd = append(cmd, shellEscape(fl))
 		}
-		// the source absolute like its -N root: aidl matches a source to its import root by path prefix
-		cmds = append(cmds, strings.Join(append(cmd, "-o", "$(genDir)", shellEscape(g.abs(f.path))), " "))
+		// the source in the same form as its -N root: aidl matches a source to its import root by path prefix
+		cmds = append(cmds, strings.Join(append(cmd, "-o", "$(genDir)", shellEscape(f.path)), " "))
 		r.outs = append(r.outs, filepath.Join(genDir, strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")+".java"))
 	}
 	r.cmd = strings.Join(cmds, " && ")

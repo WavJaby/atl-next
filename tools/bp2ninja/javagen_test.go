@@ -135,11 +135,15 @@ func TestJavaGenSources(t *testing.T) {
 	tmp := filepath.Join(dir, "gen", "aidl", "aidl0.tmp")
 	// aidlFlags: deps' exported dirs, include_dirs, the module dir (the sources' root is listed already); -t by default for an sdk "none"? no:
 	// only system_server / core / core_platform / module / system; --transaction_names; --min_sdk_version of the unnumbered sdk = current
-	base := "-I" + g.abs("lib/ex") + " -I" + g.abs("inc") + " -I" + g.abs("lib") + " --transaction_names --min_sdk_version=current"
+	// tree-relative (-I and the source, run from the tree root), as Soong's: the path lands in the generated code
+	base := "-Ilib/ex -Iinc -Ilib --transaction_names --min_sdk_version=current"
 	foo := ninjaEdgeVars(ninja, filepath.Join(tmp, "lib", "a", "IFoo.java"))
 	bar := ninjaEdgeVars(ninja, filepath.Join(tmp, "lib", "a", "IBar.java"))
 	if foo == nil || bar == nil {
 		t.Fatalf("aidl edges missing:\n%s", ninja)
+	}
+	if foo["src"] != "lib/a/IFoo.aidl" {
+		t.Errorf("aidl src %q", foo["src"])
 	}
 	// individualAidlFlags: every source but the exceptions gets -Wmissing-permission-annotation -Werror
 	if foo["flags"] != base || bar["flags"] != base+" -Wmissing-permission-annotation -Werror" {
@@ -303,8 +307,8 @@ func TestAidlJavaBackend(t *testing.T) {
 		t.Errorf("outs %v, want %v", gn.rule.outs, want)
 	}
 	flags := "--structured --version 1 --hash hash-a1 --min_sdk_version current -p" + filepath.Join(g.out, "aidl", "device", "common", "1", "preprocessed.aidl") +
-		" -I" + g.tree + "/inc/aidl -N" + g.tree + "/p/aidl_api/app/1"
-	if want := "$(location aidl) --lang=java " + flags + " -o $(genDir) " + g.tree + "/p/aidl_api/app/1/com/app/IApp.aidl"; !strings.Contains(gn.rule.cmd, want) {
+		" -Iinc/aidl -Np/aidl_api/app/1" // tree paths relative: the genrule runs from the tree root, as Soong's
+	if want := "$(location aidl) --lang=java " + flags + " -o $(genDir) p/aidl_api/app/1/com/app/IApp.aidl"; !strings.Contains(gn.rule.cmd, want) {
 		t.Errorf("cmd %q lacks %q", gn.rule.cmd, want)
 	}
 	// the library compiles the generated files

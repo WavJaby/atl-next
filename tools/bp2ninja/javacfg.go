@@ -30,36 +30,44 @@ type JavaConfig struct {
 	// kotlin.go: KotlincCmd and KotlinAbiGenPluginJar (tree paths), KotlincGlobalFlags, KotlincSuppressJDK9Warnings
 	Kotlinc, KotlinAbiGen          string
 	KotlincGlobal, KotlincJdk9Opts []string
+	// java/legacy_core_platform_api_usage.go legacyCorePlatformApiModules: modules whose core_platform / private SDK is the legacy one
+	LegacyCorePlatform map[string]bool
 }
 
 func readJavaConfig(tree, jdk string) (JavaConfig, error) {
 	lists := map[string][]string{}
 	strs := map[string]string{}
-	for _, f := range []string{"build/soong/java/config/config.go", "build/soong/java/config/droidstubs.go", "build/soong/java/config/kotlin.go"} {
+	for _, f := range []string{"build/soong/java/config/config.go", "build/soong/java/config/droidstubs.go", "build/soong/java/config/kotlin.go",
+		"build/soong/java/legacy_core_platform_api_usage.go"} {
 		if err := goConstants(filepath.Join(tree, f), lists, strs); err != nil {
 			return JavaConfig{}, err
 		}
 	}
 	c := JavaConfig{
-		CommonJdkFlags:  lists["CommonJdkFlags"],
-		JavacHeapSize:   strs["JavacHeapSize"],
-		JavacVmFlags:    lists["javacVmFlagsList"],
-		JavaVmFlags:     lists["javaVmFlagsList"],
-		D8Flags:         lists["D8Flags"],
-		MetalavaFlags:   lists["metalavaFlags"],
-		MetalavaAnno:    lists["metalavaAnnotationsFlags"],
-		MetalavaAnnoW:   lists["metalavaAnnotationsWarningsFlags"],
-		MetalavaAddOpen: strs["MetalavaAddOpens"],
-		Kotlinc:         strs["KotlincCmd"],
-		KotlinAbiGen:    strs["KotlinAbiGenPluginJar"],
-		KotlincGlobal:   lists["KotlincGlobalFlags"],
-		KotlincJdk9Opts: lists["KotlincSuppressJDK9Warnings"],
+		CommonJdkFlags:     lists["CommonJdkFlags"],
+		JavacHeapSize:      strs["JavacHeapSize"],
+		JavacVmFlags:       lists["javacVmFlagsList"],
+		JavaVmFlags:        lists["javaVmFlagsList"],
+		D8Flags:            lists["D8Flags"],
+		MetalavaFlags:      lists["metalavaFlags"],
+		MetalavaAnno:       lists["metalavaAnnotationsFlags"],
+		MetalavaAnnoW:      lists["metalavaAnnotationsWarningsFlags"],
+		MetalavaAddOpen:    strs["MetalavaAddOpens"],
+		Kotlinc:            strs["KotlincCmd"],
+		KotlinAbiGen:       strs["KotlinAbiGenPluginJar"],
+		KotlincGlobal:      lists["KotlincGlobalFlags"],
+		KotlincJdk9Opts:    lists["KotlincSuppressJDK9Warnings"],
+		LegacyCorePlatform: map[string]bool{},
+	}
+	for _, m := range lists["legacyCorePlatformApiModules"] {
+		c.LegacyCorePlatform[m] = true
 	}
 	_, global := lists["KotlincGlobalFlags"]
 	for name, v := range map[string]bool{"CommonJdkFlags": len(c.CommonJdkFlags) > 0, "JavacHeapSize": c.JavacHeapSize != "",
 		"javacVmFlagsList": len(c.JavacVmFlags) > 0, "javaVmFlagsList": len(c.JavaVmFlags) > 0, "D8Flags": len(c.D8Flags) > 0,
 		"metalavaFlags": len(c.MetalavaFlags) > 0, "MetalavaAddOpens": c.MetalavaAddOpen != "", "KotlincCmd": c.Kotlinc != "",
-		"KotlinAbiGenPluginJar": c.KotlinAbiGen != "", "KotlincGlobalFlags": global, "KotlincSuppressJDK9Warnings": len(c.KotlincJdk9Opts) > 0} {
+		"KotlinAbiGenPluginJar": c.KotlinAbiGen != "", "KotlincGlobalFlags": global, "KotlincSuppressJDK9Warnings": len(c.KotlincJdk9Opts) > 0,
+		"legacyCorePlatformApiModules": len(c.LegacyCorePlatform) > 0} {
 		if !v {
 			return c, fmt.Errorf("build/soong/java/config: %s not found", name)
 		}

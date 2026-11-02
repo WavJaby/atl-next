@@ -232,7 +232,7 @@ func (rustAidl) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
 		}
 		rel := strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")
 		out := filepath.Join(dir, rel+".rs")
-		flags, implicit := s.flags(g, f)
+		flags, implicit := s.flags(g, f, g.abs)
 		n.edges = append(n.edges, genEdge{rule: "aidl_rust", outs: []string{out}, in: g.abs(f.path), implicit: implicit, tools: tools, vars: [][2]string{
 			{"flags", shellQuote(flags)}, {"outdir", esc(dir)}, {"dep", esc(out + ".d")},
 		}})

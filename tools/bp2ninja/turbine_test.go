@@ -30,8 +30,11 @@ java_binary_host { name: "turbine", srcs: ["T.java"] }
 	if e == nil || e["bootcp"] != "--system "+esc(filepath.Join(g.out, "device", "sm", "system")) || e["cp"] != esc(depHeader) || e["ver"] != "21" {
 		t.Errorf("turbine edge %v", e)
 	}
-	// header and implementation are the Turbine jar; no javac edge
-	if n.header != out || n.implRes != out || ninjaEdgeVars(g.java.b.String(), filepath.Join(dir, "javac", "hdr.jar")) != nil {
-		t.Errorf("header %s implRes %s", n.header, n.implRes)
+	// compileJavaHeader: turbine-combined (always, stripping META-INF/TRANSITIVE) is header and implementation; no javac edge
+	comb := filepath.Join(dir, "turbine-combined", "hdr.jar")
+	ce := ninjaEdgeVars(g.java.b.String(), comb)
+	if n.header != comb || n.implRes != comb || ce == nil || ce["args"][:31] != "-stripDir META-INF/TRANSITIVE -" ||
+		ninjaEdgeVars(g.java.b.String(), filepath.Join(dir, "javac", "hdr.jar")) != nil {
+		t.Errorf("header %s implRes %s combine %v", n.header, n.implRes, ce)
 	}
 }

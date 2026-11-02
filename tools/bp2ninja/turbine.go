@@ -10,7 +10,8 @@ import (
 // Turbine for headers_only modules only (base.go compile: headers_only needs Turbine; every other module takes the javac path, J3), as
 // builder.go TransformJavaToHeaderClasses: `java <JavaVmFlags> -jar turbine.jar --output <jar>.tmp --sources @rsp --javacopts
 // <CommonJdkFlags> <javacflags> -source V -target V -- --source_jars <srcjars> <--system dir | --bootclasspath jars> --classpath <jars>`,
-// the classpath space-separated (FormTurbineClassPath), java9 classpath first for Java 9+. The header jar then goes through jarjar_rules and
+// the classpath space-separated (FormTurbineClassPath), java9 classpath first for Java 9+; compileJavaHeader then merges it with the static
+// libraries' header jars (here their combined jars) into turbine-combined. The header jar then goes through jarjar_rules and
 // the inherited rename rules as the javac path's would (jarjarIfNecessary "turbine", repackageFlagsIfNecessary "repackage-turbine"); it is
 // the module's header and implementation alike.
 
@@ -44,7 +45,10 @@ func (g *Graph) turbineHeaders(n *jNode, java, kt, srcjars, waits, flags []strin
 	g.java.edge("turbine", []string{out}, absAll(g, java), implicit, waits, [][2]string{
 		{"flags", ninjaRaw(flags)}, {"ver", ver.String()}, {"srcjars", join(srcjars)}, {"bootcp", boot}, {"cp", join(cp)}, {"turbine", esc(turbine)},
 	})
-	header := out
+	// compileJavaHeader: always combined with the static libraries' headers into turbine-combined, META-INF/TRANSITIVE stripped
+	header := filepath.Join(n.dir, "turbine-combined", jar)
+	g.java.edge("combine", []string{header}, dedupKeep(append([]string{out}, d.staticImpl...)), nil, nil, [][2]string{
+		{"args", "-stripDir META-INF/TRANSITIVE -stripFile module-info.class -stripFile 'META-INF/versions/*/module-info.class'"}})
 	if rules := g.jarjarRulesFile(n); rules != "" {
 		jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
 		g.jarjar(n, jj, header, rules, 1)

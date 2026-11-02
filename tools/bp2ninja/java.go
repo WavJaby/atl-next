@@ -233,14 +233,6 @@ func (g *Graph) flattenJava(m *Module, side Side) *Obj {
 			}
 		}
 	}
-	if sv := p.obj("soong_config_variables"); sv != nil {
-		base = removeKey(base, "soong_config_variables")
-		for _, v := range sv.keys {
-			if d := sv.obj(v).obj("conditions_default"); d != nil {
-				base = merge(base, d)
-			}
-		}
-	}
 	return base
 }
 
@@ -368,10 +360,16 @@ func (g *Graph) decodeSdk(n *jNode, s sdkSpec) (sdkDep, error) {
 		}
 		return sdkDep{boot: []string{lib, "core-lambda-stubs"}, java9: []string{lib}, sysModules: "core-" + sysKind + "-stubs-system-modules", aidlGen: aidl}
 	}
+	// legacy_core_platform_api_usage.go corePlatformSystemModules / corePlatformBootclasspathLibraries: the legacy core platform API for the
+	// modules on its list, the stable one for every other
+	corePlatform := sdkDep{sysModules: "stable-core-platform-api-stubs-system-modules", boot: []string{"stable.core.platform.api.stubs", "core-lambda-stubs"}}
+	if g.java != nil && g.java.cfg.LegacyCorePlatform[n.name] {
+		corePlatform = sdkDep{sysModules: "legacy-core-platform-api-stubs-system-modules", boot: []string{"legacy.core.platform.api.stubs", "core-lambda-stubs"}}
+	}
 	switch s.kind {
 	case "private":
-		return sdkDep{sysModules: "legacy-core-platform-api-stubs-system-modules", boot: []string{"legacy.core.platform.api.stubs", "core-lambda-stubs"},
-			classpath: []string{"ext", "framework"}}, nil
+		corePlatform.classpath = []string{"ext", "framework"}
+		return corePlatform, nil
 	case "none":
 		sm := p.str("system_modules")
 		switch sm {
@@ -382,8 +380,7 @@ func (g *Graph) decodeSdk(n *jNode, s sdkSpec) (sdkDep, error) {
 		}
 		return sdkDep{sysModules: sm, boot: []string{sm}}, nil
 	case "core_platform":
-		// legacy_core_platform_api_usage.go: modules outside its legacy list use the stable core platform API
-		return sdkDep{sysModules: "stable-core-platform-api-stubs-system-modules", boot: []string{"stable.core.platform.api.stubs", "core-lambda-stubs"}}, nil
+		return corePlatform, nil
 	case "public":
 		return toModule("android_stubs_current", "public"), nil
 	case "system":
@@ -532,6 +529,9 @@ type jSrcs struct {
 func (g *Graph) javaSrcs(n *jNode, srcs []string) jSrcs {
 	exclude := g.excludeSet(n.mod.Dir, n.side, n.props.strs("exclude_srcs"), n.name)
 	s := jSrcs{gen: map[string][]srcFile{}}
+	// a generated-source input named twice (two filegroups listing one .aidl) is generated once: Soong's module source paths are unique
+	// (FirstUniquePaths), and two srcjars declaring one class fail Turbine
+	seenGen := map[string]bool{}
 	add := func(f srcFile) {
 		switch ext := filepath.Ext(f.path); ext {
 		case ".java":
@@ -541,7 +541,8 @@ func (g *Graph) javaSrcs(n *jNode, srcs []string) jSrcs {
 		case ".srcjar":
 			s.srcjars = append(s.srcjars, f.path)
 		default:
-			if javaGen(ext) != nil {
+			if javaGen(ext) != nil && !seenGen[f.path] {
+				seenGen[f.path] = true
 				s.gen[ext] = append(s.gen[ext], f)
 			}
 		}

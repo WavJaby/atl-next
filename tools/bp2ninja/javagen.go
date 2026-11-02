@@ -15,7 +15,8 @@ import (
 // srcjars, sharded 50 sources per srcjar (android.ShardPaths) under gen/<side>/<module>/{aidl,proto}/<kind><i>.srcjar; .logtags become one .java
 // each (gen/logtags/<path below the module dir>.java), kept in place among the .java sources.
 //   - aidl: one edge per source (`aidl --ninja -d`, so each has its own depfile), then one soong_zip -srcjar edge per shard over its
-//     <kind><i>.tmp dir. Soong runs a shard's sources in one rule; the generated files are the same.
+//     <kind><i>.tmp dir, zipping the shard's own outputs that exist (a parcelable declaration generates none; a whole-dir zip would keep
+//     files of an earlier shard layout). Soong runs a shard's sources in one rule; the generated files are the same.
 //   - proto: one edge per shard, aprotoc once per source as Soong's ProtoRule; the per-source --dependency_out files are concatenated into the
 //     edge's depfile (ninja's deps = gcc takes the union of every rule in it).
 //   - Host tools (aidl, aprotoc, protoc-gen-*) are cc binaries of this graph (jhost).
@@ -105,8 +106,10 @@ func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars [
 	if st, err := os.Stat(g.abs(filepath.Join(n.mod.Dir, "src"))); err == nil && st.IsDir() {
 		incs = append(incs, filepath.Join(n.mod.Dir, "src"))
 	}
+	// tree-relative, run from the tree root as Soong's: aidl writes the source path into the generated code (UnsupportedAppUsage
+	// overrideSourcePosition), so an absolute one would differ from Soong's output and leak the build machine's path
 	for _, i := range incs {
-		flags = append(flags, "-I"+g.abs(i))
+		flags = append(flags, "-I"+i)
 	}
 	var roots []string
 	for _, f := range files {
@@ -115,7 +118,7 @@ func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars [
 		}
 	}
 	for _, r := range roots {
-		flags = append(flags, "-I"+g.abs(r))
+		flags = append(flags, "-I"+r)
 	}
 	kind := parseSdk(n.props.str("sdk_version")).kind
 	switch kind {
@@ -161,7 +164,7 @@ func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars [
 			if d.aidlPreprocess != "" {
 				implicit = append(implicit, d.aidlPreprocess)
 			}
-			j.edge("jaidl", []string{out}, []string{g.abs(f.path)}, implicit, order, [][2]string{{"flags", shellQuote(fl)}, {"aidl", esc(tool)}})
+			j.edge("jaidl", []string{out}, []string{g.abs(f.path)}, implicit, order, [][2]string{{"flags", shellQuote(fl)}, {"src", shellEsc(f.path)}, {"aidl", esc(tool)}})
 			outs = append(outs, out)
 		}
 		j.edge("srcjar", []string{srcjar}, outs, nil, nil, [][2]string{{"dir", esc(tmp)}})
@@ -267,13 +270,15 @@ func (g *Graph) javaProto(n *jNode, files []srcFile, _ javaDeps) (java, srcjars 
 func shellEsc(s string) string { return shellQuote([]string{s}) }
 
 // javaGenRules: the rules of the generators.
+// jaidl: $src is $in as Soong passes it (tree-relative from the tree root); the depfile's tree-relative lines (aidl writes one path per
+// `  path \` line) get the root prefixed, as ninja resolves them from the build dir.
 const javaGenRules = `rule jaidl
-  command = $aidl --ninja -d$out.d $flags $in $out
+  command = cd "$root" && $aidl --ninja -d$out.d $flags $src $out && sed -i "s|^  \([^/]\)|  $root/\1|" $out.d
   depfile = $out.d
   deps = gcc
   description = aidl $in
 rule srcjar
-  command = $soongzip -srcjar -write_if_changed -o $out -C $dir -D $dir
+  command = (for f in $in; do [ ! -e $$f ] || echo $$f; done) > $out.list && $soongzip -srcjar -write_if_changed -o $out -C $dir -l $out.list
   description = srcjar $out
 rule logtags
   command = python3 $script -o $out $in
