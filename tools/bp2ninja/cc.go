@@ -162,7 +162,7 @@ type Graph struct {
 	combinedRead bool
 	// modules synthesized by ref/side (synth.go), nil = none
 	synthMods map[string]*Module
-	// build/release config (release.go) and aconfig codegen (aconfig.go); nil without -release / -aconfig
+	// build/release config (release.go) and aconfig codegen (aconfig.go); nil without -release
 	release *Release
 	acfg    *aconfigGraph
 	// Java modules (java.go)

@@ -10,7 +10,8 @@
 // Android.bp module: linked first, its headers on the dependents' system include path, its defines on their compiles. A module in the -srcs file is built
 // without the sources its row lists, linking the row's provider (if any) first for their symbols. A device Rust module in -rust-android takes its android target blocks and --cfg atl_android_userspace (rust.go).
 //
-// -aconfig and -release (given together) build aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values; -release also writes <out>/gen/build.prop (buildprop.go).
+// -release builds aconfig flag libraries (aconfig.go: cc_aconfig_library, java_aconfig_library) from the release's values, with the tree's aconfig, and
+// writes <out>/gen/build.prop (buildprop.go).
 // Java goals (java.go: java_library and the types its closure needs, dex jars for device) also need them, -jdk and -build-tools; with them, a
 // goal that names a Java module builds as one (its host variant for a host-only type). Host Java tools, metalava included, are built from the tree. -measure writes <out>/measure.txt (measure.go) instead of a build.
 // -device-cxx-flags <dir> (no goals) writes <out>/compat and prints the C++ command line every device compile in <dir> shares (probeCxxFlags), for xtask check step libcxx, instead of a build.
@@ -54,8 +55,7 @@ func main() {
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
 	flag.StringVar(&jt.BuildTools, "build-tools", "", "Java goals: directory holding soong_zip, merge_zips, zip2zip, zipalign")
-	aconfig := flag.String("aconfig", "", "aconfig binary (aconfig flag libraries; Java goals)")
-	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values; given with -aconfig")
+	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
 	flag.Parse()
@@ -108,7 +108,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *aconfig, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -157,11 +157,11 @@ func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, 
 	return nil
 }
 
-// javaSetup: the Java tools (read only when given), the aconfig tool and the release config.
+// javaSetup: the Java tools (read only when given) and the release config.
 type javaSetup struct {
-	tools            JavaTools
-	aconfig, release string
-	measure          bool
+	tools   JavaTools
+	release string
+	measure bool
 }
 
 func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, stand map[string]string, goals []string) error {
@@ -176,9 +176,6 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, stand: stand, nodes: map[key]*Node{}}
-	if (js.aconfig == "") != (js.release == "") {
-		return fmt.Errorf("-aconfig and -release are given together")
-	}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
 	if js.release != "" {
 		if g.release, err = readRelease(tree, js.release); err != nil {
@@ -193,7 +190,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			return err
 		}
 		g.genFile(filepath.Join(out, buildPropFile), prop)
-		g.acfg = &aconfigGraph{tool: js.aconfig, decls: map[string]*aconfigDecl{}}
+		g.acfg = &aconfigGraph{decls: map[string]*aconfigDecl{}}
 	}
 	for side, osName := range []string{"android", "linux_glibc"} {
 		ev := &evaluator{cfg: cfg, os: osName, rel: g.release}

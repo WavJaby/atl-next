@@ -16,9 +16,13 @@ import (
 //   - Only the current release config is built (no RELEASE_ACONFIG_EXTRA_RELEASE_CONFIGS).
 //   - One declarations cache per aconfig_declarations module, shared by every codegen that names it (Java, cc): Soong's
 //     AconfigDeclarationsProviderData.IntermediateCacheOutputPath. aconfig_declarations has no variants, so it is looked up on the device side.
+//   - The aconfig tool is build/make/tools/aconfig's rust_binary_host, built in this graph as Soong builds it: its codegen depends on
+//     the tree (the finalized flags it embeds turn SDK-finalized flags into `SDK_INT >= <level>` checks), so a binary of another tree
+//     generates other code.
 //   - Not supported: rust_aconfig_library (rust.go reports it).
 
-// aconfigGraph: the aconfig tool and the declarations caches built so far; values come from Graph.release.
+// aconfigGraph: the aconfig tool (built once the first declarations need it) and the declarations caches built so far; values come
+// from Graph.release.
 type aconfigGraph struct {
 	tool  string
 	decls map[string]*aconfigDecl
@@ -56,9 +60,9 @@ const aconfigJavaRule = `rule aconfig_java
   description = aconfig java $out
 `
 
-// ninja: the aconfig variable, rules and cache edges; empty without the tool.
+// ninja: the aconfig variable, rules and cache edges; empty when no declarations were built.
 func (a *aconfigGraph) ninja() string {
-	if a == nil {
+	if a == nil || a.tool == "" {
 		return ""
 	}
 	return fmt.Sprintf("\naconfig = %s\n%s%s", esc(a.tool), aconfigRules, a.b.String())
@@ -110,11 +114,11 @@ func (g *Graph) aconfigValues(pkg string) []string {
 }
 
 // aconfigDeclarations builds (once) the aconfig_declarations module ref names: create-cache over its declarations with the release's values.
-// nil with a problem recorded when there is no tool or no such module.
+// nil with a problem recorded without a release config or such a module.
 func (g *Graph) aconfigDeclarations(ref, from string) *aconfigDecl {
 	a := g.acfg
 	if a == nil {
-		g.problem("%s: aconfig_declarations %s needs -aconfig and -release", from, ref)
+		g.problem("%s: aconfig_declarations %s needs -release", from, ref)
 		return nil
 	}
 	m := g.lookup(ref, Device)
@@ -129,6 +133,9 @@ func (g *Graph) aconfigDeclarations(ref, from string) *aconfigDecl {
 	}
 	if d, ok := a.decls[m.Name]; ok {
 		return d
+	}
+	if a.tool == "" {
+		a.tool = g.jhost("aconfig", from)
 	}
 	p := g.resolveDefaults(m, Device, map[string]bool{})
 	r := g.release

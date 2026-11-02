@@ -33,14 +33,6 @@ pub struct Host {
     pub soong_prebuilt_os: Option<String>,
 }
 
-impl Host {
-    /// `<tree>/prebuilts/build-tools/<soong_prebuilt_os>/bin`: Soong's prebuilt build-only tools for a build on this host; None where Soong ships none.
-    pub fn prebuilt_build_tools(&self, tree: &Path) -> Option<std::path::PathBuf> {
-        let os = self.soong_prebuilt_os.as_deref()?;
-        Some(tree.join(BUILD_TOOLS).join(os).join("bin"))
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(

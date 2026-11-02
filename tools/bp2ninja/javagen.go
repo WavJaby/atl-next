@@ -38,7 +38,7 @@ func javaGen(ext string) func(g *Graph, n *jNode, files []srcFile, d javaDeps) (
 // genOrder: the order genSources appends generated outputs, after the module's own .srcjar sources: protos, then aidl.
 var genOrder = []string{".logtags", ".proto", ".aidl"}
 
-// jhost: the path of host cc binary name, built once per graph (nodeOut); a missing tool is a problem and the path is one nothing builds,
+// jhost: the path of host binary name (cc or Rust), built once per graph (nodeOut); a missing tool is a problem and the path is one nothing builds,
 // so its users fail.
 func (g *Graph) jhost(name, from string) string {
 	t, ok := g.tools[name]

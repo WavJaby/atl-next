@@ -137,10 +137,22 @@ func TestAconfigCacheShared(t *testing.T) {
 	}
 }
 
-func TestCcAconfigWithoutTool(t *testing.T) {
+func TestCcAconfigWithoutRelease(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": aconfigTree, "p/f.aconfig": "", "p/v.textproto": ""})
 	n := g.node("libflags", Device, Shared, "t")
-	if n == nil || len(n.edges) != 0 || !g.hasProblem("needs -aconfig and -release") {
+	if n == nil || len(n.edges) != 0 || !g.hasProblem("needs -release") {
 		t.Errorf("%+v %v", n, g.problems)
+	}
+}
+
+// The tool is the tree's aconfig host binary (codegen/init.go: ${aconfig} is the built "aconfig"), looked up once the first declarations
+// are built: with no such module in the tree, the cache edge depends on the missing-tool path, and a problem names it.
+func TestAconfigToolFromTree(t *testing.T) {
+	g := aconfigGraphFor(t)
+	g.acfg.tool = ""
+	g.node("libflags", Device, Shared, "t")
+	missing := filepath.Join(g.out, "missing-tool", "aconfig")
+	if g.acfg.tool != missing || !strings.Contains(g.acfg.ninja(), "| "+esc(missing)+"\n") || !g.hasProblem("(tool aconfig)") {
+		t.Errorf("tool %q problems %v", g.acfg.tool, g.problems)
 	}
 }

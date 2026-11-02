@@ -61,11 +61,10 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    let (pointer_bits, arch_variant, host) = match arches.get(&args.host) {
-        Some(a @ arches::Arch { host: Some(h), .. }) => (
+    let (pointer_bits, arch_variant) = match arches.get(&args.host) {
+        Some(a @ arches::Arch { host: Some(_), .. }) => (
             a.pointer_bits.to_string(),
             a.soong_arch_variant.clone().unwrap_or_default(),
-            h,
         ),
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
@@ -205,23 +204,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&args.cc)?;
-    // aconfig flag libraries: Soong's prebuilt aconfig (owner decision J2) and the pinned tag's release config; a host Soong ships no prebuilts for gets neither, and the converter reports each such library
-    let aconfig: Vec<std::ffi::OsString> = match host.prebuilt_build_tools(&tree) {
-        Some(bin) => vec![
-            "-aconfig".into(),
-            bin.join("aconfig").into(),
-            "-release".into(),
-            aosp::target_release(&tree)?.into(),
-        ],
-        None => {
-            println!(
-                "native: {}: no soong_prebuilt_os in {}, aconfig flag libraries are not built",
-                args.host,
-                arches::FILE
-            );
-            Vec::new()
-        }
-    };
+    // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
+    let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
     let mut table: Vec<String> = Vec::new();
     let mut round = 0;
@@ -262,7 +246,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&provided_file)
             .arg("-srcs")
             .arg(&srcs_file)
-            .args(&aconfig)
+            .arg("-release")
+            .arg(&release)
             .args(cache.iter().flat_map(CompilerCache::converter_args))
             .args(&args.goals)
             .status()

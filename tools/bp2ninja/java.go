@@ -111,10 +111,10 @@ func (g *Graph) lookupJava(ref string, side Side) *Module {
 	return g.sdkLibComponent(strings.TrimPrefix(name, ":"), side)
 }
 
-// initJava reads what Java nodes need: the tools and Soong's Java flags; the release config and aconfig must be set up already.
+// initJava reads what Java nodes need: the tools and Soong's Java flags; the release config must be read already.
 func (g *Graph) initJava(t JavaTools) error {
 	if t.BuildTools == "" || g.acfg == nil {
-		return fmt.Errorf("java: -jdk, -build-tools, -aconfig and -release are required together")
+		return fmt.Errorf("java: -jdk, -build-tools and -release are required together")
 	}
 	cfg, err := readJavaConfig(g.tree, t.JDK)
 	if err != nil {
