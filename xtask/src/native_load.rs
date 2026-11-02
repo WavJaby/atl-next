@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on ART -- by default the converter's own (`stage_art`), or any ART root given with --art (Soong's host ART) -- in four stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in four stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
 //!    Without framework.jar the walk aborts at the first class the fixture lacks: a measured count, never a failure. Then register_android_os_SystemClock / _util_Log / _util_EventLog alone: each must return >= 0.
 //! 3. call: natives checked against Android semantics -- uptimeMillis is CLOCK_MONOTONIC in ms (android_os_SystemClock.cpp; bracketed by System.nanoTime, also CLOCK_MONOTONIC in ART),
-//!    isLoggable defaults to INFO (Log.isLoggable docs; liblog __android_log_is_loggable), println_native returns liblog __android_log_buf_write's 1.
-//! 4. copies: each library of [`SINGLE_COPY`] mapped once after the load (/proc/self/maps). A warning by default: Soong's host ART ships its own libbase/liblog/ICU/libc++; `--strict-copies` makes it a failure.
+//!    isLoggable defaults to INFO (Log.isLoggable docs; liblog __android_log_is_loggable), println_native returns liblog __android_log_buf_write's 1 for INFO and -EPERM (-1) for VERBOSE, which liblog drops before any logger under the minimum priority INFO every run sets (`ANDROID_LOG_TAGS=*:i`; without it buf_write's default is VERBOSE and Log.v is written, as on Android);
+//!    the INFO message reaches stderr as the launcher's logger writes it (`<L> liblog/<tag>: <text>`), the VERBOSE one nowhere: the logger receives only what liblog let through.
+//! 4. copies: each library of [`SINGLE_COPY`] mapped once after the load (/proc/self/maps). A warning by default; `--strict-copies` makes it a failure.
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver) + test-only declarations of exactly the classes and natives gRegJNI's first entries bind, compiled with the Java pipeline's JDK and d8;
 //! shim.rs, a JNI cdylib built with plain rustc, calls the C++ entry points (hidden register_* by .symtab vaddr). Built into <out>/native-load, never shipped.
-//! `--self-test` feeds the load guard broken inputs (a non-ELF file, a library with an undefined symbol) and fails unless each is refused; the result checks are unit tests.
+//! atl-app-launcher and atl-property-service are built with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
+//! `--self-test` feeds the guards broken inputs and fails unless each fires: the load guard (a non-ELF file, a library with an undefined symbol), the launcher's (no property area); the result checks are unit tests.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -184,9 +186,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 struct Env {
     art: PathBuf,
-    /// A staged ART's library dir, ART runs with it as LD_LIBRARY_PATH (stage_art); None for a given --art, whose binaries find their own.
-    lib_path: Option<PathBuf>,
-    dalvikvm: PathBuf,
+    /// The staged ART's library dir, every run's LD_LIBRARY_PATH (stage_art).
+    lib_path: PathBuf,
+    launcher: PathBuf,
+    property_service: PathBuf,
+    /// The converter's build.prop, the property service's input.
+    build_prop: PathBuf,
     boot: Vec<PathBuf>,
     javac_boot: Vec<PathBuf>,
     d8: PathBuf,
@@ -199,7 +204,17 @@ struct Env {
 struct Fixture {
     dex: PathBuf,
     shim: PathBuf,
+    /// Every run's property-area variable as atl-property-service printed it: (name, the area it wrote).
+    area: (String, String),
 }
+
+/// The workspace binaries an app process starts with, built by cargo into <out>/cargo.
+const LAUNCHER: &str = "atl-app-launcher";
+const PROPERTY_SERVICE: &str = "atl-property-service";
+/// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
+const BUILD_PROP: &str = "gen/build.prop";
+/// The launcher's refusal without a property area (atl-app-launcher main.rs).
+const NO_AREA: &str = "no system property area";
 
 impl Env {
     fn new(root: &Path, args: &Args) -> Result<Self> {
@@ -225,20 +240,15 @@ impl Env {
             Some(dir) => std::path::absolute(dir)?,
             None => ws.join("out/native").join(&args.host),
         };
-        let (art, lib_path) = match &args.art {
-            Some(dir) => (std::path::absolute(dir)?, None),
-            None => {
-                let art = out.join("native-load-art");
-                let lib = stage_art(&out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
-                (art, Some(lib))
-            }
-        };
+        let art = out.join("native-load-art");
+        let lib_path = stage_art(&out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
+        let bin = build_binaries(root, &out)?;
         let env = Env {
-            dalvikvm: art
-                .join("bin")
-                .join(format!("dalvikvm{}", arch.pointer_bits)),
             art,
             lib_path,
+            launcher: bin.join(LAUNCHER),
+            property_service: bin.join(PROPERTY_SERVICE),
+            build_prop: out.join(BUILD_PROP),
             boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
             d8: java_out.join("host/bin/d8"),
@@ -247,7 +257,7 @@ impl Env {
             work: out.join("native-load"),
             verbose: args.verbose,
         };
-        for p in [&env.dalvikvm, &env.d8, &env.jdk, &env.runtime]
+        for p in [&env.build_prop, &env.d8, &env.jdk, &env.runtime]
             .into_iter()
             .chain(&env.boot)
             .chain(&env.javac_boot)
@@ -310,16 +320,36 @@ impl Env {
         exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
         let shim = self.work.join("libnlt_shim.so");
         rustc(root, &fixture.join("shim.rs"), &shim, &[])?;
+        // the broker's step: the default property area, its variable printed as NAME=path
+        let printed = output(
+            Command::new(&self.property_service)
+                .arg("--build-prop")
+                .arg(&self.build_prop)
+                .arg("--out")
+                .arg(self.work.join("properties")),
+            "atl-property-service",
+        )?;
+        let area = printed
+            .trim()
+            .split_once('=')
+            .map(|(n, v)| (n.to_owned(), v.to_owned()))
+            .with_context(|| format!("atl-property-service printed {printed:?}, not NAME=path"))?;
         Ok(Fixture {
             dex: dex.join("classes.dex"),
             shim,
+            area,
         })
     }
 
-    /// NativeLoad.java `mode args` on dalvikvm.
+    /// NativeLoad.java `mode args`, started by the launcher over the fixture's property area.
     fn art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
+        self.launch(fixture, &fixture.area.1, mode, args)
+    }
+
+    /// `art` with the property-area variable set to `area`.
+    fn launch(&self, fixture: &Fixture, area: &str, mode: &str, args: &[String]) -> Result<ArtRun> {
         let boot = join_paths(&self.boot);
-        let mut cmd = Command::new(&self.dalvikvm);
+        let mut cmd = Command::new(&self.launcher);
         cmd.arg(format!("-Xbootclasspath:{boot}"))
             .arg(format!("-Xbootclasspath-locations:{boot}"))
             .arg("-Xnoimage-dex2oat")
@@ -333,13 +363,14 @@ impl Env {
             .env("ANDROID_I18N_ROOT", self.art.join("com.android.i18n"))
             .env("ANDROID_TZDATA_ROOT", self.art.join("com.android.tzdata"))
             .env("ANDROID_DATA", self.work.join("data"))
-            .env("LD_BIND_NOW", "1");
-        if let Some(lib) = &self.lib_path {
-            cmd.env("LD_LIBRARY_PATH", lib);
-        }
+            .env("LD_BIND_NOW", "1")
+            .env("LD_LIBRARY_PATH", &self.lib_path)
+            .env(&fixture.area.0, area)
+            // liblog's minimum priority INFO: libbase InitLogging (ART's runtime start) reads it into __android_log_set_minimum_priority, so liblog itself refuses VERBOSE (stage 3)
+            .env("ANDROID_LOG_TAGS", "*:i");
         let out = cmd
             .output()
-            .with_context(|| format!("running {}", self.dalvikvm.display()))?;
+            .with_context(|| format!("running {}", self.launcher.display()))?;
         let run = ArtRun {
             ok: out.status.success(),
             status: out.status.to_string(),
@@ -358,40 +389,29 @@ impl Env {
 const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
 
 /// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
-/// - bin/dalvikvm<bits>: the converter's dalvikvm (Soong's lib64 suffix names it so).
-/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: libnativehelper dlopens libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
+/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
 /// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
 fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
     let device = out.join("device");
-    let dalvikvm = device
-        .join("dalvikvm")
-        .join(format!("dalvikvm{pointer_bits}"));
-    ensure!(
-        dalvikvm.is_file(),
-        "no converter ART in {}: build it with `xtask native ... dalvikvm libart libjavacore libopenjdk libicu_jni`, or pass --art",
-        out.display()
-    );
+    for module in ["libart", "libnativehelper"] {
+        ensure!(
+            device.join(module).join(format!("{module}.so")).is_file(),
+            "no converter ART in {}: build it with `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime`",
+            out.display()
+        );
+    }
     if art.exists() {
         std::fs::remove_dir_all(art)?;
     }
     let lib = art.join(if pointer_bits == 64 { "lib64" } else { "lib" });
     let icu = art.join("com.android.i18n/etc/icu");
-    for d in [
-        &art.join("bin"),
-        &lib,
-        &icu,
-        &art.join("com.android.tzdata"),
-    ] {
+    for d in [&lib, &icu, &art.join("com.android.tzdata")] {
         std::fs::create_dir_all(d)?;
     }
     let link = |target: &Path, at: &Path| {
         std::os::unix::fs::symlink(target, at)
             .with_context(|| format!("linking {} -> {}", at.display(), target.display()))
     };
-    link(
-        &dalvikvm,
-        &art.join("bin").join(format!("dalvikvm{pointer_bits}")),
-    )?;
     link(Path::new("."), &art.join("com.android.art"))?;
     for module in std::fs::read_dir(&device)? {
         let module = module?.path();
@@ -441,6 +461,11 @@ fn join_paths(paths: &[PathBuf]) -> String {
 }
 
 fn exec(cmd: &mut Command, what: &str) -> Result<()> {
+    output(cmd, what).map(drop)
+}
+
+/// `cmd`'s stdout; a failure with its output.
+fn output(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd.output().with_context(|| format!("running {what}"))?;
     ensure!(
         out.status.success(),
@@ -449,7 +474,37 @@ fn exec(cmd: &mut Command, what: &str) -> Result<()> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`LAUNCHER`] and [`PROPERTY_SERVICE`], release, in the build directory's cargo target dir (cargo's own staleness check: a no-op when current); their directory.
+fn build_binaries(root: &Path, out: &Path) -> Result<PathBuf> {
+    let target = out.join("cargo");
+    exec(
+        crate::cargo_command()
+            .current_dir(root)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                LAUNCHER,
+                "-p",
+                PROPERTY_SERVICE,
+            ])
+            .arg("--target-dir")
+            .arg(&target),
+        "cargo build (launcher, property service)",
+    )?;
+    let bin = target.join("release");
+    for b in [LAUNCHER, PROPERTY_SERVICE] {
+        ensure!(
+            bin.join(b).is_file(),
+            "{} missing after cargo build",
+            bin.join(b).display()
+        );
+    }
+    Ok(bin)
 }
 
 /// A host cdylib from one Rust file, with the repo's pinned toolchain (rustup reads rust-toolchain.toml in `root`).
@@ -738,7 +793,26 @@ fn call_checks(run: &ArtRun) -> Vec<Result<String, String>> {
         expect("loggable-info", "true", "isLoggable(INFO)"),
         // liblog logger_write.cpp __android_log_buf_write: `return 1` once the message is written
         expect("println", "1", "println_native"),
+        // ... and `return -EPERM` (-1) when __android_log_is_loggable refuses, before any logger
+        expect("println-verbose", "-1", "println_native(VERBOSE)"),
+        logger_result(run),
     ]
+}
+
+/// NativeLoad.java's two println_native messages: INFO and VERBOSE.
+const LOGGED: &str = "native-load println_native";
+const FILTERED: &str = "native-load verbose";
+
+/// The launcher's logger got the INFO message (its line: `I liblog/<tag>: <text>`, atl-app-launcher log.rs) and not the VERBOSE one liblog dropped.
+fn logger_result(run: &ArtRun) -> Result<String, String> {
+    let ours = format!(" I liblog/nlt: {LOGGED}");
+    if !run.stderr.lines().any(|l| l.ends_with(&ours)) {
+        return Err(format!("logger: no `{ours}` line on stderr"));
+    }
+    if run.stderr.contains(FILTERED) {
+        return Err(format!("logger: wrote `{FILTERED}`, which liblog refuses"));
+    }
+    Ok("logger: INFO written, VERBOSE never reached it".to_owned())
 }
 
 /// Stage 4: libraries of [`SINGLE_COPY`] mapped from more than one path.
@@ -831,7 +905,33 @@ fn self_test(root: &Path, env: &Env, fixture: &Fixture) -> Result<ExitCode> {
             ),
         }
     }
+    // the launcher's guard: an area path with no file behind it (and none at /dev/__properties__ on this host) must stop the start
+    let missing = broken.join("no-property-area");
+    let run = env.launch(
+        fixture,
+        &missing.display().to_string(),
+        "load",
+        &[env.runtime.display().to_string()],
+    )?;
+    match area_refused(&run) {
+        Ok(s) => report.pass("self-test", s),
+        Err(e) => report.fail("self-test", e),
+    }
     Ok(report.finish())
+}
+
+/// The launcher refused to start: failed, its refusal on stderr, the fixture never ran.
+fn area_refused(run: &ArtRun) -> Result<String, String> {
+    if run.ok || run.value("loaded").is_some() {
+        return Err("no property area: the launcher started the VM anyway".to_owned());
+    }
+    match run.stderr.lines().find(|l| l.contains(NO_AREA)) {
+        Some(l) => Ok(format!("no property area refused: {}", l.trim())),
+        None => Err(format!(
+            "no property area: failed without `{NO_AREA}`: {}",
+            run.failure()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -889,15 +989,24 @@ mod tests {
         assert!(alone_result(&run("nlt ret 0 0\n", false), &["a", "b"]).is_err());
     }
 
+    /// The launcher's logger line for the INFO message (atl-app-launcher log.rs format).
+    const INFO_LINE: &str =
+        "1762000000.007 5.250    42    43 I liblog/nlt: native-load println_native\n";
+
     #[test]
     fn call_checks_fire_on_wrong_results() {
         // 5 ms between the two nanoTime reads; uptime inside, at the edges, outside
-        let base = "nlt loggable-verbose false\nnlt loggable-info true\nnlt println 1\n";
-        let ok = run(
+        let base = "nlt loggable-verbose false\nnlt loggable-info true\nnlt println 1\nnlt println-verbose -1\n";
+        let mut ok = run(
             &format!("nlt uptime 1000000000 1002 1005000000\n{base}"),
             true,
         );
-        assert!(call_checks(&ok).iter().all(Result::is_ok));
+        ok.stderr.push_str(INFO_LINE);
+        assert!(
+            call_checks(&ok).iter().all(Result::is_ok),
+            "{:?}",
+            call_checks(&ok)
+        );
         let edge = run(
             &format!("nlt uptime 1000999999 1000 1005000000\n{base}"),
             true,
@@ -909,11 +1018,36 @@ mod tests {
         );
         assert!(call_checks(&late)[0].is_err());
         let wrong = run(
-            "nlt uptime 1 0 1\nnlt loggable-verbose true\nnlt loggable-info false\nnlt println 0\n",
+            "nlt uptime 1 0 1\nnlt loggable-verbose true\nnlt loggable-info false\nnlt println 0\nnlt println-verbose 1\n",
             true,
         );
         assert!(call_checks(&wrong).iter().skip(1).all(Result::is_err));
         assert!(call_checks(&run("", false)).iter().all(Result::is_err));
+    }
+
+    #[test]
+    fn logger_check_fires() {
+        let mut r = run("", true);
+        // no line from our logger (e.g. liblog's own stderr logger still installed)
+        assert!(logger_result(&r).is_err());
+        r.stderr.push_str(INFO_LINE);
+        assert!(logger_result(&r).is_ok());
+        // a VERBOSE line written: something filtered nothing
+        r.stderr
+            .push_str("1 2 3 4 V liblog/nlt: native-load verbose\n");
+        assert!(logger_result(&r).is_err());
+    }
+
+    #[test]
+    fn area_guard_check() {
+        let mut refused = run("", false);
+        refused.stderr =
+            "atl-app-launcher: no system property area: neither $ATL_PROP_AREA nor ...\n"
+                .to_owned();
+        assert!(area_refused(&refused).is_ok());
+        // started anyway, or failed for another reason
+        assert!(area_refused(&run("nlt loaded /l.so\n", true)).is_err());
+        assert!(area_refused(&run("", false)).is_err());
     }
 
     #[test]

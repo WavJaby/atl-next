@@ -90,5 +90,7 @@ public class NativeLoad {
         out("loggable-info", android.util.Log.isLoggable(TAG, android.util.Log.INFO));
         // bufID 0 = LOG_ID_MAIN (liblog log_id_t)
         out("println", android.util.Log.println_native(0, android.util.Log.INFO, TAG, "native-load println_native"));
+        // below the default INFO: liblog refuses it before any logger (xtask checks it never reaches stderr)
+        out("println-verbose", android.util.Log.println_native(0, android.util.Log.VERBOSE, TAG, "native-load verbose"));
     }
 }
