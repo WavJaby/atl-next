@@ -52,10 +52,6 @@ reason = "bionic dynamic linker stub; glibc's ld.so is the linker, the namespace
 provider = "crate:atl-bionic"
 reason = "bionic-internal (defines _LIBC, glibc rejects it); atl-bionic implements the part AOSP code here calls, without allocation, logging to stderr as bionic does without logd"
 
-["libdebuggerd_client"]
-provider = "crate:atl-debuggerd-client"
-reason = "requests a dump through tombstoned, which this host lacks; as AOSP's client without tombstoned, every request fails before any signal (bionic's debugger signal is glibc's SIGRTMIN+1, free for apps)"
-
 ["libdl_android"]
 provider = "crate:atl-bionic"
 reason = "bionic linker namespace API; atl-bionic implements what the closure calls (target SDK setter, exported-namespace lookup, namespace create/link) over one namespace, the process's glibc link map; our libnativeloader's namespaces plug in there"

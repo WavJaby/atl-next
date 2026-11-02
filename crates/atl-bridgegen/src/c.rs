@@ -57,7 +57,7 @@ const STD_TYPEDEFS: &[(&str, &str)] = &[
 #[derive(Default)]
 pub struct Kept<'a> {
     /// Includes of the source, as written (`<android/log.h>`, whose `ANDROID_LOG_*` async_safe/log.h's
-    /// callers pass; `"dump_type.h"`, whose enum debuggerd/client.h's callers name), printed in the
+    /// callers pass), printed in the
     /// source's order before the printer's own; one the source lacks fails. A `"…"` one resolves through
     /// the caller's include path: the printed header's own directory holds only generated files.
     pub includes: &'a [&'a str],

@@ -352,7 +352,7 @@ pub fn install_signal_stack() -> Result<()> {
 }
 
 /// The signals AOSP's `debuggerd_init` registers its handler for on a process that has not disabled it (system/core/debuggerd/include/debuggerd/handler.h `debuggerd_register_handlers`), which bionic's linker runs before any app code.
-/// Not `BIONIC_SIGNAL_DEBUGGER` (bionic `__SIGRTMIN + 3`): it asks for a dump, never ends the process, and is a real-time signal an app may use under glibc (atl-debuggerd-client never sends it).
+/// Not `BIONIC_SIGNAL_DEBUGGER` (bionic `__SIGRTMIN + 3`): it asks for a dump, never ends the process, and is a real-time signal an app may use under glibc (libdebuggerd_client never sends it here: it fails at the tombstoned connect first).
 const CRASH_SIGNALS: [c_int; 8] = [
     signal::SIGABRT,
     signal::SIGBUS,

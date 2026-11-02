@@ -358,8 +358,10 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// `__cpu_mask`, the element of both libcs' `cpu_set_t.__bits`.
 /// `TEMP_FAILURE_RETRY` (`unistd.h`; glibc defines it under `__USE_GNU` only, so the C view lacks it; libcore
 /// ojluni FileDescriptor_md.c): the same retry-on-EINTR statement expression in both libcs.
+/// `__printflike` (`sys/cdefs.h`, printf format attribute; libdebuggerd_client debuggerd_client.cpp `log_error`).
 const FORWARDED_MACROS: &[&str] = &[
     "__unused",
+    "__printflike",
     "TEMP_FAILURE_RETRY",
     "M_PURGE",
     "M_LOG_STATS",

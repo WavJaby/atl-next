@@ -38,12 +38,6 @@ crates = ["atl-binder-wire", "atl-binderd"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
-# libdebuggerd_client for source-built AOSP code: dump requests fail as without tombstoned
-[debuggerd]
-crates = ["atl-debuggerd-client"]
-exports = ["atl-debuggerd-client"]
-uses = ["generators"]
-
 # AOSP libEGL / libGLES* surface on the host GL loaders, linked next to them (providers.toml): extension entry points as symbols, libEGL's private API
 [opengl]
 crates = ["atl-opengl"]

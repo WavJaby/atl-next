@@ -2,7 +2,7 @@
 //! `android_set_abort_message`: bionic keeps the first message of the process for debuggerd ("the first
 //! crash is the one most worth reporting"; null is stored as `(null)`), and `async_safe_fatal` sets it
 //! too. Stored here, in this process-wide library: `message()` is the reader, for the crash handler
-//! (none yet; atl-debuggerd-client fails every dump request before any signal). A handler in another
+//! (none yet; AOSP's libdebuggerd_client fails every dump request before any signal: no tombstoned). A handler in another
 //! shared object reads it through a C export added with it -- bionic's own reader is libc-internal
 //! (`__libc_shared_globals()->abort_msg`).
 //!
