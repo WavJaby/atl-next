@@ -176,30 +176,6 @@ pub fn api_crate(apis: &[Api], implementation: &str) -> Result<Vec<PathBuf>> {
     Ok(rerun)
 }
 
-/// Fails unless every function of `apis` is a global C export of the NDK symbol file `symbol_file` (relative to the AOSP tree, e.g. `frameworks/base/native/android/libandroid.map.txt`): an NDK library exports only what its map lists, so declared (header) == implemented == exported (map). Returns the paths cargo reruns the script on.
-pub fn listed_in_symbol_file(apis: &[Api], symbol_file: &str) -> Result<Vec<PathBuf>> {
-    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let up = Upstreams::of(&checkout(&manifest)?)?;
-    let path = up.file(&format!("aosp/{symbol_file}"))?;
-    let symbols = crate::symbol_file::parse(&std::fs::read_to_string(&path)?)
-        .with_context(|| path.display().to_string())?;
-    let exported: std::collections::BTreeSet<&str> = crate::symbol_file::exports(&symbols)
-        .map(|s| s.name.as_str())
-        .collect();
-    let missing: Vec<&str> = apis
-        .iter()
-        .flat_map(|a| a.functions)
-        .copied()
-        .filter(|f| !exported.contains(f))
-        .collect();
-    ensure!(
-        missing.is_empty(),
-        "{symbol_file} does not export {}",
-        missing.join(", ")
-    );
-    Ok(up.rerun_paths(&format!("aosp/{symbol_file}")))
-}
-
 /// The arches.toml row of a host target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostArch {

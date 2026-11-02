@@ -1,8 +1,0 @@
-<?xml version='1.0' encoding='UTF-8'?>
-<!-- SPDX-License-Identifier: MIT -->
-<!-- In the shape of an OEM /product/etc/fonts_customization.xml as AOSP's FontCustomizationParser reads it (android-16 pin). -->
-<fonts-modification version='1'>
-  <family customizationType='new-named-family' name='google-sans'>
-    <font weight='400' style='normal'>b3em.ttf</font>
-  </family>
-</fonts-modification>

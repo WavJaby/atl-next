@@ -2,7 +2,7 @@
 //! C-ABI interface description: a header (or a C++ source and the headers holding its types) parsed by
 //! libclang once per target arch -> the IR (every layout number is clang's) -> generated Rust types
 //! with layout asserts, signature checks, layout constants, C declarations, and the ABI-identity report.
-//! Also include wrappers giving one libc's headers another's header shape (`shape`), and the reader of NDK symbol files (`symbol_file`: which functions an NDK library exports).
+//! Also include wrappers giving one libc's headers another's header shape (`shape`).
 //! Output is deterministic for the same sources and targets.
 #![forbid(unsafe_code)]
 
@@ -13,7 +13,6 @@ pub mod ir;
 pub mod report;
 pub mod rust;
 pub mod shape;
-pub mod symbol_file;
 
 use anyhow::Result;
 

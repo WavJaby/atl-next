@@ -59,15 +59,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "atl-android"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "atl-bridgegen",
- "roxmltree",
-]
-
-[[package]]
 name = "atl-android-runtime"
 version = "0.0.0"
 

@@ -119,11 +119,6 @@ reason = "AOSP's loader finds drivers only as Android HALs (hwvulkan via hw_get_
 provider = "system:libelf"
 reason = "AOSP builds elfutils' android variant against bionic: it force-includes bionic-fixup/AndroidFixup.h (a static rawmemchr, canonicalize_file_name as a realpath macro, which breaks glibc's stdlib.h declaration under _GNU_SOURCE) and exports bionic-fixup's argp.h/libintl.h stand-ins; glibc has all of them, and the distro's libelf is the same upstream built for glibc. Its one consumer here, libbpf_minimal (libtimeinstate), uses only <libelf.h> types"
 
-# NDK libraries: ATL's own, in Rust (plan: "our NDK"), one implementation for apps and the AOSP code built here (owner decision 2026-11-01)
-["libandroid"]
-provider = "crate:atl-android"
-reason = "AOSP's libandroid is the NDK over the framework's native services (libgui, libbinder, libinput, libhwui, minikin ...) and links back into libhwui; ATL implements the NDK itself, exports added as consumers need them (system fonts first)"
-
 # licence: Adobe's DNG SDK carries a DNG-only (field-of-use) patent licence, which GPL-3 forbids and the GPL-3 QEMU bridge shares the process with (licenses.toml `external/dng_sdk/`); RAW/DNG is not shipped
 ["libdng_sdk"]
 provider = "none"

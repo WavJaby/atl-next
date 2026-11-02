@@ -440,13 +440,14 @@ const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
 
 /// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
 /// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
+///   libhwui dlopens libandroid by name too (HardwareBufferHelpers, HardwareRenderer, HintSessionWrapper), with no DT_NEEDED on it, so no dependency closure builds it: required here.
 /// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
 fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
     let device = out.join("device");
-    for module in ["libart", "libnativehelper"] {
+    for module in ["libart", "libnativehelper", "libandroid"] {
         ensure!(
             device.join(module).join(format!("{module}.so")).is_file(),
-            "no converter ART in {}: build it with `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime`",
+            "no {module} in {}: build it with `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid`",
             out.display()
         );
     }
