@@ -249,6 +249,8 @@ type aidlSpec struct {
 	prevReported bool
 	// rust: --rust_java_type values (an aidl crate with parcelables, aidlcrates.go)
 	javaTypes []string
+	// rust: --rust_unimplemented_hook (every aidl crate: our Rust services serve its interfaces, each a subset)
+	unimplementedHook bool
 }
 
 func strVals(list []string) []Val {
@@ -357,6 +359,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 			spec.preprocessed = append(spec.preprocessed, c.preprocessed)
 		}
 		spec.javaTypes = c.javaTypes
+		spec.unimplementedHook = true
 	}
 	for _, h := range p.strs("headers") {
 		spec.includes = appendMissing(spec.includes, g.aidlLibraryDirs(h, side, ref, map[string]bool{}))
@@ -519,6 +522,9 @@ func (s *aidlSpec) flags(g *Graph, f srcFile, path func(string) string) (flags, 
 	}
 	for _, j := range s.javaTypes {
 		flags = append(flags, "--rust_java_type="+j)
+	}
+	if s.unimplementedHook {
+		flags = append(flags, "--rust_unimplemented_hook")
 	}
 	for _, r := range s.includes {
 		flags = append(flags, "-I"+path(r))

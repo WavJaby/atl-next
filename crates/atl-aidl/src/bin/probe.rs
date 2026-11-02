@@ -78,16 +78,13 @@ impl ISerialManager for Serial {
             Err(Status::new_exception(ExceptionCode::SECURITY, None))
         }
     }
+    // openSerialPort keeps its default body (aidl --rust_unimplemented_hook), which answers through here
+    fn r#unimplemented(&self, _method: &'static str) -> Status {
+        binder::StatusCode::UNKNOWN_TRANSACTION.into()
+    }
     fn r#getSerialPorts(&self) -> binder::Result<Vec<String>> {
         self.ran.store(true, Ordering::SeqCst);
         Ok(vec![PORT.to_owned()])
-    }
-    fn r#openSerialPort(&self, _name: &str) -> binder::Result<binder::ParcelFileDescriptor> {
-        self.ran.store(true, Ordering::SeqCst);
-        Err(Status::new_exception(
-            ExceptionCode::UNSUPPORTED_OPERATION,
-            None,
-        ))
     }
 }
 

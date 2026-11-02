@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! SPDX gate: every file we author carries `SPDX-License-Identifier: MIT` near the top.
+//! Exception: a file translated from AOSP's Apache-2.0 sources (the Rust system services) is a derivative work: `Apache-2.0`, accepted only with an attribution line [`DERIVED`] naming the AOSP files right after the tag.
 
 use std::path::Path;
 use std::process::Command;
@@ -8,6 +9,10 @@ use anyhow::{Context, Result, bail};
 
 const TAG: &str = "SPDX-License-Identifier:";
 const OUR_LICENSE: &str = "MIT";
+/// AOSP's licence: the one a derivative file of ours may carry instead of MIT.
+const AOSP_LICENSE: &str = "Apache-2.0";
+/// The attribution an `Apache-2.0` file carries on the line after its tag: `Derived from the Android Open Source Project: <tree path>[, <tree path>...]`.
+const DERIVED: &str = "Derived from the Android Open Source Project:";
 
 /// Lines searched for the tag: room for a shebang or a Markdown frontmatter opener before it.
 const HEADER_LINES: usize = 3;
@@ -40,8 +45,16 @@ pub fn check(root: &Path) -> Result<()> {
             }
             continue;
         }
-        match header_license(&String::from_utf8_lossy(&bytes)) {
+        let text = String::from_utf8_lossy(&bytes);
+        match header_license(&text) {
             Some(OUR_LICENSE) => {}
+            Some(AOSP_LICENSE) => {
+                if !attributed(&text) {
+                    bad.push(format!(
+                        "{rel}: licence {AOSP_LICENSE} without `{DERIVED} <AOSP paths>` on the next line"
+                    ));
+                }
+            }
             Some(other) => bad.push(format!("{rel}: licence {other}, expected {OUR_LICENSE}")),
             None => bad.push(format!(
                 "{rel}: no `{TAG}` in the first {HEADER_LINES} lines"
@@ -96,6 +109,16 @@ fn header_license(text: &str) -> Option<&str> {
     tag_value(text, HEADER_LINES)
 }
 
+/// The line after the header's tag carries [`DERIVED`] and at least one path.
+fn attributed(text: &str) -> bool {
+    let mut lines = text.lines().take(HEADER_LINES + 1);
+    lines.by_ref().find(|l| l.contains(TAG)).is_some()
+        && lines
+            .next()
+            .and_then(|l| l.split_once(DERIVED))
+            .is_some_and(|(_, paths)| !paths.trim().is_empty())
+}
+
 /// Under `patches/<upstream>/`: the upstream's `LICENSE` text, and `*.patch` files carrying the
 /// licence of the files they patch (any valid SPDX expression, placed after `---` by `xtask patch`).
 fn check_patch_dir_file(root: &Path, rel: &str, text: &str) -> Option<String> {
@@ -141,7 +164,24 @@ pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_patch_dir_file, header_license};
+    use super::{attributed, check_patch_dir_file, header_license};
+
+    /// An Apache-2.0 file passes only with the attribution line, with a path, right after the tag.
+    #[test]
+    fn aosp_derived_needs_attribution() {
+        let ok = "// SPDX-License-Identifier: Apache-2.0\n//! Derived from the Android Open Source Project: frameworks/base/services/core/java/a.java\n";
+        assert_eq!(header_license(ok), Some("Apache-2.0"));
+        assert!(attributed(ok));
+        assert!(!attributed(
+            "// SPDX-License-Identifier: Apache-2.0\n//! Derived from the Android Open Source Project:\n"
+        ));
+        assert!(!attributed(
+            "// SPDX-License-Identifier: Apache-2.0\n\n//! Derived from the Android Open Source Project: x\n"
+        ));
+        assert!(!attributed(
+            "// SPDX-License-Identifier: Apache-2.0\nfn main() {}\n"
+        ));
+    }
 
     /// The guards on `patches/`, each made to fire; LICENSE content is the drift test's (patch.rs).
     #[test]

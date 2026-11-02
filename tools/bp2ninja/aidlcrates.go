@@ -18,7 +18,7 @@ import (
 //   - types: qualified AIDL names; each, and every interface / structured parcelable / enum / union it references (imports, same-package names, qualified names), is compiled.
 //   - parcelables (optional): the crate giving Rust types to every unstructured `parcelable X;` declared under include_dirs without its own rust_type (all of them, not the closure's: one
 //     scan, no second walk to keep in step), through a generated preprocessed file `parcelable X rust_type "<crate>::<x path>";` (-p; aidl skips imports it defines), and to the Java-only
-//     builtins (aidlJavaOnly) through the host aidl patch's --rust_java_type. The crate is a rust_library the converter builds from the package's cargo dir (Soong's additional_rustlibs):
+//     builtins (aidlJavaOnly) through the host aidl patch's --rust_java_type (every aidl crate also gets its --rust_unimplemented_hook: our services implement a subset). The crate is a rust_library the converter builds from the package's cargo dir (Soong's additional_rustlibs):
 //     root <dir>/src/lib.rs, its rustlibs, plus a generated `parcelables.rs` in OUT_DIR (rust_aidl_parcelables, rustsrc.go) declaring each type: `pub use crate::codecs::<path>::<Name>::<Name>;`
 //     where <dir>/src/codecs/<java path>/<Name>.rs exists (a hand-written codec), else `crate::opaque!(<Name>[<T>], "<qualified>");`, in modules mirroring the Java packages; a nested class
 //     `Outer.Inner` is the type `Outer_Inner` (aidlDecl.rustName).
