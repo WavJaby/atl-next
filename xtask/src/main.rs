@@ -29,6 +29,7 @@ mod patch;
 mod provided_gate;
 mod providers;
 mod prune;
+mod services;
 mod soong;
 mod sources;
 mod spdx;

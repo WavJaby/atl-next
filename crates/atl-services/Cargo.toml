@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-services"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+# activity.rs, package.rs, settings.rs translate AOSP's Java system services (Apache-2.0, attribution in each file); the rest is ours
+license = "MIT AND Apache-2.0"
+publish.workspace = true
+
+# The M2 system services in Rust (owner 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager, the settings IContentProvider stub.
+# They implement the converter's AIDL stubs (atl-aidl) against libbinder_rs and the parcelable codecs (libatl_parcelables), so only `xtask native` builds them (feature `converter`);
+# plain workspace builds take the policy modules (permission, counters, packages) and their tests.
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/libatl_parcelables"]
+
+[features]
+converter = ["atl-aidl/converter"]
+
+# Registers the services with servicemanager (as atld will) and serves them; `xtask test binder` runs it as uid 1000.
+[[bin]]
+name = "atl-system-services"
+path = "src/bin/system_services.rs"
+required-features = ["converter"]
+
+# Test-only client of `xtask test binder`: the M2 calls an app process makes, as an app or the system uid.
+[[bin]]
+name = "atl-services-client"
+path = "src/bin/client.rs"
+required-features = ["converter"]
+
+[dependencies]
+anyhow.workspace = true
+atl-aidl = { path = "../atl-aidl" }
+clap.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

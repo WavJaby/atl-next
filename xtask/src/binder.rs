@@ -4,6 +4,7 @@
 //! The harness stands in for the broker: it starts `atl-binderd` (admin connection on its stdin), and per process makes a SEQPACKET socketpair, passes one end as `ATL_BINDER_FD`, registers the other with binderd tagged {uid, host pid}.
 //! servicemanager: uid 1000 (AID_SYSTEM), the one process allowed to become context manager; run under bubblewrap with the test layout's /system, /vendor, /odm (empty VINTF manifests) over the host's root.
 //! `service`: uid 2000 (AID_SHELL). Gate: `service list` lists `manager` (servicemanager registers itself, main.cpp), `service check manager` finds it, `service check <absent>` does not; binderd's counters show the driver paths that must fire on this workload: the context manager's TXN_SECURITY_CTX flag (ignored) and libbinder's oneway-spam ioctl (unsupported).
+//! Then stage `services` (services.rs): the M2 Rust services registered with that servicemanager and called through binderd. Needs `xtask native` to have built crate atl-services.
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -297,6 +298,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let list = h.service(&service, &env, &["list"], &log("list"))?;
     let absent = h.service(&service, &env, &["check", ABSENT], &log("absent"))?;
+    let services_fails = crate::services::stage(root, &out, &h, &env, &service, &test_root)?;
 
     let _ = sm.kill();
     sm.wait()?;
@@ -309,6 +311,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("binder: WARN servicemanager logs NULL VINTF MANIFEST");
     }
     let mut fails = verdict(&list, &found, &absent, &counters);
+    fails.extend(services_fails);
     match bstatus {
         Some(s) if s.success() => {}
         Some(s) => fails.push(format!("atl-binderd exited {s}")),

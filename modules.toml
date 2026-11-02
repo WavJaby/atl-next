@@ -38,6 +38,11 @@ crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]
 exports = ["atl-aidl"]
 uses = ["generators"]
 
+# the M2 system services in Rust (ActivityManager subset, PackageManager subset, the settings provider stub) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
+[services]
+crates = ["atl-services"]
+uses = ["aidl", "generators"]
+
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it
 [binder]
 crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]
