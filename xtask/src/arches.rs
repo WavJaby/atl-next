@@ -2,7 +2,7 @@
 //! `arches.toml`: the only list of architectures. Column meanings live in that file's header.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -150,6 +150,16 @@ fn kernel_arch_matches(android_bp: &str, arches: &Arches) -> Result<()> {
 const SOONG_CONFIG_GO: &str = "aosp/build/soong/android/config.go";
 /// Tree-relative directory of the prebuilt build tools, one subdirectory per PrebuiltOS.
 const BUILD_TOOLS: &str = "prebuilts/build-tools";
+/// Soong's JDK (build/soong/java/config: prebuilts/jdk/jdk21), one subdirectory per PrebuiltOS.
+pub const JDK: &str = "prebuilts/jdk/jdk21";
+
+/// The converter's Java tools in AOSP tree `tree` for PrebuiltOS `os`: the JDK home and the prebuilt build tools' bin (soong_zip, ...), as Soong's ANDROID_JAVA_HOME and prebuilt Go tools.
+pub fn java_tools(tree: &Path, os: &str) -> (PathBuf, PathBuf) {
+    (
+        tree.join(JDK).join(os),
+        tree.join(BUILD_TOOLS).join(os).join("bin"),
+    )
+}
 
 /// Every `soong_prebuilt_os` is a value Soong's PrebuiltOS returns on Linux, and `prebuilts/build-tools/<it>/bin` exists in the checkout `layout`
 /// resolves. Which row gets which value (PrebuiltOS keys on Go's GOARCH, a name this table does not carry) is not checked.

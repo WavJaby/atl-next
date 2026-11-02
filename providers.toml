@@ -62,10 +62,6 @@ reason = "bionic linker namespace API; atl-bionic implements what the closure ca
 provider = "none"
 reason = "Zygote's seccomp policy; only the Zygote JNI uses it (excluded from libandroid_runtime by its srcs row); app sandboxing incl. seccomp is the broker's job (plan Q5), so it would be a second implementation"
 # ART built as its Linux target (ART_TARGET_LINUX, bp2ninja artplugin.go artTargetLinux)
-["apex-info-list-tinyxml"]
-provider = "none"
-reason = "xsd parser of /apex/apex-info-list.xml (APEX boot versions); libart's only reader, runtime.cc, includes it under ART_TARGET_ANDROID; no APEX is mounted here"
-
 ["art-apex-cache-info"]
 provider = "none"
 reason = "xsd parser of odrefresh's cache-info.xml; libart includes it (mark_compact.cc) only under ART_TARGET_ANDROID; odrefresh/artd do not run here (no boot-time dexopt)"

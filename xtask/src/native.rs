@@ -57,10 +57,16 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    let (pointer_bits, arch_variant) = match arches.get(&args.host) {
-        Some(a @ arches::Arch { host: Some(_), .. }) => (
+    let (pointer_bits, arch_variant, prebuilt_os) = match arches.get(&args.host) {
+        Some(a @ arches::Arch { host: Some(h), .. }) => (
             a.pointer_bits.to_string(),
             a.soong_arch_variant.clone().unwrap_or_default(),
+            h.soong_prebuilt_os.clone().with_context(|| {
+                format!(
+                    "{}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)",
+                    args.host
+                )
+            })?,
         ),
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
@@ -208,9 +214,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut round = 0;
     loop {
         round += 1;
+        let round_tree = aosp_tree()?;
+        // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
+        let (jdk, build_tools) = arches::java_tools(&round_tree, &prebuilt_os);
         let status = Command::new(&converter)
             .arg("-tree")
-            .arg(aosp_tree()?)
+            .arg(&round_tree)
+            .arg("-jdk")
+            .arg(&jdk)
+            .arg("-build-tools")
+            .arg(&build_tools)
             .arg("-out")
             .arg(&out)
             .args([

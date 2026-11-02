@@ -135,6 +135,8 @@ type Graph struct {
 	rustAndroid map[string]bool
 	// providers.toml `defines` rows: module -> macros its device cc compiles get (provided.go checkDefines)
 	defines map[string][]string
+	// the C++ output nodes of xsd_config modules, by the module's key (xsd.go xsdCppNode)
+	xsdCpp map[key]*Node
 	// providers.toml `module:` rows: module -> the tree module built in its place (node), whose output name must be the module's (outName)
 	stand map[string]string
 	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)
@@ -582,7 +584,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		exported[r] = true
 	}
 	for _, r := range n.props.strs("generated_headers") {
-		if gn := g.genNode(r, side, m.Name); gn != nil {
+		if gn := g.ccGenNode(r, side, m.Name); gn != nil {
 			g.useGen(n, gn)
 			if exported[r] {
 				n.genExports = append(n.genExports, gn.rule.incs...)
@@ -597,7 +599,7 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		if skip[r] {
 			continue
 		}
-		if gn := g.genNode(r, side, m.Name); gn != nil {
+		if gn := g.ccGenNode(r, side, m.Name); gn != nil {
 			g.useGen(n, gn)
 			for _, o := range gn.rule.outs {
 				// headers are only waited on

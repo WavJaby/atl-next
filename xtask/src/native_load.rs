@@ -75,8 +75,6 @@ const JAVAC_BOOT: [&str; 3] = [
     "device/core-libart/javac/core-libart.jar",
     "device/framework-minus-apex/javac-header/framework.jar",
 ];
-/// Soong's JDK (build/soong/java/config: prebuilts/jdk/jdk21), under the host's soong_prebuilt_os.
-const JDK: &str = "prebuilts/jdk/jdk21";
 const FIXTURE: &str = "xtask/testdata/native-load";
 const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// `android::AndroidRuntime::startReg(JNIEnv*)` and `android::gRegJNI` (internal linkage), Itanium-mangled.
@@ -325,7 +323,7 @@ impl Env {
             boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
             d8: java_out.join("host/bin/d8"),
-            jdk: farm::shared_tree(&layout).join(JDK).join(os),
+            jdk: arches::java_tools(&farm::shared_tree(&layout), os).0,
             runtime: out.join(RUNTIME),
             reg_jni_entries: {
                 let cpp = farm::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
