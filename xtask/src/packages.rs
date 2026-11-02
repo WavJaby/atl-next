@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Workspace packages built after the converter (`xtask native`, `xtask test native-load`): a package naming converter modules in its Cargo.toml (`[package.metadata.atl] converter`, graph.json module directories) is built with its feature `converter` once the build's graph.json `artifacts` hold every one of them; its build script links them from `$ATL_NATIVE_OUT` (atl-bridgegen converter.rs).
+//! `[package.metadata.atl] aidl = [":libbinder_aidl", ...]` (Blueprint srcs: filegroups, tree-relative .aidl paths) asks for an AIDL crate: the converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; unknown filegroup = converter error), every `xtask native` adds its `-rust` rlib to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
 //! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
@@ -17,11 +18,22 @@ const FEATURE: &str = "converter";
 /// The environment variable naming the converter's build directory (atl-bridgegen converter.rs `NATIVE_OUT`).
 const NATIVE_OUT: &str = "ATL_NATIVE_OUT";
 
+/// The suffix of a package's AIDL crate interface (`<package>-stubs`; atl-bridgegen converter.rs `AIDL_SUFFIX`): its crate `<package>_stubs` cannot clash with the package's own.
+const AIDL_SUFFIX: &str = "-stubs";
+
+/// The converter's aidl_interface name for `package`'s `[package.metadata.atl] aidl` sources (bp2ninja aidlcrates.go); its rlib is `device/<name>-rust`.
+fn aidl_interface(package: &str) -> String {
+    format!("{package}{AIDL_SUFFIX}")
+}
+
 /// A workspace package naming converter modules.
 #[derive(Debug, PartialEq)]
 pub struct Package {
     pub name: String,
+    /// the converter modules it links: `converter`, then its AIDL crate's rlib when it lists `aidl`
     pub modules: Vec<String>,
+    /// `[package.metadata.atl] aidl`: Blueprint srcs (filegroups, tree-relative .aidl paths) of its AIDL crate
+    pub aidl: Vec<String>,
     /// its executables (cargo bin targets)
     pub bins: Vec<String>,
 }
@@ -59,7 +71,7 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
         else {
             continue;
         };
-        let modules: Vec<String> = serde_json::from_value(list.clone()).with_context(|| {
+        let mut modules: Vec<String> = serde_json::from_value(list.clone()).with_context(|| {
             format!(
                 "{}: [package.metadata.atl] converter is not a list of strings",
                 p.name
@@ -70,6 +82,25 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
             "{}: [package.metadata.atl] converter is empty",
             p.name
         );
+        let aidl: Vec<String> = match p.metadata.as_ref().and_then(|m| m["atl"].get("aidl")) {
+            None => Vec::new(),
+            Some(list) => {
+                let aidl: Vec<String> =
+                    serde_json::from_value(list.clone()).with_context(|| {
+                        format!(
+                            "{}: [package.metadata.atl] aidl is not a list of strings",
+                            p.name
+                        )
+                    })?;
+                ensure!(
+                    !aidl.is_empty(),
+                    "{}: [package.metadata.atl] aidl is empty",
+                    p.name
+                );
+                modules.push(format!("device/{}-rust", aidl_interface(&p.name)));
+                aidl
+            }
+        };
         ensure!(
             p.features.contains_key(FEATURE),
             "{}: names converter modules but has no feature `{FEATURE}` to link them under",
@@ -84,10 +115,22 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
         out.push(Package {
             name: p.name,
             modules,
+            aidl,
             bins,
         });
     }
     Ok(out)
+}
+
+/// The packages' AIDL crates as bp2ninja `-aidl-crates` takes them (interface name -> srcs), and their rlibs as converter goals: added to every build, so a package listing `aidl` gets its crate whatever the goals (only these, not its other modules).
+pub fn aidl_crates(packages: &[Package]) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
+    let crates: BTreeMap<String, Vec<String>> = packages
+        .iter()
+        .filter(|p| !p.aidl.is_empty())
+        .map(|p| (aidl_interface(&p.name), p.aidl.clone()))
+        .collect();
+    let goals = crates.keys().map(|i| format!("{i}-rust")).collect();
+    (crates, goals)
 }
 
 /// The workspace packages of checkout `root` naming converter modules.
@@ -311,9 +354,23 @@ mod tests {
             [Package {
                 name: "launcher".into(),
                 modules: vec!["device/libsigchain".into()],
+                aidl: Vec::new(),
                 bins: vec!["launcher".into()]
             }]
         );
+        // `aidl` adds the package's AIDL crate: a module to link and an -aidl-crates entry + goal
+        let with_aidl = serde_json::json!({ "atl": { "converter": ["device/libbinder_rs"], "aidl": [":libbinder_aidl"] } });
+        let parsed = parse_packages(&meta(&[pkg("p", with_aidl, &["converter"], &[])])).unwrap();
+        assert_eq!(
+            parsed[0].modules,
+            ["device/libbinder_rs", "device/p-stubs-rust"]
+        );
+        let (crates, goals) = aidl_crates(&parsed);
+        assert_eq!(
+            crates,
+            BTreeMap::from([("p-stubs".to_owned(), vec![":libbinder_aidl".to_owned()])])
+        );
+        assert_eq!(goals, ["p-stubs-rust"]);
         let err = |p: serde_json::Value| format!("{:#}", parse_packages(&meta(&[p])).unwrap_err());
         assert!(err(pkg("x", list, &[], &[])).contains("no feature `converter`"));
         assert!(
@@ -334,6 +391,15 @@ mod tests {
             ))
             .contains("list of strings")
         );
+        assert!(
+            err(pkg(
+                "x",
+                serde_json::json!({ "atl": { "converter": ["device/a"], "aidl": [] } }),
+                &["converter"],
+                &[]
+            ))
+            .contains("aidl is empty")
+        );
     }
 
     fn graph() -> Graph {
@@ -353,6 +419,7 @@ mod tests {
         let p = |name: &str, modules: &[&str]| Package {
             name: name.into(),
             modules: modules.iter().map(|m| (*m).to_owned()).collect(),
+            aidl: Vec::new(),
             bins: Vec::new(),
         };
         let packages = [

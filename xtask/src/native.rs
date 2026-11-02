@@ -205,6 +205,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::write(&provided_file, serde_json::to_string_pretty(&provided)?)?;
     let srcs_file = out.join("srcs.json");
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
+    // workspace packages' AIDL crates (packages.rs aidl_crates): always converted and built, so those packages build whatever the goals
+    let (aidl_crates, aidl_goals) = packages::aidl_crates(&packages::workspace_packages(root)?);
+    let aidl_crates_file = out.join("aidl-crates.json");
+    std::fs::write(
+        &aidl_crates_file,
+        serde_json::to_string_pretty(&aidl_crates)?,
+    )?;
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&args.cc)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
@@ -258,10 +265,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&provided_file)
             .arg("-srcs")
             .arg(&srcs_file)
+            .arg("-aidl-crates")
+            .arg(&aidl_crates_file)
             .arg("-release")
             .arg(&release)
             .args(cache.iter().flat_map(CompilerCache::converter_args))
             .args(&args.goals)
+            .args(&aidl_goals)
             .status()
             .context("running bp2ninja")?;
         ensure!(status.success(), "bp2ninja failed");

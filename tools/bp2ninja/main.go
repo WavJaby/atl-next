@@ -49,6 +49,7 @@ func main() {
 	libclang := flag.String("libclang", "", "directory of -cc's libclang.so, which rust_bindgen's bindgen loads (LIBCLANG_PATH)")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
+	aidlCratesFile := flag.String("aidl-crates", "", "JSON file: interface name -> srcs (filegroups, tree-relative .aidl paths): unstable aidl_interfaces defined at the tree root, whose -rust backends workspace packages link (Cargo.toml `[package.metadata.atl] aidl`, aidlcrates.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
 	defines := flag.String("defines", "", "comma-separated module:MACRO (NAME or NAME=VALUE): macros the module's device C/C++ compiles get as -D, read by a patch to its source (providers.toml `defines`, provided.go parseDefines)")
@@ -105,6 +106,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
 		os.Exit(1)
 	}
+	aidlCrates, err := readJSON[[]string](*aidlCratesFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -aidl-crates:", err)
+		os.Exit(1)
+	}
 	moduleDefines, err := parseDefines(*defines)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -defines:", err)
@@ -114,7 +120,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -170,7 +176,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string][]string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -221,6 +227,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		return err
 	}
 	g.loadArt(art)
+	if err := g.addAidlCrates(aidlCrates); err != nil {
+		return err
+	}
 	// providers.toml's own check cannot see the tree; this one can
 	names := sortedKeys(omit)
 	for m := range provided {

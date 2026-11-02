@@ -269,7 +269,7 @@ fn main() -> Result<()> {
         println!("cargo::rerun-if-changed={}", path.display());
     }
     if std::env::var_os("CARGO_FEATURE_CONVERTER").is_some() {
-        let (_, lines) = atl_bridgegen::converter::link_package(&manifest)?;
+        let lines = atl_bridgegen::converter::link_package(&manifest)?;
         for l in lines {
             println!("{l}");
         }

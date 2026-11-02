@@ -3,11 +3,10 @@
 //! What is linked comes from `$ATL_NATIVE_OUT/graph.json` `artifacts` (tools/bp2ninja graph.go), so it is what the converter's own links take: an rlib as a crate (`extern crate <name>;` finds it on the `crate=` search path, its crate closure on `dependency=`) plus its cc libraries as link-driver arguments; a shared library as `-l` + RUNPATH.
 //! `rustc-link-lib` lands before std's `-lc`, so a shared module leads DT_NEEDED in the order named (libsigchain must precede libc); rlib link arguments are `rustc-link-arg`, which reach only this package's own links (a dependent package names the modules itself).
 //! The build around it is `xtask native`'s: cargo's linker is the converter's link driver (graph.json `link_driver`; rlib arguments are clang driver arguments such as `-stdlib=libc++`) and the profile's `panic` is `abort`, as the converter's device crates are compiled (a panic strategy mismatch fails the link).
-//! Also the host tools the converter built (`tool`) and, with its `aidl`, Rust stubs from AIDL files (`aidl_rust`), laid out as the aidl_interface Rust backend lays its crate root (aidl_rust_glue.py).
+//! `[package.metadata.atl] aidl = [":filegroup", "path/x.aidl"]` adds the package's AIDL crate `device/<package>-stubs-rust` (crate `<package>_stubs`), which the converter generates from those sources (xtask packages.rs, bp2ninja aidlcrates.go).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -94,17 +93,6 @@ impl Converter {
         })
     }
 
-    /// A host tool the converter built (`host/aidl`).
-    pub fn tool(&self, module: &str) -> Result<&Path> {
-        let a = self.artifact(module)?;
-        ensure!(
-            a.kind == Kind::Binary,
-            "{module}: a {:?}, not a binary",
-            a.kind
-        );
-        Ok(&a.out)
-    }
-
     /// The `cargo::` lines linking `modules`, in order, and rerunning when graph.json or an artifact changes.
     pub fn link_lines(&self, modules: &[String]) -> Result<Vec<String>> {
         let mut lines = vec![format!("cargo::rerun-if-changed={}", self.graph.display())];
@@ -156,7 +144,7 @@ impl Converter {
                     ));
                 }
                 Kind::Binary => {
-                    bail!("{m}: a binary links into nothing (a tool: `Converter::tool`)")
+                    bail!("{m}: a binary links into nothing")
                 }
             }
         }
@@ -174,18 +162,20 @@ fn shared_name(out: &Path) -> Result<&str> {
         .context("not lib<name>.so: `-l` cannot name it")
 }
 
-/// The converter modules a package's Cargo.toml text names (`[package.metadata.atl] converter`).
+/// The suffix of a package's AIDL crate interface (xtask packages.rs `AIDL_SUFFIX`).
+const AIDL_SUFFIX: &str = "-stubs";
+
+/// The converter modules a package's Cargo.toml text names: `[package.metadata.atl] converter`, then, when it lists `aidl` sources, its AIDL crate's rlib `device/<package>-stubs-rust` (xtask packages.rs: the converter builds it; the srcs are checked there).
 pub fn package_modules(cargo_toml: &str) -> Result<Vec<String>> {
     let table: toml::Table = toml::from_str(cargo_toml).context("parsing Cargo.toml")?;
-    let list = table
+    let atl = table
         .get("package")
         .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("atl"))
-        .and_then(|a| a.get(FEATURE))
-        .context(
-            "no [package.metadata.atl] converter list: the package names no converter module",
-        )?;
-    let modules: Vec<String> = list
+        .and_then(|m| m.get("atl"));
+    let list = atl.and_then(|a| a.get(FEATURE)).context(
+        "no [package.metadata.atl] converter list: the package names no converter module",
+    )?;
+    let mut modules: Vec<String> = list
         .clone()
         .try_into()
         .context("[package.metadata.atl] converter: a list of strings")?;
@@ -202,11 +192,19 @@ pub fn package_modules(cargo_toml: &str) -> Result<Vec<String>> {
             "[package.metadata.atl] converter: `{m}` is not a module directory <device|host>/<name>"
         );
     }
+    if atl.and_then(|a| a.get("aidl")).is_some() {
+        let name = table
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .context("[package] name: a string")?;
+        modules.push(format!("device/{name}{AIDL_SUFFIX}-rust"));
+    }
     Ok(modules)
 }
 
-/// The whole build-script step of a package with feature `converter`: reads `$ATL_NATIVE_OUT` and the package's Cargo.toml; returns the converter (for `tool` / `aidl_rust`) and the `cargo::` lines to print.
-pub fn link_package(manifest_dir: &Path) -> Result<(Converter, Vec<String>)> {
+/// The whole build-script step of a package with feature `converter`: reads `$ATL_NATIVE_OUT` and the package's Cargo.toml; returns the `cargo::` lines to print.
+pub fn link_package(manifest_dir: &Path) -> Result<Vec<String>> {
     let manifest = manifest_dir.join("Cargo.toml");
     let modules = package_modules(
         &std::fs::read_to_string(&manifest)
@@ -216,147 +214,7 @@ pub fn link_package(manifest_dir: &Path) -> Result<(Converter, Vec<String>)> {
     let conv = Converter::from_env()?;
     let mut lines = vec![format!("cargo::rerun-if-env-changed={NATIVE_OUT}")];
     lines.extend(conv.link_lines(&modules)?);
-    Ok((conv, lines))
-}
-
-/// Rust stubs of AIDL files: `aidl --lang=rust` (the converter's host aidl) on each root and, transitively, every file it imports (from aidl's depfile), into `out/<package path>.rs`;
-/// then `out/aidl.rs`, the crate-root items aidl_rust_glue.py writes: `pub mod aidl` mirroring the package dirs, one module per file (`#[path]`, as bp2ninja rustsrc.go rustAidl), and `pub mod mangled` re-exporting each file's mangled names, which the stubs reach as `crate::mangled`.
-/// The crate includes it at its root, next to `extern crate binder;`. `import_dir` is the import root (`-I`); roots are relative to it. Returns the files read (rerun paths: the .aidl files and the tool).
-pub fn aidl_rust(
-    aidl: &Path,
-    import_dir: &Path,
-    roots: &[&str],
-    out: &Path,
-) -> Result<Vec<PathBuf>> {
-    let mut queue: VecDeque<String> = roots.iter().map(|r| (*r).to_owned()).collect();
-    let mut done = BTreeSet::new();
-    let mut read = vec![aidl.to_path_buf()];
-    while let Some(rel) = queue.pop_front() {
-        if !done.insert(rel.clone()) {
-            continue;
-        }
-        let dep = out.join(format!("{rel}.d"));
-        if let Some(d) = dep.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        // the input by its path under the import root, as the converter passes it: aidl refuses a file whose directory no -I holds
-        let status = Command::new(aidl)
-            .arg("--lang=rust")
-            .arg(format!("-I{}", import_dir.display()))
-            .arg("-o")
-            .arg(out)
-            .args(["--ninja", "-d"])
-            .arg(&dep)
-            .arg(import_dir.join(&rel))
-            .status()
-            .with_context(|| format!("running {}", aidl.display()))?;
-        ensure!(
-            status.success(),
-            "{} --lang=rust {rel} failed",
-            aidl.display()
-        );
-        let text =
-            std::fs::read_to_string(&dep).with_context(|| format!("reading {}", dep.display()))?;
-        for d in depfile_inputs(&text)? {
-            let rel = Path::new(&d)
-                .strip_prefix(import_dir)
-                .with_context(|| format!("{rel} imports {d}, outside {}", import_dir.display()))?;
-            read.push(import_dir.join(rel));
-            queue.push_back(rel.display().to_string());
-        }
-    }
-    let files: Vec<String> = done
-        .into_iter()
-        .map(|rel| rel.trim_end_matches(".aidl").to_owned())
-        .collect();
-    std::fs::write(out.join("aidl.rs"), glue(out, &files)?)?;
-    Ok(read)
-}
-
-/// The inputs a make-style depfile lists (`<out> : <in> <in> ...`, `\`-continued), relative paths normalised (`./a/b.aidl` -> `a/b.aidl`).
-fn depfile_inputs(text: &str) -> Result<Vec<String>> {
-    let (_, deps) = text
-        .split_once(" :")
-        .or_else(|| text.split_once(':'))
-        .context("depfile without `:`")?;
-    Ok(deps
-        .split_whitespace()
-        .filter(|w| *w != "\\")
-        .map(|w| w.trim_start_matches("./").to_owned())
-        .collect())
-}
-
-/// The lints the stubs module is exempt from: every rustc lint and every clippy group (unwrap_used etc. are `restriction`, which `clippy::all` leaves out).
-const GLUE_ALLOW: &str = "#[allow(warnings, clippy::all, clippy::pedantic, clippy::restriction)]\n";
-
-/// aidl_rust_glue.py's crate root for the stubs `files` (paths below `out` without `.rs`, `android/os/IFoo`), files of a dir before its sub-dirs, both sorted (deterministic; the script keeps input order).
-fn glue(out: &Path, files: &[String]) -> Result<String> {
-    #[derive(Default)]
-    struct Module {
-        files: Vec<String>,
-        nested: BTreeMap<String, Module>,
-    }
-    let mut root = Module::default();
-    for f in files {
-        let mut parts: Vec<&str> = f.split('/').collect();
-        let stem = parts
-            .pop()
-            .filter(|s| !s.is_empty())
-            .with_context(|| format!("`{f}`: no file name"))?;
-        let mut m = &mut root;
-        for p in parts {
-            m = m.nested.entry(p.to_owned()).or_default();
-        }
-        m.files.push(stem.to_owned());
-    }
-    fn emit(m: &Module, out: &Path, dir: &str, indent: &str, s: &mut String) {
-        let mut files = m.files.clone();
-        files.sort();
-        for f in &files {
-            let path = out.join(format!("{dir}{f}.rs"));
-            // a Rust string literal: only \ and " need escaping
-            let lit = path
-                .display()
-                .to_string()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
-            s.push_str(&format!(
-                "{indent}#[path = \"{lit}\"]\n{indent}pub mod {f};\n"
-            ));
-        }
-        for (name, sub) in &m.nested {
-            s.push_str(&format!("{indent}pub mod {name} {{\n"));
-            emit(
-                sub,
-                out,
-                &format!("{dir}{name}/"),
-                &format!("{indent}  "),
-                s,
-            );
-            s.push_str(&format!("{indent}}}\n"));
-        }
-    }
-    fn emit_mangled(m: &Module, prefix: &str, s: &mut String) {
-        let mut files = m.files.clone();
-        files.sort();
-        for f in &files {
-            s.push_str(&format!("  pub use {prefix}::{f}::mangled::*;\n"));
-        }
-        for (name, sub) in &m.nested {
-            emit_mangled(sub, &format!("{prefix}::{name}"), s);
-        }
-    }
-    let mut s = String::from(
-        "// generated by atl-bridgegen converter.rs from aidl --lang=rust output, do not edit\n",
-    );
-    // aidl's output, not ours: exempt from lints as the converter compiles every AOSP crate (--cap-lints allow); the package's own code stays linted
-    s.push_str(GLUE_ALLOW);
-    s.push_str("pub mod aidl {\n");
-    emit(&root, out, "", "  ", &mut s);
-    s.push_str("}\npub mod mangled {\n");
-    emit_mangled(&root, "super::aidl", &mut s);
-    s.push_str("}\n");
-    Ok(s)
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -449,11 +307,6 @@ mod tests {
         assert!(err("device/libnone").contains("no such artifact"));
         assert!(err("host/aidl").contains("links into nothing"));
         assert!(err("device/odd").contains("not lib<name>.so"));
-        assert!(format!("{:#}", conv.tool("device/libdep").unwrap_err()).contains("not a binary"));
-        assert_eq!(
-            conv.tool("host/aidl").unwrap(),
-            Path::new("/o/host/aidl/aidl")
-        );
         assert!(
             format!("{:#}", Converter::load(&dir.join("nowhere")).unwrap_err())
                 .contains("cargo xtask native")
@@ -468,6 +321,12 @@ mod tests {
             package_modules(ok).unwrap(),
             ["device/libbinder_rs", "host/aidl"]
         );
+        // `aidl` adds the package's AIDL crate rlib after the list
+        let aidl = "[package]\nname = \"p\"\n[package.metadata.atl]\nconverter = [\"device/libbinder_rs\"]\naidl = [\":fg\"]\n";
+        assert_eq!(
+            package_modules(aidl).unwrap(),
+            ["device/libbinder_rs", "device/p-stubs-rust"]
+        );
         let err = |t: &str| format!("{:#}", package_modules(t).unwrap_err());
         assert!(err("[package]\nname = \"p\"\n").contains("names no converter module"));
         assert!(err("[package.metadata.atl]\nconverter = []\n").contains("empty"));
@@ -481,56 +340,5 @@ mod tests {
                 "{bad}"
             );
         }
-    }
-
-    /// aidl's make-style depfile (as host aidl `--ninja -d` writes it): the input first, imports `./`-relative.
-    #[test]
-    fn depfile() {
-        let text = "/t/android/os/IServiceManager.rs : \\\n  android/os/IServiceManager.aidl \\\n  ./android/os/IClientCallback.aidl \\\n  ./android/os/Service.aidl\n";
-        assert_eq!(
-            depfile_inputs(text).unwrap(),
-            [
-                "android/os/IServiceManager.aidl",
-                "android/os/IClientCallback.aidl",
-                "android/os/Service.aidl"
-            ]
-        );
-        assert!(depfile_inputs("no colon").is_err());
-    }
-
-    /// aidl_rust_glue.py's layout (RustModule.emit / emit_mangled): files of a package dir as modules, sub-packages nested, the mangled re-exports flat under `super::aidl::<path>`.
-    #[test]
-    fn glue_layout() {
-        let s = glue(
-            Path::new("/g"),
-            &[
-                "android/os/IServiceManager".into(),
-                "android/os/Service".into(),
-                "android/IFoo".into(),
-            ],
-        )
-        .unwrap();
-        let want =
-            "// generated by atl-bridgegen converter.rs from aidl --lang=rust output, do not edit
-#[allow(warnings, clippy::all, clippy::pedantic, clippy::restriction)]
-pub mod aidl {
-  pub mod android {
-    #[path = \"/g/android/IFoo.rs\"]
-    pub mod IFoo;
-    pub mod os {
-      #[path = \"/g/android/os/IServiceManager.rs\"]
-      pub mod IServiceManager;
-      #[path = \"/g/android/os/Service.rs\"]
-      pub mod Service;
-    }
-  }
-}
-pub mod mangled {
-  pub use super::aidl::android::IFoo::mangled::*;
-  pub use super::aidl::android::os::IServiceManager::mangled::*;
-  pub use super::aidl::android::os::Service::mangled::*;
-}
-";
-        assert_eq!(s, want);
     }
 }

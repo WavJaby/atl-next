@@ -7,13 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The stubs need the converter's libbinder_rs (AOSP's Rust binder: libbinder_ndk -> libbinder) and host aidl, which only `xtask native` builds: it builds this package after the converter with feature `converter` (atl-bridgegen converter.rs).
+# The stubs: the converter's AIDL crate `atl_aidl_stubs` over libbinder's `libbinder_aidl` filegroup (IServiceManager and what it imports; xtask packages.rs `aidl`), against libbinder_rs (AOSP's Rust binder: libbinder_ndk -> libbinder), which the probe also names.
+# Only `xtask native` builds them: it builds this package after the converter with feature `converter` (atl-bridgegen converter.rs).
 # Plain workspace builds and tests take the empty library and skip the probe.
 [package.metadata.atl]
 converter = ["device/libbinder_rs"]
+aidl = [":libbinder_aidl"]
 
 [features]
-converter = ["dep:async-trait"]
+converter = []
 
 # Links the converter's binder and round-trips an AIDL parcelable through AOSP's C++ Parcel.
 [[bin]]
@@ -23,8 +25,6 @@ required-features = ["converter"]
 
 [dependencies]
 anyhow.workspace = true
-# the stubs' `#[::async_trait::async_trait]` (aidl generate_rust.cpp; Soong adds libasync_trait to every aidl Rust crate, bp2ninja rustsrc.go rustAidl.deps)
-async-trait = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow.workspace = true
