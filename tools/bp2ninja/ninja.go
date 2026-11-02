@@ -326,6 +326,9 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	c := slices.Concat(global, f.Conly[n.side], common, []string{"-std=" + cstd}, moduleFlags(p, "conlyflags"))
 	if n.side == Device {
 		dev := []string{androidDefine, lfs64Define, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
+		for _, d := range g.defines[n.mod.Name] {
+			dev = append(dev, "-D"+d)
+		}
 		for _, h := range deviceForced {
 			dev = append(dev, "-include", h)
 		}

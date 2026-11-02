@@ -106,6 +106,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let omit = providers::omitted(&providers).join(",");
     let rust_android = providers::rust_android(&providers).join(",");
+    let defines = providers::defines(&providers).join(",");
     let stand_in = providers::stand_ins(&providers)
         .iter()
         .map(|(module, alt)| format!("{module}={alt}"))
@@ -229,6 +230,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &omit,
                 "-rust-android",
                 &rust_android,
+                "-defines",
+                &defines,
                 "-stand-in",
                 &stand_in,
                 "-rust-version",

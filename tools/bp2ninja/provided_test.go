@@ -249,3 +249,71 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 		t.Errorf("libnolibc flags %q", f)
 	}
 }
+
+// providers.toml `defines`: the row's macros reach the module's device C and C++ compiles, after the device defines; not its host variant, not another module.
+func TestModuleDefines(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_binary { name: "sm", srcs: ["a.cpp", "b.c"], host_supported: true }
+cc_library { name: "libother", srcs: ["o.cc"] }
+`})
+	var err error
+	if g.defines, err = parseDefines("sm:NO_X,sm:LEVEL=2"); err != nil {
+		t.Fatal(err)
+	}
+	g.checkDefines()
+	for _, n := range []*Node{g.node("sm", Device, Binary, "goal"), g.node("sm", Host, Binary, "goal"), g.node("libother", Device, Shared, "goal")} {
+		if n == nil {
+			t.Fatal(g.problems)
+		}
+	}
+	if len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	flags := func(name string, side Side) langFlags {
+		for _, n := range g.order {
+			if n.name == name && n.side == side {
+				return g.compileFlags(n)
+			}
+		}
+		t.Fatalf("no node %s", name)
+		return langFlags{}
+	}
+	dev := flags("sm", Device)
+	for _, f := range [][]string{dev.c, dev.cxx} {
+		i, j := slices.Index(f, androidDefine), slices.Index(f, "-DNO_X")
+		if i < 0 || j < i || !slices.Contains(f, "-DLEVEL=2") {
+			t.Errorf("device sm flags %q", f)
+		}
+	}
+	for _, f := range [][]string{flags("sm", Host).cxx, flags("libother", Device).cxx} {
+		if slices.Contains(f, "-DNO_X") {
+			t.Errorf("flags %q carry sm's define", f)
+		}
+	}
+}
+
+// The rows checkDefines refuses, where the macros would reach no compile; and -defines entries that are not module:MACRO.
+func TestModuleDefinesRefused(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+rust_library { name: "librs", crate_name: "rs", srcs: ["r.rs"] }
+cc_library_headers { name: "libh" }
+cc_binary_host { name: "tool", srcs: ["t.cc"] }
+cc_library { name: "libdev", srcs: ["d.cc"], device_supported: false, host_supported: true }
+`})
+	g.defines = map[string][]string{"librs": {"A"}, "libh": {"A"}, "tool": {"A"}, "libdev": {"A"}}
+	g.checkDefines()
+	want := []string{
+		"providers.toml: libdev: defines on a cc_library, which has no device variant",
+		"providers.toml: libh: defines on a cc_library_headers, which compiles no C/C++",
+		"providers.toml: librs: defines on a rust_library, which compiles no C/C++",
+		"providers.toml: tool: defines on a cc_binary_host, which has no device variant",
+	}
+	if !slices.Equal(g.problems, want) {
+		t.Errorf("problems %q, want %q", g.problems, want)
+	}
+	for _, bad := range []string{"sm", ":A", "sm:", "sm:=1"} {
+		if _, err := parseDefines(bad); err == nil {
+			t.Errorf("-defines %q accepted", bad)
+		}
+	}
+}

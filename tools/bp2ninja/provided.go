@@ -26,6 +26,40 @@ type Partial struct {
 	Provider *Provided `json:"provider"`
 }
 
+// parseDefines: -defines, comma-separated `module:MACRO` (MACRO = NAME or NAME=VALUE): providers.toml `defines` rows, the macros a module's device cc compiles get as -D after the device defines.
+// Each switches behaviour a patch to that module's source keys on it (xtask checks a patch reads it); the module is otherwise built as its Android.bp says.
+func parseDefines(list string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, pair := range strings.Split(list, ",") {
+		if pair == "" {
+			continue
+		}
+		m, d, ok := strings.Cut(pair, ":")
+		if !ok || m == "" || d == "" || strings.HasPrefix(d, "=") {
+			return nil, fmt.Errorf("%q is not module:MACRO", pair)
+		}
+		out[m] = append(out[m], d)
+	}
+	return out, nil
+}
+
+// checkDefines: every `defines` row names a cc module with a device variant (a Rust, header-only or host-only module never compiles with them: the field would be silently dead).
+// A row naming no module at all is reported with the other providers.toml rows.
+func (g *Graph) checkDefines() {
+	for _, name := range sortedKeys(keysOf(g.defines)) {
+		for _, m := range g.mods[Device][name] {
+			t := g.baseType(m.Type)
+			k, ok := kindOf(t, Shared)
+			switch {
+			case !ok || isRustType(t) || k == Headers:
+				g.problem("providers.toml: %s: defines on a %s, which compiles no C/C++", name, m.Type)
+			case strings.Contains(t, "_host") || !m.Props.boolean("device_supported", true):
+				g.problem("providers.toml: %s: defines on a %s, which has no device variant", name, m.Type)
+			}
+		}
+	}
+}
+
 // checkLibs: every provided entry names at least one artifact (xtask writes one per provider of its row).
 func checkLibs(provided map[string]Provided, partial map[string]Partial) error {
 	for m, p := range provided {

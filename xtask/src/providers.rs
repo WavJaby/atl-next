@@ -128,6 +128,64 @@ pub struct Provider {
     pub srcs: Vec<String>,
     /// The tree builds the module, as the OS's userspace instead of linux_glibc's (bp2ninja rust.go rustOSSide).
     pub rust_os: Option<RustOs>,
+    /// The tree builds the module, its device C/C++ compiles with these macros (`NAME` or `NAME=VALUE`), each read by a patch under patches/ (bp2ninja provided.go parseDefines).
+    #[serde(default)]
+    pub defines: Vec<String>,
+}
+
+/// `module:MACRO` pairs of the `defines` rows, the converter's `-defines`; that each names a cc module with a device variant needs the tree, the converter checks it (bp2ninja provided.go checkDefines).
+pub fn defines(providers: &Providers) -> Vec<String> {
+    providers
+        .iter()
+        .flat_map(|(module, row)| row.defines.iter().map(move |d| format!("{module}:{d}")))
+        .collect()
+}
+
+/// The macro name of a `defines` entry: `NAME` of `NAME` or `NAME=VALUE`.
+fn macro_name(define: &str) -> &str {
+    define.split_once('=').map_or(define, |(name, _)| name)
+}
+
+/// Every `defines` macro is read by a patch: some `+` line of a `.patch` file under `patches_dir` names it. A macro no patch reads switches nothing, so its row is dead.
+fn check_defines_read(providers: &Providers, patches_dir: &Path) -> Result<()> {
+    let mut added = String::new();
+    let mut stack = vec![patches_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries {
+            let path = e?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "patch") {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                for l in text
+                    .lines()
+                    .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                {
+                    added.push_str(l);
+                    added.push('\n');
+                }
+            }
+        }
+    }
+    for (module, row) in providers {
+        for d in &row.defines {
+            let name = macro_name(d);
+            let read = added.match_indices(name).any(|(i, _)| {
+                let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !added[..i].ends_with(ident) && !added[i + name.len()..].starts_with(ident)
+            });
+            ensure!(
+                read,
+                "[{module}] defines: no patch under {} reads `{name}`",
+                patches_dir.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `rust_os` values: the OS whose Android.bp `target` blocks a device Rust module takes; linux_glibc, every other crate's, is never written.
@@ -192,7 +250,9 @@ impl<'a> Targets<'a> {
 pub fn load(root: &Path, targets: &Targets) -> Result<Providers> {
     let text =
         std::fs::read_to_string(root.join(FILE)).with_context(|| format!("reading {FILE}"))?;
-    parse(&text, targets).with_context(|| format!("in {FILE}"))
+    let providers = parse(&text, targets).with_context(|| format!("in {FILE}"))?;
+    check_defines_read(&providers, &root.join("patches")).with_context(|| format!("in {FILE}"))?;
+    Ok(providers)
 }
 
 fn parse(text: &str, targets: &Targets) -> Result<Providers> {
@@ -208,9 +268,27 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     ensure!(!row.reason.trim().is_empty(), "empty reason");
     if row.rust_os.is_some() {
         ensure!(
-            row.provider.is_empty() && row.srcs.is_empty(),
-            "rust_os: the tree builds the module, so the row has no provider or srcs"
+            row.provider.is_empty() && row.srcs.is_empty() && row.defines.is_empty(),
+            "rust_os: the tree builds the module, so the row has no provider, srcs or defines"
         );
+        return Ok(());
+    }
+    if !row.defines.is_empty() {
+        ensure!(
+            row.provider.is_empty() && row.srcs.is_empty(),
+            "defines: the tree builds the module, so the row has no provider or srcs"
+        );
+        let mut seen = BTreeSet::new();
+        for d in &row.defines {
+            let name = macro_name(d);
+            ensure!(
+                name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !d.contains(','),
+                "defines: `{d}` is not NAME or NAME=VALUE (a C identifier, no comma)"
+            );
+            ensure!(seen.insert(name), "defines: `{name}` listed twice");
+        }
         return Ok(());
     }
     // that each names a source of the module at the pin needs the tree: the converter checks it (bp2ninja provided.go checkPartial)
@@ -227,7 +305,7 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     }
     ensure!(
         !row.provider.is_empty(),
-        "empty provider list (a row without one needs rust_os)"
+        "empty provider list (a row without one needs rust_os or defines)"
     );
     // another tree module is the whole library: nothing to join it with, no sources of the replaced module left
     if row.provider.iter().any(|p| p.starts_with("module:")) {
@@ -497,12 +575,13 @@ mod tests {
             "provider = \"none\"\n",
             "provider = \"crate:atl-nativeloader\"\n",
             "srcs = [\"a.rs\"]\n",
+            "defines = [\"A\"]\n",
         ] {
             assert!(
                 err(&format!(
                     "[x]\nrust_os = \"android\"\nreason = \"r\"\n{bad}"
                 ))
-                .contains("no provider or srcs"),
+                .contains("no provider, srcs or defines"),
                 "{bad}"
             );
         }
@@ -512,6 +591,56 @@ mod tests {
             err("[x]\nrust_os = \"linux_glibc\"\nreason = \"r\"\n").contains("unknown variant")
         );
         assert!(err("[x]\nreason = \"r\"\n").contains("needs rust_os"));
+    }
+
+    /// `defines` rows: handed to the converter as module:MACRO; refused with a provider or srcs, a macro that is no C identifier or holds a comma, or one listed twice.
+    #[test]
+    fn defines_rows() {
+        let providers =
+            parsed("[servicemanager]\ndefines = [\"NO_X\", \"LEVEL=2\"]\nreason = \"r\"\n")
+                .unwrap();
+        assert_eq!(
+            defines(&providers),
+            ["servicemanager:NO_X", "servicemanager:LEVEL=2"]
+        );
+        assert!(super::omitted(&providers).is_empty() && super::partial(&providers).is_empty());
+        for bad in ["provider = \"none\"\n", "srcs = [\"a.cpp\"]\n"] {
+            assert!(
+                err(&format!("[x]\ndefines = [\"A\"]\nreason = \"r\"\n{bad}"))
+                    .contains("no provider or srcs"),
+                "{bad}"
+            );
+        }
+        for bad in ["1A", "A-B", "", "=1", "A=1,2"] {
+            assert!(
+                err(&format!("[x]\ndefines = [\"{bad}\"]\nreason = \"r\"\n"))
+                    .contains("not NAME or NAME=VALUE"),
+                "{bad}"
+            );
+        }
+        assert!(err("[x]\ndefines = [\"A\", \"A=1\"]\nreason = \"r\"\n").contains("listed twice"));
+    }
+
+    /// A macro counts as read only where a patch's added line names it as a whole identifier; a context or removed line, a longer identifier or no patch at all leave the row dead.
+    #[test]
+    fn defines_read_by_a_patch() {
+        let dir =
+            std::env::temp_dir().join(format!("atl-providers-defines-{}", std::process::id()));
+        let sub = dir.join("aosp/frameworks/native");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rows =
+            |d: &str| parsed(&format!("[sm]\ndefines = [\"{d}\"]\nreason = \"r\"\n")).unwrap();
+        let patch = "--- a/Access.cpp\n+++ b/Access.cpp\n NO_CONTEXT\n-#ifdef NO_REMOVED\n+#if !defined(NO_X)\n+#ifdef NO_XY_LONGER\n";
+        std::fs::write(sub.join("0001-x.patch"), patch).unwrap();
+        // a non-patch file is not read
+        std::fs::write(sub.join("LICENSE"), "+NO_LICENSE\n").unwrap();
+        assert!(check_defines_read(&rows("NO_X=1"), &dir).is_ok());
+        for dead in ["NO_CONTEXT", "NO_REMOVED", "NO_XY", "NO_LICENSE", "Access"] {
+            let e = check_defines_read(&rows(dead), &dir).unwrap_err();
+            assert!(format!("{e:#}").contains("no patch"), "{dead}");
+        }
+        assert!(check_defines_read(&rows("NO_X"), &dir.join("absent")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

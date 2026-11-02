@@ -133,6 +133,8 @@ type Graph struct {
 	droppedSrcs map[string]bool
 	// providers.toml `rust_os = "android"` rows: device Rust modules compiled as Android userspace (rust.go rustOSSide)
 	rustAndroid map[string]bool
+	// providers.toml `defines` rows: module -> macros its device cc compiles get (provided.go checkDefines)
+	defines map[string][]string
 	// providers.toml `module:` rows: module -> the tree module built in its place (node), whose output name must be the module's (outName)
 	stand map[string]string
 	// module types defined as another type plus hooks -> that type: soong_config_module_type names (their module_type), the ART plugin's art_* types (artplugin.go)

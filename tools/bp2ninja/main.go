@@ -51,6 +51,7 @@ func main() {
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
+	defines := flag.String("defines", "", "comma-separated module:MACRO (NAME or NAME=VALUE): macros the module's device C/C++ compiles get as -D, read by a patch to its source (providers.toml `defines`, provided.go parseDefines)")
 	standIn := flag.String("stand-in", "", "comma-separated module=tree-module pairs: the tree module is built wherever the module is named, and must install under its name (stem + suffix) (providers.toml `module:`)")
 	var jt JavaTools
 	flag.StringVar(&jt.JDK, "jdk", "", "Java goals: JDK home (Soong's ANDROID_JAVA_HOME, prebuilts/jdk/jdk21/<host tag>)")
@@ -104,11 +105,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -srcs:", err)
 		os.Exit(1)
 	}
+	moduleDefines, err := parseDefines(*defines)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -defines:", err)
+		os.Exit(2)
+	}
 	if err := checkLibs(provided, partial); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, stand, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -164,7 +170,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, stand map[string]string, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -175,7 +181,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, stand: stand, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, nodes: map[key]*Node{}}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
 	if js.release != "" {
 		if g.release, err = readRelease(tree, js.release); err != nil {
@@ -224,6 +230,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		names = append(names, m)
 	}
 	names = append(names, sortedKeys(rustAndroid)...)
+	names = append(names, sortedKeys(keysOf(defines))...)
 	// a `module:` row's key may be absent (libartpalette-system: system/libartpalette is not fetched); its stand-in must exist, and node checks it installs under the key
 	for _, alt := range stand {
 		names = append(names, alt)
@@ -234,6 +241,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 	}
 	g.checkRustAndroid()
+	g.checkDefines()
 	// Java tools given: Java goals are built (java.go)
 	if js.tools.JDK != "" {
 		if err := g.initJava(js.tools); err != nil {
