@@ -113,6 +113,14 @@ type Module struct {
 	// a hidl-gen run of a hidl_interface (hidliface.go)
 	aidl *aidlSpec
 	hidl *hidlGen
+	// an aidl crate's aidl_interface (aidlcrates.go): its closure sources, includes, preprocessed file and Java-only types
+	aidlCrate *aidlCrateSpec
+	// a rust_aidl_parcelables module: the parcelables.rs it provides (aidlcrates.go)
+	genText string
+	// a workspace crate the converter builds (aidlcrates.go): its lint flags, in place of --cap-lints allow; nil for tree crates
+	lints []string
+	// a rust_aidl_parcelables module: aconfig_declarations whose flag dumps it puts in the crate's OUT_DIR
+	aconfig []string
 }
 
 // Config is what select() conditions see. PointerBits comes from the arch's arches.toml row, never from its name.

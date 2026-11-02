@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Workspace packages built after the converter (`xtask native`, `xtask test native-load`): a package naming converter modules in its Cargo.toml (`[package.metadata.atl] converter`, graph.json module directories) is built with its feature `converter` once the build's graph.json `artifacts` hold every one of them; its build script links them from `$ATL_NATIVE_OUT` (atl-bridgegen converter.rs).
-//! `[package.metadata.atl] aidl = [":libbinder_aidl", ...]` (Blueprint srcs: filegroups, tree-relative .aidl paths) asks for an AIDL crate: the converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; unknown filegroup = converter error), every `xtask native` adds its `-rust` rlib to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
+//! `[package.metadata.atl.aidl]` asks for an AIDL crate: `include_dirs` (tree-relative import roots), `types` (qualified AIDL names compiled with their import closure), optional `parcelables` (a workspace package with `rust_library`: the crate giving unstructured parcelables and Java-only builtins their Rust types).
+//! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
+//! `[package.metadata.atl.rust_library]` (`rustlibs`, optional `aconfig`) makes the converter build the package's `src/lib.rs` as rust_library `lib<crate>` with those rustlibs and the package's edition (Soong's `additional_rustlibs` crate of an aidl_interface), the flag dumps of the `aconfig` declarations in its OUT_DIR, and our lints (`lint_flags`, through clippy-driver, never capped); cargo builds it only as an empty library (`#![cfg(...)]`-gated), so it needs no feature. Only an aidl crate's `parcelables` reaches it.
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
 //! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
@@ -30,12 +32,58 @@ fn aidl_interface(package: &str) -> String {
 #[derive(Debug, PartialEq)]
 pub struct Package {
     pub name: String,
-    /// the converter modules it links: `converter`, then its AIDL crate's rlib when it lists `aidl`
+    /// the converter modules it links: `converter`, then its AIDL crate's rlib when it has `aidl`
     pub modules: Vec<String>,
-    /// `[package.metadata.atl] aidl`: Blueprint srcs (filegroups, tree-relative .aidl paths) of its AIDL crate
-    pub aidl: Vec<String>,
+    /// `[package.metadata.atl.aidl]`: its AIDL crate
+    pub aidl: Option<AidlSpec>,
     /// its executables (cargo bin targets)
     pub bins: Vec<String>,
+}
+
+/// `[package.metadata.atl.aidl]`.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AidlSpec {
+    pub include_dirs: Vec<String>,
+    pub types: Vec<String>,
+    /// the workspace package (with `rust_library`) giving parcelables their Rust types
+    #[serde(default)]
+    pub parcelables: Option<String>,
+}
+
+/// A package with `[package.metadata.atl] rust_library`, as bp2ninja `-aidl-crates` takes it (aidlcrates.go AidlParcelables).
+#[derive(Debug, PartialEq, Clone, serde::Serialize)]
+pub struct RustLibrary {
+    #[serde(skip)]
+    pub package: String,
+    pub module: String,
+    #[serde(rename = "crate")]
+    pub crate_name: String,
+    pub dir: PathBuf,
+    pub edition: String,
+    pub rustlibs: Vec<String>,
+    /// aconfig_declarations whose flag dumps go into its OUT_DIR
+    pub aconfig: Vec<String>,
+    /// lint flags: `-D warnings` and the workspace's `[workspace.lints]` (`lint_flags`), as cargo would apply them
+    pub lints: Vec<String>,
+}
+
+/// `[package.metadata.atl.rust_library]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RustLibrarySpec {
+    rustlibs: Vec<String>,
+    #[serde(default)]
+    aconfig: Vec<String>,
+}
+
+/// One bp2ninja `-aidl-crates` entry (aidlcrates.go AidlCrate).
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct AidlCrate {
+    pub include_dirs: Vec<String>,
+    pub types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parcelables: Option<RustLibrary>,
 }
 
 /// What `cargo metadata --no-deps` says of a package (the fields read here).
@@ -45,6 +93,10 @@ struct MetaPackage {
     features: BTreeMap<String, serde_json::Value>,
     metadata: Option<serde_json::Value>,
     targets: Vec<MetaTarget>,
+    #[serde(default)]
+    edition: String,
+    #[serde(default)]
+    manifest_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -82,23 +134,22 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
             "{}: [package.metadata.atl] converter is empty",
             p.name
         );
-        let aidl: Vec<String> = match p.metadata.as_ref().and_then(|m| m["atl"].get("aidl")) {
-            None => Vec::new(),
-            Some(list) => {
-                let aidl: Vec<String> =
-                    serde_json::from_value(list.clone()).with_context(|| {
-                        format!(
-                            "{}: [package.metadata.atl] aidl is not a list of strings",
-                            p.name
-                        )
-                    })?;
+        let aidl: Option<AidlSpec> = match p.metadata.as_ref().and_then(|m| m["atl"].get("aidl")) {
+            None => None,
+            Some(table) => {
+                let aidl: AidlSpec = serde_json::from_value(table.clone()).with_context(|| {
+                    format!(
+                        "{}: [package.metadata.atl.aidl] is not {{ include_dirs, types, parcelables? }}",
+                        p.name
+                    )
+                })?;
                 ensure!(
-                    !aidl.is_empty(),
-                    "{}: [package.metadata.atl] aidl is empty",
+                    !aidl.include_dirs.is_empty() && !aidl.types.is_empty(),
+                    "{}: [package.metadata.atl.aidl] include_dirs and types must not be empty",
                     p.name
                 );
                 modules.push(format!("device/{}-rust", aidl_interface(&p.name)));
-                aidl
+                Some(aidl)
             }
         };
         ensure!(
@@ -122,19 +173,131 @@ fn parse_packages(json: &str) -> Result<Vec<Package>> {
     Ok(out)
 }
 
-/// The packages' AIDL crates as bp2ninja `-aidl-crates` takes them (interface name -> srcs), and their rlibs as converter goals: added to every build, so a package listing `aidl` gets its crate whatever the goals (only these, not its other modules).
-pub fn aidl_crates(packages: &[Package]) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
-    let crates: BTreeMap<String, Vec<String>> = packages
-        .iter()
-        .filter(|p| !p.aidl.is_empty())
-        .map(|p| (aidl_interface(&p.name), p.aidl.clone()))
-        .collect();
-    let goals = crates.keys().map(|i| format!("{i}-rust")).collect();
-    (crates, goals)
+/// rustc / clippy-driver flags of the workspace's lints: `-D warnings` (xtask native's clippy denies them too), then each `[workspace.lints.<tool>]` entry by its level (`deny` -> `-D tool::name`; rustc's own without a prefix).
+fn lint_flags(workspace_toml: &str) -> Result<Vec<String>> {
+    let t: toml::Table =
+        toml::from_str(workspace_toml).context("parsing the workspace Cargo.toml")?;
+    let mut out = vec!["-D".to_owned(), "warnings".to_owned()];
+    let Some(lints) = t
+        .get("workspace")
+        .and_then(|w| w.get("lints"))
+        .and_then(|l| l.as_table())
+    else {
+        return Ok(out);
+    };
+    for (tool, table) in lints {
+        for (name, level) in table
+            .as_table()
+            .context("[workspace.lints.<tool>] is a table")?
+        {
+            let level = level
+                .as_str()
+                .or_else(|| level.get("level").and_then(|l| l.as_str()))
+                .with_context(|| format!("[workspace.lints.{tool}] {name}: no level"))?;
+            let flag = match level {
+                "forbid" => "-F",
+                "deny" => "-D",
+                "warn" => "-W",
+                "allow" => "-A",
+                other => anyhow::bail!("[workspace.lints.{tool}] {name}: level {other}"),
+            };
+            let lint = if tool == "rust" {
+                name.clone()
+            } else {
+                format!("{tool}::{name}")
+            };
+            out.extend([flag.to_owned(), lint]);
+        }
+    }
+    Ok(out)
 }
 
-/// The workspace packages of checkout `root` naming converter modules.
-pub fn workspace_packages(root: &Path) -> Result<Vec<Package>> {
+/// The packages with `[package.metadata.atl.rust_library]` (non-empty rustlibs), each compiled with `lints`; one without a lib target is refused.
+fn parse_rust_libraries(json: &str, lints: &[String]) -> Result<Vec<RustLibrary>> {
+    let meta: Metadata = serde_json::from_str(json).context("parsing cargo metadata")?;
+    let mut out = Vec::new();
+    for p in meta.packages {
+        let Some(list) = p
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("atl"))
+            .and_then(|a| a.get("rust_library"))
+        else {
+            continue;
+        };
+        let spec: RustLibrarySpec = serde_json::from_value(list.clone()).with_context(|| {
+            format!(
+                "{}: [package.metadata.atl.rust_library] is not {{ rustlibs, aconfig? }}",
+                p.name
+            )
+        })?;
+        ensure!(
+            !spec.rustlibs.is_empty(),
+            "{}: [package.metadata.atl.rust_library] rustlibs is empty",
+            p.name
+        );
+        let lib = p
+            .targets
+            .iter()
+            .find(|t| t.kind.iter().any(|k| k == "lib"))
+            .with_context(|| format!("{}: rust_library but no lib target", p.name))?;
+        out.push(RustLibrary {
+            module: format!("lib{}", lib.name),
+            crate_name: lib.name.clone(),
+            dir: p
+                .manifest_path
+                .parent()
+                .context("manifest path has a dir")?
+                .to_path_buf(),
+            edition: p.edition,
+            rustlibs: spec.rustlibs,
+            aconfig: spec.aconfig,
+            lints: lints.to_vec(),
+            package: p.name,
+        });
+    }
+    Ok(out)
+}
+
+/// The packages' AIDL crates as bp2ninja `-aidl-crates` takes them (interface name -> crate), and their rlibs as converter goals: added to every build, so a package with `aidl` gets its crate whatever the goals (only these, not its other modules).
+/// A `parcelables` naming no package with `rust_library` is refused.
+pub fn aidl_crates(
+    packages: &[Package],
+    libraries: &[RustLibrary],
+) -> Result<(BTreeMap<String, AidlCrate>, Vec<String>)> {
+    let mut crates = BTreeMap::new();
+    for p in packages {
+        let Some(a) = &p.aidl else { continue };
+        let parcelables = match &a.parcelables {
+            None => None,
+            Some(name) => Some(
+                libraries
+                    .iter()
+                    .find(|l| &l.package == name)
+                    .with_context(|| {
+                        format!(
+                            "{}: aidl.parcelables {name} is no package with [package.metadata.atl] rust_library",
+                            p.name
+                        )
+                    })?
+                    .clone(),
+            ),
+        };
+        crates.insert(
+            aidl_interface(&p.name),
+            AidlCrate {
+                include_dirs: a.include_dirs.clone(),
+                types: a.types.clone(),
+                parcelables,
+            },
+        );
+    }
+    let goals = crates.keys().map(|i| format!("{i}-rust")).collect();
+    Ok((crates, goals))
+}
+
+/// `cargo metadata --no-deps` of checkout `root`.
+fn workspace_metadata(root: &Path) -> Result<String> {
     let out = crate::cargo_command()
         .current_dir(root)
         .args(["metadata", "--no-deps", "--format-version", "1", "--locked"])
@@ -145,7 +308,26 @@ pub fn workspace_packages(root: &Path) -> Result<Vec<Package>> {
         "cargo metadata failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    parse_packages(&String::from_utf8(out.stdout)?)
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+/// The workspace packages of checkout `root` naming converter modules.
+pub fn workspace_packages(root: &Path) -> Result<Vec<Package>> {
+    parse_packages(&workspace_metadata(root)?)
+}
+
+/// The AIDL crates of checkout `root`'s packages and their goals (`aidl_crates`).
+pub fn workspace_aidl_crates(root: &Path) -> Result<(BTreeMap<String, AidlCrate>, Vec<String>)> {
+    let json = workspace_metadata(root)?;
+    let toml_path = root.join("Cargo.toml");
+    let lints = lint_flags(
+        &std::fs::read_to_string(&toml_path)
+            .with_context(|| format!("reading {}", toml_path.display()))?,
+    )?;
+    aidl_crates(
+        &parse_packages(&json)?,
+        &parse_rust_libraries(&json, &lints)?,
+    )
 }
 
 /// graph.json, the fields read here (bp2ninja graph.go).
@@ -354,23 +536,82 @@ mod tests {
             [Package {
                 name: "launcher".into(),
                 modules: vec!["device/libsigchain".into()],
-                aidl: Vec::new(),
+                aidl: None,
                 bins: vec!["launcher".into()]
             }]
         );
-        // `aidl` adds the package's AIDL crate: a module to link and an -aidl-crates entry + goal
-        let with_aidl = serde_json::json!({ "atl": { "converter": ["device/libbinder_rs"], "aidl": [":libbinder_aidl"] } });
-        let parsed = parse_packages(&meta(&[pkg("p", with_aidl, &["converter"], &[])])).unwrap();
+        // `aidl` adds the package's AIDL crate: a module to link and an -aidl-crates entry + goal; `parcelables` resolves to the rust_library package
+        let with_aidl = serde_json::json!({ "atl": { "converter": ["device/libbinder_rs"], "aidl": { "include_dirs": ["i"], "types": ["a.IFoo"], "parcelables": "lib-p" } } });
+        let mut lib_p = pkg(
+            "lib-p",
+            serde_json::json!({ "atl": { "rust_library": { "rustlibs": ["libbinder_rs"], "aconfig": ["f-aconfig"] } } }),
+            &[],
+            &[],
+        );
+        lib_p["targets"][0]["name"] = "lib_p".into();
+        lib_p["edition"] = "2024".into();
+        lib_p["manifest_path"] = "/w/crates/lib-p/Cargo.toml".into();
+        let json = meta(&[pkg("p", with_aidl, &["converter"], &[]), lib_p]);
+        let parsed = parse_packages(&json).unwrap();
         assert_eq!(
             parsed[0].modules,
             ["device/libbinder_rs", "device/p-stubs-rust"]
         );
-        let (crates, goals) = aidl_crates(&parsed);
+        let lints = vec!["-D".to_owned(), "warnings".to_owned()];
+        let libs = parse_rust_libraries(&json, &lints).unwrap();
         assert_eq!(
-            crates,
-            BTreeMap::from([("p-stubs".to_owned(), vec![":libbinder_aidl".to_owned()])])
+            (libs[0].aconfig.as_slice(), libs[0].lints.as_slice()),
+            (["f-aconfig".to_owned()].as_slice(), lints.as_slice())
         );
+        let (crates, goals) = aidl_crates(&parsed, &libs).unwrap();
+        let p = crates["p-stubs"].parcelables.as_ref().unwrap();
+        assert_eq!(
+            (
+                p.module.as_str(),
+                p.crate_name.as_str(),
+                p.dir.as_path(),
+                p.edition.as_str()
+            ),
+            ("liblib_p", "lib_p", Path::new("/w/crates/lib-p"), "2024")
+        );
+        assert_eq!(crates["p-stubs"].types, ["a.IFoo"]);
         assert_eq!(goals, ["p-stubs-rust"]);
+        // parcelables naming a package without rust_library
+        let e = aidl_crates(&parsed, &[]).unwrap_err();
+        assert!(format!("{e:#}").contains("no package with [package.metadata.atl] rust_library"));
+        let rl = |v: serde_json::Value| {
+            format!(
+                "{:#}",
+                parse_rust_libraries(
+                    &meta(&[pkg(
+                        "x",
+                        serde_json::json!({ "atl": { "rust_library": v } }),
+                        &[],
+                        &[]
+                    )]),
+                    &lints
+                )
+                .unwrap_err()
+            )
+        };
+        assert!(rl(serde_json::json!({ "rustlibs": [] })).contains("rustlibs is empty"));
+        assert!(rl(serde_json::json!(["libbinder_rs"])).contains("is not { rustlibs"));
+        assert!(
+            rl(serde_json::json!({ "rustlibs": ["a"], "typo": 1 })).contains("is not { rustlibs")
+        );
+        // lint flags: -D warnings first, then each workspace lint by level and tool
+        let flags = lint_flags("[workspace.lints.clippy]\nunwrap_used = \"deny\"\n[workspace.lints.rust]\nunsafe_op_in_unsafe_fn = { level = \"warn\" }\n").unwrap();
+        assert_eq!(
+            flags,
+            [
+                "-D",
+                "warnings",
+                "-D",
+                "clippy::unwrap_used",
+                "-W",
+                "unsafe_op_in_unsafe_fn"
+            ]
+        );
         let err = |p: serde_json::Value| format!("{:#}", parse_packages(&meta(&[p])).unwrap_err());
         assert!(err(pkg("x", list, &[], &[])).contains("no feature `converter`"));
         assert!(
@@ -394,11 +635,20 @@ mod tests {
         assert!(
             err(pkg(
                 "x",
-                serde_json::json!({ "atl": { "converter": ["device/a"], "aidl": [] } }),
+                serde_json::json!({ "atl": { "converter": ["device/a"], "aidl": { "include_dirs": [], "types": ["a.B"] } } }),
                 &["converter"],
                 &[]
             ))
-            .contains("aidl is empty")
+            .contains("must not be empty")
+        );
+        assert!(
+            err(pkg(
+                "x",
+                serde_json::json!({ "atl": { "converter": ["device/a"], "aidl": [":libbinder_aidl"] } }),
+                &["converter"],
+                &[]
+            ))
+            .contains("is not { include_dirs")
         );
     }
 
@@ -419,7 +669,7 @@ mod tests {
         let p = |name: &str, modules: &[&str]| Package {
             name: name.into(),
             modules: modules.iter().map(|m| (*m).to_owned()).collect(),
-            aidl: Vec::new(),
+            aidl: None,
             bins: Vec::new(),
         };
         let packages = [

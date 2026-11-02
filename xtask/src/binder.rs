@@ -99,13 +99,44 @@ fn sandbox_args(root: &Path) -> Result<Vec<String>> {
     Ok(a)
 }
 
-struct Harness {
+/// The broker's side of binderd: its admin connection. Dropping it closes the connection, which ends binderd.
+pub(crate) struct Harness {
     admin: OwnedFd,
+}
+
+/// atl-binderd, built into `out`'s cargo target dir as `xtask native` builds crates, started with its admin connection on stdin and its stderr (counters) in `log`.
+pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Child, Harness)> {
+    let status = crate::cargo_command()
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "atl-binderd",
+            "--bin",
+            "atl-binderd",
+            "--target-dir",
+        ])
+        .arg(out.join("cargo"))
+        .current_dir(root)
+        .status()?;
+    ensure!(status.success(), "building atl-binderd failed");
+    let (admin, theirs) = socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let binderd = Command::new(out.join("cargo/release/atl-binderd"))
+        .stdin(Stdio::from(theirs))
+        .stderr(std::fs::File::create(log)?)
+        .spawn()
+        .context("starting atl-binderd")?;
+    Ok((binderd, Harness { admin }))
 }
 
 impl Harness {
     /// Spawns `cmd` as a binder process tagged `uid` (context manager if `cm`), its control connection inherited.
-    fn spawn(&self, mut cmd: Command, uid: u32, cm: bool) -> Result<Child> {
+    pub(crate) fn spawn(&self, mut cmd: Command, uid: u32, cm: bool) -> Result<Child> {
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -217,22 +248,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             out.display()
         );
     }
-    // binderd, built into the native out dir's cargo target as xtask native builds crates
-    let status = crate::cargo_command()
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "atl-binderd",
-            "--bin",
-            "atl-binderd",
-            "--target-dir",
-        ])
-        .arg(out.join("cargo"))
-        .current_dir(root)
-        .status()?;
-    ensure!(status.success(), "building atl-binderd failed");
-    let binderd = out.join("cargo/release/atl-binderd");
     let test_root = out.join("binder-test");
     if test_root.exists() {
         std::fs::remove_dir_all(&test_root)?;
@@ -251,18 +266,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let env = vec![("LD_LIBRARY_PATH".to_owned(), lib_dirs.join(":"))];
 
-    let (admin, theirs) = socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    let mut binderd = Command::new(&binderd)
-        .stdin(Stdio::from(theirs))
-        .stderr(std::fs::File::create(test_root.join("binderd.log"))?)
-        .spawn()
-        .context("starting atl-binderd")?;
-    let h = Harness { admin };
+    let (mut binderd, h) = start_binderd(root, &out, &test_root.join("binderd.log"))?;
 
     // bwrap stays the sandbox's pid 1 (--unshare-pid) and takes servicemanager with it when killed (--die-with-parent)
     let sm_log_path = test_root.join("servicemanager.log");

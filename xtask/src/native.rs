@@ -206,7 +206,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let srcs_file = out.join("srcs.json");
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
     // workspace packages' AIDL crates (packages.rs aidl_crates): always converted and built, so those packages build whatever the goals
-    let (aidl_crates, aidl_goals) = packages::aidl_crates(&packages::workspace_packages(root)?);
+    let (aidl_crates, aidl_goals) = packages::workspace_aidl_crates(root)?;
     let aidl_crates_file = out.join("aidl-crates.json");
     std::fs::write(
         &aidl_crates_file,

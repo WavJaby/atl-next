@@ -287,7 +287,13 @@ func (g *Graph) rustNode(n *Node) {
 	if n.side == Device {
 		r.flags = append(r.flags, rustDeviceFlags...)
 	}
-	r.flags = append(r.flags, "--cap-lints", "allow", "--crate-type="+r.crateType, "--crate-name="+r.crateName)
+	if m.lints != nil {
+		// a workspace crate (aidlcrates.go): its lints, not capped; emitRust compiles it with clippy-driver
+		r.flags = append(r.flags, m.lints...)
+	} else {
+		r.flags = append(r.flags, "--cap-lints", "allow")
+	}
+	r.flags = append(r.flags, "--crate-type="+r.crateType, "--crate-name="+r.crateName)
 	edition := p.str("edition")
 	if edition == "" {
 		edition = rustDefaultEdition
@@ -569,6 +575,10 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 	genClosure(n, map[*Node]bool{}, &waits)
 	fmt.Fprintf(b, "build %s: rustc %s | %s || %s\n  env = %s\n  flags = %s\n  libs = %s\n  crates = %s\n", esc(n.out), esc(g.abs(r.root)), join(implicit), join(waits),
 		shellQuote(g.rustEnv(n, tools.RustVersion)), shellQuote(flags), shellQuote(libs), shellQuote(linked))
+	if n.mod.lints != nil {
+		// clippy-driver is rustc plus clippy's lints (cargo clippy runs it the same way), from the same toolchain dir
+		fmt.Fprintf(b, "  rustc = %s\n", esc(filepath.Join(filepath.Dir(tools.Rustc), "clippy-driver")))
+	}
 }
 
 // rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), the cc libraries its crates need (rustCcLibs) as link args, and their dirs as -L (rustLinkDirs).

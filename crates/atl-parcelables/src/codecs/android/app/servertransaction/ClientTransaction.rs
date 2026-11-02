@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: MIT
+//! android.app.servertransaction.ClientTransaction: app/servertransaction/ClientTransaction.java writeToParcel (writeParcelableList of mTransactionItems) / ClientTransaction(Parcel).
+//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem; any other item class is refused.
+
+use crate::parcel::*;
+use crate::parts::*;
+
+/// The item classes modelled, by `getClass().getName()`.
+const LAUNCH_ACTIVITY_ITEM: &str = "android.app.servertransaction.LaunchActivityItem";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientTransactionItem {
+    LaunchActivity(LaunchActivityItem),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClientTransaction {
+    /// mTransactionItems; None = a null item
+    pub items: Vec<Option<ClientTransactionItem>>,
+}
+
+impl Part for ClientTransaction {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_i32(p, len_i32(self.items.len())?)?;
+        for item in &self.items {
+            match item {
+                None => w_str16(p, &None)?,
+                Some(ClientTransactionItem::LaunchActivity(i)) => {
+                    w_str16(p, &Some(LAUNCH_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        // readParcelableList: -1 leaves the list empty
+        let n = r_i32(p)?;
+        let mut items = Vec::new();
+        for _ in 0..n.max(0) {
+            items.push(match r_str16(p)?.as_deref() {
+                None => None,
+                Some(LAUNCH_ACTIVITY_ITEM) => Some(ClientTransactionItem::LaunchActivity(
+                    LaunchActivityItem::read(p)?,
+                )),
+                Some(_) => {
+                    return Err(crate::refuse(
+                        "android.app.servertransaction.ClientTransactionItem (class not modelled)",
+                    ));
+                }
+            });
+        }
+        Ok(ClientTransaction { items })
+    }
+}
+
+crate::codec!(ClientTransaction);

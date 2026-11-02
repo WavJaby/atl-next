@@ -13,6 +13,7 @@ mod deps;
 mod farm;
 mod fetch;
 mod git;
+mod host_art;
 mod libcxx_gate;
 mod licence_gate;
 mod licenses;
@@ -126,7 +127,7 @@ enum Test {
     NativeLoad(native_load::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
-    /// atl-aidl-probe on the converter's binder: an AIDL parcelable round-trips through AOSP's C++ Parcel, and its size check fires on a wrong size.
+    /// Parcel encodings vs ground truth: atl-aidl-probe through AOSP's C++ Parcel (its size check fires on a wrong size), then atl-parcelables' codecs vs Java's Parcelables on host ART, byte-equal both ways.
     Parcel(parcel::Args),
 }
 

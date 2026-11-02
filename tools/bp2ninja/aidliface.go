@@ -193,6 +193,11 @@ func (g *Graph) aidlSources(i *aidlIface, version string) []srcFile {
 	if s, ok := i.srcs[version]; ok {
 		return s
 	}
+	if c := i.mod.aidlCrate; c != nil {
+		// an aidl crate: the closure aidlcrates.go computed, each file under its include dir
+		i.srcs[version] = c.srcs
+		return c.srcs
+	}
 	dir := i.mod.Dir
 	var out []srcFile
 	if version == i.nextVersion() {
@@ -242,6 +247,8 @@ type aidlSpec struct {
 	srcs         []srcFile
 	// the missing previous .hash is one problem, not one per source
 	prevReported bool
+	// rust: --rust_java_type values (an aidl crate with parcelables, aidlcrates.go)
+	javaTypes []string
 }
 
 func strVals(list []string) []Val {
@@ -344,6 +351,13 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		}
 	}
 	spec.includes = appendMissing(spec.includes, p.strs("include_dirs"))
+	if c := i.mod.aidlCrate; c != nil {
+		spec.includes = appendMissing(spec.includes, c.includes)
+		if c.preprocessed != "" {
+			spec.preprocessed = append(spec.preprocessed, c.preprocessed)
+		}
+		spec.javaTypes = c.javaTypes
+	}
 	for _, h := range p.strs("headers") {
 		spec.includes = appendMissing(spec.includes, g.aidlLibraryDirs(h, side, ref, map[string]bool{}))
 	}
@@ -383,7 +397,11 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		props := newObj()
 		props.set("crate_name", fixRustName(name))
 		props.set("source_stem", fixRustName(i.versionedName(ver)))
-		props.set("rustlibs", strVals(be.strs("additional_rustlibs")))
+		rustlibs := be.strs("additional_rustlibs")
+		if c := i.mod.aidlCrate; c != nil {
+			rustlibs = append(rustlibs, c.rustlibs...)
+		}
+		props.set("rustlibs", strVals(rustlibs))
 		return &Module{Type: aidlRustType, Name: ref, Dir: i.mod.Dir, Props: props, aidl: spec}
 	}
 
@@ -498,6 +516,9 @@ func (s *aidlSpec) flags(g *Graph, f srcFile, path func(string) string) (flags, 
 	}
 	if s.log {
 		flags = append(flags, "--log")
+	}
+	for _, j := range s.javaTypes {
+		flags = append(flags, "--rust_java_type="+j)
 	}
 	for _, r := range s.includes {
 		flags = append(flags, "-I"+path(r))

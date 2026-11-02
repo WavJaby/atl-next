@@ -20,7 +20,7 @@
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
-//! atl-app-launcher is linked against the converter's libsigchain as `xtask native` links it (packages.rs), atl-property-service built plainly, both with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
+//! The ART runs, the launcher and the property area: host_art.rs.
 //! `--self-test` feeds the guards broken inputs and fails unless each fires: the load guard (a non-ELF file, a library with an undefined symbol), the launcher's (no property area); the result checks are unit tests.
 
 use std::collections::BTreeMap;
@@ -33,7 +33,8 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::{arches, farm, packages};
+use crate::farm;
+use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -61,20 +62,6 @@ pub struct Args {
     verbose: bool,
 }
 
-/// The boot classpath: the ART host boot jars (core-oj, core-libart, core-icu4j hostdex), then framework.jar (framework-minus-apex's dex
-/// jar, stem framework), as the Java pipeline lays them out under --java-out.
-const BOOT_JARS: [&str; 4] = [
-    "device/core-oj/aligned/core-oj.jar",
-    "device/core-libart/aligned/core-libart.jar",
-    "device/core-icu4j-host/dex-withres-aligned/core-icu4j.jar",
-    "device/framework-minus-apex/aligned/framework.jar",
-];
-/// Their class jars: javac's bootclasspath and d8's --lib.
-const JAVAC_BOOT: [&str; 3] = [
-    "device/core-oj/javac/core-oj.jar",
-    "device/core-libart/javac/core-libart.jar",
-    "device/framework-minus-apex/javac-header/framework.jar",
-];
 const FIXTURE: &str = "xtask/testdata/native-load";
 const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// `android::AndroidRuntime::startReg(JNIEnv*)` and `android::gRegJNI` (internal linkage), Itanium-mangled.
@@ -221,7 +208,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         CHAIN_EXIT.to_string(),
         CHAIN_ROUNDS.to_string(),
     ];
-    let chain = env.launch(&fixture, &fixture.area.1, &CHAIN_VM, "chain", &chain_args)?;
+    let chain = env.launch(
+        &fixture,
+        &fixture.java.area.1,
+        &CHAIN_VM,
+        "chain",
+        &chain_args,
+    )?;
     match chain_result(&chain) {
         Ok(s) => report.pass("chain", s),
         Err(e) => report.fail("chain", e),
@@ -237,7 +230,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // 7
     let overflow = env.launch(
         &fixture,
-        &fixture.area.1,
+        &fixture.java.area.1,
         &CHAIN_VM,
         "overflow",
         &[OVERFLOW_ROUNDS.to_string()],
@@ -252,175 +245,63 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 // ---- inputs --------------------------------------------------------------------------------------
 
 struct Env {
-    art: PathBuf,
-    /// The staged ART's library dir, every run's LD_LIBRARY_PATH (stage_art).
-    lib_path: PathBuf,
-    launcher: PathBuf,
-    property_service: PathBuf,
-    /// The converter's build.prop, the property service's input.
-    build_prop: PathBuf,
-    boot: Vec<PathBuf>,
-    javac_boot: Vec<PathBuf>,
-    d8: PathBuf,
-    jdk: PathBuf,
+    host: HostArt,
     runtime: PathBuf,
     /// gRegJNI's entry count in the pinned source ([`reg_jni_entries`]).
     reg_jni_entries: usize,
     work: PathBuf,
-    /// The build directory's cargo target dir: launcher, property service, shim.
-    cargo: PathBuf,
-    verbose: bool,
 }
 
 struct Fixture {
-    dex: PathBuf,
+    java: JavaFixture,
     shim: PathBuf,
-    /// Every run's property-area variable as atl-property-service printed it: (name, the area it wrote).
-    area: (String, String),
 }
 
-/// The property service binary, built by cargo into <out>/cargo (the launcher: packages.rs).
-const PROPERTY_SERVICE: &str = "atl-property-service";
-/// The launcher package and its executable.
-const LAUNCHER: &str = "atl-app-launcher";
-/// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
-const BUILD_PROP: &str = "gen/build.prop";
 /// The launcher's refusal without a property area (atl-app-launcher lib.rs).
 const NO_AREA: &str = "no system property area";
 
 impl Env {
     fn new(root: &Path, args: &Args) -> Result<Self> {
-        let arches = arches::load(root)?;
-        let arch = arches
-            .get(&args.host)
-            .filter(|a| a.host.is_some())
-            .with_context(|| format!("{}: not a host arch in {}", args.host, arches::FILE))?;
-        let host = arch.host.as_ref().context("checked above")?;
-        let os = host.soong_prebuilt_os.as_deref().with_context(|| {
-            format!(
-                "{}: no soong_prebuilt_os (no prebuilt JDK or host ART)",
-                args.host
-            )
-        })?;
         let layout = Layout::of(root)?;
-        let ws = layout.workspace();
-        let java_out = match &args.java_out {
-            Some(dir) => std::path::absolute(dir)?,
-            None => ws.join("out/java/build"),
-        };
         let out = match &args.out {
             Some(dir) => std::path::absolute(dir)?,
-            None => ws.join("out/native").join(&args.host),
+            None => layout.workspace().join("out/native").join(&args.host),
         };
-        let art = out.join("native-load-art");
-        let lib_path = stage_art(&out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
-        let env = Env {
-            art,
-            lib_path,
-            launcher: packages::bin(root, &out, LAUNCHER, LAUNCHER)?,
-            property_service: build_property_service(root, &out.join("cargo"))?,
-            build_prop: out.join(BUILD_PROP),
-            boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
-            javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
-            d8: java_out.join("host/bin/d8"),
-            jdk: arches::java_tools(&farm::shared_tree(&layout), os).0,
-            runtime: out.join(RUNTIME),
-            reg_jni_entries: {
-                let cpp = farm::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
-                let src = std::fs::read_to_string(&cpp)
-                    .with_context(|| format!("reading {}", cpp.display()))?;
-                reg_jni_entries(&src).with_context(|| cpp.display().to_string())?
-            },
+        let host = HostArt::new(
+            root,
+            &args.host,
+            args.java_out.as_deref(),
+            &out,
+            "native-load-art",
+            args.verbose,
+        )?;
+        let runtime = out.join(RUNTIME);
+        ensure!(runtime.exists(), "missing input {}", runtime.display());
+        let cpp = farm::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
+        let src =
+            std::fs::read_to_string(&cpp).with_context(|| format!("reading {}", cpp.display()))?;
+        Ok(Env {
+            host,
+            runtime,
+            reg_jni_entries: reg_jni_entries(&src).with_context(|| cpp.display().to_string())?,
             work: out.join("native-load"),
-            cargo: out.join("cargo"),
-            verbose: args.verbose,
-        };
-        for p in [&env.build_prop, &env.d8, &env.jdk, &env.runtime]
-            .into_iter()
-            .chain(&env.boot)
-            .chain(&env.javac_boot)
-        {
-            ensure!(p.exists(), "missing input {}", p.display());
-        }
-        Ok(env)
+        })
     }
 
     /// The fixture into <out>/native-load, rebuilt every run (a few seconds; no staleness logic to get wrong).
     fn build_fixture(&self, root: &Path) -> Result<Fixture> {
-        let fixture = root.join(FIXTURE);
-        if self.work.exists() {
-            std::fs::remove_dir_all(&self.work)?;
-        }
-        let classes = self.work.join("classes");
-        std::fs::create_dir_all(&classes)?;
-        std::fs::create_dir_all(self.work.join("data"))?;
-        let mut java = Vec::new();
-        collect(&fixture.join("java"), "java", &mut java)?;
-        let jdk_bin = self.jdk.join("bin");
-        let bootcp = join_paths(&self.javac_boot);
-        exec(
-            Command::new(jdk_bin.join("javac"))
-                .args([
-                    "-source",
-                    "8",
-                    "-target",
-                    "8",
-                    "-Xlint:-options",
-                    "-bootclasspath",
-                ])
-                .arg(&bootcp)
-                .arg("-d")
-                .arg(&classes)
-                .args(&java),
-            "javac",
-        )?;
-        let jar = self.work.join("classes.jar");
-        exec(
-            Command::new(jdk_bin.join("jar"))
-                .arg("cf")
-                .arg(&jar)
-                .arg("-C")
-                .arg(&classes)
-                .arg("."),
-            "jar",
-        )?;
-        let dex = self.work.join("dex");
-        std::fs::create_dir_all(&dex)?;
-        let path = std::env::join_paths(std::iter::once(jdk_bin.clone()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))?;
-        // installed executable by the Java pipeline (a bash script running r8.jar with the JDK on PATH)
-        let mut d8 = Command::new(&self.d8);
-        d8.env("PATH", path);
-        for lib in &self.javac_boot {
-            d8.arg("--lib").arg(lib);
-        }
-        exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
-        let shim = build_shim(root, &self.cargo)?;
-        // the broker's step: the default property area, its variable printed as NAME=path
-        let printed = output(
-            Command::new(&self.property_service)
-                .arg("--build-prop")
-                .arg(&self.build_prop)
-                .arg("--out")
-                .arg(self.work.join("properties")),
-            "atl-property-service",
-        )?;
-        let area = printed
-            .trim()
-            .split_once('=')
-            .map(|(n, v)| (n.to_owned(), v.to_owned()))
-            .with_context(|| format!("atl-property-service printed {printed:?}, not NAME=path"))?;
+        let java = self
+            .host
+            .compile(&root.join(FIXTURE).join("java"), &self.work)?;
         Ok(Fixture {
-            dex: dex.join("classes.dex"),
-            shim,
-            area,
+            java,
+            shim: build_shim(root, &self.host.cargo)?,
         })
     }
 
     /// NativeLoad.java `mode args`, started by the launcher over the fixture's property area.
     fn art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
-        self.launch(fixture, &fixture.area.1, &[], mode, args)
+        self.launch(fixture, &fixture.java.area.1, &[], mode, args)
     }
 
     /// `art` with the property-area variable set to `area` and the extra VM options `vm`.
@@ -432,152 +313,12 @@ impl Env {
         mode: &str,
         args: &[String],
     ) -> Result<ArtRun> {
-        let boot = join_paths(&self.boot);
-        let mut cmd = Command::new(&self.launcher);
-        cmd.arg(format!("-Xbootclasspath:{boot}"))
-            .arg(format!("-Xbootclasspath-locations:{boot}"))
-            .arg("-Xnoimage-dex2oat")
-            .args(vm)
-            .arg("-cp")
-            .arg(&fixture.dex)
-            .arg("NativeLoad")
-            .arg(mode)
-            .args(args)
-            .env("ANDROID_ROOT", &self.art)
-            .env("ANDROID_ART_ROOT", self.art.join("com.android.art"))
-            .env("ANDROID_I18N_ROOT", self.art.join("com.android.i18n"))
-            .env("ANDROID_TZDATA_ROOT", self.art.join("com.android.tzdata"))
-            .env("ANDROID_DATA", self.work.join("data"))
-            .env("LD_BIND_NOW", "1")
-            .env("LD_LIBRARY_PATH", &self.lib_path)
-            .env(&fixture.area.0, area)
-            // liblog's minimum priority INFO: libbase InitLogging (ART's runtime start) reads it into __android_log_set_minimum_priority, so liblog itself refuses VERBOSE (stage 3)
-            .env("ANDROID_LOG_TAGS", "*:i");
-        let out = cmd
-            .output()
-            .with_context(|| format!("running {}", self.launcher.display()))?;
-        let run = ArtRun {
-            ok: out.status.success(),
-            code: out.status.code(),
-            signal: std::os::unix::process::ExitStatusExt::signal(&out.status),
-            status: out.status.to_string(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        };
-        if self.verbose {
-            println!("---- {mode}: {cmd:?} -> {}", run.status);
-            println!("{}{}", run.stdout, run.stderr);
-        }
-        Ok(run)
+        let args: Vec<String> = std::iter::once(mode.to_owned())
+            .chain(args.iter().cloned())
+            .collect();
+        self.host
+            .launch(&fixture.java, area, vm, "NativeLoad", &args)
     }
-}
-
-/// Where Android installs the ICU data ART's ICU opens (external/icu/icu4c/source/stubdata/Android.bp apex_icu.dat: prebuilt_etc of `icu*.dat`, sub_dir icu, in the com.android.i18n APEX).
-const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
-
-/// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
-/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
-///   libhwui dlopens libandroid by name too (HardwareBufferHelpers, HardwareRenderer, HintSessionWrapper), with no DT_NEEDED on it, so no dependency closure builds it: required here.
-/// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
-fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
-    let device = out.join("device");
-    for module in ["libart", "libnativehelper", "libandroid"] {
-        ensure!(
-            device.join(module).join(format!("{module}.so")).is_file(),
-            "no {module} in {}: build it with `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid`",
-            out.display()
-        );
-    }
-    if art.exists() {
-        std::fs::remove_dir_all(art)?;
-    }
-    let lib = art.join(if pointer_bits == 64 { "lib64" } else { "lib" });
-    let icu = art.join("com.android.i18n/etc/icu");
-    for d in [&lib, &icu, &art.join("com.android.tzdata")] {
-        std::fs::create_dir_all(d)?;
-    }
-    let link = |target: &Path, at: &Path| {
-        std::os::unix::fs::symlink(target, at)
-            .with_context(|| format!("linking {} -> {}", at.display(), target.display()))
-    };
-    link(Path::new("."), &art.join("com.android.art"))?;
-    for module in std::fs::read_dir(&device)? {
-        let module = module?.path();
-        if !module.is_dir() {
-            continue;
-        }
-        for f in std::fs::read_dir(&module)? {
-            let f = f?.path();
-            if f.extension().is_some_and(|e| e == "so") && f.is_file() {
-                let name = f.file_name().context("a file name")?;
-                link(&f, &lib.join(name))?;
-            }
-        }
-    }
-    let mut data = 0;
-    for f in std::fs::read_dir(tree.join(ICU_DATA))? {
-        let f = f?.path();
-        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if name.starts_with("icu") && name.ends_with(".dat") {
-            link(&f, &icu.join(name))?;
-            data += 1;
-        }
-    }
-    ensure!(data > 0, "no icu*.dat in {}", tree.join(ICU_DATA).display());
-    Ok(lib)
-}
-
-fn collect(dir: &Path, ext: &str, into: &mut Vec<PathBuf>) -> Result<()> {
-    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let p = e?.path();
-        if p.is_dir() {
-            collect(&p, ext, into)?;
-        } else if p.extension().is_some_and(|x| x == ext) {
-            into.push(p);
-        }
-    }
-    into.sort();
-    Ok(())
-}
-
-fn join_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-fn exec(cmd: &mut Command, what: &str) -> Result<()> {
-    output(cmd, what).map(drop)
-}
-
-/// `cmd`'s stdout; a failure with its output.
-fn output(cmd: &mut Command, what: &str) -> Result<String> {
-    let out = cmd.output().with_context(|| format!("running {what}"))?;
-    ensure!(
-        out.status.success(),
-        "{what} failed ({}):\n{}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// [`PROPERTY_SERVICE`], release, in the cargo target dir `target` (cargo's own staleness check: a no-op when current); its path.
-fn build_property_service(root: &Path, target: &Path) -> Result<PathBuf> {
-    exec(
-        crate::cargo_command()
-            .current_dir(root)
-            .args(["build", "--release", "--locked", "-p", PROPERTY_SERVICE])
-            .arg("--target-dir")
-            .arg(target),
-        "cargo build (property service)",
-    )?;
-    let bin = target.join("release").join(PROPERTY_SERVICE);
-    ensure!(bin.is_file(), "{} missing after cargo build", bin.display());
-    Ok(bin)
 }
 
 /// The fixture's JNI shim (its own cargo package, `<FIXTURE>/shim`), release, in the cargo target dir `target`; its path.
@@ -755,17 +496,6 @@ fn register_symbol(name: &str) -> String {
 
 // ---- results -------------------------------------------------------------------------------------
 
-struct ArtRun {
-    ok: bool,
-    /// The exit status; None when a signal ended the process.
-    code: Option<i32>,
-    /// The signal that ended the process, if one did.
-    signal: Option<i32>,
-    status: String,
-    stdout: String,
-    stderr: String,
-}
-
 impl ArtRun {
     /// Values of the `nlt <key> <value>` lines with this key.
     fn values(&self, key: &str) -> Vec<&str> {
@@ -781,17 +511,6 @@ impl ArtRun {
 
     fn value(&self, key: &str) -> Option<&str> {
         self.values(key).into_iter().next()
-    }
-
-    /// Why the run ended badly: ART's / liblog's fatal line, else the last stderr line, plus the exit status.
-    fn failure(&self) -> String {
-        let fatal = self
-            .stderr
-            .lines()
-            .find(|l| l.contains(" F ") || l.contains("FATAL") || l.contains("Abort message"))
-            .or_else(|| self.stderr.lines().rfind(|l| !l.trim().is_empty()))
-            .unwrap_or("(no stderr)");
-        format!("{} [{}]", fatal.trim(), self.status)
     }
 }
 

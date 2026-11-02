@@ -148,6 +148,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-parcel-truth"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+]
+
+[[package]]
+name = "atl-parcelables"
+version = "0.0.0"
+
+[[package]]
 name = "atl-property-service"
 version = "0.0.0"
 dependencies = [

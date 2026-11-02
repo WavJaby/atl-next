@@ -32,9 +32,9 @@ uses = ["generators", "bionic"]
 [android-runtime]
 crates = ["atl-android-runtime"]
 
-# Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it)
+# Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it), and the Rust types of the Java-only parcelables they pass (a converter rust_library)
 [aidl]
-crates = ["atl-aidl"]
+crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]
 exports = ["atl-aidl"]
 uses = ["generators"]
 

@@ -196,7 +196,7 @@ func addKey(m map[string]bool, k string) map[string]bool {
 	return m
 }
 
-func sortedKeys(m map[string]bool) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for r := range m {
 		out = append(out, r)

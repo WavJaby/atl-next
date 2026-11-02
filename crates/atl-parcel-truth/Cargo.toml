@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-parcel-truth"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# JNI library of `xtask test parcel`: Java's own Parcelables marshalled on host ART are decoded and re-encoded by atl-parcelables' codecs over AOSP's C++ Parcel (libbinder_rs -> libbinder_ndk -> libbinder).
+# Test-only, never shipped. Links the converter's libbinder_rs and libatl_parcelables, so only `xtask native` builds it (feature `converter`); plain workspace builds take an empty library.
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/libatl_parcelables"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+converter = []
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

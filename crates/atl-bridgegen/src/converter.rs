@@ -3,7 +3,7 @@
 //! What is linked comes from `$ATL_NATIVE_OUT/graph.json` `artifacts` (tools/bp2ninja graph.go), so it is what the converter's own links take: an rlib as a crate (`extern crate <name>;` finds it on the `crate=` search path, its crate closure on `dependency=`) plus its cc libraries as link-driver arguments; a shared library as `-l` + RUNPATH.
 //! `rustc-link-lib` lands before std's `-lc`, so a shared module leads DT_NEEDED in the order named (libsigchain must precede libc); rlib link arguments are `rustc-link-arg`, which reach only this package's own links (a dependent package names the modules itself).
 //! The build around it is `xtask native`'s: cargo's linker is the converter's link driver (graph.json `link_driver`; rlib arguments are clang driver arguments such as `-stdlib=libc++`) and the profile's `panic` is `abort`, as the converter's device crates are compiled (a panic strategy mismatch fails the link).
-//! `[package.metadata.atl] aidl = [":filegroup", "path/x.aidl"]` adds the package's AIDL crate `device/<package>-stubs-rust` (crate `<package>_stubs`), which the converter generates from those sources (xtask packages.rs, bp2ninja aidlcrates.go).
+//! `[package.metadata.atl.aidl]` adds the package's AIDL crate `device/<package>-stubs-rust` (crate `<package>_stubs`), which the converter generates from those types' import closure (xtask packages.rs, bp2ninja aidlcrates.go).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -165,7 +165,7 @@ fn shared_name(out: &Path) -> Result<&str> {
 /// The suffix of a package's AIDL crate interface (xtask packages.rs `AIDL_SUFFIX`).
 const AIDL_SUFFIX: &str = "-stubs";
 
-/// The converter modules a package's Cargo.toml text names: `[package.metadata.atl] converter`, then, when it lists `aidl` sources, its AIDL crate's rlib `device/<package>-stubs-rust` (xtask packages.rs: the converter builds it; the srcs are checked there).
+/// The converter modules a package's Cargo.toml text names: `[package.metadata.atl] converter`, then, when it has `aidl`, its AIDL crate's rlib `device/<package>-stubs-rust` (xtask packages.rs: the converter builds it; the table is checked there).
 pub fn package_modules(cargo_toml: &str) -> Result<Vec<String>> {
     let table: toml::Table = toml::from_str(cargo_toml).context("parsing Cargo.toml")?;
     let atl = table
@@ -322,7 +322,7 @@ mod tests {
             ["device/libbinder_rs", "host/aidl"]
         );
         // `aidl` adds the package's AIDL crate rlib after the list
-        let aidl = "[package]\nname = \"p\"\n[package.metadata.atl]\nconverter = [\"device/libbinder_rs\"]\naidl = [\":fg\"]\n";
+        let aidl = "[package]\nname = \"p\"\n[package.metadata.atl]\nconverter = [\"device/libbinder_rs\"]\n[package.metadata.atl.aidl]\ninclude_dirs = [\"i\"]\ntypes = [\"a.IFoo\"]\n";
         assert_eq!(
             package_modules(aidl).unwrap(),
             ["device/libbinder_rs", "device/p-stubs-rust"]

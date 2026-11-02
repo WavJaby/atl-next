@@ -37,7 +37,32 @@ type rustSourceProvider interface {
 var rustSourceProviders = map[string]rustSourceProvider{
 	"rust_protobuf": rustProtobuf{}, "rust_protobuf_host": rustProtobuf{},
 	"rust_bindgen": rustBindgen{}, "rust_bindgen_host": rustBindgen{},
-	aidlRustType: rustAidl{},
+	aidlRustType:        rustAidl{},
+	aidlParcelablesType: rustAidlParcelables{},
+}
+
+// rustAidlParcelables: an aidl crate's parcelables.rs (aidlcrates.go), written at conversion time, and the flag dump of each of its aconfig_declarations as `<module>.aconfig.txt`
+// (aconfig.go aconfigText, copied under that name); the parcelables crate names it in srcs, so all land in that crate's OUT_DIR.
+type rustAidlParcelables struct{}
+
+func (rustAidlParcelables) deps(*Node) ([]string, []string) { return nil, nil }
+
+func (rustAidlParcelables) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
+	dir := g.genDir(n, "")
+	out := filepath.Join(dir, "parcelables.rs")
+	g.genFile(out, n.mod.genText)
+	src := rustSource{outs: []string{out}}
+	for _, ref := range n.mod.aconfig {
+		text := g.aconfigText(ref, n.mod.Name)
+		if text == "" {
+			fail("aconfig_declarations %s unusable", ref)
+			continue
+		}
+		dump := filepath.Join(dir, ref+".aconfig.txt")
+		n.edges = append(n.edges, genEdge{rule: "cp", outs: []string{dump}, in: text})
+		src.outs = append(src.outs, dump)
+	}
+	return src
 }
 
 // rustProtobuf: rust_protobuf[_host].
