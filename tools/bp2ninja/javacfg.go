@@ -93,8 +93,12 @@ func goConstants(path string, lists map[string][]string, strs map[string]string)
 				return []string{s}, err == nil
 			}
 		case *ast.Ident:
-			l, ok := lists[x.Name]
-			return l, ok
+			// a list, else a string constant (`const art = "…"` named in a slice literal)
+			if l, ok := lists[x.Name]; ok {
+				return l, true
+			}
+			s, ok := strs[x.Name]
+			return []string{s}, ok
 		case *ast.CompositeLit:
 			var out []string
 			for _, el := range x.Elts {

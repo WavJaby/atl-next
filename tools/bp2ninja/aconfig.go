@@ -197,6 +197,14 @@ func (g *Graph) aconfigJavaLib(n *jNode) {
 		}
 		n.props.set("libs", libs)
 	}
+	n.srcjar = srcjar
+	if decl.exportable {
+		// "possibly needing jarjar repackaging" (jarjar.go): renamed by a later jarjar_prefix
+		n.renames = map[string]string{}
+		for _, c := range []string{"Flags", "FeatureFlags", "FeatureFlagsImpl", "CustomFeatureFlags", "FakeFeatureFlagsImpl"} {
+			n.renames[decl.pkg+"."+c] = ""
+		}
+	}
 	g.javaLib(n, srcjar)
 }
 

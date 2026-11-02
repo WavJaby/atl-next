@@ -129,7 +129,13 @@ func (c Config) Multilib() string { return fmt.Sprintf("lib%d", c.PointerBits) }
 type evaluator struct {
 	cfg Config
 	os  string // "android" or "linux_glibc", the answer of select(os(), …)
+	// the release config: select(release_flag(), …) and the soong config variables it sets; nil = unset
+	rel *Release
 }
+
+// productVariables: the product variables select(product_variable(…)) can name that this build sets. build_from_text_stub: soong_ui sets
+// it unless BUILD_FROM_SOURCE_STUB is in the environment (config.go SetBuildFromTextStub), which this build never sets.
+var productVariables = map[string]string{"build_from_text_stub": "true"}
 
 func (e *evaluator) eval(x parser.Expression, sc *parser.Scope) (Val, error) {
 	switch v := x.(type) {
@@ -242,14 +248,27 @@ const (
 	anyBranch     = "__soong_conditions_any__"
 )
 
-// condition answers a select() condition; ok=false means unset. Only os() and arch() are known:
-// soong_config_variable, release_flag and product_variable stay unset, so their default branch wins.
+// condition answers a select() condition; ok=false means unset, so the default branch wins: os(), arch(), release_flag() and the soong config
+// variables of the release (Release.ConfigVar) are known, product_variable() for productVariables.
 func (e *evaluator) condition(c parser.ConfigurableCondition) (string, bool) {
 	switch c.FunctionName {
 	case "os":
 		return e.os, true
 	case "arch":
 		return e.cfg.Arch, true
+	case "release_flag":
+		if e.rel != nil && len(c.Args) == 1 {
+			return e.rel.Condition(c.Args[0].Value)
+		}
+	case "soong_config_variable":
+		if e.rel != nil && len(c.Args) == 2 {
+			return e.rel.ConfigVar(c.Args[0].Value, c.Args[1].Value)
+		}
+	case "product_variable":
+		if len(c.Args) == 1 {
+			v, ok := productVariables[c.Args[0].Value]
+			return v, ok
+		}
 	}
 	return "", false
 }

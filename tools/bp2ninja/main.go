@@ -177,8 +177,27 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, stand: stand, nodes: map[key]*Node{}}
+	if (js.aconfig == "") != (js.release == "") {
+		return fmt.Errorf("-aconfig and -release are given together")
+	}
+	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
+	if js.release != "" {
+		if g.release, err = readRelease(tree, js.release); err != nil {
+			return err
+		}
+		id, err := readBuildID(tree)
+		if err != nil {
+			return err
+		}
+		prop, err := buildProp(g.release, id)
+		if err != nil {
+			return err
+		}
+		g.genFile(filepath.Join(out, buildPropFile), prop)
+		g.acfg = &aconfigGraph{tool: js.aconfig, decls: map[string]*aconfigDecl{}}
+	}
 	for side, osName := range []string{"android", "linux_glibc"} {
-		ev := &evaluator{cfg: cfg, os: osName}
+		ev := &evaluator{cfg: cfg, os: osName, rel: g.release}
 		mods, problems := ev.modules(files)
 		g.mods[side] = mods
 		for _, p := range problems {
@@ -217,24 +236,6 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		}
 	}
 	g.checkRustAndroid()
-	if (js.aconfig == "") != (js.release == "") {
-		return fmt.Errorf("-aconfig and -release are given together")
-	}
-	if js.release != "" {
-		if g.release, err = readRelease(tree, js.release); err != nil {
-			return err
-		}
-		id, err := readBuildID(tree)
-		if err != nil {
-			return err
-		}
-		prop, err := buildProp(g.release, id)
-		if err != nil {
-			return err
-		}
-		g.genFile(filepath.Join(out, buildPropFile), prop)
-		g.acfg = &aconfigGraph{tool: js.aconfig, decls: map[string]*aconfigDecl{}}
-	}
 	// Java tools given: Java goals are built (java.go)
 	if js.tools.JDK != "" {
 		if err := g.initJava(js.tools); err != nil {

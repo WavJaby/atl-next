@@ -20,6 +20,9 @@ type Release struct {
 	Chain     []string // root first, the config itself last
 	ValueSets []string // aconfig_value_set module names, in chain order
 	flags     map[string]string
+	bools     map[string]bool // flags declared with a bool_value
+	// soong config variables "<namespace>/<variable>" set from a release flag (readConfigVars)
+	configVars map[string]string
 }
 
 var (
@@ -35,7 +38,7 @@ const releaseRoot = "root"
 
 func readRelease(tree, name string) (*Release, error) {
 	dir := filepath.Join(tree, "build/release")
-	r := &Release{Name: name, flags: map[string]string{}}
+	r := &Release{Name: name, flags: map[string]string{}, bools: map[string]bool{}}
 	seen := map[string]bool{}
 	var walk func(cfg string) error
 	walk = func(cfg string) error {
@@ -68,6 +71,9 @@ func readRelease(tree, name string) (*Release, error) {
 	for _, f := range decls {
 		if n, v, ok := flagValue(f); ok {
 			r.flags[n] = v
+			if b, err := os.ReadFile(f); err == nil && reBool.Match(b) {
+				r.bools[n] = true
+			}
 		}
 	}
 	for _, cfg := range r.Chain {
@@ -78,7 +84,69 @@ func readRelease(tree, name string) (*Release, error) {
 			}
 		}
 	}
-	return r, nil
+	var err error
+	r.configVars, err = readConfigVars(filepath.Join(tree, configVarsMk), r)
+	return r, err
+}
+
+// configVarsMk: where the product config maps build flags to Soong config variables.
+const configVarsMk = "build/make/core/android_soong_config_vars.mk"
+
+var reConfigSet = regexp.MustCompile(`^\$\(call (soong_config_set|soong_config_set_bool|add_soong_config_var_value),\s*(\w+)\s*,\s*(\w+)\s*,\s*\$\((RELEASE_\w+)\)\s*\)\s*$`)
+
+// readConfigVars: the soong config variables android_soong_config_vars.mk sets straight from a release flag, outside any if block
+// (`$(call soong_config_set|soong_config_set_bool|add_soong_config_var_value,<ns>,<var>,$(RELEASE_X))`). soong_config_set_bool makes an
+// unset or false flag "false"; the others leave an empty value unset. Variables computed by make expressions or product variables are not
+// read: their selects take the default branch.
+func readConfigVars(path string, r *Release) (map[string]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	depth := 0
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "ifdef ") || strings.HasPrefix(t, "ifndef ") || strings.HasPrefix(t, "ifeq ") || strings.HasPrefix(t, "ifneq "):
+			depth++
+			continue
+		case t == "endif":
+			depth--
+			continue
+		}
+		m := reConfigSet.FindStringSubmatch(line)
+		if m == nil || depth > 0 {
+			continue
+		}
+		v, declared := r.flags[m[4]]
+		switch {
+		case m[1] == "soong_config_set_bool" && v != "true":
+			v = "false"
+		case !declared || v == "":
+			continue
+		}
+		out[m[2]+"/"+m[3]] = v
+	}
+	return out, nil
+}
+
+// Condition answers select(release_flag(name)): a bool flag "true" / "false", a string flag its value; ok=false for an undeclared flag.
+func (r *Release) Condition(name string) (string, bool) {
+	v, ok := r.flags[name]
+	if !ok {
+		return "", false
+	}
+	if r.bools[name] && v != "true" {
+		v = "false"
+	}
+	return v, true
+}
+
+// ConfigVar answers select(soong_config_variable(ns, name)) for the variables readConfigVars knows.
+func (r *Release) ConfigVar(ns, name string) (string, bool) {
+	v, ok := r.configVars[ns+"/"+name]
+	return v, ok
 }
 
 // flagValue reads one flag declaration or value file: bool flags are "true" / "" as Soong's GetBuildFlag reports them.

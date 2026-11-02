@@ -58,13 +58,15 @@ type jNode struct {
 	processor string
 	// aidl.export_include_dirs (tree-relative): dependents' aidl -I (JavaInfo.AidlIncludeDirs)
 	aidlExport []string
+	// jarjar rename rules it hands dependents, original class -> new name ("" = renamed by a later jarjar_prefix); jarjar.go
+	renames map[string]string
 	// exported_plugins
 	expPluginJars, expProcessors []string
 	// droiddoc_exported_dir
 	expDir     string
 	expDirDeps []string
-	// java_binary_host: the runnable wrapper and its jar
-	tool string
+	// java_binary_host: the runnable wrapper and its installed jar
+	tool, toolJar string
 }
 
 // javaGraph holds the Java side of a Graph.
@@ -401,7 +403,8 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 	p := n.props
 	dep := func(ref string, side Side) *jNode { return g.jnode(ref, side, n.name) }
 	var statics []*jNode
-	if n.side == Device {
+	// java_import adds no SDK dependencies (Import.DepsMutator: libs and static_libs only)
+	if n.side == Device && n.typ != "java_import" {
 		sd, err := g.decodeSdk(n, s)
 		if err != nil {
 			g.problem("%s: %v", n.name, err)
@@ -523,7 +526,7 @@ func (g *Graph) javaSrcs(n *jNode, srcs []string) jSrcs {
 		case ".srcjar":
 			s.srcjars = append(s.srcjars, f.path)
 		default:
-			if javaGens[ext] != nil {
+			if javaGen(ext) != nil {
 				s.gen[ext] = append(s.gen[ext], f)
 			}
 		}
@@ -580,8 +583,37 @@ func (g *Graph) javaSrcRef(n *jNode, ref string) ([]string, bool) {
 			return []string{d.srcjar}, true
 		}
 		return nil, true
+	case "aconfig_declarations_group":
+		if tag != ".srcjars" {
+			g.problem("%s: %s: aconfig_declarations_group output tag %q is unsupported (only .srcjars)", n.name, ref, tag)
+			return nil, true
+		}
+		return g.aconfigGroupSrcjars(m, n.side, n.name), true
 	}
 	return nil, false
+}
+
+// aconfigGroupSrcjars: an aconfig_declarations_group's `.srcjars` (aconfig_declarations_group.go): the srcjars of its nested groups, then
+// of its java_aconfig_libraries, in property order.
+func (g *Graph) aconfigGroupSrcjars(m *Module, side Side, from string) []string {
+	var out []string
+	for _, r := range m.Props.strs("aconfig_declarations_groups") {
+		gm := g.lookupJava(r, side)
+		switch {
+		case gm != nil && g.baseType(gm.Type) == "aconfig_declarations_group":
+			out = append(out, g.aconfigGroupSrcjars(gm, side, from)...)
+		case gm != nil && gm.Type == "aconfig_declarations":
+			// provides no CodegenInfo: the group's VisitDirectDeps skips it
+		default:
+			g.problem("%s: %s is not an aconfig_declarations_group", from, r)
+		}
+	}
+	for _, r := range m.Props.strs("java_aconfig_libraries") {
+		if d := g.jnode(r, side, from); d != nil && d.srcjar != "" {
+			out = append(out, d.srcjar)
+		}
+	}
+	return out
 }
 
 // javaLib builds java_library / java_library_static / java_library_host / java_plugin / java_binary_host / java_aconfig_library's
@@ -632,18 +664,14 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		}
 	}
 	src := g.javaSrcs(n, srcs)
-	if n.mod.aidl != nil {
-		// an aidl_interface's java backend (aidliface.go): its sources are the interface version's
-		src.gen[".aidl"] = n.mod.aidl.srcs
-	}
 	java, srcjars, waits := src.java, src.srcjars, src.waits
 	// genSources: logtags java in place (here: after the module's own), then proto and aidl srcjars after its own .srcjar sources
 	for _, ext := range genOrder {
 		if files := src.gen[ext]; len(files) > 0 {
-			if ext == ".aidl" && d.aidlGen != "" && n.mod.aidl == nil {
+			if ext == ".aidl" && d.aidlGen != "" {
 				g.problem("%s: aidl sources against sdk_version %q need the SDK's %s (sdkparcelables over the stubs), which is not built", n.name, p.str("sdk_version"), d.aidlGen)
 			}
-			gj, gs := javaGens[ext](g, n, files, d)
+			gj, gs := javaGen(ext)(g, n, files, d)
 			java = append(java, gj...)
 			srcjars = append(srcjars, gs...)
 		}
@@ -671,6 +699,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		}
 	}
 	var localImpl []string
+	// compile: jarjar rename rules inherited from dependencies (jarjar.go), applied to each compiled jar (repackageFlagsIfNecessary)
+	repackage := g.repackageRules(n, srcs, s)
 	if len(src.kt) > 0 {
 		// kotlinc first over every .java and .kt source (it reads the java ones only to resolve types), then javac against its header jar
 		if len(d.processorPath) > 0 {
@@ -678,13 +708,13 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		}
 		kt, kh := filepath.Join(n.dir, "kotlin", jar), filepath.Join(n.dir, "kotlin_headers", jar)
 		g.kotlinc(n, kt, kh, java, src.kt, srcjars, waits, ver, d)
-		localImpl = append(localImpl, kt)
+		localImpl = append(localImpl, g.repackage(n, kt, repackage, "kotlinc", jar))
 		d.classpath = append([]string{kh}, d.classpath...)
 	}
 	if len(java)+len(srcjars) > 0 {
 		classes := out("javac")
 		g.javac(n, classes, java, srcjars, waits, flags, ver, d)
-		localImpl = append(localImpl, classes)
+		localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
 	}
 
 	// resources (java_resource_dirs, java_resources)
@@ -734,11 +764,18 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		impl = out("combined")
 		j.combine(impl, implJars, manifest)
 	}
-	if rules := p.str("jarjar_rules"); rules != "" && impl != "" {
-		rulesPath := g.abs(filepath.Join(n.mod.Dir, rules))
+	if rules := g.jarjarRulesFile(n); rules != "" && impl != "" {
+		// jarjarIfNecessary: the implementation jar in jarjar_shards shards, the resources in one
+		shards := 1
+		if v := p.str("jarjar_shards"); v != "" {
+			if k, err := strconv.Atoi(v); err == nil && k > 0 {
+				shards = k
+			} else {
+				g.problem("%s: jarjar_shards must be an integer represented as a string", n.name)
+			}
+		}
 		jj := out("jarjar")
-		tool := g.jtool("jarjar", n.name)
-		j.edge("jarjar", []string{jj}, []string{impl}, []string{rulesPath, tool}, nil, [][2]string{{"rules", esc(rulesPath)}, {"jarjar", esc(tool)}})
+		g.jarjar(n, jj, impl, rules, shards)
 		impl = jj
 		implJars = []string{jj}
 		if len(n.res) > 0 {
@@ -747,8 +784,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 				rc = out("res-combined")
 				j.combine(rc, n.res, "")
 			}
-			rj := filepath.Join(n.dir, "resource-jarjar", jar)
-			j.edge("jarjar", []string{rj}, []string{rc}, []string{rulesPath, tool}, nil, [][2]string{{"rules", esc(rulesPath)}, {"jarjar", esc(tool)}})
+			rj := filepath.Join(n.dir, "jarjar", "resource", jar)
+			g.jarjar(n, rj, rc, rules, 1)
 			n.res = []string{rj}
 		}
 	}
@@ -923,13 +960,28 @@ func (g *Graph) javaBinary(n *jNode, stem string) {
 	j := g.java
 	jarOut := filepath.Join(g.out, "host", "framework", stem+".jar")
 	j.edge("cp", []string{jarOut}, []string{n.implRes}, nil, nil, nil)
-	n.tool = jarOut
-	if w := n.props.str("wrapper"); w != "" {
-		// installed executable whatever its mode in the tree (prebuilts/r8/d8 is 0644 in git)
-		bin := filepath.Join(g.out, "host", "bin", stem)
-		j.edge("installexec", []string{bin}, []string{g.abs(filepath.Join(n.mod.Dir, w))}, []string{jarOut}, nil, nil)
-		n.tool = bin
+	n.tool, n.toolJar = jarOut, jarOut
+	if n.typ != "java_binary_host" {
+		return
 	}
+	// java.go Binary: the wrapper, else build/soong/scripts/jar-wrapper.sh (host), installed as bin/<module name>; it runs ../framework/<name>.jar
+	w := filepath.Join("build/soong/scripts", "jar-wrapper.sh")
+	if p := n.props.str("wrapper"); p != "" {
+		w = filepath.Join(n.mod.Dir, p)
+	}
+	// installed executable whatever its mode in the tree (prebuilts/r8/d8 is 0644 in git)
+	bin := filepath.Join(g.out, "host", "bin", n.name)
+	j.edge("installexec", []string{bin}, []string{g.abs(w)}, []string{jarOut}, nil, nil)
+	n.tool = bin
+}
+
+// jtoolJar: the jar of a host Java tool, for rules that run `java -jar` themselves (jarjar).
+func (g *Graph) jtoolJar(name, from string) string {
+	g.jtool(name, from)
+	if t := g.java.nodes[jKey{name, Host}]; t != nil && t.toolJar != "" {
+		return t.toolJar
+	}
+	return filepath.Join(g.out, "missing-tool", name+".jar")
 }
 
 // jtool: the runnable path of a host Java tool module (java_binary_host / java_library_host with a Main-Class manifest).
@@ -1196,7 +1248,7 @@ rule zipalign
   command = if ! $zipalign -c -p 4 $in > /dev/null; then $zipalign -f -p 4 $in $out; else cp -f $in $out; fi
   description = align $out
 rule jarjar
-  command = rm -f $out && $jdk/bin/java %s -DremoveAndroidCompatAnnotations=true -jar $jarjar process $rules $in $out 1 0 && [ -e $out ] || (echo "Missing output file"; exit 1)
+  command = rm -f $out && $jdk/bin/java %s -DremoveAndroidCompatAnnotations=true -jar $jarjar process $rules $in $out $total $index &&[ -e $out ] || (echo "Missing output file"; exit 1)
   description = jarjar $out
 rule pkgcheck
   command = rm -f $out && $root/build/soong/scripts/package-check.sh $in $packages && touch $out

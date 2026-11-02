@@ -152,6 +152,9 @@ type Graph struct {
 	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
 	aidlIfaces map[string]*aidlIface
 	hidlIfaces map[string]*hidlIface
+	// the combined_apis module, read once (combinedapis.go)
+	combined     *combinedApis
+	combinedRead bool
 	// modules synthesized by ref/side (synth.go), nil = none
 	synthMods map[string]*Module
 	// build/release config (release.go) and aconfig codegen (aconfig.go); nil without -release / -aconfig
@@ -740,11 +743,25 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 		for _, e := range g.globs(m.Dir, m.Props.strs("exclude_srcs")) {
 			exclude[e] = true
 		}
+		// filegroup.go: srcs (less exclude_srcs), then device_first_srcs and device_common_srcs, whose dependencies are device variants
+		type entry struct {
+			src  string
+			side Side
+			excl bool
+		}
+		var entries []entry
 		for _, e := range m.Props.strs("srcs") {
-			sub, subOK := g.resolveSrc(m.Dir, side, e, from)
+			entries = append(entries, entry{e, side, true})
+		}
+		for _, e := range append(m.Props.strs("device_first_srcs"), m.Props.strs("device_common_srcs")...) {
+			entries = append(entries, entry{e, Device, false})
+		}
+		for _, en := range entries {
+			e := en.src
+			sub, subOK := g.resolveSrc(m.Dir, en.side, e, from)
 			ok = ok && subOK
 			for _, f := range sub {
-				if f.gen == nil && exclude[f.path] {
+				if f.gen == nil && en.excl && exclude[f.path] {
 					continue
 				}
 				// a nested reference keeps the root of the group that owns the file

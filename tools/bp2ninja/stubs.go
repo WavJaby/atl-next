@@ -68,10 +68,8 @@ func sdkLibScopes(p *Obj) []*apiScope {
 			explicit = true
 		}
 	}
-	stdLibs := true
-	if sv := p.str("sdk_version"); sv == "none" || sv == "core_platform" {
-		stdLibs = false
-	}
+	// sdkDep.hasStandardLibs: every SDK but "none" (core_platform lacks only the framework libraries)
+	stdLibs := p.str("sdk_version") != "none"
 	var out []*apiScope
 	for _, s := range allScopes {
 		def := s == scopePublic
@@ -441,9 +439,13 @@ func stubsLibProps(set func(string, Val), list func(...[]string) Val, str func(s
 	set("java_version", "1.8")
 }
 
-// sdkVersionForStubs is sdkVersionForStubsLibrary: the scope's SDK when the library builds against standard libraries, else none.
+// sdkVersionForStubs is sdkVersionForStubsLibrary: the scope's own sdk_version, else the scope's SDK when the library builds against
+// standard libraries (every SDK but "none"), else none.
 func sdkVersionForStubs(p *Obj, s *apiScope) string {
-	if sv := p.str("sdk_version"); sv == "none" || sv == "core_platform" {
+	if sv := p.obj(s.prop).str("sdk_version"); sv != "" {
+		return sv
+	}
+	if p.str("sdk_version") == "none" {
 		return "none"
 	}
 	return s.sdkVersion

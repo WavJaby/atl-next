@@ -20,9 +20,18 @@ import (
 //     edge's depfile (ninja's deps = gcc takes the union of every rule in it).
 //   - Host tools (aidl, aprotoc, protoc-gen-*) are cc binaries of this graph (jhost).
 
-// javaGens: extension -> generator. Each returns the java files (logtags) and srcjars it adds.
-var javaGens = map[string]func(g *Graph, n *jNode, files []srcFile, d javaDeps) (java, srcjars []string){
-	".aidl": (*Graph).javaAidl, ".logtags": (*Graph).javaLogtags, ".proto": (*Graph).javaProto,
+// javaGen: the generator of a source extension, nil for none. Each returns the java files (logtags) and srcjars it adds. A function, not a
+// map: the generators reach javaSrcs again through host tools (an initialization cycle for a package variable).
+func javaGen(ext string) func(g *Graph, n *jNode, files []srcFile, d javaDeps) (java, srcjars []string) {
+	switch ext {
+	case ".aidl":
+		return (*Graph).javaAidl
+	case ".logtags":
+		return (*Graph).javaLogtags
+	case ".proto":
+		return (*Graph).javaProto
+	}
+	return nil
 }
 
 // genOrder: the order genSources appends generated outputs, after the module's own .srcjar sources: protos, then aidl.
@@ -74,9 +83,6 @@ func (g *Graph) genSubPath(path string) string {
 //   - -t: aidl.generate_traces, default on for system_server / core / core_platform / module / system SDKs.
 //   - aidl.enforce_permissions: each source not in enforce_permissions_exceptions gets -Wmissing-permission-annotation -Werror.
 func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars []string) {
-	if s := n.mod.aidl; s != nil {
-		return g.javaAidlIface(n, s), nil
-	}
 	a := n.props.obj("aidl")
 	flags := append([]string{}, a.strs("flags")...)
 	var incs []string
@@ -162,25 +168,6 @@ func (g *Graph) javaAidl(n *jNode, files []srcFile, d javaDeps) (java, srcjars [
 		srcjars = append(srcjars, srcjar)
 	}
 	return nil, srcjars
-}
-
-// javaAidlIface: the java backend of an aidl_interface (aidl_gen_rule.go aidlJavaRule): `aidl --lang=java <flags> -o <dir>` per source, the
-// interface's flags (aidlSpec.flags), one .java per source below its root.
-func (g *Graph) javaAidlIface(n *jNode, s *aidlSpec) (java []string) {
-	tool := g.jhost("aidl", n.name)
-	dir := filepath.Join(n.dir, "gen", "aidl-java")
-	for _, f := range s.srcs {
-		flags, implicit := s.flags(g, f)
-		out := filepath.Join(dir, strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")+".java")
-		var order []string
-		if f.gen != nil {
-			order = f.gen.rule.deps
-		}
-		g.java.edge("jaidliface", []string{out}, []string{g.abs(f.path)}, append([]string{tool}, implicit...), order,
-			[][2]string{{"flags", shellQuote(flags)}, {"aidl", esc(tool)}, {"outdir", esc(dir)}})
-		java = append(java, out)
-	}
-	return java
 }
 
 // javaMinSdk is Module.MinSdkVersion as a string: min_sdk_version, else the sdk_version's API level ("current" for unnumbered SDKs).
@@ -285,11 +272,6 @@ const javaGenRules = `rule jaidl
   depfile = $out.d
   deps = gcc
   description = aidl $in
-rule jaidliface
-  command = $aidl --lang=java $flags --ninja -d $out.d -o $outdir $in
-  depfile = $out.d
-  deps = gcc
-  description = aidl java $in
 rule srcjar
   command = $soongzip -srcjar -write_if_changed -o $out -C $dir -D $dir
   description = srcjar $out

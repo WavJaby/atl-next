@@ -88,9 +88,12 @@ func (g *Graph) genNode(ref string, side Side, from string) *Node {
 	n := &Node{key: k, mod: m}
 	g.nodes[k] = n
 	n.props = g.flatten(m, side, Gen)
-	if m.hidl != nil {
+	switch {
+	case m.hidl != nil:
 		n.rule = g.hidlRule(n)
-	} else {
+	case m.aidl != nil:
+		n.rule = g.aidlJavaRule(n)
+	default:
 		n.rule = g.buildGenRule(n)
 	}
 	g.order = append(g.order, n)
@@ -249,6 +252,23 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 		}
 		l.files, l.interp = files[:1], "python3"
 		r.implicit = append(r.implicit, files...)
+		return l
+	}
+	switch {
+	case bt == "blueprint_go_binary" && g.java != nil:
+		// J2: Soong's Go host tools (soong_zip, merge_zips, …) come prebuilt from prebuilts/build-tools, the -build-tools directory
+		p := filepath.Join(g.java.tools.BuildTools, tm.Name)
+		if _, err := os.Stat(p); err != nil {
+			return bad("tool %s is a blueprint_go_binary with no prebuilt in %s", ref, g.java.tools.BuildTools)
+		}
+		l.files = []string{p}
+		r.implicit = append(r.implicit, p)
+		return l
+	case bt == "java_binary_host" && g.java != nil:
+		// its installed wrapper (javaBinary), which runs the jar beside it
+		p := g.jtool(tm.Name, n.name)
+		l.files = []string{p}
+		r.implicit = append(r.implicit, p)
 		return l
 	}
 	if k, ok := kindOf(bt, Binary); !ok || k != Binary {

@@ -286,17 +286,29 @@ func TestAidlJavaBackend(t *testing.T) {
 	if n == nil {
 		t.Fatalf("%v", g.problems)
 	}
-	// addJavaLibrary: sdk_version system_current (no platform_apis), installable, static_libs the import's java backend
+	// addJavaLibrary: srcs the -java-source rule, sdk_version system_current (no platform_apis), installable, static_libs the import's java
+	// backend
 	if n.props.str("sdk_version") != "system_current" || !n.props.boolean("installable", false) ||
-		!reflect.DeepEqual(n.props.strs("static_libs"), []string{"common-V1-java"}) {
+		!reflect.DeepEqual(n.props.strs("static_libs"), []string{"common-V1-java"}) || !reflect.DeepEqual(n.props.strs("srcs"), []string{":app-V1-java-source"}) {
 		t.Errorf("props %+v", n.props)
 	}
 	// aidl_gen_rule.go for java: no -t (gen_trace defaults on only with platform_apis), --min_sdk_version current, -I imported roots +
-	// include_dirs, -N own root; one .java per source below the root
-	ninja := g.java.b.String()
-	e := ninjaEdgeVars(ninja, filepath.Join(g.out, "device", "app-V1-java", "gen", "aidl-java", "com", "app", "IApp.java"))
-	want := "--structured --version 1 --hash hash-a1 --min_sdk_version current -I" + g.tree + "/p/aidl_api/common/1 -I" + g.tree + "/inc/aidl -N" + g.tree + "/p/aidl_api/app/1"
-	if e == nil || e["flags"] != want {
-		t.Errorf("aidl java edge %v, want flags %q", e, want)
+	// include_dirs, -N own root; one .java per source below the root, in the gen dir
+	gn := g.genNode("app-V1-java-source", Device, "test")
+	if gn == nil {
+		t.Fatalf("%v", g.problems)
+	}
+	gd := g.genDir(gn, "")
+	if want := []string{gd + "/com/app/Data.java", gd + "/com/app/IApp.java"}; !reflect.DeepEqual(gn.rule.outs, want) {
+		t.Errorf("outs %v, want %v", gn.rule.outs, want)
+	}
+	flags := "--structured --version 1 --hash hash-a1 --min_sdk_version current -I" + g.tree + "/p/aidl_api/common/1 -I" + g.tree + "/inc/aidl -N" + g.tree + "/p/aidl_api/app/1"
+	if want := "$(location aidl) --lang=java " + flags + " -o $(genDir) p/aidl_api/app/1/com/app/IApp.aidl"; !strings.Contains(gn.rule.cmd, want) {
+		t.Errorf("cmd %q lacks %q", gn.rule.cmd, want)
+	}
+	// the library compiles the generated files
+	javac := ninjaEdgeVars(g.java.b.String(), filepath.Join(g.out, "device", "app-V1-java", "javac", "app-V1-java.jar"))
+	if javac == nil || !strings.Contains(javac["srcs"], gd+"/com/app/IApp.java") {
+		t.Errorf("javac %v", javac)
 	}
 }

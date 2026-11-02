@@ -37,7 +37,7 @@ import (
 //     version the interface does not have. Soong's -Wall -Werror cflags, ldflags, tidy, sdk_version/stl are dropped (this build uses -w -Wno-error).
 
 var (
-	aidlLangSuffixes = []string{"-cpp-analyzer", "-ndk_platform", "-cpp", "-ndk", "-java", "-rust"}
+	aidlLangSuffixes = []string{"-cpp-analyzer", "-ndk_platform", "-cpp", "-ndk", "-java-source", "-java", "-rust"}
 	aidlVersionRe    = regexp.MustCompile(`-V(\d+)$`)
 )
 
@@ -283,6 +283,11 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	if i == nil {
 		return nil
 	}
+	// `-java-source`: the aidl_gen_rule of the java backend, which `-java` compiles (addJavaLibrary)
+	source := lang == "java-source"
+	if source {
+		lang = "java"
+	}
 	if lang != "cpp" && lang != "ndk" && lang != "rust" && lang != "java" {
 		g.problem("%s: aidl_interface backend %s is unsupported", ref, lang)
 		return nil
@@ -305,7 +310,9 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	case ver != next && !slices.Contains(i.versions, ver):
 		g.problem("%s: %s has no version %q (frozen %v, next %q)", ref, name, ver, i.versions, next)
 		return nil
-	case ver == next && i.frozen:
+	case ver == next && i.frozen && !source:
+		// checkAidlGeneratedModules: a cc / java / rust module depending on it fails; a `-java-source` rule reached through a filegroup (the
+		// framework's AIDL sources) carries no AidlVersionInfo past the filegroup, so Soong builds it
 		g.problem("%s: version %s of %s is unfrozen but the interface is `frozen: true` (Soong rejects its users)", ref, ver, name)
 		return nil
 	}
@@ -355,13 +362,19 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	}
 
 	for _, r := range g.resolveImports(i, ver) {
+		// the imports' backends of the same lang; for java-source too, the libraries -java takes
 		spec.imports = append(spec.imports, r.iface.versionedName(r.version)+"-"+lang)
 		spec.mangled = append(spec.mangled, fixRustName(r.iface.mod.Name))
 	}
+	if source {
+		// aidlGenRule for java: one .java per source below its root (genrule.go aidlJavaRule)
+		return &Module{Type: "genrule", Name: ref, Dir: i.mod.Dir, Props: newObj(), aidl: spec}
+	}
 	if lang == "java" {
-		// addJavaLibrary: an installable java_library compiling the generated sources; sdk_version system_current unless platform_apis;
+		// addJavaLibrary: an installable java_library compiling the `-java-source` rule's output; sdk_version system_current unless platform_apis;
 		// static_libs = additional_libs, then the imports' java libraries (aidl_interface.go addLanguageLibraries)
 		props := newObj()
+		props.set("srcs", strVals([]string{":" + strings.TrimSuffix(strings.TrimPrefix(ref, ":"), "-java") + "-java-source"}))
 		sdk := be.str("sdk_version")
 		if sdk == "" && !be.boolean("platform_apis", false) {
 			sdk = "system_current"
@@ -376,7 +389,7 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		}
 		props.set("static_libs", strVals(slices.Concat(be.strs("additional_libs"), spec.imports)))
 		props.set("installable", true)
-		return &Module{Type: "java_library", Name: ref, Dir: i.mod.Dir, Props: props, aidl: spec}
+		return &Module{Type: "java_library", Name: ref, Dir: i.mod.Dir, Props: props}
 	}
 	if lang == "rust" {
 		// addRustLibrary: crate named after the interface, root after its version; rustlibs = additional_rustlibs, the rest is the provider's (rustAidl.deps)
@@ -501,4 +514,29 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 		flags = append(flags, "-N"+g.abs(r))
 	}
 	return flags, implicit
+}
+
+// aidlJavaRule: the genrule of a `-java-source` module (aidl_gen_rule.go aidlJavaRule): `aidl --lang=java <flags> -o <genDir> <src>` per source,
+// writing <genDir>/<path below the source's root>.java. Soong's depfile (-d) is dropped as for hidl-gen: the genrule rule has none.
+func (g *Graph) aidlJavaRule(n *Node) *genRule {
+	s := n.mod.aidl
+	r, fail := g.newGenRule(n)
+	genDir := g.genDir(n, "")
+	r.hasTools = true
+	r.labels = []genLabel{g.genTool(n, r, "aidl", fail)}
+	var cmds []string
+	for _, f := range s.srcs {
+		flags, implicit := s.flags(g, f)
+		r.inputs = append(r.inputs, f.path)
+		r.implicit = appendMissing(r.implicit, implicit)
+		cmd := []string{"$(location aidl)", "--lang=java"}
+		for _, fl := range flags {
+			cmd = append(cmd, shellEscape(fl))
+		}
+		cmds = append(cmds, strings.Join(append(cmd, "-o", "$(genDir)", shellEscape(f.path)), " "))
+		r.outs = append(r.outs, filepath.Join(genDir, strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")+".java"))
+	}
+	r.cmd = strings.Join(cmds, " && ")
+	r.consumerDeps(genDir)
+	return r
 }
