@@ -25,6 +25,8 @@ struct Import {
     source: Option<&'static str>,
     /// A host system header, found as clang finds it.
     host_header: Option<&'static str>,
+    /// Host headers the header includes whose records belong to the interface too (else they are opaque), found the same way.
+    also: &'static [&'static str],
     lang: Lang,
     view: View,
     functions: &'static [&'static str],
@@ -40,23 +42,80 @@ const IMPORTS: &[Import] = &[
         name: "dlfcn",
         source: None,
         host_header: Some("dlfcn.h"),
+        also: &[],
         lang: Lang::C,
         view: View::Host,
         functions: &["dlopen", "dlsym", "dlerror"],
         types: &[],
-        macros: &["RTLD_NOW", "RTLD_GLOBAL"],
+        macros: &["RTLD_NOW", "RTLD_GLOBAL", "RTLD_LAZY", "RTLD_NOLOAD"],
         include_dirs: &[],
     },
-    // the exit dalvikvm takes (ART's FastExit): no static destructors while runtime daemons may still run
+    // the exit dalvikvm takes (ART's FastExit): no static destructors while runtime daemons may still run; the crash handler's resend (ffi `crash`)
     Import {
         name: "unistd",
         source: None,
         host_header: Some("unistd.h"),
+        also: &[],
         lang: Lang::C,
         view: View::Host,
-        functions: &["_exit"],
+        functions: &["_exit", "syscall", "getpid"],
         types: &[],
         macros: &[],
+        include_dirs: &[],
+    },
+    // debuggerd's crash-signal set and the calls of its handler's equivalent, bionic's main-thread signal stack (ffi `crash`)
+    Import {
+        name: "signal",
+        source: None,
+        host_header: Some("signal.h"),
+        // glibc defines struct sigaction, sigset_t and stack_t in these
+        also: &[
+            "bits/sigaction.h",
+            "bits/types/__sigset_t.h",
+            "bits/types/stack_t.h",
+        ],
+        lang: Lang::C,
+        view: View::Host,
+        functions: &["sigaction", "sigfillset", "sigaltstack"],
+        types: &[],
+        macros: &[
+            "SIGABRT",
+            "SIGBUS",
+            "SIGFPE",
+            "SIGILL",
+            "SIGSEGV",
+            "SIGSTKFLT",
+            "SIGSYS",
+            "SIGTRAP",
+            "SA_RESTART",
+            "SA_SIGINFO",
+            "SA_ONSTACK",
+        ],
+        include_dirs: &[],
+    },
+    Import {
+        name: "syscall",
+        source: None,
+        host_header: Some("sys/syscall.h"),
+        also: &[],
+        lang: Lang::C,
+        view: View::Host,
+        functions: &[],
+        types: &[],
+        macros: &["SYS_rt_tgsigqueueinfo"],
+        include_dirs: &[],
+    },
+    // libc's soname: the object libc's own sigaction is looked up in, as libsigchain looks up its linked_sigaction
+    Import {
+        name: "lib_names",
+        source: None,
+        host_header: Some("gnu/lib-names.h"),
+        also: &[],
+        lang: Lang::C,
+        view: View::Host,
+        functions: &[],
+        types: &[],
+        macros: &["LIBC_SO"],
         include_dirs: &[],
     },
     // the JNI invocation API and the JNIEnv / JavaVM function tables
@@ -64,6 +123,7 @@ const IMPORTS: &[Import] = &[
         name: "jni",
         source: Some("libnativehelper/include_jni/jni.h"),
         host_header: None,
+        also: &[],
         lang: Lang::C,
         view: View::Host,
         functions: &["JNI_CreateJavaVM"],
@@ -76,6 +136,7 @@ const IMPORTS: &[Import] = &[
         name: "jni_invocation",
         source: Some("libnativehelper/include_platform/nativehelper/JniInvocation.h"),
         host_header: None,
+        also: &[],
         lang: Lang::C,
         view: View::Host,
         functions: &["JniInvocationCreate", "JniInvocationInit"],
@@ -87,6 +148,7 @@ const IMPORTS: &[Import] = &[
         name: "log",
         source: Some("system/logging/liblog/include/android/log.h"),
         host_header: None,
+        also: &[],
         lang: Lang::C,
         view: View::Host,
         functions: &["__android_log_set_logger"],
@@ -98,6 +160,7 @@ const IMPORTS: &[Import] = &[
         name: "system_properties",
         source: Some("bionic/libc/include/sys/system_properties.h"),
         host_header: None,
+        also: &[],
         lang: Lang::C,
         view: View::Bionic,
         functions: &["__system_properties_init"],
@@ -110,6 +173,7 @@ const IMPORTS: &[Import] = &[
         name: "libdl_android",
         source: Some("bionic/libdl/libdl_android.cpp"),
         host_header: None,
+        also: &[],
         lang: Lang::Cxx,
         view: View::Bionic,
         functions: &["android_set_application_target_sdk_version"],
@@ -158,10 +222,23 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|d| format!("-I{}", up.aosp(d).display())),
         );
+        // not `resolve_include`: an internal header refuses to be included alone; this probe only resolves
+        let found =
+            atl_bridgegen::front::resolve_includes(import.lang, &host_target(), import.also)?;
+        let also = import
+            .also
+            .iter()
+            .map(|h| {
+                found
+                    .get(*h)
+                    .cloned()
+                    .with_context(|| format!("<{h}> not found"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let src = Source {
             path: &path,
             lang: import.lang,
-            also: &[],
+            also: &also,
             macros: import.macros,
         };
         let label = import.source.or(import.host_header).unwrap_or_default();

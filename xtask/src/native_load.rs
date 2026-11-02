@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in five stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in six stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg`, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) -> how many register before the first failure.
@@ -10,6 +10,9 @@
 //! 4. copies: each library of [`SINGLE_COPY`] mapped once after the load (/proc/self/maps). A warning by default; `--strict-copies` makes it a failure.
 //! 5. chain: a library loaded after ART calls `sigaction(SIGSEGV)` itself, as game engines and crash reporters do; the launcher links libsigchain first, so that call binds to libsigchain and is chained behind ART's fault handler.
 //!    Pass: null derefs in JIT-compiled code still become NPEs, and a native fault ART declines reaches the library's handler. Bound to libc instead, the handler replaces ART's and the first implicit null check ends the process in it.
+//! 6. crash: native code raises SIGABRT (where a registration's LOG_ALWAYS_FATAL ends); the process must die of SIGABRT, as debuggerd's handler resends it on Android.
+//!    ART's unexpected-signal handler (device variant, `ANDROID_ROOT != /system`) calls the previous action at its end: the launcher's crash handler. Without one that is a null pointer: the jump to 0 faults, and the process ends by SIGSEGV or ART's `_exit(1)` on the reentry (measured 2026-11-02: registration aborts SIGSEGV, this stage exit 1).
+//!    `raise`, not `abort`: glibc's abort re-raises with SIG_DFL itself once a handler returns, so it would pass a handler that never resends.
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -208,6 +211,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     match chain_result(&chain) {
         Ok(s) => report.pass("chain", s),
         Err(e) => report.fail("chain", e),
+    }
+
+    // 6
+    let crash = env.art(&fixture, "crash", &[fixture.shim.display().to_string()])?;
+    match crash_result(&crash) {
+        Ok(s) => report.pass("crash", s),
+        Err(e) => report.fail("crash", e),
     }
     Ok(report.finish())
 }
@@ -412,6 +422,7 @@ impl Env {
         let run = ArtRun {
             ok: out.status.success(),
             code: out.status.code(),
+            signal: std::os::unix::process::ExitStatusExt::signal(&out.status),
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -710,6 +721,8 @@ struct ArtRun {
     ok: bool,
     /// The exit status; None when a signal ended the process.
     code: Option<i32>,
+    /// The signal that ended the process, if one did.
+    signal: Option<i32>,
     status: String,
     stdout: String,
     stderr: String,
@@ -1004,6 +1017,32 @@ fn chain_result(run: &ArtRun) -> Result<String, String> {
     ))
 }
 
+/// Stage 6: the process died of the signal the shim raised (its number as the shim printed it, `nlt signal`).
+fn crash_result(run: &ArtRun) -> Result<String, String> {
+    let Some(want) = run.value("signal").and_then(|v| v.parse::<i32>().ok()) else {
+        return Err(format!("no signal number printed: {}", run.failure()));
+    };
+    if run.value("crash").is_some() {
+        return Err(format!(
+            "the process survived its SIGABRT ({want}): the crash handler returned without resending it"
+        ));
+    }
+    match run.signal {
+        Some(s) if s == want => Ok(format!(
+            "native SIGABRT -> ART's unexpected-signal handler -> the launcher's crash handler -> died of signal {s}"
+        )),
+        Some(s) => Err(format!(
+            "died of signal {s}, not the raised SIGABRT ({want}): ART's unexpected-signal handler chained to no crash handler ({})",
+            run.failure()
+        )),
+        // ART's `_exit(1)` when its handler is reentered: a fault inside the first one (null old action, or a signal stack too small for its dump)
+        None => Err(format!(
+            "exited instead of dying of SIGABRT ({want}): {}",
+            run.failure()
+        )),
+    }
+}
+
 /// The launcher refused to start: failed, its refusal on stderr, the fixture never ran.
 fn area_refused(run: &ArtRun) -> Result<String, String> {
     if run.ok || run.value("loaded").is_some() {
@@ -1026,6 +1065,7 @@ mod tests {
         ArtRun {
             ok,
             code: ok.then_some(0),
+            signal: (!ok).then_some(SIGABRT),
             status: if ok {
                 "exit status: 0"
             } else {
@@ -1045,10 +1085,41 @@ mod tests {
         ArtRun {
             ok: code == 0,
             code: Some(code),
+            signal: None,
             status: format!("exit status: {code}"),
             stdout: stdout.to_owned(),
             stderr,
         }
+    }
+
+    /// Linux's numbers (asm-generic/signal.h, x86 alike); the check only needs them distinct, as the shim prints the raised one.
+    const SIGABRT: i32 = 6;
+    const SIGSEGV: i32 = 11;
+
+    /// A crash-mode run: stdout lines, the signal that ended it (None: an exit with status 0).
+    fn crash_run(stdout: &str, signal: Option<i32>) -> ArtRun {
+        ArtRun {
+            ok: signal.is_none(),
+            code: signal.is_none().then_some(0),
+            signal,
+            status: signal.map_or("exit status: 0".to_owned(), |s| format!("signal: {s}")),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn crash_check() {
+        let printed = format!("nlt signal {SIGABRT}\n");
+        assert!(crash_result(&crash_run(&printed, Some(SIGABRT))).is_ok());
+        // no crash handler: ART's unexpected-signal handler jumps to the null old action
+        let e = crash_result(&crash_run(&printed, Some(SIGSEGV))).unwrap_err();
+        assert!(e.contains("died of signal 11"), "{e}");
+        // a handler that returns without resending: raise returns, the driver goes on
+        let survived = format!("{printed}nlt crash survived\n");
+        let e = crash_result(&crash_run(&survived, None)).unwrap_err();
+        assert!(e.contains("survived"), "{e}");
+        assert!(crash_result(&crash_run("", Some(SIGABRT))).is_err());
     }
 
     #[test]

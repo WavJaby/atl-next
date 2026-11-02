@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! The C side: glibc's loader, the JNI invocation API, liblog and bionic's API, each function typed by the header that declares it (build.rs).
+//! The C side: glibc's loader and signal API, the JNI invocation API, liblog and bionic's API, each function typed by the header that declares it (build.rs).
 //! Each entry converts to safe values at once; the launcher's logic (`main`, `args`, `log`) stays safe.
 
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::Write;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::generated::{
-    dlfcn, jni, jni_invocation, libdl_android, log as liblog, system_properties, unistd,
+    dlfcn, jni, jni_invocation, lib_names, libdl_android, log as liblog, signal, syscall as sys,
+    system_properties, unistd,
 };
 use crate::log::{self, Level, Record};
 
@@ -19,12 +21,20 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *mut c_char;
     fn _exit(status: c_int);
+    fn syscall(number: c_long, ...) -> c_long;
+    fn getpid() -> c_int;
+    fn sigfillset(set: *mut signal::__sigset_t) -> c_int;
+    fn sigaltstack(stack: *const signal::stack_t, old: *mut signal::stack_t) -> c_int;
 }
 // the declarations above have the host headers' signatures
 const _: dlfcn::dlopen = dlopen;
 const _: dlfcn::dlsym = dlsym;
 const _: dlfcn::dlerror = dlerror;
 const _: unistd::_exit = _exit;
+const _: unistd::syscall = syscall;
+const _: unistd::getpid = getpid;
+const _: signal::sigfillset = sigfillset;
+const _: signal::sigaltstack = sigaltstack;
 
 /// The runtime's loader library, by soname: dalvikvm links it (art/dalvikvm Android.bp), found on the library path as the converter's staged ART lays it out.
 /// Every function the launcher calls is looked up in it and the libraries it links (dlsym on its handle searches them, in load order): libnativehelper's own, liblog's, and the libc provider's (atl-bionic: system properties, libdl_android).
@@ -300,6 +310,123 @@ impl Vm {
             }
         }
         Ok(())
+    }
+}
+
+// ---- crash signals: what debuggerd's handler does for the process's own outcome
+
+/// bionic's alternate signal stack size above its guard page (libc/bionic/pthread_internal.h `SIGNAL_STACK_SIZE_WITHOUT_GUARD`): 32 KiB on LP64, 16 KiB otherwise.
+const SIGNAL_STACK: usize = if usize::BITS == 64 {
+    32 * 1024
+} else {
+    16 * 1024
+};
+
+/// The main thread's alternate signal stack as bionic sets it up for every thread (pthread_create.cpp `__init_alternate_signal_stack`): [`SIGNAL_STACK`] above a PROT_NONE guard page, mapped for the process's life.
+/// Why: device-variant ART sets up no signal stack of its own (thread_linux.cc refuses under ART_TARGET_ANDROID, bionic has one), and its handlers run SA_ONSTACK. The one present is Rust std's (SIGSTKSZ, 8 KiB), which ART's unexpected-signal dump (libunwindstack) overflows: a SIGSEGV inside the dump, and ART `_exit(1)`s on the reentry (measured 2026-11-02).
+/// Only this thread: glibc gives the threads ART starts none, so their handlers run on the thread's own stack.
+pub fn install_signal_stack() -> Result<()> {
+    let guard = rustix::param::page_size();
+    // SAFETY: a fresh private anonymous mapping, no address hint; nothing else refers to it
+    let base = unsafe {
+        rustix::mm::mmap_anonymous(
+            core::ptr::null_mut(),
+            guard + SIGNAL_STACK,
+            rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+            rustix::mm::MapFlags::PRIVATE,
+        )
+    }
+    .context("mapping the signal stack")?;
+    // SAFETY: the first page of the mapping just made, which nothing uses
+    unsafe { rustix::mm::mprotect(base, guard, rustix::mm::MprotectFlags::empty()) }
+        .context("guarding the signal stack")?;
+    let stack = signal::stack_t {
+        ss_sp: base.cast::<u8>().wrapping_add(guard).cast(),
+        ss_flags: 0,
+        ss_size: SIGNAL_STACK,
+    };
+    // SAFETY: the stack is mapped read-write for the process's life (never unmapped); the previous one is not asked for
+    let rc = unsafe { sigaltstack(&stack, core::ptr::null_mut()) };
+    ensure!(rc == 0, "sigaltstack failed");
+    Ok(())
+}
+
+/// The signals AOSP's `debuggerd_init` registers its handler for on a process that has not disabled it (system/core/debuggerd/include/debuggerd/handler.h `debuggerd_register_handlers`), which bionic's linker runs before any app code.
+/// Not `BIONIC_SIGNAL_DEBUGGER` (bionic `__SIGRTMIN + 3`): it asks for a dump, never ends the process, and is a real-time signal an app may use under glibc (atl-debuggerd-client never sends it).
+const CRASH_SIGNALS: [c_int; 8] = [
+    signal::SIGABRT,
+    signal::SIGBUS,
+    signal::SIGFPE,
+    signal::SIGILL,
+    signal::SIGSEGV,
+    signal::SIGSTKFLT,
+    signal::SIGSYS,
+    signal::SIGTRAP,
+];
+
+/// libc's own `sigaction`, below libsigchain; set before the handler is installed, never changed.
+static LIBC_SIGACTION: OnceLock<signal::sigaction_fn> = OnceLock::new();
+
+/// Installs [`on_crash`] for [`CRASH_SIGNALS`] with debuggerd_init's flags and mask: the action ART finds as the old one.
+/// Why: ART's device-variant runtime (art/runtime/runtime_android.cc, active when `ANDROID_ROOT != "/system"`) installs HandleUnexpectedSignalAndroid for these signals, which logs and then calls the previous action's `sa_sigaction` unconditionally.
+/// On Android that is debuggerd's; with none, glibc's SIG_DFL is a null pointer, and an abort ends in a jump to address 0 -> SIGSEGV instead of SIGABRT.
+/// Installed through libc's `sigaction`, not libsigchain's: on Android debuggerd lives in the linker, whose libc calls never pass through libsigchain; before the VM exists the two set the same kernel action anyway.
+pub fn install_crash_handler() -> Result<()> {
+    let soname = CString::new(lib_names::LIBC_SO).context("libc soname")?;
+    // SAFETY: a NUL-terminated soname and the header's flag values; RTLD_NOLOAD only finds the libc already mapped
+    let libc = unsafe { dlopen(soname.as_ptr(), dlfcn::RTLD_LAZY | dlfcn::RTLD_NOLOAD) };
+    ensure!(!libc.is_null(), "finding libc: {}", dl_error());
+    // SAFETY: sigaction_fn is the header's type of libc's sigaction; the handle is live (libc is never unloaded)
+    let libc_sigaction: signal::sigaction_fn = unsafe { sym(libc, c"sigaction")? };
+    let libc_sigaction = *LIBC_SIGACTION.get_or_init(|| libc_sigaction);
+    let mut action = signal::sigaction {
+        __sigaction_handler: signal::sigaction___sigaction_handler {
+            sa_sigaction: Some(on_crash),
+        },
+        sa_mask: signal::__sigset_t { __val: [0; _] },
+        // debuggerd_init: SA_RESTART | SA_SIGINFO | SA_ONSTACK (stack overflows reach it on the alternate stack); its SA_EXPOSE_TAGBITS only adds MTE tag bits to si_addr, which nothing here reads
+        sa_flags: signal::SA_RESTART | signal::SA_SIGINFO | signal::SA_ONSTACK,
+        sa_restorer: None,
+    };
+    // debuggerd_init blocks every signal while its handler runs
+    // SAFETY: a valid set to fill
+    let filled = unsafe { sigfillset(&mut action.sa_mask) };
+    ensure!(filled == 0, "sigfillset failed");
+    for sig in CRASH_SIGNALS {
+        // SAFETY: a valid signal number and an initialised action whose handler has the SA_SIGINFO signature; the old action is not asked for
+        let rc = unsafe { libc_sigaction(sig, &action, core::ptr::null_mut()) };
+        ensure!(rc == 0, "sigaction({sig}) failed");
+    }
+    Ok(())
+}
+
+/// debuggerd's `resend_signal` for a crash: the signal's action back to SIG_DFL, then the same signal with the same siginfo queued to this thread (`rt_tgsigqueueinfo`), so the process dies of it and a parent's `waitpid` sees it.
+/// The queued signal is blocked (the full mask) until the handler returns, and so is the faulting one when ART's handler chains here; on return it is delivered under SIG_DFL.
+/// Not done: the dump. debuggerd forks crash_dump, which writes a tombstone through tombstoned; this host has neither, and ART's handler has already logged the signal, the fault address and its own backtrace.
+/// Async-signal-safe only: libc's sigaction, getpid, gettid (a raw syscall) and syscall. errno is not restored as debuggerd does: no interrupted code runs after the resent signal is delivered.
+extern "C" fn on_crash(sig: c_int, info: *mut signal::siginfo_t, _context: *mut c_void) {
+    // set before any handler was installed: always present
+    let Some(libc_sigaction) = LIBC_SIGACTION.get() else {
+        return;
+    };
+    let default = signal::sigaction {
+        // SIG_DFL is the null handler
+        __sigaction_handler: signal::sigaction___sigaction_handler { sa_handler: None },
+        sa_mask: signal::__sigset_t { __val: [0; _] },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    let tid = rustix::thread::gettid().as_raw_nonzero().get();
+    // SAFETY: a valid signal number and action. info is the kernel's (SA_SIGINFO; ART's handler passes on its own): rt_tgsigqueueinfo to the calling thread accepts it whatever its si_code
+    unsafe {
+        libc_sigaction(sig, &default, core::ptr::null_mut());
+        syscall(
+            c_long::from(sys::SYS_rt_tgsigqueueinfo),
+            c_long::from(getpid()),
+            c_long::from(tid),
+            c_long::from(sig),
+            info,
+        );
     }
 }
 

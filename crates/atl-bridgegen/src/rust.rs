@@ -147,16 +147,23 @@ pub fn api_module(
 
 /// `api_module` for an API we call through pointers looked up at run time (`dlsym`), not implement: for each of `functions` (C names) a type alias of that name, the header's fn-pointer type, instead of the implementation check.
 /// Nothing is exported: unlike `resolver_module`'s shells, no symbol of the importing object can interpose on the library's.
+/// A function named as a record of the interface (C's separate tag namespace: `int sigaction(int, const struct sigaction*, ...)`) gets the alias `<name>_fn`: both would be Rust types of one name.
 pub fn import_module(
     iface: &Interface,
     arch: &str,
     functions: &[&str],
     types: &[&str],
 ) -> Result<String> {
+    let records = &view(iface, arch)?.records;
     functions_module(iface, arch, functions, types, &|f, ty| {
+        let name = if records.contains_key(f) {
+            format!("{f}_fn")
+        } else {
+            f.to_owned()
+        };
         format!(
             "#[allow(non_camel_case_types)]\npub type {} = {ty};",
-            ident(f)
+            ident(&name)
         )
     })
 }

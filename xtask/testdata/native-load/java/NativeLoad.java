@@ -4,6 +4,7 @@
 // Modes: load <lib> | startreg <lib> <shim> | walk <lib> <shim> <startReg vaddr> <gRegJNI slot vaddr>... | call <lib> <shim> <startReg vaddr> <function vaddr>...; vaddrs in hex, from the library's .symtab.
 // walk calls through each slot as relocated at run time and stops at the first negative return, as register_jni_procs does; call registers the given functions, then runs the native calls.
 // chain <shim> <exit status> <rounds>: the shim installs its own SIGSEGV handler with sigaction, then `rounds` null derefs in read (JIT-compiled: implicit null checks fault), then a native fault the shim's handler ends the process on.
+// crash <shim>: the shim raises SIGABRT in native code; the process must die of it (prints the number first).
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -19,6 +20,8 @@ public class NativeLoad {
     static native int callSlot(long startRegVaddr, long slotVaddr);
     static native int installSegv(int exitStatus);
     static native void nativeFault();
+    static native int abortSignal();
+    static native void raiseAbort();
 
     static class Box {
         int v;
@@ -51,6 +54,12 @@ public class NativeLoad {
         }
         if (mode.equals("chain")) {
             chain(Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+            return;
+        }
+        if (mode.equals("crash")) {
+            out("signal", abortSignal());
+            raiseAbort();
+            out("crash", "survived");
             return;
         }
         if (!load(a[2])) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-app-launcher: starts an app process's runtime -- the one launch path (the broker will run it inside the sandbox; xtask and test harnesses run it now).
 //! dalvikvm's start (art/dalvikvm/dalvikvm.cc) through the standard seams only: the JNI invocation API, liblog's logger API, bionic's API. Steps:
+//! 0. what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
 //! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-bionic `AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
 //! 2. `JNI_CreateJavaVM` through libnativehelper's JniInvocation, the VM options as dalvikvm takes them (`args`).
 //! 3. our logger via `__android_log_set_logger`, after the VM exists: ART's InitLogging (ART_TARGET_LINUX) installs libbase's StderrLogger through the same call (system/libbase/logging.cpp SetLogger), replacing any earlier one. The logger turns each message into a C6 record (`log`); liblog filters before calling it.
@@ -31,6 +32,15 @@ mod generated {
     pub mod unistd {
         include!(concat!(env!("OUT_DIR"), "/unistd.rs"));
     }
+    pub mod signal {
+        include!(concat!(env!("OUT_DIR"), "/signal.rs"));
+    }
+    pub mod syscall {
+        include!(concat!(env!("OUT_DIR"), "/syscall.rs"));
+    }
+    pub mod lib_names {
+        include!(concat!(env!("OUT_DIR"), "/lib_names.rs"));
+    }
     pub mod jni {
         include!(concat!(env!("OUT_DIR"), "/jni.rs"));
     }
@@ -52,6 +62,8 @@ use anyhow::{Result, anyhow, bail};
 
 fn run() -> Result<i32> {
     let launch = args::parse(std::env::args_os()).map_err(|e| anyhow!(e))?;
+    ffi::install_signal_stack()?;
+    ffi::install_crash_handler()?;
     let rt = ffi::Runtime::load()?;
     if !rt.has_property_area() {
         bail!(

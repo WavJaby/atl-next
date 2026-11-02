@@ -129,3 +129,21 @@ pub extern "C" fn Java_NativeLoad_nativeFault(_env: JniEnv, _class: *mut c_void)
     // SAFETY: deliberately faults: the point of the call; the handler ends the process
     unsafe { p.write_volatile(1) }
 }
+
+// ---- stage 6: a native abort
+
+/// `static native int abortSignal()`: SIGABRT's number, which the process must die of after `raiseAbort`.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_NativeLoad_abortSignal(_env: JniEnv, _class: *mut c_void) -> c_int {
+    libc::SIGABRT
+}
+
+/// `static native void raiseAbort()`: SIGABRT to this thread, abort()'s first step; returns only if every handler returned without ending the process.
+/// Not `abort()`: glibc's abort re-raises with SIG_DFL itself once a handler returns, which would hide a handler that never resends.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_NativeLoad_raiseAbort(_env: JniEnv, _class: *mut c_void) {
+    // SAFETY: raise only sends a signal
+    unsafe {
+        libc::raise(libc::SIGABRT);
+    }
+}
