@@ -81,6 +81,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-app-launcher"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bionic",
+ "atl-bridgegen",
+ "rustix",
+]
+
+[[package]]
 name = "atl-binder-wire"
 version = "0.0.0"
 dependencies = [
@@ -139,6 +149,16 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
+]
+
+[[package]]
+name = "atl-property-service"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bionic",
+ "clap",
+ "toml",
 ]
 
 [[package]]

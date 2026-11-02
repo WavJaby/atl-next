@@ -18,6 +18,16 @@ crates = ["atl-bionic"]
 exports = ["atl-bionic"]
 uses = ["generators"]
 
+# the system property service: the default property set as a bionic property area, written through bionic's image builder; a binary in the broker's place until atld hosts it
+[property-service]
+crates = ["atl-property-service"]
+uses = ["bionic"]
+
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names
+[launcher]
+crates = ["atl-app-launcher"]
+uses = ["generators", "bionic"]
+
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
 crates = ["atl-android-runtime"]

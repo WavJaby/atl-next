@@ -100,6 +100,7 @@ mod progname;
 pub mod props;
 pub mod sdk;
 mod store;
+pub use store::AREA_ENV;
 #[allow(unsafe_code)]
 #[cfg_attr(not(atl_bionic_api = "pthread"), allow(dead_code))]
 mod thread;
