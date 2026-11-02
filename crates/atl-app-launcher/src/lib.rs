@@ -8,6 +8,11 @@
 //! 4. `android_set_application_target_sdk_version` (bionic's compat checks); ART calls it from VMRuntime.setTargetSdkVersion only under ART_TARGET_ANDROID.
 //! 5. `main(String[])` of the class, then detach + DestroyJavaVM and `_exit` with dalvikvm's status.
 //!
+//! App mode (`--app`, an app process the broker starts) replaces step 5 with what zygote's child takes (ZygoteConnection.handleChildProc), app_process's native side included:
+//! 5a. libandroid_runtime around this VM (`AndroidRuntimeAttachInvokedVm`, patches/aosp/frameworks/base): the process's AndroidRuntime, its JavaVM, the framework's natives (startReg);
+//! 5b. libbinder's thread pool (`ABinderProcess_startThreadPool`, what AppRuntime::onZygoteInit does): after 5a, so its threads are made by javaCreateThreadEtc and attached to the VM, before any Java code can make a binder call;
+//! 5c. `ZygoteInit.zygoteInit(targetSdk, no disabled changes, [class, args...], boot class loader)` and the Runnable it returns (RuntimeInit.applicationInit -> `class.main(args)`), as zygote runs it; an app's class is android.app.ActivityThread with `seq=<startSeq>`.
+//!
 //! The library holds all of it; the executable (`src/main.rs`, feature `converter`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
 //! so `sigaction` / `signal` of every library loaded later bind to libsigchain and a game engine's or crash reporter's own SIGSEGV handler is chained behind ART's fault handler instead of replacing it. `xtask native` builds it (build.rs says how).
 //! Boundary crate (JNI, `dlopen`): `unsafe` only in `ffi`.
@@ -56,6 +61,12 @@ mod generated {
     pub mod libdl_android {
         include!(concat!(env!("OUT_DIR"), "/libdl_android.rs"));
     }
+    pub mod invoked_vm {
+        include!(concat!(env!("OUT_DIR"), "/invoked_vm.rs"));
+    }
+    pub mod binder_process {
+        include!(concat!(env!("OUT_DIR"), "/binder_process.rs"));
+    }
 }
 
 use anyhow::{Result, anyhow, bail};
@@ -77,7 +88,14 @@ fn run() -> Result<i32> {
     let Some(class) = &launch.class else {
         bail!("Class name required");
     };
-    let rc = vm.run_main(class, &launch.args);
+    let rc = if launch.app {
+        let android = ffi::AndroidRuntime::load()?;
+        android.attach(&vm)?;
+        android.start_thread_pool();
+        vm.run_zygote_init(launch.target_sdk, class, &launch.args)
+    } else {
+        vm.run_main(class, &launch.args)
+    };
     vm.shut_down()?;
     Ok(rc)
 }

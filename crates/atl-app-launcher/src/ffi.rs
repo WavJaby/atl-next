@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::generated::{
-    dlfcn, jni, jni_invocation, lib_names, libdl_android, log as liblog, signal, syscall as sys,
-    system_properties, unistd,
+    binder_process, dlfcn, invoked_vm, jni, jni_invocation, lib_names, libdl_android,
+    log as liblog, signal, syscall as sys, system_properties, unistd,
 };
 use crate::log::{self, Level, Record};
 
@@ -147,6 +147,66 @@ impl Runtime {
     }
 }
 
+/// libandroid_runtime by soname, found on the library path as libnativehelper is (app_process links it; the launcher loads it in app mode only). libbinder_ndk is one of its
+/// dependencies, so dlsym on its handle finds the binder process API too.
+const ANDROID_RUNTIME: &CStr = c"libandroid_runtime.so";
+
+/// App mode's native side (lib.rs 5a, 5b), resolved once.
+pub struct AndroidRuntime {
+    attach: invoked_vm::AndroidRuntimeAttachInvokedVm,
+    start_thread_pool: binder_process::ABinderProcess_startThreadPool,
+}
+
+impl AndroidRuntime {
+    /// Loads libandroid_runtime (`RTLD_GLOBAL`, as linked into app_process: libraries loaded later bind to the same libbinder) and resolves both functions.
+    pub fn load() -> Result<Self> {
+        // SAFETY: a NUL-terminated soname and the header's flag values
+        let h = unsafe {
+            dlopen(
+                ANDROID_RUNTIME.as_ptr(),
+                dlfcn::RTLD_NOW | dlfcn::RTLD_GLOBAL,
+            )
+        };
+        ensure!(!h.is_null(), "loading libandroid_runtime: {}", dl_error());
+        // SAFETY: each F is the generated type of the function of that name (build.rs `IMPORTS`); h is live (never closed)
+        unsafe {
+            Ok(AndroidRuntime {
+                attach: sym(h, c"AndroidRuntimeAttachInvokedVm")?,
+                start_thread_pool: sym(h, c"ABinderProcess_startThreadPool")?,
+            })
+        }
+    }
+
+    /// `AndroidRuntimeAttachInvokedVm` for `vm`, with argv's memory as app_main computes it (computeArgBlockSize: argv[0] to the end of the last argument), which setArgv0 rewrites
+    /// to the process name. argv[0] is glibc's `program_invocation_name`; the arguments are contiguous there, each NUL-terminated.
+    pub fn attach(&self, vm: &Vm) -> Result<()> {
+        let soname = CString::new(lib_names::LIBC_SO).context("libc soname")?;
+        // SAFETY: a NUL-terminated soname and the header's flag values; RTLD_NOLOAD only finds the libc already mapped
+        let libc = unsafe { dlopen(soname.as_ptr(), dlfcn::RTLD_LAZY | dlfcn::RTLD_NOLOAD) };
+        ensure!(!libc.is_null(), "finding libc: {}", dl_error());
+        // SAFETY: a live handle and a NUL-terminated name
+        let name = unsafe { dlsym(libc, c"program_invocation_name".as_ptr()) };
+        ensure!(!name.is_null(), "program_invocation_name: {}", dl_error());
+        // SAFETY: glibc's `char *program_invocation_name`, set to argv[0] before main
+        let start = unsafe { *name.cast::<*mut c_char>() };
+        ensure!(!start.is_null(), "no argv[0]");
+        let len: usize = std::env::args_os().map(|a| a.len() + 1).sum();
+        // SAFETY: the main thread's JNIEnv, as the patch's declaration takes it (its own JNIEnv type, the same jni.h); the argument block is argv's, writable for the process's life
+        let rc = unsafe { (self.attach)(vm.env.cast(), start, len) };
+        ensure!(
+            rc == 0,
+            "AndroidRuntimeAttachInvokedVm returned {rc} (startReg failed?)"
+        );
+        Ok(())
+    }
+
+    /// libbinder's thread pool (AppRuntime::onZygoteInit); idempotent in libbinder.
+    pub fn start_thread_pool(&self) {
+        // SAFETY: no arguments; the process's binder state is libbinder's own
+        unsafe { (self.start_thread_pool)() }
+    }
+}
+
 /// liblog's logger: the message as a C6 record, written whole. liblog filtered it already (`log` module).
 extern "C" fn logger(message: *const liblog::__android_log_message) {
     // SAFETY: liblog passes its message, valid for this call, or null
@@ -211,27 +271,12 @@ impl Vm {
         let Ok(name) = CString::new(class.replace('.', "/")) else {
             return fail(format!("Unable to locate class '{class}'"));
         };
+        let array = match self.string_array(args.iter().map(CString::as_c_str)) {
+            Ok(a) => a,
+            Err(e) => return fail(e),
+        };
         // SAFETY: JNI calls on the main thread's env with NUL-terminated names and the references they return; each result is checked before use
         unsafe {
-            let string = jni_call!(self.env, FindClass, c"java/lang/String".as_ptr());
-            if string.is_null() {
-                return fail("Failed to find class java.lang.String".to_owned());
-            }
-            let Ok(len) = i32::try_from(args.len()) else {
-                return fail("too many arguments".to_owned());
-            };
-            let array = jni_call!(self.env, NewObjectArray, len, string, core::ptr::null_mut());
-            if array.is_null() {
-                return fail("Failed to create the argument array".to_owned());
-            }
-            for (i, a) in (0..len).zip(args) {
-                let s = jni_call!(self.env, NewStringUTF, a.as_ptr());
-                if s.is_null() {
-                    return fail("Failed to create an argument string".to_owned());
-                }
-                jni_call!(self.env, SetObjectArrayElement, array, i, s);
-                jni_call!(self.env, DeleteLocalRef, s);
-            }
             let klass = jni_call!(self.env, FindClass, name.as_ptr());
             if klass.is_null() {
                 return fail(format!(
@@ -292,6 +337,119 @@ impl Vm {
                 0
             }
         }
+    }
+
+    /// A `String[]` of `items`; the message of the step that failed otherwise.
+    fn string_array<'a>(
+        &self,
+        items: impl ExactSizeIterator<Item = &'a CStr>,
+    ) -> Result<*mut c_void, String> {
+        let len = i32::try_from(items.len()).map_err(|_| "too many arguments".to_owned())?;
+        // SAFETY: JNI calls on the main thread's env with NUL-terminated strings and the references they return; each result is checked before use
+        unsafe {
+            let string = jni_call!(self.env, FindClass, c"java/lang/String".as_ptr());
+            if string.is_null() {
+                return Err("Failed to find class java.lang.String".to_owned());
+            }
+            let array = jni_call!(self.env, NewObjectArray, len, string, core::ptr::null_mut());
+            if array.is_null() {
+                return Err("Failed to create the argument array".to_owned());
+            }
+            for (i, a) in (0..len).zip(items) {
+                let s = jni_call!(self.env, NewStringUTF, a.as_ptr());
+                if s.is_null() {
+                    return Err("Failed to create an argument string".to_owned());
+                }
+                jni_call!(self.env, SetObjectArrayElement, array, i, s);
+                jni_call!(self.env, DeleteLocalRef, s);
+            }
+            Ok(array)
+        }
+    }
+
+    /// App mode's Java start (lib.rs 5c), as zygote's child: `ZygoteInit.zygoteInit(targetSdk, new long[0], [class, args...], null).run()`. The exit status as `run_main`'s: an app's
+    /// ActivityThread.main loops until the process ends, so a return is a failure (its "Main thread loop unexpectedly exited" exception, or an earlier one).
+    pub fn run_zygote_init(&self, target_sdk: i32, class: &str, args: &[CString]) -> i32 {
+        let fail = |what: String| {
+            let _ = writeln!(std::io::stderr(), "{what}");
+            // SAFETY: the main thread's env; describing a pending exception (or none) is always allowed
+            unsafe { jni_call!(self.env, ExceptionDescribe) };
+            EXIT_FAILURE
+        };
+        let Ok(class) = CString::new(class) else {
+            return fail(format!("class name with a NUL byte: {class}"));
+        };
+        let argv = match self.string_array(
+            core::iter::once(class.as_c_str())
+                .chain(args.iter().map(CString::as_c_str))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return fail(e),
+        };
+        // SAFETY: JNI calls on the main thread's env with NUL-terminated names and signatures, and the references they return; each result is checked before use
+        unsafe {
+            let zygote_init = jni_call!(
+                self.env,
+                FindClass,
+                c"com/android/internal/os/ZygoteInit".as_ptr()
+            );
+            if zygote_init.is_null() {
+                return fail("Unable to locate class 'com/android/internal/os/ZygoteInit'".into());
+            }
+            let init = jni_call!(
+                self.env,
+                GetStaticMethodID,
+                zygote_init,
+                c"zygoteInit".as_ptr(),
+                c"(I[J[Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Runnable;".as_ptr()
+            );
+            if init.is_null() {
+                return fail("Unable to find ZygoteInit.zygoteInit".into());
+            }
+            let disabled = jni_call!(self.env, NewLongArray, 0);
+            if disabled.is_null() {
+                return fail("Failed to create the disabled-changes array".into());
+            }
+            let init_args = [
+                jni::jvalue { i: target_sdk },
+                jni::jvalue { l: disabled },
+                jni::jvalue { l: argv },
+                jni::jvalue {
+                    l: core::ptr::null_mut(),
+                },
+            ];
+            let runnable = jni_call!(
+                self.env,
+                CallStaticObjectMethodA,
+                zygote_init,
+                init,
+                init_args.as_ptr()
+            );
+            if jni_call!(self.env, ExceptionCheck) != 0 || runnable.is_null() {
+                return fail("ZygoteInit.zygoteInit failed".into());
+            }
+            let runnable_class = jni_call!(self.env, FindClass, c"java/lang/Runnable".as_ptr());
+            if runnable_class.is_null() {
+                return fail("Unable to locate class 'java/lang/Runnable'".into());
+            }
+            let run = jni_call!(
+                self.env,
+                GetMethodID,
+                runnable_class,
+                c"run".as_ptr(),
+                c"()V".as_ptr()
+            );
+            if run.is_null() {
+                return fail("Unable to find Runnable.run".into());
+            }
+            jni_call!(self.env, CallVoidMethodA, runnable, run, core::ptr::null());
+            if jni_call!(self.env, ExceptionCheck) != 0 {
+                return fail(format!("{} ended", class.to_string_lossy()));
+            }
+        }
+        0
     }
 
     /// dalvikvm's end (release builds): detach the main thread, destroy the VM; false if either fails.

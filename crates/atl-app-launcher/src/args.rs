@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -11,6 +11,8 @@ use std::os::unix::ffi::OsStringExt;
 pub struct Launch {
     /// The app's target SDK, for bionic's compatibility checks (`android_set_application_target_sdk_version`); 0 = the platform level, bionic's own meaning of 0.
     pub target_sdk: i32,
+    /// An app process (lib.rs app mode): the class runs as zygote's child runs it, not as dalvikvm's main.
+    pub app: bool,
     pub vm_options: Vec<CString>,
     /// None: none given; dalvikvm reports that after creating the VM (so `-help` and the like run).
     pub class: Option<String>,
@@ -18,6 +20,7 @@ pub struct Launch {
 }
 
 const TARGET_SDK: &str = "--target-sdk=";
+const APP: &str = "--app";
 
 pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
     let mut it = argv
@@ -26,6 +29,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         .map(|a| CString::new(a.into_vec()).map_err(|e| format!("argument with a NUL byte: {e}")));
     let mut launch = Launch {
         target_sdk: 0,
+        app: false,
         vm_options: Vec::new(),
         class: None,
         args: Vec::new(),
@@ -33,6 +37,11 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
     let mut pending = it.next().transpose()?;
     while let Some(arg) = pending.take_if(|a| a.as_bytes().starts_with(b"--")) {
         let text = arg.to_string_lossy();
+        if text == APP {
+            launch.app = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
         let value = text
             .strip_prefix(TARGET_SDK)
             .ok_or_else(|| format!("unknown launcher option {text}"))?;
@@ -90,6 +99,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(l.target_sdk, 30);
+        assert!(!l.app);
         assert_eq!(l.vm_options, [c("-Xnoimage-dex2oat"), c("-cp"), c("a.jar")]);
         assert_eq!(l.class.as_deref(), Some("Main"));
         // after the class everything is main's, `-` or not
@@ -98,6 +108,16 @@ mod tests {
 
     #[test]
     fn defaults_and_refusals() {
+        let l = p(&[
+            "--app",
+            "--target-sdk=34",
+            "android.app.ActivityThread",
+            "seq=7",
+        ])
+        .unwrap();
+        assert!(l.app);
+        assert_eq!(l.target_sdk, 34);
+        assert_eq!(l.args, [c("seq=7")]);
         let l = p(&["-showversion"]).unwrap();
         assert_eq!((l.target_sdk, l.class), (0, None));
         assert!(p(&["-cp"]).unwrap_err().contains("-cp must be followed"));

@@ -168,6 +168,32 @@ const IMPORTS: &[Import] = &[
         macros: &[],
         include_dirs: &[],
     },
+    // app mode: libandroid_runtime around the VM the launcher created (patches/aosp/frameworks/base: AndroidRuntime::attachInvokedVm's C ABI)
+    Import {
+        name: "invoked_vm",
+        source: Some("frameworks/base/core/jni/include/android_runtime/invoked_vm.h"),
+        host_header: None,
+        also: &[],
+        lang: Lang::C,
+        view: View::Host,
+        functions: &["AndroidRuntimeAttachInvokedVm"],
+        types: &[],
+        macros: &[],
+        include_dirs: &["libnativehelper/include_jni"],
+    },
+    // app mode: libbinder's thread pool, as app_process starts it (AppRuntime::onZygoteInit / onStarted); bionic's view: the NDK headers' availability macros are bionic's sys/cdefs.h
+    Import {
+        name: "binder_process",
+        source: Some("frameworks/native/libs/binder/ndk/include_platform/android/binder_process.h"),
+        host_header: None,
+        also: &[],
+        lang: Lang::C,
+        view: View::Bionic,
+        functions: &["ABinderProcess_startThreadPool"],
+        types: &[],
+        macros: &[],
+        include_dirs: &["frameworks/native/libs/binder/ndk/include_ndk"],
+    },
     // no public header: libdl_android's own declaration (atl-bionic implements it, libdl_android row)
     Import {
         name: "libdl_android",

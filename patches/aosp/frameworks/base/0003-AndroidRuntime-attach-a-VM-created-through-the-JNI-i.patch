@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 05:49:01 +0800
+Subject: [PATCH] AndroidRuntime: attach a VM created through the JNI
+ invocation API
+
+AndroidRuntime::start is the only way to give a process its
+AndroidRuntime (gCurRuntime) and JavaVM (mJavaVM), and it creates the
+VM itself. A process whose launcher created the VM with
+JNI_CreateJavaVM, as dalvikvm does, gets neither: Process.setArgV0
+dereferences a null getRuntime(), and libbinder's pool threads, made
+through javaCreateThreadEtc once startReg ran, attach to a null VM.
+
+attachInvokedVm takes start()'s steps after startVm: a runtime
+instance, the VM pointer from the JNIEnv (as the host runtime,
+platform/host/HostRuntime.cpp, sets it), then startReg.
+
+Upstream-Status: Inappropriate [ATL launcher; Android starts apps through app_process / zygote]
+Patch-Reason: gCurRuntime is file-static, mJavaVM and startReg are private, and onStarted is pure virtual, so neither the launcher nor the environment can set them; a Rust C++-ABI subclass would reach under the class's layout instead
+---
+SPDX-License-Identifier: Apache-2.0
+ core/jni/AndroidRuntime.cpp                   | 27 +++++++++++++++++++
+ .../include/android_runtime/AndroidRuntime.h  |  8 ++++++
+ core/jni/include/android_runtime/invoked_vm.h | 20 ++++++++++++++
+ 3 files changed, 55 insertions(+)
+ create mode 100644 core/jni/include/android_runtime/invoked_vm.h
+
+diff --git a/core/jni/AndroidRuntime.cpp b/core/jni/AndroidRuntime.cpp
+index 1ff07745e904cb5a3a7ae002b02aec2b7f604167..9db32afbbe4bff91d40352827bee64b472d60a20 100644
+--- a/core/jni/AndroidRuntime.cpp
++++ b/core/jni/AndroidRuntime.cpp
+@@ -24,6 +24,7 @@
+ #include <android/graphics/jni_runtime.h>
+ #include <android_os.h>
+ #include <android_runtime/AndroidRuntime.h>
++#include <android_runtime/invoked_vm.h>
+ #include <assert.h>
+ #include <binder/IBinder.h>
+ #include <binder/IPCThreadState.h>
+@@ -1371,6 +1372,32 @@ extern "C" JavaVM* AndroidRuntimeGetJavaVM() {
+     return AndroidRuntime::getJavaVM();
+ }
+ 
++namespace {
++// The runtime of a process whose VM was created through the JNI invocation API: start() never
++// runs, so nothing calls onStarted.
++class InvokedRuntime : public AndroidRuntime {
++public:
++    InvokedRuntime(char* argBlockStart, size_t argBlockLength)
++          : AndroidRuntime(argBlockStart, argBlockLength) {}
++    void onStarted() override {}
++};
++} // namespace
++
++/*static*/ int AndroidRuntime::attachInvokedVm(JNIEnv* env, char* argBlockStart,
++                                               size_t argBlockLength) {
++    new InvokedRuntime(argBlockStart, argBlockLength); // gCurRuntime, for the process's life
++    if (env->GetJavaVM(&mJavaVM) != JNI_OK) {
++        return -1;
++    }
++    return startReg(env);
++}
++
++// extern "C" inside namespace android: the same C-linkage function invoked_vm.h declares
++extern "C" int AndroidRuntimeAttachInvokedVm(JNIEnv* env, char* argBlockStart,
++                                             size_t argBlockLength) {
++    return AndroidRuntime::attachInvokedVm(env, argBlockStart, argBlockLength);
++}
++
+ /*
+  * Get the JNIEnv pointer for this thread.
+  *
+diff --git a/core/jni/include/android_runtime/AndroidRuntime.h b/core/jni/include/android_runtime/AndroidRuntime.h
+index bf2ba772c39dc1f7c3470a7d9ead2f58fd22dc7a..66dbaace3caa9f91a86af5426ce995fd231fcde9 100644
+--- a/core/jni/include/android_runtime/AndroidRuntime.h
++++ b/core/jni/include/android_runtime/AndroidRuntime.h
+@@ -114,6 +114,14 @@ public:
+     /** Create a Java string from an ASCII or Latin-1 string */
+     static jstring NewStringLatin1(JNIEnv* env, const char* bytes);
+ 
++    /**
++     * Set up this process's runtime around a VM created through the JNI invocation API instead
++     * of start(): the AndroidRuntime getRuntime() returns, the JavaVM, and the registered
++     * natives (startReg). argBlockStart / argBlockLength: argv's memory, which setArgv0
++     * rewrites. Once per process, on the thread that created the VM; 0 or negative on failure.
++     */
++    static int attachInvokedVm(JNIEnv* env, char* argBlockStart, size_t argBlockLength);
++
+ private:
+     static int startReg(JNIEnv* env);
+     bool parseRuntimeOption(const char* property,
+diff --git a/core/jni/include/android_runtime/invoked_vm.h b/core/jni/include/android_runtime/invoked_vm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9220973cdce4a44fc4ea2af0684364720f1321e0
+--- /dev/null
++++ b/core/jni/include/android_runtime/invoked_vm.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: Apache-2.0
++
++#ifndef _RUNTIME_ANDROID_RUNTIME_INVOKED_VM_H
++#define _RUNTIME_ANDROID_RUNTIME_INVOKED_VM_H
++
++#include <jni.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** C ABI of android::AndroidRuntime::attachInvokedVm, for a launcher that is not C++. */
++int AndroidRuntimeAttachInvokedVm(JNIEnv* env, char* argBlockStart, size_t argBlockLength);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // _RUNTIME_ANDROID_RUNTIME_INVOKED_VM_H
