@@ -302,8 +302,9 @@ func TestAidlJavaBackend(t *testing.T) {
 	if want := []string{gd + "/com/app/Data.java", gd + "/com/app/IApp.java"}; !reflect.DeepEqual(gn.rule.outs, want) {
 		t.Errorf("outs %v, want %v", gn.rule.outs, want)
 	}
-	flags := "--structured --version 1 --hash hash-a1 --min_sdk_version current -I" + g.tree + "/p/aidl_api/common/1 -I" + g.tree + "/inc/aidl -N" + g.tree + "/p/aidl_api/app/1"
-	if want := "$(location aidl) --lang=java " + flags + " -o $(genDir) p/aidl_api/app/1/com/app/IApp.aidl"; !strings.Contains(gn.rule.cmd, want) {
+	flags := "--structured --version 1 --hash hash-a1 --min_sdk_version current -p" + filepath.Join(g.out, "aidl", "device", "common", "1", "preprocessed.aidl") +
+		" -I" + g.tree + "/inc/aidl -N" + g.tree + "/p/aidl_api/app/1"
+	if want := "$(location aidl) --lang=java " + flags + " -o $(genDir) " + g.tree + "/p/aidl_api/app/1/com/app/IApp.aidl"; !strings.Contains(gn.rule.cmd, want) {
 		t.Errorf("cmd %q lacks %q", gn.rule.cmd, want)
 	}
 	// the library compiles the generated files

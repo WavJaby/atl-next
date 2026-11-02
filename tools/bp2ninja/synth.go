@@ -13,13 +13,14 @@ import "sort"
 //     `<pkg>-V<ver>-java[-shallow|-constants]` and their genrules (hidliface.go).
 //   - sysprop_library: the cc library `lib<name>` (sysprop.go).
 //   - combined_apis: the merged API stubs libraries (combinedapis.go).
+//   - prebuilt_apis: java_import modules of prebuilt SDK jars (prebuiltapis.go).
 //
 // A name a synthesizer owns (its base module is in the tree) never goes to missing.txt: lookup said why it failed. One whose base module is absent
 // does, and the AOSP index (xtask aosp.rs) maps it to the project defining the base module.
 
 func (g *Graph) synth(ref string, side Side) *Module {
 	return g.synthMemo(ref, side, func() (m *Module) {
-		for _, f := range []func(string, Side) *Module{g.synthAidl, g.synthHidl, g.synthSysprop, g.synthCombinedApis} {
+		for _, f := range []func(string, Side) *Module{g.synthAidl, g.synthHidl, g.synthSysprop, g.synthCombinedApis, g.synthPrebuiltApi} {
 			if m = f(ref, side); m != nil {
 				break
 			}
@@ -44,7 +45,7 @@ func (g *Graph) synthMemo(ref string, side Side, make func() *Module) *Module {
 
 // synthOwned: ref names a module some synthesizer would make from a module the tree has.
 func (g *Graph) synthOwned(ref string) bool {
-	return g.aidlOwned(ref) || g.hidlOwned(ref) || g.syspropOwned(ref) || g.combinedApisOwned(ref)
+	return g.aidlOwned(ref) || g.hidlOwned(ref) || g.syspropOwned(ref) || g.combinedApisOwned(ref) || g.prebuiltApiOwned(ref)
 }
 
 // rawModule: the module of that exact name and type as an Android.bp defines it (lookup would return what a synthesizer makes of it).

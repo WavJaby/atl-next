@@ -171,6 +171,7 @@ func (g *Graph) emit(tools Tools) string {
 		esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher))
 	// before the cc edges: ninja needs a rule defined before its first use
 	b.WriteString(g.acfg.ninja())
+	b.WriteString(g.aidlPreNinja())
 	// paths first: links need their dependencies' outputs
 	for _, n := range g.order {
 		if out := g.nodeOut(n); out != "" {

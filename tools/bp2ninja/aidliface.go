@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,9 +27,9 @@ import (
 //     (export_shared_lib_headers); generated headers exported. Only the platform variant is built: ndk gets -DBINDER_STABILITY_SUPPORT (target.platform).
 //   - Imports (getImportWithVersion): `-V<n>` as written; an unstable import is bare; the importing interface's next version takes the import's
 //     next version; a frozen version takes the import's latest. Version imports come from versions_with_info, else the module's imports.
-//   - aidl flags (generateBuildActionsForSingleAidl, flagsForAidlGenRule): see aidlSpec.flags. Import types are found with -I of every imported
-//     version's source roots (transitively) instead of Soong's `aidl --preprocess` + -p chain: same types, no extra edges; revisit if a clash of
-//     two versions of one package ever shows up.
+//   - aidl flags (generateBuildActionsForSingleAidl, flagsForAidlGenRule): see aidlSpec.flags. Import types come from each direct import's
+//     preprocessed.aidl (-p, aidlPreprocessed = buildPreprocessed, chained through the imports' own), as Soong's: -I of the import sources would
+//     see two versions of one interface where a closure holds both (android.hardware.radio.*).
 //   - RELEASE_AIDL_USE_UNFROZEN is false in the pinned release chain (flag_values: ap2a, ap3a false, no later config sets it), so an unfrozen
 //     version of a frozen interface gets --previous_api_dir / --previous_hash.
 //   - `headers` (aidl_library modules) are -I dirs after include_dirs (aidl_api.go getDeps).
@@ -72,7 +73,6 @@ type aidlIface struct {
 	frozen   bool
 	srcs     map[string][]srcFile
 	imports  map[string][]aidlRef
-	closure  map[string][]aidlRef
 }
 
 // aidlRef is one version of one interface.
@@ -90,7 +90,7 @@ func (g *Graph) aidlIfaceOf(name string, side Side) *aidlIface {
 	var i *aidlIface
 	if m := g.lookup(name, side); m != nil && m.Type == "aidl_interface" {
 		p := g.flatten(m, side, Gen)
-		i = &aidlIface{mod: m, side: side, props: p, withInfo: map[string][]string{}, srcs: map[string][]srcFile{}, imports: map[string][]aidlRef{}, closure: map[string][]aidlRef{},
+		i = &aidlIface{mod: m, side: side, props: p, withInfo: map[string][]string{}, srcs: map[string][]srcFile{}, imports: map[string][]aidlRef{},
 			unstable: p.boolean("unstable", false), frozen: p.boolean("frozen", false)}
 		i.versions = p.strs("versions")
 		if l, ok := p.get("versions_with_info").([]Val); ok {
@@ -187,28 +187,6 @@ func (g *Graph) resolveImports(i *aidlIface, version string) []aidlRef {
 	return out
 }
 
-// importClosure: every interface version `version` of i imports, transitively (each once).
-func (g *Graph) importClosure(i *aidlIface, version string) []aidlRef {
-	if c, ok := i.closure[version]; ok {
-		return c
-	}
-	seen := map[string]bool{}
-	var out []aidlRef
-	var walk func(i *aidlIface, version string)
-	walk = func(i *aidlIface, version string) {
-		for _, r := range g.resolveImports(i, version) {
-			if k := r.iface.mod.Name + "-V" + r.version; !seen[k] {
-				seen[k] = true
-				out = append(out, r)
-				walk(r.iface, r.version)
-			}
-		}
-	}
-	walk(i, version)
-	i.closure[version] = out
-	return out
-}
-
 // aidlSources: aidlInterface.srcsForVersion + getPaths. The next version's srcs are the module's (paths, globs, filegroups; root =
 // local_include_dir), a frozen version's every .aidl below aidl_api/<iface>/<version>.
 func (g *Graph) aidlSources(i *aidlIface, version string) []srcFile {
@@ -257,9 +235,11 @@ type aidlSpec struct {
 	stability string
 	minSdk    string
 	roots     []string // own source roots (-N)
-	includes  []string // tree-relative import roots and include_dirs (-I)
-	prevVer   string   // previous frozen version when this one is unfrozen, "" = none
-	srcs      []srcFile
+	includes  []string // tree-relative include_dirs and headers' dirs (-I)
+	// the direct imports' preprocessed.aidl files (-p, aidlPreprocessed), absolute
+	preprocessed []string
+	prevVer      string // previous frozen version when this one is unfrozen, "" = none
+	srcs         []srcFile
 	// the missing previous .hash is one problem, not one per source
 	prevReported bool
 }
@@ -336,6 +316,12 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 		// genTrace: on by default only with platform_apis; no gen_log; gen_rpc; platform_apis -> --min_sdk_version platform_apis
 		platform := be.boolean("platform_apis", false)
 		spec.trace, spec.log, spec.rpc = be.boolean("gen_trace", platform), false, be.boolean("gen_rpc", false)
+		// addJavaLibrary: without a min_sdk_version, the API level of the sdk_version (system_current by default: current)
+		if be.str("min_sdk_version") == "" && p.str("min_sdk_version") == "" {
+			if l := parseSdk(be.str("sdk_version")).level; l != "" {
+				spec.minSdk = l
+			}
+		}
 		if platform {
 			spec.minSdk = "platform_apis"
 		}
@@ -351,9 +337,10 @@ func (g *Graph) synthAidl(ref string, side Side) *Module {
 	for _, f := range srcs {
 		spec.roots = appendMissing(spec.roots, []string{f.root})
 	}
-	for _, r := range g.importClosure(i, ver) {
-		for _, f := range g.aidlSources(r.iface, r.version) {
-			spec.includes = appendMissing(spec.includes, []string{f.root})
+	// getDeps: the direct imports' preprocessed types (-p), the interface's include_dirs and its headers' dirs (-I)
+	for _, r := range g.resolveImports(i, ver) {
+		if pre := g.aidlPreprocessed(r.iface, r.version); pre != "" {
+			spec.preprocessed = append(spec.preprocessed, pre)
 		}
 	}
 	spec.includes = appendMissing(spec.includes, p.strs("include_dirs"))
@@ -494,6 +481,10 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 		flags = append(flags, "--stability", s.stability)
 	}
 	flags = append(flags, "--min_sdk_version", s.minSdk)
+	for _, p := range s.preprocessed {
+		flags = append(flags, "-p"+p)
+		implicit = append(implicit, p)
+	}
 	if s.prevVer != "" && !hasHash {
 		prev := filepath.Join(s.dir, "aidl_api", s.name, s.prevVer)
 		if h, ok := g.readHash(filepath.Join(prev, ".hash")); ok {
@@ -516,6 +507,71 @@ func (s *aidlSpec) flags(g *Graph, f srcFile) (flags, implicit []string) {
 	return flags, implicit
 }
 
+// aidlPreprocessed is aidl_interface.go buildPreprocessed: the types of one interface version, `aidl --preprocess <out> [--structured]
+// [--stability s] -p<imports' preprocessed> -I<own source roots, include_dirs, include_dirs> <srcs>`, into
+// <out>/aidl/<iface>/<version>/preprocessed.aidl; an importer's aidl runs read it with -p (getDeps). "" when the version has no sources.
+func (g *Graph) aidlPreprocessed(i *aidlIface, ver string) string {
+	k := i.side.String() + "/" + i.mod.Name + "/" + ver
+	if out, ok := g.aidlPre[k]; ok {
+		return out
+	}
+	if g.aidlPre == nil {
+		g.aidlPre = map[string]string{}
+	}
+	g.aidlPre[k] = ""
+	srcs := g.aidlSources(i, ver)
+	if len(srcs) == 0 {
+		return ""
+	}
+	dirVer := ver
+	if dirVer == "" {
+		dirVer = "unversioned"
+	}
+	out := filepath.Join(g.out, "aidl", i.side.String(), i.mod.Name, dirVer, "preprocessed.aidl")
+	var flags, implicit []string
+	if !i.unstable {
+		flags = append(flags, "--structured")
+	}
+	if s := i.props.str("stability"); s != "" {
+		flags = append(flags, "--stability", s)
+	}
+	for _, r := range g.resolveImports(i, ver) {
+		if p := g.aidlPreprocessed(r.iface, r.version); p != "" {
+			flags = append(flags, "-p"+p)
+			implicit = append(implicit, p)
+		}
+	}
+	var imports []string
+	for _, f := range srcs {
+		imports = appendMissing(imports, []string{f.root})
+	}
+	imports = append(imports, i.props.strs("include_dirs")...)
+	imports = append(imports, i.props.strs("include_dirs")...)
+	for _, d := range imports {
+		flags = append(flags, "-I"+g.abs(d))
+	}
+	tool := filepath.Join(g.out, "missing-tool", "aidl")
+	if t := g.hostTool("aidl", &Node{mod: i.mod}); t != nil {
+		tool = g.nodeOut(t)
+	}
+	var ins []string
+	for _, f := range srcs {
+		ins = append(ins, g.abs(f.path))
+	}
+	fmt.Fprintf(&g.aidlPreB, "build %s: aidl_preprocess %s | %s\n  aidl = %s\n  flags = %s\n", esc(out), join(ins),
+		join(append([]string{tool}, implicit...)), esc(tool), shellQuote(flags))
+	g.aidlPre[k] = out
+	return out
+}
+
+// aidlPreNinja: the preprocess rule and edges (written before the cc edges that read them).
+func (g *Graph) aidlPreNinja() string {
+	if g.aidlPreB.Len() == 0 {
+		return ""
+	}
+	return "rule aidl_preprocess\n  command = $aidl --preprocess $out $flags $in\n  description = aidl preprocess $out\n" + g.aidlPreB.String()
+}
+
 // aidlJavaRule: the genrule of a `-java-source` module (aidl_gen_rule.go aidlJavaRule): `aidl --lang=java <flags> -o <genDir> <src>` per source,
 // writing <genDir>/<path below the source's root>.java. Soong's depfile (-d) is dropped as for hidl-gen: the genrule rule has none.
 func (g *Graph) aidlJavaRule(n *Node) *genRule {
@@ -533,7 +589,8 @@ func (g *Graph) aidlJavaRule(n *Node) *genRule {
 		for _, fl := range flags {
 			cmd = append(cmd, shellEscape(fl))
 		}
-		cmds = append(cmds, strings.Join(append(cmd, "-o", "$(genDir)", shellEscape(f.path)), " "))
+		// the source absolute like its -N root: aidl matches a source to its import root by path prefix
+		cmds = append(cmds, strings.Join(append(cmd, "-o", "$(genDir)", shellEscape(g.abs(f.path))), " "))
 		r.outs = append(r.outs, filepath.Join(genDir, strings.TrimSuffix(strings.TrimPrefix(f.path, f.root+"/"), ".aidl")+".java"))
 	}
 	r.cmd = strings.Join(cmds, " && ")

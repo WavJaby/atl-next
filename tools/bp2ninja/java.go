@@ -79,6 +79,10 @@ type javaGraph struct {
 	outs  []string
 	// java_sdk_library components synthesised so far (stubs.go), by name + side
 	synth map[string]*Module
+	// metalavaTool's install edges are written
+	metalavaInstalled bool
+	// the SDK's preprocessed aidl files by name (sdkaidl.go), "" = not buildable
+	sdkAidl map[string]string
 }
 
 // javaTypes: module types built by java nodes (after soong_config_module_type unwrapping).
@@ -338,10 +342,23 @@ type sdkDep struct {
 func (g *Graph) decodeSdk(n *jNode, s sdkSpec) (sdkDep, error) {
 	p := n.props
 	if s.level != "" {
-		dir := filepath.Join("prebuilts/sdk", s.level, s.kind)
+		// prebuilts/sdk/<level>/<SdkKind.String()>: the kinds named with `_` in sdk_version are `-` there
+		kind := s.kind
+		switch kind {
+		case "module":
+			kind = "module-lib"
+		case "system_server":
+			kind = "system-server"
+		}
+		dir := filepath.Join("prebuilts/sdk", s.level, kind)
 		// "There's no aidl for other SDKs yet": always the public one
-		return sdkDep{prebuiltJars: []string{filepath.Join(dir, "android.jar"), "prebuilts/sdk/tools/core-lambda-stubs.jar"},
-			aidl: filepath.Join("prebuilts/sdk", s.level, "public", "framework.aidl")}, nil
+		d := sdkDep{prebuiltJars: []string{filepath.Join(dir, "android.jar"), "prebuilts/sdk/tools/core-lambda-stubs.jar"},
+			aidl: filepath.Join("prebuilts/sdk", s.level, "public", "framework.aidl")}
+		if g.defaultJavaVersion(Device, s).modules() {
+			// prebuilt_apis' sdk_<kind>_<level>_system_modules (prebuiltapis.go), kind by systemModuleKind
+			d.sysModules = "sdk_" + prebuiltSystemModuleKind(s) + "_" + s.level + "_system_modules"
+		}
+		return d, nil
 	}
 	toModule := func(lib, sysKind string) sdkDep {
 		aidl := "framework.aidl"
@@ -512,10 +529,7 @@ type jSrcs struct {
 // javaSrcs expands srcs into sources by kind. Extensions no step consumes (package.html, …) are dropped as Soong drops them: compile filters
 // srcFiles by extension (.java, .kt, .srcjar after genSources).
 func (g *Graph) javaSrcs(n *jNode, srcs []string) jSrcs {
-	exclude := map[string]bool{}
-	for _, e := range g.globs(n.mod.Dir, n.props.strs("exclude_srcs")) {
-		exclude[e] = true
-	}
+	exclude := g.excludeSet(n.mod.Dir, n.side, n.props.strs("exclude_srcs"), n.name)
 	s := jSrcs{gen: map[string][]srcFile{}}
 	add := func(f srcFile) {
 		switch ext := filepath.Ext(f.path); ext {
@@ -669,7 +683,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	for _, ext := range genOrder {
 		if files := src.gen[ext]; len(files) > 0 {
 			if ext == ".aidl" && d.aidlGen != "" {
-				g.problem("%s: aidl sources against sdk_version %q need the SDK's %s (sdkparcelables over the stubs), which is not built", n.name, p.str("sdk_version"), d.aidlGen)
+				d.aidlPreprocess = g.sdkFrameworkAidl(d.aidlGen, n.name)
 			}
 			gj, gs := javaGen(ext)(g, n, files, d)
 			java = append(java, gj...)
@@ -753,6 +767,14 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	manifest := ""
 	if mf := p.str("manifest"); mf != "" {
 		manifest = g.abs(filepath.Join(n.mod.Dir, mf))
+	}
+	if mc := p.str("main_class"); mc != "" && n.typ == "java_binary_host" {
+		// java.go Binary: GenerateMainClassManifest's manifest.txt overrides the manifest
+		if manifest != "" {
+			g.problem("%s: main_class cannot be used when manifest is set", n.name)
+		}
+		manifest = filepath.Join(n.dir, "manifest.txt")
+		g.genFile(manifest, "Main-Class: "+mc+"\n")
 	}
 	implJars := dedupKeep(append(append([]string{}, localImpl...), d.staticImpl...))
 	var impl string
@@ -973,6 +995,20 @@ func (g *Graph) javaBinary(n *jNode, stem string) {
 	bin := filepath.Join(g.out, "host", "bin", n.name)
 	j.edge("installexec", []string{bin}, []string{g.abs(w)}, []string{jarOut}, nil, nil)
 	n.tool = bin
+}
+
+// metalavaTool: metalava as a runnable tool for genrules, the -metalava jar (J1: Soong's build of it until metalava is built here) installed
+// as host/framework/metalava.jar with jar-wrapper.sh as host/bin/metalava, as javaBinary lays out a java_binary_host.
+func (g *Graph) metalavaTool() string {
+	j := g.java
+	bin := filepath.Join(g.out, "host", "bin", "metalava")
+	if !j.metalavaInstalled {
+		j.metalavaInstalled = true
+		jar := filepath.Join(g.out, "host", "framework", "metalava.jar")
+		j.edge("cp", []string{jar}, []string{j.tools.Metalava}, nil, nil, nil)
+		j.edge("installexec", []string{bin}, []string{g.abs("build/soong/scripts/jar-wrapper.sh")}, []string{jar}, nil, nil)
+	}
+	return bin
 }
 
 // jtoolJar: the jar of a host Java tool, for rules that run `java -jar` themselves (jarjar).
@@ -1221,7 +1257,8 @@ func (j *javaGraph) header(g *Graph) string {
 	tools := j.tools
 	bt := func(t string) string { return esc(filepath.Join(tools.BuildTools, t)) }
 	javacVm := "-J-Xmx" + c.JavacHeapSize + " " + strings.Join(c.JavacVmFlags, " ")
-	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' -d $srcjardir || [ $$? -eq 11 ]; done) && find $srcjardir -name '*.java' | sort > $srcjardir/list`
+	// unzip exits 11 when nothing matches and 1 for an empty zip (a srcjar of aidl parcelable declarations only): both are no sources
+	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' -d $srcjardir || [ $$? -eq 11 ] || [ $$(unzip -Z1 $$j 2>/dev/null | wc -l) -eq 0 ]; done) && find $srcjardir -name '*.java' | sort > $srcjardir/list`
 	var b strings.Builder
 	fmt.Fprintf(&b, "jdk = %s\nsoongzip = %s\nmergezips = %s\nzip2zip = %s\nzipalign = %s\n", esc(tools.JDK), bt("soong_zip"),
 		bt("merge_zips"), bt("zip2zip"), bt("zipalign"))
@@ -1256,9 +1293,6 @@ rule pkgcheck
 rule sysmodules
   command = rm -rf $outdir $workdir && mkdir -p $workdir/jmod && $root/build/soong/scripts/jars-to-module-info-java.sh java.base $in > $workdir/module-info.java && $jdk/bin/javac --system=none --patch-module=java.base=$classpath $workdir/module-info.java && $soongzip -jar -o $workdir/classes.jar -C $workdir -f $workdir/module-info.class && $mergezips -j $workdir/module.jar $workdir/classes.jar $in && $jdk/bin/jmod create --module-version %s --target-platform LINUX-OTHER --class-path $workdir/module.jar $workdir/jmod/java.base.jmod && $jdk/bin/jlink --module-path $workdir/jmod --add-modules java.base --output $outdir --disable-plugin system-modules && rm -rf $workdir && cp $jdk/lib/jrt-fs.jar $outdir/lib/
   description = system modules $outdir
-rule cp
-  command = cp -f $in $out
-  description = cp $out
 rule installexec
   command = cp -f $in $out && chmod +x $out
   description = install $out
@@ -1267,6 +1301,7 @@ rule installexec
 	b.WriteString(aconfigJavaRule)
 	b.WriteString(javaGenRules)
 	b.WriteString(syspropJavaRule)
+	b.WriteString(sdkAidlRules)
 	b.WriteString(j.kotlincRule(g))
 	return b.String()
 }

@@ -125,7 +125,7 @@ func (j *javaGraph) kotlincRule(g *Graph) string {
 		`for f in $cp; do printf '    <classpath path="%s"/>\n' "$$f"; done; ` +
 		`for f in $$(cat $kjar.rsp $srcjardir/list); do case $$f in *.java) printf '    <javaSourceRoots path="%s"/>\n' "$$f";; *.kt) printf '    <sources path="%s"/>\n' "$$f";; *) echo "unknown source $$f"; exit 1;; esac; done; ` +
 		`printf '  </module>\n</modules>\n'; } > $buildfile`
-	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' '*.kt' -d $srcjardir || [ $$? -eq 11 ]; done) && find $srcjardir -name '*.java' -o -name '*.kt' | sort > $srcjardir/list`
+	unpack := `(for j in $srcjars; do unzip -qo $$j '*.java' '*.kt' -d $srcjardir || [ $$? -eq 11 ] || [ $$(unzip -Z1 $$j 2>/dev/null | wc -l) -eq 0 ]; done) && find $srcjardir -name '*.java' -o -name '*.kt' | sort > $srcjardir/list`
 	return "rule kotlinc\n" +
 		"  command = rm -rf $classes $hclasses $srcjardir $buildfile $emptydir && mkdir -p $classes $hclasses $srcjardir $emptydir && " + unpack + " && " + xml + " && " +
 		"JAVA_HOME=$jdk PATH=$jdk/bin:$$PATH " + esc(g.abs(c.Kotlinc)) + " " + strings.Join(c.KotlincGlobal, " ") + " " + strings.Join(c.KotlincJdk9Opts, " ") +

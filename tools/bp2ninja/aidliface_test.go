@@ -179,12 +179,14 @@ func TestAidlBackendFrozenVersion(t *testing.T) {
 	}
 	v := edgeVars(e)
 	// aidl_gen_rule.go: --structured --version 1 --hash <last line of .hash>, -t (cpp gen_trace default), --min_sdk_version current (default),
-	// -I imported roots + include_dirs, -N own roots. A frozen version has no warning flags and, being version 1, no previous version
-	wantFlags := "--structured --version 1 --hash hash-a1 -t --min_sdk_version current -I" + tree + "/p/aidl_api/common/1 -I" + tree + "/inc/aidl -N" + tree + "/p/aidl_api/app/1"
+	// -p the imported version's preprocessed types, -I include_dirs, -N own roots (getDeps). A frozen version has no warning flags and, being
+	// version 1, no previous version
+	pre := filepath.Join(g.out, "aidl", "device", "common", "1", "preprocessed.aidl")
+	wantFlags := "--structured --version 1 --hash hash-a1 -t --min_sdk_version current -p" + pre + " -I" + tree + "/inc/aidl -N" + tree + "/p/aidl_api/app/1"
 	if v["flags"] != wantFlags || v["lang"] != "cpp" {
 		t.Errorf("flags %q lang %q, want %q cpp", v["flags"], v["lang"], wantFlags)
 	}
-	if !reflect.DeepEqual(e.implicit, []string{tree + "/p/aidl_api/app/1/.hash"}) {
+	if !reflect.DeepEqual(e.implicit, []string{tree + "/p/aidl_api/app/1/.hash", pre}) {
 		t.Errorf("implicit %v", e.implicit)
 	}
 	// libbinder, libutils; libcutils because of tracing; then the import's backend (addLanguageLibraries). Exported: all but libcutils
@@ -231,13 +233,15 @@ func TestAidlBackendNextVersion(t *testing.T) {
 	}
 	// flagsForAidlGenRule: -Weverything and the interface's flags on the unfrozen version; --previous_api_dir / --previous_hash because the
 	// previous version is frozen and release_aidl_use_unfrozen is false; the bare import `common` of the next version means common's next (3)
-	wantFlags := "-Weverything -Wno-missing-permission-annotation -Werror --structured --version 2 --hash notfrozen -t --min_sdk_version current" +
-		" --previous_api_dir=" + tree + "/p/aidl_api/app/1 --previous_hash hash-a1 -I" + tree + "/p/aidl -I" + tree + "/inc/aidl -N" + tree + "/p/aidl"
+	// -p after --min_sdk_version, before the previous version (generateBuildActionsForSingleAidl's order)
+	pre := filepath.Join(g.out, "aidl", "device", "common", "3", "preprocessed.aidl")
+	wantFlags := "-Weverything -Wno-missing-permission-annotation -Werror --structured --version 2 --hash notfrozen -t --min_sdk_version current -p" + pre +
+		" --previous_api_dir=" + tree + "/p/aidl_api/app/1 --previous_hash hash-a1 -I" + tree + "/inc/aidl -N" + tree + "/p/aidl"
 	e := n.edges[0]
 	if got := edgeVars(e)["flags"]; got != wantFlags {
 		t.Errorf("flags %q\nwant  %q", got, wantFlags)
 	}
-	if !reflect.DeepEqual(e.implicit, []string{tree + "/p/aidl_api/app/1/.hash"}) {
+	if !reflect.DeepEqual(e.implicit, []string{pre, tree + "/p/aidl_api/app/1/.hash"}) {
 		t.Errorf("implicit %v", e.implicit)
 	}
 	if want := []string{"libbinder", "libutils", "libcutils", "common-V3-cpp"}; !reflect.DeepEqual(depNames(n.deps.shared), want) {
@@ -294,7 +298,8 @@ func TestAidlBackendUnstable(t *testing.T) {
 	if n == nil {
 		t.Fatalf("problems %v", g.problems)
 	}
-	wantFlags := "-Weverything -Wno-missing-permission-annotation -t --min_sdk_version current -I" + tree + "/p/aidl -N" + tree + "/p/aidl"
+	wantFlags := "-Weverything -Wno-missing-permission-annotation -t --min_sdk_version current -p" + filepath.Join(g.out, "aidl", "device", "common", "3", "preprocessed.aidl") +
+		" -N" + tree + "/p/aidl"
 	if got := edgeVars(n.edges[0])["flags"]; got != wantFlags {
 		t.Errorf("flags %q, want %q", got, wantFlags)
 	}
@@ -443,10 +448,18 @@ func TestAidlBackendEmit(t *testing.T) {
 	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
 	// one aidl edge per source: depfile var, lang, the hash as an implicit input after the tool
 	gd := filepath.Join(g.out, "gen", "device", "app-V1-ndk")
+	tool := filepath.Join(g.out, "host", "aidl", "aidl")
+	pre := filepath.Join(g.out, "aidl", "device", "common", "1", "preprocessed.aidl")
 	want := "build " + gd + "/src/com/app/IApp.cpp " + gd + "/include/aidl/com/app/IApp.h " + gd + "/include/aidl/com/app/BpApp.h " + gd +
-		"/include/aidl/com/app/BnApp.h: aidl " + g.tree + "/p/aidl_api/app/1/com/app/IApp.aidl | " + filepath.Join(g.out, "host", "aidl", "aidl") + " " + g.tree + "/p/aidl_api/app/1/.hash\n"
+		"/include/aidl/com/app/BnApp.h: aidl " + g.tree + "/p/aidl_api/app/1/com/app/IApp.aidl | " + tool + " " + g.tree + "/p/aidl_api/app/1/.hash " + pre + "\n"
 	if strings.Count(ninja, want) != 1 {
 		t.Errorf("%d edges %q in\n%s", strings.Count(ninja, want), want, ninja)
+	}
+	// buildPreprocessed: the import's types, once: --structured, -I its own root (no include_dirs, no imports of its own)
+	wantPre := "build " + pre + ": aidl_preprocess " + g.tree + "/p/aidl_api/common/1/com/common/IThing.aidl | " + tool + "\n  aidl = " + tool +
+		"\n  flags = --structured -I" + g.tree + "/p/aidl_api/common/1\n"
+	if strings.Count(ninja, wantPre) != 1 || !strings.Contains(ninja, "rule aidl_preprocess\n  command = $aidl --preprocess $out $flags $in\n") {
+		t.Errorf("preprocess edge %q missing", wantPre)
 	}
 	if !strings.Contains(ninja, "  dep = "+gd+"/src/com/app/IApp.cpp.d\n") || !strings.Contains(ninja, "rule aidl\n  command = $aidl --lang=$lang $flags --ninja -d $dep") {
 		t.Errorf("rule or depfile variable missing")

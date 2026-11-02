@@ -152,6 +152,9 @@ type Graph struct {
 	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
 	aidlIfaces map[string]*aidlIface
 	hidlIfaces map[string]*hidlIface
+	// aidl_interface versions' preprocessed.aidl by side/name/version ("" = none) and their edges (aidliface.go aidlPreprocessed)
+	aidlPre  map[string]string
+	aidlPreB strings.Builder
 	// the combined_apis module, read once (combinedapis.go)
 	combined     *combinedApis
 	combinedRead bool
@@ -246,7 +249,12 @@ func (g *Graph) lookupWith(ref string, side Side, skip func(string) bool) *Modul
 // resolveDefaults merges a module's defaults (recursively) under its own properties.
 func (g *Graph) resolveDefaults(m *Module, side Side, seen map[string]bool) *Obj {
 	acc := newObj()
-	for _, d := range m.Props.strs("defaults") {
+	// defaults.go applyDefaults prepends each defaults module in turn (proptools.PrependProperties): lists end up last-listed defaults
+	// first, then earlier ones, then the module's own; a scalar keeps the module's own value, else the first-listed defaults'. So merge
+	// (later lists after, later scalars winning) the defaults in reverse, then the module.
+	defs := slices.Clone(m.Props.strs("defaults"))
+	slices.Reverse(defs)
+	for _, d := range defs {
 		if seen[d] {
 			continue
 		}
@@ -718,6 +726,15 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 		}
 		return files, true
 	}
+	// an android_app's generated R sources (aapt.go)
+	if name, tag := splitTag(s); tag == ".aapt.srcjar" {
+		if m := g.lookup(name, side); m != nil && m.Type == "android_app" {
+			if n := g.aaptSrcjar(m, side, from); n != nil {
+				return []srcFile{{path: n.rule.outs[0], root: g.genDir(n, ""), gen: n}}, true
+			}
+			return nil, false
+		}
+	}
 	m := g.lookup(s, side)
 	switch {
 	case m != nil && g.baseType(m.Type) == "cc_object":
@@ -739,10 +756,7 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 	case m != nil && m.Type == "filegroup":
 		root := filepath.Join(m.Dir, m.Props.str("path"))
 		ok = true
-		exclude := map[string]bool{}
-		for _, e := range g.globs(m.Dir, m.Props.strs("exclude_srcs")) {
-			exclude[e] = true
-		}
+		exclude := g.excludeSet(m.Dir, side, m.Props.strs("exclude_srcs"), from)
 		// filegroup.go: srcs (less exclude_srcs), then device_first_srcs and device_common_srcs, whose dependencies are device variants
 		type entry struct {
 			src  string
@@ -782,6 +796,24 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 }
 
 func (g *Graph) expand(n *Node, pats []string) []string { return g.globs(n.mod.Dir, pats) }
+
+// excludeSet: the tree paths exclude_srcs names (PathsForModuleSrcExcludes): paths and globs below dir, and the files of module references.
+func (g *Graph) excludeSet(dir string, side Side, excludes []string, from string) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range excludes {
+		if isRef(e) {
+			files, _ := g.resolveSrc(dir, side, e, from)
+			for _, f := range files {
+				out[f.path] = true
+			}
+			continue
+		}
+		for _, f := range g.globs(dir, []string{e}) {
+			out[f] = true
+		}
+	}
+	return out
+}
 
 // globs resolves paths and globs (`**` included) relative to dir; results are tree-relative.
 func (g *Graph) globs(dir string, pats []string) []string {

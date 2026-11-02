@@ -357,8 +357,10 @@ func TestAidlRustBackend(t *testing.T) {
 	if !slices.Equal(n.rust.source.outs, append([]string{root}, outs...)) || n.rust.root != root {
 		t.Errorf("outs %v root %s", n.rust.source.outs, n.rust.root)
 	}
-	// one aidl step per source: no versions -> --version 1, no .hash -> notfrozen; no -t; --mockall; the import's sources as -I, own root as -N
-	wantFlags := "-Weverything -Wno-missing-permission-annotation --structured --version 1 --hash notfrozen --mockall --stability vintf --min_sdk_version 33 -I" + g.abs("p/base") + " -N" + g.abs("p/aidl")
+	// one aidl step per source: no versions -> --version 1, no .hash -> notfrozen; no -t; --mockall; the import's preprocessed types as -p
+	// (getDeps), own root as -N
+	wantFlags := "-Weverything -Wno-missing-permission-annotation --structured --version 1 --hash notfrozen --mockall --stability vintf --min_sdk_version 33 -p" +
+		filepath.Join(g.out, "aidl", "device", "base.iface", "2", "preprocessed.aidl") + " -N" + g.abs("p/aidl")
 	tool := g.nodes[key{"aidl", Host, Binary}]
 	srcs := []string{"p/aidl/com/top/ITop.aidl", "p/aidl/com/top/sub/Data.aidl", "p/aidl/Root.aidl"}
 	if len(n.edges) != len(srcs) || tool == nil {

@@ -92,8 +92,13 @@ func TestDecodeSdk(t *testing.T) {
 		{"module_current", "", sdkDep{boot: []string{"android_module_lib_stubs_current", "core-lambda-stubs"}, java9: []string{"android_module_lib_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework_non_updatable.aidl"}},
 		{"system_server_current", "", sdkDep{boot: []string{"android_system_server_stubs_current", "core-lambda-stubs"}, java9: []string{"android_system_server_stubs_current"}, sysModules: "core-module-lib-stubs-system-modules", aidlGen: "framework.aidl"}},
 		{"", "", sdkDep{sysModules: "legacy-core-platform-api-stubs-system-modules", boot: []string{"legacy.core.platform.api.stubs", "core-lambda-stubs"}, classpath: []string{"ext", "framework"}}},
-		// useFiles: <level>/<kind>/android.jar, the aidl always <level>/public/framework.aidl
-		{"system_30", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/30/system/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/30/public/framework.aidl"}},
+		// useFiles: <level>/<kind>/android.jar, the aidl always <level>/public/framework.aidl; Java >= 9 (level 30 -> 9) adds prebuilt_apis'
+		// sdk_<systemModuleKind>_<level>_system_modules, public up to level 31, module-lib for system_server after it
+		{"system_30", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/30/system/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/30/public/framework.aidl",
+			sysModules: "sdk_public_30_system_modules"}},
+		{"system_server_33", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/33/system-server/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/33/public/framework.aidl",
+			sysModules: "sdk_module-lib_33_system_modules"}},
+		{"29", "", sdkDep{prebuiltJars: []string{"prebuilts/sdk/29/public/android.jar", "prebuilts/sdk/tools/core-lambda-stubs.jar"}, aidl: "prebuilts/sdk/29/public/framework.aidl"}},
 	}
 	for _, c := range cases {
 		p := objOf("sdk_version", c.sdk)

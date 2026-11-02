@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -141,6 +142,18 @@ func (r *Release) Condition(name string) (string, bool) {
 		v = "false"
 	}
 	return v, true
+}
+
+// Names: the declared flags whose names start with prefix, sorted.
+func (r *Release) Names(prefix string) []string {
+	var out []string
+	for n := range r.flags {
+		if strings.HasPrefix(n, prefix) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ConfigVar answers select(soong_config_variable(ns, name)) for the variables readConfigVars knows.

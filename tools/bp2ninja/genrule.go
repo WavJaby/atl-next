@@ -58,7 +58,8 @@ type genRule struct {
 }
 
 func isGenType(t string) bool {
-	return t == "genrule" || t == "cc_genrule" || t == "gensrcs" || t == "java_genrule" || t == "java_genrule_host"
+	return t == "genrule" || t == "cc_genrule" || t == "gensrcs" || t == "java_genrule" || t == "java_genrule_host" || t == sysFeaturesType ||
+		t == xsdConfigType
 }
 
 // genNode builds (once) the genrule node a reference names. A reference of another type is a problem,
@@ -93,6 +94,12 @@ func (g *Graph) genNode(ref string, side Side, from string) *Node {
 		n.rule = g.hidlRule(n)
 	case m.aidl != nil:
 		n.rule = g.aidlJavaRule(n)
+	case m.Type == sysFeaturesType:
+		n.props = g.sysFeaturesProps(n)
+		n.rule = g.buildGenRule(n)
+	case m.Type == xsdConfigType:
+		n.props = g.xsdProps(n)
+		n.rule = g.buildGenRule(n)
 	default:
 		n.rule = g.buildGenRule(n)
 	}
@@ -265,8 +272,13 @@ func (g *Graph) genTool(n *Node, r *genRule, ref string, fail func(string, ...an
 		r.implicit = append(r.implicit, p)
 		return l
 	case bt == "java_binary_host" && g.java != nil:
-		// its installed wrapper (javaBinary), which runs the jar beside it
-		p := g.jtool(tm.Name, n.name)
+		// its installed wrapper (javaBinary), which runs the jar beside it; metalava is the given jar (J1: the Soong-built one), not built
+		p := ""
+		if tm.Name == "metalava" {
+			p = g.metalavaTool()
+		} else {
+			p = g.jtool(tm.Name, n.name)
+		}
 		l.files = []string{p}
 		r.implicit = append(r.implicit, p)
 		return l
@@ -608,7 +620,13 @@ func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 // directory, with trim_extension cut and output_extension appended, else the extension replaced. Not sharded: shards only split the work.
 func gensrcsCommands(genDir, raw, ext, trim string, inputs []srcFile, fail func(string, ...any)) (outs []string, cmd string) {
 	var cmds []string
+	seen := map[string]bool{}
 	for _, f := range inputs {
+		// an input listed twice (two filegroups naming one proto) is one command: RuleBuilder keeps an output once
+		if seen[f.path] {
+			continue
+		}
+		seen[f.path] = true
 		rel := f.path
 		if f.gen != nil {
 			rel = strings.TrimPrefix(f.path, f.root+"/")

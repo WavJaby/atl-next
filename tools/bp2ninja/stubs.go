@@ -301,8 +301,18 @@ var apiScopeOrder = map[string]int{"public": 0, "system": 1, "test": 2, "module-
 // apiContribution resolves a java_api_contribution: an explicit module, or the one every droidstubs creates as
 // <droidstubs>.api.contribution (createApiContribution: its check_api.current.api_file and api_surface).
 func (g *Graph) apiContribution(ref string, side Side, from string) (file, surface string, ok bool) {
+	// api_file: a path, or a module reference (PathForModuleSrc)
+	one := func(dir, f string) (string, bool) {
+		files, ok := g.resolveSrc(dir, side, f, from)
+		if !ok || len(files) != 1 {
+			g.problem("%s: %s: api file %s is not one file", from, ref, f)
+			return "", false
+		}
+		return files[0].path, true
+	}
 	if m := g.lookupWith(ref, side, isJavaPrebuilt); m != nil && g.baseType(m.Type) == "java_api_contribution" {
-		return filepath.Join(m.Dir, m.Props.str("api_file")), m.Props.str("api_surface"), true
+		f, ok := one(m.Dir, m.Props.str("api_file"))
+		return f, m.Props.str("api_surface"), ok
 	}
 	stubs, isContrib := strings.CutSuffix(ref, ".api.contribution")
 	if m := g.lookupJava(stubs, side); isContrib && m != nil && g.baseType(m.Type) == "droidstubs" {
@@ -312,7 +322,8 @@ func (g *Graph) apiContribution(ref string, side Side, from string) (file, surfa
 			g.problem("%s: %s: droidstubs %s has no check_api.current.api_file", from, ref, stubs)
 			return "", "", false
 		}
-		return filepath.Join(m.Dir, f), p.str("api_surface"), true
+		path, ok := one(m.Dir, f)
+		return path, p.str("api_surface"), ok
 	}
 	g.problem("%s: api contribution %s not found", from, ref)
 	g.notFound(ref)
@@ -535,8 +546,13 @@ func (g *Graph) droidstubs(n *jNode) {
 			}
 		}
 	}
+	// droiddoc.go collectDeps: args, else each of flags (setting both is an error)
 	if a := p.str("args"); a != "" {
 		tail = append(tail, strings.ReplaceAll(a, "$", "$$"))
+	} else {
+		for _, f := range p.strs("flags") {
+			tail = append(tail, strings.ReplaceAll(f, "$", "$$"))
+		}
 	}
 	if j.tools.Metalava == "" {
 		g.problem("%s: no metalava.jar given (-metalava)", n.name)

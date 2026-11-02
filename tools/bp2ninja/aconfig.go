@@ -29,6 +29,8 @@ type aconfigGraph struct {
 type aconfigDecl struct {
 	pkg, cache string
 	exportable bool
+	// intermediate.txt once some module reads it (aconfigText)
+	text string
 }
 
 // aconfigModes: the codegen modes Soong accepts (codegen/java_aconfig_library.go aconfigSupportedModes, used by cc and rust too).
@@ -41,6 +43,10 @@ const aconfigRules = `rule aconfig_cache
 rule aconfig_cc
   command = rm -rf $gendir && mkdir -p $gendir && $aconfig create-cpp-lib --mode $mode --cache $in --out $gendir
   description = aconfig cc $out
+rule aconfig_text
+  command = $aconfig dump-cache --dedup --format='{fully_qualified_name}:{permission}={state:bool}' --cache $in --out $out.tmp && (if cmp -s $out.tmp $out; then rm $out.tmp; else mv $out.tmp $out; fi)
+  restat = 1
+  description = aconfig text $out
 `
 
 // aconfigJavaRule: written with the Java rules, whose $soongzip it runs.
@@ -166,6 +172,20 @@ func (g *Graph) aconfigMode(name string, p *Obj) (string, bool) {
 		return "", false
 	}
 	return mode, true
+}
+
+// aconfigText: the declarations' flags as text (aconfig_declarations.go aconfigTextRule, intermediate.txt), aapt2's --feature-flags input;
+// "" when the declarations are unusable.
+func (g *Graph) aconfigText(ref, from string) string {
+	d := g.aconfigDeclarations(ref, from)
+	if d == nil {
+		return ""
+	}
+	if d.text == "" {
+		d.text = strings.TrimSuffix(d.cache, ".pb") + ".txt"
+		fmt.Fprintf(&g.acfg.b, "build %s: aconfig_text %s | %s\n", esc(d.text), esc(d.cache), esc(g.acfg.tool))
+	}
+	return d.text
 }
 
 // aconfigJavaLib is java_aconfig_library: the generated flag classes compiled as a java library (GeneratedJavaLibraryModule).
