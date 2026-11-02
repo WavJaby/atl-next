@@ -42,11 +42,12 @@ pub struct HostArt {
     pub launcher: PathBuf,
     property_service: PathBuf,
     /// The converter's build.prop, the property service's input.
-    build_prop: PathBuf,
-    boot: Vec<PathBuf>,
+    pub build_prop: PathBuf,
+    pub boot: Vec<PathBuf>,
     javac_boot: Vec<PathBuf>,
-    d8: PathBuf,
-    jdk: PathBuf,
+    /// The Java pipeline's d8 (a script running r8.jar with the JDK on PATH) and the JDK.
+    pub d8: PathBuf,
+    pub jdk: PathBuf,
     /// The build directory's cargo target dir: launcher, property service, test libraries.
     pub cargo: PathBuf,
     pub verbose: bool,

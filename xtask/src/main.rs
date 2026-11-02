@@ -5,6 +5,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod aosp;
+mod app;
 mod arches;
 mod binder;
 mod check;
@@ -130,6 +131,10 @@ enum Test {
     Binder(binder::Args),
     /// Parcel encodings vs ground truth: atl-aidl-probe through AOSP's C++ Parcel (its size check fires on a wrong size), then atl-parcelables' codecs vs Java's Parcelables on host ART, byte-equal both ways.
     Parcel(parcel::Args),
+    /// The M2 gate: atld starts binderd, servicemanager, the M2 services and the test APK (xtask/testdata/app) through the broker; pass = its Activity.onCreate logs.
+    ///
+    /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
+    App(app::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -153,6 +158,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Binder(args),
         } => binder::run(&root, &args),
+        Command::Test {
+            test: Test::App(args),
+        } => app::run(&root, &args),
     }
 }
 
