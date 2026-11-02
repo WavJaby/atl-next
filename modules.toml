@@ -32,6 +32,12 @@ uses = ["generators", "bionic"]
 [android-runtime]
 crates = ["atl-android-runtime"]
 
+# Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it)
+[aidl]
+crates = ["atl-aidl"]
+exports = ["atl-aidl"]
+uses = ["generators"]
+
 # binder IPC: uapi wire types, the userspace driver core
 [binder]
 crates = ["atl-binder-wire", "atl-binderd"]

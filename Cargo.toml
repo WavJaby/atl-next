@@ -13,7 +13,9 @@ publish = false
 # Every dependency is declared here once; member crates use `dep.workspace = true`.
 [workspace.dependencies]
 anyhow = "1"
-clang = { version = "2.1", features = ["clang_10_0"] }
+# at least AOSP's version (external/rust/android-crates-io): aidl's Rust stubs use it, as Soong's aidl Rust crates do
+async-trait = "0.1.88"
+clang ={ version = "2.1", features = ["clang_10_0"] }
 clap = { version = "4", features = ["derive"] }
 errno = "0.3"
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
