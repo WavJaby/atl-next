@@ -403,8 +403,8 @@ impl Part for ActivityWindowInfo {
 }
 
 /// android.app.servertransaction.LaunchActivityItem (app/servertransaction/LaunchActivityItem.java writeToParcel / LaunchActivityItem(Parcel)), the body after ClientTransaction's class name.
-/// Not modelled, null only: state (Bundle), persistentState (PersistableBundle), pendingResults, pendingNewIntents, sceneTransitionInfo, profilerInfo.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Not modelled, null only: state (Bundle), persistentState (PersistableBundle), pendingResults, pendingNewIntents, sceneTransitionInfo, profilerInfo. No `PartialEq` (its Intent has none).
+#[derive(Debug, Clone, Default)]
 pub struct LaunchActivityItem {
     pub activity_token: Option<SpIBinder>,
     pub ident: i32,

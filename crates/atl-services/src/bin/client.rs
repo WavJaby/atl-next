@@ -20,12 +20,18 @@ use atl_aidl::aidl::android::app::IActivityManager::IActivityManager;
 use atl_aidl::aidl::android::app::IApplicationThread::{BnApplicationThread, IApplicationThread};
 use atl_aidl::aidl::android::content::pm::IPackageManager::{IPackageManager, transactions};
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
-use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::ApplicationInfo;
+use atl_parcelables::android::content::{ComponentName, Intent};
+use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
+use atl_parcelables::codecs::android::os::Bundle::BUNDLE_MAGIC;
 use atl_parcelables::java::util::Map;
 use atl_services::settings;
-use binder::{BinderFeatures, ExceptionCode, Interface, ProcessState, Status, StatusCode, Strong};
+use binder::binder_impl::{Parcel, UnstructuredParcelable};
+use binder::{
+    BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, Status,
+    StatusCode, Strong,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -62,6 +68,12 @@ const ABSENT: &str = "com.example.absent";
 const INSTRUMENTATION: &str = "com.example.atltest.Runner";
 /// An @EnforcePermission method of IPackageManager outside the M2 subset: getMoveStatus, @EnforcePermission("MOUNT_UNMOUNT_FILESYSTEMS").
 const MOVE_ID: i32 = 1;
+/// AppOpsManager.OP_NONE, ActivityManager.BROADCAST_SUCCESS, UserHandle.USER_SYSTEM: the broadcast's appOp, the result of a broadcast nobody receives, its user.
+const APP_OP_NONE: i32 = -1;
+const BROADCAST_SUCCESS: i32 = 0;
+const USER_SYSTEM: i32 = 0;
+/// The action of the test broadcasts (androidx's InstrumentationConnection broadcasts `androidx.test.runner.InstrumentationConnection.BROADCAST_FILTER`-style actions; any string will do here).
+const BROADCAST_ACTION: &str = "com.example.atltest.BROADCAST";
 
 enum Event {
     Bind(Option<String>, Option<Box<ApplicationInfo>>),
@@ -355,6 +367,8 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
         format!("{:?}", none.map(|h| h.is_some())),
     );
 
+    broadcast_and_fds(&mut r, &am, &thread)?;
+
     let limit = am.getProcessLimit();
     r.check(
         "unimplemented",
@@ -368,6 +382,98 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
         format!("getMoveStatus as uid {uid}: {denied:?}"),
     );
     Ok(r.failed)
+}
+
+/// A Bundle whose body is what `put` writes (the objects of some values; no map structure, the services never read it), laid out as Bundle.writeToParcel does.
+fn bundle_of(put: impl FnOnce(&mut Parcel) -> Result<(), StatusCode>) -> Result<Bundle> {
+    let mut body = Parcel::new();
+    put(&mut body)?;
+    let length = body.get_data_size();
+    let mut wire = Parcel::new();
+    wire.write(&length)?;
+    wire.write(&BUNDLE_MAGIC)?;
+    wire.append_from(&body, 0, length)?;
+    wire.write(&0i32)?; // mHasIntent
+    wire.set_data_position_checked(0)?;
+    Ok(Bundle::from_parcel(wire.borrowed_ref())?)
+}
+
+fn is_exception<T>(r: &binder::Result<T>, code: ExceptionCode) -> bool {
+    matches!(r, Err(s) if s.exception_code() == code)
+}
+
+/// What AMS does with Bundles that carry objects: a binder in a broadcast's extras (androidx's InstrumentationConnection puts one) is taken and the broadcast reaches no receiver
+/// (BROADCAST_SUCCESS, counted); a file descriptor is an IllegalArgumentException in a broadcast (BroadcastController.verifyBroadcastLocked:1881) and in finishInstrumentation
+/// (ActivityManagerService.java:14921); a null Intent is a NullPointerException.
+fn broadcast_and_fds(
+    r: &mut Report,
+    am: &Strong<dyn IActivityManager>,
+    thread: &Strong<dyn IApplicationThread>,
+) -> Result<()> {
+    let with_binder = bundle_of(|p| p.write(&Some(thread.as_binder())))?;
+    let with_fd = bundle_of(|p| {
+        let null = std::fs::File::open("/dev/null").map_err(|_| StatusCode::UNKNOWN_ERROR)?;
+        p.write(&ParcelFileDescriptor::new(null))
+    })?;
+    r.check(
+        "Bundle:objects",
+        !with_binder.has_file_descriptors() && with_fd.has_file_descriptors(),
+        format!(
+            "hasFileDescriptors: binder {}, descriptor {}",
+            with_binder.has_file_descriptors(),
+            with_fd.has_file_descriptors()
+        ),
+    );
+    let send = |intent: Option<&Intent>| {
+        am.broadcastIntentWithFeature(
+            Some(thread),
+            None,
+            intent,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            APP_OP_NONE,
+            None,
+            false,
+            false,
+            USER_SYSTEM,
+        )
+    };
+    let intent = |extras: &Bundle| Intent {
+        action: Some(BROADCAST_ACTION.to_owned()),
+        extras: Some(extras.clone()),
+        ..Intent::default()
+    };
+    let sent = send(Some(&intent(&with_binder)));
+    r.check(
+        "broadcastIntent:binder-extras",
+        matches!(sent, Ok(BROADCAST_SUCCESS)),
+        format!("{sent:?}"),
+    );
+    let sent = send(Some(&intent(&with_fd)));
+    r.check(
+        "broadcastIntent:fd-extras",
+        is_exception(&sent, ExceptionCode::ILLEGAL_ARGUMENT),
+        format!("{sent:?}"),
+    );
+    let sent = send(None);
+    r.check(
+        "broadcastIntent:null",
+        is_exception(&sent, ExceptionCode::NULL_POINTER),
+        format!("{sent:?}"),
+    );
+    let finished = am.finishInstrumentation(Some(thread), 0, Some(&with_fd));
+    r.check(
+        "finishInstrumentation:fd-results",
+        is_exception(&finished, ExceptionCode::ILLEGAL_ARGUMENT),
+        format!("{finished:?}"),
+    );
+    Ok(())
 }
 
 /// IContentProvider.call on the settings provider (ContentProviderNative's wire format: interface token, AttributionSource, authority, method, arg, extras); returns the reply's

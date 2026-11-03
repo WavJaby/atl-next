@@ -2,11 +2,13 @@
 // Driver of `xtask test parcel` on host ART (framework.jar on the boot classpath): for each M2 parcelable, Java's own writeToParcel bytes go through atl-parcelables' codec (libatl_parcel_truth.so:
 // decode, every byte consumed, re-encode) and must come back byte-equal; Java's createFromParcel must then read the Rust bytes and write the same bytes again. Never shipped.
 // Field values are distinct from the defaults, so a codec that drops, swaps or misreads a field changes the bytes. Output: `pt pass|fail <case> <detail>` lines; exit 0 = all passed.
-// Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, an Intent with extras and a Bundle with a descriptor object or a bad mHasIntent by their refusals.
+// Bundles and Intent extras that carry objects go through Java's own Parcels (roundTripParcel: the codec reads and writes the Parcel's data and object table): a binder must come out usable, a descriptor must be reported as Java reports it.
+// Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, an Intent with ClipData and a Bundle with a bad mHasIntent by their refusals (each refusal is also a line on stderr, which xtask checks).
 
 import android.app.ContentProviderHolder;
 import android.app.servertransaction.ClientTransaction;
 import android.app.servertransaction.LaunchActivityItem;
+import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
@@ -21,11 +23,15 @@ import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.os.LocaleList;
 import android.os.Parcel;
+import android.os.ParcelFileDescriptor;
 import android.os.Parcelable;
 import android.window.ActivityWindowInfo;
+import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -39,11 +45,13 @@ public class ParcelTruth {
     static native String lastError();
     static native String refused();
     static native int startReg();
+    /// The codec of `className` decodes the value at `in`'s position (every byte consumed) and encodes it into `out`, both Java Parcels with their objects: 0 = done, -1 = failed (lastError).
+    static native int roundTripParcel(String className, Parcel in, Parcel out);
+    /// The codec's has_file_descriptors of the value at `in`'s position: 1 or 0, -1 = failed (lastError).
+    static native int rustHasFileDescriptors(String className, Parcel in);
 
     static final int MODE_PLAIN = 0;
     static final int MODE_CORRUPT = 1;
-    /// The harness appends a file descriptor object to this (non-empty) Bundle's body: Java's marshall() keeps no objects.
-    static final int MODE_DESCRIPTOR = 2;
     /// java.io.FileDescriptor only: the codec writes a descriptor and reads it back.
     static final int MODE_FD_SELF = 3;
     /// Bundle only: the input is two marshalled Bundles, A then B; the result is A with putAll(B).
@@ -73,6 +81,8 @@ public class ParcelTruth {
         Intent withSelector = new Intent(Intent.ACTION_MAIN);
         withSelector.setSelector(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_BROWSER));
         check("Intent+selector", withSelector, Intent.CREATOR);
+        // extras (Intent.writeToParcel: writeBundle(mExtras)): a non-null Bundle after the first putExtra
+        check("Intent:extras", new Intent(intent).putExtra("k", 1).putExtra("s", "v"), Intent.CREATOR);
         check("ProviderInfo", provider, ProviderInfo.CREATOR);
         check("ProviderInfoList", ProviderInfoList.fromList(Arrays.asList(provider)), ProviderInfoList.CREATOR);
         ContentProviderHolder holder = new ContentProviderHolder(provider);
@@ -109,10 +119,127 @@ public class ParcelTruth {
         more.putString("none", null);
         more.putLong("long", -5000000000L);
         checkPutAll("Bundle:put-all", entries, more);
+        // objects in Bundles: androidx's InstrumentationConnection broadcasts extras that hold a binder (AOSP Bundles carry binders)
+        Binder echo = new Echo();
+        checkBinder("Bundle:binder", echo);
+        checkDescriptors("Bundle:fd", echo);
+        checkIntentBinder("Intent:binder-extras", echo);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    /// A local binder that answers transaction 1: the string it reads, prefixed.
+    static class Echo extends Binder {
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            reply.writeString("echo:" + data.readString());
+            return true;
+        }
+    }
+
+    static Bundle bundleWith(IBinder binder) {
+        Bundle b = new Bundle();
+        b.putString("key", "value");
+        b.putBinder("binder", binder);
+        return b;
+    }
+
+    /// The Parcel `p` wrote to, rewound for reading.
+    static Parcel written(Parcelable p) {
+        Parcel parcel = Parcel.obtain();
+        p.writeToParcel(parcel, 0);
+        parcel.setDataPosition(0);
+        return parcel;
+    }
+
+    /// Calls `binder` as a client: transaction 1 with "ping" must answer "echo:ping".
+    static boolean usable(IBinder binder) {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeString("ping");
+            binder.transact(1, data, reply, 0);
+            reply.setDataPosition(0);
+            return "echo:ping".equals(reply.readString());
+        } catch (android.os.RemoteException e) {
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /// A Bundle holding a string and a binder goes Java Parcel -> codec -> Java Parcel (the binder object is copied with the body): Java reads the very same Binder back, and it answers.
+    static void checkBinder(String name, Binder echo) {
+        Parcel in = written(bundleWith(echo));
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.os.Bundle", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        Bundle back = Bundle.CREATOR.createFromParcel(out);
+        IBinder got = back.getBinder("binder");
+        boolean ok = consumed && got == echo && "value".equals(back.getString("key")) && usable(got);
+        result(ok, name, ok ? "binder survived java -> rust -> java: same object, answers a transaction" : "binder " + got + ", key " + back.getString("key") + ", sizes " + in.dataSize() + "/" + out.dataSize());
+        in.recycle();
+        out.recycle();
+    }
+
+    /// An Intent whose extras hold a binder, the same way.
+    static void checkIntentBinder(String name, Binder echo) {
+        Intent i = new Intent("com.example.BROADCAST").putExtras(bundleWith(echo));
+        Parcel in = written(i);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.content.Intent", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        out.setDataPosition(0);
+        Intent back = Intent.CREATOR.createFromParcel(out);
+        IBinder got = back.getExtras().getBinder("binder");
+        boolean ok = "com.example.BROADCAST".equals(back.getAction()) && got == echo && "value".equals(back.getStringExtra("key")) && usable(got);
+        result(ok, name, ok ? "Intent extras' binder survived java -> rust -> java" : "action " + back.getAction() + ", binder " + got);
+        in.recycle();
+        out.recycle();
+    }
+
+    /// hasFileDescriptors: the codec says what Java says (Bundle.hasFileDescriptors / Intent.hasFileDescriptors) for a Bundle with no objects, with a binder, and with a file descriptor; and the descriptor
+    /// survives the codec (Java's Bundle read from the codec's output still has one).
+    static void checkDescriptors(String name, Binder echo) {
+        try {
+            Bundle fd = new Bundle();
+            fd.putParcelable("pfd", ParcelFileDescriptor.open(new File("/dev/null"), ParcelFileDescriptor.MODE_READ_ONLY));
+            Bundle[] bundles = {new Bundle(), bundleWith(echo), fd};
+            StringBuilder said = new StringBuilder();
+            boolean ok = true;
+            for (Bundle b : bundles) {
+                Parcel in = written(b);
+                int rust = rustHasFileDescriptors("android.os.Bundle", in);
+                in.setDataPosition(0);
+                Intent intent = new Intent("x").putExtras(b);
+                Parcel inIntent = written(intent);
+                int rustIntent = rustHasFileDescriptors("android.content.Intent", inIntent);
+                int java = b.hasFileDescriptors() ? 1 : 0;
+                said.append(java).append(rust).append(rustIntent).append(' ');
+                ok &= rust == java && rustIntent == (intent.hasFileDescriptors() ? 1 : 0);
+                in.recycle();
+                inIntent.recycle();
+            }
+            Parcel in = written(fd);
+            Parcel out = Parcel.obtain();
+            boolean copied = roundTripParcel("android.os.Bundle", in, out) == 0;
+            out.setDataPosition(0);
+            boolean kept = copied && Bundle.CREATOR.createFromParcel(out).hasFileDescriptors();
+            in.recycle();
+            out.recycle();
+            result(ok && kept, name, ok && kept ? "hasFileDescriptors (java rust-bundle rust-intent): " + said + "; the descriptor survives the codec" : "java/rust/rust-intent " + said + ", copied " + copied + ", kept " + kept + ", " + lastError());
+        } catch (java.io.FileNotFoundException e) {
+            result(false, name, "cannot open /dev/null: " + e);
+        }
     }
 
     static SharedLibraryInfo reparceled(SharedLibraryInfo s) {
@@ -381,15 +508,13 @@ public class ParcelTruth {
         byte[] wrong = roundTrip("android.content.res.CompatibilityInfo", bytes, MODE_PLAIN);
         result(wrong == null && lastError().contains("stopped at byte"), "self-test:wrong-codec",
                 "Configuration bytes through CompatibilityInfo's codec: " + (wrong == null ? lastError() : "accepted"));
-        Intent extras = new Intent(intent).putExtra("k", 1);
-        byte[] refusedBytes = roundTrip("android.content.Intent", marshal(extras), MODE_PLAIN);
+        // ClipData is not modelled: refused, counted, and a line on stderr (xtask checks it)
+        Intent clip = new Intent(intent);
+        clip.setClipData(ClipData.newPlainText("label", "text"));
+        byte[] refusedBytes = roundTrip("android.content.Intent", marshal(clip), MODE_PLAIN);
         String counters = refused();
-        result(refusedBytes == null && counters.contains("android.content.Intent.extras="), "self-test:refusal",
-                "Intent extras refused and counted: " + counters.replace('\n', ' ').trim());
-        // a descriptor object in the body: refused and counted, not copied
-        byte[] fdBytes = roundTrip("android.os.Bundle", marshal(entries), MODE_DESCRIPTOR);
-        result(fdBytes == null && refused().contains("android.os.Bundle (file descriptor or binder)="), "self-test:bundle-fd",
-                "descriptor in the Bundle body: " + (fdBytes == null ? lastError() : "accepted"));
+        result(refusedBytes == null && counters.contains("android.content.Intent.clipData="), "self-test:refusal",
+                "Intent ClipData refused and counted: " + counters.replace('\n', ' ').trim());
         // mHasIntent 2: Java writes 0 or 1 only (writeBoolean), so the codec refuses the value and names the field
         byte[] flag = marshal(entries);
         ByteBuffer.wrap(flag).order(ByteOrder.nativeOrder()).putInt(flag.length - 4, 2);

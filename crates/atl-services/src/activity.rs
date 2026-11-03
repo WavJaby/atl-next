@@ -18,6 +18,7 @@ use atl_aidl::aidl::android::app::IActivityManager::{EnforcePermission, IActivit
 use atl_aidl::aidl::android::app::IApplicationThread::IApplicationThread;
 use atl_aidl::aidl::android::app::IInstrumentationWatcher::IInstrumentationWatcher;
 use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnection;
+use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
@@ -59,6 +60,10 @@ const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 /// Intent.FLAG_ACTIVITY_NEW_TASK, set on a launcher start.
 const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+/// Intent.FLAG_RECEIVER_BOOT_UPGRADE (Intent.java:7647): refused in a broadcast from an app.
+const FLAG_RECEIVER_BOOT_UPGRADE: i32 = 0x0200_0000;
+/// ActivityManager.BROADCAST_SUCCESS (ActivityManager.java:639).
+const BROADCAST_SUCCESS: i32 = 0;
 /// The locale of the global configuration until the platform layer supplies the desktop's: what Android uses when neither `persist.sys.locale` nor `ro.product.locale` is set (LocaleList's default,
 /// `Locale.US`). A started app needs at least one: ActivityThread.handleBindApplication calls `LocaleList.setDefault(config.getLocales())`, which throws on an empty list.
 const DEFAULT_LOCALE: &str = "en-US";
@@ -239,6 +244,10 @@ fn security(msg: &str) -> Status {
 
 fn illegal_state(msg: &str) -> Status {
     Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(msg))
+}
+
+fn illegal_argument(msg: &str) -> Status {
+    Status::new_exception_str(ExceptionCode::ILLEGAL_ARGUMENT, Some(msg))
 }
 
 impl ActivityManager {
@@ -804,7 +813,10 @@ impl IActivityManager for ActivityManager {
                 ThreadState::get_calling_pid()
             )));
         }
-        // :14464 `arguments.hasFileDescriptors()`: the Bundle codec refuses a body with a descriptor or binder object (counted), so none reaches here
+        // :14462-14464 refuse possible leaked file descriptors
+        if arguments.is_some_and(Bundle::has_file_descriptors) {
+            return Err(illegal_argument("File descriptors passed in Bundle"));
+        }
         let no_restart = flags & INSTR_FLAG_NO_RESTART != 0;
         if flags & INSTR_FLAG_NO_RESTART != 0 {
             return Err(counters::unimplemented(
@@ -924,12 +936,15 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.addInstrumentationResults (:14831-14850): the results of the instrumentation running in `target`'s process join its current results (:14815-14829, putAll); a process with no
-    /// instrumentation is logged and ignored. A results Bundle with a file descriptor is refused by the codec before it gets here (:14834).
+    /// instrumentation is logged and ignored. A results Bundle with a file descriptor is refused first (:14834-14836, IllegalArgumentException).
     fn r#addInstrumentationResults(
         &self,
         target: Option<&Strong<dyn IApplicationThread>>,
         results: Option<&Bundle>,
     ) -> binder::Result<()> {
+        if results.is_some_and(Bundle::has_file_descriptors) {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
         let mut st = self.inner.state();
         let Some(pid) = target.and_then(|t| Inner::record_for_thread(&st, t)) else {
             log(format_args!(
@@ -960,13 +975,16 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.finishInstrumentation (:14917-14932) -> finishInstrumentationLocked: the final report goes to the watcher, and the instrumented package is stopped
-    /// (killed through the process control) unless it was started with no-restart.
+    /// (killed through the process control) unless it was started with no-restart. Results with a file descriptor are refused first (:14921-14923, IllegalArgumentException).
     fn r#finishInstrumentation(
         &self,
         target: Option<&Strong<dyn IApplicationThread>>,
         result_code: i32,
         results: Option<&Bundle>,
     ) -> binder::Result<()> {
+        if results.is_some_and(Bundle::has_file_descriptors) {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
         let inner = &self.inner;
         let pids = {
             let mut st = inner.state();
@@ -978,6 +996,48 @@ impl IActivityManager for ActivityManager {
         };
         inner.kill(&pids);
         Ok(())
+    }
+
+    /// ActivityManagerService.broadcastIntentWithFeature:14402 -> BroadcastController.broadcastIntentWithFeature:710-754: the Intent is verified as verifyBroadcastLocked does (:1878-1905: a null
+    /// Intent is a NullPointerException (`intent.getFlags()`), a file descriptor in the extras and FLAG_RECEIVER_BOOT_UPGRADE are IllegalArgumentExceptions), then broadcastIntentLocked would queue it for the
+    /// receivers. M2 / CTS minimum: no receiver is registered (registerReceiver is not implemented) and no manifest receiver is resolved, so every broadcast reaches nobody and the result is
+    /// BROADCAST_SUCCESS, as broadcastIntentLocked returns for a broadcast with no receivers; counted. Not modelled: the isolated-caller check (:715), the permission regimes of the options Bundle (:726),
+    /// the permission and app-op filters, sticky storage, the ordered result to `resultTo`.
+    fn r#broadcastIntentWithFeature(
+        &self,
+        _caller: Option<&Strong<dyn IApplicationThread>>,
+        _calling_feature_id: Option<&str>,
+        intent: Option<&Intent>,
+        _resolved_type: Option<&str>,
+        _result_to: Option<&Strong<dyn IIntentReceiver>>,
+        _result_code: i32,
+        _result_data: Option<&str>,
+        _result_extras: Option<&Bundle>,
+        _required_permissions: Option<&[Option<String>]>,
+        _excluded_permissions: Option<&[Option<String>]>,
+        _excluded_packages: Option<&[Option<String>]>,
+        _app_op: i32,
+        _options: Option<&Bundle>,
+        _serialized: bool,
+        _sticky: bool,
+        _user_id: i32,
+    ) -> binder::Result<i32> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("broadcastIntent: null Intent"),
+            ));
+        };
+        if intent.has_file_descriptors() {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
+        if intent.flags & FLAG_RECEIVER_BOOT_UPGRADE != 0 {
+            return Err(illegal_argument(
+                "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
+            ));
+        }
+        counters::count(AM, "broadcastIntentWithFeature (no receivers: dropped)");
+        Ok(BROADCAST_SUCCESS)
     }
 }
 

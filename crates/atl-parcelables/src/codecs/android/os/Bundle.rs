@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! android.os.Bundle: os/Bundle.java writeToParcel -> BaseBundle.writeToParcelInner (BaseBundle.java:1838-1882) / Bundle(Parcel) -> BaseBundle.readFromParcelInner (BaseBundle.java:1889-1945).
 //! Wire: int32 length; 0 is the empty Bundle and nothing more. Else int32 magic (BUNDLE_MAGIC 'BNDL', or BUNDLE_MAGIC_NATIVE 'BNDN' when native code parcelled it, BaseBundle.java:60-61), `length` bytes of body (the ArrayMap of entries), int32 mHasIntent (writeBoolean: 0 or 1).
-//! The body is a blob, copied verbatim and never parsed. A body that holds a binder or file descriptor is refused and counted: the object would be lost from the bytes. The copy is made as a parcel and marshalled, and Parcel::marshal refuses objects (patches/aosp/frameworks/native/0004).
-//! AMS refuses the same in instrumentation results: ActivityManagerService.java:14917-14923 (finishInstrumentation, results.hasFileDescriptors()).
+//! The body is kept as a sub-Parcel: BaseBundle.writeToParcelInner appends mParcelledData (`parcel.appendFrom(mParcelledData, 0, length)`), readFromParcelInner appends the range into a scratch parcel, so a body holds its binder and file descriptor objects
+//! as AOSP's Bundles do (androidx puts a binder in broadcast extras). The codec copies the range with `append_from` (Parcel::appendFrom: bytes and object table entries, descriptors dup'd) and writes it back the same way: byte- and object-exact, never parsed.
+//! Descriptors are not refused here. AOSP refuses them where it takes a Bundle from an app (`hasFileDescriptors()` in ActivityManagerService / BroadcastController: [`Bundle::has_file_descriptors`]); the services do the same at those call sites.
+//! `entries` / `put_all` need the body as bytes and refuse (counted) a body with objects (Parcel::marshal, patches/aosp/frameworks/native/0004); `Bundle` has no `PartialEq`: a body with objects has no bytes to compare.
+
+use std::sync::{Mutex, MutexGuard};
 
 use binder::StatusCode;
 use binder::binder_impl::Parcel;
@@ -11,62 +15,82 @@ use crate::parcel::*;
 use crate::parts::*;
 
 /// BaseBundle.BUNDLE_MAGIC and BUNDLE_MAGIC_NATIVE (BaseBundle.java:60-61): the reader takes either, the writer writes back the one it read.
-const BUNDLE_MAGIC: i32 = 0x4C44_4E42;
+pub const BUNDLE_MAGIC: i32 = 0x4C44_4E42;
 const BUNDLE_MAGIC_NATIVE: i32 = 0x4C44_4E44;
 
-/// android.os.Bundle as its blob. `Default` is the empty Bundle: length 0 and nothing else.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// android.os.Bundle as its parcelled form. `Default` is the empty Bundle: length 0 and nothing else.
+#[derive(Debug, Clone, Default)]
 pub struct Bundle {
     /// BUNDLE_MAGIC or BUNDLE_MAGIC_NATIVE; 0 when the body is empty.
-    pub magic: i32,
-    /// The map's bytes, verbatim; a multiple of 4; empty = the empty Bundle.
-    pub body: Vec<u8>,
+    magic: i32,
+    /// The map's bytes and object table, as read; data size a multiple of 4; size 0 = the empty Bundle.
+    body: Body,
     /// mHasIntent. Java writes 0 or 1 only, so the codec refuses any other value.
-    pub has_intent: bool,
+    has_intent: bool,
+}
+
+/// A body Parcel behind a lock: a Parcel is `Send` but not `Sync` (its cursor is mutable state), and the generated AIDL stubs' async traits need every `&` argument to be `Sync`.
+/// The codec only reads a body (`get_data_size`, `marshal`, `append_from` out of it); the lock serialises those.
+#[derive(Debug, Default)]
+struct Body(Mutex<Parcel>);
+
+impl Body {
+    fn new(parcel: Parcel) -> Self {
+        Body(Mutex::new(parcel))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Parcel> {
+        // a poisoned lock still guards a whole Parcel: no body code panics half-way through a call
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Clone for Body {
+    fn clone(&self) -> Self {
+        Body::new(self.lock().clone())
+    }
 }
 
 impl Part for Bundle {
     fn write(&self, p: &mut In<'_>) -> Result<()> {
-        if self.body.is_empty() {
+        let body = self.body.lock();
+        let length = body.get_data_size();
+        if length == 0 {
             return w_i32(p, 0);
         }
-        if !matches!(self.magic, BUNDLE_MAGIC | BUNDLE_MAGIC_NATIVE)
-            || !self.body.len().is_multiple_of(4)
-        {
+        if !matches!(self.magic, BUNDLE_MAGIC | BUNDLE_MAGIC_NATIVE) || length % 4 != 0 {
             return Err(StatusCode::BAD_VALUE);
         }
-        w_i32(p, len_i32(self.body.len())?)?;
+        w_i32(p, length)?;
         w_i32(p, self.magic)?;
-        for w in self.body.as_chunks::<4>().0 {
-            w_i32(p, i32::from_ne_bytes(*w))?;
-        }
+        p.append_from(&*body, 0, length)?;
         w_bool(p, self.has_intent)
     }
 
     fn read(p: &In<'_>) -> Result<Self> {
         let length = r_i32(p)?;
-        if length == 0 {
-            return Ok(Bundle::default());
-        }
-        if length < 0 || length % 4 != 0 {
+        if length < 0 {
             return Err(crate::refuse("android.os.Bundle (length)"));
         }
-        let magic = r_i32(p)?;
-        if magic != BUNDLE_MAGIC && magic != BUNDLE_MAGIC_NATIVE {
-            return Err(crate::refuse("android.os.Bundle (magic)"));
-        }
-        let body = read_body(p, length)?;
-        let has_intent = match r_i32(p)? {
-            0 => false,
-            1 => true,
-            _ => return Err(crate::refuse("android.os.Bundle.mHasIntent")),
-        };
-        Ok(Bundle {
-            magic,
-            body,
-            has_intent,
-        })
+        Bundle::read_after_length(p, length)
     }
+}
+
+/// Parcel.writeBundle: -1 for null, else the Bundle's own writeToParcel.
+pub fn w_bundle(p: &mut In<'_>, v: &Option<Bundle>) -> Result<()> {
+    match v {
+        None => w_null(p),
+        Some(b) => b.write(p),
+    }
+}
+
+/// Parcel.readBundle: a negative length is null (Parcel.java readBundle: `if (length < 0) return null`), else the Bundle.
+pub fn r_bundle(p: &In<'_>) -> Result<Option<Bundle>> {
+    let length = r_i32(p)?;
+    if length < 0 {
+        return Ok(None);
+    }
+    Bundle::read_after_length(p, length).map(Some)
 }
 
 /// A Bundle value of the kinds a service makes or merges (Parcel.writeValue's VAL_STRING, VAL_INTEGER, VAL_LONG, VAL_BOOLEAN, VAL_NULL).
@@ -156,12 +180,70 @@ fn put_string(out: &mut Vec<u8>, s: &Option<String>) {
 }
 
 impl Bundle {
+    /// The rest of a Bundle whose `length` (a non-negative int32) was read: BaseBundle.readFromParcelInner(Parcel, length).
+    fn read_after_length(p: &In<'_>, length: i32) -> Result<Bundle> {
+        if length == 0 {
+            return Ok(Bundle::default());
+        }
+        if length % 4 != 0 {
+            return Err(crate::refuse("android.os.Bundle (length)"));
+        }
+        let magic = r_i32(p)?;
+        if magic != BUNDLE_MAGIC && magic != BUNDLE_MAGIC_NATIVE {
+            return Err(crate::refuse("android.os.Bundle (magic)"));
+        }
+        // the body's range with its object table entries (descriptors dup'd), then skipped in the source
+        let start = p.get_data_position();
+        let mut body = Parcel::new();
+        body.append_from(p, start, length)?;
+        p.set_data_position_checked(start + length)?;
+        let has_intent = match r_i32(p)? {
+            0 => false,
+            1 => true,
+            _ => return Err(crate::refuse("android.os.Bundle.mHasIntent")),
+        };
+        Ok(Bundle {
+            magic,
+            body: Body::new(body),
+            has_intent,
+        })
+    }
+
+    /// Bundle.hasFileDescriptors (Bundle.java:431-440): the parcelled data holds a file descriptor object. AOSP checks it before it takes a Bundle from an app, see the module doc.
+    pub fn has_file_descriptors(&self) -> bool {
+        self.body.lock().has_file_descriptors()
+    }
+
+    /// The body's bytes. A body with binder or file descriptor objects has none (Parcel::marshal refuses it): refused and counted.
+    fn body_bytes(&self) -> Result<Vec<u8>> {
+        self.body.lock().marshal().map_err(|e| {
+            if e == StatusCode::INVALID_OPERATION {
+                crate::refuse(
+                    "android.os.Bundle (entries of a body with binder or file descriptor objects)",
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    /// A body parcel of `bytes`: object-free, written as words in native order (the codec runs on little-endian hosts only, see `Words`).
+    fn parcel_of(bytes: &[u8]) -> Parcel {
+        let mut body = Parcel::new();
+        for w in bytes.as_chunks::<4>().0 {
+            body.write(&i32::from_ne_bytes(*w))
+                .expect("writing an int to a new Parcel");
+        }
+        body
+    }
+
     /// The entries of the map body, in order. A value of a kind outside [`Value`] (a nested Bundle, an array, a Parcelable...) is refused and counted: its length is not known without a codec for it.
     pub fn entries(&self) -> Result<Vec<(String, Value)>> {
-        if self.body.is_empty() {
+        if self.body.lock().get_data_size() == 0 {
             return Ok(Vec::new());
         }
-        let mut w = Words(&self.body);
+        let bytes = self.body_bytes()?;
+        let mut w = Words(&bytes);
         let n = w.i32()?;
         (0..n.max(0))
             .map(|_| {
@@ -221,7 +303,7 @@ impl Bundle {
         }
         Bundle {
             magic: BUNDLE_MAGIC,
-            body,
+            body: Body::new(Bundle::parcel_of(&body)),
             has_intent: false,
         }
     }
@@ -235,28 +317,12 @@ impl Bundle {
         )
     }
 
-    /// Bundle.putAll: `other`'s entries replace this one's of the same key. Refuses (counted) a Bundle with a value kind outside [`Value`]; this one is then unchanged.
+    /// Bundle.putAll: `other`'s entries replace this one's of the same key. Refuses (counted) a Bundle with a value kind outside [`Value`], or with binder or file descriptor objects; this one is then unchanged.
     pub fn put_all(&mut self, other: &Bundle) -> Result<()> {
         let merged = Bundle::from_entries(self.entries()?.into_iter().chain(other.entries()?));
         *self = merged;
         Ok(())
     }
-}
-
-/// The body's `length` bytes, copied out and skipped. The copy is a parcel, marshalled: a binder or file descriptor in the range is in its object table, and marshal refuses it (counted).
-fn read_body(p: &In<'_>, length: i32) -> Result<Vec<u8>> {
-    let start = p.get_data_position();
-    let mut copy = Parcel::new();
-    copy.append_from(p, start, length)?;
-    let body = copy.marshal().map_err(|e| {
-        if e == StatusCode::INVALID_OPERATION {
-            crate::refuse("android.os.Bundle (file descriptor or binder)")
-        } else {
-            e
-        }
-    })?;
-    p.set_data_position_checked(start + length)?;
-    Ok(body)
 }
 
 crate::codec!(Bundle);

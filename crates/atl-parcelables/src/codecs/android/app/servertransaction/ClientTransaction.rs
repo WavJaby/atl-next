@@ -8,12 +8,12 @@ use crate::parts::*;
 /// The item classes modelled, by `getClass().getName()`.
 const LAUNCH_ACTIVITY_ITEM: &str = "android.app.servertransaction.LaunchActivityItem";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum ClientTransactionItem {
     LaunchActivity(LaunchActivityItem),
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientTransaction {
     /// mTransactionItems; None = a null item
     pub items: Vec<Option<ClientTransactionItem>>,

@@ -2,6 +2,7 @@
 //! JNI library of `xtask test parcel` (ParcelTruth.java, xtask/testdata/parcel): `roundTrip(class, bytes, mode)` decodes a Java Parcel's marshalled bytes with atl-parcelables' codec of
 //! that class, requires every byte consumed, re-encodes, and returns the bytes; `lastError()` says why it returned null; `refused()` lists atl-parcelables' refusal counters.
 //! Bytes enter and leave AOSP's C++ Parcel through libbinder_ndk's AParcel_unmarshal / AParcel_marshal, the libbinder_rs parcel the codecs work on. Test-only, never shipped.
+//! `roundTripParcel(class, in, out)` and `rustHasFileDescriptors(class, in)` work on Java `Parcel` objects themselves (AParcel_fromJavaParcel: a view of the Parcel's android::Parcel), since marshalled bytes carry no binder or descriptor objects.
 //! JNI is reached through the JNIEnv function table by index (libnativehelper/include_jni/jni.h struct JNINativeInterface, stable since JNI 1.1).
 #![cfg(feature = "converter")]
 #![allow(non_snake_case)]
@@ -24,25 +25,23 @@ use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
-use binder::ParcelFileDescriptor;
-use binder::binder_impl::{Parcel, UnstructuredParcelable};
+use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
 
-/// `roundTrip` modes: as is, the re-encoded first byte flipped (ParcelTruth.java's check that a wrong encoding fails the comparison), or
-/// a Bundle's body with a file descriptor object appended (MODE_DESCRIPTOR, see `with_descriptor_in_body`).
+/// `roundTrip` modes: as is, or the re-encoded first byte flipped (ParcelTruth.java's check that a wrong encoding fails the comparison).
 const MODE_PLAIN: i32 = 0;
 const MODE_CORRUPT: i32 = 1;
-const MODE_DESCRIPTOR: i32 = 2;
 /// java.io.FileDescriptor only: the codec writes a descriptor and reads it back (`fd_self_test`).
 const MODE_FD_SELF: i32 = 3;
 /// android.os.Bundle only: the input holds two marshalled Bundles, A then B; the result is A with `putAll(B)` (`put_all_test`).
 const MODE_PUT_ALL: i32 = 4;
-/// ParcelFileDescriptor's leading int32s: the non-null flag and the comm-channel count (ndk/parcel.cpp, Parcel.cpp).
-const PFD_LEAD: i32 = 8;
 
 unsafe extern "C" {
     fn AParcel_marshal(parcel: *const AParcel, buffer: *mut u8, start: usize, len: usize) -> i32;
     fn AParcel_unmarshal(parcel: *mut AParcel, buffer: *const u8, len: usize) -> i32;
+    /// libbinder_ndk (binder_parcel_jni.h): a non-owning AParcel over a Java Parcel's own android::Parcel, so reads and writes act on Java's parcel, binder and descriptor objects included.
+    fn AParcel_fromJavaParcel(env: *mut *const *const c_void, parcel: *mut c_void) -> *mut AParcel;
+    fn AParcel_delete(parcel: *mut AParcel);
 }
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
@@ -107,40 +106,48 @@ fn round_trip_map(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
     finish(&out, mode)
 }
 
-/// Java's marshalled non-empty Bundle with one file descriptor object appended to its body, as [length][magic][body][descriptor][has_intent]:
-/// Java's marshall() keeps no objects, so the object is built here, and the codec meets it in the body.
-fn with_descriptor_in_body(input: &[u8]) -> Result<Parcel, String> {
-    let p = unmarshal(input)?;
-    let len: i32 = p
-        .borrowed_ref()
-        .read()
-        .map_err(|e| format!("length: {e:?}"))?;
-    let magic: i32 = p
-        .borrowed_ref()
-        .read()
-        .map_err(|e| format!("magic: {e:?}"))?;
-    let body = p.get_data_position();
-    let has_intent = i32::from_ne_bytes(*input.last_chunk::<4>().ok_or("no mHasIntent")?);
-    // the object's length: what a ParcelFileDescriptor writes after its PFD_LEAD bytes
-    let mut descriptor = Parcel::new();
-    let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
-    descriptor
-        .borrowed()
-        .write(&ParcelFileDescriptor::new(null))
-        .map_err(|e| format!("descriptor: {e:?}"))?;
-    let object = descriptor.get_data_size() - PFD_LEAD;
-    let mut out = Parcel::new();
-    let put =
-        |r: Result<(), binder::StatusCode>| r.map_err(|e| format!("building the Bundle: {e:?}"));
-    put(out.borrowed().write(&(len + object)))?;
-    put(out.borrowed().write(&magic))?;
-    put(out.append_from(&p, body, len))?;
-    put(out.append_from(&descriptor, PFD_LEAD, object))?;
-    put(out.borrowed().write(&has_intent))?;
-    // the writes left the position at the end: the decoder reads from the start
-    out.set_data_position_checked(0)
-        .map_err(|e| format!("rewind: {e:?}"))?;
-    Ok(out)
+/// Decode with T's codec from the Java parcel `src` (every byte consumed), then encode into `dst`: binder and descriptor objects travel with the bytes.
+fn copy_as<T: UnstructuredParcelable>(
+    src: &BorrowedParcel<'_>,
+    dst: &mut BorrowedParcel<'_>,
+) -> Result<(), String> {
+    let v = T::from_parcel(src).map_err(|e| format!("decode refused: {e:?}"))?;
+    if src.get_data_position() != src.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            src.get_data_position(),
+            src.get_data_size()
+        ));
+    }
+    v.write_to_parcel(dst)
+        .map_err(|e| format!("encode refused: {e:?}"))
+}
+
+/// The codec of `class` over Java parcels (see `Java_ParcelTruth_roundTripParcel`).
+fn copy_class(
+    class: &str,
+    src: &BorrowedParcel<'_>,
+    dst: &mut BorrowedParcel<'_>,
+) -> Result<(), String> {
+    match class {
+        "android.os.Bundle" => copy_as::<Bundle>(src, dst),
+        "android.content.Intent" => copy_as::<Intent>(src, dst),
+        _ => Err(format!("no parcel-copy codec for {class}")),
+    }
+}
+
+/// Whether the codec's decoded `class` value reports file descriptors (Bundle / Intent `has_file_descriptors`).
+fn has_file_descriptors(class: &str, src: &BorrowedParcel<'_>) -> Result<bool, String> {
+    let refused = |e: binder::StatusCode| format!("decode refused: {e:?}");
+    match class {
+        "android.os.Bundle" => Bundle::from_parcel(src)
+            .map(|b| b.has_file_descriptors())
+            .map_err(refused),
+        "android.content.Intent" => Intent::from_parcel(src)
+            .map(|i| i.has_file_descriptors())
+            .map_err(refused),
+        _ => Err(format!("no codec with has_file_descriptors for {class}")),
+    }
 }
 
 /// The re-encoded bytes, corrupted in MODE_CORRUPT.
@@ -216,14 +223,6 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             _ => Err(format!(
                 "MODE_FD_SELF tests java.io.FileDescriptor, not {class}"
             )),
-        };
-    }
-    if mode == MODE_DESCRIPTOR {
-        return match class {
-            "android.os.Bundle" => {
-                decode_as::<Bundle>(&with_descriptor_in_body(input)?, MODE_PLAIN)
-            }
-            _ => Err(format!("MODE_DESCRIPTOR builds a Bundle, not {class}")),
         };
     }
     match class {
@@ -383,6 +382,89 @@ pub unsafe extern "C" fn Java_ParcelTruth_roundTrip(
         Err(e) => {
             set_error(e);
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// Runs `f` on a view of the Java Parcel `a` (AParcel_fromJavaParcel): the Parcel's own data and object table are read and written, not a copy. `Err` if `a` is not a Parcel.
+///
+/// # Safety
+/// `env` is the JNIEnv ART passed to this thread's native method; `a` is a local reference to an android.os.Parcel (or null) that stays valid for the call, and nothing else uses the Parcel meanwhile.
+unsafe fn with_java_parcel<T>(
+    env: JniEnv,
+    a: JObject,
+    f: impl FnOnce(&mut BorrowedParcel<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    // SAFETY: the caller's guarantees; the view is non-owning and deleted below, before the reference ends
+    let pa = unsafe { AParcel_fromJavaParcel(env, a) };
+    // SAFETY: the view is null or a valid AParcel; the caller owns the Parcel exclusively for the call
+    let result = match unsafe { BorrowedParcel::from_raw(pa) } {
+        Some(mut view) => f(&mut view),
+        None => Err("not an android.os.Parcel".to_owned()),
+    };
+    // SAFETY: made above and not used after this (deleting null is a no-op)
+    unsafe { AParcel_delete(pa) };
+    result
+}
+
+/// `static native int roundTripParcel(String className, Parcel in, Parcel out)`: decodes the value at `in`'s position with the codec of `className`, every byte of `in` consumed, and encodes it into `out`;
+/// 0 = done, -1 = failed (`lastError`). Unlike `roundTrip`, the Parcels are Java's own, so binder and file descriptor objects reach the codec and come back out.
+///
+/// # Safety
+/// Called by ART as that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_ParcelTruth_roundTripParcel(
+    env: JniEnv,
+    _class: JObject,
+    class: JObject,
+    input: JObject,
+    output: JObject,
+) -> i32 {
+    // SAFETY: ART's arguments to this native method
+    let class = unsafe { string(env, class) };
+    let Some(class) = class else {
+        set_error("null class".to_owned());
+        return -1;
+    };
+    // SAFETY: as above; `input` and `output` are two different Parcels
+    let result = unsafe {
+        with_java_parcel(env, input, |src| {
+            with_java_parcel(env, output, |dst| copy_class(&class, src, dst))
+        })
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// `static native int rustHasFileDescriptors(String className, Parcel in)`: the codec's `has_file_descriptors` of the value decoded at `in`'s position: 1 or 0, -1 = failed (`lastError`).
+///
+/// # Safety
+/// Called by ART as that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_ParcelTruth_rustHasFileDescriptors(
+    env: JniEnv,
+    _class: JObject,
+    class: JObject,
+    input: JObject,
+) -> i32 {
+    // SAFETY: ART's arguments to this native method
+    let class = unsafe { string(env, class) };
+    let Some(class) = class else {
+        set_error("null class".to_owned());
+        return -1;
+    };
+    // SAFETY: as above
+    let result = unsafe { with_java_parcel(env, input, |src| has_file_descriptors(&class, src)) };
+    match result {
+        Ok(has) => i32::from(has),
+        Err(e) => {
+            set_error(e);
+            -1
         }
     }
 }

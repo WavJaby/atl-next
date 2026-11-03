@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 4 Nov 2026 00:47:28 +0800
+Subject: [PATCH] libbinder_ndk, libbinder_rs: AParcel_hasFileDescriptors and
+ Parcel::has_file_descriptors
+
+ActivityManagerService refuses an Intent or Bundle that holds file
+descriptors (`intent.hasFileDescriptors()`, Parcel.hasFileDescriptors).
+libbinder_ndk's platform API has only the getter AParcel_getAllowFds,
+so a Rust service holding a Bundle's parcel cannot tell a descriptor
+from a binder object (Parcel::marshal refuses both alike). Add the
+matching platform getter beside it and the safe wrapper.
+
+Upstream-Status: Pending
+Patch-Reason: AParcel wraps android::Parcel privately and the platform API has no descriptor query; android::Parcel::hasFileDescriptors is reachable from our unsafe-free crates only through libbinder_rs, which this extends the way patch 0004 does
+---
+SPDX-License-Identifier: Apache-2.0
+ .../include_platform/android/binder_parcel_platform.h |  6 ++++++
+ libs/binder/ndk/libbinder_ndk.map.txt                 |  1 +
+ libs/binder/ndk/parcel.cpp                            |  4 ++++
+ libs/binder/rust/src/parcel.rs                        | 11 +++++++++++
+ 4 files changed, 22 insertions(+)
+
+diff --git a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+index b24094ef16c334f7000a82079c5ea3b1efe4cc7c..45bc91129f0e251f7b1042bd361a5bba7e058526 100644
+--- a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
++++ b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+@@ -31,6 +31,12 @@ __BEGIN_DECLS
+  */
+ bool AParcel_getAllowFds(const AParcel*);
+ 
++/**
++ * Gets whether or not this AParcel holds a file descriptor object (what
++ * android::Parcel::hasFileDescriptors reports, and Java's Parcel.hasFileDescriptors).
++ */
++bool AParcel_hasFileDescriptors(const AParcel*);
++
+ #endif
+ 
+ /**
+diff --git a/libs/binder/ndk/libbinder_ndk.map.txt b/libs/binder/ndk/libbinder_ndk.map.txt
+index d4eb8c7579db343b8166b2df164a8cc073f8885c..41b74a8c7a1f44f06957498e18f0142e08533768 100644
+--- a/libs/binder/ndk/libbinder_ndk.map.txt
++++ b/libs/binder/ndk/libbinder_ndk.map.txt
+@@ -225,6 +225,7 @@ LIBBINDER_NDK36 { # introduced=36
+ LIBBINDER_NDK_PLATFORM {
+   global:
+     AParcel_getAllowFds;
++    AParcel_hasFileDescriptors;
+     extern "C++" {
+         AIBinder_fromPlatformBinder*;
+         AIBinder_toPlatformBinder*;
+diff --git a/libs/binder/ndk/parcel.cpp b/libs/binder/ndk/parcel.cpp
+index 88ce5f4d9b6f37dc4583a03000e09ae97e4adaa8..f3b34758c5552bb789095174b76860b51b8523eb 100644
+--- a/libs/binder/ndk/parcel.cpp
++++ b/libs/binder/ndk/parcel.cpp
+@@ -679,6 +679,10 @@ bool AParcel_getAllowFds(const AParcel* parcel) {
+     return parcel->get()->allowFds();
+ }
+ 
++bool AParcel_hasFileDescriptors(const AParcel* parcel) {
++    return parcel->get()->hasFileDescriptors();
++}
++
+ binder_status_t AParcel_reset(AParcel* parcel) {
+     parcel->get()->freeData();
+     return STATUS_OK;
+diff --git a/libs/binder/rust/src/parcel.rs b/libs/binder/rust/src/parcel.rs
+index 66049bb750f9b81a1c2744003ff62bb85e77fc6f..e85b78e50dc0aaff801aade16e616e503410d172 100644
+--- a/libs/binder/rust/src/parcel.rs
++++ b/libs/binder/rust/src/parcel.rs
+@@ -303,6 +303,12 @@ impl BorrowedParcel<'_> {
+         status_result(unsafe { sys::AParcel_setDataPosition(self.as_native(), pos) })
+     }
+ 
++    /// Whether the parcel holds a file descriptor object (`Parcel::hasFileDescriptors`).
++    pub fn has_file_descriptors(&self) -> bool {
++        // Safety: `BorrowedParcel` always contains a valid pointer to an `AParcel`, and this call only reads it.
++        unsafe { sys::AParcel_hasFileDescriptors(self.as_native()) }
++    }
++
+     /// Moves the position to `pos`, which must lie within the data (0 up to the data size); any other `pos` is BAD_VALUE.
+     /// The bound that `set_data_position` leaves to its caller is checked here.
+     pub fn set_data_position_checked(&self, pos: i32) -> Result<()> {
+@@ -435,6 +441,11 @@ impl Parcel {
+         self.borrowed_ref().set_data_position_checked(pos)
+     }
+ 
++    /// See [`BorrowedParcel::has_file_descriptors`].
++    pub fn has_file_descriptors(&self) -> bool {
++        self.borrowed_ref().has_file_descriptors()
++    }
++
+     /// Append a subset of another parcel.
+     ///
+     /// This appends `size` bytes of data from `other` starting at offset

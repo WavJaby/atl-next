@@ -4,7 +4,8 @@
 //!    Two runs: as built (must exit 0), then told to expect one int32 more than Parcel's encoding gives (must fail naming the byte count), so the probe's check is shown to fire.
 //! 2. java: atl-parcelables' codecs against Java's own Parcelables on host ART (host_art.rs; framework.jar from --java-out): ParcelTruth.java (xtask/testdata/parcel) marshals each M2 parcelable,
 //!    libatl_parcel_truth.so (crate atl-parcel-truth) decodes it with the codec (every byte consumed) and re-encodes; the bytes must be equal, and Java must read the Rust bytes back to the
-//!    same bytes. Every case in [`CASES`] must report pass, including the self-tests that make a corrupted encoding, a wrong codec and an unmodelled value fail.
+//!    same bytes. Bundles and Intent extras with objects go through Java's own Parcels instead (`roundTripParcel`: the codec reads and writes the Parcel's data and object table): a binder comes back the same object and answers,
+//!    `hasFileDescriptors` agrees with Java's. Every case in [`CASES`] must report pass, including the self-tests that make a corrupted encoding, a wrong codec and an unmodelled value fail; the refusal of the last also has to be a stderr line.
 //!    Needs the converter's ART in --out: `xtask native ... libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain`.
 //! 3. permission hook: `atl-aidl-probe --enforce` (the aidl patch's @EnforcePermission hook): a denying hook returns SECURITY and the method body never runs; an allowing one runs it.
 //!
@@ -56,13 +57,14 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_APP_START (system/core/libcutils/include/private/android_filesystem_config.h), the first app uid, as an app process has.
 const AID_APP_START: u32 = 10000;
 /// Every line ParcelTruth.java prints, by case, in its order: a missing one fails the stage (a driver that stops early passes nothing). `summary` is its last line.
-const CASES: [&str; 26] = [
+const CASES: [&str; 29] = [
     "ApplicationInfo",
     "ActivityInfo",
     "Configuration",
     "CompatibilityInfo",
     "Intent",
     "Intent+selector",
+    "Intent:extras",
     "ProviderInfo",
     "ProviderInfoList",
     "ContentProviderHolder",
@@ -76,10 +78,12 @@ const CASES: [&str; 26] = [
     "Bundle",
     "Bundle:entries",
     "Bundle:put-all",
+    "Bundle:binder",
+    "Bundle:fd",
+    "Intent:binder-extras",
     "self-test:corrupt",
     "self-test:wrong-codec",
     "self-test:refusal",
-    "self-test:bundle-fd",
     "self-test:bundle-flag",
     "self-test:fd-read",
     "summary",
@@ -143,8 +147,8 @@ fn java_verdict(ok: bool, stdout: &str, failure: &str) -> (Vec<String>, Vec<Stri
     (passes, fails)
 }
 
-/// The line `atl_parcelables::refuse` writes to stderr for the Intent extras refusal that ParcelTruth's `self-test:refusal` provokes (once): `parcelables: refused <what> <n>`.
-const REFUSAL_LINE: &str = "parcelables: refused android.content.Intent.extras 1";
+/// The line `atl_parcelables::refuse` writes to stderr for the Intent ClipData refusal that ParcelTruth's `self-test:refusal` provokes (once): `parcelables: refused <what> <n>`.
+const REFUSAL_LINE: &str = "parcelables: refused android.content.Intent.clipData 1";
 
 /// A failure message when the refusal of the self-test is missing from the driver's stderr: refusals that show up only in a counter nobody prints are the failure this guards.
 fn refusal_logged(stderr: &str) -> Option<String> {
@@ -277,7 +281,9 @@ mod tests {
             None
         );
         assert!(refusal_logged("").is_some());
-        assert!(refusal_logged("parcelables: refused android.content.Intent.extras 2\n").is_some());
+        assert!(
+            refusal_logged("parcelables: refused android.content.Intent.clipData 2\n").is_some()
+        );
     }
 
     /// The Java verdict: all cases passed; a failed case, a missing case, and a crash after all passes each fail.

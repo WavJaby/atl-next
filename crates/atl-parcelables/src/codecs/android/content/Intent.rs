@@ -2,15 +2,17 @@
 //! android.content.Intent: content/Intent.java writeToParcel / readFromParcel.
 //! The creator-token block exists only while aconfig flag android.security.prevent_intent_redirect is on (`preventIntentRedirect()`): is_fixed_read_only, so framework.jar compiles
 //! the release's value in; the codec takes the same value from aconfig's evaluation of the release (crate::aconfig). `xtask test parcel` fails if framework.jar's value differs.
-//! Not modelled: clipData (present = refused), extras (Bundle: null only), creator-token nested intent keys (count > 0 = refused).
+//! extras is a Bundle (Intent.java writeToParcel: `out.writeBundle(mExtras)`), kept as the parcelled Bundle with its binder objects. Not modelled: clipData (present = refused), creator-token nested intent keys (count > 0 = refused).
+//! No `PartialEq`: a Bundle with binder objects has no bytes to compare.
 
 use binder::SpIBinder;
 
 use crate::aconfig::PREVENT_INTENT_REDIRECT;
+use crate::codecs::android::os::Bundle::{Bundle, r_bundle, w_bundle};
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Intent {
     pub action: Option<String>,
     /// mData as a StringUri's string
@@ -26,6 +28,8 @@ pub struct Intent {
     pub categories: Vec<Option<String>>,
     pub selector: Option<Box<Intent>>,
     pub content_user_hint: i32,
+    /// mExtras; None = null (an empty Bundle is `Some`: Intent.putExtra creates it on first use)
+    pub extras: Option<Bundle>,
     pub original_intent: Option<Box<Intent>>,
     /// mCreatorTokenInfo: Some(creator token) when present
     pub creator_token: Option<Option<SpIBinder>>,
@@ -48,7 +52,7 @@ impl Part for Intent {
         w_typed(p, &self.selector.as_deref().cloned())?;
         w_i32(p, 0)?; // clipData
         w_i32(p, self.content_user_hint)?;
-        w_null(p)?; // extras
+        w_bundle(p, &self.extras)?;
         w_typed(p, &self.original_intent.as_deref().cloned())?;
         if PREVENT_INTENT_REDIRECT {
             match &self.creator_token {
@@ -82,7 +86,7 @@ impl Part for Intent {
             return Err(crate::refuse("android.content.Intent.clipData"));
         }
         let content_user_hint = r_i32(p)?;
-        r_null(p, "android.content.Intent.extras")?;
+        let extras = r_bundle(p)?;
         let original_intent = r_typed::<Intent>(p)?.map(Box::new);
         let mut creator_token = None;
         if PREVENT_INTENT_REDIRECT && r_present(p)? {
@@ -107,9 +111,19 @@ impl Part for Intent {
             categories,
             selector,
             content_user_hint,
+            extras,
             original_intent,
             creator_token,
         })
+    }
+}
+
+impl Intent {
+    /// Intent.hasFileDescriptors (Intent.java:9360): the extras hold a file descriptor.
+    pub fn has_file_descriptors(&self) -> bool {
+        self.extras
+            .as_ref()
+            .is_some_and(Bundle::has_file_descriptors)
     }
 }
 
