@@ -13,9 +13,9 @@ import (
 func TestKotlinCommonSrcs(t *testing.T) {
 	g := javaTestGraph(t, map[string]string{
 		"kt/Android.bp": kotlinStdlib + `
-java_library_host { name: "mp", srcs: ["src/B.kt"], common_srcs: ["common/**/*.kt"], kotlincflags: ["-Xmulti-platform"] }
+java_library_host { name: "mp", srcs: ["src/B.kt"], common_srcs: ["common/**/*.kt"], exclude_common_srcs: ["common/p/Dropped.kt"], kotlincflags: ["-Xmulti-platform"] }
 `,
-		"kt/src/B.kt": "", "kt/common/p/C.kt": "", "kt/s.jar": "", "kt/s7.jar": "", "kt/s8.jar": "", "kt/a.jar": "",
+		"kt/src/B.kt": "", "kt/common/p/C.kt": "", "kt/common/p/Dropped.kt": "", "kt/s.jar": "", "kt/s7.jar": "", "kt/s8.jar": "", "kt/a.jar": "",
 	}, nil)
 	if n := g.jnode("mp", Host, "test"); n == nil {
 		t.Fatalf("no node: %v", g.problems)

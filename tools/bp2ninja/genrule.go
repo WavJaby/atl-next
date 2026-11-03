@@ -189,7 +189,8 @@ func (g *Graph) buildGenRule(n *Node) *genRule {
 			}
 			if f.obj != nil {
 				r.objs = append(r.objs, f.obj)
-			} else if f.gen == nil {
+			} else if f.gen == nil && !strings.HasPrefix(f.path, g.out+"/") {
+				// a file of the build (an app's package, a Java module's jar) is made by an edge, not in the tree yet
 				if _, err := os.Stat(g.abs(f.path)); err != nil {
 					fail("input %s does not exist", f.path)
 				}

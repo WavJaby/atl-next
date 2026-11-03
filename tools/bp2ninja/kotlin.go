@@ -110,10 +110,13 @@ func (g *Graph) kotlinc(n *jNode, out, hdr string, java, kt, srcjars, waits []st
 	implicit = append(implicit, g.abs(c.Kotlinc), g.abs(c.KotlinAbiGen))
 	// common_srcs: PathsForModuleSrc, listed in the module file after the module's own sources
 	var common []string
+	excludeCommon := g.excludeSet(n.mod.Dir, n.side, p.strs("exclude_common_srcs"), n.name)
 	for _, s := range p.strs("common_srcs") {
 		files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.name)
 		for _, f := range files {
-			common = append(common, g.abs(f.path))
+			if !excludeCommon[f.path] {
+				common = append(common, g.abs(f.path))
+			}
 		}
 	}
 	implicit = append(implicit, common...)

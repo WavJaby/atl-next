@@ -723,15 +723,6 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 		}
 		return files, true
 	}
-	// an android_app's generated R sources (aapt.go)
-	if name, tag := splitTag(s); tag == ".aapt.srcjar" {
-		if m := g.lookup(name, side); m != nil && m.Type == "android_app" {
-			if n := g.aaptSrcjar(m, side, from); n != nil {
-				return []srcFile{{path: n.rule.outs[0], root: g.genDir(n, ""), gen: n}}, true
-			}
-			return nil, false
-		}
-	}
 	// a Java module's outputs (base.go setOutputFiles): {.jar} its implementation and resources jar, {.hjar} its header jar,
 	// {.generated_srcjars} its generated sources (a java_aconfig_library's srcjar)
 	if name, tag := splitTag(s); (tag == ".jar" || tag == ".hjar" || tag == ".generated_srcjars") && g.java != nil {

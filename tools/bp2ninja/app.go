@@ -166,17 +166,11 @@ func (g *Graph) aaptLibs(n *jNode, s sdkSpec) aaptDeps {
 
 // frameworkResPackage is the framework-res dependency (frameworkResTag): its resource package, "" with a problem when it cannot be built.
 func (g *Graph) frameworkResPackage(from string) string {
-	m := g.lookup("framework-res", Device)
-	if m == nil {
-		g.problem("%s: device module framework-res not found", from)
-		g.notFound("framework-res")
+	n := g.jnode("framework-res", Device, from)
+	if n == nil || n.aapt == nil {
 		return ""
 	}
-	gn := g.aaptSrcjar(m, Device, from)
-	if gn == nil {
-		return ""
-	}
-	return gn.rule.outs[1]
+	return n.aapt.pkg
 }
 
 // aconfigPaths is getAconfigFilePaths: the static libraries' flag packages, then this module's flags_packages, each once.
@@ -725,15 +719,39 @@ func (g *Graph) androidApp(n *jNode) {
 	embed := g.effectiveSdkInt(min) >= 23 && p.boolean("use_embedded_native_libs", false)
 	// aaptBuildActions: platform_apis and the module SDK use non-SDK APIs; hasCode is srcs or static_libs
 	platformApis := p.boolean("platform_apis", false) || s.kind == "module"
-	srcs := g.javaSrcs(n, p.strs("srcs"))
-	hasCode := len(srcs.java)+len(srcs.kt)+len(srcs.srcjars)+len(srcs.gen) > 0 || len(p.strs("static_libs")) > 0
-	a := g.aaptBuild(n, aaptOpts{s: s, hasNoCode: !hasCode, usesNonSdkApis: platformApis, embedNative: embed})
-	if a.busybox {
+	a := g.aaptBuild(n, aaptOpts{s: s, hasNoCode: !g.hasCode(n), usesNonSdkApis: platformApis, embedNative: embed})
+	switch {
+	case n.name == "framework-res":
+		// dexBuildActions: framework-res has no code to compile (its srcs are resource inputs), so no classes and no dex
+	case a.busybox:
 		g.javaLibWith(n, javaExtra{classpath: []string{a.rJar}, combined: []string{a.rJar}})
-	} else {
+	default:
 		g.javaLibWith(n, javaExtra{srcjars: []string{a.srcjar}})
 	}
 	g.appPackage(n)
+}
+
+// hasCode is Module.hasCode (base.go): any file in srcs (of any kind: framework-res's are resource inputs) less exclude_srcs, or a static
+// library.
+func (g *Graph) hasCode(n *jNode) bool {
+	if len(n.props.strs("static_libs")) > 0 {
+		return true
+	}
+	exclude := g.excludeSet(n.mod.Dir, n.side, n.props.strs("exclude_srcs"), n.name)
+	for _, s := range n.props.strs("srcs") {
+		if isRef(s) {
+			if _, ok := g.javaSrcRef(n, s); ok {
+				return true
+			}
+		}
+		files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.name)
+		for _, f := range files {
+			if !exclude[f.path] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // appPackage is CreateAndSignAppPackage (without the signature) and jniBuildActions: merge_zips of the dex jar, the resource package and the

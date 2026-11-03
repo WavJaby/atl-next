@@ -15,8 +15,8 @@ use serde::Serialize;
 use crate::host_art::{self, HostArt};
 use crate::{farm, packages};
 
-/// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja aapt.go), unsigned.
-const FRAMEWORK_RES: &str = "gen/device/framework-res.aapt/framework-res.apk";
+/// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
+const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// The system fonts of the test layout (stand-in until the desktop's fonts come through the platform layer): ActivityThread.handleBindApplication loads `/system/etc/font_fallback.xml`
 /// (SystemFonts.FONTS_XML) and every file it names under `/system/fonts/` (SystemFonts.DEVICE_FONT_DIR), and Typeface needs a `sans-serif` family (Typeface.DEFAULT_FAMILY) to start.
 /// The one font in this tree that AOSP ships and licenses as Apache-2.0 with a Latin range, AOSP's own monospace font, serves as that family; the XML is FontListParser's format (fonts.xml's `<family name><font weight style>`).

@@ -267,7 +267,8 @@ java_library { name: "opt.lib", srcs: ["L.java"], sdk_version: "none", system_mo
 	ninja := g.java.b.String()
 	cur := filepath.Join(g.out, "device", "cur")
 	link := ninjaEdgeVars(ninja, filepath.Join(cur, "package-res.apk"))
-	fwRes := filepath.Join(g.out, "gen", "device", "framework-res.aapt", "framework-res.apk")
+	// frameworkResTag: the exportPackage of framework-res, its package-res.apk
+	fwRes := filepath.Join(g.out, "device", "framework-res", "package-res.apk")
 	if link == nil || !strings.Contains(link["flags"], " -I "+fwRes) {
 		t.Errorf("link %v lacks -I %s", link, fwRes)
 	}

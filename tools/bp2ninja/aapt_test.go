@@ -27,52 +27,68 @@ func TestAapt2Path(t *testing.T) {
 	}
 }
 
-func TestAaptSrcjar(t *testing.T) {
-	g := javaTestGraph(t, map[string]string{
+// framework-res is an android_app like any other, with the special cases Soong gives it: no code is compiled (its srcs are resource inputs), the
+// version name is the platform's, the apk holds only the resource package. Its `{.aapt.srcjar}` is the R.java of use_resource_processor: false.
+func TestFrameworkResApp(t *testing.T) {
+	g := javaTestGraph(t, appFixture(map[string]string{
 		"app/Android.bp": `
-android_app { name: "fw-res", sdk_version: "core_platform", aaptflags: ["--private-symbols", "x.y"], flags_packages: ["decl"] }
+android_app { name: "framework-res", use_resource_processor: false, sdk_version: "core_platform", srcs: [":arsc"], aaptflags: ["--private-symbols", "x.y"],
+    flags_packages: ["decl"], resource_zips: [":zips"] }
+filegroup { name: "arsc", srcs: ["x.arsc"] }
+filegroup { name: "zips", srcs: ["r.zip"] }
 aconfig_declarations { name: "decl", package: "com.x.flags", container: "system", srcs: ["f.aconfig"] }
-cc_binary_host { name: "aapt2", srcs: ["a.cc"] }
-python_binary_host { name: "manifest_fixer", main: "manifest_fixer.py", srcs: ["manifest_fixer.py"] }
 `,
-		"app/AndroidManifest.xml": "", "app/res/values/strings.xml": "", "app/res/.hidden": "", "app/res/drawable/a.png": "", "app/a.cc": "",
-		"app/f.aconfig": "", "app/manifest_fixer.py": "",
-	}, map[string]string{"RELEASE_ACONFIG_FLAG_DEFAULT_PERMISSION": "READ_WRITE", "RELEASE_ACONFIG_REQUIRE_ALL_READ_ONLY": "",
+		"app/AndroidManifest.xml": "", "app/res/values/strings.xml": "", "app/res/.hidden": "", "app/res/drawable/a.png": "", "app/x.arsc": "", "app/r.zip": "",
+		"app/f.aconfig": "", "frameworks/base/core/res/Android.bp": "", // this test defines framework-res itself
+	}), map[string]string{"RELEASE_ACONFIG_FLAG_DEFAULT_PERMISSION": "READ_WRITE", "RELEASE_ACONFIG_REQUIRE_ALL_READ_ONLY": "",
 		"RELEASE_PLATFORM_VERSION": "16"})
 	g.release.ValueSets = nil
-	files, ok := g.resolveSrc("app", Device, ":fw-res{.aapt.srcjar}", "test")
-	if !ok || len(files) != 1 || files[0].gen == nil {
+	files, ok := g.resolveSrc("app", Device, ":framework-res{.aapt.srcjar}", "test")
+	d := filepath.Join(g.out, "device", "framework-res")
+	if !ok || len(files) != 1 || files[0].path != filepath.Join(d, "gen", "android", "R.srcjar") {
 		t.Fatalf("files %+v ok %v problems %v", files, ok, g.problems)
 	}
-	n := files[0].gen
-	gd := g.genDir(n, "")
-	if files[0].path != filepath.Join(gd, "R.srcjar") {
-		t.Errorf("srcjar %s", files[0].path)
-	}
-	cmd := n.rule.cmd
+	ninja := g.java.b.String()
 	text := filepath.Join(g.out, "aconfig", "decl", "intermediate.txt")
 	// androidResourceGlob drops .hidden; one compile shard; feature flags from flags_packages
-	if want := "$(location aapt2) compile -o " + gd + "/aapt2/app/res --pseudo-localize --feature-flags @" + text + " app/res/drawable/a.png app/res/values/strings.xml"; !strings.Contains(cmd, want) {
-		t.Errorf("cmd lacks %q:\n%s", want, cmd)
+	flats := []string{filepath.Join(d, "aapt2", "app", "res", "drawable_a.png.flat"), filepath.Join(d, "aapt2", "app", "res", "values_strings.arsc.flat")}
+	cz := ninjaEdgeVars(ninja, flats[0])
+	if cz == nil || cz["cflags"] != "--pseudo-localize --feature-flags @"+text || cz["outdir"] != filepath.Join(d, "aapt2", "app", "res") ||
+		!strings.Contains(cz[""], flats[0]+" "+flats[1]+": aapt2compile "+g.abs("app/res/drawable/a.png")+" "+g.abs("app/res/values/strings.xml")) {
+		t.Errorf("compile %v", cz)
 	}
-	// manifest_fixer: Soong's args for framework-res (its ninja: "--extract-native-libs=true --targetSdkVersion  36 --minSdkVersion  36
-	// --replaceMaxSdkVersionPlaceholder  36 --raise-min-sdk-version"); this fixture has no srcs, so --has-no-code too
-	fixed := gd + "/manifest_fixer/AndroidManifest.xml"
-	if want := "$(location manifest_fixer) --extract-native-libs=true --targetSdkVersion 36 --minSdkVersion 36 --replaceMaxSdkVersionPlaceholder 36 --raise-min-sdk-version --has-no-code app/AndroidManifest.xml " + fixed; !strings.Contains(cmd, want) {
-		t.Errorf("cmd lacks %q:\n%s", want, cmd)
+	// manifest_fixer: the source has code (a srcs entry of any kind), so no --has-no-code; ManifestFixer's order of flags
+	fixed := filepath.Join(d, "manifest_fixer", "AndroidManifest.xml")
+	fix := ninjaEdgeVars(ninja, fixed)
+	if want := "--extract-native-libs=true --targetSdkVersion 36 --minSdkVersion 36 --replaceMaxSdkVersionPlaceholder 36 --raise-min-sdk-version"; fix == nil || fix["args"] != want {
+		t.Errorf("manifest_fixer %v, want args %q", fix, want)
 	}
-	if len(g.problems) > 0 {
-		t.Errorf("problems %v", g.problems)
+	// link: aaptflags, --enable-compact-entries, the fixed manifest, sdk levels (core_platform: the platform SDK), version code / name (framework-res: the
+	// platform version), --java; the resource zip's flata is an overlay
+	link := ninjaEdgeVars(ninja, filepath.Join(d, "package-res.apk"))
+	wantFlags := "--private-symbols x.y --enable-compact-entries --manifest " + fixed + " --min-sdk-version 36 --target-sdk-version 36 --version-code 36 --version-name 16" +
+		" --no-static-lib-packages --java " + filepath.Join(d, "gen", "aapt2", "R")
+	if link == nil || link["flags"] != wantFlags {
+		t.Fatalf("link %v, want flags %q", link, wantFlags)
 	}
-	// apk: merge_zips into <name>-unsigned.apk (combineApk), then aligned as signapk would
-	if want := "/bt/merge_zips " + gd + "/fw-res-unsigned.apk " + gd + "/aapt2/package-res.apk && /bt/zipalign -f -p 4 " + gd + "/fw-res-unsigned.apk " + gd + "/fw-res.apk"; !strings.Contains(cmd, want) {
-		t.Errorf("cmd lacks %q:\n%s", want, cmd)
+	flata := filepath.Join(d, "reszip.0.flata")
+	if want := "@" + filepath.Join(d, "aapt2", "res.list") + " -R @" + filepath.Join(d, "aapt2", "overlay.list") + " --feature-flags @" + text; link["inflags"] != want {
+		t.Errorf("link inputs %q, want %q", link["inflags"], want)
 	}
-	// link: aaptflags, --enable-compact-entries, the fixed manifest, sdk levels (core_platform: the platform SDK), version code / name, --java
-	if want := "link -o " + gd + "/aapt2/package-res.apk --private-symbols x.y --enable-compact-entries --manifest " + fixed + " --min-sdk-version 36 --target-sdk-version 36 --version-code 36 --version-name 36 --no-static-lib-packages --java " + gd + "/aapt2/java @" + gd + "/res.list --feature-flags @" + text; !strings.Contains(cmd, want) {
-		t.Errorf("cmd lacks %q:\n%s", want, cmd)
-	}
-	if got := g.genFiles[filepath.Join(gd, "res.list")]; got != gd+"/aapt2/app/res/drawable_a.png.flat "+gd+"/aapt2/app/res/values_strings.arsc.flat" {
+	// aapt2Link: the compiled files of the dirs are resources (no static libraries, one dir), the zips' flata overlays
+	if got := g.genFiles[filepath.Join(d, "aapt2", "res.list")]; got != flats[0]+" "+flats[1] {
 		t.Errorf("res.list %q", got)
+	}
+	if got := g.genFiles[filepath.Join(d, "aapt2", "overlay.list")]; got != flata {
+		t.Errorf("overlay.list %q, want %q", got, flata)
+	}
+	// the apk: merge_zips of the resource package alone (no code: no dex), aligned as signapk would
+	n := g.jnode("framework-res", Device, "test")
+	if n == nil || n.apk != filepath.Join(d, "framework-res.apk") || n.dex != "" {
+		t.Fatalf("node %+v problems %v", n, g.problems)
+	}
+	if su := ninjaEdgeVars(ninja, filepath.Join(d, "framework-res-unsigned.apk")); su == nil || !strings.HasSuffix(su[""], ": mergezips "+filepath.Join(d, "package-res.apk")+" ") &&
+		!strings.HasSuffix(su[""], ": mergezips "+filepath.Join(d, "package-res.apk")) {
+		t.Errorf("unsigned apk %v", su)
 	}
 }
