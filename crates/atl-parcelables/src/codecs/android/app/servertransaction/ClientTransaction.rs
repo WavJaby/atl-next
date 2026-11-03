@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! android.app.servertransaction.ClientTransaction: app/servertransaction/ClientTransaction.java writeToParcel (writeParcelableList of mTransactionItems) / ClientTransaction(Parcel).
-//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem; any other item class is refused.
+//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem; any other item class is refused.
 
 use crate::parcel::*;
 use crate::parts::*;
 
 /// The item classes modelled, by `getClass().getName()`.
 const LAUNCH_ACTIVITY_ITEM: &str = "android.app.servertransaction.LaunchActivityItem";
+const RESUME_ACTIVITY_ITEM: &str = "android.app.servertransaction.ResumeActivityItem";
 
 #[derive(Debug, Clone)]
 pub enum ClientTransactionItem {
     LaunchActivity(LaunchActivityItem),
+    ResumeActivity(ResumeActivityItem),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +31,10 @@ impl Part for ClientTransaction {
                     w_str16(p, &Some(LAUNCH_ACTIVITY_ITEM.to_owned()))?;
                     i.write(p)?;
                 }
+                Some(ClientTransactionItem::ResumeActivity(i)) => {
+                    w_str16(p, &Some(RESUME_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
             }
         }
         Ok(())
@@ -43,6 +49,9 @@ impl Part for ClientTransaction {
                 None => None,
                 Some(LAUNCH_ACTIVITY_ITEM) => Some(ClientTransactionItem::LaunchActivity(
                     LaunchActivityItem::read(p)?,
+                )),
+                Some(RESUME_ACTIVITY_ITEM) => Some(ClientTransactionItem::ResumeActivity(
+                    ResumeActivityItem::read(p)?,
                 )),
                 Some(_) => {
                     return Err(crate::refuse(

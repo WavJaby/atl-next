@@ -5,9 +5,13 @@
 // Bundles and Intent extras that carry objects go through Java's own Parcels (roundTripParcel: the codec reads and writes the Parcel's data and object table): a binder must come out usable, a descriptor must be reported as Java reports it.
 // Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, an Intent with ClipData and a Bundle with a bad mHasIntent by their refusals (each refusal is also a line on stderr, which xtask checks).
 
+import android.app.ActivityManager;
 import android.app.ContentProviderHolder;
+import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ClientTransaction;
+import android.app.servertransaction.ClientTransactionItem;
 import android.app.servertransaction.LaunchActivityItem;
+import android.app.servertransaction.ResumeActivityItem;
 import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Intent;
@@ -37,6 +41,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -113,6 +118,8 @@ public class ParcelTruth {
                 "com.example.referrer", null, 2, null, null, null, null, null, true, null, null, null, null, false, null, null,
                 new ActivityWindowInfo()));
         check("ClientTransaction", transaction, ClientTransaction.CREATOR);
+        // the lifecycle item a launch is followed by (ActivityTaskSupervisor.realStartActivityLocked: Launch, then Resume)
+        checkTransactionResume("ClientTransaction:resume");
         // IPackageManager.notifyDexLoad's classLoaderContextMap: dex path -> class loader context, a null value included
         HashMap<String, String> contexts = new HashMap<>();
         contexts.put("/data/app/com.example.app/base.apk", "PCL[]");
@@ -218,6 +225,32 @@ public class ParcelTruth {
         IBinder got = back.getExtras().getBinder("binder");
         boolean ok = "com.example.BROADCAST".equals(back.getAction()) && got == echo && "value".equals(back.getStringExtra("key")) && usable(got);
         result(ok, name, ok ? "Intent extras' binder survived java -> rust -> java" : "action " + back.getAction() + ", binder " + got);
+        in.recycle();
+        out.recycle();
+    }
+
+    /// A ClientTransaction holding a ResumeActivityItem (the item ATL sends after a launch): its activity token is a binder (ActivityTransactionItem requires one), so the transaction goes
+    /// Java Parcel -> codec -> Java Parcel with its objects (roundTripParcel). Java must read back one item equal to the original (same token object, same procState, isForward and
+    /// compat flag, equals() compares them), a lifecycle item whose target state is ON_RESUME, and a token that still answers.
+    static void checkTransactionResume(String name) {
+        IBinder token = new Echo();
+        ResumeActivityItem resume = new ResumeActivityItem(token, ActivityManager.PROCESS_STATE_UNKNOWN, true, false);
+        ClientTransaction transaction = new ClientTransaction();
+        transaction.addTransactionItem(resume);
+        Parcel in = written(transaction);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.app.servertransaction.ClientTransaction", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        out.setDataPosition(0);
+        List<ClientTransactionItem> items = ClientTransaction.CREATOR.createFromParcel(out).getTransactionItems();
+        boolean ok = items.size() == 1 && resume.equals(items.get(0))
+                && ((ActivityLifecycleItem) items.get(0)).getTargetState() == ActivityLifecycleItem.ON_RESUME
+                && usable(token);
+        boolean consumed = out.dataSize() == in.dataSize();
+        result(ok && consumed, name, ok && consumed ? "resume item survived java -> rust -> java: equal fields, same token, ON_RESUME, answers a transaction"
+                : "items " + items + ", sizes " + in.dataSize() + "/" + out.dataSize());
         in.recycle();
         out.recycle();
     }

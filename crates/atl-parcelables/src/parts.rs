@@ -505,3 +505,30 @@ impl Part for LaunchActivityItem {
         })
     }
 }
+
+/// android.app.servertransaction.ResumeActivityItem (ResumeActivityItem.java writeToParcel: ActivityTransactionItem's activity token, then mProcState, mIsForward and
+/// mShouldSendCompatFakeFocus), the body after ClientTransaction's class name. Its token is a strong binder; the item is not a codec of its own (ClientTransaction holds it).
+#[derive(Debug, Clone, Default)]
+pub struct ResumeActivityItem {
+    pub activity_token: Option<SpIBinder>,
+    /// ActivityManager.ProcessState; -1 (PROCESS_STATE_UNKNOWN) when the item does not update the process state.
+    pub proc_state: i32,
+    pub is_forward: bool,
+    pub should_send_compat_fake_focus: bool,
+}
+impl Part for ResumeActivityItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_i32(p, self.proc_state)?;
+        w_bool(p, self.is_forward)?;
+        w_bool(p, self.should_send_compat_fake_focus)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(ResumeActivityItem {
+            activity_token: r_binder(p)?,
+            proc_state: r_i32(p)?,
+            is_forward: r_bool(p)?,
+            should_send_compat_fake_focus: r_bool(p)?,
+        })
+    }
+}
