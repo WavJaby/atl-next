@@ -15,7 +15,12 @@ import (
 // AIDL crates of workspace packages (-aidl-crates; Cargo.toml `[package.metadata.atl.aidl]`, xtask packages.rs). Each becomes an unstable aidl_interface at the tree root whose `<name>-rust`
 // backend synthAidl + rustAidl build like any tree interface. Its sources are not a srcs list but the import closure of `types` over `include_dirs`, what aidl itself would read:
 //   - include_dirs: tree-relative import roots, as Soong's framework `aidl.export_include_dirs` (-I); a compiled file's root is the dir it was found in (-N).
-//   - types: qualified AIDL names; each, and every interface / structured parcelable / enum / union it references (imports, same-package names, qualified names), is compiled.
+//   - types: qualified AIDL names; each, and every interface / structured parcelable / enum / union it references (imports, same-package names, qualified names), is compiled, but for the types of another tree aidl_interface:
+//     aidlFrozenDirs: files below an interface's aidl_api (frozen versions, the `current` dump) are never sources, as aidl_interface.go srcsForVersion; aidlOwner: a file an interface's `srcs` hold belongs to it.
+//     The interfaces owning a requested type are stood in for (their files compile into the crate, their rust backend's additional_rustlibs join it); a file another interface owns is imported, not compiled (the importer's aidl reads
+//     its types through -p; a stable vintf interface cannot be compiled by an unstable crate anyway), at that interface's latest frozen version (latestImport, the `<iface>-latest` defaults) as `imports` of the crate's aidl_interface.
+//     A requested type of a stable interface is refused: its own `-V<n>-rust` backend is the module to link.
+//     A compiled file referencing an unstructured parcelable with its own rust_type (`android.view.Surface`: "nativewindow::Surface") takes the tree's rust_library of that crate name as a rustlib; none in the tree is an error.
 //   - parcelables (optional): the crate giving Rust types to every unstructured `parcelable X;` declared under include_dirs without its own rust_type (all of them, not the closure's: one
 //     scan, no second walk to keep in step), through a generated preprocessed file `parcelable X rust_type "<crate>::<x path>";` (-p; aidl skips imports it defines), and to the Java-only
 //     builtins (aidlJavaOnly) through the host aidl patch's --rust_java_type (every aidl crate also gets its --rust_unimplemented_hook: our services implement a subset). The crate is a rust_library the converter builds from the package's cargo dir (Soong's additional_rustlibs):
@@ -87,7 +92,11 @@ type aidlDecl struct {
 	pkg      string // its package; name = pkg + "." + class, class may be nested (`Outer.Inner`)
 	params   string // "<T>" or ""
 	rustType bool   // carries its own rust_type
+	// the first path segment of that rust_type: the crate it names ("" without)
+	rustCrate string
 }
+
+var aidlRustTypeRe = regexp.MustCompile(`\brust_type\s+"(\w+)::`)
 
 // rustName: the declaration's Rust path below the crate: package segments as modules, the class flattened (`Outer.Inner` -> `Outer_Inner`): a module named after the outer class
 // would share the type namespace with the outer class's own type. A class named like what libbinder_rs's impl_(de)serialize_for_unstructured_parcelable macros name unqualified
@@ -127,7 +136,11 @@ func scanAidl(text string) (pkg string, code bool, imports, names []string, decl
 	code = aidlCodeRe.MatchString(text)
 	if !code {
 		for _, m := range aidlUnstructRe.FindAllStringSubmatch(text, -1) {
-			decls = append(decls, aidlDecl{name: pkg + "." + m[1], pkg: pkg, params: strings.Join(strings.Fields(m[2]), ""), rustType: strings.Contains(m[3], "rust_type")})
+			d := aidlDecl{name: pkg + "." + m[1], pkg: pkg, params: strings.Join(strings.Fields(m[2]), ""), rustType: strings.Contains(m[3], "rust_type")}
+			if c := aidlRustTypeRe.FindStringSubmatch(m[3]); c != nil {
+				d.rustCrate = c[1]
+			}
+			decls = append(decls, d)
 		}
 		return
 	}
@@ -141,8 +154,24 @@ type aidlIndex struct {
 	decls []aidlDecl              // unstructured declarations, first per name, in dir then path order
 }
 
+// aidlFrozenDirs: `<module dir>/aidl_api` of every aidl_interface of the tree. Soong reads a frozen version's sources there (aidlSources: aidl_api/<iface>/<v>/**) and the dump of the next
+// one (aidl_api/<iface>/current); the next version's own sources are the module's `srcs` (aidl_interface.go srcsForVersion). So a file below it is a copy of another version of a type
+// the interface also has as a source, never a source in its own right: an include dir that holds such an interface must not scan it (the same qualified name would resolve to a copy).
+func (g *Graph) aidlFrozenDirs() map[string]bool {
+	dirs := map[string]bool{}
+	for _, list := range g.mods[Device] {
+		for _, m := range list {
+			if m.Type == "aidl_interface" && m.aidlCrate == nil {
+				dirs[filepath.Join(m.Dir, "aidl_api")] = true
+			}
+		}
+	}
+	return dirs
+}
+
 func (g *Graph) indexAidl(dirs []string) (*aidlIndex, error) {
 	x := &aidlIndex{files: map[string]*aidlScanned{}}
+	frozen := g.aidlFrozenDirs()
 	for _, d := range dirs {
 		if st, err := os.Stat(g.abs(d)); err != nil || !st.IsDir() {
 			return nil, fmt.Errorf("include dir %s: not a directory in the tree", d)
@@ -150,6 +179,9 @@ func (g *Graph) indexAidl(dirs []string) (*aidlIndex, error) {
 		paths := globTree(g.abs(d), "**/*.aidl", d)
 		sort.Strings(paths)
 		for _, p := range paths {
+			if underAny(p, frozen) {
+				continue
+			}
 			b, err := os.ReadFile(g.abs(p))
 			if err != nil {
 				return nil, err
@@ -188,14 +220,65 @@ func (x *aidlIndex) lookup(q string) *aidlScanned {
 	}
 }
 
-// closure: the compiled files `types` reach, in visit order.
-func (x *aidlIndex) closure(types []string) ([]*aidlScanned, error) {
-	var out, queue []*aidlScanned
+// aidlOwner: the aidl_interface whose next-version sources (aidlSources: its `srcs`, as aidl_interface.go srcsForVersion) hold the tree path p, nil when no interface does (framework AIDL is
+// filegroup sources, not an interface's). Only interfaces whose module dir is above p are asked, so sources an interface takes from outside its own directory are not seen as its (libgui's
+// `android.gui` lists a few under `libs/gui/android/gui`). Frozen versions below aidl_api are never indexed (aidlFrozenDirs).
+func (g *Graph) aidlOwner(p string) *aidlIface {
+	if o, ok := g.aidlOwners[p]; ok {
+		return o
+	}
+	if g.aidlDirs == nil {
+		g.aidlDirs, g.aidlOwners = map[string][]*Module{}, map[string]*aidlIface{}
+		for _, name := range sortedKeys(g.mods[Device]) {
+			for _, m := range g.mods[Device][name] {
+				if m.Type == "aidl_interface" && m.aidlCrate == nil {
+					g.aidlDirs[m.Dir] = append(g.aidlDirs[m.Dir], m)
+				}
+			}
+		}
+	}
+	var owner *aidlIface
+	for dir := filepath.Dir(p); dir != "." && dir != "/" && owner == nil; dir = filepath.Dir(dir) {
+		for _, m := range g.aidlDirs[dir] {
+			if i := g.aidlIfaceOf(m.Name, Device); i != nil && i.mod == m && slices.ContainsFunc(g.aidlSources(i, i.nextVersion()), func(s srcFile) bool { return s.path == p }) {
+				owner = i
+				break
+			}
+		}
+	}
+	g.aidlOwners[p] = owner
+	return owner
+}
+
+// latestImport: how a stable interface is imported by name where the importer has no version of its own: the `<iface>-latest` Soong defaults every stable interface gets name its latest
+// frozen version (RELEASE_AIDL_USE_UNFROZEN is false, aidliface.go header), one never frozen its first; an unstable interface has no versions.
+func (i *aidlIface) latestImport() string {
+	if i.unstable {
+		return i.mod.Name
+	}
+	if len(i.versions) == 0 {
+		return i.versionedName(i.nextVersion())
+	}
+	return i.versionedName(i.latestVersion())
+}
+
+// closure: the files `types` reach, in visit order, split by who owns them (aidlOwner). The interfaces owning a requested type are the ones this crate stands in for: their files are compiled
+// into it. A file another interface owns is that interface's type: not compiled (a stable one may not be, as an unstable crate cannot hold @VintfStability types) and not followed, imported
+// as Soong's `imports` do, one entry per interface.
+// A compiled file referencing an unstructured parcelable that names its own rust_type (`rust_type "nativewindow::Surface"`) needs that crate: its names come back as `crates`.
+func (g *Graph) closure(x *aidlIndex, types []string) (compile []*aidlScanned, standIn, imports []*aidlIface, crates []string, err error) {
+	var queue []*aidlScanned
 	seen := map[*aidlScanned]bool{}
 	for _, t := range types {
 		f := x.files[t]
 		if f == nil || !f.code {
-			return nil, fmt.Errorf("type %s: no interface, structured parcelable, enum or union of that name under the include dirs", t)
+			return nil, nil, nil, nil, fmt.Errorf("type %s: no interface, structured parcelable, enum or union of that name under the include dirs", t)
+		}
+		if o := g.aidlOwner(f.path); o != nil && !slices.Contains(standIn, o) {
+			if !o.unstable {
+				return nil, nil, nil, nil, fmt.Errorf("type %s: owned by the stable aidl_interface %s, which this unstable crate cannot stand in for: link its backend `device/%s-rust` as a converter module instead", t, o.mod.Name, o.latestImport())
+			}
+			standIn = append(standIn, o)
 		}
 		queue = append(queue, f)
 	}
@@ -206,7 +289,13 @@ func (x *aidlIndex) closure(types []string) ([]*aidlScanned, error) {
 			continue
 		}
 		seen[f] = true
-		out = append(out, f)
+		if o := g.aidlOwner(f.path); o != nil && !slices.Contains(standIn, o) {
+			if !slices.Contains(imports, o) {
+				imports = append(imports, o)
+			}
+			continue
+		}
+		compile = append(compile, f)
 		for _, n := range slices.Concat(f.imports, f.names) {
 			r := x.lookup(n)
 			if r == nil && !strings.Contains(n, ".") {
@@ -215,9 +304,28 @@ func (x *aidlIndex) closure(types []string) ([]*aidlScanned, error) {
 			if r != nil && r.code && !seen[r] {
 				queue = append(queue, r)
 			}
+			if r != nil && !r.code {
+				for _, d := range r.unstructured {
+					if d.rustCrate != "" && !slices.Contains(crates, d.rustCrate) {
+						crates = append(crates, d.rustCrate)
+					}
+				}
+			}
 		}
 	}
-	return out, nil
+	return compile, standIn, imports, crates, nil
+}
+
+// rustCrateModule: the tree's rust_library of crate name `crate` (first by module name), nil when none.
+func (g *Graph) rustCrateModule(crate string) *Module {
+	for _, name := range sortedKeys(g.mods[Device]) {
+		for _, m := range g.mods[Device][name] {
+			if m.Type == "rust_library" && g.flatten(m, Device, Gen).str("crate_name") == crate {
+				return m
+			}
+		}
+	}
+	return nil
 }
 
 // rustIdent: a Java package or class name segment as a Rust path segment (raw where it is a keyword).
@@ -244,7 +352,7 @@ func (g *Graph) addAidlCrates(crates map[string]AidlCrate) error {
 		if err != nil {
 			return fmt.Errorf("aidl crate %s: %w", name, err)
 		}
-		files, err := x.closure(c.Types)
+		files, standIn, imported, crates, err := g.closure(x, c.Types)
 		if err != nil {
 			return fmt.Errorf("aidl crate %s: %w", name, err)
 		}
@@ -257,8 +365,28 @@ func (g *Graph) addAidlCrates(crates map[string]AidlCrate) error {
 				return fmt.Errorf("aidl crate %s: %w", name, err)
 			}
 		}
+		// the interfaces it stands in for contribute their rust backend's additional_rustlibs, as their own `-rust` library would take them (aidl_interface.go addRustLibrary)
+		for _, i := range standIn {
+			spec.rustlibs = appendMissing(spec.rustlibs, i.props.obj("backend").obj("rust").strs("additional_rustlibs"))
+		}
+		// a parcelable's own rust_type names a crate: the tree's (`binder` is every aidl crate's dependency already)
+		for _, cr := range crates {
+			if cr == "binder" {
+				continue
+			}
+			m := g.rustCrateModule(cr)
+			if m == nil {
+				return fmt.Errorf("aidl crate %s: a parcelable names rust_type crate %s, which no rust_library of the tree provides", name, cr)
+			}
+			spec.rustlibs = appendMissing(spec.rustlibs, []string{m.Name})
+		}
 		props := newObj()
 		props.set("unstable", true)
+		var imports []string
+		for _, i := range imported {
+			imports = append(imports, i.latestImport())
+		}
+		props.set("imports", strVals(imports))
 		g.mods[Device][name] = append(g.mods[Device][name], &Module{Type: "aidl_interface", Name: name, Props: props, aidlCrate: spec})
 	}
 	return nil

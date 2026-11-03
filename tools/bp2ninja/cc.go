@@ -161,6 +161,9 @@ type Graph struct {
 	tools map[string]*Node
 	// aidl_interface / hidl_interface modules by name/side (nil = none or unusable), for the modules synth makes from them
 	aidlIfaces map[string]*aidlIface
+	// the same interfaces by module dir, and the interface owning each .aidl path (nil = none), for aidl crates (aidlcrates.go aidlOwner)
+	aidlDirs   map[string][]*Module
+	aidlOwners map[string]*aidlIface
 	hidlIfaces map[string]*hidlIface
 	// aidl_interface versions' preprocessed.aidl by side/name/version ("" = none) and their edges (aidliface.go aidlPreprocessed)
 	aidlPre  map[string]string

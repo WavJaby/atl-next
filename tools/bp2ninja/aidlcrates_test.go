@@ -21,6 +21,106 @@ var aidlCratesFiles = map[string]string{
 	"inc/c/type.aidl":   "package c.type; parcelable Q;",
 	"inc/a/Outer.aidl":  "package a; parcelable Outer.Inner;",
 	"inc/a/Option.aidl": "package a; parcelable Option;",
+	// a parcelable with its own rust_type needs that crate: the tree's rust_library of the name (libx), or the crate nobody provides
+	"inc/Android.bp": `rust_library { name: "libx", crate_name: "x", srcs: ["x.rs"] }`,
+	"inc/a/IZ.aidl":  "package a; interface IZ { void f(in Z z); }",
+	"inc/a/Z.aidl":   "package a; parcelable Z rust_type \"nocrate::Z\";",
+}
+
+// A frozen version (aidl_api/<iface>/<v>/, and the `current` dump) of an aidl_interface is not a source of its type names (aidl_interface.go srcsForVersion: the next version's sources are the
+// module's `srcs`, a frozen version's are below aidl_api): the copy sorts before the source here, so scanning it would win the qualified name.
+func TestAidlCratesSkipFrozenVersions(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"hw/Android.bp":                                `aidl_interface { name: "hwif", srcs: ["z/h/IHw.aidl"], versions_with_info: [{ version: "1", imports: [] }] }`,
+		"hw/z/h/IHw.aidl":                              "package z.h; interface IHw { void now(); }",
+		"hw/aidl_api/hwif/1/z/h/IHw.aidl":              "package z.h; interface IHw { void old(); }",
+		"hw/aidl_api/hwif/current/z/h/IHw.aidl":        "package z.h; interface IHw { void dump(); }",
+		"hw/aidl_api/hwif/1/z/h/OnlyFrozen.aidl":       "package z.h; parcelable OnlyFrozen { int x; }",
+		"hw/aidl_api/hwif/1/z/h/OnlyFrozenOpaque.aidl": "package z.h; parcelable OnlyFrozenOpaque;",
+		// not an aidl_interface's tree: aidl_api there is just a directory
+		"plain/Android.bp":             `filegroup { name: "f", srcs: ["**/*.aidl"] }`,
+		"plain/aidl_api/p/IPlain.aidl": "package p; interface IPlain {}",
+	})
+	x, err := g.indexAidl([]string{"hw", "plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := x.files["z.h.IHw"]; f == nil || f.path != "hw/z/h/IHw.aidl" {
+		t.Errorf("z.h.IHw resolves to %+v, want hw/z/h/IHw.aidl", f)
+	}
+	for _, q := range []string{"z.h.OnlyFrozen", "z.h.OnlyFrozenOpaque"} {
+		if x.files[q] != nil {
+			t.Errorf("%s indexed from a frozen version", q)
+		}
+	}
+	if len(x.decls) != 0 {
+		t.Errorf("unstructured declarations %v taken from a frozen version", x.decls)
+	}
+	if x.files["p.IPlain"] == nil {
+		t.Errorf("p.IPlain: below a directory named aidl_api of a tree without an aidl_interface, still a source")
+	}
+}
+
+// Types another aidl_interface owns are imported, not compiled (aidl_interface.go: `imports`, the importer's aidl reads the import's types through -p): `hwif` is stable (vintf, frozen at 1 and 2,
+// so `hwif-latest` is V2), `fw` AIDL belongs to no interface, `unst` is unstable with an additional rust lib. A crate asked for a `fw` type imports hwif at V2; one asked for an `unst`
+// type stands in for it (compiles its files, takes its rustlibs) and still imports hwif; one asked for a stable interface's own type is refused (an unstable crate cannot hold @VintfStability).
+func TestAidlCratesImportOtherInterfaces(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"hw/Android.bp": `aidl_interface { name: "hwif", stability: "vintf", srcs: ["z/h/IHw.aidl", "z/h/Data.aidl"],
+			versions_with_info: [{ version: "1", imports: [] }, { version: "2", imports: [] }] }`,
+		"hw/z/h/IHw.aidl":                  "package z.h; @VintfStability interface IHw { Data get(); }",
+		"hw/z/h/Data.aidl":                 "package z.h; @VintfStability parcelable Data { int x; }",
+		"hw/aidl_api/hwif/1/z/h/IHw.aidl":  "package z.h; interface IHw {}",
+		"hw/aidl_api/hwif/2/z/h/IHw.aidl":  "package z.h; interface IHw { Data get(); }",
+		"hw/aidl_api/hwif/2/z/h/Data.aidl": "package z.h; parcelable Data { int x; }",
+		"fw/a/IFw.aidl":                    "package a; import z.h.IHw; interface IFw { IHw get(); }",
+		"un/Android.bp":                    `aidl_interface { name: "unst", unstable: true, srcs: ["x/IUnst.aidl", "x/Own.aidl"], backend: { rust: { additional_rustlibs: ["libunst_types"] } } }`,
+		"un/x/IUnst.aidl":                  "package x; import a.IFw; import x.Own; interface IUnst { Own own(); IFw fw(); }",
+		"un/x/Own.aidl":                    "package x; parcelable Own { int y; }",
+		"aidl/Android.bp":                  `cc_binary_host { name: "aidl", srcs: ["a.cc"] }`,
+	})
+	cases := []struct {
+		name, types          string
+		srcs, imports, rusts []string
+		err                  string
+	}{
+		{"fw", "a.IFw", []string{"fw/a/IFw.aidl"}, []string{"hwif-V2"}, nil, ""},
+		{"stand", "x.IUnst", []string{"un/x/IUnst.aidl", "fw/a/IFw.aidl", "un/x/Own.aidl"}, []string{"hwif-V2"}, []string{"libunst_types"}, ""},
+		{"stable", "z.h.IHw", nil, nil, nil, "owned by the stable aidl_interface hwif"},
+	}
+	for _, c := range cases {
+		if err := g.addAidlCrates(map[string]AidlCrate{c.name: {IncludeDirs: []string{"fw", "un", "hw"}, Types: []string{c.types}}}); err != nil {
+			if c.err == "" || !strings.Contains(err.Error(), c.err) || !strings.Contains(err.Error(), "device/hwif-V2-rust") {
+				t.Errorf("%s: %v, want error %q naming device/hwif-V2-rust", c.name, err, c.err)
+			}
+			continue
+		} else if c.err != "" {
+			t.Errorf("%s: no error, want %q", c.name, c.err)
+			continue
+		}
+		m := g.synth(c.name+"-rust", Device)
+		if m == nil || m.aidl == nil {
+			t.Errorf("%s-rust: %+v, problems %v", c.name, m, g.problems)
+			continue
+		}
+		var paths []string
+		for _, s := range m.aidl.srcs {
+			paths = append(paths, s.path)
+		}
+		if !slices.Equal(paths, c.srcs) {
+			t.Errorf("%s: compiled %v, want %v", c.name, paths, c.srcs)
+		}
+		var imports []string
+		for _, i := range m.aidl.imports {
+			imports = append(imports, strings.TrimSuffix(i, "-rust"))
+		}
+		if !slices.Equal(imports, c.imports) || len(m.aidl.preprocessed) != len(c.imports) {
+			t.Errorf("%s: imports %v with %d preprocessed files, want %v", c.name, imports, len(m.aidl.preprocessed), c.imports)
+		}
+		if got := m.Props.strs("rustlibs"); !slices.Equal(got, c.rusts) {
+			t.Errorf("%s: rustlibs %v, want %v", c.name, got, c.rusts)
+		}
+	}
 }
 
 // An aidl crate compiles the closure of its types over its include dirs; every unstructured parcelable without its own rust_type gets one from the parcelables crate, whose generated
@@ -54,6 +154,9 @@ func TestAidlCrates(t *testing.T) {
 	}
 	if want := []string{"inc/a/IFoo.aidl", "inc/b/Baz.aidl", "inc/a/Bar.aidl"}; !slices.Equal(paths, want) {
 		t.Errorf("closure %v, want %v (Unused and the parcelable files not compiled)", paths, want)
+	}
+	if !slices.Contains(m.Props.strs("rustlibs"), "libx") {
+		t.Errorf("rustlibs %v lack libx, the crate of IFoo's `R rust_type \"x::R\"`", m.Props.strs("rustlibs"))
 	}
 	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || len(m.aidl.preprocessed) != 1 || !m.aidl.rustServed {
 		t.Errorf("rustlibs %v, java types %v, preprocessed %v, unimplemented hook %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.rustServed)
@@ -93,6 +196,7 @@ func TestAidlCrates(t *testing.T) {
 	}{
 		{AidlCrate{IncludeDirs: []string{"inc"}, Types: []string{"a.Missing"}}, "type a.Missing"},
 		{AidlCrate{IncludeDirs: []string{"inc"}, Types: []string{"a.P"}}, "type a.P"},
+		{AidlCrate{IncludeDirs: []string{"inc"}, Types: []string{"a.IZ"}}, "rust_type crate nocrate"},
 		{AidlCrate{IncludeDirs: []string{"nodir"}, Types: []string{"a.IFoo"}}, "include dir nodir"},
 		{AidlCrate{IncludeDirs: []string{"inc"}}, "needs include_dirs and types"},
 	} {
