@@ -48,9 +48,6 @@ struct Args {
     min_sdk: i32,
     #[arg(long)]
     target_sdk: i32,
-    /// For a client that is a Rust test double, not a Java app: bindApplication sends no shared memory descriptor (ActivityManager::without_app_shared_memory).
-    #[arg(long)]
-    no_app_shared_memory: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -79,11 +76,10 @@ fn main() -> Result<()> {
         uid: a.uid,
     }];
     ProcessState::start_thread_pool();
-    let mut activity_manager = ActivityManager::new(packages.clone(), pending);
-    if a.no_app_shared_memory {
-        activity_manager = activity_manager.without_app_shared_memory();
-    }
-    let am = BnActivityManager::new_binder(activity_manager, BinderFeatures::default());
+    let am = BnActivityManager::new_binder(
+        ActivityManager::new(packages.clone(), pending),
+        BinderFeatures::default(),
+    );
     binder::add_service(ACTIVITY, am.as_binder()).context("addService activity")?;
     let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;

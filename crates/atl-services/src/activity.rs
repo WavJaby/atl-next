@@ -92,8 +92,6 @@ pub struct ActivityManager {
     state: Mutex<State>,
     controller: SpIBinder,
     settings: SpIBinder,
-    /// Whether bindApplication carries the shared memory descriptor (see [`ActivityManager::without_app_shared_memory`]).
-    app_shared_memory: bool,
 }
 
 fn log(msg: std::fmt::Arguments<'_>) {
@@ -120,15 +118,7 @@ impl ActivityManager {
             }),
             controller,
             settings: settings::new_binder(),
-            app_shared_memory: true,
         }
-    }
-
-    /// For a Rust test double of the app (`xtask test binder`'s client): bindApplication sends no descriptor, because no Rust code can read one (atl-parcelables java.io.FileDescriptor). A Java app needs it:
-    /// ActivityThread maps the region before anything else.
-    pub fn without_app_shared_memory(mut self) -> Self {
-        self.app_shared_memory = false;
-        self
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -285,21 +275,18 @@ impl IActivityManager for ActivityManager {
                 Some(format!("ApplicationSharedMemory: {e}")),
             )
         };
-        let app_memory = if self.app_shared_memory {
-            if st.shared_memory.is_none() {
-                st.shared_memory =
-                    Some(ApplicationSharedMemory::create().map_err(|e| memory_error(&e))?);
-            }
-            let fd = st
-                .shared_memory
-                .as_ref()
-                .map(|m| m.read_only.try_clone())
-                .transpose()
-                .map_err(|e| memory_error(&e))?;
-            fd.map(FileDescriptor::new)
-        } else {
-            Some(FileDescriptor::default())
-        };
+        if st.shared_memory.is_none() {
+            st.shared_memory =
+                Some(ApplicationSharedMemory::create().map_err(|e| memory_error(&e))?);
+        }
+        let app_memory = st
+            .shared_memory
+            .as_ref()
+            .map(|m| m.read_only.try_clone())
+            .transpose()
+            .map_err(|e| memory_error(&e))?
+            .map(FileDescriptor::new);
+        let core_settings = Bundle::default();
         // what attachApplicationLocked passes for a plain app start (no instrumentation, profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
         // an empty provider list (no providers of its own yet), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
         // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); no settings are mirrored into it yet
@@ -323,7 +310,7 @@ impl IActivityManager for ActivityManager {
             Some(&global_configuration()),
             Some(&CompatibilityInfo::default()),
             None,
-            Some(&Bundle),
+            Some(&core_settings),
             Some(BUILD_UNKNOWN),
             None,
             None,

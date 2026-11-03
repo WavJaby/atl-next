@@ -2,7 +2,7 @@
 // Driver of `xtask test parcel` on host ART (framework.jar on the boot classpath): for each M2 parcelable, Java's own writeToParcel bytes go through atl-parcelables' codec (libatl_parcel_truth.so:
 // decode, every byte consumed, re-encode) and must come back byte-equal; Java's createFromParcel must then read the Rust bytes and write the same bytes again. Never shipped.
 // Field values are distinct from the defaults, so a codec that drops, swaps or misreads a field changes the bytes. Output: `pt pass|fail <case> <detail>` lines; exit 0 = all passed.
-// Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, a Bundle the codec does not model by its refusal.
+// Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, an Intent with extras and a Bundle with a descriptor object or a bad mHasIntent by their refusals.
 
 import android.app.ContentProviderHolder;
 import android.app.servertransaction.ClientTransaction;
@@ -24,6 +24,8 @@ import android.os.LocaleList;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.window.ActivityWindowInfo;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -38,6 +40,10 @@ public class ParcelTruth {
 
     static final int MODE_PLAIN = 0;
     static final int MODE_CORRUPT = 1;
+    /// The harness appends a file descriptor object to this (non-empty) Bundle's body: Java's marshall() keeps no objects.
+    static final int MODE_DESCRIPTOR = 2;
+    /// java.io.FileDescriptor only: the codec writes a descriptor and reads it back.
+    static final int MODE_FD_SELF = 3;
     static int failures = 0;
 
     public static void main(String[] args) {
@@ -83,8 +89,14 @@ public class ParcelTruth {
         checkMap("Map:null", null);
         // IApplicationThread.bindApplication's coreSettings: the empty Bundle M2 sends
         check("Bundle", new Bundle(), Bundle.CREATOR);
+        // a non-empty Bundle: the codec copies its body verbatim
+        Bundle entries = new Bundle();
+        entries.putString("key", "value");
+        entries.putInt("int", -7);
+        entries.putBoolean("flag", true);
+        check("Bundle:entries", entries, Bundle.CREATOR);
 
-        selfTests(config, intent);
+        selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
     }
@@ -301,7 +313,7 @@ public class ParcelTruth {
         result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's map back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
     }
 
-    static void selfTests(Configuration config, Intent intent) {
+    static void selfTests(Configuration config, Intent intent, Bundle entries) {
         byte[] bytes = marshal(config);
         byte[] corrupt = roundTrip("android.content.res.Configuration", bytes, MODE_CORRUPT);
         result(corrupt != null && !Arrays.equals(bytes, corrupt), "self-test:corrupt", "a corrupted encoding differs from java's bytes");
@@ -313,5 +325,19 @@ public class ParcelTruth {
         String counters = refused();
         result(refusedBytes == null && counters.contains("android.content.Intent.extras="), "self-test:refusal",
                 "Intent extras refused and counted: " + counters.replace('\n', ' ').trim());
+        // a descriptor object in the body: refused and counted, not copied
+        byte[] fdBytes = roundTrip("android.os.Bundle", marshal(entries), MODE_DESCRIPTOR);
+        result(fdBytes == null && refused().contains("android.os.Bundle (file descriptor or binder)="), "self-test:bundle-fd",
+                "descriptor in the Bundle body: " + (fdBytes == null ? lastError() : "accepted"));
+        // mHasIntent 2: Java writes 0 or 1 only (writeBoolean), so the codec refuses the value and names the field
+        byte[] flag = marshal(entries);
+        ByteBuffer.wrap(flag).order(ByteOrder.nativeOrder()).putInt(flag.length - 4, 2);
+        byte[] badFlag = roundTrip("android.os.Bundle", flag, MODE_PLAIN);
+        result(badFlag == null && refused().contains("android.os.Bundle.mHasIntent="), "self-test:bundle-flag",
+                "mHasIntent 2: " + (badFlag == null ? lastError() : "accepted"));
+        // the codec writes a descriptor, then reads it back from the parcel that holds the object (no Java bytes involved)
+        byte[] fdSelf = roundTrip("java.io.FileDescriptor", new byte[0], MODE_FD_SELF);
+        result(fdSelf != null, "self-test:fd-read",
+                "descriptor written and read back by the codec: " + (fdSelf == null ? lastError() : "ok"));
     }
 }

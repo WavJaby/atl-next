@@ -21,13 +21,21 @@ use atl_parcelables::android::content::pm::{
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
+use binder::ParcelFileDescriptor;
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
 
-/// `roundTrip` modes: as is, or the re-encoded first byte flipped (ParcelTruth.java's check that a wrong encoding fails the comparison).
+/// `roundTrip` modes: as is, the re-encoded first byte flipped (ParcelTruth.java's check that a wrong encoding fails the comparison), or
+/// a Bundle's body with a file descriptor object appended (MODE_DESCRIPTOR, see `with_descriptor_in_body`).
 const MODE_PLAIN: i32 = 0;
 const MODE_CORRUPT: i32 = 1;
+const MODE_DESCRIPTOR: i32 = 2;
+/// java.io.FileDescriptor only: the codec writes a descriptor and reads it back (`fd_self_test`).
+const MODE_FD_SELF: i32 = 3;
+/// ParcelFileDescriptor's leading int32s: the non-null flag and the comm-channel count (ndk/parcel.cpp, Parcel.cpp).
+const PFD_LEAD: i32 = 8;
 
 unsafe extern "C" {
     fn AParcel_marshal(parcel: *const AParcel, buffer: *mut u8, start: usize, len: usize) -> i32;
@@ -61,7 +69,10 @@ fn unmarshal(bytes: &[u8]) -> Result<Parcel, String> {
 
 /// Decode with T's codec, every byte consumed, then re-encode.
 fn round_trip_as<T: UnstructuredParcelable>(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
-    let p = unmarshal(input)?;
+    decode_as::<T>(&unmarshal(input)?, mode)
+}
+
+fn decode_as<T: UnstructuredParcelable>(p: &Parcel, mode: i32) -> Result<Vec<u8>, String> {
     let v = T::from_parcel(p.borrowed_ref()).map_err(|e| format!("decode refused: {e:?}"))?;
     if p.get_data_position() != p.get_data_size() {
         return Err(format!(
@@ -93,6 +104,42 @@ fn round_trip_map(input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
     finish(&out, mode)
 }
 
+/// Java's marshalled non-empty Bundle with one file descriptor object appended to its body, as [length][magic][body][descriptor][has_intent]:
+/// Java's marshall() keeps no objects, so the object is built here, and the codec meets it in the body.
+fn with_descriptor_in_body(input: &[u8]) -> Result<Parcel, String> {
+    let p = unmarshal(input)?;
+    let len: i32 = p
+        .borrowed_ref()
+        .read()
+        .map_err(|e| format!("length: {e:?}"))?;
+    let magic: i32 = p
+        .borrowed_ref()
+        .read()
+        .map_err(|e| format!("magic: {e:?}"))?;
+    let body = p.get_data_position();
+    let has_intent = i32::from_ne_bytes(*input.last_chunk::<4>().ok_or("no mHasIntent")?);
+    // the object's length: what a ParcelFileDescriptor writes after its PFD_LEAD bytes
+    let mut descriptor = Parcel::new();
+    let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+    descriptor
+        .borrowed()
+        .write(&ParcelFileDescriptor::new(null))
+        .map_err(|e| format!("descriptor: {e:?}"))?;
+    let object = descriptor.get_data_size() - PFD_LEAD;
+    let mut out = Parcel::new();
+    let put =
+        |r: Result<(), binder::StatusCode>| r.map_err(|e| format!("building the Bundle: {e:?}"));
+    put(out.borrowed().write(&(len + object)))?;
+    put(out.borrowed().write(&magic))?;
+    put(out.append_from(&p, body, len))?;
+    put(out.append_from(&descriptor, PFD_LEAD, object))?;
+    put(out.borrowed().write(&has_intent))?;
+    // the writes left the position at the end: the decoder reads from the start
+    out.set_data_position_checked(0)
+        .map_err(|e| format!("rewind: {e:?}"))?;
+    Ok(out)
+}
+
 /// The re-encoded bytes, corrupted in MODE_CORRUPT.
 fn finish(out: &Parcel, mode: i32) -> Result<Vec<u8>, String> {
     let mut bytes = marshal(out)?;
@@ -107,7 +154,49 @@ fn finish(out: &Parcel, mode: i32) -> Result<Vec<u8>, String> {
 }
 
 /// The codec of Java class `class`.
+/// MODE_FD_SELF: a descriptor the codec writes, then reads back from the parcel that holds the object. Returns [1] when the read
+/// consumes exactly what the write put down and yields a descriptor; the read's refusal, if any, is the error.
+fn fd_self_test() -> Result<Vec<u8>, String> {
+    let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+    let mut p = Parcel::new();
+    p.write(&FileDescriptor::new(null.into()))
+        .map_err(|e| format!("write refused: {e:?}"))?;
+    let size = p.get_data_size();
+    p.set_data_position_checked(0)
+        .map_err(|e| format!("rewind: {e:?}"))?;
+    let got: FileDescriptor = p
+        .borrowed_ref()
+        .read()
+        .map_err(|e| format!("read refused: {e:?}"))?;
+    if p.get_data_position() != size {
+        return Err(format!(
+            "read stopped at byte {} of {size}",
+            p.get_data_position()
+        ));
+    }
+    if got.fd.is_none() {
+        return Err("read gave no descriptor".to_owned());
+    }
+    Ok(vec![1])
+}
+
 fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
+    if mode == MODE_FD_SELF {
+        return match class {
+            "java.io.FileDescriptor" => fd_self_test(),
+            _ => Err(format!(
+                "MODE_FD_SELF tests java.io.FileDescriptor, not {class}"
+            )),
+        };
+    }
+    if mode == MODE_DESCRIPTOR {
+        return match class {
+            "android.os.Bundle" => {
+                decode_as::<Bundle>(&with_descriptor_in_body(input)?, MODE_PLAIN)
+            }
+            _ => Err(format!("MODE_DESCRIPTOR builds a Bundle, not {class}")),
+        };
+    }
     match class {
         "android.content.pm.ApplicationInfo" => round_trip_as::<ApplicationInfo>(input, mode),
         "android.content.pm.ActivityInfo" => round_trip_as::<ActivityInfo>(input, mode),
