@@ -281,7 +281,7 @@ rule srcjar
   command = (for f in $in; do [ ! -e $$f ] || echo $$f; done) > $out.list && $soongzip -srcjar -write_if_changed -o $out -C $dir -l $out.list
   description = srcjar $out
 rule logtags
-  command = python3 $script -o $out $in
+  command = PYTHONDONTWRITEBYTECODE=1 python3 $script -o $out $in
   description = logtags $in
 rule jproto
   command = rm -rf $tmp $tmp.d && mkdir -p $tmp $tmp.d && $cmds && cat $tmp.d/*.d > $out.d && $soongzip -srcjar -write_if_changed -o $out -C $tmp -D $tmp && rm -rf $tmp $tmp.d
