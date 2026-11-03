@@ -84,7 +84,7 @@ mod tests {
 
     /// Unions (anonymous members, unnamed field types, nested), packed/aligned attributes, enumerators
     /// and macros; builtin types only.
-    const RECORDS: &str = "#define WIDTH 14\n#define MASK ((1 << WIDTH) - 1)\n#define BIG 3U << 9\nstruct V {\n  unsigned int kind;\n  union { unsigned long long p; unsigned int h; };\n  union { unsigned int x; struct { unsigned short lo, hi; } parts; unsigned char raw[8]; } u;\n  unsigned long long tail;\n};\nstruct P { unsigned int h; unsigned long long c; } __attribute__((packed));\nstruct A { int x; } __attribute__((aligned(16)));\nenum { NEG = -2, SMALL = 7 };\nenum big { HUGE = 0x80000000u };\n";
+    const RECORDS: &str = "#define WIDTH 14\n#define MASK ((1 << WIDTH) - 1)\n#define BIG 3U << 9\nstruct V {\n  unsigned int kind;\n  union { unsigned long long p; unsigned int h; };\n  union { unsigned int x; struct { unsigned short lo, hi; } parts; unsigned char raw[8]; } u;\n  unsigned long long tail;\n};\nstruct P { unsigned int h; unsigned long long c; } __attribute__((packed));\nstruct A { int x; } __attribute__((aligned(16)));\nstruct F { _Alignas(16) int x; int y; };\nenum { NEG = -2, SMALL = 7 };\nenum big { HUGE = 0x80000000u };\n";
 
     fn parsed_records(dir: &Tmp) -> ir::Interface {
         let header = dir.0.join("r.h");
@@ -150,6 +150,9 @@ mod tests {
         assert!(x.records["P"].packed);
         assert_eq!(layout(x, "A"), (16, 16, f(&[("x", 0)])));
         assert!(x.records["A"].aligned);
+        // `_Alignas` on a member (IMapper.h's `AIMapper::version`) aligns the record too: the generated `repr(C, align(16))` is what rustc is asserted against
+        assert_eq!(layout(x, "F"), (16, 16, f(&[("x", 0), ("y", 4)])));
+        assert!(x.records["F"].aligned);
         let c = |n: &str| (x.constants[n].ty.clone(), x.constants[n].bits);
         let int = |signed| Ty::Int {
             bits: 32,

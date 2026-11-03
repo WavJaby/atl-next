@@ -944,6 +944,13 @@ fn record(
         .map_err(|err| anyhow!("{name}: alignof: {err:?}"))?;
     let children = e.get_children();
     let has_attr = |k| children.iter().any(|c| c.get_kind() == k);
+    // `alignas` on a member raises the record's alignment as an attribute on the record would
+    let member_aligned = children.iter().any(|c| {
+        c.get_kind() == EntityKind::FieldDecl
+            && c.get_children()
+                .iter()
+                .any(|a| a.get_kind() == EntityKind::AlignedAttr)
+    });
     let mut fields = Vec::new();
     let mut anon = 0;
     for c in &children {
@@ -1002,7 +1009,7 @@ fn record(
             size: size as u64,
             align: align as u64,
             packed: has_attr(EntityKind::PackedAttr),
-            aligned: has_attr(EntityKind::AlignedAttr),
+            aligned: has_attr(EntityKind::AlignedAttr) || member_aligned,
             fields,
         },
     );
