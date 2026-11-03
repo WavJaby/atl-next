@@ -270,7 +270,7 @@ func (g *Graph) manifestMerger(n *jNode, main string, libs []string, library boo
 	}
 	tool := g.jtool("manifest-merger", n.name)
 	out := filepath.Join(n.dir, "manifest_merger", "AndroidManifest.xml")
-	g.java.edge("manifestmerger", []string{out}, []string{main}, libs, nil,
+	g.java.edge("manifestmerger", []string{out}, []string{main}, append([]string{tool}, libs...), nil,
 		[][2]string{{"tool", esc(tool)}, {"args", ninjaRaw(args)}, {"libs", strings.Join(libFlags, " ")}})
 	return out
 }
@@ -511,6 +511,8 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 	own := &resNode{pkg: a.pkg, manifest: a.manifest, rTxt: a.rTxt, rJar: a.rJar, assets: a.assets, busybox: a.busybox}
 	a.nodes = newDepSet([]*resNode{own}, []*depSet[*resNode]{deps.static})
 	a.manifests = newDepSet(append([]string{a.manifest}, additional...), []*depSet[string]{deps.manifests})
+	// "apps manifests are handled by aapt, don't let Module see them" (aar.go, app.go): `manifest` is no jar manifest here
+	p.set("manifest", nil)
 	return a
 }
 
@@ -781,7 +783,7 @@ func (g *Graph) jniZipEdge(n *jNode, libs []string) string {
 
 // appRules are the rules the android modules' edges use; command shapes follow the Soong rules of the same names (aapt2.go aapt2Compile,
 // aapt2CompileZip, aapt2Link, mergeAssets, extractAssets; android_manifest.go manifestFixer, manifestMerger; aar.go resourceProcessorBusyBox,
-// unzipAAR; app_builder.go combineApk, TransformJniLibsToJar).
+// unzipAAR; app_builder.go combineApk, TransformJniLibsToJar). mergeAssets and combineApk are stubs.go's `mergezips` (`merge_zips $out $in`).
 const appRules = `rule aapt2compile
   command = $aapt2 compile -o $outdir $cflags $in
   description = aapt2 compile $outdir
@@ -792,7 +794,7 @@ rule aapt2link
   command = $preamble$aapt2 link -o $pkg $flags --proguard $proguard --output-text-symbols $rtxt $inflags$postamble
   description = aapt2 link $pkg
 rule manifestfixer
-  command = $tool $args $in $out
+  command = PYTHONDONTWRITEBYTECODE=1 $tool $args $in $out
   description = fix manifest $out
 rule manifestmerger
   command = $tool $args --main $in $libs --out $out
@@ -803,9 +805,6 @@ rule busybox
   rspfile_content = --primaryRTxt $rtxt --primaryManifest $manifest --classJarOutput $out.tmp $args
   restat = 1
   description = ResourceProcessorBusyBox $out
-rule mergezips
-  command = $mergezips $out $in
-  description = merge $out
 rule extractassets
   command = $zip2zip -i $in -o $out "assets/**/*"
   description = extract assets $out

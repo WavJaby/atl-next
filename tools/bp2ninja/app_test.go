@@ -127,7 +127,7 @@ func TestAndroidLibraryResources(t *testing.T) {
 	aarManifest := filepath.Join(a, "aar", "AndroidManifest.xml")
 	merged := filepath.Join(l, "manifest_merger", "AndroidManifest.xml")
 	mm := ninjaEdgeVars(ninja, merged)
-	if mm == nil || mm["args"] != "" || mm["libs"] != "--libs "+aarManifest || !strings.Contains(mm[""], ": manifestmerger "+fixed+" | "+aarManifest) {
+	if mm == nil || mm["args"] != "" || mm["libs"] != "--libs "+aarManifest || !strings.Contains(mm[""], ": manifestmerger "+fixed+" | "+filepath.Join(g.out, "host", "bin", "manifest-merger")+" "+aarManifest) {
 		t.Errorf("manifest merger %v", mm)
 	}
 	androidJar := g.abs("prebuilts/sdk/34/public/android.jar") + " -I " + g.abs("prebuilts/sdk/tools/core-lambda-stubs.jar")
@@ -154,6 +154,9 @@ func TestAndroidLibraryResources(t *testing.T) {
 	// the library's implementation does not hold its R classes (extraClasspathJars only)
 	if comb := ninjaEdgeVars(ninja, filepath.Join(l, "combined", "lib.jar")); comb == nil || strings.Contains(comb[""], "R.jar") {
 		t.Errorf("combined %v holds an R.jar", comb)
+	} else if strings.Contains(comb["args"], "-m ") {
+		// aar.go / app.go: `a.properties.Manifest = nil`, the Android manifest is not the jar's
+		t.Errorf("combined jar takes the Android manifest as its jar manifest: %q", comb["args"])
 	}
 }
 

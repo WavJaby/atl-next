@@ -57,10 +57,15 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    let (pointer_bits, arch_variant, prebuilt_os) = match arches.get(&args.host) {
+    let (pointer_bits, arch_variant, abi, prebuilt_os) = match arches.get(&args.host) {
         Some(a @ arches::Arch { host: Some(h), .. }) => (
             a.pointer_bits.to_string(),
             a.soong_arch_variant.clone().unwrap_or_default(),
+            // Soong's Arch.Abi[0]: the lib/<abi>/ of an apk's JNI libraries
+            a.guest
+                .as_ref()
+                .and_then(|g| g.android_abis.first().cloned())
+                .unwrap_or_default(),
             h.soong_prebuilt_os.clone().with_context(|| {
                 format!(
                     "{}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)",
@@ -248,6 +253,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 &pointer_bits,
                 "-arch-variant",
                 &arch_variant,
+                "-abi",
+                &abi,
                 "-cc",
                 &args.cc,
                 "-cxx",
