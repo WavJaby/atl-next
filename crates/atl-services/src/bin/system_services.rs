@@ -45,11 +45,16 @@ struct Args {
     min_sdk: i32,
     #[arg(long)]
     target_sdk: i32,
+    /// For a client that is a Rust test double, not a Java app: bindApplication sends no shared memory descriptor (ActivityManager::without_app_shared_memory).
+    #[arg(long)]
+    no_app_shared_memory: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
 const ACTIVITY: &str = "activity";
 const PACKAGE: &str = "package";
+/// Context.DISPLAY_SERVICE.
+const DISPLAY: &str = "display";
 
 fn main() -> Result<()> {
     let a = Args::parse();

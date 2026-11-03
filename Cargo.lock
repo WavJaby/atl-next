@@ -186,6 +186,7 @@ dependencies = [
  "atl-aidl",
  "atl-bridgegen",
  "clap",
+ "rustix",
 ]
 
 [[package]]

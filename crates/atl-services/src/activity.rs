@@ -21,12 +21,14 @@ use atl_parcelables::android::content::pm::{
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
+use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
     ActivityWindowInfo, ComponentInfo, ComponentName, LaunchActivityItem, PackageItemInfo,
 };
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::packages::{PackageRecord, Packages, PendingStart};
+use crate::shared_memory::ApplicationSharedMemory;
 use crate::{counters, package, permission, settings, token};
 
 const AM: &str = "IActivityManager";
@@ -45,6 +47,19 @@ const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 /// Intent.FLAG_ACTIVITY_NEW_TASK, set on a launcher start.
 const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+/// The locale of the global configuration until the platform layer supplies the desktop's: what Android uses when neither `persist.sys.locale` nor `ro.product.locale` is set (LocaleList's default,
+/// `Locale.US`). A started app needs at least one: ActivityThread.handleBindApplication calls `LocaleList.setDefault(config.getLocales())`, which throws on an empty list.
+const DEFAULT_LOCALE: &str = "en-US";
+
+/// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), reduced to what the services know: font scale 1 (the `font_scale` setting's default) and the locale.
+/// Screen size, density and the input fields stay undefined (0) until the display and input come from the platform layer.
+fn global_configuration() -> Configuration {
+    Configuration {
+        font_scale: 1.0,
+        locale_list: Some(DEFAULT_LOCALE.to_owned()),
+        ..Configuration::default()
+    }
+}
 
 /// The settings provider (packages/SettingsProvider/AndroidManifest.xml): authority, package, class, process, initOrder; it runs as the system uid.
 const SETTINGS_AUTHORITY: &str = "settings";
@@ -68,6 +83,8 @@ struct State {
     apps: Vec<App>,
     /// System.identityHashCode(r) stand-in for LaunchActivityItem.ident
     next_ident: i32,
+    /// ActivityManagerService.mApplicationSharedMemoryReadOnlyFd's region
+    shared_memory: Option<ApplicationSharedMemory>,
 }
 
 pub struct ActivityManager {
@@ -75,6 +92,8 @@ pub struct ActivityManager {
     state: Mutex<State>,
     controller: SpIBinder,
     settings: SpIBinder,
+    /// Whether bindApplication carries the shared memory descriptor (see [`ActivityManager::without_app_shared_memory`]).
+    app_shared_memory: bool,
 }
 
 fn log(msg: std::fmt::Arguments<'_>) {
@@ -101,7 +120,15 @@ impl ActivityManager {
             }),
             controller,
             settings: settings::new_binder(),
+            app_shared_memory: true,
         }
+    }
+
+    /// For a Rust test double of the app (`xtask test binder`'s client): bindApplication sends no descriptor, because no Rust code can read one (atl-parcelables java.io.FileDescriptor). A Java app needs it:
+    /// ActivityThread maps the region before anything else.
+    pub fn without_app_shared_memory(mut self) -> Self {
+        self.app_shared_memory = false;
+        self
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -144,7 +171,7 @@ impl ActivityManager {
         LaunchActivityItem {
             activity_token: Some(token::new()),
             ident,
-            cur_config: Some(Configuration::default()),
+            cur_config: Some(global_configuration()),
             override_config: Some(Configuration::default()),
             device_id: DEVICE_ID_DEFAULT,
             proc_state: PROCESS_STATE_TOP,
@@ -251,6 +278,28 @@ impl IActivityManager for ActivityManager {
             return Ok(());
         };
         let info = package::application_info(p);
+        // ActivityManagerService's mApplicationSharedMemoryReadOnlyFd: one region for every app, made when the first one attaches
+        let memory_error = |e: &dyn std::fmt::Display| {
+            Status::new_exception_str(
+                ExceptionCode::ILLEGAL_STATE,
+                Some(format!("ApplicationSharedMemory: {e}")),
+            )
+        };
+        let app_memory = if self.app_shared_memory {
+            if st.shared_memory.is_none() {
+                st.shared_memory =
+                    Some(ApplicationSharedMemory::create().map_err(|e| memory_error(&e))?);
+            }
+            let fd = st
+                .shared_memory
+                .as_ref()
+                .map(|m| m.read_only.try_clone())
+                .transpose()
+                .map_err(|e| memory_error(&e))?;
+            fd.map(FileDescriptor::new)
+        } else {
+            Some(FileDescriptor::default())
+        };
         // what attachApplicationLocked passes for a plain app start (no instrumentation, profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
         // an empty provider list (no providers of its own yet), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
         // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); no settings are mirrored into it yet
@@ -271,7 +320,7 @@ impl IActivityManager for ActivityManager {
             false,
             false,
             false,
-            Some(&Configuration::default()),
+            Some(&global_configuration()),
             Some(&CompatibilityInfo::default()),
             None,
             Some(&Bundle),
@@ -281,7 +330,7 @@ impl IActivityManager for ActivityManager {
             Some(&[]),
             Some(&[]),
             None,
-            None,
+            app_memory.as_ref(),
             0,
             0,
         )?;

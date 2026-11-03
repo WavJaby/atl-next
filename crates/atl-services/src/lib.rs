@@ -14,9 +14,12 @@ extern crate binder;
 pub mod counters;
 pub mod packages;
 pub mod permission;
+pub mod shared_memory;
 
 #[cfg(feature = "converter")]
 pub mod activity;
+#[cfg(feature = "converter")]
+pub mod display;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]

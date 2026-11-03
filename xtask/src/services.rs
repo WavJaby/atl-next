@@ -148,6 +148,8 @@ pub fn stage(
         SDK,
         "--target-sdk",
         SDK,
+        // the client is a Rust IApplicationThread, which cannot read the raw descriptor a Java app gets
+        "--no-app-shared-memory",
     ])
     .envs(env.iter().cloned())
     .stdin(Stdio::null())

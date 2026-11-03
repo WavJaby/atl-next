@@ -33,6 +33,7 @@ required-features = ["converter"]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }
 clap.workspace = true
+rustix.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

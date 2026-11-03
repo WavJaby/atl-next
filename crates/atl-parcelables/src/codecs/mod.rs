@@ -30,6 +30,9 @@ pub mod android {
 }
 
 pub mod java {
+    pub mod io {
+        pub mod FileDescriptor;
+    }
     pub mod util {
         pub mod Map;
     }
