@@ -557,10 +557,88 @@ fn libclang_dir(cc: &str) -> Result<PathBuf> {
         .with_context(|| format!("resolving {}", dir.display()))
 }
 
+/// Where DESTDIR installs `path`: `dest` + the absolute path (cargo-c follows the DESTDIR convention; the `.pc` files keep the real prefix).
+fn staged(dest: &Path, path: &Path) -> Result<PathBuf> {
+    let rel = path
+        .strip_prefix("/")
+        .with_context(|| format!("{} is not absolute", path.display()))?;
+    Ok(dest.join(rel))
+}
+
+/// Makes `dst` a copy of `src` (files, symlinks, subdirectories), writing only what differs: an identical file keeps its mtime, so ninja's comparisons against it stay as they were.
+/// `prune` also removes what `dst` holds and `src` lacks (headers a crate stopped generating).
+fn sync_tree(src: &Path, dst: &Path, prune: bool) -> Result<()> {
+    if !dst.is_dir() {
+        remove_path(dst)?;
+        std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    }
+    let mut names = BTreeSet::new();
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let kind = entry.file_type()?; // does not follow symlinks
+        if kind.is_dir() {
+            sync_tree(&from, &to, prune)?;
+        } else if kind.is_symlink() {
+            sync_link(&from, &to)?;
+        } else {
+            sync_file(&from, &to)?;
+        }
+        names.insert(entry.file_name());
+    }
+    if prune {
+        for entry in std::fs::read_dir(dst).with_context(|| format!("reading {}", dst.display()))? {
+            let entry = entry?;
+            if !names.contains(&entry.file_name()) {
+                remove_path(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies `from` over `to` unless `to` is already a regular file with the same bytes.
+fn sync_file(from: &Path, to: &Path) -> Result<()> {
+    let new = std::fs::read(from).with_context(|| format!("reading {}", from.display()))?;
+    let same = std::fs::symlink_metadata(to).is_ok_and(|m| m.is_file())
+        && std::fs::read(to).is_ok_and(|old| old == new);
+    if same {
+        return Ok(());
+    }
+    remove_path(to)?;
+    std::fs::copy(from, to)
+        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    Ok(())
+}
+
+/// Makes `to` a symlink with the target `from` names; a link already pointing there is kept.
+fn sync_link(from: &Path, to: &Path) -> Result<()> {
+    let target =
+        std::fs::read_link(from).with_context(|| format!("reading link {}", from.display()))?;
+    if std::fs::read_link(to).is_ok_and(|t| t == target) {
+        return Ok(());
+    }
+    remove_path(to)?;
+    std::os::unix::fs::symlink(&target, to).with_context(|| format!("linking {}", to.display()))?;
+    Ok(())
+}
+
+/// Removes whatever `path` is (file, symlink or directory tree); nothing when absent.
+fn remove_path(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 /// Builds every `crate:` row's crate into `<out>/crates/<crate>` (the shared library) and
 /// `<out>/gen/<crate>/include` (its generated headers), with cargo-c; one cargo target dir per build
 /// directory, so concurrent checkouts do not share artifacts. Each crate is built once, however many rows name it (atl-bionic: libc, libasync_safe).
 /// A crate installing no header (its callers include upstream headers) gets no include dir.
+/// cargo-c installs into a DESTDIR staging tree that is replaced each run; `sync_tree` copies only what changed into the installed paths, so an unchanged header or library keeps its mtime and its dependants stay clean.
 fn build_crates<'a>(
     root: &Path,
     out: &Path,
@@ -574,10 +652,8 @@ fn build_crates<'a>(
     for krate in crates {
         let prefix = out.join("crates").join(krate);
         let include = out.join("gen").join(krate).join("include");
-        // headers the crate stopped generating must not stay on the include path
-        if include.exists() {
-            std::fs::remove_dir_all(&include)?;
-        }
+        let dest = out.join("cinstall").join(krate);
+        remove_path(&dest)?;
         let status = Command::new("cargo")
             .args([
                 "cinstall",
@@ -589,6 +665,8 @@ fn build_crates<'a>(
             ])
             .arg("--target-dir")
             .arg(out.join("cargo"))
+            .arg("--destdir")
+            .arg(&dest)
             .arg("--prefix")
             .arg(&prefix)
             .arg("--libdir")
@@ -599,6 +677,17 @@ fn build_crates<'a>(
             .status()
             .context("running cargo cinstall (deps.toml row cargo-c)")?;
         ensure!(status.success(), "building crate {krate} failed");
+        let staged_lib = staged(&dest, &prefix.join("lib"))?;
+        if staged_lib.is_dir() {
+            sync_tree(&staged_lib, &prefix.join("lib"), false)?;
+        }
+        // headers the crate stopped generating must not stay on the include path
+        let staged_include = staged(&dest, &include)?;
+        if staged_include.is_dir() {
+            sync_tree(&staged_include, &include, true)?;
+        } else {
+            remove_path(&include)?;
+        }
         // cargo's library name: the package name with `-` as `_`
         let lib = prefix
             .join("lib")
@@ -901,6 +990,60 @@ nope
             CompilerCache::of(&parse(&["--no-compiler-cache"]), ws),
             None
         );
+    }
+
+    #[test]
+    fn sync_tree_writes_only_what_changed() {
+        let root = std::env::temp_dir().join(format!("xtask-sync-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(src.join("same.h"), "same").unwrap();
+        std::fs::write(dst.join("same.h"), "same").unwrap();
+        std::fs::write(src.join("sub/nested.h"), "nested").unwrap();
+        std::fs::write(dst.join("sub/nested.h"), "nested").unwrap();
+        std::fs::write(src.join("changed.h"), "new").unwrap();
+        std::fs::write(dst.join("changed.h"), "old").unwrap();
+        // a header the crate stopped generating
+        std::fs::write(dst.join("gone.h"), "stale").unwrap();
+        std::os::unix::fs::symlink("same.h", src.join("alias.h")).unwrap();
+        // an arbitrary past mtime: a rewrite would show as now
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for f in ["same.h", "sub/nested.h"] {
+            std::fs::File::options()
+                .write(true)
+                .open(dst.join(f))
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        let mtime = |f: &str| std::fs::metadata(dst.join(f)).unwrap().modified().unwrap();
+        sync_tree(&src, &dst, true).unwrap();
+        assert_eq!(mtime("same.h"), past, "identical content keeps its mtime");
+        assert_eq!(
+            mtime("sub/nested.h"),
+            past,
+            "identical nested content keeps its mtime"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("changed.h")).unwrap(),
+            "new"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("gone.h")).is_err(),
+            "a header the crate stopped generating is pruned"
+        );
+        assert_eq!(
+            std::fs::read_link(dst.join("alias.h")).unwrap(),
+            Path::new("same.h")
+        );
+        // a second sync with nothing changed keeps every mtime, the changed file's included
+        let changed = mtime("changed.h");
+        sync_tree(&src, &dst, true).unwrap();
+        assert_eq!(mtime("changed.h"), changed);
+        assert_eq!(mtime("same.h"), past);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
