@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 18:26:44 +0800
+Subject: [PATCH] libbinder_rs: safe Parcel::marshal and checked
+ set_data_position
+
+AParcel_marshal copies a parcel's data as bytes and refuses a parcel
+that holds binder or file descriptor objects. set_data_position is
+unsafe only for its unchecked bound. libbinder_rs offers neither a
+safe object-free copy nor a checked seek, and atl-parcelables forbids
+unsafe, so its codecs can neither prove a copied range object-free
+nor read a file descriptor object from a scratch parcel.
+
+Upstream-Status: Inappropriate [ATL-only: codecs forbid unsafe; no AOSP Rust caller needs it]
+Patch-Reason: atl-parcelables must refuse a Bundle body that carries an object (its bytes lose the object) and read a java.io.FileDescriptor, which is one object without the leading ints a ParcelFileDescriptor read needs. Both need a safe wrapper beside libbinder_rs's own unsafe calls; an unsafe boundary crate would add a converter rlib edge and a modules.toml edge for these calls.
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/rust/src/parcel.rs | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/libs/binder/rust/src/parcel.rs b/libs/binder/rust/src/parcel.rs
+index 2d40ced2fdc00dc9ad503526ec3a6c8614f955e0..66049bb750f9b81a1c2744003ff62bb85e77fc6f 100644
+--- a/libs/binder/rust/src/parcel.rs
++++ b/libs/binder/rust/src/parcel.rs
+@@ -303,6 +303,16 @@ impl BorrowedParcel<'_> {
+         status_result(unsafe { sys::AParcel_setDataPosition(self.as_native(), pos) })
+     }
+ 
++    /// Moves the position to `pos`, which must lie within the data (0 up to the data size); any other `pos` is BAD_VALUE.
++    /// The bound that `set_data_position` leaves to its caller is checked here.
++    pub fn set_data_position_checked(&self, pos: i32) -> Result<()> {
++        if pos < 0 || pos > self.get_data_size() {
++            return Err(StatusCode::BAD_VALUE);
++        }
++        // Safety: `pos` is within the data, as checked above.
++        unsafe { self.set_data_position(pos) }
++    }
++
+     /// Append a subset of another parcel.
+     ///
+     /// This appends `size` bytes of data from `other` starting at offset
+@@ -420,6 +430,11 @@ impl Parcel {
+         unsafe { self.borrowed_ref().set_data_position(pos) }
+     }
+ 
++    /// See [`BorrowedParcel::set_data_position_checked`].
++    pub fn set_data_position_checked(&self, pos: i32) -> Result<()> {
++        self.borrowed_ref().set_data_position_checked(pos)
++    }
++
+     /// Append a subset of another parcel.
+     ///
+     /// This appends `size` bytes of data from `other` starting at offset
+@@ -437,6 +452,22 @@ impl Parcel {
+     pub fn append_all_from(&mut self, other: &impl AsNative<sys::AParcel>) -> Result<()> {
+         self.borrowed().append_all_from(other)
+     }
++
++    /// The parcel's data as bytes, or `INVALID_OPERATION` if it holds a binder or file descriptor object:
++    /// bytes cannot carry an object, so a caller that needs a byte-exact copy checks this first.
++    pub fn marshal(&self) -> Result<Vec<u8>> {
++        let len = usize::try_from(self.get_data_size()).map_err(|_| StatusCode::BAD_VALUE)?;
++        if len == 0 {
++            // a parcel with no data has no buffer to copy from (AParcel_marshal reports UNEXPECTED_NULL)
++            return Ok(Vec::new());
++        }
++        let mut buf = vec![0u8; len];
++        // Safety: `buf` holds `len` bytes, the parcel's whole data; AParcel_marshal writes exactly
++        // those, and refuses a parcel that holds objects.
++        let status = unsafe { sys::AParcel_marshal(self.as_native(), buf.as_mut_ptr(), 0, len) };
++        status_result(status)?;
++        Ok(buf)
++    }
+ }
+ 
+ // Data deserialization methods
