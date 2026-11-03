@@ -314,3 +314,52 @@ impl Runtime {
         cmd.spawn().context("starting atld")
     }
 }
+
+/// The services' counters, from their log: every unimplemented call (`services: unimplemented <interface>.<method> <n>`, atl_services::counters) and every refused parcelable or field
+/// (`parcelables: refused <what> <n>`, atl_parcelables `refuse`), each as `<kind> <name> x<last n>`. The services are killed at the end of a run and print no summary: the last line per name is the total.
+pub fn counter_lines(services_log: &str) -> Vec<String> {
+    const KINDS: [(&str, &str); 2] = [
+        ("services: unimplemented ", "unimplemented"),
+        ("parcelables: refused ", "refused"),
+    ];
+    let mut last = std::collections::BTreeMap::new();
+    for line in services_log.lines() {
+        for (prefix, kind) in KINDS {
+            if let Some((name, n)) = line
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.rsplit_once(' '))
+            {
+                last.insert((kind, name.to_owned()), n.to_owned());
+            }
+        }
+    }
+    last.into_iter()
+        .map(|((kind, name), n)| format!("{kind} {name} x{n}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both counter kinds, the last count per name wins, a name with spaces keeps them, other lines are ignored.
+    #[test]
+    fn counter_lines_take_the_last_count_of_each_kind() {
+        let log = "services: ready\n\
+                   services: unimplemented IActivityManager.getProcessLimit 1\n\
+                   parcelables: refused android.content.Intent.extras 1\n\
+                   services: unimplemented IActivityManager.getProcessLimit 2\n\
+                   parcelables: refused android.os.Bundle (value type) 1\n\
+                   parcelables: refused android.content.Intent.extras 2\n\
+                   services: Failure reporting\n";
+        assert_eq!(
+            counter_lines(log),
+            [
+                "refused android.content.Intent.extras x2",
+                "refused android.os.Bundle (value type) x1",
+                "unimplemented IActivityManager.getProcessLimit x2",
+            ]
+        );
+        assert!(counter_lines("nothing\n").is_empty());
+    }
+}

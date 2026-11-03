@@ -18,7 +18,7 @@ use anyhow::{Result, ensure};
 
 use atl_services::packages::Library;
 
-use crate::atld_run::{Run, Runtime, Shell};
+use crate::atld_run::{Run, Runtime, Shell, counter_lines};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -555,7 +555,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
             }
         }
-        for l in read_counters(&run) {
+        let services_log = std::fs::read_to_string(run.log("services")).unwrap_or_default();
+        for l in counter_lines(&services_log) {
             println!("instrument: {label}: counter {l}");
         }
         if fails.is_empty() {
@@ -581,13 +582,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 tail(&lines.join("\n"), TAIL)
             );
             println!("---- atld log ({label})\n{}", tail(&atld_log, TAIL));
-            println!(
-                "---- services log ({label})\n{}",
-                tail(
-                    &std::fs::read_to_string(run.log("services")).unwrap_or_default(),
-                    TAIL
-                )
-            );
+            println!("---- services log ({label})\n{}", tail(&services_log, TAIL));
             println!(
                 "---- app log ({label})\n{}",
                 tail(
@@ -603,19 +598,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
-}
-
-/// The services' unimplemented-call counter lines (atl_services::counters), as `<interface>.<method> <n>`, last count per call.
-fn read_counters(run: &Run) -> Vec<String> {
-    const COUNTER: &str = "services: unimplemented ";
-    let log = std::fs::read_to_string(run.log("services")).unwrap_or_default();
-    let mut last = BTreeMap::new();
-    for l in log.lines().filter_map(|l| l.strip_prefix(COUNTER)) {
-        if let Some((call, n)) = l.rsplit_once(' ') {
-            last.insert(call.to_owned(), n.to_owned());
-        }
-    }
-    last.into_iter().map(|(c, n)| format!("{c} x{n}")).collect()
 }
 
 #[cfg(test)]

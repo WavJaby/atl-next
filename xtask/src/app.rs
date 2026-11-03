@@ -2,7 +2,7 @@
 //! `xtask test app`: the M2 gate. The test APK (xtask/testdata/app: a manifest and one Activity whose onCreate logs [`MARKER`]) is started the Android way by atld: atl-binderd,
 //! AOSP servicemanager, the M2 services (atl-system-services), then the services start the app through atld's process control (the broker's sandbox); ActivityThread attaches, is bound, launches the activity.
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
-//! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Fail: the app log's last lines, and the services' unimplemented-call counters (atl_services::counters lines).
+//! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime};
+use crate::atld_run::{Run, Runtime, counter_lines};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -43,9 +43,6 @@ const APP_UID: u32 = 10_123;
 const LIMIT: Duration = Duration::from_secs(180);
 /// App log lines shown on failure.
 const TAIL: usize = 40;
-/// The services' counter lines (atl_services::counters).
-const COUNTER: &str = "services: unimplemented ";
-
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
@@ -113,8 +110,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    for l in services_log.lines().filter(|l| l.starts_with(COUNTER)) {
-        println!("app: counter {}", &l[COUNTER.len()..]);
+    for l in counter_lines(&services_log) {
+        println!("app: counter {l}");
     }
     if passed {
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
@@ -128,5 +125,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     println!("app: FAIL {why}");
     println!("---- atld log\n{}", tail(&read(&run.atld_log()), TAIL));
     println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
+    println!(
+        "---- services log (last {TAIL} lines)\n{}",
+        tail(&services_log, TAIL)
+    );
     Ok(ExitCode::FAILURE)
 }

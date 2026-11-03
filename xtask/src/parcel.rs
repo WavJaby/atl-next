@@ -143,6 +143,18 @@ fn java_verdict(ok: bool, stdout: &str, failure: &str) -> (Vec<String>, Vec<Stri
     (passes, fails)
 }
 
+/// The line `atl_parcelables::refuse` writes to stderr for the Intent extras refusal that ParcelTruth's `self-test:refusal` provokes (once): `parcelables: refused <what> <n>`.
+const REFUSAL_LINE: &str = "parcelables: refused android.content.Intent.extras 1";
+
+/// A failure message when the refusal of the self-test is missing from the driver's stderr: refusals that show up only in a counter nobody prints are the failure this guards.
+fn refusal_logged(stderr: &str) -> Option<String> {
+    if stderr.lines().any(|l| l == REFUSAL_LINE) {
+        None
+    } else {
+        Some(format!("stderr lacks the refusal line {REFUSAL_LINE:?}"))
+    }
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = match &args.out {
         Some(dir) => std::path::absolute(dir)?,
@@ -225,6 +237,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("parcel: pass {p}");
     }
     fails.extend(java_fails);
+    // a refusal must be visible in the process log, not only in the counter map (ParcelTruth's self-test:refusal makes one)
+    if let Some(f) = refusal_logged(&run.stderr) {
+        fails.push(f);
+    }
     for f in &fails {
         println!("parcel: FAIL {f}");
     }
@@ -251,6 +267,17 @@ mod tests {
         assert_eq!(verdict(&(false, "boom".into()), &fired).len(), 1);
         assert_eq!(verdict(&ok, &ok).len(), 1);
         assert_eq!(verdict(&ok, &(false, "other".into())).len(), 1);
+    }
+
+    /// The refusal line must be on its own line of stderr; any other text does not count.
+    #[test]
+    fn refusal_line_is_required() {
+        assert_eq!(
+            refusal_logged(&format!("noise\n{REFUSAL_LINE}\nmore\n")),
+            None
+        );
+        assert!(refusal_logged("").is_some());
+        assert!(refusal_logged("parcelables: refused android.content.Intent.extras 2\n").is_some());
     }
 
     /// The Java verdict: all cases passed; a failed case, a missing case, and a crash after all passes each fail.

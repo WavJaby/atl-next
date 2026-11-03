@@ -4,6 +4,7 @@
 //! generator's `_` suffix on a Java class of such a name (bp2ninja aidlcrates.go rustName).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::Mutex;
 
 use binder::StatusCode;
@@ -15,10 +16,16 @@ pub const NICHE: Niche = Niche::MIN;
 static REFUSED: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 
 /// Counts one refusal of `what` (a Java class or field) and returns the status to fail with.
+/// Every hit is also written to stderr as `parcelables: refused <what> <n>`: a refusal reaches the caller only as BAD_VALUE (Java: IllegalArgumentException), so the line is the one place that names what was refused.
+/// `xtask test instrument` / `app` read these lines out of the services log (atld_run.rs `counter_lines`); a process killed at the end of a run prints no summary, so the last line per name is the total.
 pub fn refuse(what: &'static str) -> StatusCode {
     // a poisoned counter still counts: the map holds plain numbers
     let mut map = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    *map.entry(what).or_insert(0) += 1;
+    let n = map.entry(what).or_insert(0);
+    *n += 1;
+    let n = *n;
+    drop(map);
+    let _ = writeln!(std::io::stderr(), "parcelables: refused {what} {n}");
     StatusCode::BAD_VALUE
 }
 
