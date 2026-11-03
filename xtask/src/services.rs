@@ -127,6 +127,7 @@ pub fn stage(
     let services_log = test_root.join("services.log");
     let mut cmd = Command::new(&host);
     let app_dir = format!("/data/user/0/{APP}");
+    let device_dir = format!("/data/user_de/0/{APP}");
     let apk = format!("/data/app/{APP}/base.apk");
     let uid = APP_UID.to_string();
     cmd.args([
@@ -138,6 +139,8 @@ pub fn stage(
         &apk,
         "--data",
         &app_dir,
+        "--device-data",
+        &device_dir,
         "--activity",
         ACTIVITY,
         "--start-seq",

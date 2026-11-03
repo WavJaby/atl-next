@@ -54,6 +54,9 @@ struct Args {
     /// The converter's build.prop: the property area's source, /system/build.prop.
     #[arg(long)]
     build_prop: PathBuf,
+    /// A file of /system besides the framework's (repeat): `<host path>=<path below /system>`, linked there (the system fonts: etc/font_fallback.xml, fonts/<name>).
+    #[arg(long = "system-file", value_parser = system_file)]
+    system_files: Vec<(PathBuf, PathBuf)>,
     /// The app's APK.
     #[arg(long)]
     apk: PathBuf,
@@ -139,19 +142,63 @@ fn system_layout(a: &Args, r: &Root) -> Result<String> {
         std::os::unix::fs::symlink(std::path::absolute(jar)?, &at)?;
         boot.push(format!("/system/framework/{}", name.to_string_lossy()));
     }
+    for (host, at) in &a.system_files {
+        let at = r.system().join(at);
+        ensure!(!at.exists(), "two /system files at {}", at.display());
+        std::fs::create_dir_all(at.parent().context("a path below /system")?)?;
+        std::os::unix::fs::symlink(std::path::absolute(host)?, &at)?;
+    }
     Ok(boot.join(":"))
 }
 
-/// /data/app/<package>/base.apk (PackageManager's install path for a base APK), the app's data dir, ART's dalvik-cache.
-fn data_layout(a: &Args, r: &Root) -> Result<(String, String)> {
+/// `--system-file`'s `<host path>=<path below /system>`; the second must be relative and stay below /system.
+fn system_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
+    let (host, at) = s
+        .split_once('=')
+        .ok_or_else(|| format!("{s}: not <host path>=<path below /system>"))?;
+    let at = PathBuf::from(at);
+    if at
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "{}: not a relative path below /system",
+            at.display()
+        ));
+    }
+    Ok((PathBuf::from(host), at))
+}
+
+/// The installed paths of the package, as the sandbox sees them.
+struct DataPaths {
+    /// /data/app/<package>/base.apk
+    apk: String,
+    /// the credential-protected data dir, /data/user/0/<package>
+    data: String,
+    /// the device-protected data dir, /data/user_de/0/<package>
+    device_data: String,
+}
+
+/// /data/app/<package>/base.apk (PackageManager's install path for a base APK), the app's credential- and device-protected data dirs, ART's dalvik-cache.
+fn data_layout(a: &Args, r: &Root) -> Result<DataPaths> {
     let app = format!("app/{}", a.package);
     let user = format!("user/0/{}", a.package);
-    for d in [app.as_str(), user.as_str(), "dalvik-cache"] {
+    let user_de = format!("user_de/0/{}", a.package);
+    for d in [
+        app.as_str(),
+        user.as_str(),
+        user_de.as_str(),
+        "dalvik-cache",
+    ] {
         std::fs::create_dir_all(r.data().join(d))?;
     }
     std::fs::copy(&a.apk, r.data().join(&app).join("base.apk"))
         .with_context(|| format!("copying {}", a.apk.display()))?;
-    Ok((format!("/data/{app}/base.apk"), format!("/data/{user}")))
+    Ok(DataPaths {
+        apk: format!("/data/{app}/base.apk"),
+        data: format!("/data/{user}"),
+        device_data: format!("/data/{user_de}"),
+    })
 }
 
 fn property_area(a: &Args, r: &Root) -> Result<()> {
@@ -190,7 +237,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(r.root.join("log"))?;
     property_area(a, &r)?;
     let boot = system_layout(a, &r)?;
-    let (apk, data_dir) = data_layout(a, &r)?;
+    let paths = data_layout(a, &r)?;
     let (mut binderd, broker) = start_binderd(a, &r)?;
     let lib = (OsString::from("LD_LIBRARY_PATH"), a.lib_path.clone());
     let system_spawn =
@@ -213,8 +260,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     let services_args: Vec<OsString> = [
         ("--package", a.package.clone()),
         ("--uid", a.uid.to_string()),
-        ("--apk", apk),
-        ("--data", data_dir),
+        ("--apk", paths.apk),
+        ("--data", paths.data),
+        ("--device-data", paths.device_data),
         ("--activity", a.activity.clone()),
         ("--start-seq", START_SEQ.to_string()),
         ("--version-code", a.version_code.to_string()),

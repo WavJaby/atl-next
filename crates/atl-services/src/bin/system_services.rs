@@ -29,9 +29,12 @@ struct Args {
     /// Its base.apk path.
     #[arg(long)]
     apk: String,
-    /// Its data directory.
+    /// Its data directory (credential protected storage).
     #[arg(long)]
     data: String,
+    /// Its device protected data directory.
+    #[arg(long)]
+    device_data: String,
     /// Its launcher activity's class name.
     #[arg(long)]
     activity: String,
@@ -76,13 +79,16 @@ fn main() -> Result<()> {
         uid: a.uid,
     }];
     ProcessState::start_thread_pool();
-    let am = BnActivityManager::new_binder(
-        ActivityManager::new(packages.clone(), pending),
-        BinderFeatures::default(),
-    );
+    let mut activity_manager = ActivityManager::new(packages.clone(), pending);
+    if a.no_app_shared_memory {
+        activity_manager = activity_manager.without_app_shared_memory();
+    }
+    let am = BnActivityManager::new_binder(activity_manager, BinderFeatures::default());
     binder::add_service(ACTIVITY, am.as_binder()).context("addService activity")?;
     let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
+    binder::add_service(DISPLAY, atl_services::display::new_binder())
+        .context("addService display")?;
     writeln!(std::io::stderr(), "services: ready")?;
     ProcessState::join_thread_pool();
     Ok(())

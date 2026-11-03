@@ -22,9 +22,17 @@ const USER_SYSTEM: i32 = 0;
 /// ApplicationInfo.FLAG_HAS_CODE (content/pm/ApplicationInfo.java): every APK ATL runs has code.
 const FLAG_HAS_CODE: i32 = 1 << 2;
 
+/// The directory of an installed package's native libraries below its install directory (PackageManagerService: `lib/<isa>` under /data/app/<package>); the ISA level is left out until the installer extracts libraries from the APK's lib/<abi>/.
+const NATIVE_LIBRARY_SUBDIR: &str = "lib";
+
 /// The ApplicationInfo of `p` (PackageInfoUtils.generateApplicationInfo, reduced to what the record holds): names, uid, paths, SDK levels, enabled.
+/// `nativeLibraryDir` is never null for an installed app: LoadedApk.makePaths adds it to the class loader's library path, and a null breaks `new File(null)` there.
 pub fn application_info(p: &PackageRecord) -> ApplicationInfo {
+    let native_library_dir = std::path::Path::new(&p.source_dir)
+        .parent()
+        .map(|dir| dir.join(NATIVE_LIBRARY_SUBDIR).display().to_string());
     ApplicationInfo {
+        native_library_dir,
         item: PackageItemInfo {
             name: None,
             package_name: Some(p.name.clone()),
@@ -36,6 +44,7 @@ pub fn application_info(p: &PackageRecord) -> ApplicationInfo {
         public_source_dir: Some(p.source_dir.clone()),
         data_dir: Some(p.data_dir.clone()),
         credential_protected_data_dir: Some(p.data_dir.clone()),
+        device_protected_data_dir: Some(p.device_protected_data_dir.clone()),
         uid: i32::try_from(p.uid).unwrap_or(i32::MAX),
         min_sdk_version: p.min_sdk,
         target_sdk_version: p.target_sdk,

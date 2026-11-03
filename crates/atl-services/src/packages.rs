@@ -8,7 +8,10 @@ pub struct PackageRecord {
     pub uid: u32,
     /// base.apk path (ApplicationInfo.sourceDir)
     pub source_dir: String,
+    /// credential-protected storage (ApplicationInfo.dataDir, credentialProtectedDataDir: /data/user/<user>/<package>)
     pub data_dir: String,
+    /// device-protected storage (ApplicationInfo.deviceProtectedDataDir: /data/user_de/<user>/<package>): the code cache dir, which graphics setup opens first
+    pub device_protected_data_dir: String,
     pub version_code: i64,
     pub version_name: Option<String>,
     pub min_sdk: i32,
@@ -72,6 +75,7 @@ mod tests {
             uid,
             source_dir: String::new(),
             data_dir: String::new(),
+            device_protected_data_dir: String::new(),
             version_code: 1,
             version_name: None,
             min_sdk: 21,
