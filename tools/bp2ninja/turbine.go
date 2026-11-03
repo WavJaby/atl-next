@@ -45,9 +45,10 @@ func (g *Graph) turbineHeaders(n *jNode, java, kt, srcjars, waits, flags []strin
 	g.java.edge("turbine", []string{out}, absAll(g, java), implicit, waits, [][2]string{
 		{"flags", ninjaRaw(flags)}, {"ver", ver.String()}, {"srcjars", join(srcjars)}, {"bootcp", boot}, {"cp", join(cp)}, {"turbine", esc(turbine)},
 	})
-	// compileJavaHeader: always combined with the static libraries' headers into turbine-combined, META-INF/TRANSITIVE stripped
+	// compileJavaHeader: always combined with the static libraries' header jars (TransitiveStaticLibsHeaderJars: a repackaged lib
+	// contributes both of its headers) into turbine-combined, META-INF/TRANSITIVE stripped
 	header := filepath.Join(n.dir, "turbine-combined", jar)
-	g.java.edge("combine", []string{header}, dedupKeep(append([]string{out}, d.staticImpl...)), nil, nil, [][2]string{
+	g.java.edge("combine", []string{header}, dedupKeep(append([]string{out}, d.staticHeaders...)), nil, nil, [][2]string{
 		{"args", "-stripDir META-INF/TRANSITIVE -stripFile module-info.class -stripFile 'META-INF/versions/*/module-info.class'"}})
 	if rules := g.jarjarRulesFile(n); rules != "" {
 		jj := filepath.Join(n.dir, "jarjar", "turbine", jar)

@@ -83,17 +83,144 @@ func TestJarjarRepackaging(t *testing.T) {
 	if n.renames["com.x.flags.Flags"] != "com.android.internal.hidden_from_bootclasspath.com.x.flags.Flags" {
 		t.Errorf("renames %v", n.renames)
 	}
-	// base.go compile localHeaderJars: the unmodified header (javac's jar without the renames, through jarjar_rules) then the
-	// repackaged one; libs dependents compile against both
-	plain, repackaged := filepath.Join(dir, "plain-header", "fw.jar"), filepath.Join(dir, "javac-header", "fw.jar")
+	// base.go compile (Turbine on, a device module): headerJarFile = jarjarIfNecessary(turbine-combined) then, repackaged,
+	// repackagedHeaderJarFile = repackageFlagsIfNecessary(headerJarFile); localHeaderJars = both, libs dependents compile against both
+	plain, repackaged := filepath.Join(dir, "javac-header", "fw.jar"), filepath.Join(dir, "repackaged-jarjar", "turbine", "fw.jar")
 	if got := n.headers(); len(got) != 2 || got[0] != plain || got[1] != repackaged {
 		t.Errorf("headers %v", got)
 	}
-	if e := ninjaEdgeVars(ninja, plain); e == nil || !strings.Contains(e[""], filepath.Join(dir, "jarjar", "plain", "fw.jar")) {
+	if e := ninjaEdgeVars(ninja, plain); e == nil || !strings.Contains(e[""], filepath.Join(dir, "jarjar", "turbine", "fw.jar")) {
 		t.Errorf("plain header %v", e)
 	}
-	if e := ninjaEdgeVars(ninja, filepath.Join(dir, "jarjar", "plain", "fw.jar")); e == nil || !strings.Contains(e[""], filepath.Join(dir, "javac", "fw.jar")) {
-		t.Errorf("plain jarjar %v", e)
+	if e := ninjaEdgeVars(ninja, filepath.Join(dir, "jarjar", "turbine", "fw.jar")); e == nil || !strings.Contains(e[""], filepath.Join(dir, "javac", "fw.jar")) ||
+		e["rules"] != esc(g.abs("j/rules.txt")) || e["total"] != "1" {
+		t.Errorf("header jarjar %v", e)
+	}
+	if e := ninjaEdgeVars(ninja, repackaged); e == nil || e["rules"] != esc(rules) || !strings.Contains(e[""], plain) {
+		t.Errorf("repackaged header %v", e)
+	}
+}
+
+// repackagedTree: lib is repackaged by its jarjar_prefix (an exportable aconfig library in its srcs); user links it as a static lib or a
+// lib, plain has no renames.
+const repackagedTree = `
+aconfig_declarations { name: "decl", package: "com.x.flags", container: "system", srcs: ["f.aconfig"], exportable: true }
+java_aconfig_library { name: "flags-java", aconfig_declarations: "decl", sdk_version: "none", system_modules: "none" }
+java_library { name: "lib", srcs: ["A.java"], static_libs: ["flags-java"], sdk_version: "none", system_modules: "none",
+    jarjar_prefix: "com.android.internal.hidden_from_bootclasspath" }
+java_library { name: "wrap", static_libs: ["lib", "plain"], sdk_version: "none", system_modules: "none" }
+java_library { name: "user", srcs: ["U.java"], libs: ["wrap"], sdk_version: "none", system_modules: "none" }
+java_library { name: "stat", srcs: ["S.java"], static_libs: ["lib"], sdk_version: "none", system_modules: "none" }
+java_library_host { name: "hostlib", srcs: ["H.java"], static_libs: ["flags-java"], jarjar_prefix: "com.android.internal.hidden_from_bootclasspath" }
+java_library { name: "plain", srcs: ["P.java"], sdk_version: "none", system_modules: "none" }
+java_library { name: "hdr", srcs: ["U.java"], static_libs: ["lib"], headers_only: true, sdk_version: "none", system_modules: "none" }
+java_binary_host { name: "turbine", srcs: ["T.java"] }
+`
+
+func repackagedGraph(t *testing.T) *Graph {
+	g := javaTestGraph(t, map[string]string{"j/Android.bp": repackagedTree, "j/A.java": "", "j/U.java": "", "j/S.java": "", "j/H.java": "", "j/P.java": "", "j/T.java": "",
+		"j/f.aconfig": ""},
+		map[string]string{"RELEASE_READ_FROM_NEW_STORAGE": "", "RELEASE_ACONFIG_NEW_EXPORTED": "", "RELEASE_ACONFIG_CHECK_API_LEVEL": "",
+			"RELEASE_ACONFIG_FLAG_DEFAULT_PERMISSION": "READ_WRITE", "RELEASE_ACONFIG_REQUIRE_ALL_READ_ONLY": ""})
+	g.release.ValueSets = nil
+	return g
+}
+
+func TestRepackagedStaticLibHeaders(t *testing.T) {
+	g := repackagedGraph(t)
+	wrap := g.jnode("wrap", Device, "test")
+	if wrap == nil {
+		t.Fatalf("%v", g.problems)
+	}
+	lib := g.java.nodes[jKey{"lib", Device}]
+	ninja := g.java.b.String()
+	wdir := filepath.Join(g.out, "device", "wrap")
+	// collectDeps staticLibTag + compileJavaHeader: lib's TransitiveStaticLibsHeaderJars (its unmodified and its repackaged header) are merged
+	// into wrap's header, unlike the implementation merge, which takes lib's repackaged implementation; wrap has no code of its own and
+	// inherits lib's rules, so it exports both headers too
+	hdr := ninjaEdgeVars(ninja, filepath.Join(wdir, "turbine-combined", "wrap.jar"))
+	plainHdr := g.java.nodes[jKey{"plain", Device}].header
+	if hdr == nil {
+		t.Fatalf("no turbine-combined edge for wrap\n%s", ninja)
+	}
+	for _, want := range append(lib.headers(), plainHdr) {
+		if !strings.Contains(hdr[""], want) {
+			t.Errorf("wrap's header merge misses %s: %s", want, hdr[""])
+		}
+	}
+	if strings.Contains(hdr[""], filepath.Join(g.out, "device", "lib", "combined")) {
+		t.Errorf("wrap's header merges lib's implementation: %s", hdr[""])
+	}
+	if got := wrap.headers(); len(got) != 2 || got[0] != filepath.Join(wdir, "javac-header", "wrap.jar") || got[1] != filepath.Join(wdir, "repackaged-jarjar", "turbine", "wrap.jar") {
+		t.Errorf("wrap headers %v", got)
+	}
+	// the implementation merge keeps lib's repackaged implementation only
+	if want := lib.impl[0]; len(wrap.impl) < 1 || wrap.impl[0] != want {
+		t.Errorf("wrap impl %v, want %v first", wrap.impl, want)
+	}
+}
+
+func TestRepackagedClasspath(t *testing.T) {
+	g := repackagedGraph(t)
+	for _, name := range []string{"user", "stat"} {
+		if g.jnode(name, Device, "test") == nil {
+			t.Fatalf("%v", g.problems)
+		}
+	}
+	ninja := g.java.b.String()
+	lib := g.java.nodes[jKey{"lib", Device}]
+	wrap := g.java.nodes[jKey{"wrap", Device}]
+	// collectDeps libTag / staticLibTag: both put TransitiveStaticLibsHeaderJars (here: the unmodified and the repackaged header) on the classpath
+	for name, dep := range map[string]*jNode{"user": wrap, "stat": lib} {
+		e := ninjaEdgeVars(ninja, filepath.Join(g.out, "device", name, "javac", name+".jar"))
+		if e == nil {
+			t.Fatalf("%s: no javac edge", name)
+		}
+		for _, h := range dep.headers() {
+			if !strings.Contains(e["cp"], h) {
+				t.Errorf("%s: classpath %q misses %s", name, e["cp"], h)
+			}
+		}
+	}
+}
+
+func TestHostModuleExportsOneHeader(t *testing.T) {
+	// compile: only a device module with Turbine on exports RepackagedHeaderJars; the host path's header is the repackaged implementation's
+	g := repackagedGraph(t)
+	h := g.jnode("hostlib", Host, "test")
+	if h == nil {
+		t.Fatalf("%v", g.problems)
+	}
+	if h.repackagedHeader != "" || len(h.headers()) != 1 || h.header != filepath.Join(g.out, "host", "hostlib", "javac-header", "hostlib.jar") {
+		t.Errorf("host headers %v (repackaged %q)", h.headers(), h.repackagedHeader)
+	}
+	// convertImplementationJarToHeaderJar: the combined implementation (repackaged classes + the static lib), not a merge of unrepackaged ones
+	if e := ninjaEdgeVars(g.java.b.String(), h.header); e == nil || !strings.Contains(e[""], filepath.Join(g.out, "host", "hostlib", "combined", "hostlib.jar")) {
+		t.Errorf("host header edge %v", e)
+	}
+}
+
+func TestHeadersOnlyMergesStaticHeaders(t *testing.T) {
+	// compileJavaHeader merges deps.transitiveStaticLibsHeaderJars: a repackaged static lib contributes its unmodified and its repackaged
+	// header, not its implementation
+	g := repackagedGraph(t)
+	n := g.jnode("hdr", Device, "test")
+	if n == nil {
+		t.Fatalf("%v", g.problems)
+	}
+	lib := g.java.nodes[jKey{"lib", Device}]
+	comb := filepath.Join(g.out, "device", "hdr", "turbine-combined", "hdr.jar")
+	e := ninjaEdgeVars(g.java.b.String(), comb)
+	if e == nil {
+		t.Fatalf("no turbine-combined edge")
+	}
+	for _, h := range lib.headers() {
+		if !strings.Contains(e[""], h) {
+			t.Errorf("turbine-combined misses %s: %s", h, e[""])
+		}
+	}
+	if strings.Contains(e[""], filepath.Join(g.out, "device", "lib", "combined")) {
+		t.Errorf("turbine-combined merges lib's implementation: %s", e[""])
 	}
 }
 

@@ -16,7 +16,8 @@ import (
 //   - Turbine is not run: Soong's TURBINE_ENABLED=false path, which every host module takes anyway. A module's header jar is its
 //     implementation jar without META-INF/services (convertImplementationJarToHeaderJar); dependents compile against it.
 //   - Header jars are one combined jar per module, where Soong lists the module's and its static libraries' header jars: same
-//     classes, one file.
+//     classes, one file. A repackaged device module (jarjar.go) is the exception, as with Turbine on: it exports its unmodified header
+//     and the repackaged one (javaHeaders), and dependents put every header of a libs / static_libs dependency on the classpath.
 //   - d8 runs in debug mode unless dxflags ask for --release: D8's own default, and what Soong's eng builds pass explicitly.
 //   - Every installable / compile_dex device jar is stored uncompressed and aligned (Soong: boot jars, APEX jars and preopted jars are,
 //     which is what this build's runtime jars are); `uncompress_dex: false` opts out.
@@ -47,7 +48,7 @@ type jNode struct {
 	dir   string // build directory of this variant
 
 	header string // HeaderJars (one jar)
-	// RepackagedHeaderJars: the header with inherited rename rules applied, exported beside header ("" = not repackaged)
+	// RepackagedHeaderJars: the header with inherited rename rules applied, exported beside header ("" = not repackaged, or host)
 	repackagedHeader string
 	impl             []string // TransitiveStaticLibsImplementationJars
 	res              []string // TransitiveStaticLibsResourceJars
@@ -220,7 +221,8 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 	return n
 }
 
-// headers: what a libs dependent compiles against (collectDeps libTag): the header jar, then the repackaged one when it differs.
+// headers: JavaInfo.TransitiveStaticLibsHeaderJars as far as a dependent sees it (collectDeps libTag and staticLibTag): the header jar,
+// then the repackaged one when the module has one.
 func (n *jNode) headers() []string {
 	if n.repackagedHeader != "" {
 		return []string{n.header, n.repackagedHeader}
@@ -443,7 +445,11 @@ type javaDeps struct {
 	processorPath, processors            []string
 	sys                                  *jNode
 	staticImpl, staticRes                []string
-	srcJars                              []string
+	// staticHeaders: the static libs' TransitiveStaticLibsHeaderJars (jNode.headers of each, in order), what compileJavaHeader merges into a
+	// device module's header; staticRepackaged: one of them exports a repackaged header beside the unmodified one
+	staticHeaders    []string
+	staticRepackaged bool
+	srcJars          []string
 	// aidl: libs' and static_libs' exported include dirs (tree-relative), the SDK's preprocessed file (absolute; "" = none), and the
 	// generated one a module SDK would need instead (not built)
 	aidlIncludes            []string
@@ -519,7 +525,10 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 				g.problem("%s: static_libs %s provides no jar", n.name, r)
 				continue
 			}
-			d.classpath = append(d.classpath, l.header)
+			// staticLibTag: TransitiveStaticLibsHeaderJars joins the classpath whole (the unmodified and the repackaged header alike)
+			d.classpath = append(d.classpath, l.headers()...)
+			d.staticHeaders = append(d.staticHeaders, l.headers()...)
+			d.staticRepackaged = d.staticRepackaged || l.repackagedHeader != ""
 			d.staticImpl = append(d.staticImpl, l.impl...)
 			d.staticRes = append(d.staticRes, l.res...)
 			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
@@ -705,7 +714,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		srcs = append(srcs, p.obj("openjdk9").strs("srcs")...)
 	}
 	g.implicitJavaLibs(n, srcs)
-	d, statics := g.collectJavaDeps(n, s)
+	d, _ := g.collectJavaDeps(n, s)
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
 	}
@@ -755,7 +764,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 			flags = append(flags, "--patch-module="+pm+"="+strings.Join(paths, ":"))
 		}
 	}
-	// localPlain: the compiled jars before repackaging, for the unmodified header jar exported beside the repackaged one
+	// localPlain: the compiled jars before repackaging, the local part of a device module's header (javaHeaders)
 	var localImpl, localPlain []string
 	// compile: jarjar rename rules inherited from dependencies (jarjar.go), applied to each compiled jar (repackageFlagsIfNecessary)
 	repackage := g.repackageRules(n, srcs, s)
@@ -871,37 +880,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	}
 	n.impl = implJars
 	if impl != "" {
-		n.header = out("javac-header")
-		j.edgeV("header", []string{n.header}, []string{impl}, nil, nil, validations, nil)
-	}
-	if repackage != "" && impl != "" {
-		// base.go compile: a repackaged module exports its unmodified header jar and the repackaged one (localHeaderJars); dependents
-		// compile against both, so sources naming the original classes (ims-common: telephony flags hidden in framework) still resolve
-		plain := dedupKeep(append(append([]string{}, localPlain...), d.staticImpl...))[0]
-		if len(localPlain)+len(d.staticImpl) > 1 {
-			plain = filepath.Join(n.dir, "plain-combined", jar)
-			j.combine(plain, dedupKeep(append(append([]string{}, localPlain...), d.staticImpl...)), "")
-		}
-		if rules := g.jarjarRulesFile(n); rules != "" {
-			pj := filepath.Join(n.dir, "jarjar", "plain", jar)
-			g.jarjar(n, pj, plain, rules, 1)
-			plain = pj
-		}
-		n.repackagedHeader = n.header
-		n.header = filepath.Join(n.dir, "plain-header", jar)
-		j.edge("header", []string{n.header}, []string{plain}, nil, nil, nil)
-	}
-	// a static lib's two headers reach this module's header as Soong combines the static libs' HeaderJars (framework <- framework-minus-apex)
-	var staticPlain []string
-	for _, l := range statics {
-		if l.repackagedHeader != "" {
-			staticPlain = append(staticPlain, l.header)
-		}
-	}
-	if len(staticPlain) > 0 && n.header != "" && n.repackagedHeader == "" {
-		h := filepath.Join(n.dir, "header-with-plain", jar)
-		j.combine(h, append([]string{n.header}, staticPlain...), "")
-		n.header = h
+		g.javaHeaders(n, impl, localPlain, d, repackage, validations, jar)
 	}
 
 	// implementation + resources
@@ -917,6 +896,40 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	}
 	if n.typ == "java_binary_host" {
 		g.javaBinary(n, stem)
+	}
+}
+
+// javaHeaders sets n.header (HeaderJars) and n.repackagedHeader (RepackagedHeaderJars) from the implementation jar and the classes
+// compiled before repackaging (base.go compile, compileJavaHeader).
+//   - Host (Soong: Turbine off) and device modules neither repackaged nor merging a repackaged static lib: the implementation jar without
+//     META-INF/services (convertImplementationJarToHeaderJar).
+//   - Device (Turbine on) otherwise: header = jarjar_rules(merge of the local classes and the static libs' headers), where a repackaged
+//     static lib contributes its unmodified and its repackaged header; repackaged header = the inherited rename rules over that header.
+//     Both are exported (localHeaderJars) and dependents compile against both, so sources naming a class the repackaging moved (ims-common
+//     naming com.android.internal.telephony.flags, which framework-minus-apex moves under hidden_from_bootclasspath) still resolve.
+//     Turbine is not run: the classes stand in for the header classes, so META-INF/services is stripped as the host path does.
+func (g *Graph) javaHeaders(n *jNode, impl string, local []string, d javaDeps, repackage string, validations []string, jar string) {
+	j := g.java
+	header := filepath.Join(n.dir, "javac-header", jar)
+	n.header = header
+	srcs := dedupKeep(append(append([]string{}, local...), d.staticHeaders...))
+	if n.side != Device || len(srcs) == 0 || repackage == "" && !d.staticRepackaged {
+		j.edgeV("header", []string{header}, []string{impl}, nil, nil, validations, nil)
+		return
+	}
+	merged := srcs[0]
+	if len(srcs) > 1 {
+		merged = filepath.Join(n.dir, "turbine-combined", jar)
+		j.combine(merged, srcs, "")
+	}
+	if rules := g.jarjarRulesFile(n); rules != "" {
+		jj := filepath.Join(n.dir, "jarjar", "turbine", jar)
+		g.jarjar(n, jj, merged, rules, 1)
+		merged = jj
+	}
+	j.edgeV("header", []string{header}, []string{merged}, nil, nil, validations, nil)
+	if repackage != "" {
+		n.repackagedHeader = g.repackage(n, header, repackage, "turbine", jar)
 	}
 }
 
