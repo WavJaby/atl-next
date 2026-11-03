@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 12:37:29 +0800
+Subject: [PATCH] Take a const EVP_PKEY* in the digest sign/verify init pointer
+
+Upstream BoringSSL declares EVP_DigestSignInit / EVP_DigestVerifyInit with a const EVP_PKEY* key; this tree's conscrypt, written for the BoringSSL of its AOSP release, passes them through a function pointer typed EVP_PKEY*, which no longer converts. The caller's key stays a plain pointer.
+
+Upstream-Status: Pending
+Patch-Reason: ATL builds against upstream BoringSSL (AOSP's copy is OpenSSL-licensed and excluded from the shipped set, CLAUDE.md), newer than the one this conscrypt release was written for; no flag, header or library the launcher or loader supplies changes a declared function's parameter type
+---
+SPDX-License-Identifier: Apache-2.0
+ common/src/jni/main/cpp/conscrypt/native_crypto.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/common/src/jni/main/cpp/conscrypt/native_crypto.cc b/common/src/jni/main/cpp/conscrypt/native_crypto.cc
+index ba926480f145d6af1e47d2e521360f0674909157..42a2093db74f67d5f4f6bce62370c2a91a588c54 100644
+--- a/common/src/jni/main/cpp/conscrypt/native_crypto.cc
++++ b/common/src/jni/main/cpp/conscrypt/native_crypto.cc
+@@ -2780,7 +2780,7 @@ static jint NativeCrypto_EVP_MD_size(JNIEnv* env, jclass, jlong evpMdRef) {
+ 
+ static jlong evpDigestSignVerifyInit(JNIEnv* env,
+                                      int (*init_func)(EVP_MD_CTX*, EVP_PKEY_CTX**, const EVP_MD*,
+-                                                      ENGINE*, EVP_PKEY*),
++                                                      ENGINE*, const EVP_PKEY*),
+                                      const char* jniName, jobject evpMdCtxRef, jlong evpMdRef,
+                                      jobject pkeyRef) {
+     EVP_MD_CTX* mdCtx = fromContextObject<EVP_MD_CTX>(env, evpMdCtxRef);
