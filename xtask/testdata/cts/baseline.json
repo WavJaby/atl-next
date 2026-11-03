@@ -5,7 +5,7 @@
     {
       "module": "CtsOsTestCases",
       "state": "BUILD_FAIL",
-      "detail": "xtask native exit status: 1; device/RemoteFrameworkClasses: at jdk.compiler/com.sun.tools.javac.Main.main(Main.java:50); device/libcts_jni: /home/wavjaby/atl-next/src/aosp/cts/common/device-side/util/jni/android_cts_CpuFeatures.cpp:22:10: fatal error: 'sys/hwprobe.h' file not found; device/libctsos_jni: /home/wavjaby/atl-next/src/aosp/cts/tests/tests/os/jni/android_os_cts_SeccompTest.cpp:23:10: fatal error: 'libminijail.h' file not found",
+      "detail": "xtask native exit status: 1; device/RemoteFrameworkClasses: at jdk.compiler/com.sun.tools.javac.Main.main(Main.java:50); device/libcts_jni: src/aosp/cts/common/device-side/util/jni/android_cts_CpuFeatures.cpp:22:10: fatal error: 'sys/hwprobe.h' file not found; device/libctsos_jni: src/aosp/cts/tests/tests/os/jni/android_os_cts_SeccompTest.cpp:23:10: fatal error: 'libminijail.h' file not found",
       "pass": 0,
       "fail": 0,
       "error": 0,

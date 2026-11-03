@@ -7,6 +7,7 @@
 //! Tests are counted from the status blocks as Tradefed's InstrumentationResultParser sees them: 0 pass, -2 fail, -1 error, -3 ignored and -4 assumption failure (both `ignored`); a test whose start block has no end block is `incomplete`.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -340,6 +341,12 @@ pub fn regressions(base: &Report, now: &Report, full: bool) -> Vec<String> {
     found
 }
 
+/// `text` with the workspace's own `<ws>/` prefix cut: a BUILD_FAIL detail names ninja causes, the load error and the APK a failed build did not write, all under the workspace, so `report.json` and a saved baseline read the same on any checkout.
+/// Paths outside the workspace stay absolute.
+pub fn relative_to_workspace(text: &str, ws: &Path) -> String {
+    text.replace(&format!("{}/", ws.display()), "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +580,30 @@ mod tests {
         );
         assert!(lines.last().is_some_and(|l| l.ends_with("refused x")));
         assert!(!lines.iter().any(|l| l.ends_with("unimplemented y")));
+    }
+
+    /// A BUILD_FAIL detail loses the workspace prefix of its paths; a path outside the workspace keeps its own.
+    #[test]
+    fn build_fail_paths_are_workspace_relative() {
+        let detail = "device/libcts_jni: /home/wavjaby/atl-next/src/aosp/cts/x.cpp:22:10: fatal error: 'sys/hwprobe.h' file not found; /home/wavjaby/atl-next/out/java/build/device/X/X.apk does not exist; /usr/include/y.h";
+        assert_eq!(
+            relative_to_workspace(detail, Path::new("/home/wavjaby/atl-next")),
+            "device/libcts_jni: src/aosp/cts/x.cpp:22:10: fatal error: 'sys/hwprobe.h' file not found; out/java/build/device/X/X.apk does not exist; /usr/include/y.h"
+        );
+    }
+
+    /// The saved baseline is what a later run is compared against: it names no machine path, so the same file reads the same on every checkout.
+    #[test]
+    fn the_saved_baseline_names_no_machine_path() {
+        let base: Report = serde_json::from_str(include_str!("../testdata/cts/baseline.json"))
+            .expect("testdata baseline parses");
+        for m in &base.modules {
+            assert!(
+                !m.detail.contains("/home/"),
+                "{}: machine path in detail: {}",
+                m.module,
+                m.detail
+            );
+        }
     }
 }

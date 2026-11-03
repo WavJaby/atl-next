@@ -12,6 +12,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
+use atl_layout::Layout;
 use atl_services::packages::{InstrumentationDecl, Manifest};
 
 use crate::atld_run::{Run, Runtime, counters};
@@ -225,6 +226,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let work = rt.out.join("cts");
     std::fs::create_dir_all(&work)?;
+    let ws = Layout::of(root)?.workspace().to_owned();
     let libraries = instrument::libraries(&rt)?;
     let limit = Duration::from_secs(args.limit_secs);
     let mut modules = Vec::new();
@@ -250,6 +252,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let packages = match staged {
             Ok(p) => p,
             Err(why) => {
+                let why = cts_report::relative_to_workspace(&why, &ws);
                 println!("cts: {module}: BUILD_FAIL {why}");
                 modules.push(Module::without_run(module, State::BuildFail, why));
                 continue;
