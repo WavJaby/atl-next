@@ -11,12 +11,14 @@ pub mod android {
         }
     }
     pub mod content {
+        pub mod ComponentName;
         pub mod Intent;
         pub mod pm {
             pub mod ActivityInfo;
             pub mod ApplicationInfo;
             pub mod InstrumentationInfo;
             pub mod PackageInfo;
+            pub mod ParceledListSlice;
             pub mod ProviderInfo;
             pub mod ProviderInfoList;
         }

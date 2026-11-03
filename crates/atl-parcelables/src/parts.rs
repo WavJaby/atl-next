@@ -35,6 +35,112 @@ pub fn r_typed<T: Part>(p: &In<'_>) -> Result<Option<T>> {
     }
 }
 
+/// Parcel.writeTypedList: -1 for null, else the count and each element as writeTypedObject.
+pub fn w_typed_list<T: Part>(p: &mut In<'_>, v: &Option<Vec<Option<T>>>) -> Result<()> {
+    match v {
+        None => w_i32(p, -1),
+        Some(list) => {
+            w_i32(p, len_i32(list.len())?)?;
+            list.iter().try_for_each(|e| w_typed(p, e))
+        }
+    }
+}
+/// Parcel.createTypedArrayList.
+pub fn r_typed_list<T: Part>(p: &In<'_>) -> Result<Option<Vec<Option<T>>>> {
+    let n = r_i32(p)?;
+    if n < 0 {
+        return Ok(None);
+    }
+    (0..n).map(|_| r_typed(p)).collect::<Result<_>>().map(Some)
+}
+
+/// android.content.pm.SharedLibraryInfo (content/pm/SharedLibraryInfo.java writeToParcel :491-509 / SharedLibraryInfo(Parcel) :194-214): path, package name, the code paths (a presence int, then a String8 array),
+/// name, version, type, declaringPackage, dependentPackages, dependencies (a typed list), isNative, optionalDependentPackages, certDigests. Not modelled, null only: declaringPackage (a VersionedPackage),
+/// dependentPackages, optionalDependentPackages, certDigests.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SharedLibraryInfo {
+    pub path: Option<String>,
+    pub package_name: Option<String>,
+    pub code_paths: Option<Vec<Option<String>>>,
+    pub name: Option<String>,
+    pub version: i64,
+    /// SharedLibraryInfo.TYPE_BUILTIN 0, TYPE_DYNAMIC 1, TYPE_STATIC 2, TYPE_SDK_PACKAGE 3
+    pub kind: i32,
+    pub dependencies: Option<Vec<Option<SharedLibraryInfo>>>,
+    pub is_native: bool,
+    /// optionalDependentPackages is written -1 (null) or 0 (empty): readParcelableList leaves an empty list for null, so a SharedLibraryInfo that was read from a parcel writes 0 here. No entries are modelled.
+    pub empty_optional_dependents: bool,
+}
+
+impl Part for SharedLibraryInfo {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_str8(p, &self.path)?;
+        w_str8(p, &self.package_name)?;
+        match &self.code_paths {
+            Some(paths) => {
+                w_i32(p, 1)?;
+                w_str8_array(p, &Some(paths.clone()))?;
+            }
+            None => w_i32(p, 0)?,
+        }
+        w_str8(p, &self.name)?;
+        w_i64(p, self.version)?;
+        w_i32(p, self.kind)?;
+        w_null(p)?; // declaringPackage: writeParcelable(null) is writeString(null)
+        w_null(p)?; // dependentPackages: writeList(null)
+        w_typed_list(p, &self.dependencies)?;
+        w_bool(p, self.is_native)?;
+        // optionalDependentPackages: writeParcelableList(null) or of an empty list
+        w_i32(
+            p,
+            if self.empty_optional_dependents {
+                0
+            } else {
+                -1
+            },
+        )?;
+        w_null(p) // certDigests: writeStringList(null)
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        let path = r_str8(p)?;
+        let package_name = r_str8(p)?;
+        let code_paths = if r_i32(p)? != 0 {
+            r_str8_array(p)?
+        } else {
+            None
+        };
+        let name = r_str8(p)?;
+        let version = r_i64(p)?;
+        let kind = r_i32(p)?;
+        r_null(p, "android.content.pm.SharedLibraryInfo.declaringPackage")?;
+        r_null(p, "android.content.pm.SharedLibraryInfo.dependentPackages")?;
+        let dependencies = r_typed_list(p)?;
+        let is_native = r_bool(p)?;
+        let empty_optional_dependents = match r_i32(p)? {
+            -1 => false,
+            0 => true,
+            _ => {
+                return Err(crate::refuse(
+                    "android.content.pm.SharedLibraryInfo.optionalDependentPackages",
+                ));
+            }
+        };
+        r_null(p, "android.content.pm.SharedLibraryInfo.certDigests")?;
+        Ok(SharedLibraryInfo {
+            path,
+            package_name,
+            code_paths,
+            name,
+            version,
+            kind,
+            dependencies,
+            is_native,
+            empty_optional_dependents,
+        })
+    }
+}
+
 /// Parcelling.BuiltIn.ForStringSet (com/android/internal/util/Parcelling.java): -1 for null, else the count and each String16. Readers turn an empty set into null, so empty = null here.
 pub fn w_string_set(p: &mut In<'_>, v: &[Option<String>]) -> Result<()> {
     if v.is_empty() {

@@ -15,11 +15,12 @@ use std::sync::Mutex;
 
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
-use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ProviderInfo, ProviderInfoList,
+    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
+    ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
+use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
@@ -34,6 +35,8 @@ const MODE_CORRUPT: i32 = 1;
 const MODE_DESCRIPTOR: i32 = 2;
 /// java.io.FileDescriptor only: the codec writes a descriptor and reads it back (`fd_self_test`).
 const MODE_FD_SELF: i32 = 3;
+/// android.os.Bundle only: the input holds two marshalled Bundles, A then B; the result is A with `putAll(B)` (`put_all_test`).
+const MODE_PUT_ALL: i32 = 4;
 /// ParcelFileDescriptor's leading int32s: the non-null flag and the comm-channel count (ndk/parcel.cpp, Parcel.cpp).
 const PFD_LEAD: i32 = 8;
 
@@ -180,7 +183,33 @@ fn fd_self_test() -> Result<Vec<u8>, String> {
     Ok(vec![1])
 }
 
+/// Bundle.putAll on the codec's typed entries: A and B decoded in turn from one parcel, A.put_all(B), encoded.
+fn put_all_test(input: &[u8]) -> Result<Vec<u8>, String> {
+    let p = unmarshal(input)?;
+    let mut a = Bundle::from_parcel(p.borrowed_ref()).map_err(|e| format!("A refused: {e:?}"))?;
+    let b = Bundle::from_parcel(p.borrowed_ref()).map_err(|e| format!("B refused: {e:?}"))?;
+    if p.get_data_position() != p.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            p.get_data_position(),
+            p.get_data_size()
+        ));
+    }
+    a.put_all(&b)
+        .map_err(|e| format!("put_all refused: {e:?}"))?;
+    let mut out = Parcel::new();
+    a.write_to_parcel(&mut out.borrowed())
+        .map_err(|e| format!("encode refused: {e:?}"))?;
+    finish(&out, MODE_PLAIN)
+}
+
 fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
+    if mode == MODE_PUT_ALL {
+        return match class {
+            "android.os.Bundle" => put_all_test(input),
+            _ => Err(format!("MODE_PUT_ALL merges Bundles, not {class}")),
+        };
+    }
     if mode == MODE_FD_SELF {
         return match class {
             "java.io.FileDescriptor" => fd_self_test(),
@@ -203,12 +232,14 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.pm.ProviderInfo" => round_trip_as::<ProviderInfo>(input, mode),
         "android.content.pm.ProviderInfoList" => round_trip_as::<ProviderInfoList>(input, mode),
         "android.content.pm.PackageInfo" => round_trip_as::<PackageInfo>(input, mode),
+        "android.content.pm.ParceledListSlice" => round_trip_as::<ParceledListSlice>(input, mode),
         "android.content.pm.InstrumentationInfo" => {
             round_trip_as::<InstrumentationInfo>(input, mode)
         }
         "android.content.res.Configuration" => round_trip_as::<Configuration>(input, mode),
         "android.content.res.CompatibilityInfo" => round_trip_as::<CompatibilityInfo>(input, mode),
         "android.content.Intent" => round_trip_as::<Intent>(input, mode),
+        "android.content.ComponentName" => round_trip_as::<ComponentName>(input, mode),
         "android.os.Bundle" => round_trip_as::<Bundle>(input, mode),
         "android.app.servertransaction.ClientTransaction" => {
             round_trip_as::<ClientTransaction>(input, mode)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! android.content.pm.ApplicationInfo: content/pm/ApplicationInfo.java writeToParcel / ApplicationInfo(Parcel), behind Parcel.maybeWriteSquashed / readSquashed.
 //! Squashing: a parcel that allows it (PackageInfo, ProviderInfoList) writes a later identical ApplicationInfo as a back-reference offset; this codec writes 0 (no squash, which every reader accepts)
-//! and refuses to read a back-reference. Not modelled, null only: splitDependencies (SparseArray), sharedLibraryInfos, optionalSharedLibraryInfos.
+//! and refuses to read a back-reference. Not modelled, null only: splitDependencies (SparseArray), optionalSharedLibraryInfos.
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -40,6 +40,7 @@ pub struct ApplicationInfo {
     pub se_info: Option<String>,
     pub se_info_user: Option<String>,
     pub shared_library_files: Option<Vec<Option<String>>>,
+    pub shared_library_infos: Option<Vec<Option<SharedLibraryInfo>>>,
     pub data_dir: Option<String>,
     pub device_protected_data_dir: Option<String>,
     pub credential_protected_data_dir: Option<String>,
@@ -126,7 +127,7 @@ impl Part for ApplicationInfo {
         w_str8(p, &self.se_info)?;
         w_str8(p, &self.se_info_user)?;
         w_str8_array(p, &self.shared_library_files)?;
-        w_null(p)?; // sharedLibraryInfos
+        w_typed_list(p, &self.shared_library_infos)?;
         w_null(p)?; // optionalSharedLibraryInfos
         w_str8(p, &self.data_dir)?;
         w_str8(p, &self.device_protected_data_dir)?;
@@ -216,7 +217,7 @@ impl Part for ApplicationInfo {
         let se_info = r_str8(p)?;
         let se_info_user = r_str8(p)?;
         let shared_library_files = r_str8_array(p)?;
-        r_null(p, "android.content.pm.ApplicationInfo.sharedLibraryInfos")?;
+        let shared_library_infos = r_typed_list(p)?;
         r_null(
             p,
             "android.content.pm.ApplicationInfo.optionalSharedLibraryInfos",
@@ -292,6 +293,7 @@ impl Part for ApplicationInfo {
             se_info,
             se_info_user,
             shared_library_files,
+            shared_library_infos,
             data_dir,
             device_protected_data_dir,
             credential_protected_data_dir,

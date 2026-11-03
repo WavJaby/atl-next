@@ -13,8 +13,10 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
+import android.content.pm.ParceledListSlice;
 import android.content.pm.ProviderInfo;
 import android.content.pm.ProviderInfoList;
+import android.content.pm.SharedLibraryInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
 import android.graphics.Rect;
@@ -44,6 +46,8 @@ public class ParcelTruth {
     static final int MODE_DESCRIPTOR = 2;
     /// java.io.FileDescriptor only: the codec writes a descriptor and reads it back.
     static final int MODE_FD_SELF = 3;
+    /// Bundle only: the input is two marshalled Bundles, A then B; the result is A with putAll(B).
+    static final int MODE_PUT_ALL = 4;
     static int failures = 0;
 
     public static void main(String[] args) {
@@ -75,7 +79,10 @@ public class ParcelTruth {
         holder.noReleaseNeeded = true;
         check("ContentProviderHolder", holder, ContentProviderHolder.CREATOR);
         check("PackageInfo", packageInfo(ai), PackageInfo.CREATOR);
+        check("ComponentName", new ComponentName("com.example.app", "com.example.app.Runner"), ComponentName.CREATOR);
         check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
+        // IPackageManager.queryInstrumentationAsUser's reply: the inline list, its element class written once
+        check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
         ClientTransaction transaction = new ClientTransaction();
         transaction.addTransactionItem(new LaunchActivityItem(null, intent, 3, activity, config, new Configuration(), 0,
                 "com.example.referrer", null, 2, null, null, null, null, null, true, null, null, null, null, false, null, null,
@@ -95,10 +102,26 @@ public class ParcelTruth {
         entries.putInt("int", -7);
         entries.putBoolean("flag", true);
         check("Bundle:entries", entries, Bundle.CREATOR);
+        // AMS merges instrumentation results (finishInstrumentationLocked: putAll) and makes the crash report's Bundle (putString): the codec's typed entries against Java's own
+        Bundle more = new Bundle();
+        more.putString("key", "replaced");
+        more.putString("shortMsg", "Process crashed.");
+        more.putString("none", null);
+        more.putLong("long", -5000000000L);
+        checkPutAll("Bundle:put-all", entries, more);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    static SharedLibraryInfo reparceled(SharedLibraryInfo s) {
+        Parcel parcel = Parcel.obtain();
+        s.writeToParcel(parcel, 0);
+        parcel.setDataPosition(0);
+        SharedLibraryInfo read = SharedLibraryInfo.CREATOR.createFromParcel(parcel);
+        parcel.recycle();
+        return read;
     }
 
     static ApplicationInfo applicationInfo() {
@@ -125,6 +148,16 @@ public class ParcelTruth {
         ai.enabled = true;
         ai.category = ApplicationInfo.CATEGORY_PRODUCTIVITY;
         ai.appComponentFactory = "androidx.core.app.CoreComponentFactory";
+        // the shape ComputerEngine gives an app of builtin libraries (SystemConfig `<library>`): a path, a name, dependencies that are themselves libraries; one with code paths instead
+        SharedLibraryInfo base = new SharedLibraryInfo("/system/framework/android.test.base.jar", null, null, "android.test.base",
+                SharedLibraryInfo.VERSION_UNDEFINED, SharedLibraryInfo.TYPE_BUILTIN, null, null, null, false);
+        SharedLibraryInfo runner = new SharedLibraryInfo("/system/framework/android.test.runner.jar", null, null, "android.test.runner",
+                SharedLibraryInfo.VERSION_UNDEFINED, SharedLibraryInfo.TYPE_BUILTIN, null, null, Arrays.asList(base), false);
+        SharedLibraryInfo split = new SharedLibraryInfo(null, "com.example.lib", Arrays.asList("/data/app/a.apk", "/data/app/b.apk"), "com.example.lib",
+                7L, SharedLibraryInfo.TYPE_DYNAMIC, null, null, null, false);
+        ai.sharedLibraryFiles = new String[] {"/system/framework/android.test.runner.jar", "/system/framework/android.test.base.jar"};
+        // as the activity manager hands them over, i.e. as read from a parcel: readParcelableList leaves an empty list where null was written, which Java then writes as a count 0
+        ai.sharedLibraryInfos = Arrays.asList(reparceled(runner), reparceled(base), reparceled(split));
         return ai;
     }
 
@@ -286,6 +319,34 @@ public class ParcelTruth {
         }
         boolean ok = Arrays.equals(java, again);
         result(ok, name, ok ? java.length + " bytes, java -> rust -> java byte-equal" : "java re-encodes rust's bytes differently at byte " + firstDiff(java, again));
+    }
+
+    /// Bundle.putAll: the codec merges A and B (both marshalled into one input); the bytes must equal Java's merged Bundle's, and Java must read them back as the merged map.
+    static void checkPutAll(String name, Bundle a, Bundle b) {
+        Bundle merged = new Bundle(a);
+        merged.putAll(b);
+        byte[] ab = marshal(a);
+        byte[] bb = marshal(b);
+        byte[] input = Arrays.copyOf(ab, ab.length + bb.length);
+        System.arraycopy(bb, 0, input, ab.length, bb.length);
+        byte[] rust = roundTrip("android.os.Bundle", input, MODE_PUT_ALL);
+        if (rust == null) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        byte[] java = marshal(merged);
+        if (!Arrays.equals(java, rust)) {
+            result(false, name, "rust bytes differ from java's at byte " + firstDiff(java, rust) + " (" + rust.length + " vs " + java.length + ")");
+            return;
+        }
+        boolean ok;
+        try {
+            ok = Arrays.equals(java, javaAgain(Bundle.CREATOR, rust));
+        } catch (RuntimeException e) {
+            result(false, name, "java cannot read rust's bytes: " + e);
+            return;
+        }
+        result(ok, name, ok ? java.length + " bytes, rust putAll == java putAll, byte-equal" : "java re-encodes rust's bytes differently");
     }
 
     /// java.util.Map, the Java-only builtin, as Parcel.writeMap writes it; Java reads Rust's bytes back with readHashMap.
