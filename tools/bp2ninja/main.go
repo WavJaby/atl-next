@@ -280,6 +280,18 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			}
 			continue
 		}
+		if goal == bootJniGoal {
+			libs, err := g.bootJniLibs()
+			if err != nil {
+				return err
+			}
+			for _, lib := range libs {
+				if n := g.node(lib, Device, Shared, "goal"); n != nil {
+					ccGoals = append(ccGoals, n)
+				}
+			}
+			continue
+		}
 		if g.java != nil {
 			if m := g.lookupJava(goal, Device); m != nil && g.isJava(m.Type) {
 				// a Java goal builds its device variant; a host-only type (metalava's java_binary_host) its host one

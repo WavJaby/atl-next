@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,10 +28,12 @@ import (
 //     (frameworks/base/boot/Android.bp) lists for its APEX (Soong checkApexModules). Fragments behind soong config variables count
 //     whatever the variable's value: membership is checked, not selected, here.
 //   - Hidden-API flags are not encoded into the dex (Soong's hiddenapi step): without them ART treats every member as SDK API.
+//   - Goal `platform-bootclasspath-jni` (bootJniLibs) builds, as native libraries, the APEX-packaged JNI libraries those jars load.
 
 const (
 	bootclasspathGoal  = "platform-bootclasspath"
 	bootclasspathFile  = "bootclasspath.txt"
+	bootJniGoal        = "platform-bootclasspath-jni"
 	artBootJarsMk      = "build/make/core/envsetup.mk"
 	productBootJarsMk  = "build/make/target/product/default_art_config.mk"
 	productConfigMk    = "build/make/core/product_config.mk"
@@ -93,12 +96,7 @@ func (g *Graph) bootclasspath() error {
 	}
 	var dex []string
 	for _, b := range jars {
-		// a java_sdk_library's runtime jar is its .impl library (platform_bootclasspath.go DepsMutator: implLibraryModuleName)
-		name := b.jar
-		if m := g.lookupJava(name, Device); m != nil && g.baseType(m.Type) == "java_sdk_library" {
-			name += ".impl"
-		}
-		n := g.jnode(name, Device, bootclasspathGoal)
+		n := g.bootJarNode(b, bootclasspathGoal)
 		if n == nil || n.dex == "" {
 			// the list is written whole or not at all: a partial boot classpath must not be read as the real one
 			g.problem("%s: boot jar %s has no device dex jar", bootclasspathGoal, b)
@@ -116,6 +114,130 @@ func (g *Graph) bootclasspath() error {
 	}
 	g.genFile(file, strings.Join(dex, "\n")+"\n")
 	return nil
+}
+
+// bootJarNode: the Java node of boot jar b's runtime jar; a java_sdk_library's is its .impl library (platform_bootclasspath.go DepsMutator: implLibraryModuleName).
+func (g *Graph) bootJarNode(b bootJar, from string) *jNode {
+	name := b.jar
+	if m := g.lookupJava(name, Device); m != nil && g.baseType(m.Type) == "java_sdk_library" {
+		name += ".impl"
+	}
+	return g.jnode(name, Device, from)
+}
+
+// bootJniLibs: the native libraries the boot jars load that an APEX packages for its Java code. Candidates are the `jni_libs` of each APEX that
+// contributes a boot jar (build/soong apex/apex.go: "JNI libraries that are embedded inside this APEX"; its own list, then multilib first / both /
+// the arch's libN, as Soong's apex module takes them). A jar finds its library by System.loadLibrary through the APEX's namespace, which is that
+// lib dir: TrafficStats.<clinit> loads framework-connectivity-tiramisu-jni, which only Tethering's `jni_libs` carries.
+//   - A candidate is kept when a boot jar loads it (loadLibraries: the name in System.loadLibrary("name") is the library's stem without lib).
+//     Blueprint links a library to its APEX, never to the jar that loads it, and an APEX packages more than its boot jars need: libbluetooth_jni,
+//     libservice-wifi-jni, libuwb_uci_jni_rust belong to apps and system server jars, none on the boot classpath.
+//   - native_shared_libs are not read: ART's and i18n's (libjavacore, libopenjdk, libicu_jni, ...) are the runtime, built as goals by name.
+//   - An APEX module absent from the tree is recorded missing (notFound), so `xtask native --fetch-missing` can pin its project.
+func (g *Graph) bootJniLibs() ([]string, error) {
+	if g.java == nil {
+		return nil, fmt.Errorf("%s needs the Java tools (-jdk …): it reads the boot jars' sources", bootJniGoal)
+	}
+	jars, err := g.bootJars()
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := g.apexJniLibs(jars)
+	if err != nil {
+		return nil, err
+	}
+	// the jars' Java graph is made only to read their sources; its problems and missing modules (API stubs, R8, ...) are the Java build's to report (goal platform-bootclasspath), not this native build's
+	problems, missing := len(g.problems), maps.Clone(g.missing)
+	loaded := map[string]bool{}
+	for _, b := range jars {
+		if n := g.bootJarNode(b, bootJniGoal); n != nil {
+			for _, l := range g.loadLibraries(n, map[*jNode]bool{}) {
+				loaded[l] = true
+			}
+		}
+	}
+	g.problems, g.missing = g.problems[:problems], missing
+	return g.loadedJniLibs(candidates, loaded), nil
+}
+
+// apexJniLibs: the `jni_libs` of every APEX of jars (see bootJniLibs), in boot classpath order, each once.
+func (g *Graph) apexJniLibs(jars []bootJar) ([]string, error) {
+	var candidates []string
+	seen := map[string]bool{}
+	for _, b := range jars {
+		if b.apex == platformApex || seen[b.apex] {
+			continue
+		}
+		seen[b.apex] = true
+		m := g.lookup(b.apex, Device)
+		if m == nil {
+			g.notFound(b.apex)
+			g.problem("%s: APEX %s (of boot jar %s) is not in the tree", bootJniGoal, b.apex, b)
+			continue
+		}
+		if g.baseType(m.Type) != "apex" {
+			return nil, fmt.Errorf("%s: %s is a %s, not an apex", bootJniGoal, b.apex, m.Type)
+		}
+		p := g.resolveDefaults(m, Device, map[string]bool{})
+		add := func(o *Obj) {
+			for _, l := range o.strs("jni_libs") {
+				if !slices.Contains(candidates, l) {
+					candidates = append(candidates, l)
+				}
+			}
+		}
+		add(p)
+		for _, k := range []string{"first", "both", g.cfg.Multilib()} {
+			add(p.obj("multilib").obj(k))
+		}
+	}
+	return candidates, nil
+}
+
+// loadedJniLibs: the candidates whose file libNAME.so (the module's stem, else its name) is loaded as loadLibrary("NAME").
+func (g *Graph) loadedJniLibs(candidates []string, loaded map[string]bool) []string {
+	var libs []string
+	for _, c := range candidates {
+		stem := c
+		if m := g.lookup(c, Device); m != nil {
+			if s := g.resolveDefaults(m, Device, map[string]bool{}).str("stem"); s != "" {
+				stem = s
+			}
+		}
+		if name, ok := strings.CutPrefix(stem, "lib"); ok && loaded[name] {
+			libs = append(libs, c)
+		}
+	}
+	return libs
+}
+
+var reLoadLibrary = regexp.MustCompile(`\bloadLibrary\(\s*"([^"]+)"\s*\)`)
+
+// loadLibraries: the names n's sources, and its static libs' (their classes are in n's jar), pass to loadLibrary("name"), in first-seen order. A name
+// held in a constant or built at run time is not seen; generated sources are not read (none of the JNI loads in the boot jars is generated).
+func (g *Graph) loadLibraries(n *jNode, done map[*jNode]bool) []string {
+	if done[n] {
+		return nil
+	}
+	done[n] = true
+	var out []string
+	for _, f := range n.javaSrcs {
+		if filepath.IsAbs(f) {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(g.tree, f))
+		if err != nil {
+			g.problem("%s: reading %s: %v", n.name, f, err)
+			continue
+		}
+		for _, m := range reLoadLibrary.FindAllSubmatch(b, -1) {
+			out = append(out, string(m[1]))
+		}
+	}
+	for _, s := range n.statics {
+		out = append(out, g.loadLibraries(s, done)...)
+	}
+	return dedupKeep(out)
 }
 
 // bootJarsFinal applies product_config.mk's boot jar lines (qualify-platform-jars, the core-icu4j move, the APEX sort); its file must

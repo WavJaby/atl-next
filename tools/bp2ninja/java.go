@@ -72,6 +72,9 @@ type jNode struct {
 	expDirDeps []string
 	// java_binary_host: the runnable wrapper and its installed jar
 	tool, toolJar string
+	// the classes it holds are compiled from javaSrcs (tree-relative .java / .kt) of its own and statics' (bootclasspath.go loadLibraries)
+	javaSrcs []string
+	statics  []*jNode
 }
 
 // javaGraph holds the Java side of a Graph.
@@ -714,7 +717,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		srcs = append(srcs, p.obj("openjdk9").strs("srcs")...)
 	}
 	g.implicitJavaLibs(n, srcs)
-	d, _ := g.collectJavaDeps(n, s)
+	d, statics := g.collectJavaDeps(n, s)
+	n.statics = statics
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
 	}
@@ -731,6 +735,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	}
 	src := g.javaSrcs(n, srcs)
 	java, srcjars, waits := src.java, src.srcjars, src.waits
+	n.javaSrcs = slices.Concat(src.java, src.kt)
 	// genSources: logtags java in place (here: after the module's own), then proto and aidl srcjars after its own .srcjar sources
 	for _, ext := range genOrder {
 		if files := src.gen[ext]; len(files) > 0 {

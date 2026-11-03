@@ -129,3 +129,82 @@ func TestBootJars(t *testing.T) {
 		t.Error("stale product_config.mk mirror not detected")
 	}
 }
+
+// bootJniLibs reads `jni_libs` of every APEX with a boot jar, in boot classpath order (ART, platform, then the sorted APEX jars; core-icu4j
+// ends the platform jars), each APEX's defaults first, then its own, then multilib first / both / the arch's libN; never lib32 on a 64-bit
+// arch, never native_shared_libs; one library listed twice once. An APEX the tree lacks is recorded missing, not skipped silently.
+func TestBootJniLibs(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		artBootJarsMk:     "ART_APEX_JARS := com.android.art:core-oj\n",
+		productBootJarsMk: "PRODUCT_BOOT_JARS := $(ART_APEX_JARS) framework-minus-apex\nPRODUCT_APEX_BOOT_JARS := com.android.tethering:framework-tethering com.android.i18n:core-icu4j\n",
+		productConfigMk:   "PRODUCT_APEX_BOOT_JARS := $(filter-out com.android.i18n:core-icu4j,$(PRODUCT_APEX_BOOT_JARS))\n",
+		bootclasspathBpDir + "/Android.bp": `
+platform_bootclasspath { name: "platform-bootclasspath", fragments: [{ apex: "com.android.tethering", module: "tethering-fragment" }] }
+bootclasspath_fragment { name: "tethering-fragment", contents: ["framework-tethering"] }
+`,
+		"art/Android.bp": `
+apex { name: "com.android.art", jni_libs: ["libartservice"], native_shared_libs: ["libart"] }
+`,
+		"tethering/Android.bp": `
+apex_defaults {
+    name: "tethering-defaults",
+    jni_libs: ["libdefault", "libown"],
+    multilib: { both: { jni_libs: ["libboth"] }, lib32: { jni_libs: ["lib32only"] }, lib64: { jni_libs: ["lib64only"] } },
+}
+apex {
+    name: "com.android.tethering",
+    defaults: ["tethering-defaults"],
+    jni_libs: ["libown"],
+    native_shared_libs: ["libnotjni"],
+    multilib: { first: { jni_libs: ["libfirst"] } },
+}
+`,
+	})
+	g.release = &Release{flags: map[string]string{}}
+	jars, err := g.bootJars()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := g.apexJniLibs(jars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"libartservice", "libdefault", "libown", "libfirst", "libboth", "lib64only"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("jni libs\n got %v\nwant %v", got, want)
+	}
+	if !g.missing["com.android.i18n"] {
+		t.Errorf("com.android.i18n (no apex module in the tree) not recorded missing: %v", g.missing)
+	}
+}
+
+// A candidate is built only when a boot jar's sources (or its static libs') say loadLibrary("<stem without lib>"): a literal call on any receiver;
+// a computed name or a mere mention of the word is not one, and generated (absolute) sources are not read.
+func TestLoadedJniLibs(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"jni/Android.bp": `
+cc_library_shared { name: "libloaded" }
+cc_library_shared { name: "libunloaded" }
+cc_library_shared { name: "libstatic-dep" }
+cc_library_shared { name: "libby-stem", stem: "libstemmed" }
+cc_library_shared { name: "libcomputed" }
+`,
+		"j/A.java": "class A { static { System.loadLibrary(\"loaded\"); Runtime.getRuntime().loadLibrary( \"stemmed\" ); } }",
+		"j/B.java": "class B { static { System.loadLibrary(\"static-dep\"); String n = \"computed\"; System.loadLibrary(n); } }",
+		"j/C.java": "class C { String s = \"loadLibrary of unloaded\"; }",
+	})
+	dep := &jNode{jKey: jKey{"dep", Device}, javaSrcs: []string{"j/B.java"}}
+	jar := &jNode{jKey: jKey{"jar", Device}, javaSrcs: []string{"j/A.java", "j/C.java", "/out/gen/G.java"}, statics: []*jNode{dep}}
+	got := g.loadLibraries(jar, map[*jNode]bool{})
+	if want := []string{"loaded", "stemmed", "static-dep"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("loadLibrary names\n got %v\nwant %v", got, want)
+	}
+	loaded := map[string]bool{}
+	for _, l := range got {
+		loaded[l] = true
+	}
+	cands := []string{"libloaded", "libunloaded", "libstatic-dep", "libby-stem", "libcomputed"}
+	if got, want := g.loadedJniLibs(cands, loaded), []string{"libloaded", "libstatic-dep", "libby-stem"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("loaded libs\n got %v\nwant %v", got, want)
+	}
+}
