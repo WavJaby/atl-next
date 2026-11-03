@@ -619,8 +619,15 @@ func (g *Graph) genScript(n *Node) string {
 	for _, k := range sortedKeys(keep) {
 		notKept = append(notKept, "! -name "+shellEscape(k))
 	}
-	clear := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -maxdepth 1 %s -exec rm -rf -- {} + || exit 1\n", shellEscape(genDir),
-		shellEscape(genDir), strings.Join(notKept, " "))
+	// then the outputs' directories, which sbox's sandbox has before the command runs (commands write into them without mkdir)
+	var outDirs []string
+	for _, o := range r.outs {
+		outDirs = append(outDirs, filepath.Dir(o))
+	}
+	slices.Sort(outDirs)
+	outDirs = slices.Compact(outDirs)
+	clear := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -maxdepth 1 %s -exec rm -rf -- {} + && mkdir -p %s || exit 1\n", shellEscape(genDir),
+		shellEscape(genDir), strings.Join(notKept, " "), strings.Join(mapStrings(outDirs, shellEscape), " "))
 	// sbox validates the outputs after the command (validateOutputFiles); ninja would only notice a missing
 	// one in a consumer
 	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + outs +
