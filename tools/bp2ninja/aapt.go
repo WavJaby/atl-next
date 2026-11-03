@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -243,9 +244,8 @@ func (g *Graph) aaptRule(n *Node) *genRule {
 
 // globDirExists: whether dir is an existing directory of the tree.
 func globDirExists(g *Graph, dir string) (bool, error) {
-	files := globTree(g.abs(dir), "*", dir)
-	if len(files) == 0 {
-		return false, fmt.Errorf("%s: empty or missing", dir)
+	if st, err := os.Stat(g.abs(dir)); err != nil || !st.IsDir() {
+		return false, fmt.Errorf("%s: not a directory", dir)
 	}
 	return true, nil
 }

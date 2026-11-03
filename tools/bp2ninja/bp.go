@@ -128,6 +128,7 @@ type Config struct {
 	Arch        string
 	PointerBits int
 	ArchVariant string // arches.toml soong_arch_variant, "" = Soong's baseline (device toolchain only, soongcfg.go DeviceArch)
+	ABI         string // arches.toml `[<arch>.guest]` android_abis[0], Soong's Arch.Abi[0]: the lib/<ABI>/ directory of an apk's JNI libraries ("" = none given)
 }
 
 // Multilib is Soong's multilib name for the arch: `multilib: { lib32/lib64 }` blocks, cc_genrule's CC_MULTILIB.

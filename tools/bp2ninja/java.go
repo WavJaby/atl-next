@@ -75,6 +75,9 @@ type jNode struct {
 	// the classes it holds are compiled from javaSrcs (tree-relative .java / .kt) of its own and statics' (bootclasspath.go loadLibraries)
 	javaSrcs []string
 	statics  []*jNode
+	// android_library, android_library_import, android apps: resources (app.go); an app's apk
+	aapt *aaptOut
+	apk  string
 }
 
 // javaGraph holds the Java side of a Graph.
@@ -96,6 +99,7 @@ var javaTypes = map[string]bool{
 	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true, "java_binary": true,
 	"java_import": true, "java_import_host": true, "android_library_import": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
 	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true, "java_host_for_device": true,
+	"java_test_helper_library": true, "android_library": true, "android_app": true, "android_test": true, "android_test_helper_app": true,
 }
 
 func (g *Graph) isJava(t string) bool { return javaTypes[g.baseType(t)] }
@@ -217,6 +221,10 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 	case "java_sdk_library":
 		// the library itself is its .impl; its stubs are separate modules (sdklib.go)
 		g.javaLib(n)
+	case "android_library":
+		g.androidLibrary(n)
+	case "android_app", "android_test", "android_test_helper_app":
+		g.androidApp(n)
 	default:
 		g.javaLib(n)
 	}
@@ -513,7 +521,10 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 	for _, r := range p.strs("libs") {
 		if l := dep(r, n.side); l != nil {
 			if l.header == "" {
-				g.problem("%s: libs %s provides no jar", n.name, r)
+				// an android_library of resources only has no classes
+				if l.aapt == nil {
+					g.problem("%s: libs %s provides no jar", n.name, r)
+				}
 				continue
 			}
 			d.classpath = append(d.classpath, l.headers()...)
@@ -525,7 +536,9 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 	for _, r := range p.strs("static_libs") {
 		if l := dep(r, n.side); l != nil {
 			if l.header == "" {
-				g.problem("%s: static_libs %s provides no jar", n.name, r)
+				if l.aapt == nil {
+					g.problem("%s: static_libs %s provides no jar", n.name, r)
+				}
 				continue
 			}
 			// staticLibTag: TransitiveStaticLibsHeaderJars joins the classpath whole (the unmodified and the repackaged header alike)
@@ -685,9 +698,18 @@ func (g *Graph) aconfigGroupSrcjars(m *Module, side Side, from string) []string 
 	return out
 }
 
+// javaExtra is what a module type hands Module.compile besides the module's own sources (base.go compile): extraSrcJars (generated sources:
+// aconfig, an R srcjar), extraClasspathJars (R jars, ahead of every dependency so an app's final R classes win over a library's non-final ones)
+// and extraCombinedJars (an app's R jar, in the implementation jar after the compiled classes).
+type javaExtra struct{ srcjars, classpath, combined []string }
+
 // javaLib builds java_library / java_library_static / java_library_host / java_plugin / java_binary_host / java_aconfig_library's
 // library half (base.go compile). extraSrcJars: generated sources of the module type (aconfig).
 func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
+	g.javaLibWith(n, javaExtra{srcjars: extraSrcJars})
+}
+
+func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	p := n.props
 	j := g.java
 	if n.typ == "java_sdk_library" {
@@ -719,6 +741,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	g.implicitJavaLibs(n, srcs)
 	d, statics := g.collectJavaDeps(n, s)
 	n.statics = statics
+	d.classpath = append(slices.Clone(extra.classpath), d.classpath...)
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
 	}
@@ -747,7 +770,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 			srcjars = append(srcjars, gs...)
 		}
 	}
-	srcjars = append(srcjars, extraSrcJars...)
+	srcjars = append(srcjars, extra.srcjars...)
 	stem := p.str("stem")
 	if stem == "" {
 		stem = n.name
@@ -795,6 +818,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
 		localPlain = append(localPlain, classes)
 	}
+	localImpl = append(localImpl, extra.combined...)
 
 	// resources (java_resource_dirs, java_resources)
 	resArgs, resDeps, resWaits := g.javaResources(n)
@@ -896,7 +920,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	}
 
 	// java_binary / java_binary_host are installable by default (java.go BinaryFactory, BinaryHostFactory); the wrapper script is not built
-	compileDex := p.boolean("compile_dex", false) || p.boolean("installable", n.typ == "java_binary")
+	compileDex := p.boolean("compile_dex", false) || p.boolean("installable", n.typ == "java_binary" || n.typ == "java_test_helper_library") || isApp(n.typ)
 	if n.side == Device && compileDex && impl != "" {
 		g.javaDex(n, d, s, jar)
 	}
@@ -942,6 +966,8 @@ func (g *Graph) javaHeaders(n *jNode, impl string, local []string, d javaDeps, r
 // output is what building a Java goal means: its dex jar, else its jar with resources, else its stubs / system modules.
 func (n *jNode) output() []string {
 	switch {
+	case n.apk != "":
+		return []string{n.apk}
 	case n.dex != "":
 		return []string{n.dex}
 	case n.implRes != "":
@@ -1125,7 +1151,7 @@ func (g *Graph) javaImport(n *jNode) {
 		jars = append(jars, g.abs(f))
 	}
 	if n.typ == "android_library_import" {
-		classes, ok := g.aarClasses(n)
+		classes, ok := g.aarImport(n)
 		if !ok {
 			return
 		}
@@ -1149,21 +1175,6 @@ func (g *Graph) javaImport(n *jNode) {
 		n.header = c
 	}
 	n.implRes = n.header
-}
-
-// aarClasses is android_library_import's classes jar: its one aar unzipped, then classes.jar and libs/*.jar merged (aar.go unzipAAR).
-// res/ and the manifest are not read: a Java classpath needs neither.
-func (g *Graph) aarClasses(n *jNode) (string, bool) {
-	aars := n.props.strs("aars")
-	if len(aars) != 1 {
-		g.problem("%s: android_library_import needs exactly one aar, has %d", n.name, len(aars))
-		return "", false
-	}
-	dir := filepath.Join(n.dir, "aar")
-	out := filepath.Join(dir, n.name+".jar")
-	g.java.edge("aar", []string{out}, []string{g.abs(filepath.Join(n.mod.Dir, aars[0]))}, nil, nil,
-		[][2]string{{"outdir", esc(filepath.Join(dir, "unzipped"))}})
-	return out, true
 }
 
 // sysModules is java_system_modules: its libs' header jars through jmod + jlink into a --system directory (system_modules.go).
@@ -1383,9 +1394,6 @@ rule jar
 rule combine
   command = $mergezips --ignore-duplicates -j $args $out $in
   description = merge $out
-rule aar
-  command = rm -rf $outdir && mkdir -p $outdir && unzip -qoDD -d $outdir $in && $mergezips $out $$(ls $outdir/classes.jar 2> /dev/null) $$(ls $outdir/libs/*.jar 2> /dev/null)
-  description = aar $out
 rule header
   command = $zip2zip -i $in -o $out -x 'META-INF/services/**/*'
   description = header $out
@@ -1408,6 +1416,7 @@ rule installexec
   command = cp -f $in $out && chmod +x $out
   description = install $out
 `, unpack, javacVm, strings.Join(c.CommonJdkFlags, " "), strings.Join(c.D8Flags, " "), strings.Join(c.JavaVmFlags, " "), c.JlinkVersion)
+	b.WriteString(appRules)
 	b.WriteString(j.stubsRules(g, unpack))
 	b.WriteString(aconfigJavaRule)
 	b.WriteString(javaGenRules)

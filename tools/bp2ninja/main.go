@@ -37,6 +37,7 @@ func main() {
 	arch := flag.String("arch", "", "Soong arch name of the host (arches.toml row key)")
 	bits := flag.Int("pointer-bits", 0, "pointer width of -arch (its arches.toml pointer_bits)")
 	variant := flag.String("arch-variant", "", "Soong arch variant of the device side (its arches.toml soong_arch_variant; empty = Soong's baseline)")
+	abi := flag.String("abi", "", "the first android_abis entry of -arch's arches.toml guest row: lib/<abi>/ in the apks of android apps that have jni_libs")
 	cc := flag.String("cc", "clang", "C compiler")
 	cxx := flag.String("cxx", "clang++", "C++ compiler and linker driver")
 	ar := flag.String("ar", "llvm-ar", "archiver")
@@ -102,7 +103,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
-	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
 		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {
