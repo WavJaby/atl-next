@@ -120,10 +120,22 @@ fn verdict(round_trip: &(bool, String), wrong: &(bool, String)) -> Vec<String> {
 
 /// The verdict of the Java run (`pt pass|fail <case> <detail>` lines, then `pt summary`): passes and failures as printed; every case of [`CASES`] once, in order, and exit 0.
 fn java_verdict(ok: bool, stdout: &str, failure: &str) -> (Vec<String>, Vec<String>) {
+    truth_verdict("pt ", &CASES, DRIVER, ok, stdout, failure)
+}
+
+/// The verdict of a truth driver's run: its `<prefix>pass|fail <case> <detail>` lines (then `<prefix>summary`) as passes and failures; `cases` must each be reported once, in order, and a bad exit needs a failure line or is one itself.
+pub fn truth_verdict(
+    prefix: &str,
+    cases: &[&str],
+    driver: &str,
+    ok: bool,
+    stdout: &str,
+    failure: &str,
+) -> (Vec<String>, Vec<String>) {
     let mut passes = Vec::new();
     let mut fails = Vec::new();
     let mut seen = Vec::new();
-    for line in stdout.lines().filter_map(|l| l.strip_prefix("pt ")) {
+    for line in stdout.lines().filter_map(|l| l.strip_prefix(prefix)) {
         let (verdict, rest) = line.split_once(' ').unwrap_or((line, ""));
         match verdict {
             "pass" => passes.push(rest.to_owned()),
@@ -139,11 +151,11 @@ fn java_verdict(ok: bool, stdout: &str, failure: &str) -> (Vec<String>, Vec<Stri
             .to_owned(),
         );
     }
-    if seen != CASES {
-        fails.push(format!("cases reported {seen:?}, want {CASES:?}"));
+    if seen != cases {
+        fails.push(format!("cases reported {seen:?}, want {cases:?}"));
     }
     if !ok && fails.is_empty() {
-        fails.push(format!("{DRIVER} ended badly: {failure}"));
+        fails.push(format!("{driver} ended badly: {failure}"));
     }
     (passes, fails)
 }

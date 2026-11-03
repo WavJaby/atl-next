@@ -240,10 +240,9 @@ mod tests {
         assert_eq!(want, 140);
         let p = TransactionState::new().encode_call().unwrap();
         assert_eq!(p.data().len(), TOKEN_BYTES + want);
-        assert_eq!(
-            p.objects(),
-            [TOKEN_BYTES + 8 + 4 + 8 + 4 + 48],
-            "only the null apply token is an object"
+        assert!(
+            p.objects().is_empty(),
+            "the null apply token is not in the object table (libbinder omits binder-word-0 objects)"
         );
         assert_eq!(
             TransactionState::decode_call(&p).unwrap(),
@@ -378,9 +377,9 @@ mod tests {
         let t = bbq_transaction();
         let p = t.encode_call().unwrap();
         assert_eq!(TransactionState::decode_call(&p).unwrap(), t);
-        // by hand: apply token 1; layer surface 1; layer listener 1; buffer fds 2; BufferData binders (listener, endpoint, cache token) 3; null trusted-presentation listener 1; release channel fd 1;
-        // uncache token 1; transaction listener 1
-        assert_eq!(p.objects().len(), 12);
+        // by hand: apply token 1; layer surface 1; layer listener 1; buffer fds 2; BufferData binders (listener, endpoint, cache token) 3; release channel fd 1; uncache token 1; transaction listener 1.
+        // The null trusted-presentation listener is written but, its binder word being 0, not listed.
+        assert_eq!(p.objects().len(), 11);
     }
 
     #[test]

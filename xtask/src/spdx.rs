@@ -32,6 +32,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "xtask/testdata/cts/baseline.json",
         "a saved report.json of `xtask test cts`: generated JSON, which has no comments",
     ),
+    (
+        "crates/atl-compositor/testdata/transaction_libgui_writer.dump",
+        "bytes AOSP's libgui C++ wrote (`xtask test compositor --golden`): binary, no comments",
+    ),
 ];
 
 pub fn check(root: &Path) -> Result<()> {

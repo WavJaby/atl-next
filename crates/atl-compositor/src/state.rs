@@ -100,11 +100,20 @@ impl FloatRect {
     }
 }
 
-/// `ui::Region` flattened: a uint32 rect count and the rects.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `ui::Region`, a variable-size LightFlattenable: a size word, then a uint32 rect count and the rects (no fd count, unlike `Flattenable`).
+/// A default-constructed AOSP Region holds one empty rect, so that is what [`Region::default`] does and what an unset `layer_state_t` region puts on the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
     /// The region's rectangles.
     pub rects: Vec<Rect>,
+}
+
+impl Default for Region {
+    fn default() -> Self {
+        Self {
+            rects: vec![Rect::default()],
+        }
+    }
 }
 
 impl Region {
@@ -116,15 +125,12 @@ impl Region {
         for r in &self.rects {
             r.write(&mut payload);
         }
-        p.write_flattenable(payload.data(), &[])
+        p.write_light_flattenable(payload.data())
     }
 
     fn read(r: &mut Reader<'_>) -> R<Self> {
-        let f = r.read_flattenable()?;
-        if !f.fds.is_empty() {
-            return Err(ParcelError::BadValue("region carries fds"));
-        }
-        let sub = WireParcel::from_wire(f.payload.to_vec(), vec![])?;
+        let payload = r.read_light_flattenable()?;
+        let sub = WireParcel::from_wire(payload.to_vec(), vec![])?;
         let mut s = sub.reader();
         let n =
             usize::try_from(s.read_u32()?).map_err(|_| ParcelError::BadValue("region count"))?;
@@ -360,23 +366,25 @@ impl BufferData {
 pub struct CallbackId {
     /// The id.
     pub id: i64,
-    /// `CallbackId::Type`: 0 on commit, 1 on complete, 2 unspecified.
+    /// `CallbackId::Type`: 0 on complete, 1 on commit.
     pub ty: i32,
 }
 
 impl CallbackId {
+    /// `CallbackId::Type::ON_COMPLETE` (`enum class Type : int32_t { ON_COMPLETE = 0, ON_COMMIT = 1 }`).
+    pub const ON_COMPLETE: i32 = 0;
     /// `CallbackId::Type::ON_COMMIT`.
-    pub const ON_COMMIT: i32 = 0;
-    /// `CallbackId::Type::ON_COMPLETE`.
-    pub const ON_COMPLETE: i32 = 1;
+    pub const ON_COMMIT: i32 = 1;
 
-    pub(crate) fn write_parcelable(&self, p: &mut WireParcel) {
+    /// `writeParcelable(callbackId)`: the non-null flag, the id, the type.
+    pub fn write_parcelable(&self, p: &mut WireParcel) {
         p.write_parcelable_flag();
         p.write_i64(self.id);
         p.write_i32(self.ty);
     }
 
-    pub(crate) fn read_parcelable(r: &mut Reader<'_>) -> R<Self> {
+    /// `readParcelable(&callbackId)`.
+    pub fn read_parcelable(r: &mut Reader<'_>) -> R<Self> {
         r.read_parcelable_flag("CallbackId")?;
         Ok(Self {
             id: r.read_i64()?,

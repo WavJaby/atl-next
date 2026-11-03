@@ -9,14 +9,18 @@ publish.workspace = true
 
 # JNI library of `xtask test parcel`: Java's own Parcelables marshalled on host ART are decoded and re-encoded by atl-parcelables' codecs over AOSP's C++ Parcel (libbinder_rs -> libbinder_ndk -> libbinder).
 # Test-only, never shipped. Links the converter's libbinder_rs and libatl_parcelables, so only `xtask native` builds it (feature `converter`); plain workspace builds take an empty library.
+# Also the JNI library of `xtask test compositor` (compositor.rs): atl-compositor's codecs vs libgui's C++ on host ART. It reads a Java Parcel's data and object table through libbinder's C++ accessors, so libbinder is linked directly.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libbinder"]
 
 [lib]
 crate-type = ["cdylib"]
 
 [features]
 converter = []
+
+[dependencies]
+atl-compositor = { path = "../atl-compositor" }
 
 [build-dependencies]
 anyhow.workspace = true

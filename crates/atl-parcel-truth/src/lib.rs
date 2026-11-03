@@ -14,6 +14,8 @@ extern crate binder;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Mutex;
 
+mod compositor;
+
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
@@ -253,14 +255,16 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
 // ---- JNI ---------------------------------------------------------------------------------------
 
 /// `JNIEnv*`: a pointer to the function table pointer.
-type JniEnv = *mut *const *const c_void;
-type JObject = *mut c_void;
+pub(crate) type JniEnv = *mut *const *const c_void;
+pub(crate) type JObject = *mut c_void;
 
 /// JNINativeInterface slots (jni.h order, counted from the struct's first member `reserved0`).
 const NEW_STRING_UTF: usize = 167;
 const GET_STRING_UTF_CHARS: usize = 169;
 const RELEASE_STRING_UTF_CHARS: usize = 170;
 const GET_ARRAY_LENGTH: usize = 171;
+/// `GetObjectArrayElement` (jni.h: NewObjectArray is 172, this 173).
+pub(crate) const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
 const NEW_BYTE_ARRAY: usize = 176;
 const GET_BYTE_ARRAY_REGION: usize = 200;
 const SET_BYTE_ARRAY_REGION: usize = 208;
@@ -269,7 +273,7 @@ const SET_BYTE_ARRAY_REGION: usize = 208;
 ///
 /// # Safety
 /// `env` is the JNIEnv ART passed to a native method of this thread.
-unsafe fn slot(env: JniEnv, i: usize) -> *const c_void {
+pub(crate) unsafe fn slot(env: JniEnv, i: usize) -> *const c_void {
     // SAFETY: the table has every JNI 1.6 slot (NEW_STRING_UTF .. SET_BYTE_ARRAY_REGION are below its end)
     unsafe { *(*env).add(i) }
 }
@@ -278,7 +282,7 @@ unsafe fn slot(env: JniEnv, i: usize) -> *const c_void {
 ///
 /// # Safety
 /// `env` as for `slot`; `s` a local reference to a java.lang.String or null.
-unsafe fn string(env: JniEnv, s: JObject) -> Option<String> {
+pub(crate) unsafe fn string(env: JniEnv, s: JObject) -> Option<String> {
     if s.is_null() {
         return None;
     }
@@ -302,7 +306,7 @@ unsafe fn string(env: JniEnv, s: JObject) -> Option<String> {
 ///
 /// # Safety
 /// `env` as for `slot`; `a` a local reference to a byte[] or null.
-unsafe fn bytes(env: JniEnv, a: JObject) -> Option<Vec<u8>> {
+pub(crate) unsafe fn bytes(env: JniEnv, a: JObject) -> Option<Vec<u8>> {
     if a.is_null() {
         return None;
     }
@@ -323,7 +327,7 @@ unsafe fn bytes(env: JniEnv, a: JObject) -> Option<Vec<u8>> {
 ///
 /// # Safety
 /// `env` as for `slot`.
-unsafe fn byte_array(env: JniEnv, b: &[u8]) -> JObject {
+pub(crate) unsafe fn byte_array(env: JniEnv, b: &[u8]) -> JObject {
     let Ok(n) = i32::try_from(b.len()) else {
         return std::ptr::null_mut();
     };
@@ -345,7 +349,7 @@ unsafe fn byte_array(env: JniEnv, b: &[u8]) -> JObject {
 ///
 /// # Safety
 /// `env` as for `slot`.
-unsafe fn java_string(env: JniEnv, s: &str) -> JObject {
+pub(crate) unsafe fn java_string(env: JniEnv, s: &str) -> JObject {
     let c = CString::new(s.replace('\0', " ")).unwrap_or_default();
     // SAFETY: slot 167 is NewStringUTF of this signature; `c` is NUL-terminated
     unsafe {
@@ -355,8 +359,13 @@ unsafe fn java_string(env: JniEnv, s: &str) -> JObject {
     }
 }
 
-fn set_error(e: String) {
+pub(crate) fn set_error(e: String) {
     *LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = e;
+}
+
+/// The last error `set_error` recorded (every truth driver reads it through its own `lastError`).
+pub(crate) fn last_error() -> String {
+    LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// `static native byte[] roundTrip(String className, byte[] marshalled, int mode)`: null on failure (`lastError`).
@@ -487,6 +496,15 @@ unsafe extern "C" {
 /// Called by ART as that native method.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_ParcelTruth_startReg(env: JniEnv, _class: JObject) -> i32 {
+    // SAFETY: the caller's guarantee
+    unsafe { start_reg(env) }
+}
+
+/// What every truth driver's `startReg` does.
+///
+/// # Safety
+/// `env` is the JNIEnv ART passed to a native method of this thread.
+pub(crate) unsafe fn start_reg(env: JniEnv) -> i32 {
     // SAFETY: NUL-terminated constants; RTLD_NOLOAD only looks up an already loaded object
     let sym = unsafe {
         let h = dlopen(RUNTIME.as_ptr(), RTLD_NOW | RTLD_NOLOAD);

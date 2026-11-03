@@ -10,6 +10,7 @@ mod arches;
 mod atld_run;
 mod binder;
 mod check;
+mod compositor;
 mod converter;
 mod cts;
 mod cts_report;
@@ -137,6 +138,8 @@ enum Test {
     Binder(binder::Args),
     /// Parcel encodings vs ground truth: atl-aidl-probe through AOSP's C++ Parcel (its size check fires on a wrong size), then atl-parcelables' codecs vs Java's Parcelables on host ART, byte-equal both ways.
     Parcel(parcel::Args),
+    /// atl-compositor's libgui wire codecs vs libgui's own C++ on host ART: Java-built Transactions marshalled by libgui decode and re-encode byte-equal in Rust, Rust's fully populated transaction survives libgui's reader and writer, Rust's callbacks run libgui's listener.
+    Compositor(compositor::Args),
     /// The M2 gate: atld starts binderd, servicemanager, the M2 services and the test APK (xtask/testdata/app) through the broker; pass = its Activity.onCreate logs.
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
@@ -171,6 +174,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Parcel(args),
         } => parcel::run(&root, &args),
+        Command::Test {
+            test: Test::Compositor(args),
+        } => compositor::run(&root, &args),
         Command::Test {
             test: Test::Binder(args),
         } => binder::run(&root, &args),

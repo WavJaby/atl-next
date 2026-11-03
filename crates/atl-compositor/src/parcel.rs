@@ -96,11 +96,12 @@ pub struct StrongBinder {
 }
 
 impl StrongBinder {
-    /// The null binder: a `BINDER_TYPE_BINDER` with zero node and cookie.
+    /// The null binder: a `BINDER_TYPE_BINDER` with zero node and cookie, and the scheduling bits libbinder ORs into every flattened binder
+    /// (`schedPolicyMask(SCHED_NORMAL = 0, priority 19)` = 19 = 0x13, Parcel.cpp flattenBinder), as libgui writes it.
     pub const NULL: StrongBinder = StrongBinder {
         obj: FlatObject {
             ty: BINDER_TYPE_BINDER,
-            flags: 0,
+            flags: 0x13,
             binder: 0,
             cookie: 0,
         },
@@ -292,8 +293,12 @@ impl WireParcel {
         self.write_utf8_as_utf16(descriptor)
     }
 
-    fn write_object(&mut self, obj: &FlatObject) {
-        self.objects.push(self.data.len());
+    /// `Parcel::writeObject(obj, nullMetaData)`: the object's 24 bytes, and its offset in the object table unless it is a null-ish binder (`binder` word 0 and `nullMetaData` false),
+    /// which libbinder leaves out of the table: the kernel has nothing to translate in it.
+    fn write_object(&mut self, obj: &FlatObject, always_listed: bool) {
+        if always_listed || obj.binder != 0 {
+            self.objects.push(self.data.len());
+        }
         self.write_u32(obj.ty);
         self.write_u32(obj.flags);
         self.write_u64(obj.binder);
@@ -302,13 +307,50 @@ impl WireParcel {
 
     /// `writeStrongBinder`: the object, then the stability word.
     pub fn write_strong_binder(&mut self, b: &StrongBinder) {
-        self.write_object(&b.obj);
+        self.write_object(&b.obj, false);
         self.write_i32(b.stability);
     }
 
-    /// `writeFileDescriptor`: one fd object.
+    /// `writeFileDescriptor`: one fd object, always in the object table.
     pub fn write_fd(&mut self, fd: &FdObject) {
-        self.write_object(&fd.flat());
+        self.write_object(&fd.flat(), true);
+    }
+
+    /// The transport form test fixtures use: data length (u32), the data, offset count (u32), the offsets (u32 each); all little-endian.
+    pub fn to_dump(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.data.len() + 4 * self.objects.len());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out.extend_from_slice(&(self.objects.len() as u32).to_le_bytes());
+        for &o in &self.objects {
+            out.extend_from_slice(&(o as u32).to_le_bytes());
+        }
+        out
+    }
+
+    /// The inverse of [`Self::to_dump`]; the dump must be consumed exactly.
+    pub fn from_dump(dump: &[u8]) -> Result<Self, ParcelError> {
+        let word = |at: usize| -> Result<usize, ParcelError> {
+            let b = dump
+                .get(at..at + 4)
+                .ok_or(ParcelError::BadValue("dump ends inside a length"))?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        let len = word(0)?;
+        let data = dump
+            .get(4..4 + len)
+            .ok_or(ParcelError::BadValue("dump data is cut short"))?
+            .to_vec();
+        let n = word(4 + len)?;
+        if dump.len() != 8 + len + 4 * n {
+            return Err(ParcelError::BadValue(
+                "dump length disagrees with its counts",
+            ));
+        }
+        let objects = (0..n)
+            .map(|i| word(8 + len + 4 * i))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_wire(data, objects)
     }
 
     /// `write(Flattenable)`: payload size, fd count, the padded payload, then the fd objects.
@@ -491,15 +533,19 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn read_object(&mut self) -> Result<FlatObject, ParcelError> {
+    /// `Parcel::readObject(nullMetaData)`: the 24 bytes at the cursor, which must be in the object table; with `unlisted_null_ok` (false for fds) an object whose binder and cookie words are both 0 passes
+    /// without being listed, as `writeObject(obj, false)` leaves it out of the table.
+    fn read_object(&mut self, unlisted_null_ok: bool) -> Result<FlatObject, ParcelError> {
         let pos = self.pos;
-        if self.parcel.objects.binary_search(&pos).is_err() {
-            return Err(ParcelError::NotAnObject { pos });
-        }
+        let listed = self.parcel.objects.binary_search(&pos).is_ok();
         let ty = self.read_u32()?;
         let flags = self.read_u32()?;
         let binder = self.read_u64()?;
         let cookie = self.read_u64()?;
+        if !listed && !(unlisted_null_ok && binder == 0 && cookie == 0) {
+            self.pos = pos;
+            return Err(ParcelError::NotAnObject { pos });
+        }
         Ok(FlatObject {
             ty,
             flags,
@@ -515,7 +561,7 @@ impl<'a> Reader<'a> {
         what: &'static str,
     ) -> Result<StrongBinder, ParcelError> {
         let pos = self.pos;
-        let obj = self.read_object()?;
+        let obj = self.read_object(true)?;
         if obj.ty != BINDER_TYPE_BINDER && obj.ty != BINDER_TYPE_HANDLE {
             return Err(ParcelError::BadObjectType { pos, ty: obj.ty });
         }
@@ -530,7 +576,7 @@ impl<'a> Reader<'a> {
     /// `readFileDescriptor`: an fd object.
     pub fn read_fd(&mut self) -> Result<FdObject, ParcelError> {
         let pos = self.pos;
-        let obj = self.read_object()?;
+        let obj = self.read_object(false)?;
         if obj.ty != BINDER_TYPE_FD {
             return Err(ParcelError::BadObjectType { pos, ty: obj.ty });
         }
@@ -712,6 +758,70 @@ mod tests {
             r2.read_strong_binder(true, "t"),
             Err(ParcelError::NotAnObject { pos: 0 })
         ));
+    }
+
+    /// libbinder lists an object only when its binder word is non-zero (null binders, handle 0) or it is an fd; a reader accepts the unlisted zero object, and refuses an unlisted live one.
+    #[test]
+    fn null_binder_is_not_listed_but_readable() {
+        let mut p = WireParcel::new();
+        p.write_strong_binder(&StrongBinder::NULL);
+        assert!(p.objects().is_empty());
+        let handle0 = StrongBinder {
+            obj: FlatObject {
+                ty: BINDER_TYPE_HANDLE,
+                flags: 0,
+                binder: 0,
+                cookie: 0,
+            },
+            stability: 0,
+        };
+        p.write_strong_binder(&handle0);
+        assert!(
+            p.objects().is_empty(),
+            "handle 0 has a zero binder word too"
+        );
+        let mut r = p.reader();
+        assert!(r.read_strong_binder(true, "n").unwrap().is_null());
+        assert_eq!(
+            r.read_strong_binder(false, "h0").unwrap().key(),
+            Some(BinderKey::Handle(0)),
+            "handle 0 is the context object, not null"
+        );
+        // a live object cut out of the table is refused
+        let mut live = WireParcel::new();
+        live.write_strong_binder(&StrongBinder {
+            obj: FlatObject {
+                ty: BINDER_TYPE_BINDER,
+                flags: 0,
+                binder: 9,
+                cookie: 8,
+            },
+            stability: 0,
+        });
+        let (data, _) = live.into_parts();
+        let unlisted = WireParcel::from_wire(data, vec![]).unwrap();
+        assert!(matches!(
+            unlisted.reader().read_strong_binder(true, "x"),
+            Err(ParcelError::NotAnObject { pos: 0 })
+        ));
+        // an fd is always listed and never read unlisted
+        let mut f = WireParcel::new();
+        f.write_fd(&FdObject::new(0, false));
+        assert_eq!(f.objects(), [0]);
+    }
+
+    #[test]
+    fn dump_round_trip() {
+        let mut p = WireParcel::new();
+        p.write_i32(3);
+        p.write_fd(&FdObject::new(5, true));
+        p.write_utf8_as_utf16("x").unwrap();
+        let d = p.to_dump();
+        assert_eq!(WireParcel::from_dump(&d).unwrap(), p);
+        assert!(WireParcel::from_dump(&d[..d.len() - 1]).is_err());
+        let mut longer = d.clone();
+        longer.push(0);
+        assert!(WireParcel::from_dump(&longer).is_err());
     }
 
     #[test]

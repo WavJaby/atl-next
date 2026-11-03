@@ -48,7 +48,8 @@ crates = ["atl-android-runtime"]
 [aidl]
 crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]
 exports = ["atl-aidl"]
-uses = ["generators"]
+# compositor: atl-parcel-truth's compositor.rs checks atl-compositor's codecs against libgui (test-only)
+uses = ["generators", "compositor"]
 
 # the M2 system services in Rust (ActivityManager subset, PackageManager subset, the settings provider stub) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
 [services]

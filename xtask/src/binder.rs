@@ -231,6 +231,68 @@ fn verdict(
     fails
 }
 
+/// The environment of every process run from a converter build in `out`: LD_LIBRARY_PATH = every library the converter linked and the provided crates' (libatl_binder_driver), as native-load stages them.
+pub(crate) fn lib_env(out: &Path) -> Result<Vec<(String, String)>> {
+    let device = out.join("device");
+    let mut lib_dirs: Vec<String> = Vec::new();
+    for dir in [device.clone(), out.join("crates")] {
+        for e in std::fs::read_dir(&dir)? {
+            let p = e?.path();
+            let p = if dir == device { p } else { p.join("lib") };
+            if p.is_dir() {
+                lib_dirs.push(p.display().to_string());
+            }
+        }
+    }
+    Ok(vec![("LD_LIBRARY_PATH".to_owned(), lib_dirs.join(":"))])
+}
+
+/// servicemanager as the context manager (uid 1000) in the test layout under `test_root` (which `layout` filled), and the result of its first `service check manager`, polled until it answers, exits or `STARTUP` passes.
+pub(crate) fn start_servicemanager(
+    h: &Harness,
+    test_root: &Path,
+    servicemanager: &Path,
+    service: &Path,
+    env: &[(String, String)],
+) -> Result<(Child, (bool, String))> {
+    // bwrap stays the sandbox's pid 1 (--unshare-pid) and takes servicemanager with it when killed (--die-with-parent)
+    let sm_log_path = test_root.join("servicemanager.log");
+    let sm_log_file = std::fs::File::create(&sm_log_path)?;
+    let mut sm = Command::new("bwrap");
+    sm.args(["--unshare-pid", "--die-with-parent"])
+        .args(sandbox_args(test_root)?)
+        .arg("--")
+        .arg(servicemanager)
+        .envs(env.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(sm_log_file.try_clone()?)
+        .stderr(sm_log_file);
+    let mut sm = h.spawn(sm, AID_SYSTEM, true)?;
+
+    // servicemanager answers once its Looper runs
+    let start = Instant::now();
+    let log = |n: &str| test_root.join(format!("service-{n}.log"));
+    let found = loop {
+        let r = h.service(service, env, &["check", MANAGER], &log("check"))?;
+        if r.0 && r.1.contains("found") && !r.1.contains("not found") || start.elapsed() > STARTUP {
+            break r;
+        }
+        if let Some(status) = sm.try_wait()? {
+            break (false, format!("servicemanager exited: {status}"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok((sm, found))
+}
+
+/// The test /system, /vendor, /odm under `root` (see `layout`), recreated empty.
+pub(crate) fn fresh_layout(root: &Path) -> Result<()> {
+    if root.exists() {
+        std::fs::remove_dir_all(root)?;
+    }
+    layout(root)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout_ = Layout::of(root)?;
     let out = match &args.out {
@@ -254,48 +316,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::fs::remove_dir_all(&test_root)?;
     }
     layout(&test_root)?;
-    // every library the converter linked, and the provided crates' (libatl_binder_driver), as native-load stages them
-    let mut lib_dirs: Vec<String> = Vec::new();
-    for dir in [device.clone(), out.join("crates")] {
-        for e in std::fs::read_dir(&dir)? {
-            let p = e?.path();
-            let p = if dir == device { p } else { p.join("lib") };
-            if p.is_dir() {
-                lib_dirs.push(p.display().to_string());
-            }
-        }
-    }
-    let env = vec![("LD_LIBRARY_PATH".to_owned(), lib_dirs.join(":"))];
+    let env = lib_env(&out)?;
 
     let (mut binderd, h) = start_binderd(root, &out, &test_root.join("binderd.log"))?;
 
-    // bwrap stays the sandbox's pid 1 (--unshare-pid) and takes servicemanager with it when killed (--die-with-parent)
     let sm_log_path = test_root.join("servicemanager.log");
-    let sm_log_file = std::fs::File::create(&sm_log_path)?;
-    let mut sm = Command::new("bwrap");
-    sm.args(["--unshare-pid", "--die-with-parent"])
-        .args(sandbox_args(&test_root)?)
-        .arg("--")
-        .arg(&servicemanager)
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(sm_log_file.try_clone()?)
-        .stderr(sm_log_file);
-    let mut sm = h.spawn(sm, AID_SYSTEM, true)?;
-
-    // servicemanager answers once its Looper runs
-    let start = Instant::now();
     let log = |n: &str| test_root.join(format!("service-{n}.log"));
-    let found = loop {
-        let r = h.service(&service, &env, &["check", MANAGER], &log("check"))?;
-        if r.0 && r.1.contains("found") && !r.1.contains("not found") || start.elapsed() > STARTUP {
-            break r;
-        }
-        if let Some(status) = sm.try_wait()? {
-            break (false, format!("servicemanager exited: {status}"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let (mut sm, found) = start_servicemanager(&h, &test_root, &servicemanager, &service, &env)?;
     let list = h.service(&service, &env, &["list"], &log("list"))?;
     let absent = h.service(&service, &env, &["check", ABSENT], &log("absent"))?;
     let services_fails = crate::services::stage(root, &out, &h, &env, &service, &test_root)?;
