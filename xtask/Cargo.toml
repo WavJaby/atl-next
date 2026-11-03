@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 atl-binderd = { path = "../crates/atl-binderd" }
+atl-broker = { path = "../crates/atl-broker" }
 atl-layout = { path = "../crates/atl-layout" }
+atl-services = { path = "../crates/atl-services" }
 clap.workspace = true
 object.workspace = true
 roxmltree.workspace = true

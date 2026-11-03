@@ -32,8 +32,11 @@ required-features = ["converter"]
 [dependencies]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }
+atl-broker = { path = "../atl-broker" }
 clap.workspace = true
 rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

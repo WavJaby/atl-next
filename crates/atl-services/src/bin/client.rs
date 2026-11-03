@@ -20,6 +20,7 @@ use atl_aidl::aidl::android::app::IActivityManager::IActivityManager;
 use atl_aidl::aidl::android::app::IApplicationThread::{BnApplicationThread, IApplicationThread};
 use atl_aidl::aidl::android::content::pm::IPackageManager::{IPackageManager, transactions};
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
+use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::ApplicationInfo;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::util::Map;
@@ -57,6 +58,8 @@ enum Mode {
 const CALLBACK: Duration = Duration::from_secs(5);
 /// A package nothing installs.
 const ABSENT: &str = "com.example.absent";
+/// The instrumentation the test package declares (xtask services.rs).
+const INSTRUMENTATION: &str = "com.example.atltest.Runner";
 /// An @EnforcePermission method of IPackageManager outside the M2 subset: getMoveStatus, @EnforcePermission("MOUNT_UNMOUNT_FILESYSTEMS").
 const MOVE_ID: i32 = 1;
 
@@ -256,6 +259,60 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
         "getPackagesForUid",
         matches!(&pkgs, Ok(Some(v)) if v == &[Some(package.to_owned())]),
         format!("{pkgs:?}"),
+    );
+    // the package declares one instrumentation, targeting itself (xtask services.rs)
+    let runner = ComponentName {
+        package: package.to_owned(),
+        class: INSTRUMENTATION.to_owned(),
+    };
+    let ii = pm.getInstrumentationInfoAsUser(Some(&runner), 0, 0);
+    r.check(
+        "getInstrumentationInfoAsUser",
+        matches!(&ii, Ok(Some(i)) if i.item.name.as_deref() == Some(INSTRUMENTATION)
+            && i.item.package_name.as_deref() == Some(package)
+            && i.target_package.as_deref() == Some(package)
+            && i.functional_test
+            && !i.handle_profiling),
+        format!("{:?}", ii.map(|i| i.map(|i| i.target_package))),
+    );
+    let not_declared = ComponentName {
+        package: package.to_owned(),
+        class: "com.example.NotDeclared".to_owned(),
+    };
+    let ii = pm.getInstrumentationInfoAsUser(Some(&not_declared), 0, 0);
+    r.check(
+        "getInstrumentationInfoAsUser:null",
+        matches!(ii, Ok(None)),
+        format!("{:?}", ii.map(|i| i.is_some())),
+    );
+    let q = pm.queryInstrumentationAsUser(Some(package), 0, 0);
+    r.check(
+        "queryInstrumentationAsUser",
+        matches!(&q, Ok(Some(l)) if l.instrumentation.len() == 1
+            && l.instrumentation[0].item.name.as_deref() == Some(INSTRUMENTATION)),
+        format!("{:?}", q.map(|l| l.map(|l| l.instrumentation.len()))),
+    );
+    let q = pm.queryInstrumentationAsUser(Some(ABSENT), 0, 0);
+    r.check(
+        "queryInstrumentationAsUser:empty",
+        matches!(&q, Ok(Some(l)) if l.instrumentation.is_empty()),
+        format!(
+            "{ABSENT}: {:?}",
+            q.map(|l| l.map(|l| l.instrumentation.len()))
+        ),
+    );
+    // PackageManager.SIGNATURE_MATCH 0, SIGNATURE_UNKNOWN_PACKAGE -4
+    let same = pm.checkSignatures(Some(package), Some(package), 0);
+    r.check(
+        "checkSignatures",
+        matches!(same, Ok(0)),
+        format!("{same:?}"),
+    );
+    let unknown = pm.checkSignatures(Some(package), Some(ABSENT), 0);
+    r.check(
+        "checkSignatures:unknown",
+        matches!(unknown, Ok(-4)),
+        format!("{ABSENT}: {unknown:?}"),
     );
     let map = Map {
         entries: vec![(Some("/data/app/base.apk".into()), Some("PCL[]".into()))],

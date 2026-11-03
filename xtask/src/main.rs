@@ -7,6 +7,7 @@
 mod aosp;
 mod app;
 mod arches;
+mod atld_run;
 mod binder;
 mod check;
 mod converter;
@@ -15,9 +16,11 @@ mod farm;
 mod fetch;
 mod git;
 mod host_art;
+mod instrument;
 mod libcxx_gate;
 mod licence_gate;
 mod licenses;
+mod manifest;
 mod modules;
 mod native;
 mod native_load;
@@ -135,6 +138,11 @@ enum Test {
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
     App(app::Args),
+    /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
+    ///
+    /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
+    /// Run 2: a test that kills its own process: the run is reported cancelled (code 0, shortMsg "Process crashed.").
+    Instrument(instrument::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -161,6 +169,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::App(args),
         } => app::run(&root, &args),
+        Command::Test {
+            test: Test::Instrument(args),
+        } => instrument::run(&root, &args),
     }
 }
 

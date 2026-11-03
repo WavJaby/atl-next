@@ -24,6 +24,16 @@ pub fn is_system_or_root(uid: u32) -> bool {
     matches!(app_id(uid), ROOT_UID | SYSTEM_UID)
 }
 
+/// Process.FIRST_APPLICATION_UID (AID_APP_START).
+pub const FIRST_APPLICATION_UID: u32 = 10_000;
+/// AID_SHELL: the uid `adb shell` (and `am`) runs as.
+pub const SHELL_UID: u32 = 2000;
+
+/// A uid that is not an application's (root, system, shell, ...): AppsFilterImpl.shouldFilterApplication filters nothing for `callingAppId < Process.FIRST_APPLICATION_UID`.
+pub fn sees_all_packages(uid: u32) -> bool {
+    app_id(uid) < FIRST_APPLICATION_UID
+}
+
 /// Whether `uid` holds `permissions` (all of them): granted to root / system; denied to every other uid. No M2 method carries @EnforcePermission (aidl lists none on the M2 subset of
 /// IActivityManager, IPackageManager, IActivityClientController), so no app permission is needed yet; an app-held permission (manifest + grants via PermissionController, plan Q5) comes with the first method that needs one.
 pub fn holds(uid: u32, permissions: &[&str]) -> bool {
@@ -45,5 +55,15 @@ mod tests {
         assert!(!holds(10_000, &["A"]));
         assert!(!holds(1_010_123, &[]));
         assert_eq!((app_id(1_010_123), user_id(1_010_123)), (10_123, 10));
+    }
+
+    #[test]
+    fn packages_are_filtered_for_applications_only() {
+        assert!(
+            sees_all_packages(ROOT_UID)
+                && sees_all_packages(SYSTEM_UID)
+                && sees_all_packages(SHELL_UID)
+        );
+        assert!(!sees_all_packages(FIRST_APPLICATION_UID) && !sees_all_packages(1_010_123));
     }
 }

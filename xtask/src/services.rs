@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test binder` stage `services`: the M2 Rust services (crate atl-services) registered with AOSP servicemanager and called through binderd, inside binder.rs's harness.
-//! 1. atl-system-services as uid 1000 (AID_SYSTEM) registers `activity` and `package` (addService) for one test package with one expected start.
-//! 2. atl-services-client `app` as the package's uid: getService of each, attach -> bindApplication, finishAttach -> LaunchActivityItem, getDisplayId, the PackageManager subset,
+//! 1. atl-system-services as uid 1000 (AID_SYSTEM) registers `activity` and `package` (addService) for one test package, whose launcher the services start (`--launch`). The harness stands in for atld:
+//!    it serves the services' process control (atl_broker::control, their stdin) and starts the process they ask for, the client below, as the package's uid with the startSeq they chose.
+//! 2. atl-services-client `app` as that process: getService of each, attach -> bindApplication, finishAttach -> LaunchActivityItem, getDisplayId, the PackageManager subset,
 //!    the settings provider and its `call`, null returns, an unimplemented method, a denied @EnforcePermission method (crates/atl-services/src/bin/client.rs).
 //! 3. atl-services-client `system` as uid 1000: the same @EnforcePermission method passes the hook and reaches the unimplemented default.
 //! 4. Java nullability through a C++ client: AOSP `service call` (shell uid) sends a null String (int32 -1, Parcel.writeString(null)) to hasSystemFeature and getApplicationInfo; the Rust
@@ -10,9 +11,13 @@
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use atl_broker::control::{self, Request, Response};
+use atl_services::packages::{InstrumentationDecl, Manifest, PackageRecord};
+use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::binder::Harness;
 use crate::packages;
@@ -22,10 +27,13 @@ const PACKAGE: &str = "atl-services";
 const APP: &str = "com.example.atltest";
 const APP_UID: u32 = 10_123;
 const ACTIVITY: &str = "com.example.atltest.Main";
-const START_SEQ: &str = "7";
+/// The instrumentation it declares (client.rs checks the PackageManager's answers for it).
+const INSTRUMENTATION: &str = "com.example.atltest.Runner";
 /// Its manifest values: versionCode 1, min and target SDK 34 (any; the client checks only what it is told here).
-const VERSION_CODE: &str = "1";
-const SDK: &str = "34";
+const VERSION_CODE: i64 = 1;
+const SDK: i32 = 34;
+/// The prefix of the startSeq argument the services pass (ActivityThread.PROC_START_SEQ_IDENT).
+const SEQ_ARG: &str = "seq=";
 /// Android uids (android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
 const AID_SHELL: u32 = 2000;
@@ -125,133 +133,200 @@ pub fn stage(
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
     let client = packages::bin(root, out, PACKAGE, "atl-services-client")?;
     let services_log = test_root.join("services.log");
-    let mut cmd = Command::new(&host);
-    let app_dir = format!("/data/user/0/{APP}");
-    let device_dir = format!("/data/user_de/0/{APP}");
-    let apk = format!("/data/app/{APP}/base.apk");
-    let uid = APP_UID.to_string();
-    cmd.args([
-        "--package",
-        APP,
-        "--uid",
-        &uid,
-        "--apk",
-        &apk,
-        "--data",
-        &app_dir,
-        "--device-data",
-        &device_dir,
-        "--activity",
-        ACTIVITY,
-        "--start-seq",
-        START_SEQ,
-        "--version-code",
-        VERSION_CODE,
-        "--min-sdk",
-        SDK,
-        "--target-sdk",
-        SDK,
-    ])
-    .envs(env.iter().cloned())
-    .stdin(Stdio::null())
-    .stderr(std::fs::File::create(&services_log)?);
-    let mut services = h
-        .spawn(cmd, AID_SYSTEM, false)
-        .context("starting atl-system-services")?;
-    let start = Instant::now();
-    while !std::fs::read_to_string(&services_log)?.contains("services: ready") {
-        if let Some(s) = services.try_wait()? {
-            return Ok(vec![format!(
-                "atl-system-services exited {s}: {}",
-                std::fs::read_to_string(&services_log)?.trim()
-            )]);
-        }
-        if start.elapsed() > READY {
-            let _ = services.kill();
-            return Ok(vec![format!(
-                "atl-system-services not ready after {READY:?}"
-            )]);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let codes = Command::new(&client)
-        .arg("codes")
-        .envs(env.iter().cloned())
-        .output()?;
-    let codes = String::from_utf8_lossy(&codes.stdout).into_owned();
-    let mut app = Command::new(&client);
-    app.envs(env.iter().cloned()).args([
-        "app",
-        "--package",
-        APP,
-        "--uid",
-        &uid,
-        "--activity",
-        ACTIVITY,
-        "--start-seq",
-        START_SEQ,
-    ]);
-    let app = run(
-        h,
-        app,
-        APP_UID,
-        &test_root.join("client-app.log"),
-        CLIENT_LIMIT,
-    )?;
-    let mut system = Command::new(&client);
-    system.envs(env.iter().cloned()).arg("system");
-    let system = run(
-        h,
-        system,
-        AID_SYSTEM,
-        &test_root.join("client-system.log"),
-        CLIENT_LIMIT,
-    )?;
-    let call = |method: &str, args: &[&str], log: &str| -> Result<Run> {
-        let Some(c) = code(&codes, method) else {
-            return Ok((
-                false,
-                format!("no transaction code for {method} in {codes:?}"),
-            ));
-        };
-        let mut cmd = Command::new(service);
-        cmd.envs(env.iter().cloned())
-            // `--`: service parses options with getopt, which would take the argument -1 for one
-            .args(["--", "call", "package", &c])
-            .args(args);
-        run(h, cmd, AID_SHELL, &test_root.join(log), CLIENT_LIMIT)
+    // the installed package, as atld's install step would write it
+    let record = PackageRecord {
+        manifest: Manifest {
+            name: APP.to_owned(),
+            version_code: VERSION_CODE,
+            version_name: None,
+            min_sdk: SDK,
+            target_sdk: SDK,
+            process_name: None,
+            launch_activity: Some(ACTIVITY.to_owned()),
+            requested_permissions: vec![],
+            libraries: vec![],
+            // one instrumentation, targeting the package itself (client.rs INSTRUMENTATION)
+            instrumentation: vec![InstrumentationDecl {
+                name: INSTRUMENTATION.to_owned(),
+                target_package: APP.to_owned(),
+                target_processes: None,
+                handle_profiling: false,
+                functional_test: true,
+            }],
+        },
+        uid: APP_UID,
+        source_dir: format!("/data/app/{APP}/base.apk"),
+        data_dir: format!("/data/user/0/{APP}"),
+        device_protected_data_dir: format!("/data/user_de/0/{APP}"),
     };
-    // hasSystemFeature(String name = null, int version = 0); getApplicationInfo(String packageName = null, long flags = 0, int userId = 0)
-    let feature = call(
-        "hasSystemFeature",
-        &["i32", "-1", "i32", "0"],
-        "service-feature.log",
+    let packages_file = test_root.join("packages.json");
+    std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;
+    let (control_ours, control_theirs) = socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
     )?;
-    let info = call(
-        "getApplicationInfo",
-        &["i32", "-1", "i64", "0", "i32", "0"],
-        "service-info.log",
-    )?;
+    let mut cmd = Command::new(&host);
+    cmd.arg("--packages")
+        .arg(&packages_file)
+        .args(["--launch", APP])
+        .envs(env.iter().cloned())
+        .stdin(Stdio::from(control_theirs))
+        .stderr(std::fs::File::create(&services_log)?);
+    // the process the services start: the client, as the package's uid; the handler sends its Child here
+    let (started_tx, started_rx) = channel::<Child>();
+    let client_log = test_root.join("client-app.log");
+    // the harness is atld for this stage: what the services start, it spawns; it kills nothing (the client ends by itself)
+    let serve = |tx: Sender<Child>| {
+        let result = control::serve(&control_ours, |request| match request {
+            Request::Start(start) => {
+                let Some(seq) = start
+                    .args
+                    .iter()
+                    .find_map(|a| a.strip_prefix(SEQ_ARG))
+                    .map(str::to_owned)
+                else {
+                    return Response::Error {
+                        message: format!("no {SEQ_ARG}<startSeq> in {:?}", start.args),
+                    };
+                };
+                let mut app = Command::new(&client);
+                app.envs(env.iter().cloned()).args([
+                    "app",
+                    "--package",
+                    &start.package,
+                    "--uid",
+                    &start.uid.to_string(),
+                    "--activity",
+                    ACTIVITY,
+                    "--start-seq",
+                    &seq,
+                ]);
+                let spawned = std::fs::File::create(&client_log)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|file| {
+                        app.stdin(Stdio::null())
+                            .stdout(file.try_clone()?)
+                            .stderr(file);
+                        h.spawn(app, start.uid, false)
+                    });
+                match spawned.and_then(|child| {
+                    let pid = i32::try_from(child.id())?;
+                    tx.send(child).ok();
+                    Ok(pid)
+                }) {
+                    Ok(pid) => Response::Started { pid },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                }
+            }
+            Request::Kill { pid } => Response::Error {
+                message: format!("the services stage starts no process it kills (pid {pid})"),
+            },
+        });
+        // the services ending their end of the socket is how the loop stops; any other error is theirs to report
+        drop(result);
+    };
+    std::thread::scope(|scope| -> Result<Vec<String>> {
+        scope.spawn(|| serve(started_tx));
+        let mut services = h
+            .spawn(cmd, AID_SYSTEM, false)
+            .context("starting atl-system-services")?;
+        let start = Instant::now();
+        while !std::fs::read_to_string(&services_log)?.contains("services: ready") {
+            if let Some(s) = services.try_wait()? {
+                return Ok(vec![format!(
+                    "atl-system-services exited {s}: {}",
+                    std::fs::read_to_string(&services_log)?.trim()
+                )]);
+            }
+            if start.elapsed() > READY {
+                let _ = services.kill();
+                let _ = services.wait();
+                return Ok(vec![format!(
+                    "atl-system-services not ready after {READY:?}"
+                )]);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
-    let _ = services.kill();
-    services.wait()?;
-    let log = std::fs::read_to_string(&services_log)?;
-    for l in app
-        .1
-        .lines()
-        .chain(system.1.lines())
-        .filter(|l| l.starts_with("client: pass"))
-    {
-        println!("binder: services {}", l.trim_start_matches("client: "));
-    }
-    let fails = verdict(&app, &system, &feature, &info, &log);
-    if fails.is_empty() {
-        println!(
-            "binder: services pass (null String in, null parcelable out through `service call`; unimplemented calls counted)"
-        );
-    }
-    Ok(fails)
+        let codes = Command::new(&client)
+            .arg("codes")
+            .envs(env.iter().cloned())
+            .output()?;
+        let codes = String::from_utf8_lossy(&codes.stdout).into_owned();
+        // the services' `--launch` made them ask for the app process: the client the handler spawned
+        let app: Run = match started_rx.recv_timeout(READY) {
+            Ok(mut child) => {
+                let status = wait(&mut child, CLIENT_LIMIT)?;
+                let text = std::fs::read_to_string(&client_log)?;
+                match status {
+                    Some(s) => (s.success(), text),
+                    None => (false, format!("{text}(killed after {CLIENT_LIMIT:?})")),
+                }
+            }
+            Err(_) => (
+                false,
+                format!("the services did not start a process within {READY:?}"),
+            ),
+        };
+        let mut system = Command::new(&client);
+        system.envs(env.iter().cloned()).arg("system");
+        let system = run(
+            h,
+            system,
+            AID_SYSTEM,
+            &test_root.join("client-system.log"),
+            CLIENT_LIMIT,
+        )?;
+        let call = |method: &str, args: &[&str], log: &str| -> Result<Run> {
+            let Some(c) = code(&codes, method) else {
+                return Ok((
+                    false,
+                    format!("no transaction code for {method} in {codes:?}"),
+                ));
+            };
+            let mut cmd = Command::new(service);
+            cmd.envs(env.iter().cloned())
+                // `--`: service parses options with getopt, which would take the argument -1 for one
+                .args(["--", "call", "package", &c])
+                .args(args);
+            run(h, cmd, AID_SHELL, &test_root.join(log), CLIENT_LIMIT)
+        };
+        // hasSystemFeature(String name = null, int version = 0); getApplicationInfo(String packageName = null, long flags = 0, int userId = 0)
+        let feature = call(
+            "hasSystemFeature",
+            &["i32", "-1", "i32", "0"],
+            "service-feature.log",
+        )?;
+        let info = call(
+            "getApplicationInfo",
+            &["i32", "-1", "i64", "0", "i32", "0"],
+            "service-info.log",
+        )?;
+
+        // the services' end of the control socket closes with them, which ends the handler's loop (the scope waits for it)
+        let _ = services.kill();
+        services.wait()?;
+        let log = std::fs::read_to_string(&services_log)?;
+        for l in app
+            .1
+            .lines()
+            .chain(system.1.lines())
+            .filter(|l| l.starts_with("client: pass"))
+        {
+            println!("binder: services {}", l.trim_start_matches("client: "));
+        }
+        let fails = verdict(&app, &system, &feature, &info, &log);
+        if fails.is_empty() {
+            println!(
+                "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted)"
+            );
+        }
+        Ok(fails)
+    })
 }
 
 #[cfg(test)]

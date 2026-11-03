@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test instrument`'s package: its own instrumentation target and the legacy JUnit3 runner (frameworks/base/test-runner), whose libraries an app must declare (they are off the default class path since P). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlinstr"
+    android:versionCode="3"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application android:label="ATL instrumentation fixture">
+        <uses-library android:name="android.test.runner" />
+        <uses-library android:name="android.test.base" />
+        <uses-library android:name="android.test.mock" android:required="false" />
+    </application>
+
+    <instrumentation
+        android:name="android.test.InstrumentationTestRunner"
+        android:targetPackage="com.example.atlinstr"
+        android:functionalTest="true"
+        android:label="ATL instrumentation fixture" />
+</manifest>

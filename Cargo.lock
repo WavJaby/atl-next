@@ -138,6 +138,7 @@ version = "0.0.0"
 dependencies = [
  "atl-binderd",
  "rustix",
+ "serde",
  "serde_json",
 ]
 
@@ -185,8 +186,11 @@ dependencies = [
  "anyhow",
  "atl-aidl",
  "atl-bridgegen",
+ "atl-broker",
  "clap",
  "rustix",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -197,8 +201,11 @@ dependencies = [
  "atl-binderd",
  "atl-broker",
  "atl-property-service",
+ "atl-services",
  "clap",
  "rustix",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -580,7 +587,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-binderd",
+ "atl-broker",
  "atl-layout",
+ "atl-services",
  "clap",
  "object",
  "roxmltree",

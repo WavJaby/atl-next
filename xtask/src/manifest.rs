@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: MIT
+//! A package's manifest as the services need it, read from the APK with AOSP's own `aapt2 dump xmltree --file AndroidManifest.xml` (owner D3, 2026-11-03: aapt2 is a build and test time tool; real installs
+//! at run time read the manifest with libandroidfw's ResXMLTree through a boundary crate, and produce the same `Manifest`). No second binary-XML decoder is written here: this reads aapt2's text.
+//! aapt2's format (tools/aapt2/Debug.cpp `Debug::DumpXml`): `N:` namespace lines, `E: <element> (line=n)`, `A: [<namespace uri>:]<name>[(0x<resource id>)]=<value>`; an element's attributes are indented two
+//! columns deeper than it, its child elements four. A value is `"string" (Raw: "string")`, a decimal or `0x` integer, `true` / `false`, or `@0x<id>` / `(type 0x..)0x..` for the rest.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use atl_services::packages::{InstrumentationDecl, Manifest, UsesLibrary};
+
+use crate::host_art;
+
+/// ACTION_MAIN / CATEGORY_LAUNCHER (Intent.java): the pair that makes an activity the package's launcher activity.
+const ACTION_MAIN: &str = "android.intent.action.MAIN";
+const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
+/// What the manifest means when `<uses-sdk>` or its attributes are absent (ParsingPackageUtils: minSdkVersion 1, targetSdkVersion = min).
+const DEFAULT_MIN_SDK: i32 = 1;
+
+/// One parsed element: its name, attributes (namespace and resource id dropped), children.
+#[derive(Debug, Default)]
+struct Element {
+    name: String,
+    attrs: BTreeMap<String, String>,
+    children: Vec<Element>,
+}
+
+impl Element {
+    fn children<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Element> {
+        self.children.iter().filter(move |c| c.name == name)
+    }
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs.get(name).map(String::as_str)
+    }
+    fn bool_attr(&self, name: &str, default: bool) -> bool {
+        match self.attr(name) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => default,
+        }
+    }
+}
+
+/// The attribute line's key and value: `A: <ns>:name(0x..)=<value>` -> (`name`, `<value>` unquoted when it is a string).
+fn attribute(line: &str) -> Result<(String, String)> {
+    let rest = line
+        .trim_start()
+        .strip_prefix("A: ")
+        .context("not an A: line")?;
+    let (key, value) = rest.split_once('=').context("attribute without `=`")?;
+    // `http://schemas.android.com/apk/res/android:name(0x01010003)` -> `name`; `package` stays
+    let key = key.split('(').next().unwrap_or(key);
+    let key = key.rsplit(':').next().unwrap_or(key);
+    let value = match value.strip_prefix('"') {
+        // `"text" (Raw: "text")`: the quoted text up to the closing quote that precedes ` (Raw:`, else the last quote
+        Some(quoted) => match quoted.find("\" (Raw: ") {
+            Some(end) => &quoted[..end],
+            None => quoted.strip_suffix('"').unwrap_or(quoted),
+        },
+        None => value.split(" (Raw: ").next().unwrap_or(value),
+    };
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// The element tree of `aapt2 dump xmltree` text; the root is the manifest element.
+fn parse_tree(text: &str) -> Result<Element> {
+    // the open elements, with their indentation; a line closes every element at its indentation or deeper
+    let mut stack: Vec<(usize, Element)> = Vec::new();
+    let mut root = None;
+    let pop_to = |stack: &mut Vec<(usize, Element)>, root: &mut Option<Element>, indent: usize| {
+        while stack.last().is_some_and(|(i, _)| *i >= indent) {
+            let (_, done) = stack.pop().expect("checked non-empty");
+            match stack.last_mut() {
+                Some((_, parent)) => parent.children.push(done),
+                None => *root = Some(done),
+            }
+        }
+    };
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let indent = line.len() - line.trim_start().len();
+        let body = line.trim_start();
+        if body.starts_with("N: ") {
+            continue;
+        }
+        if let Some(rest) = body.strip_prefix("E: ") {
+            pop_to(&mut stack, &mut root, indent);
+            let name = rest.split(" (line=").next().unwrap_or(rest).to_owned();
+            stack.push((
+                indent,
+                Element {
+                    name,
+                    ..Element::default()
+                },
+            ));
+        } else if body.starts_with("A: ") {
+            let (key, value) =
+                attribute(line).with_context(|| format!("attribute line {line:?}"))?;
+            let Some((_, element)) = stack.last_mut() else {
+                bail!("attribute outside an element: {line:?}");
+            };
+            element.attrs.insert(key, value);
+        } else {
+            bail!("unrecognised line in aapt2's xmltree: {line:?}");
+        }
+    }
+    pop_to(&mut stack, &mut root, 0);
+    root.context("no element in aapt2's xmltree")
+}
+
+/// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
+fn resolve_class(package: &str, name: &str) -> String {
+    if name.starts_with('.') {
+        format!("{package}{name}")
+    } else if !name.contains('.') {
+        format!("{package}.{name}")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The manifest of the text `aapt2 dump xmltree --file AndroidManifest.xml` printed.
+pub fn parse(text: &str) -> Result<Manifest> {
+    let root = parse_tree(text)?;
+    if root.name != "manifest" {
+        bail!("the root element is `{}`, not `manifest`", root.name);
+    }
+    let package = root.attr("package").context("manifest without a package")?;
+    let int = |element: &Element, name: &str| -> Result<Option<i64>> {
+        element
+            .attr(name)
+            .map(|v| {
+                v.strip_prefix("0x")
+                    .map_or_else(|| v.parse(), |h| i64::from_str_radix(h, 16))
+                    .with_context(|| format!("{name}={v}: not an integer"))
+            })
+            .transpose()
+    };
+    let sdk = root.children("uses-sdk").next();
+    let min_sdk = match sdk {
+        Some(s) => int(s, "minSdkVersion")?.map_or(DEFAULT_MIN_SDK, |v| v as i32),
+        None => DEFAULT_MIN_SDK,
+    };
+    let target_sdk = match sdk {
+        Some(s) => int(s, "targetSdkVersion")?.map_or(min_sdk, |v| v as i32),
+        None => min_sdk,
+    };
+    let application = root.children("application").next();
+    // `<application android:process>`: `:name` is private to the package, as ParsingUtils.buildProcessName makes it
+    let process_name =
+        application
+            .and_then(|a| a.attr("process"))
+            .map(|p| match p.strip_prefix(':') {
+                Some(suffix) => format!("{package}:{suffix}"),
+                None => p.to_owned(),
+            });
+    let launch_activity = application.and_then(|a| {
+        a.children("activity").find_map(|activity| {
+            let launcher = activity.children("intent-filter").any(|f| {
+                let has = |kind: &str, wanted: &str| {
+                    f.children(kind).any(|e| e.attr("name") == Some(wanted))
+                };
+                has("action", ACTION_MAIN) && has("category", CATEGORY_LAUNCHER)
+            });
+            launcher
+                .then(|| activity.attr("name").map(|n| resolve_class(package, n)))
+                .flatten()
+        })
+    });
+    Ok(Manifest {
+        name: package.to_owned(),
+        version_code: int(&root, "versionCode")?.unwrap_or(0),
+        version_name: root.attr("versionName").map(str::to_owned),
+        min_sdk,
+        target_sdk,
+        process_name,
+        launch_activity,
+        requested_permissions: root
+            .children("uses-permission")
+            .filter_map(|e| e.attr("name").map(str::to_owned))
+            .collect(),
+        libraries: application
+            .into_iter()
+            .flat_map(|a| a.children("uses-library"))
+            .filter_map(|e| {
+                Some(UsesLibrary {
+                    name: e.attr("name")?.to_owned(),
+                    required: e.bool_attr("required", true),
+                })
+            })
+            .collect(),
+        instrumentation: root
+            .children("instrumentation")
+            .filter_map(|e| {
+                Some(InstrumentationDecl {
+                    name: resolve_class(package, e.attr("name")?),
+                    target_package: e.attr("targetPackage")?.to_owned(),
+                    target_processes: e.attr("targetProcesses").map(str::to_owned),
+                    handle_profiling: e.bool_attr("handleProfiling", false),
+                    functional_test: e.bool_attr("functionalTest", false),
+                })
+            })
+            .collect(),
+    })
+}
+
+/// `apk`'s manifest, through `aapt2`.
+pub fn read(aapt2: &Path, apk: &Path) -> Result<Manifest> {
+    let text = host_art::output(
+        Command::new(aapt2)
+            .args(["dump", "xmltree", "--file", "AndroidManifest.xml"])
+            .arg(apk),
+        "aapt2 dump xmltree",
+    )?;
+    parse(&text).with_context(|| format!("the manifest of {}", apk.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// aapt2 2.20's `dump xmltree` of xtask/testdata/instrument/AndroidManifest.xml, as measured 2026-11-03.
+    const INSTRUMENT: &str = r#"N: android=http://schemas.android.com/apk/res/android (line=4)
+  E: manifest (line=4)
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=3
+    A: http://schemas.android.com/apk/res/android:versionName(0x0101021c)="1.0" (Raw: "1.0")
+    A: http://schemas.android.com/apk/res/android:compileSdkVersion(0x01010572)=36
+    A: http://schemas.android.com/apk/res/android:compileSdkVersionCodename(0x01010573)="16" (Raw: "16")
+    A: package="com.example.atlinstr" (Raw: "com.example.atlinstr")
+    A: platformBuildVersionCode=36
+    A: platformBuildVersionName=16
+      E: uses-sdk (line=9)
+        A: http://schemas.android.com/apk/res/android:minSdkVersion(0x0101020c)=21
+        A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)=36
+      E: uses-permission (line=10)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")
+      E: application (line=12)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="ATL instrumentation fixture" (Raw: "ATL instrumentation fixture")
+          E: uses-library (line=13)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.test.runner" (Raw: "android.test.runner")
+          E: uses-library (line=14)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.test.base" (Raw: "android.test.base")
+          E: uses-library (line=15)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.test.mock" (Raw: "android.test.mock")
+            A: http://schemas.android.com/apk/res/android:required(0x0101028e)=false
+      E: instrumentation (line=18)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="ATL instrumentation fixture" (Raw: "ATL instrumentation fixture")
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.test.InstrumentationTestRunner" (Raw: "android.test.InstrumentationTestRunner")
+        A: http://schemas.android.com/apk/res/android:targetPackage(0x01010021)="com.example.atlinstr" (Raw: "com.example.atlinstr")
+        A: http://schemas.android.com/apk/res/android:functionalTest(0x01010023)=true
+"#;
+
+    #[test]
+    fn the_instrumentation_fixture() {
+        // the values xtask/testdata/instrument/AndroidManifest.xml declares
+        let m = parse(INSTRUMENT).expect("parse");
+        assert_eq!(m.name, "com.example.atlinstr");
+        assert_eq!(
+            (m.version_code, m.version_name.as_deref()),
+            (3, Some("1.0"))
+        );
+        assert_eq!((m.min_sdk, m.target_sdk), (21, 36));
+        assert_eq!(m.requested_permissions, ["android.permission.INTERNET"]);
+        assert_eq!(
+            m.libraries,
+            [
+                UsesLibrary {
+                    name: "android.test.runner".into(),
+                    required: true
+                },
+                UsesLibrary {
+                    name: "android.test.base".into(),
+                    required: true
+                },
+                UsesLibrary {
+                    name: "android.test.mock".into(),
+                    required: false
+                },
+            ]
+        );
+        assert_eq!(
+            m.instrumentation,
+            [InstrumentationDecl {
+                name: "android.test.InstrumentationTestRunner".into(),
+                target_package: "com.example.atlinstr".into(),
+                target_processes: None,
+                handle_profiling: false,
+                functional_test: true,
+            }]
+        );
+        assert_eq!((m.process_name, m.launch_activity), (None, None));
+    }
+
+    /// A launcher activity named relative to the package, a private process, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
+    #[test]
+    fn launcher_activity_and_process_resolution() {
+        let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
+  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: application (line=7)
+        A: http://schemas.android.com/apk/res/android:process(0x01010011)=":remote" (Raw: ":remote")
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Other" (Raw: ".Other")
+          E: activity (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Main" (Raw: ".Main")
+              E: intent-filter (line=10)
+                  E: action (line=11)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+                  E: category (line=12)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+      E: instrumentation (line=14)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Runner" (Raw: ".Runner")
+        A: http://schemas.android.com/apk/res/android:targetPackage(0x01010021)="com.example.other" (Raw: "com.example.other")
+        A: http://schemas.android.com/apk/res/android:targetProcesses(0x01010a1b)="*" (Raw: "*")
+"#;
+        let m = parse(text).expect("parse");
+        assert_eq!(
+            m.launch_activity.as_deref(),
+            Some("com.example.atltest.Main")
+        );
+        assert_eq!(
+            m.process_name.as_deref(),
+            Some("com.example.atltest:remote")
+        );
+        assert_eq!(m.instrumentation[0].name, "com.example.atltest.Runner");
+        assert_eq!(m.instrumentation[0].target_processes.as_deref(), Some("*"));
+        // no <uses-sdk>: ParsingPackageUtils' defaults
+        assert_eq!((m.min_sdk, m.target_sdk, m.version_code), (1, 1, 0));
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_manifest() {
+        assert!(parse("").is_err());
+        assert!(parse("  E: application (line=1)\n").is_err());
+        assert!(parse("garbage\n").is_err());
+    }
+}

@@ -24,16 +24,16 @@ crates = ["atl-property-service"]
 exports = ["atl-property-service"]
 uses = ["bionic"]
 
-# the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd
+# the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd; its `control` module is the protocol by which the services ask for process starts and kills
 [broker]
 crates = ["atl-broker"]
 exports = ["atl-broker"]
 uses = ["binder"]
 
-# M2 wiring: binderd, servicemanager, the services and the app, each a process started through the broker
+# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "property-service"]
+uses = ["binder", "broker", "property-service", "services"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names
 [launcher]
@@ -53,7 +53,9 @@ uses = ["generators"]
 # the M2 system services in Rust (ActivityManager subset, PackageManager subset, the settings provider stub) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
 [services]
 crates = ["atl-services"]
-uses = ["aidl", "generators"]
+# the package record types (plain Rust, no converter) are what atld installs and xtask writes
+exports = ["atl-services"]
+uses = ["aidl", "generators", "broker"]
 
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it
 [binder]
@@ -80,5 +82,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will
-uses = ["layout", "binder"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld
+uses = ["layout", "binder", "broker", "services"]

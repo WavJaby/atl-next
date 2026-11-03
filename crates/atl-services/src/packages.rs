@@ -1,10 +1,55 @@
 // SPDX-License-Identifier: MIT
-//! The installed packages the services know and the process starts they expect. M2: given by the host (atld's broker later, from the APK parser); one user (0).
+//! The installed packages the services know. Given by the host (atld's install step, from the manifests `xtask` read with AOSP's `aapt2 dump xmltree`; a libandroidfw reader replaces that for real installs, owner D3); one user (0).
+//! A package is its [`Manifest`] (what the APK declares) plus where the host installed it ([`PackageRecord`]).
 
-/// One installed package: what ApplicationInfo / PackageInfo / the launch need.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PackageRecord {
+use std::collections::BTreeMap;
+use std::ops::Deref;
+
+use serde::{Deserialize, Serialize};
+
+/// `<uses-library android:name android:required>` (AndroidManifest.xml; `required` defaults to true).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsesLibrary {
     pub name: String,
+    pub required: bool,
+}
+
+/// `<instrumentation>` (ParsedInstrumentation, frameworks/base core/java/android/content/pm/parsing/component/ParsedInstrumentation.java).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentationDecl {
+    /// `android:name`, resolved against the package name: the Instrumentation class.
+    pub name: String,
+    /// `android:targetPackage`.
+    pub target_package: String,
+    /// `android:targetProcesses`; None = the target package's default process.
+    pub target_processes: Option<String>,
+    /// `android:handleProfiling`, `android:functionalTest` (both default false).
+    pub handle_profiling: bool,
+    pub functional_test: bool,
+}
+
+/// What an APK's AndroidManifest.xml declares that the services use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub name: String,
+    pub version_code: i64,
+    pub version_name: Option<String>,
+    pub min_sdk: i32,
+    pub target_sdk: i32,
+    /// `<application android:process>`; None = the package name (ApplicationInfo.processName's default).
+    pub process_name: Option<String>,
+    /// The class of the first activity that handles MAIN + LAUNCHER, if the package has one.
+    pub launch_activity: Option<String>,
+    /// `<uses-permission android:name>`, in order.
+    pub requested_permissions: Vec<String>,
+    pub libraries: Vec<UsesLibrary>,
+    pub instrumentation: Vec<InstrumentationDecl>,
+}
+
+/// One installed package: its manifest and where and as whom it is installed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PackageRecord {
+    pub manifest: Manifest,
     pub uid: u32,
     /// base.apk path (ApplicationInfo.sourceDir)
     pub source_dir: String,
@@ -12,38 +57,78 @@ pub struct PackageRecord {
     pub data_dir: String,
     /// device-protected storage (ApplicationInfo.deviceProtectedDataDir: /data/user_de/<user>/<package>): the code cache dir, which graphics setup opens first
     pub device_protected_data_dir: String,
-    pub version_code: i64,
-    pub version_name: Option<String>,
-    pub min_sdk: i32,
-    pub target_sdk: i32,
-    /// the launcher activity's class name
-    pub launch_activity: String,
 }
 
-impl PackageRecord {
-    /// The process name: the package name (ApplicationInfo.processName default when the manifest names none).
-    pub fn process_name(&self) -> &str {
-        &self.name
+impl Deref for PackageRecord {
+    type Target = Manifest;
+    fn deref(&self) -> &Manifest {
+        &self.manifest
     }
 }
 
-/// A process start the services expect (ProcessList.mPendingStarts in AOSP): the broker spawned `package` as `uid` with `start_seq`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingStart {
-    pub start_seq: i64,
-    pub package: String,
-    pub uid: u32,
+impl PackageRecord {
+    /// The process name: `<application android:process>`, else the package name (ApplicationInfo.processName's default).
+    pub fn process_name(&self) -> &str {
+        self.process_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
-/// The package set.
+/// A shared library as SystemConfig reads it from `<library name file dependency>` (frameworks/base/data/etc/platform.xml: `android.test.runner` depends on `android.test.base:android.test.mock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    /// its jar as the app processes see it
+    pub file: String,
+    /// the libraries it needs, by name: a package that uses it gets them loaded for it too
+    pub dependencies: Vec<String>,
+}
+
+impl Library {
+    /// The command-line form `<name>=<file>[,<dependency>...]` (atld's `--shared-library` and the services'): the name, the file, and the names of the libraries it depends on.
+    pub fn parse_arg(s: &str) -> Result<(String, Library), String> {
+        let (name, rest) = s
+            .split_once('=')
+            .ok_or_else(|| format!("{s}: not <name>=<file>[,<dependency>...]"))?;
+        let mut parts = rest.split(',');
+        let file = parts.next().unwrap_or_default();
+        if name.is_empty() || file.is_empty() {
+            return Err(format!("{s}: not <name>=<file>[,<dependency>...]"));
+        }
+        Ok((
+            name.to_owned(),
+            Library {
+                file: file.to_owned(),
+                dependencies: parts.map(str::to_owned).collect(),
+            },
+        ))
+    }
+
+    /// [`Library::parse_arg`]'s form of this library, with `file` in place of its own (atld installs the jar elsewhere).
+    pub fn to_arg(&self, name: &str, file: &str) -> String {
+        std::iter::once(format!("{name}={file}"))
+            .chain(self.dependencies.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// A library a package uses and the ones it depends on ([`Packages::used_libraries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryNode {
+    pub name: String,
+    pub file: String,
+    pub dependencies: Vec<LibraryNode>,
+}
+
+/// The package set and the shared libraries they may use.
 #[derive(Debug, Clone, Default)]
 pub struct Packages {
     list: Vec<PackageRecord>,
+    libraries: BTreeMap<String, Library>,
 }
 
 impl Packages {
-    pub fn new(list: Vec<PackageRecord>) -> Self {
-        Packages { list }
+    pub fn new(list: Vec<PackageRecord>, libraries: BTreeMap<String, Library>) -> Self {
+        Packages { list, libraries }
     }
 
     pub fn by_name(&self, name: &str) -> Option<&PackageRecord> {
@@ -57,11 +142,71 @@ impl Packages {
             .filter(move |p| crate::permission::app_id(p.uid) == app_id)
     }
 
-    /// What `caller` may see of `package` (ComputerEngine shouldFilterApplication): the system everything, an app its own package only (no <queries> yet).
+    /// Every package, in install order.
+    pub fn all(&self) -> &[PackageRecord] {
+        &self.list
+    }
+
+    /// The instrumentation `class` of `package` and the package declaring it (ComputerEngine's mInstrumentation, keyed by ComponentName; ParsedInstrumentation names are resolved against the package).
+    pub fn instrumentation(
+        &self,
+        package: &str,
+        class: &str,
+    ) -> Option<(&PackageRecord, &InstrumentationDecl)> {
+        let p = self.by_name(package)?;
+        let decl = p.instrumentation.iter().find(|i| i.name == class)?;
+        Some((p, decl))
+    }
+
+    /// Every instrumentation, with its package, in install order (ComputerEngine.queryInstrumentationAsUser's iteration).
+    pub fn all_instrumentation(
+        &self,
+    ) -> impl Iterator<Item = (&PackageRecord, &InstrumentationDecl)> {
+        self.list
+            .iter()
+            .flat_map(|p| p.instrumentation.iter().map(move |i| (p, i)))
+    }
+
+    /// Shared library `name`.
+    pub fn library(&self, name: &str) -> Option<&Library> {
+        self.libraries.get(name)
+    }
+
+    /// The libraries `p` uses (its `<uses-library>`s that name an installed library, in manifest order), each with the libraries it depends on below it: the shape of
+    /// ApplicationInfo.sharedLibraryInfos (ComputerEngine / SharedLibraryUtils.findSharedLibraries), which LoadedApk turns into one class loader per library, dependencies as its delegates.
+    /// A dependency cycle is cut where it closes.
+    pub fn used_libraries(&self, p: &PackageRecord) -> Vec<LibraryNode> {
+        let names: Vec<&str> = p.libraries.iter().map(|l| l.name.as_str()).collect();
+        self.nodes(&names, &mut Vec::new())
+    }
+
+    fn nodes<'a>(&'a self, names: &[&'a str], path: &mut Vec<&'a str>) -> Vec<LibraryNode> {
+        let mut out = Vec::new();
+        for &name in names {
+            let Some(lib) = self.library(name) else {
+                continue;
+            };
+            if path.contains(&name) {
+                continue;
+            }
+            path.push(name);
+            let deps: Vec<&str> = lib.dependencies.iter().map(String::as_str).collect();
+            out.push(LibraryNode {
+                name: name.to_owned(),
+                file: lib.file.clone(),
+                dependencies: self.nodes(&deps, path),
+            });
+            path.pop();
+        }
+        out
+    }
+
+    /// What `caller` may see of `package` (ComputerEngine shouldFilterApplication): a uid below the first application uid everything (AppsFilterImpl.shouldFilterApplication does not filter
+    /// them), an app its own package only (no <queries> yet).
     pub fn visible(&self, caller: u32, package: &str) -> Option<&PackageRecord> {
         let p = self.by_name(package)?;
         let own = crate::permission::app_id(p.uid) == crate::permission::app_id(caller);
-        (crate::permission::is_system_or_root(caller) || own).then_some(p)
+        (crate::permission::sees_all_packages(caller) || own).then_some(p)
     }
 }
 
@@ -71,26 +216,133 @@ mod tests {
 
     fn record(name: &str, uid: u32) -> PackageRecord {
         PackageRecord {
-            name: name.into(),
+            manifest: Manifest {
+                name: name.into(),
+                version_code: 1,
+                version_name: None,
+                min_sdk: 21,
+                target_sdk: 34,
+                process_name: None,
+                launch_activity: None,
+                requested_permissions: vec![],
+                libraries: vec![],
+                instrumentation: vec![],
+            },
             uid,
             source_dir: String::new(),
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
-            version_code: 1,
-            version_name: None,
-            min_sdk: 21,
-            target_sdk: 34,
-            launch_activity: String::new(),
         }
     }
 
     #[test]
     fn visibility() {
-        let p = Packages::new(vec![record("a", 10_001), record("b", 10_002)]);
+        let p = Packages::new(
+            vec![record("a", 10_001), record("b", 10_002)],
+            BTreeMap::new(),
+        );
         assert!(p.visible(10_001, "a").is_some());
         assert!(p.visible(10_001, "b").is_none());
+        // system and shell (AID_SHELL 2000) see every package; an unknown name is none
         assert!(p.visible(1000, "b").is_some());
+        assert!(p.visible(2000, "b").is_some());
         assert!(p.visible(1000, "c").is_none());
         assert_eq!(p.by_app_id(10_002).count(), 1);
+    }
+
+    #[test]
+    fn used_libraries_follow_the_manifest_and_carry_their_dependencies() {
+        let lib = |file: &str, deps: &[&str]| Library {
+            file: file.into(),
+            dependencies: deps.iter().map(|d| (*d).to_owned()).collect(),
+        };
+        let libraries = BTreeMap::from([
+            ("runner".to_owned(), lib("/f/runner.jar", &["base", "mock"])),
+            ("base".to_owned(), lib("/f/base.jar", &[])),
+            ("mock".to_owned(), lib("/f/mock.jar", &[])),
+            // a cycle is cut where it closes
+            ("a".to_owned(), lib("/f/a.jar", &["b"])),
+            ("b".to_owned(), lib("/f/b.jar", &["a"])),
+        ]);
+        let mut p = record("p", 10_001);
+        // manifest order; "absent" names no installed library and adds nothing
+        p.manifest.libraries = ["runner", "absent", "base", "a"]
+            .iter()
+            .map(|n| UsesLibrary {
+                name: (*n).to_owned(),
+                required: true,
+            })
+            .collect();
+        let packages = Packages::new(vec![p.clone()], libraries);
+        let node = |name: &str, file: &str, dependencies: Vec<LibraryNode>| LibraryNode {
+            name: name.into(),
+            file: file.into(),
+            dependencies,
+        };
+        assert_eq!(
+            packages.used_libraries(&p),
+            vec![
+                node(
+                    "runner",
+                    "/f/runner.jar",
+                    vec![
+                        node("base", "/f/base.jar", vec![]),
+                        node("mock", "/f/mock.jar", vec![])
+                    ]
+                ),
+                node("base", "/f/base.jar", vec![]),
+                node("a", "/f/a.jar", vec![node("b", "/f/b.jar", vec![])]),
+            ]
+        );
+    }
+
+    #[test]
+    fn library_arguments() {
+        let (name, lib) =
+            Library::parse_arg("android.test.runner=/f/r.jar,android.test.base,android.test.mock")
+                .expect("parse");
+        assert_eq!(name, "android.test.runner");
+        assert_eq!(lib.file, "/f/r.jar");
+        assert_eq!(lib.dependencies, ["android.test.base", "android.test.mock"]);
+        assert_eq!(
+            lib.to_arg(&name, "/system/framework/r.jar"),
+            "android.test.runner=/system/framework/r.jar,android.test.base,android.test.mock"
+        );
+        assert_eq!(
+            Library::parse_arg("x=/y.jar")
+                .expect("parse")
+                .1
+                .dependencies,
+            Vec::<String>::new()
+        );
+        for bad in ["x", "=y", "x=", "x=,dep"] {
+            assert!(Library::parse_arg(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn process_name_defaults_to_the_package() {
+        let mut r = record("a", 10_001);
+        assert_eq!(r.process_name(), "a");
+        r.manifest.process_name = Some("a:remote".into());
+        assert_eq!(r.process_name(), "a:remote");
+    }
+
+    /// The record file atld reads is JSON of these types: a record survives the round trip.
+    #[test]
+    fn record_round_trips_as_json() {
+        let mut r = record("a", 10_001);
+        r.manifest.instrumentation.push(InstrumentationDecl {
+            name: "a.Runner".into(),
+            target_package: "a".into(),
+            target_processes: None,
+            handle_profiling: false,
+            functional_test: true,
+        });
+        let json = serde_json::to_string(&r).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<PackageRecord>(&json).expect("decode"),
+            r
+        );
     }
 }

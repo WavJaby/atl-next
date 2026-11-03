@@ -4,8 +4,11 @@
 //! with the caller's mounts over it (`/system`, `/data`, ...), a fresh `/dev` holding the property area at bionic's default path; Landlock and seccomp come with the Q5 stages.
 //!
 //! Tag pid: the host pid bwrap reports on `--info-fd` (`child-pid`), the namespace's first process, which the broker owns (killing it ends the sandbox: `--unshare-pid` makes it pid 1).
-//! Spawns are not thread-safe: the control and info fds are made inheritable just before the spawn and closed right after it; a concurrent spawn from another thread would inherit them.
+//! Spawns are serialised by a lock in [`Broker`]: the control and info fds are made inheritable just before the spawn and closed right after it, and a concurrent spawn would inherit them.
+//! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
 #![forbid(unsafe_code)]
+
+pub mod control;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -14,9 +17,11 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
@@ -47,6 +52,8 @@ pub struct Spawn {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
+    /// The process's fd 0; None = /dev/null. The system services get their [`control`] connection here (an inherited fd would need `unsafe` to adopt; stdin does not).
+    pub stdin: Option<OwnedFd>,
     /// stdout and stderr (one file: a log).
     pub log: File,
 }
@@ -167,9 +174,18 @@ pub fn child_pid(info: &[u8]) -> Option<i32> {
     i32::try_from(v.get("child-pid")?.as_i64()?).ok()
 }
 
+/// Kills the sandbox whose first process is `host_pid` (a [`Process::host_pid`]): that process is pid 1 of the sandbox's pid namespace, so every process in it dies with it.
+pub fn kill_sandbox(host_pid: i32) -> io::Result<()> {
+    let pid =
+        Pid::from_raw(host_pid).ok_or_else(|| other(format!("{host_pid}: not a process id")))?;
+    kill_process(pid, Signal::KILL).map_err(io::Error::from)
+}
+
 /// The broker's side of binderd: its admin connection. Dropping it closes the connection, which ends binderd.
 pub struct Broker {
     admin: OwnedFd,
+    /// Held across a spawn: the fds made inheritable for it must not reach another spawn's child.
+    spawning: Mutex<()>,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
@@ -178,11 +194,16 @@ fn other(what: impl std::fmt::Display) -> io::Error {
 
 impl Broker {
     pub fn new(admin: OwnedFd) -> Self {
-        Broker { admin }
+        Broker {
+            admin,
+            spawning: Mutex::new(()),
+        }
     }
 
     /// Starts `spawn` in its sandbox and registers its control connection with binderd once bwrap reports the host pid.
     pub fn spawn(&self, spawn: Spawn) -> io::Result<Process> {
+        // a panic elsewhere leaves nothing half-done here: the guard only orders spawns
+        let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -206,7 +227,7 @@ impl Broker {
                     .map(|(k, v)| (k.as_os_str(), v.as_os_str())),
             )
             .env(CONTROL_ENV, theirs.as_raw_fd().to_string())
-            .stdin(Stdio::null())
+            .stdin(spawn.stdin.map_or_else(Stdio::null, Stdio::from))
             .stdout(spawn.log.try_clone()?)
             .stderr(spawn.log);
         let child = cmd.spawn();
@@ -276,6 +297,7 @@ mod tests {
             program: "/bin/true".into(),
             args: vec![],
             env: vec![],
+            stdin: None,
             log: tempfile(),
         }
     }
