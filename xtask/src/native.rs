@@ -465,28 +465,28 @@ impl CompilerCache {
         ]
     }
 
-    /// Starts the server before ninja: sccache has no fallback to a plain compile when its server cannot start or its dir is unwritable (measured: every compile fails), so that fails here, once, naming the way out.
+    /// Connects to the server on this cache's socket, starting one when none answers: `--show-stats` does both (measured: with no server it starts one, with one it only reports).
+    /// `--start-server` is not called: on a live socket it starts a second server that takes the socket and orphans the first (measured: every run left one behind).
+    /// sccache has no fallback to a plain compile when its server cannot start or its dir is unwritable (measured: every compile fails), so that fails here, once, naming the way out.
     fn start(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating the compiler cache {}", self.dir.display()))?;
-        for arg in ["--start-server", "--show-stats"] {
-            let out = Command::new(&self.launcher)
-                .arg(arg)
-                .envs(self.env())
-                .output()
-                .with_context(|| {
-                    format!(
-                        "running {} {arg} (deps.toml row sccache; --no-compiler-cache builds without it)",
-                        self.launcher
-                    )
-                })?;
-            ensure!(
-                out.status.success(),
-                "{} {arg} failed (--no-compiler-cache builds without it): {}",
-                self.launcher,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let out = Command::new(&self.launcher)
+            .arg("--show-stats")
+            .envs(self.env())
+            .output()
+            .with_context(|| {
+                format!(
+                    "running {} --show-stats (deps.toml row sccache; --no-compiler-cache builds without it)",
+                    self.launcher
+                )
+            })?;
+        ensure!(
+            out.status.success(),
+            "{} --show-stats failed (--no-compiler-cache builds without it): {}",
+            self.launcher,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         println!(
             "native: compiler cache {} in {} (limit {CACHE_SIZE})",
             self.launcher,
