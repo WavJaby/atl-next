@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT
+# The CTS modules `xtask test cts` builds, installs and runs with `am instrument`: its per-module pass count is the progress metric of the CTS port. One row per `android_test` module of the pinned AOSP tree.
+#
+# Row key: the module's `name` in its Android.bp. Checked against the module index of the pinned tree (`xtask aosp --index`): it must be defined there as an `android_test` (step `tables` of `xtask check`).
+#   apps      optional. Modules installed beside the test APK: the app a test manifest's `<instrumentation android:targetPackage>` names when it is not the test package, helper apps the tests start. Each must be an
+#             `android_app`, `android_test` or `android_test_helper_app` of the index. `xtask test cts` also fails a row whose instrumentation targets a package none of its staged APKs is.
+#   classes   optional. `am instrument -e class`: `<package>.<Class>` or `<package>.<Class>#<method>`. Each class must be a source file of the module (a method must appear in it).
+#   packages  optional. `am instrument -e package`: each must be a source directory of the module.
+#   reason    required exactly when `classes` or `packages` is set: why the module is not run whole. Not checked by a script (a reason is prose); the filters it explains are.
+# Not a column: the runner. It is the `<instrumentation>` of the built APK's manifest that targets the APK itself (cts.rs `pick_instrumentation`); a manifest with several is an error until a row needs a column naming one.
+# Rows are added when a module is first worth running: the converter builds its APK and the runtime gets past starting it.
+
+[libcore-sdk-current-test]
+
+[CtsUtilTestCases]
+
+[CtsOsTestCases]
+reason = "pure android.os API: CtsOsTestCasesRavenwood's own source list in the module's Android.bp, the CtsOsTestCases classes AOSP runs without a device (no services, activities, other processes or permissions); the rest of the module is whole-service tests this port has no services for yet"
+classes = [
+    "android.os.connectivity.cts.CellularBatteryStatsTest",
+    "android.os.connectivity.cts.WifiActivityEnergyInfoTest",
+    "android.os.connectivity.cts.WifiBatteryStatsTest",
+    "android.os.cts.BadParcelableExceptionTest",
+    "android.os.cts.BinderTest",
+    "android.os.cts.BuildTest",
+    "android.os.cts.BundleTest",
+    "android.os.cts.DeadObjectExceptionTest",
+    "android.os.cts.HandlerTest",
+    "android.os.cts.HandlerThreadTest",
+    "android.os.cts.IpcDataCacheTest",
+    "android.os.cts.LocaleListTest",
+    "android.os.cts.LooperTest",
+    "android.os.cts.MessageQueueTest",
+    "android.os.cts.MessageTest",
+    "android.os.cts.ParcelFileDescriptorTest",
+    "android.os.cts.ParcelFileDescriptor_AutoCloseInputStreamTest",
+    "android.os.cts.ParcelFileDescriptor_AutoCloseOutputStreamTest",
+    "android.os.cts.ParcelFormatExceptionTest",
+    "android.os.cts.ParcelTest",
+    "android.os.cts.ParcelUuidTest",
+    "android.os.cts.PatternMatcherTest",
+    "android.os.cts.PersistableBundleTest",
+    "android.os.cts.ProcessTest",
+    "android.os.cts.RemoteExceptionTest",
+    "android.os.cts.ServiceSpecificExceptionTest",
+    "android.os.cts.SystemClockTest",
+    "android.os.cts.UserHandleTest",
+]

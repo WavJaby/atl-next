@@ -11,6 +11,9 @@ mod atld_run;
 mod binder;
 mod check;
 mod converter;
+mod cts;
+mod cts_report;
+mod cts_table;
 mod deps;
 mod farm;
 mod fetch;
@@ -143,6 +146,11 @@ enum Test {
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
     /// Run 2: a test that kills its own process: the run is reported cancelled (code 0, shortMsg "Process crashed.").
     Instrument(instrument::Args),
+    /// The CTS progress metric: every cts.toml row's test APK is built, installed and run with `am instrument`; the number of passing tests per module is the result.
+    ///
+    /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the unimplemented-call and refused-parcelable counters summed over the run, most hit first. `<out>/cts/report.json` holds every test's outcome.
+    /// Exit status is nonzero only for harness errors and, with `--baseline <report.json>`, for modules or tests that got worse than that saved report; failing tests are the metric, not errors.
+    Cts(cts::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -172,6 +180,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
+        Command::Test {
+            test: Test::Cts(args),
+        } => cts::run(&root, &args),
     }
 }
 

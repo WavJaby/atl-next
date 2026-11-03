@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 use atl_services::packages::{Library, Manifest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::host_art::{self, HostArt};
 use crate::{farm, packages};
@@ -315,9 +315,17 @@ impl Runtime {
     }
 }
 
+/// One service counter: what it counts (`unimplemented` call or `refused` parcelable), its name and its total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counter {
+    pub kind: String,
+    pub name: String,
+    pub count: u64,
+}
+
 /// The services' counters, from their log: every unimplemented call (`services: unimplemented <interface>.<method> <n>`, atl_services::counters) and every refused parcelable or field
-/// (`parcelables: refused <what> <n>`, atl_parcelables `refuse`), each as `<kind> <name> x<last n>`. The services are killed at the end of a run and print no summary: the last line per name is the total.
-pub fn counter_lines(services_log: &str) -> Vec<String> {
+/// (`parcelables: refused <what> <n>`, atl_parcelables `refuse`). The services are killed at the end of a run and print no summary: the last line per name is the total.
+pub fn counters(services_log: &str) -> Vec<Counter> {
     const KINDS: [(&str, &str); 2] = [
         ("services: unimplemented ", "unimplemented"),
         ("parcelables: refused ", "refused"),
@@ -328,13 +336,26 @@ pub fn counter_lines(services_log: &str) -> Vec<String> {
             if let Some((name, n)) = line
                 .strip_prefix(prefix)
                 .and_then(|rest| rest.rsplit_once(' '))
+                .and_then(|(name, n)| Some((name, n.parse::<u64>().ok()?)))
             {
-                last.insert((kind, name.to_owned()), n.to_owned());
+                last.insert((kind, name.to_owned()), n);
             }
         }
     }
     last.into_iter()
-        .map(|((kind, name), n)| format!("{kind} {name} x{n}"))
+        .map(|((kind, name), count)| Counter {
+            kind: kind.to_owned(),
+            name,
+            count,
+        })
+        .collect()
+}
+
+/// [`counters`] as `<kind> <name> x<total>` lines.
+pub fn counter_lines(services_log: &str) -> Vec<String> {
+    counters(services_log)
+        .into_iter()
+        .map(|c| format!("{} {} x{}", c.kind, c.name, c.count))
         .collect()
 }
 

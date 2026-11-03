@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::{
-    arches, converter, deps, libcxx_gate, licenses, modules, patch, providers, prune, sources,
-    spdx, workspace,
+    aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, patch, providers,
+    prune, sources, spdx, workspace,
 };
 use atl_layout::Layout;
 
@@ -26,7 +26,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers, licenses) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses, prune, cts) parse with their schema and invariants
     Tables,
     /// modules.toml equals the real cross-module crate graph
     Modules,
@@ -111,6 +111,13 @@ impl Step {
                 );
                 let prune = prune::load(root, &sources)?;
                 eprintln!("tables: {} ok ({} rows)", prune::FILE, prune.len());
+                let cts = cts_table::load(root)?;
+                // the rows against the module index of the pinned tree and the modules' own sources
+                let index = aosp::Index::load(root, &sources.aosp)?;
+                cts_table::check(&cts, &index, &|tree_path| {
+                    layout.locate(&Path::new("aosp").join(tree_path)).dir
+                })?;
+                eprintln!("tables: {} ok ({} rows)", cts_table::FILE, cts.len());
                 Ok(())
             }
             Step::Modules => {

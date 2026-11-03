@@ -10,6 +10,7 @@
 //! Run 2 (CrashTest: the process kills itself mid-run): the run ends with code 0 (RESULT_CANCELED) and `shortMsg=Process crashed.`, without a kill from the services.
 //! Run 3 (the converter-built `libcore-sdk-current-test`, androidx's AndroidJUnitRunner): LinkedHashMapTest passes; the runner's InstrumentationConnection broadcasts an Intent whose extras hold a binder and registers a receiver, which the services take (counted) without delivering.
 //! The services' counters (unimplemented calls, refused parcelables) are printed for every run.
+//! `xtask test cts` (cts.rs) reuses the run machinery ([`am_instrument`], [`am_shell`], [`libraries`]) and the parser for the cts.toml modules.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ const FIXTURE: &str = "xtask/testdata/instrument";
 /// The shell's uid (AID_SHELL, system/core/libcutils/include/private/android_filesystem_config.h): `am` runs as it, as `adb shell am` does.
 const SHELL_UID: u32 = 2000;
 /// The test package's uid: AID_APP_START + 123, any app id.
-const APP_UID: u32 = 10_123;
+pub const APP_UID: u32 = 10_123;
 /// AOSP's `am` main class (frameworks/base/cmds/am/Android.bp `am`; am.sh runs it through app_process).
 const AM_CLASS: &str = "com.android.commands.am.Am";
 /// Where the Java pipeline puts the dex jars (bp2ninja java.go): `device/<module>/aligned/<stem>.jar`.
@@ -100,7 +101,7 @@ enum Expect {
     Passing(&'static [&'static str]),
 }
 
-/// One `am instrument` run: an installed package and the component it runs.
+/// One `am instrument` run of the gate: an installed package and the component it runs.
 struct Case<'a> {
     label: &'a str,
     apk: PathBuf,
@@ -110,13 +111,16 @@ struct Case<'a> {
     expect: Expect,
 }
 
-/// Instrumentation status codes (Instrumentation.java REPORT_VALUE_RESULT_*: START 1, OK 0, ERROR -1, FAILURE -2), and the result codes (Activity.RESULT_OK -1, RESULT_CANCELED 0).
-const STATUS_START: i32 = 1;
-const STATUS_OK: i32 = 0;
-const STATUS_ERROR: i32 = -1;
-const STATUS_FAILURE: i32 = -2;
-const RESULT_OK: i32 = -1;
-const RESULT_CANCELED: i32 = 0;
+/// Instrumentation status codes (Instrumentation.java REPORT_VALUE_RESULT_*: START 1, OK 0, ERROR -1, FAILURE -2; androidx.test.internal.runner.listener.InstrumentationResultPrinter adds IGNORED -3 and ASSUMPTION_FAILURE -4),
+/// and the result codes (Activity.RESULT_OK -1, RESULT_CANCELED 0).
+pub const STATUS_START: i32 = 1;
+pub const STATUS_OK: i32 = 0;
+pub const STATUS_ERROR: i32 = -1;
+pub const STATUS_FAILURE: i32 = -2;
+pub const STATUS_IGNORED: i32 = -3;
+pub const STATUS_ASSUMPTION_FAILURE: i32 = -4;
+pub const RESULT_OK: i32 = -1;
+pub const RESULT_CANCELED: i32 = 0;
 
 /// One `INSTRUMENTATION_STATUS` block: its key=value lines and the code that closed it.
 #[derive(Debug, Default, PartialEq)]
@@ -367,18 +371,27 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// One atld run of `am instrument -w -r -e class <class> <package>/<RUNNER>`; the parsed session, atld's log and `am`'s lines.
-fn am_instrument(rt: &Runtime, run: &Run, verbose: bool) -> Result<(Session, String, Vec<String>)> {
+/// What one `am instrument` run left: the parsed session, atld's log, `am`'s lines, whether the time limit ended it and how long it took.
+pub struct Outcome {
+    pub session: Session,
+    pub atld_log: String,
+    pub lines: Vec<String>,
+    pub timed_out: bool,
+    pub elapsed: Duration,
+}
+
+/// One atld run of `am instrument -w -r ...` (the `Shell` of `run`), killed after `limit`.
+pub fn am_instrument(rt: &Runtime, run: &Run, limit: Duration, verbose: bool) -> Result<Outcome> {
     let mut atld = rt.start_atld(run)?;
     let start = Instant::now();
-    let status = loop {
-        if let Some(s) = atld.try_wait()? {
-            break Some(s);
+    let timed_out = loop {
+        if atld.try_wait()?.is_some() {
+            break false;
         }
-        if start.elapsed() > LIMIT {
+        if start.elapsed() > limit {
             let _ = atld.kill();
             atld.wait()?;
-            break None;
+            break true;
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -391,30 +404,28 @@ fn am_instrument(rt: &Runtime, run: &Run, verbose: bool) -> Result<(Session, Str
     if verbose {
         println!("---- am output\n{}", lines.join("\n"));
     }
-    let atld_log = read(&run.atld_log());
-    println!(
-        "instrument: atld {} after {:.1?}",
-        status.map_or_else(|| "killed at the limit".to_owned(), |s| s.to_string()),
-        start.elapsed()
-    );
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Ok((parse(&refs), atld_log, lines))
+    Ok(Outcome {
+        session: parse(&refs),
+        atld_log: read(&run.atld_log()),
+        lines,
+        timed_out,
+        elapsed: start.elapsed(),
+    })
 }
 
-pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let rt = Runtime::new(
-        root,
-        &args.host,
-        args.out.as_deref(),
-        args.java_out.as_deref(),
-        "instrument-art",
-        args.verbose,
-    )?;
-    let java = |rel: &str| rt.java_out.join(rel);
-    let am_jar = java(AM_JAR);
+/// The jar of AOSP's `am` in the Java pipeline's out.
+fn am_jar(rt: &Runtime) -> PathBuf {
+    rt.java_out.join(AM_JAR)
+}
+
+/// The shared libraries every test run installs (name, library), from the Java pipeline's out; each must have been built.
+pub fn libraries(rt: &Runtime) -> Result<Vec<(String, Library)>> {
     let mut libraries = Vec::new();
     for (name, module, dependencies) in LIBRARIES {
-        let jar = java(&format!("device/{module}/aligned/{name}.jar"));
+        let jar = rt
+            .java_out
+            .join(format!("device/{module}/aligned/{name}.jar"));
         ensure!(
             jar.is_file(),
             "missing {}: build `{module}` with the Java pipeline",
@@ -428,14 +439,42 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             },
         ));
     }
-    let test_base = java(TEST_BASE_CLASSES);
-    for p in [&am_jar, &test_base] {
-        ensure!(
-            p.is_file(),
-            "missing {}: build it with the Java pipeline (see --java-out)",
-            p.display()
-        );
+    ensure!(
+        am_jar(rt).is_file(),
+        "missing {}: build it with the Java pipeline (see --java-out)",
+        am_jar(rt).display()
+    );
+    Ok(libraries)
+}
+
+/// `am <args>` as the shell user runs it.
+pub fn am_shell(rt: &Runtime, args: Vec<String>) -> Shell {
+    Shell {
+        class: AM_CLASS.to_owned(),
+        uid: SHELL_UID,
+        name: "am".to_owned(),
+        args,
+        boot_jars: vec![am_jar(rt)],
     }
+}
+
+pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let rt = Runtime::new(
+        root,
+        &args.host,
+        args.out.as_deref(),
+        args.java_out.as_deref(),
+        "instrument-art",
+        args.verbose,
+    )?;
+    let java = |rel: &str| rt.java_out.join(rel);
+    let libraries = libraries(&rt)?;
+    let test_base = java(TEST_BASE_CLASSES);
+    ensure!(
+        test_base.is_file(),
+        "missing {}: build it with the Java pipeline (see --java-out)",
+        test_base.display()
+    );
     let work = rt.out.join("instrument");
     let mut cases = Vec::new();
     if args.case != CaseSet::Converter {
@@ -508,18 +547,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             first_uid: APP_UID,
             launch: None,
             libraries: libraries.clone(),
-            shell: Some(Shell {
-                class: AM_CLASS.to_owned(),
-                uid: SHELL_UID,
-                name: "am".to_owned(),
-                args: ["instrument", "-w", "-r", "-e", "class", class, &component]
+            shell: Some(am_shell(
+                &rt,
+                ["instrument", "-w", "-r", "-e", "class", class, &component]
                     .map(str::to_owned)
                     .to_vec(),
-                boot_jars: vec![am_jar.clone()],
-            }),
+            )),
             log_tags: "*:i".to_owned(),
         };
-        let (session, atld_log, lines) = am_instrument(&rt, &run, args.verbose)?;
+        let Outcome {
+            session,
+            atld_log,
+            lines,
+            timed_out,
+            elapsed,
+        } = am_instrument(&rt, &run, LIMIT, args.verbose)?;
+        println!(
+            "instrument: atld {} after {elapsed:.1?}",
+            if timed_out {
+                "killed at the limit"
+            } else {
+                "ended"
+            }
+        );
         let life = lifecycle(&atld_log, &m.name);
         let mut fails = match expect {
             Expect::Sample => check_sample(&session),

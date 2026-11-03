@@ -321,6 +321,15 @@ impl Index {
         serde_json::from_str(&text).with_context(|| file.display().to_string())
     }
 
+    /// Every definition of `name` as (module type, tree path of its `Android.bp`).
+    pub fn definitions_of(&self, name: &str) -> Vec<(&str, &str)> {
+        self.modules.get(name).map_or_else(Vec::new, |defs| {
+            defs.iter()
+                .map(|d| (d.module_type.as_str(), d.file.as_str()))
+                .collect()
+        })
+    }
+
     /// The project to fetch for a dependency reference as Soong prints it (`name`, `:name`,
     /// `name{.tag}`, `//dir:name`). `//dir:name` names a soong_namespace or the package directory of a
     /// root-namespace module (`//external/llvm-libc:llvmlibc`). A bare name prefers the root namespace,
