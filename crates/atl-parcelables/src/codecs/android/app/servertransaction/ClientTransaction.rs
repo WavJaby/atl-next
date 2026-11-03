@@ -11,7 +11,8 @@ const RESUME_ACTIVITY_ITEM: &str = "android.app.servertransaction.ResumeActivity
 
 #[derive(Debug, Clone)]
 pub enum ClientTransactionItem {
-    LaunchActivity(LaunchActivityItem),
+    /// Boxed: LaunchActivityItem is several hundred bytes, the other variant tens (clippy `large_enum_variant`, denied by the converter's clippy-driver build).
+    LaunchActivity(Box<LaunchActivityItem>),
     ResumeActivity(ResumeActivityItem),
 }
 
@@ -48,7 +49,7 @@ impl Part for ClientTransaction {
             items.push(match r_str16(p)?.as_deref() {
                 None => None,
                 Some(LAUNCH_ACTIVITY_ITEM) => Some(ClientTransactionItem::LaunchActivity(
-                    LaunchActivityItem::read(p)?,
+                    Box::new(LaunchActivityItem::read(p)?),
                 )),
                 Some(RESUME_ACTIVITY_ITEM) => Some(ClientTransactionItem::ResumeActivity(
                     ResumeActivityItem::read(p)?,

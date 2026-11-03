@@ -21,8 +21,8 @@ use atl_aidl::aidl::android::app::IInstrumentationWatcher::IInstrumentationWatch
 use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnection;
 use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
 use atl_broker::control::StartRequest;
-use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
+use atl_parcelables::android::app::{ActivityManager_TaskDescription, ContentProviderHolder};
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
 };
@@ -768,11 +768,8 @@ impl IActivityManager for ActivityManager {
         let token = token::new();
         let transaction = ClientTransaction {
             items: vec![
-                Some(ClientTransactionItem::LaunchActivity(inner.launch_item(
-                    p,
-                    activity,
-                    token.clone(),
-                    ident,
+                Some(ClientTransactionItem::LaunchActivity(Box::new(
+                    inner.launch_item(p, activity, token.clone(), ident),
                 ))),
                 Some(ClientTransactionItem::ResumeActivity(resume_item(token))),
             ],
@@ -1124,5 +1121,16 @@ impl IActivityClientController for ActivityClientController {
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
     fn r#getDisplayId(&self, _token: Option<&SpIBinder>) -> binder::Result<i32> {
         Ok(DEFAULT_DISPLAY)
+    }
+
+    /// ActivityClientController.setTaskDescription: Activity.onApplyThemeResource sends it for every themed activity, so the launch fails without it. The values are read (the codec
+    /// checks them) and not kept: the task description is for the recents, which ATL does not have yet. Counted, so the run shows the call.
+    fn r#setTaskDescription(
+        &self,
+        _token: Option<&SpIBinder>,
+        _values: Option<&ActivityManager_TaskDescription>,
+    ) -> binder::Result<()> {
+        counters::count(ACC, "setTaskDescription (not kept: no recents)");
+        Ok(())
     }
 }
