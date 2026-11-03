@@ -354,13 +354,41 @@ func sandboxPrelude(sb string, data []toolFile) string {
 }
 
 // pythonTool: the script a python_binary_host runs and the sources it imports, tree-relative, main first. Run as is (`python3 main.py`) when
-// there are no libs, data or pkg_path and every source sits beside main: the par Soong builds puts them at its top level, which is the script's
-// own directory on sys.path (python.go getPkgPath, binary.go getPyMainFile: main defaults to <name>.py). Soong packages the others with their
-// library tree, which is not rebuilt here. why says what disqualifies the module.
+// there are no data or pkg_path and every source, its python_library_host libs' included (transitively, none with data or pkg_path), sits
+// beside main: the par Soong builds puts them at its top level, which is the script's own directory on sys.path (python.go getPkgPath,
+// binary.go getPyMainFile: main defaults to <name>.py). Soong packages the others with their library tree, which is not rebuilt here. why
+// says what disqualifies the module.
 func pythonTool(g *Graph, m *Module) (files []string, why string) {
 	p := g.flatten(m, Host, Gen)
-	if len(p.strs("libs")) > 0 || len(p.strs("data")) > 0 || p.str("pkg_path") != "" {
-		return nil, "with libs, data or pkg_path"
+	if len(p.strs("data")) > 0 || p.str("pkg_path") != "" {
+		return nil, "with data or pkg_path"
+	}
+	var libSrcs []string
+	seen := map[string]bool{}
+	var addLibs func(libs []string) string
+	addLibs = func(libs []string) string {
+		for _, l := range libs {
+			if seen[l] {
+				continue
+			}
+			seen[l] = true
+			lm := g.lookup(l, Host)
+			if lm == nil || g.baseType(lm.Type) != "python_library_host" {
+				return "with lib " + l + " that is no python_library_host"
+			}
+			lp := g.flatten(lm, Host, Gen)
+			if lp.str("pkg_path") != "" || len(lp.strs("data")) > 0 {
+				return "with lib " + l + " that has data or pkg_path"
+			}
+			libSrcs = append(libSrcs, g.globs(lm.Dir, lp.strs("srcs"))...)
+			if why := addLibs(lp.strs("libs")); why != "" {
+				return why
+			}
+		}
+		return ""
+	}
+	if why := addLibs(p.strs("libs")); why != "" {
+		return nil, why
 	}
 	srcs := g.globs(m.Dir, p.strs("srcs"))
 	main := ""
@@ -368,6 +396,7 @@ func pythonTool(g *Graph, m *Module) (files []string, why string) {
 		main = filepath.Join(m.Dir, mn)
 	}
 	switch {
+	case len(libSrcs) > 0:
 	case len(srcs) == 0 && main != "":
 		return []string{main}, ""
 	case len(srcs) == 1 && (main == "" || main == srcs[0]):
@@ -380,7 +409,7 @@ func pythonTool(g *Graph, m *Module) (files []string, why string) {
 		return nil, fmt.Sprintf("whose main %s is not in its %d sources", main, len(srcs))
 	}
 	files = []string{main}
-	for _, s := range srcs {
+	for _, s := range append(srcs, libSrcs...) {
 		if filepath.Dir(s) != filepath.Dir(main) {
 			return nil, fmt.Sprintf("with source %s outside main's directory", s)
 		}

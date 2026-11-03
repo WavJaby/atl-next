@@ -730,6 +730,22 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 			return nil, false
 		}
 	}
+	// a Java module's outputs (base.go setOutputFiles): {.jar} its implementation and resources jar, {.hjar} its header jar,
+	// {.generated_srcjars} its generated sources (a java_aconfig_library's srcjar)
+	if name, tag := splitTag(s); (tag == ".jar" || tag == ".hjar" || tag == ".generated_srcjars") && g.java != nil {
+		if m := g.lookupJava(name, side); m != nil && g.isJava(m.Type) {
+			jn := g.jnode(name, side, from)
+			if jn == nil {
+				return nil, false
+			}
+			out := map[string]string{".jar": jn.implRes, ".hjar": jn.header, ".generated_srcjars": jn.srcjar}[tag]
+			if out == "" {
+				g.problem("%s: %s has no %s output", from, name, tag)
+				return nil, false
+			}
+			return []srcFile{{path: out, root: filepath.Dir(out)}}, true
+		}
+	}
 	m := g.lookup(s, side)
 	switch {
 	case m != nil && g.baseType(m.Type) == "cc_object":
