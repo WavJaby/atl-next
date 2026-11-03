@@ -4,7 +4,7 @@
 //! The APK is built here as an app is built, against the SDK's android.jar of the platform's API level (prebuilts/sdk/<ro.build.version.sdk>/public): aapt2 link (manifest only),
 //! javac + d8 (the Java pipeline's), classes.dex added uncompressed. The package record atld registers is read back from the APK (`aapt2 dump badging`), not restated.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Fail: the app log's last lines, and the services' unimplemented-call counters (atl_services::counters lines).
-//! Needs the converter's ART, servicemanager and atl-services in --out (`xtask native ... servicemanager libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain atl-aidl-stubs-rust`).
+//! Needs the converter's ART, servicemanager, atl-services and the boot jars' JNI libraries in --out (`xtask native ... servicemanager libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain atl-aidl-stubs-rust platform-bootclasspath-jni`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -49,6 +49,12 @@ const TAIL: usize = 40;
 const COUNTER: &str = "services: unimplemented ";
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja aapt.go), unsigned.
 const FRAMEWORK_RES: &str = "gen/device/framework-res.aapt/framework-res.apk";
+/// The system fonts of the test layout (stand-in until the desktop's fonts come through the platform layer): ActivityThread.handleBindApplication loads `/system/etc/font_fallback.xml`
+/// (SystemFonts.FONTS_XML) and every file it names under `/system/fonts/` (SystemFonts.DEVICE_FONT_DIR), and Typeface needs a `sans-serif` family (Typeface.DEFAULT_FAMILY) to start.
+/// The one font in this tree that AOSP ships and licenses as Apache-2.0 with a Latin range, AOSP's own monospace font, serves as that family; the XML is FontListParser's format (fonts.xml's `<family name><font weight style>`).
+const FONT_FILE: &str = "DroidSansMono.ttf";
+const FONT_DIR: &str = "frameworks/base/data/fonts";
+const FONT_FALLBACK_XML: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<familyset version=\"23\">\n    <family name=\"sans-serif\">\n        <font weight=\"400\" style=\"normal\">DroidSansMono.ttf</font>\n    </family>\n</familyset>\n";
 
 /// The package as `aapt2 dump badging` reports it.
 #[derive(Debug, PartialEq)]
@@ -254,7 +260,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         b.activity
     );
 
+    let fonts = work.join("fonts");
+    std::fs::create_dir_all(&fonts)?;
+    let font_xml = fonts.join("font_fallback.xml");
+    std::fs::write(&font_xml, FONT_FALLBACK_XML)?;
+    let font_file = farm::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
+    ensure!(font_file.is_file(), "missing input {}", font_file.display());
+
     let run_root = work.join("root");
+    // atld makes the root again itself, but only once it runs: the poll below must not see the previous run's app log (a stale marker passed the gate before the app started)
+    if run_root.exists() {
+        std::fs::remove_dir_all(&run_root)
+            .with_context(|| format!("removing {}", run_root.display()))?;
+    }
     let atld_log = work.join("atld.log");
     let mut cmd = Command::new(&atld);
     cmd.arg("--root")
@@ -275,6 +293,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .arg(&art.build_prop)
         .arg("--framework-res")
         .arg(&framework_res)
+        .arg("--system-file")
+        .arg(format!("{}=etc/font_fallback.xml", font_xml.display()))
+        .arg("--system-file")
+        .arg(format!("{}=fonts/{FONT_FILE}", font_file.display()))
         .arg("--apk")
         .arg(&apk)
         .args(["--package", &b.package])
