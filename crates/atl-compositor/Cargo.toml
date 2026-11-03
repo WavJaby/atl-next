@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-compositor"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+# parcel.rs, layer_state.rs, transaction.rs, callbacks.rs, event.rs translate AOSP's libgui C++ (Apache-2.0, attribution in each file); model.rs, scene.rs are ours
+license = "MIT AND Apache-2.0"
+publish.workspace = true
+
+# The in-app compositor core (M3 slice 3, plan C3 "Amended 2026-11-04"): AOSP's SurfaceFlinger-facing wire codecs over a plain bytes + object-table Parcel, the layer tree and buffer cache,
+# transaction-completed / release callbacks, the vsync EventThread and the `Scene` handed to the platform layer. Sync, message-driven, no runtime, no unsafe (core crate).
+# The binder front-ends (service registration, libbinder_rs Parcel conversion) are M3 slice 4 and live elsewhere.
+
+[dependencies]
+
+[lints]
+workspace = true

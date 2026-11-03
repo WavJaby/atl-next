@@ -57,6 +57,11 @@ crates = ["atl-services"]
 exports = ["atl-services"]
 uses = ["aidl", "generators", "broker"]
 
+# the in-app compositor core (M3 slice 3): libgui's SurfaceFlinger-facing wire codecs over a bytes + object-table Parcel, layer tree, buffer cache, release / completion callbacks, vsync EventThread, the Scene for the platform layer; plain Rust, no binder or converter dependency
+[compositor]
+crates = ["atl-compositor"]
+exports = ["atl-compositor"]
+
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it
 [binder]
 crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]

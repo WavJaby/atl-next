@@ -143,6 +143,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-compositor"
+version = "0.0.0"
+
+[[package]]
 name = "atl-layout"
 version = "0.0.0"
 dependencies = [

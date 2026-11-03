@@ -1,0 +1,922 @@
+// SPDX-License-Identifier: MIT
+//! The compositor core: layer tree keyed by layer handle, the client buffer cache, per-apply-token transaction queues, buffer hand-off and the callbacks that go with it.
+//! Message driven and synchronous: the front-end feeds decoded [`TransactionState`]s and layer create/destroy, calls [`Compositor::on_frame`] on each frame tick of the platform's clock, and delivers the [`ClientCall`]s
+//! and the [`Scene`] that come back.
+//!
+//! What SurfaceFlinger does that matters to clients, and what is modelled here (Android 16 semantics read from libgui's BLASTBufferQueue / TransactionCompletedListener):
+//! * a transaction is applied at a frame tick, queued per apply token in order; with `eEnableBackpressure` a layer takes one new buffer per tick, the next transaction waits (BBQ sets the flag on its layer);
+//! * a buffer that stops being shown (replaced, dropped in the same tick, layer destroyed, cache miss) is released exactly once, through the layer's `BufferReleaseChannel` when it has one, else `onReleaseBuffer`
+//!   on the buffer's release listener. BBQ stalls at `mNumAcquired >= mMaxAcquiredBuffers + 2` (`BLASTBufferQueue.cpp:564`) if releases never come, so none is ever skipped silently (an unroutable one is counted);
+//! * transaction callbacks (commit and complete ids) are answered after the tick that applied the transaction, in one `onTransactionCompleted` per listener with `SurfaceStats` for each layer that registered the
+//!   callback, `eventStats.frameNumber` = the latched frame number (BBQ's `transactionCallback` releases every submitted buffer older than it).
+//!
+//! Fields of `layer_state_t` the software path does not need are decoded and counted by name in [`Counters::ignored`], never dropped without a trace.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
+
+use crate::callbacks::{
+    AcquireTimeOrFence, FrameEventHistoryStats, ListenerStats, NO_RELEASE_CALLBACK, ReleaseBuffer,
+    ReleaseCallbackId, SurfaceStats, TransactionStats,
+};
+use crate::parcel::{BinderKey, FdObject, StrongBinder};
+use crate::scene::{Quad, Scene};
+use crate::state::{
+    BufferData, CallbackId, Fence, FloatRect, GraphicBuffer, LayerState, ListenerCallbacks, Rect,
+    buffer_data_change, layer_flags, what,
+};
+use crate::transaction::TransactionState;
+
+/// `ui::Transform::ROT_90`, the one buffer-transform bit that swaps width and height.
+const BUFFER_TRANSFORM_ROT_90: u32 = 4;
+
+/// Static settings of the compositor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositorConfig {
+    /// What `getMaxAcquiredBufferCount` answers and every release / `SurfaceStats` reports: how many buffers a BBQ producer may hold acquired.
+    /// SurfaceFlinger derives it from its pipeline depth (`sf.max_acquired_buffers`, 2 by default); one tick latches one buffer and releases the previous, so 2 keeps a producer one buffer ahead of the screen.
+    pub max_acquired_buffer_count: u32,
+    /// The layer stack the scene shows.
+    pub layer_stack: u32,
+}
+
+impl Default for CompositorConfig {
+    fn default() -> Self {
+        Self {
+            max_acquired_buffer_count: 2,
+            layer_stack: 0,
+        }
+    }
+}
+
+/// A layer the client created (`ISurfaceComposerClient.createSurface`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerSpec {
+    /// The layer handle binder: the key of every later transaction on it.
+    pub handle: StrongBinder,
+    /// The layer id the client was given.
+    pub id: i32,
+    /// The layer name.
+    pub name: String,
+    /// The parent layer's handle; `None` for a root.
+    pub parent: Option<BinderKey>,
+}
+
+/// Why the model refused a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelError {
+    /// A layer handle that is null.
+    NullHandle,
+    /// A layer with this handle exists.
+    DuplicateLayer(BinderKey),
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NullHandle => write!(f, "layer handle is null"),
+            Self::DuplicateLayer(k) => write!(f, "layer {k:?} exists"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
+/// A call the front-end must make into the client, produced by the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientCall {
+    /// `ITransactionCompletedListener.onTransactionCompleted(stats)` on `listener`.
+    TransactionCompleted {
+        /// The listener the callbacks were registered with.
+        listener: StrongBinder,
+        /// The outcomes.
+        stats: ListenerStats,
+    },
+    /// `ITransactionCompletedListener.onReleaseBuffer` on `listener`: the layer has no release channel.
+    ReleaseBuffer {
+        /// The buffer's release listener.
+        listener: StrongBinder,
+        /// The release.
+        release: ReleaseBuffer,
+    },
+    /// A `BufferReleaseChannel` message: write `release.channel_datagram()` to the producer endpoint `channel` (the fence fd rides as SCM_RIGHTS).
+    ReleaseOnChannel {
+        /// The producer endpoint the layer registered.
+        channel: FdObject,
+        /// The release.
+        release: ReleaseBuffer,
+    },
+}
+
+/// Everything the model counted instead of doing: the visible record of what is not implemented or not routable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Transactions applied.
+    pub transactions_applied: u64,
+    /// Layer states applied.
+    pub layer_states_applied: u64,
+    /// `layer_state_t::what` bits set that the software path ignores, by AOSP name, and how often.
+    pub ignored: BTreeMap<&'static str, u64>,
+    /// Layer states naming a layer that does not exist.
+    pub unknown_layer: u64,
+    /// A cached-buffer id with no buffer behind it (the buffer is released at once).
+    pub cache_misses: u64,
+    /// `eMatrixChanged` with rotation or shear (only scale is applied).
+    pub matrix_rotation_ignored: u64,
+    /// Transactions with a desired present time (applied at the next tick regardless).
+    pub desired_present_time_ignored: u64,
+    /// Display states (one display, one layer stack: not applied).
+    pub display_states_ignored: u64,
+    /// Input window commands (focus requests, window-info listeners: not applied).
+    pub input_commands_ignored: u64,
+    /// Buffers released with neither a release channel nor a listener to tell.
+    pub release_unroutable: u64,
+    /// Callback registrations with a null listener.
+    pub null_listener: u64,
+    /// Buffers released (any route).
+    pub buffers_released: u64,
+    /// Buffers acquired (accepted into a layer, or dropped on a cache miss).
+    pub buffers_acquired: u64,
+    /// Transaction-completed stats sent.
+    pub completions_sent: u64,
+}
+
+impl Counters {
+    fn ignore(&mut self, name: &'static str) {
+        *self.ignored.entry(name).or_insert(0) += 1;
+    }
+}
+
+/// What one frame tick produced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FrameOutput {
+    /// The new scene when anything visible changed since the last tick.
+    pub scene: Option<Scene>,
+    /// Calls to make into clients, in order.
+    pub calls: Vec<ClientCall>,
+}
+
+/// The buffer a layer shows, and how to tell its producer when it is done with it.
+#[derive(Clone, Debug)]
+struct Held {
+    buffer: Arc<GraphicBuffer>,
+    frame_number: u64,
+    acquire_fence: Option<Fence>,
+    release_listener: StrongBinder,
+}
+
+impl Held {
+    fn id(&self) -> ReleaseCallbackId {
+        ReleaseCallbackId {
+            buffer_id: self.buffer.id,
+            frame_number: self.frame_number,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Layer {
+    handle: StrongBinder,
+    id: i32,
+    name: String,
+    parent: Option<BinderKey>,
+    relative_to: Option<BinderKey>,
+    z: i32,
+    x: f32,
+    y: f32,
+    scale_x: f32,
+    scale_y: f32,
+    layer_stack: Option<u32>,
+    flags: u32,
+    alpha: f32,
+    crop: Option<FloatRect>,
+    buffer_crop: Option<Rect>,
+    destination_frame: Option<Rect>,
+    buffer_transform: u32,
+    held: Option<Held>,
+    release_channel: Option<FdObject>,
+    latched_this_frame: bool,
+    seq: u64,
+}
+
+/// What a frame knows about one transaction it applied, to answer its callbacks afterwards.
+#[derive(Debug)]
+struct Applied {
+    transaction_level: Vec<ListenerCallbacks>,
+    layers: Vec<AppliedLayer>,
+}
+
+#[derive(Debug)]
+struct AppliedLayer {
+    handle: StrongBinder,
+    listeners: Vec<ListenerCallbacks>,
+    frame_number: u64,
+    previous_frame_number: u64,
+}
+
+fn rect_valid(r: &Rect) -> bool {
+    r.right > r.left && r.bottom > r.top
+}
+
+fn float_rect_valid(r: &FloatRect) -> bool {
+    r.right > r.left && r.bottom > r.top
+}
+
+fn intersect(a: FloatRect, b: FloatRect) -> FloatRect {
+    FloatRect {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
+/// A layer's accumulated placement: its world transform (scale and translation), alpha, visibility and clip.
+#[derive(Clone, Copy, Debug)]
+struct Geometry {
+    sx: f32,
+    sy: f32,
+    tx: f32,
+    ty: f32,
+    alpha: f32,
+    hidden: bool,
+    layer_stack: u32,
+    clip: Option<FloatRect>,
+}
+
+impl Geometry {
+    fn root(layer_stack: u32) -> Self {
+        Self {
+            sx: 1.0,
+            sy: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+            alpha: 1.0,
+            hidden: false,
+            layer_stack,
+            clip: None,
+        }
+    }
+
+    fn map(&self, r: FloatRect) -> FloatRect {
+        FloatRect {
+            left: r.left * self.sx + self.tx,
+            top: r.top * self.sy + self.ty,
+            right: r.right * self.sx + self.tx,
+            bottom: r.bottom * self.sy + self.ty,
+        }
+    }
+}
+
+/// The compositor.
+#[derive(Debug)]
+pub struct Compositor {
+    config: CompositorConfig,
+    layers: HashMap<BinderKey, Layer>,
+    next_seq: u64,
+    /// The server side of the client buffer cache, keyed by the client's cache token and the buffer id.
+    cache: HashMap<(BinderKey, u64), Arc<GraphicBuffer>>,
+    /// Transactions waiting for a tick, per apply token (`None`: the null token), each queue in arrival order.
+    queues: BTreeMap<Option<BinderKey>, VecDeque<TransactionState>>,
+    frame: u64,
+    dirty: bool,
+    counters: Counters,
+}
+
+impl Compositor {
+    /// A compositor with no layers.
+    pub fn new(config: CompositorConfig) -> Self {
+        Self {
+            config,
+            layers: HashMap::new(),
+            next_seq: 0,
+            cache: HashMap::new(),
+            queues: BTreeMap::new(),
+            frame: 0,
+            dirty: false,
+            counters: Counters::default(),
+        }
+    }
+
+    /// The settings.
+    pub fn config(&self) -> &CompositorConfig {
+        &self.config
+    }
+
+    /// What was counted instead of done.
+    pub fn counters(&self) -> &Counters {
+        &self.counters
+    }
+
+    /// Layers alive.
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Transactions queued and not yet applied.
+    pub fn pending_transactions(&self) -> usize {
+        self.queues.values().map(VecDeque::len).sum()
+    }
+
+    /// Whether the next tick has anything to do: the platform's frame clock may stay stopped otherwise.
+    pub fn wants_frame(&self) -> bool {
+        self.dirty || self.pending_transactions() > 0
+    }
+
+    /// A layer was created.
+    pub fn create_layer(&mut self, spec: LayerSpec) -> Result<(), ModelError> {
+        let key = spec.handle.key().ok_or(ModelError::NullHandle)?;
+        if self.layers.contains_key(&key) {
+            return Err(ModelError::DuplicateLayer(key));
+        }
+        self.next_seq += 1;
+        self.layers.insert(
+            key,
+            Layer {
+                handle: spec.handle,
+                id: spec.id,
+                name: spec.name,
+                parent: spec.parent,
+                relative_to: None,
+                z: 0,
+                x: 0.0,
+                y: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                layer_stack: None,
+                flags: 0,
+                alpha: 1.0,
+                crop: None,
+                buffer_crop: None,
+                destination_frame: None,
+                buffer_transform: 0,
+                held: None,
+                release_channel: None,
+                latched_this_frame: false,
+                seq: self.next_seq,
+            },
+        );
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The client dropped its last reference to the layer: it leaves the tree (its children with it) and the buffer it held is released.
+    pub fn destroy_layer(&mut self, handle: BinderKey) -> Vec<ClientCall> {
+        let mut calls = Vec::new();
+        if let Some(mut layer) = self.layers.remove(&handle) {
+            self.dirty = true;
+            if let Some(h) = layer.held.take() {
+                self.release(&h, layer.release_channel, &mut calls);
+            }
+        }
+        calls
+    }
+
+    /// A transaction arrived: it waits for the next tick behind the earlier ones of its apply token.
+    pub fn queue_transaction(&mut self, t: TransactionState) {
+        self.queues
+            .entry(t.apply_token.key())
+            .or_default()
+            .push_back(t);
+    }
+
+    /// Releases every held buffer (the compositor is going away) and drops what is queued.
+    pub fn shutdown(&mut self) -> Vec<ClientCall> {
+        self.queues.clear();
+        let keys: Vec<BinderKey> = self.layers.keys().copied().collect();
+        keys.into_iter()
+            .flat_map(|k| self.destroy_layer(k))
+            .collect()
+    }
+
+    fn release(&mut self, held: &Held, channel: Option<FdObject>, calls: &mut Vec<ClientCall>) {
+        self.counters.buffers_released += 1;
+        let release = ReleaseBuffer {
+            callback_id: held.id(),
+            release_fence: Fence(None),
+            current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
+        };
+        if let Some(channel) = channel {
+            calls.push(ClientCall::ReleaseOnChannel { channel, release });
+        } else if !held.release_listener.is_null() {
+            calls.push(ClientCall::ReleaseBuffer {
+                listener: held.release_listener,
+                release,
+            });
+        } else {
+            self.counters.release_unroutable += 1;
+        }
+    }
+
+    /// The ids a buffer-less release has: AOSP's `generateReleaseCallbackId` falls back to the cached id (which is the buffer id) when there is no buffer.
+    fn release_unresolved(
+        &mut self,
+        bd: &BufferData,
+        channel: Option<FdObject>,
+        calls: &mut Vec<ClientCall>,
+    ) {
+        let id = ReleaseCallbackId {
+            buffer_id: bd.cached_buffer_id,
+            frame_number: bd.frame_number,
+        };
+        self.counters.buffers_released += 1;
+        let release = ReleaseBuffer {
+            callback_id: id,
+            release_fence: Fence(None),
+            current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
+        };
+        if let Some(channel) = channel {
+            calls.push(ClientCall::ReleaseOnChannel { channel, release });
+        } else if !bd.release_buffer_listener.is_null() {
+            calls.push(ClientCall::ReleaseBuffer {
+                listener: bd.release_buffer_listener,
+                release,
+            });
+        } else {
+            self.counters.release_unroutable += 1;
+        }
+    }
+
+    /// Whether applying `t` now would give a backpressured layer a second buffer this tick.
+    fn blocked(&self, t: &TransactionState) -> bool {
+        t.composer_states.iter().any(|s| {
+            s.what & what::E_BUFFER_CHANGED != 0
+                && s.buffer_data
+                    .as_ref()
+                    .is_some_and(|b| b.buffer.is_some() || b.cached_buffer_id != 0)
+                && s.surface
+                    .key()
+                    .and_then(|k| self.layers.get(&k))
+                    .is_some_and(|l| {
+                        l.latched_this_frame && l.flags & layer_flags::ENABLE_BACKPRESSURE != 0
+                    })
+        })
+    }
+
+    /// One frame tick at `now_ns`: apply what is due, answer callbacks, and build the scene if anything visible changed.
+    pub fn on_frame(&mut self, now_ns: i64) -> FrameOutput {
+        self.frame += 1;
+        for l in self.layers.values_mut() {
+            l.latched_this_frame = false;
+        }
+        let mut calls = Vec::new();
+        let mut applied = Vec::new();
+        let tokens: Vec<_> = self.queues.keys().copied().collect();
+        for token in tokens {
+            while let Some(front) = self.queues.get(&token).and_then(VecDeque::front) {
+                if self.blocked(front) {
+                    break;
+                }
+                let t = self.queues.get_mut(&token).and_then(VecDeque::pop_front);
+                if let Some(t) = t {
+                    applied.push(self.apply(t, &mut calls));
+                }
+            }
+        }
+        self.queues.retain(|_, q| !q.is_empty());
+        self.complete(applied, now_ns, &mut calls);
+        let scene = if std::mem::take(&mut self.dirty) {
+            Some(self.build_scene())
+        } else {
+            None
+        };
+        FrameOutput { scene, calls }
+    }
+
+    fn apply(&mut self, t: TransactionState, calls: &mut Vec<ClientCall>) -> Applied {
+        self.counters.transactions_applied += 1;
+        if !t.is_auto_timestamp {
+            self.counters.desired_present_time_ignored += 1;
+        }
+        if !t.display_states.is_empty() {
+            self.counters.display_states_ignored += t.display_states.len() as u64;
+        }
+        if !t.input_window_commands.focus_requests.is_empty()
+            || !t
+                .input_window_commands
+                .window_infos_reported_listeners
+                .is_empty()
+        {
+            self.counters.input_commands_ignored += 1;
+        }
+        let mut layers = Vec::new();
+        for s in &t.composer_states {
+            if let Some(note) = self.apply_layer_state(s, calls) {
+                layers.push(note);
+            }
+        }
+        for u in &t.uncache_buffers {
+            if let Some(k) = u.token.key() {
+                self.cache.remove(&(k, u.id));
+            }
+        }
+        Applied {
+            transaction_level: t.listener_callbacks,
+            layers,
+        }
+    }
+
+    fn apply_layer_state(
+        &mut self,
+        s: &LayerState,
+        calls: &mut Vec<ClientCall>,
+    ) -> Option<AppliedLayer> {
+        let Some(key) = s.surface.key() else {
+            self.counters.unknown_layer += 1;
+            return None;
+        };
+        if !self.layers.contains_key(&key) {
+            self.counters.unknown_layer += 1;
+            // a buffer for a layer that is gone still has a producer waiting for its release
+            if s.what & what::E_BUFFER_CHANGED != 0
+                && let Some(bd) = &s.buffer_data
+            {
+                let channel = s.buffer_release_channel.as_ref().map(|c| c.fd);
+                self.counters.buffers_acquired += 1;
+                self.release_unresolved(bd, channel, calls);
+            }
+            return None;
+        }
+        self.counters.layer_states_applied += 1;
+        let w = s.what;
+        let mut handled = 0u64;
+        let mut frame_number = 0u64;
+        let mut previous_frame_number = 0u64;
+        {
+            let l = self.layers.get_mut(&key).expect("checked above");
+            if w & what::E_POSITION_CHANGED != 0 {
+                l.x = s.x;
+                l.y = s.y;
+                handled |= what::E_POSITION_CHANGED;
+            }
+            if w & what::E_LAYER_CHANGED != 0 {
+                l.z = s.z;
+                l.relative_to = None;
+                handled |= what::E_LAYER_CHANGED;
+            }
+            if w & what::E_RELATIVE_LAYER_CHANGED != 0 {
+                l.z = s.z;
+                l.relative_to = s.relative_layer.as_ref().and_then(|r| r.handle.key());
+                handled |= what::E_RELATIVE_LAYER_CHANGED;
+            }
+            if w & what::E_REPARENT != 0 {
+                l.parent = s.parent.as_ref().and_then(|p| p.handle.key());
+                handled |= what::E_REPARENT;
+            }
+            if w & what::E_ALPHA_CHANGED != 0 {
+                l.alpha = s.color[3];
+                handled |= what::E_ALPHA_CHANGED;
+            }
+            if w & what::E_FLAGS_CHANGED != 0 {
+                l.flags = (l.flags & !s.mask) | (s.flags & s.mask);
+                handled |= what::E_FLAGS_CHANGED;
+            }
+            if w & what::E_LAYER_STACK_CHANGED != 0 {
+                l.layer_stack = Some(s.layer_stack);
+                handled |= what::E_LAYER_STACK_CHANGED;
+            }
+            if w & what::E_CROP_CHANGED != 0 {
+                l.crop = float_rect_valid(&s.crop).then_some(s.crop);
+                handled |= what::E_CROP_CHANGED;
+            }
+            if w & what::E_BUFFER_CROP_CHANGED != 0 {
+                l.buffer_crop = rect_valid(&s.buffer_crop).then_some(s.buffer_crop);
+                handled |= what::E_BUFFER_CROP_CHANGED;
+            }
+            if w & what::E_DESTINATION_FRAME_CHANGED != 0 {
+                l.destination_frame =
+                    rect_valid(&s.destination_frame).then_some(s.destination_frame);
+                handled |= what::E_DESTINATION_FRAME_CHANGED;
+            }
+            if w & what::E_MATRIX_CHANGED != 0 {
+                l.scale_x = s.matrix_dsdx;
+                l.scale_y = s.matrix_dsdy;
+                if s.matrix_dtdx != 0.0 || s.matrix_dtdy != 0.0 {
+                    self.counters.matrix_rotation_ignored += 1;
+                }
+                handled |= what::E_MATRIX_CHANGED;
+            }
+            if w & what::E_BUFFER_TRANSFORM_CHANGED != 0 {
+                l.buffer_transform = s.buffer_transform;
+                handled |= what::E_BUFFER_TRANSFORM_CHANGED;
+            }
+            if w & what::E_BUFFER_RELEASE_CHANNEL_CHANGED != 0 {
+                l.release_channel = s.buffer_release_channel.as_ref().map(|c| c.fd);
+                handled |= what::E_BUFFER_RELEASE_CHANNEL_CHANGED;
+            }
+            // listener callbacks are answered per transaction (see `complete`)
+            handled |= what::E_HAS_LISTENER_CALLBACKS_CHANGED;
+        }
+        if w & what::E_BUFFER_CHANGED != 0 {
+            handled |= what::E_BUFFER_CHANGED;
+            (previous_frame_number, frame_number) =
+                self.apply_buffer(key, s.buffer_data.as_ref(), calls);
+        }
+        self.dirty = true;
+        for &(bit, name) in what::ALL {
+            if w & bit != 0 && handled & bit == 0 {
+                self.counters.ignore(name);
+            }
+        }
+        let l = self.layers.get(&key).expect("still present");
+        Some(AppliedLayer {
+            handle: l.handle,
+            listeners: s.listeners.clone(),
+            frame_number,
+            previous_frame_number,
+        })
+    }
+
+    /// Gives the layer the buffer `bd` names (or clears it); returns (previous frame number, new frame number), 0 when none.
+    fn apply_buffer(
+        &mut self,
+        key: BinderKey,
+        bd: Option<&BufferData>,
+        calls: &mut Vec<ClientCall>,
+    ) -> (u64, u64) {
+        let channel = self.layers.get(&key).and_then(|l| l.release_channel);
+        let previous = self.layers.get_mut(&key).and_then(|l| l.held.take());
+        let previous_frame = previous.as_ref().map_or(0, |h| h.frame_number);
+        let mut new_frame = 0;
+        let mut new_held = None;
+        if let Some(bd) = bd {
+            let cached = bd.flags & buffer_data_change::CACHED_BUFFER_CHANGED != 0;
+            // a null buffer (no buffer, no cached id) clears the layer: there is no producer buffer to account for
+            if bd.buffer.is_some() || cached {
+                self.counters.buffers_acquired += 1;
+            }
+            let cache_key = bd
+                .cached_buffer_token
+                .key()
+                .map(|k| (k, bd.cached_buffer_id));
+            let resolved = match (&bd.buffer, cached, cache_key) {
+                (Some(b), true, Some(ck)) => {
+                    let b = Arc::new(b.clone());
+                    self.cache.insert(ck, Arc::clone(&b));
+                    Some(b)
+                }
+                (Some(b), _, _) => Some(Arc::new(b.clone())),
+                (None, true, Some(ck)) => self.cache.get(&ck).cloned(),
+                (None, _, _) => None,
+            };
+            match resolved {
+                Some(buffer) => {
+                    new_frame = bd.frame_number;
+                    new_held = Some(Held {
+                        buffer,
+                        frame_number: bd.frame_number,
+                        acquire_fence: bd.acquire_fence,
+                        release_listener: bd.release_buffer_listener,
+                    });
+                }
+                None if cached => {
+                    self.counters.cache_misses += 1;
+                    self.release_unresolved(bd, channel, calls);
+                }
+                None => {}
+            }
+        }
+        if let Some(l) = self.layers.get_mut(&key) {
+            l.held = new_held;
+            l.latched_this_frame = true;
+        }
+        if let Some(p) = previous {
+            self.release(&p, channel, calls);
+        }
+        (previous_frame, new_frame)
+    }
+
+    fn complete(&mut self, applied: Vec<Applied>, now_ns: i64, calls: &mut Vec<ClientCall>) {
+        // one ListenerStats per listener, one TransactionStats per applied transaction that registered callbacks with it
+        let mut per_listener: Vec<(StrongBinder, ListenerStats)> = Vec::new();
+        for a in &applied {
+            let mut listeners: Vec<StrongBinder> = Vec::new();
+            for lc in a
+                .transaction_level
+                .iter()
+                .chain(a.layers.iter().flat_map(|l| l.listeners.iter()))
+            {
+                if lc.listener.is_null() {
+                    self.counters.null_listener += 1;
+                } else if !listeners.iter().any(|l| l.key() == lc.listener.key()) {
+                    listeners.push(lc.listener);
+                }
+            }
+            for listener in listeners {
+                let key = listener.key();
+                let mut ids: Vec<CallbackId> = Vec::new();
+                for lc in a
+                    .transaction_level
+                    .iter()
+                    .chain(a.layers.iter().flat_map(|l| l.listeners.iter()))
+                {
+                    if lc.listener.key() == key {
+                        for id in &lc.callback_ids {
+                            if !ids.contains(id) {
+                                ids.push(*id);
+                            }
+                        }
+                    }
+                }
+                let surface_stats = a
+                    .layers
+                    .iter()
+                    .filter(|l| l.listeners.iter().any(|lc| lc.listener.key() == key))
+                    .map(|l| SurfaceStats {
+                        surface_control: l.handle,
+                        acquire_time_or_fence: AcquireTimeOrFence::Time(now_ns),
+                        previous_release_fence: None,
+                        transform_hint: None,
+                        current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
+                        event_stats: FrameEventHistoryStats {
+                            frame_number: l.frame_number,
+                            previous_frame_number: l.previous_frame_number,
+                            refresh_start_time: now_ns,
+                            ..Default::default()
+                        },
+                        previous_release_callback_id: NO_RELEASE_CALLBACK,
+                    })
+                    .collect();
+                let ts = TransactionStats {
+                    callback_ids: ids,
+                    latch_time: now_ns,
+                    present_fence: None,
+                    surface_stats,
+                };
+                match per_listener.iter_mut().find(|(l, _)| l.key() == key) {
+                    Some((_, stats)) => stats.transaction_stats.push(ts),
+                    None => per_listener.push((
+                        listener,
+                        ListenerStats {
+                            transaction_stats: vec![ts],
+                        },
+                    )),
+                }
+            }
+        }
+        for (listener, stats) in per_listener {
+            self.counters.completions_sent += 1;
+            calls.push(ClientCall::TransactionCompleted { listener, stats });
+        }
+    }
+
+    /// The effective placement of the layer at `key`, from its parent chain.
+    fn geometry(&self, key: BinderKey, depth: usize) -> Option<Geometry> {
+        let l = self.layers.get(&key)?;
+        if depth > self.layers.len() {
+            return None; // a parent cycle: the layer is not shown
+        }
+        let parent = match l.parent {
+            Some(p) => self.geometry(p, depth + 1)?,
+            None => Geometry::root(self.config.layer_stack),
+        };
+        let own = Geometry {
+            sx: parent.sx * l.scale_x,
+            sy: parent.sy * l.scale_y,
+            tx: parent.tx + parent.sx * l.x,
+            ty: parent.ty + parent.sy * l.y,
+            alpha: parent.alpha * l.alpha,
+            hidden: parent.hidden || l.flags & layer_flags::HIDDEN != 0,
+            layer_stack: l.layer_stack.unwrap_or(parent.layer_stack),
+            clip: parent.clip,
+        };
+        let clip = match l.crop {
+            Some(c) => {
+                let c = own.map(c);
+                Some(parent.clip.map_or(c, |p| intersect(p, c)))
+            }
+            None => parent.clip,
+        };
+        Some(Geometry { clip, ..own })
+    }
+
+    /// The z-ordered draw list: per layer, children below zero, itself, children from zero up; a layer ordered `relative_to` another sorts among that layer's children.
+    fn z_order(&self) -> Vec<BinderKey> {
+        let mut children: HashMap<Option<BinderKey>, Vec<BinderKey>> = HashMap::new();
+        for (k, l) in &self.layers {
+            let anchor = match l.relative_to {
+                Some(r) if self.layers.contains_key(&r) => Some(r),
+                _ => l.parent.filter(|p| self.layers.contains_key(p)),
+            };
+            // a layer whose parent is gone leaves the tree with it
+            if anchor.is_none() && l.parent.is_some() {
+                continue;
+            }
+            children.entry(anchor).or_default().push(*k);
+        }
+        for v in children.values_mut() {
+            v.sort_by_key(|k| {
+                let l = &self.layers[k];
+                (l.z, l.seq)
+            });
+        }
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.walk(None, &children, &mut visited, &mut out);
+        out
+    }
+
+    fn walk(
+        &self,
+        node: Option<BinderKey>,
+        children: &HashMap<Option<BinderKey>, Vec<BinderKey>>,
+        visited: &mut std::collections::HashSet<BinderKey>,
+        out: &mut Vec<BinderKey>,
+    ) {
+        let list = children.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+        let split = list.partition_point(|k| self.layers[k].z < 0);
+        for &k in &list[..split] {
+            self.visit(k, children, visited, out);
+        }
+        if let Some(n) = node {
+            out.push(n);
+        }
+        for &k in &list[split..] {
+            self.visit(k, children, visited, out);
+        }
+    }
+
+    fn visit(
+        &self,
+        k: BinderKey,
+        children: &HashMap<Option<BinderKey>, Vec<BinderKey>>,
+        visited: &mut std::collections::HashSet<BinderKey>,
+        out: &mut Vec<BinderKey>,
+    ) {
+        if visited.insert(k) {
+            self.walk(Some(k), children, visited, out);
+        }
+    }
+
+    fn build_scene(&self) -> Scene {
+        let mut quads = Vec::new();
+        for key in self.z_order() {
+            let l = &self.layers[&key];
+            let (Some(held), Some(g)) = (&l.held, self.geometry(key, 0)) else {
+                continue;
+            };
+            if g.hidden || g.alpha <= 0.0 || g.layer_stack != self.config.layer_stack {
+                continue;
+            }
+            let (bw, bh) = (held.buffer.width as f32, held.buffer.height as f32);
+            let src = l.buffer_crop.map_or(
+                FloatRect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: bw,
+                    bottom: bh,
+                },
+                |r| FloatRect {
+                    left: r.left as f32,
+                    top: r.top as f32,
+                    right: r.right as f32,
+                    bottom: r.bottom as f32,
+                },
+            );
+            let use_destination = l.flags & layer_flags::IGNORE_DESTINATION_FRAME == 0;
+            let local = match l.destination_frame.filter(|_| use_destination) {
+                Some(d) => FloatRect {
+                    left: d.left as f32,
+                    top: d.top as f32,
+                    right: d.right as f32,
+                    bottom: d.bottom as f32,
+                },
+                None => {
+                    let (w, h) = (src.right - src.left, src.bottom - src.top);
+                    let (w, h) = if l.buffer_transform & BUFFER_TRANSFORM_ROT_90 != 0 {
+                        (h, w)
+                    } else {
+                        (w, h)
+                    };
+                    FloatRect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: w,
+                        bottom: h,
+                    }
+                }
+            };
+            quads.push(Quad {
+                layer_id: l.id,
+                name: l.name.clone(),
+                buffer: Arc::clone(&held.buffer),
+                frame_number: held.frame_number,
+                acquire_fence: held.acquire_fence,
+                src,
+                dst: g.map(local),
+                clip: g.clip,
+                alpha: g.alpha,
+                opaque: l.flags & layer_flags::OPAQUE != 0,
+                buffer_transform: l.buffer_transform,
+            });
+        }
+        Scene {
+            frame: self.frame,
+            layer_stack: self.config.layer_stack,
+            quads,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
