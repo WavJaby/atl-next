@@ -336,8 +336,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
         .flat_map(|p| p.libs.iter().map(PathBuf::as_path))
         .collect();
-    let gate_ok = gate(&out, provided_libs.into_iter())?
-        & licence_gate(root, &layout, &sources, &out, args.verbose)?;
+    // every check that fails the run, by name: the last line names them (`verdict`)
+    let mut failed: Vec<&str> = Vec::new();
+    if !gate(&out, provided_libs.into_iter())? {
+        failed.push("provided gate");
+    }
+    if !licence_gate(root, &layout, &sources, &out, args.verbose)? {
+        failed.push("licence gate");
+    }
     let graph_file = out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
         &std::fs::read_to_string(&graph_file)
@@ -351,11 +357,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
-        return Ok(if gate_ok && table_check(&table) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        });
+        if !table_check(&table) {
+            failed.push("table check");
+        }
+        return Ok(verdict(&failed));
     }
     let text = std::fs::read_to_string(&log)?;
     let prefixes = [
@@ -386,8 +391,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .iter()
             .map(ToString::to_string),
     );
-    table_check(&table);
-    Ok(ExitCode::FAILURE)
+    // the ninja failure first: it is the cause the gates' and the table's findings may follow from
+    failed.insert(0, "ninja");
+    if !table_check(&table) {
+        failed.push("table check");
+    }
+    Ok(verdict(&failed))
+}
+
+/// The run's last line and exit code: failure names every failed check, so a run is never read as passed from a tail that ends in a check reporting 0 problems.
+/// Errors (`?`, `bail!`: package build, clippy, converter) exit through main's `Err`, whose `Error:` line is last.
+fn verdict(failed: &[&str]) -> ExitCode {
+    if failed.is_empty() {
+        println!("native: ok");
+        ExitCode::SUCCESS
+    } else {
+        println!("native: FAILED: {}", failed.join(", "));
+        ExitCode::FAILURE
+    }
 }
 
 /// Size limit of the compiler cache (sccache evicts least recently used entries past it).
@@ -725,6 +746,15 @@ fn wanted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each check `run` can fail by name exits nonzero alone; only none failed exits 0.
+    #[test]
+    fn verdict_fails_on_every_check() {
+        for check in ["ninja", "provided gate", "licence gate", "table check"] {
+            assert_eq!(verdict(&[check]), ExitCode::FAILURE, "{check}");
+        }
+        assert_eq!(verdict(&[]), ExitCode::SUCCESS);
+    }
 
     /// Index of a fake tree: `libz` in external/zlib, `libpng` in a project the tests pin, `fg` in
     /// frameworks/base, `dup` in two projects.
