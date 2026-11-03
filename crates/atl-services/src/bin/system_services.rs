@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! atl-system-services: registers the M2 services with servicemanager (`activity`, `package`, as Context.ACTIVITY_SERVICE / PACKAGE_SERVICE name them) and serves them on
+//! atl-system-services: registers the M2 services with servicemanager (`activity`, `package`, `display`, as Context.ACTIVITY_SERVICE / PACKAGE_SERVICE / DISPLAY_SERVICE name them) and serves them on
 //! libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. One package and one expected start, from the arguments (the broker gives them later).
-//! Prints `services: ready` once both are registered; unimplemented calls are counted on stderr (atl_services::counters).
+//! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services::counters).
 
 // the converter's rlib, on the crate search path build.rs sets (no cargo dependency names it)
 extern crate binder;
@@ -63,6 +63,7 @@ fn main() -> Result<()> {
         uid: a.uid,
         source_dir: a.apk,
         data_dir: a.data,
+        device_protected_data_dir: a.device_data,
         version_code: a.version_code,
         version_name: None,
         min_sdk: a.min_sdk,
