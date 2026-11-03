@@ -159,3 +159,29 @@ func TestGensrcsCommands(t *testing.T) {
 		t.Errorf("trim only: %v", outs)
 	}
 }
+
+func TestTopLevelStubsCompileDex(t *testing.T) {
+	// sdk_library_internal.go topLevelStubsLibraryProps: compile_dex = the library's, forced on by stubLibrariesCompiledForDex =
+	// !sharedLibrary (shared_library defaults true; api_only sets it false, SetDefaultableHook)
+	for _, c := range []struct {
+		props string
+		want  bool
+	}{
+		{`shared_library: true`, false},
+		{`shared_library: false`, true},
+		{`api_only: true`, true},
+		{`compile_dex: true`, true},
+	} {
+		g := javaTestGraph(t, map[string]string{
+			"s/Android.bp": `java_sdk_library { name: "lib", srcs: ["A.java"], sdk_version: "none", ` + c.props + ` }`,
+			"s/A.java":     "",
+		}, nil)
+		m := g.sdkLibComponent("lib.stubs", Device)
+		if m == nil {
+			t.Fatalf("%s: no lib.stubs component (%v)", c.props, g.problems)
+		}
+		if got := m.Props.boolean("compile_dex", false); got != c.want {
+			t.Errorf("%s: compile_dex %v, want %v", c.props, got, c.want)
+		}
+	}
+}

@@ -272,7 +272,9 @@ func (g *Graph) sdkLibModule(lib *Module, p *Obj, s *apiScope, kind, name string
 	case "top":
 		set("sdk_version", sdkVersionForStubs(p, s))
 		set("system_modules", str("system_modules"))
-		if p.boolean("compile_dex", false) {
+		// topLevelStubsLibraryProps: compile_dex, forced on by stubLibrariesCompiledForDex (the library is not a shared_library, default true,
+		// which api_only turns off), since the stubs are then on the boot classpath
+		if p.boolean("compile_dex", false) || !p.boolean("shared_library", true) || p.boolean("api_only", false) {
 			set("compile_dex", true)
 		}
 		static := lib.Name + ".stubs" + s.suffix + ".from-source"
