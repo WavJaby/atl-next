@@ -44,7 +44,12 @@ type aaptOut struct {
 	rJars []string
 	// FlagsPackages.AconfigTextFiles
 	aconfig []string
+	// package_splits: the split resource packages
+	splits []aaptSplit
 }
+
+// aaptSplit is one package_splits entry: the suffix of its apk's name and its resource package.
+type aaptSplit struct{ suffix, path string }
 
 // resNode is Soong's resourcesNode.
 type resNode struct {
@@ -53,8 +58,8 @@ type resNode struct {
 }
 
 // appUnsupported are app properties the converter does not model (reported when set).
-var appUnsupported = []string{"package_splits", "generate_product_characteristics_rro", "privapp_allowlist", "use_embedded_dex", "embed_notices",
-	"package_name", "instrumentation_for", "instrumentation_target_package", "additional_certificates", "lineage"}
+var appUnsupported = []string{"generate_product_characteristics_rro", "privapp_allowlist", "use_embedded_dex", "embed_notices",
+	"package_name", "instrumentation_for", "instrumentation_target_package"}
 
 // androidTypes: module types built by android nodes (java.go jnode).
 var androidTypes = map[string]bool{"android_library": true, "android_app": true, "android_test": true, "android_test_helper_app": true}
@@ -480,7 +485,15 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 		slices.Reverse(assetPkgs)
 	}
 	a.pkg = filepath.Join(n.dir, "package-res.apk")
-	g.aapt2Link(n, a, link, linkFF, linkDeps, compiledRes, compiledOverlay, assetPkgs, proguard, aapt2, aapt2Deps)
+	// package_splits: one `--split <path>:<name>` each, the split packages implicit outputs of the link (a name's commas become `_`)
+	var splitPaths []string
+	for _, s := range p.strs("package_splits") {
+		sp := filepath.Join(n.dir, "package_"+strings.ReplaceAll(s, ",", "_")+".apk")
+		link = append(link, "--split", shellEscape(sp)+":"+s)
+		splitPaths = append(splitPaths, sp)
+		a.splits = append(a.splits, aaptSplit{suffix: strings.ReplaceAll(s, ",", "_"), path: sp})
+	}
+	g.aapt2Link(n, a, link, linkFF, linkDeps, compiledRes, compiledOverlay, assetPkgs, splitPaths, proguard, aapt2, aapt2Deps)
 	if len(assetArgs) > 0 {
 		a.assets = filepath.Join(n.dir, "assets.zip")
 		j.edge("extractassets", []string{a.assets}, []string{a.pkg}, nil, nil, nil)
@@ -570,7 +583,7 @@ func (g *Graph) aarImport(n *jNode) (string, bool) {
 		}
 	}
 	slices.Reverse(assetPkgs)
-	g.aapt2Link(n, a, link, nil, linkDeps, nil, []string{flata}, assetPkgs, filepath.Join(n.dir, "gen", "proguard.options"), aapt2, []string{aapt2})
+	g.aapt2Link(n, a, link, nil, linkDeps, nil, []string{flata}, assetPkgs, nil, filepath.Join(n.dir, "gen", "proguard.options"), aapt2, []string{aapt2})
 
 	a.rJar = filepath.Join(n.dir, "busybox", "R.jar")
 	g.busyboxR(n, a, extractedRTxt, manifest, a.rJar, nil, true, nil)
@@ -601,7 +614,7 @@ func (g *Graph) aapt2CompileZip(n *jNode, flata, zip, zipPrefix string, cflags [
 
 // aapt2Link is aapt2Link (aapt2.go): the compiled resources as a list file, the overlays as -R, assets merged after the link when dependencies
 // bring some, and with a.srcjar `--java` plus a soong_zip of its output.
-func (g *Graph) aapt2Link(n *jNode, a *aaptOut, flags, featureFlags, deps, compiledRes, compiledOverlay, assetPkgs []string, proguard, aapt2 string, aapt2Deps []string) {
+func (g *Graph) aapt2Link(n *jNode, a *aaptOut, flags, featureFlags, deps, compiledRes, compiledOverlay, assetPkgs, splits []string, proguard, aapt2 string, aapt2Deps []string) {
 	j := g.java
 	var in []string
 	if len(compiledRes) > 0 {
@@ -629,7 +642,8 @@ func (g *Graph) aapt2Link(n *jNode, a *aaptOut, flags, featureFlags, deps, compi
 		}
 	}
 	in = append(in, featureFlags...)
-	outs := []string{linkOut, proguard, a.rTxt}
+	outs := append([]string{linkOut}, splits...)
+	outs = append(outs, proguard, a.rTxt)
 	vars := [][2]string{{"aapt2", esc(aapt2)}, {"pkg", esc(linkOut)}, {"flags", ninjaRaw(flags)}, {"proguard", esc(proguard)}, {"rtxt", esc(a.rTxt)},
 		{"inflags", ninjaRaw(in)}}
 	if a.srcjar != "" {
@@ -742,6 +756,14 @@ func (g *Graph) appPackage(n *jNode) {
 	j.edge("mergezips", []string{unsigned}, inputs, nil, nil, nil)
 	n.apk = filepath.Join(n.dir, name+".apk")
 	j.edge("zipalign", []string{n.apk}, []string{unsigned}, nil, nil, nil)
+	// a split is packaged alone (no dex, no JNI): <name>_<suffix>.apk, the module's extraOutputFiles
+	for _, s := range n.aapt.splits {
+		su := filepath.Join(n.dir, name+"_"+s.suffix+"-unsigned.apk")
+		j.edge("mergezips", []string{su}, []string{s.path}, nil, nil, nil)
+		apk := filepath.Join(n.dir, name+"_"+s.suffix+".apk")
+		j.edge("zipalign", []string{apk}, []string{su}, nil, nil, nil)
+		n.extraApks = append(n.extraApks, apk)
+	}
 }
 
 // jniZip is TransformJniLibsToJar: the jni_libs shared libraries stored under lib/<abi>/ in one zip ("" without any).
@@ -779,6 +801,63 @@ func (g *Graph) jniZipEdge(n *jNode, libs []string) string {
 	zip := filepath.Join(n.dir, "jnilibs.zip")
 	g.java.edge("jnizip", []string{zip}, nil, libs, nil, [][2]string{{"args", strings.Join(args, " ")}})
 	return zip
+}
+
+// appOutputs is what `:name{tag}` in srcs / java_resources names for an android app (app.go setOutputFiles: "" the apk and its splits, .apk the
+// apk, .export-package.apk the resource package, .manifest.xml the manifest, .aapt.jar the R.jar, .aapt.srcjar the R srcjar) and for a prebuilt_apex
+// (prebuilt.go: "" the apex file; its `src`, picked by the arch block of the device arch, stands for the copy Soong makes). handled=false: not one of
+// those modules; files nil with handled: it has no such output (problem recorded).
+func (g *Graph) appOutputs(name, tag string, side Side, from string) (files []srcFile, handled bool) {
+	// lookupJava skips prebuilt_* modules (a source module of the name wins): a prebuilt_apex is found by any type
+	m := g.lookupWith(name, side, func(string) bool { return false })
+	if m == nil {
+		return nil, false
+	}
+	t := g.baseType(m.Type)
+	if t == "prebuilt_apex" && tag == "" {
+		src := m.Props.obj("arch").obj(g.cfg.Arch).str("src")
+		if src == "" {
+			src = m.Props.str("src")
+		}
+		if src == "" {
+			g.problem("%s: %s has no src for %s", from, m.Name, g.cfg.Arch)
+			return nil, true
+		}
+		path := filepath.Join(m.Dir, src)
+		return []srcFile{{path: path, root: m.Dir}}, true
+	}
+	if !isApp(t) || side != Device {
+		return nil, false
+	}
+	jn := g.jnode(name, side, from)
+	if jn == nil || jn.aapt == nil {
+		return nil, true
+	}
+	var out []string
+	switch tag {
+	case "":
+		out = append([]string{jn.apk}, jn.extraApks...)
+	case ".apk":
+		out = []string{jn.apk}
+	case ".export-package.apk":
+		out = []string{jn.aapt.pkg}
+	case ".manifest.xml":
+		out = []string{jn.aapt.manifest}
+	case ".aapt.jar":
+		out = []string{jn.aapt.rJar}
+	case ".aapt.srcjar":
+		out = []string{jn.aapt.srcjar}
+	default:
+		return nil, false
+	}
+	for _, o := range out {
+		if o == "" {
+			g.problem("%s: %s has no %s output", from, name, tag)
+			return nil, true
+		}
+		files = append(files, srcFile{path: o, root: filepath.Dir(o)})
+	}
+	return files, true
 }
 
 // appRules are the rules the android modules' edges use; command shapes follow the Soong rules of the same names (aapt2.go aapt2Compile,

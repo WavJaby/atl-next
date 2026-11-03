@@ -33,6 +33,9 @@ pub struct Args {
     /// `xtask native --out <dir> platform-bootclasspath am android.test.runner.impl android.test.base.impl android.test.mock.impl`.
     #[arg(long)]
     java_out: Option<PathBuf>,
+    /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (build it with the Java pipeline too: its `androidx.test` runner broadcasts a Bundle holding a binder through IActivityManager.broadcastIntentWithFeature, which the services refuse, so that case fails until they take it), or both.
+    #[arg(long, value_enum, default_value = "fixture")]
+    case: CaseSet,
     /// Print every run's whole `am` output.
     #[arg(long, short)]
     verbose: bool,
@@ -69,6 +72,41 @@ const CRASH_TEST: &str = "com.example.atlinstr.CrashTest";
 const LIMIT: Duration = Duration::from_secs(300);
 /// Lines of a log shown on failure.
 const TAIL: usize = 40;
+
+/// The converter-built test APK (bp2ninja app.go `android_test`): libcore's JUnit4 test of LinkedHashMap, run by androidx's AndroidJUnitRunner (libcore/luni/src/test/androidsdkcurrent).
+const CONVERTER_MODULE: &str = "libcore-sdk-current-test";
+const CONVERTER_RUNNER: &str = "androidx.test.runner.AndroidJUnitRunner";
+const CONVERTER_CLASS: &str = "libcore.sdkcurrent.java.util.LinkedHashMapTest";
+const CONVERTER_TEST: &str = "test_entryCompatibility_compiletime";
+
+/// Which APKs a run uses: the hand-built fixture's two runs, the converter-built APK's, or all.
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum CaseSet {
+    All,
+    Fixture,
+    Converter,
+}
+
+/// What a run must show.
+#[derive(Clone, Copy)]
+enum Expect {
+    /// SampleTest: one passing, one failing, one erroring test
+    Sample,
+    /// CrashTest: the process kills itself mid-run
+    Crash,
+    /// these tests of the class all pass
+    Passing(&'static [&'static str]),
+}
+
+/// One `am instrument` run: an installed package and the component it runs.
+struct Case<'a> {
+    label: &'a str,
+    apk: PathBuf,
+    manifest: atl_services::packages::Manifest,
+    runner: &'a str,
+    class: &'a str,
+    expect: Expect,
+}
 
 /// Instrumentation status codes (Instrumentation.java REPORT_VALUE_RESULT_*: START 1, OK 0, ERROR -1, FAILURE -2), and the result codes (Activity.RESULT_OK -1, RESULT_CANCELED 0).
 const STATUS_START: i32 = 1;
@@ -232,6 +270,31 @@ fn check_sample(s: &Session) -> Vec<String> {
     fails
 }
 
+/// The checks of a run of tests that must all pass: each named test started (1) and ended OK (0), the final code RESULT_OK, no failed session.
+fn check_passing(s: &Session, tests: &[&str]) -> Vec<String> {
+    let mut fails = Vec::new();
+    for test in tests {
+        let want = vec![STATUS_START, STATUS_OK];
+        let got = s.codes(test);
+        if got != want {
+            fails.push(format!("{test}: status codes {got:?}, want {want:?}"));
+            if let Some(stack) = s.value(test, "stack") {
+                fails.push(format!("{test}: stack {stack}"));
+            }
+        }
+    }
+    if s.code != Some(RESULT_OK) {
+        fails.push(format!(
+            "INSTRUMENTATION_CODE {:?}, want {RESULT_OK}",
+            s.code
+        ));
+    }
+    if let Some(f) = &s.failed {
+        fails.push(format!("INSTRUMENTATION_FAILED/ABORTED: {f}"));
+    }
+    fails
+}
+
 /// The checks of run 2: started, never finished, reported cancelled by the activity manager.
 fn check_crash(s: &Session) -> Vec<String> {
     let mut fails = Vec::new();
@@ -372,28 +435,70 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
     }
     let work = rt.out.join("instrument");
-    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[test_base])?;
-    let m = manifest::read(&rt.aapt2, &apk)?;
-    ensure!(
-        m.instrumentation
-            .iter()
-            .any(|i| i.name == RUNNER && i.target_package == m.name),
-        "the fixture declares no {RUNNER} instrumenting itself: {:?}",
-        m.instrumentation
-    );
-    println!(
-        "instrument: built {} ({} versionCode {}, instrumentation {RUNNER}, libraries {:?})",
-        apk.display(),
-        m.name,
-        m.version_code,
-        m.libraries
-            .iter()
-            .map(|l| l.name.as_str())
-            .collect::<Vec<_>>()
-    );
-    let component = format!("{}/{RUNNER}", m.name);
+    let mut cases = Vec::new();
+    if args.case != CaseSet::Converter {
+        let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[test_base])?;
+        let m = manifest::read(&rt.aapt2, &apk)?;
+        for (label, class, expect) in [
+            ("sample", SAMPLE_TEST, Expect::Sample),
+            ("crash", CRASH_TEST, Expect::Crash),
+        ] {
+            cases.push(Case {
+                label,
+                apk: apk.clone(),
+                manifest: m.clone(),
+                runner: RUNNER,
+                class,
+                expect,
+            });
+        }
+    }
+    if args.case != CaseSet::Fixture {
+        // built by the converter from the AOSP tree (bp2ninja app.go): the apk is `device/<module>/<module>.apk` of the Java pipeline's out
+        let apk = java(&format!("device/{CONVERTER_MODULE}/{CONVERTER_MODULE}.apk"));
+        ensure!(
+            apk.is_file(),
+            "missing {}: build `{CONVERTER_MODULE}` with the Java pipeline (see --java-out)",
+            apk.display()
+        );
+        cases.push(Case {
+            label: "libcore",
+            manifest: manifest::read(&rt.aapt2, &apk)?,
+            apk,
+            runner: CONVERTER_RUNNER,
+            class: CONVERTER_CLASS,
+            expect: Expect::Passing(&[CONVERTER_TEST]),
+        });
+    }
     let mut all_fails = Vec::new();
-    for (label, class) in [("sample", SAMPLE_TEST), ("crash", CRASH_TEST)] {
+    for Case {
+        label,
+        apk,
+        manifest: m,
+        runner,
+        class,
+        expect,
+    } in cases
+    {
+        ensure!(
+            m.instrumentation
+                .iter()
+                .any(|i| i.name == runner && i.target_package == m.name),
+            "{label}: {} declares no {runner} instrumenting itself: {:?}",
+            apk.display(),
+            m.instrumentation
+        );
+        println!(
+            "instrument: {label}: built {} ({} versionCode {}, instrumentation {runner}, libraries {:?})",
+            apk.display(),
+            m.name,
+            m.version_code,
+            m.libraries
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let component = format!("{}/{runner}", m.name);
         let run = Run {
             root: work.join(format!("root-{label}")),
             scratch: work.join(format!("scratch-{label}")),
@@ -414,13 +519,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         };
         let (session, atld_log, lines) = am_instrument(&rt, &run, args.verbose)?;
         let life = lifecycle(&atld_log, &m.name);
-        let mut fails = match label {
-            "sample" => check_sample(&session),
-            _ => check_crash(&session),
+        let mut fails = match expect {
+            Expect::Sample => check_sample(&session),
+            Expect::Crash => check_crash(&session),
+            Expect::Passing(tests) => check_passing(&session, tests),
         };
-        match (&life, label) {
+        match (&life, matches!(expect, Expect::Crash)) {
             (None, _) => fails.push(format!("atld never started {}", m.name)),
-            (Some(l), "sample") => {
+            (Some(l), false) => {
                 if !l.killed_by_services {
                     fails.push(format!(
                         "finishing the run did not kill process {} (no `killed process`)",
@@ -453,14 +559,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             println!("instrument: {label}: counter {l}");
         }
         if fails.is_empty() {
-            match label {
-                "sample" => println!(
-                    "instrument: sample pass (testPass 1,0; testFail 1,-2; testError 1,-1; final code -1; process {} killed by the finish)",
-                    life.as_ref().map_or(0, |l| l.pid)
+            let pid = life.as_ref().map_or(0, |l| l.pid);
+            match expect {
+                Expect::Sample => println!(
+                    "instrument: sample pass (testPass 1,0; testFail 1,-2; testError 1,-1; final code -1; process {pid} killed by the finish)"
                 ),
-                _ => println!(
-                    "instrument: crash pass (process {} died mid-run: code 0, shortMsg \"Process crashed.\")",
-                    life.as_ref().map_or(0, |l| l.pid)
+                Expect::Crash => println!(
+                    "instrument: crash pass (process {pid} died mid-run: code 0, shortMsg \"Process crashed.\")"
+                ),
+                Expect::Passing(tests) => println!(
+                    "instrument: {label} pass ({} of {class} 1,0; final code -1; process {pid} killed by the finish)",
+                    tests.join(", ")
                 ),
             }
         } else {
@@ -598,6 +707,25 @@ INSTRUMENTATION_CODE: -1
         assert_eq!(check_crash(&crashed), Vec::<String>::new());
         // a run that finished normally is not a crash
         assert_eq!(check_crash(&ok).len(), 3);
+    }
+
+    /// A run of passing tests: each test's blocks 1 then 0, the final code -1; a failing test, a missing one and a wrong final code each fail it (the probe responds both ways).
+    #[test]
+    fn passing_check_fires() {
+        let pass = session(
+            "INSTRUMENTATION_STATUS: test=t1\nINSTRUMENTATION_STATUS_CODE: 1\n\
+             INSTRUMENTATION_STATUS: test=t1\nINSTRUMENTATION_STATUS_CODE: 0\n\
+             INSTRUMENTATION_CODE: -1\n",
+        );
+        assert_eq!(check_passing(&pass, &["t1"]), Vec::<String>::new());
+        assert_eq!(check_passing(&pass, &["t1", "t2"]).len(), 1);
+        let failed = session(
+            "INSTRUMENTATION_STATUS: test=t1\nINSTRUMENTATION_STATUS_CODE: 1\n\
+             INSTRUMENTATION_STATUS: stack=boom\nINSTRUMENTATION_STATUS: test=t1\nINSTRUMENTATION_STATUS_CODE: -2\n\
+             INSTRUMENTATION_CODE: -1\n",
+        );
+        assert_eq!(check_passing(&failed, &["t1"]).len(), 2);
+        assert_eq!(check_passing(&Session::default(), &["t1"]).len(), 2);
     }
 
     #[test]

@@ -18,7 +18,9 @@ import (
 //     absolute, sources from the rsp file and the unpacked srcjars' list.
 //   - kotlin-stdlib, -jdk7, -jdk8 and kotlin-annotations are added to static_libs (libs with static_kotlin_stdlib: false) when srcs name .kt
 //     files, as Soong's deps() does from the literal srcs.
-//   - Not supported, one problem each: kapt (annotation processors on a module with Kotlin sources), common_srcs, compose.
+//   - common_srcs (multiplatform common sources) are `<sources>` and `<commonSources>` entries of the module file (gen-kotlin-build-file.py
+//     --common_srcs), inputs of the kotlinc edge.
+//   - Not supported, one problem each: kapt (annotation processors on a module with Kotlin sources), compose.
 
 // implicitJavaLibs: the libraries deps() adds for source kinds named in srcs (kotlin stdlib; protobuf runtime of proto.type), appended to
 // static_libs (libs for a kotlin stdlib that is not static).
@@ -54,9 +56,6 @@ func (g *Graph) implicitJavaLibs(n *jNode, srcs []string) {
 		} else {
 			libs = append(libs, std...)
 		}
-	}
-	if len(p.strs("common_srcs")) > 0 {
-		g.problem("%s: common_srcs is unsupported", n.name)
 	}
 	if len(static) > 0 {
 		p.set("static_libs", strVals(append(p.strs("static_libs"), static...)))
@@ -109,8 +108,17 @@ func (g *Graph) kotlinc(n *jNode, out, hdr string, java, kt, srcjars, waits []st
 	dir := filepath.Dir(filepath.Dir(out))
 	implicit := append(append(append([]string{}, cp...), plugins...), srcjars...)
 	implicit = append(implicit, g.abs(c.Kotlinc), g.abs(c.KotlinAbiGen))
+	// common_srcs: PathsForModuleSrc, listed in the module file after the module's own sources
+	var common []string
+	for _, s := range p.strs("common_srcs") {
+		files, _ := g.resolveSrc(n.mod.Dir, n.side, s, n.name)
+		for _, f := range files {
+			common = append(common, g.abs(f.path))
+		}
+	}
+	implicit = append(implicit, common...)
 	g.java.edge("kotlinc", []string{out, hdr}, absAll(g, append(append([]string{}, java...), kt...)), implicit, waits, [][2]string{
-		{"name", name}, {"cp", esc(strings.Join(cp, " "))}, {"srcjars", join(srcjars)}, {"flags", ninjaRaw(flags)}, {"target", target},
+		{"name", name}, {"cp", esc(strings.Join(cp, " "))}, {"srcjars", join(srcjars)}, {"common", join(common)}, {"flags", ninjaRaw(flags)}, {"target", target},
 		{"classes", esc(filepath.Join(dir, "kotlinc", "classes"))}, {"hclasses", esc(filepath.Join(dir, "kotlinc", "header_classes"))},
 		{"srcjardir", esc(filepath.Join(dir, "kotlinc", "srcJars"))}, {"buildfile", esc(filepath.Join(dir, "kotlinc-build.xml"))},
 		{"emptydir", esc(filepath.Join(dir, "kotlinc", "empty"))}, {"kjar", esc(out)}, {"hdr", esc(hdr)},
@@ -124,6 +132,7 @@ func (j *javaGraph) kotlincRule(g *Graph) string {
 	xml := `{ printf '<modules>\n  <module name="%s" type="java-production" outputDir="%s">\n' "$name" "$classes"; ` +
 		`for f in $cp; do printf '    <classpath path="%s"/>\n' "$$f"; done; ` +
 		`for f in $$(cat $kjar.rsp $srcjardir/list); do case $$f in *.java) printf '    <javaSourceRoots path="%s"/>\n' "$$f";; *.kt) printf '    <sources path="%s"/>\n' "$$f";; *) echo "unknown source $$f"; exit 1;; esac; done; ` +
+		`for f in $common; do printf '    <sources path="%s"/>\n    <commonSources path="%s"/>\n' "$$f" "$$f"; done; ` +
 		`printf '  </module>\n</modules>\n'; } > $buildfile`
 	unpack := `(for j in $srcjars; do if unzip -Z1 $$j 2>/dev/null | grep -q '\.\(java\|kt\)$$'; then unzip -qo $$j '*.java' '*.kt' -d $srcjardir 2>/dev/null; rc=$$?; [ $$rc -le 1 ] || [ $$rc -eq 11 ] || exit 1; fi; done) && find $srcjardir -name '*.java' -o -name '*.kt' | sort > $srcjardir/list`
 	return "rule kotlinc\n" +

@@ -16,7 +16,9 @@ import (
 //     then all-updatable-modules-system-stubs.
 //   - framework-updatable-stubs-module_libs_api: <bootclasspath minus core libraries minus non-updatable>.stubs.module_lib.
 //   - Each a java_library of those static_libs, sdk_version module_current, is_stubs_module.
-//   - Not made: the merged API text files, the exportable / test / system-server variants, annotation and source filegroups.
+//   - all-non-updatable-modules-test-stubs: <non-updatable>.stubs.test (createMergedTestStubsForNonUpdatableModules; android_test_stubs_current
+//     is built on it).
+//   - Not made: the merged API text files, the exportable / system-server variants, annotation and source filegroups.
 
 const combinedApisType = "combined_apis"
 
@@ -58,7 +60,7 @@ func (g *Graph) combinedApisOf() *combinedApis {
 
 // combinedApisNames: the modules synthCombinedApis makes.
 var combinedApisNames = []string{"all-modules-public-stubs", "all-updatable-modules-system-stubs", "all-modules-system-stubs",
-	"framework-updatable-stubs-module_libs_api"}
+	"framework-updatable-stubs-module_libs_api", "all-non-updatable-modules-test-stubs"}
 
 func (g *Graph) combinedApisOwned(ref string) bool {
 	return slices.Contains(combinedApisNames, trimRef(ref)) && g.combinedApisOf() != nil
@@ -100,6 +102,8 @@ func (g *Graph) synthCombinedApis(ref string, side Side) *Module {
 		libs = append(suffix(c.nonUpdatable, ".stubs.system"), "all-updatable-modules-system-stubs")
 	case "framework-updatable-stubs-module_libs_api":
 		libs = suffix(without(without(c.bootclasspath, c.core), c.nonUpdatable), ".stubs.module_lib")
+	case "all-non-updatable-modules-test-stubs":
+		libs = suffix(c.nonUpdatable, ".stubs.test")
 	}
 	props := newObj()
 	props.set("static_libs", strVals(libs))

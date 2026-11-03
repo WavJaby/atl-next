@@ -305,3 +305,49 @@ android_app { name: "k", srcs: ["A.java"], sdk_version: "34" }`, nil)
 		t.Errorf("no libraries, no zip")
 	}
 }
+
+// An app named in srcs / java_resources (app.go setOutputFiles): `:name` is the apk and its splits, {.apk} the apk alone, {.export-package.apk}
+// the resource package; package_splits link `--split <path>:<name>` (a comma in the name becomes `_` in the file name) and each split is
+// packaged on its own. A prebuilt_apex is its src, from the arch block of the device arch (prebuilt.go).
+func TestAppOutputsAndSplits(t *testing.T) {
+	g := appGraph(t, `
+android_test_helper_app { name: "h", srcs: ["A.java"], sdk_version: "34", package_splits: ["anydpi", "a,b"] }
+prebuilt_apex { name: "ap", src: "generic.apex", arch: { x86_64: { src: "x86/ap.apex" }, arm: { src: "arm/ap.apex" } } }
+`, nil)
+	d := filepath.Join(g.out, "device", "h")
+	paths := func(ref string) []string {
+		files, ok := g.resolveSrc("p", Device, ref, "test")
+		if !ok {
+			t.Fatalf("%s unresolved: %v", ref, g.problems)
+		}
+		var out []string
+		for _, f := range files {
+			out = append(out, f.path)
+		}
+		return out
+	}
+	if got, want := paths(":h"), []string{filepath.Join(d, "h.apk"), filepath.Join(d, "h_anydpi.apk"), filepath.Join(d, "h_a_b.apk")}; !reflect.DeepEqual(got, want) {
+		t.Errorf(":h = %v, want %v", got, want)
+	}
+	if got, want := paths(":h{.apk}"), []string{filepath.Join(d, "h.apk")}; !reflect.DeepEqual(got, want) {
+		t.Errorf(":h{.apk} = %v, want %v", got, want)
+	}
+	if got, want := paths(":h{.export-package.apk}"), []string{filepath.Join(d, "package-res.apk")}; !reflect.DeepEqual(got, want) {
+		t.Errorf(":h{.export-package.apk} = %v, want %v", got, want)
+	}
+	if got, want := paths(":ap"), []string{"p/x86/ap.apex"}; !reflect.DeepEqual(got, want) {
+		t.Errorf(":ap = %v, want %v", got, want)
+	}
+	ninja := g.java.b.String()
+	link := ninjaEdgeVars(ninja, filepath.Join(d, "package-res.apk"))
+	if link == nil || !strings.HasSuffix(link["flags"], " --split "+filepath.Join(d, "package_anydpi.apk")+":anydpi --split "+filepath.Join(d, "package_a_b.apk")+":a,b") ||
+		!strings.Contains(link[""], filepath.Join(d, "package_a_b.apk")) {
+		t.Errorf("link %v", link)
+	}
+	if su := ninjaEdgeVars(ninja, filepath.Join(d, "h_a_b-unsigned.apk")); su == nil || !strings.Contains(su[""], ": mergezips "+filepath.Join(d, "package_a_b.apk")) {
+		t.Errorf("split apk %v", su)
+	}
+	if al := ninjaEdgeVars(ninja, filepath.Join(d, "h_a_b.apk")); al == nil || !strings.Contains(al[""], ": zipalign "+filepath.Join(d, "h_a_b-unsigned.apk")) {
+		t.Errorf("split aligned apk %v", al)
+	}
+}

@@ -76,8 +76,9 @@ type jNode struct {
 	javaSrcs []string
 	statics  []*jNode
 	// android_library, android_library_import, android apps: resources (app.go); an app's apk
-	aapt *aaptOut
-	apk  string
+	aapt      *aaptOut
+	apk       string
+	extraApks []string // split apks (Module.extraOutputFiles)
 }
 
 // javaGraph holds the Java side of a Graph.

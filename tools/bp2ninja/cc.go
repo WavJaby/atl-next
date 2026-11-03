@@ -748,6 +748,11 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 			return []srcFile{{path: out, root: filepath.Dir(out)}}, true
 		}
 	}
+	if name, tag := splitTag(s); g.java != nil {
+		if files, handled := g.appOutputs(name, tag, side, from); handled {
+			return files, files != nil
+		}
+	}
 	m := g.lookup(s, side)
 	switch {
 	case m != nil && g.baseType(m.Type) == "cc_object":

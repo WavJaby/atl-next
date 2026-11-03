@@ -244,6 +244,11 @@ func TestCombinedApis(t *testing.T) {
 		!reflect.DeepEqual(p.Props.strs("static_libs"), []string{"art.module.public.api.stubs", "framework-a.stubs", "framework-location.stubs"}) {
 		t.Errorf("public stubs %+v", p)
 	}
+	// createMergedTestStubsForNonUpdatableModules (api.go:323): the non-updatable modules' .stubs.test, module_current
+	if s := g.lookupJava("all-non-updatable-modules-test-stubs", Device); s == nil ||
+		!reflect.DeepEqual(s.Props.strs("static_libs"), []string{"framework-location.stubs.test"}) || s.Props.str("sdk_version") != "module_current" {
+		t.Errorf("test stubs %+v", s)
+	}
 }
 
 func TestFilegroupDeviceSrcs(t *testing.T) {
