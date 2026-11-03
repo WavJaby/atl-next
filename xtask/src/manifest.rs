@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services::packages::{InstrumentationDecl, Manifest, UsesLibrary};
+use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, UsesLibrary};
 
 use crate::host_art;
 
@@ -109,6 +109,19 @@ fn parse_tree(text: &str) -> Result<Element> {
     root.context("no element in aapt2's xmltree")
 }
 
+/// The boolean attributes of `element` by name: those whose text is `true` or `false` (aapt2 prints a boolean resource that way).
+fn booleans(element: &Element) -> BTreeMap<String, bool> {
+    element
+        .attrs
+        .iter()
+        .filter_map(|(name, value)| match value.as_str() {
+            "true" => Some((name.clone(), true)),
+            "false" => Some((name.clone(), false)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
 fn resolve_class(package: &str, name: &str) -> String {
     if name.starts_with('.') {
@@ -155,19 +168,24 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 Some(suffix) => format!("{package}:{suffix}"),
                 None => p.to_owned(),
             });
-    let launch_activity = application.and_then(|a| {
-        a.children("activity").find_map(|activity| {
+    // every `<activity>` in manifest order: its class, whether it handles MAIN + LAUNCHER, its boolean attributes (ParsedActivity's inputs)
+    let activities = application
+        .into_iter()
+        .flat_map(|a| a.children("activity"))
+        .filter_map(|activity| {
             let launcher = activity.children("intent-filter").any(|f| {
                 let has = |kind: &str, wanted: &str| {
                     f.children(kind).any(|e| e.attr("name") == Some(wanted))
                 };
                 has("action", ACTION_MAIN) && has("category", CATEGORY_LAUNCHER)
             });
-            launcher
-                .then(|| activity.attr("name").map(|n| resolve_class(package, n)))
-                .flatten()
+            Some(ActivityDecl {
+                name: resolve_class(package, activity.attr("name")?),
+                launcher,
+                booleans: booleans(activity),
+            })
         })
-    });
+        .collect();
     Ok(Manifest {
         name: package.to_owned(),
         version_code: int(&root, "versionCode")?.unwrap_or(0),
@@ -175,7 +193,8 @@ pub fn parse(text: &str) -> Result<Manifest> {
         min_sdk,
         target_sdk,
         process_name,
-        launch_activity,
+        application_booleans: application.map(booleans).unwrap_or_default(),
+        activities,
         requested_permissions: root
             .children("uses-permission")
             .filter_map(|e| e.attr("name").map(str::to_owned))
@@ -289,7 +308,9 @@ mod tests {
                 functional_test: true,
             }]
         );
-        assert_eq!((m.process_name, m.launch_activity), (None, None));
+        assert_eq!(m.process_name, None);
+        assert!(m.activities.is_empty() && m.launch_activity().is_none());
+        assert!(m.application_booleans.is_empty());
     }
 
     /// A launcher activity named relative to the package, a private process, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
@@ -316,9 +337,23 @@ mod tests {
 "#;
         let m = parse(text).expect("parse");
         assert_eq!(
-            m.launch_activity.as_deref(),
+            m.launch_activity().map(|a| a.name.as_str()),
             Some("com.example.atltest.Main")
         );
+        // both activities, in order; only Main handles MAIN + LAUNCHER and it wrote no boolean
+        let shape: Vec<(&str, bool)> = m
+            .activities
+            .iter()
+            .map(|a| (a.name.as_str(), a.launcher))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("com.example.atltest.Other", false),
+                ("com.example.atltest.Main", true)
+            ]
+        );
+        assert!(m.activities.iter().all(|a| a.booleans.is_empty()));
         assert_eq!(
             m.process_name.as_deref(),
             Some("com.example.atltest:remote")
@@ -334,5 +369,54 @@ mod tests {
         assert!(parse("").is_err());
         assert!(parse("  E: application (line=1)\n").is_err());
         assert!(parse("garbage\n").is_err());
+    }
+
+    /// aapt2 2.20's `dump xmltree` of xtask/testdata/window/AndroidManifest.xml (built against android-36's android.jar), as measured 2026-11-04. The activity alone is not hardware
+    /// accelerated; the application wrote no boolean, so its flags are the defaults (targetSdkVersion 36): hasCode, hardwareAccelerated, allowBackup, allowClearUserData, extractNativeLibs.
+    const WINDOW: &str = r#"N: android=http://schemas.android.com/apk/res/android (line=4)
+  E: manifest (line=4)
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1
+    A: http://schemas.android.com/apk/res/android:versionName(0x0101021c)="1.0" (Raw: "1.0")
+    A: http://schemas.android.com/apk/res/android:compileSdkVersion(0x01010572)=36
+    A: http://schemas.android.com/apk/res/android:compileSdkVersionCodename(0x01010573)="16" (Raw: "16")
+    A: package="com.example.atlwindow" (Raw: "com.example.atlwindow")
+    A: platformBuildVersionCode=36
+    A: platformBuildVersionName=16
+      E: uses-sdk (line=9)
+        A: http://schemas.android.com/apk/res/android:minSdkVersion(0x0101020c)=21
+        A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)=36
+      E: application (line=11)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="ATL window test" (Raw: "ATL window test")
+          E: activity (line=12)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Main" (Raw: ".Main")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+            A: http://schemas.android.com/apk/res/android:hardwareAccelerated(0x010102d3)=false
+              E: intent-filter (line=13)
+                  E: action (line=14)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+                  E: category (line=15)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+"#;
+
+    /// The window fixture's record: the launcher activity's `hardwareAccelerated=false` is its ActivityInfo bit clear (0), the application's defaults are ApplicationInfo.flags 0x3000_8044
+    /// (manifest_flags' default test), and the activity's other boolean (`exported`) is kept as written but sets no flag.
+    #[test]
+    fn the_window_fixture_record() {
+        use atl_services::manifest_flags::{activity_flags, application_flags};
+        let m = parse(WINDOW).expect("parse");
+        assert_eq!(m.name, "com.example.atlwindow");
+        assert_eq!((m.min_sdk, m.target_sdk), (21, 36));
+        assert!(m.application_booleans.is_empty());
+        let launch = m.launch_activity().expect("a launcher activity");
+        assert_eq!(launch.name, "com.example.atlwindow.Main");
+        assert_eq!(
+            launch.booleans,
+            BTreeMap::from([
+                ("exported".to_owned(), true),
+                ("hardwareAccelerated".to_owned(), false)
+            ])
+        );
+        assert_eq!(application_flags(&m), 0x3000_8044);
+        assert_eq!(activity_flags(&m, launch), 0);
     }
 }

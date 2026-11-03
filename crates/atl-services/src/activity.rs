@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java, frameworks/base/services/core/java/com/android/server/am/ProcessList.java, frameworks/base/services/core/java/com/android/server/am/InstrumentationReporter.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderHelper.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java, frameworks/base/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java, frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java
 //! IActivityManager + the ActivityTaskManager launch path + IActivityClientController, subset: a process the services started attaches (attachApplication -> bindApplication), finishes attaching
-//! (finishAttachApplication -> scheduleTransaction(LaunchActivityItem) of its launcher activity), asks for the settings provider (getContentProvider) and its display (getDisplayId);
+//! (finishAttachApplication -> scheduleTransaction([LaunchActivityItem, ResumeActivityItem]) of its launcher activity), asks for the settings provider (getContentProvider) and its display (getDisplayId);
 //! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process), and the broadcast calls a test runner makes
 //! (broadcastIntentWithFeature, registerReceiverWithFeature: validated as AOSP does, then nothing is delivered).
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); every other method is counted unimplemented (counters).
@@ -32,18 +32,18 @@ use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
-    ActivityWindowInfo, ComponentInfo, LaunchActivityItem, PackageItemInfo,
+    ActivityWindowInfo, ComponentInfo, LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
 };
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
     ThreadState,
 };
 
-use crate::packages::{PackageRecord, Packages};
+use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
-use crate::{counters, package, settings, token};
+use crate::{counters, manifest_flags, package, settings, token};
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -54,6 +54,8 @@ const DEFAULT_DISPLAY: i32 = 0;
 const DEVICE_ID_DEFAULT: i32 = 0;
 /// ActivityManager.PROCESS_STATE_TOP: the reported state of the process whose activity is launched in front.
 const PROCESS_STATE_TOP: i32 = 2;
+/// ActivityManager.PROCESS_STATE_UNKNOWN (ProcessStateEnum.UNKNOWN, -1): the procState of ResumeActivityItem's three-argument constructor, which realStartActivityLocked uses.
+const PROCESS_STATE_UNKNOWN: i32 = -1;
 /// Build.UNKNOWN: the serial apps targeting P+ get (ActivityManagerService attachApplicationLocked buildSerial).
 const BUILD_UNKNOWN: &str = "unknown";
 /// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
@@ -94,6 +96,17 @@ fn global_configuration() -> Configuration {
         font_scale: 1.0,
         locale_list: Some(DEFAULT_LOCALE.to_owned()),
         ..Configuration::default()
+    }
+}
+
+/// ActivityTaskSupervisor.java:1034: the ResumeActivityItem realStartActivityLocked schedules after the launch (andResume), with the same token as the launch.
+/// isForward is the launch's (the transition is forward), no compat fake focus.
+fn resume_item(token: SpIBinder) -> ResumeActivityItem {
+    ResumeActivityItem {
+        activity_token: Some(token),
+        proc_state: PROCESS_STATE_UNKNOWN,
+        is_forward: true,
+        should_send_compat_fake_focus: false,
     }
 }
 
@@ -278,7 +291,7 @@ impl ActivityManager {
             .packages
             .by_name(package)
             .ok_or_else(|| format!("no package {package}"))?;
-        if p.launch_activity.is_none() {
+        if p.launch_activity().is_none() {
             return Err(format!("{package} has no launcher activity"));
         }
         let mut st = self.inner.state();
@@ -334,9 +347,15 @@ impl Inner {
         Ok(())
     }
 
-    /// realStartActivityLocked (ActivityTaskSupervisor.java:1021-1030): the LaunchActivityItem of the package's launcher activity. Not sent yet (slice 7 needs them): the lifecycle
-    /// ResumeActivityItem, results, new intents, saved state; the assist / shareable / fragment tokens stay null.
-    fn launch_item(&self, p: &PackageRecord, activity: &str, ident: i32) -> LaunchActivityItem {
+    /// realStartActivityLocked (ActivityTaskSupervisor.java:1021-1029): the LaunchActivityItem of the package's launcher activity, under `token` (the one its ResumeActivityItem carries).
+    /// ActivityInfo.flags are the activity's manifest flags (manifest_flags). Not sent yet (slice 7 needs them): results, new intents, saved state; the assist / shareable / fragment tokens stay null.
+    fn launch_item(
+        &self,
+        p: &PackageRecord,
+        activity: &ActivityDecl,
+        token: SpIBinder,
+        ident: i32,
+    ) -> LaunchActivityItem {
         let ai = package::application_info(p, &self.packages);
         let intent = Intent {
             action: Some(ACTION_MAIN.into()),
@@ -344,14 +363,14 @@ impl Inner {
             flags: FLAG_ACTIVITY_NEW_TASK,
             component: Some(ComponentName {
                 package: p.name.clone(),
-                class: activity.to_owned(),
+                class: activity.name.clone(),
             }),
             ..Default::default()
         };
         let info = ActivityInfo {
             component: ComponentInfo {
                 item: PackageItemInfo {
-                    name: Some(activity.to_owned()),
+                    name: Some(activity.name.clone()),
                     package_name: Some(p.name.clone()),
                     ..Default::default()
                 },
@@ -361,10 +380,11 @@ impl Inner {
                 exported: true,
                 ..Default::default()
             },
+            flags: manifest_flags::activity_flags(p, activity),
             ..Default::default()
         };
         LaunchActivityItem {
-            activity_token: Some(token::new()),
+            activity_token: Some(token),
             ident,
             cur_config: Some(global_configuration()),
             override_config: Some(Configuration::default()),
@@ -714,7 +734,7 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.finishAttachApplication:4995 -> finishAttachApplicationInner:4865: the attached app of the caller's pid with the same uid and startSeq (:4874), else
-    /// dropped (:4877-4892, killed); then the ActivityTaskManager attach (:4905-4909 -> realStartActivityLocked) schedules the launch transaction of the activity it was started for, if any.
+    /// dropped (:4877-4892, killed); then the ActivityTaskManager attach (:4905-4909 -> realStartActivityLocked) schedules the launch transaction of the activity it was started for, if any: LaunchActivityItem, then ResumeActivityItem.
     fn r#finishAttachApplication(&self, start_seq: i64, _on_create_ns: i64) -> binder::Result<()> {
         let inner = &self.inner;
         let pid = ThreadState::get_calling_pid();
@@ -741,13 +761,21 @@ impl IActivityManager for ActivityManager {
         let Some(p) = inner.packages.by_name(&package) else {
             return Ok(());
         };
-        let Some(activity) = &p.launch_activity else {
+        let Some(activity) = p.launch_activity() else {
             return Ok(());
         };
+        // one token for both items: the app keys its activity record by it
+        let token = token::new();
         let transaction = ClientTransaction {
-            items: vec![Some(ClientTransactionItem::LaunchActivity(
-                inner.launch_item(p, activity, ident),
-            ))],
+            items: vec![
+                Some(ClientTransactionItem::LaunchActivity(inner.launch_item(
+                    p,
+                    activity,
+                    token.clone(),
+                    ident,
+                ))),
+                Some(ClientTransactionItem::ResumeActivity(resume_item(token))),
+            ],
         };
         thread.r#scheduleTransaction(Some(&transaction))
     }

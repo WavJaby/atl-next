@@ -9,6 +9,7 @@
 //!    server takes it as None (before aidl --rust_java_nullability it failed the transaction with UNEXPECTED_NULL) and getApplicationInfo answers null (parcelable flag 0).
 //! 5. The services' counter lines: the unimplemented calls of 2 and 3 were counted.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Sender, channel};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use atl_broker::control::{self, Request, Response};
-use atl_services::packages::{InstrumentationDecl, Manifest, PackageRecord};
+use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::binder::Harness;
@@ -142,7 +143,12 @@ pub fn stage(
             min_sdk: SDK,
             target_sdk: SDK,
             process_name: None,
-            launch_activity: Some(ACTIVITY.to_owned()),
+            application_booleans: BTreeMap::new(),
+            activities: vec![ActivityDecl {
+                name: ACTIVITY.to_owned(),
+                launcher: true,
+                booleans: BTreeMap::new(),
+            }],
             requested_permissions: vec![],
             libraries: vec![],
             // one instrumentation, targeting the package itself (client.rs INSTRUMENTATION)

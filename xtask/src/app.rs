@@ -62,8 +62,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
     let activity = m
-        .launch_activity
-        .clone()
+        .launch_activity()
+        .map(|a| a.name.clone())
         .context("the fixture has no launcher activity")?;
     println!(
         "app: built {} ({} versionCode {}, sdk {}..{}, launcher activity {})",

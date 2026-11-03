@@ -17,14 +17,12 @@ use atl_parcelables::parts::{PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
 use crate::packages::{InstrumentationDecl, LibraryNode, PackageRecord, Packages};
-use crate::{counters, permission};
+use crate::{counters, manifest_flags, permission};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPackageManager";
 /// The only user (UserHandle.USER_SYSTEM).
 const USER_SYSTEM: i32 = 0;
-/// ApplicationInfo.FLAG_HAS_CODE (content/pm/ApplicationInfo.java): every APK ATL runs has code.
-const FLAG_HAS_CODE: i32 = 1 << 2;
 /// SharedLibraryInfo.TYPE_BUILTIN and VERSION_UNDEFINED (SharedLibraryInfo.java:60, :92).
 const SHARED_LIBRARY_TYPE_BUILTIN: i32 = 0;
 const SHARED_LIBRARY_VERSION_UNDEFINED: i64 = -1;
@@ -35,7 +33,7 @@ const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
 /// The directory of an installed package's native libraries below its install directory (PackageManagerService: `lib/<isa>` under /data/app/<package>); the ISA level is left out until the installer extracts libraries from the APK's lib/<abi>/.
 const NATIVE_LIBRARY_SUBDIR: &str = "lib";
 
-/// The ApplicationInfo of `p` (PackageInfoUtils.generateApplicationInfo, reduced to what the record holds): names, uid, paths, SDK levels, enabled, and the shared libraries its manifest
+/// The ApplicationInfo of `p` (PackageInfoUtils.generateApplicationInfo, reduced to what the record holds): names, uid, paths, SDK levels, enabled, flags (manifest_flags), and the shared libraries its manifest
 /// uses: `sharedLibraryFiles` (their jars, in manifest order; what ComputerEngine fills for GET_SHARED_LIBRARY_FILES, which ActivityManagerService's STOCK_PM_FLAGS always sets) and `sharedLibraryInfos`,
 /// from which LoadedApk builds the libraries' class loaders (it takes only `.apk` entries of `sharedLibraryFiles`, ApplicationInfo's legacy field). A `<uses-library>` that names no installed
 /// library adds nothing (a required one would stop the install in AOSP; the services do not install).
@@ -57,7 +55,7 @@ pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationIn
             ..Default::default()
         },
         process_name: Some(p.process_name().to_owned()),
-        flags: FLAG_HAS_CODE,
+        flags: manifest_flags::application_flags(p),
         source_dir: Some(p.source_dir.clone()),
         public_source_dir: Some(p.source_dir.clone()),
         shared_library_files: (!library_files.is_empty()).then_some(library_files),

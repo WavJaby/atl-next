@@ -28,6 +28,17 @@ pub struct InstrumentationDecl {
     pub functional_test: bool,
 }
 
+/// `<activity>` (ParsedActivity, reduced): its class resolved against the package, whether it handles MAIN + LAUNCHER, and its boolean attributes as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityDecl {
+    /// `android:name`, resolved against the package name: the Activity class.
+    pub name: String,
+    /// It handles MAIN + LAUNCHER (the first such activity is the package's launcher activity).
+    pub launcher: bool,
+    /// Its boolean attributes by name, only those the manifest wrote (`hardwareAccelerated`, ...); the flags they set are in manifest_flags.
+    pub booleans: BTreeMap<String, bool>,
+}
+
 /// What an APK's AndroidManifest.xml declares that the services use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -38,12 +49,21 @@ pub struct Manifest {
     pub target_sdk: i32,
     /// `<application android:process>`; None = the package name (ApplicationInfo.processName's default).
     pub process_name: Option<String>,
-    /// The class of the first activity that handles MAIN + LAUNCHER, if the package has one.
-    pub launch_activity: Option<String>,
+    /// `<application>`'s boolean attributes by name, only those the manifest wrote; the flags they set are in manifest_flags.
+    pub application_booleans: BTreeMap<String, bool>,
+    /// Every `<activity>`, in manifest order.
+    pub activities: Vec<ActivityDecl>,
     /// `<uses-permission android:name>`, in order.
     pub requested_permissions: Vec<String>,
     pub libraries: Vec<UsesLibrary>,
     pub instrumentation: Vec<InstrumentationDecl>,
+}
+
+impl Manifest {
+    /// The package's launcher activity: the first `<activity>` that handles MAIN + LAUNCHER.
+    pub fn launch_activity(&self) -> Option<&ActivityDecl> {
+        self.activities.iter().find(|a| a.launcher)
+    }
 }
 
 /// One installed package: its manifest and where and as whom it is installed.
@@ -223,7 +243,8 @@ mod tests {
                 min_sdk: 21,
                 target_sdk: 34,
                 process_name: None,
-                launch_activity: None,
+                application_booleans: BTreeMap::new(),
+                activities: vec![],
                 requested_permissions: vec![],
                 libraries: vec![],
                 instrumentation: vec![],
@@ -326,6 +347,24 @@ mod tests {
         assert_eq!(r.process_name(), "a");
         r.manifest.process_name = Some("a:remote".into());
         assert_eq!(r.process_name(), "a:remote");
+    }
+
+    /// The launcher activity is the first activity that handles MAIN + LAUNCHER; none when no activity does.
+    #[test]
+    fn launch_activity_is_the_first_launcher() {
+        let activity = |name: &str, launcher: bool| ActivityDecl {
+            name: name.into(),
+            launcher,
+            booleans: BTreeMap::new(),
+        };
+        let mut r = record("a", 10_001);
+        assert!(r.launch_activity().is_none());
+        r.manifest.activities = vec![
+            activity("a.Other", false),
+            activity("a.Main", true),
+            activity("a.Second", true),
+        ];
+        assert_eq!(r.launch_activity().map(|a| a.name.as_str()), Some("a.Main"));
     }
 
     /// The record file atld reads is JSON of these types: a record survives the round trip.

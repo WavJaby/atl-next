@@ -12,6 +12,7 @@ extern crate atl_parcelables;
 extern crate binder;
 
 pub mod counters;
+pub mod manifest_flags;
 pub mod packages;
 pub mod permission;
 pub mod process_control;
