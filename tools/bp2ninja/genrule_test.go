@@ -284,8 +284,10 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	})
 	n := g.genNode("g", Device, "t")
 	out := g.out + "/gen/device/g/o.txt"
-	// the declared outputs removed (sbox's fresh sandbox), the command, then Soong's check that every declared output exists
-	wantScript := "rm -f -- " + out + " || exit 1\ncp p/in.txt " + out + "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + out +
+	// the output dir emptied but for this script (sbox clearOutputDirectory, alwaysWrite), the command, then Soong's check that every
+	// declared output exists
+	gd := g.out + "/gen/device/g"
+	wantScript := "mkdir -p " + gd + " && find " + gd + " -mindepth 1 -maxdepth 1 ! -name genrule.sh -exec rm -rf -- {} + || exit 1\ncp p/in.txt " + out + "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + out +
 		"; do\n  [ -e \"$f\" ] || { echo \"error: genrule g: $f was not created\" >&2; exit 1; }\ndone\n"
 	if got := g.genScript(n); got != wantScript {
 		t.Errorf("script %q, want %q", got, wantScript)
@@ -300,6 +302,29 @@ func TestGenruleScriptAndEdge(t *testing.T) {
 	}
 	if g.genFiles[g.out+"/gen/device/g/genrule.sh"] != wantScript {
 		t.Error("script not recorded for writing")
+	}
+}
+
+// A rerun sees no earlier output (sbox): a command that mkdirs into $(genDir) passes twice; the script itself survives.
+func TestGenruleRerun(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"p/Android.bp": `genrule { name: "g", cmd: "mkdir $(genDir)/res/ && echo x >> $(genDir)/res/a && cp $(genDir)/res/a $(out)", out: ["o.txt"] }`,
+	})
+	n := g.genNode("g", Device, "t")
+	var b strings.Builder
+	g.emitGen(&b, n)
+	if err := g.writeGenFiles(); err != nil {
+		t.Fatal(err)
+	}
+	for run := 1; run <= 2; run++ {
+		c := exec.Command("/bin/bash", n.rule.script)
+		c.Dir = g.tree
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("run %d: %v\n%s", run, err, out)
+		}
+	}
+	if got, _ := os.ReadFile(g.out + "/gen/device/g/o.txt"); string(got) != "x\n" {
+		t.Errorf("output after two runs %q, want one line", got)
 	}
 }
 

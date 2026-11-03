@@ -604,9 +604,23 @@ func (g *Graph) genScript(n *Node) string {
 		return "echo " + shellEscape(fmt.Sprintf("error: genrule %s: %s", n.name, msg)) + " >&2\nexit 1\n"
 	}
 	outs := strings.Join(mapStrings(r.outs, shellEscape), " ")
-	// Soong's command never sees a previous run's outputs: sbox runs it in a fresh sandbox and clears the output dir before copying
-	// back (cmd/sbox/sbox.go runCommand -> clearOutputDirectory). Without this, `>> $(out)` commands append to a reused out dir's file.
-	clear := "rm -f -- " + outs + " || exit 1\n"
+	// Soong's command never sees a previous run's outputs: sbox runs it in a fresh sandbox and removes the whole output dir first
+	// (cmd/sbox/sbox.go runCommand -> clearOutputDirectory, alwaysWrite). Without this, `>> $(out)` appends to a reused file and
+	// `mkdir $(genDir)/x` fails on a rerun (mimemap-res.jar). Kept: what the converter itself wrote there (this script, res.list, ...).
+	genDir := g.genDir(n, "")
+	keep := map[string]bool{}
+	for f := range g.genFiles {
+		if rel, err := filepath.Rel(genDir, f); err == nil && !strings.HasPrefix(rel, "..") {
+			keep[strings.Split(rel, string(filepath.Separator))[0]] = true
+		}
+	}
+	keep[filepath.Base(r.script)] = true
+	var notKept []string
+	for _, k := range sortedKeys(keep) {
+		notKept = append(notKept, "! -name "+shellEscape(k))
+	}
+	clear := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -maxdepth 1 %s -exec rm -rf -- {} + || exit 1\n", shellEscape(genDir),
+		shellEscape(genDir), strings.Join(notKept, " "))
 	// sbox validates the outputs after the command (validateOutputFiles); ninja would only notice a missing
 	// one in a consumer
 	check := "\nrc=$?\n[ $rc -eq 0 ] || exit $rc\nfor f in " + outs +
