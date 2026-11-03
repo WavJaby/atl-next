@@ -17,7 +17,7 @@ use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, PackageInfo, ProviderInfo, ProviderInfoList,
+    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::os::Bundle;
@@ -114,6 +114,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.pm.ProviderInfo" => round_trip_as::<ProviderInfo>(input, mode),
         "android.content.pm.ProviderInfoList" => round_trip_as::<ProviderInfoList>(input, mode),
         "android.content.pm.PackageInfo" => round_trip_as::<PackageInfo>(input, mode),
+        "android.content.pm.InstrumentationInfo" => {
+            round_trip_as::<InstrumentationInfo>(input, mode)
+        }
         "android.content.res.Configuration" => round_trip_as::<Configuration>(input, mode),
         "android.content.res.CompatibilityInfo" => round_trip_as::<CompatibilityInfo>(input, mode),
         "android.content.Intent" => round_trip_as::<Intent>(input, mode),

@@ -11,6 +11,7 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ProviderInfo;
 import android.content.pm.ProviderInfoList;
@@ -68,6 +69,7 @@ public class ParcelTruth {
         holder.noReleaseNeeded = true;
         check("ContentProviderHolder", holder, ContentProviderHolder.CREATOR);
         check("PackageInfo", packageInfo(ai), PackageInfo.CREATOR);
+        check("InstrumentationInfo", instrumentationInfo(ai), InstrumentationInfo.CREATOR);
         ClientTransaction transaction = new ClientTransaction();
         transaction.addTransactionItem(new LaunchActivityItem(null, intent, 3, activity, config, new Configuration(), 0,
                 "com.example.referrer", null, 2, null, null, null, null, null, true, null, null, null, null, false, null, null,
@@ -187,6 +189,32 @@ public class ParcelTruth {
         p.requestedPermissionsFlags = new int[] {PackageInfo.REQUESTED_PERMISSION_GRANTED};
         p.compileSdkVersion = 35;
         return p;
+    }
+
+    /// The test package's InstrumentationInfo (AMS's instrumentation record), each field distinct from its default.
+    static InstrumentationInfo instrumentationInfo(ApplicationInfo ai) {
+        InstrumentationInfo i = new InstrumentationInfo();
+        i.name = "com.example.app.test.Runner";
+        i.packageName = "com.example.app.test";
+        i.nonLocalizedLabel = "Example tests";
+        i.icon = 0x7f080004;
+        i.targetPackage = ai.packageName;
+        i.targetProcesses = "*";
+        i.sourceDir = ai.sourceDir;
+        i.publicSourceDir = ai.publicSourceDir;
+        i.splitNames = new String[] {"config.xxhdpi"};
+        i.splitSourceDirs = new String[] {"/data/app/com.example.app/split_config.xxhdpi.apk"};
+        i.splitPublicSourceDirs = i.splitSourceDirs;
+        i.dataDir = ai.dataDir;
+        i.deviceProtectedDataDir = "/data/user_de/0/com.example.app";
+        i.credentialProtectedDataDir = ai.dataDir;
+        i.primaryCpuAbi = "x86_64";
+        i.secondaryCpuAbi = "x86";
+        i.nativeLibraryDir = ai.nativeLibraryDir;
+        i.secondaryNativeLibraryDir = "/data/app/com.example.app/lib/x86";
+        i.handleProfiling = true;
+        i.functionalTest = true;
+        return i;
     }
 
     static byte[] marshal(Parcelable p) {

@@ -15,6 +15,7 @@ pub mod android {
         pub mod pm {
             pub mod ActivityInfo;
             pub mod ApplicationInfo;
+            pub mod InstrumentationInfo;
             pub mod PackageInfo;
             pub mod ProviderInfo;
             pub mod ProviderInfoList;
