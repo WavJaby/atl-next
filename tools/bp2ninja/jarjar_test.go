@@ -83,6 +83,18 @@ func TestJarjarRepackaging(t *testing.T) {
 	if n.renames["com.x.flags.Flags"] != "com.android.internal.hidden_from_bootclasspath.com.x.flags.Flags" {
 		t.Errorf("renames %v", n.renames)
 	}
+	// base.go compile localHeaderJars: the unmodified header (javac's jar without the renames, through jarjar_rules) then the
+	// repackaged one; libs dependents compile against both
+	plain, repackaged := filepath.Join(dir, "plain-header", "fw.jar"), filepath.Join(dir, "javac-header", "fw.jar")
+	if got := n.headers(); len(got) != 2 || got[0] != plain || got[1] != repackaged {
+		t.Errorf("headers %v", got)
+	}
+	if e := ninjaEdgeVars(ninja, plain); e == nil || !strings.Contains(e[""], filepath.Join(dir, "jarjar", "plain", "fw.jar")) {
+		t.Errorf("plain header %v", e)
+	}
+	if e := ninjaEdgeVars(ninja, filepath.Join(dir, "jarjar", "plain", "fw.jar")); e == nil || !strings.Contains(e[""], filepath.Join(dir, "javac", "fw.jar")) {
+		t.Errorf("plain jarjar %v", e)
+	}
 }
 
 func TestCombinedApis(t *testing.T) {

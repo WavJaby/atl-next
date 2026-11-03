@@ -46,12 +46,14 @@ type jNode struct {
 	props *Obj
 	dir   string // build directory of this variant
 
-	header  string   // HeaderJars (one jar)
-	impl    []string // TransitiveStaticLibsImplementationJars
-	res     []string // TransitiveStaticLibsResourceJars
-	implRes string   // ImplementationAndResourcesJars
-	dex     string   // dex jar: device and (installable or compile_dex)
-	srcjar  string   // droidstubs / java_aconfig_library sources
+	header string // HeaderJars (one jar)
+	// RepackagedHeaderJars: the header with inherited rename rules applied, exported beside header ("" = not repackaged)
+	repackagedHeader string
+	impl             []string // TransitiveStaticLibsImplementationJars
+	res              []string // TransitiveStaticLibsResourceJars
+	implRes          string   // ImplementationAndResourcesJars
+	dex              string   // dex jar: device and (installable or compile_dex)
+	srcjar           string   // droidstubs / java_aconfig_library sources
 	// java_system_modules: --system directory, the files that stand for it, header jars of its libs
 	sysDir  string
 	sysDeps []string
@@ -216,6 +218,14 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 	}
 	j.order = append(j.order, n)
 	return n
+}
+
+// headers: what a libs dependent compiles against (collectDeps libTag): the header jar, then the repackaged one when it differs.
+func (n *jNode) headers() []string {
+	if n.repackagedHeader != "" {
+		return []string{n.header, n.repackagedHeader}
+	}
+	return []string{n.header}
 }
 
 // hostForDevice is java_host_for_device (device_host_converter.go): the host variants of its libs as a device library, their jars
@@ -470,8 +480,8 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 		// SDK classpath libs are libTag dependencies (sdkDeps): their exported aidl include dirs count as a libs entry's do
 		for _, r := range sd.classpath {
 			if b := dep(r, Device); b != nil {
-				d.classpath = append(d.classpath, b.header)
-				d.dexClasspath = append(d.dexClasspath, b.header)
+				d.classpath = append(d.classpath, b.headers()...)
+				d.dexClasspath = append(d.dexClasspath, b.headers()...)
 				d.aidlIncludes = append(d.aidlIncludes, b.aidlExport...)
 			}
 		}
@@ -497,8 +507,8 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 				g.problem("%s: libs %s provides no jar", n.name, r)
 				continue
 			}
-			d.classpath = append(d.classpath, l.header)
-			d.dexClasspath = append(d.dexClasspath, l.header)
+			d.classpath = append(d.classpath, l.headers()...)
+			d.dexClasspath = append(d.dexClasspath, l.headers()...)
 			d.aidlIncludes = append(d.aidlIncludes, l.aidlExport...)
 			addPlugins(l.expPluginJars, l.expProcessors)
 		}
@@ -695,7 +705,7 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		srcs = append(srcs, p.obj("openjdk9").strs("srcs")...)
 	}
 	g.implicitJavaLibs(n, srcs)
-	d, _ := g.collectJavaDeps(n, s)
+	d, statics := g.collectJavaDeps(n, s)
 	if n.typ == "java_plugin" {
 		n.processor = p.str("processor_class")
 	}
@@ -745,7 +755,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 			flags = append(flags, "--patch-module="+pm+"="+strings.Join(paths, ":"))
 		}
 	}
-	var localImpl []string
+	// localPlain: the compiled jars before repackaging, for the unmodified header jar exported beside the repackaged one
+	var localImpl, localPlain []string
 	// compile: jarjar rename rules inherited from dependencies (jarjar.go), applied to each compiled jar (repackageFlagsIfNecessary)
 	repackage := g.repackageRules(n, srcs, s)
 	if p.boolean("headers_only", false) {
@@ -761,12 +772,14 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		kt, kh := filepath.Join(n.dir, "kotlin", jar), filepath.Join(n.dir, "kotlin_headers", jar)
 		g.kotlinc(n, kt, kh, java, src.kt, srcjars, waits, ver, d)
 		localImpl = append(localImpl, g.repackage(n, kt, repackage, "kotlinc", jar))
+		localPlain = append(localPlain, kt)
 		d.classpath = append([]string{kh}, d.classpath...)
 	}
 	if len(java)+len(srcjars) > 0 {
 		classes := out("javac")
 		g.javac(n, classes, java, srcjars, waits, flags, ver, d)
 		localImpl = append(localImpl, g.repackage(n, classes, repackage, "javac", jar))
+		localPlain = append(localPlain, classes)
 	}
 
 	// resources (java_resource_dirs, java_resources)
@@ -860,6 +873,35 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 	if impl != "" {
 		n.header = out("javac-header")
 		j.edgeV("header", []string{n.header}, []string{impl}, nil, nil, validations, nil)
+	}
+	if repackage != "" && impl != "" {
+		// base.go compile: a repackaged module exports its unmodified header jar and the repackaged one (localHeaderJars); dependents
+		// compile against both, so sources naming the original classes (ims-common: telephony flags hidden in framework) still resolve
+		plain := dedupKeep(append(append([]string{}, localPlain...), d.staticImpl...))[0]
+		if len(localPlain)+len(d.staticImpl) > 1 {
+			plain = filepath.Join(n.dir, "plain-combined", jar)
+			j.combine(plain, dedupKeep(append(append([]string{}, localPlain...), d.staticImpl...)), "")
+		}
+		if rules := g.jarjarRulesFile(n); rules != "" {
+			pj := filepath.Join(n.dir, "jarjar", "plain", jar)
+			g.jarjar(n, pj, plain, rules, 1)
+			plain = pj
+		}
+		n.repackagedHeader = n.header
+		n.header = filepath.Join(n.dir, "plain-header", jar)
+		j.edge("header", []string{n.header}, []string{plain}, nil, nil, nil)
+	}
+	// a static lib's two headers reach this module's header as Soong combines the static libs' HeaderJars (framework <- framework-minus-apex)
+	var staticPlain []string
+	for _, l := range statics {
+		if l.repackagedHeader != "" {
+			staticPlain = append(staticPlain, l.header)
+		}
+	}
+	if len(staticPlain) > 0 && n.header != "" && n.repackagedHeader == "" {
+		h := filepath.Join(n.dir, "header-with-plain", jar)
+		j.combine(h, append([]string{n.header}, staticPlain...), "")
+		n.header = h
 	}
 
 	// implementation + resources
