@@ -82,6 +82,7 @@ pub struct JavaFixture {
 }
 
 /// The boot classpath list the Java pipeline wrote into `java_out` (BOOTCLASSPATH); absent when its goal `platform-bootclasspath` was not built or a jar on it could not be.
+/// The converter writes the list from declared dex paths, not from built outputs, so a jar the failed build never made can be listed: every listed jar must exist, and the error names those that do not.
 fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
     let file = java_out.join(BOOTCLASSPATH);
     let text = std::fs::read_to_string(&file).with_context(|| {
@@ -91,11 +92,24 @@ fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
             java_out.display()
         )
     })?;
-    Ok(text
+    let jars: Vec<PathBuf> = text
         .lines()
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
-        .collect())
+        .collect();
+    let missing: Vec<String> = jars
+        .iter()
+        .filter(|j| !j.is_file())
+        .map(|j| j.display().to_string())
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "{} lists {} jar(s) that were not built; rebuild platform-bootclasspath: {}",
+        file.display(),
+        missing.len(),
+        missing.join(", ")
+    );
+    Ok(jars)
 }
 
 impl HostArt {
