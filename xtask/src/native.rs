@@ -139,9 +139,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("native: system {row} (pkg-config {pkg}) -> {}", libs(&p));
         systems.insert(row, p);
     }
+    let libcxx = PathBuf::from(
+        crate::host_art::output(
+            Command::new(&converter).args(["-libcxx-headers", "-cxx", &args.cxx]),
+            "bp2ninja -libcxx-headers",
+        )?
+        .trim(),
+    );
     let toolchain = upstream::Toolchain {
         cc: &args.cc,
         cxx: &args.cxx,
+        libcxx: &libcxx,
     };
     let checkouts = sources.checkouts(None);
     // by module: a recipe installs one artifact per module it provides

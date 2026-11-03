@@ -45,7 +45,12 @@ pub fn recipe(name: &str) -> Option<&'static Recipe> {
 pub struct Toolchain<'a> {
     pub cc: &'a str,
     pub cxx: &'a str,
+    /// The libc++ headers `cxx` is installed with, as the converter derives them (`bp2ninja -libcxx-headers`), not restated here.
+    pub libcxx: &'a Path,
 }
+
+/// The link flags of the default libc++ selection (bp2ninja stl.go `stlLinkFlags`).
+const STL_LINK_FLAGS: &str = "-nostdlib++ -lc++";
 
 /// Configures, builds and installs one upstream (incremental: cmake + ninja reuse `<out>/upstream/<name>/build`; install leaves unchanged files' mtimes alone, so dependents do not relink), then its provided modules.
 pub fn build(
@@ -67,10 +72,13 @@ pub fn build(
         ("CMAKE_BUILD_TYPE", "Release".to_owned()),
         ("CMAKE_C_COMPILER", tc.cc.to_owned()),
         ("CMAKE_CXX_COMPILER", tc.cxx.to_owned()),
-        // one C++ runtime per process: the converter compiles and links all C++ against libc++
-        ("CMAKE_CXX_FLAGS", "-stdlib=libc++".to_owned()),
-        ("CMAKE_SHARED_LINKER_FLAGS", "-stdlib=libc++".to_owned()),
-        ("CMAKE_EXE_LINKER_FLAGS", "-stdlib=libc++".to_owned()),
+        // one C++ runtime per process, selected as the converter selects it for a module with the default stl (bp2ninja stl.go, after Soong's cc/stl.go non-Bionic branch)
+        (
+            "CMAKE_CXX_FLAGS",
+            format!("-nostdinc++ -isystem {}", tc.libcxx.display()),
+        ),
+        ("CMAKE_SHARED_LINKER_FLAGS", STL_LINK_FLAGS.to_owned()),
+        ("CMAKE_EXE_LINKER_FLAGS", STL_LINK_FLAGS.to_owned()),
         ("CMAKE_INSTALL_PREFIX", prefix.display().to_string()),
         // GNUInstallDirs may pick lib/<multiarch>; the artifact path below assumes lib
         ("CMAKE_INSTALL_LIBDIR", "lib".to_owned()),

@@ -60,7 +60,17 @@ func main() {
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
+	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory -cxx searches (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs); takes no other flag")
 	flag.Parse()
+	if *libcxxHeaders {
+		dir, err := libcxxProvider(*cxx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
+			os.Exit(1)
+		}
+		fmt.Println(dir)
+		return
+	}
 	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || (flag.NArg() == 0) == (*cxxProbe == "") {
 		flag.Usage()
 		os.Exit(2)
