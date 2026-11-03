@@ -532,3 +532,41 @@ impl Part for ResumeActivityItem {
         })
     }
 }
+
+/// android.view.Display.Mode (Display.java:2695 writeToParcel / Mode(Parcel)): a nested class of DisplayInfo, not an AIDL parcelable, so a Part here and no codec file.
+/// Its arrays are the Java ones (`createFloatArray` / `createIntArray`): null is -1, which Mode's constructor never produces.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisplayMode {
+    pub mode_id: i32,
+    pub width: i32,
+    pub height: i32,
+    pub peak_refresh_rate: f32,
+    pub vsync_rate: f32,
+    pub is_synthetic: bool,
+    pub alternative_refresh_rates: Option<Vec<f32>>,
+    pub supported_hdr_types: Option<Vec<i32>>,
+}
+impl Part for DisplayMode {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_i32(p, self.mode_id)?;
+        w_i32(p, self.width)?;
+        w_i32(p, self.height)?;
+        w_f32(p, self.peak_refresh_rate)?;
+        w_f32(p, self.vsync_rate)?;
+        w_bool(p, self.is_synthetic)?;
+        w_f32_array(p, &self.alternative_refresh_rates)?;
+        w_i32_array(p, &self.supported_hdr_types)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(DisplayMode {
+            mode_id: r_i32(p)?,
+            width: r_i32(p)?,
+            height: r_i32(p)?,
+            peak_refresh_rate: r_f32(p)?,
+            vsync_rate: r_f32(p)?,
+            is_synthetic: r_bool(p)?,
+            alternative_refresh_rates: r_f32_array(p)?,
+            supported_hdr_types: r_i32_array(p)?,
+        })
+    }
+}

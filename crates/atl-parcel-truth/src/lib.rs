@@ -26,6 +26,7 @@ use atl_parcelables::android::content::pm::{
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::android::view::DisplayInfo;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
@@ -252,6 +253,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.app.ActivityManager$TaskDescription" => {
             round_trip_as::<ActivityManager_TaskDescription>(input, mode)
         }
+        "android.view.DisplayInfo" => round_trip_as::<DisplayInfo>(input, mode),
         "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }

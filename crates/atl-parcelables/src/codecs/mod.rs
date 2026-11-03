@@ -32,6 +32,9 @@ pub mod android {
     pub mod os {
         pub mod Bundle;
     }
+    pub mod view {
+        pub mod DisplayInfo;
+    }
 }
 
 pub mod java {

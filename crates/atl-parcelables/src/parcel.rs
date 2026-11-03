@@ -116,6 +116,24 @@ pub fn r_i32_array(p: &In<'_>) -> Result<Option<Vec<i32>>> {
         .map(Some)
 }
 
+/// Java writeFloatArray: -1 for null, else the count and each float.
+pub fn w_f32_array(p: &mut In<'_>, v: &Option<Vec<f32>>) -> Result<()> {
+    let Some(v) = v else { return w_i32(p, -1) };
+    w_i32(p, len_i32(v.len())?)?;
+    v.iter().try_for_each(|x| w_f32(p, *x))
+}
+/// Java createFloatArray.
+pub fn r_f32_array(p: &In<'_>) -> Result<Option<Vec<f32>>> {
+    let n = r_i32(p)?;
+    if n < 0 {
+        return Ok(None);
+    }
+    (0..n)
+        .map(|_| r_f32(p))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// Java writeStrongBinder / writeStrongInterface.
 pub fn w_binder(p: &mut In<'_>, v: &Option<SpIBinder>) -> Result<()> {
     p.write(v)

@@ -27,6 +27,8 @@ import android.content.pm.SharedLibraryInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
 import android.graphics.Rect;
+import android.view.Display;
+import android.view.DisplayInfo;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -83,6 +85,8 @@ public class ParcelTruth {
         check("ActivityInfo", activity, ActivityInfo.CREATOR);
         // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
         check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);
+        // IDisplayManager.getDisplayInfo's record (DisplayInfo.writeToParcel): every field set off its default, its Mode arrays in use
+        check("DisplayInfo", displayInfo(), DisplayInfo.CREATOR);
         check("Configuration", config, Configuration.CREATOR);
         check("CompatibilityInfo", CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO, CompatibilityInfo.CREATOR);
         check("Intent", intent, Intent.CREATOR);
@@ -354,6 +358,66 @@ public class ParcelTruth {
         a.taskAffinity = "com.example.task";
         a.targetActivity = "com.example.app.Target";
         return a;
+    }
+
+    /// The default display's DisplayInfo as a test value (1280x800 at 60 Hz, 160 dpi: the model default of atl-services' display_model.rs): each field off its default, the nested
+    /// parcelables null (the codec models them null only).
+    static DisplayInfo displayInfo() {
+        DisplayInfo info = new DisplayInfo();
+        info.layerStack = 1;
+        info.flags = 0x20;
+        info.type = Display.TYPE_INTERNAL;
+        info.displayId = Display.DEFAULT_DISPLAY;
+        info.displayGroupId = 3;
+        info.name = "ATL display";
+        info.uniqueId = "local:0";
+        info.appWidth = 1280;
+        info.appHeight = 800;
+        info.smallestNominalAppWidth = 800;
+        info.smallestNominalAppHeight = 800;
+        info.largestNominalAppWidth = 1280;
+        info.largestNominalAppHeight = 1280;
+        info.logicalWidth = 1280;
+        info.logicalHeight = 800;
+        info.rotation = 1;
+        info.modeId = 1;
+        info.renderFrameRate = 60f;
+        info.hasArrSupport = true;
+        info.supportedRefreshRates = new float[] {60f, 30f};
+        info.defaultModeId = 1;
+        info.userPreferredModeId = 2;
+        info.supportedModes = new Display.Mode[] {
+            new Display.Mode(1, 1280, 800, 60f, 60f, false, new float[] {30f, 48f}, new int[] {1, 3}),
+            new Display.Mode(2, 1920, 1080, 50f, 49.9f, true, new float[0], new int[0]),
+        };
+        info.appsSupportedModes = new Display.Mode[] {
+            new Display.Mode(1, 1280, 800, 60f),
+        };
+        info.colorMode = 1;
+        info.supportedColorModes = new int[] {0, 7};
+        info.isForceSdr = true;
+        info.minimalPostProcessingSupported = true;
+        info.logicalDensityDpi = 160;
+        info.physicalXDpi = 159.5f;
+        info.physicalYDpi = 160.5f;
+        info.appVsyncOffsetNanos = 1000L;
+        info.presentationDeadlineNanos = 2000000L;
+        info.state = Display.STATE_ON;
+        info.committedState = Display.STATE_ON;
+        info.ownerUid = 10123;
+        info.ownerPackageName = "com.example.owner";
+        info.removeMode = 1;
+        info.refreshRateOverride = 0f;
+        info.brightnessMinimum = 0.1f;
+        info.brightnessMaximum = 1.0f;
+        info.brightnessDefault = 0.5f;
+        info.brightnessDim = 0.2f;
+        info.userDisabledHdrTypes = new int[] {2};
+        info.installOrientation = 1;
+        info.hdrSdrRatio = 1.5f;
+        info.thermalBrightnessThrottlingDataId = "default";
+        info.canHostTasks = true;
+        return info;
     }
 
     /// ActivityManager.TaskDescription with every field off its default (colours opaque, as the setters require; no icon, which the codec does not model).
