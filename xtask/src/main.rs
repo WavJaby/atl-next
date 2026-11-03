@@ -44,6 +44,7 @@ mod spdx;
 mod system;
 mod triage;
 mod upstream;
+mod window;
 mod workspace;
 
 use std::collections::BTreeSet;
@@ -154,6 +155,10 @@ enum Test {
     /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the unimplemented-call and refused-parcelable counters summed over the run, most hit first. `<out>/cts/report.json` holds every test's outcome.
     /// Exit status is nonzero only for harness errors and, with `--baseline <report.json>`, for modules or tests that got worse than that saved report; failing tests are the metric, not errors.
     Cts(cts::Args),
+    /// The window path, one stage at a time. `--stage resume` (M3 plan step 1, slice 1): a software window fixture (xtask/testdata/window) is started through atld, as `xtask test app` starts its app; pass = its activity's onResume is logged.
+    ///
+    /// The app then calls into WindowManager, which no service provides yet: its log after the marker and the services' counters that rose after it are printed.
+    Window(window::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -189,6 +194,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Cts(args),
         } => cts::run(&root, &args),
+        Command::Test {
+            test: Test::Window(args),
+        } => window::run(&root, &args),
     }
 }
 
