@@ -91,7 +91,7 @@ type javaGraph struct {
 // javaTypes: module types built by java nodes (after soong_config_module_type unwrapping).
 var javaTypes = map[string]bool{
 	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true,
-	"java_import": true, "java_import_host": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
+	"java_import": true, "java_import_host": true, "android_library_import": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
 	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true, "java_host_for_device": true,
 }
 
@@ -197,7 +197,7 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 	switch t {
 	case "java_system_modules":
 		g.sysModules(n)
-	case "java_import", "java_import_host":
+	case "java_import", "java_import_host", "android_library_import":
 		g.javaImport(n)
 	case "droidstubs":
 		g.droidstubs(n)
@@ -463,8 +463,8 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 	p := n.props
 	dep := func(ref string, side Side) *jNode { return g.jnode(ref, side, n.name) }
 	var statics []*jNode
-	// java_import adds no SDK dependencies (Import.DepsMutator: libs and static_libs only)
-	if n.side == Device && n.typ != "java_import" {
+	// java_import adds no SDK dependencies (Import.DepsMutator: libs and static_libs only); AARImport neither (aar.go DepsMutator: its framework-res dependency is resources)
+	if n.side == Device && n.typ != "java_import" && n.typ != "android_library_import" {
 		sd, err := g.decodeSdk(n, s)
 		if err != nil {
 			g.problem("%s: %v", n.name, err)
@@ -1111,12 +1111,19 @@ func (g *Graph) jtool(name, from string) string {
 	return t.tool
 }
 
-// javaImport is java_import / java_import_host: the jars (and static_libs) combined into one; header = implementation.
+// javaImport is java_import / java_import_host / android_library_import: the jars (and static_libs) combined into one; header = implementation.
 func (g *Graph) javaImport(n *jNode) {
 	p := n.props
 	var jars []string
 	for _, f := range g.globs(n.mod.Dir, p.strs("jars")) {
 		jars = append(jars, g.abs(f))
+	}
+	if n.typ == "android_library_import" {
+		classes, ok := g.aarClasses(n)
+		if !ok {
+			return
+		}
+		jars = append(jars, classes)
 	}
 	_, statics := g.collectJavaDeps(n, sdkSpec{kind: "none"})
 	for _, s := range statics {
@@ -1136,6 +1143,21 @@ func (g *Graph) javaImport(n *jNode) {
 		n.header = c
 	}
 	n.implRes = n.header
+}
+
+// aarClasses is android_library_import's classes jar: its one aar unzipped, then classes.jar and libs/*.jar merged (aar.go unzipAAR).
+// res/ and the manifest are not read: a Java classpath needs neither.
+func (g *Graph) aarClasses(n *jNode) (string, bool) {
+	aars := n.props.strs("aars")
+	if len(aars) != 1 {
+		g.problem("%s: android_library_import needs exactly one aar, has %d", n.name, len(aars))
+		return "", false
+	}
+	dir := filepath.Join(n.dir, "aar")
+	out := filepath.Join(dir, n.name+".jar")
+	g.java.edge("aar", []string{out}, []string{g.abs(filepath.Join(n.mod.Dir, aars[0]))}, nil, nil,
+		[][2]string{{"outdir", esc(filepath.Join(dir, "unzipped"))}})
+	return out, true
 }
 
 // sysModules is java_system_modules: its libs' header jars through jmod + jlink into a --system directory (system_modules.go).
@@ -1355,6 +1377,9 @@ rule jar
 rule combine
   command = $mergezips --ignore-duplicates -j $args $out $in
   description = merge $out
+rule aar
+  command = rm -rf $outdir && mkdir -p $outdir && unzip -qoDD -d $outdir $in && $mergezips $out $$(ls $outdir/classes.jar 2> /dev/null) $$(ls $outdir/libs/*.jar 2> /dev/null)
+  description = aar $out
 rule header
   command = $zip2zip -i $in -o $out -x 'META-INF/services/**/*'
   description = header $out
