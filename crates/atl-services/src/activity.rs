@@ -39,6 +39,7 @@ use binder::{
     ThreadState,
 };
 
+use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
@@ -89,12 +90,30 @@ const INSTR_FLAG_ALWAYS_CHECK_SIGNATURE: i32 = 1 << 4;
 const USER_CURRENT: i32 = -2;
 const USER_SYSTEM: i32 = 0;
 
-/// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), reduced to what the services know: font scale 1 (the `font_scale` setting's default) and the locale.
-/// Screen size, density and the input fields stay undefined (0) until the display and input come from the platform layer.
-fn global_configuration() -> Configuration {
+/// Configuration.ORIENTATION_PORTRAIT / ORIENTATION_LANDSCAPE (Configuration.java:713-714) and DisplayMetrics.DENSITY_DEFAULT (160): the density a dpi is measured against.
+const ORIENTATION_PORTRAIT: i32 = 1;
+const ORIENTATION_LANDSCAPE: i32 = 2;
+const DENSITY_DEFAULT: f32 = 160.0;
+
+/// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale,
+/// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
+/// The input fields stay undefined (0) until the platform layer supplies input.
+fn global_configuration(display: &DisplayModel) -> Configuration {
+    let density = display.dpi as f32 / DENSITY_DEFAULT;
+    let width_dp = (display.width as f32 / density + 0.5) as i32;
+    let height_dp = (display.height as f32 / density + 0.5) as i32;
     Configuration {
         font_scale: 1.0,
         locale_list: Some(DEFAULT_LOCALE.to_owned()),
+        density_dpi: display.dpi,
+        screen_width_dp: width_dp,
+        screen_height_dp: height_dp,
+        smallest_screen_width_dp: width_dp.min(height_dp),
+        orientation: if width_dp <= height_dp {
+            ORIENTATION_PORTRAIT
+        } else {
+            ORIENTATION_LANDSCAPE
+        },
         ..Configuration::default()
     }
 }
@@ -240,6 +259,8 @@ struct Inner {
     reporter: Reporter,
     controller: SpIBinder,
     settings: SpIBinder,
+    /// the display the configuration of every started app is made from (display_model.rs)
+    display: DisplayModel,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -265,7 +286,11 @@ fn illegal_argument(msg: &str) -> Status {
 }
 
 impl ActivityManager {
-    pub fn new(packages: Arc<Packages>, control: Arc<dyn ProcessControl>) -> Self {
+    pub fn new(
+        packages: Arc<Packages>,
+        control: Arc<dyn ProcessControl>,
+        display: DisplayModel,
+    ) -> Self {
         let controller = BnActivityClientController::new_binder(
             ActivityClientController,
             BinderFeatures::default(),
@@ -279,6 +304,7 @@ impl ActivityManager {
                 reporter: Reporter::new(),
                 controller,
                 settings: settings::new_binder(),
+                display,
             }),
         }
     }
@@ -386,7 +412,7 @@ impl Inner {
         LaunchActivityItem {
             activity_token: Some(token),
             ident,
-            cur_config: Some(global_configuration()),
+            cur_config: Some(global_configuration(&self.display)),
             override_config: Some(Configuration::default()),
             device_id: DEVICE_ID_DEFAULT,
             proc_state: PROCESS_STATE_TOP,
@@ -712,7 +738,7 @@ impl IActivityManager for ActivityManager {
             false,
             false,
             false,
-            Some(&global_configuration()),
+            Some(&global_configuration(&inner.display)),
             Some(&CompatibilityInfo::default()),
             None,
             Some(&core_settings),

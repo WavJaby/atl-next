@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Mount, Process, Spawn, kill_sandbox};
+use atl_services::display_model::DisplayModel;
 use atl_services::packages::{Library, Manifest, PackageRecord};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -83,6 +84,9 @@ struct Args {
     /// A package whose launcher activity the services start once they are up.
     #[arg(long)]
     launch: Option<String>,
+    /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the services use the model's default.
+    #[arg(long, value_parser = DisplayModel::parse_arg)]
+    display: Option<DisplayModel>,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -548,6 +552,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     if let Some(p) = &a.launch {
         services_args.extend(["--launch".into(), p.into()]);
+    }
+    if let Some(d) = &a.display {
+        services_args.extend(["--display".into(), d.to_arg().into()]);
     }
     let mut services = host
         .broker

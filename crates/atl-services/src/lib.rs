@@ -12,6 +12,7 @@ extern crate atl_parcelables;
 extern crate binder;
 
 pub mod counters;
+pub mod display_model;
 pub mod manifest_flags;
 pub mod packages;
 pub mod permission;
@@ -28,3 +29,5 @@ pub mod package;
 pub mod settings;
 #[cfg(feature = "converter")]
 mod token;
+#[cfg(feature = "converter")]
+pub mod window;
