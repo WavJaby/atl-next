@@ -54,7 +54,8 @@ type genRule struct {
 	deps     []string // what consumers wait for: the outputs, or one phony behind many
 	phony    string
 	script   string
-	broken   string // first reason the command cannot run
+	edge     *genEdge // a generator that is one tool edge, not a script (cc_preprocess_no_configuration, preprocess.go)
+	broken   string   // first reason the command cannot run
 }
 
 func isGenType(t string) bool {
@@ -641,6 +642,10 @@ func (g *Graph) genScript(n *Node) string {
 // emitGen writes the build edge of one genrule node and records its script for the caller to write.
 func (g *Graph) emitGen(b *strings.Builder, n *Node) {
 	r := n.rule
+	if r.edge != nil {
+		g.emitEdge(b, *r.edge)
+		return
+	}
 	g.genFile(r.script, g.genScript(n))
 	var implicit []string
 	for _, f := range append(append([]string{}, r.inputs...), r.implicit...) {

@@ -754,6 +754,12 @@ func (g *Graph) resolveSrc(dir string, side Side, s, from string) (files []srcFi
 			return nil, false
 		}
 		return []srcFile{{path: g.objectOut(o), obj: o}}, true
+	case m != nil && g.baseType(m.Type) == ccPreprocessType:
+		pn := g.preprocessNode(s, side, from)
+		if pn == nil {
+			return nil, false
+		}
+		return []srcFile{{path: pn.rule.outs[0], root: g.genDir(pn, ""), gen: pn}}, true
 	case m != nil && isGenType(g.baseType(m.Type)):
 		gn := g.genNode(s, side, from)
 		// providers.toml none: dropped
