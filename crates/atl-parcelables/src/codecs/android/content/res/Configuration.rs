@@ -4,7 +4,42 @@
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// `new Configuration()` (Configuration.java: `unset()` = `setToDefaults()` with fontScale 0): every `*_UNDEFINED` constant is 0, the locale list is the empty one, never null (`readFromParcel` calls `mLocaleList.get(0)`).
+impl Default for Configuration {
+    fn default() -> Self {
+        Configuration {
+            font_scale: 0.0,
+            mcc: 0,
+            mnc: 0,
+            locale_list: Some(String::new()),
+            user_set_locale: false,
+            touchscreen: 0,
+            keyboard: 0,
+            keyboard_hidden: 0,
+            hard_keyboard_hidden: 0,
+            navigation: 0,
+            navigation_hidden: 0,
+            orientation: 0,
+            screen_layout: 0,
+            color_mode: 0,
+            ui_mode: 0,
+            screen_width_dp: 0,
+            screen_height_dp: 0,
+            smallest_screen_width_dp: 0,
+            density_dpi: 0,
+            compat_screen_width_dp: 0,
+            compat_screen_height_dp: 0,
+            compat_smallest_screen_width_dp: 0,
+            window_configuration: WindowConfiguration::default(),
+            assets_seq: 0,
+            seq: 0,
+            font_weight_adjustment: 0,
+            grammatical_gender: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Configuration {
     pub font_scale: f32,
     pub mcc: i32,
