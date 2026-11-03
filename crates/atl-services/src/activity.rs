@@ -2,7 +2,8 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java, frameworks/base/services/core/java/com/android/server/am/ProcessList.java, frameworks/base/services/core/java/com/android/server/am/InstrumentationReporter.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderHelper.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java, frameworks/base/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java, frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java
 //! IActivityManager + the ActivityTaskManager launch path + IActivityClientController, subset: a process the services started attaches (attachApplication -> bindApplication), finishes attaching
 //! (finishAttachApplication -> scheduleTransaction(LaunchActivityItem) of its launcher activity), asks for the settings provider (getContentProvider) and its display (getDisplayId);
-//! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process).
+//! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process), and the broadcast calls a test runner makes
+//! (broadcastIntentWithFeature, registerReceiverWithFeature: validated as AOSP does, then nothing is delivered).
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); every other method is counted unimplemented (counters).
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
@@ -26,7 +27,7 @@ use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
-use atl_parcelables::android::content::{ComponentName, Intent};
+use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
@@ -1038,6 +1039,47 @@ impl IActivityManager for ActivityManager {
         }
         counters::count(AM, "broadcastIntentWithFeature (no receivers: dropped)");
         Ok(BROADCAST_SUCCESS)
+    }
+
+    /// ActivityManagerService.registerReceiverWithFeature -> BroadcastController.registerReceiverWithFeature:249 -> registerReceiverWithFeatureTraced:296: the caller's process is looked up by its thread
+    /// (unknown: logged, null, :312-315); a caller package the process does not run is a SecurityException (:316-320; core uids, below 10000, are exempt: UserHandle.isCore). M2 / CTS minimum, the
+    /// counterpart of broadcastIntentWithFeature's: the registration is not kept (no broadcast is delivered to a registered receiver, so none is lost by that) and there is no sticky broadcast to answer
+    /// with, so the result is null; counted. The filter was decoded, so a filter with parts the codec does not model was refused before it got here.
+    fn r#registerReceiverWithFeature(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        caller_package: Option<&str>,
+        _calling_feature_id: Option<&str>,
+        _receiver_id: Option<&str>,
+        _receiver: Option<&Strong<dyn IIntentReceiver>>,
+        _filter: Option<&IntentFilter>,
+        _required_permission: Option<&str>,
+        _user_id: i32,
+        _flags: i32,
+    ) -> binder::Result<Option<Intent>> {
+        let st = self.inner.state();
+        let Some(rec) = caller
+            .and_then(|t| Inner::record_for_thread(&st, t))
+            .and_then(|pid| st.processes.iter().find(|r| r.pid == pid))
+        else {
+            log(format_args!(
+                "registerReceiverWithFeature: no app for the caller"
+            ));
+            return Ok(None);
+        };
+        if permission::app_id(rec.uid) >= permission::FIRST_APPLICATION_UID
+            && caller_package != Some(rec.package.as_str())
+        {
+            return Err(security(&format!(
+                "Given caller package {caller_package:?} is not running in process {}",
+                rec.process_name
+            )));
+        }
+        counters::count(
+            AM,
+            "registerReceiverWithFeature (registration not kept: no broadcast is delivered)",
+        );
+        Ok(None)
     }
 }
 

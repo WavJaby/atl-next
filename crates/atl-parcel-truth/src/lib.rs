@@ -21,7 +21,7 @@ use atl_parcelables::android::content::pm::{
     ProviderInfo, ProviderInfoList,
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
-use atl_parcelables::android::content::{ComponentName, Intent};
+use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
@@ -238,6 +238,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.content.res.Configuration" => round_trip_as::<Configuration>(input, mode),
         "android.content.res.CompatibilityInfo" => round_trip_as::<CompatibilityInfo>(input, mode),
         "android.content.Intent" => round_trip_as::<Intent>(input, mode),
+        "android.content.IntentFilter" => round_trip_as::<IntentFilter>(input, mode),
         "android.content.ComponentName" => round_trip_as::<ComponentName>(input, mode),
         "android.os.Bundle" => round_trip_as::<Bundle>(input, mode),
         "android.app.servertransaction.ClientTransaction" => {

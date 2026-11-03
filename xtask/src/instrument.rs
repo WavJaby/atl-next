@@ -8,6 +8,8 @@
 //! (`log/am.log`); [`stdout_lines`] takes the text back out of them.
 //! Run 1 (SampleTest: passes, fails an assertion, throws): per test the codes 1 then 0 / -2 / -1, the final code -1 (RESULT_OK), the instrumented process killed by the services' finish.
 //! Run 2 (CrashTest: the process kills itself mid-run): the run ends with code 0 (RESULT_CANCELED) and `shortMsg=Process crashed.`, without a kill from the services.
+//! Run 3 (the converter-built `libcore-sdk-current-test`, androidx's AndroidJUnitRunner): LinkedHashMapTest passes; the runner's InstrumentationConnection broadcasts an Intent whose extras hold a binder and registers a receiver, which the services take (counted) without delivering.
+//! The services' counters (unimplemented calls, refused parcelables) are printed for every run.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,8 +35,8 @@ pub struct Args {
     /// `xtask native --out <dir> platform-bootclasspath am android.test.runner.impl android.test.base.impl android.test.mock.impl`.
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (build it with the Java pipeline too: its `androidx.test` runner broadcasts a Bundle holding a binder through IActivityManager.broadcastIntentWithFeature, which the services refuse, so that case fails until they take it), or both.
-    #[arg(long, value_enum, default_value = "fixture")]
+    /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (build it with the Java pipeline too; its `androidx.test` runner broadcasts a Bundle holding a binder and registers a receiver), or both.
+    #[arg(long, value_enum, default_value = "all")]
     case: CaseSet,
     /// Print every run's whole `am` output.
     #[arg(long, short)]

@@ -13,6 +13,7 @@ pub mod android {
     pub mod content {
         pub mod ComponentName;
         pub mod Intent;
+        pub mod IntentFilter;
         pub mod pm {
             pub mod ActivityInfo;
             pub mod ApplicationInfo;

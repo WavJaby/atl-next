@@ -11,6 +11,7 @@ import android.app.servertransaction.LaunchActivityItem;
 import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.InstrumentationInfo;
@@ -83,6 +84,20 @@ public class ParcelTruth {
         check("Intent+selector", withSelector, Intent.CREATOR);
         // extras (Intent.writeToParcel: writeBundle(mExtras)): a non-null Bundle after the first putExtra
         check("Intent:extras", new Intent(intent).putExtra("k", 1).putExtra("s", "v"), Intent.CREATOR);
+        // IActivityManager.registerReceiverWithFeature's filter: the lists the codec models, priority, order, autoVerify
+        IntentFilter filter = new IntentFilter("com.example.A");
+        filter.addAction("com.example.B");
+        filter.addCategory(Intent.CATEGORY_DEFAULT);
+        filter.addDataScheme("content");
+        try {
+            filter.addDataType("text/plain");
+        } catch (IntentFilter.MalformedMimeTypeException e) {
+            throw new IllegalStateException(e);
+        }
+        filter.setPriority(5);
+        filter.setOrder(3);
+        filter.setAutoVerify(true);
+        check("IntentFilter", filter, IntentFilter.CREATOR);
         check("ProviderInfo", provider, ProviderInfo.CREATOR);
         check("ProviderInfoList", ProviderInfoList.fromList(Arrays.asList(provider)), ProviderInfoList.CREATOR);
         ContentProviderHolder holder = new ContentProviderHolder(provider);
