@@ -241,6 +241,8 @@ pub fn check(root: &Path) -> Result<()> {
             arch.soong_arch_variant.as_deref().unwrap_or_default(),
             "-device-cxx-flags",
             PROBE_DIR,
+            "-cxx",
+            CXX,
         ])
         .arg("-provided")
         .arg(&provided)
