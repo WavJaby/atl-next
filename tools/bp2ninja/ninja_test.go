@@ -62,7 +62,8 @@ cc_library_static { name: "libdbg", srcs: ["d.cc"], cflags: ["-g"] }
 			if err != nil {
 				t.Fatal(err)
 			}
-			argv := strings.Fields(string(out))
+			// the compile cds to the tree root first (cwd_test.go): `cd`, the quoted root and `&&` are 3 words
+			argv := strings.Fields(string(out))[3:]
 			want := []string{launcher, "c++"}
 			if strings.HasSuffix(m[1], ".c.o") {
 				want[1] = "cc"
