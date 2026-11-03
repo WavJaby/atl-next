@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 mod compositor;
 
+use atl_parcelables::android::app::ActivityManager_TaskDescription;
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
@@ -134,6 +135,7 @@ fn copy_class(
     match class {
         "android.os.Bundle" => copy_as::<Bundle>(src, dst),
         "android.content.Intent" => copy_as::<Intent>(src, dst),
+        "android.app.servertransaction.ClientTransaction" => copy_as::<ClientTransaction>(src, dst),
         _ => Err(format!("no parcel-copy codec for {class}")),
     }
 }
@@ -247,6 +249,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_as::<ClientTransaction>(input, mode)
         }
         "android.app.ContentProviderHolder" => round_trip_as::<ContentProviderHolder>(input, mode),
+        "android.app.ActivityManager$TaskDescription" => {
+            round_trip_as::<ActivityManager_TaskDescription>(input, mode)
+        }
         "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }

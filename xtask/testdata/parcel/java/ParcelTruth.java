@@ -81,6 +81,8 @@ public class ParcelTruth {
 
         check("ApplicationInfo", ai, ApplicationInfo.CREATOR);
         check("ActivityInfo", activity, ActivityInfo.CREATOR);
+        // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
+        check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);
         check("Configuration", config, Configuration.CREATOR);
         check("CompatibilityInfo", CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO, CompatibilityInfo.CREATOR);
         check("Intent", intent, Intent.CREATOR);
@@ -354,6 +356,26 @@ public class ParcelTruth {
         return a;
     }
 
+    /// ActivityManager.TaskDescription with every field off its default (colours opaque, as the setters require; no icon, which the codec does not model).
+    static ActivityManager.TaskDescription taskDescription() {
+        ActivityManager.TaskDescription td = new ActivityManager.TaskDescription();
+        td.setLabel("ATL window test");
+        td.setPrimaryColor(0xff1565c0);
+        td.setBackgroundColor(0xfffafafa);
+        td.setBackgroundColorFloating(0xfff0f0f0);
+        td.setStatusBarColor(0xff0d47a1);
+        td.setNavigationBarColor(0xff000000);
+        td.setSystemBarsAppearance(8);
+        td.setTopOpaqueSystemBarsAppearance(4);
+        td.setEnsureStatusBarContrastWhenTransparent(true);
+        td.setEnsureNavigationBarContrastWhenTransparent(false);
+        td.setResizeMode(2);
+        td.setMinWidth(320);
+        td.setMinHeight(480);
+        td.setIconFilename("icon.png");
+        return td;
+    }
+
     static Configuration configuration() {
         Configuration c = new Configuration();
         c.fontScale = 1.25f;
@@ -474,7 +496,7 @@ public class ParcelTruth {
 
     static void check(String name, Parcelable p, Parcelable.Creator<?> creator) {
         String cls = p.getClass().getName();
-        if (cls.indexOf('$') >= 0) cls = p.getClass().getSuperclass().getName(); // CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO is an anonymous subclass
+        if (p.getClass().isAnonymousClass()) cls = p.getClass().getSuperclass().getName(); // CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO is an anonymous subclass; a nested class keeps its `$` name
         byte[] java = marshal(p);
         byte[] rust = roundTrip(cls, java, MODE_PLAIN);
         if (rust == null) {
