@@ -210,13 +210,9 @@ func (g *Graph) javaLogtags(n *jNode, files []srcFile, _ javaDeps) (java, srcjar
 //     proto.output_params append to the out params.
 //   - -I: the import root (`.` = the tree with canonical_path_from_root, the default; else the source's own root), then
 //     proto.local_include_dirs, proto.include_dirs.
-//   - Not generated, problem once per module: proto.plugin.
+//   - proto.plugin: the host tool protoc-gen-<plugin> with `--<plugin>_out=` and no lite parameter (GetProtoFlags; protoFlags adds nothing for a plugin); exclusive with proto.type.
 func (g *Graph) javaProto(n *jNode, files []srcFile, _ javaDeps) (java, srcjars []string) {
 	p := n.props.obj("proto")
-	if pl := p.str("plugin"); pl != "" {
-		g.problem("%s: proto.plugin %q is unsupported", n.name, pl)
-		return nil, nil
-	}
 	var flags, implicit []string
 	for _, d := range p.strs("local_include_dirs") {
 		flags = append(flags, "-I"+g.abs(filepath.Join(n.mod.Dir, d)))
@@ -225,18 +221,29 @@ func (g *Graph) javaProto(n *jNode, files []srcFile, _ javaDeps) (java, srcjars 
 		flags = append(flags, "-I"+g.abs(d))
 	}
 	outFlag, params := "--java_out", []string{}
-	switch t := p.str("type"); t {
-	case "stream", "micro", "nano":
-		outFlag = "--java" + t + "_out"
-		tool := g.jhost("protoc-gen-java"+t, n.name)
-		flags = append(flags, "--plugin=protoc-gen-java"+t+"="+tool)
+	pluginTool := func(plugin string) {
+		outFlag = "--" + plugin + "_out"
+		tool := g.jhost("protoc-gen-"+plugin, n.name)
+		flags = append(flags, "--plugin=protoc-gen-"+plugin+"="+tool)
 		implicit = append(implicit, tool)
-	case "lite", "":
-		params = append(params, "lite")
-	case "full":
-	default:
-		g.problem("%s: unknown proto type %q", n.name, t)
-		return nil, nil
+	}
+	if pl := p.str("plugin"); pl != "" {
+		if p.str("type") != "" {
+			g.problem("%s: only one of proto.type and proto.plugin can be specified", n.name)
+			return nil, nil
+		}
+		pluginTool(pl)
+	} else {
+		switch t := p.str("type"); t {
+		case "stream", "micro", "nano":
+			pluginTool("java" + t)
+		case "lite", "":
+			params = append(params, "lite")
+		case "full":
+		default:
+			g.problem("%s: unknown proto type %q", n.name, t)
+			return nil, nil
+		}
 	}
 	params = append(params, p.strs("output_params")...)
 	canonical := p.boolean("canonical_path_from_root", true)

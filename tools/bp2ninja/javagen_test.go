@@ -174,6 +174,36 @@ func TestJavaGenSources(t *testing.T) {
 	}
 }
 
+// proto.plugin (android/proto.go GetProtoFlags): protoc-gen-<plugin> from the host tools, `--<plugin>_out=:` (no lite parameter, no implicit runtime library), as the `am` binary uses it.
+func TestJavaProtoPlugin(t *testing.T) {
+	g := javaTestGraph(t, map[string]string{
+		"lib/Android.bp": `java_library { name: "pl", srcs: ["p/m.proto"], sdk_version: "none", system_modules: "none", proto: { plugin: "javastream" } }
+java_library { name: "both", srcs: ["p/m.proto"], sdk_version: "none", system_modules: "none", proto: { plugin: "javastream", type: "lite" } }`,
+		"lib/p/m.proto":    "",
+		"tools/Android.bp": `cc_binary_host { name: "aprotoc", srcs: ["p.cc"] } cc_binary_host { name: "protoc-gen-javastream", srcs: ["s.cc"] }`,
+		"tools/p.cc":       "", "tools/s.cc": "",
+	}, nil)
+	if n := g.jnode("pl", Device, "test"); n == nil {
+		t.Fatalf("%v", g.problems)
+	}
+	dir := filepath.Join(g.out, "device", "pl")
+	pr := ninjaEdgeVars(g.java.b.String(), filepath.Join(dir, "gen", "proto", "proto0.srcjar"))
+	tool := filepath.Join(g.out, "host", "protoc-gen-javastream", "protoc-gen-javastream")
+	want := "--javastream_out=:" + filepath.Join(dir, "gen", "proto", "proto0.tmp") + " "
+	if pr == nil || !strings.Contains(pr["cmds"], want) || !strings.Contains(pr["cmds"], "--plugin=protoc-gen-javastream="+tool) {
+		t.Errorf("proto %v, want %q and the plugin %s", pr, want, tool)
+	}
+	if strings.Contains(pr["cmds"], "lite") {
+		t.Errorf("a plugin takes no lite parameter: %q", pr["cmds"])
+	}
+	// type and plugin are exclusive (ProtoDeps)
+	g.problems = nil
+	g.jnode("both", Device, "test")
+	if !strings.Contains(strings.Join(g.problems, "\n"), "only one of proto.type and proto.plugin") {
+		t.Errorf("problems %v", g.problems)
+	}
+}
+
 func TestPythonToolBesideMain(t *testing.T) {
 	g := javaTestGraph(t, map[string]string{
 		"t/Android.bp": `

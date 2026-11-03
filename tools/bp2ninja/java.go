@@ -93,7 +93,7 @@ type javaGraph struct {
 
 // javaTypes: module types built by java nodes (after soong_config_module_type unwrapping).
 var javaTypes = map[string]bool{
-	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true,
+	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true, "java_binary": true,
 	"java_import": true, "java_import_host": true, "android_library_import": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
 	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true, "java_host_for_device": true,
 }
@@ -895,7 +895,8 @@ func (g *Graph) javaLib(n *jNode, extraSrcJars ...string) {
 		j.combine(n.implRes, append(append([]string{}, n.res...), implJars...), manifest)
 	}
 
-	compileDex := p.boolean("compile_dex", false) || p.boolean("installable", false)
+	// java_binary / java_binary_host are installable by default (java.go BinaryFactory, BinaryHostFactory); the wrapper script is not built
+	compileDex := p.boolean("compile_dex", false) || p.boolean("installable", n.typ == "java_binary")
 	if n.side == Device && compileDex && impl != "" {
 		g.javaDex(n, d, s, jar)
 	}
