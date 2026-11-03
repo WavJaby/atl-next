@@ -857,6 +857,14 @@ func (g *Graph) javaLibWith(n *jNode, extra javaExtra) {
 	manifest := ""
 	if mf := p.str("manifest"); mf != "" {
 		manifest = g.abs(filepath.Join(n.mod.Dir, mf))
+		if isRef(mf) {
+			// the property is an android:"path": `:genrule` names that module's one output (java_binary_host guice_munge)
+			if fs, _ := g.resolveSrc(n.mod.Dir, n.side, mf, n.name); len(fs) == 1 {
+				manifest = fs[0].path
+			} else {
+				g.problem("%s: manifest %s is not exactly one file", n.name, mf)
+			}
+		}
 	}
 	if mc := p.str("main_class"); mc != "" && n.typ == "java_binary_host" {
 		// java.go Binary: GenerateMainClassManifest's manifest.txt overrides the manifest

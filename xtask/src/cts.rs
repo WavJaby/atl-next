@@ -5,12 +5,11 @@
 //! unimplemented-call and refused-parcelable counters summed over the run, the list of what to implement next.
 //! The runner of a module is derived: the one `<instrumentation>` of its manifest that targets the APK itself (or the one instrumentation, when none does); a manifest with several is an error naming the rows to add a column for. Its target package must be installed (the module itself, or one of `apps`).
 //! Exit status: nonzero only when the harness itself fails (a table or staging error, no runtime) or, with `--baseline <report.json>`, when a module or a test that passed in that saved report is worse now; failing tests are the metric, not errors.
-//! A module whose APK is missing after the build is BUILD_FAIL with the first causes of its failed dependencies (ninja.log of the build directory, triage.rs), also when an older APK is still on disk.
+//! Each row is built by its own `xtask native` invocation; a row whose invocation shows a failed step in its ninja.log or a ninja load error (or never reached ninja) is BUILD_FAIL with the failed modules and their first causes (triage.rs), also when an older APK is still on disk. With `--no-build` the APKs on disk are taken as they are.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use atl_services::packages::{InstrumentationDecl, Manifest};
@@ -58,6 +57,8 @@ const LIMIT_SECS: u64 = 1800;
 const TOP_COUNTERS: usize = 15;
 /// Lines of a log shown for a module that did not reach RAN.
 const TAIL: usize = 30;
+/// Failed modules a BUILD_FAIL detail names.
+const MAX_FAILED_SHOWN: usize = 5;
 /// Where the Java pipeline puts an app's APK: `device/<module>/<module>.apk` (bp2ninja app.go).
 fn apk_path(java_out: &Path, module: &str) -> PathBuf {
     java_out.join(format!("device/{module}/{module}.apk"))
@@ -83,47 +84,45 @@ fn pick_instrumentation(m: &Manifest) -> Result<&InstrumentationDecl, String> {
     }
 }
 
-/// The failed modules of a build (`device/<name>` keys of triage's table) that `module` depends on, transitively (itself included), and the first cause line of each one that has no failed direct dependency of its own.
-fn build_blockers(
-    graph: &triage::Graph,
+/// The failed modules of a build, each with the first cause line of its most frequent error, at most `limit` of them.
+fn failed_modules(
     failures: &std::collections::BTreeMap<String, triage::Failed>,
-    module: &str,
+    limit: usize,
 ) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut todo = vec![format!("device/{module}")];
-    while let Some(m) = todo.pop() {
-        if seen.insert(m.clone()) {
-            todo.extend(graph.deps.get(&m).cloned().unwrap_or_default());
-        }
-    }
-    let mut out = Vec::new();
-    for (name, f) in failures.iter().filter(|(n, _)| seen.contains(*n)) {
-        let blocked_by_another = graph
-            .deps
-            .get(name)
-            .is_some_and(|ds| ds.iter().any(|d| failures.contains_key(d)));
-        if blocked_by_another {
-            continue;
-        }
-        let cause = f
-            .errors
-            .first()
-            .map_or_else(|| "(no cause line)".to_owned(), |c| c.line.clone());
-        out.push(format!("{name}: {cause}"));
-    }
-    out
+    failures
+        .iter()
+        .take(limit)
+        .map(|(name, f)| {
+            let cause = f
+                .errors
+                .first()
+                .map_or("(no cause line)", |c| c.line.as_str());
+            format!("{name}: {cause}")
+        })
+        .collect()
 }
 
-/// `xtask native` for the rows' modules into the Java build directory (this binary again, output in `<work>/build.log`); its exit status is not the result: a module is built when its APK is, and a failed one is told from ninja.log.
-fn build(args: &Args, java_out: &Path, goals: &BTreeSet<String>, work: &Path) -> Result<()> {
-    let log = work.join("build.log");
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// `xtask native` for one row's modules into the Java build directory (this binary again, output in `<work>/build-<row>.log`); None = it built, Some(why) = it did not.
+/// One invocation per row: a module whose graph ninja cannot even load (a dangling reference in some Android.bp) fails that whole invocation, and the other rows must not share its fate or run an APK of an earlier build.
+/// The exit status is not the verdict (a failed licence gate leaves good APKs), and neither is an APK file's presence (an earlier build's stays when this one fails): ninja's own record of this invocation is. It built when `ninja.log` was written by it (not older than its start: else it stopped before ninja) with no failed step and no `ninja: error:` in `ninja.err`.
+/// `graph.json` lists no Java module, so a failed module cannot be tied to the row by its dependencies: every failed step of the invocation counts (one row's goals plus the workspace's AIDL crates, which do not fail on their own).
+/// (`ninja -n <apk>` after the build is no verdict: measured 2026-11-04, it lists 16 steps of framework-protos and the metalava stubs again after a build that succeeded.)
+fn build_row(
+    args: &Args,
+    java_out: &Path,
+    row: &str,
+    goals: &[&str],
+    work: &Path,
+) -> Result<Option<String>> {
+    let log = work.join(format!("build-{row}.log"));
     let file = std::fs::File::create(&log)?;
-    println!(
-        "cts: building {} modules into {} (log {})",
-        goals.len(),
-        java_out.display(),
-        log.display()
-    );
+    println!("cts: {row}: building {goals:?} (log {})", log.display());
+    let start = SystemTime::now();
     let status = Command::new(std::env::current_exe().context("locating xtask")?)
         .args(["native", "--host", &args.host, "--out"])
         .arg(java_out)
@@ -132,38 +131,48 @@ fn build(args: &Args, java_out: &Path, goals: &BTreeSet<String>, work: &Path) ->
         .stderr(file)
         .status()
         .context("running xtask native")?;
-    println!("cts: build {status}");
-    Ok(())
-}
-
-/// What the build left of one module: its APK and manifest, or why it has none.
-struct Built {
-    apk: PathBuf,
-    manifest: Manifest,
-}
-
-fn built(rt: &Runtime, module: &str, blockers: &[String], log: &Path) -> Result<Built, String> {
-    let apk = apk_path(&rt.java_out, module);
-    if !blockers.is_empty() {
-        return Err(format!(
-            "{module} waits on failed modules: {}",
-            blockers.join("; ")
+    let read = |name: &str| std::fs::read_to_string(java_out.join(name)).unwrap_or_default();
+    let ninja_ran = std::fs::metadata(java_out.join("ninja.log"))
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t >= start);
+    let failures = if ninja_ran {
+        triage::failures(&read("ninja.log"), &[&format!("{}/", java_out.display())])
+    } else {
+        Default::default()
+    };
+    let ninja_err = read("ninja.err");
+    let load_error = ninja_err
+        .lines()
+        .find(|l| ninja_ran && l.contains("ninja: error:"));
+    if ninja_ran && failures.is_empty() && load_error.is_none() {
+        return Ok(None);
+    }
+    let mut why = vec![format!("xtask native {status}")];
+    why.extend(failed_modules(&failures, MAX_FAILED_SHOWN));
+    if failures.len() > MAX_FAILED_SHOWN {
+        why.push(format!(
+            "and {} more failed modules",
+            failures.len() - MAX_FAILED_SHOWN
         ));
     }
-    if !apk.is_file() {
-        return Err(format!(
-            "{} was not built (no failed module in its closure; see {})",
-            apk.display(),
-            log.display()
+    why.extend(load_error.map(str::to_owned));
+    if !ninja_ran {
+        why.push(format!(
+            "stopped before ninja ran; last log line: {}",
+            tail(&std::fs::read_to_string(&log).unwrap_or_default(), 1)
         ));
+    }
+    Ok(Some(why.join("; ")))
+}
+
+/// A module's APK and manifest; Err = why it has none.
+fn built(rt: &Runtime, module: &str) -> Result<(PathBuf, Manifest), String> {
+    let apk = apk_path(&rt.java_out, module);
+    if !apk.is_file() {
+        return Err(format!("{} does not exist", apk.display()));
     }
     let manifest = manifest::read(&rt.aapt2, &apk).map_err(|e| format!("{module}: {e:#}"))?;
-    Ok(Built { apk, manifest })
-}
-
-fn tail(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    Ok((apk, manifest))
 }
 
 /// The `am instrument` arguments of a row: wait, raw text, the filters, the component.
@@ -216,60 +225,39 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let work = rt.out.join("cts");
     std::fs::create_dir_all(&work)?;
-    let goals: BTreeSet<String> = rows
-        .iter()
-        .flat_map(|(m, r)| std::iter::once((*m).clone()).chain(r.apps.iter().cloned()))
-        .collect();
-    if !args.no_build {
-        build(args, &rt.java_out, &goals, &work)?;
-    }
-    // ninja.log of the build directory names the failed modules; with --no-build it is whatever the last build there left
-    let ninja_log = rt.java_out.join("ninja.log");
-    let failures = triage::failures(
-        &std::fs::read_to_string(&ninja_log).unwrap_or_default(),
-        &[&format!("{}/", rt.java_out.display())],
-    );
-    // the graph of that build: it must parse, or a failed dependency would go unseen and a stale APK be run
-    let graph_file = rt.java_out.join("graph.json");
-    let graph: triage::Graph = serde_json::from_str(
-        &std::fs::read_to_string(&graph_file)
-            .with_context(|| format!("reading {}", graph_file.display()))?,
-    )
-    .with_context(|| format!("parsing {}", graph_file.display()))?;
     let libraries = instrument::libraries(&rt)?;
     let limit = Duration::from_secs(args.limit_secs);
     let mut modules = Vec::new();
     let mut all_counters = Vec::new();
     for (module, row) in &rows {
         let module = module.as_str();
-        println!("cts: {module}: staging");
-        let blockers = |m: &str| build_blockers(&graph, &failures, m);
-        let test = match built(&rt, module, &blockers(module), &work.join("build.log")) {
-            Ok(b) => b,
+        let goals: Vec<&str> = std::iter::once(module)
+            .chain(row.apps.iter().map(String::as_str))
+            .collect();
+        // with --no-build the APKs on disk are taken as they are
+        let staged = match (!args.no_build)
+            .then(|| build_row(args, &rt.java_out, module, &goals, &work))
+            .transpose()?
+            .flatten()
+        {
+            Some(why) => Err(why),
+            None => goals
+                .iter()
+                .map(|g| built(&rt, g))
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        // the test APK first, then the apps, in uid order
+        let packages = match staged {
+            Ok(p) => p,
             Err(why) => {
                 println!("cts: {module}: BUILD_FAIL {why}");
                 modules.push(Module::without_run(module, State::BuildFail, why));
                 continue;
             }
         };
-        let mut packages = vec![(test.apk.clone(), test.manifest.clone())];
-        let mut missing = None;
-        for app in &row.apps {
-            match built(&rt, app, &blockers(app), &work.join("build.log")) {
-                Ok(b) => packages.push((b.apk, b.manifest)),
-                Err(why) => {
-                    missing = Some(why);
-                    break;
-                }
-            }
-        }
-        if let Some(why) = missing {
-            println!("cts: {module}: BUILD_FAIL {why}");
-            modules.push(Module::without_run(module, State::BuildFail, why));
-            continue;
-        }
+        let test = packages[0].1.clone();
         let instrumentation =
-            pick_instrumentation(&test.manifest).map_err(|e| anyhow::anyhow!("{module}: {e}"))?;
+            pick_instrumentation(&test).map_err(|e| anyhow::anyhow!("{module}: {e}"))?;
         ensure!(
             packages
                 .iter()
@@ -279,7 +267,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             instrumentation.target_package,
             cts_table::FILE
         );
-        let component = format!("{}/{}", test.manifest.name, instrumentation.name);
+        let component = format!("{}/{}", test.name, instrumentation.name);
         let run = Run {
             root: work.join(format!("root-{module}")),
             scratch: work.join(format!("scratch-{module}")),
@@ -447,30 +435,19 @@ mod tests {
         );
     }
 
-    /// A failure in a dependency of the module is its blocker, named by its first cause; a failed module that waits on another failed one is not (the root cause is), and an unrelated failure is not.
+    /// The failed modules are named with their first cause and cut at the limit.
     #[test]
-    fn blockers_are_the_root_failures_in_the_closure() {
-        let graph = triage::Graph {
-            deps: [
-                ("device/T", vec!["device/L1", "device/L2"]),
-                ("device/L1", vec!["device/Base"]),
-                ("device/L2", vec![]),
-                ("device/Other", vec![]),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.into_iter().map(str::to_owned).collect()))
-            .collect(),
-            ..triage::Graph::default()
-        };
-        let log = "FAILED: device/Base/x.o\ncmd\nbase.c:1:1: error: no such header\n[1/9] next\n\
-                   FAILED: device/L1/y.o\ncmd\ny.c:1:1: error: undeclared\n[2/9] next\n\
-                   FAILED: device/Other/z.o\ncmd\nz.c:1:1: error: unrelated\n[3/9] next\n";
+    fn failed_modules_are_named_with_their_cause() {
+        let log = "FAILED: device/B/y.o\ncmd\ny.c:1:1: error: undeclared\n[2/9] next\n\
+                   FAILED: device/A/x.o\ncmd\nx.c:1:1: error: no such header\n[1/9] next\n";
         let failures = triage::failures(log, &[]);
         assert_eq!(
-            build_blockers(&graph, &failures, "T"),
-            ["device/Base: base.c:1:1: error: no such header"]
+            failed_modules(&failures, 5),
+            [
+                "device/A: x.c:1:1: error: no such header",
+                "device/B: y.c:1:1: error: undeclared"
+            ]
         );
-        assert!(build_blockers(&graph, &failures, "Other").len() == 1);
-        assert!(build_blockers(&graph, &triage::failures("", &[]), "T").is_empty());
+        assert_eq!(failed_modules(&failures, 1).len(), 1);
     }
 }

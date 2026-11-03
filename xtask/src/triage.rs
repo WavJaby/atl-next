@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// `graph.json`: goal module directories and each module directory's step dependencies; the providers.toml
 /// `none` edges the converter dropped and those modules' export directories (none_gate.rs).
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 pub struct Graph {
     pub goals: Vec<String>,
     pub deps: BTreeMap<String, Vec<String>>,
