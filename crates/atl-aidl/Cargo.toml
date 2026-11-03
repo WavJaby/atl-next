@@ -10,12 +10,15 @@ publish.workspace = true
 # The stubs: the converter's AIDL crate `atl_aidl_stubs` (xtask packages.rs `aidl`, bp2ninja aidlcrates.go) against libbinder_rs (AOSP's Rust binder: libbinder_ndk -> libbinder), which the probe also names.
 # Only `xtask native` builds them: it builds this package after the converter with feature `converter` (atl-bridgegen converter.rs).
 # Plain workspace builds and tests take the empty library and skip the probe.
+# `android.hardware.graphics.allocator-V2-rust` is AOSP's own Rust backend of the stable HAL interface (stability vintf, frozen at V2 = its current sources): an unstable crate cannot compile @VintfStability types (aidl.cpp), so it is not one of the crate's `types`.
 [package.metadata.atl]
-converter = ["device/libbinder_rs"]
+converter = ["device/libbinder_rs", "device/android.hardware.graphics.allocator-V2-rust"]
 
-# types: IServiceManager (libbinder's own AIDL) and the M2 framework interfaces, compiled with their import closure.
+# types: IServiceManager (libbinder's own AIDL), the M2 framework interfaces, and the M3 window path (IWindowManager, IWindowSession, IWindow, IDisplayManager; libgui's `android.gui` ISurfaceComposer and its client / display-event interfaces), compiled with their import closure.
+# A type another aidl_interface owns is imported at its latest frozen version, not compiled (bp2ninja aidlcrates.go): android.hardware.graphics.common (DisplayDecorationSupport, ...) is `android.hardware.graphics.common-V6-rust`. The interfaces owning a requested type are stood in for: `android.gui` brings its rust backend's `libgui_aidl_types_rs` (BitTube, LayerMetadata, VsyncEventData, ... as `todo!()` stubs).
 # Interfaces with @EnforcePermission methods (IPackageManager, IActivityManager, ...) get a required `enforce_permission` hook (patches/aosp/system/tools/aidl): their services must implement it.
-# include_dirs: libbinder's AIDL root, then frameworks/base's `framework-aidl-export-defaults` aidl.export_include_dirs (Android.bp) in its order, then frameworks/native/aidl/binder (PersistableBundle, which framework AIDL imports).
+# include_dirs: libbinder's AIDL root, then frameworks/base's `framework-aidl-export-defaults` aidl.export_include_dirs (Android.bp) in its order, then frameworks/native/aidl/binder (PersistableBundle, which framework AIDL imports),
+# frameworks/native/aidl/gui (android.view.Surface, whose rust_type is the tree's `nativewindow` crate), libgui's own `android.gui` include_dirs (libs/gui/aidl/Android.bp), and the HAL interface roots the framework AIDL imports (graphics/common).
 # parcelables: Rust types of every unstructured parcelable and Java-only builtin (atl-parcelables).
 [package.metadata.atl.aidl]
 include_dirs = [
@@ -36,8 +39,19 @@ include_dirs = [
     "frameworks/base/telecomm/java",
     "frameworks/base/telephony/java",
     "frameworks/native/aidl/binder",
+    "frameworks/native/aidl/gui",
+    "frameworks/native/libs/gui/aidl",
+    "frameworks/native/libs/gui",
+    "hardware/interfaces/graphics/common/aidl",
 ]
 types = [
+    "android.hardware.display.IDisplayManager",
+    "android.view.IWindowManager",
+    "android.view.IWindowSession",
+    "android.view.IWindow",
+    "android.gui.ISurfaceComposer",
+    "android.gui.ISurfaceComposerClient",
+    "android.gui.IDisplayEventConnection",
     "android.os.IServiceManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",

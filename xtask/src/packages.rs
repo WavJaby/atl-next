@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Workspace packages built after the converter (`xtask native`, `xtask test native-load`): a package naming converter modules in its Cargo.toml (`[package.metadata.atl] converter`, graph.json module directories) is built with its feature `converter` once the build's graph.json `artifacts` hold every one of them; its build script links them from `$ATL_NATIVE_OUT` (atl-bridgegen converter.rs).
 //! `[package.metadata.atl.aidl]` asks for an AIDL crate: `include_dirs` (tree-relative import roots), `types` (qualified AIDL names compiled with their import closure), optional `parcelables` (a workspace package with `rust_library`: the crate giving unstructured parcelables and Java-only builtins their Rust types).
-//! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
+//! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib and the package's other modules to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
 //! `[package.metadata.atl.rust_library]` (`rustlibs`, optional `aconfig`) makes the converter build the package's `src/lib.rs` as rust_library `lib<crate>` with those rustlibs and the package's edition (Soong's `additional_rustlibs` crate of an aidl_interface), the flag dumps of the `aconfig` declarations in its OUT_DIR, and our lints (`lint_flags`, through clippy-driver, never capped); cargo builds it only as an empty library (`#![cfg(...)]`-gated), so it needs no feature. Only an aidl crate's `parcelables` reaches it.
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
 //! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted.
@@ -259,15 +259,23 @@ fn parse_rust_libraries(json: &str, lints: &[String]) -> Result<Vec<RustLibrary>
     Ok(out)
 }
 
-/// The packages' AIDL crates as bp2ninja `-aidl-crates` takes them (interface name -> crate), and their rlibs as converter goals: added to every build, so a package with `aidl` gets its crate whatever the goals (only these, not its other modules).
+/// The packages' AIDL crates as bp2ninja `-aidl-crates` takes them (interface name -> crate), and converter goals: their rlibs and the package's other modules, added to every build, so a package with `aidl` links whatever the goals
+/// (a stable HAL interface's own `-V<n>-rust` backend is such a module: no goal of the stubs' closure reaches it).
 /// A `parcelables` naming no package with `rust_library` is refused.
 pub fn aidl_crates(
     packages: &[Package],
     libraries: &[RustLibrary],
 ) -> Result<(BTreeMap<String, AidlCrate>, Vec<String>)> {
     let mut crates = BTreeMap::new();
+    let mut goals: Vec<String> = Vec::new();
     for p in packages {
         let Some(a) = &p.aidl else { continue };
+        for m in &p.modules {
+            let goal = m.strip_prefix("device/").unwrap_or(m);
+            if !goals.iter().any(|g| g == goal) {
+                goals.push(goal.to_owned());
+            }
+        }
         let parcelables = match &a.parcelables {
             None => None,
             Some(name) => Some(
@@ -292,7 +300,6 @@ pub fn aidl_crates(
             },
         );
     }
-    let goals = crates.keys().map(|i| format!("{i}-rust")).collect();
     Ok((crates, goals))
 }
 
@@ -575,7 +582,7 @@ mod tests {
             ("liblib_p", "lib_p", Path::new("/w/crates/lib-p"), "2024")
         );
         assert_eq!(crates["p-stubs"].types, ["a.IFoo"]);
-        assert_eq!(goals, ["p-stubs-rust"]);
+        assert_eq!(goals, ["libbinder_rs", "p-stubs-rust"]);
         // parcelables naming a package without rust_library
         let e = aidl_crates(&parsed, &[]).unwrap_err();
         assert!(format!("{e:#}").contains("no package with [package.metadata.atl] rust_library"));

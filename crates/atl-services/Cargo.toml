@@ -11,8 +11,9 @@ publish.workspace = true
 # The M2 system services in Rust (owner 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager, the settings IContentProvider stub.
 # They implement the converter's AIDL stubs (atl-aidl) against libbinder_rs and the parcelable codecs (libatl_parcelables), so only `xtask native` builds them (feature `converter`);
 # plain workspace builds take the policy modules (permission, counters, packages) and their tests.
+# The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust"]
 
 [features]
 converter = ["atl-aidl/converter"]
