@@ -4,7 +4,9 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -417,7 +419,7 @@ func libcHeaderLinks(provided map[string]Provided) (map[string]string, error) {
 }
 
 // writeCompat fills <out>/compat: cxx and device link their tree headers, device also the libc provider's (libcCompat), libcxx holds the shims.
-// Every entry is replaced, so a run never keeps an earlier run's target.
+// An entry is written only when its target or text changed, so an unchanged header keeps its mtime for ninja; an entry no longer wanted is removed.
 func writeCompat(tree, out string, provided map[string]Provided) error {
 	libc, err := libcHeaderLinks(provided)
 	if err != nil {
@@ -432,30 +434,100 @@ func writeCompat(tree, out string, provided map[string]Provided) error {
 	for name, f := range libc {
 		links[filepath.Join("device", name)] = f
 	}
-	place := func(rel string) (string, error) {
-		path := filepath.Join(out, "compat", rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return "", err
-		}
-		os.Remove(path)
-		return path, nil
-	}
+	root := filepath.Join(out, "compat")
+	wanted := map[string]bool{}
 	for rel, target := range links {
-		path, err := place(rel)
-		if err != nil {
-			return err
-		}
-		if err := os.Symlink(target, path); err != nil {
+		wanted[rel] = true
+		if err := placeLink(filepath.Join(root, rel), target); err != nil {
 			return err
 		}
 	}
 	for name, text := range libcxxShim {
-		path, err := place(filepath.Join("libcxx", name))
+		rel := filepath.Join("libcxx", name)
+		wanted[rel] = true
+		if err := placeFile(filepath.Join(root, rel), text); err != nil {
+			return err
+		}
+	}
+	return pruneCompat(root, wanted)
+}
+
+// placeLink leaves a symlink already pointing at target alone, else makes path one.
+func placeLink(path, target string) error {
+	if got, err := os.Readlink(path); err == nil && got == target {
+		return nil
+	}
+	if err := removeEntry(path); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(target, path)
+}
+
+// placeFile leaves a regular file already holding text alone, else writes it; a symlink there is replaced, never written through.
+func placeFile(path, text string) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
+		if b, err := os.ReadFile(path); err == nil && string(b) == text {
+			return nil
+		}
+	}
+	if err := removeEntry(path); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(text), 0o644)
+}
+
+// removeEntry removes the file or symlink at path; a missing one is no error.
+func removeEntry(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// pruneCompat removes the files and symlinks under root that wanted does not name, then each directory no wanted entry lies under.
+// WalkDir does not follow symlinks, so a link into the tree is removed, never its target.
+func pruneCompat(root string, wanted map[string]bool) error {
+	keepDir := map[string]bool{}
+	for rel := range wanted {
+		for d := filepath.Dir(rel); d != "."; d = filepath.Dir(d) {
+			keepDir[d] = true
+		}
+	}
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // first run: no compat dir yet
+		}
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == "." {
 			return err
+		}
+		switch {
+		case d.IsDir():
+			dirs = append(dirs, rel)
+		case !wanted[rel]:
+			return os.Remove(path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// deepest first: a directory is removed after what lies under it
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if !keepDir[dirs[i]] {
+			if err := os.Remove(filepath.Join(root, dirs[i])); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

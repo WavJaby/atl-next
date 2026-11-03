@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // soongTree writes the four files readSoongConfig reads, shaped like the pinned android-16.0.0_r1 ones: global.go's var block (commonGlobalCflags a ValueSpec, commonGlobalIncludes an assignment), config.go's const, bionic.go's var block, api-level.h's #define.
@@ -257,7 +258,7 @@ func TestWriteCompat(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(out, "compat", "libcxx", "xlocale.h")); err != nil || !strings.Contains(string(b), "#include <locale.h>") {
 		t.Errorf("xlocale.h: %q %v", b, err)
 	}
-	// a second run replaces every entry
+	// a second run on the same inputs succeeds (TestWriteCompatIncremental: what it touches)
 	if err := writeCompat(tree, out, provided); err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +267,77 @@ func TestWriteCompat(t *testing.T) {
 	}
 	if err := writeCompat(tree, out, map[string]Provided{"libc": {Include: []string{other}}}); err == nil || !strings.Contains(err.Error(), "hold no android/api-level.h") {
 		t.Errorf("header missing: %v", err)
+	}
+}
+
+// writeCompat on unchanged inputs touches nothing: the link to the same target keeps its inode, the shim its mtime.
+// A changed shim text and a changed target are rewritten; an entry no longer wanted goes, with its directory.
+func TestWriteCompatIncremental(t *testing.T) {
+	tree, out, gen, other := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	write := func(path, text string) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	headers := func(dir string) {
+		for _, h := range append(append([]compatHeader{}, cxxCompat...), deviceCompat...) {
+			write(filepath.Join(dir, h.path), "tree "+h.name)
+		}
+	}
+	headers(tree)
+	write(filepath.Join(gen, "android/api-level.h"), "generated")
+	provided := map[string]Provided{"libc": {Libs: []string{"x.so"}, Include: []string{other, gen}}}
+	if err := writeCompat(tree, out, provided); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(out, "compat/device/android/versioning.h")
+	shim := filepath.Join(out, "compat/libcxx/xlocale.h")
+	linkBefore, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// an arbitrary past mtime: a rewrite would show as now
+	past := time.Unix(1_000_000_000, 0)
+	if err := os.Chtimes(shim, past, past); err != nil {
+		t.Fatal(err)
+	}
+	// entries the compat set no longer names: a stale link, and a stale file in a directory of its own
+	staleLink := filepath.Join(out, "compat/device/old.h")
+	if err := os.Symlink(filepath.Join(tree, "gone.h"), staleLink); err != nil {
+		t.Fatal(err)
+	}
+	staleDir := filepath.Join(out, "compat/device/stale")
+	write(filepath.Join(staleDir, "x.h"), "stale")
+	if err := writeCompat(tree, out, provided); err != nil {
+		t.Fatal(err)
+	}
+	linkAfter, err := os.Lstat(link)
+	if err != nil || !os.SameFile(linkBefore, linkAfter) {
+		t.Errorf("unchanged link rewritten: %v", err)
+	}
+	if fi, err := os.Stat(shim); err != nil || !fi.ModTime().Equal(past) {
+		t.Errorf("unchanged shim rewritten: %v", err)
+	}
+	for _, gone := range []string{staleLink, staleDir} {
+		if _, err := os.Lstat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s kept: %v", gone, err)
+		}
+	}
+	// a changed shim text and a changed target are rewritten
+	write(shim, "edited")
+	tree2 := t.TempDir()
+	headers(tree2)
+	if err := writeCompat(tree2, out, provided); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(shim); err != nil || !strings.Contains(string(b), "#include <locale.h>") {
+		t.Errorf("edited shim not restored: %q %v", b, err)
+	}
+	if got, err := os.Readlink(link); err != nil || got != filepath.Join(tree2, compatPath(deviceCompat, "android/versioning.h")) {
+		t.Errorf("link target %q %v", got, err)
 	}
 }
 
