@@ -123,7 +123,9 @@ type Graph struct {
 	tree, out string
 	cfg       Config
 	soong     SoongConfig
-	omit      map[string]bool
+	// the libc++ headers of the stl provider: -isystem of every libc++ C++ compile (stl.go libcxxProvider)
+	libcxx string
+	omit   map[string]bool
 	// dependencies dropped by omit: "<side>/<module> <omitted module>"
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
@@ -471,7 +473,7 @@ func compatPath(set []compatHeader, name string) string {
 	panic("compat header " + name + " not in its set")
 }
 
-// stlModules: Soong's STL libraries (cc/stl.go). Every link takes the toolchain's libc++ (-stdlib=libc++, linkLibs), so a module naming one directly (libcxx's shared_libs) needs nothing more.
+// stlModules: Soong's STL libraries (cc/stl.go). Every link takes -lc++ with its module's stl selection (stl.go linkStlFlags), so a module naming one directly (libcxx's shared_libs) needs nothing more.
 var stlModules = map[string]bool{"libc++": true, "libc++_static": true}
 
 // node builds (once) the node for a reference, depth first.

@@ -24,7 +24,7 @@ type graphFile struct {
 	// module directory -> what a build outside the converter takes of it: cargo packages `xtask native` builds after ninja (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs).
 	// Rust libraries, shared libraries and binaries the emitted graph builds (broken crates and provided modules aside); the shared node of a module with both.
 	Artifacts map[string]artifact `json:"artifacts"`
-	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (-stdlib=libc++), so an outside build links with it too
+	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (its stl's -nostdlib++ / -lc++), so an outside build links with it too
 	LinkDriver string `json:"link_driver"`
 }
 

@@ -95,7 +95,7 @@ func main() {
 	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
-		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxxProbe); err != nil {
+		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {
 			fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 			os.Exit(1)
 		}
@@ -149,7 +149,7 @@ func loadSoong(tree string, cfg Config) (SoongConfig, error) {
 }
 
 // deviceCxxFlags: -device-cxx-flags. Writes <out>/compat, as a build would, and prints {"argv": probeCxxFlags(dir), "android": androidDefine}: the probe's command line and the define xtask check step libcxx toggles in it.
-func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, dir string) error {
+func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, cxx, dir string) error {
 	soong, err := loadSoong(tree, cfg)
 	if err != nil {
 		return err
@@ -158,6 +158,9 @@ func deviceCxxFlags(tree, out string, cfg Config, provided map[string]Provided, 
 		return err
 	}
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, nodes: map[key]*Node{}}
+	if g.libcxx, err = libcxxProvider(cxx); err != nil {
+		return err
+	}
 	b, err := json.Marshal(struct {
 		Argv    []string `json:"argv"`
 		Android string   `json:"android"`
@@ -188,6 +191,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
 	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, nodes: map[key]*Node{}}
+	if g.libcxx, err = libcxxProvider(tools.CXX); err != nil {
+		return err
+	}
 	// the release first: select(release_flag(…)) and the soong config variables it sets are evaluated with it
 	if js.release != "" {
 		if g.release, err = readRelease(tree, js.release); err != nil {

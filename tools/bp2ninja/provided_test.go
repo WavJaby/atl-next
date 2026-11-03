@@ -51,8 +51,9 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 				}
 			}
 		}
-		i := slices.Index(flags, "-isystem")
-		if compile == "" || i < 0 || flags[i+1] != "/prefix/include" || !slices.Contains(flags, "-DPFX=X") {
+		// the provided module's own -isystem: the libc++ provider's comes first in a C++ compile (stl.go)
+		i := slices.Index(flags, "/prefix/include")
+		if compile == "" || i < 1 || flags[i-1] != "-isystem" || !slices.Contains(flags, "-DPFX=X") {
 			t.Errorf("%s: compile flags %q", goal, flags)
 		}
 		// the tree's own export dir is not; its re-exported header library's is
