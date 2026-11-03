@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Tue, 3 Nov 2026 14:24:25 +0800
+Subject: [PATCH] libnativeloader: answer the namespace lookups when there are
+ no namespaces
+
+Without ART_TARGET_ANDROID libnativeloader exports no FindNamespaceByClassLoader / FindNativeLoaderNamespaceByClassLoader, which its lazy wrapper (native_loader_lazy.cpp) and libandroid_runtime's GraphicsEnvironment.setLayerPaths call; the wrapper dlsym()s them and, with LOG_FATAL_IF compiled out, calls the null result, so every app start crashed at GraphicsEnvironment.setLayerPaths. Both now return nullptr: no class loader has a namespace.
+
+Upstream-Status: Pending
+Patch-Reason: the symbols are libnativeloader's own API, looked up in libnativeloader.so by name; no launcher flag, loader setting or library elsewhere can define them there, and the ART_TARGET_LINUX configuration (chosen so ART needs no bionic linker) leaves out the only definitions
+---
+SPDX-License-Identifier: Apache-2.0
+ libnativeloader/native_loader.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/libnativeloader/native_loader.cpp b/libnativeloader/native_loader.cpp
+index 964279446fa315e29d180089cb2b8ed36560073e..1a4e6a6d3d1f29186b386cdf71c736e57cc97e38 100644
+--- a/libnativeloader/native_loader.cpp
++++ b/libnativeloader/native_loader.cpp
+@@ -587,6 +587,13 @@ void LinkNativeLoaderNamespaceToExportedNamespaceLibrary(struct NativeLoaderName
+   }
+ }
+ 
++#else  // !ART_TARGET_ANDROID
++
++// No linker namespaces without bionic's linker: no class loader has one.
++android_namespace_t* FindNamespaceByClassLoader(JNIEnv*, jobject) { return nullptr; }
++
++NativeLoaderNamespace* FindNativeLoaderNamespaceByClassLoader(JNIEnv*, jobject) { return nullptr; }
++
+ #endif  // ART_TARGET_ANDROID
+ 
+ }  // namespace android
