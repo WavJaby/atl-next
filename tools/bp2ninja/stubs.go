@@ -103,6 +103,13 @@ func (g *Graph) sdkLibComponent(name string, side Side) *Module {
 				props.set(k, lib.Props.m[k])
 			}
 			props.set("name", name)
+			// the jar keeps the library's name (Stem), installable defaults true as for every java_sdk_library (InitSdkLibraryProperties)
+			if !props.has("stem") {
+				props.set("stem", base)
+			}
+			if !props.has("installable") {
+				props.set("installable", true)
+			}
 			p := g.flattenJava(lib, side)
 			for from, to := range map[string]string{"impl_only_libs": "libs", "impl_only_static_libs": "static_libs"} {
 				if extra := p.strs(from); len(extra) > 0 {

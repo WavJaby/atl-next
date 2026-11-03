@@ -47,9 +47,8 @@ const LIMIT: Duration = Duration::from_secs(180);
 const TAIL: usize = 40;
 /// The services' counter lines (atl_services::counters).
 const COUNTER: &str = "services: unimplemented ";
-/// framework-res's resources in the Java pipeline's out: its aapt2 link output (bp2ninja aapt.go), which the converter writes to build R.java and does not install.
-/// Soong's framework-res.apk is this apk after manifest_fixer, zipalign and signing, none of which changes the resource table AssetManager reads.
-const FRAMEWORK_RES: &str = "gen/device/framework-res.aapt/aapt2/package-res.apk";
+/// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja aapt.go), unsigned.
+const FRAMEWORK_RES: &str = "gen/device/framework-res.aapt/framework-res.apk";
 
 /// The package as `aapt2 dump badging` reports it.
 #[derive(Debug, PartialEq)]

@@ -268,6 +268,12 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	var ccGoals []*Node
 	for _, goal := range goals {
+		if goal == bootclasspathGoal && g.java != nil {
+			if err := g.bootclasspath(); err != nil {
+				return err
+			}
+			continue
+		}
 		if g.java != nil {
 			if m := g.lookupJava(goal, Device); m != nil && g.isJava(m.Type) {
 				// a Java goal builds its device variant; a host-only type (metalava's java_binary_host) its host one

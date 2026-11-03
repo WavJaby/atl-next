@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Host ART as an app process starts, for test stages that run Java on it (`xtask test native-load`, `xtask test parcel`): the converter's ART staged as an install lays it out (`stage_art`),
-//! atl-app-launcher over the default property area atl-property-service writes (the broker's place), framework.jar on the boot classpath, a test's Java compiled with the Java pipeline's JDK and d8.
+//! atl-app-launcher over the default property area atl-property-service writes (the broker's place), the Java pipeline's derived boot classpath, a test's Java compiled with the Java pipeline's JDK and d8.
 //! atl-app-launcher is linked against the converter's libsigchain as `xtask native` links it (packages.rs), atl-property-service built plainly, both with cargo into <out>/cargo; the area from the converter's <out>/gen/build.prop.
 
 use std::path::{Path, PathBuf};
@@ -11,15 +11,9 @@ use atl_layout::Layout;
 
 use crate::{arches, farm, packages};
 
-/// The boot classpath: the ART host boot jars (core-oj, core-libart, core-icu4j hostdex), then framework.jar (framework-minus-apex's dex
-/// jar, stem framework), as the Java pipeline lays them out under --java-out.
-const BOOT_JARS: [&str; 4] = [
-    "device/core-oj/aligned/core-oj.jar",
-    "device/core-libart/aligned/core-libart.jar",
-    "device/core-icu4j-host/dex-withres-aligned/core-icu4j.jar",
-    "device/framework-minus-apex/aligned/framework.jar",
-];
-/// Their class jars: javac's bootclasspath and d8's --lib.
+/// The boot classpath: the dex jars the Java pipeline's goal `platform-bootclasspath` built, one per line in BOOTCLASSPATH order (bp2ninja bootclasspath.go derives it as Soong's product config and derive_classpath do).
+const BOOTCLASSPATH: &str = "bootclasspath.txt";
+/// The class jars a test compiles against (javac's bootclasspath, d8's --lib): ART's core and framework, the API the tests use.
 const JAVAC_BOOT: [&str; 3] = [
     "device/core-oj/javac/core-oj.jar",
     "device/core-libart/javac/core-libart.jar",
@@ -87,6 +81,23 @@ pub struct JavaFixture {
     pub work: PathBuf,
 }
 
+/// The boot classpath list the Java pipeline wrote into `java_out` (BOOTCLASSPATH); absent when its goal `platform-bootclasspath` was not built or a jar on it could not be.
+fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
+    let file = java_out.join(BOOTCLASSPATH);
+    let text = std::fs::read_to_string(&file).with_context(|| {
+        format!(
+            "reading {}: build goal platform-bootclasspath (cargo xtask native --out {} platform-bootclasspath)",
+            file.display(),
+            java_out.display()
+        )
+    })?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
 impl HostArt {
     /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default <workspace>/out/java/build).
     pub fn new(
@@ -119,7 +130,7 @@ impl HostArt {
             launcher: packages::bin(root, out, LAUNCHER, LAUNCHER)?,
             property_service: build_property_service(root, &out.join("cargo"))?,
             build_prop: out.join(BUILD_PROP),
-            boot: BOOT_JARS.iter().map(|j| java_out.join(j)).collect(),
+            boot: boot_jars(&java_out)?,
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
             d8: java_out.join("host/bin/d8"),
             jdk: arches::java_tools(&farm::shared_tree(&layout), os).0,

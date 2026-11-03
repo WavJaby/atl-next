@@ -11,21 +11,25 @@ import (
 	"strings"
 )
 
-// android_app resources, the `{.aapt.srcjar}` output only (R.java and Manifest.java as `aapt2 link --java` writes them), following
-// build/soong/java aar.go aapt2Flags / buildActions and aapt2.go (the spec). Built as one generated step (a genrule node), its script running:
+// android_app resources: the `{.aapt.srcjar}` output (R.java and Manifest.java as `aapt2 link --java` writes them) and the app's resource-only
+// apk (<name>.apk, framework-res's install), following build/soong/java aar.go aapt2Flags / buildActions, aapt2.go, android_manifest.go and
+// app_builder.go (the spec). Built as one generated step (a genrule node), its script running:
+//   - manifest_fixer (android_manifest.go ManifestFixer) on the manifest: --extract-native-libs=true (no embedded JNI libs, min SDK >= 23),
+//     --targetSdkVersion / --minSdkVersion / --replaceMaxSdkVersionPlaceholder at the SDK's effective level, --raise-min-sdk-version,
+//     --has-no-code without srcs and static_libs. Not modelled: uses-library (class loader contexts), logging_parent, default manifest
+//     version, embedded dex / JNI: framework-res, the one app built, sets none.
 //   - aapt2 compile per resource dir in shards of AAPT2_SHARD_SIZE sources (resource_dirs, default res; androidResourceGlob's exclusions),
 //     with --pseudo-localize and --feature-flags @<text> of every flags_packages aconfig_declarations (sorted, unique);
 //   - per resource_zips entry: unzip, then `aapt2 compile --dir` into reszip.<i>.flata (aapt2CompileZip);
-//   - aapt2 link: aaptflags, --enable-compact-entries, --manifest, -A asset dirs (asset_dirs, default assets), --min-sdk-version /
-//     --target-sdk-version (the SDK's effective level), --version-code (platform SDK), --version-name (framework-res: the platform version
-//     name, RELEASE_PLATFORM_VERSION; else the platform SDK), --no-static-lib-packages, --java, then @res.list (pathToAapt2Path order),
-//     -R each resource zip's flata, --feature-flags; soong_zip -jar of the --java dir is the srcjar.
-//   - manifest_fixer is not run: the condition is that it edits only uses-sdk / extractNativeLibs / uses-library / placeholder versions
-//     (android_manifest.go ManifestFixer args), which reach the apk, not R.java / Manifest.java; framework-res's R.srcjar measured
-//     byte-identical to Soong's. Re-check if ManifestFixer gains an argument that adds permissions or resources.
-//   - Dropped: the asset-dir hash
-//     comment, product characteristics (-c / --product: the apk's configs), overlays and RROs (this product has none), the apk, R.txt,
-//     proguard options and every app-level step after link.
+//   - aapt2 link: aaptflags, --enable-compact-entries, --manifest (the fixed one), -A asset dirs (asset_dirs, default assets),
+//     --min-sdk-version / --target-sdk-version (the SDK's effective level), --version-code (platform SDK), --version-name (framework-res: the
+//     platform version name, RELEASE_PLATFORM_VERSION; else the platform SDK), --no-static-lib-packages, --java, then @res.list
+//     (pathToAapt2Path order), -R each resource zip's flata, --feature-flags; soong_zip -jar of the --java dir is the srcjar.
+//   - the apk (CreateAndSignAppPackage without a dex or JNI jar): merge_zips of package-res.apk into <name>-unsigned.apk, then zipalign -p 4
+//     in place of signapk, which aligns as it signs. Not signed: signapk needs its host jar and conscrypt's host JNI library built, and
+//     nothing reads framework-res's signature on this runtime yet (AssetManager reads the resource table).
+//   - Dropped: the asset-dir hash comment, product characteristics (-c / --product: the apk's configs), overlays and RROs (this product has
+//     none), R.txt, proguard options, dexpreopt and the signature.
 
 // aapt2ShardSize: aapt2.go AAPT2_SHARD_SIZE.
 const aapt2ShardSize = 100
@@ -105,9 +109,11 @@ func (g *Graph) aaptRule(n *Node) *genRule {
 	genDir := g.genDir(n, "")
 	r.hasTools = true
 	aapt2 := g.genTool(n, r, "aapt2", fail)
-	r.labels = []genLabel{aapt2}
+	fixer := g.genTool(n, r, "manifest_fixer", fail)
+	r.labels = []genLabel{aapt2, fixer}
 	tool := "$(location aapt2)"
-	soongZip := shellEscape(filepath.Join(g.java.tools.BuildTools, "soong_zip"))
+	bt := func(t string) string { return filepath.Join(g.java.tools.BuildTools, t) }
+	soongZip := shellEscape(bt("soong_zip"))
 	var cmds []string
 	add := func(format string, args ...any) { cmds = append(cmds, fmt.Sprintf(format, args...)) }
 
@@ -176,7 +182,20 @@ func (g *Graph) aaptRule(n *Node) *genRule {
 		manifest = filepath.Join(m.Dir, mf)
 	}
 	r.inputs = append(r.inputs, manifest)
-	link = append(link, "--manifest", shellEscape(manifest))
+	level, _ := g.release.PlatformSdk()
+	if v := parseSdk(p.str("sdk_version")).level; v != "" {
+		level = v
+	}
+	if v := p.str("min_sdk_version"); v != "" {
+		level = v
+	}
+	fixArgs := []string{"--extract-native-libs=true", "--targetSdkVersion", level, "--minSdkVersion", level, "--replaceMaxSdkVersionPlaceholder", level, "--raise-min-sdk-version"}
+	if len(p.strs("srcs")) == 0 && len(p.strs("static_libs")) == 0 {
+		fixArgs = append(fixArgs, "--has-no-code")
+	}
+	fixed := filepath.Join(genDir, "manifest_fixer", "AndroidManifest.xml")
+	add("mkdir -p %s && $(location manifest_fixer) %s %s %s", shellEscape(filepath.Dir(fixed)), strings.Join(fixArgs, " "), shellEscape(manifest), shellEscape(fixed))
+	link = append(link, "--manifest", shellEscape(fixed))
 	assetDirs := p.strs("asset_dirs")
 	if len(assetDirs) == 0 {
 		if _, err := globDirExists(g, filepath.Join(m.Dir, "assets")); err == nil {
@@ -187,13 +206,6 @@ func (g *Graph) aaptRule(n *Node) *genRule {
 		dir := filepath.Join(m.Dir, a)
 		link = append(link, "-A", shellEscape(dir))
 		r.implicit = append(r.implicit, g.resourceGlob(dir)...)
-	}
-	level, _ := g.release.PlatformSdk()
-	if v := parseSdk(p.str("sdk_version")).level; v != "" {
-		level = v
-	}
-	if v := p.str("min_sdk_version"); v != "" {
-		level = v
 	}
 	link = append(link, "--min-sdk-version", level, "--target-sdk-version", level)
 	if !slices.ContainsFunc(p.strs("aaptflags"), func(f string) bool { return strings.HasPrefix(f, "--version-code") }) {
@@ -218,9 +230,13 @@ func (g *Graph) aaptRule(n *Node) *genRule {
 	out := filepath.Join(genDir, "R.srcjar")
 	add("rm -rf %s && %s link -o %s %s %s", shellEscape(java), tool, shellEscape(apk), strings.Join(link, " "), strings.Join(in, " "))
 	add("%s -write_if_changed -jar -o %s -C %s -D %s", soongZip, shellEscape(out), shellEscape(java), shellEscape(java))
+	unsigned := filepath.Join(genDir, m.Name+"-unsigned.apk")
+	installed := filepath.Join(genDir, m.Name+".apk")
+	add("%s %s %s && %s -f -p 4 %s %s", shellEscape(bt("merge_zips")), shellEscape(unsigned), shellEscape(apk), shellEscape(bt("zipalign")),
+		shellEscape(unsigned), shellEscape(installed))
 	r.cmd = strings.Join(cmds, " && ")
-	r.implicit = append(r.implicit, filepath.Join(g.java.tools.BuildTools, "soong_zip"))
-	r.outs = []string{out}
+	r.implicit = append(r.implicit, bt("soong_zip"), bt("merge_zips"), bt("zipalign"))
+	r.outs = []string{out, installed}
 	r.consumerDeps(genDir)
 	return r
 }

@@ -89,7 +89,7 @@ type javaGraph struct {
 var javaTypes = map[string]bool{
 	"java_library": true, "java_library_static": true, "java_library_host": true, "java_plugin": true, "java_binary_host": true,
 	"java_import": true, "java_import_host": true, "java_system_modules": true, "droidstubs": true, "java_aconfig_library": true,
-	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true,
+	"droiddoc_exported_dir": true, "java_sdk_library": true, "java_api_library": true, syspropType: true, "java_host_for_device": true,
 }
 
 func (g *Graph) isJava(t string) bool { return javaTypes[g.baseType(t)] }
@@ -206,6 +206,8 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 		g.aconfigJavaLib(n)
 	case syspropType:
 		g.syspropJava(n)
+	case "java_host_for_device":
+		g.hostForDevice(n)
 	case "java_sdk_library":
 		// the library itself is its .impl; its stubs are separate modules (sdklib.go)
 		g.javaLib(n)
@@ -214,6 +216,31 @@ func (g *Graph) jnode(ref string, side Side, from string) *jNode {
 	}
 	j.order = append(j.order, n)
 	return n
+}
+
+// hostForDevice is java_host_for_device (device_host_converter.go): the host variants of its libs as a device library, their jars
+// combined when there are several.
+func (g *Graph) hostForDevice(n *jNode) {
+	var headers, implRes []string
+	for _, r := range n.props.strs("libs") {
+		if l := g.jnode(r, Host, n.name); l != nil {
+			headers = append(headers, l.header)
+			implRes = append(implRes, l.implRes)
+			n.impl = append(n.impl, l.impl...)
+			n.res = append(n.res, l.res...)
+		}
+	}
+	if len(headers) == 0 {
+		g.problem("%s: libs: at least one dependency is required", n.name)
+		return
+	}
+	n.header, n.implRes = headers[0], implRes[0]
+	if len(headers) > 1 {
+		n.header = filepath.Join(n.dir, "turbine-combined", n.name+".jar")
+		g.java.combine(n.header, headers, "")
+		n.implRes = filepath.Join(n.dir, "combined", n.name+".jar")
+		g.java.combine(n.implRes, implRes, "")
+	}
 }
 
 // flattenJava applies a side's target blocks onto the defaults-merged properties. Java variants are arch-common: no arch,
@@ -440,10 +467,12 @@ func (g *Graph) collectJavaDeps(n *jNode, s sdkSpec) (javaDeps, []*jNode) {
 				d.java9 = append(d.java9, b.header)
 			}
 		}
+		// SDK classpath libs are libTag dependencies (sdkDeps): their exported aidl include dirs count as a libs entry's do
 		for _, r := range sd.classpath {
 			if b := dep(r, Device); b != nil {
 				d.classpath = append(d.classpath, b.header)
 				d.dexClasspath = append(d.dexClasspath, b.header)
+				d.aidlIncludes = append(d.aidlIncludes, b.aidlExport...)
 			}
 		}
 		for _, j := range sd.prebuiltJars {
