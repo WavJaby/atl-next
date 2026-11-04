@@ -114,6 +114,16 @@ arch = "go"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# the platform layer's window toolkit (M3 slice 6): the gtk4 crate's build scripts resolve it through pkg-config and the app process links it; the cargo feature `v4_14` fixes the minimum
+[gtk4]
+debian = "libgtk-4-dev"
+arch = "gtk4"
+pkgconfig = "gtk4"
+min = "4.14"
+min_reason = "workspace Cargo.toml gtk4 feature v4_14: GDK_MEMORY_R8G8B8X8 and the other X8 formats, which opaque layers are uploaded as"
+scope = ["build", "runtime"]
+used_by = ["crate:atl-platform-ui-linux"]
+
 # xtask native: rust_bindgen's bindgen loads the libclang of the `clang` row's clang (libclang_dir)
 [libclang]
 debian = "libclang-19-dev"

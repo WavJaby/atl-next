@@ -14,6 +14,8 @@ ignore = []
 # exception anywhere.
 allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 confidence-threshold = 0.93
+# A licence outside `allow` for one crate that is never linked into an artifact: gtk4-rs's build scripts (system-deps -> cfg-expr -> target-lexicon) run at build time only. `Apache-2.0 WITH LLVM-exception` is Apache-2.0 plus a permission to omit its notices from compiled output, and is GPL-3-compatible, so it would be safe in the runtime too; it stays out of `allow` (and out of licenses.toml's runtime list) until a linked crate needs it.
+exceptions = [{ crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] }]
 
 [bans]
 # one version of each crate in the graph
@@ -23,11 +25,14 @@ allow-wildcard-paths = true
 # Host toolkit / desktop-bus crates are reachable only through the platform layer: core crates depend
 # on the `atl-platform-*` facades. When a `-<os>` implementation crate is created, it is added to the
 # matching entry's `wrappers` -- the only crates allowed to depend on it directly.
+# GTK: only atl-platform-ui-linux depends on gtk4; the other gtk-rs crates are listed with the gtk-rs crates that depend on them (the bindings' own layering), so a workspace crate reaching for gdk4 or gsk4 directly still fails.
 deny = [
-    { crate = "gtk4", reason = "platform layer only" },
-    { crate = "gtk4-sys", reason = "platform layer only" },
-    { crate = "gdk4", reason = "platform layer only" },
-    { crate = "gdk4-sys", reason = "platform layer only" },
+    { crate = "gtk4", reason = "platform layer only", wrappers = ["atl-platform-ui-linux"] },
+    { crate = "gtk4-sys", reason = "platform layer only", wrappers = ["gtk4"] },
+    { crate = "gdk4", reason = "platform layer only", wrappers = ["gtk4", "gsk4"] },
+    { crate = "gdk4-sys", reason = "platform layer only", wrappers = ["gdk4", "gsk4-sys", "gtk4-sys"] },
+    { crate = "gsk4", reason = "platform layer only", wrappers = ["gtk4"] },
+    { crate = "gsk4-sys", reason = "platform layer only", wrappers = ["gsk4", "gtk4-sys"] },
     { crate = "gdk4-wayland", reason = "platform layer only" },
     { crate = "wayland-client", reason = "platform layer only" },
     { crate = "wayland-backend", reason = "platform layer only" },

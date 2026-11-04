@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-platform-ui"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The facade core crates depend on (plan S1, review B8): the `-api` traits plus the one implementation the target OS selects at compile time, under neutral names. Static dispatch, no `dyn`.
+# `examples/gate.rs` is the client of `xtask test platform-ui`.
+
+[dependencies]
+atl-platform-ui-api = { path = "../atl-platform-ui-api" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atl-platform-ui-linux = { path = "../atl-platform-ui-linux" }
+
+[dev-dependencies]
+anyhow.workspace = true
+atl-compositor = { path = "../atl-compositor" }
+atl-gralloc = { path = "../atl-gralloc" }
+clap.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

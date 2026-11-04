@@ -69,6 +69,12 @@ crates = ["atl-gralloc", "atl-gralloc-mapper", "atl-gralloc-service", "atl-grall
 exports = ["atl-gralloc"]
 uses = ["aidl", "generators"]
 
+# the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, reading each quad's buffer through gralloc's format and handle definitions
+[platform-ui]
+crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
+exports = ["atl-platform-ui"]
+uses = ["compositor", "gralloc"]
+
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it
 [binder]
 crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]

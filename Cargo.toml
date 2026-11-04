@@ -18,14 +18,21 @@ clap = { version = "4", features = ["derive"] }
 errno = "0.3"
 # libgbm bindings; no wayland / egl import and no drm crate (its 0.14 pins a second rustix): the allocator creates linear buffers and exports them itself (atl-gralloc-service `prime`)
 gbm = { version = "0.18", default-features = false }
+# GLib's unix fd sources (`g_unix_fd_add`), split out of glib-rs in 0.22; same gtk-rs release train as gtk4
+glib-unix = "0.22"
+# GTK4 bindings (re-exporting gdk, gsk, glib, gio, graphene): only atl-platform-ui-linux depends on it (deny.toml bans). v4_14 = the X8 memory formats (opaque layers) on top of v4_12's fractional surface scale; Debian 13 ships 4.18
+gtk4 = { version = "0.11", features = ["v4_14"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 roxmltree = "0.21"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 spdx = "0.13"
+thiserror = "2"
 toml = "1"
 toml_edit = "0.25"
+# no `attributes` (the #[instrument] macro): it is the only user of syn 2, the rest of the graph is on syn 3
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # Inherited by every crate via `[lints] workspace = true`; such a crate cannot add lints in its own
 # Cargo.toml, so crate-specific extras (`missing_docs` in `-api` crates, `forbid(unsafe_code)` in core
