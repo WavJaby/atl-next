@@ -37,8 +37,6 @@ public class Main extends Activity {
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
         attrs.setTitle(WINDOW_TITLE);
         getWindow().setAttributes(attrs);
-        // an opaque window's surface is RGBX_8888, which atl-gralloc does not allocate yet ("pixel format 2 is not supported", gralloc.log); RGBA_8888 is what the picture check reads
-        getWindow().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
         setContentView(new Quadrants(this));
     }
 

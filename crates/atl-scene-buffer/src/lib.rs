@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Reading a Scene buffer's pixels on the CPU: the only `unsafe` of the crate.
-//! A quad's buffer is a gralloc handle (`atl-gralloc` `handle`): fd 0 is the dma-buf (or, in tests and for software producers, any mappable file such as a memfd) holding linear RGBA_8888 rows of `stride` pixels.
+//! A quad's buffer is a gralloc handle (`atl-gralloc` `handle`): fd 0 is the dma-buf (or, in tests and for software producers, any mappable file such as a memfd) holding linear RGBA_8888 or RGBX_8888 rows of `stride` pixels.
 //! Step 1 maps it, brackets the read with `DMA_BUF_IOCTL_SYNC` as the kernel requires for CPU access to a dma-buf, and copies the rows out; step 2 hands the dma-buf to the compositor as a texture instead.
 
 use std::io;
@@ -8,7 +8,7 @@ use std::os::fd::BorrowedFd;
 
 use atl_compositor::parcel::FdObject;
 use atl_compositor::state::GraphicBuffer;
-use atl_gralloc::format::{self, RGBA_8888};
+use atl_gralloc::format::{self, COMPONENT_A, RGBA_8888, RGBX_8888};
 use atl_gralloc::handle::FD_DMABUF;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::fstat;
@@ -26,7 +26,7 @@ pub struct Pixels {
     pub height: u32,
     /// Distance between row starts, in bytes.
     pub stride_bytes: usize,
-    /// `stride_bytes * height` bytes, RGBA_8888 in memory order R, G, B, A.
+    /// `stride_bytes * height` bytes in memory order R, G, B, A; A is 255 when the buffer has no alpha (RGBX_8888, whose byte 3 is undefined).
     pub bytes: Vec<u8>,
 }
 
@@ -125,8 +125,13 @@ impl Drop for Mapping {
 /// Copies `buffer`'s pixels out of its dma-buf. Every field comes from another process's parcel, so the geometry is checked against the format table and the fd's real size before anything is mapped (a mapping past the end of a file faults on access).
 pub fn read_pixels(buffer: &GraphicBuffer) -> Result<Pixels, String> {
     let info = format::lookup(buffer.format)
-        .filter(|f| f.pixel_format == RGBA_8888)
-        .ok_or_else(|| format!("pixel format {} is not RGBA_8888", buffer.format))?;
+        .filter(|f| matches!(f.pixel_format, RGBA_8888 | RGBX_8888))
+        .ok_or_else(|| {
+            format!(
+                "pixel format {} is not RGBA_8888 or RGBX_8888",
+                buffer.format
+            )
+        })?;
     let (width, height, stride) = (
         u32::try_from(buffer.width).ok().filter(|&v| v > 0),
         u32::try_from(buffer.height).ok().filter(|&v| v > 0),
@@ -161,8 +166,11 @@ pub fn read_pixels(buffer: &GraphicBuffer) -> Result<Pixels, String> {
     }
     let mapping = Mapping::new(fd, len).map_err(|e| format!("mmap: {e}"))?;
     sync_if_dmabuf(fd, SYNC_START | SYNC_READ).map_err(|e| format!("sync start: {e}"))?;
-    let bytes = mapping.copy();
+    let mut bytes = mapping.copy();
     sync_if_dmabuf(fd, SYNC_END | SYNC_READ).map_err(|e| format!("sync end: {e}"))?;
+    if !info.components.iter().any(|c| c.0 == COMPONENT_A) {
+        bytes.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+    }
     Ok(Pixels {
         width,
         height,
@@ -211,6 +219,16 @@ mod tests {
         let p = read_pixels(&buffer(&fd, 2, 2, 3)).expect("readable");
         assert_eq!((p.width, p.height, p.stride_bytes), (2, 2, 12));
         assert_eq!(p.bytes, bytes);
+    }
+
+    /// RGBX_8888: byte 3 of every pixel is padding, whatever the producer left there; it reads as opaque, colours untouched.
+    #[test]
+    fn rgbx_reads_opaque() {
+        let fd = memfd_with(&[1, 2, 3, 0, 4, 5, 6, 77]);
+        let mut b = buffer(&fd, 2, 1, 2);
+        b.format = RGBX_8888;
+        let p = read_pixels(&b).expect("readable");
+        assert_eq!(p.bytes, [1, 2, 3, 255, 4, 5, 6, 255]);
     }
 
     /// A parcel can claim any geometry; a file shorter than it needs must be refused, not mapped (access past the end of a file faults).
