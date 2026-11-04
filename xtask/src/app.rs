@@ -31,6 +31,9 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
+    /// Also start the graphics allocator HAL under atld (needs a DRM device that allocates, WSL: vgem; and `xtask native` with the gralloc crates built): the run must register it with servicemanager, the VINTF-declared way, and the app must still reach onCreate with `mapper.atl.so` on its library path.
+    #[arg(long)]
+    gralloc: bool,
 }
 
 /// The fixture's dir.
@@ -58,6 +61,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "app-art",
         args.verbose,
     )?;
+    let rt = if args.gralloc {
+        rt.with_gralloc(root)?
+    } else {
+        rt
+    };
     let work = rt.out.join("app");
     let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
@@ -113,9 +121,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for l in counter_lines(&services_log) {
         println!("app: counter {l}");
     }
-    if passed {
+    // atld waits for the allocator's ready line before it starts the app, so a started app means a registered allocator; the line is checked anyway, with the allocator's own log as the explanation
+    let gralloc_log = read(&run.log("gralloc"));
+    let gralloc_ok = !args.gralloc || gralloc_log.contains("gralloc: ready");
+    if passed && gralloc_ok {
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
+        if args.gralloc {
+            println!("app: gralloc registered: {}", gralloc_log.trim());
+        }
         return Ok(ExitCode::SUCCESS);
+    }
+    if passed {
+        println!(
+            "app: FAIL the allocator did not register:\n{}",
+            gralloc_log.trim()
+        );
+        return Ok(ExitCode::FAILURE);
     }
     let why = match ended {
         Some(s) => format!("atld exited {s} before the marker"),

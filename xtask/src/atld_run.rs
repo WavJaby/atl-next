@@ -39,6 +39,8 @@ pub struct Runtime {
     framework_res: PathBuf,
     font_xml: PathBuf,
     font_file: PathBuf,
+    /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
+    gralloc: Option<(PathBuf, PathBuf)>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -164,7 +166,22 @@ impl Runtime {
             framework_res,
             font_xml,
             font_file,
+            gralloc: None,
         })
+    }
+
+    /// Also starts the graphics allocator HAL under atld (`--gralloc`): the allocator `xtask native` built, and `mapper.atl.so` installed in `<out>/gralloc/lib`, which joins every process's library path.
+    /// Needs a DRM device that allocates (atld names what is missing when it does not start).
+    pub fn with_gralloc(mut self, root: &Path) -> Result<Self> {
+        let allocator = packages::bin(
+            root,
+            &self.out,
+            "atl-gralloc-service",
+            "atl-gralloc-allocator",
+        )?;
+        let lib = crate::gralloc::stage_mapper(root, &self.out)?;
+        self.gralloc = Some((allocator, lib));
+        Ok(self)
     }
 
     /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar.
@@ -254,7 +271,16 @@ impl Runtime {
             std::fs::remove_dir_all(&run.root)
                 .with_context(|| format!("removing {}", run.root.display()))?;
         }
+        // the staged ART's library dir, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
+        let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
+        if let Some((_, dir)) = &self.gralloc {
+            lib_path.push(":");
+            lib_path.push(dir);
+        }
         let mut cmd = Command::new(&self.atld);
+        if let Some((allocator, _)) = &self.gralloc {
+            cmd.arg("--gralloc").arg(allocator);
+        }
         cmd.arg("--root")
             .arg(&run.root)
             .arg("--binderd")
@@ -266,7 +292,7 @@ impl Runtime {
             .arg("--launcher")
             .arg(&self.art.launcher)
             .arg("--lib-path")
-            .arg(&self.art.lib_path)
+            .arg(&lib_path)
             .arg("--art-root")
             .arg(&self.art.art)
             .arg("--build-prop")
