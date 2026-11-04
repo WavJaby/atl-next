@@ -8,6 +8,8 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
 import android.view.View;
 
 /**
@@ -29,6 +31,11 @@ public class Main extends Activity {
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume reached");
+        // the virtual keyboard's ground truth (PhoneWindow.preparePanel loads this map on every resume)
+        KeyCharacterMap map = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
+        int keyA = map.get(KeyEvent.KEYCODE_A, 0);
+        Log.i(TAG, "keymap keyboardType=" + map.getKeyboardType() + " keyA=" + (char) keyA
+                + (keyA == 'a' ? " ok" : " wrong"));
     }
 
     /** Four solid colours, one per quadrant; no text. */
