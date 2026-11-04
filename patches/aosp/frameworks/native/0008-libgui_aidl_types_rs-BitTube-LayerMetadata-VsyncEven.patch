@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 4 Nov 2026 09:25:03 +0800
+Subject: [PATCH] libgui_aidl_types_rs: BitTube, LayerMetadata, VsyncEventData
+
+The crate's stand-ins for libgui's unstructured parcelables panic
+(todo!()) as soon as one is read or written, so a Rust service of
+android.gui.ISurfaceComposerClient / IDisplayEventConnection dies on
+createSurface, stealReceiveChannel and getLatestVsyncEventData. Give
+the three that the software path crosses their wire form:
+LayerMetadata is read (count, then key and byte vector), BitTube is
+written (the receive end, then the send end, each a bare fd object:
+BitTube::writeToParcel), VsyncEventData (the Rust type that the AIDL
+type ParcelableVsyncEventData names) is written as the words the caller
+built. The other stand-ins stay.
+
+Upstream-Status: Pending
+Patch-Reason: the stand-ins are AOSP's own Rust half of the interface and ship unimplemented; the launcher, loader and environment cannot supply a type that the generated AIDL code names by crate path (rust_type in the .aidl)
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/gui/rust/aidl_types/src/lib.rs | 63 +++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/libs/gui/rust/aidl_types/src/lib.rs b/libs/gui/rust/aidl_types/src/lib.rs
+index 2351df0318b54908e8e7a6461b6eb417334eecfb..24b9eb1c6028136a16aae6dd2de6236c622d16ff 100644
+--- a/libs/gui/rust/aidl_types/src/lib.rs
++++ b/libs/gui/rust/aidl_types/src/lib.rs
+@@ -41,12 +41,69 @@ macro_rules! stub_unstructured_parcelable {
+     };
+ }
+ 
+-stub_unstructured_parcelable!(BitTube);
++/// A display event connection's channel: the receive end, then the send end, each a bare file descriptor object (BitTube::writeToParcel).
++#[derive(Debug, Default)]
++pub struct BitTube(pub Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>);
++
++impl UnstructuredParcelable for BitTube {
++    fn write_to_parcel(&self, parcel: &mut BorrowedParcel) -> Result<(), StatusCode> {
++        let (receive, send) = self.0.as_ref().ok_or(StatusCode::BAD_VALUE)?;
++        parcel.write_dup_file_descriptor(receive)?;
++        parcel.write_dup_file_descriptor(send)
++    }
++
++    fn from_parcel(_parcel: &BorrowedParcel) -> Result<Self, StatusCode> {
++        Err(StatusCode::INVALID_OPERATION)
++    }
++}
++
++impl_deserialize_for_unstructured_parcelable!(BitTube);
++impl_serialize_for_unstructured_parcelable!(BitTube);
++
++/// A layer's metadata: an int32 count, then per entry an int32 key and a byte vector (LayerMetadata::readFromParcel).
++#[derive(Debug, Default)]
++pub struct LayerMetadata(pub Vec<(i32, Vec<u8>)>);
++
++impl UnstructuredParcelable for LayerMetadata {
++    fn write_to_parcel(&self, parcel: &mut BorrowedParcel) -> Result<(), StatusCode> {
++        parcel.write(&i32::try_from(self.0.len()).map_err(|_| StatusCode::BAD_VALUE)?)?;
++        self.0.iter().try_for_each(|(key, data)| {
++            parcel.write(key)?;
++            parcel.write(data)
++        })
++    }
++
++    fn from_parcel(parcel: &BorrowedParcel) -> Result<Self, StatusCode> {
++        let count: i32 = parcel.read()?;
++        let count = usize::try_from(count).map_err(|_| StatusCode::BAD_VALUE)?;
++        (0..count).map(|_| Ok((parcel.read()?, parcel.read()?))).collect::<Result<_, _>>().map(Self)
++    }
++}
++
++impl_deserialize_for_unstructured_parcelable!(LayerMetadata);
++impl_serialize_for_unstructured_parcelable!(LayerMetadata);
++
++/// A vsync event's timelines, already in wire form: the words ParcelableVsyncEventData::writeToParcel writes, little-endian
++/// (the AIDL type ParcelableVsyncEventData names this Rust type).
++#[derive(Debug, Default)]
++pub struct VsyncEventData(pub Vec<u8>);
++
++impl UnstructuredParcelable for VsyncEventData {
++    fn write_to_parcel(&self, parcel: &mut BorrowedParcel) -> Result<(), StatusCode> {
++        self.0.chunks_exact(4).try_for_each(|w| parcel.write(&i32::from_le_bytes([w[0], w[1], w[2], w[3]])))
++    }
++
++    fn from_parcel(_parcel: &BorrowedParcel) -> Result<Self, StatusCode> {
++        Err(StatusCode::INVALID_OPERATION)
++    }
++}
++
++impl_deserialize_for_unstructured_parcelable!(VsyncEventData);
++impl_serialize_for_unstructured_parcelable!(VsyncEventData);
++
+ stub_unstructured_parcelable!(DisplayInfo);
+ stub_unstructured_parcelable!(LayerDebugInfo);
+-stub_unstructured_parcelable!(LayerMetadata);
+ stub_unstructured_parcelable!(ParcelableVsyncEventData);
+ stub_unstructured_parcelable!(ScreenCaptureResults);
+-stub_unstructured_parcelable!(VsyncEventData);
+ stub_unstructured_parcelable!(WindowInfo);
+ stub_unstructured_parcelable!(WindowInfosUpdate);

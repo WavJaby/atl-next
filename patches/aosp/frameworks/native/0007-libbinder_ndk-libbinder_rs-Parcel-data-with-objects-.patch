@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 4 Nov 2026 09:25:03 +0800
+Subject: [PATCH] libbinder_ndk, libbinder_rs: Parcel data with objects, bare
+ fd write
+
+An in-process Rust service that implements AOSP's hand-written C++
+binder interface (android.ui.ISurfaceComposer, ITransactionCompletedListener)
+must read a Parcel the way libgui's C++ writes it: the bytes with the
+flat binder and fd objects inline. AParcel_marshal refuses a Parcel
+holding objects, and libbinder_rs has no way to see them.
+AParcel_getDataWithObjects exposes the bytes and the object count
+(the same Parcel::data / objectsCount the NDK map already reaches via
+AParcel_viewPlatformParcel), AParcel_writeDupFileDescriptor writes an
+fd as a bare object (BitTube::writeToParcel; the NDK's only fd writer
+adds two leading ints). Safe wrappers beside libbinder_rs's own unsafe
+calls, as patches 0004 and 0005.
+
+Upstream-Status: Pending
+Patch-Reason: AParcel wraps android::Parcel privately and the platform API offers neither; reaching android::Parcel from our unsafe-free crates is possible only through libbinder_rs, an unsafe boundary crate would add a converter rlib edge and a modules.toml edge for two calls
+---
+SPDX-License-Identifier: Apache-2.0
+ .../android/binder_parcel_platform.h          | 13 ++++++++++
+ libs/binder/ndk/libbinder_ndk.map.txt         |  2 ++
+ libs/binder/ndk/parcel.cpp                    | 11 +++++++++
+ libs/binder/rust/src/parcel.rs                | 24 +++++++++++++++++++
+ 4 files changed, 50 insertions(+)
+
+diff --git a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+index 45bc91129f0e251f7b1042bd361a5bba7e058526..25ef7a98b0b65f0d8288cd56f8eea9b4fada5e24 100644
+--- a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
++++ b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+@@ -37,6 +37,19 @@ bool AParcel_getAllowFds(const AParcel*);
+  */
+ bool AParcel_hasFileDescriptors(const AParcel*);
+ 
++/**
++ * Gets the data as android::Parcel holds it, flat binder and file descriptor
++ * objects inline, and how many objects it holds. Valid until the parcel changes.
++ */
++const uint8_t* AParcel_getDataWithObjects(const AParcel*, size_t* dataSize, size_t* objectCount);
++
++/**
++ * Writes a duplicate of fd as a bare file descriptor object, without the
++ * leading ints of AParcel_writeParcelFileDescriptor
++ * (android::Parcel::writeDupFileDescriptor; BitTube::writeToParcel uses it).
++ */
++binder_status_t AParcel_writeDupFileDescriptor(AParcel*, int fd);
++
+ #endif
+ 
+ /**
+diff --git a/libs/binder/ndk/libbinder_ndk.map.txt b/libs/binder/ndk/libbinder_ndk.map.txt
+index 41b74a8c7a1f44f06957498e18f0142e08533768..8c10777148fe225eb3a8b7b082a6c325a3b08434 100644
+--- a/libs/binder/ndk/libbinder_ndk.map.txt
++++ b/libs/binder/ndk/libbinder_ndk.map.txt
+@@ -226,6 +226,8 @@ LIBBINDER_NDK_PLATFORM {
+   global:
+     AParcel_getAllowFds;
+     AParcel_hasFileDescriptors;
++    AParcel_getDataWithObjects;
++    AParcel_writeDupFileDescriptor;
+     extern "C++" {
+         AIBinder_fromPlatformBinder*;
+         AIBinder_toPlatformBinder*;
+diff --git a/libs/binder/ndk/parcel.cpp b/libs/binder/ndk/parcel.cpp
+index f3b34758c5552bb789095174b76860b51b8523eb..ef2d52ff4b6baf37f05e8d1a2d3efe809d97a1c6 100644
+--- a/libs/binder/ndk/parcel.cpp
++++ b/libs/binder/ndk/parcel.cpp
+@@ -683,6 +683,17 @@ bool AParcel_hasFileDescriptors(const AParcel* parcel) {
+     return parcel->get()->hasFileDescriptors();
+ }
+ 
++const uint8_t* AParcel_getDataWithObjects(const AParcel* parcel, size_t* dataSize,
++                                          size_t* objectCount) {
++    *dataSize = parcel->get()->dataSize();
++    *objectCount = parcel->get()->objectsCount();
++    return parcel->get()->data();
++}
++
++binder_status_t AParcel_writeDupFileDescriptor(AParcel* parcel, int fd) {
++    return PruneStatusT(parcel->get()->writeDupFileDescriptor(fd));
++}
++
+ binder_status_t AParcel_reset(AParcel* parcel) {
+     parcel->get()->freeData();
+     return STATUS_OK;
+diff --git a/libs/binder/rust/src/parcel.rs b/libs/binder/rust/src/parcel.rs
+index e85b78e50dc0aaff801aade16e616e503410d172..dfc48dfada294288f187b8da4afee7c748b41eb6 100644
+--- a/libs/binder/rust/src/parcel.rs
++++ b/libs/binder/rust/src/parcel.rs
+@@ -309,6 +309,25 @@ impl BorrowedParcel<'_> {
+         unsafe { sys::AParcel_hasFileDescriptors(self.as_native()) }
+     }
+ 
++    /// A copy of the parcel's data as `android::Parcel` holds it, binder and file descriptor objects inline (`marshal` refuses those), and the number of objects in it.
++    pub fn data_with_objects(&self) -> (Vec<u8>, usize) {
++        let (mut size, mut objects) = (0, 0);
++        // Safety: `BorrowedParcel` always contains a valid pointer to an `AParcel`; the call only reads it and sets both counts.
++        let data = unsafe { sys::AParcel_getDataWithObjects(self.as_native(), &mut size, &mut objects) };
++        if data.is_null() {
++            return (Vec::new(), 0);
++        }
++        // Safety: `data` points at `size` bytes the parcel owns, valid until it changes; they are copied before the parcel is used again.
++        (unsafe { std::slice::from_raw_parts(data, size) }.to_vec(), objects)
++    }
++
++    /// Writes a duplicate of `fd` as a bare file descriptor object (`Parcel::writeDupFileDescriptor`), without the leading ints of a `ParcelFileDescriptor`.
++    pub fn write_dup_file_descriptor(&mut self, fd: impl std::os::fd::AsFd) -> Result<()> {
++        // Safety: `BorrowedParcel` always contains a valid pointer to an `AParcel`; `fd` is open for the call and the parcel dups it.
++        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd.as_fd());
++        status_result(unsafe { sys::AParcel_writeDupFileDescriptor(self.as_native_mut(), raw) })
++    }
++
+     /// Moves the position to `pos`, which must lie within the data (0 up to the data size); any other `pos` is BAD_VALUE.
+     /// The bound that `set_data_position` leaves to its caller is checked here.
+     pub fn set_data_position_checked(&self, pos: i32) -> Result<()> {
+@@ -446,6 +465,11 @@ impl Parcel {
+         self.borrowed_ref().has_file_descriptors()
+     }
+ 
++    /// See [`BorrowedParcel::data_with_objects`].
++    pub fn data_with_objects(&self) -> (Vec<u8>, usize) {
++        self.borrowed_ref().data_with_objects()
++    }
++
+     /// Append a subset of another parcel.
+     ///
+     /// This appends `size` bytes of data from `other` starting at offset
