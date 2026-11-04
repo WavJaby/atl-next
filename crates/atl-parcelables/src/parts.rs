@@ -213,6 +213,45 @@ impl Part for Rect {
     }
 }
 
+/// android.view.InsetsSource (view/InsetsSource.java writeToParcel:689-700, InsetsSource(Parcel):668-680): one inset source of an InsetsState, written as writeTypedObject inside it. Order:
+/// id, type, frame, visibleFrame (presence, Rect), visible, flags, sideHint, boundingRects (writeTypedArray: -1 null or count, each element with its own presence). Every field is modelled.
+/// A layout, not a codec: no .aidl declares InsetsSource (the converter takes codecs only for declared parcelables).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InsetsSource {
+    pub id: i32,
+    pub r#type: i32,
+    pub frame: Rect,
+    pub visible_frame: Option<Rect>,
+    pub visible: bool,
+    pub flags: i32,
+    pub side_hint: i32,
+    pub bounding_rects: Option<Vec<Option<Rect>>>,
+}
+impl Part for InsetsSource {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_i32(p, self.id)?;
+        w_i32(p, self.r#type)?;
+        self.frame.write(p)?;
+        w_typed(p, &self.visible_frame)?;
+        w_bool(p, self.visible)?;
+        w_i32(p, self.flags)?;
+        w_i32(p, self.side_hint)?;
+        w_typed_list(p, &self.bounding_rects)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(InsetsSource {
+            id: r_i32(p)?,
+            r#type: r_i32(p)?,
+            frame: Rect::read(p)?,
+            visible_frame: r_typed(p)?,
+            visible: r_bool(p)?,
+            flags: r_i32(p)?,
+            side_hint: r_i32(p)?,
+            bounding_rects: r_typed_list(p)?,
+        })
+    }
+}
+
 /// android.content.ComponentName (content/ComponentName.java): the static writeToParcel(ComponentName, Parcel) / readFromParcel(Parcel) pair, two String16s; a null name is a null package.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComponentName {

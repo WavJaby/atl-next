@@ -55,3 +55,16 @@ const SECURITY: &str = include_str!(concat!(
 /// `android.security.Flags.preventIntentRedirect()`: Intent's creator-token block (codecs/android/content/Intent.rs).
 pub const PREVENT_INTENT_REDIRECT: bool =
     read_only_flag(SECURITY, "android.security.prevent_intent_redirect");
+
+/// android.view.flags (core/java/android/view/flags/*.aconfig, module `android.view.flags-aconfig`).
+const VIEW_FLAGS: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/android.view.flags-aconfig.aconfig.txt"
+));
+
+/// `android.view.flags.Flags.toolkitSetFrameRateReadOnly()` (WindowManager.java:4684): the LayoutParams frame-rate fields
+/// (codecs/android/view/WindowManager_LayoutParams.rs) exist in the Java format only when it is true.
+pub const TOOLKIT_SET_FRAME_RATE_READ_ONLY: bool = read_only_flag(
+    VIEW_FLAGS,
+    "android.view.flags.toolkit_set_frame_rate_read_only",
+);

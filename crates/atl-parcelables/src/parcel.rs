@@ -172,6 +172,16 @@ pub fn r_absent(p: &In<'_>, what: &'static str) -> Result<()> {
     }
 }
 
+/// writeTypedArray of a type no codec models: the count as written, -1 for null (Parcel.writeTypedArray) or 0 for empty. Kept so the bytes come back as they were;
+/// a non-empty array is refused. Returns the count (negative = null).
+pub fn r_absent_array(p: &In<'_>, what: &'static str) -> Result<i32> {
+    let n = r_i32(p)?;
+    if n > 0 {
+        return Err(crate::refuse(what));
+    }
+    Ok(n)
+}
+
 pub fn len_i32(n: usize) -> Result<i32> {
     i32::try_from(n).map_err(|_| StatusCode::BAD_VALUE)
 }

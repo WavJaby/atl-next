@@ -30,11 +30,26 @@ pub mod android {
             pub mod Configuration;
         }
     }
+    pub mod graphics {
+        pub mod Rect;
+    }
     pub mod os {
         pub mod Bundle;
     }
+    pub mod util {
+        pub mod MergedConfiguration;
+    }
     pub mod view {
         pub mod DisplayInfo;
+        pub mod InputChannel;
+        pub mod InsetsSourceControl_Array;
+        pub mod InsetsState;
+        pub mod SurfaceControl;
+        pub mod WindowManager_LayoutParams;
+        pub mod WindowRelayoutResult;
+    }
+    pub mod window {
+        pub mod ClientWindowFrames;
     }
 }
 

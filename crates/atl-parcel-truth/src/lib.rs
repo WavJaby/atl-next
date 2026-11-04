@@ -26,8 +26,14 @@ use atl_parcelables::android::content::pm::{
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
+use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
-use atl_parcelables::android::view::DisplayInfo;
+use atl_parcelables::android::util::MergedConfiguration;
+use atl_parcelables::android::view::{
+    DisplayInfo, InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
+    WindowManager_LayoutParams, WindowRelayoutResult,
+};
+use atl_parcelables::android::window::ClientWindowFrames;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
@@ -137,6 +143,7 @@ fn copy_class(
     match class {
         "android.os.Bundle" => copy_as::<Bundle>(src, dst),
         "android.content.Intent" => copy_as::<Intent>(src, dst),
+        "android.view.InputChannel" => copy_as::<InputChannel>(src, dst),
         "android.app.servertransaction.ClientTransaction" => copy_as::<ClientTransaction>(src, dst),
         _ => Err(format!("no parcel-copy codec for {class}")),
     }
@@ -258,6 +265,18 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_as::<ApplicationErrorReport_ParcelableCrashInfo>(input, mode)
         }
         "android.view.DisplayInfo" => round_trip_as::<DisplayInfo>(input, mode),
+        "android.graphics.Rect" => round_trip_as::<Rect>(input, mode),
+        "android.view.WindowManager$LayoutParams" => {
+            round_trip_as::<WindowManager_LayoutParams>(input, mode)
+        }
+        "android.view.InsetsState" => round_trip_as::<InsetsState>(input, mode),
+        "android.view.InsetsSourceControl$Array" => {
+            round_trip_as::<InsetsSourceControl_Array>(input, mode)
+        }
+        "android.view.SurfaceControl" => round_trip_as::<SurfaceControl>(input, mode),
+        "android.window.ClientWindowFrames" => round_trip_as::<ClientWindowFrames>(input, mode),
+        "android.util.MergedConfiguration" => round_trip_as::<MergedConfiguration>(input, mode),
+        "android.view.WindowRelayoutResult" => round_trip_as::<WindowRelayoutResult>(input, mode),
         "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }

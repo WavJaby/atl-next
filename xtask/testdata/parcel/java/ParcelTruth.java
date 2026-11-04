@@ -30,6 +30,16 @@ import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.view.Display;
 import android.view.DisplayInfo;
+import android.view.InputChannel;
+import android.view.InsetsSource;
+import android.view.InsetsSourceControl;
+import android.view.InsetsState;
+import android.view.SurfaceControl;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.WindowRelayoutResult;
+import android.window.ClientWindowFrames;
+import android.util.MergedConfiguration;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -155,6 +165,17 @@ public class ParcelTruth {
         checkBinder("Bundle:binder", echo);
         checkDescriptors("Bundle:fd", echo);
         checkIntentBinder("Intent:binder-extras", echo);
+
+        // the window path (M3 slice 5): the LayoutParams IWindowSession receives, and the replies it sends (addToDisplayAsUser, relayout), each field off its default
+        check("WindowManager.LayoutParams", layoutParams(), WindowManager.LayoutParams.CREATOR);
+        check("InsetsState", insetsState(), InsetsState.CREATOR);
+        check("ClientWindowFrames", clientWindowFrames(), ClientWindowFrames.CREATOR);
+        check("MergedConfiguration", mergedConfiguration(config), MergedConfiguration.CREATOR);
+        check("SurfaceControl", new SurfaceControl(), SurfaceControl.CREATOR);
+        check("InsetsSourceControl.Array", new InsetsSourceControl.Array(), InsetsSourceControl.Array.CREATOR);
+        check("WindowRelayoutResult", windowRelayoutResult(config), WindowRelayoutResult.CREATOR);
+        check("Rect", new Rect(1, 2, 3, 4), Rect.CREATOR);
+        checkInputChannel("InputChannel");
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
@@ -297,6 +318,142 @@ public class ParcelTruth {
         } catch (java.io.FileNotFoundException e) {
             result(false, name, "cannot open /dev/null: " + e);
         }
+    }
+
+    /// Sets a private or package field of a framework object (the values the public API does not set; a field the release lacks fails the run).
+    static void setField(Object target, String field, Object value) {
+        try {
+            java.lang.reflect.Field f = target.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            f.set(target, value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(field + ": " + e, e);
+        }
+    }
+
+    /// Every LayoutParams field is off its default, the nullable ones included where a non-null value is modelled; providedInsets and paramsForRotation stay null.
+    static WindowManager.LayoutParams layoutParams() {
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(WindowManager.LayoutParams.TYPE_BASE_APPLICATION, 0x01020304);
+        lp.width = 1280;
+        lp.height = 800;
+        lp.x = -3;
+        lp.y = 5;
+        setField(lp, "privateFlags", 0x10);
+        lp.softInputMode = 0x21;
+        lp.layoutInDisplayCutoutMode = 1;
+        lp.gravity = 0x33;
+        lp.horizontalMargin = 0.25f;
+        lp.verticalMargin = 0.5f;
+        lp.format = 1;
+        lp.windowAnimations = 0x7f010001;
+        lp.alpha = 0.75f;
+        lp.dimAmount = 0.5f;
+        lp.screenBrightness = 0.125f;
+        lp.buttonBrightness = 0.875f;
+        lp.rotationAnimation = 2;
+        lp.packageName = "com.example.atlwindow";
+        setField(lp, "mTitle", "com.example.atlwindow/Main");
+        lp.screenOrientation = 1;
+        lp.preferredRefreshRate = 60f;
+        lp.preferredDisplayModeId = 3;
+        lp.preferredMinDisplayRefreshRate = 30f;
+        lp.preferredMaxDisplayRefreshRate = 120f;
+        lp.systemUiVisibility = 0x100;
+        lp.subtreeSystemUiVisibility = 0x200;
+        setField(lp, "hasSystemUiListeners", true);
+        lp.inputFeatures = 0x4;
+        lp.userActivityTimeout = 5000000000L;
+        lp.surfaceInsets.set(1, 2, 3, 4);
+        setField(lp, "hasManualSurfaceInsets", true);
+        setField(lp, "receiveInsetsIgnoringZOrder", true);
+        setField(lp, "preservePreviousSurfaceInsets", false);
+        setField(lp, "accessibilityIdOfAnchor", 0x1122334455L);
+        setField(lp, "accessibilityTitle", "a11y title");
+        setField(lp, "mColorMode", 1);
+        setField(lp, "hideTimeoutMilliseconds", 7000L);
+        setField(lp.insetsFlags, "appearance", 0x5);
+        setField(lp.insetsFlags, "behavior", 0x3);
+        setField(lp, "mFitInsetsTypes", 0x7);
+        setField(lp, "mFitInsetsSides", 0xf);
+        setField(lp, "mFitInsetsIgnoringVisibility", true);
+        setField(lp, "preferMinimalPostProcessing", true);
+        setField(lp, "mBlurBehindRadius", 9);
+        setField(lp, "mWallpaperTouchEventsEnabled", true);
+        setField(lp, "forciblyShownTypes", 0x2);
+        setField(lp, "mDisplayFlags", 0x3);
+        setField(lp, "mDesiredHdrHeadroom", 2.5f);
+        setField(lp, "mFrameRateBoostOnTouch", true);
+        setField(lp, "mIsFrameRatePowerSavingsBalanced", true);
+        return lp;
+    }
+
+    /// A bar and a navigation bar: one with a visible frame, flags, side hint and bounding rects; the other with the defaults.
+    static InsetsSource insetsSource() {
+        InsetsSource bar = new InsetsSource(0x11, WindowInsets.Type.statusBars());
+        bar.setFrame(0, 0, 1280, 24);
+        bar.setVisibleFrame(new Rect(0, 0, 1280, 20));
+        bar.setVisible(true);
+        bar.setFlags(0x2);
+        setField(bar, "mSideHint", 0x5);
+        bar.setBoundingRects(new Rect[] {new Rect(1, 2, 3, 4)});
+        return bar;
+    }
+
+    static InsetsState insetsState() {
+        InsetsState s = new InsetsState();
+        s.setDisplayFrame(new Rect(0, 0, 1280, 800));
+        s.setRoundedCornerFrame(new Rect(0, 0, 1280, 800));
+        s.setSeq(7);
+        s.addSource(insetsSource());
+        InsetsSource nav = new InsetsSource(0x22, WindowInsets.Type.navigationBars());
+        nav.setFrame(0, 776, 1280, 800);
+        s.addSource(nav);
+        return s;
+    }
+
+    static ClientWindowFrames clientWindowFrames() {
+        ClientWindowFrames f = new ClientWindowFrames();
+        f.frame.set(0, 0, 1280, 800);
+        f.displayFrame.set(0, 0, 1280, 800);
+        f.parentFrame.set(0, 24, 1280, 776);
+        f.attachedFrame = new Rect(10, 20, 30, 40);
+        f.isParentFrameClippedByDisplayCutout = true;
+        f.compatScale = 0.75f;
+        f.seq = 5;
+        return f;
+    }
+
+    static MergedConfiguration mergedConfiguration(Configuration config) {
+        Configuration override = new Configuration();
+        override.densityDpi = 240;
+        override.screenWidthDp = 411;
+        return new MergedConfiguration(config, override);
+    }
+
+    static WindowRelayoutResult windowRelayoutResult(Configuration config) {
+        WindowRelayoutResult r = new WindowRelayoutResult(clientWindowFrames(), mergedConfiguration(config), new SurfaceControl(), insetsState(), new InsetsSourceControl.Array());
+        r.syncSeqId = 9;
+        r.activityWindowInfo = new ActivityWindowInfo();
+        return r;
+    }
+
+    /// An input channel pair's client end: Java -> codec -> Java with its descriptor and token (roundTripParcel); Java reads the copy back with the same name and a token.
+    static void checkInputChannel(String name) {
+        InputChannel[] pair = InputChannel.openInputChannelPair("atl-test");
+        InputChannel client = pair[1];
+        Parcel in = written(client);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.view.InputChannel", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        InputChannel back = InputChannel.CREATOR.createFromParcel(out);
+        boolean ok = consumed && "atl-test".equals(back.getName()) && back.getToken() != null;
+        result(ok, name, ok ? "input channel survived java -> rust -> java: same name, a token, descriptor copied" : "name " + back.getName() + ", consumed " + consumed + ", sizes " + in.dataSize() + "/" + out.dataSize());
+        in.recycle();
+        out.recycle();
     }
 
     static SharedLibraryInfo reparceled(SharedLibraryInfo s) {
