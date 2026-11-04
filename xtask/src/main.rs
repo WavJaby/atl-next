@@ -35,6 +35,7 @@ mod packages;
 mod par;
 mod parcel;
 mod patch;
+mod platform_ui;
 mod provided_gate;
 mod providers;
 mod prune;
@@ -45,6 +46,7 @@ mod spdx;
 mod system;
 mod triage;
 mod upstream;
+mod wayland_proxy;
 mod window;
 mod workspace;
 
@@ -164,6 +166,11 @@ enum Test {
     ///
     /// The app then calls into WindowManager, which no service provides yet: its log after the marker and the services' counters that rose after it are printed.
     Window(window::Args),
+    /// The GTK platform layer (M3 slice 6) on a real Wayland compositor: a window maps, frame-clock ticks present scenes, GSK readback equals the pattern, a blocked UI thread answers no `xdg_wm_base` ping.
+    ///
+    /// Runs crates/atl-platform-ui/examples/gate.rs against $WAYLAND_DISPLAY (WSLg: wayland-0) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
+    /// The compositor's own "not responding" reaction is not observable on WSLg: `--hold-blocked <s>` keeps the UI thread blocked for the Arch-laptop run to watch.
+    PlatformUi(platform_ui::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -205,6 +212,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Window(args),
         } => window::run(&root, &args),
+        Command::Test {
+            test: Test::PlatformUi(args),
+        } => platform_ui::run(&root, &args),
     }
 }
 
