@@ -153,26 +153,40 @@ impl Process {
     }
 
     /// Runs `f` on the calling thread's connection, made first if the thread has none.
+    /// Once the thread's thread-locals are destroyed (libbinder releases its last references from C++ exit handlers, after them) the slot is gone: `f` runs on a one-shot connection (a `binder_thread` for this call alone, closed after it) instead of panicking, which `extern "C"` turns into an abort.
     fn with_thread<R>(
         &self,
         f: impl FnOnce(BorrowedFd<'_>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        THREAD.with(|slot| {
+        let mut f = Some(f);
+        let stored = THREAD.try_with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(self.new_thread()?);
             }
-            f(slot.as_ref().ok_or(Errno::IO)?.as_fd())
-        })
+            (f.take().expect("taken once"))(slot.as_ref().ok_or(Errno::IO)?.as_fd())
+        });
+        match (stored, f) {
+            (Ok(r), _) => r,
+            (Err(_), Some(f)) => {
+                let sock = self.new_thread()?;
+                f(sock.as_fd())
+            }
+            (Err(_), None) => Err(Errno::IO),
+        }
     }
 
-    /// `BINDER_THREAD_EXIT`: closes the calling thread's connection.
+    /// `BINDER_THREAD_EXIT`: closes the calling thread's connection (nothing to close once the thread-local is destroyed: the slot's drop closed it).
     pub fn thread_exit(&self) {
-        THREAD.with(|slot| drop(slot.borrow_mut().take()));
+        let _ = THREAD.try_with(|slot| drop(slot.borrow_mut().take()));
     }
 
     /// The calling thread's connection, in poll mode: readable while the thread has work.
+    /// Needs the stored connection (the fd outlives the call): `EBADF` once the thread-local is destroyed.
     pub fn poll_fd(&self) -> Result<RawFd, Errno> {
+        if THREAD.try_with(|_| ()).is_err() {
+            return Err(Errno::BADF);
+        }
         self.with_thread(|sock| {
             proto::send(sock, &Request::Poll.encode(), &[])?;
             status(&recv_reply(sock)?.0)?;
@@ -295,6 +309,71 @@ mod tests {
         let p = Process::connect(ours).expect("connect");
         p.mmap(REGION).expect("mmap");
         p
+    }
+
+    thread_local! {
+        /// Registered before the driver's own `THREAD`, so it is destroyed after it (destructors run in reverse order of registration): what a C++ static's destructor at `exit()` is to libbinder.
+        static LATE: RefCell<Option<Late>> = const { RefCell::new(None) };
+    }
+
+    /// Calls the driver from its destructor, after the thread's connection slot is gone.
+    struct Late {
+        process: std::sync::Arc<Process>,
+        done: std::sync::mpsc::Sender<Result<(usize, usize), WriteReadError>>,
+    }
+
+    impl Drop for Late {
+        fn drop(&mut self) {
+            let mut read_mem = |_: u64, _: usize| -> Vec<u8> { Vec::new() };
+            let mut dup_fd = |_: i32| -> Result<OwnedFd, Errno> { Err(Errno::BADF) };
+            // BC_ENTER_LOOPER with a zero read capacity: the write stream is consumed and the call returns at once
+            let mut w = CommandWriter::new();
+            w.push(&Command::EnterLooper);
+            let r = self
+                .process
+                .write_read(&w.0, &mut [], &mut read_mem, &mut dup_fd);
+            let _ = self.done.send(r);
+        }
+    }
+
+    /// libbinder releases its last references from C++ exit handlers, after the main thread's thread-locals are destroyed (libui's process-wide Gralloc5 allocator proxy, measured 2026-11-04): `binder_driver_ioctl` then runs with the per-thread connection slot gone, and a panic there aborts the process (`extern "C"` cannot unwind).
+    /// The call must work on a one-shot connection instead.
+    #[test]
+    fn driver_call_after_thread_local_destruction() {
+        let (admin, theirs) = pair();
+        let server = std::thread::spawn(move || {
+            let mut s = Server::new(theirs);
+            s.run().expect("run");
+            s
+        });
+        let process = std::sync::Arc::new(connect(&admin, 10001, false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = std::sync::Arc::clone(&process);
+        std::thread::spawn(move || {
+            // LATE first (destroyed last), then the thread's connection (made by the call)
+            LATE.with(|l| {
+                *l.borrow_mut() = Some(Late {
+                    process: p.clone(),
+                    done: tx,
+                })
+            });
+            let mut read_mem = |_: u64, _: usize| -> Vec<u8> { Vec::new() };
+            let mut dup_fd = |_: i32| -> Result<OwnedFd, Errno> { Err(Errno::BADF) };
+            let mut w = CommandWriter::new();
+            w.push(&Command::EnterLooper);
+            p.write_read(&w.0, &mut [], &mut read_mem, &mut dup_fd)
+                .expect("the call on a live thread");
+        })
+        .join()
+        .expect("thread");
+        let late = rx.recv().expect("the destructor reported");
+        assert_eq!(
+            late.expect("a call after thread-local destruction succeeds")
+                .0,
+            4
+        );
+        drop((process, admin));
+        server.join().expect("server thread");
     }
 
     /// An fd that does not dup fails the transaction as the kernel does (binder_translate_fd -EBADF -> BR_FAILED_REPLY): the ioctl succeeds with the write stream consumed, the read returns BR_FAILED_REPLY, binderd counts the missing fd.
