@@ -145,6 +145,108 @@ pub fn api_module(
     })
 }
 
+/// A record of function pointers we fill (a vtable handed out by a loader function, such as IMapper.h's `AIMapperV5`): the entry shells are generated from the header.
+pub struct Table<'a> {
+    /// The record; each of its fields is a pointer to a function.
+    pub record: &'a str,
+    /// Rust path of the implementation: `<implementation>::<field>` is an `unsafe fn` of the field's exact signature (the compiler checks it where the shell calls it).
+    pub implementation: &'a str,
+    /// What a panic in the implementation answers, as a Rust expression of the field's return type: (field, return type). Not asked for a field that returns void.
+    pub on_panic: &'a dyn Fn(&str, &Ty) -> Result<String>,
+}
+
+/// `api_module`, plus for `table` one exported-by-pointer `unsafe extern "C"` shell per field with the header's exact signature, and `impl <record> { pub const fn shells() -> Self }` with every field set to its shell.
+/// A shell calls the implementation with its arguments unchanged inside `catch_unwind` (a Rust panic must not cross into a C++ caller): a panic answers `on_panic`. Raw-pointer-to-safe-type conversion is the implementation's, at its first line (the thin-shell pattern).
+/// The record must be reached by `functions` or `types` (so its layout is asserted); a variadic entry has no shell.
+pub fn api_module_with_table(
+    iface: &Interface,
+    arch: &str,
+    functions: &[&str],
+    types: &[&str],
+    implementation: &str,
+    table: &Table<'_>,
+) -> Result<String> {
+    let mut out = api_module(iface, arch, functions, types, implementation)?;
+    let record = view(iface, arch)?
+        .records
+        .get(table.record)
+        .with_context(|| format!("{}: no record {}", iface.header, table.record))?;
+    ensure!(
+        out.contains(&format!("pub struct {} {{", ident(table.record))),
+        "{}: not reached by `functions` or `types`, so its layout is not asserted",
+        table.record
+    );
+    let mut opaque = BTreeSet::new();
+    let mut entries = Vec::new();
+    for field in &record.fields {
+        let f = field.name.as_str();
+        let sig = match field.ty.resolved() {
+            Ty::Pointer { pointee, .. } => match pointee.resolved() {
+                Ty::Function(sig) => sig,
+                _ => bail!("{}.{f}: not a function pointer", table.record),
+            },
+            _ => bail!("{}.{f}: not a function pointer", table.record),
+        };
+        ensure!(
+            !sig.variadic,
+            "{}.{f}: a variadic function cannot be forwarded",
+            table.record
+        );
+        let params = sig
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Ok(format!("p{i}: {}", rust_ty(p, &mut opaque)?)))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| f.to_owned())?;
+        let args = (0..sig.params.len())
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let call = format!(
+            "unsafe {{ {}::{}({args}) }}",
+            table.implementation,
+            ident(f)
+        );
+        let (ret, body) = match sig.ret.resolved() {
+            Ty::Void => (
+                String::new(),
+                format!(
+                    "let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {call}));"
+                ),
+            ),
+            _ => {
+                let fallback = (table.on_panic)(f, &sig.ret).with_context(|| f.to_owned())?;
+                (
+                    format!(" -> {}", rust_ty(&sig.ret, &mut opaque)?),
+                    format!(
+                        "::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {call})).unwrap_or_else(|_| {fallback})"
+                    ),
+                )
+            }
+        };
+        let shell = format!("shell_{f}");
+        writeln!(
+            out,
+            "#[allow(non_snake_case)]\nunsafe extern \"C\" fn {shell}({params}){ret} {{\n    // SAFETY: the implementation of `{f}`, of this exact signature (the compiler checks the call); the caller's contract is its own\n    {body}\n}}\n",
+            params = params.join(", "),
+        )?;
+        entries.push(format!("            {}: Some({shell}),", ident(f)));
+    }
+    ensure!(
+        opaque.is_empty(),
+        "{}: entries use types the functions do not define: {opaque:?}",
+        table.record
+    );
+    writeln!(
+        out,
+        "impl {} {{\n    /// Every entry set to its generated shell.\n    pub const fn shells() -> Self {{\n        Self {{\n{}\n        }}\n    }}\n}}",
+        ident(table.record),
+        entries.join("\n")
+    )?;
+    Ok(out)
+}
+
 /// `api_module` for an API we call through pointers looked up at run time (`dlsym`), not implement: for each of `functions` (C names) a type alias of that name, the header's fn-pointer type, instead of the implementation check.
 /// Nothing is exported: unlike `resolver_module`'s shells, no symbol of the importing object can interpose on the library's.
 /// A function named as a record of the interface (C's separate tag namespace: `int sigaction(int, const struct sigaction*, ...)`) gets the alias `<name>_fn`: both would be Rust types of one name.

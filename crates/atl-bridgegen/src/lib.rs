@@ -708,6 +708,93 @@ mod tests {
         assert!(rust::resolver_module(&iface, "x86_64", &["say"], "r::resolve", &on_null).is_err());
     }
 
+    /// Entry tables: a record of function pointers gets one shell per field (header signature, panic shield, forwarding to `<implementation>::<field>`) and `shells()`; rustc accepts the module with a matching implementation, rejects one whose signature differs, and a panic in an entry answers `on_panic`.
+    #[test]
+    fn table_shells_compile_and_shield() {
+        let dir = tmp("table");
+        let header = dir.0.join("t.h");
+        std::fs::write(
+            &header,
+            "struct Ops { int (*add)(int a, long b); void (*poke)(int *p); const char *(*name)(void); };\nstruct Ctx { unsigned version; struct Ops ops; };\nint load(struct Ctx **out);\nstruct Plain { int x; };\nint plain(struct Plain *p);\n",
+        )
+        .unwrap();
+        let targets = [target("x86_64", "x86_64-unknown-linux-gnu")];
+        let iface = interface("t", "t.h", &Source::c(&header, &[]), &targets).unwrap();
+        let on_panic = |f: &str, ret: &Ty| -> Result<String> {
+            Ok(match (f, ret.resolved()) {
+                ("name", _) => "core::ptr::null()".to_owned(),
+                _ => "-7".to_owned(),
+            })
+        };
+        let table = rust::Table {
+            record: "Ops",
+            implementation: "imp",
+            on_panic: &on_panic,
+        };
+        let gen_ = |functions: &[&str], record: &str| {
+            rust::api_module_with_table(
+                &iface,
+                "x86_64",
+                functions,
+                &[],
+                "exports",
+                &rust::Table { record, ..table },
+            )
+        };
+        let code = gen_(&["load"], "Ops").unwrap();
+        for want in [
+            "unsafe extern \"C\" fn shell_add(p0: i32, p1: i64) -> i32 {",
+            "unsafe extern \"C\" fn shell_poke(p0: *mut i32) {",
+            "catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe { imp::add(p0, p1) })).unwrap_or_else(|_| -7)",
+            "pub const fn shells() -> Self {",
+            "add: Some(shell_add),",
+        ] {
+            assert!(code.contains(want), "{want:?} missing:\n{code}");
+        }
+        // a table record the functions do not reach has no asserted layout: refused; so is a non-pointer field
+        assert!(gen_(&["plain"], "Ops").is_err());
+        assert!(gen_(&["load"], "Ctx").is_err());
+        let prelude = "extern crate std;\nmod exports { pub unsafe extern \"C\" fn load(_: *mut *mut super::Ctx) -> i32 { 0 } }\n";
+        let imp = "mod imp {\n  pub unsafe fn add(a: i32, b: i64) -> i32 { if a < 0 { panic!(\"boom\") } a + b as i32 }\n  pub unsafe fn poke(p: *mut i32) { unsafe { *p = 1 } }\n  pub unsafe fn name() -> *const i8 { core::ptr::null() }\n}\n";
+        let ok = rustc(&dir, &format!("{prelude}{code}{imp}"));
+        assert!(
+            ok.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        let wrong = imp.replace("b: i64", "b: i32");
+        assert_ne!(wrong, imp);
+        assert!(
+            !rustc(&dir, &format!("{prelude}{code}{wrong}"))
+                .status
+                .success()
+        );
+        // run it: the shielded panic answers -7 instead of unwinding out of the extern "C" fn
+        let main = format!(
+            "{prelude}{code}{imp}\n#[test]\nfn shield() {{ let t = Ops::shells(); let add = t.add.unwrap(); unsafe {{ assert_eq!(add(1, 2), 3); assert_eq!(add(-1, 2), -7); }} }}\n"
+        );
+        let src = dir.0.join("run.rs");
+        std::fs::write(&src, main.replace("extern crate std;", "")).unwrap();
+        let bin = dir.0.join("run");
+        let build = std::process::Command::new("rustc")
+            .args(["--edition", "2024", "--test", "-A", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = std::process::Command::new(&bin).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
     /// Imports: one fn-pointer type alias per function, named as the function, nothing exported; an array parameter without a size (`char *const argv[]`) is its adjusted pointer, as one with a size.
     #[test]
     fn import_types_compile() {
