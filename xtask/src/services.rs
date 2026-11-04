@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use atl_broker::control::{self, Request, Response};
 use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -133,6 +133,12 @@ pub fn stage(
     test_root: &Path,
 ) -> Result<Vec<String>> {
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
+    let keymap = crate::keymap::staged(out);
+    ensure!(
+        keymap.is_file(),
+        "missing {}: `xtask native` stages it from the goal validatekeymaps",
+        keymap.display()
+    );
     let client = packages::bin(root, out, PACKAGE, "atl-services-client")?;
     let services_log = test_root.join("services.log");
     // the installed package, as atld's install step would write it
@@ -177,6 +183,8 @@ pub fn stage(
     let mut cmd = Command::new(&host);
     cmd.arg("--packages")
         .arg(&packages_file)
+        .arg("--virtual-keymap")
+        .arg(&keymap)
         .args(["--launch", APP])
         .envs(env.iter().cloned())
         .stdin(Stdio::from(control_theirs))

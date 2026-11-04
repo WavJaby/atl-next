@@ -58,7 +58,7 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_APP_START (system/core/libcutils/include/private/android_filesystem_config.h), the first app uid, as an app process has.
 const AID_APP_START: u32 = 10000;
 /// Every line ParcelTruth.java prints, by case, in its order: a missing one fails the stage (a driver that stops early passes nothing). `summary` is its last line.
-const CASES: [&str; 43] = [
+const CASES: [&str; 45] = [
     "ApplicationInfo",
     "ActivityInfo",
     "ActivityManager.TaskDescription",
@@ -94,6 +94,8 @@ const CASES: [&str; 43] = [
     "SurfaceControl",
     "InsetsSourceControl.Array",
     "WindowRelayoutResult",
+    "InputDevice",
+    "InputDevice:pointer",
     "Rect",
     "InputChannel",
     "self-test:corrupt",
@@ -227,12 +229,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // writing a binder, even null, reaches libbinder's IPCThreadState and so opens the driver: the run is a binder process of binderd, as an app's is
     let (mut binderd, harness) =
         binder::start_binderd(root, &out, &out.join("parcel/binderd.log"))?;
+    let keymap = crate::keymap::staged(&out);
+    ensure!(
+        keymap.is_file(),
+        "missing {}: `xtask native` stages it from the goal validatekeymaps",
+        keymap.display()
+    );
     let cmd = art.command(
         &fixture,
         &fixture.area.1,
         &[],
         DRIVER,
-        &[lib.display().to_string(), runtime.display().to_string()],
+        &[
+            lib.display().to_string(),
+            runtime.display().to_string(),
+            keymap.display().to_string(),
+        ],
     );
     let what = format!("{cmd:?}");
     let run = harness

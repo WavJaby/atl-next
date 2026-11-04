@@ -379,6 +379,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
+        stage_keymap(&layout, &out, &mut failed);
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }
@@ -423,10 +424,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             |c| c.line.clone(),
         );
     failed.insert(0, Failure::step("ninja", cause));
+    stage_keymap(&layout, &out, &mut failed);
     if let Some(first) = table_check(&table) {
         failed.push(Failure::step("table check", first));
     }
     Ok(verdict(failed))
+}
+
+/// Stages the virtual keyboard map (keymap.rs) when its tool was built. A tool that is missing (the goal was not in this run's closure) is reported, not failed: the gates that need the map fail on it.
+fn stage_keymap(layout: &Layout, out: &Path, failed: &mut Vec<Failure>) {
+    if !out.join("device/validatekeymaps/validatekeymaps").is_file() {
+        println!(
+            "native: keymap not staged: goal validatekeymaps not built in {}",
+            out.display()
+        );
+        return;
+    }
+    match crate::keymap::stage(layout, out) {
+        Ok(path) => println!("native: keymap -> {}", path.display()),
+        Err(e) => {
+            let text = format!("{e:#}");
+            println!("native: keymap: {text}");
+            failed.push(Failure::step("keymap", text));
+        }
+    }
 }
 
 /// The run's last line and exit code: every failed check by name, with the first error line of the first one. A run is never read as passed from a tail that ends in a check reporting 0 problems.

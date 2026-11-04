@@ -42,6 +42,7 @@ pub mod android {
     pub mod view {
         pub mod DisplayInfo;
         pub mod InputChannel;
+        pub mod InputDevice;
         pub mod InsetsSourceControl_Array;
         pub mod InsetsState;
         pub mod SurfaceControl;

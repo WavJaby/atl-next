@@ -30,7 +30,7 @@ use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
-    DisplayInfo, InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
+    DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, SurfaceControl,
     WindowManager_LayoutParams, WindowRelayoutResult,
 };
 use atl_parcelables::android::window::ClientWindowFrames;
@@ -277,6 +277,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.window.ClientWindowFrames" => round_trip_as::<ClientWindowFrames>(input, mode),
         "android.util.MergedConfiguration" => round_trip_as::<MergedConfiguration>(input, mode),
         "android.view.WindowRelayoutResult" => round_trip_as::<WindowRelayoutResult>(input, mode),
+        "android.view.InputDevice" => round_trip_as::<InputDevice>(input, mode),
         "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }
@@ -401,7 +402,34 @@ pub(crate) fn last_error() -> String {
 /// `static native byte[] roundTrip(String className, byte[] marshalled, int mode)`: null on failure (`lastError`).
 ///
 /// # Safety
+/// `ParcelTruth.setKeyCharacterMap(byte[])`: the staged map every InputDevice codec read compares against. 0 when set, else -1 with the reason in `lastError`.
+///
+/// # Safety
+/// Called by ART as that native method: `env` is the JNIEnv of this thread's call, `map` a local reference valid for it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_ParcelTruth_setKeyCharacterMap(
+    env: JniEnv,
+    _class: JObject,
+    map: JObject,
+) -> i32 {
+    // SAFETY: ART's argument to this native method
+    let Some(map) = (unsafe { bytes(env, map) }) else {
+        set_error("null argument".to_owned());
+        return -1;
+    };
+    match atl_parcelables::codecs::android::view::InputDevice::set_key_character_map(&map) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e.to_owned());
+            -1
+        }
+    }
+}
+
 /// Called by ART as that native method.
+///
+/// # Safety
+/// `env` is the JNIEnv of this thread's native call; the object arguments are local references valid for it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_ParcelTruth_roundTrip(
     env: JniEnv,

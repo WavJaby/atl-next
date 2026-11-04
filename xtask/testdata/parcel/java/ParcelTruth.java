@@ -31,6 +31,8 @@ import android.graphics.Rect;
 import android.view.Display;
 import android.view.DisplayInfo;
 import android.view.InputChannel;
+import android.view.InputDevice;
+import android.view.KeyCharacterMap;
 import android.view.InsetsSource;
 import android.view.InsetsSourceControl;
 import android.view.InsetsState;
@@ -61,6 +63,8 @@ import java.util.UUID;
 
 public class ParcelTruth {
     static native byte[] roundTrip(String className, byte[] marshalled, int mode);
+    /// The staged KeyCharacterMap (validatekeymaps --parcel-out, args[2]): the InputDevice codec reads its bytes against this. 0 when set, else -1 (lastError).
+    static native int setKeyCharacterMap(byte[] map);
     static native String lastError();
     static native String refused();
     static native int startReg();
@@ -84,6 +88,12 @@ public class ParcelTruth {
         int reg = startReg();
         if (reg != 0) {
             System.out.println("pt fail startReg returned " + reg);
+            System.exit(1);
+        }
+        // args[2]: the virtual keyboard's map as AOSP's loader writes it; every InputDevice carries these bytes
+        byte[] keymap = readFile(args[2]);
+        if (setKeyCharacterMap(keymap) != 0) {
+            System.out.println("pt fail keymap " + lastError());
             System.exit(1);
         }
         ApplicationInfo ai = applicationInfo();
@@ -174,6 +184,9 @@ public class ParcelTruth {
         check("SurfaceControl", new SurfaceControl(), SurfaceControl.CREATOR);
         check("InsetsSourceControl.Array", new InsetsSourceControl.Array(), InsetsSourceControl.Array.CREATOR);
         check("WindowRelayoutResult", windowRelayoutResult(config), WindowRelayoutResult.CREATOR);
+        // the desktop's device list (atl-services input.rs): the virtual keyboard (-1) and the pointer, both with the staged map
+        check("InputDevice", inputDevice(-1, "Virtual", "atl:virtual-keyboard", InputDevice.SOURCE_KEYBOARD, InputDevice.KEYBOARD_TYPE_ALPHABETIC, keymap), InputDevice.CREATOR);
+        check("InputDevice:pointer", inputDevice(1, "ATL pointer", "atl:pointer", InputDevice.SOURCE_MOUSE, 0, keymap), InputDevice.CREATOR);
         check("Rect", new Rect(1, 2, 3, 4), Rect.CREATOR);
         checkInputChannel("InputChannel");
 
@@ -697,6 +710,40 @@ public class ParcelTruth {
         i.handleProfiling = true;
         i.functionalTest = true;
         return i;
+    }
+
+    static byte[] readFile(String path) {
+        try {
+            return java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(path + ": " + e);
+        }
+    }
+
+    /// KeyCharacterMap's Java framing (android_view_KeyCharacterMap.cpp nativeWriteToParcel): deviceId, present, then libinput's form (the staged bytes).
+    static byte[] framedMap(int deviceId, byte[] keymap) {
+        return java.nio.ByteBuffer.allocate(8 + keymap.length).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putInt(deviceId).putInt(1).put(keymap).array();
+    }
+
+    /// An InputDevice as the services build it (Builder values; the map read through KeyCharacterMap.CREATOR from the framed staged bytes, as Java's own reader does).
+    static InputDevice inputDevice(int id, String name, String descriptor, int sources, int keyboardType, byte[] keymap) {
+        Parcel in = Parcel.obtain();
+        byte[] framed = framedMap(id, keymap);
+        in.unmarshall(framed, 0, framed.length);
+        in.setDataPosition(0);
+        KeyCharacterMap kcm = KeyCharacterMap.CREATOR.createFromParcel(in);
+        in.recycle();
+        return new InputDevice.Builder()
+                .setId(id)
+                .setGeneration(1)
+                .setName(name)
+                .setDescriptor(descriptor)
+                .setSources(sources)
+                .setKeyboardType(keyboardType)
+                .setKeyCharacterMap(kcm)
+                .setEnabled(true)
+                .build();
     }
 
     static byte[] marshal(Parcelable p) {

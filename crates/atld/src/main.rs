@@ -94,6 +94,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the services use the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// The virtual keyboard's KeyCharacterMap in Parcel form (`validatekeymaps --parcel-out` on Virtual.kcm): forwarded to atl-system-services, which serves it with every InputDevice.
+    #[arg(long)]
+    virtual_keymap: PathBuf,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -660,6 +663,10 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let Some(d) = &a.display {
         services_args.extend(["--display".into(), d.to_arg().into()]);
     }
+    services_args.extend([
+        "--virtual-keymap".into(),
+        a.virtual_keymap.clone().into_os_string(),
+    ]);
     let mut services = host
         .broker
         .spawn(system_spawn(

@@ -39,6 +39,8 @@ pub struct Runtime {
     framework_res: PathBuf,
     font_xml: PathBuf,
     font_file: PathBuf,
+    /// The virtual keyboard's staged KeyCharacterMap (keymap.rs), served by the input service.
+    keymap: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
 }
@@ -153,6 +155,12 @@ impl Runtime {
         std::fs::write(&font_xml, FONT_FALLBACK_XML)?;
         let font_file = farm::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
         ensure!(font_file.is_file(), "missing input {}", font_file.display());
+        let keymap = crate::keymap::staged(&out);
+        ensure!(
+            keymap.is_file(),
+            "missing {}: `xtask native` stages it from the goal validatekeymaps",
+            keymap.display()
+        );
         Ok(Runtime {
             art,
             out,
@@ -166,6 +174,7 @@ impl Runtime {
             framework_res,
             font_xml,
             font_file,
+            keymap,
             gralloc: None,
         })
     }
@@ -303,6 +312,8 @@ impl Runtime {
             .arg(format!("{}=etc/font_fallback.xml", self.font_xml.display()))
             .arg("--system-file")
             .arg(format!("{}=fonts/{FONT_FILE}", self.font_file.display()))
+            .arg("--virtual-keymap")
+            .arg(&self.keymap)
             .args(["--first-uid", &run.first_uid.to_string()])
             .args(["--log-tags", &run.log_tags]);
         for jar in &self.art.boot {
