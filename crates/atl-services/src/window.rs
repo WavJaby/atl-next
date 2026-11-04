@@ -68,6 +68,10 @@ impl IWindowManager for WindowManager {
             &Strong<dyn atl_aidl::mangled::_7_android_4_view_22_IWindowSessionCallback>,
         >,
     ) -> binder::Result<Option<Strong<dyn IWindowSession>>> {
+        counters::count(
+            WINDOW_MANAGER,
+            "openSession (session created: no window yet)",
+        );
         Ok(Some(BnWindowSession::new_binder(
             Session,
             BinderFeatures::default(),

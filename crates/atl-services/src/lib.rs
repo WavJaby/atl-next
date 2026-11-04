@@ -24,6 +24,8 @@ pub mod activity;
 #[cfg(feature = "converter")]
 pub mod display;
 #[cfg(feature = "converter")]
+pub mod input_method;
+#[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
 pub mod settings;
