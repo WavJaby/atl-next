@@ -12,7 +12,7 @@ use clap::ValueEnum;
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
-    providers, prune, sources, spdx, workspace,
+    providers, prune, slot, sources, spdx, workspace,
 };
 use atl_layout::Layout;
 
@@ -24,7 +24,7 @@ pub struct Args {
     /// Run only these steps (repeatable).
     #[arg(long, value_enum)]
     only: Vec<Step>,
-    /// Native build directory for converter-packages (default `<workspace>/out/native/<build machine>`, as `xtask native`); without its graph.json that step is skipped.
+    /// Native build directory for converter-packages (default: this checkout's slot, see `xtask slot`; else `<workspace>/out/native/<build machine>`); without its graph.json that step is skipped.
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -188,17 +188,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .into_iter()
         .filter(|s| args.only.is_empty() || args.only.contains(s))
         .collect();
-    let out = match &args.out {
-        Some(dir) => std::path::absolute(dir)?,
-        None => {
-            let arches = arches::load(root)?;
-            let (machine, _) = arches::build_machine(root, &arches)?;
-            Layout::of(root)?
-                .workspace()
-                .join("out/native")
-                .join(machine)
-        }
-    };
+    let arches = arches::load(root)?;
+    let (machine, _) = arches::build_machine(root, &arches)?;
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+        workspace.join("out/native").join(machine)
+    })?;
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for step in &steps {

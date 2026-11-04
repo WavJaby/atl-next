@@ -15,21 +15,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, ensure};
-use atl_layout::Layout;
 
 use crate::atld_run::without_stamp;
 use crate::host_art::HostArt;
-use crate::{binder, packages};
+use crate::{binder, packages, slot};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory whose graph holds libbinder_rs, libatl_parcelables and ART (default <workspace>/out/native/<host>, as `xtask native`).
+    /// Native build directory whose graph holds libbinder_rs, libatl_parcelables and ART (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Print every ART run's command, stdout and stderr.
@@ -189,13 +188,9 @@ fn refusal_logged(stderr: &str) -> Option<String> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = match &args.out {
-        Some(dir) => std::path::absolute(dir)?,
-        None => Layout::of(root)?
-            .workspace()
-            .join("out/native")
-            .join(&args.host),
-    };
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+        workspace.join("out/native").join(&args.host)
+    })?;
     let probe = packages::bin(root, &out, PACKAGE, PROBE)?;
     let mut fails = verdict(
         &run_probe(&probe, &[])?,

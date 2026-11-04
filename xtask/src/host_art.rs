@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::{arches, farm, packages};
+use crate::{arches, farm, packages, slot};
 
 /// The boot classpath: the dex jars the Java pipeline's goal `platform-bootclasspath` built, one per line in BOOTCLASSPATH order (bp2ninja bootclasspath.go derives it as Soong's product config and derive_classpath do).
 const BOOTCLASSPATH: &str = "bootclasspath.txt";
@@ -113,7 +113,7 @@ fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl HostArt {
-    /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default <workspace>/out/java/build).
+    /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     pub fn new(
         root: &Path,
         host: &str,
@@ -132,10 +132,9 @@ impl HostArt {
             format!("{host}: no soong_prebuilt_os (no prebuilt JDK or host ART)")
         })?;
         let layout = Layout::of(root)?;
-        let java_out = match java_out {
-            Some(dir) => std::path::absolute(dir)?,
-            None => layout.workspace().join("out/java/build"),
-        };
+        let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
+            workspace.join("out/java/build")
+        })?;
         let art = out.join(stage);
         let lib_path = stage_art(out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
         let h = HostArt {

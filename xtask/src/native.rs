@@ -17,7 +17,7 @@ use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages, patch,
-    provided_gate, providers, prune, sources, system, triage, upstream, workspace,
+    provided_gate, providers, prune, slot, sources, system, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -48,7 +48,7 @@ pub struct Args {
     /// runs once, after that.
     #[arg(long)]
     fetch_missing: bool,
-    /// Build directory (default `<workspace>/out/native/<host>`): concurrent checkouts keep their outputs apart.
+    /// Build directory (default: this checkout's slot, see `xtask slot`; else `<workspace>/out/native/<host>`): concurrent checkouts keep their outputs apart.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Failure summary: every distinct error message, undefined symbol and failed dependency per module (default: the first few; ninja.log keeps the full output).
@@ -89,17 +89,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if tree != farm::shared_tree(&layout) {
         println!("native: AOSP tree with task copies: {}", tree.display());
     }
-    // go.work and the converter binary name this checkout's tools/bp2ninja: with an explicit --out they live there too, so concurrent checkouts do not overwrite each other's
-    let (out, tool_dir) = match &args.out {
-        Some(dir) => {
-            let dir = std::path::absolute(dir)?;
-            (dir.clone(), dir.join("bp2ninja"))
-        }
-        None => (
-            ws.join("out").join("native").join(&args.host),
-            ws.join("out").join("bp2ninja"),
-        ),
-    };
+    // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+        workspace.join("out").join("native").join(&args.host)
+    })?;
+    let tool_dir = out.join("bp2ninja");
     std::fs::create_dir_all(&out)?;
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
     let converter = tool_dir.join("bp2ninja");

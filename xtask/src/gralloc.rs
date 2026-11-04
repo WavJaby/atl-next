@@ -14,19 +14,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_gralloc::vintf;
-use atl_layout::Layout;
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::binder::{self, Harness};
-use crate::packages;
+use crate::{packages, slot};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory (default <workspace>/out/native/<host>, as `xtask native`).
+    /// Native build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
     /// The DRM node the allocator uses instead of trying /dev/dri's render then card nodes.
@@ -184,13 +183,9 @@ fn spawn_probe(
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = match &args.out {
-        Some(dir) => std::path::absolute(dir)?,
-        None => Layout::of(root)?
-            .workspace()
-            .join("out/native")
-            .join(&args.host),
-    };
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+        workspace.join("out/native").join(&args.host)
+    })?;
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
     let service = device.join("service/service");

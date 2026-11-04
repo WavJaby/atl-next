@@ -5,7 +5,7 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 
 ## Workspace
 
-- `~/atl-next/` (WSL ext4, never an NTFS drive): `repo/` main checkout; `wt/<task>/` one git worktree per task / subagent; `src/<upstream>/` `xtask fetch` checkouts at pinned commits + origin/main's patches, shared by all checkouts; `src-wt/<task>/<upstream>/` task copies (`<task>` = the repo checkout's branch) of upstreams a task patches, `src-wt/<task>/aosp-tree/` the AOSP link farm over them; `out/<checkout>/<target>/` build output (`bin`, `lib`, `include`, `share`, `gen/`); `cache/` sccache, downloads, test APKs; `tools/` test-environment tools.
+- `~/atl-next/` (WSL ext4, never an NTFS drive): `repo/` main checkout; `wt/<task>/` one git worktree per task / subagent; `src/<upstream>/` `xtask fetch` checkouts at pinned commits + origin/main's patches, shared by all checkouts; `src-wt/<task>/<upstream>/` task copies (`<task>` = the repo checkout's branch) of upstreams a task patches, `src-wt/<task>/aosp-tree/` the AOSP link farm over them; `out/slot-<n>/` build output of the checkout holding slot n (`cargo xtask slot`; `native`, `check` and `test` build there by default) (`bin`, `lib`, `include`, `share`, `gen/`); `cache/` sccache, downloads, test APKs; `tools/` test-environment tools.
 - The repo holds only our code, the manifests and `patches/<upstream>/`. Never commit upstream sources, imported AOSP Java or generated code.
 - `cargo xtask` is the only build/test driver. Read-only or dry-run by default.
 

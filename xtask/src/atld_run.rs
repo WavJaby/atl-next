@@ -13,7 +13,7 @@ use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::host_art::{self, HostArt};
-use crate::{farm, packages};
+use crate::{farm, packages, slot};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
@@ -122,14 +122,12 @@ impl Runtime {
         verbose: bool,
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
-        let out = match out {
-            Some(dir) => std::path::absolute(dir)?,
-            None => layout.workspace().join("out/native").join(host),
-        };
-        let java_out = match java_out {
-            Some(dir) => std::path::absolute(dir)?,
-            None => layout.workspace().join("out/java/build"),
-        };
+        let out = slot::out_dir(root, out, "--out", |workspace| {
+            workspace.join("out/native").join(host)
+        })?;
+        let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
+            workspace.join("out/java/build")
+        })?;
         let art = HostArt::new(root, host, Some(&java_out), &out, stage, verbose)?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
         ensure!(

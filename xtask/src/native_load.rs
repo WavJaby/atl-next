@@ -33,9 +33,9 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::farm;
 use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
 use crate::verdict::{Failure, Verdict};
+use crate::{farm, slot};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -46,10 +46,10 @@ pub struct Args {
     /// Default: the converter's ART in --out (`xtask native` goals dalvikvm, libart, ...), staged into <out>/native-load-art as an install would lay it out (see `stage_art`).
     #[arg(long)]
     art: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// Native build directory holding libandroid_runtime (default <workspace>/out/native/<host>, as `xtask native`); the fixture is built into its native-load/.
+    /// Native build directory holding libandroid_runtime (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>); the fixture is built into its native-load/.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Stage 4 fails, instead of warning, when a library is mapped more than once (for an ART built by the converter).
@@ -264,10 +264,9 @@ const NO_AREA: &str = "no system property area";
 impl Env {
     fn new(root: &Path, args: &Args) -> Result<Self> {
         let layout = Layout::of(root)?;
-        let out = match &args.out {
-            Some(dir) => std::path::absolute(dir)?,
-            None => layout.workspace().join("out/native").join(&args.host),
-        };
+        let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+            workspace.join("out/native").join(&args.host)
+        })?;
         let host = HostArt::new(
             root,
             &args.host,

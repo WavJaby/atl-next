@@ -26,10 +26,10 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`).
     #[arg(long)]
     host: String,
-    /// Native build directory holding ART, servicemanager and the services (default <workspace>/out/native/<host>, as `xtask native`); the report goes to `<out>/cts/report.json`.
+    /// Native build directory holding ART, servicemanager and the services (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>); the report goes to `<out>/cts/report.json`.
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory (default <workspace>/out/java/build): the converter builds the test APKs there, next to the boot jars, aapt2, `am` and the android.test.* libraries `xtask test instrument` needs.
+    /// Java pipeline build directory (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build): the converter builds the test APKs there, next to the boot jars, aapt2, `am` and the android.test.* libraries `xtask test instrument` needs.
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Run only these cts.toml rows (repeatable); default every row.

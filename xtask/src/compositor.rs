@@ -14,21 +14,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
-use atl_layout::Layout;
 
 use crate::binder;
 use crate::host_art::HostArt;
 use crate::parcel::truth_verdict;
+use crate::slot;
 
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
-    /// Native build directory whose graph holds libgui, libbinder and ART (default <workspace>/out/native/<host>, as `xtask native`).
+    /// Native build directory whose graph holds libgui, libbinder and ART (default: this checkout's slot, see `xtask slot`; else <workspace>/out/native/<host>).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default <workspace>/out/java/build).
+    /// Java pipeline build directory: the ART host boot jars, framework-minus-apex and its d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Write the libgui-written Transaction dump into this existing directory.
@@ -62,13 +62,9 @@ const CASES: [&str; 9] = [
 ];
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = match &args.out {
-        Some(dir) => std::path::absolute(dir)?,
-        None => Layout::of(root)?
-            .workspace()
-            .join("out/native")
-            .join(&args.host),
-    };
+    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
+        workspace.join("out/native").join(&args.host)
+    })?;
     let art = HostArt::new(
         root,
         &args.host,
