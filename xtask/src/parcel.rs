@@ -17,6 +17,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
+use crate::atld_run::without_stamp;
 use crate::host_art::HostArt;
 use crate::{binder, packages};
 
@@ -57,10 +58,11 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_APP_START (system/core/libcutils/include/private/android_filesystem_config.h), the first app uid, as an app process has.
 const AID_APP_START: u32 = 10000;
 /// Every line ParcelTruth.java prints, by case, in its order: a missing one fails the stage (a driver that stops early passes nothing). `summary` is its last line.
-const CASES: [&str; 33] = [
+const CASES: [&str; 34] = [
     "ApplicationInfo",
     "ActivityInfo",
     "ActivityManager.TaskDescription",
+    "ApplicationErrorReport.ParcelableCrashInfo",
     "DisplayInfo",
     "Configuration",
     "CompatibilityInfo",
@@ -168,7 +170,7 @@ const REFUSAL_LINE: &str = "parcelables: refused android.content.Intent.clipData
 
 /// A failure message when the refusal of the self-test is missing from the driver's stderr: refusals that show up only in a counter nobody prints are the failure this guards.
 fn refusal_logged(stderr: &str) -> Option<String> {
-    if stderr.lines().any(|l| l == REFUSAL_LINE) {
+    if stderr.lines().any(|l| without_stamp(l) == REFUSAL_LINE) {
         None
     } else {
         Some(format!("stderr lacks the refusal line {REFUSAL_LINE:?}"))
@@ -297,6 +299,7 @@ mod tests {
             None
         );
         assert!(refusal_logged("").is_some());
+        assert_eq!(refusal_logged(&format!("{REFUSAL_LINE} at=1.000\n")), None);
         assert!(
             refusal_logged("parcelables: refused android.content.Intent.clipData 2\n").is_some()
         );

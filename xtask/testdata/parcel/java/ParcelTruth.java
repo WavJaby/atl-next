@@ -6,6 +6,7 @@
 // Self-tests (must fail as stated, else `pt fail`): a corrupted Rust encoding is caught by the comparison, a wrong codec by the consumption check, an Intent with ClipData and a Bundle with a bad mHasIntent by their refusals (each refusal is also a line on stderr, which xtask checks).
 
 import android.app.ActivityManager;
+import android.app.ApplicationErrorReport;
 import android.app.ContentProviderHolder;
 import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ClientTransaction;
@@ -85,6 +86,8 @@ public class ParcelTruth {
         check("ActivityInfo", activity, ActivityInfo.CREATOR);
         // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
         check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);
+        // the crash report an app's process sends as it dies (RuntimeInit's uncaught-exception handler): nine strings and one int, nulls where unset
+        check("ApplicationErrorReport.ParcelableCrashInfo", crashInfo(), ApplicationErrorReport.ParcelableCrashInfo.CREATOR);
         // IDisplayManager.getDisplayInfo's record (DisplayInfo.writeToParcel): every field set off its default, its Mode arrays in use
         check("DisplayInfo", displayInfo(), DisplayInfo.CREATOR);
         check("Configuration", config, Configuration.CREATOR);
@@ -418,6 +421,21 @@ public class ParcelTruth {
         info.thermalBrightnessThrottlingDataId = "default";
         info.canHostTasks = true;
         return info;
+    }
+
+    /// ApplicationErrorReport.ParcelableCrashInfo as the uncaught-exception handler fills it: text in UTF-16 with one non-ASCII character, the handler's class set and the tag null.
+    static ApplicationErrorReport.ParcelableCrashInfo crashInfo() {
+        ApplicationErrorReport.ParcelableCrashInfo c = new ApplicationErrorReport.ParcelableCrashInfo();
+        c.exceptionHandlerClassName = "com.android.internal.os.RuntimeInit$KillApplicationHandler";
+        c.exceptionClassName = "java.lang.IllegalStateException";
+        c.exceptionMessage = "IInputMethodManager is not available é";
+        c.throwFileName = "InputMethodManager.java";
+        c.throwClassName = "android.view.inputmethod.InputMethodManager";
+        c.throwMethodName = "createRealInstance";
+        c.throwLineNumber = 1640;
+        c.stackTrace = "java.lang.IllegalStateException: IInputMethodManager is not available é\n\tat android.view.inputmethod.InputMethodManager.createRealInstance(InputMethodManager.java:1640)";
+        c.crashTag = null;
+        return c;
     }
 
     /// ActivityManager.TaskDescription with every field off its default (colours opaque, as the setters require; no icon, which the codec does not model).

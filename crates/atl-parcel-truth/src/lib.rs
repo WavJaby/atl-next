@@ -17,6 +17,7 @@ use std::sync::Mutex;
 mod compositor;
 
 use atl_parcelables::android::app::ActivityManager_TaskDescription;
+use atl_parcelables::android::app::ApplicationErrorReport_ParcelableCrashInfo;
 use atl_parcelables::android::app::ContentProviderHolder;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{
@@ -252,6 +253,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.app.ContentProviderHolder" => round_trip_as::<ContentProviderHolder>(input, mode),
         "android.app.ActivityManager$TaskDescription" => {
             round_trip_as::<ActivityManager_TaskDescription>(input, mode)
+        }
+        "android.app.ApplicationErrorReport$ParcelableCrashInfo" => {
+            round_trip_as::<ApplicationErrorReport_ParcelableCrashInfo>(input, mode)
         }
         "android.view.DisplayInfo" => round_trip_as::<DisplayInfo>(input, mode),
         "java.util.Map" => round_trip_map(input, mode),

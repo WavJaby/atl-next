@@ -4,7 +4,7 @@
 //! (finishAttachApplication -> scheduleTransaction([LaunchActivityItem, ResumeActivityItem]) of its launcher activity), asks for the settings provider (getContentProvider) and its display (getDisplayId);
 //! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process), and the broadcast calls a test runner makes
 //! (broadcastIntentWithFeature, registerReceiverWithFeature: validated as AOSP does, then nothing is delivered).
-//! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); every other method is counted unimplemented (counters).
+//! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); a crash report (handleApplicationCrash) is logged; every other method is counted unimplemented (counters).
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
 
@@ -22,7 +22,10 @@ use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnecti
 use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
-use atl_parcelables::android::app::{ActivityManager_TaskDescription, ContentProviderHolder};
+use atl_parcelables::android::app::{
+    ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
+    ContentProviderHolder,
+};
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
 };
@@ -628,6 +631,42 @@ impl IActivityManager for ActivityManager {
 
     fn r#unimplemented(&self, method: &'static str) -> Status {
         counters::unimplemented(AM, method)
+    }
+
+    /// ActivityManagerService.handleApplicationCrash (AppErrors shows and records the report in AOSP): an app's uncaught exception as its process dies (RuntimeInit's
+    /// KillApplicationHandler, which kills the process itself afterwards). Logged here with the process it came from; nothing else, as the process is already going down.
+    fn r#handleApplicationCrash(
+        &self,
+        app: Option<&SpIBinder>,
+        crash: Option<&ApplicationErrorReport_ParcelableCrashInfo>,
+    ) -> binder::Result<()> {
+        let Some(crash) = crash else {
+            return Ok(());
+        };
+        let who = {
+            let st = self.inner.state();
+            st.processes
+                .iter()
+                .find(|r| {
+                    r.attached
+                        .as_ref()
+                        .is_some_and(|a| app.is_some_and(|b| a.thread.as_binder() == *b))
+                })
+                .map_or_else(
+                    || "an unknown process".to_owned(),
+                    |r| format!("{} (pid {})", r.process_name, r.pid),
+                )
+        };
+        log(format_args!(
+            "crash report from {who}: {}: {}; thrown at {}.{}({}:{})",
+            crash.exception_class_name.as_deref().unwrap_or("?"),
+            crash.exception_message.as_deref().unwrap_or(""),
+            crash.throw_class_name.as_deref().unwrap_or("?"),
+            crash.throw_method_name.as_deref().unwrap_or("?"),
+            crash.throw_file_name.as_deref().unwrap_or("?"),
+            crash.throw_line_number,
+        ));
+        Ok(())
     }
 
     /// ActivityManagerService.attachApplication:4852 -> attachApplicationLocked:4517: a null thread is a SecurityException; the app is the process this service started (:4540-4563: found by

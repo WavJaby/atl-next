@@ -20,6 +20,7 @@ use atl_broker::control::{self, Request, Response};
 use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
+use crate::atld_run::without_stamp;
 use crate::binder::Harness;
 use crate::packages;
 
@@ -115,7 +116,7 @@ fn verdict(app: &Run, system: &Run, feature: &Run, info: &Run, services_log: &st
         }
     }
     for want in MUST_COUNT {
-        if !services_log.lines().any(|l| l == *want) {
+        if !services_log.lines().any(|l| without_stamp(l) == *want) {
             fails.push(format!("counter line missing: {want}"));
         }
     }

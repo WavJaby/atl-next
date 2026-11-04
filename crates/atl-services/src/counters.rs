@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Transactions the services do not implement, counted per (interface, method). Each count also goes to stderr as `services: unimplemented <interface>.<method> <n>`,
-//! the line `xtask test binder` reads (a process killed at the end of a test prints no summary).
+//! Transactions the services do not implement, counted per (interface, method). Each count also goes to stderr as `services: unimplemented <interface>.<method> <n> at=<stamp>`,
+//! `<stamp>` being [`wall_stamp`] (the app log's clock; xtask's atld_run.rs `events` reads the lines). A process killed at the end of a test prints no summary.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -18,7 +18,8 @@ pub fn count(interface: &'static str, method: &str) -> u64 {
     drop(map);
     let _ = writeln!(
         std::io::stderr(),
-        "services: unimplemented {interface}.{method} {n}"
+        "services: unimplemented {interface}.{method} {n} at={}",
+        wall_stamp()
     );
     n
 }
@@ -27,6 +28,14 @@ pub fn count(interface: &'static str, method: &str) -> u64 {
 pub fn counts() -> Vec<(&'static str, String, u64)> {
     let map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     map.iter().map(|((i, m), n)| (*i, m.clone(), *n)).collect()
+}
+
+/// The wall clock as logcat stamps lines (`secs.mmm`): the clock of the app's log, which the window gate orders counter lines against.
+pub fn wall_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
 /// The stubs' `unimplemented` hook: counted, then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
@@ -50,5 +59,14 @@ mod tests {
         let c = counts();
         assert!(c.contains(&("ITest", "a".to_owned(), 2)));
         assert!(c.contains(&("IOther", "a".to_owned(), 1)));
+    }
+
+    /// The stamp is logcat's shape: `secs.mmm`, three digits of milliseconds.
+    #[test]
+    fn wall_stamp_is_logcat_shaped() {
+        let s = wall_stamp();
+        let (secs, ms) = s.split_once('.').expect("secs.mmm");
+        assert!(secs.parse::<u64>().is_ok());
+        assert_eq!(ms.len(), 3);
     }
 }

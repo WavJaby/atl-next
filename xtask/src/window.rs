@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test window`: the window path, one stage at a time. Stage `resume` (M3 plan step 1, slice 1): the window fixture (xtask/testdata/window: a software activity painting four solid colours)
+//! `xtask test window`: the window path, one stage at a time. Stage `resume` (M3 plan step 1): the window fixture (xtask/testdata/window: a software activity painting four solid colours)
 //! is started the Android way by atld, as `xtask test app` starts its fixture; the services send ResumeActivityItem after LaunchActivityItem (activity.rs), so ActivityThread runs onResume.
-//! Pass: the stage's marker in the app's log within [`LIMIT`]. The app then goes on into WindowManager, which no service provides yet (no `window` service is registered), so what it logs after
-//! the marker and which service counters rose after it are printed. The counters are sampled when the marker is first seen (every [`POLL`]): a call made within that interval is counted as before.
-//! Always printed: the services' counters (atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
+//! Pass: the stage's marker is logged, and the app neither logs FATAL EXCEPTION nor dies within [`WINDOW_MS`] after it. The app's log lines and the services' counter lines carry the same
+//! wall clock (logcat's first field; `at=` on a counter line, atl_services::counters), so every counted call is printed as before or after the marker, with its offset.
+//! Always printed: the counters before the marker, the calls after it, the services' crash reports and the app's log after it; on failure also the atld, app and services log tails.
+//! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use atl_layout::Layout;
 
-use crate::atld_run::{Counter, Run, Runtime, counters};
+use crate::atld_run::{Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, totals};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -26,9 +27,12 @@ pub struct Args {
     /// Java pipeline build directory: boot jars, aapt2, d8 (default <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// The stage to run. `resume`: the activity's onResume is logged.
+    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it.
     #[arg(long, value_enum, default_value = "resume")]
     stage: Stage,
+    /// Instead of the stage: the verdict on synthetic logs (what the stage must fail and must pass). Needs no device.
+    #[arg(long)]
+    self_test: bool,
     /// liblog tag filter of the app (ANDROID_LOG_TAGS).
     #[arg(long, default_value = "*:i")]
     log_tags: String,
@@ -55,12 +59,14 @@ impl Stage {
 const FIXTURE: &str = "xtask/testdata/window";
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
 const APP_UID: u32 = 10_123;
-/// How long a cold start may take (as `xtask test app`).
+/// How long a cold start may take to reach the marker (as `xtask test app`).
 const LIMIT: Duration = Duration::from_secs(180);
-/// How often the app log is read; how long the run goes on after the marker before the counters are read: the window path's next calls, or its failure, come within it.
+/// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
+/// milliseconds when it fails, so two seconds leaves the failure time to show.
+const WINDOW_MS: u64 = 2_000;
+/// How often the logs are read while waiting.
 const POLL: Duration = Duration::from_millis(50);
-const AFTER: Duration = Duration::from_secs(10);
-/// Lines shown of a log on failure, and of the app log after the marker.
+/// Lines shown of a log on failure.
 const TAIL: usize = 40;
 
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
@@ -70,29 +76,209 @@ fn marker(stage: Stage) -> &'static str {
     }
 }
 
-/// The lines of `text` after the first one that contains `marker` (none when no line does).
-fn after_marker<'a>(text: &'a str, marker: &str) -> Vec<&'a str> {
-    text.lines()
-        .skip_while(|l| !l.contains(marker))
-        .skip(1)
-        .collect()
+/// The wall clock, ms since the epoch: the clock of the logcat stamps and of the services' `at=` stamps.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// The counters that rose from `before` to `after`, per kind and name, each with its rise as the count.
-fn rose(before: &[Counter], after: &[Counter]) -> Vec<Counter> {
-    after
-        .iter()
-        .filter_map(|a| {
-            let was = before
-                .iter()
-                .find(|b| b.kind == a.kind && b.name == a.name)
-                .map_or(0, |b| b.count);
-            (a.count > was).then(|| Counter {
-                kind: a.kind.clone(),
-                name: a.name.clone(),
-                count: a.count - was,
-            })
+/// `secs.mmm` for `ms` since the epoch: the form of a stamp (parse_stamp reads it back).
+fn stamp_text(ms: u64) -> String {
+    format!("{}.{:03}", ms / MS_PER_S, ms % MS_PER_S)
+}
+
+/// A logcat line's time: its first field.
+fn line_stamp(line: &str) -> Option<u64> {
+    parse_stamp(line.split_whitespace().next()?)
+}
+
+/// onResume's time: the first stamped app-log line that contains the marker.
+fn marker_stamp(app_log: &str, marker: &str) -> Option<u64> {
+    app_log
+        .lines()
+        .filter(|l| l.contains(marker))
+        .find_map(line_stamp)
+}
+
+/// The stage's verdict: `marker_ms` is when onResume was logged (None: never); `fault` is the first thing inside the window after it that fails the stage (None: pass).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verdict {
+    pub marker_ms: Option<u64>,
+    pub fault: Option<String>,
+}
+
+/// The verdict on an app log. Inside [marker, marker + WINDOW_MS]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), and `atld_exited`
+/// (the services went away before the window ended). A line outside the window, or without a stamp, does not count.
+pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
+    let Some(marker_ms) = marker_stamp(app_log, marker) else {
+        return Verdict {
+            marker_ms: None,
+            fault: None,
+        };
+    };
+    let end = marker_ms + WINDOW_MS;
+    let mut faults: Vec<(u64, String)> = app_log
+        .lines()
+        .filter_map(|l| Some((line_stamp(l)?, l)))
+        .filter(|(t, _)| (marker_ms..=end).contains(t))
+        .filter_map(|(t, l)| {
+            let what = if l.contains("FATAL EXCEPTION") {
+                "FATAL EXCEPTION"
+            } else if l.contains("Sending signal") {
+                "the process was killed"
+            } else {
+                return None;
+            };
+            Some((t, format!("{what} at +{} ms after onResume", t - marker_ms)))
         })
+        .collect();
+    if atld_exited {
+        faults.push((end, "atld exited inside the window".to_owned()));
+    }
+    faults.sort_by_key(|(t, _)| *t);
+    Verdict {
+        marker_ms: Some(marker_ms),
+        fault: faults.into_iter().next().map(|(_, f)| f),
+    }
+}
+
+/// One synthetic app log and what the verdict must say about it.
+struct SelfCase {
+    name: &'static str,
+    log: String,
+    atld_exited: bool,
+    marked: bool,
+    fault: bool,
+}
+
+/// A logcat line of the app at `at_ms`, with the fields logcat puts between the stamp and the tag.
+fn app_line(at_ms: u64, tag: &str, text: &str) -> String {
+    format!("{} 1 2 I {tag}: {text}\n", stamp_text(at_ms))
+}
+
+/// The self-test's cases. `T` is onResume's time, so the window is [T, T + WINDOW_MS].
+fn self_cases() -> Vec<SelfCase> {
+    const T: u64 = 1_000_000;
+    let mark = app_line(T, "liblog/AtlWindow", "onResume reached");
+    let crash_at = |at: u64| app_line(at, "liblog/AndroidRuntime", "FATAL EXCEPTION: main");
+    let case =
+        |name: &'static str, log: String, atld_exited: bool, marked: bool, fault: bool| SelfCase {
+            name,
+            log,
+            atld_exited,
+            marked,
+            fault,
+        };
+    vec![
+        case("marked, nothing after", mark.clone(), false, true, false),
+        case(
+            "crash inside the window",
+            mark.clone() + &crash_at(T + 500),
+            false,
+            true,
+            true,
+        ),
+        case(
+            "process killed inside the window",
+            mark.clone() + &app_line(T + 100, "liblog/Process", "Sending signal. PID: 2 SIG: 9"),
+            false,
+            true,
+            true,
+        ),
+        case(
+            "crash just past the window",
+            mark.clone() + &crash_at(T + WINDOW_MS + 1),
+            false,
+            true,
+            false,
+        ),
+        case("crash with no marker", crash_at(T), false, false, false),
+        case("atld exits inside the window", mark, true, true, true),
+    ]
+}
+
+/// Whether the verdict on a case is the one it expects, and the verdict itself.
+fn case_holds(c: &SelfCase) -> (bool, Verdict) {
+    let v = verdict(&c.log, marker(Stage::Resume), c.atld_exited);
+    let holds = v.marker_ms.is_some() == c.marked && v.fault.is_some() == c.fault;
+    (holds, v)
+}
+
+/// `--self-test`: every case's verdict is checked; the exit status is nonzero when one differs.
+fn self_test() -> ExitCode {
+    let mut all = true;
+    for c in self_cases() {
+        let (holds, v) = case_holds(&c);
+        all &= holds;
+        let said = v.fault.unwrap_or_else(|| {
+            if v.marker_ms.is_some() {
+                "pass".into()
+            } else {
+                "no marker".into()
+            }
+        });
+        println!(
+            "window: self-test {}: {} ({said})",
+            c.name,
+            if holds { "pass" } else { "FAIL" }
+        );
+    }
+    if all {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The counters' totals as they stood before `at_ms`.
+fn before(all: &[Event], at_ms: u64) -> Vec<Counter> {
+    totals(all.iter().filter(|e| e.at_ms < at_ms))
+}
+
+fn show(c: &Counter) -> String {
+    format!("{} {} x{}", c.kind, c.name, c.count)
+}
+
+/// The counters before the marker (their totals), then each counted call from the marker on, with its offset from it.
+fn print_calls(all: &[Event], marked: u64) {
+    for c in before(all, marked) {
+        println!("window: before onResume: {}", show(&c));
+    }
+    for e in all.iter().filter(|e| e.at_ms >= marked) {
+        println!(
+            "window: +{} ms after onResume: {} {} (total {})",
+            e.at_ms - marked,
+            e.counter.kind,
+            e.counter.name,
+            e.counter.count
+        );
+    }
+}
+
+/// The app's waits on a service nothing serves (libbinder's IServiceManager.cpp:727, "Waited one second for <service>"), from the marker on: the calls those waits hold up.
+fn print_waits(app_after: &[&str]) {
+    for l in app_after
+        .iter()
+        .filter(|l| l.contains("Waited one second for"))
+    {
+        println!("window: app waits, service not served: {l}");
+    }
+}
+
+/// The services' crash reports (ActivityManager's handleApplicationCrash, activity.rs): logged, not counted.
+fn print_crash_reports(services: &str) {
+    for l in services.lines().filter(|l| l.contains("crash report from")) {
+        println!("window: {l}");
+    }
+}
+
+/// The app's lines after the first one that contains `marker`.
+fn after_marker<'a>(app_log: &'a str, marker: &str) -> Vec<&'a str> {
+    app_log
+        .lines()
+        .skip_while(|l| !l.contains(marker))
+        .skip(1)
         .collect()
 }
 
@@ -102,6 +288,9 @@ fn tail(text: &str, n: usize) -> String {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if args.self_test {
+        return Ok(self_test());
+    }
     let _ = Layout::of(root)?;
     let rt = Runtime::new(
         root,
@@ -136,27 +325,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         shell: None,
         log_tags: args.log_tags.clone(),
     };
+    let start_ms = now_ms();
+    let started = Instant::now();
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let marker = marker(args.stage);
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
-    let start = Instant::now();
-    // when the marker was first seen, and the services' counters then
-    let mut seen: Option<(Instant, Vec<Counter>)> = None;
     let mut ended = None;
     loop {
-        if seen.is_none() && read(&app_log).lines().any(|l| l.contains(marker)) {
-            seen = Some((Instant::now(), counters(&read(&services_log))));
-        }
-        if seen.as_ref().is_some_and(|(at, _)| at.elapsed() >= AFTER) {
+        // the window runs from the marker's own stamp, not from when this loop saw the marker
+        if marker_stamp(&read(&app_log), marker).is_some_and(|t| now_ms() >= t + WINDOW_MS) {
             break;
         }
         if let Some(s) = atld_child.try_wait()? {
             ended = Some(s);
             break;
         }
-        if start.elapsed() > LIMIT {
+        if started.elapsed() > LIMIT {
             break;
         }
         std::thread::sleep(POLL);
@@ -167,48 +353,39 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let app = read(&app_log);
     let services = read(&services_log);
-    let reached = app.lines().any(|l| l.contains(marker));
+    let all = events(&services);
+    let v = verdict(&app, marker, ended.is_some());
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    let after = counters(&services);
-    let before = seen.as_ref().map_or_else(Vec::new, |(_, c)| c.clone());
-    let rose = rose(&before, &after);
-    let show = |cs: &[Counter]| -> Vec<String> {
-        cs.iter()
-            .map(|c| format!("{} {} x{}", c.kind, c.name, c.count))
-            .collect()
-    };
-    if reached {
-        let logged_after = seen.as_ref().map(|(at, _)| at.duration_since(start));
+    if let (Some(marked), None) = (v.marker_ms, &v.fault) {
         println!(
-            "window: pass {} (`{marker}` logged after {:.1?}; the run went on {AFTER:?} after it)",
+            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION or death in the {WINDOW_MS} ms after it)",
             args.stage.name(),
-            logged_after.unwrap_or_default()
+            marked.saturating_sub(start_ms)
         );
-        for l in show(&before) {
-            println!("window: counted before the marker: {l}");
-        }
-        for l in show(&rose) {
-            println!("window: counted after the marker: {l}");
-        }
-        let after_lines = after_marker(&app, marker);
+        print_calls(&all, marked);
+        print_crash_reports(&services);
+        let rest = after_marker(&app, marker);
+        print_waits(&rest);
         println!(
             "---- app log after the marker (last {TAIL} of {} lines)\n{}",
-            after_lines.len(),
-            after_lines[after_lines.len().saturating_sub(TAIL)..].join("\n")
+            rest.len(),
+            rest[rest.len().saturating_sub(TAIL)..].join("\n")
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let why = match ended {
-        Some(s) => format!("atld exited {s} before the marker"),
-        None if start.elapsed() > LIMIT => format!("no marker after {LIMIT:?}"),
-        None => "no marker".to_owned(),
+    let why = match (&v.fault, ended) {
+        (Some(fault), _) => fault.clone(),
+        (None, Some(s)) => format!("atld exited {s} before onResume"),
+        (None, None) => format!("`{marker}` never logged within {LIMIT:?}"),
     };
     println!("window: FAIL {}: {why}", args.stage.name());
-    for l in show(&after) {
-        println!("window: counter {l}");
+    if let Some(marked) = v.marker_ms {
+        print_calls(&all, marked);
+        print_waits(&after_marker(&app, marker));
     }
+    print_crash_reports(&services);
     println!("---- atld log\n{}", tail(&read(&run.atld_log()), TAIL));
     println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
     println!(
@@ -222,40 +399,58 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 mod tests {
     use super::*;
 
-    fn counter(kind: &str, name: &str, count: u64) -> Counter {
-        Counter {
-            kind: kind.into(),
-            name: name.into(),
-            count,
+    /// Every self-test case holds: a crash or a death inside the window fails, one just past it passes, a missing marker and an atld exit are as stated.
+    #[test]
+    fn self_cases_hold() {
+        for c in self_cases() {
+            let (holds, v) = case_holds(&c);
+            assert!(holds, "{}: {v:?}", c.name);
         }
     }
 
-    /// The lines after the marker, marker excluded; nothing when the marker is absent.
+    /// The marker's time is the first stamped line that contains it; an unstamped line is no stamp.
     #[test]
-    fn after_marker_takes_the_lines_below_it() {
-        let text = "a\nAtlWindow: onResume reached\nb\nc\n";
-        assert_eq!(
-            after_marker(text, "AtlWindow: onResume reached"),
-            ["b", "c"]
-        );
-        assert!(after_marker("a\nb\n", "AtlWindow: onResume reached").is_empty());
+    fn marker_stamp_reads_the_first_stamped_line() {
+        let log = "boot line\n1000.001 x marker\n1000.500 x marker\n";
+        assert_eq!(marker_stamp(log, "marker"), Some(1_000_001));
+        assert_eq!(marker_stamp("no marker here\n", "marker"), None);
     }
 
-    /// A counter's rise is its count now less its count before; a counter not seen before rises by its whole count; one that did not move is not listed.
+    /// The counters before the marker are totals; the calls from it on keep their offsets.
     #[test]
-    fn rose_is_the_difference_per_kind_and_name() {
-        let before = [counter("unimplemented", "IWindowManager.openSession", 1)];
-        let after = [
-            counter("unimplemented", "IWindowManager.openSession", 3),
-            counter("unimplemented", "IActivityManager.getProcessLimit", 2),
-            counter("refused", "android.os.Bundle", 1),
-        ];
-        let want = [
-            counter("unimplemented", "IWindowManager.openSession", 2),
-            counter("unimplemented", "IActivityManager.getProcessLimit", 2),
-            counter("refused", "android.os.Bundle", 1),
-        ];
-        assert_eq!(rose(&before, &after), want);
-        assert!(rose(&after, &after).is_empty());
+    fn calls_split_at_the_marker() {
+        let ev = |at_ms, count| Event {
+            at_ms,
+            counter: Counter {
+                kind: "unimplemented".into(),
+                name: "IA.m".into(),
+                count,
+            },
+        };
+        let all = [ev(900, 1), ev(1_000, 2), ev(1_004, 3)];
+        assert_eq!(
+            before(&all, 1_000),
+            [Counter {
+                kind: "unimplemented".into(),
+                name: "IA.m".into(),
+                count: 1,
+            }]
+        );
+        let offsets: Vec<u64> = all
+            .iter()
+            .filter(|e| e.at_ms >= 1_000)
+            .map(|e| e.at_ms - 1_000)
+            .collect();
+        assert_eq!(offsets, [0, 4]);
+    }
+
+    /// A stamp is printed in the form parse_stamp reads.
+    #[test]
+    fn stamp_text_round_trips() {
+        assert_eq!(stamp_text(1_793_747_156_733), "1793747156.733");
+        assert_eq!(
+            parse_stamp(&stamp_text(1_793_747_156_733)),
+            Some(1_793_747_156_733)
+        );
     }
 }
