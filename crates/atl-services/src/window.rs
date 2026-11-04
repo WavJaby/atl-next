@@ -21,9 +21,10 @@ use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
-    InputChannel, InputChannelCore, InsetsSourceControl_Array, InsetsState, SurfaceControl,
+    InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
     WindowManager_LayoutParams, WindowRelayoutResult,
 };
+use atl_parcelables::codecs::android::view::InputChannel::InputChannelCore;
 use atl_parcelables::android::window::ClientWindowFrames;
 use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
