@@ -132,8 +132,9 @@ mod publish {
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             x_precision: 1.0,
             y_precision: 1.0,
-            x_cursor: f32::NAN,
-            y_cursor: f32::NAN,
+            // a mouse hit-tests at the cursor (MotionEvent.getXDispatchLocation); its NaN check is `!=`, always true, so NaN hits no child
+            x_cursor: e.position.x as f32,
+            y_cursor: e.position.y as f32,
             down_time: i64::from(down_ms) * NANOS_PER_MS,
             event_time: i64::from(e.time_ms) * NANOS_PER_MS,
             pointers: vec![Pointer {
@@ -144,7 +145,12 @@ mod publish {
         }
     }
 
-    /// The dispatch state: the window's publisher (None until its channel arrives), the gesture's down time, the next seq.
+    /// The seq after `last`. InputPublisher refuses seq 0 (BAD_VALUE, InputTransport.cpp publishMotionEvent), which lost the gesture's DOWN: 0 is skipped, first and on wrap.
+    fn next_seq(last: u32) -> u32 {
+        last.wrapping_add(1).max(1)
+    }
+
+    /// The dispatch state: the window's publisher (None until its channel arrives), the gesture's down time, the last seq.
     #[derive(Default)]
     struct State {
         publisher: RefCell<Option<Publisher>>,
@@ -158,8 +164,8 @@ mod publish {
         if matches!(e.phase, PointerPhase::Down(_)) {
             state.down_ms.set(e.time_ms);
         }
-        let seq = state.seq.get();
-        state.seq.set(seq.wrapping_add(1));
+        let seq = next_seq(state.seq.get());
+        state.seq.set(seq);
         let event_motion = motion(&e, seq, state.down_ms.get());
         let mut slot = state.publisher.borrow_mut();
         let Some(publisher) = slot.as_mut() else {
@@ -229,6 +235,12 @@ mod publish {
         use atl_platform_ui::{PhysPoint, PointerButton};
 
         use super::*;
+
+        /// 0 is InputPublisher's refused seq: the first event and the wrap both land on 1.
+        #[test]
+        fn seq_is_never_zero() {
+            assert_eq!((next_seq(0), next_seq(1), next_seq(u32::MAX)), (1, 2, 1));
+        }
 
         /// An up at (260, 340) at 7 ms, the gesture down at 5 ms, as event 3. The expected action (ACTION_UP 1) and source (0x2002) are written out, not taken from the code.
         #[test]

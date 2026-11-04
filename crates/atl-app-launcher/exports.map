@@ -1,0 +1,8 @@
+/* SPDX-License-Identifier: MIT */
+/* Linkers export any executable symbol a DSO on the link line also defines, and the executable wins global lookup.
+ * libinput.so carries its own Rust std + cxx runtime, so without this the launcher's copies interpose every AOSP DSO's: its libstdc++ cxx_string on their libc++ std::string segfaults.
+ * Images keep their Rust and C++ runtimes private; the launcher's ABI is C names only (atl-bionic). */
+{
+  global: *;
+  local: _R*; _Z*; cxxbridge1$*; rust_*; __rust_*;
+};

@@ -299,6 +299,13 @@ fn main() -> Result<()> {
         for l in lines {
             println!("{l}");
         }
+        // why: exports.map
+        let map = manifest.join("exports.map");
+        println!("cargo::rerun-if-changed={}", map.display());
+        println!(
+            "cargo::rustc-link-arg-bins=-Wl,--version-script={}",
+            map.display()
+        );
     }
     Ok(())
 }

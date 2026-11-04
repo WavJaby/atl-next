@@ -45,6 +45,7 @@ pub mod android {
         pub mod InputDevice;
         pub mod InsetsSourceControl_Array;
         pub mod InsetsState;
+        pub mod PointerIcon;
         pub mod SurfaceControl;
         pub mod WindowManager_LayoutParams;
         pub mod WindowRelayoutResult;

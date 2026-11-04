@@ -36,6 +36,7 @@ import android.view.KeyCharacterMap;
 import android.view.InsetsSource;
 import android.view.InsetsSourceControl;
 import android.view.InsetsState;
+import android.view.PointerIcon;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -190,10 +191,21 @@ public class ParcelTruth {
         check("InputDevice:pointer", inputDevice(1, "ATL pointer", "atl:pointer", InputDevice.SOURCE_MOUSE, 0, keymap), InputDevice.CREATOR);
         check("Rect", new Rect(1, 2, 3, 4), Rect.CREATOR);
         checkInputChannel("InputChannel");
+        check("PointerIcon", systemIcon(PointerIcon.TYPE_ARROW), PointerIcon.CREATOR);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    /// A system icon as a receiver gets one: getSystemIcon(int) is private, and the public overload loads resources through a Context.
+    static PointerIcon systemIcon(int type) {
+        Parcel p = Parcel.obtain();
+        p.writeInt(type);
+        p.setDataPosition(0);
+        PointerIcon icon = PointerIcon.CREATOR.createFromParcel(p);
+        p.recycle();
+        return icon;
     }
 
     /// A local binder that answers transaction 1: the string it reads, prefixed.

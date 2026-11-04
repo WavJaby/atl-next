@@ -30,8 +30,8 @@ use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
-    DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, SurfaceControl,
-    WindowManager_LayoutParams, WindowRelayoutResult,
+    DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
+    SurfaceControl, WindowManager_LayoutParams, WindowRelayoutResult,
 };
 use atl_parcelables::android::window::ClientWindowFrames;
 use atl_parcelables::java::io::FileDescriptor;
@@ -279,6 +279,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.util.MergedConfiguration" => round_trip_as::<MergedConfiguration>(input, mode),
         "android.view.WindowRelayoutResult" => round_trip_as::<WindowRelayoutResult>(input, mode),
         "android.view.InputDevice" => round_trip_as::<InputDevice>(input, mode),
+        "android.view.PointerIcon" => round_trip_as::<PointerIcon>(input, mode),
         "java.util.Map" => round_trip_map(input, mode),
         _ => Err(format!("no codec for {class}")),
     }

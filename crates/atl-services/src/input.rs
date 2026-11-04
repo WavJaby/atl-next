@@ -4,7 +4,7 @@
 use atl_aidl::aidl::android::hardware::input::IInputManager::{
     BnInputManager, EnforcePermission, IInputManager,
 };
-use atl_parcelables::android::view::InputDevice;
+use atl_parcelables::android::view::{InputDevice, PointerIcon};
 use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
@@ -110,6 +110,19 @@ impl IInputManager for InputManager {
     ) -> binder::Result<()> {
         counters::count(INTERFACE, "registerInputDevicesChangedListener (not kept)");
         Ok(())
+    }
+
+    /// Not applied, so false (InputManager.setPointerIcon: whether the icon was set): no host cursor mapping yet. ViewRootImpl.updatePointerIcon ignores the result; it calls this for every mouse event whose resolved icon changed.
+    fn r#setPointerIcon(
+        &self,
+        _icon: Option<&PointerIcon>,
+        _display_id: i32,
+        _device_id: i32,
+        _pointer_id: i32,
+        _input_token: Option<&SpIBinder>,
+    ) -> binder::Result<bool> {
+        counters::count(INTERFACE, "setPointerIcon (not applied)");
+        Ok(false)
     }
 }
 
