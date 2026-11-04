@@ -11,6 +11,7 @@ extern crate atl_parcelables;
 #[cfg(feature = "converter")]
 extern crate binder;
 
+pub mod compositor_registry;
 pub mod counters;
 pub mod display_model;
 pub mod manifest_flags;
@@ -27,6 +28,8 @@ pub mod display;
 pub mod input_method;
 #[cfg(feature = "converter")]
 pub mod package;
+#[cfg(feature = "converter")]
+pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod settings;
 #[cfg(feature = "converter")]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until its main process ends.
-//! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
+//! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
 //!    `data/` (`app/<package>/base.apk`, `user/0/<package>/`, `dalvik-cache/`), `packages.json` (the installed packages), `log/<process>.log` (each process's stdout + stderr; a System.out line is a liblog record there).
 //! 2. the install: each `--package` (an APK and the manifest xtask read from it) gets the next app uid, its data directories and `/data/app/<package>/base.apk`; the records go to `packages.json`.
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
@@ -27,6 +27,8 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Mount, Process, Spawn, kill_sandbox};
 use atl_gralloc::vintf;
+use atl_property_service::Property;
+use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
 use atl_services::packages::{Library, Manifest, PackageRecord};
 use clap::Parser;
@@ -152,6 +154,12 @@ impl Root {
     }
     fn properties(&self) -> PathBuf {
         self.root.join("properties")
+    }
+    /// The area of the app process `name` of `uid`; a name's `:` and `/` cannot sit in a file name.
+    fn process_properties(&self, uid: u32, name: &str) -> PathBuf {
+        self.root
+            .join("properties.d")
+            .join(format!("{uid}-{}", name.replace([':', '/'], "_")))
     }
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
@@ -281,12 +289,14 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
     Ok(records)
 }
 
-fn property_area(a: &Args, r: &Root) -> Result<()> {
+/// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
+fn property_area(a: &Args, r: &Root) -> Result<Vec<Property>> {
     let text = std::fs::read_to_string(&a.build_prop)
         .with_context(|| format!("reading {}", a.build_prop.display()))?;
     let props = atl_property_service::defaults(&text)?;
     std::fs::write(r.properties(), atl_property_service::area(&props)?)?;
-    Ok(())
+    std::fs::create_dir(r.root.join("properties.d"))?;
+    Ok(props)
 }
 
 /// atl-binderd with its admin connection on stdin, its stderr (counters) in its log; the broker over the other end.
@@ -316,6 +326,9 @@ struct Host {
     art_root: PathBuf,
     /// the boot classpath as the sandbox sees it
     boot: Vec<String>,
+    /// the default property set and the display model: what [`Host::process_properties`] builds an app process's area from
+    defaults: Vec<Property>,
+    display: DisplayModel,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// set by the first process that claims to be the main one
@@ -347,7 +360,25 @@ impl Host {
         .collect()
     }
 
-    /// The launcher running `class` as zygote's child runs it (`--app`), as `uid`, in the sandbox with /system, /data and the property area; its log is `log/<name>.log` (appended to: a process
+    /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.surfaceflinger.suffix` makes libgui look up this process's own compositor
+    /// (compositor_registry.rs); `ro.atl.display` is the display that compositor answers with, the model the services answer with too.
+    fn process_properties(&self, uid: u32, name: &str) -> Result<PathBuf> {
+        let mut props = self.defaults.clone();
+        props.push((
+            compositor_registry::SUFFIX_PROPERTY.to_owned(),
+            compositor_registry::suffix(uid, name),
+        ));
+        props.push((
+            compositor_registry::DISPLAY_PROPERTY.to_owned(),
+            self.display.to_arg(),
+        ));
+        let path = self.root.process_properties(uid, name);
+        std::fs::write(&path, atl_property_service::area(&props)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// The launcher running `class` as zygote's child runs it (`--app`), as `uid`, in the sandbox with /system, /data and its property area; its log is `log/<name>.log` (appended to: a process
     /// that starts again keeps the earlier run's lines).
     fn app_spawn(
         &self,
@@ -387,7 +418,7 @@ impl Host {
                 },
             ],
             devices: vec![],
-            property_area: Some(self.root.properties()),
+            property_area: Some(self.process_properties(uid, name)?),
             program: self.launcher.clone(),
             args: launcher_args,
             env: self.art_env(),
@@ -523,7 +554,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         root: std::path::absolute(&a.root)?,
     };
     std::fs::create_dir_all(r.root.join("log"))?;
-    property_area(a, &r)?;
+    let defaults = property_area(a, &r)?;
     let boot = system_layout(a, &r)?;
     vintf_layout(a, &r)?;
     let mut libraries = Vec::new();
@@ -599,6 +630,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         log_tags: a.log_tags.clone(),
         art_root: a.art_root.clone(),
         boot,
+        defaults,
+        display: a.display.unwrap_or_default(),
         controlled: Mutex::new(BTreeSet::new()),
         main_claimed: AtomicBool::new(false),
         done: done_tx,

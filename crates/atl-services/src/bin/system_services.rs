@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! atl-system-services: registers the M2 services and the window service with servicemanager (`activity`, `package`, `display`, `window`, as Context.ACTIVITY_SERVICE / PACKAGE_SERVICE /
-//! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages come
+//! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages come
 //! from a record file (atld's install step writes it), the shared libraries and the display from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
 //! and killed through the control connection atld passes as stdin ([`atl_services::process_control`]).
 //! Prints `services: ready` once all are registered; unimplemented calls are counted on stderr (atl_services::counters).
@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::ActivityManager;
+use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
 use atl_services::package::PackageManager;
 use atl_services::packages::{Library, PackageRecord, Packages};
@@ -76,6 +77,11 @@ fn main() -> Result<()> {
     binder::add_service(WINDOW, atl_services::window::new_binder()).context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
         .context("addService input_method")?;
+    binder::add_service(
+        compositor_registry::SERVICE,
+        atl_services::registry_service::new_binder(),
+    )
+    .context("addService compositor registry")?;
     writeln!(std::io::stderr(), "services: ready")?;
     if let Some(package) = &a.launch {
         activity
