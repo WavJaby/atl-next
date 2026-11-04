@@ -256,6 +256,56 @@ pub struct Vm {
     env: Env,
 }
 
+/// The created VM's `JavaVM*`, which any thread may use (JNI invocation API: a JavaVM is shared between threads, a JNIEnv is not).
+#[derive(Clone, Copy)]
+pub struct VmHandle(*mut *const jni::JNIInvokeInterface);
+
+// SAFETY: the JNI specification makes the JavaVM pointer valid and usable on every thread for the VM's life, which is the process's
+unsafe impl Send for VmHandle {}
+// SAFETY: as above: the invocation interface is thread-safe
+unsafe impl Sync for VmHandle {}
+
+impl VmHandle {
+    /// The pointer; a method so a closure captures the whole (Send) handle, not its raw field.
+    fn raw(self) -> *mut *const jni::JNIInvokeInterface {
+        self.0
+    }
+
+    /// Runs `f` on a new thread called `name` that is attached to the VM (`AttachCurrentThread`, as libandroid_runtime's javaCreateThreadEtc makes a binder thread), detached when `f` returns.
+    /// Native code that calls back into Java (libgui's SurfaceControl listeners) finds the JNIEnv of the thread it runs on.
+    pub fn spawn_attached(self, name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let vm = self.raw();
+                let mut env: Env = core::ptr::null_mut();
+                // SAFETY: the VM's own invoke table, valid for the process's life
+                let (attach, detach) =
+                    unsafe { ((**vm).AttachCurrentThread, (**vm).DetachCurrentThread) };
+                let (Some(attach), Some(detach)) = (attach, detach) else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "atl-app-launcher: the VM has no AttachCurrentThread"
+                    );
+                    return;
+                };
+                // SAFETY: a live VM, a writable out pointer, no thread arguments (a null name and group)
+                if unsafe { attach(vm, &mut env, core::ptr::null_mut()) } != jni::JNI_OK {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "atl-app-launcher: AttachCurrentThread failed for {:?}",
+                        std::thread::current().name()
+                    );
+                    return;
+                }
+                f();
+                // SAFETY: attached above, from this thread
+                unsafe { detach(vm) };
+            })
+            .map(|_| ())
+    }
+}
+
 const EXIT_FAILURE: i32 = 1;
 
 impl Vm {
@@ -450,6 +500,11 @@ impl Vm {
             }
         }
         0
+    }
+
+    /// The VM, for threads other than this one.
+    pub fn handle(&self) -> VmHandle {
+        VmHandle(self.vm)
     }
 
     /// dalvikvm's end (release builds): detach the main thread, destroy the VM; false if either fails.

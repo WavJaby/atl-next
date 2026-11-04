@@ -8,20 +8,22 @@ license.workspace = true
 publish.workspace = true
 
 # The executable links the converter's libsigchain, which only `xtask native` has built: it builds this package after the converter with feature `converter` (build.rs, atl-bridgegen converter.rs).
-# Plain workspace builds and tests skip the executable and take the library.
+# Plain workspace builds and tests skip the executable and take the library. With it, in app mode, the process's SurfaceFlinger (atl-composer) runs in the launcher: its converter modules are linked here too
+# (a package's link arguments reach only its own links).
 [package.metadata.atl]
-converter = ["device/libsigchain"]
+converter = ["device/libsigchain", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [[bin]]
 name = "atl-app-launcher"
 required-features = ["converter"]
 
 [features]
-converter = []
+converter = ["dep:atl-composer", "atl-composer/converter"]
 
 [dependencies]
 anyhow.workspace = true
 atl-bionic = { path = "../atl-bionic" }
+atl-composer = { path = "../atl-composer", optional = true }
 rustix.workspace = true
 
 [build-dependencies]

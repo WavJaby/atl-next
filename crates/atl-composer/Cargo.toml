@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-composer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The in-app SurfaceFlinger (M3 slice 4, plan C3 "Amended 2026-11-04"): the binder front-ends of the atl-compositor core. They implement AOSP's own interfaces (android.ui.ISurfaceComposer raw,
+# android.gui.ISurfaceComposer / ISurfaceComposerClient / IDisplayEventConnection through the converter's stubs) and call back ITransactionCompletedListener, so only `xtask native` builds them (feature `converter`);
+# plain workspace builds take the modules without binder types (wire, objects, vsync, clock) and their tests. The launcher (atl-app-launcher) starts the compositor in an app process.
+# librustutils: the process's system properties (the suffix and display atld wrote into its property area).
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+
+[features]
+converter = ["atl-aidl/converter"]
+
+[dependencies]
+atl-aidl = { path = "../atl-aidl" }
+atl-compositor = { path = "../atl-compositor" }
+atl-services = { path = "../atl-services" }
+rustix.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

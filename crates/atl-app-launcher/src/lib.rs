@@ -11,6 +11,8 @@
 //! App mode (`--app`, an app process the broker starts) replaces step 5 with what zygote's child takes (ZygoteConnection.handleChildProc), app_process's native side included:
 //! 5a. libandroid_runtime around this VM (`AndroidRuntimeAttachInvokedVm`, patches/aosp/frameworks/base): the process's AndroidRuntime, its JavaVM, the framework's natives (startReg);
 //! 5b. libbinder's thread pool (`ABinderProcess_startThreadPool`, what AppRuntime::onZygoteInit does): after 5a, so its threads are made by javaCreateThreadEtc and attached to the VM, before any Java code can make a binder call;
+//! 5b'. the process's SurfaceFlinger (`atl_composer::start`, feature `converter`): the compositor libgui looks up by name, created before any Java code runs and registered through the system process (plan C3, amended 2026-11-04); a process atld did not
+//!      give the suffix and display properties has none and starts without, saying so;
 //! 5c. `ZygoteInit.zygoteInit(targetSdk, no disabled changes, [class, args...], boot class loader)` and the Runnable it returns (RuntimeInit.applicationInit -> `class.main(args)`), as zygote runs it; an app's class is android.app.ActivityThread with `seq=<startSeq>`.
 //!
 //! The library holds all of it; the executable (`src/main.rs`, feature `converter`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
@@ -71,6 +73,30 @@ mod generated {
 
 use anyhow::{Result, anyhow, bail};
 
+/// The compositor's threads: attached to the VM, as a binder thread is.
+#[cfg(feature = "converter")]
+struct AttachedThreads(ffi::VmHandle);
+
+#[cfg(feature = "converter")]
+impl atl_composer::ThreadHost for AttachedThreads {
+    fn spawn(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        self.0.spawn_attached(name, f)
+    }
+}
+
+/// Step 5b'. The compositor lives as long as the process (its clock thread holds it); a start that fails is reported and the app starts without one, and waits at its first libgui call.
+#[cfg(feature = "converter")]
+fn start_compositor(vm: &ffi::Vm) {
+    use std::io::Write;
+    if let Err(e) = atl_composer::start(&AttachedThreads(vm.handle())) {
+        let _ = writeln!(std::io::stderr(), "atl-app-launcher: no compositor: {e}");
+    }
+}
+
+/// Without the converter's libraries there is no binder to serve it with.
+#[cfg(not(feature = "converter"))]
+fn start_compositor(_vm: &ffi::Vm) {}
+
 fn run() -> Result<i32> {
     let launch = args::parse(std::env::args_os()).map_err(|e| anyhow!(e))?;
     ffi::install_signal_stack()?;
@@ -92,6 +118,7 @@ fn run() -> Result<i32> {
         let android = ffi::AndroidRuntime::load()?;
         android.attach(&vm)?;
         android.start_thread_pool();
+        start_compositor(&vm);
         vm.run_zygote_init(launch.target_sdk, class, &launch.args)
     } else {
         vm.run_main(class, &launch.args)

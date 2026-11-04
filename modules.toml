@@ -35,10 +35,16 @@ uses = ["binder"]
 crates = ["atld"]
 uses = ["binder", "broker", "gralloc", "property-service", "services"]
 
-# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "bionic"]
+uses = ["generators", "bionic", "composer"]
+
+# the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules
+[composer]
+crates = ["atl-composer"]
+exports = ["atl-composer"]
+uses = ["aidl", "compositor", "services"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
