@@ -56,7 +56,7 @@ func keepFlag(f string) bool {
 }
 
 // toolchainLocation: how many argv words a Soong toolchain flag naming its prebuilt toolchain spans (0 = not one): --gcc-toolchain=<dir> and --sysroot <dir> (also --sysroot=<dir>, --gcc-toolchain <dir>).
-// linux_glibc points clang at prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 (GCC 4.8 runtime, glibc 2.17 sysroot), the companion of Soong's prebuilt clang (pinned only for the Soong spike, which builds with both).
+// linux_glibc points clang at prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 (GCC 4.8 runtime, glibc 2.17 sysroot), the companion of Soong's prebuilt clang (not fetched: the flags naming it are dropped below).
 // The converter's toolchain is the distro clang with the build machine's glibc, libc++ and GCC runtime, compile and link alike; 2.17 headers would compile against one C library and link another (and the distro libc++, built on the host's).
 // A toolchain choice, like the compiler itself, not a flag AOSP code relies on; dropped with its argument and listed in Skipped.
 func toolchainLocation(f string) int {
