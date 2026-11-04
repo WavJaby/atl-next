@@ -62,6 +62,8 @@ fn run(cmd: Command, args: &[&str]) -> Result<String> {
 }
 
 fn raw(mut cmd: Command, args: &[&str]) -> Result<String> {
+    // read-only `git status` otherwise takes index.lock to refresh the index: that bumps the mtime of `.git`, which build scripts on a task branch watch (atl-layout resolution_inputs) -> crates rebuild on every gate
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     let out = cmd.args(args).output().context("running git")?;
     ensure!(
         out.status.success(),
