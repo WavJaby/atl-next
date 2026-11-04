@@ -16,8 +16,8 @@
     {
       "module": "CtsUtilTestCases",
       "state": "RAN",
-      "pass": 345,
-      "fail": 23,
+      "pass": 346,
+      "fail": 22,
       "error": 0,
       "ignored": 0,
       "total": 368,
@@ -67,7 +67,7 @@
         "android.util.cts.CloseGuardTest#testEnabled_OpenThenClosed": "pass",
         "android.util.cts.CloseGuardTest#testOpen_withNullMethodName_throwsNPE": "pass",
         "android.util.cts.DebugUtilsTest#testIsObjectSelected": "pass",
-        "android.util.cts.DisplayMetricsTest#testDisplayMetricsOp_defaultDisplay": "fail",
+        "android.util.cts.DisplayMetricsTest#testDisplayMetricsOp_defaultDisplay": "pass",
         "android.util.cts.DisplayMetricsTest#testDisplayMetricsOp_defaultValues": "pass",
         "android.util.cts.DumpableTest#testGetDumpableName": "pass",
         "android.util.cts.EventLogTest#testGetTagCode": "fail",
@@ -408,11 +408,6 @@
   "counters": [
     {
       "kind": "unimplemented",
-      "name": "IDisplayManager.getDisplayInfo",
-      "count": 7
-    },
-    {
-      "kind": "unimplemented",
       "name": "IActivityManager.checkPermissionForDevice",
       "count": 6
     },
@@ -447,13 +442,13 @@
       "count": 2
     },
     {
-      "kind": "refused",
-      "name": "android.app.ApplicationErrorReport.ParcelableCrashInfo",
+      "kind": "unimplemented",
+      "name": "IActivityManager.frozenBinderTransactionDetected",
       "count": 1
     },
     {
       "kind": "unimplemented",
-      "name": "IActivityManager.frozenBinderTransactionDetected",
+      "name": "IActivityManager.handleApplicationWtf",
       "count": 1
     }
   ]
