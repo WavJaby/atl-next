@@ -131,6 +131,12 @@ pub fn quote(text: &str) -> String {
     format!("{shown:?}")
 }
 
+/// The verdict line `cmd` ended `output` with: the last line starting `<cmd>: `.
+pub fn last_line<'a>(output: &'a str, cmd: &str) -> Option<&'a str> {
+    let prefix = format!("{cmd}: ");
+    output.lines().rev().find(|l| l.starts_with(&prefix))
+}
+
 /// The first line of a cargo or test run's output that names a failure: an `error...` line (rustc, clippy, deny), a panic, a failed libtest case, rustfmt's `Diff in`.
 /// Colour codes are removed from the line returned.
 pub fn first_failure_line(output: &str) -> Option<String> {
@@ -331,5 +337,12 @@ mod tests {
             "error: x"
         );
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn last_line_is_the_final_verdict_of_the_command() {
+        let out = "== check: fmt\nchecks: not a verdict\ncheck: ok (3 steps)\n";
+        assert_eq!(last_line(out, "check"), Some("check: ok (3 steps)"));
+        assert_eq!(last_line("== check: fmt\n", "check"), None);
     }
 }

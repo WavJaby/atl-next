@@ -85,6 +85,11 @@ impl Main {
             "this checkout's {what} differ from {MAIN_REF}'s, and src/ holds main's: {how}"
         ))
     }
+
+    /// Whether origin/main has a row for `c`. A row it lacks is one nothing on main reads, so `refusal` allows it.
+    pub fn lists(&self, c: &Checkout) -> bool {
+        self.pins.contains_key(&c.dir)
+    }
 }
 
 #[derive(clap::Args)]

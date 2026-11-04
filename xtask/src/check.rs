@@ -229,21 +229,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 fn cargo(root: &Path, args: &[&str]) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(args).current_dir(root);
-    let (status, output) =
+    let (status, stdout, stderr) =
         run_teed(cmd).with_context(|| format!("spawning cargo {}", args.join(" ")))?;
     if status.success() {
         return Ok(());
     }
     let exit = format!("cargo {} exited with {status}", args.join(" "));
-    match verdict::first_failure_line(&output) {
+    match verdict::first_failure_line(&format!("{stdout}{stderr}")) {
         Some(line) => bail!("{line}\n{exit}"),
         None => bail!("{exit}"),
     }
 }
 
-/// Runs `cmd` with its stdout and stderr shown as they arrive and kept: returns the status and the captured stdout then stderr.
+/// Runs `cmd` with its stdout and stderr shown as they arrive and kept: returns the status, then the captured stdout and stderr.
 /// Colour and progress stay on only when this process's stderr is a terminal, so cargo's output looks as it did when inherited.
-fn run_teed(mut cmd: Command) -> Result<(ExitStatus, String)> {
+pub(crate) fn run_teed(mut cmd: Command) -> Result<(ExitStatus, String, String)> {
     let when = if std::io::stderr().is_terminal() {
         "always"
     } else {
@@ -258,9 +258,11 @@ fn run_teed(mut cmd: Command) -> Result<(ExitStatus, String)> {
     let out = tee(child.stdout.take().context("cargo stdout")?, true);
     let err = tee(child.stderr.take().context("cargo stderr")?, false);
     let status = child.wait()?;
-    let mut text = out.join().unwrap_or_default();
-    text.push_str(&err.join().unwrap_or_default());
-    Ok((status, text))
+    Ok((
+        status,
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    ))
 }
 
 /// Copies `from` to our stdout (or stderr) as it arrives and returns everything read, lossily decoded.

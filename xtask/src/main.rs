@@ -24,6 +24,7 @@ mod gralloc;
 mod host_art;
 mod instrument;
 mod keymap;
+mod land;
 mod libcxx_gate;
 mod licence_gate;
 mod licenses;
@@ -106,9 +107,15 @@ enum Command {
     /// Our commits on upstream checkouts: patch branch -> patches/<upstream>/*.patch.
     ///
     /// Without flags: per upstream, whether checkout, branch and patches/ are in step (read-only; `xtask check` step `drift` and `xtask native` run the same test). Untracked files count, except those xtask puts there (manifest link/copy files, prune markers).
-    /// `xtask fetch --execute` applies patches/. Develop on a task branch: `--edit <upstream>` makes the task copy src-wt/<task>/<upstream> on atl-patches-<task>; commit there, every commit with `Upstream-Status:` and `Patch-Reason:` trailers, then `--export`; `--done` removes the copy.
+    /// `xtask fetch --execute` applies patches/. Develop on a task branch: `--edit <upstream>` makes the task copy src-wt/<task>/<upstream> on atl-patches-<task>; commit there, every commit with `Upstream-Status:` and `Patch-Reason:` trailers, then `--export`; `--done` removes the copy (`--task <branch>` from main).
     /// After a pin bump `xtask fetch --execute` re-applies patches/ on the new pin; where they no longer apply: `--rebase`, resolve, `--export`.
     Patch(patch::Args),
+    /// Lands a task branch on origin/main, after the branch's own patches pass the full check.
+    ///
+    /// Dry run by default: prints the steps after a read-only preflight (the branch is a fast-forward of origin/main; the main checkout is on origin/main, clean and in step; the branch's worktree is clean).
+    /// `--execute` runs them: task copies for the upstreams whose patches/ or pin differ from origin/main's, `cargo xtask check` in the branch's worktree, push, `fetch --execute` in the main checkout, `cargo xtask check` there, then removal of the copies, worktree and branch.
+    /// Nothing is pushed unless the branch's check passes. `--execute` fetches origin first; a dry run judges origin/main as last fetched.
+    Land(land::Args),
     /// Licence of every source file in a fetched upstream checkout (read-only).
     ///
     /// Per file: a `paths` entry of the upstream in licenses.toml (longest prefix), else its SPDX tag,
@@ -182,6 +189,7 @@ fn main() -> Result<ExitCode> {
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::Patch(args) => patch::run(&root, &args),
+        Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
         Command::Test {
             test: Test::NativeLoad(args),
@@ -229,6 +237,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
     Some(match command {
         Command::Native(_) => "native",
         Command::Check(_) => "check",
+        Command::Land(_) => "land",
         Command::Test { test } => match test {
             Test::NativeLoad(_) => "native-load",
             Test::Parcel(_) => "parcel",

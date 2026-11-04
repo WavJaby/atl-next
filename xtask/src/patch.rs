@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_layout::Layout;
+use atl_layout::{Layout, MAIN};
 
 use crate::aosp::Manifest;
 use crate::git::{Ident, git, git_isolated, git_raw};
@@ -48,6 +48,9 @@ pub struct Args {
     /// Remove these task copies and their branch; refused while one holds uncommitted, untracked or unexported work.
     #[arg(long, value_name = "UPSTREAM", num_args = 1..)]
     done: Vec<String>,
+    /// With --done: the task whose copies go (default: this checkout's branch). From main, which has no task copies, only this removes them; `land` cleans up this way.
+    #[arg(long, value_name = "BRANCH", requires = "done")]
+    task: Option<String>,
 }
 
 /// One upstream as this module sees it: the checkout the layout resolves, and its patch branch.
@@ -183,12 +186,42 @@ fn ups<'a>(
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    Ok(if failures(root, args)? == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// `patch --done --task <task> <names>`: what `land` runs to remove its task copies, through the command's own code path.
+pub fn done_task(root: &Path, task: &str, names: Vec<String>) -> Result<usize> {
+    failures(
+        root,
+        &Args {
+            export: Vec::new(),
+            rebase: Vec::new(),
+            edit: Vec::new(),
+            done: names,
+            task: Some(task.to_owned()),
+        },
+    )
+}
+
+/// `run`'s work: reports each row on its own line and returns how many failed.
+fn failures(root: &Path, args: &Args) -> Result<usize> {
     let sources = sources::load(root)?;
     let licenses = licenses::load(root, &sources.upstream_names())?;
     // --rebase and --edit fetch, so AOSP rows need their URLs from the manifest
     let manifest = aosp::load(root, &sources.aosp)?;
     let all = sources.checkouts(manifest.as_ref().map(Manifest::names).as_ref());
-    let layout = Layout::of(root)?;
+    let here = Layout::of(root)?;
+    let layout = match &args.task {
+        Some(task) => {
+            ensure!(task != MAIN, "--task {MAIN}: the trunk has no task copies");
+            Layout::new(here.workspace(), Some(task.as_str()))
+        }
+        None => here,
+    };
     let declared = declared(&sources, manifest.as_ref(), &prune::load(root, &sources)?);
     let ups = ups(&all, &layout, root, &declared);
     let pick = |names: &[String]| -> Result<Vec<&Up>> {
@@ -248,11 +281,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             report(u.name(), shown);
         }
     }
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(failed)
 }
 
 /// A mutation of a shared checkout (rebase, fetch's settle) only for a repo checkout whose pin and patches/ are main's.
@@ -614,7 +643,7 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
 
 /// `--edit`: the task copy of `c`, a worktree of `src/<up>` on `atl-patches-<task>` = pin + this checkout's patches/.
 /// It commits as the repo checkout's identity (`ident`): `user.*` in the copy's own worktree config (`extensions.worktreeConfig`), so it goes with the copy and `src/<up>`, where nobody commits, gets none.
-fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<String> {
+pub(crate) fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) -> Result<String> {
     let (shared, copy, task) = layout.edit_paths(&c.dir)?;
     let branch = format!("{BRANCH}-{task}");
     ensure!(
@@ -1112,7 +1141,7 @@ fn insert_spdx(patch: &str, expr: &str) -> Result<String> {
 }
 
 /// `*.patch` files of a directory, sorted by name, with their contents.
-fn stored(dir: &Path) -> Result<Vec<(String, String)>> {
+pub(crate) fn stored(dir: &Path) -> Result<Vec<(String, String)>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
