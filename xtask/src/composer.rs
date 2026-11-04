@@ -349,6 +349,8 @@ fn finish(mut out: Vec<Check>, app: &str) -> Vec<Check> {
     for (label, text) in [
         ("no crash", "FATAL EXCEPTION"),
         ("no unserved-service wait", "Waited one second for"),
+        // Rust's message when a thread panics; one inside an extern "C" callback aborts the process ("panic in a function that cannot unwind"), once seen at exit
+        ("no panic", "panicked at"),
     ] {
         let hit = app.lines().find(|l| l.contains(text));
         out.push(check(
@@ -484,6 +486,13 @@ fn self_cases() -> Vec<SelfCase> {
             good + "7 1 1 W libbinder: Waited one second for SurfaceFlingerAIDL\n",
             good_services(),
             &["no unserved-service wait"],
+        ),
+        case(
+            "a panic at exit",
+            good_log()
+                + "thread '<unnamed>' (12) panicked at library/std/src/thread/local.rs:429:25:\n",
+            good_services(),
+            &["no panic"],
         ),
         case(
             "no counters line",
