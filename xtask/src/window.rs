@@ -297,6 +297,7 @@ fn case_holds(c: &SelfCase) -> (bool, Verdict) {
 /// `--self-test`: every case's verdict is checked; the exit status is nonzero when one differs.
 fn self_test() -> ExitCode {
     let mut all = true;
+    let mut failures = Vec::new();
     for c in self_cases() {
         let (holds, v) = case_holds(&c);
         all &= holds;
@@ -312,10 +313,22 @@ fn self_test() -> ExitCode {
             c.name,
             if holds { "pass" } else { "FAIL" }
         );
+        if !holds {
+            failures.push(crate::verdict::Failure::step(
+                c.name,
+                format!("the verdict was {said}, which the case does not expect"),
+            ));
+        }
     }
     if all {
         ExitCode::SUCCESS
     } else {
+        let verdict = crate::verdict::Verdict {
+            cmd: "window",
+            total: None,
+            failures,
+        };
+        println!("{}", verdict.line());
         ExitCode::FAILURE
     }
 }
@@ -487,6 +500,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "---- services log (last {TAIL} lines)\n{}",
         tail(&services, TAIL)
     );
+    let verdict = crate::verdict::Verdict {
+        cmd: "window",
+        total: None,
+        failures: vec![crate::verdict::Failure::step(args.stage.name(), why)],
+    };
+    println!("{}", verdict.line());
     Ok(ExitCode::FAILURE)
 }
 

@@ -315,6 +315,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    println!("{}", crate::verdict::gate("gralloc", &fails));
     Ok(ExitCode::FAILURE)
 }
 

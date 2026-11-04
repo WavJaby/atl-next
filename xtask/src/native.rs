@@ -14,6 +14,7 @@ use atl_layout::Layout;
 use crate::aosp::{self, Index, Manifest, Prebuilts};
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
+use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages, patch,
     provided_gate, providers, prune, sources, system, triage, upstream, workspace,
@@ -354,13 +355,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
         .flat_map(|p| p.libs.iter().map(PathBuf::as_path))
         .collect();
-    // every check that fails the run, by name: the last line names them (`verdict`)
-    let mut failed: Vec<&str> = Vec::new();
-    if !gate(&out, provided_libs.into_iter())? {
-        failed.push("provided gate");
+    // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
+    let mut failed: Vec<Failure> = Vec::new();
+    if let Some(first) = gate(&out, provided_libs.into_iter())? {
+        failed.push(Failure::step("provided gate", first));
     }
-    if !licence_gate(root, &layout, &sources, &out, args.verbose)? {
-        failed.push("licence gate");
+    if let Some(first) = licence_gate(root, &layout, &sources, &out, args.verbose)? {
+        failed.push(Failure::step("licence gate", first));
     }
     let graph_file = out.join("graph.json");
     let graph: triage::Graph = serde_json::from_str(
@@ -375,10 +376,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
-        if !table_check(&table) {
-            failed.push("table check");
+        if let Some(first) = table_check(&table) {
+            failed.push(Failure::step("table check", first));
         }
-        return Ok(verdict(&failed));
+        return Ok(verdict(failed));
     }
     let text = std::fs::read_to_string(&log)?;
     let prefixes = [
@@ -410,21 +411,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .map(ToString::to_string),
     );
     // the ninja failure first: it is the cause the gates' and the table's findings may follow from
-    failed.insert(0, "ninja");
-    if !table_check(&table) {
-        failed.push("table check");
+    let cause = failures
+        .values()
+        .max_by_key(|f| f.steps)
+        .and_then(|f| f.errors.first())
+        .map_or_else(
+            || "ninja failed; its log names no error line".to_owned(),
+            |c| c.line.clone(),
+        );
+    failed.insert(0, Failure::step("ninja", cause));
+    if let Some(first) = table_check(&table) {
+        failed.push(Failure::step("table check", first));
     }
-    Ok(verdict(&failed))
+    Ok(verdict(failed))
 }
 
-/// The run's last line and exit code: failure names every failed check, so a run is never read as passed from a tail that ends in a check reporting 0 problems.
-/// Errors (`?`, `bail!`: package build, clippy, converter) exit through main's `Err`, whose `Error:` line is last.
-fn verdict(failed: &[&str]) -> ExitCode {
-    if failed.is_empty() {
-        println!("native: ok");
+/// The run's last line and exit code: every failed check by name, with the first error line of the first one. A run is never read as passed from a tail that ends in a check reporting 0 problems.
+/// Errors (`?`, `bail!`: package build, clippy, converter) get their verdict line from main, then their `Error:` line.
+fn verdict(failed: Vec<Failure>) -> ExitCode {
+    let verdict = Verdict {
+        cmd: "native",
+        total: None,
+        failures: failed,
+    };
+    println!("{}", verdict.line());
+    if verdict.failures.is_empty() {
         ExitCode::SUCCESS
     } else {
-        println!("native: FAILED: {}", failed.join(", "));
         ExitCode::FAILURE
     }
 }
@@ -499,13 +512,13 @@ impl CompilerCache {
     }
 }
 
-/// Prints the table check's problems; true when there are none.
-fn table_check(problems: &[String]) -> bool {
+/// Prints the table check's problems; the first one, None when there are none.
+fn table_check(problems: &[String]) -> Option<String> {
     println!("native: table check: {} problems", problems.len());
     for p in problems {
         println!("native:   table: {p}");
     }
-    problems.is_empty()
+    problems.first().cloned()
 }
 
 /// The rustc AOSP Rust modules build with: rust-toolchain.toml's, the toolchain this repo builds with (no second Rust toolchain, hence no prebuilts/rust).
@@ -730,13 +743,14 @@ fn libs(p: &Provided) -> String {
 /// The provided gate (provided_gate.rs) over the device artifacts ninja produced; false on a violation.
 /// Every provided shared object, whatever its row kind (`srcs` rows' included): the converter links each one first, and an in-tree strong definition of a provided symbol is a second implementation wherever it comes from.
 /// Archives are not checked: their members are copied into the dependent, so there is no DT_NEEDED order or cross-object lookup to get wrong.
-fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<bool> {
+/// The provided gate's first violation, None when it passes.
+fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<String>> {
     let exported = libs
         .filter(|lib| lib.extension().is_some_and(|e| e == "so"))
         .map(provided_gate::exported)
         .collect::<Result<Vec<_>>>()?;
     if exported.is_empty() {
-        return Ok(true);
+        return Ok(None);
     }
     let report = provided_gate::check(&out.join("device"), &exported)?;
     println!(
@@ -749,17 +763,18 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<bool> {
     for v in &report.violations {
         println!("native:   gate: {v}");
     }
-    Ok(report.violations.is_empty())
+    Ok(report.violations.first().map(ToString::to_string))
 }
 
 /// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.
+/// The licence gate's first problem, None when it passes: a denied file, an unresolved one, then a stale artifact.
 fn licence_gate(
     root: &Path,
     layout: &Layout,
     sources: &sources::Sources,
     out: &Path,
     verbose: bool,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let licenses = licenses::load(root, &sources.upstream_names())?;
     let roots = licence_gate::roots(layout, &sources.checkouts(None));
     let report = licence_gate::check(&std::fs::canonicalize(out)?, &roots, &licenses)?;
@@ -795,7 +810,26 @@ fn licence_gate(
     for s in report.stale.iter().take(shown(report.stale.len())) {
         println!("native:   licence: stale {s} (its link did not run in this build: not checked)");
     }
-    Ok(report.ok())
+    if report.ok() {
+        return Ok(None);
+    }
+    let first = report
+        .denied
+        .iter()
+        .flat_map(|(expr, files)| {
+            files.iter().map(move |(file, artifact)| {
+                format!(
+                    "{file} (in {artifact}): `{expr}` is not allowed in [artifact.{}]",
+                    licenses::RUNTIME
+                )
+            })
+        })
+        .chain(report.unresolved.iter().map(|u| format!("unresolved {u}")))
+        .chain(report.stale.iter().map(|s| format!("stale {s}")))
+        .next();
+    Ok(Some(
+        first.unwrap_or_else(|| "licence gate failed".to_owned()),
+    ))
 }
 
 /// One converter round's output files.
@@ -858,9 +892,13 @@ mod tests {
     #[test]
     fn verdict_fails_on_every_check() {
         for check in ["ninja", "provided gate", "licence gate", "table check"] {
-            assert_eq!(verdict(&[check]), ExitCode::FAILURE, "{check}");
+            assert_eq!(
+                verdict(vec![Failure::step(check, "x")]),
+                ExitCode::FAILURE,
+                "{check}"
+            );
         }
-        assert_eq!(verdict(&[]), ExitCode::SUCCESS);
+        assert_eq!(verdict(vec![]), ExitCode::SUCCESS);
     }
 
     /// Index of a fake tree: `libz` in external/zlib, `libpng` in a project the tests pin, `fg` in

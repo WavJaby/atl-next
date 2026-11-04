@@ -344,6 +344,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if worse.len() > SHOWN {
         println!("cts:   ... and {} more", worse.len() - SHOWN);
     }
+    println!("{}", crate::verdict::gate("cts", &worse));
     Ok(ExitCode::FAILURE)
 }
 

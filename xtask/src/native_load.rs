@@ -35,6 +35,7 @@ use object::{
 
 use crate::farm;
 use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
+use crate::verdict::{Failure, Verdict};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -669,9 +670,10 @@ fn duplicates(maps: &[String]) -> BTreeMap<&'static str, Vec<String>> {
     by_lib
 }
 
+/// The stage lines; the first failing stage is the one the verdict names and quotes.
 #[derive(Default)]
 struct Report {
-    failed: bool,
+    first: Option<(String, String)>,
 }
 
 impl Report {
@@ -685,15 +687,20 @@ impl Report {
         self.line(stage, "WARN", &detail);
     }
     fn fail(&mut self, stage: &str, detail: String) {
-        self.failed = true;
         self.line(stage, "FAIL", &detail);
+        self.first.get_or_insert_with(|| (stage.to_owned(), detail));
     }
     fn finish(self) -> ExitCode {
-        if self.failed {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        }
+        let Some((stage, detail)) = self.first else {
+            return ExitCode::SUCCESS;
+        };
+        let verdict = Verdict {
+            cmd: "native-load",
+            total: None,
+            failures: vec![Failure::step(&stage, detail)],
+        };
+        println!("{}", verdict.line());
+        ExitCode::FAILURE
     }
 }
 

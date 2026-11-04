@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
+use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
 
 #[derive(clap::Args)]
@@ -269,10 +270,11 @@ fn upstream_socket() -> Result<PathBuf> {
     Ok(PathBuf::from(runtime).join(display))
 }
 
-/// The tally of checks; the exit status is nonzero if any failed.
+/// The tally of checks and the failing ones: the verdict names and quotes them; the exit status is nonzero if any failed.
 #[derive(Default)]
 struct Report {
-    failed: usize,
+    total: usize,
+    failures: Vec<Failure>,
 }
 
 impl Report {
@@ -286,8 +288,9 @@ impl Report {
                 format!(": {detail}")
             }
         );
+        self.total += 1;
         if !ok {
-            self.failed += 1;
+            self.failures.push(Failure::step(what, detail));
         }
     }
 }
@@ -571,8 +574,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.keep.is_none() {
         let _ = std::fs::remove_dir_all(&out_dir);
     }
-    if report.failed > 0 {
-        println!("platform-ui: {} check(s) FAILED", report.failed);
+    if !report.failures.is_empty() {
+        let verdict = Verdict {
+            cmd: "platform-ui",
+            total: Some((report.total, "checks")),
+            failures: report.failures,
+        };
+        println!("{}", verdict.line());
         return Ok(ExitCode::FAILURE);
     }
     println!("platform-ui: all checks passed");

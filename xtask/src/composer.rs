@@ -22,6 +22,7 @@ use atl_services::display_model::DisplayModel;
 
 use crate::atld_run::{Run, Runtime, Shell, counter_lines};
 use crate::manifest;
+use crate::verdict::{Failure, Verdict};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -594,6 +595,7 @@ fn self_cases() -> Vec<SelfCase> {
 fn self_test() -> ExitCode {
     let display = DisplayModel::default();
     let mut all = true;
+    let mut failures: Vec<Failure> = Vec::new();
     for c in self_cases() {
         let failed: Vec<&str> = evaluate(&c.app, &c.services, &display)
             .into_iter()
@@ -612,10 +614,22 @@ fn self_test() -> ExitCode {
             c.name,
             if holds { "pass" } else { "FAIL" }
         );
+        if !holds {
+            failures.push(Failure::step(
+                c.name,
+                format!("failed {failed:?}, the case expects {:?}", c.failing),
+            ));
+        }
     }
     if all {
         ExitCode::SUCCESS
     } else {
+        let verdict = Verdict {
+            cmd: "composer",
+            total: None,
+            failures,
+        };
+        println!("{}", verdict.line());
         ExitCode::FAILURE
     }
 }
@@ -684,15 +698,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("---- client log\n{app}");
     }
     let mut ok = true;
+    let mut failures: Vec<Failure> = Vec::new();
     let exited = status.is_some_and(|s| s.success());
+    let atld = match status {
+        Some(s) => format!("exited {s} (the client's status)"),
+        None => format!("did not exit within {LIMIT:?}"),
+    };
     println!(
-        "composer: {} atld {}",
-        if exited { "pass" } else { "FAIL" },
-        match status {
-            Some(s) => format!("exited {s} (the client's status)"),
-            None => format!("did not exit within {LIMIT:?}"),
-        }
+        "composer: {} atld {atld}",
+        if exited { "pass" } else { "FAIL" }
     );
+    if !exited {
+        failures.push(Failure::step("atld", atld));
+    }
     ok &= exited;
     for c in evaluate(&app, &services, &DisplayModel::default()) {
         println!(
@@ -701,6 +719,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             c.name,
             c.detail
         );
+        if !c.ok {
+            failures.push(Failure::step(c.name, c.detail.clone()));
+        }
         ok &= c.ok;
     }
     if let Some(l) = last_counters(&app) {
@@ -722,6 +743,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "---- services log (last {TAIL} lines)\n{}",
             tail(&services, TAIL)
         );
+        let verdict = Verdict {
+            cmd: "composer",
+            total: None,
+            failures,
+        };
+        println!("{}", verdict.line());
     }
     Ok(if ok {
         ExitCode::SUCCESS

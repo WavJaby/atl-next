@@ -136,6 +136,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: FAIL the allocator did not register:\n{}",
             gralloc_log.trim()
         );
+        let why = format!("the allocator did not register: {}", gralloc_log.trim());
+        println!(
+            "{}",
+            crate::verdict::gate("app", std::slice::from_ref(&why))
+        );
         return Ok(ExitCode::FAILURE);
     }
     let why = match ended {
@@ -149,6 +154,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     println!(
         "---- services log (last {TAIL} lines)\n{}",
         tail(&services_log, TAIL)
+    );
+    println!(
+        "{}",
+        crate::verdict::gate("app", std::slice::from_ref(&why))
     );
     Ok(ExitCode::FAILURE)
 }

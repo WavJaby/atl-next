@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: MIT
 //! `xtask check`: the static + unit test tiers.
 
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
+use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, patch, providers,
     prune, sources, spdx, workspace,
 };
 use atl_layout::Layout;
+
+/// Read size of the cargo tee: 8 KiB, the usual pipe buffer. A chunk size, no measured value behind it.
+const TEE_CHUNK: usize = 8192;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -163,36 +169,91 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .into_iter()
         .filter(|s| args.only.is_empty() || args.only.contains(s))
         .collect();
-    let mut failed = Vec::new();
+    let mut failures = Vec::new();
     for step in &steps {
         eprintln!("== check: {}", step.name());
         if let Err(e) = step.run(root) {
             eprintln!("== check: {} FAILED: {e:#}", step.name());
-            failed.push(step.name());
+            failures.push(Failure::step(step.name(), format!("{e:#}")));
         }
     }
-    if failed.is_empty() {
-        println!("check: ok ({} steps)", steps.len());
-        Ok(ExitCode::SUCCESS)
+    let verdict = Verdict {
+        cmd: "check",
+        total: Some((steps.len(), "steps")),
+        failures,
+    };
+    println!("{}", verdict.line());
+    Ok(if verdict.failures.is_empty() {
+        ExitCode::SUCCESS
     } else {
-        println!(
-            "check: FAILED {} of {} steps: {}",
-            failed.len(),
-            steps.len(),
-            failed.join(", ")
-        );
-        Ok(ExitCode::FAILURE)
+        ExitCode::FAILURE
+    })
+}
+
+/// A cargo step: its output shown live as before, and kept, so a failure's first error line can name the cause.
+fn cargo(root: &Path, args: &[&str]) -> Result<()> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(args).current_dir(root);
+    let (status, output) =
+        run_teed(cmd).with_context(|| format!("spawning cargo {}", args.join(" ")))?;
+    if status.success() {
+        return Ok(());
+    }
+    let exit = format!("cargo {} exited with {status}", args.join(" "));
+    match verdict::first_failure_line(&output) {
+        Some(line) => bail!("{line}\n{exit}"),
+        None => bail!("{exit}"),
     }
 }
 
-fn cargo(root: &Path, args: &[&str]) -> Result<()> {
-    let status = crate::cargo_command()
-        .args(args)
-        .current_dir(root)
-        .status()
-        .with_context(|| format!("spawning cargo {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("cargo {} exited with {status}", args.join(" "));
-    }
-    Ok(())
+/// Runs `cmd` with its stdout and stderr shown as they arrive and kept: returns the status and the captured stdout then stderr.
+/// Colour and progress stay on only when this process's stderr is a terminal, so cargo's output looks as it did when inherited.
+fn run_teed(mut cmd: Command) -> Result<(ExitStatus, String)> {
+    let when = if std::io::stderr().is_terminal() {
+        "always"
+    } else {
+        "never"
+    };
+    let mut child = cmd
+        .env("CARGO_TERM_COLOR", when)
+        .env("CARGO_TERM_PROGRESS_WHEN", when)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let out = tee(child.stdout.take().context("cargo stdout")?, true);
+    let err = tee(child.stderr.take().context("cargo stderr")?, false);
+    let status = child.wait()?;
+    let mut text = out.join().unwrap_or_default();
+    text.push_str(&err.join().unwrap_or_default());
+    Ok((status, text))
+}
+
+/// Copies `from` to our stdout (or stderr) as it arrives and returns everything read, lossily decoded.
+/// A failed write stops the showing, never the capture: the first error line must survive a closed terminal.
+fn tee<R: Read + Send + 'static>(mut from: R, to_stdout: bool) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; TEE_CHUNK];
+        let mut showing = true;
+        loop {
+            match from.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    captured.extend_from_slice(&chunk[..n]);
+                    if showing {
+                        let shown = if to_stdout {
+                            let mut out = std::io::stdout().lock();
+                            out.write_all(&chunk[..n]).and_then(|()| out.flush())
+                        } else {
+                            std::io::stderr().write_all(&chunk[..n])
+                        };
+                        showing = shown.is_ok();
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&captured).into_owned()
+    })
 }

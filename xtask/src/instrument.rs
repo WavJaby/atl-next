@@ -23,6 +23,7 @@ use atl_services::packages::Library;
 
 use crate::atld_run::{Run, Runtime, Shell, counter_lines};
 use crate::manifest;
+use crate::verdict::{Failure, Verdict};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -511,7 +512,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             expect: Expect::Passing(&[CONVERTER_TEST]),
         });
     }
-    let mut all_fails = Vec::new();
+    let mut all_fails: Vec<Failure> = Vec::new();
     for Case {
         label,
         apk,
@@ -643,12 +644,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 )
             );
         }
-        all_fails.extend(fails);
+        all_fails.extend(fails.into_iter().map(|f| Failure::step(label, f)));
     }
-    Ok(if all_fails.is_empty() {
-        ExitCode::SUCCESS
-    } else {
+    let failed = !all_fails.is_empty();
+    if failed {
+        let verdict = Verdict {
+            cmd: "instrument",
+            total: None,
+            failures: all_fails,
+        };
+        println!("{}", verdict.line());
+    }
+    Ok(if failed {
         ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     })
 }
 

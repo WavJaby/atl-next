@@ -46,6 +46,7 @@ mod spdx;
 mod system;
 mod triage;
 mod upstream;
+mod verdict;
 mod wayland_proxy;
 mod window;
 mod workspace;
@@ -172,7 +173,8 @@ enum Test {
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = repo_root()?;
-    match cli.command {
+    let name = verdict_name(&cli.command);
+    let result = match cli.command {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
@@ -213,7 +215,34 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::PlatformUi(args),
         } => platform_ui::run(&root, &args),
+    };
+    // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
+    if let (Err(e), Some(name)) = (&result, name) {
+        println!("{}", verdict::error(name, e));
     }
+    result
+}
+
+/// The verdict-line name of a command whose failures end in a verdict line; None for the others.
+fn verdict_name(command: &Command) -> Option<&'static str> {
+    Some(match command {
+        Command::Native(_) => "native",
+        Command::Check(_) => "check",
+        Command::Test { test } => match test {
+            Test::NativeLoad(_) => "native-load",
+            Test::Parcel(_) => "parcel",
+            Test::Compositor(_) => "compositor",
+            Test::Gralloc(_) => "gralloc",
+            Test::Binder(_) => "binder",
+            Test::App(_) => "app",
+            Test::Instrument(_) => "instrument",
+            Test::Cts(_) => "cts",
+            Test::Composer(_) => "composer",
+            Test::Window(_) => "window",
+            Test::PlatformUi(_) => "platform-ui",
+        },
+        _ => return None,
+    })
 }
 
 /// Subcommand names, the targets of `xtask:<name>` references in deps.toml.

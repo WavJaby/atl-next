@@ -358,6 +358,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!("servicemanager log:\n{sm_log}");
+    println!("{}", crate::verdict::gate("binder", &fails));
     Ok(ExitCode::FAILURE)
 }
 

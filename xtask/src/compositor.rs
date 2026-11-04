@@ -140,5 +140,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("compositor: pass ({} java cases)", passes.len());
         return Ok(ExitCode::SUCCESS);
     }
+    println!("{}", crate::verdict::gate("compositor", &fails));
     Ok(ExitCode::FAILURE)
 }
