@@ -12,13 +12,12 @@ ignore = []
 # Only what the current dependency graph needs. A new licence is a deliberate addition checked
 # against the licence rules: no GPL-3 linked into the runtime; no GPL-2.0-only without a linking
 # exception anywhere.
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+# Zlib: already on licenses.toml's runtime list (owner, 2026-10-31); cxx >= 1.0.190 links it into atl-services through foldhash.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.93
 # A licence outside `allow` for one crate that is never linked into an artifact: gtk4-rs's build scripts (system-deps -> cfg-expr -> target-lexicon) run at build time only. `Apache-2.0 WITH LLVM-exception` is Apache-2.0 plus a permission to omit its notices from compiled output, and is GPL-3-compatible, so it would be safe in the runtime too; it stays out of `allow` (and out of licenses.toml's runtime list) until a linked crate needs it.
-# foldhash (Zlib, OSI-approved, permissive, GPL-3-compatible) is cxx's hash dependency from 1.0.190 on, and cxx is linked into atl-services (the atl-libinput bridge): the one Zlib crate, kept by name until a second one appears.
 exceptions = [
     { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
-    { crate = "foldhash", allow = ["Zlib"] },
 ]
 
 [bans]
