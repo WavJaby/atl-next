@@ -27,6 +27,17 @@ std::shared_ptr<android::InputChannel> open_channel(int32_t fd, rust::Str name) 
     return std::shared_ptr<android::InputChannel>(android::InputChannel::create(std::move(core)));
 }
 
+// A mouse pointer is a MOUSE tool, a stylus a STYLUS, touch and touchpad a FINGER (AMOTION_EVENT_TOOL_TYPE_*).
+android::ToolType tool_type(int32_t source) {
+    if ((source & AINPUT_SOURCE_MOUSE) == AINPUT_SOURCE_MOUSE) {
+        return android::ToolType::MOUSE;
+    }
+    if ((source & AINPUT_SOURCE_STYLUS) == AINPUT_SOURCE_STYLUS) {
+        return android::ToolType::STYLUS;
+    }
+    return android::ToolType::FINGER;
+}
+
 }  // namespace
 
 Publisher::Publisher(std::shared_ptr<android::InputChannel> channel) : publisher(std::move(channel)) {}
@@ -59,7 +70,7 @@ int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int
     for (size_t i = 0; i < count; i++) {
         properties[i].clear();
         properties[i].id = pointer_ids[i];
-        properties[i].toolType = android::ToolType::FINGER;
+        properties[i].toolType = tool_type(source);
         pointer_coords[i].clear();
         pointer_coords[i].setAxisValue(AMOTION_EVENT_AXIS_X, coords[2 * i]);
         pointer_coords[i].setAxisValue(AMOTION_EVENT_AXIS_Y, coords[2 * i + 1]);

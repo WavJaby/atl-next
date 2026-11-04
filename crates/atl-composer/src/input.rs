@@ -76,6 +76,41 @@ impl InputSource for HeadlessInput {
     }
 }
 
+/// MotionEvent.BUTTON_PRIMARY, _SECONDARY, _TERTIARY, _BACK, _FORWARD (NDK input.h: one bit each).
+#[cfg(any(feature = "converter", test))]
+const BUTTON_PRIMARY: i32 = 1 << 0;
+#[cfg(any(feature = "converter", test))]
+const BUTTON_SECONDARY: i32 = 1 << 1;
+#[cfg(any(feature = "converter", test))]
+const BUTTON_TERTIARY: i32 = 1 << 2;
+#[cfg(any(feature = "converter", test))]
+const BUTTON_BACK: i32 = 1 << 3;
+#[cfg(any(feature = "converter", test))]
+const BUTTON_FORWARD: i32 = 1 << 4;
+
+/// The bit of `button` in a MotionEvent's button state. GDK numbers 8 and 9 are back and forward (X11 convention); other buttons have no bit.
+#[cfg(any(feature = "converter", test))]
+fn button_bit(button: PointerButton) -> i32 {
+    match button {
+        PointerButton::Primary => BUTTON_PRIMARY,
+        PointerButton::Secondary => BUTTON_SECONDARY,
+        PointerButton::Middle => BUTTON_TERTIARY,
+        PointerButton::Other(8) => BUTTON_BACK,
+        PointerButton::Other(9) => BUTTON_FORWARD,
+        PointerButton::Other(_) => 0,
+    }
+}
+
+/// The buttons held after `phase`: a press adds its button, a release removes it, a move keeps the set.
+#[cfg(any(feature = "converter", test))]
+fn held_after(held: i32, phase: PointerPhase) -> i32 {
+    match phase {
+        PointerPhase::Down(button) => held | button_bit(button),
+        PointerPhase::Up(button) => held & !button_bit(button),
+        PointerPhase::Move => held,
+    }
+}
+
 #[cfg(feature = "converter")]
 pub use publish::spawn;
 
@@ -91,7 +126,7 @@ mod publish {
     use atl_libinput::{MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent, PointerPhase};
 
-    use super::{HeadlessInput, Message, Step};
+    use super::{HeadlessInput, Message, Step, held_after};
 
     /// MotionEvent.ACTION_DOWN, ACTION_UP, ACTION_MOVE (MotionEvent.java).
     const ACTION_DOWN: i32 = 0;
@@ -109,8 +144,8 @@ mod publish {
     /// The channel's name in AOSP's logs.
     const CHANNEL: &str = "atl-headless-pointer";
 
-    /// The MotionEvent of `e` as event `seq`: one pointer at its position, identity transform. `down_ms` is the gesture's down time, carried by every event of it.
-    fn motion(e: &PointerEvent, seq: u32, down_ms: u32) -> MotionEvent {
+    /// The MotionEvent of `e` as event `seq`: one pointer at its position, identity transform. `down_ms` is the gesture's down time, carried by every event of it; `buttons` the buttons held after `e`.
+    fn motion(e: &PointerEvent, seq: u32, down_ms: u32, buttons: i32) -> MotionEvent {
         let action = match e.phase {
             PointerPhase::Down(_) => ACTION_DOWN,
             PointerPhase::Up(_) => ACTION_UP,
@@ -127,7 +162,7 @@ mod publish {
             flags: 0,
             edge_flags: 0,
             meta_state: 0,
-            button_state: 0,
+            button_state: buttons,
             classification: 0,
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             x_precision: 1.0,
@@ -156,6 +191,7 @@ mod publish {
         publisher: RefCell<Option<Publisher>>,
         down_ms: Cell<u32>,
         seq: Cell<u32>,
+        buttons: Cell<i32>,
     }
 
     /// Publishes one injected event, then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
@@ -166,7 +202,9 @@ mod publish {
         }
         let seq = next_seq(state.seq.get());
         state.seq.set(seq);
-        let event_motion = motion(&e, seq, state.down_ms.get());
+        let buttons = held_after(state.buttons.get(), e.phase);
+        state.buttons.set(buttons);
+        let event_motion = motion(&e, seq, state.down_ms.get(), buttons);
         let mut slot = state.publisher.borrow_mut();
         let Some(publisher) = slot.as_mut() else {
             tracing::warn!("headless pointer: no input channel yet, event {seq} dropped");
@@ -250,7 +288,7 @@ mod publish {
                 position: PhysPoint { x: 260.0, y: 340.0 },
                 time_ms: 7,
             };
-            let m = motion(&e, 3, 5);
+            let m = motion(&e, 3, 5, 0);
             assert_eq!((m.seq, m.action, m.source), (3, 1, 0x0000_2002));
             assert_eq!(
                 m.pointers,
@@ -274,6 +312,29 @@ mod tests {
     use atl_platform_ui::PointerEvent;
 
     use super::*;
+
+    /// Press and release move the held set by their button, a move keeps it, a second button stacks: primary 1, plus secondary 2 = 3, release primary = 2. Bits as NDK input.h (AMOTION_EVENT_BUTTON_*).
+    #[test]
+    fn held_buttons_follow_press_and_release() {
+        let held = held_after(0, PointerPhase::Down(PointerButton::Primary));
+        assert_eq!(held, 1);
+        assert_eq!(held_after(held, PointerPhase::Move), 1);
+        let both = held_after(held, PointerPhase::Down(PointerButton::Secondary));
+        assert_eq!(both, 3);
+        assert_eq!(
+            held_after(both, PointerPhase::Up(PointerButton::Primary)),
+            2
+        );
+        assert_eq!(held_after(2, PointerPhase::Up(PointerButton::Secondary)), 0);
+        assert_eq!(
+            held_after(0, PointerPhase::Down(PointerButton::Other(8))),
+            8
+        );
+        assert_eq!(
+            held_after(0, PointerPhase::Down(PointerButton::Other(3))),
+            0
+        );
+    }
 
     /// The script's items in order: kinds, positions and phases as written; a bad item refuses the whole script; an empty script has no steps.
     #[test]
