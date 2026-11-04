@@ -112,6 +112,7 @@ fn evaluate(app: &str, services: &str, display: &DisplayModel) -> Vec<Check> {
     ));
     let steps = [
         ("layers", "layers created valid=true"),
+        ("bbq surface", "bbq created surface valid=true"),
         ("vsync complete", "complete=true"),
         ("callback fired", "committed callback fired=true"),
         ("client done", "AtlComposer: done"),
@@ -214,6 +215,7 @@ fn finish(mut out: Vec<Check>, app: &str) -> Vec<Check> {
 fn good_log() -> String {
     "1 1 1 I liblog/AtlComposer: start\n\
      2 1 1 I liblog/AtlComposer: layers created valid=true\n\
+     2 1 1 I liblog/AtlComposer: bbq created surface valid=true\n\
      3 1 1 I liblog/AtlComposer: vsync frames=30 complete=true\n\
      4 1 1 I liblog/AtlComposer: vsync mean_frame_interval_us=16666 mean_wall_interval_us=16700\n\
      5 1 1 I liblog/AtlComposer: committed callback fired=true\n\
@@ -315,6 +317,12 @@ fn self_cases() -> Vec<SelfCase> {
             "AtlComposer: done\n".to_owned(),
             good_services(),
             &["compositor counters"],
+        ),
+        case(
+            "no bbq surface",
+            good_log().replace("bbq created surface valid=true", "bbq failed: x"),
+            good_services(),
+            &["bbq surface"],
         ),
     ]
 }

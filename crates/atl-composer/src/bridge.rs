@@ -1,37 +1,50 @@
 // SPDX-License-Identifier: MIT
 //! libbinder Parcel <-> the core's `WireParcel`, through libbinder_rs's safe accessors only (patches/aosp/frameworks/native: `Parcel::data_with_objects`).
 //! In: the data with the binder objects renamed to keys ([`read_parcel`]; [`crate::wire`] for the byte work). Out: a `WireParcel`'s words written after the interface token `prepare_transact` already wrote,
-//! each binder object as the real binder its key stands for ([`write_body`]). File descriptor objects are refused both ways until buffers come (fds need an ownership rule: libbinder closes the ones in a Parcel it frees).
+//! each binder object as the real binder its key stands for ([`write_body`]). File descriptors are taken in (duplicated, kept by the compositor); none goes out yet (a callback never carries one without buffers).
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 
 use atl_compositor::parcel::{BINDER_TYPE_BINDER, FLAT_OBJECT_SIZE, WireParcel};
+use atl_parcelables::java::io::FileDescriptor;
 use binder::binder_impl::{BorrowedParcel, Parcel};
 use binder::{SpIBinder, StatusCode, WpIBinder};
 
 use crate::objects::ObjectMap;
-use crate::wire::{ObjectKind, kind_at, scan_objects, set_binder_key};
+use crate::wire::{ObjectKind, kind_at, scan_objects, set_binder_key, set_fd_number};
 
 /// `data` as a `WireParcel` from its start (whatever the read position), the binder objects named by `objects`' keys (a binder not met before gets the next key).
 /// A binder met for the first time is a client's own (a listener: libgui's TransactionCompletedListener), not one of the compositor's (a layer handle is known from its creation): it is kept in `foreign`,
 /// strongly, because libbinder_rs wraps a binder it did not create in an object that dies with its last reference, and the weak reference in `objects` would die with it.
-/// A parcel with a file descriptor is refused with `INVALID_OPERATION`; the read position is restored.
+/// Each file descriptor object is duplicated into `fds` (libbinder closes the Parcel's own when the call returns, and the core keeps what it is given: a release channel, later a buffer's fences) and the object
+/// renamed to the duplicate's number, which is the key of `fds`. `fds` keeps them until the compositor stops: the core has no event for "no longer referenced" yet (see `Composer::stop`).
+/// The read position is restored.
 pub fn read_parcel(
     data: &BorrowedParcel<'_>,
     objects: &mut ObjectMap<WpIBinder>,
     foreign: &mut HashMap<u64, SpIBinder>,
+    fds: &mut HashMap<i32, Arc<OwnedFd>>,
 ) -> Result<WireParcel, StatusCode> {
     let (mut bytes, count) = data.data_with_objects();
     let offsets = scan_objects(&bytes, count).map_err(|_| StatusCode::BAD_VALUE)?;
     let saved = data.get_data_position();
     let renamed = (|| {
         for &offset in &offsets {
-            if kind_at(&bytes, offset) == ObjectKind::Fd {
-                return Err(StatusCode::INVALID_OPERATION);
-            }
             data.set_data_position_checked(
                 i32::try_from(offset).map_err(|_| StatusCode::BAD_VALUE)?,
             )?;
+            if kind_at(&bytes, offset) == ObjectKind::Fd {
+                let fd = data
+                    .read::<FileDescriptor>()?
+                    .fd
+                    .ok_or(StatusCode::BAD_VALUE)?;
+                let number = fd.as_raw_fd();
+                set_fd_number(&mut bytes, offset, number);
+                fds.insert(number, fd);
+                continue;
+            }
             let mut binder: SpIBinder = data.read()?;
             let weak = binder.downgrade();
             let key = match objects.find(&weak) {

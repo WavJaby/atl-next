@@ -92,6 +92,12 @@ pub fn kind_at(data: &[u8], offset: usize) -> ObjectKind {
     }
 }
 
+/// Renames the fd object at `offset` to descriptor number `fd`: the `handle` (low 4 bytes of the binder word) is `fd`, the high bytes zero, and the cookie 0 (the compositor owns the descriptor, not the parcel).
+pub fn set_fd_number(data: &mut [u8], offset: usize, fd: i32) {
+    data[offset + 8..offset + 16].copy_from_slice(&u64::from(fd as u32).to_le_bytes());
+    data[offset + 16..offset + 24].copy_from_slice(&0u64.to_le_bytes());
+}
+
 /// The core's binder for `key`, as [`set_binder_key`] leaves one in a parcel (flags as libbinder writes every binder: the scheduling bits of [`StrongBinder::NULL`]).
 pub fn canonical_binder(key: u64) -> StrongBinder {
     StrongBinder {
@@ -170,6 +176,14 @@ mod tests {
         assert_eq!(b.key(), Some(atl_compositor::parcel::BinderKey::Local(42)));
         assert_eq!(b.obj.binder, 42);
         assert!(!b.is_null());
+    }
+
+    /// Renaming an fd object rewrites its handle and cookie words (the handle is the low four bytes of the binder word, as binder.h's union) and keeps type and flags.
+    #[test]
+    fn set_fd_number_rewrites_handle_and_cookie() {
+        let mut data = flat(BINDER_TYPE_FD, 0, 0xFFFF_FFFF_0000_0005, 1);
+        set_fd_number(&mut data, 0, 9);
+        assert_eq!(data, flat(BINDER_TYPE_FD, 0, 9, 0));
     }
 
     /// An fd is told from a binder by its type word.

@@ -18,14 +18,18 @@ pub fn channel() -> io::Result<(OwnedFd, OwnedFd)> {
     )?)
 }
 
-/// Writes `event` as one datagram. A full socket (a client that does not read) is `WouldBlock`: the event is dropped, as the real EventThread drops one for a connection whose BitTube is full.
-pub fn send_event(tube: impl AsFd, event: &VsyncEvent) -> io::Result<()> {
-    let bytes = event.to_bytes();
-    let sent = send(tube, &bytes, SendFlags::DONTWAIT | SendFlags::NOSIGNAL)?;
+/// Writes `bytes` as one datagram, never blocking. A full socket (a client that does not read) is `WouldBlock`.
+pub fn send_datagram(socket: impl AsFd, bytes: &[u8]) -> io::Result<()> {
+    let sent = send(socket, bytes, SendFlags::DONTWAIT | SendFlags::NOSIGNAL)?;
     if sent != bytes.len() {
         return Err(io::Error::other("short write on a SEQPACKET socket"));
     }
     Ok(())
+}
+
+/// Writes `event` as one datagram. A full socket is `WouldBlock`: the event is dropped, as the real EventThread drops one for a connection whose BitTube is full.
+pub fn send_event(tube: impl AsFd, event: &VsyncEvent) -> io::Result<()> {
+    send_datagram(tube, &event.to_bytes())
 }
 
 #[cfg(test)]

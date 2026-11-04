@@ -92,6 +92,9 @@ struct State {
     objects: ObjectMap<WpIBinder>,
     /// The binders clients sent that are not the compositor's own (listeners), held strongly: see [`bridge::read_parcel`]. Never released yet: a client's listener lives as long as its process.
     foreign: HashMap<u64, SpIBinder>,
+    /// The file descriptors transactions carried (a layer's release channel, later buffers' fences), duplicated out of the parcel that libbinder closes, by descriptor number: what the core's `FdObject`s name.
+    /// Held until [`Composer::stop`]: the core has no event for an fd it no longer refers to, so a closed layer's channel stays open (one fd per BLASTBufferQueue layer). The ownership rule belongs to the buffer path (gralloc, M3 slice 2).
+    fds: HashMap<i32, Arc<OwnedFd>>,
     /// The compositor's end of each connection's channel.
     tubes: HashMap<ConnectionId, OwnedFd>,
     sink: Box<dyn SceneSink>,
@@ -208,6 +211,7 @@ impl Composer {
                 events: EventThread::new(DISPLAY_ID),
                 objects: ObjectMap::new(),
                 foreign: HashMap::new(),
+                fds: HashMap::new(),
                 tubes: HashMap::new(),
                 sink,
                 pending_calls: Vec::new(),
@@ -256,9 +260,12 @@ impl Composer {
     pub fn read_parcel(&self, data: &BorrowedParcel<'_>) -> Result<WireParcel, StatusCode> {
         let mut st = self.lock();
         let State {
-            objects, foreign, ..
+            objects,
+            foreign,
+            fds,
+            ..
         } = &mut *st;
-        bridge::read_parcel(data, objects, foreign)
+        bridge::read_parcel(data, objects, foreign, fds)
     }
 
     /// A transaction arrived (`setTransactionState`): it is applied at the next tick.
@@ -393,9 +400,11 @@ impl Composer {
         threads.spawn("atl-frame-clock", Box::new(move || me.run()))
     }
 
-    /// Ends the clock thread.
+    /// Ends the clock thread and closes the descriptors held.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        let held = std::mem::take(&mut self.lock().fds);
+        drop(held);
         self.wake.notify_all();
     }
 
@@ -472,18 +481,28 @@ impl Composer {
 
     /// One call of the core into a client: `Ok` when it arrived, else why not.
     fn deliver(&self, call: &ClientCall) -> Result<(), String> {
-        let (listener, code, wire) = match call {
-            ClientCall::TransactionCompleted { listener, stats } => {
-                (listener, ON_TRANSACTION_COMPLETED, stats.encode_call())
-            }
-            ClientCall::ReleaseBuffer { listener, release } => {
-                (listener, ON_RELEASE_BUFFER, release.encode_call())
-            }
-            // a BufferReleaseChannel needs the producer's fd, which comes with buffers
-            ClientCall::ReleaseOnChannel { .. } => {
-                return Err("a release channel: no buffers yet".to_owned());
-            }
-        };
+        let (listener, code, wire) =
+            match call {
+                ClientCall::TransactionCompleted { listener, stats } => {
+                    (listener, ON_TRANSACTION_COMPLETED, stats.encode_call())
+                }
+                ClientCall::ReleaseBuffer { listener, release } => {
+                    (listener, ON_RELEASE_BUFFER, release.encode_call())
+                }
+                // the layer's BufferReleaseChannel: one datagram on the producer's socket (BBQ reads it on its own thread)
+                ClientCall::ReleaseOnChannel { channel, release } => {
+                    let (datagram, fence) = release.channel_datagram();
+                    if fence.is_some() {
+                        return Err("a release fence: fences come with buffers".to_owned());
+                    }
+                    let socket =
+                        self.lock().fds.get(&channel.fd).cloned().ok_or_else(|| {
+                            format!("release channel fd {} is not held", channel.fd)
+                        })?;
+                    return vsync::send_datagram(&*socket, &datagram)
+                        .map_err(|e| format!("release channel fd {}: {e}", channel.fd));
+                }
+            };
         let wire = wire.map_err(|e| format!("encoding the call: {e}"))?;
         let binder = self
             .listener_binder(listener)

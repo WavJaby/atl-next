@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 package com.example.atlcomposer;
 
+import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
 import android.view.Choreographer;
+import android.view.Surface;
 import android.view.SurfaceControl;
 
 import java.util.ArrayList;
@@ -39,6 +41,21 @@ public class Client {
         SurfaceControl parent = new SurfaceControl.Builder().setName("atl-parent").setBufferSize(128, 128).build();
         SurfaceControl child = new SurfaceControl.Builder().setName("atl-child").setParent(parent).setBufferSize(64, 64).build();
         log("layers created valid=" + (parent.isValid() && child.isValid()));
+
+        // BLASTBufferQueue (hidden API, reached by reflection: the class is the platform's and this process runs in the boot class path): its native side asks the compositor for
+        // getMaxAcquiredBufferCount, opens a BufferReleaseChannel and applies its own transactions. It stops there: the first Surface.lockCanvas would allocate a buffer, which needs a gralloc allocator (M3 slice 2).
+        Object bbq = null;
+        Surface surface = null;
+        try {
+            Class<?> bbqClass = Class.forName("android.graphics.BLASTBufferQueue");
+            bbq = bbqClass.getConstructor(String.class, boolean.class).newInstance("atl-bbq", true);
+            bbqClass.getMethod("update", SurfaceControl.class, int.class, int.class, int.class)
+                    .invoke(bbq, child, 64, 64, PixelFormat.RGBA_8888);
+            surface = (Surface) bbqClass.getMethod("createSurface").invoke(bbq);
+            log("bbq created surface valid=" + surface.isValid());
+        } catch (Throwable t) {
+            log("bbq failed: " + t);
+        }
 
         // vsync: Choreographer on a looper thread, FRAMES callbacks, each also a transaction that moves the child
         HandlerThread thread = new HandlerThread("atl-vsync-client");
@@ -94,6 +111,13 @@ public class Client {
         boolean gotCallback = committed.await(CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         log("committed callback fired=" + gotCallback);
 
+        // the Surface holds the queue, and the queue the layer: let them go first, as a window's teardown does
+        if (surface != null) {
+            surface.release();
+        }
+        if (bbq != null) {
+            Class.forName("android.graphics.BLASTBufferQueue").getMethod("destroy").invoke(bbq);
+        }
         child.release();
         parent.release();
         Thread.sleep(SETTLE_MS);
