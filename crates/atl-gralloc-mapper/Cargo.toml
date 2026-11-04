@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-gralloc-mapper"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `mapper.atl.so`: the IMapper v5 provider AOSP libui loads (`AServiceManager_openDeclaredPassthroughHal("mapper", "atl")` -> `AIMapper_loadIMapper`, Gralloc5.cpp).
+# xtask native installs libatl_gralloc_mapper.so under that file name next to the other runtime libraries (atl-gralloc `vintf::mapper_library_name`).
+# Boundary crate: `unsafe` only in `exports` (the C ABI shells and raw handle / pointer conversion) and `dmabuf` (mmap and DMA_BUF_IOCTL_SYNC); the buffer logic is atl-gralloc's.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+atl-gralloc = { path = "../atl-gralloc" }
+rustix.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

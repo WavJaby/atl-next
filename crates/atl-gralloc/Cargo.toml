@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-gralloc"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gralloc core (M3 slice 2): what an AOSP libui client and our allocator service / IMapper v5 library agree on, as plain Rust with no unsafe, binder or GPU dependency.
+# The buffer descriptor and its supported set, the buffer handle (native_handle ints) and the one-page shared metadata region, the IMapper standard-metadata wire encoding (hardware/interfaces/graphics/mapper/stable-c/implutils IMapperMetadataTypes.h),
+# and the VINTF declarations. Users: atl-gralloc-service (allocator), atl-gralloc-mapper (mapper.atl.so), atld and xtask (the VINTF manifest).
+
+[dependencies]
+
+[lints]
+workspace = true
