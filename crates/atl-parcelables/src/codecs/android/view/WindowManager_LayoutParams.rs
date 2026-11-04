@@ -193,7 +193,10 @@ impl Part for WindowManager_LayoutParams {
             wallpaper_touch_events_enabled: r_bool(p)?,
             provided_insets_count: r_absent_array(p, "android.view.InsetsFrameProvider[]")?,
             forcibly_shown_types: r_i32(p)?,
-            params_for_rotation_count: r_absent_array(p, "android.view.WindowManager.LayoutParams[]")?,
+            params_for_rotation_count: r_absent_array(
+                p,
+                "android.view.WindowManager.LayoutParams[]",
+            )?,
             display_flags: r_i32(p)?,
             desired_hdr_headroom: r_f32(p)?,
             frame_rate_boost_on_touch: TOOLKIT_SET_FRAME_RATE_READ_ONLY && r_bool(p)?,

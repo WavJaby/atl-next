@@ -24,8 +24,8 @@ use atl_parcelables::android::view::{
     InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
     WindowManager_LayoutParams, WindowRelayoutResult,
 };
-use atl_parcelables::codecs::android::view::InputChannel::InputChannelCore;
 use atl_parcelables::android::window::ClientWindowFrames;
+use atl_parcelables::codecs::android::view::InputChannel::InputChannelCore;
 use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
@@ -213,7 +213,10 @@ impl IWindowSession for Session {
         size_compat_scale: &mut Option<Vec<f32>>,
     ) -> binder::Result<i32> {
         let (Some(window), Some(attrs)) = (window, attrs) else {
-            counters::refused(WINDOW_SESSION, "addToDisplayAsUser: no window or LayoutParams");
+            counters::refused(
+                WINDOW_SESSION,
+                "addToDisplayAsUser: no window or LayoutParams",
+            );
             return Err(StatusCode::BAD_VALUE.into());
         };
         let (channel, input_server) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0

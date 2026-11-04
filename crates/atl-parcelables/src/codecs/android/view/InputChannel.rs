@@ -34,10 +34,7 @@ impl Part for InputChannel {
         };
         w_i32(p, 1)?;
         w_str16(p, &core.name)?;
-        let dup = core
-            .fd
-            .try_clone()
-            .map_err(|_| StatusCode::UNKNOWN_ERROR)?;
+        let dup = core.fd.try_clone().map_err(|_| StatusCode::UNKNOWN_ERROR)?;
         p.write(&ParcelFileDescriptor::new(dup))?;
         w_binder(p, &core.token)
     }
