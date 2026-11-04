@@ -73,7 +73,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "compositor-art",
         args.verbose,
     )?;
-    let lib = art.cargo.join("release").join(TRUTH_LIB);
+    let lib = crate::packages::target_dir(&out)
+        .join("release")
+        .join(TRUTH_LIB);
     ensure!(
         lib.is_file(),
         "{} missing: `xtask native` builds atl-parcel-truth once its graph holds libatl_parcelables and libbinder",

@@ -3,7 +3,7 @@
 //! `[package.metadata.atl.aidl]` asks for an AIDL crate: `include_dirs` (tree-relative import roots), `types` (qualified AIDL names compiled with their import closure), optional `parcelables` (a workspace package with `rust_library`: the crate giving unstructured parcelables and Java-only builtins their Rust types).
 //! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib and the package's other modules to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
 //! `[package.metadata.atl.rust_library]` (`rustlibs`, optional `aconfig`) makes the converter build the package's `src/lib.rs` as rust_library `lib<crate>` with those rustlibs and the package's edition (Soong's `additional_rustlibs` crate of an aidl_interface), the flag dumps of the `aconfig` declarations in its OUT_DIR, and our lints (`lint_flags`, through clippy-driver, never capped); cargo builds it only as an empty library (`#![cfg(...)]`-gated), so it needs no feature. Only an aidl crate's `parcelables` reaches it.
-//! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
+//! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `target_dir(out)` (a no-op when current).
 //! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted. `xtask check` step converter-packages runs that clippy (`lint`) against an existing out dir.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
 
@@ -338,6 +338,12 @@ pub fn workspace_aidl_crates(root: &Path) -> Result<(BTreeMap<String, AidlCrate>
     )
 }
 
+/// The cargo target dir of the converter's builds (`Selection::cargo`), read back by parcel.rs, compositor.rs.
+/// Not `<out>/cargo`: the link driver (`--config target.<triple>.linker`) is checked per unit (`ConfigSettingsChanged`) but is not in the unit hash, so a plain build sharing the dir overwrites the other's fingerprints and every alternation recompiles (measured: 26-38 units per run).
+pub fn target_dir(out: &Path) -> PathBuf {
+    out.join("cargo-converter")
+}
+
 /// graph.json, the fields read here (bp2ninja graph.go).
 #[derive(Deserialize)]
 struct Graph {
@@ -437,7 +443,7 @@ impl<'a> Selection<'a> {
         Ok(Self {
             root,
             out,
-            target: out.join("cargo"),
+            target: target_dir(out),
             graph,
             selected,
             skipped,
