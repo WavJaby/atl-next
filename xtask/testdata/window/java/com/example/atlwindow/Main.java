@@ -8,22 +8,37 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.WindowManager;
 
 /**
  * The window gate: `xtask test window` (xtask/src/window.rs) waits for the onResume line.
- * The content view paints four solid quadrants and no text: top-left red, top-right green, bottom-left blue, bottom-right white (later stages check these pixels).
+ * The content view paints four solid quadrants and no text: top-left red, top-right green, bottom-left blue, bottom-right white (the frames stage checks these pixels).
+ * After onResume the activity takes FRAME_CALLBACKS Choreographer frame callbacks, each logging its frame time (the frames stage checks the cadence).
  * Each marker is logged once, when it is first reached.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
+    /** The window's title: the compositor's layer name, by which the frames stage finds the first frame (xtask/src/window.rs WINDOW_TITLE). */
+    static final String WINDOW_TITLE = "AtlWindowFixture";
+    /** Frame callbacks per run (xtask/src/window.rs FRAME_CALLBACKS). */
+    static final int FRAME_CALLBACKS = 31;
+
+    private int frameCallbacks;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "onCreate reached");
+        // the title reaches the window's attributes only through them: Window.setTitle leaves the default (the component name)
+        WindowManager.LayoutParams attrs = getWindow().getAttributes();
+        attrs.setTitle(WINDOW_TITLE);
+        getWindow().setAttributes(attrs);
+        // an opaque window's surface is RGBX_8888, which atl-gralloc does not allocate yet ("pixel format 2 is not supported", gralloc.log); RGBA_8888 is what the picture check reads
+        getWindow().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
         setContentView(new Quadrants(this));
     }
 
@@ -36,6 +51,21 @@ public class Main extends Activity {
         int keyA = map.get(KeyEvent.KEYCODE_A, 0);
         Log.i(TAG, "keymap keyboardType=" + map.getKeyboardType() + " keyA=" + (char) keyA
                 + (keyA == 'a' ? " ok" : " wrong"));
+        postFrame();
+    }
+
+    /** One frame callback per vsync, FRAME_CALLBACKS in all; each logs the frame time it was given (CLOCK_MONOTONIC ns). */
+    private void postFrame() {
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            @Override
+            public void doFrame(long frameTimeNanos) {
+                frameCallbacks++;
+                Log.i(TAG, "frame " + frameCallbacks + " time=" + frameTimeNanos);
+                if (frameCallbacks < FRAME_CALLBACKS) {
+                    postFrame();
+                }
+            }
+        });
     }
 
     /** Four solid colours, one per quadrant; no text. */

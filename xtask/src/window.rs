@@ -5,6 +5,8 @@
 //! wall clock (logcat's first field; `at=` on a counter line, atl_services::counters), so every counted call is printed as before or after the marker, with its offset.
 //! Always printed: the counters before the marker, the calls after it, the services' crash reports and the app's log after it; on failure also the atld, app and services log tails.
 //! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
+//! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
+//! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,8 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use atl_layout::Layout;
+use atl_services::display_model::DisplayModel;
 
 use crate::atld_run::{Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, totals};
+use crate::composer::{fnv1a64, word};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -27,7 +31,7 @@ pub struct Args {
     /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it.
+    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it. `frames`: resume, and the first frame's pixels and the frame cadence are right.
     #[arg(long, value_enum, default_value = "resume")]
     stage: Stage,
     /// Instead of the stage: the verdict on synthetic logs (what the stage must fail and must pass). Needs no device.
@@ -45,12 +49,23 @@ pub struct Args {
 enum Stage {
     /// The launch is followed by the resume (ResumeActivityItem): onResume is logged.
     Resume,
+    /// Resume, then the sub-gates on the first frame and the frame cadence.
+    Frames,
 }
 
 impl Stage {
     fn name(self) -> &'static str {
         match self {
             Stage::Resume => "resume",
+            Stage::Frames => "frames",
+        }
+    }
+
+    /// How long the app must survive after the marker: the resume window, or the frames stage's longer watch.
+    fn window_ms(self) -> u64 {
+        match self {
+            Stage::Resume => WINDOW_MS,
+            Stage::Frames => FRAMES_WINDOW_MS,
         }
     }
 }
@@ -64,6 +79,16 @@ const LIMIT: Duration = Duration::from_secs(180);
 /// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
 /// milliseconds when it fails, so two seconds leaves the failure time to show.
 const WINDOW_MS: u64 = 2_000;
+/// The frames stage's watch after the marker: the first draw, then FRAME_CALLBACKS vsyncs (0.5 s at 60 Hz), with slack for a slow start.
+const FRAMES_WINDOW_MS: u64 = 5_000;
+/// The fixture's frame callbacks (Main.java FRAME_CALLBACKS): FRAME_CALLBACKS - 1 intervals, each one display period.
+const FRAME_CALLBACKS: usize = 31;
+/// The layer name of the fixture's window (Main.java WINDOW_TITLE, set by `Window.setTitle`): the compositor's report names the layer by it.
+const WINDOW_TITLE: &str = "AtlWindowFixture";
+/// The mean interval may differ from the display period by this share: the callbacks run on the app's main thread, which the vsync timer does not wait for.
+const CADENCE_TOLERANCE: f64 = 0.10;
+/// No single interval may exceed this many periods: a missed vsync shows as two.
+const CADENCE_MAX_PERIODS: f64 = 1.5;
 /// How often the logs are read while waiting.
 const POLL: Duration = Duration::from_millis(50);
 /// Lines shown of a log on failure.
@@ -72,7 +97,7 @@ const TAIL: usize = 40;
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
     match stage {
-        Stage::Resume => "AtlWindow: onResume reached",
+        Stage::Resume | Stage::Frames => "AtlWindow: onResume reached",
     }
 }
 
@@ -111,16 +136,16 @@ pub struct Verdict {
 /// libbinder's line when a service nothing serves holds a call up (IServiceManager.cpp:727, once a second): the app is hung, not crashed, so only this line tells.
 const UNSERVED_WAIT: &str = "Waited one second for";
 
-/// The verdict on an app log. Inside [marker, marker + WINDOW_MS]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), a wait on an unserved service ([`UNSERVED_WAIT`]),
+/// The verdict on an app log. Inside [marker, marker + window_ms]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), a wait on an unserved service ([`UNSERVED_WAIT`]),
 /// and `atld_exited` (the services went away before the window ended). A line outside the window, or without a stamp, does not count.
-pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
+pub fn verdict(app_log: &str, marker: &str, atld_exited: bool, window_ms: u64) -> Verdict {
     let Some(marker_ms) = marker_stamp(app_log, marker) else {
         return Verdict {
             marker_ms: None,
             fault: None,
         };
     };
-    let end = marker_ms + WINDOW_MS;
+    let end = marker_ms + window_ms;
     let mut faults: Vec<(u64, String)> = app_log
         .lines()
         .filter_map(|l| Some((line_stamp(l)?, l)))
@@ -223,7 +248,7 @@ fn self_cases() -> Vec<SelfCase> {
 
 /// Whether the verdict on a case is the one it expects, and the verdict itself.
 fn case_holds(c: &SelfCase) -> (bool, Verdict) {
-    let v = verdict(&c.log, marker(Stage::Resume), c.atld_exited);
+    let v = verdict(&c.log, marker(Stage::Resume), c.atld_exited, WINDOW_MS);
     let holds = v.marker_ms.is_some() == c.marked && v.fault.is_some() == c.fault;
     (holds, v)
 }
@@ -324,6 +349,109 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// The quadrants the fixture paints (Main.java `Quadrants.onDraw`): top-left red, top-right green, bottom-left blue, bottom-right white, as RGBA_8888 bytes
+/// (Color.RED and the others). Each boundary is half the view's size with integer division (`getWidth() / 2`). The picture is the buffer's rows without stride padding,
+/// the bytes the compositor's sink digests.
+fn quadrant_pixels(width: u32, height: u32) -> Vec<u8> {
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    let (half_width, half_height) = (width / 2, height / 2);
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let colour = match (x < half_width, y < half_height) {
+                (true, true) => RED,
+                (false, true) => GREEN,
+                (true, false) => BLUE,
+                (false, false) => WHITE,
+            };
+            pixels.extend_from_slice(&colour);
+        }
+    }
+    pixels
+}
+
+/// Sub-gate (a): the first `composer: quad` line of the fixture's layer (the compositor's report of the first frame it got) is the display's size, and its digest is
+/// the digest of the quadrants (FNV-1a over [`quadrant_pixels`]).
+fn picture_check(app: &str, display: DisplayModel) -> Result<String, String> {
+    let (width, height) = (display.width as u32, display.height as u32);
+    let size = format!("{width}x{height}");
+    let quad = app
+        .lines()
+        .filter(|l| l.starts_with("composer: quad "))
+        .find(|l| word(l, "name") == Some(WINDOW_TITLE))
+        .ok_or_else(|| format!("no `composer: quad` line for layer {WINDOW_TITLE}"))?;
+    let buffer = word(quad, "buffer").unwrap_or("none");
+    if buffer != size {
+        return Err(format!("first frame is {buffer}, the display is {size}"));
+    }
+    let digest = word(quad, "digest").ok_or_else(|| format!("first frame unreadable: {quad}"))?;
+    let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
+    let want = fnv1a64(&quadrant_pixels(width, height));
+    if got != want {
+        return Err(format!(
+            "first frame digest {got:016x}, the quadrants {want:016x}"
+        ));
+    }
+    Ok(format!(
+        "first frame {size}, digest {want:016x} = the quadrants"
+    ))
+}
+
+/// The frame time (ns) of an `AtlWindow: frame N time=T` line: the fixture's Choreographer callback.
+fn frame_time(line: &str) -> Option<u64> {
+    let (_, rest) = line.split_once("AtlWindow: frame ")?;
+    word(rest, "time")?.parse().ok()
+}
+
+/// Sub-gate (b): the first FRAME_CALLBACKS callbacks after the marker come once per display period. The mean interval is within CADENCE_TOLERANCE of the period, and no
+/// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's, so the mean does not depend on when the app ran its callbacks.
+fn cadence_check(after: &[&str], refresh_hz: f32) -> Result<String, String> {
+    let times: Vec<u64> = after
+        .iter()
+        .filter_map(|l| frame_time(l))
+        .take(FRAME_CALLBACKS)
+        .collect();
+    if times.len() < FRAME_CALLBACKS {
+        return Err(format!(
+            "{} frame callbacks after the marker, want {FRAME_CALLBACKS}",
+            times.len()
+        ));
+    }
+    let period = 1e9 / f64::from(refresh_hz);
+    let mut longest = 0.0_f64;
+    for pair in times.windows(2) {
+        let gap = pair[1]
+            .checked_sub(pair[0])
+            .ok_or_else(|| format!("frame time goes back: {} then {}", pair[0], pair[1]))?;
+        longest = longest.max(gap as f64);
+    }
+    let span = times[times.len() - 1] - times[0];
+    let mean = span as f64 / (times.len() - 1) as f64;
+    if (mean - period).abs() > CADENCE_TOLERANCE * period {
+        return Err(format!(
+            "mean interval {:.3} ms, display period {:.3} ms",
+            mean / 1e6,
+            period / 1e6
+        ));
+    }
+    if longest > CADENCE_MAX_PERIODS * period {
+        return Err(format!(
+            "longest interval {:.3} ms, over {CADENCE_MAX_PERIODS} periods of {:.3} ms",
+            longest / 1e6,
+            period / 1e6
+        ));
+    }
+    Ok(format!(
+        "{FRAME_CALLBACKS} callbacks, mean interval {:.3} ms, longest {:.3} ms, display period {:.3} ms",
+        mean / 1e6,
+        longest / 1e6,
+        period / 1e6
+    ))
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -370,11 +498,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let marker = marker(args.stage);
+    let window_ms = args.stage.window_ms();
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let mut ended = None;
     loop {
         // the window runs from the marker's own stamp, not from when this loop saw the marker
-        if marker_stamp(&read(&app_log), marker).is_some_and(|t| now_ms() >= t + WINDOW_MS) {
+        if marker_stamp(&read(&app_log), marker).is_some_and(|t| now_ms() >= t + window_ms) {
             break;
         }
         if let Some(s) = atld_child.try_wait()? {
@@ -393,13 +522,31 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
-    let v = verdict(&app, marker, ended.is_some());
+    let v = verdict(&app, marker, ended.is_some(), window_ms);
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    if let (Some(marked), None) = (v.marker_ms, &v.fault) {
+    // the frames stage's sub-gates, once the marker is logged (they read the frames after it)
+    let sub: Vec<Result<String, String>> =
+        if matches!(args.stage, Stage::Frames) && v.marker_ms.is_some() {
+            let display = DisplayModel::default();
+            vec![
+                picture_check(&app, display),
+                cadence_check(&after_marker(&app, marker), display.refresh_hz),
+            ]
+        } else {
+            Vec::new()
+        };
+    let sub_fault = sub.iter().find_map(|r| r.as_ref().err().cloned());
+    for (name, result) in ["picture", "cadence"].iter().zip(&sub) {
+        match result {
+            Ok(s) => println!("window: {name}: pass {s}"),
+            Err(s) => println!("window: {name}: FAIL {s}"),
+        }
+    }
+    if let (Some(marked), None, None) = (v.marker_ms, &v.fault, &sub_fault) {
         println!(
-            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION, death or unserved-service wait in the {WINDOW_MS} ms after it)",
+            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION, death or unserved-service wait in the {window_ms} ms after it)",
             args.stage.name(),
             marked.saturating_sub(start_ms)
         );
@@ -414,10 +561,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let why = match (&v.fault, ended) {
-        (Some(fault), _) => fault.clone(),
-        (None, Some(s)) => format!("atld exited {s} before onResume"),
-        (None, None) => format!("`{marker}` never logged within {LIMIT:?}"),
+    let why = match (&v.fault, ended, &sub_fault) {
+        (Some(fault), _, _) => fault.clone(),
+        (None, Some(s), _) => format!("atld exited {s} before onResume"),
+        (None, None, Some(fault)) => fault.clone(),
+        (None, None, None) => format!("`{marker}` never logged within {LIMIT:?}"),
     };
     println!("window: FAIL {}: {why}", args.stage.name());
     if let Some(marked) = v.marker_ms {
@@ -488,6 +636,101 @@ mod tests {
             .map(|e| e.at_ms - 1_000)
             .collect();
         assert_eq!(offsets, [0, 4]);
+    }
+
+    /// The fixture's quadrants on a 4x2 buffer, written out pixel by pixel (red and green above the line y = 1, blue and white below; the vertical boundary at x = 2).
+    #[test]
+    fn quadrants_are_the_fixture_colours() {
+        let (r, g, b, w): ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) = (
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        );
+        let want: Vec<u8> = [r, r, g, g, b, b, w, w].concat();
+        assert_eq!(quadrant_pixels(4, 2), want);
+        // an odd size: the boundary is still width / 2 = 2 (getWidth() / 2), so x = 1 is red and x = 2 green
+        let odd = quadrant_pixels(5, 3);
+        assert_eq!(odd.len(), 5 * 3 * 4);
+        assert_eq!(&odd[4..8], &r, "x = 1, y = 0");
+        assert_eq!(&odd[8..12], &g, "x = 2, y = 0");
+    }
+
+    /// The first frame of the fixture's layer must be the quadrants at the display's size. The expected digest is FNV-1a over the bytes written out here, not over quadrant_pixels.
+    #[test]
+    fn picture_check_reads_the_first_frame_of_the_layer() {
+        let display = DisplayModel {
+            width: 4,
+            height: 2,
+            ..DisplayModel::default()
+        };
+        let (r, g, b, w): ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) = (
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        );
+        let picture: Vec<u8> = [r, r, g, g, b, b, w, w].concat();
+        let quad = |name: &str, buffer: &str, digest: String| {
+            format!(
+                "composer: quad frame=1 layer=2 name={name} buffer={buffer} frame_number=1 dst=0,0,4,2 digest={digest}\n"
+            )
+        };
+        let good = format!("{:016x}", fnv1a64(&picture));
+        assert!(picture_check(&quad(WINDOW_TITLE, "4x2", good.clone()), display).is_ok());
+        assert!(
+            picture_check(&quad("other", "4x2", good.clone()), display).is_err(),
+            "another layer's frame is not the fixture's"
+        );
+        assert!(
+            picture_check(&quad(WINDOW_TITLE, "4x3", good.clone()), display).is_err(),
+            "a buffer of the wrong size"
+        );
+        let red = format!("{:016x}", fnv1a64(&r.repeat(8)));
+        assert!(
+            picture_check(&quad(WINDOW_TITLE, "4x2", red), display).is_err(),
+            "all red is not the quadrants"
+        );
+        let unreadable = format!(
+            "composer: quad frame=1 layer=2 name={WINDOW_TITLE} buffer=4x2 unreadable=no dma-buf\n"
+        );
+        assert!(picture_check(&unreadable, display).is_err());
+    }
+
+    /// Callbacks one display period apart pass. A mean off by a fifth, too few callbacks, and one missed vsync (one interval of two periods, the mean still within tolerance) fail.
+    #[test]
+    fn cadence_check_reads_the_callbacks() {
+        const STEP: u64 = 16_666_667;
+        let lines = |times: &[u64]| -> Vec<String> {
+            times
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("1000.000 1 2 I AtlWindow: frame {} time={t}", i + 1))
+                .collect()
+        };
+        let check = |times: &[u64], hz: f32| {
+            let owned = lines(times);
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            cadence_check(&refs, hz)
+        };
+        let steady: Vec<u64> = (0..31).map(|i| 5_000_000_000 + i * STEP).collect();
+        let ok = check(&steady, 60.0);
+        assert!(ok.is_ok(), "{ok:?}");
+        let short: Vec<u64> = (0..30).map(|i| 5_000_000_000 + i * STEP).collect();
+        assert!(check(&short, 60.0).is_err());
+        let fast: Vec<u64> = (0..31).map(|i| 5_000_000_000 + i * 20_000_000).collect();
+        assert!(
+            check(&fast, 60.0).is_err(),
+            "20 ms intervals on a 60 Hz display"
+        );
+        let mut missed = Vec::new();
+        let mut t = 5_000_000_000u64;
+        for i in 0..31 {
+            missed.push(t);
+            t += if i == 15 { 2 * STEP } else { STEP };
+        }
+        assert!(check(&missed, 60.0).is_err(), "one interval of two periods");
+        assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
     }
 
     /// A stamp is printed in the form parse_stamp reads.

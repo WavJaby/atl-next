@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: MIT -->
-<!-- `xtask test window`: the window gate's app. One launcher activity, not hardware accelerated (software drawing: ActivityInfo.FLAG_HARDWARE_ACCELERATED clear), so the window path needs no GPU. -->
+<!-- `xtask test window`: the window gate's app. One launcher activity, not hardware accelerated (software drawing: ActivityInfo.FLAG_HARDWARE_ACCELERATED clear), so the window path needs no GPU.
+     Full screen without an action bar: the content view is the whole display, so the frames stage's picture is the quadrants alone. -->
+
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.atlwindow"
     android:versionCode="1"
@@ -9,7 +11,8 @@
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
 
     <application android:label="ATL window test">
-        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

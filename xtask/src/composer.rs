@@ -114,7 +114,7 @@ fn client_says(app: &str, text: &str) -> bool {
 }
 
 /// FNV-1a, 64 bit (offset basis 0xcbf29ce484222325, prime 0x100000001b3): the digest the compositor reports a quad's pixels by (atl-composer sink.rs; both are checked against the published vectors).
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
@@ -153,7 +153,7 @@ struct Quad {
     digest: Option<u64>,
 }
 
-fn word<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn word<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
