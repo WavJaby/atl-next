@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list: the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD) and one pointer. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(VIRTUAL_KEYBOARD) (:365-376) takes the keyboard's native map from getInputDevice(-1), so the keyboard carries the staged Virtual.kcm (`validatekeymaps --parcel-out`, built by AOSP's own loader: the environment supplies the file, rung 2). The pointer carries the same bytes: it has no keys, and a second map would be a second file. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
+//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list: the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD) and one pointer. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(VIRTUAL_KEYBOARD) (:365-376) takes the keyboard's native map from getInputDevice(-1), so the keyboard carries Virtual.kcm in Parcel form, loaded by AOSP's own libinput through atl-libinput (the environment supplies the file, rung 2). The pointer carries the same bytes: it has no keys, and a second map would be a second file. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
 
 use atl_aidl::aidl::android::hardware::input::IInputManager::{
     BnInputManager, EnforcePermission, IInputManager,
@@ -30,7 +30,7 @@ struct InputManager {
 
 impl Interface for InputManager {}
 
-/// The desktop's devices; both carry the staged keyboard map (see the module doc).
+/// The desktop's devices; both carry the keyboard map (see the module doc).
 fn devices(map: &[u8]) -> Vec<InputDevice> {
     let base = InputDevice {
         key_character_map: map.to_vec(),
@@ -113,7 +113,7 @@ impl IInputManager for InputManager {
     }
 }
 
-/// A new input service binder serving the staged keyboard map `map` (the bytes of `validatekeymaps --parcel-out`). Fails when `map` is not a Parcel-form blob.
+/// A new input service binder serving the keyboard map `map`: the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`). Fails when `map` is not a Parcel-form blob.
 pub fn new_binder(map: &[u8]) -> Result<SpIBinder, String> {
     set_key_character_map(map).map_err(str::to_owned)?;
     let service = InputManager {

@@ -39,9 +39,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
-    /// The virtual keyboard's KeyCharacterMap in Parcel form (`validatekeymaps --parcel-out` on Virtual.kcm, staged by xtask native): every InputDevice carries it verbatim.
+    /// AOSP's keychars/Virtual.kcm: loaded through libinput at start; its Parcel form goes with every InputDevice.
     #[arg(long)]
-    virtual_keymap: PathBuf,
+    keychars: PathBuf,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -83,9 +83,16 @@ fn main() -> Result<()> {
         .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
         .context("addService input_method")?;
-    let keymap = std::fs::read(&a.virtual_keymap)
-        .with_context(|| format!("reading {}", a.virtual_keymap.display()))?;
-    let input = atl_services::input::new_binder(&keymap).map_err(anyhow::Error::msg)?;
+    let contents =
+        std::fs::read(&a.keychars).with_context(|| format!("reading {}", a.keychars.display()))?;
+    let name = a
+        .keychars
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("the key map's file name")?;
+    let map = atl_libinput::KeyCharacterMap::load(name, &contents)
+        .with_context(|| format!("loading {}", a.keychars.display()))?;
+    let input = atl_services::input::new_binder(&map.parcel_bytes()).map_err(anyhow::Error::msg)?;
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,

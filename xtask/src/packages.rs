@@ -269,13 +269,14 @@ pub fn aidl_crates(
     let mut crates = BTreeMap::new();
     let mut goals: Vec<String> = Vec::new();
     for p in packages {
-        let Some(a) = &p.aidl else { continue };
+        // every converter module a package names is a goal of every build, AIDL package or not: the package links it, and the graph.json the gates and `xtask check` read holds it
         for m in &p.modules {
             let goal = m.strip_prefix("device/").unwrap_or(m);
             if !goals.iter().any(|g| g == goal) {
                 goals.push(goal.to_owned());
             }
         }
+        let Some(a) = &p.aidl else { continue };
         let parcelables = match &a.parcelables {
             None => None,
             Some(name) => Some(

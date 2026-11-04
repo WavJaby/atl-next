@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! android.view.InputDevice (frameworks/base/core/java/android/view/InputDevice.java writeToParcel:1604-1644; the reading constructor :540-560). The first field is the KeyCharacterMap as Java frames it (frameworks/base/core/jni/android_view_KeyCharacterMap.cpp nativeWriteToParcel): the map's deviceId, a present flag (1), then libinput's KeyCharacterMap::writeToParcel bytes. Rust never parses or writes libinput's part: those bytes are the staged map (`validatekeymaps --parcel-out`, xtask native), passed through verbatim. The map's length is not in the stream, so a read needs the staged bytes first ([`set_key_character_map`]) and compares its words against them. The map's deviceId is the device's id (the map is loaded for that device). Motion ranges are modelled as none (a device with ranges is refused by name). HostUsiVersion is two int32 (mMajorVersion, mMinorVersion), always present.
+//! android.view.InputDevice (frameworks/base/core/java/android/view/InputDevice.java writeToParcel:1604-1644; the reading constructor :540-560). The first field is the KeyCharacterMap as Java frames it (frameworks/base/core/jni/android_view_KeyCharacterMap.cpp nativeWriteToParcel): the map's deviceId, a present flag (1), then libinput's KeyCharacterMap::writeToParcel bytes. Rust never parses or writes libinput's part: those bytes are the map atl-libinput writes (`KeyCharacterMap::writeToParcel` of Virtual.kcm), passed through verbatim. The map's length is not in the stream, so a read needs those bytes first ([`set_key_character_map`]) and compares its words against them. The map's deviceId is the device's id (the map is loaded for that device). Motion ranges are modelled as none (a device with ranges is refused by name). HostUsiVersion is two int32 (mMajorVersion, mMinorVersion), always present.
 
 use std::sync::OnceLock;
 
 use crate::parcel::*;
 use crate::parts::*;
 
-/// The staged KeyCharacterMap Parcel form, set once per process by the process that reads or serves devices.
+/// The KeyCharacterMap Parcel form, set once per process by the process that reads or serves devices.
 static KEY_CHARACTER_MAP: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// Sets the staged map that every InputDevice carries. Parcel data is 4-byte words, so the length must be a non-empty multiple of 4; a second set must give the same bytes.
+/// Sets the map that every InputDevice carries. Parcel data is 4-byte words, so the length must be a non-empty multiple of 4; a second set must give the same bytes.
 pub fn set_key_character_map(bytes: &[u8]) -> std::result::Result<(), &'static str> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err("key character map: not a non-empty multiple of 4 bytes");
@@ -20,7 +20,7 @@ pub fn set_key_character_map(bytes: &[u8]) -> std::result::Result<(), &'static s
     Ok(())
 }
 
-/// The staged map, once set.
+/// The map, once set.
 pub fn key_character_map() -> Option<&'static [u8]> {
     KEY_CHARACTER_MAP.get().map(Vec::as_slice)
 }
@@ -106,7 +106,7 @@ impl Part for InputDevice {
     fn read(p: &In<'_>) -> Result<Self> {
         let Some(map) = key_character_map() else {
             return Err(crate::refuse(
-                "android.view.InputDevice (no staged KeyCharacterMap to read against)",
+                "android.view.InputDevice (no KeyCharacterMap set to read against)",
             ));
         };
         let map_id = r_i32(p)?;
@@ -118,7 +118,7 @@ impl Part for InputDevice {
         for want in words(map) {
             if r_i32(p)? != want {
                 return Err(crate::refuse(
-                    "android.view.InputDevice (KeyCharacterMap differs from the staged map)",
+                    "android.view.InputDevice (KeyCharacterMap differs from the map set)",
                 ));
             }
         }

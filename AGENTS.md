@@ -41,7 +41,7 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 
 ## Languages
 
-- Rust for everything we write, tools and generators included. Java only for the api-impl surface ART requires. Go only for the Blueprint -> ninja converter. No Python. Assembly only inside Rust (`global_asm!` / naked functions).
+- Rust for everything we write, tools and generators included. Java only for the api-impl surface ART requires. Go only for the Blueprint -> ninja converter. C++ only as cxx-bridge wrapper files inside a Rust boundary crate that call the public API of AOSP C++ classes (`crates/atl-libinput/wrap/`); wrappers only adapt types and forward, no logic. No Python. Assembly only inside Rust (`global_asm!` / naked functions).
 - Every file carries an SPDX header; our code is `MIT`. A patch carries the licence of the file it patches.
 
 ## Format

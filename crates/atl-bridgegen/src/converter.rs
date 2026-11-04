@@ -43,11 +43,15 @@ pub struct Artifact {
     /// rlib: those libraries' dirs, where rustc finds its crates' `#[link(name = ...)]` (rustc `-L native=`)
     #[serde(default)]
     pub native: Vec<PathBuf>,
+    /// shared: the C++ argv of the module's own C++ compiles (libc++, device defines, include paths); a package compiling a C++ wrapper against the module takes it
+    #[serde(default)]
+    pub cxx: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct GraphFile {
     artifacts: BTreeMap<String, Artifact>,
+    link_driver: String,
 }
 
 /// The converter's build directory as graph.json describes it.
@@ -55,6 +59,8 @@ struct GraphFile {
 pub struct Converter {
     graph: PathBuf,
     artifacts: BTreeMap<String, Artifact>,
+    /// The C++ compiler and link driver every converter link runs (graph.json `link_driver`, e.g. `clang++-19`); a C++ unit built against a module compiles with it.
+    pub link_driver: String,
 }
 
 impl Converter {
@@ -80,6 +86,7 @@ impl Converter {
         Ok(Converter {
             graph,
             artifacts: file.artifacts,
+            link_driver: file.link_driver,
         })
     }
 

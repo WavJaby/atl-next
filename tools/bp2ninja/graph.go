@@ -37,6 +37,8 @@ type artifact struct {
 	Search []string `json:"search,omitempty"`
 	Link   []string `json:"link,omitempty"`
 	Native []string `json:"native,omitempty"`
+	// shared only: the C++ argv of the module's own C++ compiles (compileFlags cxx: libc++, device defines, include paths), what a Rust package compiling a C++ wrapper against the module takes
+	Cxx []string `json:"cxx,omitempty"`
 }
 
 // artifactOf: n's graph.json artifact; ok=false for kinds no outside build links (archives, headers, generators, proc macros) and for crates that cannot compile.
@@ -45,7 +47,9 @@ func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
 	case n.kind == Rlib && n.rust.broken == "":
 		link, _ := g.rustCcLibs(n)
 		return artifact{Kind: n.kind.String(), Out: n.out, Crate: n.rust.crateName, Search: crateDirs([]*Node{n}), Link: link, Native: rustLinkDirs(link)}, true
-	case n.kind == Shared || n.kind == Binary:
+	case n.kind == Shared:
+		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx}, n.out != ""
+	case n.kind == Binary:
 		return artifact{Kind: n.kind.String(), Out: n.out}, n.out != ""
 	}
 	return artifact{}, false

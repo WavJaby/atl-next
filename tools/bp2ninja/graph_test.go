@@ -98,6 +98,10 @@ func TestGraphJSONArtifacts(t *testing.T) {
 	if u := f.Artifacts["device/libuser"]; u.Kind != "shared" || u.Out != out("device/libuser/libuser.so") || u.Crate != "" || u.Search != nil {
 		t.Errorf("libuser %+v", u)
 	}
+	// a shared artifact carries the C++ argv its own compiles take (a package compiling a C++ wrapper against it uses it): the language standard is among them
+	if u := f.Artifacts["device/libuser"]; !slices.ContainsFunc(u.Cxx, func(s string) bool { return strings.HasPrefix(s, "-std=") }) {
+		t.Errorf("libuser cxx %q", u.Cxx)
+	}
 	if tool := f.Artifacts["host/tool"]; tool.Kind != "binary" || tool.Out != out("host/tool/tool") {
 		t.Errorf("tool %+v", tool)
 	}

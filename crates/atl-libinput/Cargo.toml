@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-libinput"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Boundary crate: the Rust face of AOSP libinput, run as the converter builds it (`device/libinput`, unpatched): key and motion events published over an InputChannel (InputPublisher), the consumer end for the publish gate (InputConsumer), and a KeyCharacterMap loaded from a .kcm file, in the Parcel form InputDevice carries.
+# Everything needs libinput, so without feature `converter` the crate is empty; its bin and test require it.
+# C++ is cxx glue (src/bridge.rs) plus wrap/input.{h,cpp}: adapters that convert types and forward to AOSP's public API, no logic (project CLAUDE.md, C++ exception). The C++ argv is the converter's own (graph.json `cxx`), so the adapters see libinput's class layouts.
+[package.metadata.atl]
+converter = ["device/libinput", "device/libbinder", "device/libutils"]
+
+[features]
+converter = []
+
+[[bin]]
+name = "atl-kcm-parcel"
+path = "src/bin/kcm_parcel.rs"
+required-features = ["converter"]
+
+[[test]]
+name = "publish"
+required-features = ["converter"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cxx.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true

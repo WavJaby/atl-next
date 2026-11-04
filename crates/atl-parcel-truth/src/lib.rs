@@ -402,7 +402,7 @@ pub(crate) fn last_error() -> String {
 /// `static native byte[] roundTrip(String className, byte[] marshalled, int mode)`: null on failure (`lastError`).
 ///
 /// # Safety
-/// `ParcelTruth.setKeyCharacterMap(byte[])`: the staged map every InputDevice codec read compares against. 0 when set, else -1 with the reason in `lastError`.
+/// `ParcelTruth.setKeyCharacterMap(byte[])`: the map every InputDevice codec read compares against. 0 when set, else -1 with the reason in `lastError`.
 ///
 /// # Safety
 /// Called by ART as that native method: `env` is the JNIEnv of this thread's call, `map` a local reference valid for it.

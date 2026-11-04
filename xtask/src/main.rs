@@ -23,7 +23,6 @@ mod git;
 mod gralloc;
 mod host_art;
 mod instrument;
-mod keymap;
 mod land;
 mod libcxx_gate;
 mod licence_gate;

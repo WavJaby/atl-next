@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: MIT
+//! AOSP libinput for ATL-next, run as the converter builds it: key and motion events published over an InputChannel, the consumer end the publish gate reads them with, and the KeyCharacterMap of a `.kcm` file in the Parcel form an InputDevice carries.
+//! Without feature `converter` the crate is empty: libinput and its C++ come from the converter.
+//! The C++ is the cxx glue (bridge.rs) and adapters (wrap/input.{h,cpp}) that convert types and call AOSP's public API; the logic is here.
+#![cfg(feature = "converter")]
+
+// The bridge takes scalars, not records: a C++ adapter cannot name a cxx shared struct, so publish_motion lists every field as an argument.
+#[allow(clippy::too_many_arguments)]
+mod bridge;
+
+use std::os::fd::{IntoRawFd, OwnedFd};
+
+use bridge::ffi;
+
+use rustix::io::Errno;
+
+/// AOSP's `status_t` OK.
+const OK: i32 = 0;
+/// AOSP's `WOULD_BLOCK`: `-EAGAIN` (utils/Errors.h).
+const WOULD_BLOCK: i32 = -(Errno::AGAIN.raw_os_error());
+/// Message kinds the adapters report (wrap/input.h).
+const KIND_KEY: i32 = 1;
+const KIND_MOTION: i32 = 2;
+const KIND_FINISHED: i32 = 3;
+
+/// An AOSP call that failed: its `status_t`, or a null object where AOSP returns none.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{call} failed with status {status}")]
+    Status { call: &'static str, status: i32 },
+    #[error("{call} returned no object")]
+    Null { call: &'static str },
+}
+
+fn status(call: &'static str, status: i32) -> Result<(), Error> {
+    if status == OK {
+        Ok(())
+    } else {
+        Err(Error::Status { call, status })
+    }
+}
+
+/// A key event to publish (InputPublisher::publishKeyEvent); the verifier's HMAC is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub seq: u32,
+    pub event_id: i32,
+    pub device_id: i32,
+    pub source: i32,
+    pub display_id: i32,
+    pub action: i32,
+    pub flags: i32,
+    pub key_code: i32,
+    pub scan_code: i32,
+    pub meta_state: i32,
+    pub repeat_count: i32,
+    pub down_time: i64,
+    pub event_time: i64,
+}
+
+/// One pointer of a motion event: its id and its (x, y) in the event's coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pointer {
+    pub id: i32,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A motion event to publish (InputPublisher::publishMotionEvent). `transform` is the affine (a, b, c, d, tx, ty) applied to the event's coordinates; the raw transform is the same.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MotionEvent {
+    pub seq: u32,
+    pub event_id: i32,
+    pub device_id: i32,
+    pub source: i32,
+    pub display_id: i32,
+    pub action: i32,
+    pub action_button: i32,
+    pub flags: i32,
+    pub edge_flags: i32,
+    pub meta_state: i32,
+    pub button_state: i32,
+    /// AOSP's MotionClassification (`enum class`, uint8_t).
+    pub classification: u8,
+    pub transform: [f32; 6],
+    pub x_precision: f32,
+    pub y_precision: f32,
+    pub x_cursor: f32,
+    pub y_cursor: f32,
+    pub down_time: i64,
+    pub event_time: i64,
+    pub pointers: Vec<Pointer>,
+}
+
+/// The publisher end of a channel: AOSP's InputPublisher over the InputChannel it owns.
+pub struct Publisher(cxx::UniquePtr<ffi::Publisher>);
+
+impl Publisher {
+    /// Takes ownership of `fd`, one end of a SEQPACKET socket pair; `name` labels the channel.
+    pub fn new(fd: OwnedFd, name: &str) -> Result<Self, Error> {
+        let publisher = ffi::new_publisher(fd.into_raw_fd(), name);
+        if publisher.is_null() {
+            return Err(Error::Null {
+                call: "InputChannel::create",
+            });
+        }
+        Ok(Self(publisher))
+    }
+
+    /// Publishes a key event (InputPublisher::publishKeyEvent).
+    pub fn publish_key(&mut self, e: &KeyEvent) -> Result<(), Error> {
+        let s = ffi::publish_key(
+            self.0.pin_mut(),
+            e.seq,
+            e.event_id,
+            e.device_id,
+            e.source,
+            e.display_id,
+            e.action,
+            e.flags,
+            e.key_code,
+            e.scan_code,
+            e.meta_state,
+            e.repeat_count,
+            e.down_time,
+            e.event_time,
+        );
+        status("InputPublisher::publishKeyEvent", s)
+    }
+
+    /// Publishes a motion event (InputPublisher::publishMotionEvent).
+    pub fn publish_motion(&mut self, e: &MotionEvent) -> Result<(), Error> {
+        let ids: Vec<i32> = e.pointers.iter().map(|p| p.id).collect();
+        let coords: Vec<f32> = e.pointers.iter().flat_map(|p| [p.x, p.y]).collect();
+        let s = ffi::publish_motion(
+            self.0.pin_mut(),
+            e.seq,
+            e.event_id,
+            e.device_id,
+            e.source,
+            e.display_id,
+            e.action,
+            e.action_button,
+            e.flags,
+            e.edge_flags,
+            e.meta_state,
+            e.button_state,
+            e.classification,
+            &e.transform,
+            e.x_precision,
+            e.y_precision,
+            e.x_cursor,
+            e.y_cursor,
+            e.down_time,
+            e.event_time,
+            &ids,
+            &coords,
+        );
+        status("InputPublisher::publishMotionEvent", s)
+    }
+
+    /// The next finished signal from the consumer (InputPublisher::receiveConsumerResponse); None when none is pending. Timeline responses are not returned.
+    pub fn receive_finished(&mut self) -> Result<Option<Finished>, Error> {
+        let mut message = ffi::new_message();
+        let s = ffi::receive_finished(self.0.pin_mut(), message.pin_mut());
+        if s == WOULD_BLOCK {
+            return Ok(None);
+        }
+        status("InputPublisher::receiveConsumerResponse", s)?;
+        Ok((message.kind() == KIND_FINISHED).then(|| Finished {
+            seq: message.seq(),
+            handled: message.handled(),
+        }))
+    }
+}
+
+/// The consumer's answer to one dispatched event (InputPublisher::Finished).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finished {
+    pub seq: u32,
+    pub handled: bool,
+}
+
+/// One message a consumer received: a key or motion event, as AOSP's InputConsumer delivers it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Received {
+    Key {
+        seq: u32,
+        action: i32,
+        key_code: i32,
+        device_id: i32,
+    },
+    Motion {
+        seq: u32,
+        action: i32,
+        device_id: i32,
+        /// The first pointer's id and (x, y).
+        pointer_id: i32,
+        x: f32,
+        y: f32,
+    },
+    /// Any other message kind; `seq` is what the consumer must answer.
+    Other { seq: u32 },
+}
+
+/// The consumer end of a channel: AOSP's InputConsumer over the other SEQPACKET end.
+pub struct Consumer(cxx::UniquePtr<ffi::Consumer>);
+
+impl Consumer {
+    /// Takes ownership of `fd`, the other end of the socket pair; `name` labels the channel.
+    pub fn new(fd: OwnedFd, name: &str) -> Result<Self, Error> {
+        let consumer = ffi::new_consumer(fd.into_raw_fd(), name);
+        if consumer.is_null() {
+            return Err(Error::Null {
+                call: "InputChannel::create",
+            });
+        }
+        Ok(Self(consumer))
+    }
+
+    /// The next message (InputConsumer::consume); None when none is pending.
+    pub fn consume(&mut self) -> Result<Option<Received>, Error> {
+        let mut message = ffi::new_message();
+        let s = ffi::consume(self.0.pin_mut(), message.pin_mut());
+        if s == WOULD_BLOCK {
+            return Ok(None);
+        }
+        status("InputConsumer::consume", s)?;
+        let seq = message.seq();
+        Ok(Some(match message.kind() {
+            KIND_KEY => Received::Key {
+                seq,
+                action: message.action(),
+                key_code: message.key_code(),
+                device_id: message.device_id(),
+            },
+            KIND_MOTION => Received::Motion {
+                seq,
+                action: message.action(),
+                device_id: message.device_id(),
+                pointer_id: message.pointer_id(),
+                x: message.x(),
+                y: message.y(),
+            },
+            _ => Received::Other { seq },
+        }))
+    }
+
+    /// Answers the message `seq` (InputConsumer::sendFinishedSignal).
+    pub fn finish(&mut self, seq: u32, handled: bool) -> Result<(), Error> {
+        status(
+            "InputConsumer::sendFinishedSignal",
+            ffi::finish(self.0.pin_mut(), seq, handled),
+        )
+    }
+}
+
+/// AOSP's KeyCharacterMap, loaded from a `.kcm` file's contents.
+pub struct KeyCharacterMap(cxx::UniquePtr<ffi::KeyCharacterMap>);
+
+impl KeyCharacterMap {
+    /// Loads `contents` (format ANY, as validatekeymaps loads a map). `file_name` is the load name the Parcel form carries: the bare file name, `Virtual.kcm`, keeps the bytes independent of the directory.
+    pub fn load(file_name: &str, contents: &[u8]) -> Result<Self, Error> {
+        let map = ffi::load_kcm(file_name, contents);
+        if map.is_null() {
+            return Err(Error::Null {
+                call: "KeyCharacterMap::loadContents",
+            });
+        }
+        Ok(Self(map))
+    }
+
+    /// The Parcel form (KeyCharacterMap::writeToParcel): the bytes InputDevice carries after its device id and present flag.
+    pub fn parcel_bytes(&self) -> Vec<u8> {
+        ffi::kcm_parcel_bytes(&self.0)
+    }
+}

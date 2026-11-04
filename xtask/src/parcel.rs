@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, ensure};
+use atl_layout::Layout;
 
 use crate::atld_run::without_stamp;
 use crate::host_art::HostArt;
-use crate::{binder, packages, slot};
+use crate::{binder, farm, packages, slot};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -224,11 +225,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // writing a binder, even null, reaches libbinder's IPCThreadState and so opens the driver: the run is a binder process of binderd, as an app's is
     let (mut binderd, harness) =
         binder::start_binderd(root, &out, &out.join("parcel/binderd.log"))?;
-    let keymap = crate::keymap::staged(&out);
+    // the virtual keyboard's KeyCharacterMap in Parcel form, loaded by the same atl-libinput code the input service runs
+    let keymap = out.join("parcel/Virtual.kcm.parcel");
+    let to_parcel = packages::bin(root, &out, "atl-libinput", "atl-kcm-parcel")?;
+    let kcm = farm::virtual_kcm(&Layout::of(root)?);
+    let status = Command::new(&to_parcel)
+        .arg(&kcm)
+        .arg(&keymap)
+        .status()
+        .with_context(|| format!("running {}", to_parcel.display()))?;
     ensure!(
-        keymap.is_file(),
-        "missing {}: `xtask native` stages it from the goal validatekeymaps",
-        keymap.display()
+        status.success(),
+        "{} refused {} ({status})",
+        to_parcel.display(),
+        kcm.display()
     );
     let cmd = art.command(
         &fixture,

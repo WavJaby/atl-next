@@ -63,7 +63,7 @@ import java.util.UUID;
 
 public class ParcelTruth {
     static native byte[] roundTrip(String className, byte[] marshalled, int mode);
-    /// The staged KeyCharacterMap (validatekeymaps --parcel-out, args[2]): the InputDevice codec reads its bytes against this. 0 when set, else -1 (lastError).
+    /// The KeyCharacterMap's Parcel form (atl-kcm-parcel on Virtual.kcm, args[2]): the InputDevice codec reads its bytes against this. 0 when set, else -1 (lastError).
     static native int setKeyCharacterMap(byte[] map);
     static native String lastError();
     static native String refused();

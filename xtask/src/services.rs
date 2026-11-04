@@ -17,12 +17,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use atl_broker::control::{self, Request, Response};
+use atl_layout::Layout;
 use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::atld_run::without_stamp;
 use crate::binder::Harness;
-use crate::packages;
+use crate::{farm, packages};
 
 const PACKAGE: &str = "atl-services";
 /// The test package: an app uid (AID_APP_START 10000 + 123, any app id), its paths, launcher activity and start.
@@ -133,12 +134,8 @@ pub fn stage(
     test_root: &Path,
 ) -> Result<Vec<String>> {
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
-    let keymap = crate::keymap::staged(out);
-    ensure!(
-        keymap.is_file(),
-        "missing {}: `xtask native` stages it from the goal validatekeymaps",
-        keymap.display()
-    );
+    let keychars = farm::virtual_kcm(&Layout::of(root)?);
+    ensure!(keychars.is_file(), "missing input {}", keychars.display());
     let client = packages::bin(root, out, PACKAGE, "atl-services-client")?;
     let services_log = test_root.join("services.log");
     // the installed package, as atld's install step would write it
@@ -183,8 +180,8 @@ pub fn stage(
     let mut cmd = Command::new(&host);
     cmd.arg("--packages")
         .arg(&packages_file)
-        .arg("--virtual-keymap")
-        .arg(&keymap)
+        .arg("--keychars")
+        .arg(&keychars)
         .args(["--launch", APP])
         .envs(env.iter().cloned())
         .stdin(Stdio::from(control_theirs))

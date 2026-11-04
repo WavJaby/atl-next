@@ -62,7 +62,13 @@ uses = ["generators", "compositor"]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
-uses = ["aidl", "generators", "broker"]
+uses = ["aidl", "generators", "broker", "libinput"]
+
+# AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
+[libinput]
+crates = ["atl-libinput"]
+exports = ["atl-libinput"]
+uses = ["generators"]
 
 # the in-app compositor core (M3 slice 3): libgui's SurfaceFlinger-facing wire codecs over a bytes + object-table Parcel, layer tree, buffer cache, release / completion callbacks, vsync EventThread, the Scene for the platform layer; plain Rust, no binder or converter dependency
 [compositor]
