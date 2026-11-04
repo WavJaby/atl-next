@@ -48,6 +48,8 @@ const PACKAGE: &str = "package";
 const DISPLAY: &str = "display";
 /// Context.WINDOW_SERVICE.
 const WINDOW: &str = "window";
+/// Context.INPUT_SERVICE (InputManagerGlobal.java:172-181 looks it up by this name).
+const INPUT: &str = "input";
 /// Context.INPUT_METHOD_SERVICE (Context.java:5471).
 const INPUT_METHOD: &str = "input_method";
 
@@ -78,6 +80,7 @@ fn main() -> Result<()> {
         .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
         .context("addService input_method")?;
+    binder::add_service(INPUT, atl_services::input::new_binder()).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
         atl_services::registry_service::new_binder(),
