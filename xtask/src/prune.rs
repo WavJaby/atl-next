@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! `aosp-prune.toml`: directories of the AOSP tree Soong must not see, and Soong's own marker that hides
-//! them. Column meanings live in that file's header.
+//! `aosp-prune.toml`: directories of the AOSP tree the converter must not scan, and the marker that hides
+//! them. `xtask native` places the markers before every round. Column meanings live in that file's header.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::sources::{self, Sources};
 
 pub const FILE: &str = "aosp-prune.toml";
-/// Soong's finder skips a directory holding this file, with everything below it (`ui/build/finder.go`).
+/// A directory holding this file is skipped with everything below it: bp2ninja's tree scan (`tools/bp2ninja/bp.go` discover) and Soong's finder (`ui/build/finder.go`).
 pub const MARKER: &str = ".find-ignore";
 /// Tree-root list of the markers `apply` placed, so one whose row is gone gets removed.
 const PLACED: &str = ".atl-pruned";

@@ -304,7 +304,7 @@ fn loaded_ups<'a>(root: &Path, sources: &Sources, all: &'a [Checkout]) -> Result
     Ok(ups(all, &Layout::of(root)?, root, &declared))
 }
 
-/// Untracked files xtask itself puts in AOSP checkouts, by checkout dir (`aosp/<project>`), as paths inside it: the manifest's link/copy destinations (`xtask fetch`) and the prune markers (`xtask soong`). Any other untracked file is drift: a new file not committed on the patch branch.
+/// Untracked files xtask itself puts in AOSP checkouts, by checkout dir (`aosp/<project>`), as paths inside it: the manifest's link/copy destinations (`xtask fetch`) and the prune markers (`xtask native`). Any other untracked file is drift: a new file not committed on the patch branch.
 fn declared(
     sources: &Sources,
     manifest: Option<&Manifest>,

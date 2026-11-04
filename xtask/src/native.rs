@@ -16,7 +16,7 @@ use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::{
     arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages, patch,
-    provided_gate, providers, sources, system, triage, upstream, workspace,
+    provided_gate, providers, prune, sources, system, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -234,6 +234,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut round = 0;
     loop {
         round += 1;
+        // the converter's tree scan skips the directories prune.rs marks (bp.go discover); the table is re-read every round
+        let sources = sources::load(root)?;
+        prune::apply(&farm::shared_tree(&layout), &prune::load(root, &sources)?)?;
         let round_tree = aosp_tree()?;
         // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
         let (jdk, build_tools) = arches::java_tools(&round_tree, &prebuilt_os);
@@ -505,7 +508,7 @@ fn table_check(problems: &[String]) -> bool {
     problems.is_empty()
 }
 
-/// The rustc AOSP Rust modules build with: rust-toolchain.toml's, the toolchain this repo builds with (no second Rust toolchain; Soong's `prebuilts/rust` goes with Soong).
+/// The rustc AOSP Rust modules build with: rust-toolchain.toml's, the toolchain this repo builds with (no second Rust toolchain, hence no prebuilts/rust).
 struct RustToolchain {
     rustc: std::path::PathBuf,
     /// `x.y.z`: Soong's ANDROID_RUST_VERSION

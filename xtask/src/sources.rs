@@ -28,7 +28,7 @@ pub struct Aosp {
     pub projects: BTreeMap<String, String>,
 }
 
-/// Directory of the manifest checkout under `src/`: outside the AOSP tree, which Soong scans.
+/// Directory of the manifest checkout under `src/`: outside the AOSP tree, which the converter scans.
 pub const AOSP_MANIFEST_DIR: &str = "aosp-manifest";
 
 #[derive(Debug, Deserialize)]

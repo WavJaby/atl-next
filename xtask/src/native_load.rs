@@ -41,7 +41,7 @@ pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): dalvikvm<pointer_bits>, the JDK's prebuilt OS directory, the default --out.
     #[arg(long)]
     host: String,
-    /// ART root: bin/dalvikvm<bits>, com.android.art, com.android.i18n, com.android.tzdata, e.g. Soong's host ART (<workspace>/out/aosp/<product>/host/<soong_prebuilt_os>, as `xtask soong` builds it).
+    /// ART root: bin/dalvikvm<bits>, com.android.art, com.android.i18n, com.android.tzdata, e.g. a host ART built outside this repo, in its install layout.
     /// Default: the converter's ART in --out (`xtask native` goals dalvikvm, libart, ...), staged into <out>/native-load-art as an install would lay it out (see `stage_art`).
     #[arg(long)]
     art: Option<PathBuf>,

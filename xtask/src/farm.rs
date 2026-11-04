@@ -14,7 +14,7 @@ use crate::sources::{Checkout, Pin};
 /// The AOSP link farm inside a task's directory.
 const FARM: &str = "aosp-tree";
 
-/// The shared AOSP tree, `src/aosp`: its root holds no checkout of its own, so only the tree-wide readers (the farm, `xtask soong`, manifest links) take it whole.
+/// The shared AOSP tree, `src/aosp`: its root holds no checkout of its own, so only the tree-wide readers (the farm, the prune markers, manifest links) take it whole.
 pub fn shared_tree(layout: &Layout) -> PathBuf {
     layout.src().join("aosp")
 }
