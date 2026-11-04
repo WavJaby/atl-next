@@ -179,6 +179,7 @@ mod tests {
             min_sdk: 21,
             target_sdk,
             process_name: None,
+            application_theme: 0,
             application_booleans: application
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))
@@ -194,6 +195,7 @@ mod tests {
         ActivityDecl {
             name: "com.example.flags.Main".into(),
             launcher: true,
+            theme: 0,
             booleans: booleans
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))

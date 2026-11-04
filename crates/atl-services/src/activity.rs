@@ -409,6 +409,7 @@ impl Inner {
                 exported: true,
                 ..Default::default()
             },
+            theme: activity.theme,
             flags: manifest_flags::activity_flags(p, activity),
             ..Default::default()
         };

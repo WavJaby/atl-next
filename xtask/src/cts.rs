@@ -370,6 +370,7 @@ mod tests {
             min_sdk: 1,
             target_sdk: 1,
             process_name: None,
+            application_theme: 0,
             application_booleans: std::collections::BTreeMap::new(),
             activities: Vec::new(),
             requested_permissions: Vec::new(),

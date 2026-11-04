@@ -35,6 +35,8 @@ pub struct ActivityDecl {
     pub name: String,
     /// It handles MAIN + LAUNCHER (the first such activity is the package's launcher activity).
     pub launcher: bool,
+    /// `android:theme` as a resource id (ActivityInfo.theme); 0 = none written, ActivityInfo.getThemeResource then takes the application's.
+    pub theme: i32,
     /// Its boolean attributes by name, only those the manifest wrote (`hardwareAccelerated`, ...); the flags they set are in manifest_flags.
     pub booleans: BTreeMap<String, bool>,
 }
@@ -49,6 +51,8 @@ pub struct Manifest {
     pub target_sdk: i32,
     /// `<application android:process>`; None = the package name (ApplicationInfo.processName's default).
     pub process_name: Option<String>,
+    /// `<application android:theme>` as a resource id (ApplicationInfo.theme); 0 = none written.
+    pub application_theme: i32,
     /// `<application>`'s boolean attributes by name, only those the manifest wrote; the flags they set are in manifest_flags.
     pub application_booleans: BTreeMap<String, bool>,
     /// Every `<activity>`, in manifest order.
@@ -243,6 +247,7 @@ mod tests {
                 min_sdk: 21,
                 target_sdk: 34,
                 process_name: None,
+                application_theme: 0,
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
                 requested_permissions: vec![],
@@ -355,6 +360,7 @@ mod tests {
         let activity = |name: &str, launcher: bool| ActivityDecl {
             name: name.into(),
             launcher,
+            theme: 0,
             booleans: BTreeMap::new(),
         };
         let mut r = record("a", 10_001);

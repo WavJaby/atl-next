@@ -55,6 +55,7 @@ pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationIn
             ..Default::default()
         },
         process_name: Some(p.process_name().to_owned()),
+        theme: p.application_theme,
         flags: manifest_flags::application_flags(p),
         source_dir: Some(p.source_dir.clone()),
         public_source_dir: Some(p.source_dir.clone()),

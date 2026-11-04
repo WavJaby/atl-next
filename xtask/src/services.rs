@@ -147,10 +147,12 @@ pub fn stage(
             min_sdk: SDK,
             target_sdk: SDK,
             process_name: None,
+            application_theme: 0,
             application_booleans: BTreeMap::new(),
             activities: vec![ActivityDecl {
                 name: ACTIVITY.to_owned(),
                 launcher: true,
+                theme: 0,
                 booleans: BTreeMap::new(),
             }],
             requested_permissions: vec![],

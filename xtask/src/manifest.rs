@@ -122,6 +122,18 @@ fn booleans(element: &Element) -> BTreeMap<String, bool> {
         .collect()
 }
 
+/// `android:theme` of `element` as a resource id: aapt2 prints a reference `@0x01030128`. None written = 0 (ParsedActivityUtils: `getResourceId(theme, 0)`); a reference to the app's own or the framework's style reads alike.
+fn theme(element: &Element) -> Result<i32> {
+    let Some(value) = element.attr("theme") else {
+        return Ok(0);
+    };
+    let hex = value
+        .strip_prefix("@0x")
+        .with_context(|| format!("theme {value:?} is not a resource reference"))?;
+    let id = u32::from_str_radix(hex, 16).with_context(|| format!("theme {value:?}"))?;
+    Ok(id as i32)
+}
+
 /// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
 fn resolve_class(package: &str, name: &str) -> String {
     if name.starts_with('.') {
@@ -172,19 +184,26 @@ pub fn parse(text: &str) -> Result<Manifest> {
     let activities = application
         .into_iter()
         .flat_map(|a| a.children("activity"))
-        .filter_map(|activity| {
+        .map(|activity| {
             let launcher = activity.children("intent-filter").any(|f| {
                 let has = |kind: &str, wanted: &str| {
                     f.children(kind).any(|e| e.attr("name") == Some(wanted))
                 };
                 has("action", ACTION_MAIN) && has("category", CATEGORY_LAUNCHER)
             });
-            Some(ActivityDecl {
-                name: resolve_class(package, activity.attr("name")?),
+            let Some(name) = activity.attr("name") else {
+                return Ok(None);
+            };
+            Ok(Some(ActivityDecl {
+                name: resolve_class(package, name),
                 launcher,
+                theme: theme(activity)?,
                 booleans: booleans(activity),
-            })
+            }))
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect();
     Ok(Manifest {
         name: package.to_owned(),
@@ -193,6 +212,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         min_sdk,
         target_sdk,
         process_name,
+        application_theme: application.map_or(Ok(0), theme)?,
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
         requested_permissions: root
@@ -311,6 +331,30 @@ mod tests {
         assert_eq!(m.process_name, None);
         assert!(m.activities.is_empty() && m.launch_activity().is_none());
         assert!(m.application_booleans.is_empty());
+    }
+
+    /// `android:theme` as aapt2 prints it, on the application and on one activity; unwritten = 0; a theme that is no reference is refused.
+    #[test]
+    fn themes_are_resource_ids() {
+        let text = |value: &str| {
+            format!(
+                r#"  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: application (line=7)
+        A: http://schemas.android.com/apk/res/android:theme(0x01010000)=@0x7f0a0001
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+            A: http://schemas.android.com/apk/res/android:theme(0x01010000)={value}
+          E: activity (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".B" (Raw: ".B")
+"#
+            )
+        };
+        let m = parse(&text("@0x0103012a")).expect("parse");
+        assert_eq!(m.application_theme, 0x7f0a_0001);
+        assert_eq!(m.activities[0].theme, 0x0103_012a);
+        assert_eq!(m.activities[1].theme, 0);
+        assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
     }
 
     /// A launcher activity named relative to the package, a private process, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
