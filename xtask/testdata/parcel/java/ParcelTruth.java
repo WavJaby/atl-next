@@ -445,6 +445,7 @@ public class ParcelTruth {
         Parcel out = Parcel.obtain();
         if (roundTripParcel("android.view.InputChannel", in, out) != 0) {
             result(false, name, "rust: " + lastError());
+            dumpParcel(name, in);
             return;
         }
         boolean consumed = out.dataSize() == in.dataSize();
@@ -728,6 +729,35 @@ public class ParcelTruth {
         return n;
     }
 
+    /// Failure dump: `bytes` as hex, 16 to a line (`hex <case> <offset>: <words>`), so a codec can be walked field by field against the bytes Java wrote.
+    static void dumpHex(String name, byte[] bytes) {
+        for (int off = 0; off < bytes.length; off += 16) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = off; i < Math.min(off + 16, bytes.length); i++) {
+                if (i % 4 == 0) sb.append(' ');
+                sb.append(String.format("%02x", bytes[i] & 0xff));
+            }
+            System.out.println("hex " + name + " " + String.format("%04x", off) + ":" + sb);
+        }
+    }
+
+    /// Failure dump of a Parcel that holds objects (binders, FDs), which marshall() refuses: its data is read back word by word from the start.
+    static void dumpParcel(String name, Parcel p) {
+        int n = p.dataSize() / 4 * 4;
+        int at = p.dataPosition();
+        p.setDataPosition(0);
+        byte[] bytes = new byte[n];
+        for (int i = 0; i < n; i += 4) {
+            int w = p.readInt();
+            bytes[i] = (byte) w;
+            bytes[i + 1] = (byte) (w >> 8);
+            bytes[i + 2] = (byte) (w >> 16);
+            bytes[i + 3] = (byte) (w >> 24);
+        }
+        p.setDataPosition(at);
+        dumpHex(name, bytes);
+    }
+
     static void result(boolean ok, String name, String detail) {
         System.out.println("pt " + (ok ? "pass " : "fail ") + name + " " + detail);
         if (!ok) failures++;
@@ -740,6 +770,7 @@ public class ParcelTruth {
         byte[] rust = roundTrip(cls, java, MODE_PLAIN);
         if (rust == null) {
             result(false, name, "rust: " + lastError());
+            dumpHex(name, java);
             return;
         }
         if (!Arrays.equals(java, rust)) {
