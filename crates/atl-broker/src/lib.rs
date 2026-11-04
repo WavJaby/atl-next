@@ -47,6 +47,8 @@ pub struct Spawn {
     /// May become binder's context manager (servicemanager only).
     pub context_manager: bool,
     pub mounts: Vec<Mount>,
+    /// Host device nodes (or directories of them) the process may open, at the same path in the sandbox, whose `/dev` is otherwise a fresh minimal one (the graphics allocator's `/dev/dri`).
+    pub devices: Vec<PathBuf>,
     /// The property area file, mounted read-only at [`PROPERTY_AREA`].
     pub property_area: Option<PathBuf>,
     pub program: PathBuf,
@@ -155,6 +157,13 @@ pub fn bwrap_args(spawn: &Spawn, root: &[RootEntry], info_fd: i32) -> Vec<OsStri
             kind.into(),
             m.host.clone().into_os_string(),
             m.at.clone().into_os_string(),
+        ]);
+    }
+    for d in &spawn.devices {
+        a.extend([
+            "--dev-bind".into(),
+            d.clone().into_os_string(),
+            d.clone().into_os_string(),
         ]);
     }
     if let Some(area) = &spawn.property_area {
@@ -293,6 +302,7 @@ mod tests {
                     writable: true,
                 },
             ],
+            devices: vec!["/dev/dri".into()],
             property_area: Some("/r/properties".into()),
             program: "/bin/true".into(),
             args: vec![],
@@ -339,8 +349,8 @@ mod tests {
                 "{replaced}"
             );
         }
-        // the mounts after the root, then the area at bionic's path, then the end of options
-        assert!(joined.ends_with("--ro-bind /r/system /system --bind /r/data /data --ro-bind /r/properties /dev/__properties__ --"));
+        // the mounts after the root, then the device nodes, then the area at bionic's path, then the end of options
+        assert!(joined.ends_with("--ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"));
     }
 
     #[test]

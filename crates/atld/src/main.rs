@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Mount, Process, Spawn, kill_sandbox};
+use atl_gralloc::vintf;
 use atl_services::display_model::DisplayModel;
 use atl_services::packages::{Library, Manifest, PackageRecord};
 use clap::Parser;
@@ -47,6 +48,10 @@ struct Args {
     /// atl-system-services executable.
     #[arg(long)]
     services: PathBuf,
+    /// atl-gralloc-allocator executable: the graphics allocator HAL (`android.hardware.graphics.allocator.IAllocator/default`), started next to the services with `/dev/dri` and declared in the VINTF manifest servicemanager reads.
+    /// Omitted: no graphics buffers (headless runs on a host without a DRM device). The mapper library `mapper.atl.so` it names to libui must be in `--lib-path`.
+    #[arg(long)]
+    gralloc: Option<PathBuf>,
     /// atl-app-launcher executable.
     #[arg(long)]
     launcher: PathBuf,
@@ -110,6 +115,10 @@ const AID_APP_START: u32 = 10_000;
 const READY: Duration = Duration::from_secs(20);
 /// What atl-system-services prints once registered.
 const READY_LINE: &str = "services: ready";
+/// What atl-gralloc-allocator prints once registered.
+const GRALLOC_READY_LINE: &str = "gralloc: ready";
+/// The DRM device directory the allocator opens (atl_gralloc_service::backend::DRM_DIR); the sandbox's `/dev` is otherwise minimal.
+const DRM_DIR: &str = "/dev/dri";
 /// framework-res's installed name in /system/framework (AssetManager.FRAMEWORK_APK_PATH_DEVICE).
 const FRAMEWORK_RES: &str = "framework-res.apk";
 /// The target SDK of a process that is not an app (the shell's `am`): 0 = the platform's level, bionic's own meaning (atl-app-launcher args).
@@ -134,6 +143,9 @@ struct Root {
 impl Root {
     fn system(&self) -> PathBuf {
         self.root.join("system")
+    }
+    fn vendor(&self) -> PathBuf {
+        self.root.join("vendor")
     }
     fn data(&self) -> PathBuf {
         self.root.join("data")
@@ -182,6 +194,28 @@ fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
         std::os::unix::fs::symlink(std::path::absolute(host)?, &at)?;
     }
     Ok(boot)
+}
+
+/// The VINTF manifests servicemanager reads (libvintf's default paths): `/system/etc/vintf/manifest.xml` (framework) and `/vendor/etc/vintf/manifest.xml` (device), which declares the graphics HALs when `--gralloc` is given.
+/// servicemanager refuses to register an undeclared @VintfStability service and answers `isDeclared` from these (libui checks it before it loads the mapper).
+fn vintf_layout(a: &Args, r: &Root) -> Result<()> {
+    for (dir, kind, hals) in [
+        (r.system(), "framework", String::new()),
+        (
+            r.vendor(),
+            "device",
+            if a.gralloc.is_some() {
+                vintf::device_hals()
+            } else {
+                String::new()
+            },
+        ),
+    ] {
+        let d = dir.join("etc/vintf");
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(d.join("manifest.xml"), vintf::manifest(kind, &hals))?;
+    }
+    Ok(())
 }
 
 /// `--system-file`'s `<host path>=<path below /system>`; the second must be relative and stay below /system.
@@ -352,6 +386,7 @@ impl Host {
                     writable: true,
                 },
             ],
+            devices: vec![],
             property_area: Some(self.root.properties()),
             program: self.launcher.clone(),
             args: launcher_args,
@@ -458,6 +493,28 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
     }
 }
 
+/// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after [`READY`].
+fn wait_ready(child: &mut Child, log: &Path, line: &str, what: &str) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if text.contains(line) {
+            return Ok(());
+        }
+        if let Some(s) = child.try_wait()? {
+            bail!(
+                "{what} exited {s}:\n{}\n(log {})",
+                text.trim(),
+                log.display()
+            );
+        }
+        if start.elapsed() > READY {
+            bail!("{what} not ready after {READY:?} (log {})", log.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn run(a: &Args) -> Result<ExitCode> {
     if a.root.exists() {
         std::fs::remove_dir_all(&a.root)?;
@@ -468,6 +525,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(r.root.join("log"))?;
     property_area(a, &r)?;
     let boot = system_layout(a, &r)?;
+    vintf_layout(a, &r)?;
     let mut libraries = Vec::new();
     for (name, lib) in &a.shared_libraries {
         let installed = link_into_framework(&r, Path::new(&lib.file))?;
@@ -495,7 +553,20 @@ fn run(a: &Args) -> Result<ExitCode> {
         Ok(Spawn {
             uid: AID_SYSTEM,
             context_manager: cm,
-            mounts: vec![],
+            // the VINTF manifests are servicemanager's alone to read; the others reach HALs through it
+            mounts: if cm {
+                [("system", r.system()), ("vendor", r.vendor())]
+                    .into_iter()
+                    .map(|(at, host)| Mount {
+                        host,
+                        at: PathBuf::from("/").join(at),
+                        writable: false,
+                    })
+                    .collect()
+            } else {
+                vec![]
+            },
+            devices: vec![],
             property_area: Some(r.properties()),
             program: program.to_owned(),
             args,
@@ -566,20 +637,30 @@ fn run(a: &Args) -> Result<ExitCode> {
             Some(control_theirs),
         )?)
         .context("starting atl-system-services")?;
-    let start = Instant::now();
-    while !std::fs::read_to_string(r.log("services"))?.contains(READY_LINE) {
-        if let Some(s) = services.child.try_wait()? {
-            bail!(
-                "atl-system-services exited {s} (log {})",
-                r.log("services").display()
-            );
-        }
-        if start.elapsed() > READY {
-            bail!("atl-system-services not ready after {READY:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_ready(
+        &mut services.child,
+        &r.log("services"),
+        READY_LINE,
+        "atl-system-services",
+    )?;
     log(format_args!("services ready"));
+    let mut gralloc = None;
+    if let Some(program) = &a.gralloc {
+        let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
+        spawn.devices = vec![PathBuf::from(DRM_DIR)];
+        let mut p = host
+            .broker
+            .spawn(spawn)
+            .context("starting atl-gralloc-allocator")?;
+        wait_ready(
+            &mut p.child,
+            &r.log("gralloc"),
+            GRALLOC_READY_LINE,
+            "atl-gralloc-allocator",
+        )?;
+        log(format_args!("gralloc ready"));
+        gralloc = Some(p);
+    }
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
@@ -606,7 +687,10 @@ fn run(a: &Args) -> Result<ExitCode> {
         log(format_args!("left at the end: {pid}"));
         let _ = kill_sandbox(pid);
     }
-    for p in [&mut services, &mut sm] {
+    for p in [Some(&mut services), gralloc.as_mut(), Some(&mut sm)]
+        .into_iter()
+        .flatten()
+    {
         let _ = kill_sandbox(p.host_pid);
         let _ = p.child.wait();
     }

@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 atl-binderd = { path = "../atl-binderd" }
 atl-broker = { path = "../atl-broker" }
+atl-gralloc = { path = "../atl-gralloc" }
 atl-property-service = { path = "../atl-property-service" }
 atl-services = { path = "../atl-services" }
 clap.workspace = true
