@@ -72,12 +72,7 @@ impl ISurfaceComposer for SurfaceComposer {
     }
 
     fn r#createConnection(&self) -> binder::Result<Option<Strong<dyn ISurfaceComposerClient>>> {
-        Ok(Some(BnSurfaceComposerClient::new_binder(
-            Client {
-                composer: Arc::clone(&self.composer),
-            },
-            BinderFeatures::default(),
-        )))
+        Ok(Some(new_client(Arc::clone(&self.composer))))
     }
 
     fn r#createDisplayEventConnection(
@@ -292,6 +287,11 @@ impl IDisplayEventConnection for EventConnection {
             .write_parcelable_body(&mut wire);
         Ok(Some(VsyncEventData(wire.data().to_vec())))
     }
+}
+
+/// A client connection of `composer`: what createConnection gives, and the client a window's SurfaceControl carries (ui_agent.rs).
+pub fn new_client(composer: Arc<Composer>) -> Strong<dyn ISurfaceComposerClient> {
+    BnSurfaceComposerClient::new_binder(Client { composer }, BinderFeatures::default())
 }
 
 /// The "SurfaceFlingerAIDL" service object of `composer`.

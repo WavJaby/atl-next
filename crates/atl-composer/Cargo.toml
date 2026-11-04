@@ -15,7 +15,7 @@ publish.workspace = true
 converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
-converter = ["atl-aidl/converter"]
+converter = ["atl-aidl/converter", "atl-services/converter"]
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }

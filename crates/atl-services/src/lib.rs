@@ -37,4 +37,6 @@ pub mod settings;
 #[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
+pub mod ui_agent;
+#[cfg(feature = "converter")]
 pub mod window;

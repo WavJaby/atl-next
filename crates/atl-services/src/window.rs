@@ -31,6 +31,7 @@ use binder::{
 };
 
 use crate::display_model::DisplayModel;
+use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters, permission};
 
 /// The interface names counters use.
@@ -49,43 +50,66 @@ const SOCKET_BUFFER_SIZE: usize = 32 * 1024;
 /// CompatibilityInfo's scale of an app that needs no size compatibility: the value addToDisplay reports (outSizeCompatScale).
 const COMPAT_SCALE_NONE: f32 = 1.0;
 
-/// IUiAgent (plan 8c), as WMS uses it: at relayout, the app process that owns a window's surface gives the window's SurfaceControl. Only the window path's use is shaped here:
-/// the transport (a binder the app process registers) and the in-app side come with the composer (M3 slice 4). Until then [`NoUiAgent`] answers, counted.
-pub trait UiAgent: Send + Sync {
-    /// The SurfaceControl of the window with client binder `window`; None: the window has no surface (yet).
-    fn window_surface(&self, window: &SpIBinder) -> Option<SurfaceControl>;
+/// The UI agent of the app that opened a session (ui_agent.rs): the registry holds one per uid, so a session asks the agent of its own uid.
+struct RegisteredAgent {
+    agents: Arc<UiAgents>,
+    uid: u32,
 }
 
-/// No agent is registered: no window has a surface.
-struct NoUiAgent;
-
-impl UiAgent for NoUiAgent {
-    fn window_surface(&self, _window: &SpIBinder) -> Option<SurfaceControl> {
-        counters::count(
-            WINDOW_SESSION,
-            "relayout: no window surface (no UI agent until the composer, M3 slice 4)",
-        );
-        None
+impl RegisteredAgent {
+    /// The agent's layer for a window named `title`; None, counted, when the app registered no agent or the call failed.
+    fn window_surface(&self, title: &str) -> Option<SurfaceControl> {
+        let Some(binder) = self.agents.get(self.uid) else {
+            counters::count(
+                WINDOW_SESSION,
+                "relayout: no UI agent registered for the app's uid",
+            );
+            return None;
+        };
+        let agent: Strong<dyn IUiAgent> = match binder.into_interface() {
+            Ok(agent) => agent,
+            Err(e) => {
+                counters::count(
+                    WINDOW_SESSION,
+                    &format!("relayout: registered UI agent is not an IUiAgent: {e:?}"),
+                );
+                return None;
+            }
+        };
+        match agent.window_surface(title) {
+            Ok(surface) => Some(surface),
+            Err(e) => {
+                counters::count(
+                    WINDOW_SESSION,
+                    &format!("relayout: UI agent refused the window surface: {e:?}"),
+                );
+                None
+            }
+        }
     }
 }
 
-/// One window the session added: its client binder (what `remove` and `relayout` find it by) and the server end of its input channel, which AOSP's InputDispatcher
-/// publishes on; it closes when the window goes.
+/// One window the session added: its client binder (what `remove` and `relayout` find it by), its title (the layer name), and the server end of its input channel, which AOSP's
+/// InputDispatcher publishes on; it closes when the window goes.
 struct Window {
     client: SpIBinder,
+    title: String,
     /// Held only to keep the channel open until the window is removed (dropping it closes the channel); no reader yet.
     _input_server: Option<OwnedFd>,
     laid_out: bool,
+    /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
+    surface: Option<SurfaceControl>,
 }
 
 struct WindowManager {
     model: DisplayModel,
+    agents: Arc<UiAgents>,
 }
 
 /// The session openSession gives: the windows it added, and the display they lay out on.
 struct Session {
     model: DisplayModel,
-    agent: Box<dyn UiAgent>,
+    agent: RegisteredAgent,
     windows: Mutex<Vec<Window>>,
 }
 
@@ -137,7 +161,10 @@ impl IWindowManager for WindowManager {
         Ok(Some(BnWindowSession::new_binder(
             Session {
                 model: self.model,
-                agent: Box::new(NoUiAgent),
+                agent: RegisteredAgent {
+                    agents: Arc::clone(&self.agents),
+                    uid: ThreadState::get_calling_uid(),
+                },
                 windows: Mutex::new(Vec::new()),
             },
             BinderFeatures::default(),
@@ -226,7 +253,8 @@ impl IWindowSession for Session {
                 core: Some(InputChannelCore {
                     name: attrs.title.clone(),
                     fd: Arc::new(client),
-                    token: None,
+                    // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
+                    token: Some(crate::token::new()),
                 }),
             };
             (channel, Some(server))
@@ -235,14 +263,23 @@ impl IWindowSession for Session {
         };
         self.lock().push(Window {
             client: window.as_binder(),
+            title: attrs.title.clone().unwrap_or_default(),
             _input_server: input_server,
             laid_out: false,
+            surface: None,
         });
         *out_input_channel = Some(channel);
         *insets_state = Some(self.insets_state());
         *active_controls = None;
         *attached_frame = Some(Rect::default());
         *size_compat_scale = Some(vec![COMPAT_SCALE_NONE]);
+        // WMS dispatches the app's visibility to its windows (WindowState's app visibility): ViewRootImpl draws only while its app is visible, and it starts out not.
+        if let Err(e) = window.r#dispatchAppVisibility(true) {
+            counters::count(
+                WINDOW_SESSION,
+                &format!("addToDisplayAsUser: dispatchAppVisibility refused: {e:?}"),
+            );
+        }
         Ok(ADD_OKAY)
     }
 
@@ -265,7 +302,7 @@ impl IWindowSession for Session {
             return Err(StatusCode::BAD_VALUE.into());
         };
         let client = window.as_binder();
-        let (first, surface) = {
+        let (first, pending) = {
             let mut windows = self.lock();
             let Some(record) = windows.iter_mut().find(|w| w.client == client) else {
                 counters::refused(WINDOW_SESSION, "relayout: window not added by this session");
@@ -273,10 +310,26 @@ impl IWindowSession for Session {
             };
             let first = !record.laid_out;
             record.laid_out = true;
-            (first, self.agent.window_surface(&record.client))
+            (
+                first,
+                record.surface.is_none().then(|| record.title.clone()),
+            )
         };
+        // The agent is another process, asked without the windows lock. A window gets its surface once; a failed call is asked again at the next relayout.
+        let created = pending.and_then(|title| self.agent.window_surface(&title));
+        if let Some(surface) = &created
+            && let Some(record) = self.lock().iter_mut().find(|w| w.client == client)
+        {
+            record.surface = Some(surface.clone());
+        }
+        // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
+        let surface = self
+            .lock()
+            .iter()
+            .find(|w| w.client == client)
+            .and_then(|w| w.surface.clone());
         let configuration: Configuration = activity::global_configuration(&self.model);
-        let surface_changed = surface.is_some();
+        let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
             frames: ClientWindowFrames {
                 frame: self.display_rect(),
@@ -324,7 +377,8 @@ impl IWindowSession for Session {
     }
 }
 
-/// A new window service binder: the one display's model, which every session lays out on.
-pub fn new_binder(model: DisplayModel) -> SpIBinder {
-    BnWindowManager::new_binder(WindowManager { model }, BinderFeatures::default()).as_binder()
+/// A new window service binder: the one display's model, which every session lays out on, and the table of UI agents (system_services.rs gives it the registry's).
+pub fn new_binder(model: DisplayModel, agents: Arc<UiAgents>) -> SpIBinder {
+    BnWindowManager::new_binder(WindowManager { model, agents }, BinderFeatures::default())
+        .as_binder()
 }

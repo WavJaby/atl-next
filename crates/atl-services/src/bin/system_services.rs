@@ -22,6 +22,7 @@ use atl_services::display_model::DisplayModel;
 use atl_services::package::PackageManager;
 use atl_services::packages::{Library, PackageRecord, Packages};
 use atl_services::process_control::ControlSocket;
+use atl_services::ui_agent::UiAgents;
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
 
@@ -79,8 +80,13 @@ fn main() -> Result<()> {
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(DISPLAY, atl_services::display::new_binder(display))
         .context("addService display")?;
-    binder::add_service(WINDOW, atl_services::window::new_binder(display))
-        .context("addService window")?;
+    // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
+    let agents = Arc::new(UiAgents::default());
+    binder::add_service(
+        WINDOW,
+        atl_services::window::new_binder(display, Arc::clone(&agents)),
+    )
+    .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
         .context("addService input_method")?;
     let contents =
@@ -96,7 +102,7 @@ fn main() -> Result<()> {
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
-        atl_services::registry_service::new_binder(),
+        atl_services::registry_service::new_binder(Arc::clone(&agents)),
     )
     .context("addService compositor registry")?;
     writeln!(std::io::stderr(), "services: ready")?;

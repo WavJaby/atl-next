@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Starting the compositor of an app process, and handing its two service objects to the registry in the system process (atl_services::compositor_registry has the protocol).
+//! Starting the compositor of an app process, and handing its two service objects and its UI agent (ui_agent.rs) to the registry in the system process (atl_services::compositor_registry has the protocol).
 //! Reads from the process's own property area what atld wrote there (`ro.atl.surfaceflinger.suffix`, `ro.atl.display`); a process without them is not an ATL app process and gets no compositor.
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface}
 
 use crate::host::{Composer, ComposerConfig, ThreadHost};
 use crate::sink::ReportSink;
-use crate::{service, surface_flinger};
+use crate::{service, surface_flinger, ui_agent};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
@@ -65,11 +65,12 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
-/// The REGISTER transaction.
+/// The REGISTER transaction: the suffix, the two service binders, the UI agent.
 fn register(
     suffix: &str,
     surface_flinger: &SpIBinder,
     surface_flinger_aidl: &SpIBinder,
+    ui_agent: &SpIBinder,
 ) -> Result<(), String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
@@ -78,6 +79,7 @@ fn register(
     data.write(surface_flinger).map_err(|e| e.to_string())?;
     data.write(surface_flinger_aidl)
         .map_err(|e| e.to_string())?;
+    data.write(ui_agent).map_err(|e| e.to_string())?;
     binder
         .submit_transact(REGISTER, data, 0)
         .map_err(|e| format!("register: {e}"))?;
@@ -101,7 +103,8 @@ pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
         .map_err(|e| format!("frame clock thread: {e}"))?;
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
-    register(&suffix, &surface_flinger, &surface_flinger_aidl)?;
+    let ui_agent = ui_agent::new_binder(Arc::clone(&composer));
+    register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
     // the registry holds the binders; the process holds the compositor (the clock thread does)
     Ok(composer)
 }

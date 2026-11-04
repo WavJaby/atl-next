@@ -13,7 +13,7 @@
 pub const SERVICE: &str = "atl.compositor_registry";
 /// Its interface descriptor.
 pub const DESCRIPTOR: &str = "atl.ICompositorRegistry";
-/// `IBinder.FIRST_CALL_TRANSACTION`: the one transaction. Arguments: the suffix as a String16, then the two service binders, "SurfaceFlinger" first; reply: a status only.
+/// `IBinder.FIRST_CALL_TRANSACTION`: the one transaction. Arguments: the suffix as a String16, then the two service binders, "SurfaceFlinger" first, then the app's UI agent (ui_agent.rs); reply: a status only.
 pub const REGISTER: u32 = 1;
 /// The system property libgui appends to both service names (patches/aosp/frameworks/native libgui: `composerServiceName`).
 pub const SUFFIX_PROPERTY: &str = "ro.atl.surfaceflinger.suffix";
