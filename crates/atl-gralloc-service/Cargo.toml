@@ -9,7 +9,8 @@ publish.workspace = true
 
 # The AIDL `android.hardware.graphics.allocator.IAllocator/default` service (M3 slice 2): AOSP libui's Gralloc5 allocator side. It allocates linear dma-bufs through GBM on the host's DRM device (`backend`), pairs each with the shared metadata page, and answers with the handle ints of atl-gralloc (`allocator`).
 # The binder front end (`service`, bin `atl-gralloc-allocator`) implements AOSP's own Rust stub (`android.hardware.graphics.allocator-V2-rust`, re-exported by atl-aidl) against libbinder_rs, so only `xtask native` builds it (feature `converter`); plain workspace builds take the GBM backend and the allocation logic with their tests.
-# No `unsafe` here: GBM comes through the `gbm` crate, the descriptor / handle / page logic is atl-gralloc's.
+# Why our own allocator and not AOSP's external/minigbm (rung 6, AGENTS.md; owner-delegated decision 2026-11-04): minigbm does provide the AIDL allocator and stable-C mapper libui loads, but its device layer picks a per-DRM-driver backend at compile time from one Soong variable (`minigbm.platform`: no generic desktop value, no AMD, no vgem), so fitting it needs patches beyond a few lines plus a vendor libdrm pin, and the vgem part would be a WSL-only product path. Mesa GBM is the native Linux allocator for every desktop driver, which the design targets.
+# `unsafe` only in `prime` (the PRIME export ioctl and GBM's handle union); GBM itself comes through the `gbm` crate, the descriptor / handle / page logic is atl-gralloc's.
 [package.metadata.atl]
 converter = ["device/libbinder_rs", "device/atl-aidl-stubs-rust", "device/android.hardware.graphics.allocator-V2-rust"]
 
