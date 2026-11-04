@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strings"
 )
@@ -81,12 +80,12 @@ type artPlugin struct {
 	codegenArches [2][]string
 	// android/config.go LibartImgDeviceBaseAddress / LibartImgHostBaseAddress
 	baseAddress [2]string
-	// ART_CLANG_PATH: cc/config/global.go ClangDefaultBase / android/config.go PrebuiltOS() / ClangDefaultVersion
-	clangPath string
+	// ART_CLANG_PATH = -llvm, absolute: native_stack_dump.cc composes ANDROID_BUILD_TOP + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line"; lib_env sets ANDROID_BUILD_TOP=/
+	llvmPrefix string
 }
 
-// readArtPlugin: the plugin at the pin; nil without art/build (no art_* module in the tree then).
-func readArtPlugin(tree string, cfg Config) (*artPlugin, error) {
+// readArtPlugin: the plugin at the pin; nil without art/build (no art_* module in the tree then). llvm = -llvm, required once the plugin is read.
+func readArtPlugin(tree string, cfg Config, llvm string) (*artPlugin, error) {
 	dir := filepath.Join(tree, artPluginDir)
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -119,7 +118,11 @@ func readArtPlugin(tree string, cfg Config) (*artPlugin, error) {
 		return nil, fmt.Errorf("%s: supportedArches is not a string list", artPluginDir)
 	}
 	a.codegenArches = [2][]string{Device: defaultDeviceCodegenArches([]string{cfg.Arch}), Host: supported}
-	if a.baseAddress, a.clangPath, err = readArtConfig(tree); err != nil {
+	if llvm == "" {
+		return nil, fmt.Errorf("-llvm: ART_CLANG_PATH needs the LLVM install prefix (xtask native passes it)")
+	}
+	a.llvmPrefix = llvm
+	if a.baseAddress, err = readArtConfig(tree); err != nil {
 		return nil, err
 	}
 	return a, readBarrierDefault(tree)
@@ -382,11 +385,11 @@ func defaultDeviceCodegenArches(device []string) []string {
 }
 
 // readArtConfig: the Soong config values the hooks read that live outside the plugin.
-func readArtConfig(tree string) (base [2]string, clang string, err error) {
+func readArtConfig(tree string) (base [2]string, err error) {
 	path := filepath.Join(tree, "build/soong/android/config.go")
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
-		return base, "", err
+		return base, err
 	}
 	methods := map[string]*ast.FuncDecl{}
 	for _, d := range f.Decls {
@@ -402,54 +405,10 @@ func readArtConfig(tree string) (base [2]string, clang string, err error) {
 			}
 		}
 		if base[side] == "" {
-			return base, "", fmt.Errorf("%s: %s does not return a string literal", path, m)
+			return base, fmt.Errorf("%s: %s does not return a string literal", path, m)
 		}
 	}
-	prebuilt := prebuiltOS(methods["PrebuiltOS"], runtime.GOOS, runtime.GOARCH)
-	if prebuilt == "" {
-		return base, "", fmt.Errorf("%s: PrebuiltOS has no literal for %s/%s", path, runtime.GOOS, runtime.GOARCH)
-	}
-	gpath := filepath.Join(tree, "build/soong/cc/config/global.go")
-	g, err := parser.ParseFile(token.NewFileSet(), gpath, nil, 0)
-	if err != nil {
-		return base, "", err
-	}
-	vals := valueSpecs(g)
-	cbase, cver := goString(vals["ClangDefaultBase"]), goString(vals["ClangDefaultVersion"])
-	if cbase == "" || cver == "" {
-		return base, "", fmt.Errorf("%s: ClangDefaultBase / ClangDefaultVersion not found", gpath)
-	}
-	return base, filepath.Join(cbase, prebuilt, cver), nil
-}
-
-// prebuiltOS: what android/config.go PrebuiltOS returns on this build machine: `switch runtime.GOOS { case "linux": switch runtime.GOARCH { case "amd64": return "linux-x86" … } }`.
-func prebuiltOS(fd *ast.FuncDecl, goos, goarch string) string {
-	if fd == nil {
-		return ""
-	}
-	var arm func(sw *ast.SwitchStmt, want string) []ast.Stmt
-	arm = func(sw *ast.SwitchStmt, want string) []ast.Stmt {
-		for _, s := range sw.Body.List {
-			if cc, ok := s.(*ast.CaseClause); ok && slices.ContainsFunc(cc.List, func(e ast.Expr) bool { return goString(e) == want }) {
-				return cc.Body
-			}
-		}
-		return nil
-	}
-	for _, s := range fd.Body.List {
-		if sw, ok := s.(*ast.SwitchStmt); ok {
-			for _, s := range arm(sw, goos) {
-				if inner, ok := s.(*ast.SwitchStmt); ok {
-					for _, s := range arm(inner, goarch) {
-						if r, ok := s.(*ast.ReturnStmt); ok && len(r.Results) == 1 {
-							return goString(r.Results[0])
-						}
-					}
-				}
-			}
-		}
-	}
-	return ""
+	return base, nil
 }
 
 // readBarrierExpr: build/make/core/soong_config.mk's derivation of Soong's ArtUseReadBarrier product variable (android/config.go ArtUseReadBarrier).
@@ -561,7 +520,7 @@ func (a *artPlugin) globalDefaults() *Obj {
 		return []string{"-Wframe-larger-than=1744", "-DART_FRAME_SIZE_LIMIT=1744", "-DART_BASE_ADDRESS=" + a.baseAddress[s],
 			"-DART_BASE_ADDRESS_MIN_DELTA=(-0x1000000)", "-DART_BASE_ADDRESS_MAX_DELTA=0x1000000"}
 	}
-	host := append(side(Host), fmt.Sprintf("-DART_CLANG_PATH=%q", a.clangPath))
+	host := append(side(Host), fmt.Sprintf("-DART_CLANG_PATH=%q", a.llvmPrefix))
 	p := lists("cflags", cflags, "asflags", barrier)
 	p = merge(p, block(lists("cflags", side(Device)), "target", sideBlocks[Device]))
 	return merge(p, block(lists("cflags", host), "target", sideBlocks[Host]))

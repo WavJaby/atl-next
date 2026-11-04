@@ -48,6 +48,7 @@ func main() {
 	rustc := flag.String("rustc", "rustc", "Rust compiler of Rust modules (rust.go), with its own sysroot")
 	rustVersion := flag.String("rust-version", "", "-rustc's version x.y.z (Soong's ANDROID_RUST_VERSION)")
 	libclang := flag.String("libclang", "", "directory of -cc's libclang.so, which rust_bindgen's bindgen loads (LIBCLANG_PATH)")
+	llvm := flag.String("llvm", "", "install prefix of -cc's LLVM tools (bin/llvm-addr2line): ART_CLANG_PATH of the host ART flags (artplugin.go)")
 	omit := flag.String("omit", "", "comma-separated modules whose dependencies are dropped (providers.toml `none`)")
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	aidlCratesFile := flag.String("aidl-crates", "", "JSON file: interface name -> {include_dirs, types, parcelables}: unstable aidl_interfaces defined at the tree root over the import closure of types, whose -rust backends workspace packages link (Cargo.toml `[package.metadata.atl.aidl]`, aidlcrates.go)")
@@ -239,7 +240,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			}
 		}
 	}
-	art, err := readArtPlugin(tree, cfg)
+	art, err := readArtPlugin(tree, cfg, *llvm)
 	if err != nil {
 		return err
 	}

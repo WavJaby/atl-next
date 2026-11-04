@@ -138,22 +138,6 @@ func TestArtDeviceCodegenArches(t *testing.T) {
 	}
 }
 
-// android/config.go PrebuiltOS's nested switch on runtime.GOOS / runtime.GOARCH.
-func TestArtPrebuiltOS(t *testing.T) {
-	src := "package android\n\nfunc (c *config) PrebuiltOS() string {\n\tswitch runtime.GOOS {\n\tcase \"linux\":\n\t\tswitch runtime.GOARCH {\n\t\tcase \"amd64\":\n\t\t\treturn \"linux-x86\"\n" +
-		"\t\tcase \"arm64\":\n\t\t\treturn \"linux-arm64\"\n\t\t}\n\tcase \"darwin\":\n\t\treturn \"darwin-x86\"\n\t}\n\treturn \"\"\n}\n"
-	f, err := parser.ParseFile(token.NewFileSet(), "config.go", src, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fd := f.Decls[0].(*ast.FuncDecl)
-	for _, c := range []struct{ goos, goarch, want string }{{"linux", "amd64", "linux-x86"}, {"linux", "arm64", "linux-arm64"}, {"linux", "riscv64", ""}} {
-		if got := prebuiltOS(fd, c.goos, c.goarch); got != c.want {
-			t.Errorf("%s/%s: %q, want %q", c.goos, c.goarch, got, c.want)
-		}
-	}
-}
-
 func TestArtReadBarrierDefault(t *testing.T) {
 	for _, c := range []struct {
 		line string
@@ -215,19 +199,19 @@ art_cc_library_static {
 		t.Fatal(err)
 	}
 	a := &artPlugin{types: types, codegenArches: [2][]string{Device: {"x86", "x86_64"}, Host: {"arm", "arm64", "riscv64", "x86", "x86_64"}},
-		baseAddress: [2]string{"0xD", "0xH"}, clangPath: "prebuilts/clang/host/linux-x86/clang-rX"}
+		baseAddress: [2]string{"0xD", "0xH"}, llvmPrefix: "/usr/lib/llvm-19"}
 	g.loadArt(a)
 	// art.go globalFlags with none of its variables set, no sanitizer and ArtUseReadBarrier true
 	global := []string{"-O3", "-DART_DEFAULT_GC_TYPE_IS_CMC", "-DART_USE_READ_BARRIER=1", "-DART_READ_BARRIER_TYPE_IS_BAKER=1", "-DART_USE_GENERATIONAL_GC=1", "-DART_USE_TLAB=1",
 		"-DART_STACK_OVERFLOW_GAP_arm=8192", "-DART_STACK_OVERFLOW_GAP_arm64=8192", "-DART_STACK_OVERFLOW_GAP_riscv64=8192", "-DART_STACK_OVERFLOW_GAP_x86=8192", "-DART_STACK_OVERFLOW_GAP_x86_64=8192",
 		"-DART_PAGE_SIZE_AGNOSTIC=1", "-DUSE_D8_DESUGAR=1"}
-	// deviceFlags / hostFlags: frame limit, the base address config.go returns, the deltas' defaults; the host's clang path
+	// deviceFlags / hostFlags: frame limit, the base address config.go returns, the deltas' defaults; the host's LLVM prefix
 	side := func(base string) []string {
 		return []string{"-Wframe-larger-than=1744", "-DART_FRAME_SIZE_LIMIT=1744", "-DART_BASE_ADDRESS=" + base, "-DART_BASE_ADDRESS_MIN_DELTA=(-0x1000000)", "-DART_BASE_ADDRESS_MAX_DELTA=0x1000000"}
 	}
 	// art.go addImplicitFlags' IsEnvTrue("ART_TARGET_LINUX") branch
 	implicit := []string{"-DART_TARGET", "-DART_TARGET_LINUX"}
-	clang := `-DART_CLANG_PATH="prebuilts/clang/host/linux-x86/clang-rX"`
+	clang := `-DART_CLANG_PATH="/usr/lib/llvm-19"`
 	// defaults' target block: codegen of the side's arches, then addImplicitFlags (device only), then globalDefaults' side flags
 	defDevice := slices.Concat([]string{"-DCG_x86", "-DCG_x86_64"}, implicit, side("0xD"))
 	defHost := slices.Concat([]string{"-DCG_arm", "-DCG_x86", "-DCG_x86_64"}, side("0xH"), []string{clang})

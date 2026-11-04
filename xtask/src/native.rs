@@ -228,6 +228,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&args.cc)?;
+    let llvm = llvm_prefix(&args.cc)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
@@ -280,6 +281,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&rust.rustc)
             .arg("-libclang")
             .arg(&libclang)
+            .arg("-llvm")
+            .arg(&llvm)
             .arg("-provided")
             .arg(&provided_file)
             .arg("-srcs")
@@ -571,6 +574,34 @@ fn libclang_dir(cc: &str) -> Result<PathBuf> {
     let dir = lib.parent().context("libclang.so has no parent")?;
     dir.canonicalize()
         .with_context(|| format!("resolving {}", dir.display()))
+}
+
+/// The LLVM install prefix of `cc` (deps.toml row `llvm`): the directory above the `bin/llvm-addr2line` that clang's own `-print-prog-name` finds, so the tool is the one of the clang that compiles the build. ART_CLANG_PATH names it (tools/bp2ninja artplugin.go).
+fn llvm_prefix(cc: &str) -> Result<PathBuf> {
+    let out = Command::new(cc)
+        .arg("-print-prog-name=llvm-addr2line")
+        .output()
+        .with_context(|| format!("running {cc} -print-prog-name=llvm-addr2line"))?;
+    ensure!(
+        out.status.success(),
+        "{cc} -print-prog-name=llvm-addr2line failed"
+    );
+    llvm_prefix_of(Path::new(String::from_utf8(out.stdout)?.trim()))
+}
+
+/// `tool`'s install prefix, `<prefix>/bin/<tool>`. The file must exist: clang's bare-name answer (no such tool found) or a missing file fails here, not in ART's stack dump.
+fn llvm_prefix_of(tool: &Path) -> Result<PathBuf> {
+    ensure!(
+        tool.is_absolute() && tool.is_file(),
+        "{} is not an installed llvm-addr2line: install deps.toml row `llvm` (`cargo xtask deps --check`)",
+        tool.display()
+    );
+    let bin = tool.parent().context("llvm-addr2line has no parent")?;
+    ensure!(bin.ends_with("bin"), "{} is not under a bin/ directory", tool.display());
+    let prefix = bin.parent().context("bin/ has no parent")?;
+    prefix
+        .canonicalize()
+        .with_context(|| format!("resolving {}", prefix.display()))
 }
 
 /// Where DESTDIR installs `path`: `dest` + the absolute path (cargo-c follows the DESTDIR convention; the `.pc` files keep the real prefix).
@@ -1031,6 +1062,23 @@ nope
             CompilerCache::of(&parse(&["--no-compiler-cache"]), ws),
             None
         );
+    }
+
+    #[test]
+    fn llvm_prefix_is_the_directory_above_bin() {
+        let root = std::env::temp_dir().join(format!("xtask-llvm-prefix-{}", std::process::id()));
+        let bin = root.join("llvm").join("bin");
+        std::fs::create_dir_all(&bin).expect("test dir");
+        let tool = bin.join("llvm-addr2line");
+        std::fs::write(&tool, b"").expect("test tool");
+        assert_eq!(
+            llvm_prefix_of(&tool).expect("installed tool"),
+            root.join("llvm").canonicalize().expect("test prefix")
+        );
+        // clang answers with the bare name when it finds no such tool; a missing file is the same failure
+        assert!(llvm_prefix_of(Path::new("llvm-addr2line")).is_err());
+        assert!(llvm_prefix_of(&bin.join("missing")).is_err());
+        std::fs::remove_dir_all(&root).expect("test cleanup");
     }
 
     #[test]
