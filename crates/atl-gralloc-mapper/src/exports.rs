@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The C ABI of `mapper.atl.so`: `AIMapper_loadIMapper` and the 15 entries of the `AIMapperV5` table it returns.
-//! Each entry is a thin shell (the thin-shell pattern of AGENTS.md): it turns the caller's raw pointers into safe arguments at once (a handle's descriptors and ints, byte slices, an owned fence), calls [`Mapper`], and writes results back through the caller's out-pointers.
-//! Every shell is shielded from unwinding (a Rust panic must not cross into libui's C++): a panic answers `NO_RESOURCES` / `-NO_RESOURCES` and the process goes on.
-//! The shells are assigned to the generated `AIMapperV5` fields (build.rs, from IMapper.h), so a signature differing from the header does not compile.
+//! The entry shells are generated from IMapper.h (build.rs, atl-bridgegen `Table`): each has the header's exact signature, calls the function of the same name below with its arguments unchanged inside `catch_unwind` (a Rust panic must not cross into libui's C++; a panic answers `NO_RESOURCES`, `-NO_RESOURCES` for the getters), and `AIMapperV5::shells()` fills the table.
+//! The functions below are the thin-shell pattern of AGENTS.md: each turns the caller's raw pointers into safe arguments at once (a handle's descriptors and ints, byte slices, an owned fence), calls [`Mapper`], and writes results back through the caller's out-pointers. Their signatures are checked by the compiler against the generated shells' calls.
+//! Names are the header's field names, hence the lint allowance.
+#![allow(non_snake_case)]
 
 use std::ffi::{CStr, c_void};
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
@@ -13,27 +14,16 @@ use atl_gralloc::handle;
 use atl_gralloc::metadata::{self, STANDARD_METADATA_NAME};
 
 use crate::generated::{
+    AIMAPPER_ERROR_BAD_VALUE, AIMAPPER_ERROR_NONE, AIMAPPER_ERROR_UNSUPPORTED, AIMAPPER_VERSION_5,
     AIMapper, AIMapper_MetadataType, AIMapper_MetadataTypeDescription, AIMapperV5, ARect,
     native_handle,
 };
 use crate::mapper::{Error, Kernel, Mapper, Rect};
 
-use crate::generated::AIMAPPER_VERSION_5;
-/// `AIMAPPER_ERROR_NONE`, `AIMAPPER_ERROR_NO_RESOURCES`, `AIMAPPER_ERROR_BAD_VALUE`, `AIMAPPER_ERROR_UNSUPPORTED` (the generated constants).
-use crate::generated::{
-    AIMAPPER_ERROR_BAD_VALUE, AIMAPPER_ERROR_NO_RESOURCES, AIMAPPER_ERROR_NONE,
-    AIMAPPER_ERROR_UNSUPPORTED,
-};
-
 /// The process's mapper: one table of imported buffers (IMapper.h: "the imported handle must be considered valid everywhere in the process, including in another instance of the mapper").
 fn mapper() -> &'static Mapper {
     static MAPPER: OnceLock<Mapper> = OnceLock::new();
     MAPPER.get_or_init(|| Mapper::new(Kernel::DMABUF))
-}
-
-/// Runs `f`; a panic becomes `fail`.
-fn shield<R>(fail: R, f: impl FnOnce() -> R) -> R {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fail)
 }
 
 fn status(r: Result<(), Error>) -> i32 {
@@ -101,65 +91,59 @@ unsafe fn is_standard(t: &AIMapper_MetadataType) -> bool {
     unsafe { CStr::from_ptr(t.name) }.to_bytes() == STANDARD_METADATA_NAME.as_bytes()
 }
 
-unsafe extern "C" fn import_buffer(h: *const native_handle, out: *mut *const native_handle) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        if out.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
+pub(crate) unsafe fn importBuffer(h: *const native_handle, out: *mut *const native_handle) -> i32 {
+    if out.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    // SAFETY: `h` is the raw handle `importBuffer` is called with (IMapper.h), valid for the call.
+    let Some(raw) = (unsafe { read_handle(h) }) else {
+        return Error::BadBuffer.code();
+    };
+    if raw.fds.iter().any(|&fd| fd < 0) {
+        return Error::BadBuffer.code();
+    }
+    // SAFETY: the descriptors are open for the duration of the call (they belong to the caller's handle), and are only borrowed: `import` duplicates what it keeps.
+    let fds: Vec<BorrowedFd<'_>> = raw
+        .fds
+        .iter()
+        .map(|&fd| unsafe { BorrowedFd::borrow_raw(fd) })
+        .collect();
+    match mapper().import(&fds, &raw.ints) {
+        Ok(key) => {
+            // SAFETY: `out` is a valid out-pointer (non-null above).
+            unsafe { *out = key as *const native_handle };
+            AIMAPPER_ERROR_NONE
         }
-        // SAFETY: `h` is the raw handle `importBuffer` is called with (IMapper.h), valid for the call.
-        let Some(raw) = (unsafe { read_handle(h) }) else {
-            return Error::BadBuffer.code();
-        };
-        if raw.fds.iter().any(|&fd| fd < 0) {
-            return Error::BadBuffer.code();
-        }
-        // SAFETY: the descriptors are open for the duration of the call (they belong to the caller's handle), and are only borrowed: `import` duplicates what it keeps.
-        let fds: Vec<BorrowedFd<'_>> = raw
-            .fds
-            .iter()
-            .map(|&fd| unsafe { BorrowedFd::borrow_raw(fd) })
-            .collect();
-        match mapper().import(&fds, &raw.ints) {
-            Ok(key) => {
-                // SAFETY: `out` is a valid out-pointer (non-null above).
-                unsafe { *out = key as *const native_handle };
-                AIMAPPER_ERROR_NONE
-            }
-            Err(e) => e.code(),
-        }
-    })
+        Err(e) => e.code(),
+    }
 }
 
-unsafe extern "C" fn free_buffer(b: *const native_handle) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        status(mapper().free(b as usize))
-    })
+pub(crate) unsafe fn freeBuffer(b: *const native_handle) -> i32 {
+    status(mapper().free(b as usize))
 }
 
-unsafe extern "C" fn get_transport_size(
+pub(crate) unsafe fn getTransportSize(
     b: *const native_handle,
     fds: *mut u32,
     ints: *mut u32,
 ) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        if fds.is_null() || ints.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
-        }
-        match mapper().transport_size(b as usize) {
-            Ok((f, i)) => {
-                // SAFETY: both out-pointers are valid (non-null above).
-                unsafe {
-                    *fds = f;
-                    *ints = i;
-                }
-                AIMAPPER_ERROR_NONE
+    if fds.is_null() || ints.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    match mapper().transport_size(b as usize) {
+        Ok((f, i)) => {
+            // SAFETY: both out-pointers are valid (non-null above).
+            unsafe {
+                *fds = f;
+                *ints = i;
             }
-            Err(e) => e.code(),
+            AIMAPPER_ERROR_NONE
         }
-    })
+        Err(e) => e.code(),
+    }
 }
 
-unsafe extern "C" fn lock(
+pub(crate) unsafe fn lock(
     b: *const native_handle,
     cpu_usage: u64,
     region: ARect,
@@ -171,49 +155,41 @@ unsafe extern "C" fn lock(
         // SAFETY: a non-negative `acquireFence` is an open descriptor whose ownership the caller hands over (IMapper.h).
         unsafe { OwnedFd::from_raw_fd(acquire_fence) }
     });
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        if out.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
+    if out.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    let region = Rect {
+        left: region.left,
+        top: region.top,
+        right: region.right,
+        bottom: region.bottom,
+    };
+    match mapper().lock(b as usize, cpu_usage, region, fence) {
+        Ok(p) => {
+            // SAFETY: `out` is a valid out-pointer (non-null above).
+            unsafe { *out = p.cast() };
+            AIMAPPER_ERROR_NONE
         }
-        let region = Rect {
-            left: region.left,
-            top: region.top,
-            right: region.right,
-            bottom: region.bottom,
-        };
-        match mapper().lock(b as usize, cpu_usage, region, fence) {
-            Ok(p) => {
-                // SAFETY: `out` is a valid out-pointer (non-null above).
-                unsafe { *out = p.cast() };
-                AIMAPPER_ERROR_NONE
-            }
-            Err(e) => e.code(),
-        }
-    })
+        Err(e) => e.code(),
+    }
 }
 
-unsafe extern "C" fn unlock(b: *const native_handle, release_fence: *mut i32) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        if release_fence.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
-        }
-        let r = status(mapper().unlock(b as usize));
-        // SAFETY: valid out-pointer (non-null above). No work is pending after the CPU access ends: the empty fence.
-        unsafe { *release_fence = -1 };
-        r
-    })
+pub(crate) unsafe fn unlock(b: *const native_handle, release_fence: *mut i32) -> i32 {
+    if release_fence.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    let r = status(mapper().unlock(b as usize));
+    // SAFETY: valid out-pointer (non-null above). No work is pending after the CPU access ends: the empty fence.
+    unsafe { *release_fence = -1 };
+    r
 }
 
-unsafe extern "C" fn flush_locked_buffer(b: *const native_handle) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        status(mapper().resync(b as usize))
-    })
+pub(crate) unsafe fn flushLockedBuffer(b: *const native_handle) -> i32 {
+    status(mapper().resync(b as usize))
 }
 
-unsafe extern "C" fn reread_locked_buffer(b: *const native_handle) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        status(mapper().resync(b as usize))
-    })
+pub(crate) unsafe fn rereadLockedBuffer(b: *const native_handle) -> i32 {
+    status(mapper().resync(b as usize))
 }
 
 /// `getMetadata` / `getStandardMetadata` common part.
@@ -221,18 +197,16 @@ unsafe extern "C" fn reread_locked_buffer(b: *const native_handle) -> i32 {
 /// # Safety
 /// `dest` is null with `size == 0`, or valid for writes of `size` bytes.
 unsafe fn get_standard(b: *const native_handle, ty: i64, dest: *mut c_void, size: usize) -> i32 {
-    shield(-AIMAPPER_ERROR_NO_RESOURCES, || {
-        let dest = if dest.is_null() {
-            None
-        } else {
-            // SAFETY: valid for `size` bytes per the caller.
-            Some(unsafe { std::slice::from_raw_parts_mut(dest.cast::<u8>(), size) })
-        };
-        mapper().get_standard(b as usize, ty, dest)
-    })
+    let dest = if dest.is_null() {
+        None
+    } else {
+        // SAFETY: valid for `size` bytes per the caller.
+        Some(unsafe { std::slice::from_raw_parts_mut(dest.cast::<u8>(), size) })
+    };
+    mapper().get_standard(b as usize, ty, dest)
 }
 
-unsafe extern "C" fn get_metadata(
+pub(crate) unsafe fn getMetadata(
     b: *const native_handle,
     t: AIMapper_MetadataType,
     dest: *mut c_void,
@@ -246,7 +220,7 @@ unsafe extern "C" fn get_metadata(
     unsafe { get_standard(b, t.value, dest, size) }
 }
 
-unsafe extern "C" fn get_standard_metadata(
+pub(crate) unsafe fn getStandardMetadata(
     b: *const native_handle,
     ty: i64,
     dest: *mut c_void,
@@ -261,16 +235,14 @@ unsafe extern "C" fn get_standard_metadata(
 /// # Safety
 /// `data` is valid for reads of `size` bytes, or null with `size == 0`.
 unsafe fn set_standard(b: *const native_handle, ty: i64, data: *const c_void, size: usize) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        // SAFETY: per the caller.
-        let Some(data) = (unsafe { bytes(data, size) }) else {
-            return AIMAPPER_ERROR_BAD_VALUE;
-        };
-        status(mapper().set_standard(b as usize, ty, data))
-    })
+    // SAFETY: per the caller.
+    let Some(data) = (unsafe { bytes(data, size) }) else {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    };
+    status(mapper().set_standard(b as usize, ty, data))
 }
 
-unsafe extern "C" fn set_metadata(
+pub(crate) unsafe fn setMetadata(
     b: *const native_handle,
     t: AIMapper_MetadataType,
     data: *const c_void,
@@ -284,7 +256,7 @@ unsafe extern "C" fn set_metadata(
     unsafe { set_standard(b, t.value, data, size) }
 }
 
-unsafe extern "C" fn set_standard_metadata(
+pub(crate) unsafe fn setStandardMetadata(
     b: *const native_handle,
     ty: i64,
     data: *const c_void,
@@ -326,22 +298,20 @@ fn descriptions() -> &'static Descriptions {
     })
 }
 
-unsafe extern "C" fn list_supported_metadata_types(
+pub(crate) unsafe fn listSupportedMetadataTypes(
     list: *mut *const AIMapper_MetadataTypeDescription,
     count: *mut u64,
 ) -> i32 {
-    shield(AIMAPPER_ERROR_UNSUPPORTED, || {
-        if list.is_null() || count.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
-        }
-        let d = descriptions();
-        // SAFETY: both out-pointers are valid (non-null above).
-        unsafe {
-            *list = d.0.as_ptr();
-            *count = d.0.len() as u64;
-        }
-        AIMAPPER_ERROR_NONE
-    })
+    if list.is_null() || count.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    let d = descriptions();
+    // SAFETY: both out-pointers are valid (non-null above).
+    unsafe {
+        *list = d.0.as_ptr();
+        *count = d.0.len() as u64;
+    }
+    AIMAPPER_ERROR_NONE
 }
 
 type DumpCallback =
@@ -371,44 +341,40 @@ fn dump(key: Option<usize>, begin: BeginCallback, cb: DumpCallback, ctx: *mut c_
     }))
 }
 
-unsafe extern "C" fn dump_buffer(
+pub(crate) unsafe fn dumpBuffer(
     b: *const native_handle,
     cb: DumpCallback,
     ctx: *mut c_void,
 ) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        dump(Some(b as usize), None, cb, ctx)
-    })
+    dump(Some(b as usize), None, cb, ctx)
 }
 
-unsafe extern "C" fn dump_all_buffers(
+pub(crate) unsafe fn dumpAllBuffers(
     begin: BeginCallback,
     cb: DumpCallback,
     ctx: *mut c_void,
 ) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || dump(None, begin, cb, ctx))
+    dump(None, begin, cb, ctx)
 }
 
-unsafe extern "C" fn get_reserved_region(
+pub(crate) unsafe fn getReservedRegion(
     b: *const native_handle,
     region: *mut *mut c_void,
     size: *mut u64,
 ) -> i32 {
-    shield(AIMAPPER_ERROR_NO_RESOURCES, || {
-        if region.is_null() || size.is_null() {
-            return AIMAPPER_ERROR_BAD_VALUE;
-        }
-        if mapper().transport_size(b as usize).is_err() {
-            return Error::BadBuffer.code();
-        }
-        // allocation refuses a reserved size (atl_gralloc::descriptor::Refusal::ReservedRegion), so every buffer's region is empty
-        // SAFETY: both out-pointers are valid (non-null above).
-        unsafe {
-            *region = std::ptr::null_mut();
-            *size = 0;
-        }
-        AIMAPPER_ERROR_NONE
-    })
+    if region.is_null() || size.is_null() {
+        return AIMAPPER_ERROR_BAD_VALUE;
+    }
+    if mapper().transport_size(b as usize).is_err() {
+        return Error::BadBuffer.code();
+    }
+    // allocation refuses a reserved size (atl_gralloc::descriptor::Refusal::ReservedRegion), so every buffer's region is empty
+    // SAFETY: both out-pointers are valid (non-null above).
+    unsafe {
+        *region = std::ptr::null_mut();
+        *size = 0;
+    }
+    AIMAPPER_ERROR_NONE
 }
 
 /// The `AIMapper` the library hands out, built once and kept for the process.
@@ -425,7 +391,7 @@ unsafe impl Sync for Table {}
 /// `out` is null or valid for a pointer write.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn AIMapper_loadIMapper(out: *mut *mut AIMapper) -> i32 {
-    shield(AIMAPPER_ERROR_UNSUPPORTED, || {
+    catch_unwind(AssertUnwindSafe(|| {
         if out.is_null() {
             return AIMAPPER_ERROR_BAD_VALUE;
         }
@@ -433,29 +399,14 @@ pub unsafe extern "C" fn AIMapper_loadIMapper(out: *mut *mut AIMapper) -> i32 {
         let t = TABLE.get_or_init(|| {
             Table(Box::leak(Box::new(AIMapper {
                 version: AIMAPPER_VERSION_5,
-                v5: AIMapperV5 {
-                    importBuffer: Some(import_buffer),
-                    freeBuffer: Some(free_buffer),
-                    getTransportSize: Some(get_transport_size),
-                    lock: Some(lock),
-                    unlock: Some(unlock),
-                    flushLockedBuffer: Some(flush_locked_buffer),
-                    rereadLockedBuffer: Some(reread_locked_buffer),
-                    getMetadata: Some(get_metadata),
-                    getStandardMetadata: Some(get_standard_metadata),
-                    setMetadata: Some(set_metadata),
-                    setStandardMetadata: Some(set_standard_metadata),
-                    listSupportedMetadataTypes: Some(list_supported_metadata_types),
-                    dumpBuffer: Some(dump_buffer),
-                    dumpAllBuffers: Some(dump_all_buffers),
-                    getReservedRegion: Some(get_reserved_region),
-                },
+                v5: AIMapperV5::shells(),
             })))
         });
         // SAFETY: `out` is valid for a pointer write (non-null above).
         unsafe { *out = t.0 };
         AIMAPPER_ERROR_NONE
-    })
+    }))
+    .unwrap_or(AIMAPPER_ERROR_UNSUPPORTED)
 }
 
 // the handle ints this library parses are atl-gralloc's; keep the dependency on its layout explicit
@@ -509,6 +460,27 @@ mod tests {
         assert!(all.iter().all(|&s| s));
     }
 
+    /// Entries are called through the table, as libui does: a handle the table does not know answers BAD_BUFFER (2) from `freeBuffer`, and the getter's failure is the negative error.
+    #[test]
+    fn entries_work_through_the_table() {
+        let t = AIMapperV5::shells();
+        let free = t.freeBuffer.expect("entry");
+        let get = t.getStandardMetadata.expect("entry");
+        // SAFETY: a handle value the table has never seen is only looked up, never dereferenced.
+        let (f, g) = unsafe {
+            (
+                free(usize::MAX as *const native_handle),
+                get(
+                    usize::MAX as *const native_handle,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                ),
+            )
+        };
+        assert_eq!((f, g), (2, -2));
+    }
+
     #[test]
     fn handle_reads_are_bounded() {
         // SAFETY: null is allowed.
@@ -537,7 +509,7 @@ mod tests {
         let mut list: *const AIMapper_MetadataTypeDescription = std::ptr::null();
         let mut n = 0u64;
         // SAFETY: valid out-pointers to locals.
-        let status = unsafe { list_supported_metadata_types(&mut list, &mut n) };
+        let status = unsafe { listSupportedMetadataTypes(&mut list, &mut n) };
         assert_eq!(status, AIMAPPER_ERROR_NONE);
         assert_eq!(n as usize, metadata::SUPPORTED.len());
         // SAFETY: `list` points at `n` descriptions that live for the process.

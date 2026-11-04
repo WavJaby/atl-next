@@ -496,13 +496,11 @@ fn main() -> Result<ExitCode> {
         Role::Writer { sock } => writer(adopt(sock)?)?,
         Role::Reader { sock } => reader(adopt(sock)?)?,
     };
-    // `_exit`, not a return: libui's process-wide Gralloc5 allocator proxy is destroyed by the C++ exit handlers, after the main thread's thread-locals; its last binder reference makes libbinder call `binder_driver_ioctl`, whose per-thread connection (atl-binder-driver process.rs `THREAD.with`) panics on a destroyed thread-local, and a panic in that `extern "C"` function aborts the process.
-    // Skipping the handlers keeps the probe's exit status about what it checked; the driver bug is reported with the gate's result.
+    // a normal return: libui's process-wide Gralloc5 allocator proxy is released by the C++ exit handlers, after the thread-locals, which the driver must survive (atl-binder-driver `driver_call_after_thread_local_destruction`); a bad exit status here is the gate's failure
     let _ = std::io::stdout().flush();
-    // SAFETY: `_exit` ends the process at once; stdout was flushed above and nothing else needs flushing.
-    unsafe { _exit(i32::from(failed)) }
-}
-
-unsafe extern "C" {
-    fn _exit(status: i32) -> !;
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
