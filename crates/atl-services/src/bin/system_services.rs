@@ -74,7 +74,8 @@ fn main() -> Result<()> {
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(DISPLAY, atl_services::display::new_binder(display))
         .context("addService display")?;
-    binder::add_service(WINDOW, atl_services::window::new_binder()).context("addService window")?;
+    binder::add_service(WINDOW, atl_services::window::new_binder(display))
+        .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
         .context("addService input_method")?;
     binder::add_service(

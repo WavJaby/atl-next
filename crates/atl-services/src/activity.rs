@@ -100,8 +100,8 @@ const DENSITY_DEFAULT: f32 = 160.0;
 
 /// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale,
 /// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
-/// The input fields stay undefined (0) until the platform layer supplies input.
-fn global_configuration(display: &DisplayModel) -> Configuration {
+/// The input fields stay undefined (0) until the platform layer supplies input. Shared with window.rs (the MergedConfiguration of a relayout).
+pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
     let density = display.dpi as f32 / DENSITY_DEFAULT;
     let width_dp = (display.width as f32 / density + 0.5) as i32;
     let height_dp = (display.height as f32 / density + 0.5) as i32;

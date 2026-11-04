@@ -38,6 +38,24 @@ pub fn wall_stamp() -> String {
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
+static REFUSED: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// Counts one call of `method` on `interface` that the service refuses (a request it cannot serve: a null argument, an unknown window). Each hit is also written to stderr as
+/// `services: refused <interface>.<method> <n> at=<stamp>`; xtask reads these lines as the `refused` kind (atld_run.rs `events`), next to the parcelables' refusals.
+pub fn refused(interface: &'static str, method: &str) -> u64 {
+    let mut map = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.entry((interface, method.to_owned())).or_insert(0);
+    *n += 1;
+    let n = *n;
+    drop(map);
+    let _ = writeln!(
+        std::io::stderr(),
+        "services: refused {interface}.{method} {n} at={}",
+        wall_stamp()
+    );
+    n
+}
+
 /// The stubs' `unimplemented` hook: counted, then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
 /// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
 #[cfg(feature = "converter")]

@@ -375,11 +375,12 @@ pub fn without_stamp(line: &str) -> &str {
     line.rsplit_once(" at=").map_or(line, |(head, _)| head)
 }
 
-/// Every counter line of the services' log, in log order: `services: unimplemented <interface>.<method> <n> at=<stamp>` (atl_services::counters) and
-/// `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
+/// Every counter line of the services' log, in log order: `services: unimplemented <interface>.<method> <n> at=<stamp>` and `services: refused <interface>.<method> <n> at=<stamp>`
+/// (atl_services::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
 pub fn events(services_log: &str) -> Vec<Event> {
-    const KINDS: [(&str, &str); 2] = [
+    const KINDS: [(&str, &str); 3] = [
         ("services: unimplemented ", "unimplemented"),
+        ("services: refused ", "refused"),
         ("parcelables: refused ", "refused"),
     ];
     let mut out = Vec::new();
