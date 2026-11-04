@@ -91,15 +91,12 @@ fn register(
 pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
     let suffix = property(SUFFIX_PROPERTY)?;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
-    let composer = Composer::new(
-        ComposerConfig {
-            display,
-            compositor: Default::default(),
-        },
-        Box::new(ReportSink(std::io::stderr())),
-    );
+    let composer = Composer::new(ComposerConfig {
+        display,
+        compositor: Default::default(),
+    });
     composer
-        .start(threads)
+        .start(threads, Box::new(ReportSink(std::io::stderr())))
         .map_err(|e| format!("frame clock thread: {e}"))?;
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));

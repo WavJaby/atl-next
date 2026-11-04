@@ -7,7 +7,7 @@ use std::io::Write;
 use atl_compositor::scene::Scene;
 use atl_scene_buffer::Pixels;
 
-/// Called on the clock thread, once per tick that changed anything visible.
+/// Called on the present thread (never the clock thread: a sink may take longer than a period), once per tick that changed anything visible.
 pub trait SceneSink: Send {
     /// A new scene.
     fn present(&mut self, scene: &Scene);
