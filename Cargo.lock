@@ -151,6 +151,7 @@ dependencies = [
  "atl-aidl",
  "atl-bridgegen",
  "atl-compositor",
+ "atl-scene-buffer",
  "atl-services",
  "rustix",
 ]
@@ -250,8 +251,8 @@ name = "atl-platform-ui-linux"
 version = "0.0.0"
 dependencies = [
  "atl-compositor",
- "atl-gralloc",
  "atl-platform-ui-api",
+ "atl-scene-buffer",
  "glib-unix",
  "gtk4",
  "rustix",
@@ -266,6 +267,15 @@ dependencies = [
  "atl-bionic",
  "clap",
  "toml",
+]
+
+[[package]]
+name = "atl-scene-buffer"
+version = "0.0.0"
+dependencies = [
+ "atl-compositor",
+ "atl-gralloc",
+ "rustix",
 ]
 
 [[package]]

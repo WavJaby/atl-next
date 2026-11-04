@@ -44,7 +44,7 @@ uses = ["generators", "bionic", "composer"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "services", "generators"]
+uses = ["aidl", "compositor", "scene-buffer", "services", "generators"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
@@ -75,10 +75,16 @@ crates = ["atl-gralloc", "atl-gralloc-mapper", "atl-gralloc-service", "atl-grall
 exports = ["atl-gralloc"]
 uses = ["aidl", "generators"]
 
-# the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, reading each quad's buffer through gralloc's format and handle definitions
+# the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, reading each quad's buffer through scene-buffer (the facade's example names a gralloc format)
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
+uses = ["compositor", "gralloc", "scene-buffer"]
+
+# a Scene buffer's pixels on the CPU (mmap + DMA_BUF_IOCTL_SYNC of the quad's dma-buf, sync_file polling), read through gralloc's format and handle definitions: what the GTK presenter and the compositor's scene checks (composer) share
+[scene-buffer]
+crates = ["atl-scene-buffer"]
+exports = ["atl-scene-buffer"]
 uses = ["compositor", "gralloc"]
 
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it

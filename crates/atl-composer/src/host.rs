@@ -13,8 +13,7 @@ use std::time::Duration;
 use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
 use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData};
 use atl_compositor::model::{ClientCall, Compositor, CompositorConfig, FrameOutput, LayerSpec};
-use atl_compositor::parcel::{BinderKey, StrongBinder, WireParcel};
-use atl_compositor::scene::Scene;
+use atl_compositor::parcel::{BinderKey, StrongBinder};
 use atl_compositor::transaction::TransactionState;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
@@ -24,6 +23,7 @@ use binder::{
 use rustix::time::{ClockId, clock_gettime};
 
 use crate::objects::ObjectMap;
+use crate::sink::SceneSink;
 use crate::wire::canonical_binder;
 use crate::{bridge, clock, listener, vsync};
 
@@ -35,26 +35,6 @@ pub const DISPLAY_ID: u64 = 1;
 pub trait ThreadHost: Send + Sync {
     /// Runs `f` on a new thread called `name`, attached to the VM.
     fn spawn(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
-}
-
-/// Where a frame goes: the platform layer's presentation. Called on the clock thread, once per tick that changed anything visible.
-pub trait SceneSink: Send {
-    /// A new scene.
-    fn present(&mut self, scene: &Scene);
-}
-
-/// Logs each scene's size to stderr, `composer: scene frame=<n> quads=<q>`: the sink until the platform layer exists.
-pub struct LogSink;
-
-impl SceneSink for LogSink {
-    fn present(&mut self, scene: &Scene) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "composer: scene frame={} quads={}",
-            scene.frame,
-            scene.quads.len()
-        );
-    }
 }
 
 /// What a compositor is built with.
@@ -84,6 +64,14 @@ pub struct Stats {
     pub callbacks_sent: u64,
     /// Calls that could not be delivered (listener gone, call refused, no route).
     pub callbacks_failed: u64,
+    /// Buffer releases written to a layer's BufferReleaseChannel socket.
+    pub releases_on_channel: u64,
+    /// Releases whose channel had no reader any more (counted apart: nobody was waiting).
+    pub releases_peer_gone: u64,
+    /// File descriptors taken out of transaction parcels.
+    pub fds_taken: u64,
+    /// File descriptors closed because the core named them no longer.
+    pub fds_closed: u64,
 }
 
 struct State {
@@ -92,8 +80,9 @@ struct State {
     objects: ObjectMap<WpIBinder>,
     /// The binders clients sent that are not the compositor's own (listeners), held strongly: see [`bridge::read_parcel`]. Never released yet: a client's listener lives as long as its process.
     foreign: HashMap<u64, SpIBinder>,
-    /// The file descriptors transactions carried (a layer's release channel, later buffers' fences), duplicated out of the parcel that libbinder closes, by descriptor number: what the core's `FdObject`s name.
-    /// Held until [`Composer::stop`]: the core has no event for an fd it no longer refers to, so a closed layer's channel stays open (one fd per BLASTBufferQueue layer). The ownership rule belongs to the buffer path (gralloc, M3 slice 2).
+    /// The file descriptors transactions carried (a layer's release channel, buffers' dma-bufs and fences), duplicated out of the parcel that libbinder closes, by descriptor number: what the core's `FdObject`s name.
+    /// The ownership rule: a descriptor lives while the core names it ([`Compositor::referenced_fds`], plus the channels of the calls not yet delivered). [`State::close_unreferenced`] closes the rest, after each tick's deliveries;
+    /// taking the descriptors, decoding and queueing the transaction happen under one hold of the lock ([`Composer::set_transaction_state`]), so no descriptor is unreferenced for a moment between.
     fds: HashMap<i32, Arc<OwnedFd>>,
     /// The compositor's end of each connection's channel.
     tubes: HashMap<ConnectionId, OwnedFd>,
@@ -110,13 +99,25 @@ impl State {
         self.compositor.wants_frame() || self.events.wants_frame() || !self.pending_calls.is_empty()
     }
 
+    /// Closes the descriptors the core no longer names: not in a layer, the client cache or a queued transaction, and not the channel of a call still to deliver.
+    fn close_unreferenced(&mut self) {
+        let mut keep = self.compositor.referenced_fds();
+        keep.extend(self.pending_calls.iter().filter_map(|c| match c {
+            ClientCall::ReleaseOnChannel { channel, .. } => Some(channel.fd),
+            _ => None,
+        }));
+        let before = self.fds.len();
+        self.fds.retain(|number, _| keep.contains(number));
+        self.stats.fds_closed += (before - self.fds.len()) as u64;
+    }
+
     /// `composer: counters <key>=<value> ...`: what the gate (`xtask test composer`) reads. `ignored` lists the layer-state bits the core counted instead of applying.
     fn counters_line(&self) -> String {
         let c = self.compositor.counters();
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} fds_held={} fds_taken={} fds_closed={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -132,6 +133,11 @@ impl State {
             s.vsync_dropped,
             s.callbacks_sent,
             s.callbacks_failed,
+            s.releases_on_channel,
+            s.releases_peer_gone,
+            self.fds.len(),
+            s.fds_taken,
+            s.fds_closed,
             ignored.join(","),
         )
     }
@@ -256,8 +262,9 @@ impl Composer {
         self.lock().counters_line()
     }
 
-    /// A parcel a client sent, as the core reads it ([`bridge::read_parcel`]).
-    pub fn read_parcel(&self, data: &BorrowedParcel<'_>) -> Result<WireParcel, StatusCode> {
+    /// `setTransactionState`: the parcel a client sent, as the core reads it ([`bridge::read_parcel`], `TransactionState::decode_call`), queued for the next tick. All under one hold of the lock: the descriptors
+    /// the parcel carried are the core's to name from the moment they are taken, and a parcel that does not decode gives them back at once.
+    pub fn set_transaction_state(&self, data: &BorrowedParcel<'_>) -> Result<(), StatusCode> {
         let mut st = self.lock();
         let State {
             objects,
@@ -265,16 +272,31 @@ impl Composer {
             fds,
             ..
         } = &mut *st;
-        bridge::read_parcel(data, objects, foreign, fds)
-    }
-
-    /// A transaction arrived (`setTransactionState`): it is applied at the next tick.
-    pub fn queue_transaction(&self, t: TransactionState) {
-        let mut st = self.lock();
-        st.stats.transactions += 1;
-        st.compositor.queue_transaction(t);
-        drop(st);
-        self.wake.notify_all();
+        let held = fds.len();
+        let wire = bridge::read_parcel(data, objects, foreign, fds);
+        st.stats.fds_taken += (st.fds.len() - held) as u64;
+        let decoded = wire.and_then(|w| {
+            TransactionState::decode_call(&w).map_err(|e| {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "composer: setTransactionState refused: {e}"
+                );
+                StatusCode::BAD_VALUE
+            })
+        });
+        match decoded {
+            Ok(t) => {
+                st.stats.transactions += 1;
+                st.compositor.queue_transaction(t);
+                drop(st);
+                self.wake.notify_all();
+                Ok(())
+            }
+            Err(e) => {
+                st.close_unreferenced();
+                Err(e)
+            }
+        }
     }
 
     /// `createSurface`: a layer with a new handle. `parent` is the handle of the parent layer (null: a root). Returns the handle and the layer id.
@@ -477,6 +499,8 @@ impl Composer {
                 st.stats.callbacks_failed += 1;
             }
         }
+        // the calls are delivered (a release channel is written): what the core names no longer can be closed
+        self.lock().close_unreferenced();
     }
 
     /// One call of the core into a client: `Ok` when it arrived, else why not.
@@ -499,8 +523,23 @@ impl Composer {
                         self.lock().fds.get(&channel.fd).cloned().ok_or_else(|| {
                             format!("release channel fd {} is not held", channel.fd)
                         })?;
-                    return vsync::send_datagram(&*socket, &datagram)
-                        .map_err(|e| format!("release channel fd {}: {e}", channel.fd));
+                    match vsync::send_datagram(&*socket, &datagram) {
+                        Ok(()) => self.lock().stats.releases_on_channel += 1,
+                        // the queue that held the other end is gone (its BBQ was destroyed, or its process closed it): nobody is waiting for the release
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::NotConnected
+                            ) =>
+                        {
+                            self.lock().stats.releases_peer_gone += 1
+                        }
+                        Err(e) => return Err(format!("release channel fd {}: {e}", channel.fd)),
+                    }
+                    return Ok(());
                 }
             };
         let wire = wire.map_err(|e| format!("encoding the call: {e}"))?;

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-scene-buffer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Reading a Scene buffer's pixels on the CPU (M3): mmap of the quad's dma-buf bracketed by DMA_BUF_IOCTL_SYNC, and the poll of a sync_file fence. What the GTK presenter (atl-platform-ui-linux) and the compositor's
+# own scene checks (atl-composer) share; it was the platform crate's `buffer` module until the second reader needed it, so no GTK is pulled in by reading a buffer.
+# Boundary crate (CLAUDE.md "unsafe"): `unsafe` for the mapping, the ioctl and borrowing the quad's fd number; each block says why it holds.
+
+[dependencies]
+atl-compositor = { path = "../atl-compositor" }
+atl-gralloc = { path = "../atl-gralloc" }
+rustix.workspace = true
+
+[lints]
+workspace = true

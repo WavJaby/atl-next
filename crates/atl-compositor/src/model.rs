@@ -12,7 +12,7 @@
 //!
 //! Fields of `layer_state_t` the software path does not need are decoded and counted by name in [`Counters::ignored`], never dropped without a trace.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::callbacks::{
@@ -316,6 +316,26 @@ impl Compositor {
     /// Transactions queued and not yet applied.
     pub fn pending_transactions(&self) -> usize {
         self.queues.values().map(VecDeque::len).sum()
+    }
+
+    /// The descriptor numbers the core still refers to: the buffers layers show and the client cache keeps, the layers' release channels and acquire fences, and everything in the transactions still queued.
+    /// The core never owns a descriptor; the front-end that took them from the parcels closes the ones missing here (the fd ownership rule: a descriptor lives while the core names it).
+    pub fn referenced_fds(&self) -> BTreeSet<i32> {
+        let mut fds: Vec<FdObject> = Vec::new();
+        for l in self.layers.values() {
+            fds.extend(l.release_channel);
+            if let Some(h) = &l.held {
+                fds.extend(h.buffer.fds.iter().copied());
+                fds.extend(h.acquire_fence.iter().filter_map(|f| f.0));
+            }
+        }
+        for b in self.cache.values() {
+            fds.extend(b.fds.iter().copied());
+        }
+        for t in self.queues.values().flatten() {
+            fds.extend(t.fds());
+        }
+        fds.into_iter().map(|f| f.fd).collect()
     }
 
     /// Whether the next tick has anything to do: the platform's frame clock may stay stopped otherwise.

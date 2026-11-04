@@ -23,6 +23,7 @@ extern crate rustutils;
 
 pub mod clock;
 pub mod objects;
+pub mod sink;
 pub mod vsync;
 pub mod wire;
 

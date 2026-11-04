@@ -20,6 +20,7 @@ converter = ["atl-aidl/converter"]
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
 atl-compositor = { path = "../atl-compositor" }
+atl-scene-buffer = { path = "../atl-scene-buffer" }
 atl-services = { path = "../atl-services" }
 rustix.workspace = true
 

@@ -1248,6 +1248,24 @@ pub mod layer_flags {
 }
 
 impl LayerState {
+    /// Every file descriptor this state refers to: the buffer's (a gralloc handle's dma-buf and metadata page) and its acquire fence, the sideband stream's, the buffer release channel's, the LUT file's.
+    /// The front-end that converted the parcel owns them; this is how it learns which are still named once the core is done with the state.
+    pub fn fds(&self) -> Vec<FdObject> {
+        let mut fds = Vec::new();
+        if let Some(bd) = &self.buffer_data {
+            if let Some(b) = &bd.buffer {
+                fds.extend(b.fds.iter().copied());
+            }
+            fds.extend(bd.acquire_fence.iter().filter_map(|f| f.0));
+        }
+        if let Some(h) = &self.sideband_stream {
+            fds.extend(h.fds.iter().copied());
+        }
+        fds.extend(self.buffer_release_channel.iter().map(|c| c.fd));
+        fds.extend(self.luts.iter().map(|l| l.fd));
+        fds
+    }
+
     /// `layer_state_t()`: AOSP's constructor defaults.
     pub fn new() -> Self {
         let mut ct = [0.0f32; 16];

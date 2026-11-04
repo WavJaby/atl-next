@@ -9,7 +9,8 @@ use atl_platform_ui_api::PresentError;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
-use crate::buffer::{self, Pixels};
+use atl_scene_buffer::{self as buffer, Pixels};
+
 use crate::geometry::{Placement, placement, visible};
 
 fn graphene_rect(r: &FloatRect) -> graphene::Rect {

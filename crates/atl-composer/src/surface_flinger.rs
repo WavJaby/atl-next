@@ -3,12 +3,9 @@
 //! `setTransactionState` is the one call BLASTBufferQueue and SurfaceControl.Transaction make through it: the interface token, then a `TransactionState`, decoded by the core's codec.
 //! `getSchedulingPolicy` (the other code in BnSurfaceComposer::onTransact) is counted like any call this service does not serve.
 
-use std::io::Write;
 use std::sync::Arc;
 
-use atl_compositor::transaction::{
-    SET_TRANSACTION_STATE, SURFACE_COMPOSER_DESCRIPTOR, TransactionState,
-};
+use atl_compositor::transaction::{SET_TRANSACTION_STATE, SURFACE_COMPOSER_DESCRIPTOR};
 use atl_services::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
@@ -63,16 +60,7 @@ impl Interface for SurfaceFlinger {}
 
 impl ISurfaceFlinger for SurfaceFlinger {
     fn set_transaction_state(&self, data: &BorrowedParcel<'_>) -> Result<(), StatusCode> {
-        let wire = self.composer.read_parcel(data)?;
-        let state = TransactionState::decode_call(&wire).map_err(|e| {
-            let _ = writeln!(
-                std::io::stderr(),
-                "composer: setTransactionState refused: {e}"
-            );
-            StatusCode::BAD_VALUE
-        })?;
-        self.composer.queue_transaction(state);
-        Ok(())
+        self.composer.set_transaction_state(data)
     }
 }
 

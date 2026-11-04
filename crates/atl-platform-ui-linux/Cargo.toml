@@ -9,12 +9,12 @@ publish.workspace = true
 
 # The Linux implementation of atl-platform-ui-api on GTK4 (M3 slice 6): the only crate allowed to depend on GTK (deny.toml `wrappers`), and with the `cfg(target_os)` that selects it living in the facade.
 # One thread: GLib's default main context is iterated by `Ui::iterate` on the thread that attached, and the Android Looper's epoll fd is added to that context (`watch_fd`), so a blocked UI thread answers no `xdg_wm_base.ping`.
-# Boundary crate (CLAUDE.md "unsafe"): `unsafe` only in `buffer` (mmap + DMA_BUF_IOCTL_SYNC of a Scene buffer's fd, borrowing the quad's fd number); the rest is safe gtk4-rs.
+# No `unsafe` of its own: reading a Scene buffer's fd (mmap + DMA_BUF_IOCTL_SYNC) is atl-scene-buffer's; the rest is safe gtk4-rs.
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
-atl-gralloc = { path = "../atl-gralloc" }
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
+atl-scene-buffer = { path = "../atl-scene-buffer" }
 glib-unix.workspace = true
 gtk4.workspace = true
 rustix.workspace = true

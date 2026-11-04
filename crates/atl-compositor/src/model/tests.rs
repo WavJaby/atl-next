@@ -768,3 +768,47 @@ fn shutdown_releases_what_is_held() {
     );
     assert_eq!(c.layer_count(), 0);
 }
+
+/// The descriptors the core names, step by step: queued in a transaction, shown by a layer, kept by the client cache after the layer lets go, gone with the cache entry. Buffer id N carries fd 40 + N (`gbuf`).
+#[test]
+fn referenced_fds_follow_queue_layer_and_cache() {
+    use crate::transaction::UncacheBuffer;
+    let (layer, listener) = (local(1), local(2));
+    let mut c = Compositor::new(CompositorConfig::default());
+    assert!(c.referenced_fds().is_empty());
+    c.create_layer(spec(layer, 1, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    // queued, not applied: the transactions name both
+    assert_eq!(c.referenced_fds(), BTreeSet::from([90, 241]));
+    c.on_frame(10);
+    assert_eq!(c.referenced_fds(), BTreeSet::from([90, 241]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    assert_eq!(c.referenced_fds(), BTreeSet::from([90, 241, 242]));
+    // 201 is replaced and released, but the client's cache still holds it until it is uncached
+    c.on_frame(20);
+    assert_eq!(c.referenced_fds(), BTreeSet::from([90, 241, 242]));
+    let mut uncache = TransactionState::new();
+    uncache.uncache_buffers.push(UncacheBuffer {
+        token: listener,
+        id: 201,
+    });
+    c.queue_transaction(uncache);
+    c.on_frame(30);
+    assert_eq!(c.referenced_fds(), BTreeSet::from([90, 242]));
+    // the layer goes: its channel and shown buffer with it, the cache entry of 202 stays
+    c.destroy_layer(key(&layer));
+    assert_eq!(c.referenced_fds(), BTreeSet::from([242]));
+    let mut uncache = TransactionState::new();
+    uncache.uncache_buffers.push(UncacheBuffer {
+        token: listener,
+        id: 202,
+    });
+    c.queue_transaction(uncache);
+    c.on_frame(40);
+    assert!(c.referenced_fds().is_empty());
+}

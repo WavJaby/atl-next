@@ -12,7 +12,8 @@ use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
-use crate::host::{Composer, ComposerConfig, LogSink, ThreadHost};
+use crate::host::{Composer, ComposerConfig, ThreadHost};
+use crate::sink::ReportSink;
 use crate::{service, surface_flinger};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
@@ -93,7 +94,7 @@ pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
             display,
             compositor: Default::default(),
         },
-        Box::new(LogSink),
+        Box::new(ReportSink(std::io::stderr())),
     );
     composer
         .start(threads)

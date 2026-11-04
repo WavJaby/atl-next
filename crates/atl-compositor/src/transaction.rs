@@ -3,7 +3,7 @@
 // BnSurfaceComposer::onTransact SET_TRANSACTION_STATE), frameworks/native/libs/gui/include/gui/ISurfaceComposer.h (transaction code, flags)
 //! `TransactionState`, the payload of `android.ui.ISurfaceComposer.setTransactionState` (a hand-written C++ interface: no AIDL, so the call is an interface token and this state in one Parcel).
 
-use crate::parcel::{ParcelError, Reader, StrongBinder, WireParcel};
+use crate::parcel::{FdObject, ParcelError, Reader, StrongBinder, WireParcel};
 use crate::state::{
     DisplayState, FrameTimelineInfo, InputWindowCommands, LayerState, ListenerCallbacks,
 };
@@ -66,6 +66,14 @@ pub struct TransactionState {
 }
 
 impl TransactionState {
+    /// Every file descriptor the layer states of this transaction refer to ([`LayerState::fds`]).
+    pub fn fds(&self) -> Vec<FdObject> {
+        self.composer_states
+            .iter()
+            .flat_map(LayerState::fds)
+            .collect()
+    }
+
     /// An empty transaction with AOSP's defaults.
     pub fn new() -> Self {
         Self {
