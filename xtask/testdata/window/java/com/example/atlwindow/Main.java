@@ -11,6 +11,7 @@ import android.util.Log;
 import android.view.Choreographer;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 
@@ -18,6 +19,7 @@ import android.view.WindowManager;
  * The window gate: `xtask test window` (xtask/src/window.rs) waits for the onResume line.
  * The content view paints four solid quadrants and no text: top-left red, top-right green, bottom-left blue, bottom-right white (the frames stage checks these pixels).
  * After onResume the activity takes FRAME_CALLBACKS Choreographer frame callbacks, each logging its frame time (the frames stage checks the cadence).
+ * Each touch the content view gets is logged (the input stage checks it against the injected pointer script).
  * Each marker is logged once, when it is first reached.
  */
 public class Main extends Activity {
@@ -95,6 +97,13 @@ public class Main extends Activity {
             canvas.drawRect(0, halfHeight, halfWidth, bottom, paint);
             paint.setColor(Color.WHITE);
             canvas.drawRect(halfWidth, halfHeight, right, bottom, paint);
+        }
+
+        /** Logs each touch: the action, the pointer's x and y, the pointer count (xtask/src/window.rs input_check). */
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            Log.i(TAG, "touch action=" + event.getActionMasked() + " x=" + event.getX() + " y=" + event.getY() + " pointers=" + event.getPointerCount());
+            return true;
         }
     }
 }

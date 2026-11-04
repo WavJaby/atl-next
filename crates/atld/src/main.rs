@@ -94,6 +94,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the services use the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// The headless pointer script, `down:x,y move:x,y up:x,y` (atl-composer `input::parse_script`): every app process gets it as `ro.atl.headless.pointer`, and the app injects it after its first frame. Omitted: no input.
+    #[arg(long)]
+    headless_pointer: Option<String>,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -329,6 +332,8 @@ struct Host {
     /// the default property set and the display model: what [`Host::process_properties`] builds an app process's area from
     defaults: Vec<Property>,
     display: DisplayModel,
+    /// the headless pointer script; pushed to each app process as `ro.atl.headless.pointer`
+    headless_pointer: Option<String>,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// set by the first process that claims to be the main one
@@ -361,7 +366,7 @@ impl Host {
     }
 
     /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.surfaceflinger.suffix` makes libgui look up this process's own compositor
-    /// (compositor_registry.rs); `ro.atl.display` is the display that compositor answers with, the model the services answer with too.
+    /// (compositor_registry.rs); `ro.atl.display` is the display that compositor answers with, the model the services answer with too; `ro.atl.headless.pointer` is the input script, present only with `--headless-pointer`.
     fn process_properties(&self, uid: u32, name: &str) -> Result<PathBuf> {
         let mut props = self.defaults.clone();
         props.push((
@@ -372,6 +377,12 @@ impl Host {
             compositor_registry::DISPLAY_PROPERTY.to_owned(),
             self.display.to_arg(),
         ));
+        if let Some(script) = &self.headless_pointer {
+            props.push((
+                compositor_registry::POINTER_PROPERTY.to_owned(),
+                script.clone(),
+            ));
+        }
         let path = self.root.process_properties(uid, name);
         std::fs::write(&path, atl_property_service::area(&props)?)
             .with_context(|| format!("writing {}", path.display()))?;
@@ -632,6 +643,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         boot,
         defaults,
         display: a.display.unwrap_or_default(),
+        headless_pointer: a.headless_pointer.clone(),
         controlled: Mutex::new(BTreeSet::new()),
         main_claimed: AtomicBool::new(false),
         done: done_tx,

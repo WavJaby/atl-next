@@ -19,6 +19,8 @@ pub const REGISTER: u32 = 1;
 pub const SUFFIX_PROPERTY: &str = "ro.atl.surfaceflinger.suffix";
 /// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is.
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
+/// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.
+pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
 /// AOSP's service names, libgui's defaults.
 pub const SURFACE_FLINGER: &str = "SurfaceFlinger";
 pub const SURFACE_FLINGER_AIDL: &str = "SurfaceFlingerAIDL";

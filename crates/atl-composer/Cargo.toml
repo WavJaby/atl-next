@@ -15,14 +15,17 @@ publish.workspace = true
 converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
-converter = ["atl-aidl/converter", "atl-services/converter"]
+converter = ["atl-aidl/converter", "atl-libinput/converter", "atl-services/converter"]
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
 atl-compositor = { path = "../atl-compositor" }
+atl-libinput = { path = "../atl-libinput" }
+atl-platform-ui = { path = "../atl-platform-ui" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 atl-services = { path = "../atl-services" }
 rustix.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

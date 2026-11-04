@@ -13,6 +13,30 @@ pub trait SceneSink: Send {
     fn present(&mut self, scene: &Scene);
 }
 
+/// Runs `on_first` once, at the first scene with quads (the app's first frame reaching the compositor), and passes every scene on to `inner`.
+pub struct FirstFrame<S: SceneSink> {
+    inner: S,
+    on_first: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl<S: SceneSink> FirstFrame<S> {
+    pub fn new(inner: S, on_first: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            on_first: Some(Box::new(on_first)),
+        }
+    }
+}
+
+impl<S: SceneSink> SceneSink for FirstFrame<S> {
+    fn present(&mut self, scene: &Scene) {
+        if let Some(on_first) = self.on_first.take_if(|_| !scene.quads.is_empty()) {
+            on_first();
+        }
+        self.inner.present(scene);
+    }
+}
+
 /// FNV-1a, 64 bit: the digest a quad's pixels are reported by (offset basis 0xcbf29ce484222325, prime 0x100000001b3). Not a security hash: a short, order-sensitive fingerprint both sides compute alike.
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;

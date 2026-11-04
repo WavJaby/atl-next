@@ -6,14 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atl_services::compositor_registry::{
-    DESCRIPTOR, DISPLAY_PROPERTY, REGISTER, SERVICE, SUFFIX_PROPERTY,
+    DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SUFFIX_PROPERTY,
 };
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use crate::host::{Composer, ComposerConfig, ThreadHost};
-use crate::sink::ReportSink;
+use crate::input::{self, Message};
+use crate::sink::{FirstFrame, ReportSink};
 use crate::{service, surface_flinger, ui_agent};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
@@ -43,10 +44,15 @@ fn on_transact(
 impl IRegistry for BpRegistry {}
 impl IRegistry for Binder<BnRegistry> {}
 
-fn property(name: &str) -> Result<String, String> {
+/// A system property of the process: None when unset or empty.
+fn optional_property(name: &str) -> Result<Option<String>, String> {
     rustutils::system_properties::read(name)
-        .map_err(|e| format!("reading {name}: {e}"))?
-        .filter(|v| !v.is_empty())
+        .map(|v| v.filter(|v| !v.is_empty()))
+        .map_err(|e| format!("reading {name}: {e}"))
+}
+
+fn property(name: &str) -> Result<String, String> {
+    optional_property(name)?
         .ok_or_else(|| format!("{name} is not set: not an app process atld started"))
 }
 
@@ -91,16 +97,28 @@ fn register(
 pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
     let suffix = property(SUFFIX_PROPERTY)?;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
+    let script = match optional_property(POINTER_PROPERTY)? {
+        Some(script) => input::parse_script(&script)?,
+        None => Vec::new(),
+    };
+    let input_tx = input::spawn(script)?;
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: Default::default(),
     });
+    let first_frame = input_tx.clone();
     composer
-        .start(threads, Box::new(ReportSink(std::io::stderr())))
+        .start(
+            threads,
+            Box::new(FirstFrame::new(ReportSink(std::io::stderr()), move || {
+                // the script goes in at the first frame; the input thread owns the publisher
+                let _ = first_frame.send(Message::FirstFrame);
+            })),
+        )
         .map_err(|e| format!("frame clock thread: {e}"))?;
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
-    let ui_agent = ui_agent::new_binder(Arc::clone(&composer));
+    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx);
     register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
     // the registry holds the binders; the process holds the compositor (the clock thread does)
     Ok(composer)

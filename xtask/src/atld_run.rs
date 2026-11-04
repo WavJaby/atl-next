@@ -43,6 +43,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
+    /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
+    headless_pointer: Option<String>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -170,6 +172,7 @@ impl Runtime {
             font_file,
             keychars,
             gralloc: None,
+            headless_pointer: None,
         })
     }
 
@@ -185,6 +188,12 @@ impl Runtime {
         let lib = crate::gralloc::stage_mapper(root, &self.out)?;
         self.gralloc = Some((allocator, lib));
         Ok(self)
+    }
+
+    /// Feeds atld a headless pointer script (format: atl-composer `input::parse_script`); the app injects it after its first frame. Only the input gate sets it.
+    pub fn with_headless_pointer(mut self, script: &str) -> Self {
+        self.headless_pointer = Some(script.to_owned());
+        self
     }
 
     /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar.
@@ -313,6 +322,9 @@ impl Runtime {
             ))
             .args(["--first-uid", &run.first_uid.to_string()])
             .args(["--log-tags", &run.log_tags]);
+        if let Some(script) = &self.headless_pointer {
+            cmd.args(["--headless-pointer", script]);
+        }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
         }

@@ -4,9 +4,9 @@
 //! config_showNavigationBar (frameworks/base/core/res/res/values/config.xml:2743, false); the desktop has no software navigation bar.
 //! getCurrentAnimatorScale: 1.0. WindowManagerService.getCurrentAnimatorScale (:3687-3691) returns mAnimatorDurationScaleSetting, whose default is 1.0f (:1052), or 0 with animations disabled.
 //! openSession: a session for the caller's callback (WindowManagerService.openSession:6004-6005); the session's window methods are below.
-//! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel, the insets, the frame, scale 1),
+//! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel (its server end goes to the app's UI agent), the insets, the frame, scale 1),
 //! relayout (WindowManagerService.relayoutWindow: the client frames, the merged configuration, the SurfaceControl the window's UI agent gives, the insets), remove (the window goes:
-//! its input channel's server end closes with it). The frames are the whole display: one fullscreen window, no insets (the desktop shows no system bars).
+//! its input channel's server end stays with the app: no close signal yet, a known gap). The frames are the whole display: one fullscreen window, no insets (the desktop shows no system bars).
 //! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION. finishDrawing stays one of them: its post-draw SurfaceControl.Transaction is
 //! not modelled (the composer, M3 slice 4), so the codec refuses it before the method runs.
 
@@ -57,25 +57,30 @@ struct RegisteredAgent {
 }
 
 impl RegisteredAgent {
-    /// The agent's layer for a window named `title`; None, counted, when the app registered no agent or the call failed.
-    fn window_surface(&self, title: &str) -> Option<SurfaceControl> {
+    /// The app's UI agent; None, counted under `call`, when the app registered no agent or it is not an IUiAgent.
+    fn agent(&self, call: &str) -> Option<Strong<dyn IUiAgent>> {
         let Some(binder) = self.agents.get(self.uid) else {
             counters::count(
                 WINDOW_SESSION,
-                "relayout: no UI agent registered for the app's uid",
+                &format!("{call}: no UI agent registered for the app's uid"),
             );
             return None;
         };
-        let agent: Strong<dyn IUiAgent> = match binder.into_interface() {
-            Ok(agent) => agent,
+        match binder.into_interface() {
+            Ok(agent) => Some(agent),
             Err(e) => {
                 counters::count(
                     WINDOW_SESSION,
-                    &format!("relayout: registered UI agent is not an IUiAgent: {e:?}"),
+                    &format!("{call}: registered UI agent is not an IUiAgent: {e:?}"),
                 );
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    /// The agent's layer for a window named `title`; None, counted, when the app registered no agent or the call failed.
+    fn window_surface(&self, title: &str) -> Option<SurfaceControl> {
+        let agent = self.agent("relayout")?;
         match agent.window_surface(title) {
             Ok(surface) => Some(surface),
             Err(e) => {
@@ -87,15 +92,29 @@ impl RegisteredAgent {
             }
         }
     }
+
+    /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
+    fn give_input_server(&self, fd: OwnedFd) -> bool {
+        let Some(agent) = self.agent("addToDisplayAsUser") else {
+            return false;
+        };
+        match agent.input_server(fd) {
+            Ok(()) => true,
+            Err(e) => {
+                counters::count(
+                    WINDOW_SESSION,
+                    &format!("addToDisplayAsUser: UI agent refused the input server end: {e:?}"),
+                );
+                false
+            }
+        }
+    }
 }
 
-/// One window the session added: its client binder (what `remove` and `relayout` find it by), its title (the layer name), and the server end of its input channel, which AOSP's
-/// InputDispatcher publishes on; it closes when the window goes.
+/// One window the session added: its client binder (what `remove` and `relayout` find it by) and its title (the layer name). Its input channel's server end went to the app's UI agent.
 struct Window {
     client: SpIBinder,
     title: String,
-    /// Held only to keep the channel open until the window is removed (dropping it closes the channel); no reader yet.
-    _input_server: Option<OwnedFd>,
     laid_out: bool,
     /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
     surface: Option<SurfaceControl>,
@@ -224,7 +243,7 @@ impl IWindowSession for Session {
     }
 
     /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder; a window that takes input gets an input channel (the
-    /// client end returned, the server end kept with the window). Refused: a call without the window or its attributes (counted, BAD_VALUE).
+    /// client end returned, the server end handed to the app's UI agent). Refused: a call without the window or its attributes (counted, BAD_VALUE).
     fn r#addToDisplayAsUser(
         &self,
         window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
@@ -246,25 +265,24 @@ impl IWindowSession for Session {
             );
             return Err(StatusCode::BAD_VALUE.into());
         };
-        let (channel, input_server) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0
-        {
+        let channel = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
             let (server, client) = open_input_pair()?;
-            let channel = InputChannel {
+            // the server end is the app's: its UI agent publishes the window's input on it (no system InputDispatcher)
+            self.agent.give_input_server(server);
+            InputChannel {
                 core: Some(InputChannelCore {
                     name: attrs.title.clone(),
                     fd: Arc::new(client),
                     // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
                     token: Some(crate::token::new()),
                 }),
-            };
-            (channel, Some(server))
+            }
         } else {
-            (InputChannel::default(), None)
+            InputChannel::default()
         };
         self.lock().push(Window {
             client: window.as_binder(),
             title: attrs.title.clone().unwrap_or_default(),
-            _input_server: input_server,
             laid_out: false,
             surface: None,
         });
@@ -365,7 +383,7 @@ impl IWindowSession for Session {
         Ok(result)
     }
 
-    /// WindowManagerService.removeWindow: the window leaves the session and its input channel's server end closes. A window the session does not hold is nothing to remove
+    /// WindowManagerService.removeWindow: the window leaves the session. Its input channel's server end stays with the app until the process exits (no close signal: a known gap). A window the session does not hold is nothing to remove
     /// (AOSP does nothing for an unknown window either).
     fn r#remove(&self, client_token: Option<&SpIBinder>) -> binder::Result<()> {
         let Some(token) = client_token else {

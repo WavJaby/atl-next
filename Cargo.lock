@@ -151,9 +151,12 @@ dependencies = [
  "atl-aidl",
  "atl-bridgegen",
  "atl-compositor",
+ "atl-libinput",
+ "atl-platform-ui",
  "atl-scene-buffer",
  "atl-services",
  "rustix",
+ "tracing",
 ]
 
 [[package]]

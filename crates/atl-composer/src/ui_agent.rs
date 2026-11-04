@@ -3,7 +3,8 @@
 //! The layer is made as createSurface makes one (`Composer::create_layer`, a root layer named after the window): the client is the one createConnection gives, the handle is the layer's.
 //! The SurfaceControl is libgui's parcel form (codecs/android/view/SurfaceControl.rs); the display's size, RGBA_8888, no transform hint.
 
-use std::sync::Arc;
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, mpsc::Sender};
 
 use atl_parcelables::android::view::SurfaceControl;
 use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl;
@@ -11,14 +12,16 @@ use atl_services::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
 use crate::host::Composer;
+use crate::input::Message;
 use crate::service;
 
 /// PixelFormat.RGBA_8888 (`HAL_PIXEL_FORMAT_RGBA_8888` = 1), the format of every window layer.
 const RGBA_8888: u32 = 1;
 
-/// The agent of this process: its windows are layers of its compositor.
+/// The agent of this process: its windows are layers of its compositor, and their input channels go to the input thread.
 struct UiAgent {
     composer: Arc<Composer>,
+    input: Sender<Message>,
 }
 
 impl Interface for UiAgent {}
@@ -43,9 +46,15 @@ impl IUiAgent for UiAgent {
             }),
         })
     }
+
+    fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode> {
+        self.input
+            .send(Message::Window(fd))
+            .map_err(|_| StatusCode::DEAD_OBJECT)
+    }
 }
 
-/// A new UI agent binder of `composer`.
-pub fn new_binder(composer: Arc<Composer>) -> SpIBinder {
-    BnUiAgent::new_binder(UiAgent { composer }, BinderFeatures::default()).as_binder()
+/// A new UI agent binder of `composer`; `input` takes the windows' input channels.
+pub fn new_binder(composer: Arc<Composer>, input: Sender<Message>) -> SpIBinder {
+    BnUiAgent::new_binder(UiAgent { composer, input }, BinderFeatures::default()).as_binder()
 }

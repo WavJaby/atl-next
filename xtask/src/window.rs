@@ -7,6 +7,7 @@
 //! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
 //! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
+//! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,7 +32,7 @@ pub struct Args {
     /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it. `frames`: resume, and the first frame's pixels and the frame cadence are right.
+    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it. `frames`: resume, and the first frame's pixels and the frame cadence are right. `input`: resume, and the fixture logs the injected pointer script's touches, in order.
     #[arg(long, value_enum, default_value = "resume")]
     stage: Stage,
     /// Instead of the stage: the verdict on synthetic logs (what the stage must fail and must pass). Needs no device.
@@ -51,6 +52,8 @@ enum Stage {
     Resume,
     /// Resume, then the sub-gates on the first frame and the frame cadence.
     Frames,
+    /// Resume, then the touches the injected pointer script makes are the ones the fixture logs.
+    Input,
 }
 
 impl Stage {
@@ -58,14 +61,24 @@ impl Stage {
         match self {
             Stage::Resume => "resume",
             Stage::Frames => "frames",
+            Stage::Input => "input",
         }
     }
 
-    /// How long the app must survive after the marker: the resume window, or the frames stage's longer watch.
+    /// How long the app must survive after the marker: the resume window, or the longer watch of the frames and input stages.
     fn window_ms(self) -> u64 {
         match self {
             Stage::Resume => WINDOW_MS,
-            Stage::Frames => FRAMES_WINDOW_MS,
+            Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
+        }
+    }
+
+    /// The sub-gates run once the marker is logged, by name (each prints `window: <name>: pass|FAIL`).
+    fn sub_names(self) -> &'static [&'static str] {
+        match self {
+            Stage::Resume => &[],
+            Stage::Frames => &["picture", "cadence"],
+            Stage::Input => &["touch"],
         }
     }
 }
@@ -79,7 +92,7 @@ const LIMIT: Duration = Duration::from_secs(180);
 /// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
 /// milliseconds when it fails, so two seconds leaves the failure time to show.
 const WINDOW_MS: u64 = 2_000;
-/// The frames stage's watch after the marker: the first draw, then FRAME_CALLBACKS vsyncs (0.5 s at 60 Hz), with slack for a slow start.
+/// The frames and input stages' watch after the marker: the first draw, then FRAME_CALLBACKS vsyncs (0.5 s at 60 Hz), with slack for a slow start; the input stage's touches come after the first draw, inside it.
 const FRAMES_WINDOW_MS: u64 = 5_000;
 /// The fixture's frame callbacks (Main.java FRAME_CALLBACKS): FRAME_CALLBACKS - 1 intervals, each one display period.
 const FRAME_CALLBACKS: usize = 31;
@@ -89,6 +102,14 @@ const WINDOW_TITLE: &str = "AtlWindowFixture";
 const CADENCE_TOLERANCE: f64 = 0.10;
 /// No single interval may exceed this many periods: a missed vsync shows as two.
 const CADENCE_MAX_PERIODS: f64 = 1.5;
+/// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
+const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
+/// MotionEvent.ACTION_DOWN, ACTION_UP and ACTION_MOVE (AOSP MotionEvent.java): the action of each touch the fixture logs.
+const ACTION_DOWN: u32 = 0;
+const ACTION_UP: u32 = 1;
+const ACTION_MOVE: u32 = 2;
+/// The pointer count of each touch: the script has one pointer.
+const POINTERS: u32 = 1;
 /// How often the logs are read while waiting.
 const POLL: Duration = Duration::from_millis(50);
 /// Lines shown of a log on failure.
@@ -97,7 +118,7 @@ const TAIL: usize = 40;
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
     match stage {
-        Stage::Resume | Stage::Frames => "AtlWindow: onResume reached",
+        Stage::Resume | Stage::Frames | Stage::Input => "AtlWindow: onResume reached",
     }
 }
 
@@ -452,6 +473,76 @@ fn cadence_check(after: &[&str], refresh_hz: f32) -> Result<String, String> {
     ))
 }
 
+/// One touch as the fixture logs it (Main.java `Quadrants.onTouchEvent`): the action, the x and y of the pointer, the pointer count.
+#[derive(Debug, Clone, PartialEq)]
+struct Touch {
+    action: u32,
+    x: f32,
+    y: f32,
+    pointers: u32,
+}
+
+/// The touches the pointer script makes, in order: `kind:x,y` items, kind `down`, `move` or `up`, one pointer each.
+fn script_touches(script: &str) -> Result<Vec<Touch>, String> {
+    script
+        .split_whitespace()
+        .map(|item| {
+            let (kind, at) = item
+                .split_once(':')
+                .ok_or_else(|| format!("script item {item:?}: want kind:x,y"))?;
+            let action = match kind {
+                "down" => ACTION_DOWN,
+                "move" => ACTION_MOVE,
+                "up" => ACTION_UP,
+                _ => return Err(format!("script item {item:?}: kind is down, move or up")),
+            };
+            let (x, y) = at
+                .split_once(',')
+                .ok_or_else(|| format!("script item {item:?}: want kind:x,y"))?;
+            let coord = |v: &str| {
+                v.parse::<f32>()
+                    .map_err(|e| format!("script item {item:?}: {e}"))
+            };
+            Ok(Touch {
+                action,
+                x: coord(x)?,
+                y: coord(y)?,
+                pointers: POINTERS,
+            })
+        })
+        .collect()
+}
+
+/// The fixture's `AtlWindow: touch action=A x=X y=Y pointers=N` line as a [`Touch`]; any other line is no touch.
+fn touch_line(line: &str) -> Option<Touch> {
+    let (_, rest) = line.split_once("AtlWindow: touch ")?;
+    Some(Touch {
+        action: word(rest, "action")?.parse().ok()?,
+        x: word(rest, "x")?.parse().ok()?,
+        y: word(rest, "y")?.parse().ok()?,
+        pointers: word(rest, "pointers")?.parse().ok()?,
+    })
+}
+
+/// Sub-gate (c): after the marker the fixture logs one touch per script item, in order, each with the item's action, x and y and one pointer; no other touch.
+fn input_check(after: &[&str], script: &str) -> Result<String, String> {
+    let want = script_touches(script)?;
+    let got: Vec<Touch> = after.iter().filter_map(|l| touch_line(l)).collect();
+    if got.len() != want.len() {
+        return Err(format!(
+            "{} touch lines after the marker, the script has {}",
+            got.len(),
+            want.len()
+        ));
+    }
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        if g != w {
+            return Err(format!("touch {i}: got {g:?}, want {w:?}"));
+        }
+    }
+    Ok(format!("{} touches as `{script}`", want.len()))
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -467,6 +558,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
+    let rt = match args.stage {
+        Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
+        Stage::Resume | Stage::Frames => rt,
+    };
     let work = rt.out.join("window");
     let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
@@ -526,19 +621,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    // the frames stage's sub-gates, once the marker is logged (they read the frames after it)
-    let sub: Vec<Result<String, String>> =
-        if matches!(args.stage, Stage::Frames) && v.marker_ms.is_some() {
+    // the sub-gates, once the marker is logged (they read the frames or the touches after it)
+    let sub: Vec<Result<String, String>> = match (args.stage, v.marker_ms) {
+        (Stage::Frames, Some(_)) => {
             let display = DisplayModel::default();
             vec![
                 picture_check(&app, display),
                 cadence_check(&after_marker(&app, marker), display.refresh_hz),
             ]
-        } else {
-            Vec::new()
-        };
+        }
+        (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
+        _ => Vec::new(),
+    };
     let sub_fault = sub.iter().find_map(|r| r.as_ref().err().cloned());
-    for (name, result) in ["picture", "cadence"].iter().zip(&sub) {
+    for (name, result) in args.stage.sub_names().iter().zip(&sub) {
         match result {
             Ok(s) => println!("window: {name}: pass {s}"),
             Err(s) => println!("window: {name}: FAIL {s}"),
@@ -731,6 +827,102 @@ mod tests {
         }
         assert!(check(&missed, 60.0).is_err(), "one interval of two periods");
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
+    }
+
+    /// The fixture's touch line reads as its action, x, y and pointer count; any other line is no touch.
+    #[test]
+    fn touch_line_reads_the_fixture_log() {
+        assert_eq!(
+            touch_line("1000.000 1 2 I AtlWindow: touch action=2 x=260.0 y=340.0 pointers=1"),
+            Some(Touch {
+                action: 2,
+                x: 260.0,
+                y: 340.0,
+                pointers: 1,
+            })
+        );
+        assert!(touch_line("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
+    }
+
+    /// The script's items written out by hand: a down at (200, 300), then a move and an up at (260, 340), one pointer each. The actions are MotionEvent's ACTION_DOWN 0, ACTION_MOVE 2 and ACTION_UP 1.
+    #[test]
+    fn script_touches_follow_the_script_text() {
+        let want = [
+            Touch {
+                action: 0,
+                x: 200.0,
+                y: 300.0,
+                pointers: 1,
+            },
+            Touch {
+                action: 2,
+                x: 260.0,
+                y: 340.0,
+                pointers: 1,
+            },
+            Touch {
+                action: 1,
+                x: 260.0,
+                y: 340.0,
+                pointers: 1,
+            },
+        ];
+        assert_eq!(script_touches(POINTER_SCRIPT), Ok(want.to_vec()));
+        assert!(script_touches("tap:1,2").is_err(), "no such kind");
+        assert!(script_touches("down:1").is_err(), "no y");
+        assert!(script_touches("down:a,2").is_err(), "x is not a number");
+    }
+
+    /// The touches after the marker must be the script's, in order: one line each, with the script's action, x and y and one pointer. The expected lines are written out here, not made by the code under test.
+    #[test]
+    fn input_check_matches_the_touch_lines() {
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        let line = |action: u32, x: &str, y: &str, pointers: u32| {
+            format!(
+                "1000.000 1 2 I AtlWindow: touch action={action} x={x} y={y} pointers={pointers}"
+            )
+        };
+        let ok = [
+            line(0, "200.0", "300.0", 1),
+            line(2, "260.0", "340.0", 1),
+            line(1, "260.0", "340.0", 1),
+        ];
+        assert!(input_check(&refs(&ok), POINTER_SCRIPT).is_ok());
+        let wrong_x = [line(0, "201.0", "300.0", 1), ok[1].clone(), ok[2].clone()];
+        assert!(
+            input_check(&refs(&wrong_x), POINTER_SCRIPT).is_err(),
+            "x off by one"
+        );
+        assert!(
+            input_check(&refs(&ok[..2]), POINTER_SCRIPT).is_err(),
+            "the up is missing"
+        );
+        let extra = [ok[0].clone(), ok[0].clone(), ok[1].clone(), ok[2].clone()];
+        assert!(
+            input_check(&refs(&extra), POINTER_SCRIPT).is_err(),
+            "one touch too many"
+        );
+        let reordered = [ok[0].clone(), ok[2].clone(), ok[1].clone()];
+        assert!(
+            input_check(&refs(&reordered), POINTER_SCRIPT).is_err(),
+            "up before move"
+        );
+        let two = [line(0, "200.0", "300.0", 2), ok[1].clone(), ok[2].clone()];
+        assert!(
+            input_check(&refs(&two), POINTER_SCRIPT).is_err(),
+            "two pointers"
+        );
+        let up_first = [line(1, "200.0", "300.0", 1), ok[1].clone(), ok[2].clone()];
+        assert!(
+            input_check(&refs(&up_first), POINTER_SCRIPT).is_err(),
+            "an up where the script has a down"
+        );
+        assert!(
+            input_check(&[], POINTER_SCRIPT).is_err(),
+            "no touches at all"
+        );
     }
 
     /// A stamp is printed in the form parse_stamp reads.
