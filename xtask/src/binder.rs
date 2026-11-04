@@ -243,11 +243,7 @@ pub(crate) fn lib_env(out: &Path) -> Result<Vec<(String, String)>> {
             }
         }
     }
-    Ok(vec![
-        ("LD_LIBRARY_PATH".to_owned(), lib_dirs.join(":")),
-        // ART's host stack dump runs ANDROID_BUILD_TOP + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line" (native_stack_dump.cc FindAddr2line); ART_CLANG_PATH is absolute (-llvm), so the top is "/". Unset, it would be "./" + the prefix.
-        ("ANDROID_BUILD_TOP".to_owned(), "/".to_owned()),
-    ])
+    Ok(vec![("LD_LIBRARY_PATH".to_owned(), lib_dirs.join(":"))])
 }
 
 /// servicemanager as the context manager (uid 1000) in the test layout under `test_root` (which `layout` filled), and the result of its first `service check manager`, polled until it answers, exits or `STARTUP` passes.
