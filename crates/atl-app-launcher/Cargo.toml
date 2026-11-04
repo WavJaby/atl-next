@@ -18,12 +18,12 @@ name = "atl-app-launcher"
 required-features = ["converter"]
 
 [features]
-converter = ["dep:atl-composer", "atl-composer/converter"]
+converter = ["atl-composer/converter"]
 
 [dependencies]
 anyhow.workspace = true
 atl-bionic = { path = "../atl-bionic" }
-atl-composer = { path = "../atl-composer", optional = true }
+atl-composer = { path = "../atl-composer" }
 rustix.workspace = true
 
 [build-dependencies]

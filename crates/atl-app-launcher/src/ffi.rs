@@ -256,15 +256,19 @@ pub struct Vm {
     env: Env,
 }
 
-/// The created VM's `JavaVM*`, which any thread may use (JNI invocation API: a JavaVM is shared between threads, a JNIEnv is not).
+/// The created VM's `JavaVM*`, which any thread may use (JNI invocation API: a JavaVM is shared between threads, a JNIEnv is not). Only the compositor's threads (feature `converter`) use it.
+#[cfg(feature = "converter")]
 #[derive(Clone, Copy)]
 pub struct VmHandle(*mut *const jni::JNIInvokeInterface);
 
 // SAFETY: the JNI specification makes the JavaVM pointer valid and usable on every thread for the VM's life, which is the process's
+#[cfg(feature = "converter")]
 unsafe impl Send for VmHandle {}
 // SAFETY: as above: the invocation interface is thread-safe
+#[cfg(feature = "converter")]
 unsafe impl Sync for VmHandle {}
 
+#[cfg(feature = "converter")]
 impl VmHandle {
     /// The pointer; a method so a closure captures the whole (Send) handle, not its raw field.
     fn raw(self) -> *mut *const jni::JNIInvokeInterface {
@@ -503,6 +507,7 @@ impl Vm {
     }
 
     /// The VM, for threads other than this one.
+    #[cfg(feature = "converter")]
     pub fn handle(&self) -> VmHandle {
         VmHandle(self.vm)
     }

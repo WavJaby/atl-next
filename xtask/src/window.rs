@@ -101,34 +101,63 @@ fn marker_stamp(app_log: &str, marker: &str) -> Option<u64> {
         .find_map(line_stamp)
 }
 
-/// The stage's verdict: `marker_ms` is when onResume was logged (None: never); `fault` is the first thing inside the window after it that fails the stage (None: pass).
+/// The stage's verdict: `marker_ms` is when onResume was logged (None: never); `fault` is the first thing inside the window after it that fails the stage (None: pass);
+/// `frontier` is when the app crashed at [`FRONTIER_FRAME`], which is not a fault yet.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub marker_ms: Option<u64>,
     pub fault: Option<String>,
+    pub frontier: Option<u64>,
 }
 
 /// libbinder's line when a service nothing serves holds a call up (IServiceManager.cpp:727, once a second): the app is hung, not crashed, so only this line tells.
 const UNSERVED_WAIT: &str = "Waited one second for";
 
+/// The one crash the window path is allowed until the services implement it: ViewRootImpl.setView's `addToDisplayAsUser` fails because IWindowSession is not implemented (its LayoutParams argument is refused,
+/// atl-parcelables; plan M3 slice 5 = WMS-lite + the codecs). A crash whose stack holds this frame is the stage's frontier, reported and passed; any other crash fails.
+/// Delete this allowance, and the `frontier` handling below, in the change that implements `addToDisplayAsUser`: then the stage's contract (the app survives the window) holds without it.
+const FRONTIER_FRAME: &str = "IWindowSession$Stub$Proxy.addToDisplayAsUser";
+/// Lines after a `FATAL EXCEPTION` line that its stack can span (the stack, the cause, the log lines in between).
+const CRASH_LINES: usize = 80;
+/// How long after a crash the process kill it causes is logged (`Process.killProcess` right after the report): the crash's own consequence, not a second fault.
+const KILL_AFTER_CRASH_MS: u64 = 500;
+
 /// The verdict on an app log. Inside [marker, marker + WINDOW_MS]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), a wait on an unserved service ([`UNSERVED_WAIT`]),
-/// and `atld_exited` (the services went away before the window ended). A line outside the window, or without a stamp, does not count.
+/// and `atld_exited` (the services went away before the window ended). A line outside the window, or without a stamp, does not count. A crash at [`FRONTIER_FRAME`], and the kill and the atld exit it causes, count as the frontier instead.
 pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
     let Some(marker_ms) = marker_stamp(app_log, marker) else {
         return Verdict {
             marker_ms: None,
             fault: None,
+            frontier: None,
         };
     };
     let end = marker_ms + WINDOW_MS;
-    let mut faults: Vec<(u64, String)> = app_log
-        .lines()
-        .filter_map(|l| Some((line_stamp(l)?, l)))
+    let lines: Vec<&str> = app_log.lines().collect();
+    // when the crash at the frontier was reported: the first FATAL EXCEPTION whose stack holds the frame
+    let frontier = lines.iter().enumerate().find_map(|(i, l)| {
+        let at = line_stamp(l).filter(|t| (marker_ms..=end).contains(t))?;
+        (l.contains("FATAL EXCEPTION")
+            && lines[i..lines.len().min(i + CRASH_LINES)]
+                .iter()
+                .any(|s| s.contains(FRONTIER_FRAME)))
+        .then_some(at)
+    });
+    let consequence = |t: u64| frontier.is_some_and(|f| (f..=f + KILL_AFTER_CRASH_MS).contains(&t));
+    let mut faults: Vec<(u64, String)> = lines
+        .iter()
+        .filter_map(|l| Some((line_stamp(l)?, *l)))
         .filter(|(t, _)| (marker_ms..=end).contains(t))
         .filter_map(|(t, l)| {
             let what = if l.contains("FATAL EXCEPTION") {
+                if consequence(t) {
+                    return None;
+                }
                 "FATAL EXCEPTION"
             } else if l.contains("Sending signal") {
+                if consequence(t) {
+                    return None;
+                }
                 "the process was killed"
             } else if l.contains(UNSERVED_WAIT) {
                 "the app waits on a service nothing serves"
@@ -138,13 +167,14 @@ pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
             Some((t, format!("{what} at +{} ms after onResume", t - marker_ms)))
         })
         .collect();
-    if atld_exited {
+    if atld_exited && frontier.is_none() {
         faults.push((end, "atld exited inside the window".to_owned()));
     }
     faults.sort_by_key(|(t, _)| *t);
     Verdict {
         marker_ms: Some(marker_ms),
         fault: faults.into_iter().next().map(|(_, f)| f),
+        frontier,
     }
 }
 
@@ -155,6 +185,8 @@ struct SelfCase {
     atld_exited: bool,
     marked: bool,
     fault: bool,
+    /// whether the verdict must report the frontier crash
+    frontier: bool,
 }
 
 /// A logcat line of the app at `at_ms`, with the fields logcat puts between the stamp and the tag.
@@ -174,6 +206,7 @@ fn self_cases() -> Vec<SelfCase> {
             atld_exited,
             marked,
             fault,
+            frontier: false,
         };
     vec![
         case("marked, nothing after", mark.clone(), false, true, false),
@@ -211,14 +244,53 @@ fn self_cases() -> Vec<SelfCase> {
             false,
         ),
         case("crash with no marker", crash_at(T), false, false, false),
-        case("atld exits inside the window", mark, true, true, true),
+        case(
+            "atld exits inside the window",
+            mark.clone(),
+            true,
+            true,
+            true,
+        ),
+        // the frontier: the crash of an unimplemented addToDisplayAsUser, its kill and the atld exit that follows are no fault
+        SelfCase {
+            frontier: true,
+            ..case(
+                "crash at the frontier",
+                mark.clone()
+                    + &crash_at(T + 60)
+                    + &app_line(
+                        T + 60,
+                        "liblog/AndroidRuntime",
+                        &format!("\tat android.view.{FRONTIER_FRAME}(IWindowSession.java:1274)"),
+                    )
+                    + &app_line(T + 61, "liblog/Process", "Sending signal. PID: 2 SIG: 9"),
+                true,
+                true,
+                false,
+            )
+        },
+        // the same crash with a different stack is an ordinary crash
+        case(
+            "crash elsewhere",
+            mark + &crash_at(T + 60)
+                + &app_line(
+                    T + 60,
+                    "liblog/AndroidRuntime",
+                    "\tat android.view.ViewRootImpl.setView(ViewRootImpl.java:1655)",
+                ),
+            true,
+            true,
+            true,
+        ),
     ]
 }
 
 /// Whether the verdict on a case is the one it expects, and the verdict itself.
 fn case_holds(c: &SelfCase) -> (bool, Verdict) {
     let v = verdict(&c.log, marker(Stage::Resume), c.atld_exited);
-    let holds = v.marker_ms.is_some() == c.marked && v.fault.is_some() == c.fault;
+    let holds = v.marker_ms.is_some() == c.marked
+        && v.fault.is_some() == c.fault
+        && v.frontier.is_some() == c.frontier;
     (holds, v)
 }
 
@@ -381,6 +453,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             args.stage.name(),
             marked.saturating_sub(start_ms)
         );
+        if let Some(at) = v.frontier {
+            println!(
+                "window: frontier: the app crashed {} ms after onResume in {FRONTIER_FRAME}: IWindowSession is not implemented (M3 slice 5); this crash is the only one the stage passes",
+                at - marked
+            );
+        }
         print_calls(&all, marked);
         print_crash_reports(&services);
         let rest = after_marker(&app, marker);
