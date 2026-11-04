@@ -2,7 +2,7 @@
 //! `xtask check`: the static + unit test tiers.
 
 use std::io::{ErrorKind, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 
@@ -11,8 +11,8 @@ use clap::ValueEnum;
 
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
-    aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, patch, providers,
-    prune, sources, spdx, workspace,
+    aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
+    providers, prune, sources, spdx, workspace,
 };
 use atl_layout::Layout;
 
@@ -24,6 +24,9 @@ pub struct Args {
     /// Run only these steps (repeatable).
     #[arg(long, value_enum)]
     only: Vec<Step>,
+    /// Native build directory for converter-packages (default `<workspace>/out/native/<build machine>`, as `xtask native`); without its graph.json that step is skipped.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -50,9 +53,11 @@ enum Step {
     Converter,
     /// the distro libc++ headers under the converter's device C++ flags: -D__ANDROID__ changes no macro beyond the expected and no object byte
     Libcxx,
+    /// clippy on the packages that link converter modules (feature `converter`), against the native out dir's graph; skipped without one
+    ConverterPackages,
 }
 
-const ALL: [Step; 11] = [
+const ALL: [Step; 12] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -64,6 +69,7 @@ const ALL: [Step; 11] = [
     Step::Test,
     Step::Converter,
     Step::Libcxx,
+    Step::ConverterPackages,
 ];
 
 impl Step {
@@ -80,10 +86,22 @@ impl Step {
             Step::Test => "test",
             Step::Converter => "converter",
             Step::Libcxx => "libcxx",
+            Step::ConverterPackages => "converter-packages",
         }
     }
 
-    fn run(self, root: &Path) -> Result<()> {
+    /// Why the step has nothing to check here, when its input is absent: printed and counted, not a failure.
+    fn skip(self, out: &Path) -> Option<String> {
+        match self {
+            Step::ConverterPackages if !out.join("graph.json").is_file() => Some(format!(
+                "no {}: run `cargo xtask native` first",
+                out.join("graph.json").display()
+            )),
+            _ => None,
+        }
+    }
+
+    fn run(self, root: &Path, out: &Path) -> Result<()> {
         match self {
             Step::Fmt => cargo(root, &["fmt", "--all", "--check"]),
             Step::Spdx => spdx::check(root),
@@ -160,6 +178,7 @@ impl Step {
             Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
+            Step::ConverterPackages => packages::lint(root, out),
         }
     }
 }
@@ -169,10 +188,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .into_iter()
         .filter(|s| args.only.is_empty() || args.only.contains(s))
         .collect();
+    let out = match &args.out {
+        Some(dir) => std::path::absolute(dir)?,
+        None => {
+            let arches = arches::load(root)?;
+            let (machine, _) = arches::build_machine(root, &arches)?;
+            Layout::of(root)?
+                .workspace()
+                .join("out/native")
+                .join(machine)
+        }
+    };
+    let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for step in &steps {
         eprintln!("== check: {}", step.name());
-        if let Err(e) = step.run(root) {
+        if let Some(why) = step.skip(&out) {
+            eprintln!("== check: {} skipped: {why}", step.name());
+            skipped.push(step.name());
+        } else if let Err(e) = step.run(root, &out) {
             eprintln!("== check: {} FAILED: {e:#}", step.name());
             failures.push(Failure::step(step.name(), format!("{e:#}")));
         }
@@ -180,6 +214,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let verdict = Verdict {
         cmd: "check",
         total: Some((steps.len(), "steps")),
+        skipped,
         failures,
     };
     println!("{}", verdict.line());
@@ -256,4 +291,20 @@ fn tee<R: Read + Send + 'static>(mut from: R, to_stdout: bool) -> thread::JoinHa
         }
         String::from_utf8_lossy(&captured).into_owned()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converter_packages_skips_only_without_a_graph() {
+        let dir = std::env::temp_dir().join(format!("xtask-check-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        assert!(Step::ConverterPackages.skip(&dir).is_some());
+        assert!(Step::Fmt.skip(&dir).is_none());
+        std::fs::write(dir.join("graph.json"), b"{}").expect("test graph");
+        assert!(Step::ConverterPackages.skip(&dir).is_none());
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
 }

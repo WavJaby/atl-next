@@ -4,7 +4,7 @@
 //! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib and the package's other modules to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
 //! `[package.metadata.atl.rust_library]` (`rustlibs`, optional `aconfig`) makes the converter build the package's `src/lib.rs` as rust_library `lib<crate>` with those rustlibs and the package's edition (Soong's `additional_rustlibs` crate of an aidl_interface), the flag dumps of the `aconfig` declarations in its OUT_DIR, and our lints (`lint_flags`, through clippy-driver, never capped); cargo builds it only as an empty library (`#![cfg(...)]`-gated), so it needs no feature. Only an aidl crate's `parcelables` reaches it.
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `<out>/cargo` (a no-op when current).
-//! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted.
+//! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted. `xtask check` step converter-packages runs that clippy (`lint`) against an existing out dir.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
 
 use std::collections::BTreeMap;
@@ -402,46 +402,64 @@ pub struct Built {
     pub bins: Vec<PathBuf>,
 }
 
-/// Builds every package of `root` whose converter modules `out`'s graph.json holds (printing the others with the module they lack) and checks their executables; what was built.
-pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
-    let graph_file = out.join("graph.json");
-    let graph: Graph = serde_json::from_str(
-        &std::fs::read_to_string(&graph_file)
-            .with_context(|| format!("reading {}", graph_file.display()))?,
-    )
-    .with_context(|| format!("parsing {}", graph_file.display()))?;
-    let packages = workspace_packages(root)?;
-    let (selected, skipped) = select(&packages, &graph);
-    for (p, m) in skipped {
-        println!(
-            "native: package {} not built: the goals' closure lacks {m}",
-            p.name
-        );
+/// The converter packages of `out`'s graph.json, and the cargo invocation that builds and lints them: one shape for `build` and `lint`, so clippy sees the code as built (feature on, the converter's rlibs found).
+struct Selection<'a> {
+    root: &'a Path,
+    out: &'a Path,
+    /// cargo's target dir: `out/cargo`, the one `xtask native` builds in
+    target: PathBuf,
+    graph: Graph,
+    selected: Vec<&'a Package>,
+    /// each package the graph lacks a module of, with that module
+    skipped: Vec<(&'a Package, &'a str)>,
+    /// the build machine's Rust target triple (cargo's linker config key)
+    triple: String,
+}
+
+impl<'a> Selection<'a> {
+    fn new(root: &'a Path, out: &'a Path, packages: &'a [Package]) -> Result<Self> {
+        let graph_file = out.join("graph.json");
+        let graph: Graph = serde_json::from_str(
+            &std::fs::read_to_string(&graph_file)
+                .with_context(|| format!("reading {}", graph_file.display()))?,
+        )
+        .with_context(|| format!("parsing {}", graph_file.display()))?;
+        let (selected, skipped) = select(packages, &graph);
+        let arches = arches::load(root)?;
+        let (_, machine) = arches::build_machine(root, &arches)?;
+        let triple = machine
+            .host
+            .as_ref()
+            .context("the build machine's row is a [host] row")?
+            .rust
+            .clone();
+        Ok(Self {
+            root,
+            out,
+            target: out.join("cargo"),
+            graph,
+            selected,
+            skipped,
+            triple,
+        })
     }
-    if selected.is_empty() {
-        return Ok(Vec::new());
+
+    fn names(&self) -> String {
+        self.selected
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
-    let arches = arches::load(root)?;
-    let (_, machine) = arches::build_machine(root, &arches)?;
-    let triple = &machine
-        .host
-        .as_ref()
-        .context("the build machine's row is a [host] row")?
-        .rust;
-    let target = out.join("cargo");
-    let names = selected
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // one cargo invocation shape for the build and the lint, so clippy sees the code as built (feature on, the converter's rlibs found)
-    let cargo = |sub: &str| {
+
+    /// cargo `sub` on the selected packages
+    fn cargo(&self, sub: &str) -> std::process::Command {
         let mut cmd = crate::cargo_command();
-        cmd.current_dir(root)
+        cmd.current_dir(self.root)
             .args([sub, "--release", "--locked"])
             .arg("--target-dir")
-            .arg(&target);
-        for p in &selected {
+            .arg(&self.target);
+        for p in &self.selected {
             cmd.args([
                 "-p",
                 &p.name,
@@ -452,27 +470,49 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
         cmd.args(["--config", "profile.release.panic=\"abort\""])
             .args([
                 "--config",
-                &format!("target.{triple}.linker={:?}", graph.link_driver),
+                &format!("target.{}.linker={:?}", self.triple, self.graph.link_driver),
             ])
-            .env(NATIVE_OUT, out);
+            .env(NATIVE_OUT, self.out);
         cmd
-    };
-    let status = cargo("build")
+    }
+
+    /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature); tests stay with `xtask check`.
+    fn lint(&self) -> Result<()> {
+        let status = self
+            .cargo("clippy")
+            .args(["--lib", "--bins", "--", "-D", "warnings"])
+            .status()
+            .context("running cargo clippy (converter packages)")?;
+        ensure!(status.success(), "clippy on {} failed", self.names());
+        Ok(())
+    }
+}
+
+/// Builds every package of `root` whose converter modules `out`'s graph.json holds (printing the others with the module they lack) and checks their executables; what was built.
+pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
+    let packages = workspace_packages(root)?;
+    let sel = Selection::new(root, out, &packages)?;
+    for (p, m) in &sel.skipped {
+        println!(
+            "native: package {} not built: the goals' closure lacks {m}",
+            p.name
+        );
+    }
+    if sel.selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let status = sel
+        .cargo("build")
         .status()
         .context("running cargo build (converter packages)")?;
-    ensure!(status.success(), "building {names} failed");
-    // the code behind feature `converter` is linted here, where it is built (`xtask check` step clippy runs without the feature); tests stay with `xtask check`
-    let status = cargo("clippy")
-        .args(["--lib", "--bins", "--", "-D", "warnings"])
-        .status()
-        .context("running cargo clippy (converter packages)")?;
-    ensure!(status.success(), "clippy on {names} failed");
+    ensure!(status.success(), "building {} failed", sel.names());
+    sel.lint()?;
     let mut built = Vec::new();
-    for p in selected {
-        let leading = leading_needed(p, &graph)?;
+    for p in sel.selected.iter().copied() {
+        let leading = leading_needed(p, &sel.graph)?;
         let mut bins = Vec::new();
         for b in &p.bins {
-            let bin = target.join("release").join(b);
+            let bin = sel.target.join("release").join(b);
             check_needed(&bin, &provided_gate::needed(&bin)?, &leading)?;
             bins.push(bin);
         }
@@ -482,6 +522,22 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
         });
     }
     Ok(built)
+}
+
+/// `xtask check` step converter-packages: clippy on the converter packages of `out`'s graph.json, as `build` lints them; nothing when the graph selects none.
+pub fn lint(root: &Path, out: &Path) -> Result<()> {
+    let packages = workspace_packages(root)?;
+    let sel = Selection::new(root, out, &packages)?;
+    for (p, m) in &sel.skipped {
+        println!(
+            "converter-packages: {} not linted: the graph lacks {m}",
+            p.name
+        );
+    }
+    if sel.selected.is_empty() {
+        return Ok(());
+    }
+    sel.lint()
 }
 
 /// Executable `bin` of `package`, built as `build` builds it; fails when the graph lacks the package's modules.

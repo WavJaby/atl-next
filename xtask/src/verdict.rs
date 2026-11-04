@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The verdict line `native`, `check` and every `test <gate>` end with.
 //!
-//! Success: `<cmd>: ok`, or `<cmd>: ok (<n> <unit>)` when the run counts its steps. Unchanged from before.
-//! Failure: `<cmd>: FAILED[ <k> of <n> <unit>][: <step>, ...]; first error[ (<step>)]: "<line>"`.
+//! Success: `<cmd>: ok`, or `<cmd>: ok (<n> <unit>)` when the run counts its steps.
+//! Failure: `<cmd>: FAILED[ <k> of <n> <unit>][ (<s> skipped: <step>, ...)][: <step>, ...]; first error[ (<step>)]: "<line>"`.
+//! Skipped steps (`Verdict::skipped`) with nothing to check are named, not failed: `, <s> skipped: <step>, ...` in the ok parenthesis, `(<s> skipped: ...)` after the FAILED count.
 //! `<line>` is the first failing check's first error line: one line, cut to `FIRST_ERROR_CHARS` chars, quoted with `{:?}` so it stays one line whatever the text holds.
 //! atl-out and atl-job (scripts/.agent) read this line: keep its shape.
 //! Trap: a gate that prints its own check lines names no step; its quoted line is its first failing message. The full text is in the log.
@@ -36,20 +37,29 @@ pub struct Verdict<'a> {
     pub cmd: &'a str,
     /// `check` counts its steps; `native` and the gates do not.
     pub total: Option<(usize, &'a str)>,
+    /// Steps with nothing to check here: named in the line, not failures.
+    pub skipped: Vec<&'a str>,
     pub failures: Vec<Failure>,
 }
 
 impl Verdict<'_> {
     pub fn line(&self) -> String {
+        let skip = self.skip_note();
         let Some(first) = self.failures.first() else {
-            return match self.total {
-                Some((n, unit)) => format!("{}: ok ({n} {unit})", self.cmd),
-                None => format!("{}: ok", self.cmd),
+            let counts = self.total.map(|(n, unit)| format!("{n} {unit}"));
+            let parts: Vec<String> = counts.into_iter().chain(skip).collect();
+            return if parts.is_empty() {
+                format!("{}: ok", self.cmd)
+            } else {
+                format!("{}: ok ({})", self.cmd, parts.join(", "))
             };
         };
         let mut line = format!("{}: FAILED", self.cmd);
         if let Some((n, unit)) = self.total {
             line.push_str(&format!(" {} of {n} {unit}", self.failures.len()));
+        }
+        if let Some(skip) = skip {
+            line.push_str(&format!(" ({skip})"));
         }
         let mut steps: Vec<&str> = Vec::new();
         for step in self.failures.iter().filter_map(|f| f.step.as_deref()) {
@@ -67,6 +77,17 @@ impl Verdict<'_> {
         line.push_str(&format!(": {}", quote(&first.text)));
         line
     }
+
+    /// `<s> skipped: <step>, ...`; None when no step was skipped.
+    fn skip_note(&self) -> Option<String> {
+        (!self.skipped.is_empty()).then(|| {
+            format!(
+                "{} skipped: {}",
+                self.skipped.len(),
+                self.skipped.join(", ")
+            )
+        })
+    }
 }
 
 /// The verdict of a gate that prints its own check lines: `fails` are its failure messages, the first one is quoted.
@@ -74,6 +95,7 @@ pub fn gate(cmd: &str, fails: &[String]) -> String {
     Verdict {
         cmd,
         total: None,
+        skipped: Vec::new(),
         failures: fails.iter().map(|f| Failure::gate(f)).collect(),
     }
     .line()
@@ -84,6 +106,7 @@ pub fn error(cmd: &str, err: &anyhow::Error) -> String {
     Verdict {
         cmd,
         total: None,
+        skipped: Vec::new(),
         failures: vec![Failure::gate(&format!("{err:#}"))],
     }
     .line()
@@ -151,12 +174,14 @@ mod tests {
         let counted = Verdict {
             cmd: "check",
             total: Some((11, "steps")),
+            skipped: vec![],
             failures: vec![],
         };
         assert_eq!(counted.line(), "check: ok (11 steps)");
         let plain = Verdict {
             cmd: "native",
             total: None,
+            skipped: vec![],
             failures: vec![],
         };
         assert_eq!(plain.line(), "native: ok");
@@ -167,6 +192,7 @@ mod tests {
         let v = Verdict {
             cmd: "check",
             total: Some((11, "steps")),
+            skipped: vec![],
             failures: vec![Failure::step("drift", "drift.toml: 2 rows differ\nmore")],
         };
         assert_eq!(
@@ -180,6 +206,7 @@ mod tests {
         let v = Verdict {
             cmd: "check",
             total: Some((11, "steps")),
+            skipped: vec![],
             failures: vec![
                 Failure::step("fmt", "Diff in /x/src/a.rs at line 3:"),
                 Failure::step("drift", "patch failed"),
@@ -192,10 +219,38 @@ mod tests {
     }
 
     #[test]
+    fn skipped_steps_show_in_the_ok_and_failed_lines() {
+        let ok = Verdict {
+            cmd: "check",
+            total: Some((12, "steps")),
+            skipped: vec!["converter-packages"],
+            failures: vec![],
+        };
+        assert_eq!(
+            ok.line(),
+            "check: ok (12 steps, 1 skipped: converter-packages)"
+        );
+        let failed = Verdict {
+            cmd: "check",
+            total: Some((12, "steps")),
+            skipped: vec!["converter-packages"],
+            failures: vec![
+                Failure::step("fmt", "Diff in /x/src/a.rs at line 3:"),
+                Failure::step("spdx", "missing SPDX header"),
+            ],
+        };
+        assert_eq!(
+            failed.line(),
+            r#"check: FAILED 2 of 12 steps (1 skipped: converter-packages): fmt, spdx; first error (fmt): "Diff in /x/src/a.rs at line 3:""#
+        );
+    }
+
+    #[test]
     fn run_failure_names_steps_and_quotes_the_first() {
         let v = Verdict {
             cmd: "native",
             total: None,
+            skipped: vec![],
             failures: vec![
                 Failure::step("ninja", "error: linker command failed with exit code 1"),
                 Failure::step("provided gate", "libfoo.so exports `x`"),

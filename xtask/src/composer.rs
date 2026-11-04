@@ -627,6 +627,7 @@ fn self_test() -> ExitCode {
         let verdict = Verdict {
             cmd: "composer",
             total: None,
+            skipped: Vec::new(),
             failures,
         };
         println!("{}", verdict.line());
@@ -746,6 +747,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let verdict = Verdict {
             cmd: "composer",
             total: None,
+            skipped: Vec::new(),
             failures,
         };
         println!("{}", verdict.line());

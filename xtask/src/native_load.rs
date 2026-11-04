@@ -697,6 +697,7 @@ impl Report {
         let verdict = Verdict {
             cmd: "native-load",
             total: None,
+            skipped: Vec::new(),
             failures: vec![Failure::step(&stage, detail)],
         };
         println!("{}", verdict.line());

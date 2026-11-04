@@ -651,6 +651,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let verdict = Verdict {
             cmd: "instrument",
             total: None,
+            skipped: Vec::new(),
             failures: all_fails,
         };
         println!("{}", verdict.line());

@@ -326,6 +326,7 @@ fn self_test() -> ExitCode {
         let verdict = crate::verdict::Verdict {
             cmd: "window",
             total: None,
+            skipped: Vec::new(),
             failures,
         };
         println!("{}", verdict.line());
@@ -503,6 +504,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let verdict = crate::verdict::Verdict {
         cmd: "window",
         total: None,
+        skipped: Vec::new(),
         failures: vec![crate::verdict::Failure::step(args.stage.name(), why)],
     };
     println!("{}", verdict.line());

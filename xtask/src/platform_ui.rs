@@ -578,6 +578,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let verdict = Verdict {
             cmd: "platform-ui",
             total: Some((report.total, "checks")),
+            skipped: Vec::new(),
             failures: report.failures,
         };
         println!("{}", verdict.line());

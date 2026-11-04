@@ -435,6 +435,7 @@ fn verdict(failed: Vec<Failure>) -> ExitCode {
     let verdict = Verdict {
         cmd: "native",
         total: None,
+        skipped: Vec::new(),
         failures: failed,
     };
     println!("{}", verdict.line());
@@ -597,7 +598,11 @@ fn llvm_prefix_of(tool: &Path) -> Result<PathBuf> {
         tool.display()
     );
     let bin = tool.parent().context("llvm-addr2line has no parent")?;
-    ensure!(bin.ends_with("bin"), "{} is not under a bin/ directory", tool.display());
+    ensure!(
+        bin.ends_with("bin"),
+        "{} is not under a bin/ directory",
+        tool.display()
+    );
     let prefix = bin.parent().context("bin/ has no parent")?;
     prefix
         .canonicalize()
