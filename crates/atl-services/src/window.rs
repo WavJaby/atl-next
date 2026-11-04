@@ -73,7 +73,8 @@ impl UiAgent for NoUiAgent {
 /// publishes on; it closes when the window goes.
 struct Window {
     client: SpIBinder,
-    input_server: Option<OwnedFd>,
+    /// Held only to keep the channel open until the window is removed (dropping it closes the channel); no reader yet.
+    _input_server: Option<OwnedFd>,
     laid_out: bool,
 }
 
@@ -231,7 +232,7 @@ impl IWindowSession for Session {
         };
         self.lock().push(Window {
             client: window.as_binder(),
-            input_server,
+            _input_server: input_server,
             laid_out: false,
         });
         *out_input_channel = Some(channel);
