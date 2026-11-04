@@ -10,6 +10,7 @@ mod arches;
 mod atld_run;
 mod binder;
 mod check;
+mod composer;
 mod compositor;
 mod converter;
 mod cts;
@@ -153,6 +154,10 @@ enum Test {
     /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the unimplemented-call and refused-parcelable counters summed over the run, most hit first. `<out>/cts/report.json` holds every test's outcome.
     /// Exit status is nonzero only for harness errors and, with `--baseline <report.json>`, for modules or tests that got worse than that saved report; failing tests are the metric, not errors.
     Cts(cts::Args),
+    /// The in-app SurfaceFlinger against AOSP's libgui in a real app process (M3 slice 4): atld starts the services and a client class (xtask/testdata/composer) as an app process; its compositor is registered through the system process and found by libgui by name.
+    ///
+    /// Pass = layers created, 30 transactions applied, the transaction-committed callback delivered, vsync at the display's refresh interval on Choreographer, every compositor counter as the checks say (`--self-test` lists the defects they catch). Buffers come with gralloc.
+    Composer(composer::Args),
     /// The window path, one stage at a time. `--stage resume` (M3 plan step 1, slice 1): a software window fixture (xtask/testdata/window) is started through atld, as `xtask test app` starts its app; pass = its activity's onResume is logged.
     ///
     /// The app then calls into WindowManager, which no service provides yet: its log after the marker and the services' counters that rose after it are printed.
@@ -199,6 +204,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Cts(args),
         } => cts::run(&root, &args),
+        Command::Test {
+            test: Test::Composer(args),
+        } => composer::run(&root, &args),
         Command::Test {
             test: Test::Window(args),
         } => window::run(&root, &args),

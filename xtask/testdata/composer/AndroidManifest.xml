@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test composer`: the composer gate's package. It has no activity: its class runs as a plain app process (atld's run-class option), the way a shell command does, so the gate drives libgui without a window. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlcomposer"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL composer test" />
+</manifest>

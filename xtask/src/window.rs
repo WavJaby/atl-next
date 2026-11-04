@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test window`: the window path, one stage at a time. Stage `resume` (M3 plan step 1): the window fixture (xtask/testdata/window: a software activity painting four solid colours)
 //! is started the Android way by atld, as `xtask test app` starts its fixture; the services send ResumeActivityItem after LaunchActivityItem (activity.rs), so ActivityThread runs onResume.
-//! Pass: the stage's marker is logged, and the app neither logs FATAL EXCEPTION nor dies within [`WINDOW_MS`] after it. The app's log lines and the services' counter lines carry the same
+//! Pass: the stage's marker is logged, and the app neither logs FATAL EXCEPTION, nor dies, nor waits on a service nothing serves ([`UNSERVED_WAIT`]: a hang shows only as that line) within [`WINDOW_MS`] after it. The app's log lines and the services' counter lines carry the same
 //! wall clock (logcat's first field; `at=` on a counter line, atl_services::counters), so every counted call is printed as before or after the marker, with its offset.
 //! Always printed: the counters before the marker, the calls after it, the services' crash reports and the app's log after it; on failure also the atld, app and services log tails.
 //! `--self-test` checks the verdict on synthetic logs: a crash or a death inside the window fails, one just past it does not, a missing marker and an atld exit fail.
@@ -108,8 +108,11 @@ pub struct Verdict {
     pub fault: Option<String>,
 }
 
-/// The verdict on an app log. Inside [marker, marker + WINDOW_MS]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), and `atld_exited`
-/// (the services went away before the window ended). A line outside the window, or without a stamp, does not count.
+/// libbinder's line when a service nothing serves holds a call up (IServiceManager.cpp:727, once a second): the app is hung, not crashed, so only this line tells.
+const UNSERVED_WAIT: &str = "Waited one second for";
+
+/// The verdict on an app log. Inside [marker, marker + WINDOW_MS]: a FATAL EXCEPTION, the process killed (`Sending signal`, Process.killProcess after a crash), a wait on an unserved service ([`UNSERVED_WAIT`]),
+/// and `atld_exited` (the services went away before the window ended). A line outside the window, or without a stamp, does not count.
 pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
     let Some(marker_ms) = marker_stamp(app_log, marker) else {
         return Verdict {
@@ -127,6 +130,8 @@ pub fn verdict(app_log: &str, marker: &str, atld_exited: bool) -> Verdict {
                 "FATAL EXCEPTION"
             } else if l.contains("Sending signal") {
                 "the process was killed"
+            } else if l.contains(UNSERVED_WAIT) {
+                "the app waits on a service nothing serves"
             } else {
                 return None;
             };
@@ -182,6 +187,18 @@ fn self_cases() -> Vec<SelfCase> {
         case(
             "process killed inside the window",
             mark.clone() + &app_line(T + 100, "liblog/Process", "Sending signal. PID: 2 SIG: 9"),
+            false,
+            true,
+            true,
+        ),
+        case(
+            "unserved-service wait inside the window",
+            mark.clone()
+                + &app_line(
+                    T + 1_000,
+                    "libbinder",
+                    "Waited one second for SurfaceFlingerAIDL-10123-x (is service started? are binder threads started and available?)",
+                ),
             false,
             true,
             true,
@@ -360,7 +377,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if let (Some(marked), None) = (v.marker_ms, &v.fault) {
         println!(
-            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION or death in the {WINDOW_MS} ms after it)",
+            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION, death or unserved-service wait in the {WINDOW_MS} ms after it)",
             args.stage.name(),
             marked.saturating_sub(start_ms)
         );
