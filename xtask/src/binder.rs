@@ -43,13 +43,8 @@ const MUST_FIRE: &[&str] = &[
     "binderd: fault UnsupportedIoctl ",
 ];
 
-/// An empty VINTF manifest of `kind` (device / framework): libvintf's schema (system/libvintf/parse_xml.cpp `manifest` element, version attribute required).
-fn manifest(kind: &str) -> String {
-    format!("<manifest version=\"1.0\" type=\"{kind}\">\n</manifest>\n")
-}
-
-/// The test /system, /vendor, /odm under `root`: an empty framework manifest (/system/etc/vintf/manifest.xml) and device manifests (/vendor, /odm), libvintf's default paths (system/libvintf/include/vintf/constants.h).
-fn layout(root: &Path) -> Result<()> {
+/// The test /system, /vendor, /odm under `root`: an empty framework manifest (/system/etc/vintf/manifest.xml) and device manifests (/vendor, /odm), libvintf's default paths (system/libvintf/include/vintf/constants.h). /vendor declares `vendor_hals`.
+fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
     for (dir, kind) in [
         ("system", "framework"),
         ("vendor", "device"),
@@ -57,7 +52,11 @@ fn layout(root: &Path) -> Result<()> {
     ] {
         let d = root.join(dir).join("etc/vintf");
         std::fs::create_dir_all(&d)?;
-        std::fs::write(d.join("manifest.xml"), manifest(kind))?;
+        let hals = if dir == "vendor" { vendor_hals } else { "" };
+        std::fs::write(
+            d.join("manifest.xml"),
+            atl_gralloc::vintf::manifest(kind, hals),
+        )?;
     }
     Ok(())
 }
@@ -287,10 +286,15 @@ pub(crate) fn start_servicemanager(
 
 /// The test /system, /vendor, /odm under `root` (see `layout`), recreated empty.
 pub(crate) fn fresh_layout(root: &Path) -> Result<()> {
+    fresh_layout_with(root, "")
+}
+
+/// `fresh_layout` with /vendor's manifest declaring `vendor_hals`.
+pub(crate) fn fresh_layout_with(root: &Path, vendor_hals: &str) -> Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(root)?;
     }
-    layout(root)
+    layout(root, vendor_hals)
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -315,7 +319,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if test_root.exists() {
         std::fs::remove_dir_all(&test_root)?;
     }
-    layout(&test_root)?;
+    layout(&test_root, "")?;
     let env = lib_env(&out)?;
 
     let (mut binderd, h) = start_binderd(root, &out, &test_root.join("binderd.log"))?;
@@ -405,10 +409,20 @@ mod tests {
     #[test]
     fn manifests_and_layout() {
         let dir = std::env::temp_dir().join(format!("atl-binder-layout-{}", std::process::id()));
-        layout(&dir).unwrap();
+        layout(&dir, "").unwrap();
         let s = std::fs::read_to_string(dir.join("vendor/etc/vintf/manifest.xml")).unwrap();
         assert!(roxmltree::Document::parse(&s).is_ok());
         assert!(dir.join("system/etc/vintf/manifest.xml").is_file());
+        // declared HALs land in /vendor's manifest only, and the file stays well-formed
+        layout(&dir, &atl_gralloc::vintf::device_hals()).unwrap();
+        let s = std::fs::read_to_string(dir.join("vendor/etc/vintf/manifest.xml")).unwrap();
+        let doc = roxmltree::Document::parse(&s).unwrap();
+        assert_eq!(
+            doc.descendants().filter(|n| n.has_tag_name("hal")).count(),
+            2
+        );
+        let system = std::fs::read_to_string(dir.join("system/etc/vintf/manifest.xml")).unwrap();
+        assert!(!system.contains("<hal"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -19,6 +19,7 @@ mod deps;
 mod farm;
 mod fetch;
 mod git;
+mod gralloc;
 mod host_art;
 mod instrument;
 mod libcxx_gate;
@@ -141,6 +142,10 @@ enum Test {
     Parcel(parcel::Args),
     /// atl-compositor's libgui wire codecs vs libgui's own C++ on host ART: Java-built Transactions marshalled by libgui decode and re-encode byte-equal in Rust, Rust's fully populated transaction survives libgui's reader and writer, Rust's callbacks run libgui's listener.
     Compositor(compositor::Args),
+    /// AOSP libui's graphics buffers on our allocator service and mapper.atl.so: two processes allocate, lock, share and read a 64x64 RGBA_8888 buffer, the allocator on this host's DRM device (WSL: vgem).
+    ///
+    /// Needs a DRM device that allocates linear buffers (the allocator names what is missing); the probe's per-case lines are printed.
+    Gralloc(gralloc::Args),
     /// The M2 gate: atld starts binderd, servicemanager, the M2 services and the test APK (xtask/testdata/app) through the broker; pass = its Activity.onCreate logs.
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
@@ -182,6 +187,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Compositor(args),
         } => compositor::run(&root, &args),
+        Command::Test {
+            test: Test::Gralloc(args),
+        } => gralloc::run(&root, &args),
         Command::Test {
             test: Test::Binder(args),
         } => binder::run(&root, &args),

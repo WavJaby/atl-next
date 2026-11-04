@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MIT
+//! One allocation: a checked descriptor becomes a dma-buf from the backend, the shared metadata page, and the handle parameters (`atl_gralloc::handle::Params`) the mapper parses in the importing process.
+
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use atl_gralloc::descriptor::Checked;
+use atl_gralloc::handle::Params;
+use atl_gralloc::shared;
+use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+use crate::backend::{Backend, BackendError};
+
+/// One buffer: its two descriptors in handle order (`handle::FD_DMABUF`, `handle::FD_PAGE`) and the ints' source.
+#[derive(Debug)]
+pub struct Allocation {
+    pub dmabuf: OwnedFd,
+    pub page: OwnedFd,
+    pub params: Params,
+}
+
+#[derive(Debug)]
+pub enum AllocError {
+    Backend(BackendError),
+    /// The metadata page could not be made.
+    Page(String),
+    /// The device returned a buffer that contradicts the request (smaller pitch than a row).
+    Inconsistent(&'static str),
+}
+
+impl std::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(e) => write!(f, "{e}"),
+            Self::Page(why) => write!(f, "metadata page: {why}"),
+            Self::Inconsistent(why) => write!(f, "device returned an inconsistent buffer: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for AllocError {}
+
+impl From<BackendError> for AllocError {
+    fn from(e: BackendError) -> Self {
+        Self::Backend(e)
+    }
+}
+
+/// The allocator: a backend, and the counter that makes buffer ids unique.
+pub struct Allocator {
+    backend: Backend,
+    counter: AtomicU32,
+    pid: u32,
+}
+
+impl Allocator {
+    pub fn new(backend: Backend) -> Self {
+        Self {
+            backend,
+            counter: AtomicU32::new(1),
+            pid: std::process::id(),
+        }
+    }
+
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// A zero-filled memfd page initialised with `name`. Written with `pwrite`, so this process never maps it.
+    fn new_page(name: &str) -> Result<OwnedFd, AllocError> {
+        let page = |why: &str, e: rustix::io::Errno| AllocError::Page(format!("{why}: {e}"));
+        let fd =
+            memfd_create("atl-gralloc-meta", MemfdFlags::CLOEXEC).map_err(|e| page("memfd", e))?;
+        ftruncate(&fd, shared::PAGE_SIZE as u64).map_err(|e| page("size", e))?;
+        let mut bytes = vec![0u8; shared::PAGE_SIZE];
+        shared::init(&mut bytes, name).map_err(|e| AllocError::Page(e.to_string()))?;
+        rustix::io::pwrite(&fd, &bytes, 0).map_err(|e| page("write", e))?;
+        Ok(fd)
+    }
+
+    /// Allocates one buffer for `d`.
+    pub fn allocate(&self, d: &Checked) -> Result<Allocation, AllocError> {
+        let dmabuf = self.backend.allocate(d.width, d.height, d.format.fourcc)?;
+        let row = u64::from(d.width) * u64::from(d.format.bytes_per_pixel);
+        if u64::from(dmabuf.pitch) < row || !dmabuf.pitch.is_multiple_of(d.format.bytes_per_pixel) {
+            return Err(AllocError::Inconsistent("pitch"));
+        }
+        if dmabuf.size < u64::from(dmabuf.pitch) * u64::from(d.height) {
+            return Err(AllocError::Inconsistent("size"));
+        }
+        let page = Self::new_page(&d.name)?;
+        // pid in the high half, a per-process counter below: unique among live buffers of the system as long as pids of live allocators are (one allocator process per system)
+        let id =
+            (u64::from(self.pid) << 32) | u64::from(self.counter.fetch_add(1, Ordering::Relaxed));
+        Ok(Allocation {
+            dmabuf: dmabuf.fd,
+            page,
+            params: Params {
+                width: d.width,
+                height: d.height,
+                pixel_format: d.format.pixel_format,
+                fourcc: d.format.fourcc,
+                pitch: dmabuf.pitch,
+                size: dmabuf.size,
+                usage: d.usage,
+                modifier: dmabuf.modifier,
+                id,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use atl_gralloc::descriptor::Descriptor;
+    use atl_gralloc::format::{DRM_FORMAT_ABGR8888, RGBA_8888};
+    use atl_gralloc::handle;
+
+    use super::*;
+    use crate::backend::DRM_DIR;
+
+    fn request() -> Checked {
+        Descriptor {
+            name: b"alloc-test\0".to_vec(),
+            width: 64,
+            height: 64,
+            layer_count: 1,
+            format: RGBA_8888,
+            usage: 0x33,
+            reserved_size: 0,
+            option_names: vec![],
+        }
+        .check()
+        .expect("valid")
+    }
+
+    #[test]
+    fn page_holds_the_name() {
+        let fd = Allocator::new_page("hello").expect("page");
+        let mut buf = vec![0u8; shared::PAGE_SIZE];
+        rustix::io::pread(&fd, &mut buf, 0).expect("read");
+        assert_eq!(shared::validate(&buf), Ok(()));
+        assert_eq!(shared::name(&buf), b"hello");
+    }
+
+    /// The round trip the importer does: ints from the allocation parse back, and ids differ per buffer. Needs a DRM node; without one the backend error must explain (see backend tests).
+    #[test]
+    fn allocation_round_trips_through_the_handle_ints() {
+        let Ok(backend) = Backend::start(Path::new(DRM_DIR), None, DRM_FORMAT_ABGR8888) else {
+            return;
+        };
+        let a = Allocator::new(backend);
+        let (x, y) = (
+            a.allocate(&request()).expect("first"),
+            a.allocate(&request()).expect("second"),
+        );
+        assert_ne!(x.params.id, y.params.id);
+        assert_eq!(x.params.id >> 32, u64::from(std::process::id()));
+        assert_eq!(
+            handle::Params::from_handle(handle::NUM_FDS, &x.params.to_ints()),
+            Ok(x.params)
+        );
+        assert_eq!(x.params.pixel_stride(), x.params.pitch / 4);
+    }
+}

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-gralloc-service"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The AIDL `android.hardware.graphics.allocator.IAllocator/default` service (M3 slice 2): AOSP libui's Gralloc5 allocator side. It allocates linear dma-bufs through GBM on the host's DRM device (`backend`), pairs each with the shared metadata page, and answers with the handle ints of atl-gralloc (`allocator`).
+# The binder front end (`service`, bin `atl-gralloc-allocator`) implements AOSP's own Rust stub (`android.hardware.graphics.allocator-V2-rust`, re-exported by atl-aidl) against libbinder_rs, so only `xtask native` builds it (feature `converter`); plain workspace builds take the GBM backend and the allocation logic with their tests.
+# No `unsafe` here: GBM comes through the `gbm` crate, the descriptor / handle / page logic is atl-gralloc's.
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/atl-aidl-stubs-rust", "device/android.hardware.graphics.allocator-V2-rust"]
+
+[features]
+converter = ["atl-aidl/converter"]
+
+# Registers the allocator with servicemanager (as atld does) and serves it; `xtask test gralloc` runs it as uid 1000.
+[[bin]]
+name = "atl-gralloc-allocator"
+path = "src/bin/allocator.rs"
+required-features = ["converter"]
+
+[dependencies]
+anyhow.workspace = true
+atl-aidl = { path = "../atl-aidl" }
+atl-gralloc = { path = "../atl-gralloc" }
+clap.workspace = true
+gbm.workspace = true
+rustix.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

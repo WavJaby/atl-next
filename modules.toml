@@ -30,10 +30,10 @@ crates = ["atl-broker"]
 exports = ["atl-broker"]
 uses = ["binder"]
 
-# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types)
+# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "property-service", "services"]
+uses = ["binder", "broker", "gralloc", "property-service", "services"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names
 [launcher]
@@ -63,6 +63,12 @@ uses = ["aidl", "generators", "broker"]
 crates = ["atl-compositor"]
 exports = ["atl-compositor"]
 
+# gralloc (M3 slice 2): AOSP libui's Gralloc5 halves -- the AIDL IAllocator service (GBM on the host's DRM device) and the stable-C IMapper v5 library (mapper.atl.so, dma-buf mapping), agreeing through the core's handle / metadata / VINTF definitions; the truth crate is `xtask test gralloc`'s two-process client of AOSP's libui (test-only)
+[gralloc]
+crates = ["atl-gralloc", "atl-gralloc-mapper", "atl-gralloc-service", "atl-gralloc-truth"]
+exports = ["atl-gralloc"]
+uses = ["aidl", "generators"]
+
 # binder IPC: uapi wire types + socket protocol, the userspace driver (core + socket server), libbinder's driver I/O over it
 [binder]
 crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]
@@ -88,5 +94,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld
-uses = ["layout", "binder", "broker", "services"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share
+uses = ["layout", "binder", "broker", "services", "gralloc"]

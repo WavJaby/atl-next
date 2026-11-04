@@ -79,6 +79,14 @@ arch = "flex"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# Mesa's GBM: the gralloc allocator service creates linear dma-bufs through libgbm on the host's DRM device (the gbm crate links it); the dev package carries gbm.pc and the lib link name. Arch ships libgbm in mesa.
+[gbm]
+debian = "libgbm-dev"
+arch = "mesa"
+pkgconfig = "gbm"
+scope = ["build", "runtime"]
+used_by = ["crate:atl-gralloc-service"]
+
 [git]
 debian = "git"
 arch = "git"
