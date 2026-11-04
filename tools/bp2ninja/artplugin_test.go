@@ -5,9 +5,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"

@@ -132,7 +132,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -240,7 +240,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			}
 		}
 	}
-	art, err := readArtPlugin(tree, cfg, *llvm)
+	art, err := readArtPlugin(tree, cfg, tools.LLVM)
 	if err != nil {
 		return err
 	}

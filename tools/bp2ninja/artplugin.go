@@ -80,7 +80,7 @@ type artPlugin struct {
 	codegenArches [2][]string
 	// android/config.go LibartImgDeviceBaseAddress / LibartImgHostBaseAddress
 	baseAddress [2]string
-	// ART_CLANG_PATH = -llvm, absolute: native_stack_dump.cc composes ANDROID_BUILD_TOP + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line"; lib_env sets ANDROID_BUILD_TOP=/
+	// ART_CLANG_PATH = -llvm, absolute. Host ART only (device ART has ART_TARGET: kUseAddr2line false); its FindAddr2line joins ANDROID_BUILD_TOP + "/" + ART_CLANG_PATH, so an absolute path needs ANDROID_BUILD_TOP=/ in the host ART's environment.
 	llvmPrefix string
 }
 
