@@ -182,6 +182,7 @@ public class ParcelTruth {
         check("ClientWindowFrames", clientWindowFrames(), ClientWindowFrames.CREATOR);
         check("MergedConfiguration", mergedConfiguration(config), MergedConfiguration.CREATOR);
         check("SurfaceControl", new SurfaceControl(), SurfaceControl.CREATOR);
+        checkSurfaceControlPresent("SurfaceControl:native");
         check("InsetsSourceControl.Array", new InsetsSourceControl.Array(), InsetsSourceControl.Array.CREATOR);
         check("WindowRelayoutResult", windowRelayoutResult(config), WindowRelayoutResult.CREATOR);
         // the desktop's device list (atl-services input.rs): the virtual keyboard (-1) and the pointer, both with the staged map
@@ -448,6 +449,59 @@ public class ParcelTruth {
         r.syncSeqId = 9;
         r.activityWindowInfo = new ActivityWindowInfo();
         return r;
+    }
+
+    /// A SurfaceControl with a native layer, as the window path's relayout reply carries it. The reference is written by hand in the layout SurfaceControl.java (writeToParcel)
+    /// and libgui's SurfaceControl::writeToParcel define; Rust decodes it and re-encodes it, word for word, binder objects included. Not read with the CREATOR here: that makes
+    /// libgui's SurfaceComposerClient, which waits for "SurfaceFlingerAIDL" (absent in this gate). The window gate has AOSP's Java and libgui read the bytes Rust writes.
+    static void checkSurfaceControlPresent(String name) {
+        IBinder client = new Binder();
+        IBinder handle = new Binder();
+        Parcel reference = Parcel.obtain();
+        reference.writeString8("window-layer");
+        reference.writeInt(1280);
+        reference.writeInt(800);
+        reference.writeInt(1);
+        reference.writeStrongBinder(client);
+        reference.writeStrongBinder(handle);
+        reference.writeInt(7);
+        reference.writeString("window-layer");
+        reference.writeInt(0);
+        reference.writeInt(1280);
+        reference.writeInt(800);
+        reference.writeInt(1);
+        int[] want = words(reference);
+        Parcel rust = Parcel.obtain();
+        if (roundTripParcel("android.view.SurfaceControl", reference, rust) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        int[] back = words(rust);
+        boolean ok = Arrays.equals(want, back);
+        result(ok, name, ok ? want.length * 4 + " bytes: java's reference -> rust -> byte-equal, native layer and binders kept" : "rust re-encodes " + back.length + " words, the reference " + want.length + ", first difference at word " + firstWordDiff(want, back));
+        reference.recycle();
+        rust.recycle();
+    }
+
+    /// The parcel's data as ints from position 0; the position is left at 0.
+    static int[] words(Parcel p) {
+        p.setDataPosition(0);
+        int[] w = new int[p.dataSize() / 4];
+        for (int i = 0; i < w.length; i++) {
+            w[i] = p.readInt();
+        }
+        p.setDataPosition(0);
+        return w;
+    }
+
+    static int firstWordDiff(int[] a, int[] b) {
+        int n = Math.min(a.length, b.length);
+        for (int i = 0; i < n; i++) {
+            if (a[i] != b[i]) {
+                return i;
+            }
+        }
+        return n;
     }
 
     /// An input channel pair's client end: Java -> codec -> Java with its descriptor and token (roundTripParcel); Java reads the copy back with the same name and a token.

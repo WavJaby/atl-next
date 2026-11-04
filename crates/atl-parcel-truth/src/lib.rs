@@ -144,6 +144,7 @@ fn copy_class(
         "android.os.Bundle" => copy_as::<Bundle>(src, dst),
         "android.content.Intent" => copy_as::<Intent>(src, dst),
         "android.view.InputChannel" => copy_as::<InputChannel>(src, dst),
+        "android.view.SurfaceControl" => copy_as::<SurfaceControl>(src, dst),
         "android.app.servertransaction.ClientTransaction" => copy_as::<ClientTransaction>(src, dst),
         _ => Err(format!("no parcel-copy codec for {class}")),
     }
