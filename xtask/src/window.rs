@@ -395,6 +395,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
+    // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
         &args.host,
@@ -402,7 +403,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.java_out.as_deref(),
         "window-art",
         args.verbose,
-    )?;
+    )?
+    .with_gralloc(root)?;
     let work = rt.out.join("window");
     let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
