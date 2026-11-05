@@ -325,6 +325,7 @@ impl HostArt {
 /// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
 ///   libhwui dlopens libandroid by name too (HardwareBufferHelpers, HardwareRenderer, HintSessionWrapper), with no DT_NEEDED on it, so no dependency closure builds it: required here.
 /// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
+/// - etc/security/cacerts -> /system/etc/security/cacerts (dangling outside the sandbox): Conscrypt's system CA dir is `$ANDROID_ROOT/etc/security/cacerts` when no APEX one exists; atld writes /system's from the distro bundle.
 fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<PathBuf> {
     let device = out.join("device");
     for module in ["libart", "libnativehelper", "libandroid"] {
@@ -339,7 +340,12 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
     }
     let lib = art.join(if pointer_bits == 64 { "lib64" } else { "lib" });
     let icu = art.join("com.android.i18n/etc/icu");
-    for d in [&lib, &icu, &art.join("com.android.tzdata")] {
+    for d in [
+        &lib,
+        &icu,
+        &art.join("com.android.tzdata"),
+        &art.join("etc/security"),
+    ] {
         std::fs::create_dir_all(d)?;
     }
     let link = |target: &Path, at: &Path| {
@@ -347,6 +353,10 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
             .with_context(|| format!("linking {} -> {}", at.display(), target.display()))
     };
     link(Path::new("."), &art.join("com.android.art"))?;
+    link(
+        Path::new("/system/etc/security/cacerts"),
+        &art.join("etc/security/cacerts"),
+    )?;
     for module in std::fs::read_dir(&device)? {
         let module = module?.path();
         if !module.is_dir() {

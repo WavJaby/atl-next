@@ -33,6 +33,8 @@ use atl_services::display_model::DisplayModel;
 use atl_services::packages::{Library, Manifest, PackageRecord};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+
+mod cacerts;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -220,7 +222,10 @@ fn link_into_framework(r: &Root, host: &Path) -> Result<String> {
     Ok(format!("/system/framework/{}", name.to_string_lossy()))
 }
 
-/// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it.
+/// The system CA store below /system (cacerts.rs); the staged ART root's `etc/security/cacerts` links to it.
+const CACERTS: &str = "etc/security/cacerts";
+
+/// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it; /system's CA store from the distro bundle.
 fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
     let framework = r.system().join("framework");
     std::fs::create_dir_all(&framework)?;
@@ -234,6 +239,7 @@ fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
         .iter()
         .map(|jar| link_into_framework(r, jar))
         .collect::<Result<Vec<_>>>()?;
+    cacerts::write_store(&cacerts::distro_bundle()?, &r.system().join(CACERTS))?;
     for (host, at) in &a.system_files {
         let at = r.system().join(at);
         ensure!(!at.exists(), "two /system files at {}", at.display());

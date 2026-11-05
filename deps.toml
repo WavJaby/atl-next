@@ -173,6 +173,13 @@ arch = "ninja"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# atld's CA store tests: `openssl x509 -subject_hash_old` is the independent oracle of the store's file names; `openssl req` makes the same-subject pair of the collision test
+[openssl]
+debian = "openssl"
+arch = "openssl"
+scope = ["test"]
+used_by = ["crate:atld"]
+
 # resolves deps.toml pkgconfig modules: versions (xtask deps) and providers.toml system: rows (xtask native)
 [pkgconf]
 debian = "pkgconf"
