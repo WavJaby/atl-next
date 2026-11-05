@@ -40,6 +40,8 @@ pub struct Args {
 const FIXTURE: &str = "xtask/testdata/app";
 /// What Main.onCreate logs (tag `AtlTest`), as the launcher's logger writes it (`<tag>: <message>`).
 const MARKER: &str = "AtlTest: onCreate reached";
+/// Main.onCreate's CA line before [`MARKER`]: the default TrustManagerFactory trusts a distro root (atld's /system CA store, cacerts.rs); `cacerts: trusted ...` passes, `cacerts: FAIL ...` says why not.
+const CACERTS: &str = "AtlTest: cacerts: ";
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -128,7 +130,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // atld waits for the allocator's ready line before it starts the app, so a started app means a registered allocator; the line is checked anyway, with the allocator's own log as the explanation
     let gralloc_log = read(&run.log("gralloc"));
     let gralloc_ok = !args.gralloc || gralloc_log.contains("gralloc: ready");
+    let cacerts = app
+        .lines()
+        .find_map(|l| l.split_once(CACERTS).map(|(_, r)| r.to_owned()))
+        .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
+    if passed && !cacerts.starts_with("trusted ") {
+        let why = format!("CA store: {cacerts}");
+        println!("app: FAIL {why}");
+        println!(
+            "{}",
+            crate::verdict::gate("app", std::slice::from_ref(&why))
+        );
+        return Ok(ExitCode::FAILURE);
+    }
     if passed && gralloc_ok {
+        println!("app: cacerts {cacerts}");
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         if args.gralloc {
             println!("app: gralloc registered: {}", gralloc_log.trim());
