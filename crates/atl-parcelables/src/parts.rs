@@ -276,7 +276,7 @@ pub fn r_component(p: &In<'_>) -> Result<Option<ComponentName>> {
     Ok(Some(ComponentName { package, class }))
 }
 
-/// android.net.Uri (net/Uri.java writeToParcel(Parcel, Uri) / CREATOR): 0 for null, StringUri = 1 + String8. OpaqueUri (2) and HierarchicalUri (3) are refused.
+/// android.net.Uri (net/Uri.java writeToParcel(Parcel, Uri) / CREATOR): 0 for null, else the type int and String8. StringUri (1), OpaqueUri (2) and HierarchicalUri (3) all write toString() that way (Uri.java:520, :899, :1225); writing uses StringUri's type.
 pub fn w_uri(p: &mut In<'_>, v: &Option<String>) -> Result<()> {
     match v {
         None => w_i32(p, 0),
@@ -289,8 +289,8 @@ pub fn w_uri(p: &mut In<'_>, v: &Option<String>) -> Result<()> {
 pub fn r_uri(p: &In<'_>) -> Result<Option<String>> {
     match r_i32(p)? {
         0 => Ok(None),
-        1 => r_str8(p),
-        _ => Err(crate::refuse("android.net.Uri (opaque / hierarchical)")),
+        1..=3 => r_str8(p),
+        _ => Err(crate::refuse("android.net.Uri (unknown type)")),
     }
 }
 

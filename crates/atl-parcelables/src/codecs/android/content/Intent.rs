@@ -15,7 +15,7 @@ use crate::parts::*;
 #[derive(Debug, Clone, Default)]
 pub struct Intent {
     pub action: Option<String>,
-    /// mData as a StringUri's string
+    /// mData as the Uri's toString() (parts::r_uri)
     pub data: Option<String>,
     pub r#type: Option<String>,
     pub identifier: Option<String>,
