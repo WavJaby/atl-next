@@ -39,6 +39,13 @@ public class Main extends Activity {
     private ListView list;
     private Bitmap first;
 
+    // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines)
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent e) {
+        Log.i(TAG, "touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY());
+        return super.dispatchTouchEvent(e);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
