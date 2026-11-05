@@ -19,6 +19,7 @@ converter = ["atl-aidl/converter", "atl-libinput/converter", "atl-services/conve
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
+atl-android-paths = { path = "../atl-android-paths" }
 atl-compositor = { path = "../atl-compositor" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-ui = { path = "../atl-platform-ui" }

@@ -9,6 +9,8 @@ pub const SYSTEM: &str = "/system";
 pub const SYSTEM_FRAMEWORK: &str = "/system/framework";
 /// The CA store Conscrypt's `TrustedCertificateStore` reads (`$ANDROID_ROOT/etc/security/cacerts`).
 pub const SYSTEM_CACERTS: &str = "/system/etc/security/cacerts";
+/// AOSP's key layout for a keyboard with no own files (`KeyMap::load`'s `Generic` fallback under `$ANDROID_ROOT/usr/keylayout`), where the environment links it.
+pub const SYSTEM_GENERIC_KEY_LAYOUT: &str = "/system/usr/keylayout/Generic.kl";
 /// `ANDROID_DATA`: per-app install and data dirs, bound writable.
 pub const DATA: &str = "/data";
 /// Installed packages (`Environment.getDataAppDirectory`): `<DATA_APP>/<package>/base.apk`.

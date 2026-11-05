@@ -211,7 +211,7 @@ mod publish {
     const CHANNEL: &str = "atl-headless-pointer";
 
     /// AOSP's key layout of a keyboard with no own files (KeyMap::load's Generic fallback), where the environment links it.
-    const KEY_LAYOUT: &str = "/system/usr/keylayout/Generic.kl";
+    const KEY_LAYOUT: &str = atl_android_paths::SYSTEM_GENERIC_KEY_LAYOUT;
 
     /// `k` as the KeyEvent numbered `seq`.
     fn key_event(k: &Key, seq: u32) -> KeyEvent {
