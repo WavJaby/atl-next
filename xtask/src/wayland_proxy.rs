@@ -8,6 +8,7 @@
 //!
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
+//! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
 //! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
@@ -54,6 +55,18 @@ const XDG_SURFACE_CONFIGURE: u16 = 0;
 const XDG_STATE_ACTIVATED: u32 = 4;
 const WL_SEAT: &str = "wl_seat";
 const WL_SEAT_GET_POINTER: u16 = 0;
+const WL_SEAT_GET_TOUCH: u16 = 2;
+/// `wl_seat.capabilities(caps)`, event 0; the touch bit (wayland.xml `wl_seat.capability`).
+const WL_SEAT_CAPABILITIES: u16 = 0;
+const SEAT_CAP_TOUCH: u32 = 4;
+/// `wl_display.sync(new_id)` request 0, `delete_id(id)` event 1.
+const WL_DISPLAY_SYNC: u16 = 0;
+const WL_DISPLAY_DELETE_ID: u16 = 1;
+/// `wl_touch` events (wayland.xml): down, up, motion, frame.
+const WL_TOUCH_DOWN: u16 = 0;
+const WL_TOUCH_UP: u16 = 1;
+const WL_TOUCH_MOTION: u16 = 2;
+const WL_TOUCH_FRAME: u16 = 3;
 const WL_POINTER: &str = "wl_pointer";
 /// `wl_pointer` events (wayland.xml), with the version that introduced each one past v1.
 const WL_POINTER_ENTER: u16 = 0;
@@ -108,6 +121,10 @@ pub enum Event {
     PointerInjected,
     /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
     ConfigureInjected { serial: u32 },
+    /// The client asked for a `wl_touch` (`wl_seat.get_touch`); it is the proxy's (the compositor never sees it), and [`Proxy::inject_touch`] writes on it.
+    TouchCreated,
+    /// [`Proxy::inject_touch`]'s action was written to the client.
+    TouchInjected,
     /// A client connection closed.
     Closed,
 }
@@ -119,6 +136,8 @@ struct Ids {
     interfaces: HashMap<u32, String>,
     /// The client's `wl_pointer` (from `wl_seat.get_pointer`).
     pointer: Option<u32>,
+    /// The client's `wl_touch`, the proxy's own (see [`Proxy::inject_touch`]).
+    touch: Option<u32>,
     /// The version the client bound `wl_seat` at, which its `wl_pointer` inherits: events newer than it must not be sent.
     seat_version: Option<u32>,
     /// The `wl_surface` of the first `xdg_surface`: the window.
@@ -176,6 +195,10 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         ids.interfaces.insert(pointer, WL_POINTER.to_owned());
         ids.pointer = Some(pointer);
         return None;
+    }
+    if ids.interfaces.get(&object).is_some_and(|i| i == WL_SEAT) && opcode == WL_SEAT_GET_TOUCH {
+        ids.touch = word(body, 0);
+        return Some(Event::TouchCreated);
     }
     if ids.interfaces.get(&object).is_some_and(|i| i == WM_BASE)
         && opcode == XDG_WM_BASE_GET_XDG_SURFACE
@@ -279,10 +302,22 @@ pub enum PointerAction {
     FingerStop,
 }
 
+/// A touch action the proxy injects on its `wl_touch`, each followed by `frame`. `id` is the wl_touch contact id; coordinates surface-local, logical.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchAction {
+    Down { id: i32, x: f64, y: f64 },
+    Motion { id: i32, x: f64, y: f64 },
+    Up { id: i32 },
+}
+
 /// What the proxy writes to the client between two forwarded messages.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Injection {
     Ping(u32),
+    Touch {
+        action: TouchAction,
+        time_ms: u32,
+    },
     Pointer {
         action: PointerAction,
         time_ms: u32,
@@ -344,6 +379,12 @@ impl Proxy {
     pub fn inject_pointer(&self, action: PointerAction) -> Result<()> {
         let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
         self.queue(Injection::Pointer { action, time_ms })
+    }
+
+    /// Queues a touch action on the client's `wl_touch`, at its window surface. The compositor's seat need have no touch: the proxy adds the capability, answers `get_touch` itself and is the only source of its events (module doc). Nothing is written before the client has the touch and its window.
+    pub fn inject_touch(&self, action: TouchAction) -> Result<()> {
+        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.queue(Injection::Touch { action, time_ms })
     }
 
     /// Queues an xdg-shell configure of the window: `xdg_toplevel.configure(width, height, activated)`, then `xdg_surface.configure(serial)`, the order a compositor sends them.
@@ -434,16 +475,27 @@ fn client_to_server(
             let mut at = 0;
             while let Some((object, opcode, size)) = message(&pending[at..]) {
                 let raw = &pending[at..at + size];
+                // the touch is the proxy's: its requests (release) never reach the compositor
+                let on_touch = ids.touch == Some(object);
                 let event = note_request(&mut ids, object, opcode, &raw[HEADER_BYTES..]);
-                let absorbed = match &event {
-                    Some(Event::Acked { serial }) => ids.injected.contains(serial),
-                    _ => false,
-                };
+                let absorbed = on_touch
+                    || match &event {
+                        Some(Event::Acked { serial }) => ids.injected.contains(serial),
+                        _ => false,
+                    };
+                if event == Some(Event::TouchCreated) {
+                    // the compositor's seat has no touch and refuses get_touch (wlroots: protocol error), but the client's new id must still be taken, in order:
+                    // a wl_display.sync takes it, and its callback's done and delete_id are dropped on the way back (server_to_client)
+                    forwarded.extend(self::event(
+                        WL_DISPLAY_ID,
+                        WL_DISPLAY_SYNC,
+                        &raw[HEADER_BYTES..HEADER_BYTES + 4],
+                    ));
+                } else if !absorbed {
+                    forwarded.extend_from_slice(raw);
+                }
                 if let Some(event) = event {
                     let _ = events.send((Instant::now(), event));
-                }
-                if !absorbed {
-                    forwarded.extend_from_slice(raw);
                 }
                 at += size;
             }
@@ -483,11 +535,38 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let wm_base = ids
-                .lock()
-                .map_err(|_| anyhow::anyhow!("ids poisoned"))?
-                .id_of(WM_BASE);
+            let (wm_base, seats, touch) = {
+                let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
+                let seats: Vec<u32> = ids
+                    .interfaces
+                    .iter()
+                    .filter_map(|(id, i)| (i == WL_SEAT).then_some(*id))
+                    .collect();
+                (ids.id_of(WM_BASE), seats, ids.touch)
+            };
+            // the seat claims touch, so the client asks for the proxy's wl_touch; the sync that took that id answers on it and deletes it: both are the proxy's to drop
+            let mut out = Vec::with_capacity(pending.len());
             let complete = scan(&pending, |object, opcode, body| {
+                let id_of_touch = |v: Option<u32>| v.is_some() && v == touch;
+                if id_of_touch(Some(object))
+                    || (object == WL_DISPLAY_ID
+                        && opcode == WL_DISPLAY_DELETE_ID
+                        && id_of_touch(word(body, 0)))
+                {
+                    return;
+                }
+                if seats.contains(&object)
+                    && opcode == WL_SEAT_CAPABILITIES
+                    && let Some(caps) = word(body, 0)
+                {
+                    out.extend(self::event(
+                        object,
+                        opcode,
+                        &(caps | SEAT_CAP_TOUCH).to_ne_bytes(),
+                    ));
+                    return;
+                }
+                out.extend(self::event(object, opcode, body));
                 if Some(object) == wm_base
                     && opcode == XDG_WM_BASE_PING
                     && let Some(serial) = word(body, 0)
@@ -502,7 +581,7 @@ fn server_to_client(
                 }
             });
             if complete > 0 {
-                forward(client.as_fd(), &pending[..complete], &mut fds)?;
+                forward(client.as_fd(), &out, &mut fds)?;
                 pending.drain(..complete);
             }
         }
@@ -519,11 +598,12 @@ fn server_to_client(
         if items.is_empty() {
             continue;
         }
-        let (wm_base, pointer, surface, toplevel, xdg_surface, seat_version) = {
+        let (wm_base, pointer, touch, surface, toplevel, xdg_surface, seat_version) = {
             let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
             (
                 ids.id_of(WM_BASE),
                 ids.pointer,
+                ids.touch,
                 ids.surface,
                 ids.toplevel,
                 ids.xdg_surface,
@@ -568,6 +648,18 @@ fn server_to_client(
                     _ => {
                         eprintln!(
                             "wayland proxy: {action:?} dropped, the client has no pointer and window surface yet"
+                        );
+                        continue;
+                    }
+                },
+                Injection::Touch { action, time_ms } => match (touch, surface) {
+                    (Some(touch), Some(surface)) => {
+                        let _ = events.send((Instant::now(), Event::TouchInjected));
+                        touch_bytes(touch, surface, action, time_ms)
+                    }
+                    _ => {
+                        eprintln!(
+                            "wayland proxy: {action:?} dropped, the client has no touch and window surface yet"
                         );
                         continue;
                     }
@@ -636,6 +728,31 @@ fn configure_bytes(
         XDG_SURFACE_CONFIGURE,
         &serial.to_ne_bytes(),
     ));
+    out
+}
+
+/// A touch action's `wl_touch` events, then `frame`. The serial of down and up is the timestamp, as for the pointer.
+fn touch_bytes(touch: u32, surface: u32, action: TouchAction, time_ms: u32) -> Vec<u8> {
+    let t = time_ms.to_ne_bytes();
+    let ev = |opcode: u16, args: &[[u8; 4]]| event(touch, opcode, &args.concat());
+    let mut out = match action {
+        TouchAction::Down { id, x, y } => ev(
+            WL_TOUCH_DOWN,
+            &[
+                t,
+                t,
+                surface.to_ne_bytes(),
+                id.to_ne_bytes(),
+                fixed(x),
+                fixed(y),
+            ],
+        ),
+        TouchAction::Motion { id, x, y } => {
+            ev(WL_TOUCH_MOTION, &[t, id.to_ne_bytes(), fixed(x), fixed(y)])
+        }
+        TouchAction::Up { id } => ev(WL_TOUCH_UP, &[t, t, id.to_ne_bytes()]),
+    };
+    out.extend(event(touch, WL_TOUCH_FRAME, &[]));
     out
 }
 
@@ -834,6 +951,28 @@ mod tests {
         assert_eq!(pointer_bytes(20, 30, 5, wheel, 5), Some(tail(v5)));
         assert_eq!(pointer_bytes(20, 30, 4, wheel, 5), None);
         assert_eq!(pointer_bytes(20, 30, 4, PointerAction::FingerStop, 5), None);
+    }
+
+    /// wl_touch.down is serial, time, surface, id, x, y (wayland.xml): 8 + 24 bytes, then a bare frame (opcode 3, 8 bytes); x 10.5 is 2688 in 24.8.
+    #[test]
+    fn touch_down_follows_the_wire_format() {
+        let b = touch_bytes(
+            9,
+            5,
+            TouchAction::Down {
+                id: 1,
+                x: 10.5,
+                y: 2.0,
+            },
+            7,
+        );
+        assert_eq!(b.len(), 40);
+        assert_eq!(message(&b), Some((9, WL_TOUCH_DOWN, 32)));
+        assert_eq!(
+            (word(&b, 16), word(&b, 20), word(&b, 24)),
+            (Some(5), Some(1), Some(2688))
+        );
+        assert_eq!(message(&b[32..]), Some((9, WL_TOUCH_FRAME, 8)));
     }
 
     #[test]

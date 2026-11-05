@@ -9,6 +9,7 @@
 //!   Android flings from the finger's own velocity (handleFling ignores the library's), so no fling is synthesized here.
 
 use atl_platform_ui::{InputEvent, PhysPoint, PointerButton, PointerPhase, ScrollKind};
+use atl_services::input_devices::{POINTER, SOURCE_MOUSE};
 
 /// MotionEvent actions (NDK input.h AMOTION_EVENT_ACTION_*).
 pub const ACTION_DOWN: i32 = 0;
@@ -26,8 +27,6 @@ pub const AXIS_VSCROLL: i32 = 9;
 pub const AXIS_HSCROLL: i32 = 10;
 pub const AXIS_GESTURE_SCROLL_X_DISTANCE: i32 = 50;
 pub const AXIS_GESTURE_SCROLL_Y_DISTANCE: i32 = 51;
-/// InputDevice.SOURCE_MOUSE (input.h).
-pub const SOURCE_MOUSE: i32 = 0x0000_2002;
 /// TOOL_TYPE_FINGER 1, TOOL_TYPE_MOUSE 3 (input.h).
 pub const TOOL_TYPE_FINGER: i32 = 1;
 pub const TOOL_TYPE_MOUSE: i32 = 3;
@@ -55,23 +54,40 @@ fn button_bit(button: PointerButton) -> i32 {
     }
 }
 
-/// One MotionEvent of a single pointer, before the publisher numbers it. Positions are physical pixels of the window content; times are the platform's ms.
+/// One pointer of a MotionEvent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MotionPointer {
+    pub id: i32,
+    pub tool_type: i32,
+    /// The pointer's position.
+    pub at: PhysPoint,
+    pub axes: Vec<(i32, f32)>,
+}
+
+/// One MotionEvent, before the publisher numbers it. Positions are physical pixels of the window content; times are the platform's ms.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Motion {
+    /// The device (atl-services input_devices).
+    pub device_id: i32,
     pub action: i32,
     pub action_button: i32,
     pub button_state: i32,
     pub flags: i32,
     pub classification: u8,
     pub source: i32,
-    pub tool_type: i32,
-    /// The pointer's position.
-    pub at: PhysPoint,
-    /// The cursor position, where a mouse-source event hit-tests (MotionEvent.getXDispatchLocation).
+    /// In pointer-id order (TouchInputMapper dispatches its id bits ascending); a mouse or a swipe has one, id 0.
+    pub pointers: Vec<MotionPointer>,
+    /// The cursor position, where a mouse-source event hit-tests (MotionEvent.getXDispatchLocation); NaN (AMOTION_EVENT_INVALID_CURSOR_POSITION) for a touchscreen, which hit-tests at its pointer.
     pub cursor: PhysPoint,
-    pub axes: Vec<(i32, f32)>,
     pub down_ms: u32,
     pub time_ms: u32,
+}
+
+impl Motion {
+    /// The first pointer (a mouse's only one).
+    pub fn first(&self) -> &MotionPointer {
+        &self.pointers[0]
+    }
 }
 
 /// The fake finger of an open touchpad swipe.
@@ -107,16 +123,20 @@ impl Pointer {
     ) -> Motion {
         let in_gesture = self.buttons != 0 || action == ACTION_UP;
         Motion {
+            device_id: POINTER,
             action,
             action_button,
             button_state: self.buttons,
             flags: 0,
             classification: 0,
             source: SOURCE_MOUSE,
-            tool_type: TOOL_TYPE_MOUSE,
-            at,
+            pointers: vec![MotionPointer {
+                id: 0,
+                tool_type: TOOL_TYPE_MOUSE,
+                at,
+                axes,
+            }],
             cursor: at,
-            axes,
             down_ms: if in_gesture { self.down_ms } else { time_ms },
             time_ms,
         }
@@ -131,16 +151,20 @@ impl Pointer {
         time_ms: u32,
     ) -> Motion {
         Motion {
+            device_id: POINTER,
             action,
             action_button: 0,
             button_state: 0,
             flags: FLAG_IS_GENERATED_GESTURE,
             classification: CLASSIFICATION_TWO_FINGER_SWIPE,
             source: SOURCE_MOUSE,
-            tool_type: TOOL_TYPE_FINGER,
-            at: swipe.finger,
+            pointers: vec![MotionPointer {
+                id: 0,
+                tool_type: TOOL_TYPE_FINGER,
+                at: swipe.finger,
+                axes,
+            }],
             cursor,
-            axes,
             down_ms: swipe.down_ms,
             time_ms,
         }
@@ -282,6 +306,8 @@ impl Pointer {
             }
             // window focus is the dispatcher's, not the pointer's
             InputEvent::Focus(_) => {}
+            // touch contacts are the touchscreen's (touch.rs)
+            InputEvent::Touch(_) => {}
         }
         out
     }
@@ -391,8 +417,16 @@ mod tests {
         let mut p = Pointer::default();
         let m = p.translate(scroll(ScrollKind::Wheel { dx: 0.5, dy: 1.0 }, 1));
         assert_eq!(m.len(), 1);
-        assert_eq!((m[0].action, m[0].source, m[0].tool_type), (8, 0x2002, 3));
-        assert_eq!(m[0].axes, vec![(9, -1.0), (10, 0.5)]);
+        assert_eq!(
+            (
+                m[0].action,
+                m[0].source,
+                m[0].first().tool_type,
+                m[0].device_id
+            ),
+            (8, 0x2002, 3, 1)
+        );
+        assert_eq!(m[0].first().axes, vec![(9, -1.0), (10, 0.5)]);
         assert_eq!(m[0].cursor, P);
     }
 
@@ -409,21 +443,26 @@ mod tests {
         );
         let (down, moved) = (&first[1], &first[2]);
         assert_eq!(
-            (down.source, down.tool_type, down.classification, down.flags),
+            (
+                down.source,
+                down.first().tool_type,
+                down.classification,
+                down.flags
+            ),
             (0x2002, 1, 3, 0x8)
         );
-        assert_eq!(down.at, P);
-        assert_eq!(down.axes, vec![(2, 1.0)]);
-        assert_eq!(moved.at, PhysPoint { x: 100.0, y: 190.0 });
+        assert_eq!(down.first().at, P);
+        assert_eq!(down.first().axes, vec![(2, 1.0)]);
+        assert_eq!(moved.first().at, PhysPoint { x: 100.0, y: 190.0 });
         assert_eq!(moved.cursor, P);
-        assert_eq!(moved.axes, vec![(2, 1.0), (50, 0.0), (51, 10.0)]);
+        assert_eq!(moved.first().axes, vec![(2, 1.0), (50, 0.0), (51, 10.0)]);
         assert!(p.in_gesture());
         // a pointer move during the swipe is no hover
         assert!(p.translate(pointer(PointerPhase::Move, 3)).is_empty());
         let up = p.translate(scroll(ScrollKind::SwipeEnd, 4));
         assert_eq!((up.len(), up[0].action, up[0].down_ms), (1, 1, 2));
-        assert_eq!(up[0].at, PhysPoint { x: 100.0, y: 190.0 });
-        assert_eq!(up[0].axes, vec![(2, 0.0)]);
+        assert_eq!(up[0].first().at, PhysPoint { x: 100.0, y: 190.0 });
+        assert_eq!(up[0].first().axes, vec![(2, 0.0)]);
         assert!(!p.in_gesture());
         assert!(p.translate(scroll(ScrollKind::SwipeEnd, 5)).is_empty());
     }

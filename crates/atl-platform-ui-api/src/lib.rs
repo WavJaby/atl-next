@@ -243,11 +243,39 @@ pub struct ScrollEvent {
     pub time_ms: u32,
 }
 
+/// What a touch contact did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    /// The contact touched down.
+    Down,
+    /// The contact moved.
+    Move,
+    /// The contact lifted.
+    Up,
+    /// The toolkit or compositor took the contact away (a desktop gesture claimed it): the touch sequence is void.
+    Cancel,
+}
+
+/// One touch contact event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchEvent {
+    /// What happened.
+    pub phase: TouchPhase,
+    /// The contact: the lowest id no other down contact holds, from its Down to its Up or Cancel (the numbering Android's pointer ids use, TouchInputMapper).
+    pub id: u32,
+    /// Where, in physical pixels of the window content.
+    pub position: PhysPoint,
+    /// Event time in milliseconds on the toolkit's clock.
+    pub time_ms: u32,
+}
+
 /// An input event of a window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
-    /// Mouse or touchpad pointer. Touch, stylus, keys and gamepads are added by the slice that first consumes them.
+    /// Mouse or touchpad pointer. Stylus, keys and gamepads are added by the slice that first consumes them.
     Pointer(PointerEvent),
+    /// A touchscreen contact.
+    Touch(TouchEvent),
     /// The window gained (`true`) or lost keyboard focus (the desktop's active toplevel). Android's window focus follows it; on loss, held keys are cancelled by their consumer.
     Focus(bool),
     /// Wheel or touchpad scrolling.

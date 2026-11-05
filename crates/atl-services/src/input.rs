@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list: the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD) and one pointer. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(VIRTUAL_KEYBOARD) (:365-376) takes the keyboard's native map from getInputDevice(-1), so the keyboard carries Virtual.kcm in Parcel form, loaded by AOSP's own libinput through atl-libinput (the environment supplies the file, rung 2). The pointer carries the same bytes: it has no keys, and a second map would be a second file. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
+//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list (ids: input_devices.rs): the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD), the mouse and the touchscreen. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(VIRTUAL_KEYBOARD) (:365-376) takes the keyboard's native map from getInputDevice(-1), so the keyboard carries Virtual.kcm in Parcel form, loaded by AOSP's own libinput through atl-libinput (the environment supplies the file, rung 2). The pointer devices carry the same bytes: they have no keys, and a second map would be a second file. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
 
 use atl_aidl::aidl::android::hardware::input::IInputManager::{
     BnInputManager, EnforcePermission, IInputManager,
@@ -8,18 +8,14 @@ use atl_parcelables::android::view::{InputDevice, PointerIcon};
 use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
+use crate::input_devices::{
+    POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHSCREEN, TOUCHSCREEN, VIRTUAL_KEYBOARD,
+};
 use crate::{counters, permission};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IInputManager";
-/// InputManagerGlobal.VIRTUAL_KEYBOARD: KeyCharacterMap.load(deviceId) asks for it by this id.
-const VIRTUAL_KEYBOARD: i32 = -1;
-/// The pointer's id (the first id after the virtual keyboard's).
-const POINTER: i32 = 1;
-/// InputDevice.SOURCE_KEYBOARD (SOURCE_CLASS_BUTTON | 0x100) and SOURCE_MOUSE (SOURCE_CLASS_POINTER | 0x2000).
-const SOURCE_KEYBOARD: i32 = 0x0000_0101;
-const SOURCE_MOUSE: i32 = 0x0000_2002;
-/// InputDevice.KEYBOARD_TYPE_ALPHABETIC; the pointer has no keyboard type (KEYBOARD_TYPE_NONE = 0).
+/// InputDevice.KEYBOARD_TYPE_ALPHABETIC; pointer devices have no keyboard type (KEYBOARD_TYPE_NONE = 0).
 const KEYBOARD_TYPE_ALPHABETIC: i32 = 2;
 /// Display.INVALID_DISPLAY: the Builder default, a device not tied to a display.
 const INVALID_DISPLAY: i32 = -1;
@@ -30,7 +26,7 @@ struct InputManager {
 
 impl Interface for InputManager {}
 
-/// The desktop's devices; both carry the keyboard map (see the module doc).
+/// The desktop's devices; each carries the keyboard map (see the module doc).
 fn devices(map: &[u8]) -> Vec<InputDevice> {
     let base = InputDevice {
         key_character_map: map.to_vec(),
@@ -55,6 +51,13 @@ fn devices(map: &[u8]) -> Vec<InputDevice> {
             name: Some("ATL pointer".into()),
             descriptor: Some("atl:pointer".into()),
             sources: SOURCE_MOUSE,
+            ..base.clone()
+        },
+        InputDevice {
+            id: TOUCHSCREEN,
+            name: Some("ATL touchscreen".into()),
+            descriptor: Some("atl:touchscreen".into()),
+            sources: SOURCE_TOUCHSCREEN,
             ..base
         },
     ]

@@ -55,13 +55,14 @@ public class Main extends Activity {
     /** The last touch gesture was a touchpad swipe: its fling does not start the cadence run, the drag after it does. */
     private boolean swipeGesture;
 
-    // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines); `class` 3 = a touchpad swipe's fake finger (MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE)
+    // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines); `class` 3 = a touchpad swipe's fake finger (MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE); `source` 8194 mouse, 4098 touchscreen
     @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent e) {
         if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
             swipeGesture = e.getClassification() == CLASSIFICATION_TWO_FINGER_SWIPE;
         }
-        Log.i(TAG, "touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY() + " class=" + e.getClassification());
+        Log.i(TAG, "touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY() + " class=" + e.getClassification()
+                + " source=" + e.getSource() + " pointers=" + e.getPointerCount() + " device=" + e.getDeviceId());
         return super.dispatchTouchEvent(e);
     }
 

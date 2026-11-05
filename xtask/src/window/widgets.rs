@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use atl_services::display_model::DisplayModel;
+use atl_services::input_devices;
 
 use super::{
     ACK_WAIT, BTN_LEFT, Liveness, POLL, Sub, await_event, cadence_check, capture_line,
@@ -16,7 +17,7 @@ use super::{
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
-use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
+use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask/testdata/widgets";
@@ -62,6 +63,12 @@ const FLING_WAIT: Duration = Duration::from_secs(5);
 const LIST_ROW_SCALE: i64 = 100_000;
 /// MotionEvent actions and the touchpad swipe's classification (NDK input.h).
 const ACTION_DOWN: u32 = 0;
+/// The fixture logs MotionEvent.getSource() / getDeviceId(); the values the composer stamps (atl-services input_devices).
+const SOURCE_MOUSE: i64 = input_devices::SOURCE_MOUSE as i64;
+const SOURCE_TOUCHSCREEN: i64 = input_devices::SOURCE_TOUCHSCREEN as i64;
+const TOUCHSCREEN_DEVICE: i64 = input_devices::TOUCHSCREEN as i64;
+/// The touch: two fingers TOUCH_GAP_PX apart across the list, moved up DRAG_PX in SCROLL_STEPS motions each, the second lifting first.
+const TOUCH_GAP_PX: f64 = 40.0;
 const ACTION_UP: u32 = 1;
 const ACTION_MOVE: u32 = 2;
 const ACTION_HOVER_MOVE: u32 = 7;
@@ -423,13 +430,21 @@ fn window_check(app: &str) -> Result<String, String> {
     Ok("second window shown and closed; the tap after it reached Main (click 2)".to_owned())
 }
 
-/// The drag (the last plain touch DOWN, class 0) scrolled the list toward its end.
+/// A fixture `touch` line's field `key` (source, pointers, device).
+fn touch_field(line: &str, key: &str) -> Option<i64> {
+    let (_, rest) = line.split_once("AtlWindow: touch ")?;
+    word(rest, key)?.parse().ok()
+}
+
+/// The mouse drag (the last plain mouse DOWN: class 0, source mouse) scrolled the list toward its end.
 fn list_check(app: &str) -> Result<String, String> {
     let lines: Vec<&str> = app.lines().collect();
     let down = lines
         .iter()
-        .rposition(|l| touch(l) == Some((ACTION_DOWN, 0)))
-        .ok_or("no touch DOWN at all")?;
+        .rposition(|l| {
+            touch(l) == Some((ACTION_DOWN, 0)) && touch_field(l, "source") == Some(SOURCE_MOUSE)
+        })
+        .ok_or("no mouse DOWN at all")?;
     let before = position_before(&lines, down);
     let after = lines[down..]
         .iter()
@@ -443,6 +458,48 @@ fn list_check(app: &str) -> Result<String, String> {
     }
     Ok(format!(
         "drag scrolled the list: position {before} -> {after}"
+    ))
+}
+
+/// The two-finger touch on the list: from the touchscreen (source, device), as DOWN(0) 1 pointer, POINTER_DOWN(5) 2, MOVE(2) 2, POINTER_UP(6) 2, UP(1) 1 (input.h codes; TouchInputMapper's sequence), and the list scrolled after its DOWN.
+fn touch_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let from_screen = |l: &str| touch_field(l, "source") == Some(SOURCE_TOUCHSCREEN);
+    let first = lines
+        .iter()
+        .position(|l| from_screen(l))
+        .ok_or("no touchscreen event at all")?;
+    let mut seq: Vec<(i64, i64)> = Vec::new();
+    for l in lines[first..].iter().filter(|l| from_screen(l)) {
+        if touch_field(l, "device") != Some(TOUCHSCREEN_DEVICE) {
+            return Err(format!("a touchscreen event from another device: {l}"));
+        }
+        let (action, _) = touch(l).ok_or("unparsed touch line")?;
+        let step = (i64::from(action), touch_field(l, "pointers").unwrap_or(0));
+        // repeated MOVEs are one step
+        if seq.last() != Some(&step) {
+            seq.push(step);
+        }
+    }
+    let want = [(0, 1), (5, 2), (2, 2), (6, 2), (1, 1)];
+    if seq != want {
+        return Err(format!(
+            "touchscreen (action, pointers) {seq:?}, want {want:?}"
+        ));
+    }
+    let before = position_before(&lines, first);
+    let after = lines[first..]
+        .iter()
+        .filter_map(|l| list_position(l))
+        .max()
+        .unwrap_or(before);
+    if after <= before {
+        return Err(format!(
+            "the touch did not scroll the list: position {before} -> {after}"
+        ));
+    }
+    Ok(format!(
+        "two fingers from the touchscreen {seq:?}; list position {before} -> {after}"
     ))
 }
 
@@ -490,6 +547,7 @@ pub fn checks(
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
         ("list", list_check(app)),
+        ("touch", touch_check(app)),
         ("readback", readback_check(app)),
         ("presents", presents_check(app)),
         ("cadence", cadence_check(after, display.refresh_hz)),
@@ -635,6 +693,25 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     }) {
         return Err("the list did not scroll after the drag".to_owned());
     }
+    // two fingers on the touchscreen, once the drag's fling is idle; a miss leaves the touch check to fail alone
+    wait_until(app_log, FLING_WAIT, |t| {
+        t.rfind("AtlWindow: list state=0") > t.rfind("AtlWindow: list state=2")
+    });
+    let (x2, step) = (x + TOUCH_GAP_PX, DRAG_PX / f64::from(SCROLL_STEPS));
+    let mut fingers = vec![
+        TouchAction::Down { id: 0, x, y },
+        TouchAction::Down { id: 1, x: x2, y },
+    ];
+    for n in 1..=SCROLL_STEPS {
+        let y = y - step * f64::from(n);
+        fingers.push(TouchAction::Motion { id: 0, x, y });
+        fingers.push(TouchAction::Motion { id: 1, x: x2, y });
+    }
+    fingers.extend([TouchAction::Up { id: 1 }, TouchAction::Up { id: 0 }]);
+    for action in fingers {
+        proxy.inject_touch(action).map_err(|e| e.to_string())?;
+    }
+    wait_until(app_log, LINE_WAIT, |t| touch_check(t).is_ok());
     wait_line(app_log, FINAL_LINE)?;
     // the readback of the final frame comes after the fixture's line, once the scenes stop
     if !wait_until(app_log, LINE_WAIT, |t| {

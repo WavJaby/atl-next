@@ -173,6 +173,7 @@ impl InputSource for HeadlessInput {
 }
 
 pub mod pointer;
+pub mod touch;
 
 #[cfg(feature = "converter")]
 pub use publish::spawn;
@@ -191,24 +192,22 @@ mod publish {
     use binder::SpIBinder;
 
     use super::pointer::{self, Motion};
+    use super::touch;
     use super::{HeadlessInput, Message, Step, Windows};
 
-    /// The pointer device (atl-services input.rs) and the default display.
-    const DEVICE_ID: i32 = 1;
+    /// The default display.
     const DISPLAY_ID: i32 = 0;
-    /// The one pointer's id.
-    const POINTER_ID: i32 = 0;
     /// Event times are AOSP's ns, the platform's are ms.
     const NANOS_PER_MS: i64 = 1_000_000;
     /// The channel's name in AOSP's logs.
     const CHANNEL: &str = "atl-headless-pointer";
 
-    /// `m` as the MotionEvent numbered `seq`: one pointer, identity transform.
+    /// `m` as the MotionEvent numbered `seq`, identity transform.
     fn motion(m: &Motion, seq: u32) -> MotionEvent {
         MotionEvent {
             seq,
             event_id: i32::try_from(seq).unwrap_or(i32::MAX),
-            device_id: DEVICE_ID,
+            device_id: m.device_id,
             source: m.source,
             display_id: DISPLAY_ID,
             action: m.action,
@@ -227,13 +226,17 @@ mod publish {
             y_cursor: m.cursor.y as f32,
             down_time: i64::from(m.down_ms) * NANOS_PER_MS,
             event_time: i64::from(m.time_ms) * NANOS_PER_MS,
-            pointers: vec![Pointer {
-                id: POINTER_ID,
-                tool_type: m.tool_type,
-                x: m.at.x as f32,
-                y: m.at.y as f32,
-                axes: m.axes.clone(),
-            }],
+            pointers: m
+                .pointers
+                .iter()
+                .map(|p| Pointer {
+                    id: p.id,
+                    tool_type: p.tool_type,
+                    x: p.at.x as f32,
+                    y: p.at.y as f32,
+                    axes: p.axes.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -250,6 +253,7 @@ mod publish {
     struct State {
         windows: RefCell<Windows<SpIBinder, Publisher>>,
         pointer: RefCell<pointer::Pointer>,
+        touch: RefCell<touch::Touch>,
         seq: Cell<u32>,
     }
 
@@ -262,8 +266,13 @@ mod publish {
             return;
         }
         let mut pointer = state.pointer.borrow_mut();
-        let in_gesture = pointer.in_gesture();
-        let motions = pointer.translate(event);
+        let mut touch = state.touch.borrow_mut();
+        // one window holds every open gesture: InputDispatcher keeps a touched window per device, and all devices here start on the same top window
+        let in_gesture = pointer.in_gesture() || touch.in_gesture();
+        let motions = match event {
+            InputEvent::Touch(e) => touch.translate(e),
+            other => pointer.translate(other),
+        };
         if motions.is_empty() {
             return;
         }
@@ -385,23 +394,34 @@ mod publish {
         #[test]
         fn motion_carries_the_translation() {
             let m = Motion {
+                device_id: 4,
                 action: 1,
                 action_button: 0,
                 button_state: 0,
                 flags: 0x8,
                 classification: 3,
                 source: 0x2002,
-                tool_type: 1,
-                at: PhysPoint { x: 260.0, y: 340.0 },
+                pointers: vec![pointer::MotionPointer {
+                    id: 0,
+                    tool_type: 1,
+                    at: PhysPoint { x: 260.0, y: 340.0 },
+                    axes: vec![(2, 0.0)],
+                }],
                 cursor: PhysPoint { x: 250.0, y: 300.0 },
-                axes: vec![(2, 0.0)],
                 down_ms: 5,
                 time_ms: 7,
             };
             let m = motion(&m, 3);
             assert_eq!(
-                (m.seq, m.action, m.source, m.flags, m.classification),
-                (3, 1, 0x2002, 0x8, 3)
+                (
+                    m.seq,
+                    m.device_id,
+                    m.action,
+                    m.source,
+                    m.flags,
+                    m.classification
+                ),
+                (3, 4, 1, 0x2002, 0x8, 3)
             );
             assert_eq!((m.x_cursor, m.y_cursor), (250.0, 300.0));
             assert_eq!(

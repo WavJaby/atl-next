@@ -3,7 +3,7 @@
 
 use atl_platform_ui_api::{
     InputEvent, PhysPoint, PointerButton, PointerEvent, PointerPhase, Scale, ScrollEvent,
-    ScrollKind,
+    ScrollKind, TouchEvent, TouchPhase,
 };
 
 /// GDK button numbers (`GDK_BUTTON_PRIMARY`, `_MIDDLE`, `_SECONDARY` = 1, 2, 3).
@@ -69,6 +69,48 @@ pub fn swipe_end(at: (f64, f64), scale: Scale, time_ms: u32) -> InputEvent {
     })
 }
 
+/// Contact ids for touch sequences: a sequence (GDK's `GdkEventSequence`, keyed by its address -- stable from begin to end) takes the lowest id no live sequence holds, the id contract of [`TouchEvent`].
+#[derive(Debug, Default)]
+pub struct TouchIds {
+    /// Index = id; the sequence holding it.
+    held: Vec<Option<usize>>,
+}
+
+impl TouchIds {
+    /// The id of `sequence`, taken on `Down` and released on `Up` / `Cancel` (still returned for that last event); `None` for a sequence that never went down here.
+    pub fn id(&mut self, sequence: usize, phase: TouchPhase) -> Option<u32> {
+        let found = self.held.iter().position(|s| *s == Some(sequence));
+        let id = match (found, phase) {
+            (Some(id), _) => id,
+            (None, TouchPhase::Down) => match self.held.iter().position(Option::is_none) {
+                Some(free) => {
+                    self.held[free] = Some(sequence);
+                    free
+                }
+                None => {
+                    self.held.push(Some(sequence));
+                    self.held.len() - 1
+                }
+            },
+            (None, _) => return None,
+        };
+        if matches!(phase, TouchPhase::Up | TouchPhase::Cancel) {
+            self.held[id] = None;
+        }
+        u32::try_from(id).ok()
+    }
+}
+
+/// The event for touch contact `id` at (`x`, `y`) logical pixels of the content widget.
+pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ms: u32) -> InputEvent {
+    InputEvent::Touch(TouchEvent {
+        phase,
+        id,
+        position: physical((x, y), scale),
+        time_ms,
+    })
+}
+
 fn physical((x, y): (f64, f64), scale: Scale) -> PhysPoint {
     PhysPoint {
         x: scale.to_physical(x),
@@ -116,6 +158,32 @@ mod tests {
             event(ScrollKind::Swipe { dx: 6.0, dy: -8.0 })
         );
         assert_eq!(swipe_end((5.0, 6.0), scale, 9), event(ScrollKind::SwipeEnd));
+    }
+
+    /// Sequences A, B down -> 0, 1; A up frees 0; C down takes 0 (lowest free), B keeps 1; moves of an unknown sequence have no id; a cancelled id is free again.
+    #[test]
+    fn touch_ids_take_the_lowest_free() {
+        let (a, b, c) = (0x10, 0x20, 0x30);
+        let mut ids = TouchIds::default();
+        assert_eq!(ids.id(a, TouchPhase::Down), Some(0));
+        assert_eq!(ids.id(b, TouchPhase::Down), Some(1));
+        assert_eq!(ids.id(a, TouchPhase::Move), Some(0));
+        assert_eq!(ids.id(a, TouchPhase::Up), Some(0));
+        assert_eq!(ids.id(a, TouchPhase::Move), None);
+        assert_eq!(ids.id(c, TouchPhase::Down), Some(0));
+        assert_eq!(ids.id(b, TouchPhase::Cancel), Some(1));
+        assert_eq!(ids.id(a, TouchPhase::Down), Some(1));
+        // at 2x a contact 4 logical px in is 8 physical px in (arithmetic)
+        let scale = Scale::new(2.0).expect("valid");
+        assert_eq!(
+            touch(TouchPhase::Move, 1, 4.0, 5.0, scale, 3),
+            InputEvent::Touch(TouchEvent {
+                phase: TouchPhase::Move,
+                id: 1,
+                position: PhysPoint { x: 8.0, y: 10.0 },
+                time_ms: 3,
+            })
+        );
     }
 
     #[test]

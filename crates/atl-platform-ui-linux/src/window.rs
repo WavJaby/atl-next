@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use atl_platform_ui_api::{
     Capture, FrameClock, FrameTick, InputEvent, InputSource, Monitor, PhysSize, PointerPhase,
-    PresentError, Scale, Scene, UiError, Window, WindowAttributes,
+    PresentError, Scale, Scene, TouchPhase, UiError, Window, WindowAttributes,
 };
+use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
@@ -68,6 +69,8 @@ struct Shared {
     pointer_at: Cell<(f64, f64)>,
     /// A touchpad swipe is open: its end (GTK `scroll-end`) is reported; a wheel's is not.
     swiping: Cell<bool>,
+    /// Contact ids of the touch sequences down.
+    touch_ids: RefCell<input::TouchIds>,
 }
 
 impl Shared {
@@ -222,6 +225,46 @@ impl GtkWindow {
         });
         view.add_controller(scroll);
     }
+
+    /// Touch contacts, each sequence its own contact: GTK4 has no multi-touch controller, so the raw events are taken in the capture phase and stopped there -- GestureClick would otherwise claim a touch as a primary-button click.
+    fn wire_touch(view: &SceneView, shared: &Rc<Shared>) {
+        let legacy = gtk4::EventControllerLegacy::new();
+        legacy.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let s = Rc::clone(shared);
+        legacy.connect_event(move |c, event| {
+            let phase = match event.event_type() {
+                gdk::EventType::TouchBegin => TouchPhase::Down,
+                gdk::EventType::TouchUpdate => TouchPhase::Move,
+                gdk::EventType::TouchEnd => TouchPhase::Up,
+                gdk::EventType::TouchCancel => TouchPhase::Cancel,
+                _ => return glib::Propagation::Proceed,
+            };
+            let sequence: *mut gdk::ffi::GdkEventSequence = event.event_sequence().to_glib_none().0;
+            let id = s.touch_ids.borrow_mut().id(sequence as usize, phase);
+            // the event's position is the surface's; the content's is past the shadow and the header bar
+            let at = c.widget().zip(event.position()).and_then(|(view, (x, y))| {
+                let native = view.native()?;
+                let (shadow_x, shadow_y) = native.surface_transform();
+                native.compute_point(
+                    &view,
+                    &graphene::Point::new((x - shadow_x) as f32, (y - shadow_y) as f32),
+                )
+            });
+            if let (Some(id), Some(at)) = (id, at) {
+                let event = input::touch(
+                    phase,
+                    id,
+                    f64::from(at.x()),
+                    f64::from(at.y()),
+                    scale_of(c),
+                    c.current_event_time(),
+                );
+                s.on_event.call(|f| f(event));
+            }
+            glib::Propagation::Stop
+        });
+        view.add_controller(legacy);
+    }
 }
 
 /// The scale of the controller's `SceneView` (1 before it is attached).
@@ -244,6 +287,7 @@ impl Window for GtkWindow {
             on_resize: Slot::new(),
             pointer_at: Cell::new((0.0, 0.0)),
             swiping: Cell::new(false),
+            touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
             monitor: RefCell::new(None),
             presented: Cell::new(false),
@@ -256,6 +300,7 @@ impl Window for GtkWindow {
         Self::wire_frame_clock(&window, &shared);
         Self::wire_pointer(&view, &shared);
         Self::wire_scroll(&view, &shared);
+        Self::wire_touch(&view, &shared);
         // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor); the idle pacing reads its rate (monitor_interval_us)
         let entered = Rc::clone(&shared);
         window.connect_realize(move |w| {
