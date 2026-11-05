@@ -274,7 +274,7 @@ func (g *Graph) flattenJava(m *Module, side Side) *Obj {
 	base := newObj()
 	for _, k := range p.keys {
 		switch k {
-		case "target", "arch", "multilib", "defaults":
+		case "target", "arch", "multilib", "defaults", "product_variables":
 		default:
 			base.set(k, p.m[k])
 		}
@@ -286,7 +286,7 @@ func (g *Graph) flattenJava(m *Module, side Side) *Obj {
 			}
 		}
 	}
-	return base
+	return g.applyProductVariables(m, base, p.obj("product_variables"))
 }
 
 // javaVersion is Soong's javaVersion: the -source/-target value and whether it uses java modules (>= 9).

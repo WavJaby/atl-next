@@ -26,6 +26,8 @@ type graphFile struct {
 	Artifacts map[string]artifact `json:"artifacts"`
 	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (its stl's -nostdlib++ / -lc++), so an outside build links with it too
 	LinkDriver string `json:"link_driver"`
+	// the product variables this build sets (productvars.go), what an upstream built outside the converter for the same product is configured with (Mesa's platform-sdk-version)
+	ProductVariables map[string]Val `json:"product_variables"`
 }
 
 // artifact: one linkable output, as the converter's own links take it.
@@ -117,7 +119,10 @@ func (g *Graph) noneExports(name string, side Side) []string {
 
 // graphJSON: graph.json for the emitted nodes and the goal nodes found; linkDriver: the cc link driver the build links with (Tools.CXX).
 func (g *Graph) graphJSON(goals []*Node, linkDriver string) ([]byte, error) {
-	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}, Artifacts: map[string]artifact{}, LinkDriver: linkDriver}
+	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}, Artifacts: map[string]artifact{}, LinkDriver: linkDriver, ProductVariables: g.productVariables()}
+	if f.ProductVariables == nil {
+		f.ProductVariables = map[string]Val{}
+	}
 	for _, e := range sortedKeys(g.dropped) {
 		dir, name, _ := strings.Cut(e, " ")
 		f.Dropped[dir] = append(f.Dropped[dir], name)

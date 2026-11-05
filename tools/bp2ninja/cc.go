@@ -367,7 +367,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	// `static` / `shared` stay in base: arch and target blocks may hold them too (Soong's StaticProperties / SharedProperties are arch-variant; ART's codegen hook writes target.android.static), each merged into the module's own
 	for _, k := range p.keys {
 		switch k {
-		case "target", "arch", "multilib", "defaults":
+		case "target", "arch", "multilib", "defaults", "product_variables":
 		default:
 			base.set(k, p.m[k])
 		}
@@ -414,7 +414,7 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	if part != nil {
 		base = merge(base, part)
 	}
-	return base
+	return g.applyProductVariables(m, base, p.obj("product_variables"))
 }
 
 // kindOf is the artifact a module produces when used with `want` (Static/Shared as the dependent asks).
