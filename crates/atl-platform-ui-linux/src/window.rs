@@ -2,6 +2,7 @@
 //! `GtkWindow`: a `GtkWindow` whose only content is the `SceneView`, with its GdkFrameClock as the `FrameClock` and pointer controllers as the `InputSource`.
 
 use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::rc::Rc;
 
 use atl_platform_ui_api::{
@@ -57,11 +58,23 @@ pub struct GtkWindow {
     /// The size last asked for, until the compositor has granted one.
     requested: Cell<PhysSize>,
     shared: Rc<Shared>,
+    /// The content origin is logged once, at the first present with the window mapped.
+    origin_logged: Cell<bool>,
 }
 
 impl GtkWindow {
     fn logical(&self, physical: u32) -> i32 {
         self.view.scale().to_logical(f64::from(physical)).ceil() as i32
+    }
+
+    /// The content's origin in the surface, where pointer input is injected: the native's surface transform (the client-side shadow) plus the view's place in the window (the header bar).
+    /// GTK's controllers already report content-local points, so a surface point is content-local at `point - origin`.
+    fn content_origin(&self) -> Option<(f64, f64)> {
+        let (shadow_x, shadow_y) = self.window.surface_transform();
+        let at = self
+            .view
+            .compute_point(&self.window, &graphene::Point::new(0.0, 0.0))?;
+        Some((shadow_x + f64::from(at.x()), shadow_y + f64::from(at.y())))
     }
 
     fn wire_frame_clock(window: &gtk4::Window, shared: &Rc<Shared>) {
@@ -151,6 +164,7 @@ impl Window for GtkWindow {
             view,
             requested: Cell::new(attributes.size),
             shared,
+            origin_logged: Cell::new(false),
         };
         this.set_title(&attributes.title);
         this.set_size(attributes.size);
@@ -199,6 +213,16 @@ impl Window for GtkWindow {
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
         self.view.show_node(scene::build(scene)?);
+        let origin = (!self.origin_logged.get() && self.is_mapped())
+            .then(|| self.content_origin())
+            .flatten();
+        if let Some((x, y)) = origin {
+            self.origin_logged.set(true);
+            let _ = writeln!(
+                std::io::stderr(),
+                "atl-platform-ui: content origin x={x} y={y}"
+            );
+        }
         Ok(())
     }
 

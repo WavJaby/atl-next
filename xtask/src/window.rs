@@ -589,7 +589,11 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         button: BTN_LEFT,
         pressed,
     };
+    // chrome first: surface (100, 20) is in the header bar (below the shadow's 12 px, above the content's origin), so GTK routes the press to the header and Android gets no touch for it
     for action in [
+        PointerAction::Enter { x: 100.0, y: 20.0 },
+        press(true),
+        press(false),
         PointerAction::Enter { x: 200.0, y: 300.0 },
         press(true),
         PointerAction::Motion { x: 260.0, y: 340.0 },
@@ -777,16 +781,31 @@ fn touch_line(line: &str) -> Option<Touch> {
 }
 
 /// Sub-gate (c): after the marker the fixture logs one touch per script item, in order, each with the item's action, x and y and one pointer; no other touch.
+/// The headless pointer has no decorations: its content origin is (0, 0).
 fn input_check(after: &[&str], script: &str) -> Result<String, String> {
-    track_check(after, script, Some((0, 0)))
+    track_check(after, script, (0.0, 0.0))
 }
 
-/// The pointer script's touches against the fixture's log: the actions and pointer counts in order, each position moved by one offset. `want_offset` is that offset (the headless pointer: none); None measures it from the first touch (the gtk window's view sits inside its decorations), and every touch must share it. Touches past BLOCK_MIN_X are the probe's block, not the script.
-fn track_check(
-    after: &[&str],
-    script: &str,
-    want_offset: Option<(i64, i64)>,
-) -> Result<String, String> {
+/// The platform's log line of the content origin (atl-platform-ui `GtkWindow::present`), read by [`content_origin`].
+const CONTENT_ORIGIN_LINE: &str = "atl-platform-ui: content origin ";
+
+/// The content's origin in the surface, as the platform logs it once the window is mapped: an injected surface point lands in the content at `point - origin`.
+fn content_origin(app: &str) -> Result<(f32, f32), String> {
+    let line = app
+        .lines()
+        .find(|l| l.contains(CONTENT_ORIGIN_LINE))
+        .ok_or_else(|| "no content origin line: the window never presented".to_owned())?;
+    let coord = |key: &str| {
+        word(line, key)
+            .and_then(|v| v.parse::<f32>().ok())
+            .ok_or_else(|| format!("no {key} in {line:?}"))
+    };
+    Ok((coord("x")?, coord("y")?))
+}
+
+/// The pointer script's touches against the fixture's log: the action and pointer count of each, in order, and each position at the script's point minus `origin`
+/// (the content's origin in the surface, where the injected points land; (0, 0) for the headless pointer). The offset must round to (0, 0): no measured allowance. Touches past BLOCK_MIN_X are the probe's block, not the script.
+fn track_check(after: &[&str], script: &str, origin: (f32, f32)) -> Result<String, String> {
     let want = script_touches(script)?;
     let got: Vec<Touch> = after
         .iter()
@@ -800,21 +819,22 @@ fn track_check(
             want.len()
         ));
     }
-    let moved = |g: &Touch, w: &Touch| ((g.x - w.x).round() as i64, (g.y - w.y).round() as i64);
-    let offset = want_offset.unwrap_or_else(|| {
-        got.first()
-            .zip(want.first())
-            .map_or((0, 0), |(g, w)| moved(g, w))
-    });
+    let (ox, oy) = origin;
+    let off = |g: &Touch, w: &Touch| {
+        (
+            (g.x - (w.x - ox)).round() as i64,
+            (g.y - (w.y - oy)).round() as i64,
+        )
+    };
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        if g.action != w.action || g.pointers != w.pointers || moved(g, w) != offset {
+        if g.action != w.action || g.pointers != w.pointers || off(g, w) != (0, 0) {
             return Err(format!(
-                "touch {i}: got {g:?}, want {w:?} moved by {offset:?}"
+                "touch {i}: got {g:?}, want {w:?} at content origin {origin:?}"
             ));
         }
     }
     Ok(format!(
-        "{} touches as `{script}`, moved by {offset:?}",
+        "{} touches as `{script}` at content origin {origin:?}",
         want.len()
     ))
 }
@@ -929,7 +949,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, DisplayModel::default()),
-            track_check(&after_marker(&app, marker), POINTER_SCRIPT, None),
+            content_origin(&app).and_then(|origin| {
+                track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
+            }),
             pong_check(&liveness),
         ],
         _ => Vec::new(),
