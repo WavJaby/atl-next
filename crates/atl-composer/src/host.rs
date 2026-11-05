@@ -63,6 +63,28 @@ impl Frame {
     }
 }
 
+/// UI mode's frame path (no clock thread: the window's frame clock ticks, owner decision 2026-11-05). [`UiFrames::tick`] runs on the UI thread; the scene is shown there, and the calls go to the deliver thread.
+pub struct UiFrames {
+    composer: Arc<Composer>,
+    frames: SyncSender<Frame>,
+    interval_ns: i64,
+}
+
+impl UiFrames {
+    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread, then the calls are queued for the deliver thread (a release follows the scene that shows its buffer).
+    pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene)) {
+        let frame = self.composer.tick(time_ns, self.interval_ns);
+        if let Some(scene) = &frame.scene {
+            present(scene);
+        }
+        // an error means the deliver thread is gone: the process is ending
+        let _ = self.frames.send(Frame {
+            scene: None,
+            calls: frame.calls,
+        });
+    }
+}
+
 /// What a compositor is built with.
 pub struct ComposerConfig {
     /// The display it answers with and ticks at.
@@ -460,6 +482,21 @@ impl Composer {
         threads.spawn("atl-frame-clock", Box::new(move || me.run(frames)))
     }
 
+    /// UI mode: one deliver thread from `threads` writes each frame's calls; the frame clock is the window's ([`UiFrames`]), so no clock thread runs. Called once, on the UI thread's startup path.
+    pub fn start_ui(self: &Arc<Self>, threads: &dyn ThreadHost) -> std::io::Result<UiFrames> {
+        let (frames, queue) = sync_channel(FRAMES_QUEUED);
+        let me = Arc::clone(self);
+        threads.spawn(
+            "atl-frame-deliver",
+            Box::new(move || me.deliver_frames(queue)),
+        )?;
+        Ok(UiFrames {
+            composer: Arc::clone(self),
+            frames,
+            interval_ns: clock::interval_ns(self.display.refresh_hz),
+        })
+    }
+
     /// Ends the clock thread and closes the descriptors held.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -484,44 +521,42 @@ impl Composer {
             let now = monotonic_ns();
             let at = clock::next_tick(origin, interval, now);
             std::thread::sleep(Duration::from_nanos(u64::try_from(at - now).unwrap_or(0)));
-            self.tick(at, interval, &frames);
+            let frame = self.tick(at, interval);
+            // an error means the present thread is gone: the process is ending
+            let _ = frames.send(frame);
         }
     }
 
-    /// One frame clock tick at `at_ns`: the core applies what is due, vsync goes out, the scene and the calls go to the present thread. Nothing here waits on pixels: a tick that did would miss the next grid point, and every client's vsync with it.
-    fn tick(&self, at_ns: i64, interval_ns: i64, frames: &SyncSender<Frame>) {
-        let frame = {
-            let mut st = self.lock();
-            st.stats.ticks += 1;
-            let FrameOutput { scene, calls } = st.compositor.on_frame(at_ns);
-            st.next_vsync_id += 1;
-            let tick = FrameTick {
-                vsync_id: st.next_vsync_id,
-                timestamp: at_ns,
-                interval: interval_ns,
-            };
-            for (id, event) in st.events.on_frame_tick(tick) {
-                let sent = match st.tubes.get(&id) {
-                    Some(tube) => vsync::send_event(tube, &event).is_ok(),
-                    None => false,
-                };
-                if sent {
-                    st.stats.vsync_sent += 1;
-                } else {
-                    st.stats.vsync_dropped += 1;
-                }
-            }
-            if scene.is_some() {
-                st.stats.scenes += 1;
-            }
-            let mut all = std::mem::take(&mut st.pending_calls);
-            all.extend(calls);
-            let frame = Frame { scene, calls: all };
-            st.in_flight.push_back(frame.fds());
-            frame
+    /// One frame clock tick at `at_ns`: the core applies what is due, vsync goes out, and the frame is returned for its thread to show and deliver. Nothing here waits on pixels: a tick that did would miss the next grid point, and every client's vsync with it.
+    fn tick(&self, at_ns: i64, interval_ns: i64) -> Frame {
+        let mut st = self.lock();
+        st.stats.ticks += 1;
+        let FrameOutput { scene, calls } = st.compositor.on_frame(at_ns);
+        st.next_vsync_id += 1;
+        let tick = FrameTick {
+            vsync_id: st.next_vsync_id,
+            timestamp: at_ns,
+            interval: interval_ns,
         };
-        // an error means the present thread is gone: the process is ending
-        let _ = frames.send(frame);
+        for (id, event) in st.events.on_frame_tick(tick) {
+            let sent = match st.tubes.get(&id) {
+                Some(tube) => vsync::send_event(tube, &event).is_ok(),
+                None => false,
+            };
+            if sent {
+                st.stats.vsync_sent += 1;
+            } else {
+                st.stats.vsync_dropped += 1;
+            }
+        }
+        if scene.is_some() {
+            st.stats.scenes += 1;
+        }
+        let mut all = std::mem::take(&mut st.pending_calls);
+        all.extend(calls);
+        let frame = Frame { scene, calls: all };
+        st.in_flight.push_back(frame.fds());
+        frame
     }
 
     /// The present thread: each tick's output in order, the scene to the sink and then the calls to the clients. The order is what lets a sink read a buffer here: the release of a buffer comes in a later tick's calls than the scene that shows it, so the producer cannot rewrite it during the read.
@@ -530,15 +565,27 @@ impl Composer {
             if let Some(scene) = &frame.scene {
                 sink.present(scene);
             }
-            self.deliver_all(frame.calls);
-            let mut st = self.lock();
-            st.in_flight.pop_front();
-            // the calls are delivered (a release channel is written): what the core names no longer can be closed
-            st.close_unreferenced();
-            // the clock is about to park: nothing is left to count, so this is the line the gate reads
-            if st.in_flight.is_empty() && !st.wants_frame() {
-                let _ = writeln!(std::io::stderr(), "{}", st.counters_line());
-            }
+            self.deliver_frame(frame.calls);
+        }
+    }
+
+    /// UI mode's deliver thread: each frame's calls, after the UI thread showed its scene.
+    fn deliver_frames(&self, frames: Receiver<Frame>) {
+        for frame in frames {
+            self.deliver_frame(frame.calls);
+        }
+    }
+
+    /// One frame's calls into the clients, then the bookkeeping that frees its descriptors.
+    fn deliver_frame(&self, calls: Vec<ClientCall>) {
+        self.deliver_all(calls);
+        let mut st = self.lock();
+        st.in_flight.pop_front();
+        // the calls are delivered (a release channel is written): what the core names no longer can be closed
+        st.close_unreferenced();
+        // the clock is about to park: nothing is left to count, so this is the line the gate reads
+        if st.in_flight.is_empty() && !st.wants_frame() {
+            let _ = writeln!(std::io::stderr(), "{}", st.counters_line());
         }
     }
 

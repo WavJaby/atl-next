@@ -35,10 +35,10 @@ uses = ["binder"]
 crates = ["atld"]
 uses = ["binder", "broker", "gralloc", "property-service", "services"]
 
-# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "bionic", "composer"]
+uses = ["generators", "bionic", "composer", "platform-ui"]
 
 # the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules
 [composer]

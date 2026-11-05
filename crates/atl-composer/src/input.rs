@@ -16,6 +16,8 @@ pub type Step = (PointerPhase, PhysPoint);
 pub enum Message {
     Window(OwnedFd),
     FirstFrame,
+    /// A pointer event of the UI-mode window (its `on_events`), published like a scripted one.
+    Event(InputEvent),
 }
 
 /// The script's steps, in order. A bad item (kind, shape, non-finite position) refuses the whole script; an empty script has no steps.
@@ -243,6 +245,7 @@ mod publish {
                     Ok(publisher) => *state.publisher.borrow_mut() = Some(publisher),
                     Err(err) => tracing::warn!("headless pointer: input channel refused: {err:?}"),
                 },
+                Message::Event(event) => source.inject(event),
                 Message::FirstFrame => {
                     for &(phase, position) in &script {
                         let time_ms =

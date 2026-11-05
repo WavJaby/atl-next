@@ -12,10 +12,12 @@ use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
+use atl_platform_ui::{PhysSize, PlatformUi};
+
 use crate::host::{Composer, ComposerConfig, ThreadHost};
 use crate::input::{self, Message};
 use crate::sink::{FirstFrame, ReportSink};
-use crate::{service, surface_flinger, ui_agent};
+use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
@@ -93,8 +95,9 @@ fn register(
 }
 
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
-/// The compositor's clock thread comes from `threads`.
-pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
+/// Headless (`ui` None): the clock thread and the present thread come from `threads`, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit this UI thread attached): the window's frame clock drives the
+/// compositor and the display is a GTK window ([`ui_window`]); only the deliver thread comes from `threads`. The caller is the UI thread in UI mode.
+pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
     let suffix = property(SUFFIX_PROPERTY)?;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
     let script = match optional_property(POINTER_PROPERTY)? {
@@ -106,20 +109,31 @@ pub fn start(threads: &dyn ThreadHost) -> Result<Arc<Composer>, String> {
         display,
         compositor: Default::default(),
     });
-    let first_frame = input_tx.clone();
-    composer
-        .start(
-            threads,
-            Box::new(FirstFrame::new(ReportSink(std::io::stderr()), move || {
-                // the script goes in at the first frame; the input thread owns the publisher
-                let _ = first_frame.send(Message::FirstFrame);
-            })),
-        )
-        .map_err(|e| format!("frame clock thread: {e}"))?;
+    if let Some(ui) = ui {
+        let size = PhysSize {
+            width: u32::try_from(display.width).unwrap_or(0),
+            height: u32::try_from(display.height).unwrap_or(0),
+        };
+        let frames = composer
+            .start_ui(threads)
+            .map_err(|e| format!("deliver thread: {e}"))?;
+        ui_window::install(ui, frames, input_tx.clone(), size);
+    } else {
+        let first_frame = input_tx.clone();
+        composer
+            .start(
+                threads,
+                Box::new(FirstFrame::new(ReportSink(std::io::stderr()), move || {
+                    // the script goes in at the first frame; the input thread owns the publisher
+                    let _ = first_frame.send(Message::FirstFrame);
+                })),
+            )
+            .map_err(|e| format!("frame clock thread: {e}"))?;
+    }
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
     let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx);
     register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
-    // the registry holds the binders; the process holds the compositor (the clock thread does)
+    // the registry holds the binders; the process holds the compositor (the clock or deliver thread does)
     Ok(composer)
 }

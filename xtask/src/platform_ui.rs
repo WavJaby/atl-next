@@ -4,9 +4,9 @@
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
-//! 3. **refusals + loop**: an unsignalled acquire fence and a bad stride are refused, a signalled fence accepted; a `watch_fd` callback ran on the UI thread inside `iterate`.
+//! 3. **refusals + loop**: an unsignalled acquire fence and a bad stride are refused, a signalled fence accepted; a watched fd's callback ran on the UI thread inside the Looper's poll.
 //! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the UI thread is blocked (`block`) for the ping timeout plus a margin: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
-//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its iterating loop); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
+//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //!
 //! The client runs with GSK_RENDERER=cairo by default: the cairo renderer presents through wl_shm, which is what WSLg offers (no zwp_linux_dmabuf); the proxy confirms a wl_shm pool was created.
 //! Needs a Wayland display (WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
@@ -473,7 +473,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     report.check(
         field(&fdwatch, "on-ui-thread") == Some("true")
             && field(&fdwatch, "fired").is_some_and(|n| n != "0"),
-        "watch_fd callback ran on the UI thread inside iterate",
+        "watched fd callback ran on the UI thread inside the Looper poll",
         &fdwatch,
     );
 

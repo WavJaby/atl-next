@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! The app-process half of the platform layer as traits (plan S1 `atl-platform-ui`; M3 slice 6).
-//! * [`Ui`]: the toolkit session and the main loop. Thread-affine: the thread that attaches is the UI thread, which is also the Android Looper's thread (plan Q6, confirmed 2026-11-04). Everything below runs inside [`Ui::iterate`], so a UI thread that stops iterating answers no compositor ping and the desktop shows its own "not responding" dialog.
+//! * [`Ui`]: the toolkit session. Thread-affine: the thread that attaches is the UI thread, which is also the Android Looper's thread (plan Q6, owner 2026-11-05). The Looper is the outer loop: its poll runs the toolkit's fds through the [`Looper`] seam, so a UI thread that stops polling answers no compositor ping and the desktop shows its own "not responding" dialog.
 //! * [`Window`]: a toplevel the compositor's [`Scene`] is presented into; [`FrameClock`] and [`InputSource`] are the display's vsync and pointer events of that window.
 //!
 //! Sizes cross this boundary in physical pixels with an explicit [`Scale`]; no logical-pixel type exists here, because the compositor's layer stack and the app's buffers are physical and a toolkit's logical unit is an implementation detail of the `-<os>` crate.
-//! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the UI thread from inside `iterate`.
+//! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Window callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the UI thread from inside the Looper's poll. The [`Looper`] seam takes boxed callbacks: one erasure, because the launcher's callback is a C function pointer.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::os::fd::BorrowedFd;
-use std::time::Duration;
+use std::os::fd::RawFd;
 
 pub use atl_compositor::scene::Scene;
 
@@ -69,9 +68,9 @@ pub enum UiError {
     /// The call was made from a thread other than the one that attached the [`Ui`].
     #[error("not on the UI thread")]
     WrongThread,
-    /// [`Ui::watch_fd`] could not register the fd.
-    #[error("cannot watch fd: {0}")]
-    Watch(String),
+    /// The Looper refused a registration (or the toolkit's timer could not be made).
+    #[error("Android Looper: {0}")]
+    Looper(String),
     /// [`Window::capture`] could not produce pixels (window not realised yet, renderer failure).
     #[error("capture failed: {0}")]
     Capture(String),
@@ -96,24 +95,38 @@ pub enum PresentError {
     },
 }
 
-/// The toolkit session and the main loop of the UI thread.
+/// The toolkit session. Thread-affine: the thread that attaches is the UI thread.
 pub trait Ui: Sized {
-    /// Keeps a watched fd registered; dropping it unregisters.
-    type Watch;
+    /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
+    fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError>;
 
-    /// Starts the toolkit on the calling thread, which becomes the UI thread. Called lazily, when the first window is about to be created, never at process start.
-    fn attach() -> Result<Self, UiError>;
+    /// Runs `f` on the UI thread, from any thread: the one cross-thread entry (a binder thread asks for a window this way and does not wait for GTK). It runs when the UI thread next polls its Looper; the caller does not block on it.
+    fn invoke<F: FnOnce() + Send + 'static>(f: F);
+}
 
-    /// Runs `on_readable` on the UI thread, inside [`iterate`](Ui::iterate), whenever `fd` is readable (level-triggered: the callback must drain it). This is how the Android Looper's epoll fd joins this loop: its callback runs `Looper::pollOnce(0)`.
-    /// The fd stays owned by the caller; the implementation watches its own duplicate, so the watch ends only when the returned guard is dropped.
-    fn watch_fd<F: FnMut() + 'static>(
-        &self,
-        fd: BorrowedFd<'_>,
-        on_readable: F,
-    ) -> Result<Self::Watch, UiError>;
+/// The UI thread's Android Looper as the toolkit's main loop registers its fds with it. The launcher implements it over `ALooper_addFd` / `ALooper_removeFd`; Java's `nativePollOnce` polls it, and each readiness reaches the sink on the UI thread from inside that poll.
+pub trait Looper {
+    /// Sets the callback run for each readiness of a registered fd. Set once, before the first [`add_fd`](Looper::add_fd).
+    fn set_sink(&self, sink: Box<dyn FnMut(RawFd, FdEvents)>);
 
-    /// One pass of the main loop: dispatches what is ready (display events, frame clocks, watched fds, timers) and, when nothing is, waits up to `timeout` (`None`: until something is). May return early, never later than `timeout` plus the dispatched work; the caller (the Looper's `nativePollOnce`) re-checks its own queue after each pass.
-    fn iterate(&self, timeout: Option<Duration>) -> Result<(), UiError>;
+    /// Registers `fd` for the events it asks for, replacing a registration of the same fd.
+    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError>;
+
+    /// Unregisters `fd`. The Looper may still report it once from the batch it is polling: the sink must ignore an fd it no longer waits on.
+    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError>;
+}
+
+/// Readiness of a registered fd: `input` and `output` are what the registration asks for; `error` and `hangup` are reported on every poll.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FdEvents {
+    /// Readable.
+    pub input: bool,
+    /// Writable.
+    pub output: bool,
+    /// Error condition.
+    pub error: bool,
+    /// Peer hung up.
+    pub hangup: bool,
 }
 
 /// What a new window asks for.

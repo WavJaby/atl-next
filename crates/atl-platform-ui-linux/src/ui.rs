@@ -1,39 +1,21 @@
 // SPDX-License-Identifier: MIT
-//! The toolkit session and the one main loop.
+//! The toolkit session: GTK initialised on the UI thread, whose GLib main context is mirrored into that thread's Android Looper ([`mirror`]).
 //!
-//! Thread model (plan Q6, owner 2026-11-04): GLib's default main context is iterated by the thread that attached, and that thread is also the Android Looper's. The Looper's epoll fd is added to the GLib context (`watch_fd`), not GLib's fds to the Looper, because:
-//! * GLib's fd set is large and changes every pass (Wayland connection, GL, portals, input method), and each source has its own timeout; mirroring that into `ALooper_addFd` means re-running `prepare/query/check/dispatch` by hand. The Looper contributes one stable fd.
-//! * the Java `MessageQueue` computes its own timeout and calls `nativePollOnce(timeout)`; that native call becomes one bounded [`GtkUi::iterate`] pass, and a readable Looper fd runs `pollOnce(0)` inside it, so the Java loop is unchanged.
-//!
-//! No GTK thread exists. A UI thread that stops iterating (an app blocking in `onCreate`) stops dispatching the Wayland connection, so GDK never answers `xdg_wm_base.ping` and the compositor shows its native "not responding" dialog.
+//! Thread model (owner decision 2026-11-05, plan Q6): the Looper is the outer loop. Java's `nativePollOnce` polls it, and GLib's fds and timeout are registered with it, so GTK's dispatch runs inside the Looper's poll with no AOSP patch. No GTK thread exists.
+//! A UI thread that stops polling (an app blocking in `onCreate`) stops dispatching the Wayland connection, so GDK never answers `xdg_wm_base.ping` and the compositor shows its native "not responding" dialog.
 
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::thread::{self, ThreadId};
-use std::time::Duration;
 
-use atl_platform_ui_api::{Ui, UiError};
+use atl_platform_ui_api::{Looper, Ui, UiError};
 use gtk4::glib;
-use rustix::io::fcntl_dupfd_cloexec;
 
-/// The session: GTK initialised on this thread, whose GLib main context [`iterate`](Ui::iterate) runs. Not `Send`: it must stay on the UI thread.
+use crate::mirror;
+
+/// The session: GTK initialised on this thread, whose GLib main context the thread's Looper polls. Not `Send`: it must stay on the UI thread.
 pub struct GtkUi {
     thread: ThreadId,
     _not_send: PhantomData<*const ()>,
-}
-
-/// A watched fd; dropping it removes the watch, then closes the duplicate it watched.
-pub struct FdWatch {
-    source: Option<glib::SourceId>,
-    _duplicate: OwnedFd,
-}
-
-impl Drop for FdWatch {
-    fn drop(&mut self) {
-        if let Some(id) = self.source.take() {
-            id.remove();
-        }
-    }
 }
 
 impl GtkUi {
@@ -48,62 +30,21 @@ impl GtkUi {
 }
 
 impl Ui for GtkUi {
-    type Watch = FdWatch;
-
-    fn attach() -> Result<Self, UiError> {
+    fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError> {
         gtk4::init().map_err(|e| UiError::Unavailable(e.to_string()))?;
         // GTK may have been started by another thread earlier in this process: that thread owns it, this one cannot
         if !gtk4::is_initialized_main_thread() {
             return Err(UiError::WrongThread);
         }
+        mirror::install(looper)?;
         Ok(GtkUi {
             thread: thread::current().id(),
             _not_send: PhantomData,
         })
     }
 
-    fn watch_fd<F: FnMut() + 'static>(
-        &self,
-        fd: BorrowedFd<'_>,
-        mut on_readable: F,
-    ) -> Result<FdWatch, UiError> {
-        self.check_thread()?;
-        // GLib watches a duplicate of the fd (same open file description, so the same readiness): the guard owns it, which removes any lifetime contract with the caller.
-        let duplicate = fcntl_dupfd_cloexec(fd, 0).map_err(|e| UiError::Watch(e.to_string()))?;
-        let id = glib_unix::unix_fd_add_local(
-            duplicate.as_raw_fd(),
-            glib::IOCondition::IN,
-            move |_, _| {
-                on_readable();
-                glib::ControlFlow::Continue
-            },
-        );
-        Ok(FdWatch {
-            source: Some(id),
-            _duplicate: duplicate,
-        })
-    }
-
-    fn iterate(&self, timeout: Option<Duration>) -> Result<(), UiError> {
-        self.check_thread()?;
-        let context = glib::MainContext::default();
-        match timeout {
-            Some(t) if t.is_zero() => {
-                context.iteration(false);
-            }
-            Some(t) => {
-                // a one-shot timer bounds the blocking wait; whatever dispatches first ends the pass
-                let timer = glib::timeout_source_new(t, None, glib::Priority::DEFAULT, || {
-                    glib::ControlFlow::Break
-                });
-                timer.attach(Some(&context));
-                context.iteration(true);
-                timer.destroy();
-            }
-            None => {
-                context.iteration(true);
-            }
-        }
-        Ok(())
+    /// GLib's own cross-thread queue of the default context: it wakes the context (the mirror's registration for GLib's wakeup fd), and the closure runs in the UI thread's dispatch.
+    fn invoke<F: FnOnce() + Send + 'static>(f: F) {
+        glib::MainContext::default().invoke(f);
     }
 }

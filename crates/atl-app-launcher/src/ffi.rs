@@ -6,13 +6,14 @@ use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::Write;
+use std::os::fd::RawFd;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::generated::{
     binder_process, dlfcn, invoked_vm, jni, jni_invocation, lib_names, libdl_android,
-    log as liblog, signal, syscall as sys, system_properties, unistd,
+    log as liblog, looper, signal, syscall as sys, system_properties, unistd,
 };
 use crate::log::{self, Level, Record};
 
@@ -60,6 +61,7 @@ pub struct Runtime {
     set_logger: liblog::__android_log_set_logger,
     properties_init: system_properties::__system_properties_init,
     set_target_sdk: libdl_android::android_set_application_target_sdk_version,
+    property_get: system_properties::__system_property_get,
 }
 
 /// `name` in `handle`'s library and its dependencies, as `F`.
@@ -92,6 +94,7 @@ impl Runtime {
                 set_logger: sym(h, c"__android_log_set_logger")?,
                 properties_init: sym(h, c"__system_properties_init")?,
                 set_target_sdk: sym(h, c"android_set_application_target_sdk_version")?,
+                property_get: sym(h, c"__system_property_get")?,
             })
         }
     }
@@ -100,6 +103,19 @@ impl Runtime {
     pub fn has_property_area(&self) -> bool {
         // SAFETY: no arguments; callable any time (bionic maps the area or reports failure)
         unsafe { (self.properties_init)() == 0 }
+    }
+
+    /// bionic `__system_property_get`: the value of `name`, None when unset or empty.
+    pub fn property(&self, name: &CStr) -> Option<String> {
+        let mut value = [0 as c_char; system_properties::PROP_VALUE_MAX as usize];
+        // SAFETY: a NUL-terminated name and a buffer of PROP_VALUE_MAX bytes, bionic's contract for `__system_property_get`
+        let len = unsafe { (self.property_get)(name.as_ptr(), value.as_mut_ptr()) };
+        if len <= 0 {
+            return None;
+        }
+        // SAFETY: bionic wrote a NUL-terminated value into the buffer
+        let text = unsafe { CStr::from_ptr(value.as_ptr()) }.to_string_lossy();
+        (!text.is_empty()).then(|| text.into_owned())
     }
 
     /// dalvikvm's start: libnativehelper picks and loads the runtime library (`JniInvocationInit`, null = its default), then `JNI_CreateJavaVM`; the calling thread becomes the main thread.
@@ -204,6 +220,90 @@ impl AndroidRuntime {
     pub fn start_thread_pool(&self) {
         // SAFETY: no arguments; the process's binder state is libbinder's own
         unsafe { (self.start_thread_pool)() }
+    }
+}
+
+/// libandroid's Looper API (NDK looper.h), loaded only in UI mode. libandroid_runtime does not link libandroid, so its handle cannot resolve these.
+pub struct LooperApi {
+    prepare: looper::ALooper_prepare,
+    add_fd: looper::ALooper_addFd,
+    remove_fd: looper::ALooper_removeFd,
+}
+
+/// libandroid by soname: found on the library path as libandroid_runtime is.
+const ANDROID: &CStr = c"libandroid.so";
+
+impl LooperApi {
+    /// Loads libandroid (`RTLD_NOW | RTLD_GLOBAL`) and resolves the three functions from its handle; the handle is never closed.
+    pub fn load() -> Result<Self> {
+        // SAFETY: a NUL-terminated soname and the header's flag values
+        let h = unsafe { dlopen(ANDROID.as_ptr(), dlfcn::RTLD_NOW | dlfcn::RTLD_GLOBAL) };
+        ensure!(!h.is_null(), "loading libandroid: {}", dl_error());
+        // SAFETY: each F is the generated type of the function of that name (build.rs `IMPORTS`); h is live
+        unsafe {
+            Ok(LooperApi {
+                prepare: sym(h, c"ALooper_prepare")?,
+                add_fd: sym(h, c"ALooper_addFd")?,
+                remove_fd: sym(h, c"ALooper_removeFd")?,
+            })
+        }
+    }
+
+    /// The calling thread's Looper (`ALooper_prepare`, non-callback fds allowed). Called before Java's MessageQueue exists, so NativeMessageQueue adopts it (`Looper::getForThread`).
+    pub fn prepare_looper(&self) -> Result<Looper> {
+        let flags = looper::ALOOPER_PREPARE_ALLOW_NON_CALLBACKS as c_int;
+        // SAFETY: the header's flag value; the returned Looper belongs to this thread (libutils keeps it for the thread's life)
+        let ptr = unsafe { (self.prepare)(flags) };
+        ensure!(!ptr.is_null(), "ALooper_prepare returned no Looper");
+        Ok(Looper {
+            ptr: ptr.cast(),
+            add_fd: self.add_fd,
+            remove_fd: self.remove_fd,
+        })
+    }
+}
+
+/// The callback `ALooper_addFd` takes: the signature of the generated `ALooper_addFd` (looper.h's `ALooper_callbackFunc` typedef is not generated, and this is the same type).
+pub type Callback = Option<unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int>;
+
+/// A thread's Looper with the registration calls the GLib mirror makes. Thread-bound: only the thread that prepared it may register on it from its own callbacks.
+#[derive(Clone, Copy)]
+pub struct Looper {
+    ptr: *mut c_void,
+    add_fd: looper::ALooper_addFd,
+    remove_fd: looper::ALooper_removeFd,
+}
+
+impl Looper {
+    /// `ALooper_addFd` with a callback. `callback(fd, events, data)` runs on this thread inside the Looper's poll and returns 1 to stay registered; `data` stays valid until `remove_fd`.
+    pub fn add_fd(
+        &self,
+        fd: RawFd,
+        events: c_int,
+        callback: Callback,
+        data: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: this thread's live Looper; the callback is a function of this crate and `data` is the mirror, both valid until remove_fd
+        let rc = unsafe {
+            (self.add_fd)(
+                self.ptr.cast(),
+                fd,
+                looper::ALOOPER_POLL_CALLBACK as c_int,
+                events,
+                callback,
+                data,
+            )
+        };
+        ensure!(rc == 1, "ALooper_addFd({fd}) returned {rc}");
+        Ok(())
+    }
+
+    /// `ALooper_removeFd`: 1 when the fd was registered, 0 when it was not (both fine here).
+    pub fn remove_fd(&self, fd: RawFd) -> Result<()> {
+        // SAFETY: this thread's live Looper; removing an unregistered fd is a no-op
+        let rc = unsafe { (self.remove_fd)(self.ptr.cast(), fd) };
+        ensure!(rc == 0 || rc == 1, "ALooper_removeFd({fd}) returned {rc}");
+        Ok(())
     }
 }
 

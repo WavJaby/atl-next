@@ -163,9 +163,9 @@ const IMPORTS: &[Import] = &[
         also: &[],
         lang: Lang::C,
         view: View::Bionic,
-        functions: &["__system_properties_init"],
+        functions: &["__system_properties_init", "__system_property_get"],
         types: &[],
-        macros: &[],
+        macros: &["PROP_VALUE_MAX"],
         include_dirs: &[],
     },
     // app mode: libandroid_runtime around the VM the launcher created (patches/aosp/frameworks/base: AndroidRuntime::attachInvokedVm's C ABI)
@@ -193,6 +193,19 @@ const IMPORTS: &[Import] = &[
         types: &[],
         macros: &[],
         include_dirs: &["frameworks/native/libs/binder/ndk/include_ndk"],
+    },
+    // app mode, UI mode: the UI thread's Looper (NDK looper.h, libandroid). The GLib main context's fds and timeout are mirrored into it (atl-platform-ui-linux mirror.rs, over looper.rs); Java's MessageQueue adopts it (NativeMessageQueue: Looper::getForThread)
+    Import {
+        name: "looper",
+        source: Some("frameworks/native/include/android/looper.h"),
+        host_header: None,
+        also: &[],
+        lang: Lang::C,
+        view: View::Bionic,
+        functions: &["ALooper_prepare", "ALooper_addFd", "ALooper_removeFd"],
+        types: &[],
+        macros: &[],
+        include_dirs: &[],
     },
     // no public header: libdl_android's own declaration (atl-bionic implements it, libdl_android row)
     Import {

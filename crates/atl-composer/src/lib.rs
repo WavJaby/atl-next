@@ -42,6 +42,8 @@ pub mod start;
 pub mod surface_flinger;
 #[cfg(feature = "converter")]
 pub mod ui_agent;
+#[cfg(feature = "converter")]
+pub mod ui_window;
 
 #[cfg(feature = "converter")]
 pub use host::ThreadHost;

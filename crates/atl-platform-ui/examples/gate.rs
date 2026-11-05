@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! The client of `xtask test platform-ui` (M3 slice 6): a window through the `atl-platform-ui` facade, driven only by its frame clock and the `iterate` loop, as the launcher's UI thread drives it.
+//! The client of `xtask test platform-ui` (M3 slice 6): a window through the `atl-platform-ui` facade, driven only by its frame clock and its Looper's poll, as the launcher's UI thread drives it. [`TestLooper`] is this program's Looper: the platform's `Looper` seam, polled by [`TestLooper::poll`].
 //! The harness reads this program's stdout (one `KEY value...` line per event) and the raw RGBA captures it writes to `--out`; it checks them against its own implementation of the pattern below, not against this program.
 //!
 //! Phases, in order:
 //! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
 //! 2. one composite scene (crop, flips, rotation, scissor, opacity: [`composite_scene`]) captured to `composite.rgba`.
 //! 3. refusals: an unsignalled acquire fence and a bad-stride buffer are refused, the signalled fence is accepted.
-//! 4. an eventfd added with `Ui::watch_fd` is written from another thread; its callback must run on this thread inside `iterate`.
-//! 5. `READY`, then commands on stdin, served by a `watch_fd` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe), `quit` ends.
+//! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
+//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe), `quit` ends.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,13 +25,15 @@ use atl_compositor::scene::{Quad, Scene};
 use atl_compositor::state::{Fence, FloatRect, GraphicBuffer};
 use atl_gralloc::format::RGBA_8888;
 use atl_platform_ui::{
-    FrameClock, PhysSize, PlatformUi, PlatformWindow, PresentError, Ui, Window, WindowAttributes,
+    FdEvents, FrameClock, Looper, PhysSize, PlatformUi, PlatformWindow, PresentError, Ui, UiError,
+    Window, WindowAttributes,
 };
 use clap::Parser;
-use rustix::event::{EventfdFlags, eventfd};
+use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::io::{read, write};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+use rustix::time::Timespec;
 
 #[derive(Parser)]
 struct Args {
@@ -55,7 +58,7 @@ struct Args {
 const STRIDE_PAD_PIXELS: u32 = 16;
 /// The padding's byte value: a reader that ignores the stride shows it.
 const PAD_BYTE: u8 = 0xEE;
-/// One `iterate` pass waits at most this long when nothing is ready.
+/// One `poll` waits at most this long when nothing is ready.
 const PASS: Duration = Duration::from_millis(20);
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
 const COMPOSITE_FRAMES: [u32; 5] = [100, 101, 102, 103, 104];
@@ -225,11 +228,137 @@ fn save(out: &std::path::Path, name: &str, window: &PlatformWindow) -> Result<St
     ))
 }
 
-/// Runs `iterate` until `done` is true or `deadline` passes.
-fn spin(ui: &PlatformUi, deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
+/// The example's own callback for one of its fds, shared with the poll that runs it.
+type OwnCallback = Rc<RefCell<dyn FnMut()>>;
+
+/// The platform's sink for the toolkit's readiness.
+type ToolkitSink = Box<dyn FnMut(RawFd, FdEvents)>;
+
+/// This program's Looper: the platform's [`Looper`] seam over a `poll(2)` loop. [`TestLooper::poll`] is its `pollOnce`: it waits for the registered fds, then runs the example's own callbacks ([`TestLooper::watch`]) and hands the toolkit's readiness to the platform's sink.
+#[derive(Clone, Default)]
+struct TestLooper(Rc<LooperState>);
+
+#[derive(Default)]
+struct LooperState {
+    /// The toolkit's registrations, with the events each asked for.
+    toolkit: RefCell<BTreeMap<RawFd, FdEvents>>,
+    /// The example's own fds, with their callbacks.
+    own: RefCell<BTreeMap<RawFd, OwnCallback>>,
+    /// The platform's sink, set by `Ui::attach`.
+    sink: RefCell<Option<ToolkitSink>>,
+}
+
+/// Ends a [`TestLooper::watch`] when dropped.
+struct OwnWatch {
+    looper: Rc<LooperState>,
+    fd: RawFd,
+}
+
+impl Drop for OwnWatch {
+    fn drop(&mut self) {
+        self.looper.own.borrow_mut().remove(&self.fd);
+    }
+}
+
+impl TestLooper {
+    /// Runs `on_readable` from [`poll`](TestLooper::poll) whenever `fd` is readable (level-triggered: the callback must drain it), until the guard drops.
+    fn watch<F: FnMut() + 'static>(&self, fd: BorrowedFd<'_>, on_readable: F) -> OwnWatch {
+        let raw = fd.as_raw_fd();
+        let callback: OwnCallback = Rc::new(RefCell::new(on_readable));
+        self.0.own.borrow_mut().insert(raw, callback);
+        OwnWatch {
+            looper: Rc::clone(&self.0),
+            fd: raw,
+        }
+    }
+
+    /// One `pollOnce`: waits up to `timeout` for a registered fd, then runs what is ready, in fd order.
+    fn poll(&self, timeout: Duration) -> Result<()> {
+        let registered: Vec<(RawFd, PollFlags)> = self
+            .0
+            .toolkit
+            .borrow()
+            .iter()
+            .map(|(&fd, events)| (fd, poll_flags(*events)))
+            .chain(self.0.own.borrow().keys().map(|&fd| (fd, PollFlags::IN)))
+            .collect();
+        let mut borrowed = Vec::with_capacity(registered.len());
+        for &(fd, _) in &registered {
+            // SAFETY: a fd this looper registered and has not removed; the toolkit's fds stay open while registered (the mirror syncs its registrations after every pass)
+            borrowed.push(unsafe { BorrowedFd::borrow_raw(fd) });
+        }
+        let mut fds: Vec<PollFd<'_>> = borrowed
+            .iter()
+            .zip(&registered)
+            .map(|(fd, &(_, flags))| PollFd::new(fd, flags))
+            .collect();
+        let timespec = Timespec {
+            tv_sec: i64::try_from(timeout.as_secs())?,
+            tv_nsec: i64::from(timeout.subsec_nanos()),
+        };
+        poll(&mut fds, Some(&timespec))?;
+        let ready: Vec<(RawFd, PollFlags)> = fds
+            .iter()
+            .zip(&registered)
+            .filter(|(fd, _)| !fd.revents().is_empty())
+            .map(|(fd, &(raw, _))| (raw, fd.revents()))
+            .collect();
+        drop(fds);
+        for (fd, revents) in ready {
+            let own = self.0.own.borrow().get(&fd).cloned();
+            if let Some(callback) = own {
+                (callback.borrow_mut())();
+            } else if let Some(sink) = self.0.sink.borrow_mut().as_mut() {
+                sink(fd, events_of(revents));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Looper for TestLooper {
+    fn set_sink(&self, sink: Box<dyn FnMut(RawFd, FdEvents)>) {
+        *self.0.sink.borrow_mut() = Some(sink);
+    }
+
+    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError> {
+        self.0.toolkit.borrow_mut().insert(fd, events);
+        Ok(())
+    }
+
+    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError> {
+        self.0.toolkit.borrow_mut().remove(&fd);
+        Ok(())
+    }
+}
+
+/// The `poll(2)` events a registration asks for.
+fn poll_flags(events: FdEvents) -> PollFlags {
+    let mut flags = PollFlags::empty();
+    if events.input {
+        flags |= PollFlags::IN;
+    }
+    if events.output {
+        flags |= PollFlags::OUT;
+    }
+    flags
+}
+
+/// The readiness `poll(2)` reported, in the Looper's terms.
+fn events_of(revents: PollFlags) -> FdEvents {
+    FdEvents {
+        input: revents.contains(PollFlags::IN),
+        output: revents.contains(PollFlags::OUT),
+        error: revents.contains(PollFlags::ERR),
+        hangup: revents.contains(PollFlags::HUP),
+    }
+}
+
+/// Polls `looper` until `done` is true or `deadline` passes.
+fn spin(looper: &TestLooper, deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
     while !done() {
         ensure!(Instant::now() < deadline, "timed out waiting for {what}");
-        ui.iterate(Some(PASS))?;
+        looper.poll(PASS)?;
     }
     Ok(())
 }
@@ -238,7 +367,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.out)?;
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
-    let ui = PlatformUi::attach()?;
+    let looper = TestLooper::default();
+    let ui = PlatformUi::attach(Box::new(looper.clone()))?;
     let window = Rc::new(PlatformWindow::create(
         &ui,
         &WindowAttributes {
@@ -283,7 +413,7 @@ fn main() -> Result<()> {
         });
     }
     window.request_frame();
-    spin(&ui, deadline, "the frame series", || {
+    spin(&looper, deadline, "the frame series", || {
         frame.get() >= args.frames || failure.borrow().is_some()
     })?;
     if let Some(e) = failure.borrow().as_ref() {
@@ -327,7 +457,7 @@ fn main() -> Result<()> {
         "REFUSALS unsignalled-fence={unsignalled} signalled-fence={signalled} bad-stride={bad_refused}"
     ));
 
-    // phase 4: a watched fd is serviced on this thread, inside `iterate`
+    // phase 4: a watched fd is serviced on this thread, inside the Looper's poll
     let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
     let fired = Rc::new(Cell::new(0u32));
     let ui_thread = thread::current().id();
@@ -338,13 +468,13 @@ fn main() -> Result<()> {
             Rc::clone(&on_ui_thread),
             wake.try_clone()?,
         );
-        ui.watch_fd(wake.as_fd(), move || {
+        looper.watch(wake.as_fd(), move || {
             // drain the counter: the watch is level-triggered
             let mut counter = [0u8; 8];
             let _ = read(&drain, &mut counter);
             on_ui_thread.set(thread::current().id() == ui_thread);
             fired.set(fired.get() + 1);
-        })?
+        })
     };
     let writer = {
         let wake = wake.try_clone()?;
@@ -353,7 +483,7 @@ fn main() -> Result<()> {
             write(&wake, &1u64.to_ne_bytes())
         })
     };
-    spin(&ui, deadline, "the watched fd", || fired.get() > 0)?;
+    spin(&looper, deadline, "the watched fd", || fired.get() > 0)?;
     writer
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
@@ -369,7 +499,7 @@ fn main() -> Result<()> {
     let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
     let _stdin_watch = {
         let (quit, pending) = (Rc::clone(&quit), Rc::clone(&pending));
-        ui.watch_fd(rustix::stdio::stdin(), move || {
+        looper.watch(rustix::stdio::stdin(), move || {
             let mut chunk = [0u8; 256];
             let n = read(rustix::stdio::stdin(), &mut chunk).unwrap_or(0);
             if n == 0 {
@@ -392,11 +522,11 @@ fn main() -> Result<()> {
                     other => emit(format_args!("UNKNOWN-COMMAND {other:?}")),
                 }
             }
-        })?
+        })
     };
     emit(format_args!("READY"));
     while !quit.get() {
-        ui.iterate(Some(PASS))?;
+        looper.poll(PASS)?;
     }
     emit(format_args!("DONE"));
     Ok(())

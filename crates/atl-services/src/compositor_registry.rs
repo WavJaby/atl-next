@@ -21,6 +21,8 @@ pub const SUFFIX_PROPERTY: &str = "ro.atl.surfaceflinger.suffix";
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 /// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.
 pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
+/// The system property selecting an app process's UI mode (atld `--ui`): `gtk` presents the compositor's scenes into a GTK window of the process, on its main thread (atl-app-launcher lib.rs `start_ui`, atl-composer). Unset: headless.
+pub const UI_PROPERTY: &str = "ro.atl.ui";
 /// AOSP's service names, libgui's defaults.
 pub const SURFACE_FLINGER: &str = "SurfaceFlinger";
 pub const SURFACE_FLINGER_AIDL: &str = "SurfaceFlingerAIDL";

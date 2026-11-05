@@ -97,6 +97,9 @@ struct Args {
     /// The headless pointer script, `down:x,y move:x,y up:x,y` (atl-composer `input::parse_script`): every app process gets it as `ro.atl.headless.pointer`, and the app injects it after its first frame. Omitted: no input.
     #[arg(long)]
     headless_pointer: Option<String>,
+    /// The UI mode of every app process: `gtk` gives each one a GTK window on its main thread (delivered as `ro.atl.ui`, compositor_registry::UI_PROPERTY). Omitted: headless.
+    #[arg(long, value_parser = ["gtk"])]
+    ui: Option<String>,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -334,6 +337,8 @@ struct Host {
     display: DisplayModel,
     /// the headless pointer script; pushed to each app process as `ro.atl.headless.pointer`
     headless_pointer: Option<String>,
+    /// the UI mode; pushed to each app process as `ro.atl.ui`
+    ui: Option<String>,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// set by the first process that claims to be the main one
@@ -382,6 +387,9 @@ impl Host {
                 compositor_registry::POINTER_PROPERTY.to_owned(),
                 script.clone(),
             ));
+        }
+        if let Some(mode) = &self.ui {
+            props.push((compositor_registry::UI_PROPERTY.to_owned(), mode.clone()));
         }
         let path = self.root.process_properties(uid, name);
         std::fs::write(&path, atl_property_service::area(&props)?)
@@ -644,6 +652,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         defaults,
         display: a.display.unwrap_or_default(),
         headless_pointer: a.headless_pointer.clone(),
+        ui: a.ui.clone(),
         controlled: Mutex::new(BTreeSet::new()),
         main_claimed: AtomicBool::new(false),
         done: done_tx,

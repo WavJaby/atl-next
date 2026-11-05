@@ -6,9 +6,7 @@
 pub use atl_platform_ui_api::*;
 
 #[cfg(target_os = "linux")]
-pub use atl_platform_ui_linux::{
-    FdWatch as PlatformFdWatch, GtkUi as PlatformUi, GtkWindow as PlatformWindow,
-};
+pub use atl_platform_ui_linux::{GtkUi as PlatformUi, GtkWindow as PlatformWindow};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-ui has no implementation for this target OS");

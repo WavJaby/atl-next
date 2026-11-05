@@ -78,6 +78,7 @@ dependencies = [
  "atl-bionic",
  "atl-bridgegen",
  "atl-composer",
+ "atl-platform-ui",
  "rustix",
 ]
 
