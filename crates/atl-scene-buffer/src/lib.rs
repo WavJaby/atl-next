@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Reading a Scene buffer's pixels on the CPU: the only `unsafe` of the crate.
+//! Reading a Scene buffer's pixels on the CPU. The only `unsafe` is borrowing a quad's descriptor; mapping and the dma-buf CPU-access bracket are atl-gralloc-dmabuf's.
 //! A quad's buffer is a gralloc handle (`atl-gralloc` `handle`): fd 0 is the dma-buf (or, in tests and for software producers, any mappable file such as a memfd) holding linear RGBA_8888 or RGBX_8888 rows of `stride` pixels.
-//! Step 1 maps it, brackets the read with `DMA_BUF_IOCTL_SYNC` as the kernel requires for CPU access to a dma-buf, and copies the rows out; step 2 hands the dma-buf to the compositor as a texture instead.
+//! Step 1 maps it, brackets the read with the CPU-access sync, and copies the rows out; step 2 hands the dma-buf to the compositor as a texture instead. The sync does not wait for GPU rendering: the acquire fence does ([`fence_signalled`] before [`read_pixels`]).
 
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -10,11 +10,10 @@ use atl_compositor::scene::{SceneBuffer, SceneFd};
 use atl_gralloc::format::{self, COMPONENT_A, RGBA_8888, RGBX_8888};
 use atl_gralloc::handle::FD_DMABUF;
 use atl_gralloc::layout::Layout;
+use atl_gralloc_dmabuf::{Mapping, SYNC_READ, begin_cpu_access, end_cpu_access};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::fstat;
 use rustix::io::Errno;
-use rustix::ioctl::{self, Setter, opcode};
-use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::time::Timespec;
 
 /// A buffer's pixels copied out of the producer's memory.
@@ -30,31 +29,12 @@ pub struct Pixels {
     pub bytes: Vec<u8>,
 }
 
-/// `struct dma_buf_sync` (linux/dma-buf.h): `__u64 flags`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DmaBufSync {
-    flags: u64,
-}
-
-/// `DMA_BUF_SYNC_READ` (`1 << 0`), `_START` (`0 << 2`), `_END` (`1 << 2`) of linux/dma-buf.h.
-const SYNC_READ: u64 = 1;
-const SYNC_START: u64 = 0;
-const SYNC_END: u64 = 4;
-
-/// `DMA_BUF_IOCTL_SYNC` = `_IOW('b', 0, struct dma_buf_sync)`.
-fn sync(fd: BorrowedFd<'_>, flags: u64) -> io::Result<()> {
-    // SAFETY: the opcode is DMA_BUF_IOCTL_SYNC (`_IOW('b', 0, struct dma_buf_sync)`), whose argument the kernel reads as a `struct dma_buf_sync` -- the `#[repr(C)]` mirror above.
-    let request = unsafe {
-        Setter::<{ opcode::write::<DmaBufSync>(b'b', 0) }, DmaBufSync>::new(DmaBufSync { flags })
-    };
-    // SAFETY: `request` is a well-formed DMA_BUF_IOCTL_SYNC request; the ioctl only reads it. A fd that is not a dma-buf fails with ENOTTY.
-    unsafe { ioctl::ioctl(fd, request) }.map_err(io::Error::from)
-}
-
 /// CPU access to a dma-buf needs the sync bracket; a plain file (memfd, shm) is coherent already and answers ENOTTY, which is not an error.
-fn sync_if_dmabuf(fd: BorrowedFd<'_>, flags: u64) -> io::Result<()> {
-    match sync(fd, flags) {
+fn sync_if_dmabuf(
+    fd: BorrowedFd<'_>,
+    step: fn(BorrowedFd<'_>, u64) -> io::Result<()>,
+) -> io::Result<()> {
+    match step(fd, SYNC_READ) {
         Err(e) if e.raw_os_error() == Some(Errno::NOTTY.raw_os_error()) => Ok(()),
         other => other,
     }
@@ -111,47 +91,6 @@ pub fn fence_signalled(fence: &SceneFd) -> Result<bool, String> {
     Ok(ready > 0)
 }
 
-/// A read-only shared mapping, unmapped on drop.
-struct Mapping {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl Mapping {
-    fn new(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
-        // SAFETY: a null hint lets the kernel choose the address, so no existing mapping is touched; `fd` is open (borrowed) and the caller checked the file holds at least `len` bytes, so reads stay inside the file.
-        let ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                ProtFlags::READ,
-                MapFlags::SHARED,
-                fd,
-                0,
-            )
-        }?;
-        Ok(Self {
-            ptr: ptr.cast(),
-            len,
-        })
-    }
-
-    /// A copy of the mapped bytes. A copy, because the producer may write the shared memory at any time and no reference into it may outlive the call.
-    fn copy(&self) -> Vec<u8> {
-        let mut v = vec![0u8; self.len];
-        // SAFETY: `ptr` is valid for `len` bytes while `self` lives (mapped in `new`, unmapped in `drop`); `v` is a fresh allocation of `len` bytes, so the ranges cannot overlap; the copy is of plain bytes.
-        unsafe { std::ptr::copy_nonoverlapping(self.ptr, v.as_mut_ptr(), self.len) };
-        v
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` and `len` are exactly what `mmap` returned for this mapping and it is unmapped once, here; the only access, `copy`, has ended.
-        let _ = unsafe { munmap(self.ptr.cast(), self.len) };
-    }
-}
-
 /// Copies `buffer`'s pixels out of its dma-buf. Every field comes from another process's parcel, so the geometry is checked against the format table and the fd's real size before anything is mapped (a mapping past the end of a file faults on access).
 pub fn read_pixels(buffer: &SceneBuffer) -> Result<Pixels, String> {
     let info = format::lookup(buffer.format)
@@ -194,10 +133,11 @@ pub fn read_pixels(buffer: &SceneBuffer) -> Result<Pixels, String> {
             "fd holds {file_size} bytes, the geometry needs {len}"
         ));
     }
-    let mapping = Mapping::new(fd, len).map_err(|e| format!("mmap: {e}"))?;
-    sync_if_dmabuf(fd, SYNC_START | SYNC_READ).map_err(|e| format!("sync start: {e}"))?;
-    let mut bytes = mapping.copy();
-    sync_if_dmabuf(fd, SYNC_END | SYNC_READ).map_err(|e| format!("sync end: {e}"))?;
+    // the file holds at least `len` bytes (checked above), so the copy stays inside it
+    let mapping = Mapping::read_only(fd, len).map_err(|e| format!("mmap: {e}"))?;
+    sync_if_dmabuf(fd, begin_cpu_access).map_err(|e| format!("sync start: {e}"))?;
+    let mut bytes = mapping.read();
+    sync_if_dmabuf(fd, end_cpu_access).map_err(|e| format!("sync end: {e}"))?;
     if !info.components.iter().any(|c| c.0 == COMPONENT_A) {
         bytes.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
     }

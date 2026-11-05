@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-gralloc-dmabuf"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# CPU access to a gralloc buffer's dma-buf: mmap and the DMA_BUF_IOCTL_SYNC bracket (linux/dma-buf.h). The one implementation the mapper (IMapper lock/unlock) and the Scene reader (atl-scene-buffer) share,
+# so no Linux buffer ioctl lives above the gralloc module. A crate of its own, not a mapper module, because the mapper is the cdylib that exports AIMapper_loadIMapper and needs AOSP headers at build time.
+# Boundary crate (CLAUDE.md "unsafe"): `unsafe` for the mapping and the ioctl; each block says why it holds.
+# Fence contract: the sync ioctl makes caches coherent but does not wait for GPU rendering (measured on WSL software drivers); the producer finishes or fences its rendering before queueBuffer, and a reader waits on the acquire fence first.
+
+[dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true

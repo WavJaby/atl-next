@@ -187,12 +187,20 @@ name = "atl-gralloc"
 version = "0.0.0"
 
 [[package]]
+name = "atl-gralloc-dmabuf"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "atl-gralloc-mapper"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
  "atl-gralloc",
+ "atl-gralloc-dmabuf",
  "rustix",
 ]
 
@@ -349,6 +357,7 @@ version = "0.0.0"
 dependencies = [
  "atl-compositor",
  "atl-gralloc",
+ "atl-gralloc-dmabuf",
  "rustix",
 ]
 

@@ -17,7 +17,7 @@ use rustix::fs::{SeekFrom, fstat, seek};
 use rustix::io::fcntl_dupfd_cloexec;
 use rustix::time::Timespec;
 
-use crate::dmabuf::{self, Mapping, SYNC_READ, SYNC_WRITE};
+use atl_gralloc_dmabuf::{self as dmabuf, Mapping, SYNC_READ, SYNC_WRITE};
 
 /// `AIMapper_Error` values (IMapper.h): the ones the interface lets each function return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

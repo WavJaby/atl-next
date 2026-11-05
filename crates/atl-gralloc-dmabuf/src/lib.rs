@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The dma-buf side of the mapper: mapping a buffer into the process and the CPU-access bracket the kernel requires around it (`DMA_BUF_IOCTL_SYNC`, linux/dma-buf.h).
-//! The only `unsafe` besides the C ABI shells; everything above it is safe code.
+//! CPU access to a gralloc buffer's dma-buf: mapping it into the process and the bracket the kernel requires around the access (`DMA_BUF_IOCTL_SYNC`, linux/dma-buf.h). Users: the mapper (IMapper lock/unlock) and the Scene reader.
+//! The bracket makes CPU caches coherent; it does not wait for GPU rendering (WSL software drivers return before the render lands) -- the producer must finish or fence before queueBuffer, and a reader waits on the acquire fence first.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -46,6 +46,7 @@ pub fn end_cpu_access(fd: BorrowedFd<'_>, direction: u64) -> io::Result<()> {
 pub struct Mapping {
     ptr: *mut u8,
     len: usize,
+    writable: bool,
 }
 
 // SAFETY: a `Mapping` is a pointer to process-wide mapped memory that no thread owns; the handle only unmaps it on drop. The bytes behind it are shared memory the kernel and other processes also touch, so every access is a raw-pointer access (`read`, `write`, `as_ptr`), never a Rust reference held across calls.
@@ -56,12 +57,21 @@ unsafe impl Sync for Mapping {}
 impl Mapping {
     /// Maps the first `len` bytes of `fd` read-write and shared.
     pub fn new(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
+        Self::with(fd, len, ProtFlags::READ | ProtFlags::WRITE)
+    }
+
+    /// Maps the first `len` bytes of `fd` read-only and shared: a reader of another process's buffer; [`write`](Self::write) on it panics.
+    pub fn read_only(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
+        Self::with(fd, len, ProtFlags::READ)
+    }
+
+    fn with(fd: BorrowedFd<'_>, len: usize, prot: ProtFlags) -> io::Result<Self> {
         // SAFETY: a null hint asks the kernel to choose the address; no existing mapping is touched. The result is checked by `mmap`'s `Result`.
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
                 len,
-                ProtFlags::READ | ProtFlags::WRITE,
+                prot,
                 MapFlags::SHARED,
                 fd.as_fd(),
                 0,
@@ -70,6 +80,7 @@ impl Mapping {
         Ok(Self {
             ptr: ptr.cast(),
             len,
+            writable: prot.contains(ProtFlags::WRITE),
         })
     }
 
@@ -88,6 +99,7 @@ impl Mapping {
 
     /// Writes `bytes` at `offset` into the mapping. Panics when it does not fit (a caller bug: the offsets are constants of the page layout).
     pub fn write(&self, offset: usize, bytes: &[u8]) {
+        assert!(self.writable, "write to a read-only mapping");
         assert!(
             offset
                 .checked_add(bytes.len())
@@ -140,6 +152,16 @@ mod tests {
             e.raw_os_error(),
             Some(rustix::io::Errno::NOTTY.raw_os_error())
         );
+    }
+
+    /// A read-only mapping refuses `write` before touching memory (the store would fault).
+    #[test]
+    #[should_panic(expected = "read-only")]
+    fn write_to_a_read_only_mapping_panics() {
+        let fd = memfd(4096);
+        let m = Mapping::read_only(fd.as_fd(), 4096).expect("map");
+        assert_eq!(m.read().len(), 4096);
+        m.write(0, b"x");
     }
 
     #[test]

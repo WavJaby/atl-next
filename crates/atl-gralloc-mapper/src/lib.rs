@@ -2,15 +2,12 @@
 //! `mapper.atl.so`: the stable-C IMapper v5 provider AOSP libui loads for graphics buffers (`Gralloc5.cpp`: `AServiceManager_openDeclaredPassthroughHal("mapper", suffix)` -> `dlsym("AIMapper_loadIMapper")`), over the buffers our allocator service (atl-gralloc-service) hands out.
 //!
 //! - `exports`: `AIMapper_loadIMapper` and the 15 functions behind the `AIMapperV5` table, whose entry shells build.rs generates from IMapper.h (atl-bridgegen): header signatures, panic shield, `AIMapperV5::shells()`.
-//! - `mapper`: the table of imported buffers and what IMapper does with them, safe Rust over `dmabuf`.
-//! - `dmabuf`: mmap and `DMA_BUF_IOCTL_SYNC`, the CPU access path (no GPU, no DRM node: the mapper only needs the dma-buf descriptor).
+//! - `mapper`: the table of imported buffers and what IMapper does with them, safe Rust over atl-gralloc-dmabuf (mmap and `DMA_BUF_IOCTL_SYNC`; no GPU, no DRM node: the mapper only needs the dma-buf descriptor).
 //!
 //! A buffer's identity, layout and metadata come from atl-gralloc (handle ints, the shared page, the standard-metadata encoding).
-//! Boundary crate: `unsafe` only in `exports`, `dmabuf` and the generated shells.
+//! Boundary crate: `unsafe` only in `exports` and the generated shells.
 #![deny(unsafe_code)]
 
-#[allow(unsafe_code)]
-mod dmabuf;
 #[allow(unsafe_code)]
 mod exports;
 mod mapper;

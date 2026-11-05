@@ -7,13 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Reading a Scene buffer's pixels on the CPU (M3): mmap of the quad's dma-buf bracketed by DMA_BUF_IOCTL_SYNC, and the poll of a sync_file fence. What the GTK presenter (atl-platform-ui-linux) and the compositor's
+# Reading a Scene buffer's pixels on the CPU (M3): the quad's dma-buf copied through atl-gralloc-dmabuf (mmap + CPU-access sync), and the poll of a sync_file fence. What the GTK presenter (atl-platform-ui-linux) and the compositor's
 # own scene checks (atl-composer) share; it was the platform crate's `buffer` module until the second reader needed it, so no GTK is pulled in by reading a buffer.
-# Boundary crate (CLAUDE.md "unsafe"): `unsafe` for the mapping, the ioctl and borrowing the quad's fd number; each block says why it holds.
+# Boundary crate (CLAUDE.md "unsafe"): `unsafe` only for borrowing the quad's fd number; the block says why it holds.
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
 atl-gralloc = { path = "../atl-gralloc" }
+atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 rustix.workspace = true
 
 [lints]

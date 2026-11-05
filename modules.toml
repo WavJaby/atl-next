@@ -80,10 +80,10 @@ uses = ["generators"]
 crates = ["atl-compositor"]
 exports = ["atl-compositor"]
 
-# gralloc (M3 slice 2): AOSP libui's Gralloc5 halves -- the AIDL IAllocator service (GBM on the host's DRM device) and the stable-C IMapper v5 library (mapper.atl.so, dma-buf mapping), agreeing through the core's handle / metadata / VINTF definitions; the truth crate is `xtask test gralloc`'s two-process client of AOSP's libui (test-only)
+# gralloc (M3 slice 2): AOSP libui's Gralloc5 halves -- the AIDL IAllocator service (GBM on the host's DRM device) and the stable-C IMapper v5 library (mapper.atl.so, dma-buf mapping), agreeing through the core's handle / metadata / VINTF definitions; CPU access to a buffer's dma-buf (mmap + DMA_BUF_IOCTL_SYNC) is one crate the mapper and the Scene reader share; the truth crate is `xtask test gralloc`'s two-process client of AOSP's libui (test-only)
 [gralloc]
-crates = ["atl-gralloc", "atl-gralloc-mapper", "atl-gralloc-service", "atl-gralloc-truth"]
-exports = ["atl-gralloc"]
+crates = ["atl-gralloc", "atl-gralloc-dmabuf", "atl-gralloc-mapper", "atl-gralloc-service", "atl-gralloc-truth"]
+exports = ["atl-gralloc", "atl-gralloc-dmabuf"]
 uses = ["aidl", "generators"]
 
 # the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, reading each quad's buffer through scene-buffer (the facade's example names a gralloc format)
@@ -103,7 +103,7 @@ crates = ["atl-platform-host-api", "atl-platform-host-linux", "atl-platform-host
 exports = ["atl-platform-host"]
 uses = ["platform-types"]
 
-# a Scene buffer's pixels on the CPU (mmap + DMA_BUF_IOCTL_SYNC of the quad's dma-buf, sync_file polling), read through gralloc's format and handle definitions: what the GTK presenter and the compositor's scene checks (composer) share
+# a Scene buffer's pixels on the CPU (the quad's dma-buf copied through gralloc's CPU-access crate, sync_file polling), read through gralloc's format and handle definitions: what the GTK presenter and the compositor's scene checks (composer) share
 [scene-buffer]
 crates = ["atl-scene-buffer"]
 exports = ["atl-scene-buffer"]
