@@ -45,6 +45,10 @@ pub struct Runtime {
     gralloc: Option<(PathBuf, PathBuf)>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
+    /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
+    ui: Option<String>,
+    /// Environment of atld, inherited by the app processes (set by [`Runtime::with_env`]).
+    env: Vec<(String, String)>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -173,6 +177,8 @@ impl Runtime {
             keychars,
             gralloc: None,
             headless_pointer: None,
+            ui: None,
+            env: Vec::new(),
         })
     }
 
@@ -193,6 +199,18 @@ impl Runtime {
     /// Feeds atld a headless pointer script (format: atl-composer `input::parse_script`); the app injects it after its first frame. Only the input gate sets it.
     pub fn with_headless_pointer(mut self, script: &str) -> Self {
         self.headless_pointer = Some(script.to_owned());
+        self
+    }
+
+    /// The app processes' UI mode (atld `--ui`, value `gtk`): every app process presents into a GTK window. Only the `gtk` window stage sets it.
+    pub fn with_ui(mut self, mode: &str) -> Self {
+        self.ui = Some(mode.to_owned());
+        self
+    }
+
+    /// Sets an environment variable of atld, which the app processes inherit (the GTK stage's `GSK_RENDERER=cairo`: the default renderer's GPU init stalls the app's main thread in this sandbox).
+    pub fn with_env(mut self, key: &str, value: &str) -> Self {
+        self.env.push((key.to_owned(), value.to_owned()));
         self
     }
 
@@ -290,6 +308,7 @@ impl Runtime {
             lib_path.push(dir);
         }
         let mut cmd = Command::new(&self.atld);
+        cmd.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);
         }
@@ -324,6 +343,9 @@ impl Runtime {
             .args(["--log-tags", &run.log_tags]);
         if let Some(script) = &self.headless_pointer {
             cmd.args(["--headless-pointer", script]);
+        }
+        if let Some(mode) = &self.ui {
+            cmd.args(["--ui", mode]);
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);

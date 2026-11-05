@@ -54,6 +54,8 @@ enum Stage {
     Frames,
     /// Resume, then the touches the injected pointer script makes are the ones the fixture logs.
     Input,
+    /// Resume in UI mode (`ro.atl.ui=gtk`): the app's window is a GTK window of its process. Spike stage: the verdict is the resume one, the mirror's counters are in the app log.
+    Gtk,
 }
 
 impl Stage {
@@ -62,6 +64,7 @@ impl Stage {
             Stage::Resume => "resume",
             Stage::Frames => "frames",
             Stage::Input => "input",
+            Stage::Gtk => "gtk",
         }
     }
 
@@ -69,7 +72,7 @@ impl Stage {
     fn window_ms(self) -> u64 {
         match self {
             Stage::Resume => WINDOW_MS,
-            Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
+            Stage::Frames | Stage::Input | Stage::Gtk => FRAMES_WINDOW_MS,
         }
     }
 
@@ -77,6 +80,7 @@ impl Stage {
     fn sub_names(self) -> &'static [&'static str] {
         match self {
             Stage::Resume => &[],
+            Stage::Gtk => &["mapped", "readback"],
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -85,6 +89,12 @@ impl Stage {
 
 /// The fixture's dir.
 const FIXTURE: &str = "xtask/testdata/window";
+/// The environment variable of the composer's readback file (atl-composer `ui_window::CAPTURE_ENV`; xtask does not depend on the composer).
+const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
+/// The raw RGBA the stage's readback is written to, under the slot's output directory.
+const GTK_CAPTURE_FILE: &str = "window-gtk-capture.rgba";
+/// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
+const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take to reach the marker (as `xtask test app`).
@@ -118,7 +128,7 @@ const TAIL: usize = 40;
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
     match stage {
-        Stage::Resume | Stage::Frames | Stage::Input => "AtlWindow: onResume reached",
+        Stage::Resume | Stage::Frames | Stage::Input | Stage::Gtk => "AtlWindow: onResume reached",
     }
 }
 
@@ -421,6 +431,66 @@ fn picture_check(app: &str, display: DisplayModel) -> Result<String, String> {
     ))
 }
 
+/// Stage `gtk` sub-gate (a): the window mapped at its first frame-clock tick, and the compositor presented at least [`GTK_PRESENTED`] scenes into it before the readback.
+fn gtk_window_check(app: &str) -> Result<String, String> {
+    if !app
+        .lines()
+        .any(|l| l.contains("atl-composer: ui: first frame mapped=true"))
+    {
+        return Err("the window never mapped at its first frame-clock tick".to_owned());
+    }
+    let line = capture_line(app)?;
+    let presented = word(line, "presented")
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| format!("no presented count: {line}"))?;
+    if presented < GTK_PRESENTED {
+        return Err(format!(
+            "{presented} scenes presented before the readback, {GTK_PRESENTED} wanted"
+        ));
+    }
+    Ok(format!(
+        "mapped, {presented} scenes presented before the readback"
+    ))
+}
+
+/// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`), and its raw RGBA is kept at `file`.
+fn gtk_capture_check(app: &str, display: DisplayModel, file: &Path) -> Result<String, String> {
+    let (width, height) = (display.width as u32, display.height as u32);
+    let line = capture_line(app)?;
+    let size = word(line, "size").unwrap_or("none");
+    let want_size = format!("{width}x{height}");
+    if size != want_size {
+        return Err(format!("readback is {size}, the display is {want_size}"));
+    }
+    let digest = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
+    let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
+    let want = fnv1a64(&quadrant_pixels(width, height));
+    if got != want {
+        return Err(format!(
+            "readback digest {got:016x}, the quadrants {want:016x}"
+        ));
+    }
+    let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let expect = u64::from(width) * u64::from(height) * 4;
+    if bytes != expect {
+        return Err(format!(
+            "{} holds {bytes} bytes, {expect} wanted",
+            file.display()
+        ));
+    }
+    Ok(format!(
+        "readback {want_size} digest {want:016x} = the quadrants, raw RGBA at {}",
+        file.display()
+    ))
+}
+
+/// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
+fn capture_line(app: &str) -> Result<&str, String> {
+    app.lines()
+        .find(|l| l.contains("atl-composer: ui: capture "))
+        .ok_or_else(|| "no readback line: the window never reached its capture frame".to_owned())
+}
+
 /// The frame time (ns) of an `AtlWindow: frame N time=T` line: the fixture's Choreographer callback.
 fn frame_time(line: &str) -> Option<u64> {
     let (_, rest) = line.split_once("AtlWindow: frame ")?;
@@ -558,8 +628,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
+    let capture_file = rt.out.join(GTK_CAPTURE_FILE);
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
+        // the default renderer's GPU init stalls the app's main thread in this sandbox (measured 2026-11-05); the platform gate runs cairo too
+        Stage::Gtk => rt
+            .with_ui("gtk")
+            .with_env("GSK_RENDERER", "cairo")
+            .with_env(CAPTURE_ENV, &capture_file.to_string_lossy()),
         Stage::Resume | Stage::Frames => rt,
     };
     let work = rt.out.join("window");
@@ -631,6 +707,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ]
         }
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
+        (Stage::Gtk, Some(_)) => vec![
+            gtk_window_check(&app),
+            gtk_capture_check(&app, DisplayModel::default(), &capture_file),
+        ],
         _ => Vec::new(),
     };
     let sub_fault = sub.iter().find_map(|r| r.as_ref().err().cloned());
