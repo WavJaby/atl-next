@@ -203,7 +203,7 @@ impl IWindowManager for WindowManager {
     /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
     fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
         // counted: the window gate's input stage requires this line (xtask window.rs touch_mode_check)
-        counters::count(INTERFACE, "setInTouchMode (answered)");
+        counters::count(WINDOW_MANAGER, "setInTouchMode (answered)");
         Ok(())
     }
 

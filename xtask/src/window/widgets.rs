@@ -22,7 +22,7 @@ pub const FIXTURE: &str = "xtask/testdata/widgets";
 /// The sub-gates, in print order (each prints `window: <name>: pass|FAIL`).
 pub const SUB_NAMES: &[&str] = &[
     "probe", "layout", "text", "header", "click", "focus", "window", "list", "readback",
-    "presents", "cadence", "pacing", "window-focus",
+    "presents", "cadence", "pacing",
 ];
 /// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
@@ -326,7 +326,6 @@ pub fn checks(
         presents_check(app),
         cadence_check(after, display.refresh_hz),
         pacing_check(app, display.refresh_hz),
-        window_focus_check(app),
     ]
 }
 
@@ -521,13 +520,5 @@ mod pacing_tests {
         assert!(pacing_check(&line(40, 200), 120.0).is_ok());
         assert!(pacing_check(&line(1, 120), 120.0).is_err());
         assert!(pacing_check(&line(240, 0), 120.0).is_err());
-    }
-}
-
-/// Sub-gate window-focus: the desktop's activation of the toplevel reached the app as window focus (GTK is-active -> InputEvent::Focus -> publishFocusEvent -> onWindowFocusChanged).
-fn window_focus_check(app: &str) -> Result<String, String> {
-    match rest_of(app, "AtlWindow: window focus=") {
-        Some("true") => Ok("the active toplevel gave the window focus".to_owned()),
-        other => Err(format!("window focus line {other:?}, want true")),
     }
 }

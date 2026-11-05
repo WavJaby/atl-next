@@ -255,7 +255,7 @@ public class ParcelTruth {
         e.hintText = "hint";
         e.label = "label";
         e.packageName = "com.example.app";
-        e.autofillId = new AutofillId(42);
+        e.setAutofillId(new AutofillId(42));
         e.fieldId = 42;
         e.fieldName = "name";
         e.extras = new Bundle();

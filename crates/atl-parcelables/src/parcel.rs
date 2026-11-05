@@ -97,6 +97,23 @@ pub fn r_str8_array(p: &In<'_>) -> Result<Option<Vec<Option<String>>>> {
         .collect::<Result<Vec<_>>>()
         .map(Some)
 }
+/// Java writeStringArray: -1 for null, else the count and each String16.
+pub fn w_str16_array(p: &mut In<'_>, v: &Option<Vec<Option<String>>>) -> Result<()> {
+    let Some(v) = v else { return w_i32(p, -1) };
+    w_i32(p, len_i32(v.len())?)?;
+    v.iter().try_for_each(|s| w_str16(p, s))
+}
+/// Java createStringArray.
+pub fn r_str16_array(p: &In<'_>) -> Result<Option<Vec<Option<String>>>> {
+    let n = r_i32(p)?;
+    if n < 0 {
+        return Ok(None);
+    }
+    (0..n)
+        .map(|_| r_str16(p))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
 
 /// Java writeIntArray: -1 for null, else the count and each int.
 pub fn w_i32_array(p: &mut In<'_>, v: &Option<Vec<i32>>) -> Result<()> {

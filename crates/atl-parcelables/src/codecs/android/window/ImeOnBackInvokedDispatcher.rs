@@ -5,6 +5,7 @@
 use binder::SpIBinder;
 
 use crate::parcel::*;
+use crate::parts::*;
 
 /// The ResultReceiver's binder; None = a null ResultReceiver (presence 0).
 #[derive(Debug, Clone, Default, PartialEq)]

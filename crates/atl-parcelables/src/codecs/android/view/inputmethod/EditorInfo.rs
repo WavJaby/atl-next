@@ -77,7 +77,7 @@ pub struct SurroundingText {
     pub offset: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct EditorInfo {
     pub input_type: i32,
     pub ime_options: i32,
@@ -147,7 +147,7 @@ impl Part for EditorInfo {
             w_i32(p, t.offset)?;
         }
         w_str8(p, &self.hint_locales)?;
-        w_str8_array(p, &self.content_mime_types)?;
+        w_str16_array(p, &self.content_mime_types)?;
         w_i32(p, self.target_input_method_user)?;
         w_bool(p, self.writing_tools_enabled)
     }
@@ -214,7 +214,7 @@ impl Part for EditorInfo {
             stylus_handwriting_enabled,
             initial_surrounding_text,
             hint_locales: r_str8(p)?,
-            content_mime_types: r_str8_array(p)?,
+            content_mime_types: r_str16_array(p)?,
             target_input_method_user: r_i32(p)?,
             writing_tools_enabled: r_bool(p)?,
         })
