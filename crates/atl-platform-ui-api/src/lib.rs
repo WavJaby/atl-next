@@ -99,9 +99,6 @@ pub enum PresentError {
 pub trait Ui: Sized {
     /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
     fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError>;
-
-    /// Runs `f` on the UI thread, from any thread: the one cross-thread entry (a binder thread asks for a window this way and does not wait for GTK). It runs when the UI thread next polls its Looper; the caller does not block on it.
-    fn invoke<F: FnOnce() + Send + 'static>(f: F);
 }
 
 /// The UI thread's Android Looper as the toolkit's main loop registers its fds with it. The launcher implements it over `ALooper_addFd` / `ALooper_removeFd`; Java's `nativePollOnce` polls it, and each readiness reaches the sink on the UI thread from inside that poll.

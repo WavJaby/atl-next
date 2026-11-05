@@ -8,7 +8,6 @@ use std::marker::PhantomData;
 use std::thread::{self, ThreadId};
 
 use atl_platform_ui_api::{Looper, Ui, UiError};
-use gtk4::glib;
 
 use crate::mirror;
 
@@ -41,10 +40,5 @@ impl Ui for GtkUi {
             thread: thread::current().id(),
             _not_send: PhantomData,
         })
-    }
-
-    /// GLib's own cross-thread queue of the default context: it wakes the context (the mirror's registration for GLib's wakeup fd), and the closure runs in the UI thread's dispatch.
-    fn invoke<F: FnOnce() + Send + 'static>(f: F) {
-        glib::MainContext::default().invoke(f);
     }
 }
