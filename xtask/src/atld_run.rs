@@ -43,6 +43,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
+    /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
+    native_bridge: PathBuf,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
     /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
@@ -213,7 +215,15 @@ impl Runtime {
         ensure!(font_file.is_file(), "missing input {}", font_file.display());
         let keychars = farm::virtual_kcm(&layout);
         ensure!(keychars.is_file(), "missing input {}", keychars.display());
+        let native_bridge = crate::cdylib::stage(
+            root,
+            &out,
+            "atl-native-bridge",
+            "native-bridge/lib",
+            atl_native_bridge::LIBRARY,
+        )?;
         Ok(Runtime {
+            native_bridge,
             art,
             out,
             java_out,
@@ -410,8 +420,10 @@ impl Runtime {
             std::fs::remove_dir_all(&run.root)
                 .with_context(|| format!("removing {}", run.root.display()))?;
         }
-        // the staged ART's library dir, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
+        // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
         let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
+        lib_path.push(":");
+        lib_path.push(&self.native_bridge);
         if let Some((_, dir)) = &self.gralloc {
             lib_path.push(":");
             lib_path.push(dir);

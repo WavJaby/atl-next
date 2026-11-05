@@ -77,6 +77,7 @@ fn main() -> Result<()> {
                 record: "AIMapperV5",
                 implementation: "crate::exports",
                 on_panic: &on_panic,
+                values: &[],
             },
         )
     };

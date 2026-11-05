@@ -113,6 +113,21 @@ fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
         .map_err(|e| anyhow!("{e}"))
 }
 
+/// AndroidRuntime::startVm's NativeBridge option from `ro.dalvik.vm.native.bridge` (unset, empty or "0": none), plus `-Xforce-nb-testing`: a non-zygote ART unloads the bridge unless forced
+/// (runtime.cc `InitNonZygoteOrPostFork` action kUnload), and our app processes are not zygote forks; bridge 1 runs same-ISA bionic code through it (bridge-1 plan section 2, R4).
+fn native_bridge_options(property: Option<String>) -> Vec<std::ffi::CString> {
+    match property {
+        Some(lib) if !lib.is_empty() && lib != "0" => [
+            format!("-XX:NativeBridge={lib}"),
+            "-Xforce-nb-testing".to_owned(),
+        ]
+        .into_iter()
+        .filter_map(|o| std::ffi::CString::new(o).ok())
+        .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn run() -> Result<i32> {
     let launch = args::parse(std::env::args_os()).map_err(|e| anyhow!(e))?;
     ffi::install_signal_stack()?;
@@ -124,7 +139,13 @@ fn run() -> Result<i32> {
             atl_bionic::AREA_ENV
         );
     }
-    let vm = rt.create_vm(&launch.vm_options)?;
+    let mut vm_options = launch.vm_options.clone();
+    if launch.app {
+        vm_options.extend(native_bridge_options(
+            rt.property(c"ro.dalvik.vm.native.bridge"),
+        ));
+    }
+    let vm = rt.create_vm(&vm_options)?;
     rt.install_logger();
     rt.set_target_sdk(launch.target_sdk);
     let Some(class) = &launch.class else {
@@ -165,4 +186,24 @@ pub fn main() -> ! {
         }
     };
     ffi::fast_exit(status)
+}
+
+#[cfg(test)]
+mod nb_tests {
+    use super::native_bridge_options;
+
+    #[test]
+    fn native_bridge_option_follows_the_property() {
+        let o = native_bridge_options(Some("libx.so".into()));
+        assert_eq!(
+            o,
+            [
+                c"-XX:NativeBridge=libx.so".to_owned(),
+                c"-Xforce-nb-testing".to_owned()
+            ]
+        );
+        assert!(native_bridge_options(Some("0".into())).is_empty());
+        assert!(native_bridge_options(Some(String::new())).is_empty());
+        assert!(native_bridge_options(None).is_empty());
+    }
 }

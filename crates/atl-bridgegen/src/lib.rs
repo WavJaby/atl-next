@@ -715,7 +715,7 @@ mod tests {
         let header = dir.0.join("t.h");
         std::fs::write(
             &header,
-            "struct Ops { int (*add)(int a, long b); void (*poke)(int *p); const char *(*name)(void); };\nstruct Ctx { unsigned version; struct Ops ops; };\nint load(struct Ctx **out);\nstruct Plain { int x; };\nint plain(struct Plain *p);\n",
+            "struct Ops { int (*add)(int a, long b); void (*poke)(int *p); const char *(*name)(void); };\nstruct Ctx { unsigned version; struct Ops ops; };\nint load(struct Ctx **out);\nstruct Plain { int x; };\nint plain(struct Plain *p);\nstruct Itf { unsigned version; void (*poke)(int *p); };\nint itf(struct Itf *i);\n",
         )
         .unwrap();
         let targets = [target("x86_64", "x86_64-unknown-linux-gnu")];
@@ -730,6 +730,7 @@ mod tests {
             record: "Ops",
             implementation: "imp",
             on_panic: &on_panic,
+            values: &[],
         };
         let gen_ = |functions: &[&str], record: &str| {
             rust::api_module_with_table(
@@ -754,6 +755,24 @@ mod tests {
         // a table record the functions do not reach has no asserted layout: refused; so is a non-pointer field
         assert!(gen_(&["plain"], "Ops").is_err());
         assert!(gen_(&["load"], "Ctx").is_err());
+        // a data field takes its `values` expression; without one, or with a value for no data field, refused
+        let itf = |values: &[(&str, &str)]| {
+            rust::api_module_with_table(
+                &iface,
+                "x86_64",
+                &["itf"],
+                &[],
+                "exports",
+                &rust::Table {
+                    record: "Itf",
+                    values,
+                    ..table
+                },
+            )
+        };
+        assert!(itf(&[("version", "3")]).unwrap().contains("version: 3,"));
+        assert!(itf(&[]).is_err());
+        assert!(itf(&[("version", "3"), ("nope", "1")]).is_err());
         let prelude = "extern crate std;\nmod exports { pub unsafe extern \"C\" fn load(_: *mut *mut super::Ctx) -> i32 { 0 } }\n";
         let imp = "mod imp {\n  pub unsafe fn add(a: i32, b: i64) -> i32 { if a < 0 { panic!(\"boom\") } a + b as i32 }\n  pub unsafe fn poke(p: *mut i32) { unsafe { *p = 1 } }\n  pub unsafe fn name() -> *const i8 { core::ptr::null() }\n}\n";
         let ok = rustc(&dir, &format!("{prelude}{code}{imp}"));

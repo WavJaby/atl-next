@@ -10,6 +10,7 @@ mod arches;
 mod atld_run;
 mod binder;
 mod build_pool;
+mod cdylib;
 mod check;
 mod composer;
 mod compositor;

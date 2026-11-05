@@ -234,6 +234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-native-bridge"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "object",
+]
+
+[[package]]
 name = "atl-opengl"
 version = "0.0.0"
 dependencies = [
@@ -1596,6 +1605,7 @@ dependencies = [
  "atl-broker",
  "atl-gralloc",
  "atl-layout",
+ "atl-native-bridge",
  "atl-platform-host",
  "atl-services",
  "clap",

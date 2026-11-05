@@ -40,6 +40,8 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("ro.product.name", "atl"),
     // no boot sequence: an app process starts on a booted system. Android sets it in ActivityManagerService finishBooting
     ("sys.boot_completed", "1"),
+    // the NativeBridge core (atl-native-bridge `LIBRARY`): AndroidRuntime::startVm turns it into `-XX:NativeBridge=` for zygote's children, as atl-app-launcher's app mode does
+    ("ro.dalvik.vm.native.bridge", "libatl_native_bridge.so"),
 ];
 
 /// Why the default set or its area could not be built.

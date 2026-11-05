@@ -113,27 +113,13 @@ fn verdict(role: &str, cases: &[&str], ok: bool, stdout: &str) -> (Vec<String>, 
 
 /// Builds `mapper.atl.so` (crate atl-gralloc-mapper, plain cargo into `<out>/cargo`) and installs it under the file name libui looks for, in `<out>/gralloc/lib`; returns that directory (for LD_LIBRARY_PATH: libui's `android_load_sphal_library` is `dlopen` here).
 pub fn stage_mapper(root: &Path, out: &Path) -> Result<PathBuf> {
-    let status = crate::cargo_command()
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "atl-gralloc-mapper",
-            "--target-dir",
-        ])
-        .arg(out.join("cargo"))
-        .current_dir(root)
-        .status()?;
-    ensure!(status.success(), "building atl-gralloc-mapper failed");
-    let dir = out.join("gralloc/lib");
-    std::fs::create_dir_all(&dir)?;
-    let built = out.join("cargo/release/libatl_gralloc_mapper.so");
-    // a running app maps this file: replace it by rename, never rewrite it in place (that changed pages under a live process)
-    let dst = dir.join(vintf::mapper_library_name());
-    let tmp = dir.join(format!(".{}.tmp", vintf::mapper_library_name()));
-    std::fs::copy(&built, &tmp).with_context(|| format!("installing {}", built.display()))?;
-    std::fs::rename(&tmp, &dst).with_context(|| format!("installing {}", dst.display()))?;
-    Ok(dir)
+    crate::cdylib::stage(
+        root,
+        out,
+        "atl-gralloc-mapper",
+        "gralloc/lib",
+        &vintf::mapper_library_name(),
+    )
 }
 
 fn append_lib_path(env: &mut [(String, String)], dir: &Path) {

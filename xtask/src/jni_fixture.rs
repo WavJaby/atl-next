@@ -318,6 +318,26 @@ fn probe_failures(built: &Built) -> Result<Vec<String>> {
     Ok(f)
 }
 
+/// The NativeBridge core's `isSupported` verdict (atl-native-bridge `elf::classify`) on the fixture: ours; with glibc's libc as control: not ours.
+fn nb_failures(lib: &Path, api: u32) -> Result<Vec<String>> {
+    use atl_native_bridge::elf::{Verdict, classify, host_machine};
+    let host = host_machine().map_err(anyhow::Error::msg)?;
+    let mut fails = Vec::new();
+    match classify(&std::fs::read(lib)?, host) {
+        Verdict::Bridged => println!("pass nb android-{api}: isSupported takes it"),
+        v => fails.push(format!("nb android-{api}: isSupported refuses it ({v:?})")),
+    }
+    let glibc = Path::new(SONAME_MAP[1].1);
+    match classify(&std::fs::read(glibc)?, host) {
+        Verdict::NotBionic => {}
+        v => fails.push(format!(
+            "nb control: {} judged {v:?}, want NotBionic",
+            glibc.display()
+        )),
+    }
+    Ok(fails)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ndk = match &args.ndk {
         Some(n) => n.clone(),
@@ -355,6 +375,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         fails.extend(f);
         fails.extend(probe_failures(&built)?);
+        fails.extend(nb_failures(&built.dir.join(LIB), api)?);
         shapes.push((api, s));
     }
     // control: each variant fails the other's TLS expectation

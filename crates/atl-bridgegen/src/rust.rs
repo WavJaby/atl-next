@@ -147,15 +147,17 @@ pub fn api_module(
 
 /// A record of function pointers we fill (a vtable handed out by a loader function, such as IMapper.h's `AIMapperV5`): the entry shells are generated from the header.
 pub struct Table<'a> {
-    /// The record; each of its fields is a pointer to a function.
+    /// The record; each of its fields is a pointer to a function, or named in `values`.
     pub record: &'a str,
     /// Rust path of the implementation: `<implementation>::<field>` is an `unsafe fn` of the field's exact signature (the compiler checks it where the shell calls it).
     pub implementation: &'a str,
     /// What a panic in the implementation answers, as a Rust expression of the field's return type: (field, return type). Not asked for a field that returns void.
     pub on_panic: &'a dyn Fn(&str, &Ty) -> Result<String>,
+    /// (field, Rust expression) for the record's data fields (NativeBridgeCallbacks' `version`): `shells()` sets them so. A data field not named here is refused, as is a name that is no data field.
+    pub values: &'a [(&'a str, &'a str)],
 }
 
-/// `api_module`, plus for `table` one exported-by-pointer `unsafe extern "C"` shell per field with the header's exact signature, and `impl <record> { pub const fn shells() -> Self }` with every field set to its shell.
+/// `api_module`, plus for `table` one exported-by-pointer `unsafe extern "C"` shell per function-pointer field with the header's exact signature, and `impl <record> { pub const fn shells() -> Self }` with every such field set to its shell, every data field to its `values` expression.
 /// A shell calls the implementation with its arguments unchanged inside `catch_unwind` (a Rust panic must not cross into a C++ caller): a panic answers `on_panic`. Raw-pointer-to-safe-type conversion is the implementation's, at its first line (the thin-shell pattern).
 /// The record must be reached by `functions` or `types` (so its layout is asserted); a variadic entry has no shell.
 pub fn api_module_with_table(
@@ -178,14 +180,27 @@ pub fn api_module_with_table(
     );
     let mut opaque = BTreeSet::new();
     let mut entries = Vec::new();
+    let mut valued = 0;
     for field in &record.fields {
         let f = field.name.as_str();
         let sig = match field.ty.resolved() {
             Ty::Pointer { pointee, .. } => match pointee.resolved() {
-                Ty::Function(sig) => sig,
-                _ => bail!("{}.{f}: not a function pointer", table.record),
+                Ty::Function(sig) => Some(sig),
+                _ => None,
             },
-            _ => bail!("{}.{f}: not a function pointer", table.record),
+            _ => None,
+        };
+        let Some(sig) = sig else {
+            let (_, value) = table
+                .values
+                .iter()
+                .find(|(n, _)| *n == f)
+                .with_context(|| {
+                    format!("{}.{f}: not a function pointer and no value", table.record)
+                })?;
+            entries.push(format!("            {}: {value},", ident(f)));
+            valued += 1;
+            continue;
         };
         ensure!(
             !sig.variadic,
@@ -233,6 +248,13 @@ pub fn api_module_with_table(
         )?;
         entries.push(format!("            {}: Some({shell}),", ident(f)));
     }
+    ensure!(
+        valued == table.values.len(),
+        "{}: `values` names a field that is no data field of the record",
+        table.record
+    );
+    // the record's own fields already brought their opaque types into `out` (record_item -> opaque_types)
+    opaque.retain(|o| !out.contains(&format!("pub struct {} {{", ident(o))));
     ensure!(
         opaque.is_empty(),
         "{}: entries use types the functions do not define: {opaque:?}",
@@ -290,12 +312,16 @@ fn functions_module(
             .with_context(|| format!("{}: no function {f}", iface.header))?;
         records_used(view, &Ty::Function(Box::new(sig.clone())), &mut records);
     }
+    // a typedef, else a record tag (C++ `struct NativeBridgeCallbacks`, no typedef)
     for t in types {
-        let ty = view
-            .typedefs
-            .get(*t)
-            .with_context(|| format!("{}: no typedef {t}", iface.header))?;
-        records_used(view, ty, &mut records);
+        let ty = match view.typedefs.get(*t) {
+            Some(ty) => ty.clone(),
+            None if view.records.contains_key(*t) => Ty::Record {
+                name: (*t).to_owned(),
+            },
+            None => bail!("{}: no typedef or record {t}", iface.header),
+        };
+        records_used(view, &ty, &mut records);
     }
     for name in &records {
         let record = view

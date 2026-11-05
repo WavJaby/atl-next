@@ -116,6 +116,12 @@ crates = ["atl-opengl"]
 exports = ["atl-opengl"]
 uses = ["generators"]
 
+# the NativeBridge core ART loads (`-XX:NativeBridge=`, plan S11 NB): which app libraries are bridged (`elf`) and the NativeBridgeCallbacks shells generated from native_bridge.h; bridge 1 routing so far, engines behind it later
+[native-bridge]
+crates = ["atl-native-bridge"]
+exports = ["atl-native-bridge"]
+uses = ["generators"]
+
 [generators]
 crates = ["atl-bridgegen"]
 # build-dependency of crates whose types are generated from upstream headers
@@ -129,5 +135,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share
-uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture
+uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge"]
