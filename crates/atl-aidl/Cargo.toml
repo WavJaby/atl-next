@@ -56,6 +56,7 @@ types = [
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.content.pm.IPackageManager",
+    "android.content.IContentService",
     "android.app.IActivityClientController",
     "com.android.internal.view.IInputMethodManager",
     "android.hardware.input.IInputManager",

@@ -15,6 +15,7 @@ pub mod compositor_registry;
 pub mod counters;
 pub mod display_model;
 pub mod manifest_flags;
+pub mod observer_rules;
 pub mod packages;
 pub mod permission;
 pub mod process_control;
@@ -22,6 +23,8 @@ pub mod shared_memory;
 
 #[cfg(feature = "converter")]
 pub mod activity;
+#[cfg(feature = "converter")]
+pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;
 #[cfg(feature = "converter")]
