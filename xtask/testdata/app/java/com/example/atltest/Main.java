@@ -11,7 +11,11 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
-/** The M2 gate: `xtask test app` (xtask/src/app.rs MARKER) waits for the onCreate line; the CA line before it is checked too (app.rs CACERTS). */
+/**
+ * The M2 gate: `xtask test app` (xtask/src/app.rs MARKER) waits for the onCreate line; two lines before it are checked too.
+ * CA line (app.rs CACERTS): the default TrustManagerFactory trusts a distro root.
+ * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser); until bridge 1 loads bionic code, the NativeBridge core refuses and ART throws UnsatisfiedLinkError with its text.
+ */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
     private static final String ROOT = "CN=ISRG Root X1";
@@ -20,6 +24,12 @@ public class Main extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i("AtlTest", "cacerts: " + caCerts());
+        try {
+            Class.forName("atl.bridge1.testlib.AtlJniTest");
+            Log.i("AtlTest", "bridge1 loaded");
+        } catch (UnsatisfiedLinkError | ClassNotFoundException e) {
+            Log.i("AtlTest", "bridge1 not loaded: " + e);
+        }
         Log.i("AtlTest", "onCreate reached");
     }
 

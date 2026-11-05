@@ -42,6 +42,10 @@ const FIXTURE: &str = "xtask/testdata/app";
 const MARKER: &str = "AtlTest: onCreate reached";
 /// Main.onCreate's CA line before [`MARKER`]: the default TrustManagerFactory trusts a distro root (atld's /system CA store, cacerts.rs); `cacerts: trusted ...` passes, `cacerts: FAIL ...` says why not.
 const CACERTS: &str = "AtlTest: cacerts: ";
+/// What Main.onCreate logs before MARKER when the bridge-1 fixture did not load; the gate wants it to carry the NativeBridge core's refusal (`atl_native_bridge::LOAD_REFUSED` + the library's path): proof that libnativeloader routed the library to our `loadLibrary`.
+const BRIDGE1: &str = "AtlTest: bridge1 not loaded: java.lang.UnsatisfiedLinkError";
+/// The fixture's file name in the APK (jni_fixture.rs LIB), which the refusal names.
+const BRIDGE1_LIB: &str = "libatl-jni-test.so";
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -134,14 +138,31 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .lines()
         .find_map(|l| l.split_once(CACERTS).map(|(_, r)| r.to_owned()))
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
+    let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
+    let bridge1_ok = bridge1
+        .is_some_and(|l| l.contains(atl_native_bridge::LOAD_REFUSED) && l.contains(BRIDGE1_LIB));
+    let mut whys = Vec::new();
     if passed && !cacerts.starts_with("trusted ") {
-        let why = format!("CA store: {cacerts}");
-        println!("app: FAIL {why}");
-        println!(
-            "{}",
-            crate::verdict::gate("app", std::slice::from_ref(&why))
-        );
+        whys.push(format!("CA store: {cacerts}"));
+    }
+    if passed && !bridge1_ok {
+        whys.push(format!(
+            "bridge1: want UnsatisfiedLinkError with the NativeBridge refusal for {BRIDGE1_LIB}, got {:?}",
+            bridge1.or_else(|| app.lines().find(|l| l.contains("AtlTest: bridge1")))
+        ));
+    }
+    if !whys.is_empty() {
+        for why in &whys {
+            println!("app: FAIL {why}");
+        }
+        println!("{}", crate::verdict::gate("app", &whys));
         return Ok(ExitCode::FAILURE);
+    }
+    if passed {
+        println!(
+            "app: pass bridge1 routed: {}",
+            bridge1.unwrap_or_default().trim()
+        );
     }
     if passed && gralloc_ok {
         println!("app: cacerts {cacerts}");
