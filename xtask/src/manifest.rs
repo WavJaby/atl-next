@@ -248,6 +248,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 name: target,
                 launcher: true,
                 theme: theme(alias)?,
+                config_changes: config_changes(alias)?,
                 booleans: booleans(alias),
             }),
         }
