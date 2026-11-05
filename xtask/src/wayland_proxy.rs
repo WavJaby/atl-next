@@ -7,6 +7,7 @@
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`.
 //!
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
+//! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, motion, button, each then `frame`) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
 //! Forwarding keeps libwayland's fd semantics: fds are a FIFO attached to bytes, so each batch of complete messages goes out with all fds received so far (at most [`MAX_FDS_PER_SEND`] per `sendmsg`).
@@ -40,6 +41,18 @@ const WL_REGISTRY_BIND: u16 = 0;
 /// `xdg_wm_base`: request `pong(serial)` is opcode 3, event `ping(serial)` is opcode 0.
 const XDG_WM_BASE_PONG: u16 = 3;
 const XDG_WM_BASE_PING: u16 = 0;
+const XDG_WM_BASE_GET_XDG_SURFACE: u16 = 2;
+const XDG_SURFACE: &str = "xdg_surface";
+const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
+const WL_SEAT: &str = "wl_seat";
+const WL_SEAT_GET_POINTER: u16 = 0;
+const WL_POINTER: &str = "wl_pointer";
+const WL_POINTER_ENTER: u16 = 0;
+const WL_POINTER_MOTION: u16 = 2;
+const WL_POINTER_BUTTON: u16 = 3;
+const WL_POINTER_FRAME: u16 = 5;
+/// wl_fixed is 24.8 signed.
+const FIXED_ONE: f64 = 256.0;
 /// `wl_shm.create_pool(new_id, fd, size)`, request 0.
 const WL_SHM_CREATE_POOL: u16 = 0;
 /// libwayland's `MAX_FDS_OUT`: fds one `sendmsg` carries (wayland connection.c).
@@ -62,6 +75,8 @@ pub enum Event {
     Pong { serial: u32 },
     /// The client created a `wl_shm` pool (shared-memory buffers are in use).
     ShmPool,
+    /// The client acknowledged a configure (`xdg_surface.ack_configure`): the window is set up.
+    Acked { serial: u32 },
     /// A client connection closed.
     Closed,
 }
@@ -71,6 +86,10 @@ pub enum Event {
 struct Ids {
     registry: Option<u32>,
     interfaces: HashMap<u32, String>,
+    /// The client's `wl_pointer` (from `wl_seat.get_pointer`).
+    pointer: Option<u32>,
+    /// The `wl_surface` of the first `xdg_surface`: the window.
+    surface: Option<u32>,
 }
 
 impl Ids {
@@ -109,11 +128,30 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         ids.interfaces.insert(new_id, name.clone());
         return Some(Event::Bound(name));
     }
+    // object creations first: they insert ids, which the interface match below reads
+    if ids.interfaces.get(&object).is_some_and(|i| i == WL_SEAT) && opcode == WL_SEAT_GET_POINTER {
+        let pointer = word(body, 0)?;
+        ids.interfaces.insert(pointer, WL_POINTER.to_owned());
+        ids.pointer = Some(pointer);
+        return None;
+    }
+    if ids.interfaces.get(&object).is_some_and(|i| i == WM_BASE)
+        && opcode == XDG_WM_BASE_GET_XDG_SURFACE
+    {
+        // new_id: u32, surface: object
+        let (xdg, surface) = (word(body, 0)?, word(body, 4)?);
+        ids.interfaces.insert(xdg, XDG_SURFACE.to_owned());
+        ids.surface.get_or_insert(surface);
+        return None;
+    }
     match (ids.interfaces.get(&object).map(String::as_str), opcode) {
         (Some(WM_BASE), XDG_WM_BASE_PONG) => Some(Event::Pong {
             serial: word(body, 0)?,
         }),
         (Some(SHM), WL_SHM_CREATE_POOL) => Some(Event::ShmPool),
+        (Some(XDG_SURFACE), XDG_SURFACE_ACK_CONFIGURE) => Some(Event::Acked {
+            serial: word(body, 0)?,
+        }),
         _ => None,
     }
 }
@@ -172,12 +210,29 @@ fn forward(to: BorrowedFd<'_>, bytes: &[u8], fds: &mut Vec<OwnedFd>) -> Result<(
     Ok(())
 }
 
+/// A pointer action the proxy injects; each is followed by its `frame`. Coordinates are surface-local, logical; `button` is a linux input code (BTN_LEFT = 0x110).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerAction {
+    Enter { x: f64, y: f64 },
+    Motion { x: f64, y: f64 },
+    Button { button: u32, pressed: bool },
+}
+
+/// What the proxy writes to the client between two forwarded messages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Injection {
+    Ping(u32),
+    Pointer { action: PointerAction, time_ms: u32 },
+}
+
 /// The proxy: accepts clients on `listen`, relays them to `upstream`, reports [`Event`]s.
 pub struct Proxy {
     pub listen: PathBuf,
     pub events: Receiver<(Instant, Event)>,
-    injections: Arc<Mutex<Vec<u32>>>,
+    injections: Arc<Mutex<Vec<Injection>>>,
     wakes: Arc<Mutex<Vec<OwnedFd>>>,
+    /// Origin of the event timestamps the injected pointer events carry.
+    epoch: Instant,
 }
 
 impl Proxy {
@@ -207,15 +262,26 @@ impl Proxy {
             events,
             injections,
             wakes,
+            epoch: Instant::now(),
         })
     }
 
     /// Queues a synthetic `xdg_wm_base.ping(serial)` for the connection that bound `xdg_wm_base`; it reaches the client between two forwarded messages.
     pub fn inject_ping(&self, serial: u32) -> Result<()> {
+        self.queue(Injection::Ping(serial))
+    }
+
+    /// Queues a pointer action on the connection's `wl_pointer`, at its window surface; the client gets it as compositor input. Nothing is written until the client has both (`xdg_surface` and `get_pointer`), so inject after [`Event::Acked`].
+    pub fn inject_pointer(&self, action: PointerAction) -> Result<()> {
+        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.queue(Injection::Pointer { action, time_ms })
+    }
+
+    fn queue(&self, item: Injection) -> Result<()> {
         self.injections
             .lock()
             .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?
-            .push(serial);
+            .push(item);
         for wake in self
             .wakes
             .lock()
@@ -240,7 +306,7 @@ fn serve(
     client: UnixStream,
     upstream: &Path,
     events: &Sender<(Instant, Event)>,
-    injections: &Shared<Vec<u32>>,
+    injections: &Shared<Vec<Injection>>,
     wakes: &Shared<Vec<OwnedFd>>,
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
@@ -303,7 +369,7 @@ fn server_to_client(
     wake: &OwnedFd,
     ids: &Shared<Ids>,
     events: &Sender<(Instant, Event)>,
-    injections: &Shared<Vec<u32>>,
+    injections: &Shared<Vec<Injection>>,
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -352,41 +418,104 @@ fn server_to_client(
             let _ = read(wake, &mut counter);
         }
         // injections are written between whole forwarded messages: `pending` holds only a partial message here, which is not forwarded yet
-        let wm_base = ids
-            .lock()
-            .map_err(|_| anyhow::anyhow!("ids poisoned"))?
-            .id_of(WM_BASE);
-        if let Some(wm_base) = wm_base {
-            let serials: Vec<u32> = std::mem::take(
-                &mut *injections
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?,
-            );
-            for serial in serials {
-                forward(
-                    client.as_fd(),
-                    &ping_bytes(wm_base, serial),
-                    &mut Vec::new(),
-                )?;
-                let _ = events.send((
-                    Instant::now(),
-                    Event::Ping {
-                        serial,
-                        injected: true,
-                    },
-                ));
-            }
+        let items = std::mem::take(
+            &mut *injections
+                .lock()
+                .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?,
+        );
+        if items.is_empty() {
+            continue;
+        }
+        let (wm_base, pointer, surface) = {
+            let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
+            (ids.id_of(WM_BASE), ids.pointer, ids.surface)
+        };
+        for item in items {
+            let bytes = match item {
+                Injection::Ping(serial) => match wm_base {
+                    Some(wm_base) => {
+                        let _ = events.send((
+                            Instant::now(),
+                            Event::Ping {
+                                serial,
+                                injected: true,
+                            },
+                        ));
+                        ping_bytes(wm_base, serial)
+                    }
+                    None => {
+                        eprintln!(
+                            "wayland proxy: ping dropped, the client has not bound xdg_wm_base"
+                        );
+                        continue;
+                    }
+                },
+                Injection::Pointer { action, time_ms } => match (pointer, surface) {
+                    (Some(pointer), Some(surface)) => {
+                        pointer_bytes(pointer, surface, action, time_ms)
+                    }
+                    _ => {
+                        eprintln!(
+                            "wayland proxy: {action:?} dropped, the client has no pointer and window surface yet"
+                        );
+                        continue;
+                    }
+                },
+            };
+            forward(client.as_fd(), &bytes, &mut Vec::new())?;
         }
     }
 }
 
+/// One event as a client receives it: object, `size << 16 | opcode`, the body (native endian).
+fn event(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
+    let size = (HEADER_BYTES + body.len()) as u32;
+    let mut out = Vec::with_capacity(HEADER_BYTES + body.len());
+    out.extend_from_slice(&object.to_ne_bytes());
+    out.extend_from_slice(&((size << 16) | u32::from(opcode)).to_ne_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 /// `xdg_wm_base.ping(serial)` as a client receives it: object, `12 << 16 | 0`, serial.
 fn ping_bytes(wm_base: u32, serial: u32) -> Vec<u8> {
-    let header = ((HEADER_BYTES as u32 + 4) << 16) | u32::from(XDG_WM_BASE_PING);
-    [wm_base, header, serial]
-        .iter()
-        .flat_map(|w| w.to_ne_bytes())
-        .collect()
+    event(wm_base, XDG_WM_BASE_PING, &serial.to_ne_bytes())
+}
+
+/// A surface coordinate as wl_fixed (24.8).
+fn fixed(v: f64) -> [u8; 4] {
+    ((v * FIXED_ONE).round() as i32).to_ne_bytes()
+}
+
+/// A pointer action's `wl_pointer` events as a client receives them: the action's event, then `frame`, which GDK flushes the group on. The serial of enter and button is the timestamp.
+fn pointer_bytes(pointer: u32, surface: u32, action: PointerAction, time_ms: u32) -> Vec<u8> {
+    let (opcode, args): (u16, Vec<[u8; 4]>) = match action {
+        PointerAction::Enter { x, y } => (
+            WL_POINTER_ENTER,
+            vec![
+                time_ms.to_ne_bytes(),
+                surface.to_ne_bytes(),
+                fixed(x),
+                fixed(y),
+            ],
+        ),
+        PointerAction::Motion { x, y } => (
+            WL_POINTER_MOTION,
+            vec![time_ms.to_ne_bytes(), fixed(x), fixed(y)],
+        ),
+        PointerAction::Button { button, pressed } => (
+            WL_POINTER_BUTTON,
+            vec![
+                time_ms.to_ne_bytes(),
+                time_ms.to_ne_bytes(),
+                button.to_ne_bytes(),
+                u32::from(pressed).to_ne_bytes(),
+            ],
+        ),
+    };
+    let mut out = event(pointer, opcode, &args.concat());
+    out.extend(event(pointer, WL_POINTER_FRAME, &[]));
+    out
 }
 
 #[cfg(test)]
@@ -456,6 +585,23 @@ mod tests {
     }
 
     /// `xdg_wm_base.ping` is event 0 with one uint: 12 bytes, size 12 in the high half of the second word.
+    /// wl_pointer.motion(time, x, y) with wl_fixed 24.8 (2.5 = 0x280, -1.0 = -256), then frame: written out from the wire format, not by the encoder.
+    #[test]
+    fn pointer_motion_follows_the_wire_format() {
+        let body = [
+            5u32.to_ne_bytes(),
+            0x280u32.to_ne_bytes(),
+            (-256i32).to_ne_bytes(),
+        ]
+        .concat();
+        let mut want = msg(20, WL_POINTER_MOTION, &body);
+        want.extend(msg(20, WL_POINTER_FRAME, &[]));
+        assert_eq!(
+            pointer_bytes(20, 30, PointerAction::Motion { x: 2.5, y: -1.0 }, 5),
+            want
+        );
+    }
+
     #[test]
     fn ping_is_twelve_bytes() {
         let ping = ping_bytes(7, 0xA7C0_0002);
