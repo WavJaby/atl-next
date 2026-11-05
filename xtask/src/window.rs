@@ -89,10 +89,6 @@ impl Stage {
 
 /// The fixture's dir.
 const FIXTURE: &str = "xtask/testdata/window";
-/// The environment variable of the composer's readback file (atl-composer `ui_window::CAPTURE_ENV`; xtask does not depend on the composer).
-const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
-/// The raw RGBA the stage's readback is written to, under the slot's output directory.
-const GTK_CAPTURE_FILE: &str = "window-gtk-capture.rgba";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
@@ -453,8 +449,8 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`), and its raw RGBA is kept at `file`.
-fn gtk_capture_check(app: &str, display: DisplayModel, file: &Path) -> Result<String, String> {
+/// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`).
+fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String> {
     let (width, height) = (display.width as u32, display.height as u32);
     let line = capture_line(app)?;
     let size = word(line, "size").unwrap_or("none");
@@ -470,17 +466,8 @@ fn gtk_capture_check(app: &str, display: DisplayModel, file: &Path) -> Result<St
             "readback digest {got:016x}, the quadrants {want:016x}"
         ));
     }
-    let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-    let expect = u64::from(width) * u64::from(height) * 4;
-    if bytes != expect {
-        return Err(format!(
-            "{} holds {bytes} bytes, {expect} wanted",
-            file.display()
-        ));
-    }
     Ok(format!(
-        "readback {want_size} digest {want:016x} = the quadrants, raw RGBA at {}",
-        file.display()
+        "readback {want_size} digest {want:016x} = the quadrants"
     ))
 }
 
@@ -628,14 +615,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
-    let capture_file = rt.out.join(GTK_CAPTURE_FILE);
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        // the default renderer's GPU init stalls the app's main thread in this sandbox (measured 2026-11-05); the platform gate runs cairo too
-        Stage::Gtk => rt
-            .with_ui("gtk")
-            .with_env("GSK_RENDERER", "cairo")
-            .with_env(CAPTURE_ENV, &capture_file.to_string_lossy()),
+        Stage::Gtk => rt.with_ui("gtk"),
         Stage::Resume | Stage::Frames => rt,
     };
     let work = rt.out.join("window");
@@ -709,7 +691,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
-            gtk_capture_check(&app, DisplayModel::default(), &capture_file),
+            gtk_capture_check(&app, DisplayModel::default()),
         ],
         _ => Vec::new(),
     };

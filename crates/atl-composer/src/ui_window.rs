@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. Its frame clock ticks the compositor ([`UiFrames::tick`], no clock thread) and its pointer events reach the input thread ([`Message::Event`]).
-//! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup), and [`request`] creates the window there, through `Ui::invoke`, so the binder thread that asked does not wait on GTK.
-//! The window is the display: one per process, opened by the first window surface a client asks for.
+//! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
+//! The window is the display: one per process, opened at install (the app's first traversal waits for a vsync, which this window's frame clock supplies).
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -19,9 +19,6 @@ use crate::sink::fnv1a64;
 
 /// The frame whose readback the log names (`atl-composer: ui: capture ...`): the gate compares its digest with the fixture's expected pixels.
 const CAPTURE_FRAME: u32 = 30;
-
-/// The environment variable naming the file the readback's raw RGBA is written to (test harness only).
-pub const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
 
 /// The UI thread's session: the toolkit, the compositor's frame path, the input thread, the display's size and the window once it exists.
 struct Session {
@@ -51,7 +48,7 @@ pub fn install(ui: PlatformUi, frames: UiFrames, input: Sender<Message>, size: P
 }
 
 /// The readback of the window at [`CAPTURE_FRAME`]: its digest and size, and the frames presented so far, for the gate
-/// (`atl-composer: ui: capture`). With `ATL_UI_CAPTURE` set (the test harness), the raw RGBA is also written to that path.
+/// (`atl-composer: ui: capture`); the gate compares the digest with its own expectation.
 fn capture_report(window: &PlatformWindow, presented: u32) {
     let capture = match window.capture() {
         Ok(capture) => capture,
@@ -67,11 +64,6 @@ fn capture_report(window: &PlatformWindow, presented: u32) {
         capture.size.height,
         fnv1a64(&capture.rgba)
     );
-    if let Some(path) = std::env::var_os(CAPTURE_ENV)
-        && let Err(e) = std::fs::write(&path, &capture.rgba)
-    {
-        let _ = writeln!(std::io::stderr(), "atl-composer: ui: capture write: {e}");
-    }
 }
 
 /// Creates the window, once, on the UI thread.
