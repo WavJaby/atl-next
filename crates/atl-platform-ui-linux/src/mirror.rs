@@ -182,6 +182,24 @@ impl Mirror {
             self.registered.insert(fd, events);
             self.stats.adds += 1;
         }
+        // query's prepare took GDK's Wayland read intent; only check releases it. Left held, a roundtrip on this thread (EGL's, in a window's realise) waits on its own reader: the stall of 2026-11-05. No fd is reported ready here, so nothing is read; sources due by time are dispatched, and a dispatch may add sources, so the next pass re-syncs at once.
+        for poll in &mut self.query[..n] {
+            poll.revents = 0;
+        }
+        // SAFETY: the owned context (acquired in `install`), the priority prepare set, and the array `query` filled for `n` entries, with revents all zero
+        let ready = unsafe {
+            ffi::g_main_context_check(
+                self.ctx,
+                priority,
+                self.query.as_mut_ptr(),
+                c_int::try_from(n).unwrap_or(c_int::MAX),
+            )
+        };
+        if ready != 0 {
+            // SAFETY: the owned context, acquired by this thread
+            unsafe { ffi::g_main_context_dispatch(self.ctx) };
+            timeout = 0;
+        }
         self.arm(timeout);
         let took = started.elapsed().as_nanos();
         self.stats.syncs += 1;
