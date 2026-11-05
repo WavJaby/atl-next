@@ -26,6 +26,8 @@ pub enum Message {
     Window {
         token: SpIBinder,
         fd: OwnedFd,
+        /// the window's LayoutParams flags (Windows::add)
+        flags: i32,
     },
     /// The window of this channel token was removed (WMS removeWindow): its channel is dropped.
     WindowRemoved(SpIBinder),
@@ -34,13 +36,18 @@ pub enum Message {
     Event(InputEvent),
 }
 
-/// The app's input windows, bottom to top, each by its channel key `K` with its channel `C`, and the open pointer gesture's window: the part of AOSP's InputDispatcher that picks a window.
-/// Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top). Every window is taken as touch-modal and covering the pointer
-/// (activity windows fill the Task, dialogs are touch-modal: InputDispatcher `windowAcceptsTouchAt` takes a window without FLAG_NOT_TOUCH_MODAL wherever the touch is), so the topmost window
-/// is the touched one (`findTouchedWindowAtLocked`) and the focused one. Re-check when windows carry frames and flags here (popups are FLAG_NOT_TOUCH_MODAL).
+/// WindowManager.LayoutParams flags InputDispatcher acts on (WMS hands them over as WindowInfo inputConfig NOT_FOCUSABLE / NOT_TOUCHABLE).
+pub const FLAG_NOT_FOCUSABLE: i32 = 0x8;
+pub const FLAG_NOT_TOUCHABLE: i32 = 0x10;
+
+/// The app's input windows, bottom to top, each by its channel key `K` with its channel `C` and its LayoutParams flags, and the open pointer gesture's window: the part of AOSP's InputDispatcher
+/// that picks a window. Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top). Every touchable window is taken as touch-modal and
+/// covering the pointer (activity windows fill the Task, dialogs are touch-modal: InputDispatcher `windowAcceptsTouchAt` takes a window without FLAG_NOT_TOUCH_MODAL wherever the touch is), so the
+/// topmost window without FLAG_NOT_TOUCHABLE is the touched one (`findTouchedWindowAtLocked` skips NOT_TOUCHABLE: a toast) and the topmost without FLAG_NOT_FOCUSABLE the focused one.
+/// Re-check when windows carry frames here (popups are FLAG_NOT_TOUCH_MODAL).
 /// Focus (InputDispatcher's focused window, delivered as InputChannel focus events -> ViewRootImpl windowFocusChanged): the top window while the desktop toplevel is active, none otherwise.
 pub struct Windows<K, C> {
-    list: Vec<(K, C)>,
+    list: Vec<(K, C, i32)>,
     gesture: Option<K>,
     /// The desktop toplevel is active (InputEvent::Focus); false until told.
     active: bool,
@@ -60,16 +67,16 @@ impl<K, C> Default for Windows<K, C> {
 }
 
 impl<K: PartialEq + Clone, C> Windows<K, C> {
-    /// `key`'s channel goes on top (a key added again replaces its old channel).
-    pub fn add(&mut self, key: K, channel: C) {
+    /// `key`'s channel goes on top (a key added again replaces its old channel); `flags` = its window's LayoutParams flags.
+    pub fn add(&mut self, key: K, channel: C, flags: i32) {
         self.remove(&key);
-        self.list.push((key, channel));
+        self.list.push((key, channel, flags));
     }
 
     /// Drops `key`'s channel; true when it was held. A gesture on it stays open with no window: its remaining events are dropped (InputDispatcher drops a stream whose touched window is gone).
     pub fn remove(&mut self, key: &K) -> bool {
         let before = self.list.len();
-        self.list.retain(|(k, _)| k != key);
+        self.list.retain(|(k, _, _)| k != key);
         before != self.list.len()
     }
 
@@ -82,7 +89,11 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
     /// An event for a window whose channel is gone is still listed; [`Windows::channel`] then finds none.
     pub fn focus_changes(&mut self) -> Vec<(K, bool)> {
         let want = if self.active {
-            self.list.last().map(|(k, _)| k.clone())
+            self.list
+                .iter()
+                .rev()
+                .find(|(_, _, f)| f & FLAG_NOT_FOCUSABLE == 0)
+                .map(|(k, _, _)| k.clone())
         } else {
             None
         };
@@ -108,20 +119,28 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
 
     /// The channel of `key`, if held.
     pub fn channel(&mut self, key: &K) -> Option<&mut C> {
-        self.list.iter_mut().find(|(k, _)| k == key).map(|(_, c)| c)
+        self.list
+            .iter_mut()
+            .find(|(k, _, _)| k == key)
+            .map(|(_, c, _)| c)
     }
 
     /// The window of a pointer event, given whether a gesture (button held, swipe going) was open before it: without one the event starts a gesture (or is a hover or wheel) and goes to the top window,
     /// which the gesture keeps until it ends (InputDispatcher's TouchState: later windows do not take a stream already going).
     pub fn pointer_target(&mut self, in_gesture: bool) -> Option<(&K, &mut C)> {
         if !in_gesture {
-            self.gesture = self.list.last().map(|(k, _)| k.clone());
+            self.gesture = self
+                .list
+                .iter()
+                .rev()
+                .find(|(_, _, f)| f & FLAG_NOT_TOUCHABLE == 0)
+                .map(|(k, _, _)| k.clone());
         }
         let key = self.gesture.as_ref()?;
         self.list
             .iter_mut()
-            .find(|(k, _)| k == key)
-            .map(|(k, c)| (&*k, c))
+            .find(|(k, _, _)| k == key)
+            .map(|(k, c, _)| (&*k, c))
     }
 }
 
@@ -440,9 +459,9 @@ mod publish {
         let started = Instant::now();
         for message in rx {
             match message {
-                Message::Window { token, fd } => match Publisher::new(fd, CHANNEL) {
+                Message::Window { token, fd, flags } => match Publisher::new(fd, CHANNEL) {
                     Ok(publisher) => {
-                        state.windows.borrow_mut().add(token, publisher);
+                        state.windows.borrow_mut().add(token, publisher, flags);
                         publish_focus(&state);
                     }
                     Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
@@ -608,15 +627,15 @@ mod tests {
     fn windows_route_to_the_top_and_keep_a_gesture() {
         let mut w = Windows::<u32, &str>::default();
         assert!(w.pointer_target(false).is_none());
-        w.add(1, "main");
-        w.add(2, "history");
+        w.add(1, "main", 0);
+        w.add(2, "history", 0);
         assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(2));
         assert!(w.remove(&2));
         assert!(!w.remove(&2));
         assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
         // press on 1 (no gesture before), 3 comes up, the move with the button held stays on 1
         assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
-        w.add(3, "dialog");
+        w.add(3, "dialog", 0);
         assert_eq!(w.pointer_target(true).map(|(k, _)| *k), Some(1));
         // the gesture's window goes: the rest of the gesture has no window; the next gesture starts on the top
         w.remove(&1);
@@ -628,12 +647,12 @@ mod tests {
     #[test]
     fn focus_follows_the_top_window_while_active() {
         let mut w = Windows::<u32, &str>::default();
-        w.add(1, "main");
+        w.add(1, "main", 0);
         assert!(w.focus_changes().is_empty());
         w.set_active(true);
         assert_eq!(w.focus_changes(), [(1, true)]);
         assert!(w.focus_changes().is_empty());
-        w.add(2, "second");
+        w.add(2, "second", 0);
         assert_eq!(w.focus_changes(), [(1, false), (2, true)]);
         w.remove(&2);
         assert_eq!(w.focus_changes(), [(2, false), (1, true)]);
@@ -642,8 +661,23 @@ mod tests {
         w.remove(&1);
         w.set_active(true);
         assert!(w.focus_changes().is_empty());
-        w.add(3, "late");
+        w.add(3, "late", 0);
         assert_eq!(w.focus_changes(), [(3, true)]);
+    }
+
+    /// A toast (FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE, as Toast's TN lays it out) on top of the activity window takes neither the pointer nor the focus; they stay with the window below.
+    #[test]
+    fn a_toast_takes_neither_touch_nor_focus() {
+        let mut w = Windows::<u32, &str>::default();
+        w.set_active(true);
+        w.add(1, "main", 0);
+        assert_eq!(w.focus_changes(), [(1, true)]);
+        w.add(2, "toast", FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE);
+        assert!(w.focus_changes().is_empty());
+        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
+        w.remove(&1);
+        assert_eq!(w.focus_changes(), [(1, false)]);
+        assert!(w.pointer_target(false).is_none());
     }
 
     /// The headless source runs the callback set by `on_events` once per injected event; with none set an event is dropped.

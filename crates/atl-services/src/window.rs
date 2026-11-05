@@ -46,15 +46,18 @@ const RELAYOUT_RES_FIRST_TIME: i32 = 1;
 const RELAYOUT_RES_SURFACE_CHANGED: i32 = 1 << 1;
 /// WindowManager.LayoutParams.INPUT_FEATURE_NO_INPUT_CHANNEL (WindowManager.java:4505): such a window gets no input channel.
 const INPUT_FEATURE_NO_INPUT_CHANNEL: i32 = 1 << 0;
-/// WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE and TYPE_TOAST (WindowManager.java).
-const FLAG_NOT_TOUCHABLE: i32 = 0x10;
+/// WindowManager.LayoutParams.TYPE_TOAST and the sub-window type range (WindowManager.java FIRST_SUB_WINDOW / LAST_SUB_WINDOW): a sub-window's token is its parent window's IWindow.
 const TYPE_TOAST: i32 = 2005;
+const FIRST_SUB_WINDOW: i32 = 1000;
+const LAST_SUB_WINDOW: i32 = 1999;
 /// InputTransport.cpp:95 SOCKET_BUFFER_SIZE: the send and receive buffers of both ends of a channel pair (InputChannel::openInputChannelPair, :370-375).
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024;
 /// CompatibilityInfo's scale of an app that needs no size compatibility: the value addToDisplay reports (outSizeCompatScale).
 const COMPAT_SCALE_NONE: f32 = 1.0;
 /// WindowManagerGlobal.ADD_BAD_APP_TOKEN (WindowManagerGlobal.java:127): the window's token is no activity's, so the add fails and ViewRootImpl throws BadTokenException.
 const ADD_BAD_APP_TOKEN: i32 = -1;
+/// WindowManagerGlobal.ADD_BAD_SUBWINDOW_TOKEN: a sub-window whose token is no window's.
+const ADD_BAD_SUBWINDOW_TOKEN: i32 = -2;
 
 /// The UI agent of the app that opened a session (ui_agent.rs): the registry holds one per uid, so a session asks the agent of its own uid.
 struct RegisteredAgent {
@@ -130,11 +133,11 @@ impl RegisteredAgent {
     }
 
     /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
-    fn give_input_server(&self, token: SpIBinder, fd: OwnedFd) -> bool {
+    fn give_input_server(&self, token: SpIBinder, fd: OwnedFd, flags: i32) -> bool {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
             return false;
         };
-        match agent.input_server(token, fd) {
+        match agent.input_server(token, fd, flags) {
             Ok(()) => true,
             Err(e) => {
                 counters::count(
@@ -298,14 +301,17 @@ impl Session {
     }
 }
 
-/// The frame relayout reports: the Task's rect, except a TYPE_TOAST window, which is its requested (measured) size placed by its gravity and x/y in the Task (window_layout::gravity_frame).
+/// The frame relayout reports: the Task's rect, except a TYPE_TOAST window or a sub-window (a popup, whose parent fills the Task), which is its requested (measured) size placed by its gravity
+/// and x/y in the Task (window_layout::gravity_frame).
 fn window_frame(
     attrs: Option<&WindowManager_LayoutParams>,
     requested_width: i32,
     requested_height: i32,
     parent: Rect,
 ) -> Rect {
-    let Some(a) = attrs.filter(|a| a.r#type == TYPE_TOAST) else {
+    let Some(a) = attrs.filter(|a| {
+        a.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&a.r#type)
+    }) else {
         return parent;
     };
     let (left, top, right, bottom) = crate::window_layout::gravity_frame(
@@ -370,7 +376,27 @@ impl IWindowSession for Session {
             );
             return Err(StatusCode::BAD_VALUE.into());
         };
-        let Some(task) = self.tasks.task_of_token(attrs.token.as_ref()) else {
+        // a sub-window (a PopupWindow's panel) names its parent window by that window's IWindow and lives in the parent's Task (WindowManagerService.addWindow: windowForClientLocked,
+        // else ADD_BAD_SUBWINDOW_TOKEN)
+        let sub_window = (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&attrs.r#type);
+        let task = if sub_window {
+            attrs.token.as_ref().and_then(|parent| {
+                self.lock()
+                    .iter()
+                    .find(|w| w.client == *parent)
+                    .map(|w| w.task)
+            })
+        } else {
+            self.tasks.task_of_token(attrs.token.as_ref())
+        };
+        let Some(task) = task else {
+            if sub_window {
+                counters::refused(
+                    WINDOW_SESSION,
+                    "addToDisplayAsUser: the sub-window's token names no window of the session",
+                );
+                return Ok(ADD_BAD_SUBWINDOW_TOKEN);
+            }
             counters::refused(
                 WINDOW_SESSION,
                 "addToDisplayAsUser: the window's token names no activity's Task",
@@ -378,16 +404,16 @@ impl IWindowSession for Session {
             return Ok(ADD_BAD_APP_TOKEN);
         };
         self.agent.name_task(task);
-        // a FLAG_NOT_TOUCHABLE window (a toast) gets no input channel: InputDispatcher never picks it as a touch target (findTouchedWindowAtLocked skips NOT_TOUCHABLE), and the app's
-        // dispatcher here takes its windows as touch-modal top-down (atl-composer input Windows), so a channel would take every touch while the toast shows
-        let takes_input = attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0
-            && attrs.flags & FLAG_NOT_TOUCHABLE == 0;
-        let (channel, input) = if takes_input {
+        // every window but an INPUT_FEATURE_NO_INPUT_CHANNEL one gets a channel (WindowManagerService.addWindow -> openInputChannel), a NOT_TOUCHABLE toast too: ViewRootImpl.setView
+        // builds its input receiver on whatever channel it passed in. The flags go to the agent, whose dispatcher skips NOT_TOUCHABLE / NOT_FOCUSABLE windows as InputDispatcher does.
+        let (channel, input) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
             let (server, client) = open_input_pair()?;
             // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
             let token = crate::token::new();
             // the server end is the app's: its UI agent publishes the window's input on it (no system InputDispatcher), keyed by the token as AOSP's dispatcher keys a connection
-            let given = self.agent.give_input_server(token.clone(), server);
+            let given = self
+                .agent
+                .give_input_server(token.clone(), server, attrs.flags);
             let channel = InputChannel {
                 core: Some(InputChannelCore {
                     name: attrs.title.clone(),

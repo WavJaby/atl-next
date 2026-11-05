@@ -62,9 +62,9 @@ impl IUiAgent for UiAgent {
         })
     }
 
-    fn input_server(&self, token: SpIBinder, fd: OwnedFd) -> Result<(), StatusCode> {
+    fn input_server(&self, token: SpIBinder, fd: OwnedFd, flags: i32) -> Result<(), StatusCode> {
         self.input
-            .send(Message::Window { token, fd })
+            .send(Message::Window { token, fd, flags })
             .map_err(|_| StatusCode::DEAD_OBJECT)
     }
 
