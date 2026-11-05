@@ -304,8 +304,8 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Client> {
         );
         c.send(ch, op::CONFIG_HEAD_SET_POSITION, &[Arg::I(x), Arg::I(0)]);
         c.send(ch, op::CONFIG_HEAD_SET_SCALE, &[Arg::F(o.scale)]);
-        // logical width: the next output starts where this one ends
-        x += (f64::from(o.width) / o.scale).round() as i32;
+        // the next output starts where this one ends: its logical width at the scale as sent (wl_fixed: 1.6 goes as 410/256, 1920 px -> 1198 logical, as wlroots computes it)
+        x += (f64::from(o.width) / fixed(o.scale)).floor() as i32;
     }
     c.send(config, op::CONFIGURATION_APPLY, &[]);
     let applied = c
@@ -325,6 +325,11 @@ enum Arg<'a> {
     /// wl_fixed: 24.8.
     F(f64),
     S(&'a str),
+}
+
+/// `v` as wl_fixed (24.8) carries it.
+fn fixed(v: f64) -> f64 {
+    (v * 256.0).round() / 256.0
 }
 
 fn word(body: &[u8], at: usize) -> Result<u32> {
@@ -378,7 +383,7 @@ impl Client {
             match a {
                 Arg::U(v) => body.extend(v.to_ne_bytes()),
                 Arg::I(v) => body.extend(v.to_ne_bytes()),
-                Arg::F(v) => body.extend(((v * 256.0).round() as i32).to_ne_bytes()),
+                Arg::F(v) => body.extend(((fixed(*v) * 256.0) as i32).to_ne_bytes()),
                 Arg::S(s) => {
                     let len = s.len() + 1;
                     body.extend((len as u32).to_ne_bytes());
