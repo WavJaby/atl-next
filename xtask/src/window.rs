@@ -49,6 +49,9 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
+    /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-hold/root/log/`.
+    #[arg(long, value_name = "SECONDS")]
+    hold: Option<u64>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1088,6 +1091,25 @@ fn track_check(after: &[&str], script: &str, origin: (f32, f32)) -> Result<Strin
     ))
 }
 
+/// The hold's result: the app logged its resume and atld stayed up for the whole hold. The app log stays where it is; its size lines are echoed.
+fn hold_report(app_log: &Path, marker: &str, secs: u64, atld_exited: bool) -> ExitCode {
+    let app = std::fs::read_to_string(app_log).unwrap_or_default();
+    println!("window: hold log {}", app_log.display());
+    for line in app.lines().filter(|l| l.contains(LAYOUT_LINE)) {
+        println!("window: {line}");
+    }
+    if atld_exited {
+        println!("window: hold {secs}s FAILED: atld exited before the hold ended");
+        ExitCode::FAILURE
+    } else if marker_stamp(&app, marker).is_none() {
+        println!("window: hold {secs}s FAILED: `{marker}` never logged");
+        ExitCode::FAILURE
+    } else {
+        println!("window: hold {secs}s: `{marker}` logged, atld up for the whole hold");
+        ExitCode::SUCCESS
+    }
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -1103,13 +1125,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
+    if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
+        anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
+    }
     let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk | Stage::Widgets | Stage::Resize => {
-            let p = start_proxy()?;
-            let rt = rt.with_ui("gtk").with_wayland(&p.listen);
-            proxy = Some(p);
+            // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
+            let rt = if args.hold.is_some() {
+                rt.with_ui("gtk")
+            } else {
+                let p = start_proxy()?;
+                let rt = rt.with_ui("gtk").with_wayland(&p.listen);
+                proxy = Some(p);
+                rt
+            };
             if matches!(args.stage, Stage::Widgets) {
                 rt.with_display(widgets::display().to_arg())
             } else {
@@ -1118,7 +1149,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         Stage::Resume | Stage::Frames => rt,
     };
-    let work = rt.out.join("window");
+    let work_dir = if args.hold.is_some() {
+        "window-hold"
+    } else {
+        "window"
+    };
+    let work = rt.out.join(work_dir);
     let fixture = if matches!(args.stage, Stage::Widgets) {
         widgets::FIXTURE
     } else {
@@ -1169,7 +1205,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let marker = marker(args.stage);
-    let window_ms = args.stage.window_ms();
+    let window_ms = args.hold.map_or(args.stage.window_ms(), |s| s * 1_000);
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let mut ended = None;
     loop {
@@ -1181,7 +1217,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ended = Some(s);
             break;
         }
-        if started.elapsed() > LIMIT {
+        if started.elapsed() > LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
             break;
         }
         std::thread::sleep(POLL);
@@ -1190,6 +1226,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         stop_apps(atld_child.id());
         let _ = atld_child.kill();
         atld_child.wait()?;
+    }
+    if let Some(secs) = args.hold {
+        return Ok(hold_report(&app_log, marker, secs, ended.is_some()));
     }
     let liveness = match probe {
         Some(handle) => handle
