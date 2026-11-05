@@ -8,6 +8,7 @@ use crate::codecs::android::content::Intent::Intent;
 use crate::codecs::android::content::pm::ActivityInfo::ActivityInfo;
 use crate::codecs::android::content::pm::ApplicationInfo::ApplicationInfo;
 use crate::codecs::android::content::res::Configuration::Configuration;
+use crate::codecs::android::os::Bundle::{Bundle, r_bundle, w_bundle};
 use crate::codecs::android::util::MergedConfiguration::MergedConfiguration;
 use crate::parcel::*;
 
@@ -393,8 +394,8 @@ pub fn r_uri(p: &In<'_>) -> Result<Option<String>> {
     }
 }
 
-/// android.content.pm.PackageItemInfo (content/pm/PackageItemInfo.java writeToParcel / PackageItemInfo(Parcel)); metaData is a Bundle: null only.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// android.content.pm.PackageItemInfo (content/pm/PackageItemInfo.java writeToParcel / PackageItemInfo(Parcel)). No `PartialEq`: metaData is a Bundle, which has none (its body is a Parcel).
+#[derive(Debug, Clone, Default)]
 pub struct PackageItemInfo {
     pub name: Option<String>,
     pub package_name: Option<String>,
@@ -402,6 +403,8 @@ pub struct PackageItemInfo {
     pub non_localized_label: Option<String>,
     pub icon: i32,
     pub logo: i32,
+    /// writeBundle / readBundle; None = null (what a reader gets without GET_META_DATA).
+    pub meta_data: Option<Bundle>,
     pub banner: i32,
     pub show_user_icon: i32,
     pub is_archived: bool,
@@ -414,7 +417,7 @@ impl Part for PackageItemInfo {
         w_char_sequence(p, &self.non_localized_label)?;
         w_i32(p, self.icon)?;
         w_i32(p, self.logo)?;
-        w_null(p)?; // metaData
+        w_bundle(p, &self.meta_data)?;
         w_i32(p, self.banner)?;
         w_i32(p, self.show_user_icon)?;
         w_bool(p, self.is_archived)
@@ -426,7 +429,7 @@ impl Part for PackageItemInfo {
         let non_localized_label = r_char_sequence(p)?;
         let icon = r_i32(p)?;
         let logo = r_i32(p)?;
-        r_null(p, "android.content.pm.PackageItemInfo.metaData")?;
+        let meta_data = r_bundle(p)?;
         Ok(PackageItemInfo {
             name,
             package_name,
@@ -434,6 +437,7 @@ impl Part for PackageItemInfo {
             non_localized_label,
             icon,
             logo,
+            meta_data,
             banner: r_i32(p)?,
             show_user_icon: r_i32(p)?,
             is_archived: r_bool(p)?,
@@ -442,7 +446,7 @@ impl Part for PackageItemInfo {
 }
 
 /// android.content.pm.ComponentInfo (content/pm/ComponentInfo.java writeToParcel / ComponentInfo(Parcel)): PackageItemInfo, then the ApplicationInfo in place.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ComponentInfo {
     pub item: PackageItemInfo,
     pub application_info: ApplicationInfo,

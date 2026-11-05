@@ -6,7 +6,7 @@
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ApplicationInfo {
     pub item: PackageItemInfo,
     pub task_affinity: Option<String>,

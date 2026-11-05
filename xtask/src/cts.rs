@@ -373,6 +373,7 @@ mod tests {
             application_theme: 0,
             application_class: None,
             app_component_factory: None,
+            application_meta_data: vec![],
             application_booleans: std::collections::BTreeMap::new(),
             activities: Vec::new(),
             requested_permissions: Vec::new(),

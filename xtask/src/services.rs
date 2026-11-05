@@ -163,6 +163,7 @@ pub fn stage(
             application_theme: 0,
             application_class: None,
             app_component_factory: None,
+            application_meta_data: vec![],
             application_booleans: BTreeMap::new(),
             activities: vec![ActivityDecl {
                 name: ACTIVITY.to_owned(),

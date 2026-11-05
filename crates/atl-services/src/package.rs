@@ -2,7 +2,7 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, hasSystemFeature, getPackagesForUid, notifyDexLoad, getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures.
 //! Every other method is counted unimplemented (counters).
-//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted: the records carry no components or signatures, and `sharedLibraryFiles` is always filled.
+//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted except GET_META_DATA (application meta-data): the records carry no components or signatures, and `sharedLibraryFiles` is always filled.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -12,11 +12,13 @@ use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::{
     ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
 };
+use atl_parcelables::android::os::Bundle;
+use atl_parcelables::codecs::android::os::Bundle::Value;
 use atl_parcelables::java::util::Map;
 use atl_parcelables::parts::{PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
-use crate::packages::{InstrumentationDecl, LibraryNode, PackageRecord, Packages};
+use crate::packages::{InstrumentationDecl, LibraryNode, MetaValue, PackageRecord, Packages};
 use crate::permission::{self, Permissions};
 use crate::{counters, manifest_flags};
 
@@ -30,6 +32,23 @@ const SHARED_LIBRARY_VERSION_UNDEFINED: i64 = -1;
 /// PackageManager.SIGNATURE_MATCH / SIGNATURE_UNKNOWN_PACKAGE (PackageManager.java:1480, :1510).
 const SIGNATURE_MATCH: i32 = 0;
 const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
+/// PackageManager.GET_META_DATA (PackageManager.java).
+const GET_META_DATA: i64 = 0x80;
+/// ActivityManagerService.STOCK_PM_FLAGS: GET_SHARED_LIBRARY_FILES, the flags AMS reads an app's ApplicationInfo with (bindApplication's, the launch's).
+pub const STOCK_PM_FLAGS: i64 = 0x400;
+
+/// Property.toBundle per entry, in manifest order (a later put of a name replaces the earlier).
+fn meta_bundle(entries: &[(String, MetaValue)]) -> Bundle {
+    Bundle::from_entries(entries.iter().map(|(k, v)| {
+        let v = match v {
+            MetaValue::String(s) => Value::String(Some(s.clone())),
+            MetaValue::Int(i) => Value::Int(*i),
+            MetaValue::Bool(b) => Value::Bool(*b),
+            MetaValue::Float(f) => Value::Float(*f),
+        };
+        (k.clone(), v)
+    }))
+}
 
 /// The ApplicationInfo of `p` (PackageInfoUtils.generateApplicationInfo, reduced to what the record holds): names, uid, paths, SDK levels, enabled, flags (manifest_flags), and the shared libraries its manifest
 /// uses: `sharedLibraryFiles` (their jars, in manifest order; what ComputerEngine fills for GET_SHARED_LIBRARY_FILES, which ActivityManagerService's STOCK_PM_FLAGS always sets) and `sharedLibraryInfos`,
@@ -37,7 +56,8 @@ const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
 /// library adds nothing (a required one would stop the install in AOSP; the services do not install).
 /// `nativeLibraryDir` is never null for an installed app: LoadedApk.makePaths adds it to the class loader's library path, and a null breaks `new File(null)` there.
 /// Native-library fields as PackageManagerService sets them for a non-system app (PackageAbiHelperImpl.deriveNativeLibraryPaths): root `<code path>/lib`, dir `<root>/<isa>`, root requires the ISA.
-pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationInfo {
+/// `flags` (PackageManager GET_*): GET_META_DATA adds `<application>`'s meta-data, null when it has none (PackageInfoUtils:659, "coerce to null if empty"); the other flags are not interpreted.
+pub fn application_info(p: &PackageRecord, packages: &Packages, flags: i64) -> ApplicationInfo {
     let native_library_root_dir = std::path::Path::new(&p.native_library_dir)
         .parent()
         .map(|dir| dir.display().to_string());
@@ -57,6 +77,8 @@ pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationIn
         item: PackageItemInfo {
             name: p.manifest.application_class.clone(),
             package_name: Some(p.name.clone()),
+            meta_data: (flags & GET_META_DATA != 0 && !p.manifest.application_meta_data.is_empty())
+                .then(|| meta_bundle(&p.manifest.application_meta_data)),
             ..Default::default()
         },
         process_name: Some(p.process_name().to_owned()),
@@ -173,19 +195,19 @@ impl IPackageManager for PackageManager {
     fn r#getApplicationInfo(
         &self,
         name: Option<&str>,
-        _flags: i64,
+        flags: i64,
         user: i32,
     ) -> binder::Result<Option<ApplicationInfo>> {
         Ok(self
             .visible(name, user)
-            .map(|p| application_info(p, &self.packages)))
+            .map(|p| application_info(p, &self.packages, flags)))
     }
 
     /// ComputerEngine.getPackageInfo:1581: null as getApplicationInfo; the PackageInfo carries the ApplicationInfo, the version and the requested permissions.
     fn r#getPackageInfo(
         &self,
         name: Option<&str>,
-        _flags: i64,
+        flags: i64,
         user: i32,
     ) -> binder::Result<Option<PackageInfo>> {
         Ok(self.visible(name, user).map(|p| PackageInfo {
@@ -194,7 +216,7 @@ impl IPackageManager for PackageManager {
             version_code: p.version_code as i32,
             version_code_major: (p.version_code >> 32) as i32,
             version_name: p.version_name.clone(),
-            application_info: Some(application_info(p, &self.packages)),
+            application_info: Some(application_info(p, &self.packages, flags)),
             requested_permissions: (!p.requested_permissions.is_empty())
                 .then(|| p.requested_permissions.iter().cloned().map(Some).collect()),
             ..Default::default()

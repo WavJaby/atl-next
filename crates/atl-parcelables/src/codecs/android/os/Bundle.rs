@@ -93,12 +93,13 @@ pub fn r_bundle(p: &In<'_>) -> Result<Option<Bundle>> {
     Bundle::read_after_length(p, length).map(Some)
 }
 
-/// A Bundle value of the kinds a service makes or merges (Parcel.writeValue's VAL_STRING, VAL_INTEGER, VAL_LONG, VAL_BOOLEAN, VAL_NULL).
+/// A Bundle value of the kinds a service makes or merges (Parcel.writeValue's VAL_STRING, VAL_INTEGER, VAL_LONG, VAL_FLOAT, VAL_BOOLEAN, VAL_NULL); Float = manifest `<meta-data>` (Property.toBundle putFloat).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(Option<String>),
     Int(i32),
     Long(i64),
+    Float(f32),
     Bool(bool),
     Null,
 }
@@ -108,6 +109,7 @@ const VAL_NULL: i32 = -1;
 const VAL_STRING: i32 = 0;
 const VAL_INTEGER: i32 = 1;
 const VAL_LONG: i32 = 6;
+const VAL_FLOAT: i32 = 7;
 const VAL_BOOLEAN: i32 = 9;
 
 /// String.hashCode: the order of an ArrayMap's entries, which Parcel.readArrayMap appends in the order written (Parcel.java:5688-5689, `sorted`).
@@ -255,6 +257,8 @@ impl Bundle {
                     VAL_STRING => Value::String(w.string()?),
                     VAL_INTEGER => Value::Int(w.i32()?),
                     VAL_LONG => Value::Long(w.i64()?),
+                    // writeFloat: the IEEE bits in one word
+                    VAL_FLOAT => Value::Float(f32::from_bits(w.i32()? as u32)),
                     VAL_BOOLEAN => Value::Bool(w.i32()? != 0),
                     _ => return Err(crate::refuse("android.os.Bundle (value type)")),
                 };
@@ -294,6 +298,10 @@ impl Bundle {
                 Value::Long(l) => {
                     body.extend_from_slice(&tag(VAL_LONG));
                     body.extend_from_slice(&l.to_ne_bytes());
+                }
+                Value::Float(f) => {
+                    body.extend_from_slice(&tag(VAL_FLOAT));
+                    body.extend_from_slice(&f.to_ne_bytes());
                 }
                 Value::Bool(b) => {
                     body.extend_from_slice(&tag(VAL_BOOLEAN));

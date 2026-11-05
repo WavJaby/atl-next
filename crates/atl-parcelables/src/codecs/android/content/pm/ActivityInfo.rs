@@ -4,7 +4,7 @@
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ActivityInfo {
     pub component: ComponentInfo,
     pub theme: i32,

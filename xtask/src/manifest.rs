@@ -4,13 +4,13 @@
 //! aapt2's format (tools/aapt2/Debug.cpp `Debug::DumpXml`): `N:` namespace lines, `E: <element> (line=n)`, `A: [<namespace uri>:]<name>[(0x<resource id>)]=<value>`; an element's attributes are indented two
 //! columns deeper than it, its child elements four. A value is `"string" (Raw: "string")`, a decimal or `0x` integer, `true` / `false`, or `@0x<id>` / `(type 0x..)0x..` for the rest.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use atl_services::packages::{
-    ActivityDecl, InstrumentationDecl, Manifest, PermissionDecl, UsesLibrary,
+    ActivityDecl, InstrumentationDecl, Manifest, MetaValue, PermissionDecl, UsesLibrary,
 };
 
 use crate::host_art;
@@ -26,6 +26,8 @@ const DEFAULT_MIN_SDK: i32 = 1;
 struct Element {
     name: String,
     attrs: BTreeMap<String, String>,
+    /// The attributes aapt2 printed as a quoted string (TYPE_STRING): their text alone does not tell `"12"` from the int 12.
+    strings: BTreeSet<String>,
     children: Vec<Element>,
 }
 
@@ -45,8 +47,8 @@ impl Element {
     }
 }
 
-/// The attribute line's key and value: `A: <ns>:name(0x..)=<value>` -> (`name`, `<value>` unquoted when it is a string).
-fn attribute(line: &str) -> Result<(String, String)> {
+/// The attribute line's key, value and whether the value is a string: `A: <ns>:name(0x..)=<value>` -> (`name`, `<value>` unquoted when it is a string).
+fn attribute(line: &str) -> Result<(String, String, bool)> {
     let rest = line
         .trim_start()
         .strip_prefix("A: ")
@@ -55,6 +57,7 @@ fn attribute(line: &str) -> Result<(String, String)> {
     // `http://schemas.android.com/apk/res/android:name(0x01010003)` -> `name`; `package` stays
     let key = key.split('(').next().unwrap_or(key);
     let key = key.rsplit(':').next().unwrap_or(key);
+    let quoted = value.starts_with('"');
     let value = match value.strip_prefix('"') {
         // `"text" (Raw: "text")`: the quoted text up to the closing quote that precedes ` (Raw:`, else the last quote
         Some(quoted) => match quoted.find("\" (Raw: ") {
@@ -63,7 +66,7 @@ fn attribute(line: &str) -> Result<(String, String)> {
         },
         None => value.split(" (Raw: ").next().unwrap_or(value),
     };
-    Ok((key.to_owned(), value.to_owned()))
+    Ok((key.to_owned(), value.to_owned(), quoted))
 }
 
 /// The element tree of `aapt2 dump xmltree` text; the root is the manifest element.
@@ -97,11 +100,14 @@ fn parse_tree(text: &str) -> Result<Element> {
                 },
             ));
         } else if body.starts_with("A: ") {
-            let (key, value) =
+            let (key, value, quoted) =
                 attribute(line).with_context(|| format!("attribute line {line:?}"))?;
             let Some((_, element)) = stack.last_mut() else {
                 bail!("attribute outside an element: {line:?}");
             };
+            if quoted {
+                element.strings.insert(key.clone());
+            }
             element.attrs.insert(key, value);
         } else {
             bail!("unrecognised line in aapt2's xmltree: {line:?}");
@@ -189,6 +195,51 @@ fn resolve_class(package: &str, name: &str) -> String {
         format!("{package}.{name}")
     } else {
         name.to_owned()
+    }
+}
+
+/// The `<meta-data>` children of `element` (ParsingPackageUtils.parseMetaData): `android:resource` -> its id; else `android:value` typed by how aapt2 printed it (ResourceValues.cpp BinaryPrimitive::PrettyPrint):
+/// quoted = string, `true`/`false` = boolean, a decimal / `0x%08x` / `#%08x` (color) = int, another number = float. A reference or other type AOSP drops (Slog.w, no Property); so does this.
+/// Known loss (measured, aapt2 of slot 3): a float with no fraction prints as an int (`2.0` -> `2`), so it reads as Int here where AOSP puts a Float; the libandroidfw reader (owner D3) has the type.
+fn meta_data(element: &Element) -> Result<Vec<(String, MetaValue)>> {
+    let mut out = Vec::new();
+    for m in element.children("meta-data") {
+        let name = m.attr("name").context("<meta-data> without android:name")?;
+        let value = if let Some(r) = m.attr("resource") {
+            let hex = r
+                .strip_prefix("@0x")
+                .with_context(|| format!("<meta-data {name}> resource {r:?} is not a reference"))?;
+            Some(MetaValue::Int(u32::from_str_radix(hex, 16)? as i32))
+        } else if let Some(v) = m.attr("value") {
+            meta_value(v, m.strings.contains("value"))
+        } else {
+            bail!("<meta-data {name}> requires android:value or android:resource");
+        };
+        if let Some(value) = value {
+            out.push((name.to_owned(), value));
+        }
+    }
+    Ok(out)
+}
+
+fn meta_value(v: &str, quoted: bool) -> Option<MetaValue> {
+    if quoted {
+        return Some(MetaValue::String(v.to_owned()));
+    }
+    let hex = v.strip_prefix("0x").or_else(|| v.strip_prefix('#'));
+    match v {
+        "true" => Some(MetaValue::Bool(true)),
+        "false" => Some(MetaValue::Bool(false)),
+        _ => match hex {
+            Some(h) => u32::from_str_radix(h, 16)
+                .ok()
+                .map(|n| MetaValue::Int(n as i32)),
+            None => v
+                .parse::<i32>()
+                .map(MetaValue::Int)
+                .or_else(|_| v.parse::<f32>().map(MetaValue::Float))
+                .ok(),
+        },
     }
 }
 
@@ -292,6 +343,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         app_component_factory: application
             .and_then(|a| a.attr("appComponentFactory"))
             .map(|n| resolve_class(package, n)),
+        application_meta_data: application.map_or(Ok(vec![]), meta_data)?,
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
         permissions: permissions(&root)?,
@@ -414,6 +466,52 @@ mod tests {
         A: http://schemas.android.com/apk/res/android:targetPackage(0x01010021)="com.example.atlinstr" (Raw: "com.example.atlinstr")
         A: http://schemas.android.com/apk/res/android:functionalTest(0x01010023)=true
 "#;
+
+    /// `<application>`'s meta-data as aapt2 (slot 3) printed a manifest declaring value="12", "0x1F", "true", "1.5", "#ff112233", "text" and resource="@android:style/Theme" (2026-11-06).
+    const META: &str = r#"N: android=http://schemas.android.com/apk/res/android (line=1)
+  E: manifest (line=1)
+    A: package="com.example.meta" (Raw: "com.example.meta")
+      E: application (line=2)
+          E: meta-data (line=3)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="i" (Raw: "i")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)=12
+          E: meta-data (line=4)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="h" (Raw: "h")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)=0x0000001f
+          E: meta-data (line=5)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="b" (Raw: "b")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)=true
+          E: meta-data (line=6)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="f" (Raw: "f")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)=1.5
+          E: meta-data (line=7)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="c" (Raw: "c")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)=#ff112233
+          E: meta-data (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="r" (Raw: "r")
+            A: http://schemas.android.com/apk/res/android:resource(0x01010025)=@0x01030005
+          E: meta-data (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="t" (Raw: "t")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)="text" (Raw: "text")
+"#;
+
+    #[test]
+    fn application_meta_data_types() {
+        let m = parse(META).expect("parse");
+        // expected: the values the manifest declared, typed as parseMetaData types them; 0x01030005 = android.R.style.Theme (public.xml)
+        assert_eq!(
+            m.application_meta_data,
+            [
+                ("i".to_owned(), MetaValue::Int(12)),
+                ("h".to_owned(), MetaValue::Int(0x1f)),
+                ("b".to_owned(), MetaValue::Bool(true)),
+                ("f".to_owned(), MetaValue::Float(1.5)),
+                ("c".to_owned(), MetaValue::Int(0xff11_2233_u32 as i32)),
+                ("r".to_owned(), MetaValue::Int(0x0103_0005)),
+                ("t".to_owned(), MetaValue::String("text".to_owned())),
+            ]
+        );
+    }
 
     #[test]
     fn the_instrumentation_fixture() {

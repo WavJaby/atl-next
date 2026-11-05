@@ -250,7 +250,7 @@ pub(crate) fn launch_item(
     token: SpIBinder,
     ident: i32,
 ) -> LaunchActivityItem {
-    let ai = package::application_info(p, packages);
+    let ai = package::application_info(p, packages, package::STOCK_PM_FLAGS);
     let intent = Intent {
         action: Some(ACTION_MAIN.into()),
         categories: vec![Some(CATEGORY_LAUNCHER.into())],
@@ -1046,9 +1046,9 @@ impl IActivityManager for ActivityManager {
             Some(instr) => inner
                 .packages
                 .by_name(&instr.target_package)
-                .map(|t| package::application_info(t, &inner.packages))
+                .map(|t| package::application_info(t, &inner.packages, package::STOCK_PM_FLAGS))
                 .ok_or_else(|| illegal_state("instrumentation target vanished"))?,
-            None => package::application_info(p, &inner.packages),
+            None => package::application_info(p, &inner.packages, package::STOCK_PM_FLAGS),
         };
         // AppDeathRecipient (:4600): the record leaves the table when the process's binder dies
         let weak = Arc::downgrade(inner);

@@ -207,6 +207,7 @@ mod tests {
             application_theme: 0,
             application_class: None,
             app_component_factory: None,
+            application_meta_data: vec![],
             application_booleans: application
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))

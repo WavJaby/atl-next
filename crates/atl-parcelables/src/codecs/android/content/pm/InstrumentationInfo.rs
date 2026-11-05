@@ -5,7 +5,7 @@
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct InstrumentationInfo {
     pub item: PackageItemInfo,
     pub target_package: Option<String>,

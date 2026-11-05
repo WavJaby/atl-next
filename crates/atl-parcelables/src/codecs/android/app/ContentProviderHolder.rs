@@ -7,7 +7,7 @@ use crate::codecs::android::content::pm::ProviderInfo::ProviderInfo;
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ContentProviderHolder {
     pub info: ProviderInfo,
     /// the IContentProvider's binder

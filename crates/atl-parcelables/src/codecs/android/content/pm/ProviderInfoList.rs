@@ -6,7 +6,7 @@ use super::ProviderInfo::ProviderInfo;
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderInfoList {
     /// entries; None = a null entry (writeTypedObject 0)
     pub list: Vec<Option<ProviderInfo>>,

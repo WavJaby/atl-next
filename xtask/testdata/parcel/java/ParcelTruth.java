@@ -121,6 +121,14 @@ public class ParcelTruth {
         Intent intent = intent();
 
         check("ApplicationInfo", ai, ApplicationInfo.CREATOR);
+        // getApplicationInfo(GET_META_DATA): <application><meta-data> as Property.toBundle puts it (atl-services package.rs meta_bundle)
+        ApplicationInfo withMeta = new ApplicationInfo(ai);
+        withMeta.metaData = new Bundle();
+        withMeta.metaData.putString("io.example.componentOverride", "io.example.Component");
+        withMeta.metaData.putInt("io.example.resource", 0x01030005);
+        withMeta.metaData.putBoolean("io.example.flag", true);
+        withMeta.metaData.putFloat("io.example.ratio", 1.5f);
+        check("ApplicationInfo:meta-data", withMeta, ApplicationInfo.CREATOR);
         check("ActivityInfo", activity, ActivityInfo.CREATOR);
         // the values an activity sends with setTaskDescription (Activity.onApplyThemeResource, every themed launch)
         check("ActivityManager.TaskDescription", taskDescription(), ActivityManager.TaskDescription.CREATOR);

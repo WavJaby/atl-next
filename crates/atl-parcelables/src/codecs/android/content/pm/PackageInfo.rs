@@ -7,7 +7,7 @@ use super::ApplicationInfo::ApplicationInfo;
 use crate::parcel::*;
 use crate::parts::*;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct PackageInfo {
     pub package_name: Option<String>,
     pub split_names: Option<Vec<Option<String>>>,

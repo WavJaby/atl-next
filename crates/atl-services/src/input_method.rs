@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! The `input_method` service (Context.INPUT_METHOD_SERVICE, Context.java:5471): the converter's IInputMethodManager stub. InputMethodManager.createRealInstance throws without it
-//! (InputMethodManager.java:1638-1641; the lookup is IInputMethodManagerGlobalInvoker.java:96). Its one call on the startup path is addClient (InputMethodManager.java:1652), which AOSP
-//! answers by registering the client's controller with the IME service (InputMethodManagerService.java:1791-1805). ATL has no input method yet (the desktop IME bridge is a
-//! platform-layer item), so addClient is answered and nothing is kept. Every window focus gain sends startInputOrWindowGainedFocusAsync (ViewRootImpl.handleWindowFocusChanged ->
-//! InputMethodManager.startInputInner:3560): its EditorInfo and ImeOnBackInvokedDispatcher are decoded (atl-parcelables codecs; without them the decode failed BAD_VALUE and the
-//! app died of IllegalArgumentException), answered, not kept. Every other method stays counted and answered UNKNOWN_TRANSACTION.
+//! The `input_method` service (Context.INPUT_METHOD_SERVICE, Context.java:5471): the converter's IInputMethodManager stub. InputMethodManager.createRealInstance throws without it (InputMethodManager.java:1638-1641; the lookup is IInputMethodManagerGlobalInvoker.java:96).
+//! ATL has no input method yet (the desktop IME bridge is a platform-layer item), so every answer is the one IMMS gives with no current method, and nothing is kept:
+//! - addClient (InputMethodManager.java:1652, the startup call; AOSP registers the client's controller, InputMethodManagerService.java:1791-1805): answered.
+//! - startInputOrWindowGainedFocusAsync (every window focus gain, ViewRootImpl.handleWindowFocusChanged -> InputMethodManager.startInputInner:3560): EditorInfo and ImeOnBackInvokedDispatcher decoded (without the codecs the decode failed BAD_VALUE and the app died of IllegalArgumentException), answered.
+//! - showSoftInput / hideSoftInput (ImeTracker.Token decoded): false. getInputMethodList / getEnabledInputMethodList: the empty InputMethodInfoSafeList.
+//!
+//! Every other method stays counted and answered UNKNOWN_TRANSACTION.
 
 use atl_aidl::aidl::com::android::internal::view::IInputMethodManager::{
     BnInputMethodManager, EnforcePermission, IInputMethodManager,

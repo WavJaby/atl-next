@@ -43,12 +43,6 @@ impl<T> Clone for ParceledListSlice<T> {
     }
 }
 
-impl<T> PartialEq for ParceledListSlice<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.instrumentation == other.instrumentation
-    }
-}
-
 impl<T> std::fmt::Debug for ParceledListSlice<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParceledListSlice")

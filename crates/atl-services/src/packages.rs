@@ -70,6 +70,9 @@ pub struct Manifest {
     /// `<application android:appComponentFactory>`, resolved (ApplicationInfo.appComponentFactory): the factory that instantiates the app's components; None = AppComponentFactory.
     #[serde(default)]
     pub app_component_factory: Option<String>,
+    /// `<application>`'s `<meta-data>` in manifest order (ParsingPackageUtils.parseMetaData); a later entry of the same name replaces an earlier one, as Property.toBundle's put does.
+    #[serde(default)]
+    pub application_meta_data: Vec<(String, MetaValue)>,
     /// `<application>`'s boolean attributes by name, only those the manifest wrote; the flags they set are in manifest_flags.
     pub application_booleans: BTreeMap<String, bool>,
     /// Every `<activity>`, in manifest order.
@@ -88,6 +91,16 @@ pub struct Manifest {
 pub struct PermissionDecl {
     pub name: String,
     pub protection_level: u32,
+}
+
+/// A `<meta-data>` value as ParsingPackageUtils.parseMetaData types it: `android:resource` -> its id as an Int; `android:value` by TypedValue type: string, boolean, any int type (decimal, hex, color) -> Int, float.
+/// Other value types (a reference in `android:value`) are dropped there with a warning, so they have no variant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetaValue {
+    String(String),
+    Int(i32),
+    Bool(bool),
+    Float(f32),
 }
 
 impl Manifest {
@@ -284,6 +297,7 @@ mod tests {
                 application_theme: 0,
                 application_class: None,
                 app_component_factory: None,
+                application_meta_data: vec![],
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
                 requested_permissions: vec![],
