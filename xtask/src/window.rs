@@ -117,7 +117,7 @@ impl Stage {
                 RESIZE_SUB_NAMES
             }
             Stage::Frames => &["picture", "cadence"],
-            Stage::Input => &["touch"],
+            Stage::Input => &["touch", "touch-mode"],
         }
     }
 }
@@ -1858,6 +1858,15 @@ mod tests {
         assert!(burst_check(&layout(last), &dropped, &steps).is_err());
         let uncoalesced = bounds(&[grow, "1x1", "2x2", "3x3", last, shrink]);
         assert!(burst_check(&layout(last), &uncoalesced, &steps).is_err());
+    }
+
+    /// An unanswered setInTouchMode counts under its bare name (counters::unimplemented): only the answered line passes.
+    #[test]
+    fn touch_mode_check_needs_the_answered_line() {
+        let line = |m: &str| format!("services: unimplemented IWindowManager.{m} 1 at=1.000");
+        assert!(touch_mode_check(&line("setInTouchMode (answered)")).is_ok());
+        assert!(touch_mode_check(&line("setInTouchMode")).is_err());
+        assert!(touch_mode_check("").is_err());
     }
 
     #[test]
