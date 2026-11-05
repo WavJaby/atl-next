@@ -143,7 +143,12 @@ fn log(msg: std::fmt::Arguments<'_>) {
 fn host_display() -> DisplayModel {
     match atl_platform_host::first_monitor() {
         Ok(Some(m)) => {
-            let model = DisplayModel::from_monitor(m.width, m.height, m.refresh_hz, m.scale);
+            let model = DisplayModel::from_monitor(
+                m.size.width,
+                m.size.height,
+                m.refresh_hz,
+                m.scale.get(),
+            );
             log(format_args!("display: monitor {m:?} -> {}", model.to_arg()));
             model
         }

@@ -418,7 +418,7 @@ fn follow_monitor(shared: &Rc<Shared>, m: &gdk::Monitor) {
     report_monitor(shared, m);
 }
 
-/// Logs `m` and hands it to the window's `on_monitor`. GDK's geometry is logical pixels; the mode is that times the (fractional) scale, as the host side computes it (atl-platform-host-linux).
+/// Logs `m` and hands it to the window's `on_monitor` (Monitor::from_desktop: GDK's logical geometry times the fractional scale, milli-Hz; the host side converts with the same function).
 fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
     let g = m.geometry();
     tracing::info!(
@@ -431,17 +431,9 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
         m.refresh_rate(),
         m.scale()
     );
-    let Some(scale) = Scale::new(m.scale()) else {
+    let Some(monitor) = Monitor::from_desktop(g.width(), g.height(), m.refresh_rate(), m.scale())
+    else {
         return;
-    };
-    let physical = |logical: i32| (f64::from(logical.max(0)) * scale.get()).round() as u32;
-    let monitor = Monitor {
-        size: PhysSize {
-            width: physical(g.width()),
-            height: physical(g.height()),
-        },
-        refresh_hz: (m.refresh_rate() > 0).then(|| m.refresh_rate() as f32 / 1000.0),
-        scale,
     };
     shared.on_monitor.call(|f| f(monitor));
 }

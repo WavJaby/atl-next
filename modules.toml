@@ -85,13 +85,18 @@ uses = ["aidl", "generators"]
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
-uses = ["compositor", "gralloc", "scene-buffer"]
+uses = ["compositor", "gralloc", "scene-buffer", "platform-types"]
+
+# the value types both platform halves speak (physical size, scale, monitor) and the one conversion from a desktop's report into them; no OS or toolkit dependency
+[platform-types]
+crates = ["atl-platform-types"]
+exports = ["atl-platform-types"]
 
 # the host half of the platform layer (plan S1 `atl-platform-host`): the desktop's monitors as atld and xtask read them (refresh rate so far); the GDK implementation is the second crate deny.toml lets depend on GTK
 [platform-host]
 crates = ["atl-platform-host-api", "atl-platform-host-linux", "atl-platform-host"]
 exports = ["atl-platform-host"]
-uses = []
+uses = ["platform-types"]
 
 # a Scene buffer's pixels on the CPU (mmap + DMA_BUF_IOCTL_SYNC of the quad's dma-buf, sync_file polling), read through gralloc's format and handle definitions: what the GTK presenter and the compositor's scene checks (composer) share
 [scene-buffer]

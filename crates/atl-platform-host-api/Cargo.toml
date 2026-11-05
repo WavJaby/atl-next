@@ -11,6 +11,7 @@ publish.workspace = true
 # No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
 
 [dependencies]
+atl-platform-types = { path = "../atl-platform-types" }
 thiserror.workspace = true
 
 [lints]

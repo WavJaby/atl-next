@@ -13,18 +13,8 @@ pub struct HostError(
     pub String,
 );
 
-/// One monitor as the desktop reports it: its mode in physical pixels, its refresh rate, its scale.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Monitor {
-    /// Width in physical pixels.
-    pub width: u32,
-    /// Height in physical pixels.
-    pub height: u32,
-    /// Refresh rate in Hz; `None` where the monitor reports none.
-    pub refresh_hz: Option<f32>,
-    /// Physical pixels per desktop logical pixel, fractional (e.g. 1.6); finite and > 0.
-    pub scale: f64,
-}
+/// The value types the app side shares (atld's monitor is the same type a window reports).
+pub use atl_platform_types::{Monitor, PhysSize, Scale};
 
 /// A connection to the desktop. Connect where the monitors are read; `monitor` answers from that connection.
 pub trait Desktop: Sized {

@@ -266,6 +266,7 @@ dependencies = [
 name = "atl-platform-host-api"
 version = "0.0.0"
 dependencies = [
+ "atl-platform-types",
  "thiserror",
 ]
 
@@ -276,6 +277,10 @@ dependencies = [
  "atl-platform-host-api",
  "gtk4",
 ]
+
+[[package]]
+name = "atl-platform-types"
+version = "0.0.0"
 
 [[package]]
 name = "atl-platform-ui"
@@ -295,6 +300,7 @@ name = "atl-platform-ui-api"
 version = "0.0.0"
 dependencies = [
  "atl-compositor",
+ "atl-platform-types",
  "thiserror",
 ]
 

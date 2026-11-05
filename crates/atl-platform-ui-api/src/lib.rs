@@ -11,26 +11,8 @@
 use std::os::fd::RawFd;
 
 pub use atl_compositor::scene::Scene;
-
-/// A length in physical (device) pixels: a window's content area, a buffer's extent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PhysSize {
-    /// Width in physical pixels.
-    pub width: u32,
-    /// Height in physical pixels.
-    pub height: u32,
-}
-
-/// The monitor a window is on, as the desktop reports it: its mode in physical pixels, its refresh rate, its scale. The host side reads the same values for atld (atl-platform-host-api `Monitor`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Monitor {
-    /// The mode in physical pixels.
-    pub size: PhysSize,
-    /// Refresh rate in Hz; `None` where the monitor reports none.
-    pub refresh_hz: Option<f32>,
-    /// Physical pixels per desktop logical pixel.
-    pub scale: Scale,
-}
+/// The value types the host side shares (a window's monitor is the same type atld reads).
+pub use atl_platform_types::{Monitor, PhysSize, Scale};
 
 /// A position in physical pixels from the window content's top-left corner; fractional because pointers report sub-pixel positions.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,35 +21,6 @@ pub struct PhysPoint {
     pub x: f64,
     /// Vertical distance, in physical pixels.
     pub y: f64,
-}
-
-/// Physical pixels per toolkit logical pixel (Wayland buffer scale, possibly fractional). Always finite and positive.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Scale(f64);
-
-impl Scale {
-    /// One physical pixel per logical pixel.
-    pub const ONE: Scale = Scale(1.0);
-
-    /// `None` unless `factor` is finite and greater than zero.
-    pub fn new(factor: f64) -> Option<Scale> {
-        (factor.is_finite() && factor > 0.0).then_some(Scale(factor))
-    }
-
-    /// The factor.
-    pub fn get(self) -> f64 {
-        self.0
-    }
-
-    /// `physical` pixels expressed in logical pixels.
-    pub fn to_logical(self, physical: f64) -> f64 {
-        physical / self.0
-    }
-
-    /// `logical` pixels expressed in physical pixels.
-    pub fn to_physical(self, logical: f64) -> f64 {
-        logical * self.0
-    }
 }
 
 /// Why a [`Ui`] or [`Window`] call failed.
@@ -305,27 +258,4 @@ pub enum InputEvent {
 pub trait InputSource {
     /// Sets the callback run for each event, replacing the previous one.
     fn on_events<F: FnMut(InputEvent) + 'static>(&self, on_event: F);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A scale must be a usable divisor: zero, negative and non-finite factors are refused.
-    #[test]
-    fn scale_refuses_unusable_factors() {
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(Scale::new(bad), None, "{bad}");
-        }
-        assert_eq!(Scale::new(1.5).map(Scale::get), Some(1.5));
-    }
-
-    /// 1.5x: 300 physical pixels are 200 logical ones, and back (arithmetic, 300 / 1.5 = 200).
-    #[test]
-    fn scale_converts_both_ways() {
-        let s = Scale::new(1.5).expect("valid");
-        assert_eq!(s.to_logical(300.0), 200.0);
-        assert_eq!(s.to_physical(200.0), 300.0);
-        assert_eq!(Scale::ONE.to_logical(7.0), 7.0);
-    }
 }

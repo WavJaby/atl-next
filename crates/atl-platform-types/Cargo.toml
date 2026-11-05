@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-platform-types"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Value types both platform halves speak (atl-platform-ui-api, atl-platform-host-api): physical sizes, the scale, the monitor, and the one conversion from the desktop's units (logical px, milli-Hz) into them.
+# No OS or toolkit dependency, no unsafe.
+
+[lints]
+workspace = true
