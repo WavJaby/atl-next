@@ -98,13 +98,24 @@ impl Run {
     }
 }
 
-/// The display a run's atld answers with when no `--display` is given: the monitor's refresh rate (GDK, atl-platform-host), on the model's default size and density. The cadence gates judge against this same rate. No desktop answers: the default, and a line says so (atld falls back the same way).
+/// The gates' display: the model's default size and density (fixed, so pictures and sizes are the same on every host, and small enough that WSLg keeps the display rate) at the monitor's refresh rate
+/// (GDK, atl-platform-host), which the cadence gates judge against. No desktop or no rate: the default rate, and a line says so.
 pub fn run_display() -> DisplayModel {
-    let hz = atl_platform_host::monitor_refresh_hz().unwrap_or_else(|e| {
-        println!("display: {e}, the default refresh rate");
-        None
-    });
-    DisplayModel::with_monitor_refresh(hz)
+    let hz = match atl_platform_host::first_monitor() {
+        Ok(m) => {
+            println!("display: monitor {m:?}");
+            m.and_then(|m| m.refresh_hz)
+        }
+        Err(e) => {
+            println!("display: {e}, the default refresh rate");
+            None
+        }
+    };
+    let default = DisplayModel::default();
+    DisplayModel {
+        refresh_hz: hz.unwrap_or(default.refresh_hz),
+        ..default
+    }
 }
 
 /// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir; its path.

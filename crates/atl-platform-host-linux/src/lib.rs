@@ -5,7 +5,7 @@
 
 use std::marker::PhantomData;
 
-use atl_platform_host_api::{Desktop, HostError};
+use atl_platform_host_api::{Desktop, HostError, Monitor};
 use gtk4::gdk;
 use gtk4::prelude::*;
 
@@ -22,16 +22,28 @@ impl Desktop for GdkDesktop {
         })
     }
 
-    /// The first monitor of the default display: Wayland has no primary monitor.
-    fn refresh_hz(&self) -> Option<f32> {
+    /// The first monitor of the default display: Wayland has no primary monitor. GDK's geometry is logical pixels; the mode is that times the monitor's (fractional) scale.
+    fn monitor(&self) -> Option<Monitor> {
         let display = gdk::Display::default()?;
         let monitor = display
             .monitors()
             .item(0)?
             .downcast::<gdk::Monitor>()
             .ok()?;
-        millihz_to_hz(monitor.refresh_rate())
+        let geometry = monitor.geometry();
+        let scale = Some(monitor.scale()).filter(|s| s.is_finite() && *s > 0.0)?;
+        Some(Monitor {
+            width: logical_to_physical(geometry.width(), scale),
+            height: logical_to_physical(geometry.height(), scale),
+            refresh_hz: millihz_to_hz(monitor.refresh_rate()),
+            scale,
+        })
     }
+}
+
+/// A logical length at `scale` in physical pixels, rounded to the nearest (a 1600 px wide output at 1.6 is a 2560 px mode).
+pub fn logical_to_physical(logical: i32, scale: f64) -> u32 {
+    (f64::from(logical.max(0)) * scale).round() as u32
 }
 
 /// GDK's milli-Hz as Hz; `None` for 0 (unknown) and for a negative value.
@@ -41,7 +53,7 @@ pub fn millihz_to_hz(millihz: i32) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::millihz_to_hz;
+    use super::{logical_to_physical, millihz_to_hz};
 
     /// GDK's `refresh_rate` is milli-Hz (60000 is 60 Hz), 0 when unknown.
     #[test]
@@ -51,5 +63,14 @@ mod tests {
         assert!((millihz_to_hz(59_940).expect("59.94 Hz") - 59.94).abs() < 1e-4);
         assert_eq!(millihz_to_hz(0), None);
         assert_eq!(millihz_to_hz(-1), None);
+    }
+
+    /// The owner's laptop: 1600x1000 logical at 1.6 is the 2560x1600 panel; 1.25 of 1229 is 1536.25 -> 1536; a negative length is none.
+    #[test]
+    fn logical_is_physical_at_scale() {
+        assert_eq!(logical_to_physical(1600, 1.6), 2560);
+        assert_eq!(logical_to_physical(1000, 1.6), 1600);
+        assert_eq!(logical_to_physical(1229, 1.25), 1536);
+        assert_eq!(logical_to_physical(-5, 2.0), 0);
     }
 }

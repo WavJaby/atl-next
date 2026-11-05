@@ -91,7 +91,7 @@ struct Args {
     /// A package whose launcher activity the services start once they are up.
     #[arg(long)]
     launch: Option<String>,
-    /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the monitor's refresh rate (atl-platform-host) on the model's default size and density.
+    /// The display the services answer with (`WxH@hz,dpi`, atl_services::display_model): forwarded to atl-system-services; omitted, the desktop's first monitor (atl-platform-host, DisplayModel::from_monitor).
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
     /// The headless pointer script, `down:x,y move:x,y up:x,y` (atl-composer `input::parse_script`): every app process gets it as `ro.atl.headless.pointer`, and the app injects it after its first frame. Omitted: no input.
@@ -136,13 +136,25 @@ fn log(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "atld: {msg}");
 }
 
-/// The display without `--display`: the monitor's refresh rate from the desktop (atl-platform-host) on the model's default size and density. No desktop answers: the default, and atld says why.
+/// The display without `--display`: the desktop's first monitor (atl-platform-host) as [`DisplayModel::from_monitor`]. No desktop or no monitor: the default, and atld says why.
 fn host_display() -> DisplayModel {
-    let hz = atl_platform_host::monitor_refresh_hz().unwrap_or_else(|e| {
-        log(format_args!("display: {e}, the default refresh rate"));
-        None
-    });
-    DisplayModel::with_monitor_refresh(hz)
+    match atl_platform_host::first_monitor() {
+        Ok(Some(m)) => {
+            let model = DisplayModel::from_monitor(m.width, m.height, m.refresh_hz, m.scale);
+            log(format_args!("display: monitor {m:?} -> {}", model.to_arg()));
+            model
+        }
+        Ok(None) => {
+            log(format_args!(
+                "display: the desktop lists no monitor, the default display"
+            ));
+            DisplayModel::default()
+        }
+        Err(e) => {
+            log(format_args!("display: {e}, the default display"));
+            DisplayModel::default()
+        }
+    }
 }
 
 /// A package to install, as xtask writes it.

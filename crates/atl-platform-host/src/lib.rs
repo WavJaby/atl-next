@@ -19,7 +19,7 @@ fn implements_the_api() {
     desktop::<PlatformDesktop>();
 }
 
-/// The first monitor's refresh rate in Hz, from a connection let go at once; `None` where the monitor reports none. `Err`: no desktop answers.
-pub fn monitor_refresh_hz() -> Result<Option<f32>, HostError> {
-    Ok(PlatformDesktop::connect()?.refresh_hz())
+/// The first monitor, from a connection let go at once; `None` where the desktop lists none. `Err`: no desktop answers.
+pub fn first_monitor() -> Result<Option<Monitor>, HostError> {
+    Ok(PlatformDesktop::connect()?.monitor())
 }

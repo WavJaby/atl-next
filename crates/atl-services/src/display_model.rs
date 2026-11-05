@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! The display's values, one struct for every reader: DisplayInfo (display.rs, IDisplayManager.getDisplayInfo) and the global Configuration (activity.rs). atld passes it to the services
-//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::with_monitor_refresh`] of the monitor's rate. Nothing else holds display values.
-//! The default size and density are test values (1280x800, 160 dpi) until the host platform layer supplies the monitor's size and density (plan M3 step 5); the refresh rate comes from the monitor already.
+//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::from_monitor`] of the desktop's monitor. Nothing else holds display values.
+//! The default (1280x800, 60 Hz, 160 dpi) is a test value: the fallback when no desktop answers, and the base of the gates' fixed display.
+
+/// `DisplayMetrics.DENSITY_DEFAULT`: the dpi of density 1 (mdpi), where 1 dp is 1 px.
+pub const DENSITY_DEFAULT: i32 = 160;
 
 /// The default display: size in pixels, refresh rate in Hz, density in dots per inch (DisplayMetrics.densityDpi).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,18 +22,21 @@ impl Default for DisplayModel {
             width: 1280,
             height: 800,
             refresh_hz: 60.0,
-            dpi: 160,
+            dpi: DENSITY_DEFAULT,
         }
     }
 }
 
 impl DisplayModel {
-    /// The default size and density at the monitor's refresh rate: what atld answers with when no `--display` is given. `None` (the monitor reports none) keeps the default rate.
-    pub fn with_monitor_refresh(refresh_hz: Option<f32>) -> Self {
-        let default = DisplayModel::default();
+    /// The monitor as Android's display: its mode in physical pixels, its rate (`None`: the default's), and density `160 x scale` (owner, 2026-11-05: 1 dp = 1 desktop logical pixel; the panel's
+    /// physical DPI is not used). The scale is physical per logical pixel (Wayland `wp_fractional_scale_v1` / GDK monitor scale).
+    pub fn from_monitor(width: u32, height: u32, refresh_hz: Option<f32>, scale: f64) -> Self {
+        let clamp = |v: u32| i32::try_from(v).unwrap_or(i32::MAX).max(1);
         DisplayModel {
-            refresh_hz: refresh_hz.unwrap_or(default.refresh_hz),
-            ..default
+            width: clamp(width),
+            height: clamp(height),
+            refresh_hz: refresh_hz.unwrap_or(DisplayModel::default().refresh_hz),
+            dpi: (f64::from(DENSITY_DEFAULT) * scale).round().max(1.0) as i32,
         }
     }
 
@@ -78,17 +84,19 @@ mod tests {
         assert_eq!(d.to_arg(), "1280x800@60,160");
     }
 
-    /// The monitor's rate replaces the default's alone: size and density are the stated test values.
+    /// The owner's laptop (2560x1600, 120 Hz, scale 1.6): 1 dp = 1 logical px, so 160 x 1.6 = 256 dpi; scale 1 is mdpi (160); 1.25 is 200; a rate the monitor does not report keeps the default's.
     #[test]
-    fn monitor_refresh_keeps_the_default_size() {
-        let m = DisplayModel::with_monitor_refresh(Some(120.0));
+    fn monitor_values_and_density_from_scale() {
+        let m = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6);
         assert_eq!(
             (m.width, m.height, m.refresh_hz, m.dpi),
-            (1280, 800, 120.0, 160)
+            (2560, 1600, 120.0, 256)
         );
+        assert_eq!(DisplayModel::from_monitor(1920, 1080, None, 1.0).dpi, 160);
+        assert_eq!(DisplayModel::from_monitor(1920, 1080, None, 1.25).dpi, 200);
         assert_eq!(
-            DisplayModel::with_monitor_refresh(None),
-            DisplayModel::default()
+            DisplayModel::from_monitor(1920, 1080, None, 1.0).refresh_hz,
+            DisplayModel::default().refresh_hz
         );
     }
 
