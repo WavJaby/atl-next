@@ -33,6 +33,7 @@ mod libcxx_gate;
 mod licence_gate;
 mod licenses;
 mod manifest;
+mod mesa;
 mod modules;
 mod native;
 mod native_load;
@@ -112,6 +113,10 @@ enum Command {
     /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
     /// Task copies (`xtask patch --edit`) replace their src/ checkout; with AOSP ones the converter reads the link farm src-wt/<task>/aosp-tree, regenerated every round.
     Native(native::Args),
+    /// Mesa `platforms=android` build inputs from a converter out dir: pkg-config files for the AOSP libraries Mesa looks up, and a meson native file with the G1 options.
+    ///
+    /// Writes only under --dest; the out dir is read. Mesa's meson is then run as-is with `--native-file <dest>/native.ini`.
+    MesaConfig(mesa::Args),
     /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
     ///
     /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`.
@@ -223,6 +228,7 @@ fn main() -> Result<ExitCode> {
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
+        Command::MesaConfig(args) => mesa::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),

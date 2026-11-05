@@ -68,8 +68,11 @@ pub struct Args {
     /// Upstream checkout to scan, as named under src/ (e.g. qemu, aosp/art).
     upstream: String,
     /// Only files under this directory of the checkout.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "files")]
     under: Option<String>,
+    /// Only the files listed in this file, one checkout-relative path per line (e.g. a build's compiled set); ids the runtime does not allow are then listed with their files.
+    #[arg(long)]
+    files: Option<std::path::PathBuf>,
     /// List every file that cannot be resolved (default: the first 10).
     #[arg(long)]
     list: bool,
@@ -102,7 +105,19 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
     let upstream = licenses.upstream.get(&c.licence_key);
     let prefix = c.licence_prefix();
     let mut files = Vec::new();
-    walk(&base, &mut files)?;
+    match &args.files {
+        Some(list) => {
+            let text = std::fs::read_to_string(list)
+                .with_context(|| format!("read {}", list.display()))?;
+            files.extend(
+                text.lines()
+                    .map(|l| checkout.join(l))
+                    .filter(|p| is_source(p)),
+            );
+        }
+        None => walk(&base, &mut files)?,
+    }
+    let mut refused = BTreeMap::<String, Vec<String>>::new();
     let (mut counts, mut failed) = (BTreeMap::<String, usize>::new(), Vec::new());
     for f in &files {
         let inside = f.strip_prefix(&checkout).unwrap_or(f);
@@ -111,12 +126,20 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
         let at = inside.parent().unwrap_or(std::path::Path::new(""));
         let unlabelled = || licenses.unlabelled(&c.licence_key, &prefix, &checkout, at);
         match resolve(&rel, &text, upstream, unlabelled) {
-            Ok(id) => *counts.entry(id).or_default() += 1,
+            Ok(id) => {
+                if args.files.is_some() && !matches!(licenses.allows("runtime", &id), Ok(true)) {
+                    refused.entry(id.clone()).or_default().push(rel.clone());
+                }
+                *counts.entry(id).or_default() += 1;
+            }
             Err(e) => failed.push(format!("{e:#}")),
         }
     }
     for (id, n) in &counts {
         println!("licence: {n:6}  {id}");
+    }
+    for (id, paths) in &refused {
+        println!("licence: not allowed in runtime: {id}: {}", paths.join(" "));
     }
     let shown = if args.list {
         failed.len()
@@ -133,7 +156,7 @@ pub fn run(root: &std::path::Path, args: &Args) -> Result<std::process::ExitCode
         files.len() - failed.len(),
         failed.len()
     );
-    Ok(if failed.is_empty() {
+    Ok(if failed.is_empty() && refused.is_empty() {
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE
@@ -152,14 +175,16 @@ fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> 
             if path.file_name().is_some_and(|n| n != ".git") {
                 walk(&path, out)?;
             }
-        } else if path
-            .extension()
-            .is_some_and(|e| SOURCE_EXTENSIONS.iter().any(|x| e == *x))
-        {
+        } else if is_source(&path) {
             out.push(path);
         }
     }
     Ok(())
+}
+
+fn is_source(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| SOURCE_EXTENSIONS.iter().any(|x| e == *x))
 }
 
 /// Licence of `path` (relative to its upstream's root: an AOSP file by its tree path) in an upstream: per-path entry (longest prefix) > SPDX tag > notice >
