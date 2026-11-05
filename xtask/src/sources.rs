@@ -26,6 +26,9 @@ pub struct Aosp {
     pub manifest: String,
     /// AOSP tree path -> pinned commit.
     pub projects: BTreeMap<String, String>,
+    /// Pinned project -> the only directories checked out (cone sparse checkout over a blob-less fetch): a prebuilts repository of which the build reads one version.
+    #[serde(default)]
+    pub sparse: BTreeMap<String, Vec<String>>,
 }
 
 /// Directory of the manifest checkout under `src/`: outside the AOSP tree, which the converter scans.
@@ -50,6 +53,8 @@ pub struct Checkout {
     pub pin: Pin,
     /// Key of the upstream's `[upstream.<key>]` row in licenses.toml (`aosp` for every AOSP project).
     pub licence_key: String,
+    /// Directories of a sparse checkout (`[aosp.sparse]`); empty = the whole tree.
+    pub sparse: Vec<String>,
 }
 
 /// Where a checkout's commit lives in sources.toml.
@@ -83,6 +88,7 @@ impl Sources {
             commit: self.aosp.manifest.clone(),
             pin: Pin::Manifest,
             licence_key: "aosp".to_owned(),
+            sparse: Vec::new(),
         }
     }
 
@@ -98,6 +104,7 @@ impl Sources {
             commit: commit.clone(),
             pin: Pin::Aosp(path.clone()),
             licence_key: "aosp".to_owned(),
+            sparse: self.aosp.sparse.get(path).cloned().unwrap_or_default(),
         });
         let git = self.git.iter().map(|(name, up)| Checkout {
             dir: PathBuf::from(name),
@@ -106,6 +113,7 @@ impl Sources {
             commit: up.commit.clone(),
             pin: Pin::Git(name.clone()),
             licence_key: name.clone(),
+            sparse: Vec::new(),
         });
         aosp.chain(git).collect()
     }
@@ -156,6 +164,16 @@ fn validate(sources: &Sources) -> Result<()> {
         ensure!(
             is_commit(commit),
             "aosp project `{path}`: `{commit}` is not a full commit hash"
+        );
+    }
+    for (path, dirs) in &aosp.sparse {
+        ensure!(
+            aosp.projects.contains_key(path),
+            "aosp.sparse `{path}`: not a pinned project"
+        );
+        ensure!(
+            !dirs.is_empty() && dirs.iter().all(|d| is_tree_path(d)),
+            "aosp.sparse `{path}`: needs relative directory paths"
         );
     }
     for (name, up) in &sources.git {

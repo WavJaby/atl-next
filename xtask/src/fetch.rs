@@ -423,8 +423,27 @@ fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             git(Some(dir), &["init", "-q"])?;
             git(Some(dir), &["remote", "add", "origin", c.url()?])?;
+            if !c.sparse.is_empty() {
+                // blobs of the checked-out cone are fetched lazily from origin at checkout (a promisor remote)
+                git(Some(dir), &["config", "remote.origin.promisor", "true"])?;
+                git(
+                    Some(dir),
+                    &["config", "remote.origin.partialclonefilter", "blob:none"],
+                )?;
+                let mut set = vec!["sparse-checkout", "set", "--cone"];
+                set.extend(c.sparse.iter().map(String::as_str));
+                git(Some(dir), &set)?;
+            }
             fetch_pin(c, dir)?;
-            checkout_pin(c, dir)
+            checkout_pin(c, dir)?;
+            for d in &c.sparse {
+                ensure!(
+                    dir.join(d).is_dir(),
+                    "sparse directory {d} absent at the pin in {}",
+                    dir.display()
+                );
+            }
+            Ok(())
         }
         Action::Reclone => {
             std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -458,18 +477,12 @@ fn checkout_pin(c: &Checkout, dir: &Path) -> Result<()> {
 /// Shallow-fetch the pinned tag into `dir` and check it is the pinned commit.
 pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
     let refspec = format!("+refs/tags/{0}:refs/tags/{0}", c.tag);
-    git(
-        Some(dir),
-        &[
-            "fetch",
-            "-q",
-            "--depth",
-            "1",
-            "--no-tags",
-            c.url()?,
-            &refspec,
-        ],
-    )?;
+    let mut args = vec!["fetch", "-q", "--depth", "1", "--no-tags"];
+    if !c.sparse.is_empty() {
+        args.push("--filter=blob:none");
+    }
+    args.extend([c.url()?, refspec.as_str()]);
+    git(Some(dir), &args)?;
     let fetched = git(
         Some(dir),
         &["rev-parse", &format!("refs/tags/{}^{{commit}}", c.tag)],
@@ -692,6 +705,7 @@ mod tests {
                 commit: commit.into(),
                 pin: Pin::Git("up".into()),
                 licence_key: "up".into(),
+                sparse: Vec::new(),
             }
         }
     }

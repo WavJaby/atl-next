@@ -22,12 +22,12 @@ arch = "bison"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# the broker's sandbox (plan Q5, M2 depth Q4(a)); `xtask test binder` runs servicemanager in a mount namespace whose /system and /vendor hold the test layout (empty VINTF manifests)
+# the broker's sandbox (plan Q5, M2 depth Q4(a)); `xtask test binder` runs servicemanager in a mount namespace whose /system and /vendor hold the test layout (empty VINTF manifests); `xtask soong` runs Soong in one where each AOSP task copy is bind-mounted over its src/aosp project
 [bubblewrap]
 debian = "bubblewrap"
 arch = "bubblewrap"
-scope = ["runtime", "test"]
-used_by = ["crate:atl-broker", "xtask:test"]
+scope = ["build", "runtime", "test"]
+used_by = ["crate:atl-broker", "xtask:soong", "xtask:test"]
 
 # builds providers.toml `crate:` providers as C shared libraries, with their headers
 [cargo-c]

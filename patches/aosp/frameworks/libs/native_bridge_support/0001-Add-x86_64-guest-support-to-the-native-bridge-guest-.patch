@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 04:32:09 +0800
+Subject: [PATCH] Add x86_64 guest support to the native bridge guest libraries
+
+Add the x86_64 counterparts of the per-arch pieces the guest linker,
+libc and vdso need: the interceptable stub macro, the vdso trap
+entries, the static TLS hooks and the libc stub list, plus their
+Android.bp arch entries. The libc stub list is the riscv64 one without
+the setjmp family: an x86_64 guest on an x86_64 host shares the CPU,
+so bionic's own setjmp/longjmp are correct where a host implementation
+would capture its trampoline's frame.
+
+The stub body is movabs $0, %r11; jmp *%r11: an implementation patches
+the imm64 to its trampoline; r11 is caller-saved and carries no
+argument (rax holds the vector register count of variadic calls).
+
+Upstream-Status: Pending
+Patch-Reason: a native bridge running x86_64 guest code on an x86_64 host (ATL's identity engine) needs x86_64 builds of these guest libraries; the arch blocks and per-arch sources live inside these Android.bp modules, which no launcher, loader or environment setting can add
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libc/Android.bp                   |   9 +
+ android_api/libc/stubs_x86_64.cpp             | 215 ++++++++++++++++++
+ android_api/linker/Android.bp                 |   4 +
+ android_api/linker/init_static_tls_x86_64.cc  |  32 +++
+ android_api/vdso/Android.bp                   |   3 +
+ .../vdso/interceptable_functions.h            |  19 +-
+ android_api/vdso/vdso_x86_64.S                |  51 +++++
+ 7 files changed, 332 insertions(+), 1 deletion(-)
+ create mode 100644 android_api/libc/stubs_x86_64.cpp
+ create mode 100644 android_api/linker/init_static_tls_x86_64.cc
+ create mode 100644 android_api/vdso/vdso_x86_64.S
+
+diff --git a/android_api/libc/Android.bp b/android_api/libc/Android.bp
+index a19d1d519e8187bee6057d485ccdb641f6bb0df5..4045b904b89c525fcea64370d497d0668d82581b 100644
+--- a/android_api/libc/Android.bp
++++ b/android_api/libc/Android.bp
+@@ -107,6 +107,15 @@ cc_library {
+ 
+             version_script: ":libc.riscv64.map",
+ 
++            strip: {
++                keep_symbols: true,
++            },
++        },
++        x86_64: {
++            srcs: ["stubs_x86_64.cpp"],
++
++            version_script: ":libc.x86_64.map",
++
+             strip: {
+                 keep_symbols: true,
+             },
+diff --git a/android_api/libc/stubs_x86_64.cpp b/android_api/libc/stubs_x86_64.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..522c80eefe68ba664fbb877d0f9bf9233fa92506
+--- /dev/null
++++ b/android_api/libc/stubs_x86_64.cpp
+@@ -0,0 +1,215 @@
++//
++// Copyright (C) 2024 The Android Open Source Project
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++// x86_64 guest counterpart of stubs_riscv64.cpp. The setjmp family is not intercepted: an x86_64
++// guest runs on an x86_64 host CPU, so bionic's own setjmp/longjmp save and restore the real
++// registers, while a host implementation would capture the frame of its trampoline.
++
++// clang-format off
++#include "native_bridge_support/vdso/interceptable_functions.h"
++
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__clone_for_fork);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__get_thread_stack_top);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_pop);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__pthread_cleanup_push);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_properties_init);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_add);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_area_init);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_area_serial);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_find);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_find_nth);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_foreach);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_get);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_read);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_read_callback);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_serial);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_set);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_set_filename);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_update);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(__system_property_wait_any);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_register);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_data);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_replace_name);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_crash_detail_unregister);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_getaddrinfofornet);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_getaddrinfofornetcontext);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_mallopt);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(android_set_abort_message);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(clock_getres);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(clock_gettime);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(freeaddrinfo);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(gai_strerror);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(getaddrinfo);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(gethostbyaddr);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(gethostbyname);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(getnameinfo);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(gettimeofday);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcmp);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(memcpy);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(memset);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge___cxa_thread_atexit_impl);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_aligned_alloc);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_calloc);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_exit);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_free);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_mallinfo);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_disable);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_enable);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_info_helper);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_iterate);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_malloc_usable_size);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_mallopt);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_memalign);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_posix_memalign);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(native_bridge_realloc);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_destroy);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getdetachstate);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getguardsize);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getinheritsched);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getschedparam);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getschedpolicy);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getscope);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getstack);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_getstacksize);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_init);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setdetachstate);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setguardsize);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setinheritsched);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setschedparam);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setschedpolicy);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setscope);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setstack);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_attr_setstacksize);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_create);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_detach);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_exit);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_getattr_np);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_getcpuclockid);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_getname_np);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_getschedparam);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_getspecific);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_gettid_np);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_join);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_key_create);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_key_delete);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_kill);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setname_np);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setschedparam);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setschedprio);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_setspecific);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(pthread_sigqueue);
++DEFINE_INTERCEPTABLE_STUB_FUNCTION(time);
++DEFINE_INTERCEPTABLE_STUB_VARIABLE(environ);
++
++static void __attribute__((constructor(0))) init_stub_library() {
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __clone_for_fork);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __get_thread_stack_top);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_pop);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __pthread_cleanup_push);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_properties_init);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_add);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_area_init);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_area_serial);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_find);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_find_nth);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_foreach);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_get);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_read);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_read_callback);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_serial);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_set);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_set_filename);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_update);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", __system_property_wait_any);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_register);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_data);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_replace_name);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_crash_detail_unregister);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_getaddrinfofornet);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_getaddrinfofornetcontext);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_mallopt);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", android_set_abort_message);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", clock_getres);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", clock_gettime);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", freeaddrinfo);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gai_strerror);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", getaddrinfo);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gethostbyaddr);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gethostbyname);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", getnameinfo);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", gettimeofday);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memcmp);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memcpy);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", memset);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge___cxa_thread_atexit_impl);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_aligned_alloc);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_calloc);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_exit);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_free);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_mallinfo);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_disable);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_enable);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_info_helper);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_iterate);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_malloc_usable_size);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_mallopt);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_memalign);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_posix_memalign);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", native_bridge_realloc);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_destroy);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getdetachstate);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getguardsize);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getinheritsched);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getschedparam);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getschedpolicy);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getscope);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getstack);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_getstacksize);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_init);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setdetachstate);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setguardsize);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setinheritsched);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setschedparam);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setschedpolicy);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setscope);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setstack);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_attr_setstacksize);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_create);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_detach);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_exit);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_getattr_np);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_getcpuclockid);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_getname_np);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_getschedparam);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_getspecific);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_gettid_np);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_join);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_key_create);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_key_delete);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_kill);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setname_np);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setschedparam);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setschedprio);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_setspecific);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", pthread_sigqueue);
++  INIT_INTERCEPTABLE_STUB_FUNCTION("libc.so", time);
++  INIT_INTERCEPTABLE_STUB_VARIABLE("libc.so", environ);
++}
++// clang-format on
+diff --git a/android_api/linker/Android.bp b/android_api/linker/Android.bp
+index 14f8afa6312f15b0f3764f258dd49a31e81fbec6..e45534bfe151e7358310da20461a2f400a0d3a7a 100644
+--- a/android_api/linker/Android.bp
++++ b/android_api/linker/Android.bp
+@@ -59,6 +59,10 @@ cc_binary {
+             srcs: ["init_static_tls_riscv64.cc"],
+             version_script: "linker.generic.map",
+         },
++        x86_64: {
++            srcs: ["init_static_tls_x86_64.cc"],
++            version_script: "linker.generic.map",
++        },
+     },
+ 
+     cflags: [
+diff --git a/android_api/linker/init_static_tls_x86_64.cc b/android_api/linker/init_static_tls_x86_64.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd36339541a3a78fa81c3954a9791b3ced236f9e
+--- /dev/null
++++ b/android_api/linker/init_static_tls_x86_64.cc
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// x86_64 guest counterpart of init_static_tls_riscv64.cc: both trap until the native bridge
++// implementation intercepts them.
++
++extern "C" __attribute__((naked, visibility("default"))) void
++__native_bridge_config_static_tls() {
++  asm(R"(
++    ud2
++  )");
++}
++
++extern "C" __attribute__((naked, visibility("default"))) void
++__native_bridge_get_host_pthread() {
++  asm(R"(
++    ud2
++  )");
++}
+diff --git a/android_api/vdso/Android.bp b/android_api/vdso/Android.bp
+index a6befce0d74e668a788f3d18ed59c6018546e6b0..b69013ae730466e657d087e611c8a5fbadc740d6 100644
+--- a/android_api/vdso/Android.bp
++++ b/android_api/vdso/Android.bp
+@@ -34,6 +34,9 @@ cc_library_shared {
+         riscv64: {
+             srcs: ["vdso_riscv64.S"],
+         },
++        x86_64: {
++            srcs: ["vdso_x86_64.S"],
++        },
+         arm: {
+             srcs: ["vdso_arm.S"],
+         },
+diff --git a/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h b/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
+index 31e8e9d0e05b97a7e2b85073540d7011caf05399..bffb1b2595a822960751bb90edf8c37abfff854e 100644
+--- a/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
++++ b/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
+@@ -84,9 +84,26 @@
+     __asm__ __volatile__("j " #name "_stub");                                                   \
+   }
+ 
++#elif defined(__x86_64__)
++
++// The stub body is the patch site: an implementation rewrites the imm64 of movabs (13 bytes in
++// all, fits the 64-byte slot) to its trampoline; until then the jump to 0 faults. r11 is
++// caller-saved and not an argument register; rax is not usable (al = vector register count of
++// variadic calls).
++#define INTERCEPTABLE_STUB_ASM_FUNCTION(name)                                                   \
++  extern "C" void __attribute__((aligned(64), naked, __visibility__("hidden"))) name##_stub() { \
++    __asm__ __volatile__(                                                                       \
++        "movabs $0, %r11\n"                                                                     \
++        "jmp *%r11\n");                                                                         \
++  }                                                                                             \
++                                                                                                \
++  extern "C" __attribute__((aligned(64), naked)) void name() {                                  \
++    __asm__ __volatile__("jmp " #name "_stub");                                                 \
++  }
++
+ #else
+ 
+-#error Unknown architecture, only riscv64, arm and aarch64 are supported.
++#error Unknown architecture, only riscv64, arm, aarch64 and x86_64 are supported.
+ 
+ #endif
+ 
+diff --git a/android_api/vdso/vdso_x86_64.S b/android_api/vdso/vdso_x86_64.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc08daf48ee94f8b56cb09938a7451712450aa2d
+--- /dev/null
++++ b/android_api/vdso/vdso_x86_64.S
+@@ -0,0 +1,51 @@
++//
++// Copyright (C) 2024 The Android Open Source Project
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++// x86_64 guest counterpart of vdso_riscv64.S: every entry traps until the native bridge
++// implementation intercepts it.
++
++.text
++.globl native_bridge_trace
++.type native_bridge_trace, @function
++native_bridge_trace:
++  ud2
++
++.globl native_bridge_intercept_symbol
++.type native_bridge_intercept_symbol, @function
++native_bridge_intercept_symbol:
++  ud2
++
++.globl native_bridge_post_init
++.type native_bridge_post_init, @function
++native_bridge_post_init:
++  ud2
++
++// Symbol to set guest return address to when guest function is called from the runtime.
++// Provides unwind info that corresponds to ScopedHostCallFrame (rbp-based frame: saved rbp at
++// CFA-16, return address at CFA-8).
++// Provides 1 readable insn before and 2 after.
++  .cfi_startproc
++  .cfi_def_cfa rbp, 16
++  .cfi_offset rip, -8
++  .cfi_offset rbp, -16
++  nop
++.globl native_bridge_call_guest
++.type native_bridge_call_guest, @function
++native_bridge_call_guest:
++  nop
++  nop
++  ud2
++  .cfi_endproc

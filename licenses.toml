@@ -547,6 +547,10 @@ reason = "Apache-2.0 header; the added note that parts come from public-domain S
 licence = "Apache-2.0"
 reason = "Apache-2.0 header; the added note that poly1305-donna is public domain is not a licence notice the phrase rules accept"
 
+[upstream.berberis]
+# Reference only (sources.toml): nothing of it is compiled, so no file reaches the checked set; its LICENSE is Apache-2.0.
+unlabelled = "Apache-2.0"
+
 [upstream.qemu]
 # QEMU's LICENSE: "Source files with no licensing information are released under the GNU General
 # Public License, version 2 or (at your option) any later version."

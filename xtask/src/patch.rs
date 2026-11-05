@@ -1317,6 +1317,7 @@ pub mod fixture {
                 commit: self.up(&["rev-parse", &format!("{tag}^{{commit}}")]),
                 pin: Pin::Git("up".into()),
                 licence_key: "up".into(),
+                sparse: Vec::new(),
             }
         }
 
@@ -1326,6 +1327,7 @@ pub mod fixture {
                 dir: Path::new("aosp").join(project),
                 pin: Pin::Aosp(project.into()),
                 licence_key: "aosp".into(),
+                sparse: Vec::new(),
                 ..self.checkout(tag)
             }
         }
@@ -1957,6 +1959,7 @@ mod tests {
             commit: "c".into(),
             pin,
             licence_key: "x".into(),
+            sparse: Vec::new(),
         };
         let built = BTreeSet::from(["boringssl"]);
         assert!(built_from(
