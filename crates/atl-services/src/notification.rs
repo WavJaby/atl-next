@@ -206,7 +206,7 @@ impl INotificationManager for NotificationManager {
             && !inner
                 .packages
                 .by_app_id(permission::app_id(uid))
-                .any(|p| p.manifest.package == pkg)
+                .any(|p| p.manifest.name == pkg)
         {
             return Err(Status::new_exception_str(
                 ExceptionCode::SECURITY,

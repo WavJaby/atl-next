@@ -17,7 +17,7 @@ use atl_parcelables::parts::{PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
 use crate::packages::{InstrumentationDecl, LibraryNode, PackageRecord, Packages};
-use crate::permission::Permissions;
+use crate::permission::{self, Permissions};
 use crate::{counters, manifest_flags};
 
 /// The interface name counters use.

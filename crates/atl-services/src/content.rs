@@ -21,7 +21,7 @@ use binder::{
 
 use crate::counters;
 use crate::observer_rules::{Watch, segments};
-use crate::permission::Permissions;
+use crate::permission::{self, Permissions};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IContentService";
