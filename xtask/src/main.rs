@@ -26,7 +26,6 @@ mod git;
 mod gles2_fixture;
 mod gralloc;
 mod host_art;
-mod ime_spike;
 mod instrument;
 mod jni_fixture;
 mod land;
@@ -216,8 +215,6 @@ enum Test {
     ///
     /// Controls run every time: the probe loads a glibc library cleanly, and each variant fails the other's TLS expectation. Needs the NDK only, no native build.
     JniFixture(jni_fixture::Args),
-    /// IME spike (route R1): a fake input method on the headless labwc's `zwp_input_method_manager_v2` sends preedit + commit to a focused GtkText (xtask/testdata/ime-entry); `--break-commit` must fail.
-    ImeSpike(ime_spike::Args),
     /// The GLES2 test APK (xtask/testdata/gles2), shaped like Cut the Rope's path: GLSurfaceView + an NDK `.so` drawing with GLES2 only and reading pixels back. Static: `.so` DT_NEEDED and `gl*` imports equal the listed sets, manifest glEsVersion 2.0 + hardwareAccelerated, the library in `lib/<abi>/`.
     ///
     /// Controls run every time: each check rejects a broken copy of the real input. Needs the NDK, the Java pipeline's aapt2/d8 and a build.prop; no runtime.
@@ -287,9 +284,6 @@ fn main() -> Result<ExitCode> {
             test: Test::JniFixture(args),
         } => jni_fixture::run(&root, &args),
         Command::Test {
-            test: Test::ImeSpike(args),
-        } => ime_spike::run(&root, &args),
-        Command::Test {
             test: Test::Gles2Fixture(args),
         } => gles2_fixture::run(&root, &args),
     };
@@ -320,7 +314,6 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Window(_) => "window",
             Test::PlatformUi(_) => "platform-ui",
             Test::JniFixture(_) => "jni-fixture",
-            Test::ImeSpike(_) => "ime-spike",
             Test::Gles2Fixture(_) => "gles2-fixture",
         },
         _ => return None,

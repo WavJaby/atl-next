@@ -10,9 +10,11 @@ mod input;
 pub(crate) mod mirror;
 mod pacing;
 mod scene;
+mod text_input;
 mod ui;
 mod view;
 mod window;
 
+pub use text_input::GtkTextInput;
 pub use ui::GtkUi;
 pub use window::GtkWindow;

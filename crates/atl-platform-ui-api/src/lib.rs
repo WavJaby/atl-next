@@ -182,6 +182,11 @@ pub struct WindowAttributes {
 pub trait Window: FrameClock + InputSource + Sized {
     /// The session this window lives in.
     type Ui: Ui;
+    /// The window's connection to the desktop's input method.
+    type TextInput: TextInput;
+
+    /// The window's one text input: idle until [`TextInput::focus_in`].
+    fn text_input(&self) -> &Self::TextInput;
 
     /// Creates the window and shows it; it is mapped (on screen) some main-loop passes later, see [`is_mapped`](Window::is_mapped).
     fn create(ui: &Self::Ui, attributes: &WindowAttributes) -> Result<Self, UiError>;
@@ -394,4 +399,143 @@ pub enum InputEvent {
 pub trait InputSource {
     /// Sets the callback run for each event, replacing the previous one.
     fn on_events<F: FnMut(InputEvent) + 'static>(&self, on_event: F);
+}
+
+/// A rectangle in physical pixels of the window content, origin top-left.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhysRect {
+    /// Left edge.
+    pub x: f64,
+    /// Top edge.
+    pub y: f64,
+    /// Extent to the right.
+    pub width: f64,
+    /// Extent down.
+    pub height: f64,
+}
+
+/// What a text field holds, for the input method's choice of layout and behaviour (GTK `GtkInputPurpose`, text-input v3 `content_purpose`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContentPurpose {
+    /// Any text.
+    #[default]
+    FreeForm,
+    /// Letters only.
+    Alpha,
+    /// Digits only.
+    Digits,
+    /// A number, with sign and separators.
+    Number,
+    /// A phone number.
+    Phone,
+    /// A URL.
+    Url,
+    /// An e-mail address.
+    Email,
+    /// A person's name.
+    Name,
+    /// A hidden password.
+    Password,
+    /// A hidden numeric PIN.
+    Pin,
+    /// A terminal's input.
+    Terminal,
+}
+
+/// How the input method should treat the text, as independent bits (GTK `GtkInputHints`); combine with `|`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentHints(u32);
+
+impl ContentHints {
+    /// No hint.
+    pub const NONE: Self = Self(0);
+    /// Check spelling.
+    pub const SPELLCHECK: Self = Self(1 << 0);
+    /// Do not check spelling.
+    pub const NO_SPELLCHECK: Self = Self(1 << 1);
+    /// Offer word completion.
+    pub const WORD_COMPLETION: Self = Self(1 << 2);
+    /// Prefer lowercase.
+    pub const LOWERCASE: Self = Self(1 << 3);
+    /// Every character uppercase.
+    pub const UPPERCASE_CHARS: Self = Self(1 << 4);
+    /// Each word capitalised.
+    pub const UPPERCASE_WORDS: Self = Self(1 << 5);
+    /// Each sentence capitalised.
+    pub const UPPERCASE_SENTENCES: Self = Self(1 << 6);
+    /// Do not show an on-screen keyboard.
+    pub const INHIBIT_OSK: Self = Self(1 << 7);
+    /// Vertical text.
+    pub const VERTICAL_WRITING: Self = Self(1 << 8);
+    /// Offer emoji.
+    pub const EMOJI: Self = Self(1 << 9);
+    /// Do not offer emoji.
+    pub const NO_EMOJI: Self = Self(1 << 10);
+    /// Sensitive content: the input method should not learn or store it.
+    pub const PRIVATE: Self = Self(1 << 11);
+
+    /// Every bit of `other` is set here.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for ContentHints {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// The text around the cursor, as the input method reads it for context. Byte indices into `text` (UTF-8), each on a char boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Surrounding {
+    /// The text, usually the paragraph around the cursor.
+    pub text: String,
+    /// Cursor position.
+    pub cursor_byte: usize,
+    /// The selection's other end; equal to `cursor_byte` without a selection.
+    pub anchor_byte: usize,
+}
+
+/// What the input method asks of the focused field. Units are the toolkit's (GTK `GtkIMContext` signals); converting them to Android's is the consumer's (atl-ime `units`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextInputEvent {
+    /// The composing text changed: show `text` (UTF-8) as uncommitted, cursor `cursor_chars` chars into it. An empty `text` clears it.
+    Preedit {
+        /// The composing text.
+        text: String,
+        /// Cursor offset in chars (Unicode scalar values) from the start of `text`.
+        cursor_chars: usize,
+    },
+    /// Composing ended; the preedit is gone (a [`Commit`](TextInputEvent::Commit) may carry its result).
+    PreeditEnd,
+    /// Insert this text at the cursor, replacing the preedit.
+    Commit(String),
+    /// Delete `n_chars` chars starting `offset_chars` chars from the cursor (negative = before it).
+    DeleteSurrounding {
+        /// Start, in chars relative to the cursor.
+        offset_chars: i32,
+        /// Length in chars.
+        n_chars: u32,
+    },
+}
+
+/// One window's connection to the desktop's input method (fcitx5, IBus, an on-screen keyboard): the focused Android text field's half of it. All calls on the UI thread.
+/// The input method asks for the surrounding text whenever it wants; the implementation answers with the last [`set_surrounding`](TextInput::set_surrounding), so the caller only reports changes.
+pub trait TextInput {
+    /// A text field gained focus: the input method may start composing for it.
+    fn focus_in(&self);
+    /// The text field lost focus: composing stops and the input method is released.
+    fn focus_out(&self);
+    /// The field's text changed outside the input method: the composing state is dropped.
+    fn reset(&self);
+    /// What the field holds.
+    fn set_content(&self, purpose: ContentPurpose, hints: ContentHints);
+    /// The text around the cursor, now.
+    fn set_surrounding(&self, surrounding: &Surrounding);
+    /// Where the cursor is in the window content, for the input method's candidate popup.
+    fn set_cursor_rect(&self, rect: PhysRect);
+    /// Sets the callback run for each input-method event, replacing the previous one.
+    fn on_events<F: FnMut(TextInputEvent) + 'static>(&self, on_event: F);
 }

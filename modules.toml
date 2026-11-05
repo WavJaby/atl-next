@@ -92,6 +92,12 @@ crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
 uses = ["compositor", "gralloc", "scene-buffer", "platform-types"]
 
+# the app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method to the focused field's InputConnection; so far the one module of text-index unit conversions
+[ime]
+crates = ["atl-ime"]
+exports = ["atl-ime"]
+uses = []
+
 # the value types both platform halves speak (physical size, scale, monitor) and the one conversion from a desktop's report into them; no OS or toolkit dependency
 [platform-types]
 crates = ["atl-platform-types"]

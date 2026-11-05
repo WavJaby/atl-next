@@ -58,17 +58,6 @@ pub struct ChildGuard(Child);
 impl ChildGuard {
     /// Starts `cmd` with SIGTERM as its parent-death signal.
     pub fn spawn(cmd: &mut Command) -> Result<Self> {
-        Self::start(cmd, Stdio::null())
-    }
-
-    /// [`Self::spawn`], with the child's stdout piped back.
-    pub fn spawn_piped(cmd: &mut Command) -> Result<(Self, std::process::ChildStdout)> {
-        let mut g = Self::start(cmd, Stdio::piped())?;
-        let out = g.0.stdout.take().context("child stdout")?;
-        Ok((g, out))
-    }
-
-    fn start(cmd: &mut Command, stdout: Stdio) -> Result<Self> {
         let mut wrapped = Command::new("setpriv");
         wrapped
             .args(["--pdeathsig", "TERM", "--"])
@@ -85,7 +74,7 @@ impl ChildGuard {
         }
         let child = wrapped
             .stdin(Stdio::null())
-            .stdout(stdout)
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("starting {:?}", cmd.get_program()))?;
@@ -268,6 +257,130 @@ mod op {
     pub const CONFIG_HEAD_SET_CUSTOM_MODE: u16 = 1;
     pub const CONFIG_HEAD_SET_POSITION: u16 = 2;
     pub const CONFIG_HEAD_SET_SCALE: u16 = 4;
+}
+
+/// Opcodes from input-method-unstable-v2.xml (requests and events numbered separately, declaration order).
+pub(crate) mod im_op {
+    pub const MANAGER_GET_INPUT_METHOD: u16 = 0;
+    pub const COMMIT_STRING: u16 = 0;
+    pub const SET_PREEDIT_STRING: u16 = 1;
+    pub const DELETE_SURROUNDING_TEXT: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const ACTIVATE: u16 = 0;
+    pub const DEACTIVATE: u16 = 1;
+    pub const SURROUNDING_TEXT: u16 = 2;
+    pub const CONTENT_TYPE: u16 = 4;
+    pub const DONE: u16 = 5;
+    pub const UNAVAILABLE: u16 = 6;
+}
+
+/// No new `done` for this long = the text-input client has answered; a GTK round trip takes one main-loop pass (~ms), so 200 ms is a wide margin.
+const IME_SETTLE: Duration = Duration::from_millis(200);
+const IME_POLL: Duration = Duration::from_millis(20);
+
+/// A fake desktop input method on the labwc seat (`zwp_input_method_v2`), for the gates of a client's text input. It records what the compositor relays from the focused client's text-input v3.
+/// Serial trap (measured 2026-11-06, ime spike): the client answers a preedit with its own text-input commit, relayed as a new `done`; an IME `commit` carrying the older serial is dropped silently. [`Ime::settle`] before each commit that follows client traffic.
+pub(crate) struct Ime {
+    c: Client,
+    im: u32,
+    /// `done` count: the serial `commit` carries.
+    pub dones: u32,
+    pub active: bool,
+    /// Last `surrounding_text`: text, cursor and anchor bytes.
+    pub surrounding: Option<(String, u32, u32)>,
+    /// Last `content_type`: hint bits, purpose (text-input v3 enum values).
+    pub content_type: Option<(u32, u32)>,
+}
+
+impl Ime {
+    /// Binds the seat's input method; fails if labwc has no `zwp_input_method_manager_v2` or another IME holds the seat.
+    pub(crate) fn bind(nested: &NestedCompositor) -> Result<Self> {
+        let (mut c, registry, globals) = nested.connect()?;
+        let mut bind = |iface: &str| -> Result<u32> {
+            let &(name, _) = globals
+                .get(iface)
+                .with_context(|| format!("labwc has no {iface}"))?;
+            let id = c.new_id();
+            c.send(
+                registry,
+                op::REGISTRY_BIND,
+                &[Arg::U(name), Arg::S(iface), Arg::U(1), Arg::U(id)],
+            );
+            Ok(id)
+        };
+        let seat = bind("wl_seat")?;
+        let manager = bind("zwp_input_method_manager_v2")?;
+        let im = c.new_id();
+        c.send(
+            manager,
+            im_op::MANAGER_GET_INPUT_METHOD,
+            &[Arg::U(seat), Arg::U(im)],
+        );
+        let mut ime = Self {
+            c,
+            im,
+            dones: 0,
+            active: false,
+            surrounding: None,
+            content_type: None,
+        };
+        ime.pump()?;
+        Ok(ime)
+    }
+
+    /// Reads the events that have arrived.
+    pub(crate) fn pump(&mut self) -> Result<()> {
+        for (object, opcode, body) in self.c.roundtrip()? {
+            if object != self.im {
+                continue;
+            }
+            match opcode {
+                im_op::ACTIVATE => self.active = true,
+                im_op::DEACTIVATE => self.active = false,
+                im_op::DONE => self.dones += 1,
+                im_op::SURROUNDING_TEXT => {
+                    let text = string(&body, 0)?;
+                    let cursor = word_after_string(&body, 0)?;
+                    let anchor = word(&body, 4 + (word(&body, 0)? as usize).div_ceil(4) * 4 + 4)?;
+                    self.surrounding = Some((text, cursor, anchor));
+                }
+                im_op::CONTENT_TYPE => {
+                    self.content_type = Some((word(&body, 0)?, word(&body, 4)?));
+                }
+                im_op::UNAVAILABLE => {
+                    bail!("input method unavailable (another IME holds the seat)")
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send(&mut self, opcode: u16, args: &[Arg<'_>]) {
+        self.c.send(self.im, opcode, args);
+    }
+
+    /// Pumps until no `done` arrived for [`IME_SETTLE`].
+    pub(crate) fn settle(&mut self) -> Result<()> {
+        let mut seen = self.dones;
+        let mut quiet = Instant::now();
+        while quiet.elapsed() < IME_SETTLE {
+            self.pump()?;
+            if self.dones != seen {
+                seen = self.dones;
+                quiet = Instant::now();
+            }
+            std::thread::sleep(IME_POLL);
+        }
+        Ok(())
+    }
+
+    /// Applies the pending requests (`commit` with the current serial).
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        let serial = self.dones;
+        self.send(im_op::COMMIT, &[Arg::U(serial)]);
+        self.pump()
+    }
 }
 
 const VPOINTER_MANAGER: &str = "zwlr_virtual_pointer_manager_v1";
@@ -488,6 +601,8 @@ pub struct Client {
     stream: UnixStream,
     next: u32,
     pending: Vec<u8>,
+    /// Bytes read past the last roundtrip's `done`: events the compositor sent on its own (an input method's `done`), kept for the next roundtrip. Dropping them lost IME serials (measured 2026-11-06: 4 of 5 ime gate runs).
+    inbox: Vec<u8>,
 }
 
 impl Client {
@@ -498,6 +613,7 @@ impl Client {
             stream,
             next: 2,
             pending: Vec::new(),
+            inbox: Vec::new(),
         })
     }
 
@@ -535,7 +651,7 @@ impl Client {
         self.send(1, op::DISPLAY_SYNC, &[Arg::U(done)]);
         self.stream.write_all(&std::mem::take(&mut self.pending))?;
         let mut events = Vec::new();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = std::mem::take(&mut self.inbox);
         loop {
             let mut chunk = [0u8; 4096];
             let n = self
@@ -563,6 +679,7 @@ impl Client {
                     );
                 }
                 if object == done && opcode == op::CALLBACK_DONE {
+                    self.inbox = buf;
                     return Ok(events);
                 }
                 events.push((object, opcode, body));

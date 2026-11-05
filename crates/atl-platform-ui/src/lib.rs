@@ -6,7 +6,9 @@
 pub use atl_platform_ui_api::*;
 
 #[cfg(target_os = "linux")]
-pub use atl_platform_ui_linux::{GtkUi as PlatformUi, GtkWindow as PlatformWindow};
+pub use atl_platform_ui_linux::{
+    GtkTextInput as PlatformTextInput, GtkUi as PlatformUi, GtkWindow as PlatformWindow,
+};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-ui has no implementation for this target OS");
@@ -16,7 +18,12 @@ compile_error!("atl-platform-ui has no implementation for this target OS");
 #[allow(dead_code)]
 fn implements_the_api() {
     fn ui<T: Ui>() {}
-    fn window<T: Window<Ui = PlatformUi> + FrameClock + InputSource>() {}
+    fn window<
+        T: Window<Ui = PlatformUi, TextInput = PlatformTextInput> + FrameClock + InputSource,
+    >() {
+    }
+    fn text_input<T: TextInput>() {}
     ui::<PlatformUi>();
     window::<PlatformWindow>();
+    text_input::<PlatformTextInput>();
 }

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-ime"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method (atl-platform-ui TextInput) to the focused field's InputConnection.
+# So far only `units`: the one place text indices change units (Android UTF-16 / code points <-> the toolkit's UTF-8 bytes / chars). No unsafe.
+
+[lints]
+workspace = true

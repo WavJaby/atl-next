@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (the gate's headless weston, nested_wayland.rs; with --hold-blocked the desktop's $WAYLAND_DISPLAY), through the `atl-platform-ui` facade.
-//! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates:
+//! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (the gate's headless labwc, nested_wayland.rs; with --hold-blocked the desktop's $WAYLAND_DISPLAY), through the `atl-platform-ui` facade.
+//! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates 1-4 run in any compositor, gate 5 only in the gate's labwc. Gates:
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + loop**: an unsignalled acquire fence and a bad stride are refused, a signalled fence accepted; a watched fd's callback ran on the UI thread inside the Looper's poll.
 //! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the UI thread is blocked (`block`) for the ping timeout plus a margin: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
+//! 5. **text input**: a fake input method (`nested_wayland::Ime`, input-method v2 on labwc's seat) is bound, then the client focuses its window's `TextInput` with a content type and surrounding text. Checks: the IME is activated; it receives the content type and surrounding text as text-input v3 numbers them; its preedit, commit and delete_surrounding_text (protocol units: UTF-8 bytes) reach the client as `TextInputEvent`s (GTK units: chars). Expected values are worked out from the encodings in the constants below. `--break-ime-commit` skips the commit_string, so the commit check must fail.
+//!    Evidence tier: isolated runtime, real compositor relay (wlroots) and GTK's own Wayland IM module; a desktop IME (fcitx5) and the candidate popup at the cursor rect stay laptop checks.
 //!
 //! The client runs with GSK_RENDERER=cairo by default: the cairo renderer presents through wl_shm, which is what WSLg offers (no zwp_linux_dmabuf); the proxy confirms a wl_shm pool was created.
-//! Needs `weston` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
+//! Needs `labwc` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::nested_wayland::NestedCompositor;
+use crate::nested_wayland::{Arg, Ime, NestedCompositor, im_op};
 use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
 
@@ -45,6 +47,121 @@ pub struct Args {
     /// Print the client's stderr and every proxy event.
     #[arg(long, short)]
     verbose: bool,
+    /// The fake input method skips its commit_string (deliberate break): the ime commit check must fail.
+    #[arg(long)]
+    break_ime_commit: bool,
+}
+
+/// The ime gate's texts: multi-byte UTF-8, so a byte/char mix-up shows. Surrounding "xかy" with the cursor after か: x is 1 byte, か 3 (U+304B, UTF-8 E3 81 8B), so the cursor is at byte 4.
+const IME_SURROUNDING: &str = "xかy";
+const IME_CURSOR_BYTE: u32 = 4;
+const IME_PREEDIT: &str = "かな";
+/// か and な are 3 UTF-8 bytes each: the IME puts its cursor at the preedit's end, byte 6; GTK reports it in chars, 2.
+const IME_PREEDIT_END_BYTE: i32 = 6;
+const IME_PREEDIT_CURSOR_CHARS: usize = 2;
+const IME_COMMIT: &str = "仮名";
+/// The IME deletes か before the cursor: 3 bytes (protocol unit); GTK reports chars from the cursor: offset -1, 1 char.
+const IME_DELETE_BEFORE_BYTES: u32 = 3;
+/// What gate.rs declares (Email, LOWERCASE) as text-input-unstable-v3.xml numbers them: content_purpose `email` = 6, content_hint `lowercase` = 0x8.
+const IME_WIRE_PURPOSE: u32 = 6;
+const IME_WIRE_HINT: u32 = 0x8;
+/// How long one ime check waits: GTK answers within a main-loop pass; this bounds a hang.
+const IME_WAIT: Duration = Duration::from_secs(10);
+
+/// Gate 5: binds a fake input method on the gate's labwc, has the client focus its `TextInput`, and checks both directions (spec in the module doc).
+fn ime_gate(
+    client: &mut Client,
+    nested: &NestedCompositor,
+    report: &mut Report,
+    break_commit: bool,
+) -> Result<()> {
+    let mut ime = Ime::bind(nested)?;
+    client.command(&format!("ime-focus {IME_SURROUNDING} {IME_CURSOR_BYTE}"))?;
+    client.expect_line("IME-FOCUSED", IME_WAIT)?;
+    let deadline = Instant::now() + IME_WAIT;
+    while !(ime.active && ime.dones > 0) && Instant::now() < deadline {
+        ime.pump()?;
+        thread::sleep(Duration::from_millis(20));
+    }
+    report.check(
+        ime.active,
+        "ime: focus_in activates the desktop input method",
+        &format!("done #{}", ime.dones),
+    );
+    if !ime.active {
+        return Ok(());
+    }
+    ime.settle()?;
+    report.check(
+        ime.content_type == Some((IME_WIRE_HINT, IME_WIRE_PURPOSE)),
+        "ime: set_content reaches the input method as content_type",
+        &format!("(hint, purpose) {:?}", ime.content_type),
+    );
+    let want = (IME_SURROUNDING.to_owned(), IME_CURSOR_BYTE, IME_CURSOR_BYTE);
+    report.check(
+        ime.surrounding.as_ref() == Some(&want),
+        "ime: set_surrounding reaches the input method as surrounding_text",
+        &format!("{:?}", ime.surrounding),
+    );
+
+    ime.send(
+        im_op::SET_PREEDIT_STRING,
+        &[
+            Arg::S(IME_PREEDIT),
+            Arg::I(IME_PREEDIT_END_BYTE),
+            Arg::I(IME_PREEDIT_END_BYTE),
+        ],
+    );
+    ime.commit()?;
+    let want = format!("IME-PREEDIT cursor={IME_PREEDIT_CURSOR_CHARS} text={IME_PREEDIT}");
+    let got = wait_ime_line(client, &mut ime, "IME-PREEDIT ")?;
+    report.check(
+        got.as_deref() == Some(want.as_str()),
+        "ime: preedit arrives with its cursor in chars",
+        &format!("{got:?}"),
+    );
+
+    ime.settle()?;
+    if !break_commit {
+        ime.send(im_op::COMMIT_STRING, &[Arg::S(IME_COMMIT)]);
+    }
+    ime.send(
+        im_op::SET_PREEDIT_STRING,
+        &[Arg::S(""), Arg::I(0), Arg::I(0)],
+    );
+    ime.commit()?;
+    let got = wait_ime_line(client, &mut ime, "IME-COMMIT ")?;
+    report.check(
+        got.as_deref() == Some(format!("IME-COMMIT text={IME_COMMIT}").as_str()),
+        "ime: commit arrives",
+        &format!("{got:?}"),
+    );
+
+    ime.settle()?;
+    ime.send(
+        im_op::DELETE_SURROUNDING_TEXT,
+        &[Arg::U(IME_DELETE_BEFORE_BYTES), Arg::U(0)],
+    );
+    ime.commit()?;
+    let got = wait_ime_line(client, &mut ime, "IME-DELETE ")?;
+    report.check(
+        got.as_deref() == Some("IME-DELETE offset=-1 n=1"),
+        "ime: delete_surrounding_text arrives in chars from the cursor",
+        &format!("{got:?}"),
+    );
+    Ok(())
+}
+
+/// The next client line with `prefix` within [`IME_WAIT`], pumping the IME meanwhile; `None` on timeout.
+fn wait_ime_line(client: &mut Client, ime: &mut Ime, prefix: &str) -> Result<Option<String>> {
+    let deadline = Instant::now() + IME_WAIT;
+    while Instant::now() < deadline {
+        if let Ok(line) = client.expect_line(prefix, Duration::from_millis(20)) {
+            return Ok(Some(line));
+        }
+        ime.pump()?;
+    }
+    Ok(None)
 }
 
 /// The window content size asked for, physical pixels. Wide enough that the title bar's minimum width does not enlarge the content (WSLg: ~280 px), and at least the composite scene's 256 x 192.
@@ -359,6 +476,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .env("GSK_RENDERER", &args.gsk_renderer)
         // the sandbox has no accessibility bus; GTK warns about it on every start
         .env("GTK_A11Y", "none")
+        // GTK picks its IM module from the display (Wayland: text-input v3, which reaches gate 5's IME); a desktop GTK_IM_MODULE (ibus) would bypass it
+        .env_remove("GTK_IM_MODULE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if args.verbose {
@@ -604,6 +723,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "some unanswered"
         }
     );
+
+    // gate 5: the text input against the gate compositor's input method (the desktop's seat already has one with --hold-blocked)
+    match &nested {
+        Some(nested) => ime_gate(&mut client, nested, &mut report, args.break_ime_commit)?,
+        None => println!("skip ime: --hold-blocked runs on the desktop's compositor"),
+    }
 
     // shutdown
     client.command("quit")?;

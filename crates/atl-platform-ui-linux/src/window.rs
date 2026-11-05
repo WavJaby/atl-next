@@ -18,6 +18,7 @@ use crate::input;
 use crate::mirror;
 use crate::pacing;
 use crate::scene;
+use crate::text_input::GtkTextInput;
 use crate::ui::GtkUi;
 use crate::view::SceneView;
 
@@ -27,18 +28,18 @@ const NS_PER_US: u64 = 1000;
 const DEFAULT_REFRESH_MILLIHZ: i32 = 60_000;
 
 /// A callback slot that tolerates the callback replacing itself while it runs: it is taken out for the call and put back unless a new one was set.
-struct Slot<T: ?Sized>(RefCell<Option<Box<T>>>);
+pub(crate) struct Slot<T: ?Sized>(RefCell<Option<Box<T>>>);
 
 impl<T: ?Sized> Slot<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Slot(RefCell::new(None))
     }
 
-    fn set(&self, f: Box<T>) {
+    pub(crate) fn set(&self, f: Box<T>) {
         *self.0.borrow_mut() = Some(f);
     }
 
-    fn call(&self, run: impl FnOnce(&mut T)) {
+    pub(crate) fn call(&self, run: impl FnOnce(&mut T)) {
         let taken = self.0.borrow_mut().take();
         if let Some(mut f) = taken {
             run(&mut f);
@@ -102,6 +103,7 @@ pub struct GtkWindow {
     shared: Rc<Shared>,
     /// The content origin is logged once, at the first present with the window mapped.
     origin_logged: Cell<bool>,
+    text_input: GtkTextInput,
 }
 
 impl GtkWindow {
@@ -304,6 +306,11 @@ fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
 
 impl Window for GtkWindow {
     type Ui = GtkUi;
+    type TextInput = GtkTextInput;
+
+    fn text_input(&self) -> &GtkTextInput {
+        &self.text_input
+    }
 
     fn create(ui: &GtkUi, attributes: &WindowAttributes) -> Result<Self, UiError> {
         ui.check_thread()?;
@@ -347,12 +354,14 @@ impl Window for GtkWindow {
         let resized = Rc::clone(&shared);
         view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));
         window.set_child(Some(&view));
+        let text_input = GtkTextInput::new(&view);
         let this = GtkWindow {
             window,
             view,
             requested: Cell::new(attributes.size),
             shared,
             origin_logged: Cell::new(false),
+            text_input,
         };
         this.set_title(&attributes.title);
         this.set_size(attributes.size);

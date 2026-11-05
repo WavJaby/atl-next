@@ -7,7 +7,7 @@
 //! 2. one composite scene (crop, flips, rotation, scissor, opacity: [`composite_scene`]) captured to `composite.rgba`.
 //! 3. refusals: an unsignalled acquire fence and a bad-stride buffer are refused, the signalled fence is accepted.
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
-//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe), `quit` ends.
+//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -24,8 +24,20 @@ use atl_compositor::scene::{Quad, Scene, SceneBuffer, SceneFd};
 use atl_compositor::state::FloatRect;
 use atl_gralloc::format::RGBA_8888;
 use atl_platform_ui::{
-    FdEvents, FrameClock, Looper, PhysSize, PlatformUi, PlatformWindow, PresentError, Ui, UiError,
-    Window, WindowAttributes,
+    ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, PhysRect, PhysSize, PlatformUi,
+    PlatformWindow, PresentError, Surrounding, TextInput, TextInputEvent, Ui, UiError, Window,
+    WindowAttributes,
+};
+
+/// What `ime-focus` declares the field to be; the harness checks the input method sees it (as text-input v3 `content_type`).
+const IME_PURPOSE: ContentPurpose = ContentPurpose::Email;
+const IME_HINTS: ContentHints = ContentHints::LOWERCASE;
+/// The cursor rect `ime-focus` reports (not observable by the harness's IME: input-method v2 has no cursor event; set for coverage of the call).
+const IME_CURSOR: PhysRect = PhysRect {
+    x: 10.0,
+    y: 20.0,
+    width: 2.0,
+    height: 16.0,
 };
 use clap::Parser;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
@@ -536,11 +548,24 @@ fn main() -> Result<()> {
     ));
     drop(watch);
 
+    // the text input's events, one line each (phase 5 `ime-focus` enables it)
+    window.text_input().on_events(|event| match event {
+        TextInputEvent::Preedit { text, cursor_chars } => emit(format_args!(
+            "IME-PREEDIT cursor={cursor_chars} text={text}"
+        )),
+        TextInputEvent::PreeditEnd => emit(format_args!("IME-PREEDIT-END")),
+        TextInputEvent::Commit(text) => emit(format_args!("IME-COMMIT text={text}")),
+        TextInputEvent::DeleteSurrounding {
+            offset_chars,
+            n_chars,
+        } => emit(format_args!("IME-DELETE offset={offset_chars} n={n_chars}")),
+    });
+
     // phase 5: commands on stdin, until quit
     let quit = Rc::new(Cell::new(false));
     let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
     let _stdin_watch = {
-        let (quit, pending) = (Rc::clone(&quit), Rc::clone(&pending));
+        let (quit, pending, window) = (Rc::clone(&quit), Rc::clone(&pending), Rc::clone(&window));
         looper.watch(rustix::stdio::stdin(), move || {
             let mut chunk = [0u8; 256];
             let n = read(rustix::stdio::stdin(), &mut chunk).unwrap_or(0);
@@ -559,6 +584,19 @@ fn main() -> Result<()> {
                         emit(format_args!("BLOCKING {ms}"));
                         thread::sleep(Duration::from_millis(ms));
                         emit(format_args!("UNBLOCKED"));
+                    }
+                    ["ime-focus", text, cursor] => {
+                        let cursor_byte = cursor.parse().unwrap_or(0);
+                        let input = window.text_input();
+                        input.set_content(IME_PURPOSE, IME_HINTS);
+                        input.set_surrounding(&Surrounding {
+                            text: (*text).to_owned(),
+                            cursor_byte,
+                            anchor_byte: cursor_byte,
+                        });
+                        input.set_cursor_rect(IME_CURSOR);
+                        input.focus_in();
+                        emit(format_args!("IME-FOCUSED"));
                     }
                     ["quit"] => quit.set(true),
                     other => emit(format_args!("UNKNOWN-COMMAND {other:?}")),
