@@ -30,6 +30,7 @@ use atl_gralloc::vintf;
 use atl_property_service::Property;
 use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
+use atl_services::native_libs::{self, SupportedAbi};
 use atl_services::packages::{Library, Manifest, PackageRecord};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -172,6 +173,8 @@ fn host_display() -> DisplayModel {
 struct PackageSource {
     apk: PathBuf,
     manifest: Manifest,
+    /// The device's ABIs, preferred first, for the native-library extraction.
+    abis: Vec<SupportedAbi>,
 }
 
 /// The runtime root's layout.
@@ -290,7 +293,7 @@ fn system_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
 }
 
 /// The install step, until the package manager installs from a real APK (owner D3: libandroidfw reads the manifest): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
-/// credential- and device-protected data directories, and ART's dalvik-cache; the records the services read.
+/// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read.
 fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
     ensure!(
         a.first_uid >= AID_APP_START,
@@ -322,9 +325,17 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
         }
         std::fs::copy(&source.apk, r.data().join(&app).join("base.apk"))
             .with_context(|| format!("copying {}", source.apk.display()))?;
+        let libs = native_libs::extract(
+            &source.apk,
+            &r.data().join(&app),
+            &format!("/data/{app}"),
+            &source.abis,
+        )?;
         records.push(PackageRecord {
             uid: a.first_uid + u32::try_from(i)?,
             source_dir: format!("/data/{app}/base.apk"),
+            primary_cpu_abi: libs.primary_cpu_abi,
+            native_library_dir: libs.native_library_dir,
             data_dir: format!("/data/{user}"),
             device_protected_data_dir: format!("/data/{user_de}"),
             manifest: source.manifest,

@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 use atl_services::display_model::DisplayModel;
+use atl_services::native_libs::SupportedAbi;
 use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,8 @@ pub struct Runtime {
     gralloc: Option<(PathBuf, PathBuf)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
+    /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
+    abis: Vec<SupportedAbi>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
     /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
@@ -89,6 +92,7 @@ pub struct Run {
 struct PackageSource<'a> {
     apk: &'a Path,
     manifest: &'a Manifest,
+    abis: &'a [SupportedAbi],
 }
 
 impl Run {
@@ -222,8 +226,22 @@ impl Runtime {
             "native-bridge/lib",
             atl_native_bridge::LIBRARY,
         )?;
+        let arches = crate::arches::load(root)?;
+        let guest = arches
+            .get(host)
+            .and_then(|a| a.guest.as_ref())
+            .with_context(|| format!("{host}: no [guest] row in arches.toml"))?;
+        let abis = guest
+            .android_abis
+            .iter()
+            .map(|abi| SupportedAbi {
+                abi: abi.clone(),
+                isa: host.to_owned(),
+            })
+            .collect();
         Ok(Runtime {
             native_bridge,
+            abis,
             art,
             out,
             java_out,
@@ -486,7 +504,11 @@ impl Runtime {
             let file = run.scratch.join(format!("package-{i}.json"));
             std::fs::write(
                 &file,
-                serde_json::to_vec_pretty(&PackageSource { apk, manifest })?,
+                serde_json::to_vec_pretty(&PackageSource {
+                    apk,
+                    manifest,
+                    abis: &self.abis,
+                })?,
             )?;
             cmd.arg("--package").arg(file);
         }

@@ -73,8 +73,14 @@ src = [
     "crates/atl-services/src/package.rs",
     "crates/atl-services/src/packages.rs",
     "crates/atl-services/src/manifest_flags.rs",
+    "crates/atl-services/src/native_libs.rs",
 ]
 mirrors = [
+    "frameworks/base/core/java/com/android/internal/content/NativeLibraryHelper.java#copyNativeBinariesForSupportedAbi",
+    "frameworks/base/core/java/com/android/internal/content/NativeLibraryHelper.java#findSupportedAbi",
+    "frameworks/base/core/jni/com_android_internal_content_NativeLibraryHelper.cpp",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageAbiHelperImpl.java#derivePackageAbi",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageAbiHelperImpl.java#deriveNativeLibraryPaths",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getApplicationInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackageInfo",
     "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",

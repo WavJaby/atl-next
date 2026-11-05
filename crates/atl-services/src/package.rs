@@ -30,25 +30,26 @@ const SHARED_LIBRARY_VERSION_UNDEFINED: i64 = -1;
 const SIGNATURE_MATCH: i32 = 0;
 const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
 
-/// The directory of an installed package's native libraries below its install directory (PackageManagerService: `lib/<isa>` under /data/app/<package>); the ISA level is left out until the installer extracts libraries from the APK's lib/<abi>/.
-const NATIVE_LIBRARY_SUBDIR: &str = "lib";
-
 /// The ApplicationInfo of `p` (PackageInfoUtils.generateApplicationInfo, reduced to what the record holds): names, uid, paths, SDK levels, enabled, flags (manifest_flags), and the shared libraries its manifest
 /// uses: `sharedLibraryFiles` (their jars, in manifest order; what ComputerEngine fills for GET_SHARED_LIBRARY_FILES, which ActivityManagerService's STOCK_PM_FLAGS always sets) and `sharedLibraryInfos`,
 /// from which LoadedApk builds the libraries' class loaders (it takes only `.apk` entries of `sharedLibraryFiles`, ApplicationInfo's legacy field). A `<uses-library>` that names no installed
 /// library adds nothing (a required one would stop the install in AOSP; the services do not install).
 /// `nativeLibraryDir` is never null for an installed app: LoadedApk.makePaths adds it to the class loader's library path, and a null breaks `new File(null)` there.
+/// Native-library fields as PackageManagerService sets them for a non-system app (PackageAbiHelperImpl.deriveNativeLibraryPaths): root `<code path>/lib`, dir `<root>/<isa>`, root requires the ISA.
 pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationInfo {
-    let native_library_dir = std::path::Path::new(&p.source_dir)
+    let native_library_root_dir = std::path::Path::new(&p.native_library_dir)
         .parent()
-        .map(|dir| dir.join(NATIVE_LIBRARY_SUBDIR).display().to_string());
+        .map(|dir| dir.display().to_string());
     let libraries = packages.used_libraries(p);
     let library_files: Vec<Option<String>> =
         libraries.iter().map(|l| Some(l.file.clone())).collect();
     ApplicationInfo {
         shared_library_infos: (!libraries.is_empty())
             .then(|| libraries.iter().map(|l| Some(library_info(l))).collect()),
-        native_library_dir,
+        native_library_dir: Some(p.native_library_dir.clone()),
+        native_library_root_dir,
+        native_library_root_requires_isa: true,
+        primary_cpu_abi: p.primary_cpu_abi.clone(),
         item: PackageItemInfo {
             name: None,
             package_name: Some(p.name.clone()),
@@ -92,9 +93,7 @@ fn library_info(l: &LibraryNode) -> SharedLibraryInfo {
 
 /// PackageInfoUtils.generateInstrumentationInfo (PackageInfoUtils.java), reduced to what the record holds: the component's names, its target, the package's paths, the two flags.
 fn instrumentation_info(p: &PackageRecord, i: &InstrumentationDecl) -> InstrumentationInfo {
-    let native_library_dir = std::path::Path::new(&p.source_dir)
-        .parent()
-        .map(|dir| dir.join(NATIVE_LIBRARY_SUBDIR).display().to_string());
+    let native_library_dir = Some(p.native_library_dir.clone());
     InstrumentationInfo {
         item: PackageItemInfo {
             name: Some(i.name.clone()),

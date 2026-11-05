@@ -88,6 +88,10 @@ pub struct PackageRecord {
     pub uid: u32,
     /// base.apk path (ApplicationInfo.sourceDir)
     pub source_dir: String,
+    /// the ABI of the installed native libraries (ApplicationInfo.primaryCpuAbi), none without native code
+    pub primary_cpu_abi: Option<String>,
+    /// `/data/app/<package>/lib/<isa>` (ApplicationInfo.nativeLibraryDir; its parent is nativeLibraryRootDir), set with or without native code
+    pub native_library_dir: String,
     /// credential-protected storage (ApplicationInfo.dataDir, credentialProtectedDataDir: /data/user/<user>/<package>)
     pub data_dir: String,
     /// device-protected storage (ApplicationInfo.deviceProtectedDataDir: /data/user_de/<user>/<package>): the code cache dir, which graphics setup opens first
@@ -267,6 +271,8 @@ mod tests {
             },
             uid,
             source_dir: String::new(),
+            primary_cpu_abi: None,
+            native_library_dir: String::new(),
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
         }

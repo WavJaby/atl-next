@@ -172,6 +172,8 @@ pub fn stage(
         },
         uid: APP_UID,
         source_dir: format!("/data/app/{APP}/base.apk"),
+        primary_cpu_abi: None,
+        native_library_dir: format!("/data/app/{APP}/lib/x86_64"),
         data_dir: format!("/data/user/0/{APP}"),
         device_protected_data_dir: format!("/data/user_de/0/{APP}"),
     };
