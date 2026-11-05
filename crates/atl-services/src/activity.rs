@@ -1495,6 +1495,22 @@ impl IActivityClientController for ActivityClientController {
         counters::unimplemented(ACC, method)
     }
 
+    /// ActivityClientController.activityResumed:200-206 -> ActivityRecord.activityResumedLocked:6173, which finds the record by token, then clears its saved state, sets its splash-exit
+    /// animation and handles size compat. None of that state exists here yet: the resume is logged (`services: activity resumed at=<stamp>`), which run-apk and the window gates read as onResume.
+    fn r#activityResumed(
+        &self,
+        token: Option<&SpIBinder>,
+        _handle_splash_screen_exit: bool,
+    ) -> binder::Result<()> {
+        if token.is_some() {
+            log(format_args!(
+                "activity resumed at={}",
+                counters::wall_stamp()
+            ));
+        }
+        Ok(())
+    }
+
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
     fn r#getDisplayId(&self, _token: Option<&SpIBinder>) -> binder::Result<i32> {
         Ok(DEFAULT_DISPLAY)
