@@ -22,6 +22,7 @@ extern crate gui_aidl_types_rs;
 extern crate rustutils;
 
 pub mod clock;
+pub mod cursor;
 pub mod input;
 pub mod objects;
 pub mod sink;

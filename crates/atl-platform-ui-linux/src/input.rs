@@ -2,8 +2,8 @@
 //! GTK pointer and scroll events as `InputEvent`s: the toolkit speaks logical pixels, button numbers and scroll units, the platform traits physical pixels, named buttons and scroll kinds.
 
 use atl_platform_ui_api::{
-    InputEvent, PhysPoint, PointerButton, PointerEvent, PointerPhase, Scale, ScrollEvent,
-    ScrollKind, TouchEvent, TouchPhase,
+    CursorShape, InputEvent, PhysPoint, PointerButton, PointerEvent, PointerPhase, Scale,
+    ScrollEvent, ScrollKind, TouchEvent, TouchPhase,
 };
 
 /// GDK button numbers (`GDK_BUTTON_PRIMARY`, `_MIDDLE`, `_SECONDARY` = 1, 2, 3).
@@ -109,6 +109,34 @@ pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ms: 
         position: physical((x, y), scale),
         time_ms,
     })
+}
+
+/// The CSS cursor name GDK takes (`gdk_cursor_new_from_name`) for `shape`.
+pub fn cursor_name(shape: CursorShape) -> &'static str {
+    match shape {
+        CursorShape::Default => "default",
+        CursorShape::None => "none",
+        CursorShape::ContextMenu => "context-menu",
+        CursorShape::Pointer => "pointer",
+        CursorShape::Help => "help",
+        CursorShape::Wait => "wait",
+        CursorShape::Cell => "cell",
+        CursorShape::Crosshair => "crosshair",
+        CursorShape::Text => "text",
+        CursorShape::VerticalText => "vertical-text",
+        CursorShape::Alias => "alias",
+        CursorShape::Copy => "copy",
+        CursorShape::NoDrop => "no-drop",
+        CursorShape::AllScroll => "all-scroll",
+        CursorShape::EwResize => "ew-resize",
+        CursorShape::NsResize => "ns-resize",
+        CursorShape::NeswResize => "nesw-resize",
+        CursorShape::NwseResize => "nwse-resize",
+        CursorShape::ZoomIn => "zoom-in",
+        CursorShape::ZoomOut => "zoom-out",
+        CursorShape::Grab => "grab",
+        CursorShape::Grabbing => "grabbing",
+    }
 }
 
 fn physical((x, y): (f64, f64), scale: Scale) -> PhysPoint {

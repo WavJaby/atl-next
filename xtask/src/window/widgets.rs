@@ -149,6 +149,25 @@ fn generic(line: &str) -> Option<u32> {
     word(rest, "action")?.parse().ok()
 }
 
+/// The hover Button -> EditText -> Button: the views' resolved pointer icons reached the window as cursors (composer line) and the platform layer set them (CSS names). EditText (editable TextView): TEXT 1008; Button: none resolved -> NOT_SPECIFIED 1 (ViewRootImpl.updatePointerIcon), the arrow
+/// (Button.onResolvePointerIcon gives HAND only without flag enableArrowIconOnHoverWhenClickable, on in this build). Last lines count: the earlier mouse taps resolve icons too.
+fn cursor_check(app: &str) -> Result<String, String> {
+    let at = |needle: &str| {
+        app.rfind(needle)
+            .ok_or_else(|| format!("no `{needle}` line"))
+    };
+    let text = at("atl-composer: ui: cursor type=1008 shape=Text")?;
+    let arrow = at("atl-composer: ui: cursor type=1 shape=Default")?;
+    let (set_text, set_arrow) = (
+        at("atl-platform-ui: cursor text")?,
+        at("atl-platform-ui: cursor default")?,
+    );
+    if !(text < arrow && text < set_text && arrow < set_arrow) {
+        return Err("cursor lines out of order: want text then arrow, each then set".to_owned());
+    }
+    Ok("EditText -> text, back on the Button -> arrow, both set on the window".to_owned())
+}
+
 /// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap's enter is exited by its press, with no move: only the hover makes a 7.
 fn hover_check(app: &str) -> Result<String, String> {
     let lines: Vec<&str> = app.lines().collect();
@@ -543,6 +562,7 @@ pub fn checks(
         ("focus", focus_check(app)),
         ("window", window_check(app)),
         ("window-focus", window_focus_check(app)),
+        ("cursor", cursor_check(app)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
@@ -635,6 +655,26 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     wait_line(app_log, SECOND_CLOSED)?;
     tap(centre("button")?)?;
     wait_line(app_log, "AtlWindow: click count=2")?;
+    // the cursor follows the views under the pointer: hover the Button, the EditText, the Button again
+    let ((bx, by), (ix, iy)) = (centre("button")?, centre("input")?);
+    inject(
+        &proxy,
+        vec![
+            PointerAction::Enter { x: bx, y: by },
+            PointerAction::Motion {
+                x: bx + HOVER_PX,
+                y: by,
+            },
+            PointerAction::Motion { x: ix, y: iy },
+            PointerAction::Motion {
+                x: ix + HOVER_PX,
+                y: iy,
+            },
+            PointerAction::Motion { x: bx, y: by },
+            PointerAction::Leave,
+        ],
+    )?;
+    wait_until(app_log, LINE_WAIT, |t| cursor_check(t).is_ok());
     let (x, y) = centre("list")?;
     // hover, wheel and swipe over the list: each waits for its own check, and a miss leaves that check to fail alone (the drag and the cadence run after it still run)
     inject(

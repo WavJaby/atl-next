@@ -5,12 +5,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock};
 
 use atl_platform_ui::{
-    FrameClock, FrameRequester, InputSource, PhysSize, PlatformUi, PlatformWindow, Window,
-    WindowAttributes,
+    FrameClock, FrameRequester, InputSource, PhysSize, PlatformUi, PlatformWindow, Ui, UiInvoker,
+    Window, WindowAttributes,
 };
 
 use atl_services::display_model::DisplayModel;
@@ -40,6 +40,24 @@ thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
 }
 
+/// The UI thread's invoker, set at install: other threads' calls into the window go through it.
+static INVOKER: OnceLock<<PlatformUi as Ui>::Invoker> = OnceLock::new();
+
+/// Android pointer icon `kind` (IInputManager.setPointerIcon, relayed by the services' UI-agent call) as the window's cursor; from any thread. A type with no desktop cursor keeps the current one (cursor.rs).
+pub fn set_pointer_icon(kind: i32) {
+    let (Some(invoker), Some(shape)) = (INVOKER.get(), crate::cursor::shape(kind)) else {
+        return;
+    };
+    invoker.invoke(Box::new(move || {
+        SESSION.with_borrow(|session| {
+            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
+                tracing::info!("atl-composer: ui: cursor type={kind} shape={shape:?}");
+                window.set_cursor(shape);
+            }
+        });
+    }));
+}
+
 /// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now. The window cannot wait for the first client: the app's first traversal waits for a vsync, and vsync comes from this window's frame clock.
 pub fn install(
     ui: PlatformUi,
@@ -48,6 +66,7 @@ pub fn install(
     size: PhysSize,
     sender: Arc<TaskSender>,
 ) {
+    let _ = INVOKER.set(ui.invoker());
     SESSION.with(|cell| {
         *cell.borrow_mut() = Some(Session {
             ui,

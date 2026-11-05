@@ -11,7 +11,9 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 use crate::input_devices::{
     POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHSCREEN, TOUCHSCREEN, VIRTUAL_KEYBOARD,
 };
+use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{counters, permission};
+use std::sync::Arc;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IInputManager";
@@ -22,6 +24,8 @@ const INVALID_DISPLAY: i32 = -1;
 
 struct InputManager {
     devices: Vec<InputDevice>,
+    /// The apps' UI agents: setPointerIcon goes to the caller's.
+    agents: Arc<UiAgents>,
 }
 
 impl Interface for InputManager {}
@@ -115,25 +119,34 @@ impl IInputManager for InputManager {
         Ok(())
     }
 
-    /// Not applied, so false (InputManager.setPointerIcon: whether the icon was set): no host cursor mapping yet. ViewRootImpl.updatePointerIcon ignores the result; it calls this for every mouse event whose resolved icon changed.
+    /// ViewRootImpl.updatePointerIcon calls this when the icon resolved for a mouse event changed. Relayed (oneway) to the calling app's UI agent, which shows it on its window; true once relayed (InputManager.setPointerIcon: whether the icon was set).
+    /// The token is unused: one window per app (multi-window resolves `inputToken` to its window). A caller with no agent (headless) or no icon -> false, counted.
     fn r#setPointerIcon(
         &self,
-        _icon: Option<&PointerIcon>,
+        icon: Option<&PointerIcon>,
         _display_id: i32,
         _device_id: i32,
         _pointer_id: i32,
         _input_token: Option<&SpIBinder>,
     ) -> binder::Result<bool> {
-        counters::count(INTERFACE, "setPointerIcon (not applied)");
-        Ok(false)
+        let agent = self
+            .agents
+            .get(ThreadState::get_calling_uid())
+            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok());
+        let (Some(icon), Some(agent)) = (icon, agent) else {
+            counters::count(INTERFACE, "setPointerIcon (no icon or no UI agent)");
+            return Ok(false);
+        };
+        Ok(agent.pointer_icon(icon.kind).is_ok())
     }
 }
 
-/// A new input service binder serving the keyboard map `map`: the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`). Fails when `map` is not a Parcel-form blob.
-pub fn new_binder(map: &[u8]) -> Result<SpIBinder, String> {
+/// A new input service binder serving the keyboard map `map`: the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), and relaying pointer icons to `agents`. Fails when `map` is not a Parcel-form blob.
+pub fn new_binder(map: &[u8], agents: Arc<UiAgents>) -> Result<SpIBinder, String> {
     set_key_character_map(map).map_err(str::to_owned)?;
     let service = InputManager {
         devices: devices(map),
+        agents,
     };
     Ok(BnInputManager::new_binder(service, BinderFeatures::default()).as_binder())
 }

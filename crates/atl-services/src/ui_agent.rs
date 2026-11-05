@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has four transactions. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has five transactions. POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) in, nothing out.
 //! REMOVE_INPUT: a removed window's input channel token in, nothing out: the agent drops that channel (WindowState.disposeInputChannel -> InputDispatcher::removeInputChannel). TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
 //! The app serves it (atl-composer `ui_agent`: the layer in its in-process compositor, the input server end to its input thread). This module holds the protocol on both sides and the table the registry fills per uid.
@@ -27,6 +27,8 @@ pub const INPUT_SERVER: TransactionCode = 2;
 pub const TASK: TransactionCode = 3;
 /// A removed window's input channel token in; the agent drops that channel. Nothing out.
 pub const REMOVE_INPUT: TransactionCode = 4;
+/// A pointer icon type in (oneway: the app's own setPointerIcon call is waiting on the input service meanwhile).
+pub const POINTER_ICON: TransactionCode = 5;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -39,6 +41,8 @@ pub trait IUiAgent: Interface {
     fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode>;
     /// The Task the app's window belongs to, by its number (tasks.rs TaskId::raw): the app's bounds go to it.
     fn task(&self, task: i32) -> Result<(), StatusCode>;
+    /// The pointer icon the app's view hierarchy resolved (PointerIconType value): the app's window shows it as its cursor.
+    fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -72,6 +76,10 @@ fn on_transact(
         TASK => {
             let task: i32 = data.read()?;
             service.task(task)
+        }
+        POINTER_ICON => {
+            let kind: i32 = data.read()?;
+            service.pointer_icon(kind)
         }
         _ => {
             counters::count(INTERFACE, &format!("code {code}"));
@@ -113,6 +121,14 @@ impl IUiAgent for BpUiAgent {
         binder.submit_transact(TASK, data, 0)?;
         Ok(())
     }
+
+    fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(&kind)?;
+        binder.submit_transact(POINTER_ICON, data, binder::binder_impl::FLAG_ONEWAY)?;
+        Ok(())
+    }
 }
 
 impl IUiAgent for Binder<BnUiAgent> {
@@ -130,6 +146,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn task(&self, task: i32) -> Result<(), StatusCode> {
         self.0.task(task)
+    }
+
+    fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {
+        self.0.pointer_icon(kind)
     }
 }
 

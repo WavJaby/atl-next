@@ -7,7 +7,8 @@
 use std::marker::PhantomData;
 use std::thread::{self, ThreadId};
 
-use atl_platform_ui_api::{Looper, Ui, UiError};
+use atl_platform_ui_api::{Looper, Ui, UiError, UiInvoker};
+use gtk4::glib;
 
 use crate::mirror;
 
@@ -28,7 +29,22 @@ impl GtkUi {
     }
 }
 
+/// [`UiInvoker`] for GTK: the UI thread's GLib main context, safe to invoke on from any thread (its wakeup fd is among the fds the Looper polls).
+pub struct GtkInvoker(glib::MainContext);
+
+impl UiInvoker for GtkInvoker {
+    fn invoke(&self, f: Box<dyn FnOnce() + Send>) {
+        self.0.invoke(f);
+    }
+}
+
 impl Ui for GtkUi {
+    type Invoker = GtkInvoker;
+
+    fn invoker(&self) -> GtkInvoker {
+        GtkInvoker(glib::MainContext::default())
+    }
+
     fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError> {
         gtk4::init().map_err(|e| UiError::Unavailable(e.to_string()))?;
         // GTK may have been started by another thread earlier in this process: that thread owns it, this one cannot

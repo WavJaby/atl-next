@@ -6,8 +6,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use atl_platform_ui_api::{
-    Capture, FrameClock, FrameTick, InputEvent, InputSource, Monitor, PhysSize, PointerPhase,
-    PresentError, Scale, Scene, TouchPhase, UiError, Window, WindowAttributes,
+    Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Monitor, PhysSize,
+    PointerPhase, PresentError, Scale, Scene, TouchPhase, UiError, Window, WindowAttributes,
 };
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
@@ -352,6 +352,14 @@ impl Window for GtkWindow {
 
     fn set_title(&self, title: &str) {
         self.window.set_title(Some(title));
+        mirror::resync();
+    }
+
+    /// On the content view: GDK sets it through `wp_cursor_shape_v1` where the compositor has it, else a themed cursor surface.
+    fn set_cursor(&self, shape: CursorShape) {
+        let name = input::cursor_name(shape);
+        tracing::info!("atl-platform-ui: cursor {name}");
+        self.view.set_cursor_from_name(Some(name));
         mirror::resync();
     }
 

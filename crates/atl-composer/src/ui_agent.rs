@@ -68,6 +68,12 @@ impl IUiAgent for UiAgent {
             .send(Message::WindowRemoved(token))
             .map_err(|_| StatusCode::DEAD_OBJECT)
     }
+
+    /// To the UI thread's window (ui_window); headless mode has none and ignores it.
+    fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {
+        crate::ui_window::set_pointer_icon(kind);
+        Ok(())
+    }
 }
 
 /// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task.

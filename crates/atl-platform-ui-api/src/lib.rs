@@ -61,8 +61,69 @@ pub enum PresentError {
 
 /// The toolkit session. Thread-affine: the thread that attaches is the UI thread.
 pub trait Ui: Sized {
+    /// The handle that runs work on the UI thread from any thread.
+    type Invoker: UiInvoker;
+
     /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
     fn attach(looper: Box<dyn Looper>) -> Result<Self, UiError>;
+
+    /// A handle that runs closures on this UI thread, from any thread.
+    fn invoker(&self) -> Self::Invoker;
+}
+
+/// Runs work on the UI thread from another thread (a binder thread's call that must touch a window).
+pub trait UiInvoker: Send + Sync + 'static {
+    /// Queues `f`; it runs on the UI thread at its next main-loop pass, in queue order.
+    fn invoke(&self, f: Box<dyn FnOnce() + Send>);
+}
+
+/// A pointer cursor, by the CSS cursor names desktop toolkits share (the set Android's pointer icon types name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    /// The arrow.
+    Default,
+    /// No cursor shown.
+    None,
+    /// A context menu is available.
+    ContextMenu,
+    /// A link or a clickable control (a hand).
+    Pointer,
+    /// Help is available.
+    Help,
+    /// Busy.
+    Wait,
+    /// A table cell.
+    Cell,
+    /// Precise selection.
+    Crosshair,
+    /// Text that can be selected or edited.
+    Text,
+    /// Vertical text.
+    VerticalText,
+    /// A drag would make an alias.
+    Alias,
+    /// A drag would copy.
+    Copy,
+    /// The drop target refuses.
+    NoDrop,
+    /// Scrollable in any direction.
+    AllScroll,
+    /// Resize east-west.
+    EwResize,
+    /// Resize north-south.
+    NsResize,
+    /// Resize along the "/" diagonal.
+    NeswResize,
+    /// Resize along the "\" diagonal.
+    NwseResize,
+    /// Zoom in.
+    ZoomIn,
+    /// Zoom out.
+    ZoomOut,
+    /// Can be grabbed.
+    Grab,
+    /// Being grabbed.
+    Grabbing,
 }
 
 /// The UI thread's Android Looper as the toolkit's main loop registers its fds with it. The launcher implements it over `ALooper_addFd` / `ALooper_removeFd`; Java's `nativePollOnce` polls it, and each readiness reaches the sink on the UI thread from inside that poll.
@@ -112,6 +173,9 @@ pub trait Window: FrameClock + InputSource + Sized {
 
     /// Sets the title shown in the window chrome.
     fn set_title(&self, title: &str);
+
+    /// Sets the cursor shown while the pointer is over the content.
+    fn set_cursor(&self, shape: CursorShape);
 
     /// The content size now: what the compositor granted once mapped, else what was asked for.
     fn size(&self) -> PhysSize;

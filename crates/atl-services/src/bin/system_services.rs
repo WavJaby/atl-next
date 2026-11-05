@@ -129,7 +129,8 @@ fn main() -> Result<()> {
         .context("the key map's file name")?;
     let map = atl_libinput::KeyCharacterMap::load(name, &contents)
         .with_context(|| format!("loading {}", a.keychars.display()))?;
-    let input = atl_services::input::new_binder(&map.parcel_bytes()).map_err(anyhow::Error::msg)?;
+    let input = atl_services::input::new_binder(&map.parcel_bytes(), Arc::clone(&agents))
+        .map_err(anyhow::Error::msg)?;
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
