@@ -823,12 +823,11 @@ fn licence_gate(
     let roots = licence_gate::roots(layout, &sources.checkouts(None));
     let report = licence_gate::check(&std::fs::canonicalize(out)?, &roots, &licenses)?;
     println!(
-        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} members of libraries built outside ninja, {} stale artifacts; {} licences denied, {} files unresolved",
+        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
         report.artifacts,
         report.checked,
         report.generated,
         report.system,
-        report.outside,
         report.stale.len(),
         report.denied.len(),
         report.unresolved.len()

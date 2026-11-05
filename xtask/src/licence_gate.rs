@@ -6,7 +6,9 @@
 //!   Then each object's source and headers, from its depfile (`ninja -t deps`); a depfile entry with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
 //! - A file's licence: `notice::resolve` with the `[upstream.<key>]` of the checkout holding it; AOSP projects share key `aosp`, their paths relative to the tree root (`external/dng_sdk/...`).
 //!
-//! Not checked, only counted: files generated into `<out>` (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed); members of archives built outside ninja (providers.toml upstreams, by their own build); system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
+//! - A member of an archive no edge of this build makes (built by an upstream's own CMake/ninja build: `xtask runtimes`, providers.toml `upstream:`) is mapped to its object through that build's edges and depfiles (`external_build`).
+//!
+//! Not checked, only counted: files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr` and `/lib*` (toolchain, distro headers and libraries: the platform's, not ours to ship).
 //! A file anywhere else fails: nothing passes because the gate cannot place it.
 //! Stale artifacts fail unread: after a failed build an artifact whose relink did not run is an earlier link's, and its trace may name archive members the current graph lacks (`relinked`).
 
@@ -38,8 +40,6 @@ pub struct Report {
     pub checked: usize,
     pub generated: usize,
     pub system: usize,
-    /// Archive members of libraries built outside ninja.
-    pub outside: usize,
     /// Licence expression -> files under it (as resolved: key-relative) -> the first artifact reaching it.
     pub denied: BTreeMap<String, BTreeMap<String, String>>,
     /// Files with no licence the rules can name, or that the gate cannot place.
@@ -113,9 +113,24 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
         )?)
     };
     let deps = parse_deps(&ninja(out, &["-t", "deps"])?);
+    // archives no edge of this build makes: external build dir -> (archive, member, artifact)
+    let mut external: BTreeMap<PathBuf, Vec<(&Path, &str, &Path)>> = BTreeMap::new();
     for (archive, member, artifact) in &members {
         let Some(objs) = inputs.get(archive) else {
-            report.outside += 1;
+            if is_system(archive) {
+                report.system += 1;
+            } else if let Some(b) = external_build(archive, out) {
+                external
+                    .entry(b)
+                    .or_default()
+                    .push((archive, member, artifact));
+            } else {
+                report.unresolved.push(format!(
+                    "{}: member {member} of an archive no ninja build makes (in {})",
+                    archive.display(),
+                    artifact.display()
+                ));
+            }
             continue;
         };
         let matching: Vec<&PathBuf> = objs
@@ -159,12 +174,141 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
         placed.entry(real).or_insert(artifact);
     }
     judge(placed, roots, out, licenses, &mut report)?;
+    for (build, loaded) in external {
+        check_external(&build, &loaded, roots, licenses, &mut report)?;
+    }
     Ok(report)
+}
+
+/// The CMake/ninja build an archive outside this build's edges came from: the nearest ancestor below `out` holding `build.ninja` (the archive sits in its build dir, as `xtask runtimes` leaves it) or `build/build.ninja` (an install prefix beside its build dir, as `upstream::build` leaves it).
+fn external_build(archive: &Path, out: &Path) -> Option<PathBuf> {
+    archive
+        .ancestors()
+        .skip(1)
+        .take_while(|a| *a != out)
+        .flat_map(|a| [a.to_path_buf(), a.join("build")])
+        .find(|d| d.join("build.ninja").is_file())
+}
+
+/// Archive members loaded from one external build, mapped to their objects through that build's own edges (by archive file name: an install copies the archive under the same name) and depfiles, then judged; files under `build` count as generated.
+fn check_external(
+    build: &Path,
+    loaded: &[(&Path, &str, &Path)],
+    roots: &[Root],
+    licenses: &Licenses,
+    report: &mut Report,
+) -> Result<()> {
+    let targets: Vec<PathBuf> = lines(&ninja(build, &["-t", "targets", "all"])?)
+        .filter_map(|l| l.rsplit_once(": ").map(|(t, _)| build.join(t)))
+        .collect();
+    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let abs = |f: &Path| {
+        let p = if f.is_absolute() {
+            f.to_path_buf()
+        } else {
+            build.join(f)
+        };
+        std::fs::canonicalize(&p).unwrap_or(p)
+    };
+    let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for (archive, member, artifact) in loaded {
+        let named: Vec<&PathBuf> = targets
+            .iter()
+            .filter(|t| t.file_name() == archive.file_name())
+            .collect();
+        let [made] = named[..] else {
+            report.unresolved.push(format!(
+                "{}: {} edges of {} make an archive of this name (in {})",
+                archive.display(),
+                named.len(),
+                build.display(),
+                artifact.display()
+            ));
+            continue;
+        };
+        let query = ninja(build, &["-t", "query", &made.display().to_string()])?;
+        let objs: Vec<PathBuf> = parse_query(&query).into_values().flatten().collect();
+        let Some(object) = objs
+            .iter()
+            .find(|o| o.file_name().is_some_and(|n| n == *member))
+        else {
+            report.unresolved.push(format!(
+                "{}: member {member} is none of its inputs in {} (in {})",
+                archive.display(),
+                build.display(),
+                artifact.display()
+            ));
+            continue;
+        };
+        let Some(files) = deps.get(object) else {
+            report.unresolved.push(format!(
+                "{}: no depfile record in {}",
+                object.display(),
+                build.display()
+            ));
+            continue;
+        };
+        for f in files {
+            placed.entry(abs(f)).or_insert(artifact);
+        }
+    }
+    judge(placed, roots, build, licenses, report)
+}
+
+/// A directory a build copies source files into (CMake header staging: libc++'s `include/c++/v1`), and where they come from.
+/// A file there byte-identical to `<from>/<its relative path>` is judged as that source; any other (a `configure_file` output) on its own notice under `key`, as `<dir>/<rest>` with no package fallback: a staged file the gate cannot trace to a source must name its own licence.
+pub struct Staged {
+    /// Absolute, canonical.
+    pub dir: PathBuf,
+    /// Source directories, canonical, searched in order.
+    pub from: Vec<PathBuf>,
+    /// licenses.toml upstream key of the configured files.
+    pub key: String,
+}
+
+/// Replaces each staged file of `placed` by its source; returns the configured ones (no identical source).
+#[allow(clippy::type_complexity)]
+fn unstage<'a>(
+    placed: BTreeMap<PathBuf, &'a Path>,
+    staged: &'a [Staged],
+) -> (
+    BTreeMap<PathBuf, &'a Path>,
+    Vec<(PathBuf, &'a Staged, &'a Path)>,
+) {
+    let mut kept = BTreeMap::new();
+    let mut configured = Vec::new();
+    for (file, artifact) in placed {
+        let Some((s, rest)) = staged
+            .iter()
+            .find_map(|s| Some((s, file.strip_prefix(&s.dir).ok()?.to_path_buf())))
+        else {
+            kept.entry(file).or_insert(artifact);
+            continue;
+        };
+        let bytes = std::fs::read(&file).ok();
+        match s
+            .from
+            .iter()
+            .map(|d| d.join(&rest))
+            .find(|src| bytes.is_some() && std::fs::read(src).ok() == bytes)
+        {
+            Some(src) => {
+                kept.entry(src).or_insert(artifact);
+            }
+            None => configured.push((file, s, artifact)),
+        }
+    }
+    (kept, configured)
 }
 
 /// Every file an object of the CMake-generated ninja build in `build` (canonical) was compiled from, by its depfiles: what the runtimes build (`xtask runtimes`) can put into an archive.
 /// All objects of the build, not only the archive members a later link loads: a superset, so a pass here holds for any link of its archives.
-pub fn check_build(build: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> {
+pub fn check_build(
+    build: &Path,
+    staged: &[Staged],
+    roots: &[Root],
+    licenses: &Licenses,
+) -> Result<Report> {
     let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
     let mut report = Report {
         artifacts: deps.len(),
@@ -182,7 +326,32 @@ pub fn check_build(build: &Path, roots: &[Root], licenses: &Licenses) -> Result<
             placed.entry(real).or_insert(object.as_path());
         }
     }
+    let (placed, configured) = unstage(placed, staged);
     judge(placed, roots, build, licenses, &mut report)?;
+    for (file, s, object) in configured {
+        let text = String::from_utf8_lossy(
+            &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+        )
+        .into_owned();
+        let rel = file.display().to_string();
+        let own = || {
+            Err(anyhow::anyhow!(
+                "{rel}: staged but no identical source, and no own notice"
+            ))
+        };
+        match notice::resolve(&rel, &text, licenses.upstream.get(&s.key), own) {
+            Ok(expr) => {
+                report.checked += 1;
+                if !licenses.allows(licenses::RUNTIME, &expr)? {
+                    let name = object
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    report.denied.entry(expr).or_default().insert(rel, name);
+                }
+            }
+            Err(e) => report.unresolved.push(format!("{e:#}")),
+        }
+    }
     Ok(report)
 }
 
@@ -668,6 +837,79 @@ mod tests {
             [PathBuf::from("/t/a.cpp"), PathBuf::from("/t/a.h")]
         );
         assert_eq!(d[Path::new("/o/b.o")], [PathBuf::from("/t/b.c")]);
+    }
+
+    /// A staged copy identical to a source of the second `from` dir is that source; a changed one (configure_file output) stays, to be judged on its own notice.
+    #[test]
+    fn staged_copies_map_to_their_source() {
+        let tmp = std::env::temp_dir().join(format!("xtask-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (cxx, abi, dir) = (
+            tmp.join("libcxx"),
+            tmp.join("libcxxabi"),
+            tmp.join("build/v1"),
+        );
+        for d in [&cxx, &abi, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(abi.join("cxxabi.h"), "abi").unwrap();
+        std::fs::write(dir.join("cxxabi.h"), "abi").unwrap();
+        std::fs::write(cxx.join("__config_site"), "template").unwrap();
+        std::fs::write(dir.join("__config_site"), "configured").unwrap();
+        let staged = [Staged {
+            dir: dir.clone(),
+            from: vec![cxx.clone(), abi.clone()],
+            key: "llvm".into(),
+        }];
+        let o = Path::new("x.o");
+        let placed = BTreeMap::from([
+            (dir.join("cxxabi.h"), o),
+            (dir.join("__config_site"), o),
+            (tmp.join("other.c"), o),
+        ]);
+        let (kept, configured) = unstage(placed, &staged);
+        assert_eq!(
+            kept.keys().cloned().collect::<Vec<_>>(),
+            vec![abi.join("cxxabi.h"), tmp.join("other.c")]
+        );
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, dir.join("__config_site"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An archive in a CMake build dir, or in an install prefix beside one, belongs to that build; the main build's own dir never counts.
+    #[test]
+    fn external_build_by_layout() {
+        let tmp = std::env::temp_dir().join(format!("xtask-external-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = tmp.join("out");
+        let rt = out.join("upstream/llvm/x86_64/libunwind/build");
+        let up = out.join("upstream/ssl");
+        for d in [
+            rt.join("lib"),
+            up.join("build"),
+            up.join("prefix/lib"),
+            out.join("device"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for f in [
+            out.join("build.ninja"),
+            rt.join("build.ninja"),
+            up.join("build/build.ninja"),
+        ] {
+            std::fs::write(f, "").unwrap();
+        }
+        assert_eq!(
+            external_build(&rt.join("lib/libunwind.a"), &out),
+            Some(rt.clone())
+        );
+        assert_eq!(
+            external_build(&up.join("prefix/lib/libssl.a"), &out),
+            Some(up.join("build"))
+        );
+        assert_eq!(external_build(&out.join("device/liba.a"), &out), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -35,7 +35,13 @@ struct Variant {
     cxxflags: &'static str,
     /// (module, archive file name, found anywhere under the build dir).
     modules: &'static [(&'static str, &'static str)],
+    /// (build-relative dir the build copies headers into, llvm-project dirs they come from): the licence gate judges each copy as its source (licence_gate `Staged`).
+    staged: &'static [(&'static str, &'static [&'static str])],
 }
+
+/// libc++'s CMake copies its headers and libc++abi's public ones into the build's `include/c++/v1`; `__config_site` and `__assertion_handler` are `configure_file` outputs carrying their template's notice.
+const LIBCXX_STAGED: &[(&str, &[&str])] =
+    &[("include/c++/v1", &["libcxx/include", "libcxxabi/include"])];
 
 /// Cache entries every runtimes variant needs and no builder sets differently: tests and benchmarks are not ours to build.
 const NO_TESTS: &[(&str, &str)] = &[
@@ -82,6 +88,7 @@ const VARIANTS: &[Variant] = &[
             ("libc++_static_noexcept", "libc++_static_noexcept.a"),
             ("libc++demangle_noexcept", "libc++demangle_noexcept.a"),
         ],
+        staged: LIBCXX_STAGED,
     },
     // LibUnwindBuilder, is_exported=False: the hermetic copy every other module links
     Variant {
@@ -96,6 +103,7 @@ const VARIANTS: &[Variant] = &[
         cflags: "-D_LIBUNWIND_USE_DLADDR=0",
         cxxflags: "-D_LIBUNWIND_USE_DLADDR=0",
         modules: &[("libunwind", "libunwind.a")],
+        staged: &[],
     },
     // LibUnwindBuilder, is_exported=True: libc.so exports the unwinder; the frame header cache needs dlpi_adds/dlpi_subs, which bionic has
     Variant {
@@ -110,6 +118,7 @@ const VARIANTS: &[Variant] = &[
         cflags: "-D_LIBUNWIND_USE_DLADDR=0",
         cxxflags: "-D_LIBUNWIND_USE_DLADDR=0",
         modules: &[("libunwind-exported", "libunwind.a")],
+        staged: &[],
     },
     // BuiltinsBuilder, is_exported=False (the -exported copy exists for arm and x86 only, prebuilts/clang Android.bp)
     Variant {
@@ -131,6 +140,7 @@ const VARIANTS: &[Variant] = &[
         cflags: "",
         cxxflags: "",
         modules: &[("libclang_rt.builtins", "libclang_rt.builtins-")],
+        staged: &[],
     },
 ];
 
@@ -215,7 +225,17 @@ pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
     let mut ok = true;
     for v in VARIANTS {
         let build = std::fs::canonicalize(base.join(v.name).join("build"))?;
-        let r = licence_gate::check_build(&build, &roots, &licenses)?;
+        let canon_src = std::fs::canonicalize(&src)?;
+        let staged: Vec<licence_gate::Staged> = v
+            .staged
+            .iter()
+            .map(|(dir, from)| licence_gate::Staged {
+                dir: build.join(dir),
+                from: from.iter().map(|f| canon_src.join(f)).collect(),
+                key: c.licence_key.clone(),
+            })
+            .collect();
+        let r = licence_gate::check_build(&build, &staged, &roots, &licenses)?;
         println!(
             "runtimes: licence {:<20} {} objects, {} files checked, {} generated, {} system",
             v.name, r.artifacts, r.checked, r.generated, r.system

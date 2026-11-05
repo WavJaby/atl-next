@@ -596,6 +596,49 @@ mod tests {
         assert_eq!(peeled_commit(out, "refs/tags/v2"), None);
     }
 
+    /// A branch pin (sources.toml `branch` + `commit`) passes while the remote branch is at the pin and fails once the branch advances: a real git remote, so the ls-remote query is the one `verify_ref` sends.
+    #[test]
+    fn advanced_branch_pin_fails() {
+        let tmp = std::env::temp_dir().join(format!("xtask-branch-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let g = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "git {args:?}");
+            String::from_utf8(st.stdout).unwrap().trim().to_owned()
+        };
+        g(&["init", "-q", "-b", "rel"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        let pinned = g(&["rev-parse", "HEAD"]);
+        let c = Checkout {
+            dir: PathBuf::from("llvm"),
+            url: Some(tmp.display().to_string()),
+            rev: "refs/heads/rel".into(),
+            commit: pinned,
+            sparse: vec![],
+            pin: crate::sources::Pin::Git("llvm".into()),
+            licence_key: "llvm".into(),
+        };
+        verify_ref(&c).unwrap();
+        g(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        let err = format!("{:#}", verify_ref(&c).unwrap_err());
+        assert!(err.contains("moved ref"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn decisions() {
         let at = |head: &str, branch: Option<&str>, dirty| Local::Present {
