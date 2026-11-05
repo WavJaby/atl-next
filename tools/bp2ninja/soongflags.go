@@ -32,6 +32,8 @@ type GlobalFlags struct {
 	Yasm map[Side][]string
 	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
 	NoToolchain map[Side]string
+	// per bionic Side (native bridge): the toolchain's ClangTriple, which AddTargetFlags (cc/compiler.go) suffixes with the API level as `-target`; glibc sides compile for the distro clang's default triple
+	Triple map[Side]string
 }
 
 // toolchainOS: the android.OsType identifier the side's toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
@@ -155,7 +157,7 @@ func readThirdParty(tree string) (ThirdParty, error) {
 
 func newGlobalFlags() GlobalFlags {
 	return GlobalFlags{Head: map[Side][]string{}, Tail: map[Side][]string{}, Conly: map[Side][]string{}, Cpp: map[Side][]string{}, As: map[Side][]string{},
-		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}}
+		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}, Triple: map[Side]string{}}
 }
 
 // readGlobalFlags: GlobalFlags for the device arch cfg (its arches.toml variant and Soong's feature list for it, DeviceArch).
@@ -186,13 +188,16 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 		}
 		return out, nil
 	}
-	ident, err := archIdent(tree, cfg.Arch)
-	if err != nil {
-		return g, err
+	idents := map[Side]string{}
+	for _, side := range cfg.sides() {
+		arch, _ := cfg.archOf(side)
+		if idents[side], err = archIdent(tree, arch); err != nil {
+			return g, err
+		}
 	}
-	// android.Arch per side: Soong sets a variant and features for the Android OS only
+	// android.Arch per side: Soong sets a variant and features for the Android OS only; the native bridge guest takes its arch's baseline (no arches.toml variant for guests)
 	archFields := func(s Side) map[string]any {
-		if s.android() {
+		if s == Device {
 			return map[string]any{"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features}
 		}
 		return map[string]any{"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)}
@@ -201,7 +206,7 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 		dst  map[Side][]string
 		vars []string // ${config.X}, in order
 	}
-	for _, side := range defaultSides {
+	for _, side := range cfg.sides() {
 		for _, p := range []part{
 			{g.Head, []string{"CommonGlobalCflags", hod(side) + "GlobalCflags"}},
 			{g.Conly, []string{"CommonGlobalConlyflags"}},
@@ -218,8 +223,8 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 		}
 	}
 	// each side's toolchain around the global lists (compiler.go: instruction set first, tc.Cflags before CommonGlobalCflags, tc.ToolchainCflags last; tc.Cppflags after the global C++ lists, tc.Asflags before CommonGlobalAsflags)
-	for _, side := range defaultSides {
-		osName := toolchainOS(side)
+	for _, side := range cfg.sides() {
+		osName, ident := toolchainOS(side), idents[side]
 		if !ev.hasToolchain(osName, ident) {
 			if side.android() {
 				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, osName, ident)
@@ -260,6 +265,16 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 			return g, err
 		}
 		g.As[side] = append(as, g.As[side]...)
+		if !side.glibc() {
+			t, err := method("ClangTriple")
+			if err != nil {
+				return g, err
+			}
+			if len(t) != 1 {
+				return g, fmt.Errorf("%s: ClangTriple for (%s, %s) is %q, not one word", ev.dir, osName, ident, t)
+			}
+			g.Triple[side] = t[0]
+		}
 		yasm, err := ev.method(tc, "YasmFlags")
 		if err != nil {
 			return g, err

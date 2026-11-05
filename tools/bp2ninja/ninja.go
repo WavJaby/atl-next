@@ -286,10 +286,19 @@ type langFlags struct{ c, cxx, asm, yasm []string }
 // yasm is the whole argv of a .asm compile; the others go to the cc rule.
 // -w -Wno-error: distro clang warns differently from AOSP's clang; errors are what this build measures (keepFlag drops Soong's warning flags for the same reason).
 // libc++: AOSP's C++ assumes it (libstdc++ 14 rejects libbase's non-const set comparator).
+// bionicTargetFlags: what Soong's device compile adds for a bionic side (cc/compiler.go): AddTargetFlags' `-target <ClangTriple><FutureApiLevelInt>` (clang then defines __ANDROID__ and __ANDROID_API__ itself), -nostdlibinc (bionic's headers come from libc's exports), and -D__ANDROID_NATIVE_BRIDGE__ for a native bridge target.
+func (g *Graph) bionicTargetFlags(s Side) []string {
+	level := strings.TrimPrefix(g.soong.APILevel, apiLevelPrefix)
+	return []string{"-target", g.soong.Flags.Triple[s] + level, "-nostdlibinc", "-D__ANDROID_NATIVE_BRIDGE__"}
+}
+
 func (g *Graph) compileFlags(n *Node) langFlags {
 	p := n.props
 	f := &g.soong.Flags
 	global := append([]string{"-fPIC", "-w"}, f.common(n.side, n.mod.Dir)...)
+	if !n.side.glibc() {
+		global = append(global, g.bionicTargetFlags(n.side)...)
+	}
 	// .S/.s: global common + asflags, none of the module's cflags (cc/builder.go transformSourceToObj)
 	asm := slices.Concat(global, f.As[n.side], []string{"-Wno-error"}, moduleFlags(p, "asflags"))
 	common := slices.Concat(moduleFlags(p, "cflags"), n.genCflags, []string{"-Wno-error"})
@@ -325,7 +334,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	inc = dedup(inc)
 	cstd, cppstd := g.stdVersions(p)
 	// Soong's -std heads the language's local flags, after the module's cflags (cc/builder.go: localCFlags, then localConlyFlags / localCppFlags), so it wins over a -std in cflags (camera_metadata's -std=c11 builds as gnu23, which declares dprintf)
-	cxx := slices.Concat(g.stlCompileFlags(g.stlOf(n)), global, f.Cpp[n.side], common, []string{"-std=" + cppstd}, moduleFlags(p, "cppflags"))
+	cxx := slices.Concat(g.sideStlCompileFlags(n), global, f.Cpp[n.side], common, []string{"-std=" + cppstd}, moduleFlags(p, "cppflags"))
 	c := slices.Concat(global, f.Conly[n.side], common, []string{"-std=" + cstd}, moduleFlags(p, "conlyflags"))
 	// android properties compiled against glibc: bionic's macros and declarations supplied (LFS64, compat dirs, forced api-level headers); the native bridge side compiles against bionic itself
 	if n.side == Device {
@@ -414,8 +423,12 @@ func (g *Graph) linkFlags(n *Node) []string {
 	if n.kind == Shared {
 		out = append(out, "-shared", "-Wl,-soname,"+g.outName(n)+".so")
 	}
-	if n.side == Device {
+	if n.side.android() {
 		out = append(out, g.soong.DeviceLink.Ldflags...)
+	}
+	// a bionic side links for its triple without the driver's C library, crt objects or runtimes (Soong's device link: -nostdlib, crt and runtimes as dependencies), and takes the packing Soong gives a device link: the loader is bionic's linker, which reads both
+	if !n.side.glibc() {
+		out = append(out, "-target", g.soong.Flags.Triple[n.side]+strings.TrimPrefix(g.soong.APILevel, apiLevelPrefix), "-nostdlib", "-Wl,--pack-dyn-relocs=android+relr")
 	}
 	out = append(out, g.soong.Lldflags...)
 	out = append(out, "-Wl,--no-undefined")

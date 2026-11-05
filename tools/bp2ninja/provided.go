@@ -90,8 +90,9 @@ func readJSON[T any](path string) (map[string]T, error) {
 
 // dropPartial removes the module's `srcs` row files from its sources and records each one found, for checkPartial.
 func (g *Graph) dropPartial(n *Node, files []srcFile) []srcFile {
+	// a bionic side builds the module whole: the rows replace sources glibc cannot build
 	part, ok := g.partial[n.mod.Name]
-	if !ok {
+	if !ok || !n.side.glibc() {
 		return files
 	}
 	drop := map[string]bool{}
@@ -112,7 +113,7 @@ func (g *Graph) dropPartial(n *Node, files []srcFile) []srcFile {
 // partialProvider: the provided node a `srcs` row's provider links into n, nil for none. Named after its artifact: the module's own name is n's.
 func (g *Graph) partialProvider(n *Node) *Node {
 	part, ok := g.partial[n.mod.Name]
-	if !ok || part.Provider == nil {
+	if !ok || part.Provider == nil || !n.side.glibc() {
 		return nil
 	}
 	lib := filepath.Base(part.Provider.Libs[0])

@@ -70,6 +70,18 @@ func (g *Graph) stlCompileFlags(sel string) []string {
 	return []string{"-nostdinc++", "-isystem", g.libcxx}
 }
 
+// sideStlCompileFlags: stlCompileFlags of the node's selection on glibc sides. A bionic side has no C++ runtime yet (its libc++ comes from the runtimes build as provided modules): a C++ selection there is a problem, compiled -nostdinc++.
+func (g *Graph) sideStlCompileFlags(n *Node) []string {
+	sel := g.stlOf(n)
+	if n.side.glibc() {
+		return g.stlCompileFlags(sel)
+	}
+	if sel != "" {
+		g.problem("%s: %s side: C++ standard library %s not provided", n.name, n.side, sel)
+	}
+	return []string{"-nostdinc++"}
+}
+
 // stlLinkFlags: the link flags of selection sel (cc/stl.go flags, non-Bionic): -nostdlib++ always, -lc++ for libc++.
 func stlLinkFlags(sel string) []string {
 	if sel == "" {

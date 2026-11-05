@@ -138,6 +138,12 @@ func TestMultilib(t *testing.T) {
 // graphFor evaluates the Android.bp files of a fake tree (dir -> content) for both sides.
 func graphFor(t *testing.T, files map[string]string) *Graph {
 	t.Helper()
+	return graphForCfg(t, Config{Arch: "x86_64", PointerBits: 64}, files)
+}
+
+// graphForCfg: graphFor with every side cfg names evaluated (a native bridge side with -native-bridge).
+func graphForCfg(t *testing.T, cfg Config, files map[string]string) *Graph {
+	t.Helper()
 	tree, out := t.TempDir(), t.TempDir()
 	for name, body := range files {
 		path := filepath.Join(tree, name)
@@ -152,10 +158,11 @@ func graphFor(t *testing.T, files map[string]string) *Graph {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Arch: "x86_64", PointerBits: 64}
 	g := &Graph{tree: tree, out: out, cfg: cfg, libcxx: standInLibcxx, nodes: map[key]*Node{}, baseTypes: map[string]string{}, mods: map[Side]map[string][]*Module{}}
-	for _, side := range defaultSides {
-		mods, problems := (&evaluator{cfg: cfg, os: side.evalOS()}).modules(parsed)
+	for _, side := range cfg.sides() {
+		ecfg := cfg
+		ecfg.Arch, ecfg.PointerBits = cfg.archOf(side)
+		mods, problems := (&evaluator{cfg: ecfg, os: side.evalOS()}).modules(parsed)
 		if len(problems) > 0 {
 			t.Fatal(problems)
 		}

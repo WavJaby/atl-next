@@ -164,7 +164,7 @@ func javaTestGraph(t *testing.T, files map[string]string, flags map[string]strin
 	}
 	cfg := Config{Arch: "x86_64", PointerBits: 64}
 	g := &Graph{tree: tree, out: out, cfg: cfg, nodes: map[key]*Node{}, baseTypes: map[string]string{}, mods: map[Side]map[string][]*Module{}}
-	for _, side := range defaultSides {
+	for _, side := range cfg.sides() {
 		g.mods[side], _ = (&evaluator{cfg: cfg, os: side.evalOS()}).modules(parsed)
 	}
 	fl := map[string]string{"RELEASE_TARGET_JAVA_21": "true", "RELEASE_PLATFORM_VERSION_CODENAME": "REL", "RELEASE_PLATFORM_SDK_VERSION": "36",

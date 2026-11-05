@@ -380,5 +380,7 @@ func apiLevel(tree string) (string, error) {
 	if soong == "" || future != soong {
 		return "", fmt.Errorf("FutureApiLevelInt %q (%s) and __ANDROID_API_FUTURE__ %q (%s) differ or are missing", soong, path, future, hdr)
 	}
-	return "-D__ANDROID_API__=" + soong, nil
+	return apiLevelPrefix + soong, nil
 }
+
+const apiLevelPrefix = "-D__ANDROID_API__="

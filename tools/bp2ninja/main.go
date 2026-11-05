@@ -38,6 +38,9 @@ func main() {
 	bits := flag.Int("pointer-bits", 0, "pointer width of -arch (its arches.toml pointer_bits)")
 	variant := flag.String("arch-variant", "", "Soong arch variant of the device side (its arches.toml soong_arch_variant; empty = Soong's baseline)")
 	abi := flag.String("abi", "", "the first android_abis entry of -arch's arches.toml guest row: lib/<abi>/ in the apks of android apps that have jni_libs")
+	nbArch := flag.String("native-bridge", "", "guest arch of the native bridge side (arches.toml row with [guest]): android properties + target.native_bridge built against bionic into <out>/nb/<arch>; goals `nb:<module>` build there; empty = no native bridge side")
+	nbBits := flag.Int("native-bridge-bits", 0, "pointer width of -native-bridge (its arches.toml pointer_bits)")
+	nbProvidedFile := flag.String("nb-provided", "", "JSON file like -provided: the native bridge side's provided modules (the LLVM runtimes built for the guest: libc++_static_noexcept, libc++demangle_noexcept, libunwind, libclang_rt.builtins)")
 	cc := flag.String("cc", "clang", "C compiler")
 	cxx := flag.String("cxx", "clang++", "C++ compiler and linker driver")
 	ar := flag.String("ar", "llvm-ar", "archiver")
@@ -104,7 +107,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided:", err)
 		os.Exit(1)
 	}
-	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi}
+	nbProvided, err := readJSON[Provided](*nbProvidedFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -nb-provided:", err)
+		os.Exit(1)
+	}
+	if (*nbArch == "") != (*nbBits == 0) {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -native-bridge and -native-bridge-bits go together")
+		os.Exit(1)
+	}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
 		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {
@@ -132,7 +144,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -191,7 +203,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -202,7 +214,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX); err != nil {
 		return err
 	}
@@ -223,8 +235,10 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		g.acfg = &aconfigGraph{decls: map[string]*aconfigDecl{}}
 	}
 	g.mods = map[Side]map[string][]*Module{}
-	for _, side := range defaultSides {
-		ev := &evaluator{cfg: cfg, os: side.evalOS(), rel: g.release}
+	for _, side := range cfg.sides() {
+		ecfg := cfg
+		ecfg.Arch, ecfg.PointerBits = cfg.archOf(side)
+		ev := &evaluator{cfg: ecfg, os: side.evalOS(), rel: g.release}
 		mods, problems := ev.modules(files)
 		g.mods[side] = mods
 		for _, p := range problems {
@@ -287,6 +301,16 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	var ccGoals []*Node
 	for _, goal := range goals {
+		// nb:<module>: the module's native bridge variant (a C/C++ library or binary)
+		if name, ok := strings.CutPrefix(goal, nbGoalPrefix); ok {
+			if cfg.NativeBridge == "" {
+				return fmt.Errorf("goal %s: no -native-bridge side", goal)
+			}
+			if n := g.node(name, NativeBridge(cfg.NativeBridge), Shared, "goal"); n != nil {
+				ccGoals = append(ccGoals, n)
+			}
+			continue
+		}
 		if goal == bootclasspathGoal && g.java != nil {
 			if err := g.bootclasspath(); err != nil {
 				return err

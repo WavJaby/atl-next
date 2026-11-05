@@ -532,7 +532,7 @@ func (a *artPlugin) globalDefaults() *Obj {
 func (a *artPlugin) codegen(p *Obj, t artModuleType) *Obj {
 	cg := p.obj("codegen")
 	p = removeKey(p, "codegen")
-	for _, side := range defaultSides {
+	for _, side := range []Side{Device, Host} {
 		arches := a.codegenArches[side]
 		var srcs []string
 		for _, arch := range arches {

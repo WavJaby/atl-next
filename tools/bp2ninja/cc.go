@@ -61,20 +61,41 @@ func (s Side) evalOS() string {
 	return "linux_glibc"
 }
 
-// defaultSides: the sides every run evaluates, in emit order.
-var defaultSides = []Side{Device, Host}
+// nbGoalPrefix: a goal naming a module's native bridge variant.
+const nbGoalPrefix = "nb:"
+
+// sides: the sides a run evaluates, in emit order: device, host, then the native bridge guest if -native-bridge names one.
+func (c Config) sides() []Side {
+	s := []Side{Device, Host}
+	if c.NativeBridge != "" {
+		s = append(s, NativeBridge(c.NativeBridge))
+	}
+	return s
+}
+
+// archOf: the Soong arch and pointer width a side's modules are built for: the host arch, or the native bridge guest's.
+func (c Config) archOf(s Side) (string, int) {
+	if s.kind == nativeBridgeSide {
+		return s.arch, c.NativeBridgeBits
+	}
+	return c.Arch, c.PointerBits
+}
 
 // osBlocks: the OS-only `target: {…}` blocks a side applies, in Soong's order (android/arch.go setOSProperties, the os mutator: before any arch block).
 // not_windows is a host class block; android64/android32 follow the device's pointer width.
 func osBlocks(s Side, pointerBits int) []string {
-	if s == Device {
+	if s.android() {
 		return []string{"linux", "bionic", "android", fmt.Sprintf("android%d", pointerBits)}
 	}
 	return []string{"host", "linux", "host_linux", "glibc", "linux_glibc", "not_windows"}
 }
 
 // osArchBlocks: the OS+arch `target: {…}` blocks, in Soong's order (android/arch.go getArchProperties, after `arch` and `multilib`).
+// The native bridge side applies target.native_bridge last (getArchProperties: after the OS+arch blocks, os == Android && NativeBridgeEnabled).
 func osArchBlocks(s Side, arch string) []string {
+	if s.kind == nativeBridgeSide {
+		return []string{"linux_" + arch, "bionic_" + arch, "android_" + arch, "native_bridge"}
+	}
 	if s == Device {
 		return []string{"linux_" + arch, "bionic_" + arch, "android_" + arch}
 	}
@@ -170,6 +191,8 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
+	// bionic sides' provided modules: the LLVM runtimes archives built for the guest (xtask runtimes) under Soong's module names (libc++_static_noexcept, libclang_rt.builtins, ...)
+	nbProvided map[string]Provided
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
 	partial     map[string]Partial
 	droppedSrcs map[string]bool
@@ -362,9 +385,10 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 	if isRustType(g.baseType(m.Type)) {
 		osSide = g.rustOSSide(m, side)
 	}
-	target(osBlocks(osSide, g.cfg.PointerBits))
+	arch, bits := g.cfg.archOf(side)
+	target(osBlocks(osSide, bits))
 	if a := p.obj("arch"); a != nil {
-		if o := a.obj(g.cfg.Arch); o != nil {
+		if o := a.obj(arch); o != nil {
 			base = merge(base, o)
 			// variant and feature sub-blocks: only the device toolchain has a variant and features
 			if side == Device {
@@ -377,11 +401,11 @@ func (g *Graph) flatten(m *Module, side Side, kind Kind) *Obj {
 		}
 	}
 	if ml := p.obj("multilib"); ml != nil {
-		if o := ml.obj(g.cfg.Multilib()); o != nil {
+		if o := ml.obj(fmt.Sprintf("lib%d", bits)); o != nil {
 			base = merge(base, o)
 		}
 	}
-	target(osArchBlocks(osSide, g.cfg.Arch))
+	target(osArchBlocks(osSide, arch))
 	var part *Obj
 	if kind == Static || kind == Shared {
 		part = base.obj(kind.String())
@@ -606,6 +630,13 @@ var stlModules = map[string]bool{"libc++": true, "libc++_static": true}
 // node builds (once) the node for a reference, depth first.
 func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	name := strings.TrimPrefix(ref, ":")
+	// providers.toml replaces bionic and platform pieces for glibc sides only; a bionic side builds them from the tree, and takes only its own provided modules (the runtimes build: -nb-provided)
+	if !side.glibc() {
+		if p, ok := g.nbProvided[name]; ok {
+			return g.providedNode(name, side, p)
+		}
+		return g.treeNode(ref, side, want, from)
+	}
 	// providers.toml `provider = "none"`: the dependency is dropped (bionic itself, platform-only APIs); recorded for the caller's none gate (graph.go)
 	if g.omit[name] {
 		if from != "goal" {
@@ -628,6 +659,11 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 		}
 		return n
 	}
+	return g.treeNode(ref, side, want, from)
+}
+
+// treeNode: node for a reference the tree's own module answers.
+func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 	m := g.lookup(ref, side)
 	if m == nil {
 		// made by a module type the tree has: lookup recorded why there is none, and the name is nothing to fetch
@@ -689,8 +725,8 @@ func (g *Graph) node(ref string, side Side, want Kind, from string) *Node {
 	n.deps.whole = append(dep(n.props.strs("whole_static_libs"), Static), n.objSrcs...)
 	n.deps.static = dep(n.props.strs("static_libs"), Static)
 	n.deps.shared = dep(n.props.strs("shared_libs"), Shared)
-	// Soong's implicit system_shared_libs (cc/linker.go): the toolchain's default when unset, `[]` declines it; device only, host tools link the host's C library
-	if side == Device {
+	// Soong's implicit system_shared_libs (cc/linker.go): the toolchain's default when unset, `[]` declines it; android sides only, host tools link the host's C library
+	if side.android() {
 		system := g.soong.SystemSharedLibs
 		if n.props.has("system_shared_libs") {
 			system = n.props.strs("system_shared_libs")
