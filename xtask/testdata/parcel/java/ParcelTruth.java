@@ -8,7 +8,9 @@
 import android.app.ActivityManager;
 import android.app.ApplicationErrorReport;
 import android.app.ContentProviderHolder;
+import android.app.servertransaction.ActivityConfigurationChangeItem;
 import android.app.servertransaction.ActivityLifecycleItem;
+import android.app.servertransaction.ActivityRelaunchItem;
 import android.app.servertransaction.ClientTransaction;
 import android.app.servertransaction.ClientTransactionItem;
 import android.app.servertransaction.LaunchActivityItem;
@@ -52,6 +54,7 @@ import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.Parcelable;
 import android.window.ActivityWindowInfo;
+import android.window.SizeConfigurationBuckets;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -150,6 +153,24 @@ public class ParcelTruth {
         check("ClientTransaction", transaction, ClientTransaction.CREATOR);
         // the lifecycle item a launch is followed by (ActivityTaskSupervisor.realStartActivityLocked: Launch, then Resume)
         checkTransactionResume("ClientTransaction:resume");
+        // the items of a configuration change (ActivityRecord.scheduleConfigurationChanged, relaunchActivityLocked)
+        IBinder itemToken = new Echo();
+        checkTransactionItem("ClientTransaction:configuration-change",
+                new ActivityConfigurationChangeItem(itemToken, config, new ActivityWindowInfo()), itemToken);
+        checkTransactionItem("ClientTransaction:relaunch",
+                new ActivityRelaunchItem(itemToken, null, null, ActivityInfo.CONFIG_SCREEN_SIZE, new MergedConfiguration(config, config), true, new ActivityWindowInfo()), itemToken);
+        // ActivityThread.reportSizeConfigurations: an app with no size-qualified resource sends the flags alone; a full one every array and the long bit
+        check("SizeConfigurationBuckets:none", new SizeConfigurationBuckets(new Configuration[0]), SizeConfigurationBuckets.CREATOR);
+        Configuration sized = new Configuration();
+        sized.screenWidthDp = 800;
+        sized.screenHeightDp = 480;
+        sized.smallestScreenWidthDp = 600;
+        sized.screenLayout = Configuration.SCREENLAYOUT_SIZE_LARGE | Configuration.SCREENLAYOUT_LONG_YES;
+        check("SizeConfigurationBuckets:all", new SizeConfigurationBuckets(new Configuration[] {sized}), SizeConfigurationBuckets.CREATOR);
+        Configuration smallestOnly = new Configuration();
+        smallestOnly.screenWidthDp = Configuration.SCREEN_WIDTH_DP_UNDEFINED;
+        smallestOnly.smallestScreenWidthDp = 600;
+        check("SizeConfigurationBuckets:smallest", new SizeConfigurationBuckets(new Configuration[] {smallestOnly}), SizeConfigurationBuckets.CREATOR);
         // IPackageManager.notifyDexLoad's classLoaderContextMap: dex path -> class loader context, a null value included
         HashMap<String, String> contexts = new HashMap<>();
         contexts.put("/data/app/com.example.app/base.apk", "PCL[]");
@@ -307,6 +328,24 @@ public class ParcelTruth {
         boolean consumed = out.dataSize() == in.dataSize();
         result(ok && consumed, name, ok && consumed ? "resume item survived java -> rust -> java: equal fields, same token, ON_RESUME, answers a transaction"
                 : "items " + items + ", sizes " + in.dataSize() + "/" + out.dataSize());
+        in.recycle();
+        out.recycle();
+    }
+
+    /// A ClientTransaction holding `item`, whose token is `token`: Java Parcel -> codec -> Java Parcel with its objects, as checkTransactionResume. Java must read back one equal item (its equals() compares every field), the same size, and a token that answers.
+    static void checkTransactionItem(String name, ClientTransactionItem item, IBinder token) {
+        ClientTransaction transaction = new ClientTransaction();
+        transaction.addTransactionItem(item);
+        Parcel in = written(transaction);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.app.servertransaction.ClientTransaction", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        out.setDataPosition(0);
+        List<ClientTransactionItem> items = ClientTransaction.CREATOR.createFromParcel(out).getTransactionItems();
+        boolean ok = items.size() == 1 && item.equals(items.get(0)) && usable(token) && out.dataSize() == in.dataSize();
+        result(ok, name, ok ? "item survived java -> rust -> java: equal fields, same token, answers a transaction" : "items " + items + ", sizes " + in.dataSize() + "/" + out.dataSize());
         in.recycle();
         out.recycle();
     }

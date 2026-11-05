@@ -56,6 +56,13 @@ public class Main extends Activity {
         postFrame();
     }
 
+    /** A configuration change delivered without a relaunch (ActivityConfigurationChangeItem): one line each, with the screenWidthDp it now has. */
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        Log.i(TAG, "configuration changed screenWidthDp=" + newConfig.screenWidthDp);
+    }
+
     /** One frame callback per vsync, FRAME_CALLBACKS in all; each logs the frame time it was given (CLOCK_MONOTONIC ns). */
     private void postFrame() {
         Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {

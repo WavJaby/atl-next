@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::packages::{ActivityDecl, Manifest};
+use crate::size_buckets::{CONFIG_SCREEN_SIZE, CONFIG_SMALLEST_SCREEN_SIZE};
 
 /// Build.VERSION_CODES.ICE_CREAM_SANDWICH and P: the targetSdkVersion levels two application defaults turn on at or below (ParsingPackageUtils:2428, :2430).
 const ICE_CREAM_SANDWICH: i32 = 14;
@@ -167,9 +168,33 @@ pub fn activity_flags(m: &Manifest, a: &ActivityDecl) -> i32 {
         .fold(0, |flags, r| flags | r.flag)
 }
 
+/// Build.VERSION_CODES.HONEYCOMB_MR2: apps below it predate the size bits, so they handle size changes.
+const HONEYCOMB_MR2: i32 = 13;
+
+/// ActivityInfo.getRealConfigChanged of `a`: what it handles itself, the bits a relaunch decision reads.
+pub fn real_config_changes(m: &Manifest, a: &ActivityDecl) -> u32 {
+    let declared = a.config_changes as u32;
+    if m.target_sdk < HONEYCOMB_MR2 {
+        declared | CONFIG_SCREEN_SIZE | CONFIG_SMALLEST_SCREEN_SIZE
+    } else {
+        declared
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ActivityInfo.getRealConfigChanged: an app below 13 also handles screenSize (0x400) and smallestScreenSize (0x800); 13 on, only what it declares.
+    #[test]
+    fn real_config_changes_add_the_size_bits_below_13() {
+        let a = ActivityDecl {
+            config_changes: 0x3,
+            ..activity(&[])
+        };
+        assert_eq!(real_config_changes(&manifest(12, &[]), &a), 0xC03);
+        assert_eq!(real_config_changes(&manifest(13, &[]), &a), 0x3);
+    }
 
     fn manifest(target_sdk: i32, application: &[(&str, bool)]) -> Manifest {
         Manifest {
@@ -196,6 +221,7 @@ mod tests {
             name: "com.example.flags.Main".into(),
             launcher: true,
             theme: 0,
+            config_changes: 0,
             booleans: booleans
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))

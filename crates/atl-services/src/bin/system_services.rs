@@ -111,7 +111,11 @@ fn main() -> Result<()> {
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
-        atl_services::registry_service::new_binder(Arc::clone(&agents), Arc::clone(&tasks)),
+        atl_services::registry_service::new_binder(
+            Arc::clone(&agents),
+            Arc::clone(&tasks),
+            activity.clone(),
+        ),
     )
     .context("addService compositor registry")?;
     writeln!(std::io::stderr(), "services: ready")?;

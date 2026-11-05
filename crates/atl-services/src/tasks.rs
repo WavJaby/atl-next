@@ -36,6 +36,8 @@ pub struct TaskSize {
 struct TaskRecord {
     owner: u32,
     size: Option<TaskSize>,
+    /// The seq of the override this size makes (config_seq).
+    config_seq: i32,
 }
 
 /// One window of a Task: the client handle (what `remove` finds the window by) and the Task it belongs to.
@@ -104,7 +106,14 @@ impl<C: Clone + PartialEq> Tasks<C> {
         let mut st = self.lock();
         st.last_id = st.last_id.checked_add(1).expect("TaskId space exhausted");
         let id = TaskId(st.last_id);
-        st.tasks.insert(id, TaskRecord { owner, size: None });
+        st.tasks.insert(
+            id,
+            TaskRecord {
+                owner,
+                size: None,
+                config_seq: 0,
+            },
+        );
         id
     }
 
@@ -133,7 +142,13 @@ impl<C: Clone + PartialEq> Tasks<C> {
             return false;
         }
         record.size = Some(size);
+        record.config_seq = record.config_seq.wrapping_add(1).max(1);
         true
+    }
+
+    /// The Configuration.seq of `task`'s override (ActivityRecord.java:7697): numbered per size, 0 until the first change. Every copy of one override carries it: the item, IWindow.resized, relayout. They race on the app's main thread (AOSP orders them), and a seq-0 copy reads as older than a pending numbered one, so ActivityThread drops it and a layout runs on the old configuration; an item at seq 0 fares no better: handleActivityConfigurationChangedInner:7112 takes its own pending copy for newer and drops it.
+    pub fn config_seq(&self, task: TaskId) -> i32 {
+        self.lock().tasks.get(&task).map_or(0, |r| r.config_seq)
     }
 
     /// Names `task` as the Task of the activity `token` (ActivityRecord.task). A token bound again takes the new Task.
@@ -240,6 +255,20 @@ mod tests {
         assert!(t.set_size(task, display_size()));
         assert_eq!(t.size(task), display_size());
         assert!(!t.set_size(task, display_size()));
+    }
+
+    /// One number per size: 0 before the first change, up by one at each change, not at a size it already has; none for no Task.
+    #[test]
+    fn config_seq_follows_the_size_changes() {
+        let t = tasks();
+        let task = t.new_task(7);
+        assert_eq!(t.config_seq(task), 0);
+        t.set_size(task, size(1000, 700));
+        assert_eq!(t.config_seq(task), 1);
+        t.set_size(task, size(1000, 700));
+        assert_eq!(t.config_seq(task), 1);
+        t.set_size(task, size(900, 650));
+        assert_eq!(t.config_seq(task), 2);
     }
 
     /// A Task that does not exist has no owner, takes no size, and has the display's size.

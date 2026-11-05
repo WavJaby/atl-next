@@ -37,6 +37,8 @@ pub struct ActivityDecl {
     pub launcher: bool,
     /// `android:theme` as a resource id (ActivityInfo.theme); 0 = none written, ActivityInfo.getThemeResource then takes the application's.
     pub theme: i32,
+    /// ActivityInfo.configChanges: `android:configChanges` with the recreateOnConfigChanges rule applied (ParsedActivityUtils.getActivityConfigChanges).
+    pub config_changes: i32,
     /// Its boolean attributes by name, only those the manifest wrote (`hardwareAccelerated`, ...); the flags they set are in manifest_flags.
     pub booleans: BTreeMap<String, bool>,
 }
@@ -361,6 +363,7 @@ mod tests {
             name: name.into(),
             launcher,
             theme: 0,
+            config_changes: 0,
             booleans: BTreeMap::new(),
         };
         let mut r = record("a", 10_001);

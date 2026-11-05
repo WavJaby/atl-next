@@ -134,6 +134,27 @@ fn theme(element: &Element) -> Result<i32> {
     Ok(id as i32)
 }
 
+/// ParsedActivityUtils.RECREATE_ON_CONFIG_CHANGES_MASK: ActivityInfo.CONFIG_MCC | CONFIG_MNC.
+const RECREATE_ON_CONFIG_CHANGES_MASK: u32 = 0x1 | 0x2;
+
+/// A flags attribute as aapt2 prints it (`0x00000d80`); unwritten = 0 (`sa.getInt(.., 0)`).
+fn flags_attr(element: &Element, name: &str) -> Result<u32> {
+    let Some(value) = element.attr(name) else {
+        return Ok(0);
+    };
+    let hex = value
+        .strip_prefix("0x")
+        .with_context(|| format!("{name} {value:?} is not a flags value"))?;
+    u32::from_str_radix(hex, 16).with_context(|| format!("{name} {value:?}"))
+}
+
+/// ParsedActivityUtils.getActivityConfigChanges: `configChanges`, plus MCC and MNC unless `recreateOnConfigChanges` names them (an activity handles those two by default).
+fn config_changes(activity: &Element) -> Result<i32> {
+    let written = flags_attr(activity, "configChanges")?;
+    let recreate = flags_attr(activity, "recreateOnConfigChanges")?;
+    Ok((written | (!recreate & RECREATE_ON_CONFIG_CHANGES_MASK)) as i32)
+}
+
 /// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
 fn resolve_class(package: &str, name: &str) -> String {
     if name.starts_with('.') {
@@ -198,6 +219,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 name: resolve_class(package, name),
                 launcher,
                 theme: theme(activity)?,
+                config_changes: config_changes(activity)?,
                 booleans: booleans(activity),
             }))
         })
@@ -331,6 +353,29 @@ mod tests {
         assert_eq!(m.process_name, None);
         assert!(m.activities.is_empty() && m.launch_activity().is_none());
         assert!(m.application_booleans.is_empty());
+    }
+
+    /// `android:configChanges` as aapt2 prints it. getActivityConfigChanges: unwritten -> MCC | MNC (0x3, the default handled pair); 0xd80 (screenSize, smallestScreenSize, orientation, screenLayout... as written) keeps them; recreateOnConfigChanges=mcc (0x1) drops MCC.
+    #[test]
+    fn config_changes_follow_get_activity_config_changes() {
+        let text = |attrs: &str| {
+            format!(
+                r#"  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: application (line=7)
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+{attrs}
+"#
+            )
+        };
+        let changes = "            A: http://schemas.android.com/apk/res/android:configChanges(0x0101001f)=0x00000d80";
+        let recreate = "            A: http://schemas.android.com/apk/res/android:recreateOnConfigChanges(0x01010547)=0x00000001";
+        let value = |attrs: &str| parse(&text(attrs)).expect("parse").activities[0].config_changes;
+        assert_eq!(value(""), 0x3);
+        assert_eq!(value(changes), 0xd83);
+        assert_eq!(value(&format!("{changes}\n{recreate}")), 0xd82);
+        assert!(parse(&text("            A: http://schemas.android.com/apk/res/android:configChanges(0x0101001f)=\"x\" (Raw: \"x\")")).is_err());
     }
 
     /// `android:theme` as aapt2 prints it, on the application and on one activity; unwritten = 0; a theme that is no reference is refused.

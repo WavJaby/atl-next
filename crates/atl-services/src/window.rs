@@ -17,6 +17,7 @@ use atl_aidl::aidl::android::view::IWindowManager::{
     BnWindowManager, EnforcePermission, IWindowManager,
 };
 use atl_aidl::aidl::android::view::IWindowSession::{BnWindowSession, IWindowSession};
+use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
@@ -402,7 +403,10 @@ impl IWindowSession for Session {
             },
             merged_configuration: MergedConfiguration {
                 global: activity::global_configuration(&self.model),
-                override_config: activity::task_override(&self.model, size),
+                override_config: Configuration {
+                    seq: self.tasks.config_seq(task),
+                    ..activity::task_override(&self.model, size)
+                },
                 merged: activity::task_configuration(&self.model, size),
             },
             surface_control: surface.unwrap_or_default(),
@@ -456,7 +460,7 @@ pub fn new_binder(
 }
 
 /// `task` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
-/// AOSP's WindowState.reportResized (WindowState.java:3584) sends the same call; the relaunch wait it skips (`inRelaunchingActivity`) is not modelled, since no relaunch exists yet.
+/// AOSP's WindowState.reportResized (WindowState.java:3584) sends the same call; it skips a relaunching activity (`inRelaunchingActivity`), so callers do too (activity.rs task_resized, relaunch_finished).
 /// forceLayout is set so the app relayouts with the new frames; reportDraw is false because finishDrawing is not modelled (module doc).
 pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
@@ -469,7 +473,10 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     };
     let merged = MergedConfiguration {
         global: activity::global_configuration(&display),
-        override_config: activity::task_override(&display, size),
+        override_config: Configuration {
+            seq: tasks.config_seq(task),
+            ..activity::task_override(&display, size)
+        },
         merged: activity::task_configuration(&display, size),
     };
     let clients = tasks.windows_of(task);

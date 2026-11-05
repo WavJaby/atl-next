@@ -8,6 +8,7 @@ use crate::codecs::android::content::Intent::Intent;
 use crate::codecs::android::content::pm::ActivityInfo::ActivityInfo;
 use crate::codecs::android::content::pm::ApplicationInfo::ApplicationInfo;
 use crate::codecs::android::content::res::Configuration::Configuration;
+use crate::codecs::android::util::MergedConfiguration::MergedConfiguration;
 use crate::parcel::*;
 
 /// A parcel layout: written and read in the AOSP order.
@@ -568,6 +569,66 @@ impl Part for ResumeActivityItem {
             proc_state: r_i32(p)?,
             is_forward: r_bool(p)?,
             should_send_compat_fake_focus: r_bool(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.ActivityRelaunchItem (ActivityRelaunchItem.java writeToParcel): the token, the pending results and new intents (typed lists; only null modelled: the services hold neither), the
+/// MergedConfiguration and ActivityWindowInfo as typed objects, the config changes, preserveWindow. The body after ClientTransaction's class name.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityRelaunchItem {
+    pub activity_token: Option<SpIBinder>,
+    pub config: Option<MergedConfiguration>,
+    pub activity_window_info: Option<ActivityWindowInfo>,
+    pub config_changes: i32,
+    pub preserve_window: bool,
+}
+
+impl Part for ActivityRelaunchItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_null(p)?;
+        w_null(p)?;
+        w_typed(p, &self.config)?;
+        w_typed(p, &self.activity_window_info)?;
+        w_i32(p, self.config_changes)?;
+        w_bool(p, self.preserve_window)
+    }
+
+    fn read(p: &In<'_>) -> Result<Self> {
+        let activity_token = r_binder(p)?;
+        r_null(p, "ActivityRelaunchItem.mPendingResults")?;
+        r_null(p, "ActivityRelaunchItem.mPendingNewIntents")?;
+        Ok(ActivityRelaunchItem {
+            activity_token,
+            config: r_typed(p)?,
+            activity_window_info: r_typed(p)?,
+            config_changes: r_i32(p)?,
+            preserve_window: r_bool(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.ActivityConfigurationChangeItem (ActivityConfigurationChangeItem.java:79-89 writeToParcel): the ActivityTransactionItem's token, then the
+/// Configuration and the ActivityWindowInfo as typed objects. The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityConfigurationChangeItem {
+    pub activity_token: Option<SpIBinder>,
+    /// the activity's override configuration (AOSP: mergedOverrideConfiguration)
+    pub configuration: Option<Configuration>,
+    pub activity_window_info: Option<ActivityWindowInfo>,
+}
+impl Part for ActivityConfigurationChangeItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_typed(p, &self.configuration)?;
+        w_typed(p, &self.activity_window_info)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(ActivityConfigurationChangeItem {
+            activity_token: r_binder(p)?,
+            configuration: r_typed(p)?,
+            activity_window_info: r_typed(p)?,
         })
     }
 }

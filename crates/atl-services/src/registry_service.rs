@@ -11,6 +11,7 @@ use binder::{
     BinderFeatures, Interface, SpIBinder, StatusCode, ThreadState, declare_binder_interface,
 };
 
+use crate::activity::ActivityManager;
 use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, check, service_names};
 use crate::counters;
 use crate::tasks::{TaskId, TaskSize, Tasks};
@@ -126,6 +127,8 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 struct Registry {
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
+    /// the activities of the Tasks: a size change reaches their app threads (activity.rs task_resized)
+    activities: ActivityManager,
 }
 
 impl Interface for Registry {}
@@ -162,6 +165,15 @@ impl ICompositorRegistry for Registry {
                 "services: task {} of uid {caller_uid} bounds {width}x{height}",
                 task.raw()
             );
+            self.activities.task_resized(task);
+            if self.activities.task_relaunching(task) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "services: resize of task {} held for the relaunch",
+                    task.raw()
+                );
+                return Ok(());
+            }
             let windows = crate::window::notify_resized(&self.tasks, task);
             let _ = writeln!(
                 std::io::stderr(),
@@ -199,8 +211,19 @@ impl ICompositorRegistry for Registry {
     }
 }
 
-/// A new registry binder. `agents` is the table the window service reads (system_services.rs gives both the same one).
-pub fn new_binder(agents: Arc<UiAgents>, tasks: Arc<Tasks<SpIBinder>>) -> SpIBinder {
-    BnCompositorRegistry::new_binder(Registry { agents, tasks }, BinderFeatures::default())
-        .as_binder()
+/// A new registry binder. `agents` is the table the window service reads (system_services.rs gives both the same one); `activities` is the service a Task's size change reaches.
+pub fn new_binder(
+    agents: Arc<UiAgents>,
+    tasks: Arc<Tasks<SpIBinder>>,
+    activities: ActivityManager,
+) -> SpIBinder {
+    BnCompositorRegistry::new_binder(
+        Registry {
+            agents,
+            tasks,
+            activities,
+        },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }

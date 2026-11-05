@@ -237,6 +237,49 @@ pub fn needs_relaunch(changes: u32, declared: u32) -> bool {
     changes & !declared != 0
 }
 
+/// The change bits a resize alone makes (ActivityRecord.ensureActivityConfiguration isAppResizeOnly).
+const APP_RESIZE_BITS: u32 =
+    CONFIG_SCREEN_SIZE | CONFIG_SMALLEST_SCREEN_SIZE | CONFIG_ORIENTATION | CONFIG_SCREEN_LAYOUT;
+
+/// What a new configuration asks of an activity (ensureActivityConfiguration's outcomes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Same configuration as last reported: nothing to do.
+    Nothing,
+    /// A relaunch is in flight: the size is read again when it ends, so the latest wins and a burst costs one more relaunch at most. AOSP sends each and lets ActivityThread merge them (prepareRelaunchActivity).
+    Wait,
+    /// The activity keeps running: send the configuration.
+    Send,
+    /// `changes` are not all declared: relaunch. `preserve_window` is isAppResizeOnly.
+    Relaunch { changes: u32, preserve_window: bool },
+}
+
+/// ensureActivityConfiguration over the last reported configuration: the `delivery` of `new` to an activity that declares `declared` and is or is not `relaunching`.
+pub fn delivery(
+    last: &Config,
+    new: &Config,
+    buckets: Option<&SizeBuckets>,
+    declared: u32,
+    relaunching: bool,
+) -> Delivery {
+    if last == new {
+        return Delivery::Nothing;
+    }
+    if relaunching {
+        return Delivery::Wait;
+    }
+    let changes = configuration_changes(last, new, buckets);
+    if !needs_relaunch(changes, declared) {
+        return Delivery::Send;
+    }
+    let display_may_change = last.window.display_rotation != new.window.display_rotation
+        || last.window.max_bounds != new.window.max_bounds;
+    Delivery::Relaunch {
+        changes,
+        preserve_window: !display_may_change && changes & !APP_RESIZE_BITS == 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +447,53 @@ mod tests {
         assert!(!needs_relaunch(0, 0));
     }
 
+    /// The outcomes in ensureActivityConfiguration's order, over the sw600dp bucket: same -> nothing; in flight -> wait; inside the bucket -> send; crossing undeclared -> relaunch, window kept (only resize bits); declared -> send.
+    #[test]
+    fn delivery_follows_ensure_activity_configuration() {
+        let b = smallest(&[600]);
+        let (large, small) = (resized(1600, 961), resized(960, 561));
+        assert_eq!(
+            delivery(&large, &large, Some(&b), 0, false),
+            Delivery::Nothing
+        );
+        assert_eq!(delivery(&large, &small, Some(&b), 0, true), Delivery::Wait);
+        assert_eq!(
+            delivery(&base(), &large, Some(&b), 0, false),
+            Delivery::Send
+        );
+        assert_eq!(
+            delivery(&large, &small, Some(&b), 0, false),
+            Delivery::Relaunch {
+                changes: CONFIG_SMALLEST_SCREEN_SIZE,
+                preserve_window: true
+            }
+        );
+        assert_eq!(
+            delivery(&large, &small, Some(&b), CONFIG_SMALLEST_SCREEN_SIZE, false),
+            Delivery::Send
+        );
+    }
+
+    /// A change beyond the resize bits (density) or a display change takes the window down with the relaunch (isAppResizeOnly false).
+    #[test]
+    fn only_a_pure_resize_preserves_the_window() {
+        let large = resized(1600, 961);
+        let mut denser = large.clone();
+        denser.density_dpi += 80;
+        let mut moved = large.clone();
+        moved.window.max_bounds.right += 1;
+        moved.screen_width_dp += 1;
+        for new in [denser, moved] {
+            assert!(matches!(
+                delivery(&large, &new, None, 0, false),
+                Delivery::Relaunch {
+                    preserve_window: false,
+                    ..
+                }
+            ));
+        }
+    }
+
     /// The undefined grammatical gender is -1 (AOSP): a defined value that differs is a change, the default against itself is none.
     #[test]
     fn grammatical_gender_is_undefined_at_minus_one() {
@@ -411,8 +501,10 @@ mod tests {
             diff(&Config::default(), &Config::default(), false, false),
             0
         );
-        let mut gendered = Config::default();
-        gendered.grammatical_gender = 1;
+        let gendered = Config {
+            grammatical_gender: 1,
+            ..Config::default()
+        };
         assert_eq!(
             diff(&Config::default(), &gendered, false, false),
             CONFIG_GRAMMATICAL_GENDER

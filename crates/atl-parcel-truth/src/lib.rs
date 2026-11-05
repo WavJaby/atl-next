@@ -33,7 +33,7 @@ use atl_parcelables::android::view::{
     DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
     SurfaceControl, WindowManager_LayoutParams, WindowRelayoutResult,
 };
-use atl_parcelables::android::window::ClientWindowFrames;
+use atl_parcelables::android::window::{ClientWindowFrames, SizeConfigurationBuckets};
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
@@ -277,6 +277,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.view.SurfaceControl" => round_trip_as::<SurfaceControl>(input, mode),
         "android.window.ClientWindowFrames" => round_trip_as::<ClientWindowFrames>(input, mode),
         "android.util.MergedConfiguration" => round_trip_as::<MergedConfiguration>(input, mode),
+        "android.window.SizeConfigurationBuckets" => {
+            round_trip_as::<SizeConfigurationBuckets>(input, mode)
+        }
         "android.view.WindowRelayoutResult" => round_trip_as::<WindowRelayoutResult>(input, mode),
         "android.view.InputDevice" => round_trip_as::<InputDevice>(input, mode),
         "android.view.PointerIcon" => round_trip_as::<PointerIcon>(input, mode),

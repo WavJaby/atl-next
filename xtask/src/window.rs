@@ -8,7 +8,7 @@
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
 //! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
 //! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
-//! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics.
+//! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,6 +70,10 @@ enum Stage {
     Widgets,
     /// Resume in UI mode, then the probe configures the window larger, then smaller ([`drive_resize`]); the sub-gates follow each size ([`resize_checks`]).
     Resize,
+    /// The resize stage on window-sized (a sw600dp resource, no configChanges): the shrink crosses 600 dp, so the activity relaunches; the grow crosses nothing and does not.
+    Relaunch,
+    /// The resize stage on window-declared (the same resource, the resize bits declared): no relaunch, each change reaches onConfigurationChanged.
+    Declared,
 }
 
 impl Stage {
@@ -81,6 +85,8 @@ impl Stage {
             Stage::Gtk => "gtk",
             Stage::Widgets => "widgets",
             Stage::Resize => "resize",
+            Stage::Relaunch => "relaunch",
+            Stage::Declared => "declared",
         }
     }
 
@@ -91,7 +97,7 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
-            Stage::Resize => RESIZE_WINDOW_MS,
+            Stage::Resize | Stage::Relaunch | Stage::Declared => RESIZE_WINDOW_MS,
         }
     }
 
@@ -101,7 +107,7 @@ impl Stage {
             Stage::Resume => &[],
             Stage::Gtk => &["mapped", "readback", "touch", "pong"],
             Stage::Widgets => widgets::SUB_NAMES,
-            Stage::Resize => RESIZE_SUB_NAMES,
+            Stage::Resize | Stage::Relaunch | Stage::Declared => RESIZE_SUB_NAMES,
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -110,6 +116,9 @@ impl Stage {
 
 /// The fixture's dir.
 const FIXTURE: &str = "xtask/testdata/window";
+/// The same app with a sw600dp resource (their java/ links to FIXTURE's): no configChanges; the resize bits declared.
+const SIZED_FIXTURE: &str = "xtask/testdata/window-sized";
+const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
@@ -126,10 +135,41 @@ const GTK_WINDOW_MS: u64 = 10_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
 /// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
-const RESIZE_WINDOW_MS: u64 = 12_000;
+const RESIZE_WINDOW_MS: u64 = 18_000;
 const RESIZE_SETTLE: Duration = Duration::from_millis(2_000);
-/// The resize stage's sub-gates, in order (each prints `window: <name>: pass|FAIL`).
-const RESIZE_SUB_NAMES: &[&str] = &["configure", "bounds", "relayout", "frame", "display"];
+/// The resize stages' sub-gates, in order (each prints `window: <name>: pass|FAIL`): [`resize_checks`]' up to `display`, then the click, [`burst_check`], [`lifecycle_check`].
+const RESIZE_SUB_NAMES: &[&str] = &[
+    "configure",
+    "bounds",
+    "relayout",
+    "frame",
+    "display",
+    "click",
+    "burst",
+    "lifecycle",
+];
+/// The click after the resize (surface coordinates, inside the shrunk window, under BLOCK_MIN_X): a pointer script for [`track_check`].
+const CLICK_SCRIPT: &str = "down:200,300 up:200,300";
+const CLICK_POINT: (f64, f64) = (200.0, 300.0);
+/// Configures sent between the grow and the shrink, BURST_GAP apart. The second is under 600 dp smallest width and the third over it, so in the relaunch stage the third lands while the second's relaunch runs. Their size is the burst's last.
+const BURST_STEPS: [(i32, i32, u32); 3] = [
+    (1200, 800, 0xA7C0_0103),
+    (900, 500, 0xA7C0_0104),
+    (1100, 700, 0xA7C0_0105),
+];
+/// About two frames at 60 Hz: back to back, GTK applies only the last configure, and nothing behind it sees a burst.
+const BURST_GAP: Duration = Duration::from_millis(30);
+/// The fixture's lines: each instance's onCreate; onConfigurationChanged.
+const CREATE_LINE: &str = "AtlWindow: onCreate reached";
+const CHANGED_LINE: &str = "AtlWindow: configuration changed";
+/// The services' counters (activity.rs task_resized, activityRelaunched).
+const SENT_COUNTER: &str = "configuration change sent (ActivityConfigurationChangeItem)";
+const RELAUNCH_COUNTER: &str = "configuration change relaunch (ActivityRelaunchItem)";
+/// registry_service.rs set_bounds: a size change that reaches the windows only when the relaunch ends.
+const RESIZE_HELD: &str = "held for the relaunch";
+const RELAUNCHED_COUNTER: &str = "IActivityClientController.activityRelaunched ";
+/// Relaunches the relaunch stage may see: the shrink's, then at most two for the burst (its first size, and the last read when that one ends). More means the pending relaunch does not hold back the sizes behind it.
+const MAX_RELAUNCHES: u32 = 3;
 /// The fixture's blocking touch: an UP past this view x sleeps the UI thread (Main.java BLOCK_MIN_X). The probe's click lands past it, under the window's decorations.
 const BLOCK_MIN_X: f32 = 500.0;
 const BTN_LEFT: u32 = 0x110;
@@ -182,7 +222,9 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Input
         | Stage::Gtk
         | Stage::Widgets
-        | Stage::Resize => "AtlWindow: onResume reached",
+        | Stage::Resize
+        | Stage::Relaunch
+        | Stage::Declared => "AtlWindow: onResume reached",
     }
 }
 
@@ -671,19 +713,43 @@ fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         .then_some(())
         .ok_or("the fixture never drew")?;
     std::thread::sleep(INPUT_SETTLE);
-    let mut configured = Vec::new();
-    for (width, height, serial) in RESIZE_STEPS {
+    let (mut configured, [grow, shrink]) = (Vec::new(), RESIZE_STEPS);
+    let step = |(width, height, serial): (i32, i32, u32)| -> Result<bool, String> {
         proxy
             .inject_configure(width, height, serial)
             .map_err(|e| e.to_string())?;
-        configured.push(
-            await_event(&proxy.events, PONG_WAIT, |e| {
-                *e == ProxyEvent::Acked { serial }
-            })
-            .is_some(),
-        );
+        let acked = await_event(&proxy.events, PONG_WAIT, |e| {
+            *e == ProxyEvent::Acked { serial }
+        })
+        .is_some();
         std::thread::sleep(RESIZE_SETTLE);
+        Ok(acked)
+    };
+    configured.push(step(grow)?);
+    for (width, height, serial) in BURST_STEPS {
+        proxy
+            .inject_configure(width, height, serial)
+            .map_err(|e| e.to_string())?;
+        std::thread::sleep(BURST_GAP);
     }
+    std::thread::sleep(RESIZE_SETTLE);
+    configured.push(step(shrink)?);
+    // the window still takes input at its new size; in the relaunch stage this is the relaunched instance
+    let (x, y) = CLICK_POINT;
+    for action in [
+        PointerAction::Enter { x, y },
+        PointerAction::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        },
+        PointerAction::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        },
+    ] {
+        proxy.inject_pointer(action).map_err(|e| e.to_string())?;
+    }
+    std::thread::sleep(INPUT_SETTLE);
     Ok(Liveness {
         answered: false,
         silent: false,
@@ -783,7 +849,8 @@ type Steps = ((i32, i32), (i32, i32));
 /// The resize's steps from the Task's logged bounds. The services log a change only: a Task opens at the display's size (tasks.rs `size`), so the log is grow then shrink, and the display is the implicit first size.
 /// Grow is over the display in both dimensions, shrink under it in both.
 fn resize_steps(bounds: &[(i32, i32)], display: (i32, i32)) -> Result<Steps, String> {
-    let &[grow, shrink] = bounds else {
+    // what follows is the burst's: burst_check reads it
+    let &[grow, .., shrink] = bounds else {
         return Err(format!(
             "the Task's bounds {bounds:?}, want grow then shrink (the display is the first size)"
         ));
@@ -805,9 +872,10 @@ fn resize_steps(bounds: &[(i32, i32)], display: (i32, i32)) -> Result<Steps, Str
 fn bounds_check(services: &str, steps: &Result<Steps, String>) -> Result<String, String> {
     let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
     let counts = resized_counts(services);
-    if counts.len() != 2 || counts.contains(&0) {
+    let held = services.lines().filter(|l| l.contains(RESIZE_HELD)).count();
+    if counts.len() + held != task_bounds(services).len() || counts.contains(&0) {
         return Err(format!(
-            "resized {counts:?} windows, want one count per bounds change, at least one each"
+            "resized {counts:?} windows, {held} held, want one of the two per bounds change, at least one window each"
         ));
     }
     Ok(format!(
@@ -868,12 +936,28 @@ fn frame_check(app: &str, steps: &Result<Steps, String>) -> Result<String, Strin
     Ok("readbacks at grow and shrink are the quadrants at their sizes".to_owned())
 }
 
+/// The layout lines, less each that the next onCreate replaces with no layout between. The relaunch item is queued behind a traversal whose relayout already returns the Task's new size, so the old instance lays out once at that size on its old configuration. That layout is of an instance about to go, so its stale bounds are not a defect. Every other layout is judged.
+fn surviving_layouts(app: &str) -> Vec<&str> {
+    let lines: Vec<&str> = app
+        .lines()
+        .filter(|l| l.contains(LAYOUT_LINE) || l.contains(CREATE_LINE))
+        .collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            l.contains(LAYOUT_LINE) && !lines.get(i + 1).is_some_and(|n| n.contains(CREATE_LINE))
+        })
+        .map(|(_, l)| *l)
+        .collect()
+}
+
 /// Stage `resize` sub-gate (e): the display is the monitor's at every layout, the window's bounds are the layout's size, screenWidthDp changes with each size and equals the layout's px over its density.
 fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
     let want = format!("{}x{}", display.width, display.height);
     let mut sizes: Vec<&str> = Vec::new();
     let mut last: Option<(&str, &str)> = None;
-    for line in app.lines().filter(|l| l.contains(LAYOUT_LINE)) {
+    for line in surviving_layouts(app) {
         let size = word(line, "size").unwrap_or_default();
         let shown = word(line, "display");
         let window = word(line, "window");
@@ -922,7 +1006,7 @@ fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
     ))
 }
 
-/// Stage `resize`'s sub-gates, in [`RESIZE_SUB_NAMES`] order.
+/// The resize stages' sub-gates up to `display`, in [`RESIZE_SUB_NAMES`] order.
 fn resize_checks(
     app: &str,
     services: &str,
@@ -937,6 +1021,91 @@ fn resize_checks(
         frame_check(app, &steps),
         display_check(app, display),
     ]
+}
+
+/// The burst settled at its last size: the Task's bounds between grow and shrink number at most the configures and end there, and the app laid out at it. Content size = configured size less the header, read off the grow step.
+fn burst_check(app: &str, services: &str, steps: &Result<Steps, String>) -> Result<String, String> {
+    let &(grow, _) = steps.as_ref().map_err(Clone::clone)?;
+    let (width, height, _) = BURST_STEPS[BURST_STEPS.len() - 1];
+    let want = (width, height - (RESIZE_STEPS[0].1 - grow.1));
+    let bounds = task_bounds(services);
+    let burst = bounds.get(1..bounds.len().saturating_sub(1)).unwrap_or(&[]);
+    let layout = format!("{LAYOUT_LINE}{}x{} ", want.0, want.1);
+    if burst.len() > BURST_STEPS.len() || burst.last() != Some(&want) || !app.contains(&layout) {
+        return Err(format!(
+            "burst bounds {burst:?}, want at most {} ending at {want:?} and a layout there",
+            BURST_STEPS.len()
+        ));
+    }
+    Ok(format!("bounds {burst:?}, laid out at {want:?}"))
+}
+
+/// The last value of a services counter (`services: unimplemented <interface>.<method> N at=T`); 0 if it never counted.
+fn counter(services: &str, method: &str) -> u32 {
+    services
+        .lines()
+        .filter_map(|l| l.split_once(method))
+        .filter_map(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// What a fixture's activity must do across the resizes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lifecycle {
+    /// No thresholds: nothing crosses, the activity lives on and the configuration is sent. Whether it is told is not read: the item's alwaysReportChange tells it, the window's copy (no such flag) does not, and the two race.
+    Kept,
+    /// The sw600dp bucket, undeclared: the grow crosses nothing, the shrink relaunches.
+    Relaunches,
+    /// The sw600dp bucket, declared: no relaunch, onConfigurationChanged at each size.
+    Told,
+}
+
+/// Stage `resize`, `relaunch`, `declared` last sub-gate: the instances the app created, the relaunches the services sent and the changes the app was told are `want`'s.
+fn lifecycle_check(
+    app: &str,
+    services: &str,
+    steps: &Result<Steps, String>,
+    want: Lifecycle,
+) -> Result<String, String> {
+    let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
+    let creates = app.matches(CREATE_LINE).count() as u32;
+    let told: Vec<i32> = app
+        .lines()
+        .filter(|l| l.contains(CHANGED_LINE))
+        .filter_map(|l| word(l, "screenWidthDp")?.parse().ok())
+        .collect();
+    let sent = counter(services, SENT_COUNTER);
+    let relaunches = counter(services, RELAUNCH_COUNTER);
+    let relaunched = counter(services, RELAUNCHED_COUNTER);
+    let seen = format!(
+        "{creates} onCreate, {sent} sent, {relaunches} relaunches ({relaunched} ended), told {told:?}"
+    );
+    let ok = match want {
+        Lifecycle::Kept => creates == 1 && relaunches == 0 && sent >= 2,
+        Lifecycle::Told => {
+            // dp = px at the gate's density (display_check holds that)
+            creates == 1
+                && relaunches == 0
+                && told.contains(&grow.0)
+                && told.last() == Some(&shrink.0)
+        }
+        Lifecycle::Relaunches => {
+            let grown = app
+                .find(&format!("{LAYOUT_LINE}{}x{}", grow.0, grow.1))
+                .unwrap_or(usize::MAX);
+            let second = app.match_indices(CREATE_LINE).nth(1).map(|(at, _)| at);
+            (1..=MAX_RELAUNCHES).contains(&relaunches)
+                && relaunched == relaunches
+                && creates == relaunches + 1
+                && second.is_some_and(|at| at > grown)
+        }
+    };
+    if ok {
+        Ok(seen)
+    } else {
+        Err(format!("{seen}, want {want:?}"))
+    }
 }
 
 /// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
@@ -1150,7 +1319,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        Stage::Gtk | Stage::Widgets | Stage::Resize => {
+        Stage::Gtk | Stage::Widgets | Stage::Resize | Stage::Relaunch | Stage::Declared => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1176,10 +1345,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "window"
     };
     let work = rt.out.join(work_dir);
-    let fixture = if matches!(args.stage, Stage::Widgets) {
-        widgets::FIXTURE
-    } else {
-        FIXTURE
+    let fixture = match args.stage {
+        Stage::Widgets => widgets::FIXTURE,
+        Stage::Relaunch => SIZED_FIXTURE,
+        Stage::Declared => DECLARED_FIXTURE,
+        _ => FIXTURE,
     };
     let apk = rt.build_apk(&root.join(fixture), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
@@ -1210,7 +1380,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
     let widget_stage = matches!(args.stage, Stage::Widgets);
-    let resize_stage = matches!(args.stage, Stage::Resize);
+    let resize_stage = matches!(
+        args.stage,
+        Stage::Resize | Stage::Relaunch | Stage::Declared
+    );
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         std::thread::spawn(move || {
@@ -1279,7 +1452,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &liveness,
             widgets::display(display),
         ),
-        (Stage::Resize, Some(_)) => resize_checks(&app, &services, display, &liveness),
+        (Stage::Resize | Stage::Relaunch | Stage::Declared, Some(_)) => {
+            let want = match args.stage {
+                Stage::Relaunch => Lifecycle::Relaunches,
+                Stage::Declared => Lifecycle::Told,
+                _ => Lifecycle::Kept,
+            };
+            let steps = resize_steps(&task_bounds(&services), (display.width, display.height));
+            let mut sub = resize_checks(&app, &services, display, &liveness);
+            sub.push(
+                content_origin(&app).and_then(|origin| {
+                    track_check(&after_marker(&app, marker), CLICK_SCRIPT, origin)
+                }),
+            );
+            sub.push(burst_check(&app, &services, &steps));
+            sub.push(lifecycle_check(&app, &services, &steps, want));
+            sub
+        }
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, display),
@@ -1478,7 +1667,10 @@ mod tests {
             readback(3, 1),
         ];
         let ok = resize_run(&good, RESIZE_SERVICES, vec![true, true]);
-        assert_eq!(ok.len(), RESIZE_SUB_NAMES.len());
+        assert_eq!(
+            Some(ok.len()),
+            RESIZE_SUB_NAMES.iter().position(|n| *n == "click")
+        );
         assert!(ok.iter().all(Result::is_ok), "{ok:?}");
 
         let acks = resize_run(&good, RESIZE_SERVICES, vec![true, false]);
@@ -1535,6 +1727,75 @@ mod tests {
             dp[4].is_err(),
             "screenWidthDp did not change with the grow: {dp:?}"
         );
+    }
+
+    /// Each Lifecycle against a log of what it wants, and the one defect each must catch. Sizes are arbitrary: grow (6, 4), shrink (3, 1).
+    #[test]
+    fn lifecycle_check_tells_the_three_lives_apart() {
+        let steps: Result<Steps, String> = Ok(((6, 4), (3, 1)));
+        let count = |name: &str, n: u32| format!("services: unimplemented I.{name} {n} at=1\n");
+        let create = format!("{CREATE_LINE}\n");
+        let grown = format!("{LAYOUT_LINE}6x4 x\n");
+        let told = |dp: i32| format!("{CHANGED_LINE} screenWidthDp={dp}\n");
+        let check = |app: &str, services: &str, want| lifecycle_check(app, services, &steps, want);
+        let sent = count(SENT_COUNTER, 2);
+        assert!(check(&create, &sent, Lifecycle::Kept).is_ok());
+        assert!(check(&create, "", Lifecycle::Kept).is_err(), "never sent");
+        let twice = format!("{create}{grown}{create}");
+        assert!(check(&twice, &sent, Lifecycle::Kept).is_err());
+
+        let relaunched = format!(
+            "{}services: unimplemented {RELAUNCHED_COUNTER}1 at=1\n",
+            count(RELAUNCH_COUNTER, 1)
+        );
+        assert!(check(&twice, &relaunched, Lifecycle::Relaunches).is_ok());
+        let early = format!("{create}{create}{grown}");
+        assert!(
+            check(&early, &relaunched, Lifecycle::Relaunches).is_err(),
+            "relaunched before the grow"
+        );
+        assert!(check(&create, &relaunched, Lifecycle::Relaunches).is_err());
+        let many = count(RELAUNCH_COUNTER, MAX_RELAUNCHES + 1);
+        assert!(check(&twice, &many, Lifecycle::Relaunches).is_err());
+
+        let both = format!("{create}{}{}", told(6), told(3));
+        assert!(check(&both, "", Lifecycle::Told).is_ok());
+        let wrong_last = format!("{create}{}{}", told(3), told(6));
+        assert!(check(&wrong_last, "", Lifecycle::Told).is_err());
+        assert!(check(&create, "", Lifecycle::Told).is_err());
+    }
+
+    /// Only a layout straight before an onCreate drops out; the layout after it and one followed by another layout stay.
+    #[test]
+    fn a_layout_a_relaunch_replaces_is_not_judged() {
+        let app = format!(
+            "{CREATE_LINE}\n{LAYOUT_LINE}1\n{LAYOUT_LINE}2\n{CREATE_LINE}\n{LAYOUT_LINE}3\n"
+        );
+        let kept = surviving_layouts(&app);
+        assert_eq!(kept, [format!("{LAYOUT_LINE}1"), format!("{LAYOUT_LINE}3")]);
+    }
+
+    /// A 39 px header (grow configured 1000, content 961): the burst's last, 1100x700, is content 1100x661. It must be the last of the middle bounds, with a layout, and the middle no longer than the burst.
+    #[test]
+    fn burst_check_reads_the_last_size() {
+        let steps: Result<Steps, String> = Ok(((1600, 961), (960, 561)));
+        let bounds = |sizes: &[&str]| {
+            sizes
+                .iter()
+                .map(|s| format!("services: task 1 of uid 2 bounds {s}\n"))
+                .collect::<String>()
+        };
+        let layout = |s: &str| format!("x {LAYOUT_LINE}{s} y\n");
+        let (grow, last, shrink) = ("1600x961", "1100x661", "960x561");
+        let services = bounds(&[grow, "900x461", last, shrink]);
+        assert!(burst_check(&layout(last), &services, &steps).is_ok());
+        assert!(burst_check(&layout("900x461"), &services, &steps).is_err());
+        let stuck = bounds(&[grow, last, "900x461", shrink]);
+        assert!(burst_check(&layout(last), &stuck, &steps).is_err());
+        let dropped = bounds(&[grow, shrink]);
+        assert!(burst_check(&layout(last), &dropped, &steps).is_err());
+        let uncoalesced = bounds(&[grow, "1x1", "2x2", "3x3", last, shrink]);
+        assert!(burst_check(&layout(last), &uncoalesced, &steps).is_err());
     }
 
     #[test]

@@ -153,6 +153,7 @@ pub fn stage(
                 name: ACTIVITY.to_owned(),
                 launcher: true,
                 theme: 0,
+                config_changes: 0,
                 booleans: BTreeMap::new(),
             }],
             requested_permissions: vec![],

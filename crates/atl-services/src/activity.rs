@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use atl_aidl::aidl::android::app::IActivityClientController::{
     BnActivityClientController, IActivityClientController,
@@ -33,24 +33,27 @@ use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::window::SizeConfigurationBuckets;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
-    ActivityWindowInfo, ComponentInfo, LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
+    ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo, ComponentInfo,
+    LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
 };
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
     ThreadState,
 };
 
+use crate::config_diff::{self, Config, Delivery};
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::size_buckets::SizeBuckets;
-use crate::tasks::{TaskSize, Tasks};
+use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::{counters, manifest_flags, package, settings, token};
 
 const AM: &str = "IActivityManager";
@@ -173,6 +176,52 @@ pub(crate) fn task_configuration(display: &DisplayModel, size: TaskSize) -> Conf
     config
 }
 
+/// The plain form of a configuration: the fields config_diff reads, as the parcelable holds them (undefined stays as the parcel has it).
+impl From<&Configuration> for Config {
+    fn from(c: &Configuration) -> Self {
+        let rect = |r: &Rect| config_diff::Rect4 {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        };
+        let w = &c.window_configuration;
+        Config {
+            font_scale: c.font_scale,
+            mcc: c.mcc,
+            mnc: c.mnc,
+            locale_list: c.locale_list.clone(),
+            touchscreen: c.touchscreen,
+            keyboard: c.keyboard,
+            keyboard_hidden: c.keyboard_hidden,
+            hard_keyboard_hidden: c.hard_keyboard_hidden,
+            navigation: c.navigation,
+            navigation_hidden: c.navigation_hidden,
+            orientation: c.orientation,
+            screen_layout: c.screen_layout,
+            color_mode: c.color_mode,
+            ui_mode: c.ui_mode,
+            screen_width_dp: c.screen_width_dp,
+            screen_height_dp: c.screen_height_dp,
+            smallest_screen_width_dp: c.smallest_screen_width_dp,
+            density_dpi: c.density_dpi,
+            assets_seq: c.assets_seq,
+            font_weight_adjustment: c.font_weight_adjustment,
+            grammatical_gender: c.grammatical_gender,
+            window: config_diff::Window {
+                bounds: rect(&w.bounds),
+                app_bounds: w.app_bounds.as_ref().map(rect),
+                max_bounds: rect(&w.max_bounds),
+                windowing_mode: w.windowing_mode,
+                activity_type: w.activity_type,
+                always_on_top: w.always_on_top,
+                rotation: w.rotation,
+                display_rotation: w.display_rotation,
+            },
+        }
+    }
+}
+
 /// ActivityTaskSupervisor.java:1034: the ResumeActivityItem realStartActivityLocked schedules after the launch (andResume), with the same token as the launch.
 /// isForward is the launch's (the transition is forward), no compat fake focus.
 fn resume_item(token: SpIBinder) -> ResumeActivityItem {
@@ -227,6 +276,18 @@ struct Attached {
     _death: DeathRecipient,
 }
 
+/// An activity the services launched (ActivityRecord, reduced): the app thread it runs on and the merged configuration the app last got (ActivityRecord.mLastReportedConfiguration).
+struct ActivityEntry {
+    token: SpIBinder,
+    pid: i32,
+    thread: Strong<dyn IApplicationThread>,
+    reported: Config,
+    /// ActivityInfo.getRealConfigChanged: the CONFIG_* bits the activity handles itself
+    declared: u32,
+    /// a relaunch was sent and activityRelaunched has not come (ActivityRecord.mPendingRelaunchCount, at most 1 here: Delivery::Wait)
+    relaunching: bool,
+}
+
 #[derive(Default)]
 struct State {
     processes: Vec<ProcessRecord>,
@@ -236,6 +297,8 @@ struct State {
     next_ident: i32,
     /// ActivityManagerService.mApplicationSharedMemoryReadOnlyFd's region
     shared_memory: Option<ApplicationSharedMemory>,
+    /// the activities launched and attached; a configuration change reaches each through its thread (task_resized)
+    activities: Vec<ActivityEntry>,
 }
 
 /// InstrumentationReporter.Report: a status or the final report for a watcher.
@@ -318,6 +381,8 @@ struct Inner {
     display: DisplayModel,
     /// the Tasks: a launch that starts a Task creates it here and binds its activity's token to it (tasks.rs)
     tasks: Arc<Tasks<SpIBinder>>,
+    /// what each activity reported (ReportedBuckets), shared with the activity client controller
+    buckets: Arc<ReportedBuckets>,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -351,23 +416,27 @@ impl ActivityManager {
         tasks: Arc<Tasks<SpIBinder>>,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
-        let controller = BnActivityClientController::new_binder(
-            ActivityClientController {
-                buckets: Arc::clone(&buckets),
-            },
-            BinderFeatures::default(),
-        )
-        .as_binder();
         ActivityManager {
-            inner: Arc::new(Inner {
-                packages,
-                control,
-                state: Mutex::new(State::default()),
-                reporter: Reporter::new(),
-                controller,
-                settings: settings::new_binder(),
-                display,
-                tasks,
+            inner: Arc::new_cyclic(|inner| {
+                let controller = BnActivityClientController::new_binder(
+                    ActivityClientController {
+                        buckets: Arc::clone(&buckets),
+                        inner: inner.clone(),
+                    },
+                    BinderFeatures::default(),
+                )
+                .as_binder();
+                Inner {
+                    packages,
+                    control,
+                    state: Mutex::new(State::default()),
+                    reporter: Reporter::new(),
+                    controller,
+                    settings: settings::new_binder(),
+                    display,
+                    tasks,
+                    buckets,
+                }
             }),
         }
     }
@@ -388,9 +457,136 @@ impl ActivityManager {
             .start_process_locked(&mut st, p, p.process_name(), true, None)
             .map_err(|e| format!("starting {package}: {e}"))
     }
+
+    /// Registry set_bounds changed `task`'s size.
+    pub(crate) fn task_resized(&self, task: TaskId) {
+        self.inner.task_resized(task);
+    }
+
+    /// An activity of `task` is relaunching (WindowState.inRelaunchingActivity): its windows wait, a layout now would run in the old instance on the old configuration.
+    pub(crate) fn task_relaunching(&self, task: TaskId) -> bool {
+        self.inner.task_relaunching(task)
+    }
 }
 
 impl Inner {
+    /// ActivityRecord.ensureActivityConfiguration for each activity of `task`, at the Task's size now. Reported is recorded before the send, as AOSP's mLastReportedConfiguration.
+    /// A relaunch resumes the activity: the services keep no activity state, and an activity of a live Task is taken as resumed.
+    fn task_resized(&self, task: TaskId) {
+        let size = self.tasks.size(task);
+        let over = Configuration {
+            seq: self.tasks.config_seq(task),
+            ..task_override(&self.display, size)
+        };
+        let new = Config::from(&task_configuration(&self.display, size));
+        let task_rect = || Rect {
+            left: 0,
+            top: 0,
+            right: size.width,
+            bottom: size.height,
+        };
+        let window_info = || {
+            Some(ActivityWindowInfo {
+                is_embedded: false,
+                task_bounds: task_rect(),
+                task_fragment_bounds: task_rect(),
+            })
+        };
+        let mut sends = Vec::new();
+        {
+            let mut st = self.state();
+            for entry in st.activities.iter_mut() {
+                if self.tasks.task_of_activity(Some(&entry.token)) != Some(task) {
+                    continue;
+                }
+                let buckets = self.buckets.get(&entry.token);
+                let items = match config_diff::delivery(
+                    &entry.reported,
+                    &new,
+                    buckets.as_ref(),
+                    entry.declared,
+                    entry.relaunching,
+                ) {
+                    Delivery::Nothing => continue,
+                    Delivery::Wait => {
+                        counters::count(AM, "configuration change waits for the relaunch");
+                        continue;
+                    }
+                    Delivery::Send => {
+                        counters::count(
+                            AM,
+                            "configuration change sent (ActivityConfigurationChangeItem)",
+                        );
+                        vec![Some(ClientTransactionItem::ActivityConfigurationChange(
+                            Box::new(ActivityConfigurationChangeItem {
+                                activity_token: Some(entry.token.clone()),
+                                configuration: Some(over.clone()),
+                                activity_window_info: window_info(),
+                            }),
+                        ))]
+                    }
+                    Delivery::Relaunch {
+                        changes,
+                        preserve_window,
+                    } => {
+                        counters::count(AM, "configuration change relaunch (ActivityRelaunchItem)");
+                        entry.relaunching = true;
+                        vec![
+                            Some(ClientTransactionItem::ActivityRelaunch(Box::new(
+                                ActivityRelaunchItem {
+                                    activity_token: Some(entry.token.clone()),
+                                    config: Some(MergedConfiguration {
+                                        global: global_configuration(&self.display),
+                                        override_config: over.clone(),
+                                        merged: task_configuration(&self.display, size),
+                                    }),
+                                    activity_window_info: window_info(),
+                                    config_changes: changes as i32,
+                                    preserve_window,
+                                },
+                            ))),
+                            Some(ClientTransactionItem::ResumeActivity(resume_item(
+                                entry.token.clone(),
+                            ))),
+                        ]
+                    }
+                };
+                entry.reported = new.clone();
+                sends.push((entry.thread.clone(), ClientTransaction { items }));
+            }
+        }
+        for (thread, transaction) in sends {
+            if let Err(e) = thread.r#scheduleTransaction(Some(&transaction)) {
+                log(format_args!(
+                    "scheduleTransaction (configuration change): {e}"
+                ));
+            }
+        }
+    }
+
+    /// ActivityRecord.finishRelaunching: the relaunch of `token` ended, so what its Task's size did meanwhile is delivered now, and its windows, held back meanwhile, get the size unless another relaunch began.
+    fn relaunch_finished(&self, token: &SpIBinder) {
+        let mut st = self.state();
+        if let Some(entry) = st.activities.iter_mut().find(|e| e.token == *token) {
+            entry.relaunching = false;
+        }
+        drop(st);
+        let Some(task) = self.tasks.task_of_activity(Some(token)) else {
+            return;
+        };
+        self.task_resized(task);
+        if !self.task_relaunching(task) {
+            crate::window::notify_resized(&self.tasks, task);
+        }
+    }
+
+    fn task_relaunching(&self, task: TaskId) -> bool {
+        self.state()
+            .activities
+            .iter()
+            .any(|e| e.relaunching && self.tasks.task_of_activity(Some(&e.token)) == Some(task))
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -471,6 +667,7 @@ impl Inner {
             },
             theme: activity.theme,
             flags: manifest_flags::activity_flags(p, activity),
+            config_changes: activity.config_changes,
             ..Default::default()
         };
         LaunchActivityItem {
@@ -629,6 +826,7 @@ impl Inner {
                 return;
             };
             let mut rec = st.processes.remove(i);
+            st.activities.retain(|a| a.pid != pid);
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -894,6 +1092,15 @@ impl IActivityManager for ActivityManager {
         let token = token::new();
         let task = inner.tasks.new_task(uid);
         inner.tasks.bind_activity(token.clone(), task);
+        // the app starts with the global configuration and no override (launch_item): what it holds
+        inner.state().activities.push(ActivityEntry {
+            token: token.clone(),
+            pid,
+            thread: thread.clone(),
+            reported: Config::from(&global_configuration(&inner.display)),
+            declared: manifest_flags::real_config_changes(p, activity),
+            relaunching: false,
+        });
         let transaction = ClientTransaction {
             items: vec![
                 Some(ClientTransactionItem::LaunchActivity(Box::new(
@@ -1264,11 +1471,21 @@ impl ReportedBuckets {
             entries.push((token.clone(), buckets));
         }
     }
+
+    /// What `token` reported last; None when it reported none.
+    fn get(&self, token: &SpIBinder) -> Option<SizeBuckets> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .find(|(t, _)| t == token)
+            .map(|(_, b)| b.clone())
+    }
 }
 
-/// IActivityClientController, handed to the app in LaunchActivityItem (ActivityTaskSupervisor.java:1028 activityClientController). `buckets` holds what each activity reports.
+/// IActivityClientController, handed to the app in LaunchActivityItem (ActivityTaskSupervisor.java:1028 activityClientController). `buckets` holds what each activity reports. `inner` is weak: Inner owns this binder.
 struct ActivityClientController {
     buckets: Arc<ReportedBuckets>,
+    inner: Weak<Inner>,
 }
 
 impl Interface for ActivityClientController {}
@@ -1283,8 +1500,18 @@ impl IActivityClientController for ActivityClientController {
         Ok(DEFAULT_DISPLAY)
     }
 
-    /// ActivityClientController.reportSizeConfigurations:333-342: the activity's size buckets, kept under its token for the size changes after it (filterDiff reads them there, once the
-    /// resize path does). The app sends it oneway, so a token-less report is only counted.
+    /// ActivityClientController.activityRelaunched (ActivityThread.reportRelaunch): the relaunch ended. Oneway, so a token-less call is only counted.
+    fn r#activityRelaunched(&self, token: Option<&SpIBinder>) -> binder::Result<()> {
+        let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
+            counters::count(ACC, "activityRelaunched: no token");
+            return Ok(());
+        };
+        counters::count(ACC, "activityRelaunched");
+        inner.relaunch_finished(token);
+        Ok(())
+    }
+
+    /// ActivityClientController.reportSizeConfigurations:333-342: the activity's size buckets, kept under its token for the size changes after it (filterDiff reads them there). The app sends it oneway, so a token-less report is only counted.
     fn r#reportSizeConfigurations(
         &self,
         token: Option<&SpIBinder>,
