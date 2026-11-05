@@ -43,6 +43,11 @@ import android.view.InsetsSource;
 import android.view.InsetsSourceControl;
 import android.view.InsetsState;
 import android.view.PointerIcon;
+import android.os.UserHandle;
+import android.text.InputType;
+import android.view.autofill.AutofillId;
+import android.view.inputmethod.EditorInfo;
+import android.window.ImeOnBackInvokedDispatcher;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -226,10 +231,66 @@ public class ParcelTruth {
         check("StorageVolume", new StorageVolume.Builder("emulated", new File("/storage/emulated/0"), "Internal shared storage", UserHandle.SYSTEM, "mounted").setPrimary(true).setEmulated(true).build(), StorageVolume.CREATOR);
         checkInputChannel("InputChannel");
         check("PointerIcon", systemIcon(PointerIcon.TYPE_ARROW), PointerIcon.CREATOR);
+        // the focus path: InputMethodManager.startInputInner sends both on every window focus gain (atl-services input_method.rs)
+        check("EditorInfo", editorInfo(), EditorInfo.CREATOR);
+        check("EditorInfo:empty", new EditorInfo(), EditorInfo.CREATOR);
+        checkImeDispatcher("ImeOnBackInvokedDispatcher");
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    /// An EditorInfo with every field off its default: autofill id, extras, surrounding text, hint locales, MIME types, target user.
+    static EditorInfo editorInfo() {
+        EditorInfo e = new EditorInfo();
+        e.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
+        e.imeOptions = EditorInfo.IME_ACTION_DONE;
+        e.privateImeOptions = "com.example.opt";
+        e.actionLabel = "Go";
+        e.actionId = 7;
+        e.initialSelStart = 1;
+        e.initialSelEnd = 3;
+        e.initialCapsMode = 0x2000;
+        e.hintText = "hint";
+        e.label = "label";
+        e.packageName = "com.example.app";
+        e.autofillId = new AutofillId(42);
+        e.fieldId = 42;
+        e.fieldName = "name";
+        e.extras = new Bundle();
+        e.extras.putString("key", "value");
+        e.setInitialSurroundingText("hello world");
+        e.hintLocales = LocaleList.forLanguageTags("en-US,fr");
+        e.contentMimeTypes = new String[] {"image/png"};
+        e.targetInputMethodUser = UserHandle.of(10);
+        return e;
+    }
+
+    /// ImeOnBackInvokedDispatcher carries its ResultReceiver's binder: Java Parcel -> codec -> Java Parcel with its objects (roundTripParcel); every byte consumed, Java reads it back,
+    /// and the binder Java re-writes from the read value is the original one.
+    static void checkImeDispatcher(String name) {
+        ImeOnBackInvokedDispatcher d = new ImeOnBackInvokedDispatcher(null);
+        Parcel in = written(d);
+        in.readInt();
+        IBinder sent = in.readStrongBinder();
+        in.setDataPosition(0);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.window.ImeOnBackInvokedDispatcher", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        ImeOnBackInvokedDispatcher back = ImeOnBackInvokedDispatcher.CREATOR.createFromParcel(out);
+        Parcel again = written(back);
+        again.readInt();
+        IBinder got = again.readStrongBinder();
+        boolean ok = consumed && sent != null && got == sent;
+        result(ok, name, ok ? "result receiver's binder survived java -> rust -> java" : "sizes " + in.dataSize() + "/" + out.dataSize() + ", binder " + got + " vs " + sent);
+        in.recycle();
+        out.recycle();
+        again.recycle();
     }
 
     /// A system icon as a receiver gets one: getSystemIcon(int) is private, and the public overload loads resources through a Context.

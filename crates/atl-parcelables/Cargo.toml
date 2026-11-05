@@ -14,7 +14,7 @@ publish.workspace = true
 # as aconfig evaluates them for the release (src/aconfig.rs).
 [package.metadata.atl.rust_library]
 rustlibs = ["libbinder_rs"]
-aconfig = ["android.security.flags-aconfig", "android.view.flags-aconfig"]
+aconfig = ["android.security.flags-aconfig", "android.view.flags-aconfig", "android.view.inputmethod.flags-aconfig"]
 
 [lints]
 workspace = true

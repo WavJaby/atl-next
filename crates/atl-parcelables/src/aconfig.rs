@@ -56,6 +56,18 @@ const SECURITY: &str = include_str!(concat!(
 pub const PREVENT_INTENT_REDIRECT: bool =
     read_only_flag(SECURITY, "android.security.prevent_intent_redirect");
 
+/// android.view.inputmethod (core/java/android/view/inputmethod/flags.aconfig, module `android.view.inputmethod.flags-aconfig`).
+const IME_FLAGS: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/android.view.inputmethod.flags-aconfig.aconfig.txt"
+));
+
+/// `android.view.inputmethod.Flags.editorinfoHandwritingEnabled()` (EditorInfo.java:1369): EditorInfo's stylus-handwriting boolean (codecs/android/view/inputmethod/EditorInfo.rs).
+pub const EDITORINFO_HANDWRITING_ENABLED: bool = read_only_flag(
+    IME_FLAGS,
+    "android.view.inputmethod.editorinfo_handwriting_enabled",
+);
+
 /// android.view.flags (core/java/android/view/flags/*.aconfig, module `android.view.flags-aconfig`).
 const VIEW_FLAGS: &str = include_str!(concat!(
     env!("OUT_DIR"),

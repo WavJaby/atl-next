@@ -52,12 +52,16 @@ pub mod android {
         pub mod InsetsSourceControl_Array;
         pub mod InsetsState;
         pub mod PointerIcon;
+        pub mod inputmethod {
+            pub mod EditorInfo;
+        }
         pub mod SurfaceControl;
         pub mod WindowManager_LayoutParams;
         pub mod WindowRelayoutResult;
     }
     pub mod window {
         pub mod ClientWindowFrames;
+        pub mod ImeOnBackInvokedDispatcher;
         pub mod SizeConfigurationBuckets;
     }
 }

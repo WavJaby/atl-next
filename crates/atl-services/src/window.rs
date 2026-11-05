@@ -202,6 +202,8 @@ impl IWindowManager for WindowManager {
     /// WindowManagerService.setInTouchMode:4045: records the mode and has the dispatcher tell the display's other windows (TouchModeEvent). The caller changes its own mode locally after the call
     /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
     fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
+        // counted: the window gate's input stage requires this line (xtask window.rs touch_mode_check)
+        counters::count(INTERFACE, "setInTouchMode (answered)");
         Ok(())
     }
 

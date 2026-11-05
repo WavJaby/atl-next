@@ -1249,6 +1249,18 @@ fn input_check(after: &[&str], script: &str) -> Result<String, String> {
     track_check(after, script, (0.0, 0.0))
 }
 
+/// The services' count line of an answered WMS setInTouchMode (atl-services window.rs). Unanswered, the same call counts as plain `setInTouchMode`.
+const TOUCH_MODE_LINE: &str = "IWindowManager.setInTouchMode (answered)";
+
+/// Sub-gate: the script's first touch takes the window into touch mode (ViewRootImpl.ensureTouchMode -> IWindowManager.setInTouchMode), and the services answer it.
+fn touch_mode_check(services: &str) -> Result<String, String> {
+    if services.contains(TOUCH_MODE_LINE) {
+        Ok("touch-mode: WMS setInTouchMode answered".to_owned())
+    } else {
+        Err("touch-mode: no answered IWindowManager.setInTouchMode in the services log".to_owned())
+    }
+}
+
 /// The platform's log line of the content origin (atl-platform-ui `GtkWindow::present`), read by [`content_origin`].
 const CONTENT_ORIGIN_LINE: &str = "atl-platform-ui: content origin ";
 
@@ -1475,47 +1487,49 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("---- app log\n{app}");
     }
     // the sub-gates, once the marker is logged (they read the frames or the touches after it)
-    let sub: Vec<Result<String, String>> = match (args.stage, v.marker_ms) {
-        (Stage::Frames, Some(_)) => {
-            vec![
-                picture_check(&app, display),
-                cadence_check(&after_marker(&app, marker), display.refresh_hz),
-            ]
-        }
-        (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
-        (Stage::Widgets, Some(_)) => widgets::checks(
-            &app,
-            &after_marker(&app, marker),
-            &liveness,
-            widgets::display(display),
-        ),
-        (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
-            let want = match args.stage {
-                Stage::Relaunch => Lifecycle::Relaunches,
-                Stage::Declared | Stage::StartFinish => Lifecycle::Told,
-                _ => Lifecycle::Kept,
-            };
-            let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
-            let mut sub = resize_checks(&app, &services, display, &liveness);
-            sub.push(
-                content_origin(&app).and_then(|origin| {
+    let sub: Vec<Result<String, String>> =
+        match (args.stage, v.marker_ms) {
+            (Stage::Frames, Some(_)) => {
+                vec![
+                    picture_check(&app, display),
+                    cadence_check(&after_marker(&app, marker), display.refresh_hz),
+                ]
+            }
+            (Stage::Input, Some(_)) => vec![
+                input_check(&after_marker(&app, marker), POINTER_SCRIPT),
+                touch_mode_check(&services),
+            ],
+            (Stage::Widgets, Some(_)) => widgets::checks(
+                &app,
+                &after_marker(&app, marker),
+                &liveness,
+                widgets::display(display),
+            ),
+            (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
+                let want = match args.stage {
+                    Stage::Relaunch => Lifecycle::Relaunches,
+                    Stage::Declared | Stage::StartFinish => Lifecycle::Told,
+                    _ => Lifecycle::Kept,
+                };
+                let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
+                let mut sub = resize_checks(&app, &services, display, &liveness);
+                sub.push(content_origin(&app).and_then(|origin| {
                     track_check(&after_marker(&app, marker), CLICK_SCRIPT, origin)
+                }));
+                sub.push(burst_check(&app, &services, &steps));
+                sub.push(lifecycle_check(&app, &services, &steps, want));
+                sub
+            }
+            (Stage::Gtk, Some(_)) => vec![
+                gtk_window_check(&app),
+                gtk_capture_check(&app, display),
+                content_origin(&app).and_then(|origin| {
+                    track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
                 }),
-            );
-            sub.push(burst_check(&app, &services, &steps));
-            sub.push(lifecycle_check(&app, &services, &steps, want));
-            sub
-        }
-        (Stage::Gtk, Some(_)) => vec![
-            gtk_window_check(&app),
-            gtk_capture_check(&app, display),
-            content_origin(&app).and_then(|origin| {
-                track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
-            }),
-            pong_check(&liveness),
-        ],
-        _ => Vec::new(),
-    };
+                pong_check(&liveness),
+            ],
+            _ => Vec::new(),
+        };
     let sub_fault = sub.iter().find_map(|r| r.as_ref().err().cloned());
     for (name, result) in args.stage.sub_names().iter().zip(&sub) {
         match result {
