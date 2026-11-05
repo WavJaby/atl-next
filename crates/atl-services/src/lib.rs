@@ -11,6 +11,7 @@ extern crate atl_parcelables;
 #[cfg(feature = "converter")]
 extern crate binder;
 
+pub mod activity_stack;
 pub mod compositor_registry;
 pub mod config_diff;
 pub mod counters;

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! android.app.servertransaction.ClientTransaction: app/servertransaction/ClientTransaction.java writeToParcel (writeParcelableList of mTransactionItems) / ClientTransaction(Parcel).
-//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
+//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, PauseActivityItem, StopActivityItem, DestroyActivityItem, StartActivityItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -11,12 +11,20 @@ const RESUME_ACTIVITY_ITEM: &str = "android.app.servertransaction.ResumeActivity
 const ACTIVITY_CONFIGURATION_CHANGE_ITEM: &str =
     "android.app.servertransaction.ActivityConfigurationChangeItem";
 const ACTIVITY_RELAUNCH_ITEM: &str = "android.app.servertransaction.ActivityRelaunchItem";
+const PAUSE_ACTIVITY_ITEM: &str = "android.app.servertransaction.PauseActivityItem";
+const STOP_ACTIVITY_ITEM: &str = "android.app.servertransaction.StopActivityItem";
+const DESTROY_ACTIVITY_ITEM: &str = "android.app.servertransaction.DestroyActivityItem";
+const START_ACTIVITY_ITEM: &str = "android.app.servertransaction.StartActivityItem";
 
 #[derive(Debug, Clone)]
 pub enum ClientTransactionItem {
     /// Boxed: LaunchActivityItem is several hundred bytes, the other variant tens (clippy `large_enum_variant`, denied by the converter's clippy-driver build).
     LaunchActivity(Box<LaunchActivityItem>),
     ResumeActivity(ResumeActivityItem),
+    PauseActivity(PauseActivityItem),
+    StopActivity(StopActivityItem),
+    DestroyActivity(DestroyActivityItem),
+    StartActivity(StartActivityItem),
     /// Boxed like LaunchActivity: the Configuration and ActivityWindowInfo make it large.
     ActivityConfigurationChange(Box<ActivityConfigurationChangeItem>),
     /// Boxed: three Configurations.
@@ -41,6 +49,22 @@ impl Part for ClientTransaction {
                 }
                 Some(ClientTransactionItem::ResumeActivity(i)) => {
                     w_str16(p, &Some(RESUME_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
+                Some(ClientTransactionItem::PauseActivity(i)) => {
+                    w_str16(p, &Some(PAUSE_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
+                Some(ClientTransactionItem::StopActivity(i)) => {
+                    w_str16(p, &Some(STOP_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
+                Some(ClientTransactionItem::DestroyActivity(i)) => {
+                    w_str16(p, &Some(DESTROY_ACTIVITY_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
+                Some(ClientTransactionItem::StartActivity(i)) => {
+                    w_str16(p, &Some(START_ACTIVITY_ITEM.to_owned()))?;
                     i.write(p)?;
                 }
                 Some(ClientTransactionItem::ActivityConfigurationChange(i)) => {
@@ -68,6 +92,18 @@ impl Part for ClientTransaction {
                 )),
                 Some(RESUME_ACTIVITY_ITEM) => Some(ClientTransactionItem::ResumeActivity(
                     ResumeActivityItem::read(p)?,
+                )),
+                Some(PAUSE_ACTIVITY_ITEM) => Some(ClientTransactionItem::PauseActivity(
+                    PauseActivityItem::read(p)?,
+                )),
+                Some(STOP_ACTIVITY_ITEM) => Some(ClientTransactionItem::StopActivity(
+                    StopActivityItem::read(p)?,
+                )),
+                Some(DESTROY_ACTIVITY_ITEM) => Some(ClientTransactionItem::DestroyActivity(
+                    DestroyActivityItem::read(p)?,
+                )),
+                Some(START_ACTIVITY_ITEM) => Some(ClientTransactionItem::StartActivity(
+                    StartActivityItem::read(p)?,
                 )),
                 Some(ACTIVITY_CONFIGURATION_CHANGE_ITEM) => {
                     Some(ClientTransactionItem::ActivityConfigurationChange(

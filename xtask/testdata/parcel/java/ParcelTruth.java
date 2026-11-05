@@ -13,8 +13,12 @@ import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ActivityRelaunchItem;
 import android.app.servertransaction.ClientTransaction;
 import android.app.servertransaction.ClientTransactionItem;
+import android.app.servertransaction.DestroyActivityItem;
 import android.app.servertransaction.LaunchActivityItem;
+import android.app.servertransaction.PauseActivityItem;
 import android.app.servertransaction.ResumeActivityItem;
+import android.app.servertransaction.StartActivityItem;
+import android.app.servertransaction.StopActivityItem;
 import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Intent;
@@ -159,6 +163,11 @@ public class ParcelTruth {
                 new ActivityConfigurationChangeItem(itemToken, config, new ActivityWindowInfo()), itemToken);
         checkTransactionItem("ClientTransaction:relaunch",
                 new ActivityRelaunchItem(itemToken, null, null, ActivityInfo.CONFIG_SCREEN_SIZE, new MergedConfiguration(config, config), true, new ActivityWindowInfo()), itemToken);
+        // the lifecycle items of an activity switch (ActivityRecord.startPausing, stopIfPossible, destroyIfPossible; a start of a stopped record: ActivityRecord.java:6055)
+        checkTransactionItem("ClientTransaction:pause", new PauseActivityItem(itemToken, true, false, true, false), itemToken);
+        checkTransactionItem("ClientTransaction:stop", new StopActivityItem(itemToken), itemToken);
+        checkTransactionItem("ClientTransaction:destroy", new DestroyActivityItem(itemToken, true), itemToken);
+        checkTransactionItem("ClientTransaction:start", new StartActivityItem(itemToken, null), itemToken);
         // ActivityThread.reportSizeConfigurations: an app with no size-qualified resource sends the flags alone; a full one every array and the long bit
         check("SizeConfigurationBuckets:none", new SizeConfigurationBuckets(new Configuration[0]), SizeConfigurationBuckets.CREATOR);
         Configuration sized = new Configuration();

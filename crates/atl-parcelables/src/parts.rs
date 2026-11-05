@@ -633,6 +633,93 @@ impl Part for ActivityConfigurationChangeItem {
     }
 }
 
+/// android.app.servertransaction.PauseActivityItem (PauseActivityItem.java:84-89 writeToParcel): the ActivityTransactionItem's token, then finished, userLeaving, dontReport and autoEnteringPip as booleans.
+/// The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct PauseActivityItem {
+    pub activity_token: Option<SpIBinder>,
+    pub finished: bool,
+    pub user_leaving: bool,
+    pub dont_report: bool,
+    pub auto_entering_pip: bool,
+}
+impl Part for PauseActivityItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_bool(p, self.finished)?;
+        w_bool(p, self.user_leaving)?;
+        w_bool(p, self.dont_report)?;
+        w_bool(p, self.auto_entering_pip)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(PauseActivityItem {
+            activity_token: r_binder(p)?,
+            finished: r_bool(p)?,
+            user_leaving: r_bool(p)?,
+            dont_report: r_bool(p)?,
+            auto_entering_pip: r_bool(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.StopActivityItem (StopActivityItem.java:62-63: no writeToParcel of its own): the ActivityTransactionItem's token alone.
+/// The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct StopActivityItem {
+    pub activity_token: Option<SpIBinder>,
+}
+impl Part for StopActivityItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(StopActivityItem {
+            activity_token: r_binder(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.DestroyActivityItem (DestroyActivityItem.java:73-75 writeToParcel): the token, then finished.
+/// The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct DestroyActivityItem {
+    pub activity_token: Option<SpIBinder>,
+    pub finished: bool,
+}
+impl Part for DestroyActivityItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_bool(p, self.finished)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(DestroyActivityItem {
+            activity_token: r_binder(p)?,
+            finished: r_bool(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.StartActivityItem (StartActivityItem.java:63-65 writeToParcel): the token, then the SceneTransitionInfo as a typed object. Only null is modelled
+/// (flag 0), as LaunchActivityItem does. The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct StartActivityItem {
+    pub activity_token: Option<SpIBinder>,
+}
+impl Part for StartActivityItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_present(p, false) // sceneTransitionInfo
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        let activity_token = r_binder(p)?;
+        r_absent(
+            p,
+            "android.app.servertransaction.StartActivityItem.sceneTransitionInfo",
+        )?;
+        Ok(StartActivityItem { activity_token })
+    }
+}
+
 /// android.view.Display.Mode (Display.java:2695 writeToParcel / Mode(Parcel)): a nested class of DisplayInfo, not an AIDL parcelable, so a Part here and no codec file.
 /// Its arrays are the Java ones (`createFloatArray` / `createIntArray`): null is -1, which Mode's constructor never produces.
 #[derive(Debug, Clone, Default, PartialEq)]
