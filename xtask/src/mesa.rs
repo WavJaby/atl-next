@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! `xtask mesa-config`: inputs for Mesa's own meson build with `platforms=android` (GPU slice G1), from one converter out dir.
-//! Mesa's `meson.build` looks up AOSP libraries by pkg-config (`dependency('cutils')` & co., AOSP Mesa `meson.build` `if with_platform_android`); on Android Soong supplies them, here the converter built them. Writes `<dest>/pkgconfig/<name>.pc` per looked-up name, each pointing at the converter's `.so` and the include dirs the converter compiled that library with (graph.json `artifacts.<module>.cxx` `-I`), plus `<dest>/native.ini`, a meson native file carrying `pkg_config_path` and the decided project options. Mesa itself is run as-is (`meson setup --native-file <dest>/native.ini <build> <mesa>`); no Mesa source change.
+//! Mesa's `meson.build` looks up AOSP libraries by pkg-config (`dependency('cutils')` & co., AOSP Mesa `meson.build` `if with_platform_android`); on Android Soong supplies them, here the converter built them. Writes `<dest>/pkgconfig/<name>.pc` per looked-up name, each pointing at the converter's `.so` and the include dirs the converter compiled that library with (graph.json `artifacts.<module>.cxx` `-I`), the host libraries Mesa may find ([`HOST_PC`]), `<dest>/forced.h`, and `<dest>/native.ini`, a meson native file carrying the converter's device compilers and flags (graph.json `device`), `pkg_config_libdir` and the decided project options. Mesa itself is run by meson (`meson setup --native-file <dest>/native.ini <build> <mesa>`) from its checkout = pin + patches/aosp/external/mesa3d (`--mesa`: the task copy while one exists).
 //! Include dirs are the library's own compile dirs, a superset of its Android.bp `export_include_dirs` (private dirs included): graph.json does not record the exported subset. Narrow it when the converter emits exports.
 //! Every option name is checked against the pinned Mesa's `meson_options.txt`, so a pin bump that renames an option fails here, not as a silent meson default.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
@@ -25,6 +25,14 @@ pub const PC_MODULES: &[(&str, &str)] = &[
     ("sync", "device/libsync"),
     ("nativewindow", "device/libnativewindow"),
     ("ui", "device/libui"),
+];
+
+/// Host (distro) libraries Mesa may find by pkg-config; their `.pc` files are copied next to [`PC_MODULES`]' and native.ini restricts pkg-config to that dir (`pkg_config_libdir`).
+/// Mesa looks up libudev, SPIRV-Tools and libelf as `required: false` with no option to turn them off (owner 2026-11-06: not linked; SPIRV-Tools is a libstdc++ static archive, which breaks the libc++ link of libgallium_dri). Whatever the build host has installed, only these are found.
+pub const HOST_PC: &[&str] = &[
+    // disk cache and blob compression (`zlib` / `zstd` options)
+    "zlib", "libzstd", // platform_android.c, u_gralloc: render node / dmabuf handling
+    "libdrm",
 ];
 
 /// One meson option value, in machine-file syntax.
@@ -140,6 +148,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for (name, module) in PC_MODULES {
         let text = pc_file(name, module, &graph)?;
         std::fs::write(pc_dir.join(format!("{name}.pc")), text)?;
+    }
+    for name in HOST_PC {
+        let out = Command::new("pkg-config")
+            .args(["--variable=pcfiledir", name])
+            .output()
+            .context("running pkg-config")?;
+        ensure!(
+            out.status.success(),
+            "pkg-config does not find host library `{name}` (HOST_PC)"
+        );
+        let dir = PathBuf::from(String::from_utf8(out.stdout)?.trim());
+        std::fs::copy(
+            dir.join(format!("{name}.pc")),
+            pc_dir.join(format!("{name}.pc")),
+        )?;
     }
     let forced = args.dest.join(FORCED_HEADER);
     std::fs::write(&forced, forced_header(&graph.device))?;
@@ -278,9 +301,10 @@ pub fn native_file(pc_dir: &Path, forced: &Path, graph: &Graph) -> Result<String
     );
     let _ = writeln!(s, "c_link_args = {}", array(d.link.iter()));
     let _ = writeln!(s, "cpp_link_args = {}", array(d.link.iter()));
+    // libdir, not path: pkg-config then searches only this dir, never the host's defaults (HOST_PC)
     let _ = writeln!(
         s,
-        "pkg_config_path = ['{}']\n\n[project options]",
+        "\n[properties]\npkg_config_libdir = ['{}']\n\n[project options]",
         pc_dir.display()
     );
     let _ = writeln!(
@@ -439,7 +463,10 @@ mod tests {
         g.product_variables
             .insert("platform_sdk_version".into(), 1.into());
         let text = native_file(pc, Path::new("/d/f.h"), &g).unwrap();
-        assert!(text.contains(&format!("pkg_config_path = ['{}']", pc.display())));
+        assert!(text.contains(&format!(
+            "[properties]\npkg_config_libdir = ['{}']\n",
+            pc.display()
+        )));
         for (n, o) in OPTIONS {
             let line = text
                 .lines()
