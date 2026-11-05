@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: MIT
+# The Rust system services (crate atl-services) and the AOSP code each one reproduces: what an AOSP tag bump must be reviewed against (`xtask upgrade-diff <old> <new>` prints the churn per entry).
+#
+# Row key: the servicemanager name the service is registered under. The set of rows must equal the names atl-system-services registers (`binder::add_service` in crates/atl-services/src/bin/system_services.rs), checked by step `tables` of `xtask check`.
+#   src       the Rust files that implement the service, repo-relative; each must exist.
+#   mirrors   AOSP tree paths at the pin in sources.toml, each `<path>` (whole file) or `<path>#<Name>`. A Name starting upper-case is a class/interface/enum/record and must be declared in the file
+#             (`class Name`, ...); one starting lower-case is a method and must be declared there: a line `<modifiers/annotations> <type> name(` (a call or a field does not count). Overloads count as one entry.
+#             The file is read from the pinned commit of its project (longest `[aosp.projects]` prefix), not the checkout's working tree, so our patches never hide upstream churn.
+#   reason    required exactly when `mirrors` is empty: why the service reproduces no AOSP code. Prose, not checked.
+# Rows list the AOSP code the Rust logic copies behaviour from, plus the client-side wire it speaks when that wire is not generated from AIDL (servertransaction items). AIDL files are not listed: the converter regenerates the stubs.
+
+[activity]
+src = [
+    "crates/atl-services/src/activity.rs",
+    "crates/atl-services/src/activity_stack.rs",
+    "crates/atl-services/src/config_diff.rs",
+    "crates/atl-services/src/size_buckets.rs",
+    "crates/atl-services/src/process_control.rs",
+]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#attachApplication",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#finishAttachApplication",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#handleApplicationCrash",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#getContentProvider",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#startInstrumentation",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#addInstrumentationResults",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#finishInstrumentation",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#broadcastIntentWithFeature",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#registerReceiverWithFeature",
+    "frameworks/base/services/core/java/com/android/server/am/ProcessList.java#startProcessLocked",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityResumed",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityPaused",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityStopped",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityDestroyed",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#finishActivity",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#getDisplayId",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#activityRelaunched",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#reportSizeConfigurations",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java#setTaskDescription",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java#realStartActivityLocked",
+    "frameworks/base/services/core/java/com/android/server/wm/TaskFragment.java#resumeTopActivity",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java#shouldRelaunchLocked",
+    "frameworks/base/services/core/java/com/android/server/wm/ClientLifecycleManager.java#scheduleTransactionItem",
+    "frameworks/base/core/java/android/content/res/Configuration.java#diff",
+    "frameworks/base/core/java/android/window/SizeConfigurationBuckets.java#filterDiff",
+    "frameworks/base/core/java/android/app/servertransaction/ClientTransactionItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/LaunchActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/ResumeActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/PauseActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/StopActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/StartActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/DestroyActivityItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/ActivityRelaunchItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/ActivityConfigurationChangeItem.java",
+    "frameworks/base/core/java/android/app/servertransaction/ConfigurationChangeItem.java",
+]
+
+[activity_task]
+src = [
+    "crates/atl-services/src/activity_task.rs",
+    "crates/atl-services/src/activity_start.rs",
+    "crates/atl-services/src/tasks.rs",
+]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java#startActivity",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java#getActivityClientController",
+    "frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java#executeRequest",
+    "frameworks/base/services/core/java/com/android/server/wm/Task.java#setBounds",
+]
+
+[package]
+src = [
+    "crates/atl-services/src/package.rs",
+    "crates/atl-services/src/packages.rs",
+    "crates/atl-services/src/manifest_flags.rs",
+]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getApplicationInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackageInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getPackagesForUid",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#checkSignatures",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#getInstrumentationInfoAsUser",
+    "frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java#queryInstrumentationAsUser",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java#hasSystemFeature",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java#notifyDexLoad",
+    "frameworks/base/core/java/com/android/internal/pm/pkg/component/ComponentParseUtils.java",
+]
+
+[display]
+src = [
+    "crates/atl-services/src/display.rs",
+    "crates/atl-services/src/display_model.rs",
+]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#getDisplayInfo",
+    "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#getDisplayIds",
+    "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#registerCallback",
+    "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#registerCallbackWithEventMask",
+    "frameworks/base/core/java/android/view/DisplayInfo.java#writeToParcel",
+]
+
+[window]
+src = ["crates/atl-services/src/window.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#openSession",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#hasNavigationBar",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#setInTouchMode",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#getCurrentAnimatorScale",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#addWindow",
+    "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#relayoutWindow",
+    "frameworks/base/services/core/java/com/android/server/wm/Session.java#addToDisplayAsUser",
+    "frameworks/base/services/core/java/com/android/server/wm/Session.java#relayout",
+    "frameworks/base/services/core/java/com/android/server/wm/Session.java#remove",
+]
+
+[input_method]
+src = ["crates/atl-services/src/input_method.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#addClient",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#startInputOrWindowGainedFocus",
+]
+
+[content]
+src = [
+    "crates/atl-services/src/content.rs",
+    "crates/atl-services/src/observer_rules.rs",
+]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/content/ContentService.java#registerContentObserver",
+    "frameworks/base/services/core/java/com/android/server/content/ContentService.java#unregisterContentObserver",
+    "frameworks/base/services/core/java/com/android/server/content/ContentService.java#notifyChange",
+    "frameworks/base/services/core/java/com/android/server/content/ContentService.java#ObserverNode",
+]
+
+[audio]
+src = ["crates/atl-services/src/audio.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#areNavigationRepeatSoundEffectsEnabled",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playSoundEffect",
+]
+
+[user]
+src = ["crates/atl-services/src/user.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserRunning",
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserUnlocked",
+    "frameworks/base/services/core/java/com/android/server/pm/UserManagerService.java#isUserUnlockingOrUnlocked",
+]
+
+[mount]
+src = ["crates/atl-services/src/storage.rs"]
+mirrors = ["frameworks/base/services/core/java/com/android/server/StorageManagerService.java#getVolumeList"]
+
+[clipboard]
+src = ["crates/atl-services/src/clipboard.rs"]
+mirrors = []
+reason = "registered only so ClipboardManager's constructor finds the service; every method keeps the stub's UNKNOWN_TRANSACTION default (clipboard.rs), so no ClipboardService behaviour is reproduced yet"
+
+[input]
+src = ["crates/atl-services/src/input.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#getVelocityTrackerStrategy",
+    "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#getInputDeviceIds",
+    "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#getInputDevice",
+    "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#registerInputDevicesChangedListener",
+    "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#setPointerIcon",
+]
+
+["atl.compositor_registry"]
+src = [
+    "crates/atl-services/src/registry_service.rs",
+    "crates/atl-services/src/compositor_registry.rs",
+]
+mirrors = []
+reason = "ATL's own interface (ICompositorRegistry): registers each app's in-process SurfaceFlinger and UI agent (plan C3); AOSP has no counterpart, its one SurfaceFlinger is a separate process"

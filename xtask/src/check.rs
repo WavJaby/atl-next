@@ -12,7 +12,7 @@ use clap::ValueEnum;
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
-    providers, prune, slot, sources, spdx, workspace,
+    providers, prune, service_mirrors, slot, sources, spdx, workspace,
 };
 use atl_layout::Layout;
 
@@ -142,6 +142,15 @@ impl Step {
                     layout.locate(&Path::new("aosp").join(tree_path)).dir
                 })?;
                 eprintln!("tables: {} ok ({} rows)", cts_table::FILE, cts.len());
+                let mirrors = service_mirrors::load(root)?;
+                let entries = service_mirrors::check(root, &mirrors, &sources.aosp, &|project| {
+                    layout.locate(&Path::new("aosp").join(project)).dir
+                })?;
+                eprintln!(
+                    "tables: {} ok ({} services, {entries} mirrored entries at the pin)",
+                    service_mirrors::FILE,
+                    mirrors.len()
+                );
                 Ok(())
             }
             Step::Modules => {

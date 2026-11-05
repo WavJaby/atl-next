@@ -45,6 +45,7 @@ mod provided_gate;
 mod providers;
 mod prune;
 mod run_apk;
+mod service_mirrors;
 mod services;
 mod slot;
 mod sources;
@@ -134,6 +135,11 @@ enum Command {
     /// file has no notice at all. An unrecognised notice is reported, never guessed. The licence
     /// gate applies the same resolution to what a build links.
     Licence(notice::Args),
+    /// Churn of the AOSP code the Rust system services mirror (services.toml) between two AOSP revisions: what a tag bump must be reviewed against.
+    ///
+    /// Per service, most churn first; per entry lines added + deleted, of the whole file or of the named declaration's body (overloads together), GONE when it vanished. Read-only.
+    /// The src/aosp checkouts are shallow (pinned tag only): fetch the other tag there blobless, or pass `--repo <project>=<git dir>` holding both; a missing revision fails with the command it needs.
+    UpgradeDiff(service_mirrors::Args),
     /// Runs any APK under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
     ///
     /// The package file is the APK's own manifest; the APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
@@ -213,6 +219,15 @@ fn main() -> Result<ExitCode> {
         Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
         Command::RunApk(args) => run_apk::run(&root, &args),
+        Command::UpgradeDiff(args) => {
+            let layout = atl_layout::Layout::of(&root)?;
+            service_mirrors::upgrade_diff(&root, &args, &|project| {
+                layout
+                    .locate(&std::path::Path::new("aosp").join(project))
+                    .dir
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Test {
             test: Test::NativeLoad(args),
         } => native_load::run(&root, &args),
