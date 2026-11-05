@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     ProcessState::start_thread_pool();
     binder::add_service(
         &vintf::allocator_service_name(),
-        service::new_binder(allocator),
+        service::new_binder(Arc::clone(&allocator)),
     )
     .context("addService (is the instance declared in the VINTF manifest?)")?;
     writeln!(std::io::stderr(), "{}", allocator.counters_line())?;
