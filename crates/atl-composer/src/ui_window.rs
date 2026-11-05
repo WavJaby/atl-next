@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use atl_platform_ui::{
-    FrameClock, InputSource, PhysSize, PlatformUi, PlatformWindow, Window, WindowAttributes,
+    FrameClock, FrameRequester, InputSource, PhysSize, PlatformUi, PlatformWindow, Window,
+    WindowAttributes,
 };
 
 use crate::host::UiFrames;
@@ -76,6 +77,13 @@ fn capture_report(window: &PlatformWindow, presented: u32) {
     );
 }
 
+/// Whether the window clock asks for another tick: only while the compositor wants one (a vsync request, a queued transaction or buffer, calls to deliver: UiFrames::wants_frame) or a gate's readback waits for the picture to settle.
+/// Otherwise it stops, as an app's vsync does on Android: SurfaceFlinger's EventThread (EventThread.cpp:622 `shouldConsumeEvent`) sends a connection vsync only after its `requestNextVsync` (:401), which DisplayEventDispatcher::scheduleVsync (DisplayEventDispatcher.cpp:79-93) makes for Choreographer.scheduleVsyncLocked (Choreographer.java:1214), one frame at a time.
+/// Any later request restarts it (UiFrames::set_frame_requester).
+fn keep_ticking(wants_frame: bool, settling: bool) -> bool {
+    wants_frame || settling
+}
+
 /// Creates the window, once, on the UI thread.
 fn open() {
     SESSION.with(|cell| {
@@ -107,8 +115,18 @@ fn open() {
         let frames = Arc::clone(&session.frames);
         let capture = std::env::var_os(CAPTURE_ENV).is_some();
         let (mut tick_count, mut presented, mut quiet_ticks) = (0u32, 0u32, 0u32);
+        // ticks that ran with nothing wanting them (not the opening tick): the on-demand clock keeps this 0
+        let mut unwanted = 0u32;
+        let requester = window.frame_requester();
+        session
+            .frames
+            .set_frame_requester(Box::new(move || requester.request_frame()));
         window.on_tick(move |tick| {
             let time_ns = i64::try_from(tick.time_ns).unwrap_or(i64::MAX);
+            let settling = capture && presented > 0 && quiet_ticks < SETTLED_TICKS;
+            if tick_count > 0 && !frames.wants_frame() && !settling {
+                unwanted += 1;
+            }
             quiet_ticks = quiet_ticks.saturating_add(1);
             frames.tick(time_ns, |scene| {
                 presented += 1;
@@ -125,7 +143,15 @@ fn open() {
                 capture_report(&shown, presented);
             }
             tick_count += 1;
-            shown.request_frame();
+            let settling = capture && presented > 0 && quiet_ticks < SETTLED_TICKS;
+            if keep_ticking(frames.wants_frame(), settling) {
+                shown.request_frame();
+            } else if capture {
+                // gates only (one line per stop: an animating app stops and restarts every frame)
+                tracing::info!(
+                    "atl-composer: ui: clock stopped ticks={tick_count} unwanted={unwanted}"
+                );
+            }
         });
         let sizes = Arc::clone(&session.bounds);
         window.on_resize(move |size| sizes.submit(size));

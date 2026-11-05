@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Frame clock pacing between commits. Android expects vsync at the display's refresh whether or not the last frame drew anything (SurfaceFlinger's VSyncDispatch runs off the hardware vsync model, not off client commits),
-//! so Choreographer's callbacks and its frame-interval estimate assume that rate. GDK's frame clock is paced by the compositor's frame callback only after a commit; with nothing drawn it falls back to its own
-//! timer at its refresh estimate (GTK default 16.667 ms), which on a 120 Hz monitor gives ~60 ticks/s. So: after a tick that presented, GDK paces the next one (frame callback); after one that did not, a timer
-//! ticks on the grid `last tick + k x monitor interval`. Times are CLOCK_MONOTONIC microseconds, GDK's frame-time unit.
+//! Frame clock pacing of requested ticks. The clock is on demand (no request, no tick: an app's vsync on Android comes only after it asks, EventThread::requestNextVsync), but a requested tick lands on the display's vsync grid
+//! whether or not the last frame drew anything: SurfaceFlinger's VSyncDispatch runs off the hardware vsync model, not off client commits, and Choreographer's frame-interval estimate assumes that rate.
+//! GDK's frame clock is paced by the compositor's frame callback only after a commit; with nothing drawn it falls back to its own timer at its refresh estimate (GTK default 16.667 ms), which on a 120 Hz monitor gives ~60 ticks/s.
+//! So: after a tick that presented, GDK paces the next one (frame callback); after one that did not, a timer ticks on the grid `last tick + k x monitor interval`. Times are CLOCK_MONOTONIC microseconds, GDK's frame-time unit.
 
 /// A monitor's refresh interval in µs from GDK's milli-Hz; `None` for 0 (unknown) or negative.
 pub fn interval_us(refresh_millihz: i32) -> Option<i64> {

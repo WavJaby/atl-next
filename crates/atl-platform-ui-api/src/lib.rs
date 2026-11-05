@@ -184,10 +184,22 @@ pub struct FrameTick {
     pub time_ns: u64,
 }
 
+/// [`FrameClock::request_frame`] from another thread.
+pub trait FrameRequester: Send + Sync + 'static {
+    /// Asks the window's clock for one tick.
+    fn request_frame(&self);
+}
+
 /// The display's frame clock for one window: one callback per requested frame, paced by the compositor (Wayland frame callbacks), so a hidden window gets none.
 pub trait FrameClock {
-    /// Asks for one tick; ticks stop again until the next request (`Choreographer.postFrameCallback`'s one-shot shape).
+    /// What [`frame_requester`](FrameClock::frame_requester) hands out.
+    type Requester: FrameRequester;
+
+    /// Asks for one tick; ticks stop again until the next request (`Choreographer.postFrameCallback`'s one-shot shape). Requests before the tick coalesce into it.
     fn request_frame(&self);
+
+    /// A handle that requests a tick from any thread (a binder thread's `requestNextVsync` or transaction); the tick still runs on this window's thread. It names the window weakly: once the window is gone, a request does nothing.
+    fn frame_requester(&self) -> Self::Requester;
 
     /// Sets the callback run on each tick, replacing the previous one.
     fn on_tick<F: FnMut(FrameTick) + 'static>(&self, on_tick: F);

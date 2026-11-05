@@ -3,7 +3,7 @@
 //! The probe presses the header bar, then taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
 //! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
 //! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), list, readback (the last readback is the fixture's final frame and differs from the first),
-//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage).
+//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage), on-demand (the window clock stops once nothing asks for a frame).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -323,7 +323,7 @@ pub fn checks(
         ("readback", readback_check(app)),
         ("presents", presents_check(app)),
         ("cadence", cadence_check(after, display.refresh_hz)),
-        ("pacing", pacing_check(app, display.refresh_hz)),
+        ("on-demand", on_demand_check(app)),
     ]
 }
 
@@ -465,58 +465,44 @@ mod tests {
     }
 }
 
-/// The platform frame clock's stats line (atl-platform-ui-linux window.rs, every ~2 s of ticking).
-const PACING_LINE: &str = "atl-platform-ui: frame clock paced=";
+/// The composer's line at each stop of the on-demand window clock (ui_window.rs; gates only).
+const CLOCK_STOPPED_LINE: &str = "atl-composer: ui: clock stopped ";
 
-/// Sub-gate pacing: over the stats windows that had idle ticks (a tick after one that presented nothing), ticks come at the display rate within CADENCE_TOLERANCE, not at GDK's 60 Hz fallback.
-/// On a 60 Hz host the two agree, so there this proves the idle path runs and keeps the rate; telling them apart needs a faster monitor.
-fn pacing_check(app: &str, refresh_hz: f32) -> Result<String, String> {
-    let field = |l: &str, key: &str| -> Option<f64> {
-        l.split_whitespace()
-            .find_map(|w| w.strip_prefix(key))
-            .and_then(|v| v.parse().ok())
-    };
-    let (mut ticks, mut us, mut windows) = (0.0, 0.0, 0);
-    for line in app.lines().filter(|l| l.contains(PACING_LINE)) {
-        let (Some(paced), Some(idle), Some(over)) = (
-            field(line, "paced="),
-            field(line, "idle="),
-            field(line, "over_us="),
-        ) else {
-            return Err(format!("unreadable stats line: {line}"));
-        };
-        if idle > 0.0 {
-            ticks += paced + idle;
-            us += over;
-            windows += 1;
-        }
+/// Sub-gate on-demand: the window clock ticks only while asked (EventThread sends an app vsync only after requestNextVsync). It stopped at least once, no tick ran with nothing wanting it (`unwanted=0`),
+/// and it stopped after the last readback: the idle fixture leaves the clock stopped for the rest of the watch, where a free-running clock would tick at the display rate.
+fn on_demand_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let stops: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains(CLOCK_STOPPED_LINE))
+        .collect();
+    let &last = stops.last().ok_or("the window clock never stopped")?;
+    let unwanted = word(lines[last], "unwanted").ok_or("no unwanted= in the stop line")?;
+    if unwanted != "0" {
+        return Err(format!("{unwanted} ticks ran with nothing wanting them"));
     }
-    if windows == 0 {
-        return Err("no frame clock window with idle ticks".to_owned());
+    let last_capture = lines.iter().rposition(|l| l.contains(CAPTURE_LINE));
+    if last_capture.is_some_and(|c| c > last) {
+        return Err("no stop after the last readback: the clock still ran at the end".to_owned());
     }
-    let rate = ticks / us * 1e6;
-    let want = f64::from(refresh_hz);
-    if (rate - want).abs() > super::CADENCE_TOLERANCE * want {
-        return Err(format!(
-            "{rate:.1} ticks/s over {windows} idle windows, display {want} Hz"
-        ));
-    }
+    let ticks = word(lines[last], "ticks").unwrap_or("?");
     Ok(format!(
-        "{rate:.1} ticks/s over {windows} idle windows, display {want} Hz"
+        "{} stops, the last after the final readback at tick {ticks}; 0 unwanted ticks",
+        stops.len()
     ))
 }
 
 #[cfg(test)]
-mod pacing_tests {
-    use super::pacing_check;
+mod on_demand_tests {
+    use super::on_demand_check;
 
-    /// 120 Hz display: 240 ticks in 2 s pass; GDK's 60 Hz fallback (121 ticks in 2 s) fails; no idle window fails.
+    /// A stop after the last readback with 0 unwanted passes; no stop, an unwanted tick, or a readback after the last stop (the clock still running) fails.
     #[test]
-    fn idle_ticks_at_the_display_rate() {
-        let line =
-            |p, i| format!("x atl-platform-ui: frame clock paced={p} idle={i} over_us=2000000\n");
-        assert!(pacing_check(&line(40, 200), 120.0).is_ok());
-        assert!(pacing_check(&line(1, 120), 120.0).is_err());
-        assert!(pacing_check(&line(240, 0), 120.0).is_err());
+    fn on_demand_needs_a_final_stop_with_no_unwanted_tick() {
+        let stop = |u| format!("atl-composer: ui: clock stopped ticks=90 unwanted={u}");
+        let capture = "atl-composer: ui: capture presented=3 size=3x1 fnv1a64=0";
+        assert!(on_demand_check(&[capture, &stop(0)].join("\n")).is_ok());
+        assert!(on_demand_check(capture).is_err());
+        assert!(on_demand_check(&[capture, &stop(2)].join("\n")).is_err());
+        assert!(on_demand_check(&[&stop(0), capture].join("\n")).is_err());
     }
 }

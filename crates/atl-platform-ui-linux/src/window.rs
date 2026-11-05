@@ -63,8 +63,9 @@ struct Shared {
 }
 
 impl Shared {
-    /// One tick at `time_us`: a pending idle tick is dropped (this one replaces it), the tick is counted, and the callback runs.
+    /// One requested tick at `time_us`: the request is spent, a pending timer tick is dropped (this one replaces it), the tick is counted, and the callback runs. No request, no tick: the clock is on demand.
     fn tick(&self, time_us: i64, idle: bool) {
+        self.frame_requested.set(false);
         if let Some(id) = self.idle_timer.borrow_mut().take() {
             id.remove();
         }
@@ -106,18 +107,6 @@ impl GtkWindow {
         Some((shadow_x + f64::from(at.x()), shadow_y + f64::from(at.y())))
     }
 
-    /// The refresh interval of the monitor the window is on; GDK's own default (60 Hz) where the monitor reports none.
-    fn monitor_interval_us(&self) -> i64 {
-        let millihz = self
-            .window
-            .surface()
-            .and_then(|s| WidgetExt::display(&self.window).monitor_at_surface(&s))
-            .map_or(0, |m| m.refresh_rate());
-        pacing::interval_us(millihz)
-            .or_else(|| pacing::interval_us(DEFAULT_REFRESH_MILLIHZ))
-            .unwrap_or(1)
-    }
-
     fn wire_frame_clock(window: &gtk4::Window, shared: &Rc<Shared>) {
         let shared = Rc::clone(shared);
         window.connect_realize(move |window| {
@@ -127,7 +116,7 @@ impl GtkWindow {
             };
             let on_update = Rc::clone(&shared);
             clock.connect_update(move |clock| {
-                if on_update.frame_requested.replace(false) {
+                if on_update.frame_requested.get() {
                     on_update.tick(clock.frame_time(), false);
                 }
             });
@@ -333,32 +322,104 @@ impl Window for GtkWindow {
     }
 }
 
-impl FrameClock for GtkWindow {
-    /// After a tick that presented (or before the first tick) GDK paces the next: the compositor's frame callback. Otherwise the idle timer ticks on the monitor's grid (pacing.rs: GDK's own fallback runs at 60 Hz).
+/// One requested tick of `window`. After a tick that presented (or before the first tick) GDK paces the next: the compositor's frame callback. Otherwise the timer ticks on the monitor's grid (pacing.rs: GDK's own fallback runs at 60 Hz).
+fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
+    if shared.frame_requested.replace(true) {
+        // one tick is already on its way: a second request is the same tick (Choreographer.scheduleVsyncLocked asks once per frame)
+        return;
+    }
+    let last = shared.last_tick_us.get();
+    let Some(last) = last.filter(|_| !shared.presented.replace(false)) else {
+        if let Some(clock) = window.frame_clock() {
+            clock.request_phase(gdk::FrameClockPhase::UPDATE);
+        }
+        return;
+    };
+    let interval = monitor_interval_us(window);
+    let now = glib::monotonic_time();
+    let at = pacing::next_grid_us(last, interval, now);
+    // whole ms, rounded up: the timer fires at or after the grid point, never before it (a point fired early would be computed again)
+    let delay_ms = u64::try_from((at - now + 999) / 1000).unwrap_or(0);
+    let fired = Rc::clone(shared);
+    let id = glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+        // fired: the id is spent and must not be removed again
+        fired.idle_timer.borrow_mut().take();
+        if fired.frame_requested.get() {
+            fired.tick(at, true);
+        }
+    });
+    if let Some(old) = shared.idle_timer.replace(Some(id)) {
+        old.remove();
+    }
+}
+
+/// The refresh interval of the monitor `window` is on; GDK's own default (60 Hz) where the monitor reports none.
+fn monitor_interval_us(window: &gtk4::Window) -> i64 {
+    let millihz = window
+        .surface()
+        .and_then(|s| WidgetExt::display(window).monitor_at_surface(&s))
+        .map_or(0, |m| m.refresh_rate());
+    pacing::interval_us(millihz)
+        .or_else(|| pacing::interval_us(DEFAULT_REFRESH_MILLIHZ))
+        .unwrap_or(1)
+}
+
+/// A window a [`GtkFrameRequester`] names: its id, then the window and its state, weakly.
+type RequestTarget = (u64, glib::WeakRef<gtk4::Window>, std::rc::Weak<Shared>);
+
+thread_local! {
+    /// The windows a [`GtkFrameRequester`] may name, by id: on the GTK thread only, so the handle itself holds nothing thread-bound and drops safely on any thread.
+    static REQUEST_TARGETS: RefCell<Vec<RequestTarget>> = const { RefCell::new(Vec::new()) };
+}
+
+/// [`atl_platform_ui_api::FrameRequester`] for a GtkWindow: a request is invoked on the window's main context; requests until then coalesce into one.
+pub struct GtkFrameRequester {
+    id: u64,
+    context: glib::MainContext,
+    queued: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl atl_platform_ui_api::FrameRequester for GtkFrameRequester {
     fn request_frame(&self) {
-        self.shared.frame_requested.set(true);
-        let last = self.shared.last_tick_us.get();
-        let Some(last) = last.filter(|_| !self.shared.presented.replace(false)) else {
-            if let Some(clock) = self.window.frame_clock() {
-                clock.request_phase(gdk::FrameClockPhase::UPDATE);
-            }
+        use std::sync::atomic::Ordering;
+        if self.queued.swap(true, Ordering::AcqRel) {
             return;
-        };
-        let interval = self.monitor_interval_us();
-        let now = glib::monotonic_time();
-        let at = pacing::next_grid_us(last, interval, now);
-        // whole ms, rounded up: the timer fires at or after the grid point, never before it (a point fired early would be computed again)
-        let delay_ms = u64::try_from((at - now + 999) / 1000).unwrap_or(0);
-        let shared = Rc::clone(&self.shared);
-        let id = glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
-            // fired: the id is spent and must not be removed again
-            shared.idle_timer.borrow_mut().take();
-            if shared.frame_requested.replace(false) {
-                shared.tick(at, true);
+        }
+        let (id, queued) = (self.id, std::sync::Arc::clone(&self.queued));
+        self.context.invoke(move || {
+            queued.store(false, Ordering::Release);
+            let target = REQUEST_TARGETS.with_borrow(|targets| {
+                let (_, window, shared) = targets.iter().find(|(i, _, _)| *i == id)?;
+                Some((window.upgrade()?, shared.upgrade()?))
+            });
+            if let Some((window, shared)) = target {
+                request_frame(&window, &shared);
             }
         });
-        if let Some(old) = self.shared.idle_timer.replace(Some(id)) {
-            old.remove();
+        // Do not remove: the composer's binder calls are served on the UI thread's Looper, outside a mirror pass (mirror.rs). There `invoke` runs the closure in place and GLib writes no wakeup (the thread owns the context),
+        // so the timer source it adds never reaches the mirror's timerfd sync and the tick never comes. The wakeup makes the Looper run a pass, which re-syncs.
+        self.context.wakeup();
+    }
+}
+
+impl FrameClock for GtkWindow {
+    type Requester = GtkFrameRequester;
+
+    fn request_frame(&self) {
+        request_frame(&self.window, &self.shared);
+    }
+
+    fn frame_requester(&self) -> GtkFrameRequester {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        REQUEST_TARGETS.with_borrow_mut(|targets| {
+            targets.retain(|(_, w, s)| w.upgrade().is_some() && s.upgrade().is_some());
+            targets.push((id, self.window.downgrade(), Rc::downgrade(&self.shared)));
+        });
+        GtkFrameRequester {
+            id,
+            context: glib::MainContext::default(),
+            queued: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

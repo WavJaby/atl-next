@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
@@ -70,6 +70,19 @@ pub struct UiFrames {
 }
 
 impl UiFrames {
+    /// The window clock is on demand, as SurfaceFlinger's EventThread is for an app (it sends vsync only to a connection that asked, `requestNextVsync` / `setVsyncRate`; Choreographer asks per frame, `scheduleVsyncLocked`):
+    /// `request` is called whenever a client asks for vsync or sends work (a transaction, a destroyed layer), from any thread, and the UI thread then asks its clock for a tick. Without it nothing ticks.
+    pub fn set_frame_requester(&self, request: Box<dyn Fn() + Send + Sync>) {
+        if self.composer.ui_wake.set(request).is_err() {
+            tracing::warn!("atl-composer: ui: a second frame requester refused");
+        }
+    }
+
+    /// Whether the next tick has anything to do: a connection waits for vsync, a transaction or buffer is queued, or calls wait to be delivered. False: the clock stays stopped until [`UiFrames::set_frame_requester`]'s callback runs.
+    pub fn wants_frame(&self) -> bool {
+        self.composer.lock().wants_frame()
+    }
+
     /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread, then the calls are queued for the deliver thread (a release follows the scene that shows its buffer).
     pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene)) {
         let frame = self.composer.tick(time_ns, self.interval_ns);
@@ -199,6 +212,8 @@ pub struct Composer {
     state: Mutex<State>,
     /// The clock thread parks here while nothing wants a frame.
     wake: Condvar,
+    /// UI mode's clock restart (UiFrames::set_frame_requester): what [`Composer::notify`] calls besides `wake`.
+    ui_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
     stop: AtomicBool,
     display: DisplayModel,
     /// The token `getPhysicalDisplayToken` hands out: any binder, named by nothing.
@@ -278,10 +293,19 @@ impl Composer {
                 stats: Stats::default(),
             }),
             wake: Condvar::new(),
+            ui_wake: OnceLock::new(),
             stop: AtomicBool::new(false),
             display: config.display,
             display_token,
         })
+    }
+
+    /// Something may want a frame now: wakes the clock thread, or asks UI mode's window clock for a tick. Called with the state lock released.
+    fn notify(&self) {
+        self.wake.notify_all();
+        if let Some(request) = self.ui_wake.get() {
+            request();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -338,7 +362,7 @@ impl Composer {
                 st.stats.transactions += 1;
                 st.compositor.queue_transaction(t);
                 drop(st);
-                self.wake.notify_all();
+                self.notify();
                 Ok(())
             }
             Err(e) => {
@@ -392,7 +416,7 @@ impl Composer {
         drop(st);
         // a weak reference: dropping it takes no lock of ours
         drop(gone);
-        self.wake.notify_all();
+        self.notify();
     }
 
     /// `createDisplayEventConnection`: a connection with vsync off, and what its client gets of the channel: the end it reads, and a duplicate of the end the compositor writes
@@ -421,7 +445,7 @@ impl Composer {
         st.events
             .set_vsync_rate(id, u32::try_from(count).unwrap_or(0));
         drop(st);
-        self.wake.notify_all();
+        self.notify();
     }
 
     /// `requestNextVsync`.
@@ -429,7 +453,7 @@ impl Composer {
         let mut st = self.lock();
         st.events.request_next_vsync(id);
         drop(st);
-        self.wake.notify_all();
+        self.notify();
     }
 
     /// `getLatestVsyncEventData`: the last tick's timelines, or, before the first tick, those a tick now would have.
@@ -501,7 +525,7 @@ impl Composer {
         self.stop.store(true, Ordering::Release);
         let held = std::mem::take(&mut self.lock().fds);
         drop(held);
-        self.wake.notify_all();
+        self.notify();
     }
 
     fn run(&self, frames: SyncSender<Frame>) {
