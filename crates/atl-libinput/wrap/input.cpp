@@ -27,17 +27,6 @@ std::shared_ptr<android::InputChannel> open_channel(int32_t fd, rust::Str name) 
     return std::shared_ptr<android::InputChannel>(android::InputChannel::create(std::move(core)));
 }
 
-// A mouse pointer is a MOUSE tool, a stylus a STYLUS, touch and touchpad a FINGER (AMOTION_EVENT_TOOL_TYPE_*).
-android::ToolType tool_type(int32_t source) {
-    if ((source & AINPUT_SOURCE_MOUSE) == AINPUT_SOURCE_MOUSE) {
-        return android::ToolType::MOUSE;
-    }
-    if ((source & AINPUT_SOURCE_STYLUS) == AINPUT_SOURCE_STYLUS) {
-        return android::ToolType::STYLUS;
-    }
-    return android::ToolType::FINGER;
-}
-
 }  // namespace
 
 Publisher::Publisher(std::shared_ptr<android::InputChannel> channel) : publisher(std::move(channel)) {}
@@ -60,7 +49,7 @@ int32_t publish_key(Publisher& publisher, uint32_t seq, int32_t event_id, int32_
     return publisher.publisher.publishKeyEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, flags, key_code, scan_code, meta_state, repeat_count, down_time, event_time);
 }
 
-int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const float> coords) {
+int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const int32_t> tool_types, rust::Slice<const uint32_t> axis_pointers, rust::Slice<const int32_t> axis_ids, rust::Slice<const float> axis_values) {
     android::ui::Transform affine;
     affine.set(transform[0], transform[1], transform[2], transform[3]);
     affine.set(transform[4], transform[5]);
@@ -70,10 +59,11 @@ int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int
     for (size_t i = 0; i < count; i++) {
         properties[i].clear();
         properties[i].id = pointer_ids[i];
-        properties[i].toolType = tool_type(source);
+        properties[i].toolType = static_cast<android::ToolType>(tool_types[i]);
         pointer_coords[i].clear();
-        pointer_coords[i].setAxisValue(AMOTION_EVENT_AXIS_X, coords[2 * i]);
-        pointer_coords[i].setAxisValue(AMOTION_EVENT_AXIS_Y, coords[2 * i + 1]);
+    }
+    for (size_t k = 0; k < axis_ids.size(); k++) {
+        pointer_coords[axis_pointers[k]].setAxisValue(axis_ids[k], axis_values[k]);
     }
     return publisher.publisher.publishMotionEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, action_button, flags, edge_flags, meta_state, button_state, static_cast<android::MotionClassification>(classification), affine, x_precision, y_precision, x_cursor, y_cursor, affine, down_time, event_time, static_cast<uint32_t>(count), properties.data(), pointer_coords.data());
 }
@@ -126,6 +116,8 @@ int32_t consume(Consumer& consumer, Message& out) {
         out.pointer_id_ = motion->getPointerId(0);
         out.x_ = motion->getX(0);
         out.y_ = motion->getY(0);
+        out.tool_type_ = static_cast<int32_t>(motion->getToolType(0));
+        out.vscroll_ = motion->getAxisValue(AMOTION_EVENT_AXIS_VSCROLL, 0);
     } else {
         out.kind_ = 4;
     }

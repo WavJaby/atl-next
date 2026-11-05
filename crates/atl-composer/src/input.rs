@@ -192,6 +192,8 @@ mod publish {
     const ACTION_MOVE: i32 = 2;
     /// InputDevice.SOURCE_MOUSE: a pointer device. Its DOWN/MOVE/UP reach View.onTouchEvent through View.dispatchPointerEvent.
     const SOURCE_MOUSE: i32 = 0x0000_2002;
+    /// MotionEvent.TOOL_TYPE_MOUSE (NDK input.h AMOTION_EVENT_TOOL_TYPE_MOUSE = 3).
+    const TOOL_TYPE_MOUSE: i32 = 3;
     /// The headless pointer device and the default display.
     const DEVICE_ID: i32 = 1;
     const DISPLAY_ID: i32 = 0;
@@ -232,8 +234,10 @@ mod publish {
             event_time: i64::from(e.time_ms) * NANOS_PER_MS,
             pointers: vec![Pointer {
                 id: POINTER_ID,
+                tool_type: TOOL_TYPE_MOUSE,
                 x: e.position.x as f32,
                 y: e.position.y as f32,
+                axes: Vec::new(),
             }],
         }
     }
@@ -371,8 +375,10 @@ mod publish {
                 m.pointers,
                 vec![Pointer {
                     id: 0,
+                    tool_type: 3,
                     x: 260.0,
-                    y: 340.0
+                    y: 340.0,
+                    axes: Vec::new()
                 }]
             );
             assert_eq!(m.transform, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);

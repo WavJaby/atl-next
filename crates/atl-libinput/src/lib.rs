@@ -58,12 +58,18 @@ pub struct KeyEvent {
     pub event_time: i64,
 }
 
-/// One pointer of a motion event: its id and its (x, y) in the event's coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// MotionEvent.AXIS_X, AXIS_Y (NDK input.h AMOTION_EVENT_AXIS_*).
+pub const AXIS_X: i32 = 0;
+pub const AXIS_Y: i32 = 1;
+
+/// One pointer of a motion event: its id, tool type (MotionEvent.TOOL_TYPE_*), its (x, y) in the event's coordinates and any other axes as (MotionEvent.AXIS_*, value).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pointer {
     pub id: i32,
+    pub tool_type: i32,
     pub x: f32,
     pub y: f32,
+    pub axes: Vec<(i32, f32)>,
 }
 
 /// A motion event to publish (InputPublisher::publishMotionEvent). `transform` is the affine (a, b, c, d, tx, ty) applied to the event's coordinates; the raw transform is the same.
@@ -131,7 +137,21 @@ impl Publisher {
     /// Publishes a motion event (InputPublisher::publishMotionEvent).
     pub fn publish_motion(&mut self, e: &MotionEvent) -> Result<(), Error> {
         let ids: Vec<i32> = e.pointers.iter().map(|p| p.id).collect();
-        let coords: Vec<f32> = e.pointers.iter().flat_map(|p| [p.x, p.y]).collect();
+        let tools: Vec<i32> = e.pointers.iter().map(|p| p.tool_type).collect();
+        // X and Y first, then the pointer's other axes; the pointer index is always in range, so the C++ loop indexes no pointer it was not given
+        let mut axis_pointers = Vec::new();
+        let mut axis_ids = Vec::new();
+        let mut axis_values = Vec::new();
+        for (index, p) in (0_u32..).zip(&e.pointers) {
+            for (axis, value) in [(AXIS_X, p.x), (AXIS_Y, p.y)]
+                .into_iter()
+                .chain(p.axes.iter().copied())
+            {
+                axis_pointers.push(index);
+                axis_ids.push(axis);
+                axis_values.push(value);
+            }
+        }
         let s = ffi::publish_motion(
             self.0.pin_mut(),
             e.seq,
@@ -154,7 +174,10 @@ impl Publisher {
             e.down_time,
             e.event_time,
             &ids,
-            &coords,
+            &tools,
+            &axis_pointers,
+            &axis_ids,
+            &axis_values,
         );
         status("InputPublisher::publishMotionEvent", s)
     }
@@ -194,10 +217,12 @@ pub enum Received {
         seq: u32,
         action: i32,
         device_id: i32,
-        /// The first pointer's id and (x, y).
+        /// The first pointer's id, (x, y), tool type and AXIS_VSCROLL.
         pointer_id: i32,
         x: f32,
         y: f32,
+        tool_type: i32,
+        vscroll: f32,
     },
     /// Any other message kind; `seq` is what the consumer must answer.
     Other { seq: u32 },
@@ -241,6 +266,8 @@ impl Consumer {
                 pointer_id: message.pointer_id(),
                 x: message.x(),
                 y: message.y(),
+                tool_type: message.tool_type(),
+                vscroll: message.vscroll(),
             },
             _ => Received::Other { seq },
         }))

@@ -12,6 +12,9 @@ const KEYCODE_A: i32 = 29;
 /// AINPUT_SOURCE_KEYBOARD, AINPUT_SOURCE_TOUCHSCREEN.
 const SOURCE_KEYBOARD: i32 = 0x0000_0101;
 const SOURCE_TOUCHSCREEN: i32 = 0x0000_1002;
+/// MotionEvent.TOOL_TYPE_FINGER (NDK input.h AMOTION_EVENT_TOOL_TYPE_FINGER = 1) and AXIS_VSCROLL (= 9): the tool type and an axis beyond X/Y must arrive as published.
+const TOOL_TYPE_FINGER: i32 = 1;
+const AXIS_VSCROLL: i32 = 9;
 /// MotionClassification::NONE.
 const CLASSIFICATION_NONE: u8 = 0;
 /// The identity transform (a, b, c, d, tx, ty).
@@ -69,8 +72,10 @@ fn key_and_motion_reach_the_consumer_and_finish() {
             event_time: 2_000,
             pointers: vec![Pointer {
                 id: 3,
+                tool_type: TOOL_TYPE_FINGER,
                 x: 12.5,
                 y: 40.0,
+                axes: vec![(AXIS_VSCROLL, -1.5)],
             }],
         })
         .expect("publish motion");
@@ -110,6 +115,8 @@ fn key_and_motion_reach_the_consumer_and_finish() {
             pointer_id: 3,
             x: 12.5,
             y: 40.0,
+            tool_type: TOOL_TYPE_FINGER,
+            vscroll: -1.5,
         }
     );
     consumer.finish(2, false).expect("finish motion");

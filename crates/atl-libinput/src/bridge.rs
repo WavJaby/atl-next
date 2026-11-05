@@ -29,6 +29,8 @@ pub(crate) mod ffi {
         pub fn pointer_id(self: &Message) -> i32;
         pub fn x(self: &Message) -> f32;
         pub fn y(self: &Message) -> f32;
+        pub fn tool_type(self: &Message) -> i32;
+        pub fn vscroll(self: &Message) -> f32;
 
         /// Takes `fd` (one SEQPACKET end) into an InputChannel named `name`; null when AOSP refuses it.
         pub fn new_publisher(fd: i32, name: &str) -> UniquePtr<Publisher>;
@@ -49,7 +51,7 @@ pub(crate) mod ffi {
             down_time: i64,
             event_time: i64,
         ) -> i32;
-        /// InputPublisher::publishMotionEvent. `transform` is (a, b, c, d, tx, ty), used for both the transform and the raw transform; `coords` holds (x, y) per pointer, `pointer_ids` one id per pointer.
+        /// InputPublisher::publishMotionEvent. `transform` is (a, b, c, d, tx, ty), used for both the transform and the raw transform; `pointer_ids` and `tool_types` hold one entry per pointer; axis entry k sets axis `axis_ids[k]` of pointer `axis_pointers[k]` to `axis_values[k]`.
         pub fn publish_motion(
             publisher: Pin<&mut Publisher>,
             seq: u32,
@@ -72,7 +74,10 @@ pub(crate) mod ffi {
             down_time: i64,
             event_time: i64,
             pointer_ids: &[i32],
-            coords: &[f32],
+            tool_types: &[i32],
+            axis_pointers: &[u32],
+            axis_ids: &[i32],
+            axis_values: &[f32],
         ) -> i32;
         /// InputPublisher::receiveConsumerResponse into `out`; the status is WOULD_BLOCK when none is pending.
         pub fn receive_finished(publisher: Pin<&mut Publisher>, out: Pin<&mut Message>) -> i32;

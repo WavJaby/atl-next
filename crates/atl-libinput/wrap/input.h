@@ -41,6 +41,8 @@ public:
     int32_t pointer_id() const { return pointer_id_; }
     float x() const { return x_; }
     float y() const { return y_; }
+    int32_t tool_type() const { return tool_type_; }
+    float vscroll() const { return vscroll_; }
 
     int32_t kind_ = 0;
     uint32_t seq_ = 0;
@@ -51,6 +53,8 @@ public:
     int32_t pointer_id_ = 0;
     float x_ = 0;
     float y_ = 0;
+    int32_t tool_type_ = 0;
+    float vscroll_ = 0;
 };
 
 // A KeyCharacterMap as libinput loaded it.
@@ -65,8 +69,8 @@ std::unique_ptr<Message> new_message();
 // fd: one SEQPACKET end, owned from here on; null when AOSP refuses the channel.
 std::unique_ptr<Publisher> new_publisher(int32_t fd, rust::Str name);
 int32_t publish_key(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t flags, int32_t key_code, int32_t scan_code, int32_t meta_state, int32_t repeat_count, int64_t down_time, int64_t event_time);
-// transform: a, b, c, d, tx, ty. coords: x, y per pointer.
-int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const float> coords);
+// transform: a, b, c, d, tx, ty. pointer_ids, tool_types: one per pointer; axis entry k: pointer axis_pointers[k], axis axis_ids[k], value axis_values[k].
+int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const int32_t> tool_types, rust::Slice<const uint32_t> axis_pointers, rust::Slice<const int32_t> axis_ids, rust::Slice<const float> axis_values);
 int32_t receive_finished(Publisher& publisher, Message& out);
 
 std::unique_ptr<Consumer> new_consumer(int32_t fd, rust::Str name);
