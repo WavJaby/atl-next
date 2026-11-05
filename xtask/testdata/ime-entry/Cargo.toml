@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# `xtask test ime-spike`'s GTK client: a GtkText that prints what its input method delivers. Own workspace: GTK stays out of the repo workspace (deny.toml bans gtk4 outside the platform layer); a test fixture, never shipped.
+[package]
+name = "ime-entry"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+gtk4 = { version = "0.11", features = ["v4_14"] }
+
+[workspace]

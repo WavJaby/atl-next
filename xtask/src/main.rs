@@ -23,6 +23,7 @@ mod fetch;
 mod git;
 mod gralloc;
 mod host_art;
+mod ime_spike;
 mod instrument;
 mod jni_fixture;
 mod land;
@@ -202,6 +203,8 @@ enum Test {
     ///
     /// Controls run every time: the probe loads a glibc library cleanly, and each variant fails the other's TLS expectation. Needs the NDK only, no native build.
     JniFixture(jni_fixture::Args),
+    /// IME spike (route R1): a fake input method on the headless labwc's `zwp_input_method_manager_v2` sends preedit + commit to a focused GtkText (xtask/testdata/ime-entry); `--break-commit` must fail.
+    ImeSpike(ime_spike::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -264,6 +267,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::JniFixture(args),
         } => jni_fixture::run(&root, &args),
+        Command::Test {
+            test: Test::ImeSpike(args),
+        } => ime_spike::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -292,6 +298,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Window(_) => "window",
             Test::PlatformUi(_) => "platform-ui",
             Test::JniFixture(_) => "jni-fixture",
+            Test::ImeSpike(_) => "ime-spike",
         },
         _ => return None,
     })

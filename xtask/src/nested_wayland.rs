@@ -58,6 +58,17 @@ pub struct ChildGuard(Child);
 impl ChildGuard {
     /// Starts `cmd` with SIGTERM as its parent-death signal.
     pub fn spawn(cmd: &mut Command) -> Result<Self> {
+        Self::start(cmd, Stdio::null())
+    }
+
+    /// [`Self::spawn`], with the child's stdout piped back.
+    pub fn spawn_piped(cmd: &mut Command) -> Result<(Self, std::process::ChildStdout)> {
+        let mut g = Self::start(cmd, Stdio::piped())?;
+        let out = g.0.stdout.take().context("child stdout")?;
+        Ok((g, out))
+    }
+
+    fn start(cmd: &mut Command, stdout: Stdio) -> Result<Self> {
         let mut wrapped = Command::new("setpriv");
         wrapped
             .args(["--pdeathsig", "TERM", "--"])
@@ -74,7 +85,7 @@ impl ChildGuard {
         }
         let child = wrapped
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("starting {:?}", cmd.get_program()))?;
@@ -108,6 +119,9 @@ impl Drop for ChildGuard {
         }
     }
 }
+
+/// A registry's globals: interface -> (global name, version).
+pub type Globals = HashMap<String, (u32, u32)>;
 
 /// A running headless labwc: its socket, log and private runtime dir (all under the run's work dir). Dropping it stops labwc.
 pub struct NestedCompositor {
@@ -200,6 +214,23 @@ impl NestedCompositor {
     /// Output `index` as Android's display (see [`Output::display`]).
     pub fn output_display(&self, index: usize) -> DisplayModel {
         self.outputs[index].display()
+    }
+
+    /// A new raw client connection with its registry's globals (name -> (global name, version)): for gates that act as a privileged client themselves (the IME spike's input method).
+    pub fn connect(&self) -> Result<(Client, u32, Globals)> {
+        let mut c = Client::new(UnixStream::connect(&self.socket)?)?;
+        let registry = c.new_id();
+        c.send(1, op::DISPLAY_GET_REGISTRY, &[Arg::U(registry)]);
+        let mut globals = HashMap::new();
+        for (object, opcode, body) in c.roundtrip()? {
+            if object == registry && opcode == op::REGISTRY_GLOBAL {
+                globals.insert(
+                    string(&body, 4)?,
+                    (word(&body, 0)?, word_after_string(&body, 4)?),
+                );
+            }
+        }
+        Ok((c, registry, globals))
     }
 }
 
@@ -407,7 +438,7 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
     Ok(s)
 }
 
-enum Arg<'a> {
+pub(crate) enum Arg<'a> {
     U(u32),
     I(i32),
     /// wl_fixed: 24.8.
@@ -420,14 +451,14 @@ fn fixed(v: f64) -> f64 {
     (v * 256.0).round() / 256.0
 }
 
-fn word(body: &[u8], at: usize) -> Result<u32> {
+pub(crate) fn word(body: &[u8], at: usize) -> Result<u32> {
     body.get(at..at + 4)
         .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
         .context("short Wayland message")
 }
 
 /// A string argument at `at`: length (with the NUL), bytes, padding to 4.
-fn string(body: &[u8], at: usize) -> Result<String> {
+pub(crate) fn string(body: &[u8], at: usize) -> Result<String> {
     let len = word(body, at)? as usize;
     let text = body
         .get(at + 4..at + 4 + len)
@@ -442,7 +473,7 @@ fn word_after_string(body: &[u8], at: usize) -> Result<u32> {
 }
 
 /// A minimal Wayland client: requests out, events back by roundtrip. No fds: nothing it binds sends any.
-struct Client {
+pub struct Client {
     stream: UnixStream,
     next: u32,
     pending: Vec<u8>,
@@ -459,13 +490,13 @@ impl Client {
         })
     }
 
-    fn new_id(&mut self) -> u32 {
+    pub(crate) fn new_id(&mut self) -> u32 {
         let id = self.next;
         self.next += 1;
         id
     }
 
-    fn send(&mut self, object: u32, opcode: u16, args: &[Arg<'_>]) {
+    pub(crate) fn send(&mut self, object: u32, opcode: u16, args: &[Arg<'_>]) {
         let mut body = Vec::new();
         for a in args {
             match a {
@@ -488,7 +519,7 @@ impl Client {
     }
 
     /// Flushes the requests, then reads events until a `wl_display.sync` sent after them is done; a `wl_display.error` fails.
-    fn roundtrip(&mut self) -> Result<Vec<(u32, u16, Vec<u8>)>> {
+    pub(crate) fn roundtrip(&mut self) -> Result<Vec<(u32, u16, Vec<u8>)>> {
         let done = self.new_id();
         self.send(1, op::DISPLAY_SYNC, &[Arg::U(done)]);
         self.stream.write_all(&std::mem::take(&mut self.pending))?;
