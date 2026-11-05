@@ -33,9 +33,14 @@ pub enum Message {
 /// Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top). Every window is taken as touch-modal and covering the pointer
 /// (activity windows fill the Task, dialogs are touch-modal: InputDispatcher `windowAcceptsTouchAt` takes a window without FLAG_NOT_TOUCH_MODAL wherever the touch is), so the topmost window
 /// is the touched one (`findTouchedWindowAtLocked`) and the focused one. Re-check when windows carry frames and flags here (popups are FLAG_NOT_TOUCH_MODAL).
+/// Focus (InputDispatcher's focused window, delivered as InputChannel focus events -> ViewRootImpl windowFocusChanged): the top window while the desktop toplevel is active, none otherwise.
 pub struct Windows<K, C> {
     list: Vec<(K, C)>,
     gesture: Option<K>,
+    /// The desktop toplevel is active (InputEvent::Focus); false until told.
+    active: bool,
+    /// The window last told it has focus.
+    focused: Option<K>,
 }
 
 impl<K, C> Default for Windows<K, C> {
@@ -43,6 +48,8 @@ impl<K, C> Default for Windows<K, C> {
         Self {
             list: Vec::new(),
             gesture: None,
+            active: false,
+            focused: None,
         }
     }
 }
@@ -59,6 +66,38 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         let before = self.list.len();
         self.list.retain(|(k, _)| k != key);
         before != self.list.len()
+    }
+
+    /// The desktop toplevel became active (`true`) or not.
+    pub fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
+
+    /// The focus events owed since the last call, in order: the old window loses focus, then the new one gains it. Called after every add, remove and [`Windows::set_active`], so a window added later gets the current state replayed.
+    /// An event for a window whose channel is gone is still listed; [`Windows::channel`] then finds none.
+    pub fn focus_changes(&mut self) -> Vec<(K, bool)> {
+        let want = if self.active {
+            self.list.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        if want == self.focused {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(old) = self.focused.take() {
+            out.push((old, false));
+        }
+        if let Some(new) = want.clone() {
+            out.push((new, true));
+        }
+        self.focused = want;
+        out
+    }
+
+    /// The channel of `key`, if held.
+    pub fn channel(&mut self, key: &K) -> Option<&mut C> {
+        self.list.iter_mut().find(|(k, _)| k == key).map(|(_, c)| c)
     }
 
     /// The window of a pointer event, given whether a gesture (button held, swipe going) was open before it: without one the event starts a gesture (or is a hover or wheel) and goes to the top window,
@@ -217,6 +256,11 @@ mod publish {
     /// Publishes the MotionEvents of one event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
     /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
+        if let InputEvent::Focus(active) = event {
+            state.windows.borrow_mut().set_active(active);
+            publish_focus(state);
+            return;
+        }
         let mut pointer = state.pointer.borrow_mut();
         let in_gesture = pointer.in_gesture();
         let motions = pointer.translate(event);
@@ -262,6 +306,23 @@ mod publish {
         }
     }
 
+    /// Publishes the focus events owed ([`Windows::focus_changes`]) to the windows still held.
+    fn publish_focus(state: &State) {
+        let mut windows = state.windows.borrow_mut();
+        for (token, has_focus) in windows.focus_changes() {
+            let Some(publisher) = windows.channel(&token) else {
+                continue;
+            };
+            let seq = next_seq(state.seq.get());
+            state.seq.set(seq);
+            let event_id = i32::try_from(seq).unwrap_or(i32::MAX);
+            match publisher.publish_focus(seq, event_id, has_focus) {
+                Ok(()) => tracing::info!("input: focus {has_focus} published (seq {seq})"),
+                Err(err) => tracing::warn!("input: publishing focus {has_focus}: {err:?}"),
+            }
+        }
+    }
+
     /// The input thread: takes each window's channel, and at the first frame injects the script through the headless source. The publisher stays on this thread (it is not Send).
     fn dispatch(rx: Receiver<Message>, script: Vec<Step>) {
         let state = Rc::new(State::default());
@@ -272,11 +333,15 @@ mod publish {
         for message in rx {
             match message {
                 Message::Window { token, fd } => match Publisher::new(fd, CHANNEL) {
-                    Ok(publisher) => state.windows.borrow_mut().add(token, publisher),
+                    Ok(publisher) => {
+                        state.windows.borrow_mut().add(token, publisher);
+                        publish_focus(&state);
+                    }
                     Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
                 },
                 Message::WindowRemoved(token) => {
                     state.windows.borrow_mut().remove(&token);
+                    publish_focus(&state);
                 }
                 Message::Event(event) => source.inject(event),
                 Message::FirstFrame => {
@@ -408,6 +473,28 @@ mod tests {
         w.remove(&1);
         assert!(w.pointer_target(true).is_none());
         assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(3));
+    }
+
+    /// Focus goes to the top window only while the desktop window is active: replayed to a window added later, moved when the top changes, taken (false) on deactivation.
+    #[test]
+    fn focus_follows_the_top_window_while_active() {
+        let mut w = Windows::<u32, &str>::default();
+        w.add(1, "main");
+        assert!(w.focus_changes().is_empty());
+        w.set_active(true);
+        assert_eq!(w.focus_changes(), [(1, true)]);
+        assert!(w.focus_changes().is_empty());
+        w.add(2, "second");
+        assert_eq!(w.focus_changes(), [(1, false), (2, true)]);
+        w.remove(&2);
+        assert_eq!(w.focus_changes(), [(2, false), (1, true)]);
+        w.set_active(false);
+        assert_eq!(w.focus_changes(), [(1, false)]);
+        w.remove(&1);
+        w.set_active(true);
+        assert!(w.focus_changes().is_empty());
+        w.add(3, "late");
+        assert_eq!(w.focus_changes(), [(3, true)]);
     }
 
     /// The headless source runs the callback set by `on_events` once per injected event; with none set an event is dropped.
