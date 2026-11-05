@@ -17,6 +17,7 @@ use atl_platform_ui::{PhysSize, PlatformUi};
 use crate::host::{Composer, ComposerConfig, ThreadHost};
 use crate::input::{self, Message};
 use crate::sink::{FirstFrame, ReportSink};
+use crate::task_bounds::BoundsSender;
 use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
@@ -117,7 +118,9 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         let frames = composer
             .start_ui(threads)
             .map_err(|e| format!("deliver thread: {e}"))?;
-        ui_window::install(ui, frames, input_tx.clone(), size);
+        let bounds =
+            BoundsSender::spawn(threads).map_err(|e| format!("task bounds thread: {e}"))?;
+        ui_window::install(ui, frames, input_tx.clone(), size, bounds);
     } else {
         let first_frame = input_tx.clone();
         composer

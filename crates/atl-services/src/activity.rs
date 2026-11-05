@@ -31,6 +31,7 @@ use atl_parcelables::android::content::pm::{
 };
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
+use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
@@ -47,13 +48,14 @@ use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
+use crate::tasks::TaskSize;
 use crate::{counters, manifest_flags, package, settings, token};
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
 
 /// Display.DEFAULT_DISPLAY.
-const DEFAULT_DISPLAY: i32 = 0;
+pub(crate) const DEFAULT_DISPLAY: i32 = 0;
 /// Context.DEVICE_ID_DEFAULT.
 const DEVICE_ID_DEFAULT: i32 = 0;
 /// ActivityManager.PROCESS_STATE_TOP: the reported state of the process whose activity is launched in front.
@@ -119,6 +121,54 @@ pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
         },
         ..Configuration::default()
     }
+}
+
+/// WindowConfiguration.WINDOWING_MODE_FREEFORM (WindowConfiguration.java:113): a Task the user sizes, one per toplevel window.
+const WINDOWING_MODE_FREEFORM: i32 = 5;
+
+/// The override of a Task of `size` on `display` (TaskFragment.computeConfigResourceOverrides, TaskFragment.java:2408, for a FREEFORM Task): the bounds from the origin, the mode, and
+/// the dp of the bounds. A floating Task is not restricted to the stable (inset) area (TaskFragment.java:2510-2516), so the dp come from the bounds; the smallest width is min(w, h) / density (:2552-2560).
+/// Density stays the display's: a resize changes only screenWidthDp/HeightDp and what derives from them. screenLayout is left undefined (not computed yet).
+pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configuration {
+    let density = display.dpi as f32 / DENSITY_DEFAULT;
+    let width_dp = (size.width as f32 / density + 0.5) as i32;
+    let height_dp = (size.height as f32 / density + 0.5) as i32;
+    let rect = |right: i32, bottom: i32| Rect {
+        left: 0,
+        top: 0,
+        right,
+        bottom,
+    };
+    Configuration {
+        screen_width_dp: width_dp,
+        screen_height_dp: height_dp,
+        smallest_screen_width_dp: width_dp.min(height_dp),
+        orientation: if width_dp <= height_dp {
+            ORIENTATION_PORTRAIT
+        } else {
+            ORIENTATION_LANDSCAPE
+        },
+        window_configuration: atl_parcelables::parts::WindowConfiguration {
+            bounds: rect(size.width, size.height),
+            app_bounds: Some(rect(size.width, size.height)),
+            max_bounds: rect(display.width, display.height),
+            windowing_mode: WINDOWING_MODE_FREEFORM,
+            ..Default::default()
+        },
+        ..Configuration::default()
+    }
+}
+
+/// The configuration of a Task of `size` on `display`: the global configuration with the Task's override (the fields the override sets replace the global ones).
+pub(crate) fn task_configuration(display: &DisplayModel, size: TaskSize) -> Configuration {
+    let over = task_override(display, size);
+    let mut config = global_configuration(display);
+    config.screen_width_dp = over.screen_width_dp;
+    config.screen_height_dp = over.screen_height_dp;
+    config.smallest_screen_width_dp = over.smallest_screen_width_dp;
+    config.orientation = over.orientation;
+    config.window_configuration = over.window_configuration;
+    config
 }
 
 /// ActivityTaskSupervisor.java:1034: the ResumeActivityItem realStartActivityLocked schedules after the launch (andResume), with the same token as the launch.

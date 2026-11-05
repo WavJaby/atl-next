@@ -6,7 +6,7 @@
 //! openSession: a session for the caller's callback (WindowManagerService.openSession:6004-6005); the session's window methods are below.
 //! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel (its server end goes to the app's UI agent), the insets, the frame, scale 1),
 //! relayout (WindowManagerService.relayoutWindow: the client frames, the merged configuration, the SurfaceControl the window's UI agent gives, the insets), remove (the window goes:
-//! its input channel's server end stays with the app: no close signal yet, a known gap). The frames are the whole display: one fullscreen window, no insets (the desktop shows no system bars).
+//! its input channel's server end stays with the app: no close signal yet, a known gap). The frames are the Task's bounds (tasks.rs, freeform); the display frame is the display; no insets (the desktop shows no system bars).
 //! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION. finishDrawing stays one of them: its post-draw SurfaceControl.Transaction is
 //! not modelled (the composer, M3 slice 4), so the codec refuses it before the method runs.
 
@@ -17,7 +17,6 @@ use atl_aidl::aidl::android::view::IWindowManager::{
     BnWindowManager, EnforcePermission, IWindowManager,
 };
 use atl_aidl::aidl::android::view::IWindowSession::{BnWindowSession, IWindowSession};
-use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
@@ -31,6 +30,7 @@ use binder::{
 };
 
 use crate::display_model::DisplayModel;
+use crate::tasks::Tasks;
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters, permission};
 
@@ -123,12 +123,14 @@ struct Window {
 struct WindowManager {
     model: DisplayModel,
     agents: Arc<UiAgents>,
+    tasks: Arc<Tasks>,
 }
 
 /// The session openSession gives: the windows it added, and the display they lay out on.
 struct Session {
     model: DisplayModel,
     agent: RegisteredAgent,
+    tasks: Arc<Tasks>,
     windows: Mutex<Vec<Window>>,
 }
 
@@ -184,6 +186,7 @@ impl IWindowManager for WindowManager {
                     agents: Arc::clone(&self.agents),
                     uid: ThreadState::get_calling_uid(),
                 },
+                tasks: Arc::clone(&self.tasks),
                 windows: Mutex::new(Vec::new()),
             },
             BinderFeatures::default(),
@@ -192,13 +195,24 @@ impl IWindowManager for WindowManager {
 }
 
 impl Session {
-    /// The display as a window's frame: the whole display, from the origin.
+    /// The display's frame: the insets' display frame and the global bounds. A window's frame is [`Session::task_rect`].
     fn display_rect(&self) -> Rect {
         Rect {
             left: 0,
             top: 0,
             right: self.model.width,
             bottom: self.model.height,
+        }
+    }
+
+    /// A window's frame: from the origin, the size of its Task (tasks.rs). Freeform, so it is the window's bounds, not the display's.
+    fn task_rect(&self) -> Rect {
+        let size = self.tasks.size(self.agent.uid);
+        Rect {
+            left: 0,
+            top: 0,
+            right: size.width,
+            bottom: size.height,
         }
     }
 
@@ -280,6 +294,7 @@ impl IWindowSession for Session {
         } else {
             InputChannel::default()
         };
+        self.tasks.add_window(self.agent.uid, window.as_binder());
         self.lock().push(Window {
             client: window.as_binder(),
             title: attrs.title.clone().unwrap_or_default(),
@@ -346,22 +361,22 @@ impl IWindowSession for Session {
             .iter()
             .find(|w| w.client == client)
             .and_then(|w| w.surface.clone());
-        let configuration: Configuration = activity::global_configuration(&self.model);
+        let size = self.tasks.size(self.agent.uid);
         let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
             frames: ClientWindowFrames {
-                frame: self.display_rect(),
+                frame: self.task_rect(),
                 display_frame: self.display_rect(),
-                parent_frame: self.display_rect(),
+                parent_frame: self.task_rect(),
                 attached_frame: None,
                 is_parent_frame_clipped_by_display_cutout: false,
                 compat_scale: COMPAT_SCALE_NONE,
                 seq,
             },
             merged_configuration: MergedConfiguration {
-                global: configuration.clone(),
-                override_config: Configuration::default(),
-                merged: configuration,
+                global: activity::global_configuration(&self.model),
+                override_config: activity::task_override(&self.model, size),
+                merged: activity::task_configuration(&self.model, size),
             },
             surface_control: surface.unwrap_or_default(),
             insets_state: self.insets_state(),
@@ -391,12 +406,85 @@ impl IWindowSession for Session {
             return Err(StatusCode::BAD_VALUE.into());
         };
         self.lock().retain(|w| w.client != *token);
+        self.tasks.remove_window(token);
         Ok(())
     }
 }
 
 /// A new window service binder: the one display's model, which every session lays out on, and the table of UI agents (system_services.rs gives it the registry's).
-pub fn new_binder(model: DisplayModel, agents: Arc<UiAgents>) -> SpIBinder {
-    BnWindowManager::new_binder(WindowManager { model, agents }, BinderFeatures::default())
-        .as_binder()
+pub fn new_binder(model: DisplayModel, agents: Arc<UiAgents>, tasks: Arc<Tasks>) -> SpIBinder {
+    BnWindowManager::new_binder(
+        WindowManager {
+            model,
+            agents,
+            tasks,
+        },
+        BinderFeatures::default(),
+    )
+    .as_binder()
+}
+
+/// The Task of `uid` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
+/// AOSP's WindowState.reportResized (WindowState.java:3584) sends the same call; the relaunch wait it skips (`inRelaunchingActivity`) is not modelled, since no relaunch exists yet.
+/// forceLayout is set so the app relayouts with the new frames; reportDraw is false because finishDrawing is not modelled (module doc).
+pub fn notify_resized(tasks: &Tasks, uid: u32) -> usize {
+    let display = tasks.display();
+    let size = tasks.size(uid);
+    let rect = |right: i32, bottom: i32| Rect {
+        left: 0,
+        top: 0,
+        right,
+        bottom,
+    };
+    let merged = MergedConfiguration {
+        global: activity::global_configuration(&display),
+        override_config: activity::task_override(&display, size),
+        merged: activity::task_configuration(&display, size),
+    };
+    let clients = tasks.windows_of(uid);
+    for client in &clients {
+        let window = match client
+            .clone()
+            .into_interface::<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>()
+        {
+            Ok(window) => window,
+            Err(e) => {
+                counters::count(
+                    WINDOW_SESSION,
+                    &format!("resized: client is not an IWindow: {e:?}"),
+                );
+                continue;
+            }
+        };
+        let frames = ClientWindowFrames {
+            frame: rect(size.width, size.height),
+            display_frame: rect(display.width, display.height),
+            parent_frame: rect(size.width, size.height),
+            attached_frame: None,
+            is_parent_frame_clipped_by_display_cutout: false,
+            compat_scale: COMPAT_SCALE_NONE,
+            seq: tasks.next_seq(),
+        };
+        let insets = InsetsState {
+            display_frame: rect(display.width, display.height),
+            rounded_corner_frame: rect(display.width, display.height),
+            seq: 0,
+            sources: Vec::new(),
+        };
+        if let Err(e) = window.r#resized(
+            Some(&frames),
+            false,
+            Some(&merged),
+            Some(&insets),
+            true,
+            false,
+            activity::DEFAULT_DISPLAY,
+            0,
+            false,
+            None,
+        ) {
+            counters::count(WINDOW_SESSION, &format!("resized: IWindow refused: {e:?}"));
+        }
+    }
+    clients.len()
 }

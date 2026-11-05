@@ -86,9 +86,11 @@ fn main() -> Result<()> {
         .context("addService display")?;
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());
+    // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry
+    let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
     binder::add_service(
         WINDOW,
-        atl_services::window::new_binder(display, Arc::clone(&agents)),
+        atl_services::window::new_binder(display, Arc::clone(&agents), Arc::clone(&tasks)),
     )
     .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
@@ -109,7 +111,7 @@ fn main() -> Result<()> {
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,
-        atl_services::registry_service::new_binder(Arc::clone(&agents)),
+        atl_services::registry_service::new_binder(Arc::clone(&agents), Arc::clone(&tasks)),
     )
     .context("addService compositor registry")?;
     writeln!(std::io::stderr(), "services: ready")?;

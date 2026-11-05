@@ -40,6 +40,8 @@ pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod settings;
 #[cfg(feature = "converter")]
+pub mod tasks;
+#[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]
 pub mod ui_agent;

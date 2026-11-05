@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. Its frame clock ticks the compositor ([`UiFrames::tick`], no clock thread) and its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
-//! The window is the display: one per process, opened at install (the app's first traversal waits for a vsync, which this window's frame clock supplies).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at the display's size (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds (task_bounds.rs).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +15,7 @@ use atl_platform_ui::{
 use crate::host::UiFrames;
 use crate::input::Message;
 use crate::sink::fnv1a64;
+use crate::task_bounds::BoundsSender;
 
 /// Set by the window gates: each settled picture is read back and logged (`atl-composer: ui: capture ...`). Unset in normal runs: a readback is a GPU render plus a download on the UI thread.
 const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
@@ -27,6 +28,8 @@ struct Session {
     frames: Arc<UiFrames>,
     input: Sender<Message>,
     size: PhysSize,
+    /// the window's size changes go here (Task bounds in the services)
+    bounds: Arc<BoundsSender>,
     window: Option<Rc<PlatformWindow>>,
 }
 
@@ -35,13 +38,20 @@ thread_local! {
 }
 
 /// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now. The window cannot wait for the first client: the app's first traversal waits for a vsync, and vsync comes from this window's frame clock.
-pub fn install(ui: PlatformUi, frames: UiFrames, input: Sender<Message>, size: PhysSize) {
+pub fn install(
+    ui: PlatformUi,
+    frames: UiFrames,
+    input: Sender<Message>,
+    size: PhysSize,
+    bounds: Arc<BoundsSender>,
+) {
     SESSION.with(|cell| {
         *cell.borrow_mut() = Some(Session {
             ui,
             frames: Arc::new(frames),
             input,
             size,
+            bounds,
             window: None,
         });
     });
@@ -117,6 +127,8 @@ fn open() {
             tick_count += 1;
             shown.request_frame();
         });
+        let sizes = Arc::clone(&session.bounds);
+        window.on_resize(move |size| sizes.submit(size));
         window.request_frame();
         session.window = Some(window);
     });
