@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The display's values, one struct for every reader: DisplayInfo (display.rs, IDisplayManager.getDisplayInfo) and the global Configuration (activity.rs). atld passes it to the services
-//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag the services use [`DisplayModel::default`]. Nothing else holds display values.
-//! The default is a test value (1280x800 at 60 Hz, 160 dpi) until the platform layer supplies the desktop's display (M3 plan slice 6).
+//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::with_monitor_refresh`] of the monitor's rate. Nothing else holds display values.
+//! The default size and density are test values (1280x800, 160 dpi) until the host platform layer supplies the monitor's size and density (plan M3 step 5); the refresh rate comes from the monitor already.
 
 /// The default display: size in pixels, refresh rate in Hz, density in dots per inch (DisplayMetrics.densityDpi).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +25,15 @@ impl Default for DisplayModel {
 }
 
 impl DisplayModel {
+    /// The default size and density at the monitor's refresh rate: what atld answers with when no `--display` is given. `None` (the monitor reports none) keeps the default rate.
+    pub fn with_monitor_refresh(refresh_hz: Option<f32>) -> Self {
+        let default = DisplayModel::default();
+        DisplayModel {
+            refresh_hz: refresh_hz.unwrap_or(default.refresh_hz),
+            ..default
+        }
+    }
+
     /// `WxH@hz,dpi`, e.g. `1920x1080@59.94,240`. Every number must be positive.
     pub fn parse_arg(s: &str) -> Result<Self, String> {
         let bad = || format!("{s}: not WxH@hz,dpi");
@@ -67,6 +76,20 @@ mod tests {
             (1280, 800, 60.0, 160)
         );
         assert_eq!(d.to_arg(), "1280x800@60,160");
+    }
+
+    /// The monitor's rate replaces the default's alone: size and density are the stated test values.
+    #[test]
+    fn monitor_refresh_keeps_the_default_size() {
+        let m = DisplayModel::with_monitor_refresh(Some(120.0));
+        assert_eq!(
+            (m.width, m.height, m.refresh_hz, m.dpi),
+            (1280, 800, 120.0, 160)
+        );
+        assert_eq!(
+            DisplayModel::with_monitor_refresh(None),
+            DisplayModel::default()
+        );
     }
 
     /// Fractional rates and other sizes parse; the form round-trips.

@@ -19,7 +19,9 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 use atl_services::display_model::DisplayModel;
 
-use crate::atld_run::{Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, totals};
+use crate::atld_run::{
+    Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, run_display, totals,
+};
 use crate::composer::{fnv1a64, word};
 use crate::manifest;
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
@@ -1115,6 +1117,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
+    // the monitor's refresh rate: atld answers with it, and the cadence checks below judge against it
+    let display = run_display();
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
@@ -1142,7 +1146,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 rt
             };
             if matches!(args.stage, Stage::Widgets) {
-                rt.with_display(widgets::display().to_arg())
+                rt.with_display(widgets::display(display).to_arg())
             } else {
                 rt
             }
@@ -1246,20 +1250,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the sub-gates, once the marker is logged (they read the frames or the touches after it)
     let sub: Vec<Result<String, String>> = match (args.stage, v.marker_ms) {
         (Stage::Frames, Some(_)) => {
-            let display = DisplayModel::default();
             vec![
                 picture_check(&app, display),
                 cadence_check(&after_marker(&app, marker), display.refresh_hz),
             ]
         }
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
-        (Stage::Widgets, Some(_)) => widgets::checks(&app, &after_marker(&app, marker), &liveness),
-        (Stage::Resize, Some(_)) => {
-            resize_checks(&app, &services, DisplayModel::default(), &liveness)
-        }
+        (Stage::Widgets, Some(_)) => widgets::checks(
+            &app,
+            &after_marker(&app, marker),
+            &liveness,
+            widgets::display(display),
+        ),
+        (Stage::Resize, Some(_)) => resize_checks(&app, &services, display, &liveness),
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
-            gtk_capture_check(&app, DisplayModel::default()),
+            gtk_capture_check(&app, display),
             content_origin(&app).and_then(|origin| {
                 track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
             }),

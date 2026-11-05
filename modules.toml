@@ -33,7 +33,7 @@ uses = ["binder"]
 # M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "property-service", "services"]
+uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
@@ -87,6 +87,12 @@ crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
 uses = ["compositor", "gralloc", "scene-buffer"]
 
+# the host half of the platform layer (plan S1 `atl-platform-host`): the desktop's monitors as atld and xtask read them (refresh rate so far); the GDK implementation is the second crate deny.toml lets depend on GTK
+[platform-host]
+crates = ["atl-platform-host-api", "atl-platform-host-linux", "atl-platform-host"]
+exports = ["atl-platform-host"]
+uses = []
+
 # a Scene buffer's pixels on the CPU (mmap + DMA_BUF_IOCTL_SYNC of the quad's dma-buf, sync_file polling), read through gralloc's format and handle definitions: what the GTK presenter and the compositor's scene checks (composer) share
 [scene-buffer]
 crates = ["atl-scene-buffer"]
@@ -119,4 +125,4 @@ exports = ["atl-layout"]
 [xtask]
 crates = ["xtask"]
 # binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share
-uses = ["layout", "binder", "broker", "services", "gralloc"]
+uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host"]

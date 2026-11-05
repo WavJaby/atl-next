@@ -9,6 +9,7 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
+use atl_services::display_model::DisplayModel;
 use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +96,15 @@ impl Run {
     pub fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
     }
+}
+
+/// The display a run's atld answers with when no `--display` is given: the monitor's refresh rate (GDK, atl-platform-host), on the model's default size and density. The cadence gates judge against this same rate. No desktop answers: the default, and a line says so (atld falls back the same way).
+pub fn run_display() -> DisplayModel {
+    let hz = atl_platform_host::monitor_refresh_hz().unwrap_or_else(|e| {
+        println!("display: {e}, the default refresh rate");
+        None
+    });
+    DisplayModel::with_monitor_refresh(hz)
 }
 
 /// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir; its path.

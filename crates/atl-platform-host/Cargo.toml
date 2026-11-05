@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-platform-host"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The facade core crates depend on for the host side (plan S1): the `-api` trait plus the one implementation the target OS selects at compile time, under neutral names. Static dispatch, no `dyn`.
+
+[dependencies]
+atl-platform-host-api = { path = "../atl-platform-host-api" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atl-platform-host-linux = { path = "../atl-platform-host-linux" }
+
+[lints]
+workspace = true

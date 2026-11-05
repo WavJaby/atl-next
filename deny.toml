@@ -28,9 +28,9 @@ allow-wildcard-paths = true
 # Host toolkit / desktop-bus crates are reachable only through the platform layer: core crates depend
 # on the `atl-platform-*` facades. When a `-<os>` implementation crate is created, it is added to the
 # matching entry's `wrappers` -- the only crates allowed to depend on it directly.
-# GTK: only atl-platform-ui-linux depends on gtk4; the other gtk-rs crates are listed with the gtk-rs crates that depend on them (the bindings' own layering), so a workspace crate reaching for gdk4 or gsk4 directly still fails.
+# GTK: only atl-platform-ui-linux and atl-platform-host-linux depend on gtk4; the other gtk-rs crates are listed with the gtk-rs crates that depend on them (the bindings' own layering), so a workspace crate reaching for gdk4 or gsk4 directly still fails.
 deny = [
-    { crate = "gtk4", reason = "platform layer only", wrappers = ["atl-platform-ui-linux"] },
+    { crate = "gtk4", reason = "platform layer only", wrappers = ["atl-platform-ui-linux", "atl-platform-host-linux"] },
     { crate = "gtk4-sys", reason = "platform layer only", wrappers = ["gtk4"] },
     { crate = "gdk4", reason = "platform layer only", wrappers = ["gtk4", "gsk4"] },
     { crate = "gdk4-sys", reason = "platform layer only", wrappers = ["gdk4", "gsk4-sys", "gtk4-sys"] },

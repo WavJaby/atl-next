@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-platform-host-api"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The platform layer's host side as a trait (plan S1 `atl-platform-host`, M3 step 5): the desktop's monitors, read by atld and xtask. Shaped by its one implementation, GDK on Linux (atl-platform-host-linux): a thread-affine connection, the refresh rate in Hz.
+# No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

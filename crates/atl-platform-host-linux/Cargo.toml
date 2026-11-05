@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-platform-host-linux"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown).
+# No `unsafe` of its own: the safe gtk4-rs bindings only.
+
+[dependencies]
+atl-platform-host-api = { path = "../atl-platform-host-api" }
+gtk4.workspace = true
+
+[lints]
+workspace = true

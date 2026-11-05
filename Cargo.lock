@@ -253,6 +253,29 @@ name = "atl-parcelables"
 version = "0.0.0"
 
 [[package]]
+name = "atl-platform-host"
+version = "0.0.0"
+dependencies = [
+ "atl-platform-host-api",
+ "atl-platform-host-linux",
+]
+
+[[package]]
+name = "atl-platform-host-api"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "atl-platform-host-linux"
+version = "0.0.0"
+dependencies = [
+ "atl-platform-host-api",
+ "gtk4",
+]
+
+[[package]]
 name = "atl-platform-ui"
 version = "0.0.0"
 dependencies = [
@@ -328,6 +351,7 @@ dependencies = [
  "atl-binderd",
  "atl-broker",
  "atl-gralloc",
+ "atl-platform-host",
  "atl-property-service",
  "atl-services",
  "clap",
@@ -1478,6 +1502,7 @@ dependencies = [
  "atl-broker",
  "atl-gralloc",
  "atl-layout",
+ "atl-platform-host",
  "atl-services",
  "clap",
  "object",

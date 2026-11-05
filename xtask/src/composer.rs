@@ -20,7 +20,7 @@ use anyhow::Result;
 use atl_layout::Layout;
 use atl_services::display_model::DisplayModel;
 
-use crate::atld_run::{Run, Runtime, Shell, counter_lines};
+use crate::atld_run::{Run, Runtime, Shell, counter_lines, run_display};
 use crate::manifest;
 use crate::verdict::{Failure, Verdict};
 
@@ -645,6 +645,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
+    // atld answers with the monitor's refresh rate; the frame cadence is judged against it
+    let display = run_display();
     let rt = Runtime::new(
         root,
         &args.host,
@@ -713,7 +715,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         failures.push(Failure::step("atld", atld));
     }
     ok &= exited;
-    for c in evaluate(&app, &services, &DisplayModel::default()) {
+    for c in evaluate(&app, &services, &display) {
         println!(
             "composer: {} {}: {}",
             if c.ok { "pass" } else { "FAIL" },
