@@ -72,7 +72,11 @@ fn main() -> Result<()> {
     let packages = Arc::new(Packages::new(list, libraries));
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     ProcessState::start_thread_pool();
-    let activity = ActivityManager::new(packages.clone(), control, display);
+    // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
+    let agents = Arc::new(UiAgents::default());
+    // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry; the activity service creates each launch's Task here
+    let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
+    let activity = ActivityManager::new(packages.clone(), control, display, Arc::clone(&tasks));
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()
     {
@@ -84,10 +88,6 @@ fn main() -> Result<()> {
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(DISPLAY, atl_services::display::new_binder(display))
         .context("addService display")?;
-    // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
-    let agents = Arc::new(UiAgents::default());
-    // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry
-    let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
     binder::add_service(
         WINDOW,
         atl_services::window::new_binder(display, Arc::clone(&agents), Arc::clone(&tasks)),

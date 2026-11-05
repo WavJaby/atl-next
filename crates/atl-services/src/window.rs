@@ -30,7 +30,7 @@ use binder::{
 };
 
 use crate::display_model::DisplayModel;
-use crate::tasks::Tasks;
+use crate::tasks::{TaskId, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters, permission};
 
@@ -49,6 +49,8 @@ const INPUT_FEATURE_NO_INPUT_CHANNEL: i32 = 1 << 0;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024;
 /// CompatibilityInfo's scale of an app that needs no size compatibility: the value addToDisplay reports (outSizeCompatScale).
 const COMPAT_SCALE_NONE: f32 = 1.0;
+/// WindowManagerGlobal.ADD_BAD_APP_TOKEN (WindowManagerGlobal.java:127): the window's token is no activity's, so the add fails and ViewRootImpl throws BadTokenException.
+const ADD_BAD_APP_TOKEN: i32 = -1;
 
 /// The UI agent of the app that opened a session (ui_agent.rs): the registry holds one per uid, so a session asks the agent of its own uid.
 struct RegisteredAgent {
@@ -93,6 +95,19 @@ impl RegisteredAgent {
         }
     }
 
+    /// Names the window's Task to the agent: the composer sends that Task's bounds with it (SET_BOUNDS). Counted when the agent refuses it.
+    fn name_task(&self, task: TaskId) {
+        let Some(agent) = self.agent("addToDisplayAsUser") else {
+            return;
+        };
+        if let Err(e) = agent.task(task.raw()) {
+            counters::count(
+                WINDOW_SESSION,
+                &format!("addToDisplayAsUser: UI agent refused the task: {e:?}"),
+            );
+        }
+    }
+
     /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
     fn give_input_server(&self, fd: OwnedFd) -> bool {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
@@ -111,10 +126,11 @@ impl RegisteredAgent {
     }
 }
 
-/// One window the session added: its client binder (what `remove` and `relayout` find it by) and its title (the layer name). Its input channel's server end went to the app's UI agent.
+/// One window the session added: its client binder (what `remove` and `relayout` find it by), its title (the layer name) and its Task (the activity its `attrs.token` names). Its input channel's server end went to the app's UI agent.
 struct Window {
     client: SpIBinder,
     title: String,
+    task: TaskId,
     laid_out: bool,
     /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
     surface: Option<SurfaceControl>,
@@ -123,14 +139,14 @@ struct Window {
 struct WindowManager {
     model: DisplayModel,
     agents: Arc<UiAgents>,
-    tasks: Arc<Tasks>,
+    tasks: Arc<Tasks<SpIBinder>>,
 }
 
 /// The session openSession gives: the windows it added, and the display they lay out on.
 struct Session {
     model: DisplayModel,
     agent: RegisteredAgent,
-    tasks: Arc<Tasks>,
+    tasks: Arc<Tasks<SpIBinder>>,
     windows: Mutex<Vec<Window>>,
 }
 
@@ -206,8 +222,8 @@ impl Session {
     }
 
     /// A window's frame: from the origin, the size of its Task (tasks.rs). Freeform, so it is the window's bounds, not the display's.
-    fn task_rect(&self) -> Rect {
-        let size = self.tasks.size(self.agent.uid);
+    fn task_rect(&self, task: TaskId) -> Rect {
+        let size = self.tasks.size(task);
         Rect {
             left: 0,
             top: 0,
@@ -256,8 +272,9 @@ impl IWindowSession for Session {
         counters::unimplemented(WINDOW_SESSION, method)
     }
 
-    /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder; a window that takes input gets an input channel (the
-    /// client end returned, the server end handed to the app's UI agent). Refused: a call without the window or its attributes (counted, BAD_VALUE).
+    /// WindowManagerService.addWindow for a window of the one display: the window is recorded by its client binder and its Task (the activity its `attrs.token` names); a window that takes
+    /// input gets an input channel (the client end returned, the server end handed to the app's UI agent). Refused: a call without the window or its attributes (counted, BAD_VALUE); a token
+    /// no activity was bound to (counted, ADD_BAD_APP_TOKEN).
     fn r#addToDisplayAsUser(
         &self,
         window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
@@ -279,6 +296,14 @@ impl IWindowSession for Session {
             );
             return Err(StatusCode::BAD_VALUE.into());
         };
+        let Some(task) = self.tasks.task_of_activity(attrs.token.as_ref()) else {
+            counters::refused(
+                WINDOW_SESSION,
+                "addToDisplayAsUser: the window's token names no activity's Task",
+            );
+            return Ok(ADD_BAD_APP_TOKEN);
+        };
+        self.agent.name_task(task);
         let channel = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
             let (server, client) = open_input_pair()?;
             // the server end is the app's: its UI agent publishes the window's input on it (no system InputDispatcher)
@@ -294,10 +319,11 @@ impl IWindowSession for Session {
         } else {
             InputChannel::default()
         };
-        self.tasks.add_window(self.agent.uid, window.as_binder());
+        self.tasks.add_window(task, window.as_binder());
         self.lock().push(Window {
             client: window.as_binder(),
             title: attrs.title.clone().unwrap_or_default(),
+            task,
             laid_out: false,
             surface: None,
         });
@@ -335,7 +361,7 @@ impl IWindowSession for Session {
             return Err(StatusCode::BAD_VALUE.into());
         };
         let client = window.as_binder();
-        let (first, pending) = {
+        let (first, pending, task) = {
             let mut windows = self.lock();
             let Some(record) = windows.iter_mut().find(|w| w.client == client) else {
                 counters::refused(WINDOW_SESSION, "relayout: window not added by this session");
@@ -346,6 +372,7 @@ impl IWindowSession for Session {
             (
                 first,
                 record.surface.is_none().then(|| record.title.clone()),
+                record.task,
             )
         };
         // The agent is another process, asked without the windows lock. A window gets its surface once; a failed call is asked again at the next relayout.
@@ -361,13 +388,13 @@ impl IWindowSession for Session {
             .iter()
             .find(|w| w.client == client)
             .and_then(|w| w.surface.clone());
-        let size = self.tasks.size(self.agent.uid);
+        let size = self.tasks.size(task);
         let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
             frames: ClientWindowFrames {
-                frame: self.task_rect(),
+                frame: self.task_rect(task),
                 display_frame: self.display_rect(),
-                parent_frame: self.task_rect(),
+                parent_frame: self.task_rect(task),
                 attached_frame: None,
                 is_parent_frame_clipped_by_display_cutout: false,
                 compat_scale: COMPAT_SCALE_NONE,
@@ -412,7 +439,11 @@ impl IWindowSession for Session {
 }
 
 /// A new window service binder: the one display's model, which every session lays out on, and the table of UI agents (system_services.rs gives it the registry's).
-pub fn new_binder(model: DisplayModel, agents: Arc<UiAgents>, tasks: Arc<Tasks>) -> SpIBinder {
+pub fn new_binder(
+    model: DisplayModel,
+    agents: Arc<UiAgents>,
+    tasks: Arc<Tasks<SpIBinder>>,
+) -> SpIBinder {
     BnWindowManager::new_binder(
         WindowManager {
             model,
@@ -424,12 +455,12 @@ pub fn new_binder(model: DisplayModel, agents: Arc<UiAgents>, tasks: Arc<Tasks>)
     .as_binder()
 }
 
-/// The Task of `uid` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
+/// `task` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
 /// AOSP's WindowState.reportResized (WindowState.java:3584) sends the same call; the relaunch wait it skips (`inRelaunchingActivity`) is not modelled, since no relaunch exists yet.
 /// forceLayout is set so the app relayouts with the new frames; reportDraw is false because finishDrawing is not modelled (module doc).
-pub fn notify_resized(tasks: &Tasks, uid: u32) -> usize {
+pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
-    let size = tasks.size(uid);
+    let size = tasks.size(task);
     let rect = |right: i32, bottom: i32| Rect {
         left: 0,
         top: 0,
@@ -441,7 +472,7 @@ pub fn notify_resized(tasks: &Tasks, uid: u32) -> usize {
         override_config: activity::task_override(&display, size),
         merged: activity::task_configuration(&display, size),
     };
-    let clients = tasks.windows_of(uid);
+    let clients = tasks.windows_of(task);
     for client in &clients {
         let window = match client
             .clone()

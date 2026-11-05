@@ -13,7 +13,7 @@ use binder::{
 
 use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, check, service_names};
 use crate::counters;
-use crate::tasks::{TaskSize, Tasks};
+use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agent::UiAgents;
 
 /// The interface name counters use.
@@ -30,8 +30,14 @@ pub trait ICompositorRegistry: Interface {
         ui_agent: SpIBinder,
     ) -> Result<(), StatusCode>;
 
-    /// SET_BOUNDS once its arguments are read: the caller's Task is `width` x `height` physical pixels (tasks.rs). A non-positive size is refused; a size change notifies the Task's windows.
-    fn set_bounds(&self, caller_uid: u32, width: i32, height: i32) -> Result<(), StatusCode>;
+    /// SET_BOUNDS once its arguments are read: Task `task` (its number, tasks.rs) is `width` x `height` physical pixels. The caller's uid must own the Task; a non-positive size is refused; a size change notifies the Task's windows.
+    fn set_bounds(
+        &self,
+        caller_uid: u32,
+        task: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -49,9 +55,10 @@ fn on_transact(
     _reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
     if code == SET_BOUNDS {
+        let task: i32 = data.read()?;
         let width: i32 = data.read()?;
         let height: i32 = data.read()?;
-        return service.set_bounds(ThreadState::get_calling_uid(), width, height);
+        return service.set_bounds(ThreadState::get_calling_uid(), task, width, height);
     }
     if code != REGISTER {
         counters::count(INTERFACE, &format!("code {code}"));
@@ -71,7 +78,7 @@ fn on_transact(
 }
 
 impl ICompositorRegistry for BpCompositorRegistry {
-    fn set_bounds(&self, _: u32, _: i32, _: i32) -> Result<(), StatusCode> {
+    fn set_bounds(&self, _: u32, _: i32, _: i32, _: i32) -> Result<(), StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -88,8 +95,14 @@ impl ICompositorRegistry for BpCompositorRegistry {
 }
 
 impl ICompositorRegistry for Binder<BnCompositorRegistry> {
-    fn set_bounds(&self, caller_uid: u32, width: i32, height: i32) -> Result<(), StatusCode> {
-        self.0.set_bounds(caller_uid, width, height)
+    fn set_bounds(
+        &self,
+        caller_uid: u32,
+        task: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode> {
+        self.0.set_bounds(caller_uid, task, width, height)
     }
 
     fn register(
@@ -112,29 +125,48 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 
 struct Registry {
     agents: Arc<UiAgents>,
-    tasks: Arc<Tasks>,
+    tasks: Arc<Tasks<SpIBinder>>,
 }
 
 impl Interface for Registry {}
 
 impl ICompositorRegistry for Registry {
-    fn set_bounds(&self, caller_uid: u32, width: i32, height: i32) -> Result<(), StatusCode> {
+    fn set_bounds(
+        &self,
+        caller_uid: u32,
+        task: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode> {
+        // an app sizes its own Tasks only: the caller's uid must own the one it names
+        let Some(task) =
+            TaskId::from_raw(task).filter(|t| self.tasks.owner(*t) == Some(caller_uid))
+        else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "services: bounds refused uid {caller_uid}: task {task} is not its"
+            );
+            return Err(StatusCode::PERMISSION_DENIED);
+        };
         if width <= 0 || height <= 0 {
             let _ = writeln!(
                 std::io::stderr(),
-                "services: bounds refused uid {caller_uid}: {width}x{height}"
+                "services: bounds refused task {}: {width}x{height}",
+                task.raw()
             );
             return Err(StatusCode::BAD_VALUE);
         }
-        if self.tasks.set_size(caller_uid, TaskSize { width, height }) {
+        if self.tasks.set_size(task, TaskSize { width, height }) {
             let _ = writeln!(
                 std::io::stderr(),
-                "services: task of uid {caller_uid} bounds {width}x{height}"
+                "services: task {} of uid {caller_uid} bounds {width}x{height}",
+                task.raw()
             );
-            let windows = crate::window::notify_resized(&self.tasks, caller_uid);
+            let windows = crate::window::notify_resized(&self.tasks, task);
             let _ = writeln!(
                 std::io::stderr(),
-                "services: resized {windows} windows of uid {caller_uid}"
+                "services: resized {windows} windows of task {}",
+                task.raw()
             );
         }
         Ok(())
@@ -168,7 +200,7 @@ impl ICompositorRegistry for Registry {
 }
 
 /// A new registry binder. `agents` is the table the window service reads (system_services.rs gives both the same one).
-pub fn new_binder(agents: Arc<UiAgents>, tasks: Arc<Tasks>) -> SpIBinder {
+pub fn new_binder(agents: Arc<UiAgents>, tasks: Arc<Tasks<SpIBinder>>) -> SpIBinder {
     BnCompositorRegistry::new_binder(Registry { agents, tasks }, BinderFeatures::default())
         .as_binder()
 }

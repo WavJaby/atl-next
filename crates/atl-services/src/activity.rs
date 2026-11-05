@@ -48,7 +48,7 @@ use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
-use crate::tasks::TaskSize;
+use crate::tasks::{TaskSize, Tasks};
 use crate::{counters, manifest_flags, package, settings, token};
 
 const AM: &str = "IActivityManager";
@@ -314,6 +314,8 @@ struct Inner {
     settings: SpIBinder,
     /// the display the configuration of every started app is made from (display_model.rs)
     display: DisplayModel,
+    /// the Tasks: a launch that starts a Task creates it here and binds its activity's token to it (tasks.rs)
+    tasks: Arc<Tasks<SpIBinder>>,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -339,10 +341,12 @@ fn illegal_argument(msg: &str) -> Status {
 }
 
 impl ActivityManager {
+    /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there.
     pub fn new(
         packages: Arc<Packages>,
         control: Arc<dyn ProcessControl>,
         display: DisplayModel,
+        tasks: Arc<Tasks<SpIBinder>>,
     ) -> Self {
         let controller = BnActivityClientController::new_binder(
             ActivityClientController,
@@ -358,6 +362,7 @@ impl ActivityManager {
                 controller,
                 settings: settings::new_binder(),
                 display,
+                tasks,
             }),
         }
     }
@@ -880,8 +885,10 @@ impl IActivityManager for ActivityManager {
         let Some(activity) = p.launch_activity() else {
             return Ok(());
         };
-        // one token for both items: the app keys its activity record by it
+        // one token for both items: the app keys its activity record by it. The launch starts the app's Task (a new one: no launch yet names a caller's Task), and the activity's window names it by the token (window.rs).
         let token = token::new();
+        let task = inner.tasks.new_task(uid);
+        inner.tasks.bind_activity(token.clone(), task);
         let transaction = ClientTransaction {
             items: vec![
                 Some(ClientTransactionItem::LaunchActivity(Box::new(

@@ -20,6 +20,7 @@ pub mod packages;
 pub mod permission;
 pub mod process_control;
 pub mod shared_memory;
+pub mod tasks;
 
 #[cfg(feature = "converter")]
 pub mod activity;
@@ -39,8 +40,6 @@ pub mod package;
 pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod settings;
-#[cfg(feature = "converter")]
-pub mod tasks;
 #[cfg(feature = "converter")]
 mod token;
 #[cfg(feature = "converter")]

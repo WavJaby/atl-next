@@ -110,7 +110,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         display,
         compositor: Default::default(),
     });
-    if let Some(ui) = ui {
+    let bounds = if let Some(ui) = ui {
         let size = PhysSize {
             width: u32::try_from(display.width).unwrap_or(0),
             height: u32::try_from(display.height).unwrap_or(0),
@@ -120,7 +120,8 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             .map_err(|e| format!("deliver thread: {e}"))?;
         let bounds =
             BoundsSender::spawn(threads).map_err(|e| format!("task bounds thread: {e}"))?;
-        ui_window::install(ui, frames, input_tx.clone(), size, bounds);
+        ui_window::install(ui, frames, input_tx.clone(), size, Arc::clone(&bounds));
+        Some(bounds)
     } else {
         let first_frame = input_tx.clone();
         composer
@@ -132,10 +133,11 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
                 })),
             )
             .map_err(|e| format!("frame clock thread: {e}"))?;
-    }
+        None
+    };
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
-    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx);
+    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, bounds);
     register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
     // the registry holds the binders; the process holds the compositor (the clock or deliver thread does)
     Ok(composer)

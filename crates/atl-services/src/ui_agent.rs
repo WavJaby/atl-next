@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has two transactions. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
-//! INPUT_SERVER: a window's input channel server end (an fd, ParcelFileDescriptor) in, nothing out.
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has three transactions. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
+//! INPUT_SERVER: a window's input channel server end (an fd, ParcelFileDescriptor) in, nothing out. TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
 //! The app serves it (atl-composer `ui_agent`: the layer in its in-process compositor, the input server end to its input thread). This module holds the protocol on both sides and the table the registry fills per uid.
 //! The window service calls it through the proxy; the server object is only ever a remote one here, so `Binder<BnUiAgent>` delegates to the native object like any AIDL interface.
 
@@ -22,6 +22,8 @@ pub const DESCRIPTOR: &str = "atl.IUiAgent";
 pub const WINDOW_SURFACE: TransactionCode = 1;
 /// A window's input channel server end in; the agent publishes the window's input on it. Nothing out.
 pub const INPUT_SERVER: TransactionCode = 2;
+/// A window's Task number in (TaskId::raw); nothing out. Sent when the window is added: the agent holds the number for its SET_BOUNDS.
+pub const TASK: TransactionCode = 3;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -30,6 +32,8 @@ pub trait IUiAgent: Interface {
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode>;
     /// A window's input channel server end: the app publishes the window's input on it from now on. The agent owns the fd.
     fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode>;
+    /// The Task the app's window belongs to, by its number (tasks.rs TaskId::raw): the app's bounds go to it.
+    fn task(&self, task: i32) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -55,6 +59,10 @@ fn on_transact(
             let fd: ParcelFileDescriptor = data.read()?;
             service.input_server(fd.into())
         }
+        TASK => {
+            let task: i32 = data.read()?;
+            service.task(task)
+        }
         _ => {
             counters::count(INTERFACE, &format!("code {code}"));
             Err(StatusCode::UNKNOWN_TRANSACTION)
@@ -78,6 +86,14 @@ impl IUiAgent for BpUiAgent {
         binder.submit_transact(INPUT_SERVER, data, 0)?;
         Ok(())
     }
+
+    fn task(&self, task: i32) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(&task)?;
+        binder.submit_transact(TASK, data, 0)?;
+        Ok(())
+    }
 }
 
 impl IUiAgent for Binder<BnUiAgent> {
@@ -87,6 +103,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode> {
         self.0.input_server(fd)
+    }
+
+    fn task(&self, task: i32) -> Result<(), StatusCode> {
+        self.0.task(task)
     }
 }
 

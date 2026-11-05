@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: MIT
-//! The Tasks of the one display (plan `Lifecycle / windows`: freeform, one Task = one toplevel window). A Task's size is its toplevel's content size in physical pixels
-//! (`Task.setBounds`, Task.java:2786; the compositor's configure plays the Shell's `wct.setBounds`, VeiledResizeTaskPositioner.java:188). The display ([`DisplayModel`]) is the monitor:
-//! a window's size never changes it. The table also keeps the IWindow client of each window of a Task, so a size change reaches them (window.rs `notify_resized`).
-//! A Task is keyed by the caller's uid, as the UI agents are (ui_agent.rs): one app process per uid until activity tokens key Tasks.
+//! The Tasks of the one display (plan `Lifecycle / windows`: freeform, one Task = one toplevel window). A Task's size is its toplevel's content size in physical pixels (`Task.setBounds`, Task.java:2786; the compositor's configure plays the Shell's `wct.setBounds`, VeiledResizeTaskPositioner.java:188). The display ([`DisplayModel`]) is the monitor: a window's size never changes it.
+//! A Task is keyed by its [`TaskId`], which the services assign when the launch that makes the Task attaches its process (activity.rs). An activity's token names its Task (ActivityRecord.task), and a window names its Task by its `attrs.token` (window.rs). The owner uid is kept for the checks the registry makes (registry_service.rs), never as a key.
+//! The table also keeps the IWindow client of each window of a Task, so a size change reaches them (window.rs `notify_resized`).
+//! The table is generic over the handle `C` (the services use SpIBinder): handles are cloned and compared by equality, so the table and its tests build without the converter feature, which the test step needs.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use binder::SpIBinder;
-
 use crate::display_model::DisplayModel;
+
+/// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskId(i32);
+
+impl TaskId {
+    /// The number the wire carries.
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// The Task a wire number names; None for a number no Task has (zero or negative).
+    pub fn from_raw(raw: i32) -> Option<Self> {
+        (raw > 0).then_some(TaskId(raw))
+    }
+}
 
 /// A Task's size: the toplevel's content size in physical pixels. The origin is not kept: the compositor places the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,33 +32,53 @@ pub struct TaskSize {
     pub height: i32,
 }
 
-/// One window of a Task: the client binder (what `remove` finds the window by) and the Task it belongs to.
-struct WindowEntry {
-    uid: u32,
-    client: SpIBinder,
+/// What the services keep per Task: the uid of the app it belongs to (checked by the registry), and its size once one was set (only the sizes that were set are kept: a Task without one has the display's size).
+struct TaskRecord {
+    owner: u32,
+    size: Option<TaskSize>,
 }
 
-#[derive(Default)]
-struct State {
-    /// Only the sizes that were set: a Task without one has the display's size.
-    sizes: BTreeMap<u32, TaskSize>,
-    windows: Vec<WindowEntry>,
+/// One window of a Task: the client handle (what `remove` finds the window by) and the Task it belongs to.
+struct WindowEntry<C> {
+    task: TaskId,
+    client: C,
+}
+
+struct State<C> {
+    tasks: BTreeMap<TaskId, TaskRecord>,
+    /// the last TaskId handed out
+    last_id: i32,
+    /// activity token -> Task (ActivityRecord.task). A token is an identity: compared by equality.
+    activities: Vec<(C, TaskId)>,
+    windows: Vec<WindowEntry<C>>,
     /// The last `ClientWindowFrames.seq` handed out, global across windows.
     seq: i32,
 }
 
-/// The Tasks of the display: sizes by uid and the windows of each.
-pub struct Tasks {
-    display: DisplayModel,
-    state: Mutex<State>,
+impl<C> State<C> {
+    fn new() -> Self {
+        State {
+            tasks: BTreeMap::new(),
+            last_id: 0,
+            activities: Vec::new(),
+            windows: Vec::new(),
+            seq: 0,
+        }
+    }
 }
 
-impl Tasks {
+/// The Tasks of the display: their owners and sizes, the activities bound to each, and the windows of each. `C` is the handle an activity or window is known by.
+pub struct Tasks<C> {
+    display: DisplayModel,
+    state: Mutex<State<C>>,
+}
+
+impl<C: Clone + PartialEq> Tasks<C> {
     /// `display` is the monitor. A Task with no size yet has the display's size: its window opens at it.
     pub fn new(display: DisplayModel) -> Self {
         Tasks {
             display,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State::new()),
         }
     }
 
@@ -53,8 +87,8 @@ impl Tasks {
         self.display
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        // a poisoned table still holds the sizes and windows
+    fn lock(&self) -> MutexGuard<'_, State<C>> {
+        // a poisoned table still holds the tasks and windows
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -65,49 +99,81 @@ impl Tasks {
         }
     }
 
-    /// The size of `uid`'s Task: the one it was set to, else the display's.
-    pub fn size(&self, uid: u32) -> TaskSize {
+    /// A new Task of the app `owner` (its uid). The launch that starts a Task calls it once.
+    pub fn new_task(&self, owner: u32) -> TaskId {
+        let mut st = self.lock();
+        st.last_id = st.last_id.checked_add(1).expect("TaskId space exhausted");
+        let id = TaskId(st.last_id);
+        st.tasks.insert(id, TaskRecord { owner, size: None });
+        id
+    }
+
+    /// The uid of the app `task` belongs to; None for no Task.
+    pub fn owner(&self, task: TaskId) -> Option<u32> {
+        self.lock().tasks.get(&task).map(|t| t.owner)
+    }
+
+    /// The size of `task`: the one it was set to, else the display's (a Task that does not exist has the display's size too).
+    pub fn size(&self, task: TaskId) -> TaskSize {
         self.lock()
-            .sizes
-            .get(&uid)
-            .copied()
+            .tasks
+            .get(&task)
+            .and_then(|t| t.size)
             .unwrap_or_else(|| self.display_size())
     }
 
-    /// Sets `uid`'s Task size; true when it changed, so its windows need `resized`. The last size set is the one kept.
-    pub fn set_size(&self, uid: u32, size: TaskSize) -> bool {
+    /// Sets `task`'s size; true when it changed, so its windows need `resized`. False for the size it already has and for no Task (the registry checks the owner first).
+    pub fn set_size(&self, task: TaskId, size: TaskSize) -> bool {
+        let display = self.display_size();
         let mut st = self.lock();
-        let current = st
-            .sizes
-            .get(&uid)
-            .copied()
-            .unwrap_or_else(|| self.display_size());
-        if current == size {
+        let Some(record) = st.tasks.get_mut(&task) else {
+            return false;
+        };
+        if record.size.unwrap_or(display) == size {
             return false;
         }
-        st.sizes.insert(uid, size);
+        record.size = Some(size);
         true
     }
 
-    /// Records a window of `uid`'s Task; a client already recorded is not recorded twice.
-    pub fn add_window(&self, uid: u32, client: SpIBinder) {
+    /// Names `task` as the Task of the activity `token` (ActivityRecord.task). A token bound again takes the new Task.
+    pub fn bind_activity(&self, token: C, task: TaskId) {
+        let mut st = self.lock();
+        match st.activities.iter_mut().find(|(t, _)| *t == token) {
+            Some(entry) => entry.1 = task,
+            None => st.activities.push((token, task)),
+        }
+    }
+
+    /// The Task of the activity `token`; None for no token, or one no activity was bound to (a window with it is refused).
+    pub fn task_of_activity(&self, token: Option<&C>) -> Option<TaskId> {
+        let token = token?;
+        self.lock()
+            .activities
+            .iter()
+            .find(|(t, _)| t == token)
+            .map(|(_, task)| *task)
+    }
+
+    /// Records a window of `task`; a client already recorded is not recorded twice.
+    pub fn add_window(&self, task: TaskId, client: C) {
         let mut st = self.lock();
         if !st.windows.iter().any(|w| w.client == client) {
-            st.windows.push(WindowEntry { uid, client });
+            st.windows.push(WindowEntry { task, client });
         }
     }
 
     /// Forgets the window whose client is `client` (removeWindow).
-    pub fn remove_window(&self, client: &SpIBinder) {
+    pub fn remove_window(&self, client: &C) {
         self.lock().windows.retain(|w| w.client != *client);
     }
 
-    /// The clients of `uid`'s windows, in the order they were added.
-    pub fn windows_of(&self, uid: u32) -> Vec<SpIBinder> {
+    /// The clients of `task`'s windows, in the order they were added.
+    pub fn windows_of(&self, task: TaskId) -> Vec<C> {
         self.lock()
             .windows
             .iter()
-            .filter(|w| w.uid == uid)
+            .filter(|w| w.task == task)
             .map(|w| w.client.clone())
             .collect()
     }
@@ -124,107 +190,104 @@ impl Tasks {
 mod tests {
     use super::*;
 
+    /// A stand-in handle: the table only compares and clones them.
+    type Handle = u32;
+
     /// The display the tests use: DisplayModel's default, 1280x800.
-    fn tasks() -> Tasks {
+    fn tasks() -> Tasks<Handle> {
         Tasks::new(DisplayModel::default())
     }
 
-    /// A Task with no size has the display's size. A set size is kept per uid, and no resize changes the display.
+    /// The display's size as a TaskSize: what a Task without a size has.
+    fn display_size() -> TaskSize {
+        TaskSize {
+            width: 1280,
+            height: 800,
+        }
+    }
+
+    fn size(width: i32, height: i32) -> TaskSize {
+        TaskSize { width, height }
+    }
+
+    /// Two Tasks of one app hold their own bounds: both start at the display's size, each keeps the size set for it, and no resize changes the display.
     #[test]
-    fn sizes_are_per_uid_and_default_to_the_display() {
+    fn tasks_of_one_uid_hold_their_own_bounds() {
         let t = tasks();
-        assert_eq!(
-            t.size(10_123),
-            TaskSize {
-                width: 1280,
-                height: 800
-            }
-        );
-        assert!(t.set_size(
-            10_123,
-            TaskSize {
-                width: 352,
-                height: 272
-            }
-        ));
-        assert!(t.set_size(
-            10_124,
-            TaskSize {
-                width: 288,
-                height: 208
-            }
-        ));
-        assert_eq!(
-            t.size(10_123),
-            TaskSize {
-                width: 352,
-                height: 272
-            }
-        );
-        assert_eq!(
-            t.size(10_124),
-            TaskSize {
-                width: 288,
-                height: 208
-            }
-        );
+        let (main, second) = (t.new_task(10_123), t.new_task(10_123));
+        assert_ne!(main, second);
+        assert_eq!(t.owner(main), Some(10_123));
+        assert_eq!(t.owner(second), Some(10_123));
+        assert_eq!(t.size(main), display_size());
+        assert_eq!(t.size(second), display_size());
+        assert!(t.set_size(main, size(352, 272)));
+        assert!(t.set_size(second, size(288, 208)));
+        assert_eq!(t.size(main), size(352, 272));
+        assert_eq!(t.size(second), size(288, 208));
         assert_eq!(t.display(), DisplayModel::default());
     }
 
-    /// Setting the size a Task already has is no change; each change replaces the size, so the last one set is the one kept.
+    /// Setting the size a Task already has is no change; each change replaces the size, so the last one set is the one kept. Back to the display's size is a change: the entry is kept, not dropped.
     #[test]
     fn set_size_reports_changes_and_keeps_the_last() {
         let t = tasks();
-        assert!(t.set_size(
-            7,
-            TaskSize {
-                width: 1000,
-                height: 700
-            }
-        ));
-        assert!(t.set_size(
-            7,
-            TaskSize {
-                width: 900,
-                height: 650
-            }
-        ));
-        assert!(t.set_size(
-            7,
-            TaskSize {
-                width: 800,
-                height: 600
-            }
-        ));
-        assert!(!t.set_size(
-            7,
-            TaskSize {
-                width: 800,
-                height: 600
-            }
-        ));
-        assert_eq!(
-            t.size(7),
-            TaskSize {
-                width: 800,
-                height: 600
-            }
-        );
-        // back to the display's size is a change: the entry is kept, not dropped
-        assert!(t.set_size(
-            7,
-            TaskSize {
-                width: 1280,
-                height: 800
-            }
-        ));
-        assert_eq!(
-            t.size(7),
-            TaskSize {
-                width: 1280,
-                height: 800
-            }
-        );
+        let task = t.new_task(7);
+        assert!(t.set_size(task, size(1000, 700)));
+        assert!(t.set_size(task, size(900, 650)));
+        assert!(t.set_size(task, size(800, 600)));
+        assert!(!t.set_size(task, size(800, 600)));
+        assert_eq!(t.size(task), size(800, 600));
+        assert!(t.set_size(task, display_size()));
+        assert_eq!(t.size(task), display_size());
+        assert!(!t.set_size(task, display_size()));
+    }
+
+    /// A Task that does not exist has no owner, takes no size, and has the display's size.
+    #[test]
+    fn unknown_task_is_refused() {
+        let t = tasks();
+        let ghost = TaskId::from_raw(99).expect("positive");
+        assert_eq!(t.owner(ghost), None);
+        assert!(!t.set_size(ghost, size(352, 272)));
+        assert_eq!(t.size(ghost), display_size());
+    }
+
+    /// The wire form: zero and negative numbers name no Task; a Task's number round-trips.
+    #[test]
+    fn task_numbers_round_trip_and_refuse_non_positive() {
+        let t = tasks();
+        let task = t.new_task(7);
+        assert_eq!(TaskId::from_raw(0), None);
+        assert_eq!(TaskId::from_raw(-1), None);
+        assert_eq!(TaskId::from_raw(task.raw()), Some(task));
+    }
+
+    /// An activity's token names its Task: the bound token finds it, no token and an unbound token find none; a token bound again takes the new Task.
+    #[test]
+    fn activity_tokens_name_their_task() {
+        let t = tasks();
+        let (first, second) = (t.new_task(7), t.new_task(7));
+        t.bind_activity(1, first);
+        assert_eq!(t.task_of_activity(Some(&1)), Some(first));
+        assert_eq!(t.task_of_activity(None), None);
+        assert_eq!(t.task_of_activity(Some(&2)), None);
+        t.bind_activity(1, second);
+        assert_eq!(t.task_of_activity(Some(&1)), Some(second));
+    }
+
+    /// A window belongs to the Task it was added under: two Tasks of one app list their own windows; a window added twice is kept once; a removed one is gone.
+    #[test]
+    fn windows_belong_to_their_task() {
+        let t = tasks();
+        let (main, second) = (t.new_task(7), t.new_task(7));
+        t.add_window(main, 100);
+        t.add_window(second, 200);
+        t.add_window(main, 100);
+        assert_eq!(t.windows_of(main), vec![100]);
+        assert_eq!(t.windows_of(second), vec![200]);
+        t.remove_window(&100);
+        assert!(t.windows_of(main).is_empty());
+        assert_eq!(t.windows_of(second), vec![200]);
     }
 
     /// Frame sequence numbers only go up.
