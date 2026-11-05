@@ -31,6 +31,7 @@ mod manifest;
 mod modules;
 mod native;
 mod native_load;
+mod nested_wayland;
 mod none_gate;
 mod notice;
 mod packages;
@@ -134,7 +135,7 @@ enum Command {
     /// Runs any APK under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
     ///
     /// The package file is the APK's own manifest; the APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
-    /// `--hold SECS` keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Until GPU lands only apps with `android:hardwareAccelerated="false"` are supported (owner, 2026-11-05).
+    /// Without `--hold` the window maps in the gate's headless weston (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Until GPU lands only apps with `android:hardwareAccelerated="false"` are supported (owner, 2026-11-05).
     RunApk(run_apk::Args),
     /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).
     Test {
@@ -186,7 +187,7 @@ enum Test {
     Window(window::Args),
     /// The GTK platform layer (M3 slice 6) on a real Wayland compositor: a window maps, frame-clock ticks present scenes, GSK readback equals the pattern, a blocked UI thread answers no `xdg_wm_base` ping.
     ///
-    /// Runs crates/atl-platform-ui/examples/gate.rs against $WAYLAND_DISPLAY (WSLg: wayland-0) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
+    /// Runs crates/atl-platform-ui/examples/gate.rs in the gate's headless weston (`--hold-blocked`: on $WAYLAND_DISPLAY) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
     /// The compositor's own "not responding" reaction is not observable on WSLg: `--hold-blocked <s>` keeps the UI thread blocked for the Arch-laptop run to watch.
     PlatformUi(platform_ui::Args),
 }

@@ -24,6 +24,7 @@ use crate::atld_run::{
 };
 use crate::composer::{fnv1a64, word};
 use crate::manifest;
+use crate::nested_wayland::NestedCompositor;
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod widgets;
@@ -646,12 +647,12 @@ fn ppid(pid: u32) -> Option<u32> {
         .ok()
 }
 
-/// The gtk stage's proxy: the app's Wayland connection goes through it, so the probe sees the pongs and injects the pointer.
-fn start_proxy() -> Result<Proxy> {
+/// The gtk stage's proxy in front of `upstream` (the nested compositor): the app's Wayland connection goes through it, so the probe sees the pongs and injects the pointer.
+fn start_proxy(upstream: &Path) -> Result<Proxy> {
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?);
     Proxy::start(
-        &crate::platform_ui::upstream_socket()?,
+        upstream,
         &runtime.join(format!("atl-window-gate-{}.sock", std::process::id())),
     )
 }
@@ -1321,8 +1322,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
-    // the monitor's refresh rate: atld answers with it, and the cadence checks below judge against it
-    let display = run_display();
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
@@ -1336,7 +1335,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }
+    let work_dir = if args.hold.is_some() {
+        "window-hold"
+    } else {
+        "window"
+    };
+    let work = rt.out.join(work_dir);
     let mut proxy = None;
+    // declared before atld, so dropped after it; a hold keeps the desktop's compositor
+    let mut nested = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
@@ -1349,14 +1356,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
-                let p = start_proxy()?;
+                let n = NestedCompositor::start(&work.join("nested"))?;
+                let p = start_proxy(&n.socket)?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
                 proxy = Some(p);
+                nested = Some(n);
                 rt
             }
         }
         Stage::Resume | Stage::Frames => rt,
     };
+    // the monitor's refresh rate (the gate's own compositor's, else the desktop's): atld answers with it, and the cadence checks below judge against it
+    let display = nested
+        .as_ref()
+        .map_or_else(run_display, NestedCompositor::display);
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
     let shown = if matches!(args.stage, Stage::Widgets) {
         widgets::display(display)
@@ -1364,12 +1377,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         display
     };
     let rt = rt.with_display(shown.to_arg());
-    let work_dir = if args.hold.is_some() {
-        "window-hold"
-    } else {
-        "window"
-    };
-    let work = rt.out.join(work_dir);
     let fixture = match args.stage {
         Stage::Widgets => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,

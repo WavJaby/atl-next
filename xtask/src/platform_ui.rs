@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (WSLg's `wayland-0`), through the `atl-platform-ui` facade.
+//! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (the gate's headless weston, nested_wayland.rs; with --hold-blocked the desktop's $WAYLAND_DISPLAY), through the `atl-platform-ui` facade.
 //! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates:
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
@@ -9,7 +9,7 @@
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //!
 //! The client runs with GSK_RENDERER=cairo by default: the cairo renderer presents through wl_shm, which is what WSLg offers (no zwp_linux_dmabuf); the proxy confirms a wl_shm pool was created.
-//! Needs a Wayland display (WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
+//! Needs `weston` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
+use crate::nested_wayland::NestedCompositor;
 use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
 
@@ -262,7 +263,8 @@ fn build_client(root: &Path) -> Result<PathBuf> {
         .context("cargo reported no gate executable")
 }
 
-pub(crate) fn upstream_socket() -> Result<PathBuf> {
+/// The desktop's compositor socket, from WAYLAND_DISPLAY (absolute, or under XDG_RUNTIME_DIR).
+fn desktop_socket() -> Result<PathBuf> {
     let display = std::env::var_os("WAYLAND_DISPLAY").context("WAYLAND_DISPLAY is not set")?;
     let display = PathBuf::from(display);
     if display.is_absolute() {
@@ -303,12 +305,6 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let upstream = upstream_socket()?;
-    ensure!(
-        upstream.exists(),
-        "no Wayland socket at {}",
-        upstream.display()
-    );
     let exe = build_client(root)?;
     let out_dir = match &args.keep {
         Some(dir) => {
@@ -321,6 +317,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             dir
         }
     };
+    // --hold-blocked is watched on the desktop's compositor; every other run maps in the gate's own (outlives the client: declared before it)
+    let nested = match args.hold_blocked {
+        Some(_) => None,
+        None => Some(NestedCompositor::start(&out_dir.join("nested"))?),
+    };
+    let upstream = match &nested {
+        Some(n) => n.socket.clone(),
+        None => desktop_socket()?,
+    };
+    ensure!(
+        upstream.exists(),
+        "no Wayland socket at {}",
+        upstream.display()
+    );
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?);
     let proxy = Proxy::start(

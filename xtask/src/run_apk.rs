@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask run-apk <APK>`: any APK, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop.
+//! `xtask run-apk <APK>`: any APK, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
 //! No probe and no injected input. The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
+use crate::nested_wayland::NestedCompositor;
 use crate::{manifest, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
@@ -66,6 +67,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
+    // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
+    let nested = match args.hold {
+        Some(_) => None,
+        None => Some(NestedCompositor::start(&work.join("nested"))?),
+    };
+    let rt = match &nested {
+        Some(n) => rt.with_wayland(&n.socket),
+        None => rt,
+    };
     let apk = work.join("base.apk");
     std::fs::copy(&args.apk, &apk).with_context(|| format!("copying {}", args.apk.display()))?;
     let m = manifest::read(&rt.aapt2, &apk)?;
