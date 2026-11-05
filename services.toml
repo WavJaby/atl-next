@@ -133,6 +133,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#hideSoftInput",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#getInputMethodList",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#getEnabledInputMethodList",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#getImeTrackerService",
 ]
 
 [notification]

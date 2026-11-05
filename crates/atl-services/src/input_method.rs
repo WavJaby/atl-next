@@ -3,7 +3,7 @@
 //! ATL has no input method yet (the desktop IME bridge is a platform-layer item), so every answer is the one IMMS gives with no current method, and nothing is kept:
 //! - addClient (InputMethodManager.java:1652, the startup call; AOSP registers the client's controller, InputMethodManagerService.java:1791-1805): answered.
 //! - startInputOrWindowGainedFocusAsync (every window focus gain, ViewRootImpl.handleWindowFocusChanged -> InputMethodManager.startInputInner:3560): EditorInfo and ImeOnBackInvokedDispatcher decoded (without the codecs the decode failed BAD_VALUE and the app died of IllegalArgumentException), answered.
-//! - showSoftInput / hideSoftInput (ImeTracker.Token decoded): false. getInputMethodList / getEnabledInputMethodList: the empty InputMethodInfoSafeList.
+//! - showSoftInput / hideSoftInput (ImeTracker.Token decoded): false. getImeTrackerService: null (the client's no-tracker path). getInputMethodList / getEnabledInputMethodList: the empty InputMethodInfoSafeList.
 //!
 //! Every other method stays counted and answered UNKNOWN_TRANSACTION.
 
@@ -136,6 +136,21 @@ impl IInputMethodManager for InputMethodManager {
     ) -> binder::Result<bool> {
         counters::count(INTERFACE, "hideSoftInput (false: no IME)");
         Ok(false)
+    }
+
+    /// getImeTrackerService: null. AOSP's ImeTrackerService only logs show/hide requests for IMEs; the client's null path is the designed one (IInputMethodManagerGlobalInvoker.onStart -> ImeTracker.Token.empty, every other tracker call returns).
+    /// The client caches only a non-null answer, so it asks on every request: counted.
+    fn r#getImeTrackerService(
+        &self,
+    ) -> binder::Result<
+        Option<
+            Strong<
+                dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_11_IImeTracker,
+            >,
+        >,
+    > {
+        counters::count(INTERFACE, "getImeTrackerService (null: no IME tracker)");
+        Ok(None)
     }
 
     /// getInputMethodList / getEnabledInputMethodList: no input methods, as InputMethodInfoSafeList.empty() (callers dereference it, so never null).

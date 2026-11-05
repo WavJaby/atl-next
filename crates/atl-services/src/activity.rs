@@ -70,10 +70,9 @@ const PROCESS_STATE_TOP: i32 = 2;
 const PROCESS_STATE_UNKNOWN: i32 = -1;
 /// Build.UNKNOWN: the serial apps targeting P+ get (ActivityManagerService attachApplicationLocked buildSerial).
 const BUILD_UNKNOWN: &str = "unknown";
-/// bindApplication's disabledCompatChanges (AppCompatCallbacks.install in handleBindApplication): Toast.CHANGE_TEXT_TOASTS_IN_THE_SYSTEM (Toast.java:124, 147798919). Enabled (AOSP's
-/// default for targetSdk > Q), a text toast goes to enqueueTextToast and SystemUI's ToastUI draws it; there is no SystemUI here, so every app takes the pre-R path: Toast.makeText builds
-/// the view (ToastPresenter.getTextToastView) and the app's own TN shows it through ToastPresenter as a TYPE_TOAST window (owner 2026-11-05: toast = in-window overlay by ToastPresenter).
-/// App-visible difference: Toast.getView() is non-null for text toasts. Delete this when a system UI renders enqueueTextToast.
+/// bindApplication's disabledCompatChanges (AppCompatCallbacks.install in handleBindApplication): Toast.CHANGE_TEXT_TOASTS_IN_THE_SYSTEM (Toast.java:124, 147798919). Enabled (AOSP's default for targetSdk > Q), a text toast goes to enqueueTextToast and SystemUI's ToastUI draws it.
+/// There is no SystemUI here, so every app takes AOSP's own disabled-change path (owner 2026-11-05, kept 2026-11-06): Toast.makeText builds the view (Toast.java:523, ToastPresenter.getTextToastView); Toast.show's else branch (:199-215) sends enqueueToast with the app's TN;
+/// notification.rs answers TN.show(windowToken), and TN.handleShow (:758-792) adds the TYPE_TOAST window through ToastPresenter.show in the app. App-visible difference: Toast.getView() is non-null for text toasts. Delete this when a system UI renders enqueueTextToast.
 const DISABLED_COMPAT_CHANGES: [i64; 1] = [147_798_919];
 /// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
