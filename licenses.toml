@@ -24,8 +24,10 @@
 # MPL-2.0: owner decision 2026-11-01 (Eigen, via libinput); file-level copyleft, and we do not modify Eigen. GPL-3-compatible through MPL-2.0 section 3.3 unless a file carries the "Incompatible With Secondary Licenses" notice, which the gate reads as MPL-2.0-no-copyleft-exception, not allowed.
 # GPL-2.0-only WITH Classpath-exception-2.0: owner decision 2026-10-29 (libcore ojluni natives, libjdwp); the exception permits linking with independent modules of any licence, so it is a linking exception in the sense of the GPL-2.0-only rule. Listed when the converter first linked libcore (2026-11-02).
 # SunPro: owner decision 2026-11-02 (fdlibm, via libcore's libfdlibm); Sun's all-permissive notice (use, copy, modify, distribute if the notice is kept), GPL-3-compatible.
+# Apache-2.0 WITH LLVM-exception: owner decision 2026-11-06 (llvm-project runtimes libc++/libc++abi/libunwind/compiler-rt builtins for the bionic targets); the exception only removes Apache-2.0 attribution duties for compiled-in runtime code, so it stays GPL-3-compatible as Apache-2.0 is.
 allow = [
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "blessing",
@@ -550,6 +552,18 @@ reason = "Apache-2.0 header; the added note that poly1305-donna is public domain
 [upstream.berberis]
 # Reference only (sources.toml): nothing of it is compiled, so no file reaches the checked set; its LICENSE is Apache-2.0.
 unlabelled = "Apache-2.0"
+
+[upstream.llvm-project]
+# llvm-project's LICENSE.TXT: Apache License v2.0 with LLVM Exceptions; runtime sources carry `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`.
+unlabelled = "Apache-2.0 WITH LLVM-exception"
+
+[upstream.llvm-project.paths."compiler-rt/lib/builtins/extendhftf2.c"]
+licence = "MIT OR NCSA"
+reason = "pre-relicensing LLVM notice: \"dual licensed under the MIT and the University of Illinois Open Source Licenses\" (lines 5-6), which the phrase rules do not read"
+
+[upstream.llvm-project.paths."compiler-rt/lib/builtins/trunctfhf2.c"]
+licence = "MIT OR NCSA"
+reason = "pre-relicensing LLVM notice: \"dual licensed under the MIT and the University of Illinois Open Source Licenses\" (lines 5-6), which the phrase rules do not read"
 
 [upstream.qemu]
 # QEMU's LICENSE: "Source files with no licensing information are released under the GNU General

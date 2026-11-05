@@ -211,8 +211,9 @@ mod tests {
         Checkout {
             dir: Path::new("aosp").join(path),
             url: None,
-            tag: "t".into(),
+            rev: "refs/tags/t".into(),
             commit: "c".into(),
+            sparse: Vec::new(),
             pin: Pin::Aosp(path.into()),
             licence_key: "aosp".into(),
         }

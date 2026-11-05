@@ -262,12 +262,8 @@ pub(crate) fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses
                 name != AOSP,
                 "[upstream.{AOSP}]: no `unlabelled`; each project's comes from its Android.bp license modules"
             );
-            let licence =
-                parse_licence(unlabelled).with_context(|| format!("[upstream.{name}]"))?;
-            ensure!(
-                licence.exception.is_none(),
-                "[upstream.{name}]: unlabelled takes a plain id"
-            );
+            // one licence, `<id>` or `<id> WITH <exception>` (llvm-project's LICENSE.TXT is Apache-2.0 WITH LLVM-exception)
+            parse_licence(unlabelled).with_context(|| format!("[upstream.{name}]"))?;
         }
         for (prefix, entry) in &upstream.paths {
             let at = format!("[upstream.{name}.paths.\"{prefix}\"]");

@@ -35,8 +35,24 @@ pub const AOSP_MANIFEST_DIR: &str = "aosp-manifest";
 #[serde(deny_unknown_fields)]
 pub struct GitUpstream {
     pub git: String,
-    pub tag: String,
+    /// Exactly one of `tag` / `branch`: the ref the pin is read from (a branch only where upstream publishes no tag for the wanted build).
+    pub tag: Option<String>,
+    pub branch: Option<String>,
     pub commit: String,
+    /// Cone-mode sparse directories; empty = whole tree. Set => partial (blob:none) clone.
+    #[serde(default)]
+    pub sparse: Vec<String>,
+}
+
+impl GitUpstream {
+    /// Full ref name the pin is read from (`refs/tags/..` or `refs/heads/..`).
+    pub fn refname(&self) -> String {
+        match (&self.tag, &self.branch) {
+            (Some(t), _) => format!("refs/tags/{t}"),
+            (None, Some(b)) => format!("refs/heads/{b}"),
+            (None, None) => String::new(),
+        }
+    }
 }
 
 /// One upstream checkout: where it lives under `<workspace>/src` (and under `patches/`), and its pin.
@@ -45,8 +61,11 @@ pub struct Checkout {
     pub dir: PathBuf,
     /// None for an AOSP project while the manifest (which holds its git name) is not fetched.
     pub url: Option<String>,
-    pub tag: String,
+    /// Full ref name the commit is pinned from (`refs/tags/..` or `refs/heads/..`).
+    pub rev: String,
     pub commit: String,
+    /// Cone-mode sparse directories; empty = full checkout.
+    pub sparse: Vec<String>,
     pub pin: Pin,
     /// Key of the upstream's `[upstream.<key>]` row in licenses.toml (`aosp` for every AOSP project).
     pub licence_key: String,
@@ -79,8 +98,9 @@ impl Sources {
         Checkout {
             dir: PathBuf::from(AOSP_MANIFEST_DIR),
             url: Some(self.aosp_url("platform/manifest")),
-            tag: self.aosp.tag.clone(),
+            rev: format!("refs/tags/{}", self.aosp.tag),
             commit: self.aosp.manifest.clone(),
+            sparse: Vec::new(),
             pin: Pin::Manifest,
             licence_key: "aosp".to_owned(),
         }
@@ -94,16 +114,18 @@ impl Sources {
             url: names
                 .and_then(|n| n.get(path))
                 .map(|name| self.aosp_url(name)),
-            tag: self.aosp.tag.clone(),
+            rev: format!("refs/tags/{}", self.aosp.tag),
             commit: commit.clone(),
+            sparse: Vec::new(),
             pin: Pin::Aosp(path.clone()),
             licence_key: "aosp".to_owned(),
         });
         let git = self.git.iter().map(|(name, up)| Checkout {
             dir: PathBuf::from(name),
             url: Some(up.git.clone()),
-            tag: up.tag.clone(),
+            rev: up.refname(),
             commit: up.commit.clone(),
+            sparse: up.sparse.clone(),
             pin: Pin::Git(name.clone()),
             licence_key: name.clone(),
         });
@@ -163,10 +185,17 @@ fn validate(sources: &Sources) -> Result<()> {
             is_name(name),
             "upstream `{name}`: name must be [a-z0-9-], starting alphanumeric"
         );
+        ensure!(!up.git.is_empty(), "upstream `{name}`: empty git");
         ensure!(
-            !up.git.is_empty() && !up.tag.is_empty(),
-            "upstream `{name}`: empty git or tag"
+            matches!((&up.tag, &up.branch), (Some(r), None) | (None, Some(r)) if !r.is_empty()),
+            "upstream `{name}`: needs exactly one non-empty `tag` or `branch`"
         );
+        for d in &up.sparse {
+            ensure!(
+                is_tree_path(d),
+                "upstream `{name}`: sparse `{d}` is not a relative tree path"
+            );
+        }
         ensure!(
             is_commit(&up.commit),
             "upstream `{name}`: `{}` is not a full commit hash",
@@ -219,7 +248,24 @@ mod tests {
         );
         let sources = parse(&text).unwrap();
         assert_eq!(sources.aosp.projects["external/icu"], SHA);
-        assert_eq!(sources.git["qemu"].tag, "v1");
+        assert_eq!(sources.git["qemu"].refname(), "refs/tags/v1");
+    }
+
+    #[test]
+    fn branch_pin_with_sparse_dirs() {
+        let ok = format!(
+            "{AOSP}[llvm]\ngit = \"g\"\nbranch = \"rel\"\ncommit = \"{SHA}\"\nsparse = [\"libcxx\", \"llvm/cmake\"]\n"
+        );
+        let sources = parse(&ok).unwrap();
+        assert_eq!(sources.git["llvm"].refname(), "refs/heads/rel");
+        let both = format!(
+            "{AOSP}[llvm]\ngit = \"g\"\ntag = \"t\"\nbranch = \"rel\"\ncommit = \"{SHA}\"\n"
+        );
+        assert!(err(&both).contains("exactly one"));
+        let bad = format!(
+            "{AOSP}[llvm]\ngit = \"g\"\ntag = \"t\"\ncommit = \"{SHA}\"\nsparse = [\"../x\"]\n"
+        );
+        assert!(err(&bad).contains("not a relative tree path"));
     }
 
     #[test]

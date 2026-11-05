@@ -158,6 +158,42 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
         let real = std::fs::canonicalize(&file).unwrap_or(file);
         placed.entry(real).or_insert(artifact);
     }
+    judge(placed, roots, out, licenses, &mut report)?;
+    Ok(report)
+}
+
+/// Every file an object of the CMake-generated ninja build in `build` (canonical) was compiled from, by its depfiles: what the runtimes build (`xtask runtimes`) can put into an archive.
+/// All objects of the build, not only the archive members a later link loads: a superset, so a pass here holds for any link of its archives.
+pub fn check_build(build: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> {
+    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let mut report = Report {
+        artifacts: deps.len(),
+        ..Report::default()
+    };
+    let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for (object, files) in &deps {
+        for f in files {
+            let abs = if f.is_absolute() {
+                f.clone()
+            } else {
+                build.join(f)
+            };
+            let real = std::fs::canonicalize(&abs).unwrap_or(abs);
+            placed.entry(real).or_insert(object.as_path());
+        }
+    }
+    judge(placed, roots, build, licenses, &mut report)?;
+    Ok(report)
+}
+
+/// Resolves and checks the licence of each placed file (canonical path -> the first artifact reaching it); files under `out` count as generated.
+fn judge(
+    placed: BTreeMap<PathBuf, &Path>,
+    roots: &[Root],
+    out: &Path,
+    licenses: &Licenses,
+    report: &mut Report,
+) -> Result<()> {
     for (file, artifact) in placed {
         let name = artifact
             .file_name()
@@ -193,7 +229,7 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
             )),
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 /// The linker trace bp2ninja's link rule writes beside an artifact.

@@ -280,8 +280,11 @@ fn add(
             .projects
             .get(*path)
             .with_context(|| format!("{path}: not in the AOSP manifest"))?;
-        remote_tag_commit(&sources.aosp_url(&project.name), &sources.aosp.tag)
-            .with_context(|| path.to_string())
+        remote_ref_commit(
+            &sources.aosp_url(&project.name),
+            &format!("refs/tags/{}", sources.aosp.tag),
+        )
+        .with_context(|| path.to_string())
     });
     let commits = resolved.into_iter().collect::<Result<Vec<_>>>()?;
     edit_sources(root, |doc| {
@@ -419,10 +422,13 @@ fn inspect(dir: &Path) -> Result<Local> {
 fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
     match action {
         Action::Clone => {
-            verify_tag(c)?;
+            verify_ref(c)?;
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             git(Some(dir), &["init", "-q"])?;
             git(Some(dir), &["remote", "add", "origin", c.url()?])?;
+            if !c.sparse.is_empty() {
+                init_sparse(c, dir)?;
+            }
             fetch_pin(c, dir)?;
             checkout_pin(c, dir)
         }
@@ -431,7 +437,7 @@ fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
             apply(&Action::Clone, c, dir)
         }
         Action::MoveToPin => {
-            verify_tag(c)?;
+            verify_ref(c)?;
             fetch_pin(c, dir)?;
             checkout_pin(c, dir)
         }
@@ -455,67 +461,64 @@ fn checkout_pin(c: &Checkout, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Shallow-fetch the pinned tag into `dir` and check it is the pinned commit.
+/// Shallow-fetch the pinned ref into `dir` and check it is the pinned commit. A sparse checkout is
+/// a partial clone: blobs outside the cone are never fetched.
 pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
-    let refspec = format!("+refs/tags/{0}:refs/tags/{0}", c.tag);
-    git(
-        Some(dir),
-        &[
-            "fetch",
-            "-q",
-            "--depth",
-            "1",
-            "--no-tags",
-            c.url()?,
-            &refspec,
-        ],
-    )?;
-    let fetched = git(
-        Some(dir),
-        &["rev-parse", &format!("refs/tags/{}^{{commit}}", c.tag)],
-    )?;
+    let refspec = format!("+{0}:{0}", c.rev);
+    let mut args = vec!["fetch", "-q", "--depth", "1", "--no-tags"];
+    if !c.sparse.is_empty() {
+        args.push("--filter=blob:none");
+    }
+    args.extend([c.url()?, &refspec]);
+    git(Some(dir), &args)?;
+    let fetched = git(Some(dir), &["rev-parse", &format!("{}^{{commit}}", c.rev)])?;
     ensure!(
         fetched == c.commit,
-        "tag {} is {fetched}, pin says {}",
-        c.tag,
+        "{} is {fetched}, pin says {}",
+        c.rev,
         c.commit
     );
     Ok(())
 }
 
-/// The remote's current commit for the tag must be the pin: a moved tag fails here.
-pub fn verify_tag(c: &Checkout) -> Result<()> {
+/// Marks a fresh repository as a promisor partial clone limited to `c.sparse` (cone mode).
+fn init_sparse(c: &Checkout, dir: &Path) -> Result<()> {
+    let g = |args: &[&str]| git(Some(dir), args);
+    // lazy blob fetch on checkout needs the remote marked as a partial-clone promisor
+    g(&["config", "remote.origin.promisor", "true"])?;
+    g(&["config", "remote.origin.partialclonefilter", "blob:none"])?;
+    let mut set = vec!["sparse-checkout", "set", "--cone"];
+    set.extend(c.sparse.iter().map(String::as_str));
+    g(&set)?;
+    Ok(())
+}
+
+/// The remote's current commit for the ref must be the pin: a moved tag (or advanced branch) fails here.
+pub fn verify_ref(c: &Checkout) -> Result<()> {
     let url = c.url()?;
-    let now = remote_tag_commit(url, &c.tag)?;
+    let now = remote_ref_commit(url, &c.rev)?;
     ensure!(
         now == c.commit,
-        "tag {} on {url} now resolves to {now}, pin says {} (moved tag, or run --bump)",
-        c.tag,
+        "{} on {url} now resolves to {now}, pin says {} (moved ref, or run --bump)",
+        c.rev,
         c.commit
     );
     Ok(())
 }
 
-fn remote_tag_commit(url: &str, tag: &str) -> Result<String> {
-    let tag_ref = format!("refs/tags/{tag}");
+fn remote_ref_commit(url: &str, refname: &str) -> Result<String> {
     let out = git(
         None,
-        &[
-            "ls-remote",
-            "--tags",
-            url,
-            &tag_ref,
-            &format!("{tag_ref}^{{}}"),
-        ],
+        &["ls-remote", url, refname, &format!("{refname}^{{}}")],
     )?;
-    peeled_commit(&out, tag).with_context(|| format!("no tag {tag} on {url}"))
+    peeled_commit(&out, refname).with_context(|| format!("no {refname} on {url}"))
 }
 
 /// From `git ls-remote` output: the commit an annotated tag points to (`^{}` line), else the
-/// lightweight tag's own commit.
-fn peeled_commit(ls_remote: &str, tag: &str) -> Option<String> {
+/// ref's own commit.
+fn peeled_commit(ls_remote: &str, refname: &str) -> Option<String> {
     let line = |suffix: &str| {
-        let want = format!("refs/tags/{tag}{suffix}");
+        let want = format!("{refname}{suffix}");
         ls_remote.lines().find_map(|l| {
             let (sha, name) = l.split_once('\t')?;
             (name == want).then(|| sha.to_owned())
@@ -529,17 +532,17 @@ fn peeled_commit(ls_remote: &str, tag: &str) -> Option<String> {
 fn bump(root: &Path, all: &[Checkout], write: bool, jobs: usize) -> Result<bool> {
     let mut moved = Vec::new();
     let mut failed = 0;
-    let resolved = par::map(all, jobs, |c| remote_tag_commit(c.url()?, &c.tag));
+    let resolved = par::map(all, jobs, |c| remote_ref_commit(c.url()?, &c.rev));
     for (c, result) in all.iter().zip(resolved) {
         match result {
             Ok(now) if now == c.commit => {
-                println!("bump: {:<40} {} unchanged", c.dir.display(), c.tag)
+                println!("bump: {:<40} {} unchanged", c.dir.display(), c.rev)
             }
             Ok(now) => {
                 println!(
                     "bump: {:<40} {} {} -> {now}",
                     c.dir.display(),
-                    c.tag,
+                    c.rev,
                     &c.commit[..12]
                 );
                 moved.push((c, now));
@@ -588,9 +591,9 @@ mod tests {
     fn peeled_commit_prefers_annotated_target() {
         // `git ls-remote` format: <sha>\t<ref>; an annotated tag also lists its target as `^{}`
         let out = "aaaa\trefs/tags/v1\nbbbb\trefs/tags/v1^{}\ncccc\trefs/tags/v10\n";
-        assert_eq!(peeled_commit(out, "v1").as_deref(), Some("bbbb"));
-        assert_eq!(peeled_commit(out, "v10").as_deref(), Some("cccc"));
-        assert_eq!(peeled_commit(out, "v2"), None);
+        assert_eq!(peeled_commit(out, "refs/tags/v1").as_deref(), Some("bbbb"));
+        assert_eq!(peeled_commit(out, "refs/tags/v10").as_deref(), Some("cccc"));
+        assert_eq!(peeled_commit(out, "refs/tags/v2"), None);
     }
 
     #[test]
@@ -688,8 +691,9 @@ mod tests {
             Checkout {
                 dir: PathBuf::from("up"),
                 url: Some(format!("file://{}", self.dir.display())),
-                tag: "v1".into(),
+                rev: "refs/tags/v1".into(),
                 commit: commit.into(),
+                sparse: Vec::new(),
                 pin: Pin::Git("up".into()),
                 licence_key: "up".into(),
             }
@@ -758,7 +762,7 @@ mod tests {
         let remote = Remote::new("moved");
         // pin claims v1 is the second commit: the remote disagrees
         let c = remote.checkout(&remote.second);
-        let e = format!("{:#}", verify_tag(&c).unwrap_err());
+        let e = format!("{:#}", verify_ref(&c).unwrap_err());
         assert!(
             e.contains(&format!("now resolves to {}", remote.first)),
             "{e}"

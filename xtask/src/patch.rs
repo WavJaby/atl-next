@@ -28,15 +28,15 @@ const TRAILERS: [&str; 2] = ["Upstream-Status", "Patch-Reason"];
 /// Untracked files named in a drift message; the rest are counted.
 const STRAYS_SHOWN: usize = 3;
 /// `patches/<upstream>/LICENSE` (`upstream_licence`, written by `--export`, compared by the drift test) is a copy of the first of these at the top of the upstream at its pin.
-/// Many AOSP projects' top-level text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names. An AOSP project with none of them takes the `license_text` of the Soong packages its patches touch (owner, 2026-11-01).
-const LICENCE_FILES: [&str; 3] = ["LICENSE", "COPYING", "NOTICE"];
+/// Many AOSP projects' top-level text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names; llvm-project's is `LICENSE.TXT`. An AOSP project with none of them takes the `license_text` of the Soong packages its patches touch (owner, 2026-11-01).
+const LICENCE_FILES: [&str; 4] = ["LICENSE", "LICENSE.TXT", "COPYING", "NOTICE"];
 const LICENCE_COPY: &str = "LICENSE";
 /// The fix for patches/ ahead of a checkout: the normal state on main between merging a patch change and the next fetch.
 const FETCH: &str = "cargo xtask fetch --execute (the step after merging a change to patches/)";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one, with LICENSE = the upstream's LICENSE, COPYING or NOTICE at the pin (first found); an AOSP project with none gets the license_text files of the Soong `license` modules covering every patched file, which must be one set (several texts concatenated in tree-path order). Refused with no commits past the pin.
+    /// Write <pin>..<patch branch> of these upstreams (e.g. qemu, aosp/art) to patches/<upstream>/, from the task copy where there is one, with LICENSE = the upstream's LICENSE, LICENSE.TXT, COPYING or NOTICE at the pin (first found); an AOSP project with none gets the license_text files of the Soong `license` modules covering every patched file, which must be one set (several texts concatenated in tree-path order). Refused with no commits past the pin.
     #[arg(long, value_name = "UPSTREAM", num_args = 1.., conflicts_with_all = ["rebase", "edit", "done"])]
     export: Vec<String>,
     /// Move the patch branch of these upstreams from their old base onto the current pin (after a bump).
@@ -564,7 +564,7 @@ fn drop_branch(u: &Up) -> Result<()> {
     let dir = &u.checkout;
     let pin = u.c.commit.as_str();
     if git(Some(dir), &["cat-file", "-e", &format!("{pin}^{{commit}}")]).is_err() {
-        fetch::verify_tag(u.c)?;
+        fetch::verify_ref(u.c)?;
         fetch::fetch_pin(u.c, dir)?;
     }
     git(Some(dir), &["checkout", "-q", "--detach", pin])?;
@@ -581,7 +581,7 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
     let branch = u.branch.as_str();
     // fetch leaves a checkout on its patch branch where it is, so a new pin may not be here yet
     if git(Some(dir), &["cat-file", "-e", &format!("{pin}^{{commit}}")]).is_err() {
-        fetch::verify_tag(u.c)?;
+        fetch::verify_ref(u.c)?;
         fetch::fetch_pin(u.c, dir)?;
     }
     let was_on = u.on_branch()?;
@@ -668,7 +668,7 @@ pub(crate) fn edit(c: &Checkout, layout: &Layout, root: &Path, ident: &Ident) ->
     )
     .is_err()
     {
-        fetch::verify_tag(c)?;
+        fetch::verify_ref(c)?;
         fetch::fetch_pin(c, &shared)?;
     }
     if let Some(parent) = copy.parent() {
@@ -963,7 +963,7 @@ fn rebase(u: &Up, ident: &Ident) -> Result<String> {
     }
     // `xtask fetch` refused this branch, so the new pin may not be here yet
     if git(Some(dir), &["cat-file", "-e", &format!("{pin}^{{commit}}")]).is_err() {
-        fetch::verify_tag(u.c)?;
+        fetch::verify_ref(u.c)?;
         fetch::fetch_pin(u.c, dir)?;
     }
     let resumed = git(Some(dir), &["merge-base", "--is-ancestor", pin, &u.branch]).is_ok();
@@ -1313,8 +1313,9 @@ pub mod fixture {
             Checkout {
                 dir: PathBuf::from("up"),
                 url: Some(format!("file://{}", self.upstream.display())),
-                tag: tag.into(),
+                rev: format!("refs/tags/{tag}"),
                 commit: self.up(&["rev-parse", &format!("{tag}^{{commit}}")]),
+                sparse: Vec::new(),
                 pin: Pin::Git("up".into()),
                 licence_key: "up".into(),
             }
@@ -1604,7 +1605,7 @@ mod tests {
         std::fs::remove_dir_all(&u3.patches).unwrap();
         let e = format!("{:#}", export(&u3, &licenses()).unwrap_err());
         assert!(
-            e.contains("up has none of LICENSE, COPYING, NOTICE at the pin"),
+            e.contains("up has none of LICENSE, LICENSE.TXT, COPYING, NOTICE at the pin"),
             "{e}"
         );
         assert!(!u3.patches.exists());
@@ -1731,7 +1732,7 @@ mod tests {
         for (got, want) in refused {
             let e = got.unwrap_err();
             assert!(
-                e.contains("aosp/system/core has none of LICENSE, COPYING, NOTICE at the pin, and no Soong licence text")
+                e.contains("aosp/system/core has none of LICENSE, LICENSE.TXT, COPYING, NOTICE at the pin, and no Soong licence text")
                     && e.contains(want),
                 "{e}"
             );
@@ -1953,8 +1954,9 @@ mod tests {
         let c = |pin: Pin| Checkout {
             dir: PathBuf::from("x"),
             url: None,
-            tag: "t".into(),
+            rev: "refs/tags/t".into(),
             commit: "c".into(),
+            sparse: Vec::new(),
             pin,
             licence_key: "x".into(),
         };

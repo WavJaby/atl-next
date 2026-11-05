@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Upstreams built by their own build system for `providers.toml` rows `upstream:<name>`: `xtask native` configures, builds and installs each into `<out>/upstream/<name>/prefix` before the converter runs, then hands the converter one `Provided` entry per module (artifact, include dirs, defines; bp2ninja `-provided`).
-//! CMake only: the one upstream built this way is BoringSSL, and CMake is allowed for it alone (CLAUDE.md). A second build system becomes a `Recipe` field when its first upstream arrives.
+//! CMake only: the one upstream built this way is BoringSSL (CLAUDE.md). `cmake` is shared with the LLVM runtimes for the bionic targets (`runtimes`), CMake's other allowed use. A second build system becomes a `Recipe` field when its first upstream arrives.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -83,38 +83,12 @@ pub fn build(
         // GNUInstallDirs may pick lib/<multiarch>; the artifact path below assumes lib
         ("CMAKE_INSTALL_LIBDIR", "lib".to_owned()),
     ];
-    let mut configure = Command::new("cmake");
-    configure
-        .args(["-G", "Ninja", "-S"])
-        .arg(src)
-        .arg("-B")
-        .arg(&build);
-    for (k, v) in cache.iter().map(|(k, v)| (*k, v.as_str())).chain(
-        recipe
-            .cache
-            .iter()
-            .chain(recipe.shared_defines)
-            .map(|(k, v)| (*k, *v)),
-    ) {
-        configure.arg(format!("-D{k}={v}"));
-    }
-    let mut steps = [configure, Command::new("cmake"), Command::new("cmake")];
-    steps[1].arg("--build").arg(&build);
-    steps[2].arg("--install").arg(&build);
-    let file = std::fs::File::create(&log)?;
-    for step in &mut steps {
-        let status = step
-            .stdout(file.try_clone()?)
-            .stderr(file.try_clone()?)
-            .status()
-            .context("running cmake (deps.toml row `cmake`)")?;
-        ensure!(
-            status.success(),
-            "upstream {}: cmake failed, log {}",
-            recipe.name,
-            log.display()
-        );
-    }
+    let cache: Vec<(&str, &str)> = cache
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .chain(recipe.cache.iter().chain(recipe.shared_defines).copied())
+        .collect();
+    cmake(src, &build, &cache, &log, true).with_context(|| format!("upstream {}", recipe.name))?;
     let defines: Vec<String> = recipe
         .shared_defines
         .iter()
@@ -139,4 +113,41 @@ pub fn build(
         );
     }
     Ok(provided)
+}
+
+/// Configures (Ninja generator, `cache` as `-D` entries), builds and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
+pub fn cmake(
+    src: &Path,
+    build: &Path,
+    cache: &[(&str, &str)],
+    log: &Path,
+    install: bool,
+) -> Result<()> {
+    std::fs::create_dir_all(build)?;
+    let mut configure = Command::new("cmake");
+    configure
+        .args(["-G", "Ninja", "-S"])
+        .arg(src)
+        .arg("-B")
+        .arg(build);
+    for (k, v) in cache {
+        configure.arg(format!("-D{k}={v}"));
+    }
+    let mut steps = vec![configure, Command::new("cmake")];
+    steps[1].arg("--build").arg(build);
+    if install {
+        let mut i = Command::new("cmake");
+        i.arg("--install").arg(build);
+        steps.push(i);
+    }
+    let file = std::fs::File::create(log)?;
+    for step in &mut steps {
+        let status = step
+            .stdout(file.try_clone()?)
+            .stderr(file.try_clone()?)
+            .status()
+            .context("running cmake (deps.toml row `cmake`)")?;
+        ensure!(status.success(), "cmake failed, log {}", log.display());
+    }
+    Ok(())
 }

@@ -12,10 +12,13 @@
 #             (checkout src/aosp/<path>, patches patches/aosp/<path>/; `xtask fetch --add` adds rows)
 # [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
 #   git       clone URL
-#   tag       release tag
-#   commit    commit the tag resolves to
+#   tag       release tag; or
+#   branch    instead of tag, only where upstream tags nothing matching the build we must reproduce
+#   commit    commit the tag/branch resolves to
+#   sparse    optional cone-mode directory list: partial (blob:none) clone of only those dirs
 #
-# The commit is the content pin; fetch verifies the tag still resolves to it, so a moved tag fails.
+# The commit is the content pin; fetch verifies the ref still resolves to it, so a moved tag (or an
+# advanced branch) fails.
 # Rows are added when a build step first needs them.
 
 [aosp]
@@ -248,6 +251,16 @@ commit = "13d2423d7658a7f1146b97cb0389dbd5f50e3429"
 git = "https://boringssl.googlesource.com/boringssl"
 tag = "0.20261020.0"
 commit = "d3bf4795ad5b79d646cddf2fec687da5b9b502db"
+
+# LLVM runtimes (libc++, libc++abi, libunwind, compiler-rt builtins) for the bionic targets. android-16 build/soong
+# cc/config/global.go ClangDefaultVersion = clang-r547379; prebuilts/clang/host/linux-x86 @android-16.0.0_r1
+# clang-r547379/clang_source_info.md: base llvm/llvm-project f142f8afe21b + toolchain/llvm_android patches. AOSP
+# publishes that patched tree as toolchain/llvm-project branch llvm-r547379-release (no tag), so the branch is the pin.
+[llvm-project]
+git = "https://android.googlesource.com/toolchain/llvm-project"
+branch = "llvm-r547379-release"
+commit = "b718bcaf8c198c82f3021447d943401e3ab5bd54"
+sparse = ["cmake", "compiler-rt", "libc", "libcxx", "libcxxabi", "libunwind", "llvm/cmake", "llvm/utils/llvm-lit", "runtimes", "third-party"]
 
 [qemu]
 git = "https://gitlab.com/qemu-project/qemu.git"
