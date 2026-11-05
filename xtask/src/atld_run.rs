@@ -52,6 +52,8 @@ pub struct Runtime {
     ui: Option<String>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
+    /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
+    app_seccomp: bool,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -203,6 +205,7 @@ impl Runtime {
             display: None,
             ui: None,
             wayland: None,
+            app_seccomp: true,
         })
     }
 
@@ -241,6 +244,12 @@ impl Runtime {
     /// Atld's WAYLAND_DISPLAY, an absolute socket path, which the app processes inherit: the window gate's proxy.
     pub fn with_wayland(mut self, socket: &Path) -> Self {
         self.wayland = Some(socket.to_owned());
+        self
+    }
+
+    /// Apps start without the app seccomp filter (atld `--no-app-seccomp`): the deliberate-failure check of the thread-priority rule (seccomp.rs).
+    pub fn without_app_seccomp(mut self) -> Self {
+        self.app_seccomp = false;
         self
     }
 
@@ -402,6 +411,9 @@ impl Runtime {
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);
+        }
+        if !self.app_seccomp {
+            cmd.arg("--no-app-seccomp");
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);

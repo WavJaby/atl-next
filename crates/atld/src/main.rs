@@ -113,6 +113,9 @@ struct Args {
     /// The dex jar(s) that hold --run-class (repeat): mounted as /system/framework/<file name> and appended to that command's boot classpath (zygoteInit loads the class with the boot class loader).
     #[arg(long = "run-boot-jar")]
     run_boot_jars: Vec<PathBuf>,
+    /// Test only: apps start without the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of its thread-priority rule: without the filter queued-work-looper dies with SecurityException.
+    #[arg(long)]
+    no_app_seccomp: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -340,7 +343,12 @@ fn start_binderd(a: &Args, r: &Root) -> Result<(Child, Broker)> {
         .stderr(std::fs::File::create(r.log("binderd"))?)
         .spawn()
         .with_context(|| format!("starting {}", a.binderd.display()))?;
-    Ok((binderd, Broker::new(admin)))
+    let broker = if a.no_app_seccomp {
+        Broker::new(admin).without_app_seccomp()
+    } else {
+        Broker::new(admin)
+    };
+    Ok((binderd, broker))
 }
 
 /// What spawning a process takes beyond the process itself: everything the apps share, and the table of the processes the services started.

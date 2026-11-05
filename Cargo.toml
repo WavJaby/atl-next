@@ -19,6 +19,8 @@ clap = { version = "4", features = ["derive"] }
 cxx = "1.0.205"
 cxx-build = "1.0.205"
 errno = "0.3"
+# SYS_* syscall numbers per target arch (atl-broker seccomp filter); the only use of libc is those constants
+libc = "0.2"
 # libgbm bindings; no wayland / egl import and no drm crate (its 0.14 pins a second rustix): the allocator creates linear buffers and exports them itself (atl-gralloc-service `prime`)
 gbm = { version = "0.18", default-features = false }
 # GLib's unix fd sources (`g_unix_fd_add`), split out of glib-rs in 0.22; same gtk-rs release train as gtk4
@@ -29,6 +31,7 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 roxmltree = "0.21"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }
+seccompiler = "0.5"
 serde_json = "1"
 spdx = "0.13"
 thiserror = "2"

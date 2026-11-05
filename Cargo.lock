@@ -149,7 +149,9 @@ name = "atl-broker"
 version = "0.0.0"
 dependencies = [
  "atl-binderd",
+ "libc",
  "rustix",
+ "seccompiler",
  "serde",
  "serde_json",
 ]
@@ -1181,6 +1183,15 @@ name = "scratch"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "semver"

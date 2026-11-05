@@ -9,7 +9,9 @@ publish.workspace = true
 
 [dependencies]
 atl-binderd = { path = "../atl-binderd" }
+libc.workspace = true
 rustix.workspace = true
+seccompiler.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

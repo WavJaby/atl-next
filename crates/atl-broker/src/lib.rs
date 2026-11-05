@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MIT
 //! atl-broker: the one launcher of sandboxed processes (plan Q5). Each process gets its binderd control connection, registered tagged {uid, host pid}.
 //! M2 depth (owner Q4(a), 2026-10-31): bubblewrap with a user namespace mapping the process's uid and gid, a pid namespace, the host's root (Landlock narrows it in a later Q5 stage)
-//! with the caller's mounts over it (`/system`, `/data`, ...), a fresh `/dev` holding the property area at bionic's default path; Landlock and seccomp come with the Q5 stages.
+//! with the caller's mounts over it (`/system`, `/data`, ...), a fresh `/dev` holding the property area at bionic's default path; Landlock comes with the Q5 stages. The app's seccomp filter is [`seccomp`] (bwrap `--seccomp`).
 //!
 //! Tag pid: the host pid bwrap reports on `--info-fd` (`child-pid`), the namespace's first process, which the broker owns (killing it ends the sandbox: `--unshare-pid` makes it pid 1).
-//! Spawns are serialised by a lock in [`Broker`]: the control and info fds are made inheritable just before the spawn and closed right after it, and a concurrent spawn would inherit them.
+//! Spawns are serialised by a lock in [`Broker`]: the control, info and seccomp fds are made inheritable just before the spawn and closed right after it, and a concurrent spawn would inherit them.
 //! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
 #![forbid(unsafe_code)]
 
 pub mod control;
+mod seccomp;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
+use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use rustix::process::{Pid, Signal, kill_process};
@@ -102,9 +104,14 @@ fn key(e: &RootEntry) -> &str {
     }
 }
 
-/// bwrap's arguments for `spawn` over `root`, info on fd `info_fd`, up to and including `--`.
+/// bwrap's arguments for `spawn` over `root`, info on fd `info_fd`, the seccomp program on `seccomp_fd` when given, up to and including `--`.
 /// A root entry a mount covers (its first path component) is left out, as are `/dev` and `/proc`, which the sandbox gets fresh.
-pub fn bwrap_args(spawn: &Spawn, root: &[RootEntry], info_fd: i32) -> Vec<OsString> {
+pub fn bwrap_args(
+    spawn: &Spawn,
+    root: &[RootEntry],
+    info_fd: i32,
+    seccomp_fd: Option<i32>,
+) -> Vec<OsString> {
     let uid = spawn.uid.to_string();
     let mut a: Vec<OsString> = [
         "--unshare-user",
@@ -126,6 +133,9 @@ pub fn bwrap_args(spawn: &Spawn, root: &[RootEntry], info_fd: i32) -> Vec<OsStri
     .iter()
     .map(OsString::from)
     .collect();
+    if let Some(fd) = seccomp_fd {
+        a.extend(["--seccomp".into(), fd.to_string().into()]);
+    }
     let covered = |name: &str| {
         name == "dev"
             || name == "proc"
@@ -195,6 +205,8 @@ pub struct Broker {
     admin: OwnedFd,
     /// Held across a spawn: the fds made inheritable for it must not reach another spawn's child.
     spawning: Mutex<()>,
+    /// Whether apps get the app seccomp filter (seccomp.rs); off only for the `--no-app-seccomp` check.
+    app_seccomp: bool,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
@@ -206,7 +218,14 @@ impl Broker {
         Broker {
             admin,
             spawning: Mutex::new(()),
+            app_seccomp: true,
         }
+    }
+
+    /// Apps start without the seccomp filter: the deliberate-failure check that shows what the filter answers (atld `--no-app-seccomp`, test only).
+    pub fn without_app_seccomp(mut self) -> Self {
+        self.app_seccomp = false;
+        self
     }
 
     /// Starts `spawn` in its sandbox and registers its control connection with binderd once bwrap reports the host pid.
@@ -224,7 +243,14 @@ impl Broker {
         // inherited by this child only: cleared just before the spawn, closed right after it
         fcntl_setfd(&theirs, FdFlags::empty())?;
         fcntl_setfd(&info_w, FdFlags::empty())?;
-        let args = bwrap_args(&spawn, &host_root()?, info_w.as_raw_fd());
+        // the app's seccomp program, read by bwrap from this fd before the program runs; inherited by this child only, like the fds above
+        let seccomp = self.app_seccomp.then(seccomp_memfd).transpose()?;
+        let args = bwrap_args(
+            &spawn,
+            &host_root()?,
+            info_w.as_raw_fd(),
+            seccomp.as_ref().map(AsRawFd::as_raw_fd),
+        );
         let mut cmd = Command::new(BWRAP);
         cmd.args(&args)
             .arg(&spawn.program)
@@ -242,6 +268,7 @@ impl Broker {
         let child = cmd.spawn();
         drop(theirs);
         drop(info_w);
+        drop(seccomp);
         let mut child = child.map_err(|e| other(format!("starting {BWRAP}: {e}")))?;
         let host_pid = match read_info(info_r) {
             Ok(pid) => pid,
@@ -261,6 +288,14 @@ impl Broker {
         .map_err(|e| other(format!("registering pid {host_pid} with binderd: {e}")))?;
         Ok(Process { child, host_pid })
     }
+}
+
+/// The app seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`. Inheritable (memfd's default), so the spawn passes it on like the info fd.
+fn seccomp_memfd() -> io::Result<OwnedFd> {
+    let mut file = File::from(memfd_create("atl-app-seccomp", MemfdFlags::empty())?);
+    file.write_all(&seccomp::app_filter()?)?;
+    file.rewind()?;
+    Ok(file.into())
 }
 
 /// Reads bwrap's info until it parses: bwrap writes it once the sandbox's first process exists; EOF before that = bwrap failed (its stderr is in the log).
@@ -334,8 +369,11 @@ mod tests {
             RootEntry::Dir("proc".into()),
             RootEntry::Dir("system".into()),
         ];
-        let a = s(&bwrap_args(&spawn(), &root, 9));
+        let a = s(&bwrap_args(&spawn(), &root, 9, None));
         let joined = a.join(" ");
+        assert!(!joined.contains("--seccomp"));
+        let with_filter = s(&bwrap_args(&spawn(), &root, 9, Some(8)));
+        assert!(with_filter.windows(2).any(|w| w == ["--seccomp", "8"]));
         // the uid map and the namespaces Q4(a) names
         assert!(joined.starts_with(
             "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 "

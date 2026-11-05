@@ -40,6 +40,9 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
+    /// Deliberate-failure check: apps run without the app seccomp filter (atl-broker seccomp.rs). Without the filter the app's queued-work looper dies with SecurityException.
+    #[arg(long)]
+    no_app_seccomp: bool,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -54,6 +57,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?
     .with_ui("gtk")
     .with_display(run_display().to_arg());
+    let rt = if args.no_app_seccomp {
+        rt.without_app_seccomp()
+    } else {
+        rt
+    };
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     let apk = work.join("base.apk");
