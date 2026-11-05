@@ -24,9 +24,10 @@ use crate::atld_run::{
 };
 use crate::composer::{fnv1a64, word};
 use crate::manifest;
-use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor};
+use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
+mod move_output;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -77,6 +78,8 @@ enum Stage {
     Declared,
     /// The declared stage on window-start: the launcher starts Main (startActivity) and finishes; Main resumes, and each resize reaches it as onConfigurationChanged.
     StartFinish,
+    /// Two outputs, the second at scale 1.6: the first goes off, the window moves, and Android's density follows (xtask/src/window/move_output.rs).
+    Move,
 }
 
 impl Stage {
@@ -91,6 +94,7 @@ impl Stage {
             Stage::Relaunch => "relaunch",
             Stage::Declared => "declared",
             Stage::StartFinish => "start-finish",
+            Stage::Move => "move",
         }
     }
 
@@ -101,9 +105,11 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
-            Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish => {
-                RESIZE_WINDOW_MS
-            }
+            Stage::Resize
+            | Stage::Relaunch
+            | Stage::Declared
+            | Stage::StartFinish
+            | Stage::Move => RESIZE_WINDOW_MS,
         }
     }
 }
@@ -213,7 +219,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Resize
         | Stage::Relaunch
         | Stage::Declared
-        | Stage::StartFinish => "AtlWindow: onResume reached",
+        | Stage::StartFinish
+        | Stage::Move => "AtlWindow: onResume reached",
     }
 }
 
@@ -1345,12 +1352,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Resize
         | Stage::Relaunch
         | Stage::Declared
-        | Stage::StartFinish => {
+        | Stage::StartFinish
+        | Stage::Move => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
-                let n = NestedCompositor::start(&work.join("nested"))?;
+                let outputs: &[Output] = match args.stage {
+                    Stage::Widgets => &[widgets::OUTPUT],
+                    Stage::Move => &move_output::OUTPUTS,
+                    _ => &[GATE_OUTPUT],
+                };
+                let n = NestedCompositor::start_with(&work.join("nested"), outputs)?;
+                if matches!(args.stage, Stage::Move) {
+                    // the window opens on the first output (move_output.rs)
+                    n.control().only(0)?;
+                }
                 let p = start_proxy(&n.socket)?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
                 proxy = Some(p);
@@ -1367,12 +1384,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => GATE_OUTPUT.display(),
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
-    let shown = if matches!(args.stage, Stage::Widgets) {
-        widgets::display(display)
-    } else {
-        display
-    };
-    let rt = rt.with_display(shown.to_arg());
+    let rt = rt.with_display(display.to_arg());
+    let outputs = nested.as_ref().map(NestedCompositor::control);
+    // the move stage's second output, as Android's display
+    let moved = nested
+        .as_ref()
+        .filter(|_| matches!(args.stage, Stage::Move))
+        .map(|n| n.output_display(1));
     let fixture = match args.stage {
         Stage::Widgets => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,
@@ -1408,21 +1426,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let started = Instant::now();
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
-    let widget_stage = matches!(args.stage, Stage::Widgets);
-    let resize_stage = matches!(
-        args.stage,
-        Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish
-    );
+    let stage = args.stage;
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
-        std::thread::spawn(move || {
-            if widget_stage {
-                widgets::drive(p, &log)
-            } else if resize_stage {
+        std::thread::spawn(move || match (stage, outputs) {
+            (Stage::Widgets, _) => widgets::drive(p, &log),
+            (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _) => {
                 drive_resize(p, &log)
-            } else {
-                drive(p, &log)
             }
+            (Stage::Move, Some(outputs)) => move_output::drive(p, &log, outputs),
+            _ => drive(p, &log),
         })
     });
     let app_log = run.log(&m.name);
@@ -1484,12 +1497,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ),
             ("touch-mode", touch_mode_check(&services)),
         ],
-        (Stage::Widgets, Some(_)) => widgets::checks(
-            &app,
-            &after_marker(&app, marker),
-            &liveness,
-            widgets::display(display),
-        ),
+        (Stage::Widgets, Some(_)) => {
+            widgets::checks(&app, &after_marker(&app, marker), &liveness, display)
+        }
+        (Stage::Move, Some(_)) => match moved {
+            Some(moved) => move_output::checks(&app, &services, &liveness, display, moved),
+            None => vec![("outputs", Err("no nested compositor".to_owned()))],
+        },
         (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
             let want = match args.stage {
                 Stage::Relaunch => Lifecycle::Relaunches,

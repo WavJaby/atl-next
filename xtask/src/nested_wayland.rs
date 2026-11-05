@@ -15,6 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -111,7 +112,7 @@ impl Drop for ChildGuard {
 /// A running headless labwc: its socket, log and private runtime dir (all under the run's work dir). Dropping it stops labwc.
 pub struct NestedCompositor {
     /// Field order is drop order: the setup connection (and with it the virtual pointer) goes first, then the compositor.
-    _setup: Client,
+    setup: OutputControl,
     _child: ChildGuard,
     outputs: Vec<Output>,
     /// The absolute socket path: atld's (or the proxy's upstream) WAYLAND_DISPLAY.
@@ -179,11 +180,16 @@ impl NestedCompositor {
             log.display()
         );
         Ok(Self {
-            _setup: setup,
+            setup: OutputControl(Arc::new(Mutex::new(setup))),
             _child: child,
             outputs: outputs.to_vec(),
             socket,
         })
+    }
+
+    /// The outputs' control, for a probe thread: [`OutputControl::disable`].
+    pub fn control(&self) -> OutputControl {
+        self.setup.clone()
     }
 
     /// The gates' display on this compositor: the first output as Android's display (DisplayModel::from_monitor, as the app's window reports it once on that output). A different value given to atld would change the app's display when its window opens.
@@ -224,6 +230,7 @@ mod op {
     pub const OUTPUT_MANAGER_DONE: u16 = 1;
     pub const HEAD_NAME: u16 = 0;
     pub const CONFIGURATION_ENABLE_HEAD: u16 = 0;
+    pub const CONFIGURATION_DISABLE_HEAD: u16 = 1;
     pub const CONFIGURATION_APPLY: u16 = 2;
     pub const CONFIGURATION_SUCCEEDED: u16 = 0;
     pub const CONFIG_HEAD_SET_CUSTOM_MODE: u16 = 1;
@@ -236,8 +243,99 @@ const OUTPUT_MANAGER: &str = "zwlr_output_manager_v1";
 /// Version 2 has `set_custom_mode` and everything used here.
 const OUTPUT_MANAGER_VERSION: u32 = 2;
 
+/// The setup connection: it keeps the virtual pointer alive and holds the output manager and its heads (ordered as the outputs), so the outputs can be changed later.
+struct Setup {
+    client: Client,
+    om: u32,
+    heads: Vec<u32>,
+    outputs: Vec<Output>,
+    /// The last `zwlr_output_manager_v1.done` serial: a configuration names it, or the compositor cancels it.
+    serial: u32,
+}
+
+impl Setup {
+    /// Applies one configuration: output i on (its mode, rate, scale, position) where `on[i]`, else off. Positions are left to right over all outputs, on or off, so an output keeps its place.
+    fn configure(&mut self, on: &[bool]) -> Result<()> {
+        ensure!(
+            on.len() == self.heads.len(),
+            "{} heads, {} switches",
+            self.heads.len(),
+            on.len()
+        );
+        // events since the last configuration (a later done) come in with this roundtrip
+        let events = self.client.roundtrip()?;
+        self.note_serial(&events)?;
+        let c = &mut self.client;
+        let config = c.new_id();
+        c.send(
+            self.om,
+            op::OUTPUT_MANAGER_CREATE_CONFIGURATION,
+            &[Arg::U(config), Arg::U(self.serial)],
+        );
+        let mut x = 0;
+        for ((head, o), &enable) in self.heads.iter().zip(&self.outputs).zip(on) {
+            if enable {
+                let ch = c.new_id();
+                c.send(
+                    config,
+                    op::CONFIGURATION_ENABLE_HEAD,
+                    &[Arg::U(ch), Arg::U(*head)],
+                );
+                c.send(
+                    ch,
+                    op::CONFIG_HEAD_SET_CUSTOM_MODE,
+                    &[Arg::I(o.width), Arg::I(o.height), Arg::I(o.refresh_mhz)],
+                );
+                c.send(ch, op::CONFIG_HEAD_SET_POSITION, &[Arg::I(x), Arg::I(0)]);
+                c.send(ch, op::CONFIG_HEAD_SET_SCALE, &[Arg::F(o.scale)]);
+            } else {
+                c.send(config, op::CONFIGURATION_DISABLE_HEAD, &[Arg::U(*head)]);
+            }
+            // the next output starts where this one ends: its logical width at the scale as sent (wl_fixed: 1.6 goes as 410/256, 1920 px -> 1198 logical, as wlroots computes it)
+            x += (f64::from(o.width) / fixed(o.scale)).floor() as i32;
+        }
+        c.send(config, op::CONFIGURATION_APPLY, &[]);
+        let events = c.roundtrip()?;
+        self.note_serial(&events)?;
+        ensure!(
+            events
+                .iter()
+                .any(|(o, opcode, _)| *o == config && *opcode == op::CONFIGURATION_SUCCEEDED),
+            "the compositor did not apply the output configuration {:?} on {on:?}",
+            self.outputs
+        );
+        Ok(())
+    }
+
+    fn note_serial(&mut self, events: &[(u32, u16, Vec<u8>)]) -> Result<()> {
+        for (object, opcode, body) in events {
+            if *object == self.om && *opcode == op::OUTPUT_MANAGER_DONE {
+                self.serial = word(body, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The outputs of a running [`NestedCompositor`], shareable with a probe thread.
+#[derive(Clone)]
+pub struct OutputControl(Arc<Mutex<Setup>>);
+
+impl OutputControl {
+    /// Output `index` on, every other one off, in one configuration: the compositor moves the windows of an output going off to the one left on (labwc output_disable -> views to another output). Before a window opens, it makes that output the window's: labwc opens a view on the output under the cursor or the last added, not the first (measured 2026-11-06: HEADLESS-2).
+    pub fn only(&self, index: usize) -> Result<()> {
+        let mut s = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
+        ensure!(index < s.heads.len(), "no output {index}");
+        let on: Vec<bool> = (0..s.heads.len()).map(|i| i == index).collect();
+        s.configure(&on)
+    }
+}
+
 /// Gives the seat its pointer device and configures the outputs, over `stream`; the returned connection keeps the virtual pointer alive.
-fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Client> {
+fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
     let mut c = Client::new(stream)?;
     let registry = c.new_id();
     c.send(1, op::DISPLAY_GET_REGISTRY, &[Arg::U(registry)]);
@@ -298,40 +396,15 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Client> {
         outputs.len(),
         heads.len()
     );
-    let config = c.new_id();
-    c.send(
+    let mut s = Setup {
+        client: c,
         om,
-        op::OUTPUT_MANAGER_CREATE_CONFIGURATION,
-        &[Arg::U(config), Arg::U(serial)],
-    );
-    let mut x = 0;
-    for ((head, _), o) in heads.iter().zip(outputs) {
-        let ch = c.new_id();
-        c.send(
-            config,
-            op::CONFIGURATION_ENABLE_HEAD,
-            &[Arg::U(ch), Arg::U(*head)],
-        );
-        c.send(
-            ch,
-            op::CONFIG_HEAD_SET_CUSTOM_MODE,
-            &[Arg::I(o.width), Arg::I(o.height), Arg::I(o.refresh_mhz)],
-        );
-        c.send(ch, op::CONFIG_HEAD_SET_POSITION, &[Arg::I(x), Arg::I(0)]);
-        c.send(ch, op::CONFIG_HEAD_SET_SCALE, &[Arg::F(o.scale)]);
-        // the next output starts where this one ends: its logical width at the scale as sent (wl_fixed: 1.6 goes as 410/256, 1920 px -> 1198 logical, as wlroots computes it)
-        x += (f64::from(o.width) / fixed(o.scale)).floor() as i32;
-    }
-    c.send(config, op::CONFIGURATION_APPLY, &[]);
-    let applied = c
-        .roundtrip()?
-        .iter()
-        .any(|(object, opcode, _)| *object == config && *opcode == op::CONFIGURATION_SUCCEEDED);
-    ensure!(
-        applied,
-        "the compositor did not apply the output configuration {outputs:?}"
-    );
-    Ok(c)
+        heads: heads.into_iter().map(|(h, _)| h).collect(),
+        outputs: outputs.to_vec(),
+        serial,
+    };
+    s.configure(&vec![true; outputs.len()])?;
+    Ok(s)
 }
 
 enum Arg<'a> {

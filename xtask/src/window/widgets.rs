@@ -15,6 +15,7 @@ use super::{
     content_origin, wait_for_line,
 };
 use crate::composer::word;
+use crate::nested_wayland::{GATE_OUTPUT, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// The fixture's dir.
@@ -31,15 +32,13 @@ const SECOND_CLOSED: &str = "AtlWindow: window second closed";
 const HEADER_POINT: (f64, f64) = (100.0, 20.0);
 /// How long a fixture line may take after the injection that should cause it.
 const LINE_WAIT: Duration = Duration::from_secs(5);
-/// The run's display, smaller than the default: WSLg paces a full-size window at about half the display rate whatever draws it (vkcube: 31 ms frame callbacks at 1308x875, 17 ms at 640x400), and the cadence gate needs a host that keeps the display rate.
-/// The size is this run's; the refresh rate is the window gate's (`monitor`: the nested compositor's output, or the desktop's under `--hold`).
-pub fn display(monitor: DisplayModel) -> DisplayModel {
-    DisplayModel {
-        width: 640,
-        height: 400,
-        ..monitor
-    }
-}
+/// The run's nested output, smaller than the gates' (as Android's display: NestedCompositor::display, like every nested stage): the cadence gate needs a compositor that keeps the display rate, and a large window costs it per frame (WSLg paced a full-size window at about half the rate: vkcube 31 ms frame callbacks at 1308x875, 17 ms at 640x400; labwc headless composites with pixman, also per pixel).
+/// It holds the opening window (3/4 of each side, 480x300) plus its client-side chrome.
+pub const OUTPUT: Output = Output {
+    width: 640,
+    height: 400,
+    ..GATE_OUTPUT
+};
 
 /// A tap's injections: enter, press, release.
 const HEADER_ACTIONS: u32 = 3;

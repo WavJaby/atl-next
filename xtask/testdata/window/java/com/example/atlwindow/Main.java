@@ -37,6 +37,7 @@ public class Main extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "onCreate reached");
+        logDensity("created", getResources().getConfiguration());
         // the title reaches the window's attributes only through them: Window.setTitle leaves the default (the component name)
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
         attrs.setTitle(WINDOW_TITLE);
@@ -61,6 +62,13 @@ public class Main extends Activity {
     public void onConfigurationChanged(android.content.res.Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         Log.i(TAG, "configuration changed screenWidthDp=" + newConfig.screenWidthDp);
+        logDensity("changed", newConfig);
+    }
+
+    /** The density this instance sees (xtask/src/window.rs move_checks): the Configuration's and the resources' DisplayMetrics, which must agree. */
+    private void logDensity(String when, android.content.res.Configuration config) {
+        Log.i(TAG, "density " + when + " config=" + config.densityDpi
+                + " metrics=" + getResources().getDisplayMetrics().densityDpi);
     }
 
     /** One frame callback per vsync, FRAME_CALLBACKS in all; each logs the frame time it was given (CLOCK_MONOTONIC ns). */
