@@ -20,17 +20,22 @@ import java.nio.ByteBuffer;
 
 /**
  * The widget gate: `xtask test window --stage widgets` (xtask/src/window.rs) reads the lines below from the app log.
- * Layout: each widget's rectangle in the content (`layout`), the density, and the software frame (`decor` drawn into a bitmap at first layout):
- * its FNV-1a 64 digest must equal the composer's readback at the capture frame, and the text pixels inside the TextView and EditText are non-background (`pixels`).
+ * Layout: each widget's rectangle in the content (`layout`), the density. Software frame: `decor` drawn into a bitmap SETTLE_FRAMES after onResume, once the default-focus ripple has ended:
+ * its FNV-1a 64 digest must equal the composer's first settled readback, and the text pixels inside the TextView and EditText are non-background (`pixels`).
  * Click: the Button's OnClickListener changes the TextView text, and the next layout differs inside the TextView (`changed`).
- * Focus: a touch on the EditText focuses it. List: a drag scrolls it (`list first`). The frame callbacks are logged as in the window fixture (`frame`).
+ * Focus: a touch on the EditText focuses it. List: a drag scrolls it (`list first`).
+ * When the scroll ends, the list redraws on FRAME_CALLBACKS frame callbacks (`frame`, the cadence gate: the window fixture's lines, under real redraws); the last one logs the `final frame`, the last readback's expectation.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
     /** Frame callbacks per run (xtask/src/window.rs FRAME_CALLBACKS). */
     static final int FRAME_CALLBACKS = 31;
+    /** Frames from onResume to the software frame: 0.5 s at 60 Hz, past the first frames and the default-focus ripple (the first readback waits 1/3 s after them). */
+    static final int SETTLE_FRAMES = 30;
 
     private int frameCallbacks;
+    private int settleFrames;
+    private boolean cadenceStarted;
     private int clicks;
     private boolean laidOut;
     private TextView label;
@@ -65,6 +70,10 @@ public class Main extends Activity {
         list.setOnScrollListener(new AbsListView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(AbsListView view, int scrollState) {
+                if (scrollState == SCROLL_STATE_IDLE && view.getFirstVisiblePosition() > 0 && !cadenceStarted) {
+                    cadenceStarted = true;
+                    postFrame();
+                }
             }
 
             @Override
@@ -96,10 +105,27 @@ public class Main extends Activity {
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume reached");
-        postFrame();
+        postSettle();
     }
 
-    /** One frame callback per vsync, FRAME_CALLBACKS in all; each logs the frame time it was given (CLOCK_MONOTONIC ns). */
+    /** SETTLE_FRAMES frame callbacks, then the software frame (the expectation of the first readback) and the ink inside the text fields. */
+    private void postSettle() {
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            @Override
+            public void doFrame(long frameTimeNanos) {
+                settleFrames++;
+                if (settleFrames < SETTLE_FRAMES) {
+                    postSettle();
+                    return;
+                }
+                first = render();
+                Log.i(TAG, "software frame fnv1a64=" + digest(first) + " size=" + first.getWidth() + "x" + first.getHeight());
+                Log.i(TAG, "pixels label=" + ink(first, boundsOf(label)) + " input=" + ink(first, boundsOf(input)));
+            }
+        });
+    }
+
+    /** One frame callback per vsync, FRAME_CALLBACKS in all, each with a list redraw; each logs the frame time it was given (CLOCK_MONOTONIC ns). The last logs the final frame. */
     private void postFrame() {
         Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
             @Override
@@ -107,13 +133,16 @@ public class Main extends Activity {
                 frameCallbacks++;
                 Log.i(TAG, "frame " + frameCallbacks + " time=" + frameTimeNanos);
                 if (frameCallbacks < FRAME_CALLBACKS) {
+                    list.invalidate();
                     postFrame();
+                } else {
+                    Log.i(TAG, "final frame fnv1a64=" + digest(render()));
                 }
             }
         });
     }
 
-    /** Once: the geometry, then the software frame (the expectation of the readback) and the ink inside the text fields. */
+    /** Once: the geometry. */
     private void onFirstLayout() {
         if (laidOut) {
             return;
@@ -124,24 +153,22 @@ public class Main extends Activity {
         logLayout("button", button);
         logLayout("input", input);
         logLayout("list", list);
-        first = render();
-        Log.i(TAG, "software frame fnv1a64=" + digest(first) + " size=" + first.getWidth() + "x" + first.getHeight());
-        Log.i(TAG, "pixels label=" + ink(first, boundsOf(label)) + " input=" + ink(first, boundsOf(input)));
     }
 
     private void onButton() {
         clicks++;
         label.setText("Clicked " + clicks);
         Log.i(TAG, "click count=" + clicks);
-        // the next layout carries the new text: render it then
+        // the next draw carries the new text; a same-size text change has no layout pass, so no global layout callback
         final ViewTreeObserver observer = label.getViewTreeObserver();
-        observer.addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+        observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
             @Override
-            public void onGlobalLayout() {
-                observer.removeOnGlobalLayoutListener(this);
+            public boolean onPreDraw() {
+                observer.removeOnPreDrawListener(this);
                 Bitmap after = render();
                 Log.i(TAG, "changed label=" + changed(first, after, boundsOf(label)));
                 Log.i(TAG, "text label=" + label.getText());
+                return true;
             }
         });
     }

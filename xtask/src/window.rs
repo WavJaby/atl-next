@@ -872,7 +872,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             let p = start_proxy()?;
             let rt = rt.with_ui("gtk").with_wayland(&p.listen);
             proxy = Some(p);
-            rt
+            if matches!(args.stage, Stage::Widgets) {
+                rt.with_display(widgets::display().to_arg())
+            } else {
+                rt
+            }
         }
         Stage::Resume | Stage::Frames => rt,
     };
@@ -969,7 +973,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ]
         }
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
-        (Stage::Widgets, Some(_)) => widgets::checks(&app, &after_marker(&app, marker)),
+        (Stage::Widgets, Some(_)) => widgets::checks(&app, &after_marker(&app, marker), &liveness),
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, DisplayModel::default()),

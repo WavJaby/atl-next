@@ -45,6 +45,8 @@ pub struct Runtime {
     gralloc: Option<(PathBuf, PathBuf)>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
+    /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
+    display: Option<String>,
     /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
     ui: Option<String>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
@@ -177,6 +179,7 @@ impl Runtime {
             keychars,
             gralloc: None,
             headless_pointer: None,
+            display: None,
             ui: None,
             wayland: None,
         })
@@ -199,6 +202,12 @@ impl Runtime {
     /// Feeds atld a headless pointer script (format: atl-composer `input::parse_script`); the app injects it after its first frame. Only the input gate sets it.
     pub fn with_headless_pointer(mut self, script: &str) -> Self {
         self.headless_pointer = Some(script.to_owned());
+        self
+    }
+
+    /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
+    pub fn with_display(mut self, display: String) -> Self {
+        self.display = Some(display);
         self
     }
 
@@ -361,8 +370,11 @@ impl Runtime {
         if let Some(script) = &self.headless_pointer {
             cmd.args(["--headless-pointer", script]);
         }
+        if let Some(display) = &self.display {
+            cmd.args(["--display", display]);
+        }
         if let Some(mode) = &self.ui {
-            cmd.args(["--ui", mode]);
+            cmd.args(["--ui", mode]).env("ATL_UI_CAPTURE", "1");
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);

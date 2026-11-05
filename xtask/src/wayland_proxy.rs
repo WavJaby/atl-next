@@ -77,6 +77,8 @@ pub enum Event {
     ShmPool,
     /// The client acknowledged a configure (`xdg_surface.ack_configure`): the window is set up.
     Acked { serial: u32 },
+    /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
+    PointerInjected,
     /// A client connection closed.
     Closed,
 }
@@ -452,6 +454,7 @@ fn server_to_client(
                 },
                 Injection::Pointer { action, time_ms } => match (pointer, surface) {
                     (Some(pointer), Some(surface)) => {
+                        let _ = events.send((Instant::now(), Event::PointerInjected));
                         pointer_bytes(pointer, surface, action, time_ms)
                     }
                     _ => {

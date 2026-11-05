@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
-//! The probe taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
-//! Sub-gates ([`SUB_NAMES`]): layout (geometry from the XML), text (the software frame logged at first layout is the readback's digest, so the text is in the capture),
-//! click, focus, list, presents (more than 2 scenes), cadence (the frame callbacks, as the frames stage).
+//! The probe presses the header bar, then taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
+//! Sub-gates ([`SUB_NAMES`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
+//! header (the press reached the client, no touch reached Android), click, focus, list, readback (the last readback is the fixture's final frame and differs from the first),
+//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 use atl_services::display_model::DisplayModel;
 
 use super::{
-    ACK_WAIT, BTN_LEFT, DRAW_LINE, Liveness, POLL, await_event, cadence_check, capture_line,
-    content_origin, wait_for_line,
+    ACK_WAIT, BTN_LEFT, Liveness, POLL, await_event, cadence_check, capture_line, content_origin,
+    wait_for_line,
 };
 use crate::composer::word;
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
@@ -20,10 +21,29 @@ use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 pub const FIXTURE: &str = "xtask/testdata/widgets";
 /// The sub-gates, in print order (each prints `window: <name>: pass|FAIL`).
 pub const SUB_NAMES: &[&str] = &[
-    "layout", "text", "click", "focus", "list", "presents", "cadence",
+    "probe", "layout", "text", "header", "click", "focus", "list", "readback", "presents",
+    "cadence",
 ];
+/// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
+const SOFTWARE_LINE: &str = "AtlWindow: software frame";
+/// The fixture's line after the cadence run: the picture the last readback must show.
+const FINAL_LINE: &str = "AtlWindow: final frame";
+const CAPTURE_LINE: &str = "atl-composer: ui: capture ";
+/// A surface point in the header bar: below the shadow's 12 px, above the content's origin (as the gtk stage's chrome press).
+const HEADER_POINT: (f64, f64) = (100.0, 20.0);
 /// How long a fixture line may take after the injection that should cause it.
 const LINE_WAIT: Duration = Duration::from_secs(5);
+/// The run's display, smaller than the default: WSLg paces a full-size window at about half the display rate whatever draws it (vkcube: 31 ms frame callbacks at 1308x875, 17 ms at 640x400), and the cadence gate needs a host that keeps the display rate.
+pub fn display() -> DisplayModel {
+    DisplayModel {
+        width: 640,
+        height: 400,
+        ..DisplayModel::default()
+    }
+}
+
+/// A tap's injections: enter, press, release.
+const HEADER_ACTIONS: u32 = 3;
 /// The list drag: DRAG_PX up in SCROLL_STEPS motions.
 const DRAG_PX: f64 = 200.0;
 const SCROLL_STEPS: u32 = 10;
@@ -158,6 +178,49 @@ fn text_check(app: &str) -> Result<String, String> {
     ))
 }
 
+/// `drive` saw the proxy report the header press before the first tap. GTK keeps a header press, so the first touch Android gets must be the Button's tap.
+fn header_check(app: &str) -> Result<String, String> {
+    let (ox, oy) = button_centre(app)?;
+    let line = app
+        .lines()
+        .find_map(|l| l.split_once("AtlWindow: touch ").map(|(_, rest)| rest))
+        .ok_or("no touch line at all")?;
+    let x: f64 = number(word(line, "x"), "touch x")?;
+    let y: f64 = number(word(line, "y"), "touch y")?;
+    if (x, y) != (ox, oy) {
+        return Err(format!(
+            "first touch at ({x}, {y}), the Button's centre is ({ox}, {oy}): the header press reached Android"
+        ));
+    }
+    Ok("proxy injected the press; the first touch Android got is the Button's tap".to_owned())
+}
+
+/// The centre of the Button in the content, where the probe taps.
+fn button_centre(app: &str) -> Result<(f64, f64), String> {
+    let r = widget(app, "button")?;
+    Ok(((r.left + r.width / 2) as f64, (r.top + r.height / 2) as f64))
+}
+
+/// After the taps and the drag: the last settled readback is the fixture's final frame, and not the first picture.
+fn readback_check(app: &str) -> Result<String, String> {
+    let wanted = field(app, FINAL_LINE, "fnv1a64").ok_or("no final frame line")?;
+    let first = word(capture_line(app)?, "fnv1a64").ok_or("no digest in the first readback")?;
+    let last = app
+        .lines()
+        .rfind(|l| l.contains(CAPTURE_LINE))
+        .and_then(|l| word(l, "fnv1a64"))
+        .ok_or("no digest in the last readback")?;
+    if last != wanted {
+        return Err(format!("last readback {last}, the final frame {wanted}"));
+    }
+    if last == first {
+        return Err(format!("the readback stayed {first} through the input"));
+    }
+    Ok(format!(
+        "last readback {last} = the final frame, first readback {first}"
+    ))
+}
+
 fn click_check(app: &str) -> Result<String, String> {
     let count: u32 = number(
         field(app, "AtlWindow: click ", "count"),
@@ -219,16 +282,26 @@ fn presents_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The widgets stage's sub-gates in [`SUB_NAMES`] order, from the app log and the frame callbacks after the marker.
-pub fn checks(app: &str, after: &[&str]) -> Vec<Result<String, String>> {
+/// The widgets stage's sub-gates in [`SUB_NAMES`] order, from the probe's result, the app log and the frame callbacks after the marker.
+pub fn checks(
+    app: &str,
+    after: &[&str],
+    probe: &Result<Liveness, String>,
+) -> Vec<Result<String, String>> {
     vec![
+        probe
+            .as_ref()
+            .map(|_| "every injection got its answer".to_owned())
+            .map_err(Clone::clone),
         layout_check(app),
         text_check(app),
+        header_check(app),
         click_check(app),
         focus_check(app),
         list_check(app),
+        readback_check(app),
         presents_check(app),
-        cadence_check(after, DisplayModel::default().refresh_hz),
+        cadence_check(after, display().refresh_hz),
     ]
 }
 
@@ -264,17 +337,17 @@ fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))
 }
 
-/// The widgets probe: after the first draw and the readback (so the readback shows the frame before the taps), taps the Button, taps the EditText, drags the ListView up.
-/// Each injection waits for the fixture's line for it. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
+/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, drags the ListView up, and waits for the readback of the final frame.
+/// Each injection waits for its answer: the proxy's report for the header, the fixture's line for the rest. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
     .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
+    wait_for_line(app_log, SOFTWARE_LINE, ACK_WAIT)
         .then_some(())
-        .ok_or("the fixture never drew")?;
-    wait_for_line(app_log, "atl-composer: ui: capture ", ACK_WAIT)
+        .ok_or("the fixture never logged its software frame")?;
+    wait_for_line(app_log, CAPTURE_LINE, ACK_WAIT)
         .then_some(())
         .ok_or("the window never read back")?;
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
@@ -292,6 +365,18 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
             vec![PointerAction::Enter { x, y }, press(true), press(false)],
         )
     };
+    tap(HEADER_POINT)?;
+    for n in 1..=HEADER_ACTIONS {
+        await_event(&proxy.events, LINE_WAIT, |e| {
+            *e == ProxyEvent::PointerInjected
+        })
+        .ok_or_else(|| {
+            format!(
+                "the proxy reported {} of the header press's {HEADER_ACTIONS} actions",
+                n - 1
+            )
+        })?;
+    }
     tap(centre("button")?)?;
     wait_line(app_log, "AtlWindow: click count=1")?;
     tap(centre("input")?)?;
@@ -309,9 +394,46 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     if !wait_until(app_log, LINE_WAIT, |t| list_first(t) > 0) {
         return Err("the list did not scroll after the drag".to_owned());
     }
+    wait_line(app_log, FINAL_LINE)?;
+    // the readback of the final frame comes after the fixture's line, once the scenes stop
+    if !wait_until(app_log, LINE_WAIT, |t| {
+        t.rfind(CAPTURE_LINE) > t.find(FINAL_LINE)
+    }) {
+        return Err("no readback after the final frame".to_owned());
+    }
     Ok(Liveness {
         answered: false,
         silent: false,
         resumed_ms: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Button at left 16, top 49, 88x48: centre (60, 73), as a real run logs it.
+    const BUTTON: &str = "AtlWindow: layout button left=16 top=49 width=88 height=48\n";
+
+    #[test]
+    fn header_check_wants_the_buttons_tap_first() {
+        let tap = format!("{BUTTON}AtlWindow: touch action=0 x=60.0 y=73.0\n");
+        assert!(header_check(&tap).is_ok());
+        // a header press that leaked: content y is above the content's origin
+        let leak = format!("{BUTTON}AtlWindow: touch action=0 x=86.0 y=-31.0\n{tap}");
+        assert!(header_check(&leak).is_err());
+        assert!(header_check(BUTTON).is_err());
+    }
+
+    #[test]
+    fn readback_check_wants_the_final_frame_and_a_change() {
+        let log = |first: &str, last: &str, want: &str| {
+            format!(
+                "atl-composer: ui: capture presented=5 size=640x400 fnv1a64={first}\nAtlWindow: final frame fnv1a64={want}\natl-composer: ui: capture presented=9 size=640x400 fnv1a64={last}\n"
+            )
+        };
+        assert!(readback_check(&log("aa", "bb", "bb")).is_ok());
+        assert!(readback_check(&log("aa", "cc", "bb")).is_err());
+        assert!(readback_check(&log("bb", "bb", "bb")).is_err());
+    }
 }
