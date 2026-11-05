@@ -175,7 +175,8 @@ pub fn r_opt_bool(p: &In<'_>) -> Result<Option<bool>> {
     }
 }
 
-/// TextUtils.writeToParcel / CHAR_SEQUENCE_CREATOR (android/text/TextUtils.java) of plain text: 1, then the String8. Spanned text (kind 0, spans) is refused.
+/// TextUtils.writeToParcel / CHAR_SEQUENCE_CREATOR (android/text/TextUtils.java) of plain text: 1, then the String8. Read also takes kind 0 (Spanned: String8, then per ParcelableSpan its type id, payload, where; id 0 ends) when it carries no span -- an EditText's
+/// text, whose selection / watcher spans are not ParcelableSpan -- as its text; a span's payload layout depends on its type, so a Spanned with any span is refused.
 pub fn w_char_sequence(p: &mut In<'_>, v: &Option<String>) -> Result<()> {
     w_i32(p, 1)?;
     w_str8(p, v)
@@ -183,10 +184,13 @@ pub fn w_char_sequence(p: &mut In<'_>, v: &Option<String>) -> Result<()> {
 pub fn r_char_sequence(p: &In<'_>) -> Result<Option<String>> {
     let kind = r_i32(p)?;
     let s = r_str8(p)?;
-    if kind != 1 {
-        return Err(crate::refuse("android.text.Spanned"));
+    match kind {
+        1 => Ok(s),
+        0 if r_i32(p)? == 0 => Ok(s),
+        _ => Err(crate::refuse(
+            "android.text.Spanned (with a ParcelableSpan)",
+        )),
     }
-    Ok(s)
 }
 
 /// android.graphics.Rect (frameworks/base/graphics/java/android/graphics/Rect.java writeToParcel / readFromParcel).

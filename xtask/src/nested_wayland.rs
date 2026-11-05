@@ -5,7 +5,7 @@
 //! Why labwc (measured 2026-11-06, all headless, pixman renderer):
 //! - sway tiles, and even with every window floating it configures them with an explicit size, so `gtk_window_set_default_size` on a mapped window never resizes it (`test platform-ui` phase 2b stalls); WSLg's weston leaves a floating window's size to the client.
 //! - weston headless has no `wl_seat` at all: GTK binds no `wl_pointer`, so the window gates' injected pointer has nothing to go to. wlroots compositors refuse `get_pointer` on a seat that never had a pointer (protocol error), so the proxy cannot fake the capability either.
-//! - labwc (wlroots, stacking) has a seat; this module gives it a pointer device through `zwlr_virtual_pointer_manager_v1` that never moves, so the gates' input still comes only from the proxy's injections. Its outputs are configured through `zwlr_output_manager_v1` ([`Output`]): size, rate and (fractional) scale; `WLR_HEADLESS_OUTPUTS` sets the output count.
+//! - labwc (wlroots, stacking) has a seat; this module gives it a pointer device through `zwlr_virtual_pointer_manager_v1` that never moves, and a keyboard through `zwp_virtual_keyboard_manager_v1` that never types (GTK's `is-active` needs a wl_keyboard enter), so the gates' input still comes only from the proxy's injections. Its outputs are configured through `zwlr_output_manager_v1` ([`Output`]): size, rate and (fractional) scale; `WLR_HEADLESS_OUTPUTS` sets the output count.
 //!
 //! Needs `labwc` (>= 0.8) on PATH; in WSL a wrapper supplies what wlroots needs there (environment setup, not this module).
 
@@ -256,6 +256,7 @@ mod op {
     pub const REGISTRY_GLOBAL: u16 = 0;
     pub const CALLBACK_DONE: u16 = 0;
     pub const VPOINTER_MANAGER_CREATE: u16 = 0;
+    pub const VKEYBOARD_MANAGER_CREATE: u16 = 0;
     pub const OUTPUT_MANAGER_CREATE_CONFIGURATION: u16 = 0;
     pub const OUTPUT_MANAGER_HEAD: u16 = 0;
     pub const OUTPUT_MANAGER_DONE: u16 = 1;
@@ -270,6 +271,7 @@ mod op {
 }
 
 const VPOINTER_MANAGER: &str = "zwlr_virtual_pointer_manager_v1";
+const VKEYBOARD_MANAGER: &str = "zwp_virtual_keyboard_manager_v1";
 const OUTPUT_MANAGER: &str = "zwlr_output_manager_v1";
 /// Version 2 has `set_custom_mode` and everything used here.
 const OUTPUT_MANAGER_VERSION: u32 = 2;
@@ -403,6 +405,15 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
         vpm,
         op::VPOINTER_MANAGER_CREATE,
         &[Arg::U(0), Arg::U(pointer)],
+    );
+    // keyboard device: GTK's window `is-active` follows wl_keyboard enter/leave, not xdg `activated`, and a seat without a keyboard has no wl_keyboard to enter. No keymap sent and no key ever pressed: clients get the seat's (labwc's keyboard group) keymap, gates' keys come from the proxy.
+    let seat = bind(&mut c, "wl_seat", 1)?;
+    let vkm = bind(&mut c, VKEYBOARD_MANAGER, 1)?;
+    let keyboard = c.new_id();
+    c.send(
+        vkm,
+        op::VKEYBOARD_MANAGER_CREATE,
+        &[Arg::U(seat), Arg::U(keyboard)],
     );
     let om = bind(&mut c, OUTPUT_MANAGER, OUTPUT_MANAGER_VERSION)?;
     let mut heads: Vec<(u32, String)> = Vec::new();

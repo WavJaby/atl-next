@@ -389,6 +389,23 @@ fn focus_check(app: &str) -> Result<String, String> {
     }
 }
 
+/// Main's window focus (onWindowFocusChanged, fed by the compositor's per-window focus publish): gained when the GTK window became active, lost to the second activity's window, regained when it closed.
+fn window_focus_check(app: &str) -> Result<String, String> {
+    let seen: Vec<&str> = app
+        .lines()
+        .filter_map(|l| {
+            l.split_once("AtlWindow: window focus=")
+                .map(|(_, v)| v.trim())
+        })
+        .collect();
+    if seen != ["true", "false", "true"] {
+        return Err(format!(
+            "Main window focus {seen:?}, want [true, false, true]"
+        ));
+    }
+    Ok("Main focused, lost focus to the second window, focused again".to_owned())
+}
+
 /// The fixture started and finished its second activity, and the Button tap after the close reached Main (its second click).
 fn window_check(app: &str) -> Result<String, String> {
     let at = |needle: &str| {
@@ -468,6 +485,7 @@ pub fn checks(
         ("click", click_check(app)),
         ("focus", focus_check(app)),
         ("window", window_check(app)),
+        ("window-focus", window_focus_check(app)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
