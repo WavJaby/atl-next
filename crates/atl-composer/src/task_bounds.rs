@@ -8,10 +8,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use atl_platform_ui::PhysSize;
 use atl_services::compositor_registry::{SERVICE, SET_BOUNDS};
-use binder::SpIBinder;
+use binder::Strong;
 use binder::binder_impl::IBinderInternal;
 
 use crate::host::ThreadHost;
+use crate::start::IRegistry;
 
 /// What the sender waits for: the Task the window is (none until the services name it) and the latest size not yet sent.
 #[derive(Default)]
@@ -86,20 +87,25 @@ impl BoundsSender {
 }
 
 /// One SET_BOUNDS transaction: the Task's number, then the size. The services are looked up at each send (they are up before any app starts).
+/// The binder is converted to the registry's interface first: libbinder_ndk's prepare_transact refuses a remote binder with no class (`AIBinder_associateClass`), and the conversion associates it, as REGISTER does (start.rs).
 fn send(task: i32, size: PhysSize) -> Result<(), String> {
-    let registry: SpIBinder = binder::check_service(SERVICE).ok_or_else(|| {
-        format!(
-            "{SERVICE}: not registered, task {task} bounds {}x{} not sent",
-            size.width, size.height
-        )
-    })?;
+    let registry: Strong<dyn IRegistry> = binder::check_service(SERVICE)
+        .ok_or_else(|| {
+            format!(
+                "{SERVICE}: not registered, task {task} bounds {}x{} not sent",
+                size.width, size.height
+            )
+        })?
+        .into_interface()
+        .map_err(|e| format!("{SERVICE}: not the registry: {e}"))?;
+    let binder = registry.as_binder();
     let width = i32::try_from(size.width).map_err(|e| e.to_string())?;
     let height = i32::try_from(size.height).map_err(|e| e.to_string())?;
-    let mut data = registry.prepare_transact().map_err(|e| e.to_string())?;
+    let mut data = binder.prepare_transact().map_err(|e| e.to_string())?;
     data.write(&task).map_err(|e| e.to_string())?;
     data.write(&width).map_err(|e| e.to_string())?;
     data.write(&height).map_err(|e| e.to_string())?;
-    registry
+    binder
         .submit_transact(SET_BOUNDS, data, 0)
         .map_err(|e| format!("set bounds: {e}"))?;
     Ok(())

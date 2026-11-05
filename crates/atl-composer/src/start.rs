@@ -25,7 +25,7 @@ const REGISTRY_WAIT: Duration = Duration::from_secs(5);
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
-pub trait IRegistry: Interface {}
+pub(crate) trait IRegistry: Interface {}
 
 declare_binder_interface! {
     IRegistry[DESCRIPTOR] {

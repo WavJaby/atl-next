@@ -8,6 +8,7 @@
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
 //! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
 //! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
+//! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,7 +37,7 @@ pub struct Args {
     /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
-    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it. `frames`: resume, and the first frame's pixels and the frame cadence are right. `input`: resume, and the fixture logs the injected pointer script's touches, in order.
+    /// The stage to run. `resume`: onResume is logged, and the app survives the window after it. `frames`: resume, and the first frame's pixels and the frame cadence are right. `input`: resume, and the fixture logs the injected pointer script's touches, in order. `resize`: UI mode; the window is configured larger, then smaller, and the app, the Task's bounds, the readback and the display follow each size.
     #[arg(long, value_enum, default_value = "resume")]
     stage: Stage,
     /// Instead of the stage: the verdict on synthetic logs (what the stage must fail and must pass). Needs no device.
@@ -62,6 +63,8 @@ enum Stage {
     Gtk,
     /// The widget fixture in UI mode: layout, the text in the readback, a tap on the button, focus, a list drag, presents and cadence (xtask/src/window/widgets.rs).
     Widgets,
+    /// Resume in UI mode, then the probe configures the window larger, then smaller ([`drive_resize`]); the sub-gates follow each size ([`resize_checks`]).
+    Resize,
 }
 
 impl Stage {
@@ -72,6 +75,7 @@ impl Stage {
             Stage::Input => "input",
             Stage::Gtk => "gtk",
             Stage::Widgets => "widgets",
+            Stage::Resize => "resize",
         }
     }
 
@@ -82,6 +86,7 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
+            Stage::Resize => RESIZE_WINDOW_MS,
         }
     }
 
@@ -91,6 +96,7 @@ impl Stage {
             Stage::Resume => &[],
             Stage::Gtk => &["mapped", "readback", "touch", "pong"],
             Stage::Widgets => widgets::SUB_NAMES,
+            Stage::Resize => RESIZE_SUB_NAMES,
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -114,6 +120,11 @@ const FRAMES_WINDOW_MS: u64 = 5_000;
 const GTK_WINDOW_MS: u64 = 10_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
+/// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
+const RESIZE_WINDOW_MS: u64 = 12_000;
+const RESIZE_SETTLE: Duration = Duration::from_millis(2_000);
+/// The resize stage's sub-gates, in order (each prints `window: <name>: pass|FAIL`).
+const RESIZE_SUB_NAMES: &[&str] = &["configure", "bounds", "relayout", "frame", "display"];
 /// The fixture's blocking touch: an UP past this view x sleeps the UI thread (Main.java BLOCK_MIN_X). The probe's click lands past it, under the window's decorations.
 const BLOCK_MIN_X: f32 = 500.0;
 const BTN_LEFT: u32 = 0x110;
@@ -141,6 +152,10 @@ const CADENCE_TOLERANCE: f64 = 0.10;
 const CADENCE_MAX_PERIODS: f64 = 1.5;
 /// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
 const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
+/// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the display's size and shrink under it in both dimensions.
+const RESIZE_STEPS: [(i32, i32, u32); 2] = [(1600, 1000, 0xA7C0_0101), (960, 600, 0xA7C0_0102)];
+/// The fixture's layout line prefix (Main.java Quadrants.onSizeChanged): `AtlWindow: size=WxH screenWidthDp=N window=WxH display=WxH`.
+const LAYOUT_LINE: &str = "AtlWindow: size=";
 /// MotionEvent.ACTION_DOWN, ACTION_UP and ACTION_MOVE (AOSP MotionEvent.java): the action of each touch the fixture logs.
 const ACTION_DOWN: u32 = 0;
 const ACTION_UP: u32 = 1;
@@ -155,9 +170,12 @@ const TAIL: usize = 40;
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
     match stage {
-        Stage::Resume | Stage::Frames | Stage::Input | Stage::Gtk | Stage::Widgets => {
-            "AtlWindow: onResume reached"
-        }
+        Stage::Resume
+        | Stage::Frames
+        | Stage::Input
+        | Stage::Gtk
+        | Stage::Widgets
+        | Stage::Resize => "AtlWindow: onResume reached",
     }
 }
 
@@ -569,7 +587,7 @@ fn start_proxy() -> Result<Proxy> {
     )
 }
 
-/// What the probe saw of the client's liveness.
+/// What the probe saw of the client: its liveness (gtk, widgets), or the acks of the injected configures (resize, where the liveness fields stay at their defaults).
 #[derive(Debug)]
 struct Liveness {
     /// The pong to the first ping came within [`PONG_WAIT`].
@@ -578,6 +596,8 @@ struct Liveness {
     silent: bool,
     /// Ms from the second ping to its pong, after the sleep (None: no pong within [`RESUME_WAIT`]).
     resumed_ms: Option<u128>,
+    /// Resize stage: whether the client acked each of [`RESIZE_STEPS`], in order (empty in the other stages).
+    configured: Vec<bool>,
 }
 
 /// The gtk stage's probe, from the proxy's side: the window's configure is acked; a ping is answered; the pointer script goes in; then a click whose UP sleeps the UI thread (past BLOCK_MIN_X). A ping sent meanwhile gets no pong until the sleep ends.
@@ -630,6 +650,38 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         answered,
         silent,
         resumed_ms,
+        configured: Vec::new(),
+    })
+}
+
+/// The resize stage's probe, from the proxy's side: once the window is up and has drawn, it is configured to each of [`RESIZE_STEPS`] in turn. Each configure must be acked; then the probe leaves the client [`RESIZE_SETTLE`] to relayout and present.
+fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+    await_event(&proxy.events, ACK_WAIT, |e| {
+        matches!(e, ProxyEvent::Acked { .. })
+    })
+    .ok_or("the window never acked a configure")?;
+    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never drew")?;
+    std::thread::sleep(INPUT_SETTLE);
+    let mut configured = Vec::new();
+    for (width, height, serial) in RESIZE_STEPS {
+        proxy
+            .inject_configure(width, height, serial)
+            .map_err(|e| e.to_string())?;
+        configured.push(
+            await_event(&proxy.events, PONG_WAIT, |e| {
+                *e == ProxyEvent::Acked { serial }
+            })
+            .is_some(),
+        );
+        std::thread::sleep(RESIZE_SETTLE);
+    }
+    Ok(Liveness {
+        answered: false,
+        silent: false,
+        resumed_ms: None,
+        configured,
     })
 }
 
@@ -679,6 +731,192 @@ fn pong_check(liveness: &Result<Liveness, String>) -> Result<String, String> {
     Ok(format!(
         "ping answered; no pong while the UI thread slept; pong {resumed} ms after its ping"
     ))
+}
+
+/// Stage `resize` sub-gate (a): the client acked each injected configure.
+fn configure_check(liveness: &Result<Liveness, String>) -> Result<String, String> {
+    let l = liveness.as_ref().map_err(Clone::clone)?;
+    if l.configured.len() != RESIZE_STEPS.len() || l.configured.contains(&false) {
+        return Err(format!(
+            "acks {:?}, want every configure acked",
+            l.configured
+        ));
+    }
+    Ok(format!("acked the configures {RESIZE_STEPS:?}"))
+}
+
+/// The Task's bounds in order, as the services logged them (`services: task T of uid U bounds WxH`); the first is the window's size when it opened.
+fn task_bounds(services: &str) -> Vec<(i32, i32)> {
+    services
+        .lines()
+        .filter(|l| l.starts_with("services: task "))
+        .filter_map(|l| l.split_once(" bounds "))
+        .filter_map(|(_, size)| parse_wxh(size.split_whitespace().next()?))
+        .collect()
+}
+
+/// The windows each bounds change told (`services: resized N windows of task T`), in order.
+fn resized_counts(services: &str) -> Vec<u32> {
+    services
+        .lines()
+        .filter(|l| l.starts_with("services: resized "))
+        .filter_map(|l| l.split_whitespace().nth(2)?.parse().ok())
+        .collect()
+}
+
+/// `WxH`, the form of every size the stage reads.
+fn parse_wxh(text: &str) -> Option<(i32, i32)> {
+    let (w, h) = text.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+/// The Task's sizes at the two changes of a resize: grow, then shrink (the display's size is the window's first).
+type Steps = ((i32, i32), (i32, i32));
+
+/// The resize's steps from the Task's logged bounds. The services log a change only: a Task opens at the display's size (tasks.rs `size`), so the log is grow then shrink, and the display is the implicit first size.
+/// Grow is over the display in both dimensions, shrink under it in both.
+fn resize_steps(bounds: &[(i32, i32)], display: (i32, i32)) -> Result<Steps, String> {
+    let &[grow, shrink] = bounds else {
+        return Err(format!(
+            "the Task's bounds {bounds:?}, want grow then shrink (the display is the first size)"
+        ));
+    };
+    if grow.0 <= display.0 || grow.1 <= display.1 {
+        return Err(format!(
+            "grow {grow:?} is not over the display {display:?} in both dimensions"
+        ));
+    }
+    if shrink.0 >= display.0 || shrink.1 >= display.1 {
+        return Err(format!(
+            "shrink {shrink:?} is not under the display {display:?} in both dimensions"
+        ));
+    }
+    Ok((grow, shrink))
+}
+
+/// Stage `resize` sub-gate (b): the services' Task went to grow, then to shrink, and each change told at least one window.
+fn bounds_check(services: &str, steps: &Result<Steps, String>) -> Result<String, String> {
+    let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
+    let counts = resized_counts(services);
+    if counts.len() != 2 || counts.contains(&0) {
+        return Err(format!(
+            "resized {counts:?} windows, want one count per bounds change, at least one each"
+        ));
+    }
+    Ok(format!(
+        "grow {}x{}, shrink {}x{}; resized {counts:?} windows",
+        grow.0, grow.1, shrink.0, shrink.1
+    ))
+}
+
+/// Stage `resize` sub-gate (c): the app laid out at grow, then at shrink, and its last layout is shrink. Consecutive repeats of one size are one layout.
+fn relayout_check(app: &str, steps: &Result<Steps, String>) -> Result<String, String> {
+    let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
+    let mut layouts: Vec<(i32, i32)> = Vec::new();
+    for line in app.lines().filter(|l| l.contains(LAYOUT_LINE)) {
+        let size = word(line, "size")
+            .and_then(parse_wxh)
+            .ok_or_else(|| format!("no size in {line}"))?;
+        if layouts.last() != Some(&size) {
+            layouts.push(size);
+        }
+    }
+    let mut wanted = [grow, shrink].into_iter();
+    let mut pending = wanted.next();
+    for size in &layouts {
+        if Some(*size) == pending {
+            pending = wanted.next();
+        }
+    }
+    if pending.is_some() || layouts.last() != Some(&shrink) {
+        return Err(format!(
+            "layouts {layouts:?}, want grow {grow:?} then shrink {shrink:?} last"
+        ));
+    }
+    Ok(format!("laid out at {layouts:?}"))
+}
+
+/// Stage `resize` sub-gate (d): the composer's readback at grow is the quadrants at grow's size, and its last readback is the quadrants at shrink's (the digest as gtk_capture_check).
+fn frame_check(app: &str, steps: &Result<Steps, String>) -> Result<String, String> {
+    let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
+    let readbacks: Vec<((i32, i32), &str)> = app
+        .lines()
+        .filter(|l| l.contains("atl-composer: ui: capture "))
+        .filter_map(|l| Some((parse_wxh(word(l, "size")?)?, word(l, "fnv1a64")?)))
+        .collect();
+    let quadrants =
+        |(w, h): (i32, i32)| format!("{:016x}", fnv1a64(&quadrant_pixels(w as u32, h as u32)));
+    let (grow_digest, shrink_digest) = (quadrants(grow), quadrants(shrink));
+    let grow_seen = readbacks
+        .iter()
+        .any(|&(size, digest)| size == grow && digest == grow_digest.as_str());
+    let shrink_last = readbacks
+        .last()
+        .is_some_and(|&(size, digest)| size == shrink && digest == shrink_digest.as_str());
+    if !grow_seen || !shrink_last {
+        return Err(format!(
+            "readbacks {readbacks:?}, want the quadrants at grow {grow:?} and the last at shrink {shrink:?}"
+        ));
+    }
+    Ok("readbacks at grow and shrink are the quadrants at their sizes".to_owned())
+}
+
+/// Stage `resize` sub-gate (e): the display is the monitor's at every layout, the window's bounds are the layout's size, and screenWidthDp changes with each size.
+fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
+    let want = format!("{}x{}", display.width, display.height);
+    let mut sizes: Vec<&str> = Vec::new();
+    let mut last: Option<(&str, &str)> = None;
+    for line in app.lines().filter(|l| l.contains(LAYOUT_LINE)) {
+        let size = word(line, "size").unwrap_or_default();
+        let shown = word(line, "display");
+        let window = word(line, "window");
+        let dp = word(line, "screenWidthDp").unwrap_or_default();
+        if shown != Some(want.as_str()) {
+            return Err(format!(
+                "the display reported {shown:?} at layout {size}, want {want}"
+            ));
+        }
+        if window != Some(size) {
+            return Err(format!("window bounds {window:?} at layout {size}"));
+        }
+        if let Some((prev_size, prev_dp)) = last
+            && prev_size != size
+            && prev_dp == dp
+        {
+            return Err(format!(
+                "screenWidthDp stayed {dp} while the layout went {prev_size} -> {size}"
+            ));
+        }
+        if sizes.last() != Some(&size) {
+            sizes.push(size);
+        }
+        last = Some((size, dp));
+    }
+    if sizes.len() < 3 {
+        return Err(format!(
+            "layouts {sizes:?}, want the display's size, then grow, then shrink"
+        ));
+    }
+    Ok(format!(
+        "display {want} at every layout; window bounds and screenWidthDp follow the layouts {sizes:?}"
+    ))
+}
+
+/// Stage `resize`'s sub-gates, in [`RESIZE_SUB_NAMES`] order.
+fn resize_checks(
+    app: &str,
+    services: &str,
+    display: DisplayModel,
+    liveness: &Result<Liveness, String>,
+) -> Vec<Result<String, String>> {
+    let steps = resize_steps(&task_bounds(services), (display.width, display.height));
+    vec![
+        configure_check(liveness),
+        bounds_check(services, &steps),
+        relayout_check(app, &steps),
+        frame_check(app, &steps),
+        display_check(app, display),
+    ]
 }
 
 /// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
@@ -868,7 +1106,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        Stage::Gtk | Stage::Widgets => {
+        Stage::Gtk | Stage::Widgets | Stage::Resize => {
             let p = start_proxy()?;
             let rt = rt.with_ui("gtk").with_wayland(&p.listen);
             proxy = Some(p);
@@ -915,11 +1153,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
     let widget_stage = matches!(args.stage, Stage::Widgets);
+    let resize_stage = matches!(args.stage, Stage::Resize);
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         std::thread::spawn(move || {
             if widget_stage {
                 widgets::drive(p, &log)
+            } else if resize_stage {
+                drive_resize(p, &log)
             } else {
                 drive(p, &log)
             }
@@ -954,7 +1195,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(handle) => handle
             .join()
             .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
-        None => Err("no probe: only the gtk stage runs one".to_owned()),
+        None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
     let app = read(&app_log);
     let services = read(&services_log);
@@ -974,6 +1215,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
         (Stage::Widgets, Some(_)) => widgets::checks(&app, &after_marker(&app, marker), &liveness),
+        (Stage::Resize, Some(_)) => {
+            resize_checks(&app, &services, DisplayModel::default(), &liveness)
+        }
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, DisplayModel::default()),
@@ -1104,6 +1348,122 @@ mod tests {
     }
 
     /// The first frame of the fixture's layer must be the quadrants at the display's size. The expected digest is FNV-1a over the bytes written out here, not over quadrant_pixels.
+    /// The fixture's layout line (Main.java onSizeChanged) at `w`x`h`, with screenWidthDp `dp` and the 4x2 test display.
+    fn layout(w: i32, h: i32, dp: i32) -> String {
+        format!("AtlWindow: size={w}x{h} screenWidthDp={dp} window={w}x{h} display=4x2")
+    }
+
+    /// The composer's readback line at `w`x`h`. Its digest is the gate's quadrant pattern, which the gtk stage checks against the live readback.
+    fn readback(w: u32, h: u32) -> String {
+        let digest = fnv1a64(&quadrant_pixels(w, h));
+        format!("atl-composer: ui: capture presented=3 size={w}x{h} fnv1a64={digest:016x}")
+    }
+
+    /// The services' log of a 4x2 display resized to 6x4 (grow) and 3x1 (shrink). A Task opens at the display's size, so only the changes are logged.
+    const RESIZE_SERVICES: &str = "services: task 1 of uid 10123 bounds 6x4\nservices: resized 1 windows of task 1\nservices: task 1 of uid 10123 bounds 3x1\nservices: resized 1 windows of task 1";
+
+    fn resize_run(
+        app: &[String],
+        services: &str,
+        configured: Vec<bool>,
+    ) -> Vec<Result<String, String>> {
+        let display = DisplayModel {
+            width: 4,
+            height: 2,
+            ..DisplayModel::default()
+        };
+        let liveness = Ok(Liveness {
+            answered: false,
+            silent: false,
+            resumed_ms: None,
+            configured,
+        });
+        resize_checks(&app.join("\n"), services, display, &liveness)
+    }
+
+    /// The consistent run passes every sub-gate; each defect fails the sub-gate that names it. Sizes and pattern come from the spec, not from the code under test.
+    #[test]
+    fn resize_checks_pass_a_consistent_run_and_fail_each_defect() {
+        let good = vec![
+            layout(4, 2, 4),
+            layout(6, 4, 6),
+            layout(3, 1, 3),
+            readback(6, 4),
+            readback(3, 1),
+        ];
+        let ok = resize_run(&good, RESIZE_SERVICES, vec![true, true]);
+        assert_eq!(ok.len(), RESIZE_SUB_NAMES.len());
+        assert!(ok.iter().all(Result::is_ok), "{ok:?}");
+
+        let acks = resize_run(&good, RESIZE_SERVICES, vec![true, false]);
+        assert!(acks[0].is_err(), "a configure not acked: {acks:?}");
+
+        let services = RESIZE_SERVICES.replace("bounds 6x4", "bounds 4x4");
+        let grow = resize_run(&good, &services, vec![true, true]);
+        assert!(grow[1].is_err(), "grow not over the display: {grow:?}");
+
+        let no_grow = [
+            layout(4, 2, 4),
+            layout(3, 1, 3),
+            readback(6, 4),
+            readback(3, 1),
+        ];
+        let relayout = resize_run(&no_grow, RESIZE_SERVICES, vec![true, true]);
+        assert!(relayout[2].is_err(), "no layout at grow: {relayout:?}");
+
+        let stale = [
+            layout(4, 2, 4),
+            layout(6, 4, 6),
+            layout(3, 1, 3),
+            readback(6, 4),
+            "atl-composer: ui: capture presented=3 size=3x1 fnv1a64=0000000000000000".to_owned(),
+        ];
+        let frame = resize_run(&stale, RESIZE_SERVICES, vec![true, true]);
+        assert!(
+            frame[3].is_err(),
+            "shrink readback has other pixels: {frame:?}"
+        );
+
+        let moved = [
+            layout(4, 2, 4),
+            layout(6, 4, 6),
+            layout(3, 1, 3).replace("display=4x2", "display=8x4"),
+            readback(6, 4),
+            readback(3, 1),
+        ];
+        let display = resize_run(&moved, RESIZE_SERVICES, vec![true, true]);
+        assert!(
+            display[4].is_err(),
+            "the display moved with the window: {display:?}"
+        );
+
+        let same_dp = [
+            layout(4, 2, 4),
+            layout(6, 4, 4),
+            layout(3, 1, 3),
+            readback(6, 4),
+            readback(3, 1),
+        ];
+        let dp = resize_run(&same_dp, RESIZE_SERVICES, vec![true, true]);
+        assert!(
+            dp[4].is_err(),
+            "screenWidthDp did not change with the grow: {dp:?}"
+        );
+    }
+
+    #[test]
+    fn resize_steps_are_grow_then_shrink_around_the_display() {
+        let display = (4, 2);
+        assert_eq!(
+            resize_steps(&[(6, 4), (3, 1)], display),
+            Ok(((6, 4), (3, 1)))
+        );
+        assert!(resize_steps(&[(4, 4), (3, 1)], display).is_err());
+        assert!(resize_steps(&[(6, 4), (4, 1)], display).is_err());
+        assert!(resize_steps(&[(6, 4)], display).is_err());
+        assert!(resize_steps(&[(4, 2), (6, 4), (3, 1)], display).is_err());
+    }
+
     #[test]
     fn picture_check_reads_the_first_frame_of_the_layer() {
         let display = DisplayModel {

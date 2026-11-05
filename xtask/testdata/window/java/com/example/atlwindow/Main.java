@@ -6,6 +6,7 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Choreographer;
@@ -20,6 +21,7 @@ import android.view.WindowManager;
  * The content view paints four solid quadrants and no text: top-left red, top-right green, bottom-left blue, bottom-right white (the frames stage checks these pixels).
  * After onResume the activity takes FRAME_CALLBACKS Choreographer frame callbacks, each logging its frame time (the frames stage checks the cadence).
  * Each touch the content view gets is logged (the input stage checks it against the injected pointer script).
+ * Each layout of the content view logs its size, the window's and the display's bounds and screenWidthDp (the resize stage checks them against the configures it injects).
  * Each marker is logged once, when it is first reached.
  */
 public class Main extends Activity {
@@ -97,6 +99,18 @@ public class Main extends Activity {
             canvas.drawRect(0, halfHeight, halfWidth, bottom, paint);
             paint.setColor(Color.WHITE);
             canvas.drawRect(halfWidth, halfHeight, right, bottom, paint);
+        }
+
+        /** One line per size change (xtask/src/window.rs resize_checks): the content size, screenWidthDp, the window's bounds and the display's. */
+        @Override
+        protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            WindowManager wm = getContext().getSystemService(WindowManager.class);
+            Rect window = wm.getCurrentWindowMetrics().getBounds();
+            Rect display = wm.getMaximumWindowMetrics().getBounds();
+            Log.i(TAG, "size=" + w + "x" + h + " screenWidthDp=" + getResources().getConfiguration().screenWidthDp
+                    + " window=" + window.width() + "x" + window.height()
+                    + " display=" + display.width() + "x" + display.height());
         }
 
         /** Logs each touch: the action, the pointer's x and y, the pointer count (xtask/src/window.rs input_check). An UP past BLOCK_MIN_X sleeps BLOCK_MS on the UI thread: the gtk stage's liveness probe expects no pong meanwhile. */

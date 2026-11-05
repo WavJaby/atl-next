@@ -8,6 +8,7 @@
 //!
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, motion, button, each then `frame`) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
+//! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
 //! Forwarding keeps libwayland's fd semantics: fds are a FIFO attached to bytes, so each batch of complete messages goes out with all fds received so far (at most [`MAX_FDS_PER_SEND`] per `sendmsg`).
@@ -44,6 +45,13 @@ const XDG_WM_BASE_PING: u16 = 0;
 const XDG_WM_BASE_GET_XDG_SURFACE: u16 = 2;
 const XDG_SURFACE: &str = "xdg_surface";
 const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
+const XDG_SURFACE_GET_TOPLEVEL: u16 = 1;
+const XDG_TOPLEVEL: &str = "xdg_toplevel";
+/// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
+const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
+const XDG_SURFACE_CONFIGURE: u16 = 0;
+/// xdg-shell's `activated` window state: the injected configure says the window has focus, as the compositor's do for the focused window.
+const XDG_STATE_ACTIVATED: u32 = 4;
 const WL_SEAT: &str = "wl_seat";
 const WL_SEAT_GET_POINTER: u16 = 0;
 const WL_POINTER: &str = "wl_pointer";
@@ -79,6 +87,8 @@ pub enum Event {
     Acked { serial: u32 },
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
     PointerInjected,
+    /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
+    ConfigureInjected { serial: u32 },
     /// A client connection closed.
     Closed,
 }
@@ -92,6 +102,11 @@ struct Ids {
     pointer: Option<u32>,
     /// The `wl_surface` of the first `xdg_surface`: the window.
     surface: Option<u32>,
+    /// The window's shell roles: its first `xdg_surface` and that surface's `xdg_toplevel`, which [`Proxy::inject_configure`] addresses.
+    xdg_surface: Option<u32>,
+    toplevel: Option<u32>,
+    /// The serials [`Proxy::inject_configure`] wrote: the client's acks of them are absorbed (see `client_to_server`).
+    injected: Vec<u32>,
 }
 
 impl Ids {
@@ -144,6 +159,19 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         let (xdg, surface) = (word(body, 0)?, word(body, 4)?);
         ids.interfaces.insert(xdg, XDG_SURFACE.to_owned());
         ids.surface.get_or_insert(surface);
+        ids.xdg_surface.get_or_insert(xdg);
+        return None;
+    }
+    if ids
+        .interfaces
+        .get(&object)
+        .is_some_and(|i| i == XDG_SURFACE)
+        && opcode == XDG_SURFACE_GET_TOPLEVEL
+    {
+        // new_id: u32
+        let toplevel = word(body, 0)?;
+        ids.interfaces.insert(toplevel, XDG_TOPLEVEL.to_owned());
+        ids.toplevel.get_or_insert(toplevel);
         return None;
     }
     match (ids.interfaces.get(&object).map(String::as_str), opcode) {
@@ -224,7 +252,15 @@ pub enum PointerAction {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Injection {
     Ping(u32),
-    Pointer { action: PointerAction, time_ms: u32 },
+    Pointer {
+        action: PointerAction,
+        time_ms: u32,
+    },
+    Configure {
+        width: i32,
+        height: i32,
+        serial: u32,
+    },
 }
 
 /// The proxy: accepts clients on `listen`, relays them to `upstream`, reports [`Event`]s.
@@ -277,6 +313,16 @@ impl Proxy {
     pub fn inject_pointer(&self, action: PointerAction) -> Result<()> {
         let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
         self.queue(Injection::Pointer { action, time_ms })
+    }
+
+    /// Queues an xdg-shell configure of the window: `xdg_toplevel.configure(width, height, activated)`, then `xdg_surface.configure(serial)`, the order a compositor sends them.
+    /// The client's `ack_configure(serial)` comes back as [`Event::Acked`] but is not forwarded: the compositor never sent that serial, and it would drop the client for it (`client_to_server`). Inject after the first [`Event::Acked`], as [`Proxy::inject_pointer`]: nothing is written before the window exists.
+    pub fn inject_configure(&self, width: i32, height: i32, serial: u32) -> Result<()> {
+        self.queue(Injection::Configure {
+            width,
+            height,
+            serial,
+        })
     }
 
     fn queue(&self, item: Injection) -> Result<()> {
@@ -350,18 +396,32 @@ fn client_to_server(
         }
         pending.extend_from_slice(&data);
         fds.extend(received);
-        let complete = {
+        // an ack of an injected configure is absorbed: the compositor never sent that serial, so forwarding it is a protocol error that drops the client
+        let (complete, forwarded) = {
             let mut ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
-            scan(&pending, |object, opcode, body| {
-                if let Some(event) = note_request(&mut ids, object, opcode, body) {
+            let mut forwarded = Vec::new();
+            let mut at = 0;
+            while let Some((object, opcode, size)) = message(&pending[at..]) {
+                let raw = &pending[at..at + size];
+                let event = note_request(&mut ids, object, opcode, &raw[HEADER_BYTES..]);
+                let absorbed = match &event {
+                    Some(Event::Acked { serial }) => ids.injected.contains(serial),
+                    _ => false,
+                };
+                if let Some(event) = event {
                     let _ = events.send((Instant::now(), event));
                 }
-            })
+                if !absorbed {
+                    forwarded.extend_from_slice(raw);
+                }
+                at += size;
+            }
+            (at, forwarded)
         };
-        if complete > 0 {
-            forward(server.as_fd(), &pending[..complete], &mut fds)?;
-            pending.drain(..complete);
+        if !forwarded.is_empty() {
+            forward(server.as_fd(), &forwarded, &mut fds)?;
         }
+        pending.drain(..complete);
     }
 }
 
@@ -428,9 +488,15 @@ fn server_to_client(
         if items.is_empty() {
             continue;
         }
-        let (wm_base, pointer, surface) = {
+        let (wm_base, pointer, surface, toplevel, xdg_surface) = {
             let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
-            (ids.id_of(WM_BASE), ids.pointer, ids.surface)
+            (
+                ids.id_of(WM_BASE),
+                ids.pointer,
+                ids.surface,
+                ids.toplevel,
+                ids.xdg_surface,
+            )
         };
         for item in items {
             let bytes = match item {
@@ -464,6 +530,27 @@ fn server_to_client(
                         continue;
                     }
                 },
+                Injection::Configure {
+                    width,
+                    height,
+                    serial,
+                } => match (toplevel, xdg_surface) {
+                    (Some(toplevel), Some(xdg_surface)) => {
+                        // recorded before the bytes go out: the client's ack cannot come before this
+                        ids.lock()
+                            .map_err(|_| anyhow::anyhow!("ids poisoned"))?
+                            .injected
+                            .push(serial);
+                        let _ = events.send((Instant::now(), Event::ConfigureInjected { serial }));
+                        configure_bytes(toplevel, xdg_surface, width, height, serial)
+                    }
+                    _ => {
+                        eprintln!(
+                            "wayland proxy: configure {width}x{height} dropped, the client has no window role yet"
+                        );
+                        continue;
+                    }
+                },
             };
             forward(client.as_fd(), &bytes, &mut Vec::new())?;
         }
@@ -483,6 +570,31 @@ fn event(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
 /// `xdg_wm_base.ping(serial)` as a client receives it: object, `12 << 16 | 0`, serial.
 fn ping_bytes(wm_base: u32, serial: u32) -> Vec<u8> {
     event(wm_base, XDG_WM_BASE_PING, &serial.to_ne_bytes())
+}
+
+/// `xdg_toplevel.configure(width, height, states)` then `xdg_surface.configure(serial)` as a client receives them. The states array is the one `activated` entry: a u32 byte length, then the entry.
+fn configure_bytes(
+    toplevel: u32,
+    xdg_surface: u32,
+    width: i32,
+    height: i32,
+    serial: u32,
+) -> Vec<u8> {
+    let states_bytes = 4u32;
+    let body = [
+        width.to_ne_bytes(),
+        height.to_ne_bytes(),
+        states_bytes.to_ne_bytes(),
+        XDG_STATE_ACTIVATED.to_ne_bytes(),
+    ]
+    .concat();
+    let mut out = event(toplevel, XDG_TOPLEVEL_CONFIGURE, &body);
+    out.extend(event(
+        xdg_surface,
+        XDG_SURFACE_CONFIGURE,
+        &serial.to_ne_bytes(),
+    ));
+    out
 }
 
 /// A surface coordinate as wl_fixed (24.8).
@@ -611,5 +723,22 @@ mod tests {
         assert_eq!(ping.len(), 12);
         assert_eq!(message(&ping), Some((7, 0, 12)));
         assert_eq!(word(&ping, 8), Some(0xA7C0_0002));
+    }
+
+    /// Written out from xdg-shell's XML (`xdg_toplevel.configure(int width, int height, array states)`, `xdg_surface.configure(uint serial)`): the expected bytes are literals, not this module's encoder.
+    /// The toplevel's message is 24 bytes (header, 1600, 1000, a 4-byte array holding `activated` = 4); the surface's is 12 bytes (header, serial 5).
+    #[test]
+    fn configure_is_the_toplevel_then_the_surface() {
+        let bytes = configure_bytes(7, 8, 1600, 1000, 5);
+        let parts: [&[u8]; 5] = [
+            &[7, 0, 0, 0, 0x00, 0x00, 0x18, 0x00],
+            &[0x40, 0x06, 0, 0, 0xE8, 0x03, 0, 0],
+            &[4, 0, 0, 0, 4, 0, 0, 0],
+            &[8, 0, 0, 0, 0x00, 0x00, 0x0C, 0x00],
+            &[5, 0, 0, 0],
+        ];
+        assert_eq!(bytes, parts.concat());
+        assert_eq!(message(&bytes), Some((7, 0, 24)));
+        assert_eq!(message(&bytes[24..]), Some((8, 0, 12)));
     }
 }

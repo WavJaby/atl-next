@@ -405,6 +405,7 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         answered: false,
         silent: false,
         resumed_ms: None,
+        configured: Vec::new(),
     })
 }
 
