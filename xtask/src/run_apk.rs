@@ -58,8 +58,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_ui("gtk")
-    .with_display(run_display().to_arg());
+    .with_ui("gtk");
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()
     } else {
@@ -72,9 +71,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(_) => None,
         None => Some(NestedCompositor::start(&work.join("nested"))?),
     };
+    // the display at the rate of the compositor the window maps on
     let rt = match &nested {
-        Some(n) => rt.with_wayland(&n.socket),
-        None => rt,
+        Some(n) => rt
+            .with_wayland(&n.socket)
+            .with_display(n.display().to_arg()),
+        None => rt.with_display(run_display().to_arg()),
     };
     let apk = work.join("base.apk");
     std::fs::copy(&args.apk, &apk).with_context(|| format!("copying {}", args.apk.display()))?;

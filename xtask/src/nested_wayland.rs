@@ -108,21 +108,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// A directory removed when dropped.
-struct TempDir(PathBuf);
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A running headless labwc: its socket, log and private runtime dir. Dropping it stops labwc and removes the runtime dir.
+/// A running headless labwc: its socket, log and private runtime dir (all under the run's work dir). Dropping it stops labwc.
 pub struct NestedCompositor {
-    /// Field order is drop order: the setup connection (and with it the virtual pointer) goes first, the compositor next, its runtime dir last.
+    /// Field order is drop order: the setup connection (and with it the virtual pointer) goes first, then the compositor.
     _setup: Client,
     _child: ChildGuard,
-    _runtime: TempDir,
     outputs: Vec<Output>,
     /// The absolute socket path: atld's (or the proxy's upstream) WAYLAND_DISPLAY.
     pub socket: PathBuf,
@@ -141,18 +131,20 @@ impl NestedCompositor {
         let config = work.join("labwc");
         std::fs::create_dir_all(&config)?;
         std::fs::write(config.join("rc.xml"), RC_XML)?;
-        // a short private runtime dir (sun_path holds 108 bytes)
-        let runtime =
-            TempDir(std::env::temp_dir().join(format!("atl-nested-{}", std::process::id())));
-        std::fs::create_dir_all(&runtime.0)?;
-        std::fs::set_permissions(&runtime.0, std::fs::Permissions::from_mode(0o700))?;
+        // a private runtime dir, emptied first: a killed run's socket left there would move wlroots to the next name (sun_path holds 108 bytes; the slot work dirs stay well under)
+        let runtime = work.join("rt");
+        if runtime.exists() {
+            std::fs::remove_dir_all(&runtime)?;
+        }
+        std::fs::create_dir_all(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
         let log = work.join("labwc.log");
         // labwc logs to stderr; `sh -c` sends it to the log, and `exec` keeps the pid labwc's (the wrapper's)
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exec labwc --config-dir \"$0\" 2>\"$1\""])
             .arg(&config)
             .arg(&log)
-            .env("XDG_RUNTIME_DIR", &runtime.0)
+            .env("XDG_RUNTIME_DIR", &runtime)
             .env("WLR_BACKENDS", "headless")
             .env("WLR_HEADLESS_OUTPUTS", outputs.len().to_string())
             .env("WLR_LIBINPUT_NO_DEVICES", "1")
@@ -161,7 +153,7 @@ impl NestedCompositor {
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY");
         let mut child = ChildGuard::spawn(&mut cmd)?;
-        let socket = runtime.0.join(SOCKET);
+        let socket = runtime.join(SOCKET);
         let deadline = Instant::now() + READY_WAIT;
         let stream = loop {
             if let Ok(s) = UnixStream::connect(&socket) {
@@ -189,7 +181,6 @@ impl NestedCompositor {
         Ok(Self {
             _setup: setup,
             _child: child,
-            _runtime: runtime,
             outputs: outputs.to_vec(),
             socket,
         })
