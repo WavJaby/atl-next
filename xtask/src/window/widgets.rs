@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
 //! The probe presses the header bar, then taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
-//! Sub-gates ([`SUB_NAMES`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
+//! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
 //! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), list, readback (the last readback is the fixture's final frame and differs from the first),
 //! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage).
 
@@ -11,19 +11,14 @@ use std::time::{Duration, Instant};
 use atl_services::display_model::DisplayModel;
 
 use super::{
-    ACK_WAIT, BTN_LEFT, Liveness, POLL, await_event, cadence_check, capture_line, content_origin,
-    wait_for_line,
+    ACK_WAIT, BTN_LEFT, Liveness, POLL, Sub, await_event, cadence_check, capture_line,
+    content_origin, wait_for_line,
 };
 use crate::composer::word;
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask/testdata/widgets";
-/// The sub-gates, in print order (each prints `window: <name>: pass|FAIL`).
-pub const SUB_NAMES: &[&str] = &[
-    "probe", "layout", "text", "header", "click", "focus", "window", "list", "readback",
-    "presents", "cadence", "pacing",
-];
 /// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
 /// The fixture's line after the cadence run: the picture the last readback must show.
@@ -303,29 +298,32 @@ fn presents_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The widgets stage's sub-gates in [`SUB_NAMES`] order, from the probe's result, the app log and the frame callbacks after the marker.
+/// The widgets stage's sub-gates, in print order, from the probe's result, the app log and the frame callbacks after the marker.
 pub fn checks(
     app: &str,
     after: &[&str],
     probe: &Result<Liveness, String>,
     display: DisplayModel,
-) -> Vec<Result<String, String>> {
+) -> Vec<Sub> {
     vec![
-        probe
-            .as_ref()
-            .map(|_| "every injection got its answer".to_owned())
-            .map_err(Clone::clone),
-        layout_check(app),
-        text_check(app),
-        header_check(app),
-        click_check(app),
-        focus_check(app),
-        window_check(app),
-        list_check(app),
-        readback_check(app),
-        presents_check(app),
-        cadence_check(after, display.refresh_hz),
-        pacing_check(app, display.refresh_hz),
+        (
+            "probe",
+            probe
+                .as_ref()
+                .map(|_| "every injection got its answer".to_owned())
+                .map_err(Clone::clone),
+        ),
+        ("layout", layout_check(app)),
+        ("text", text_check(app)),
+        ("header", header_check(app)),
+        ("click", click_check(app)),
+        ("focus", focus_check(app)),
+        ("window", window_check(app)),
+        ("list", list_check(app)),
+        ("readback", readback_check(app)),
+        ("presents", presents_check(app)),
+        ("cadence", cadence_check(after, display.refresh_hz)),
+        ("pacing", pacing_check(app, display.refresh_hz)),
     ]
 }
 

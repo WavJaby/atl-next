@@ -106,21 +106,10 @@ impl Stage {
             }
         }
     }
-
-    /// The sub-gates run once the marker is logged, by name (each prints `window: <name>: pass|FAIL`).
-    fn sub_names(self) -> &'static [&'static str] {
-        match self {
-            Stage::Resume => &[],
-            Stage::Gtk => &["mapped", "readback", "touch", "pong"],
-            Stage::Widgets => widgets::SUB_NAMES,
-            Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish => {
-                RESIZE_SUB_NAMES
-            }
-            Stage::Frames => &["picture", "cadence"],
-            Stage::Input => &["touch", "touch-mode"],
-        }
-    }
 }
+
+/// One sub-gate's result under its name (printed `window: <name>: pass|FAIL`); the name travels with the result, so no list of names can fall out of step with the checks.
+pub(crate) type Sub = (&'static str, Result<String, String>);
 
 /// The fixture's dir.
 const FIXTURE: &str = "xtask/testdata/window";
@@ -147,17 +136,6 @@ const WIDGETS_WINDOW_MS: u64 = 12_000;
 /// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
 const RESIZE_WINDOW_MS: u64 = 18_000;
 const RESIZE_SETTLE: Duration = Duration::from_millis(2_000);
-/// The resize stages' sub-gates, in order (each prints `window: <name>: pass|FAIL`): [`resize_checks`]' up to `display`, then the click, [`burst_check`], [`lifecycle_check`].
-const RESIZE_SUB_NAMES: &[&str] = &[
-    "configure",
-    "bounds",
-    "relayout",
-    "frame",
-    "display",
-    "click",
-    "burst",
-    "lifecycle",
-];
 /// The click after the resize (surface coordinates, inside the shrunk window, under BLOCK_MIN_X): a pointer script for [`track_check`].
 const CLICK_SCRIPT: &str = "down:200,300 up:200,300";
 const CLICK_POINT: (f64, f64) = (200.0, 300.0);
@@ -1031,20 +1009,20 @@ fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
     ))
 }
 
-/// The resize stages' sub-gates up to `display`, in [`RESIZE_SUB_NAMES`] order.
+/// The resize stages' sub-gates up to `display`; the stage adds click, burst, lifecycle.
 fn resize_checks(
     app: &str,
     services: &str,
     display: DisplayModel,
     liveness: &Result<Liveness, String>,
-) -> Vec<Result<String, String>> {
+) -> Vec<Sub> {
     let steps = resize_steps(&task_bounds(services), opening_size_i32(display));
     vec![
-        configure_check(liveness),
-        bounds_check(services, &steps),
-        relayout_check(app, &steps),
-        frame_check(app, &steps),
-        display_check(app, display),
+        ("configure", configure_check(liveness)),
+        ("bounds", bounds_check(services, &steps)),
+        ("relayout", relayout_check(app, &steps)),
+        ("frame", frame_check(app, &steps)),
+        ("display", display_check(app, display)),
     ]
 }
 
@@ -1487,51 +1465,62 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("---- app log\n{app}");
     }
     // the sub-gates, once the marker is logged (they read the frames or the touches after it)
-    let sub: Vec<Result<String, String>> =
-        match (args.stage, v.marker_ms) {
-            (Stage::Frames, Some(_)) => {
-                vec![
-                    picture_check(&app, display),
+    let sub: Vec<Sub> = match (args.stage, v.marker_ms) {
+        (Stage::Frames, Some(_)) => {
+            vec![
+                ("picture", picture_check(&app, display)),
+                (
+                    "cadence",
                     cadence_check(&after_marker(&app, marker), display.refresh_hz),
-                ]
-            }
-            (Stage::Input, Some(_)) => vec![
+                ),
+            ]
+        }
+        (Stage::Input, Some(_)) => vec![
+            (
+                "touch",
                 input_check(&after_marker(&app, marker), POINTER_SCRIPT),
-                touch_mode_check(&services),
-            ],
-            (Stage::Widgets, Some(_)) => widgets::checks(
-                &app,
-                &after_marker(&app, marker),
-                &liveness,
-                widgets::display(display),
             ),
-            (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
-                let want = match args.stage {
-                    Stage::Relaunch => Lifecycle::Relaunches,
-                    Stage::Declared | Stage::StartFinish => Lifecycle::Told,
-                    _ => Lifecycle::Kept,
-                };
-                let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
-                let mut sub = resize_checks(&app, &services, display, &liveness);
-                sub.push(content_origin(&app).and_then(|origin| {
+            ("touch-mode", touch_mode_check(&services)),
+        ],
+        (Stage::Widgets, Some(_)) => widgets::checks(
+            &app,
+            &after_marker(&app, marker),
+            &liveness,
+            widgets::display(display),
+        ),
+        (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
+            let want = match args.stage {
+                Stage::Relaunch => Lifecycle::Relaunches,
+                Stage::Declared | Stage::StartFinish => Lifecycle::Told,
+                _ => Lifecycle::Kept,
+            };
+            let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
+            let mut sub = resize_checks(&app, &services, display, &liveness);
+            sub.push((
+                "click",
+                content_origin(&app).and_then(|origin| {
                     track_check(&after_marker(&app, marker), CLICK_SCRIPT, origin)
-                }));
-                sub.push(burst_check(&app, &services, &steps));
-                sub.push(lifecycle_check(&app, &services, &steps, want));
-                sub
-            }
-            (Stage::Gtk, Some(_)) => vec![
-                gtk_window_check(&app),
-                gtk_capture_check(&app, display),
+                }),
+            ));
+            sub.push(("burst", burst_check(&app, &services, &steps)));
+            sub.push(("lifecycle", lifecycle_check(&app, &services, &steps, want)));
+            sub
+        }
+        (Stage::Gtk, Some(_)) => vec![
+            ("mapped", gtk_window_check(&app)),
+            ("readback", gtk_capture_check(&app, display)),
+            (
+                "touch",
                 content_origin(&app).and_then(|origin| {
                     track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
                 }),
-                pong_check(&liveness),
-            ],
-            _ => Vec::new(),
-        };
-    let sub_fault = sub.iter().find_map(|r| r.as_ref().err().cloned());
-    for (name, result) in args.stage.sub_names().iter().zip(&sub) {
+            ),
+            ("pong", pong_check(&liveness)),
+        ],
+        _ => Vec::new(),
+    };
+    let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
+    for (name, result) in &sub {
         match result {
             Ok(s) => println!("window: {name}: pass {s}"),
             Err(s) => println!("window: {name}: FAIL {s}"),
@@ -1698,11 +1687,12 @@ mod tests {
     /// The services' log of a Task opened at 4x2 resized to 6x4 (grow) and 3x1 (shrink). A Task opens at its opening size, so only the changes are logged.
     const RESIZE_SERVICES: &str = "services: task 1 of uid 10123 bounds 6x4\nservices: resized 1 windows of task 1\nservices: task 1 of uid 10123 bounds 3x1\nservices: resized 1 windows of task 1";
 
-    fn resize_run(
-        app: &[String],
-        services: &str,
-        configured: Vec<bool>,
-    ) -> Vec<Result<String, String>> {
+    /// The named sub-gate is present and failed.
+    fn failed(sub: &[Sub], name: &str) -> bool {
+        sub.iter().any(|(n, r)| *n == name && r.is_err())
+    }
+
+    fn resize_run(app: &[String], services: &str, configured: Vec<bool>) -> Vec<Sub> {
         // opens at 4x2: 3/4 of 6x3, truncated (opening_size)
         let display = DisplayModel {
             width: 6,
@@ -1729,18 +1719,20 @@ mod tests {
             readback(3, 1),
         ];
         let ok = resize_run(&good, RESIZE_SERVICES, vec![true, true]);
-        assert_eq!(
-            Some(ok.len()),
-            RESIZE_SUB_NAMES.iter().position(|n| *n == "click")
-        );
-        assert!(ok.iter().all(Result::is_ok), "{ok:?}");
+        assert!(ok.iter().all(|(_, r)| r.is_ok()), "{ok:?}");
 
         let acks = resize_run(&good, RESIZE_SERVICES, vec![true, false]);
-        assert!(acks[0].is_err(), "a configure not acked: {acks:?}");
+        assert!(
+            failed(&acks, "configure"),
+            "a configure not acked: {acks:?}"
+        );
 
         let services = RESIZE_SERVICES.replace("bounds 6x4", "bounds 4x4");
         let grow = resize_run(&good, &services, vec![true, true]);
-        assert!(grow[1].is_err(), "grow not over the display: {grow:?}");
+        assert!(
+            failed(&grow, "bounds"),
+            "grow not over the display: {grow:?}"
+        );
 
         let no_grow = [
             layout(4, 2, 4),
@@ -1749,7 +1741,10 @@ mod tests {
             readback(3, 1),
         ];
         let relayout = resize_run(&no_grow, RESIZE_SERVICES, vec![true, true]);
-        assert!(relayout[2].is_err(), "no layout at grow: {relayout:?}");
+        assert!(
+            failed(&relayout, "relayout"),
+            "no layout at grow: {relayout:?}"
+        );
 
         let stale = [
             layout(4, 2, 4),
@@ -1760,7 +1755,7 @@ mod tests {
         ];
         let frame = resize_run(&stale, RESIZE_SERVICES, vec![true, true]);
         assert!(
-            frame[3].is_err(),
+            failed(&frame, "frame"),
             "shrink readback has other pixels: {frame:?}"
         );
 
@@ -1773,7 +1768,7 @@ mod tests {
         ];
         let display = resize_run(&moved, RESIZE_SERVICES, vec![true, true]);
         assert!(
-            display[4].is_err(),
+            failed(&display, "display"),
             "the display moved with the window: {display:?}"
         );
 
@@ -1786,7 +1781,7 @@ mod tests {
         ];
         let dp = resize_run(&same_dp, RESIZE_SERVICES, vec![true, true]);
         assert!(
-            dp[4].is_err(),
+            failed(&dp, "display"),
             "screenWidthDp did not change with the grow: {dp:?}"
         );
     }
