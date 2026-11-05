@@ -33,6 +33,7 @@ use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::android::window::SizeConfigurationBuckets;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
@@ -48,6 +49,7 @@ use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
+use crate::size_buckets::SizeBuckets;
 use crate::tasks::{TaskSize, Tasks};
 use crate::{counters, manifest_flags, package, settings, token};
 
@@ -348,8 +350,11 @@ impl ActivityManager {
         display: DisplayModel,
         tasks: Arc<Tasks<SpIBinder>>,
     ) -> Self {
+        let buckets = Arc::new(ReportedBuckets::default());
         let controller = BnActivityClientController::new_binder(
-            ActivityClientController,
+            ActivityClientController {
+                buckets: Arc::clone(&buckets),
+            },
             BinderFeatures::default(),
         )
         .as_binder();
@@ -1231,8 +1236,40 @@ impl IActivityManager for ActivityManager {
     }
 }
 
-/// IActivityClientController, handed to the app in LaunchActivityItem (ActivityTaskSupervisor.java:1028 activityClientController).
-struct ActivityClientController;
+/// The size buckets each activity reported (ActivityRecord.setSizeConfigurations, ActivityClientController.java:333-342), by the activity's token. A report of none forgets the activity's.
+#[derive(Default)]
+struct ReportedBuckets {
+    entries: Mutex<Vec<(SpIBinder, SizeBuckets)>>,
+}
+
+/// The parcelable's thresholds, as size_buckets.rs reads them.
+impl From<&SizeConfigurationBuckets> for SizeBuckets {
+    fn from(b: &SizeConfigurationBuckets) -> Self {
+        SizeBuckets {
+            horizontal: b.horizontal.clone(),
+            vertical: b.vertical.clone(),
+            smallest: b.smallest.clone(),
+            screen_layout_size: b.screen_layout_size.clone(),
+            screen_layout_long_set: b.screen_layout_long_set,
+        }
+    }
+}
+
+impl ReportedBuckets {
+    /// Keeps `buckets` for `token`, replacing what it reported before.
+    fn set(&self, token: &SpIBinder, buckets: Option<SizeBuckets>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(t, _)| t != token);
+        if let Some(buckets) = buckets {
+            entries.push((token.clone(), buckets));
+        }
+    }
+}
+
+/// IActivityClientController, handed to the app in LaunchActivityItem (ActivityTaskSupervisor.java:1028 activityClientController). `buckets` holds what each activity reports.
+struct ActivityClientController {
+    buckets: Arc<ReportedBuckets>,
+}
 
 impl Interface for ActivityClientController {}
 
@@ -1244,6 +1281,22 @@ impl IActivityClientController for ActivityClientController {
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
     fn r#getDisplayId(&self, _token: Option<&SpIBinder>) -> binder::Result<i32> {
         Ok(DEFAULT_DISPLAY)
+    }
+
+    /// ActivityClientController.reportSizeConfigurations:333-342: the activity's size buckets, kept under its token for the size changes after it (filterDiff reads them there, once the
+    /// resize path does). The app sends it oneway, so a token-less report is only counted.
+    fn r#reportSizeConfigurations(
+        &self,
+        token: Option<&SpIBinder>,
+        sizes: Option<&SizeConfigurationBuckets>,
+    ) -> binder::Result<()> {
+        let Some(token) = token else {
+            counters::count(ACC, "reportSizeConfigurations: no token");
+            return Ok(());
+        };
+        counters::count(ACC, "reportSizeConfigurations (kept per activity)");
+        self.buckets.set(token, sizes.map(SizeBuckets::from));
+        Ok(())
     }
 
     /// ActivityClientController.setTaskDescription: Activity.onApplyThemeResource sends it for every themed activity, so the launch fails without it. The values are read (the codec

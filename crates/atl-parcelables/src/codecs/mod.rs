@@ -55,6 +55,7 @@ pub mod android {
     }
     pub mod window {
         pub mod ClientWindowFrames;
+        pub mod SizeConfigurationBuckets;
     }
 }
 

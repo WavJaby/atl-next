@@ -20,6 +20,7 @@ pub mod packages;
 pub mod permission;
 pub mod process_control;
 pub mod shared_memory;
+pub mod size_buckets;
 pub mod tasks;
 
 #[cfg(feature = "converter")]
