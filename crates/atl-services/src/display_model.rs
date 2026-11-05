@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The display's values, one struct for every reader: DisplayInfo (display.rs, IDisplayManager.getDisplayInfo) and the global Configuration (activity.rs). atld passes it to the services
-//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::from_monitor`] of the desktop's monitor. Nothing else holds display values.
+//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::from_monitor`] of the desktop's monitor. That is the start value: the services keep the live one (tasks.rs `Tasks::display`, changed by registry SET_DISPLAY when the window's monitor changes), the app's compositor its SurfaceFlinger copy of the same monitor (atl-composer `Composer::set_display`).
 //! The default (1280x800, 60 Hz, 160 dpi) is a test value: the fallback when no desktop answers, and the base of the gates' fixed display.
 
 /// `persist.wm.debug.desktop_mode_initial_bounds_scale`'s default, in percent (DesktopModeUtils.kt:43-44: `SystemProperties.getInt(..., 75) / 100f`). The debug property is not read: no product sets it.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering from the one display model ([`DisplayModel`], passed by atld) for display 0.
+//! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering for display 0 from the display the Tasks own (tasks.rs `Tasks::display`: atld's `--display` at start, then the window's monitor via registry SET_DISPLAY); registered callbacks hear each change ([`DisplayCallbacks`]).
 //! getDisplayInfo is display 0's record (DisplayManagerService.getDisplayInfo: null for any other id) and getDisplayIds lists display 0. Every other method keeps the stub's default body,
 //! so each call is counted (counters.rs) and answered UNKNOWN_TRANSACTION. An activity launch made these calls before this service answered (measured by `xtask test app`):
 //! `getDisplayInfo` 7 times, `getPreferredWideGamutColorSpaceId` and `getOverlaySupport` once each.
