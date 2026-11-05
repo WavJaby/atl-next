@@ -222,12 +222,13 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		g.genFile(filepath.Join(out, buildPropFile), prop)
 		g.acfg = &aconfigGraph{decls: map[string]*aconfigDecl{}}
 	}
-	for side, osName := range []string{"android", "linux_glibc"} {
-		ev := &evaluator{cfg: cfg, os: osName, rel: g.release}
+	g.mods = map[Side]map[string][]*Module{}
+	for _, side := range defaultSides {
+		ev := &evaluator{cfg: cfg, os: side.evalOS(), rel: g.release}
 		mods, problems := ev.modules(files)
 		g.mods[side] = mods
 		for _, p := range problems {
-			g.problem("%s eval: %s", Side(side), p)
+			g.problem("%s eval: %s", side, p)
 		}
 	}
 	g.baseTypes = map[string]string{}

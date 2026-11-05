@@ -21,21 +21,34 @@ import (
 // The device side takes the bionic toolchain for (Android, arch), the host side the linux_glibc one for (Linux, arch) (-fstack-protector-strong, -D_FORTIFY_SOURCE=3, -fno-omit-frame-pointer, -m64, ...).
 // Every flag passes toolchainLocation and keepFlag; what they drop is in Skipped.
 type GlobalFlags struct {
-	Head, Tail     [2][]string // Common up to <Hod>GlobalCflags, and tc.ToolchainCflags: ExternalCflags goes between them
-	External       []string    // ExternalCflags, for third-party module dirs (ThirdParty)
-	Conly, Cpp, As [2][]string
+	Head, Tail     map[Side][]string // Common up to <Hod>GlobalCflags, and tc.ToolchainCflags: ExternalCflags goes between them
+	External       []string          // ExternalCflags, for third-party module dirs (ThirdParty)
+	Conly, Cpp, As map[Side][]string
 	NoOverride     []string // NoOverrideGlobalCflags + NoOverride64GlobalCflags (64-bit arches)
 	NoOverrideExt  []string // NoOverrideExternalGlobalCflags, third-party only
 	ThirdParty     ThirdParty
 	Skipped        []string // dropped by toolchainLocation (with its argument) or keepFlag, unique, sorted
 	// per Side: the toolchain's YasmFlags, the format flags of every .asm compile (cc/compiler.go Global.YasmFlags: `-f elf64 -m amd64` for x86_64); toolchainBase's "" on arches without .asm sources
-	Yasm [2][]string
+	Yasm map[Side][]string
 	// per Side: why Soong has no toolchain there ("" = it has one): linux_glibc exists for x86/x86_64 only, so an arm64 or riscv64 host's host side has none, and an .asm source there is a problem, not a run failure
-	NoToolchain [2]string
+	NoToolchain map[Side]string
 }
 
-// toolchainOS: per side, the android.OsType identifier its toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
-var toolchainOS = [...]string{Device: "Android", Host: "Linux"}
+// toolchainOS: the android.OsType identifier the side's toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
+func toolchainOS(s Side) string {
+	if s.android() {
+		return "Android"
+	}
+	return "Linux"
+}
+
+// hod: the side's Host-or-Device prefix of Soong's global flag variables (<Hod>GlobalCflags).
+func hod(s Side) string {
+	if s.android() {
+		return "Device"
+	}
+	return "Host"
+}
 
 // keepFlag: a Soong global flag the converter passes. Dropped are the flags that never change the object's code or data, only diagnostics or DWARF:
 //   - -W* warnings and warning-errors (the converter compiles with -w -Wno-error: distro clang warns differently from AOSP's); -Wa, -Wl, -Wp are pass-throughs and kept
@@ -140,9 +153,14 @@ func readThirdParty(tree string) (ThirdParty, error) {
 	return t, nil
 }
 
+func newGlobalFlags() GlobalFlags {
+	return GlobalFlags{Head: map[Side][]string{}, Tail: map[Side][]string{}, Conly: map[Side][]string{}, Cpp: map[Side][]string{}, As: map[Side][]string{},
+		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}}
+}
+
 // readGlobalFlags: GlobalFlags for the device arch cfg (its arches.toml variant and Soong's feature list for it, DeviceArch).
 func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, error) {
-	var g GlobalFlags
+	g := newGlobalFlags()
 	ev, err := newSoongEval(tree)
 	if err != nil {
 		return g, err
@@ -173,40 +191,43 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 		return g, err
 	}
 	// android.Arch per side: Soong sets a variant and features for the Android OS only
-	archFields := [2]map[string]any{
-		Device: {"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features},
-		Host:   {"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)},
+	archFields := func(s Side) map[string]any {
+		if s.android() {
+			return map[string]any{"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features}
+		}
+		return map[string]any{"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)}
 	}
 	type part struct {
-		dst  *[]string
+		dst  map[Side][]string
 		vars []string // ${config.X}, in order
 	}
-	for side, hod := range [2]string{Device: "Device", Host: "Host"} {
+	for _, side := range defaultSides {
 		for _, p := range []part{
-			{&g.Head[side], []string{"CommonGlobalCflags", hod + "GlobalCflags"}},
-			{&g.Conly[side], []string{"CommonGlobalConlyflags"}},
-			{&g.Cpp[side], []string{"CommonGlobalCppflags", hod + "GlobalCppflags"}},
-			{&g.As[side], []string{"CommonGlobalAsflags"}},
+			{g.Head, []string{"CommonGlobalCflags", hod(side) + "GlobalCflags"}},
+			{g.Conly, []string{"CommonGlobalConlyflags"}},
+			{g.Cpp, []string{"CommonGlobalCppflags", hod(side) + "GlobalCppflags"}},
+			{g.As, []string{"CommonGlobalAsflags"}},
 		} {
 			for _, v := range p.vars {
 				l, err := get("${config." + v + "}")
 				if err != nil {
 					return g, err
 				}
-				*p.dst = append(*p.dst, l...)
+				p.dst[side] = append(p.dst[side], l...)
 			}
 		}
 	}
 	// each side's toolchain around the global lists (compiler.go: instruction set first, tc.Cflags before CommonGlobalCflags, tc.ToolchainCflags last; tc.Cppflags after the global C++ lists, tc.Asflags before CommonGlobalAsflags)
-	for side := range archFields {
-		if !ev.hasToolchain(toolchainOS[side], ident) {
-			if Side(side) == Device {
-				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, toolchainOS[side], ident)
+	for _, side := range defaultSides {
+		osName := toolchainOS(side)
+		if !ev.hasToolchain(osName, ident) {
+			if side.android() {
+				return g, fmt.Errorf("%s: no toolchain factory registered for (%s, %s)", ev.dir, osName, ident)
 			}
-			g.NoToolchain[side] = "Soong registers no toolchain for (" + toolchainOS[side] + ", " + ident + ")"
+			g.NoToolchain[side] = "Soong registers no toolchain for (" + osName + ", " + ident + ")"
 			continue
 		}
-		tc, err := ev.toolchain(toolchainOS[side], ident, archFields[side])
+		tc, err := ev.toolchain(osName, ident, archFields(side))
 		if err != nil {
 			return g, err
 		}

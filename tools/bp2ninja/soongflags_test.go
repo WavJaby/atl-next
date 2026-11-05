@@ -409,7 +409,7 @@ func TestToolchainYasm(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"-f", "elf64", "-m", "amd64"}
-	if !slices.Equal(g.Yasm[Device], want) || !slices.Equal(g.Yasm[Host], want) || g.NoToolchain != [2]string{} {
+	if !slices.Equal(g.Yasm[Device], want) || !slices.Equal(g.Yasm[Host], want) || len(g.NoToolchain) != 0 {
 		t.Errorf("x86_64: %q, none %q", g.Yasm, g.NoToolchain)
 	}
 	g, err = readGlobalFlags(tree, Config{Arch: "arm64", PointerBits: 64}, DeviceArch{})
@@ -424,7 +424,7 @@ func TestToolchainYasm(t *testing.T) {
 // probeCxxFlags = compileFlags' C++ argv for a module with nothing of its own: only the shared parts, in compileFlags' order, -D__ANDROID__ once (xtask check step libcxx drops it for its other run).
 func TestProbeCxxFlags(t *testing.T) {
 	g := graphFor(t, nil)
-	g.soong.Flags = GlobalFlags{Head: [2][]string{Device: {"-O2"}}, Tail: [2][]string{Device: {"-m64"}}, Cpp: [2][]string{Device: {"-fvisibility-inlines-hidden"}}, NoOverride: []string{"-fno-x"}}
+	g.soong.Flags = GlobalFlags{Head: map[Side][]string{Device: {"-O2"}}, Tail: map[Side][]string{Device: {"-m64"}}, Cpp: map[Side][]string{Device: {"-fvisibility-inlines-hidden"}}, NoOverride: []string{"-fno-x"}}
 	g.soong.CppStd, g.soong.APILevel = "gnu++20", "-D__ANDROID_API__=10000"
 	compat := filepath.Join(g.out, "compat")
 	want := []string{"-nostdinc++", "-isystem", standInLibcxx, "-fPIC", "-w", "-O2", "-m64", "-fvisibility-inlines-hidden", "-Wno-error", "-std=gnu++20",
@@ -439,11 +439,11 @@ func TestProbeCxxFlags(t *testing.T) {
 func TestGlobalFlagsOrder(t *testing.T) {
 	g := graphFor(t, map[string]string{"external/z/Android.bp": `cc_library { name: "libz", srcs: ["a.c", "b.cpp", "c.S"], cflags: ["-fno-function-sections"], cppflags: ["-fexceptions"] }`})
 	g.soong.Flags = GlobalFlags{
-		Head:          [2][]string{Device: {"-ffunction-sections", "-fno-exceptions"}},
-		Tail:          [2][]string{Device: {"-m64"}},
+		Head:          map[Side][]string{Device: {"-ffunction-sections", "-fno-exceptions"}},
+		Tail:          map[Side][]string{Device: {"-m64"}},
 		External:      []string{"-DEXT"},
-		Cpp:           [2][]string{Device: {"-fvisibility-inlines-hidden"}},
-		As:            [2][]string{Device: {"-D__ASSEMBLY__"}},
+		Cpp:           map[Side][]string{Device: {"-fvisibility-inlines-hidden"}},
+		As:            map[Side][]string{Device: {"-D__ASSEMBLY__"}},
 		NoOverrideExt: []string{"-fcommon"},
 		ThirdParty:    ThirdParty{Prefixes: []string{"external/"}},
 	}

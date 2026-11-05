@@ -14,17 +14,55 @@ import (
 	"strings"
 )
 
-// Side is which source set a module is built from. Every artifact is a Linux glibc binary; device =
-// the module's android properties (runtime libraries of an app process), host = its host properties
-// (build tools such as aidl that run on the build machine).
-type Side int
+// Side is which source set a module is built from, and for which C library. device = the module's android properties built as a Linux glibc binary (runtime libraries of an app process); host = its host properties (build tools such as aidl that run on the build machine); native bridge = android properties + target.native_bridge, built against bionic for a guest arch.
+// Comparable: per-side state is a map keyed by Side, iterated in Graph.sides order (never map order: emit must be deterministic).
+type Side struct {
+	kind sideKind
+	arch string // native bridge only: the guest arch (arches.toml name)
+}
+
+type sideKind int
 
 const (
-	Device Side = iota
-	Host
+	deviceSide sideKind = iota
+	hostSide
+	nativeBridgeSide
 )
 
-func (s Side) String() string { return [...]string{"device", "host"}[s] }
+var (
+	Device = Side{kind: deviceSide}
+	Host   = Side{kind: hostSide}
+)
+
+// NativeBridge: the native bridge side for guest arch.
+func NativeBridge(arch string) Side { return Side{kind: nativeBridgeSide, arch: arch} }
+
+func (s Side) String() string {
+	switch s.kind {
+	case deviceSide:
+		return "device"
+	case hostSide:
+		return "host"
+	}
+	return "nb/" + s.arch
+}
+
+// android: the side evaluates the module's android properties (device and native bridge).
+func (s Side) android() bool { return s.kind != hostSide }
+
+// glibc: the side links against the build machine's glibc (device and host); the native bridge side links bionic.
+func (s Side) glibc() bool { return s.kind != nativeBridgeSide }
+
+// evalOS: the Soong OS the side's modules are evaluated for (select(os(), …), target blocks).
+func (s Side) evalOS() string {
+	if s.android() {
+		return "android"
+	}
+	return "linux_glibc"
+}
+
+// defaultSides: the sides every run evaluates, in emit order.
+var defaultSides = []Side{Device, Host}
 
 // osBlocks: the OS-only `target: {…}` blocks a side applies, in Soong's order (android/arch.go setOSProperties, the os mutator: before any arch block).
 // not_windows is a host class block; android64/android32 follow the device's pointer width.
@@ -147,7 +185,7 @@ type Graph struct {
 	baseTypes map[string]string
 	// soong_config_module_type definitions by name (soongconfig.go)
 	soongConfigTypes map[string]*soongConfigType
-	mods             [2]map[string][]*Module
+	mods             map[Side]map[string][]*Module
 	nodes            map[key]*Node
 	order            []*Node
 	problems         []string

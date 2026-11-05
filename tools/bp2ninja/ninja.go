@@ -327,6 +327,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	// Soong's -std heads the language's local flags, after the module's cflags (cc/builder.go: localCFlags, then localConlyFlags / localCppFlags), so it wins over a -std in cflags (camera_metadata's -std=c11 builds as gnu23, which declares dprintf)
 	cxx := slices.Concat(g.stlCompileFlags(g.stlOf(n)), global, f.Cpp[n.side], common, []string{"-std=" + cppstd}, moduleFlags(p, "cppflags"))
 	c := slices.Concat(global, f.Conly[n.side], common, []string{"-std=" + cstd}, moduleFlags(p, "conlyflags"))
+	// android properties compiled against glibc: bionic's macros and declarations supplied (LFS64, compat dirs, forced api-level headers); the native bridge side compiles against bionic itself
 	if n.side == Device {
 		dev := []string{androidDefine, lfs64Define, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
 		for _, d := range g.defines[n.mod.Name] {
@@ -518,11 +519,11 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every
 	// one of them at load time (libselinux: distro lacks AOSP's LIBSELINUX_R version node -> load fails)
 	libs = append(libs, providedRpath...)
-	// the C++ runtime the module's stl selects (stl.go); glibc's split of bionic's libc; bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) is
-	// glibc's libresolv, needed only where used
+	// the C++ runtime the module's stl selects (stl.go); on glibc sides glibc's split of bionic's libc, and bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) as glibc's libresolv, needed only where used
 	libs = append(libs, stlLinkFlags(g.stlOf(n))...)
-	libs = append(libs, "-lpthread", "-ldl", "-lrt", "-lm",
-		"-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state")
+	if n.side.glibc() {
+		libs = append(libs, "-lpthread", "-ldl", "-lrt", "-lm", "-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state")
+	}
 	return libs, inputs
 }
 

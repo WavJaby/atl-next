@@ -77,9 +77,9 @@ type artType struct {
 type artPlugin struct {
 	types map[string]artType
 	// codegen arches per side: device = defaultDeviceCodegenArches of the device arch, host = supportedArches (ART_TARGET_CODEGEN_ARCHS / ART_HOST_CODEGEN_ARCHS unset)
-	codegenArches [2][]string
+	codegenArches map[Side][]string
 	// android/config.go LibartImgDeviceBaseAddress / LibartImgHostBaseAddress
-	baseAddress [2]string
+	baseAddress map[Side]string
 	// ART_CLANG_PATH = -llvm, absolute. Host ART only (device ART has ART_TARGET: kUseAddr2line false); its FindAddr2line joins ANDROID_BUILD_TOP + "/" + ART_CLANG_PATH, so an absolute path needs ANDROID_BUILD_TOP=/ in the host ART's environment.
 	llvmPrefix string
 }
@@ -117,7 +117,7 @@ func readArtPlugin(tree string, cfg Config, llvm string) (*artPlugin, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s: supportedArches is not a string list", artPluginDir)
 	}
-	a.codegenArches = [2][]string{Device: defaultDeviceCodegenArches([]string{cfg.Arch}), Host: supported}
+	a.codegenArches = map[Side][]string{Device: defaultDeviceCodegenArches([]string{cfg.Arch}), Host: supported}
 	if llvm == "" {
 		return nil, fmt.Errorf("-llvm: ART_CLANG_PATH needs the LLVM install prefix (xtask native passes it)")
 	}
@@ -385,7 +385,8 @@ func defaultDeviceCodegenArches(device []string) []string {
 }
 
 // readArtConfig: the Soong config values the hooks read that live outside the plugin.
-func readArtConfig(tree string) (base [2]string, err error) {
+func readArtConfig(tree string) (base map[Side]string, err error) {
+	base = map[Side]string{}
 	path := filepath.Join(tree, "build/soong/android/config.go")
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
@@ -397,7 +398,7 @@ func readArtConfig(tree string) (base [2]string, err error) {
 			methods[fd.Name.Name] = fd
 		}
 	}
-	for side, m := range [2]string{Device: "LibartImgDeviceBaseAddress", Host: "LibartImgHostBaseAddress"} {
+	for side, m := range map[Side]string{Device: "LibartImgDeviceBaseAddress", Host: "LibartImgHostBaseAddress"} {
 		fd := methods[m]
 		if fd != nil && len(fd.Body.List) == 1 {
 			if r, ok := fd.Body.List[0].(*ast.ReturnStmt); ok && len(r.Results) == 1 {
@@ -461,7 +462,7 @@ func (a *artPlugin) apply(m *Module) {
 }
 
 // sideBlocks: the `target: {…}` block a hook's Target.Android / Target.Host struct fills.
-var sideBlocks = [2]string{Device: "android", Host: "host"}
+var sideBlocks = map[Side]string{Device: "android", Host: "host"}
 
 // block: props nested under the path of blocks, e.g. block(p, "target", "android") = { target: { android: p } }.
 func block(p *Obj, path ...string) *Obj {
@@ -531,7 +532,8 @@ func (a *artPlugin) globalDefaults() *Obj {
 func (a *artPlugin) codegen(p *Obj, t artModuleType) *Obj {
 	cg := p.obj("codegen")
 	p = removeKey(p, "codegen")
-	for side, arches := range a.codegenArches {
+	for _, side := range defaultSides {
+		arches := a.codegenArches[side]
 		var srcs []string
 		for _, arch := range arches {
 			c := cg.obj(arch)

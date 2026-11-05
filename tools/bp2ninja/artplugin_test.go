@@ -195,8 +195,8 @@ art_cc_library_static {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &artPlugin{types: types, codegenArches: [2][]string{Device: {"x86", "x86_64"}, Host: {"arm", "arm64", "riscv64", "x86", "x86_64"}},
-		baseAddress: [2]string{"0xD", "0xH"}, llvmPrefix: "/usr/lib/llvm-19"}
+	a := &artPlugin{types: types, codegenArches: map[Side][]string{Device: {"x86", "x86_64"}, Host: {"arm", "arm64", "riscv64", "x86", "x86_64"}},
+		baseAddress: map[Side]string{Device: "0xD", Host: "0xH"}, llvmPrefix: "/usr/lib/llvm-19"}
 	g.loadArt(a)
 	// art.go globalFlags with none of its variables set, no sanitizer and ArtUseReadBarrier true
 	global := []string{"-O3", "-DART_DEFAULT_GC_TYPE_IS_CMC", "-DART_USE_READ_BARRIER=1", "-DART_READ_BARRIER_TYPE_IS_BAKER=1", "-DART_USE_GENERATIONAL_GC=1", "-DART_USE_TLAB=1",
