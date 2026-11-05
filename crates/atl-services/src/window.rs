@@ -173,6 +173,8 @@ struct Window {
     surface: Option<SurfaceControl>,
     /// Where the agent placed the window's layer in its Task (a new layer sits at the origin): its frame's origin at the last relayout the agent took.
     position: (i32, i32),
+    /// Its LayoutParams as the frame needs them: from addToDisplayAsUser, replaced by a relayout that carries LayoutParams.
+    layout: Layout,
     /// The token of the input channel the agent took; None for a window without one.
     input: Option<SpIBinder>,
 }
@@ -301,19 +303,32 @@ impl Session {
     }
 }
 
+/// The LayoutParams fields the frame depends on, kept per window from its add and its relayouts that carry LayoutParams (WindowState.mAttrs).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Layout {
+    r#type: i32,
+    gravity: i32,
+    x: i32,
+    y: i32,
+}
+
+impl Layout {
+    fn of(a: &WindowManager_LayoutParams) -> Self {
+        Layout {
+            r#type: a.r#type,
+            gravity: a.gravity,
+            x: a.x,
+            y: a.y,
+        }
+    }
+}
+
 /// The frame relayout reports: the Task's rect, except a TYPE_TOAST window or a sub-window (a popup, whose parent fills the Task), which is its requested (measured) size placed by its gravity
 /// and x/y in the Task (window_layout::gravity_frame).
-fn window_frame(
-    attrs: Option<&WindowManager_LayoutParams>,
-    requested_width: i32,
-    requested_height: i32,
-    parent: Rect,
-) -> Rect {
-    let Some(a) = attrs.filter(|a| {
-        a.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&a.r#type)
-    }) else {
+fn window_frame(a: Layout, requested_width: i32, requested_height: i32, parent: Rect) -> Rect {
+    if !(a.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&a.r#type)) {
         return parent;
-    };
+    }
     let (left, top, right, bottom) = crate::window_layout::gravity_frame(
         a.gravity,
         (requested_width, requested_height),
@@ -433,6 +448,7 @@ impl IWindowSession for Session {
             laid_out: false,
             surface: None,
             position: (0, 0),
+            layout: Layout::of(attrs),
             input,
         });
         *out_input_channel = Some(channel);
@@ -469,7 +485,7 @@ impl IWindowSession for Session {
             return Err(StatusCode::BAD_VALUE.into());
         };
         let client = window.as_binder();
-        let (first, pending, task) = {
+        let (first, pending, task, layout) = {
             let mut windows = self.lock();
             let Some(record) = windows.iter_mut().find(|w| w.client == client) else {
                 counters::refused(WINDOW_SESSION, "relayout: window not added by this session");
@@ -477,10 +493,15 @@ impl IWindowSession for Session {
             };
             let first = !record.laid_out;
             record.laid_out = true;
+            // relayout carries the LayoutParams only when they changed (ViewRootImpl sends null otherwise); WMS keeps the window's own (WindowState.mAttrs)
+            if let Some(a) = attrs {
+                record.layout = Layout::of(a);
+            }
             (
                 first,
                 record.surface.is_none().then(|| record.title.clone()),
                 record.task,
+                record.layout,
             )
         };
         // The agent is another process, asked without the windows lock. A window gets its surface once; a failed call is asked again at the next relayout.
@@ -492,7 +513,7 @@ impl IWindowSession for Session {
         }
         // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
         let frame = window_frame(
-            attrs,
+            layout,
             requested_width,
             requested_height,
             self.task_rect(task),
