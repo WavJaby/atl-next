@@ -4,7 +4,7 @@
 //! The widget scales the whole tree by 1 / scale into toolkit logical units when it draws; capture renders it as it is.
 
 use atl_compositor::scene::{Quad, Scene};
-use atl_compositor::state::{Fence, FloatRect};
+use atl_compositor::state::FloatRect;
 use atl_platform_ui_api::PresentError;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
@@ -62,7 +62,7 @@ fn quad_node(quad: &Quad) -> Result<Option<gsk::RenderNode>, PresentError> {
         layer_id: quad.layer_id,
         reason,
     };
-    if let Some(Fence(Some(fence))) = &quad.acquire_fence
+    if let Some(fence) = &quad.acquire_fence
         && !buffer::fence_signalled(fence).map_err(fail)?
     {
         return Err(PresentError::FenceNotSignalled {

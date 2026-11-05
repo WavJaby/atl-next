@@ -98,9 +98,8 @@ mod tests {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::sync::Arc;
 
-    use atl_compositor::parcel::FdObject;
-    use atl_compositor::scene::Quad;
-    use atl_compositor::state::{FloatRect, GraphicBuffer};
+    use atl_compositor::scene::{Quad, SceneBuffer, SceneFd};
+    use atl_compositor::state::FloatRect;
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::write;
 
@@ -143,16 +142,14 @@ mod tests {
         let quad = Quad {
             layer_id: 7,
             name: "child".into(),
-            buffer: Arc::new(GraphicBuffer {
+            buffer: Arc::new(SceneBuffer {
                 width: 2,
                 height: 1,
                 stride: 2,
                 format: 1,
-                layer_count: 1,
                 usage: 0,
                 id: 5,
-                generation_number: 0,
-                fds: vec![FdObject::new(fd.as_raw_fd(), false)],
+                fds: vec![SceneFd::new(fd.as_raw_fd())],
                 ints: vec![],
             }),
             frame_number: 3,

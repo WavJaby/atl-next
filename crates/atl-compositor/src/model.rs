@@ -20,7 +20,7 @@ use crate::callbacks::{
     ReleaseCallbackId, SurfaceStats, TransactionStats,
 };
 use crate::parcel::{BinderKey, FdObject, StrongBinder};
-use crate::scene::{Quad, Scene};
+use crate::scene::{Quad, Scene, SceneBuffer, SceneFd};
 use crate::state::{
     BufferData, CallbackId, Fence, FloatRect, GraphicBuffer, LayerState, ListenerCallbacks, Rect,
     buffer_data_change, layer_flags, what,
@@ -159,9 +159,9 @@ pub struct FrameOutput {
 /// The buffer a layer shows, and how to tell its producer when it is done with it.
 #[derive(Clone, Debug)]
 struct Held {
-    buffer: Arc<GraphicBuffer>,
+    buffer: Arc<SceneBuffer>,
     frame_number: u64,
-    acquire_fence: Option<Fence>,
+    acquire_fence: Option<SceneFd>,
     release_listener: StrongBinder,
 }
 
@@ -321,21 +321,21 @@ impl Compositor {
     /// The descriptor numbers the core still refers to: the buffers layers show and the client cache keeps, the layers' release channels and acquire fences, and everything in the transactions still queued.
     /// The core never owns a descriptor; the front-end that took them from the parcels closes the ones missing here (the fd ownership rule: a descriptor lives while the core names it).
     pub fn referenced_fds(&self) -> BTreeSet<i32> {
-        let mut fds: Vec<FdObject> = Vec::new();
+        let mut fds: Vec<i32> = Vec::new();
         for l in self.layers.values() {
-            fds.extend(l.release_channel);
+            fds.extend(l.release_channel.map(|f| f.fd));
             if let Some(h) = &l.held {
-                fds.extend(h.buffer.fds.iter().copied());
-                fds.extend(h.acquire_fence.iter().filter_map(|f| f.0));
+                fds.extend(h.buffer.fds.iter().map(|f| f.raw()));
+                fds.extend(h.acquire_fence.map(SceneFd::raw));
             }
         }
         for b in self.cache.values() {
-            fds.extend(b.fds.iter().copied());
+            fds.extend(b.fds.iter().map(|f| f.fd));
         }
         for t in self.queues.values().flatten() {
-            fds.extend(t.fds());
+            fds.extend(t.fds().into_iter().map(|f| f.fd));
         }
-        fds.into_iter().map(|f| f.fd).collect()
+        fds.into_iter().collect()
     }
 
     /// Whether the next tick has anything to do: the platform's frame clock may stay stopped otherwise.
@@ -683,9 +683,9 @@ impl Compositor {
                 Some(buffer) => {
                     new_frame = bd.frame_number;
                     new_held = Some(Held {
-                        buffer,
+                        buffer: Arc::new(SceneBuffer::of(&buffer)),
                         frame_number: bd.frame_number,
-                        acquire_fence: bd.acquire_fence,
+                        acquire_fence: bd.acquire_fence.as_ref().and_then(SceneFd::of_fence),
                         release_listener: bd.release_buffer_listener,
                     });
                 }

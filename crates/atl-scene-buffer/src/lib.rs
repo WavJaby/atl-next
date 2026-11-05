@@ -6,8 +6,7 @@
 use std::io;
 use std::os::fd::BorrowedFd;
 
-use atl_compositor::parcel::FdObject;
-use atl_compositor::state::GraphicBuffer;
+use atl_compositor::scene::{SceneBuffer, SceneFd};
 use atl_gralloc::format::{self, COMPONENT_A, RGBA_8888, RGBX_8888};
 use atl_gralloc::handle::FD_DMABUF;
 use atl_gralloc::layout::Layout;
@@ -62,12 +61,13 @@ fn sync_if_dmabuf(fd: BorrowedFd<'_>, flags: u64) -> io::Result<()> {
 }
 
 /// The descriptor of a quad's fd object as a borrow for the duration of one call.
-fn borrow(obj: &FdObject) -> Result<BorrowedFd<'_>, String> {
-    if obj.fd < 0 {
-        return Err(format!("fd number {} is not a descriptor", obj.fd));
+fn borrow(obj: &SceneFd) -> Result<BorrowedFd<'_>, String> {
+    let fd = obj.raw();
+    if fd < 0 {
+        return Err(format!("fd number {fd} is not a descriptor"));
     }
-    // SAFETY: `FdObject::fd` is a descriptor open in this process (its doc), owned by the `Scene` the caller holds for the whole `present` call, so it stays open for the borrow; the borrow does not outlive `obj`.
-    Ok(unsafe { BorrowedFd::borrow_raw(obj.fd) })
+    // SAFETY: a `SceneFd` is open in this process while the `Scene` holding it lives (its doc); the caller holds that scene for the whole call, and the borrow does not outlive `obj`.
+    Ok(unsafe { BorrowedFd::borrow_raw(fd) })
 }
 
 /// A buffer's dma-buf as an importer sees it: the plane fds and the layout gralloc's handle states (`atl_gralloc::layout`, the same values the mapper's metadata answers). For a dmabuf texture / EGL image import; the CPU reader is [`read_pixels`].
@@ -81,7 +81,7 @@ pub struct DmabufView<'a> {
 
 impl<'a> DmabufView<'a> {
     /// The view of `buffer`, whose handle came from another process: its ints are validated as the mapper's import does, and each plane fd must exist.
-    pub fn of(buffer: &'a GraphicBuffer) -> Result<Self, String> {
+    pub fn of(buffer: &'a SceneBuffer) -> Result<Self, String> {
         let layout = atl_gralloc::layout::from_handle(buffer.fds.len(), &buffer.ints)
             .map_err(|e| format!("not a gralloc handle: {e:?}"))?;
         let fds = layout
@@ -100,7 +100,7 @@ impl<'a> DmabufView<'a> {
 }
 
 /// Whether a sync_file fence has signalled: it polls readable once it has (linux/sync_file.h). Never waits.
-pub fn fence_signalled(fence: &FdObject) -> Result<bool, String> {
+pub fn fence_signalled(fence: &SceneFd) -> Result<bool, String> {
     let fd = borrow(fence)?;
     let mut fds = [PollFd::new(&fd, PollFlags::IN)];
     let no_wait = Timespec {
@@ -153,7 +153,7 @@ impl Drop for Mapping {
 }
 
 /// Copies `buffer`'s pixels out of its dma-buf. Every field comes from another process's parcel, so the geometry is checked against the format table and the fd's real size before anything is mapped (a mapping past the end of a file faults on access).
-pub fn read_pixels(buffer: &GraphicBuffer) -> Result<Pixels, String> {
+pub fn read_pixels(buffer: &SceneBuffer) -> Result<Pixels, String> {
     let info = format::lookup(buffer.format)
         .filter(|f| matches!(f.pixel_format, RGBA_8888 | RGBX_8888))
         .ok_or_else(|| {
@@ -226,17 +226,15 @@ mod tests {
         fd
     }
 
-    fn buffer(fd: &OwnedFd, width: i32, height: i32, stride: i32) -> GraphicBuffer {
-        GraphicBuffer {
+    fn buffer(fd: &OwnedFd, width: i32, height: i32, stride: i32) -> SceneBuffer {
+        SceneBuffer {
             width,
             height,
             stride,
             format: RGBA_8888,
-            layer_count: 1,
             usage: 0,
             id: 1,
-            generation_number: 0,
-            fds: vec![FdObject::new(fd.as_raw_fd(), false)],
+            fds: vec![SceneFd::new(fd.as_raw_fd())],
             ints: vec![],
         }
     }
@@ -261,7 +259,7 @@ mod tests {
             id: 7,
         };
         let mut b = buffer(&dmabuf, 16, 2, 16);
-        b.fds.push(FdObject::new(page.as_raw_fd(), false));
+        b.fds.push(SceneFd::new(page.as_raw_fd()));
         b.ints = params.to_ints().to_vec();
         let v = DmabufView::of(&b).expect("view");
         assert_eq!(v.fds.len(), 1);
@@ -319,7 +317,7 @@ mod tests {
         let mut none = buffer(&fd, 2, 2, 2);
         none.fds.clear();
         assert!(read_pixels(&none).expect_err("fd").contains("no dma-buf"));
-        none.fds.push(FdObject::new(-1, false));
+        none.fds.push(SceneFd::new(-1));
         assert!(
             read_pixels(&none)
                 .expect_err("fd")
@@ -337,7 +335,7 @@ mod tests {
             None,
         )
         .expect("socketpair");
-        let obj = FdObject::new(r.as_raw_fd(), false);
+        let obj = SceneFd::new(r.as_raw_fd());
         assert!(!fence_signalled(&obj).expect("poll"));
         write(&w, b"x").expect("write");
         assert!(fence_signalled(&obj).expect("poll"));

@@ -20,9 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_compositor::parcel::FdObject;
-use atl_compositor::scene::{Quad, Scene};
-use atl_compositor::state::{Fence, FloatRect, GraphicBuffer};
+use atl_compositor::scene::{Quad, Scene, SceneBuffer, SceneFd};
+use atl_compositor::state::FloatRect;
 use atl_gralloc::format::RGBA_8888;
 use atl_platform_ui::{
     FdEvents, FrameClock, Looper, PhysSize, PlatformUi, PlatformWindow, PresentError, Ui, UiError,
@@ -87,7 +86,7 @@ fn emit(line: std::fmt::Arguments<'_>) {
 }
 
 /// A memfd holding `width` x `height` pixels of `frame`'s pattern in rows of `width + STRIDE_PAD_PIXELS`, as a gralloc-shaped buffer. The fd must outlive the present call.
-fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Arc<GraphicBuffer>)> {
+fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Arc<SceneBuffer>)> {
     let stride = width + STRIDE_PAD_PIXELS;
     let mut bytes = Vec::with_capacity(stride as usize * height as usize * 4);
     for y in 0..height {
@@ -106,16 +105,14 @@ fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Arc<G
         let n = write(&fd, rest)?;
         rest = &rest[n..];
     }
-    let buffer = GraphicBuffer {
+    let buffer = SceneBuffer {
         width: width as i32,
         height: height as i32,
         stride: stride as i32,
         format: RGBA_8888,
-        layer_count: 1,
         usage: 0,
         id: u64::from(frame),
-        generation_number: 0,
-        fds: vec![FdObject::new(fd.as_raw_fd(), false)],
+        fds: vec![SceneFd::new(fd.as_raw_fd())],
         ints: vec![],
     };
     Ok((fd, Arc::new(buffer)))
@@ -130,7 +127,7 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> FloatRect {
     }
 }
 
-fn quad(layer_id: i32, buffer: Arc<GraphicBuffer>, src: FloatRect, dst: FloatRect) -> Quad {
+fn quad(layer_id: i32, buffer: Arc<SceneBuffer>, src: FloatRect, dst: FloatRect) -> Quad {
     Quad {
         layer_id,
         name: format!("layer-{layer_id}"),
@@ -175,7 +172,7 @@ fn frame_scene(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Scene)> 
 /// 4. frame 104, 40 x 40 buffer at (30,100)-(70,140), alpha 0.5.
 fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
     let mut fds = Vec::new();
-    let mut buffer = |w, h, f| -> Result<Arc<GraphicBuffer>> {
+    let mut buffer = |w, h, f| -> Result<Arc<SceneBuffer>> {
         let (fd, b) = pattern_buffer(w, h, f)?;
         fds.push(fd);
         Ok(b)
@@ -478,7 +475,7 @@ fn main() -> Result<()> {
         SocketFlags::CLOEXEC,
         None,
     )?;
-    scene.quads[0].acquire_fence = Some(Fence(Some(FdObject::new(fence_read.as_raw_fd(), false))));
+    scene.quads[0].acquire_fence = Some(SceneFd::new(fence_read.as_raw_fd()));
     let unsignalled = matches!(
         window.present(&scene),
         Err(PresentError::FenceNotSignalled { layer_id: 0 })
@@ -490,7 +487,7 @@ fn main() -> Result<()> {
     let releases = accepted.map_or(usize::MAX, |p| p.releases.len());
     let mut bad = scene.clone();
     bad.quads[0].acquire_fence = None;
-    bad.quads[0].buffer = Arc::new(GraphicBuffer {
+    bad.quads[0].buffer = Arc::new(SceneBuffer {
         stride: 1,
         ..(*bad.quads[0].buffer).clone()
     });

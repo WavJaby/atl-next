@@ -4,7 +4,7 @@
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -56,7 +56,7 @@ impl Frame {
             _ => None,
         });
         buffers
-            .flat_map(|q| q.buffer.fds.iter().map(|f| f.fd))
+            .flat_map(|q| q.buffer.fds.iter().map(|f| f.raw()))
             .chain(channels)
             .collect()
     }
