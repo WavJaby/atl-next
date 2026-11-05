@@ -139,6 +139,8 @@ struct State {
     pending_calls: Vec<ClientCall>,
     next_layer_id: i32,
     next_vsync_id: i64,
+    /// The last counters line logged, without its `ticks=` field (see `deliver_frame`).
+    counters_logged: String,
     stats: Stats,
 }
 
@@ -272,6 +274,7 @@ impl Composer {
                 pending_calls: Vec::new(),
                 next_layer_id: 1,
                 next_vsync_id: 0,
+                counters_logged: String::new(),
                 stats: Stats::default(),
             }),
             wake: Condvar::new(),
@@ -580,8 +583,14 @@ impl Composer {
         // the calls are delivered (a release channel is written): what the core names no longer can be closed
         st.close_unreferenced();
         // the clock is about to park: nothing is left to count, so this is the line the gate reads
+        // an idle clock parks on every tick and moves only `ticks`: log the line when anything else moved, so the last one is the state after the last work
         if st.in_flight.is_empty() && !st.wants_frame() {
-            tracing::info!("{}", st.counters_line());
+            let line = st.counters_line();
+            let key = line.replacen(&format!("ticks={} ", st.stats.ticks), "", 1);
+            if key != st.counters_logged {
+                st.counters_logged = key;
+                tracing::info!("{line}");
+            }
         }
     }
 
