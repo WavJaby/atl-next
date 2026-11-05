@@ -31,6 +31,9 @@ pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
 pub const PROPERTY_AREA: &str = "/dev/__properties__";
 /// The sandbox program.
 const BWRAP: &str = "bwrap";
+/// The shared storage root as the sandbox sees it (Environment's external storage, `/storage/emulated/0`): the path the mount service reports for the emulated primary (atl-services storage.rs),
+/// under which app_spawn mounts each package's Android/data and Android/obb and links `/sdcard` to it.
+pub const SHARED_STORAGE: &str = "/storage/emulated/0";
 
 /// One bind mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,14 @@ pub struct Mount {
     pub writable: bool,
 }
 
+/// A symbolic link in the sandbox (bwrap `--symlink TARGET AT`): `at` links to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub target: PathBuf,
+    /// Absolute path inside the sandbox.
+    pub at: PathBuf,
+}
+
 /// What to start.
 #[derive(Debug)]
 pub struct Spawn {
@@ -49,6 +60,8 @@ pub struct Spawn {
     /// May become binder's context manager (servicemanager only).
     pub context_manager: bool,
     pub mounts: Vec<Mount>,
+    /// Symbolic links made after the mounts (bwrap `--symlink`): the app's `/sdcard`.
+    pub links: Vec<Link>,
     /// Host device nodes (or directories of them) the process may open, at the same path in the sandbox, whose `/dev` is otherwise a fresh minimal one (the graphics allocator's `/dev/dri`).
     pub devices: Vec<PathBuf>,
     /// The property area file, mounted read-only at [`PROPERTY_AREA`].
@@ -167,6 +180,13 @@ pub fn bwrap_args(
             kind.into(),
             m.host.clone().into_os_string(),
             m.at.clone().into_os_string(),
+        ]);
+    }
+    for l in &spawn.links {
+        a.extend([
+            "--symlink".into(),
+            l.target.clone().into_os_string(),
+            l.at.clone().into_os_string(),
         ]);
     }
     for d in &spawn.devices {
@@ -321,6 +341,20 @@ fn read_info(mut f: io::PipeReader) -> io::Result<i32> {
 mod tests {
     use super::*;
 
+    /// Spawn.links follow the mounts as bwrap `--symlink TARGET AT`: the app's /sdcard -> the shared storage root.
+    #[test]
+    fn links_follow_the_mounts() {
+        let mut sp = spawn();
+        sp.links.push(Link {
+            target: "/storage/emulated/0".into(),
+            at: "/sdcard".into(),
+        });
+        let joined = s(&bwrap_args(&sp, &[], 9, None)).join(" ");
+        assert!(joined.ends_with(
+            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"
+        ));
+    }
+
     fn spawn() -> Spawn {
         Spawn {
             uid: 10_123,
@@ -337,6 +371,7 @@ mod tests {
                     writable: true,
                 },
             ],
+            links: vec![],
             devices: vec!["/dev/dri".into()],
             property_area: Some("/r/properties".into()),
             program: "/bin/true".into(),
