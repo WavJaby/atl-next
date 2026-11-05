@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::c_int;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use atl_platform_ui_api::{FdEvents, Looper, UiError};
@@ -31,6 +31,8 @@ struct Stats {
     /// Callbacks for an fd that is no longer registered: its response was queued in the same Looper batch before its removal.
     stale: u64,
     timer_fires: u64,
+    /// [] calls that synced (UI thread, outside a pass)
+    resyncs: u64,
     syncs: u64,
     adds: u64,
     removes: u64,
@@ -246,10 +248,11 @@ impl Mirror {
         let s = &self.stats;
         let avg = s.sync_ns.checked_div(u128::from(s.syncs)).unwrap_or(0);
         tracing::debug!(
-            "atl-platform-ui: mirror: passes={} stale={} timer_fires={} syncs={} sync_avg_ns={avg} sync_max_ns={} fds={} fds_max={} adds={} removes={}",
+            "atl-platform-ui: mirror: passes={} stale={} timer_fires={} resyncs={} syncs={} sync_avg_ns={avg} sync_max_ns={} fds={} fds_max={} adds={} removes={}",
             s.passes,
             s.stale,
             s.timer_fires,
+            s.resyncs,
             s.syncs,
             s.sync_max_ns,
             self.registered.len(),
@@ -257,6 +260,23 @@ impl Mirror {
             s.adds,
             s.removes,
         );
+    }
+}
+
+thread_local! {
+    /// The UI thread's mirror, for [`resync`]; empty on every other thread.
+    static MIRROR: RefCell<Weak<RefCell<Mirror>>> = const { RefCell::new(Weak::new()) };
+}
+
+/// Syncs the Looper's registrations to GLib now, when called on the UI thread outside a pass; a no-op inside a pass (the pass syncs when it ends) and on any other thread (GLib wakes the owner itself).
+/// Needed after any GLib change the UI thread makes outside a pass (Java calling in from the Looper, e.g. the app's vsync request): a source attached by the context's owner writes no wakeup (GLib `g_source_attach_unlocked` wakes only another owner thread), so its fd or timeout would otherwise never reach the Looper and never fire.
+pub fn resync() {
+    let mirror = MIRROR.with_borrow(Weak::upgrade);
+    if let Some(mirror) = mirror
+        && let Ok(mut m) = mirror.try_borrow_mut()
+    {
+        m.stats.resyncs += 1;
+        m.sync();
     }
 }
 
@@ -290,6 +310,7 @@ pub fn install(looper: Box<dyn Looper>) -> Result<(), UiError> {
     mirror.borrow().looper.set_sink(Box::new(move |fd, events| {
         sink.borrow_mut().pass(fd, events)
     }));
+    MIRROR.with_borrow_mut(|slot| *slot = Rc::downgrade(&mirror));
     let mut m = mirror.borrow_mut();
     m.looper.add_fd(
         timer_fd,

@@ -7,7 +7,7 @@
 mod geometry;
 mod input;
 #[allow(unsafe_code)]
-mod mirror;
+pub(crate) mod mirror;
 mod pacing;
 mod scene;
 mod ui;

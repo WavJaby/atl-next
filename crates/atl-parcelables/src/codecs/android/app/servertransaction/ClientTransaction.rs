@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! android.app.servertransaction.ClientTransaction: app/servertransaction/ClientTransaction.java writeToParcel (writeParcelableList of mTransactionItems) / ClientTransaction(Parcel).
-//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, PauseActivityItem, StopActivityItem, DestroyActivityItem, StartActivityItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
+//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, PauseActivityItem, StopActivityItem, DestroyActivityItem, StartActivityItem, ConfigurationChangeItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -10,6 +10,7 @@ const LAUNCH_ACTIVITY_ITEM: &str = "android.app.servertransaction.LaunchActivity
 const RESUME_ACTIVITY_ITEM: &str = "android.app.servertransaction.ResumeActivityItem";
 const ACTIVITY_CONFIGURATION_CHANGE_ITEM: &str =
     "android.app.servertransaction.ActivityConfigurationChangeItem";
+const CONFIGURATION_CHANGE_ITEM: &str = "android.app.servertransaction.ConfigurationChangeItem";
 const ACTIVITY_RELAUNCH_ITEM: &str = "android.app.servertransaction.ActivityRelaunchItem";
 const PAUSE_ACTIVITY_ITEM: &str = "android.app.servertransaction.PauseActivityItem";
 const STOP_ACTIVITY_ITEM: &str = "android.app.servertransaction.StopActivityItem";
@@ -27,6 +28,8 @@ pub enum ClientTransactionItem {
     StartActivity(StartActivityItem),
     /// Boxed like LaunchActivity: the Configuration and ActivityWindowInfo make it large.
     ActivityConfigurationChange(Box<ActivityConfigurationChangeItem>),
+    /// Boxed: a Configuration.
+    ConfigurationChange(Box<ConfigurationChangeItem>),
     /// Boxed: three Configurations.
     ActivityRelaunch(Box<ActivityRelaunchItem>),
 }
@@ -71,6 +74,10 @@ impl Part for ClientTransaction {
                     w_str16(p, &Some(ACTIVITY_CONFIGURATION_CHANGE_ITEM.to_owned()))?;
                     i.write(p)?;
                 }
+                Some(ClientTransactionItem::ConfigurationChange(i)) => {
+                    w_str16(p, &Some(CONFIGURATION_CHANGE_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
                 Some(ClientTransactionItem::ActivityRelaunch(i)) => {
                     w_str16(p, &Some(ACTIVITY_RELAUNCH_ITEM.to_owned()))?;
                     i.write(p)?;
@@ -110,6 +117,9 @@ impl Part for ClientTransaction {
                         Box::new(ActivityConfigurationChangeItem::read(p)?),
                     ))
                 }
+                Some(CONFIGURATION_CHANGE_ITEM) => Some(ClientTransactionItem::ConfigurationChange(
+                    Box::new(ConfigurationChangeItem::read(p)?),
+                )),
                 Some(ACTIVITY_RELAUNCH_ITEM) => Some(ClientTransactionItem::ActivityRelaunch(
                     Box::new(ActivityRelaunchItem::read(p)?),
                 )),

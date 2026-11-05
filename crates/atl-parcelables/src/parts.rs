@@ -703,6 +703,30 @@ impl Part for ActivityRelaunchItem {
     }
 }
 
+/// android.app.servertransaction.ConfigurationChangeItem (ConfigurationChangeItem.java:63-66 writeToParcel): the process's new global Configuration as a typed object (non-null on read), then the device id.
+/// The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigurationChangeItem {
+    pub configuration: Configuration,
+    /// mDeviceId: Context.DEVICE_ID_DEFAULT (0) for the default device
+    pub device_id: i32,
+}
+impl Part for ConfigurationChangeItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_typed(p, &Some(self.configuration.clone()))?;
+        w_i32(p, self.device_id)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        let configuration = r_typed(p)?.ok_or_else(|| {
+            crate::refuse("android.app.servertransaction.ConfigurationChangeItem.mConfiguration (null)")
+        })?;
+        Ok(ConfigurationChangeItem {
+            configuration,
+            device_id: r_i32(p)?,
+        })
+    }
+}
+
 /// android.app.servertransaction.ActivityConfigurationChangeItem (ActivityConfigurationChangeItem.java:79-89 writeToParcel): the ActivityTransactionItem's token, then the
 /// Configuration and the ActivityWindowInfo as typed objects. The body after ClientTransaction's class name; the item is not a codec of its own.
 #[derive(Debug, Clone, Default)]

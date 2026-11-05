@@ -21,6 +21,17 @@ pub struct PhysSize {
     pub height: u32,
 }
 
+/// The monitor a window is on, as the desktop reports it: its mode in physical pixels, its refresh rate, its scale. The host side reads the same values for atld (atl-platform-host-api `Monitor`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Monitor {
+    /// The mode in physical pixels.
+    pub size: PhysSize,
+    /// Refresh rate in Hz; `None` where the monitor reports none.
+    pub refresh_hz: Option<f32>,
+    /// Physical pixels per desktop logical pixel.
+    pub scale: Scale,
+}
+
 /// A position in physical pixels from the window content's top-left corner; fractional because pointers report sub-pixel positions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PhysPoint {
@@ -166,6 +177,9 @@ pub trait Window: FrameClock + InputSource + Sized {
 
     /// Calls `on_resize` with the content's size in physical pixels once it has one, then on each change. A tiling compositor resizes every window: the content follows the window, and the caller re-lays out and presents at the new size.
     fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F);
+
+    /// Calls `on_monitor` with the monitor the window is on once it is on one, then each time it moves to another or that monitor's mode, rate or scale changes. On two monitors at once, the one entered last counts.
+    fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F);
 }
 
 /// Window content pixels, as [`Window::capture`] returns them.

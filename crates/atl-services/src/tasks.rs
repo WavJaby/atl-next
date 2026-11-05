@@ -47,6 +47,8 @@ struct WindowEntry<C> {
 }
 
 struct State<C> {
+    /// the monitor the app windows are on (one display, plan `Lifecycle / windows`)
+    display: DisplayModel,
     tasks: BTreeMap<TaskId, TaskRecord>,
     /// the last TaskId handed out
     last_id: i32,
@@ -58,8 +60,9 @@ struct State<C> {
 }
 
 impl<C> State<C> {
-    fn new() -> Self {
+    fn new(display: DisplayModel) -> Self {
         State {
+            display,
             tasks: BTreeMap::new(),
             last_id: 0,
             activities: Vec::new(),
@@ -71,33 +74,36 @@ impl<C> State<C> {
 
 /// The Tasks of the display: their owners and sizes, the activities bound to each, and the windows of each. `C` is the handle an activity or window is known by.
 pub struct Tasks<C> {
-    display: DisplayModel,
     state: Mutex<State<C>>,
 }
 
+/// A new Task's size on `display` ([`DisplayModel::opening_size`]).
+fn opening(display: &DisplayModel) -> TaskSize {
+    let (width, height) = display.opening_size();
+    TaskSize { width, height }
+}
+
+/// The config_seq after `seq`: positive, as a numbered override must be (0 = never changed).
+fn next_config_seq(seq: i32) -> i32 {
+    seq.wrapping_add(1).max(1)
+}
+
 impl<C: Clone + PartialEq> Tasks<C> {
-    /// `display` is the monitor. A Task with no size yet has the display's size: its window opens at it.
+    /// `display` is the monitor at start. A Task with no size yet has the display's opening size: its window opens at it.
     pub fn new(display: DisplayModel) -> Self {
         Tasks {
-            display,
-            state: Mutex::new(State::new()),
+            state: Mutex::new(State::new(display)),
         }
     }
 
-    /// The display (monitor values): unchanged by any window's size.
+    /// The display now (the monitor's values, [`Tasks::set_display`]): unchanged by any window's size. The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
-        self.display
+        self.lock().display
     }
 
     fn lock(&self) -> MutexGuard<'_, State<C>> {
         // a poisoned table still holds the tasks and windows
         self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// A new Task's size: the display's opening size ([`DisplayModel::opening_size`]), the one the composer opens the window at.
-    fn initial_size(&self) -> TaskSize {
-        let (width, height) = self.display.opening_size();
-        TaskSize { width, height }
     }
 
     /// A new Task of the app `owner` (its uid). The launch that starts a Task calls it once.
@@ -121,19 +127,24 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.get(&task).map(|t| t.owner)
     }
 
+    /// Whether the app `owner` has a Task: only such an app reports the monitor (registry SET_DISPLAY).
+    pub fn owns_any(&self, owner: u32) -> bool {
+        self.lock().tasks.values().any(|t| t.owner == owner)
+    }
+
     /// The size of `task`: the one it was set to, else the initial size (a Task that does not exist has it too).
     pub fn size(&self, task: TaskId) -> TaskSize {
-        self.lock()
-            .tasks
+        let st = self.lock();
+        st.tasks
             .get(&task)
             .and_then(|t| t.size)
-            .unwrap_or_else(|| self.initial_size())
+            .unwrap_or_else(|| opening(&st.display))
     }
 
     /// Sets `task`'s size; true when it changed, so its windows need `resized`. False for the size it already has and for no Task (the registry checks the owner first).
     pub fn set_size(&self, task: TaskId, size: TaskSize) -> bool {
-        let initial = self.initial_size();
         let mut st = self.lock();
+        let initial = opening(&st.display);
         let Some(record) = st.tasks.get_mut(&task) else {
             return false;
         };
@@ -141,8 +152,27 @@ impl<C: Clone + PartialEq> Tasks<C> {
             return false;
         }
         record.size = Some(size);
-        record.config_seq = record.config_seq.wrapping_add(1).max(1);
+        record.config_seq = next_config_seq(record.config_seq);
         true
+    }
+
+    /// The window's monitor changed (size, density or refresh rate: DisplayModel::from_monitor): it becomes the display. Every Task's configuration follows it, so each gets a new config_seq; returns those Tasks, empty when nothing changed.
+    /// A Task with no size set keeps its opening size from the old display: its window is already open at that size, and only a SET_BOUNDS changes it.
+    pub fn set_display(&self, display: DisplayModel) -> Vec<TaskId> {
+        let mut st = self.lock();
+        if st.display == display {
+            return Vec::new();
+        }
+        let old = opening(&st.display);
+        st.display = display;
+        st.tasks
+            .iter_mut()
+            .map(|(id, record)| {
+                record.size.get_or_insert(old);
+                record.config_seq = next_config_seq(record.config_seq);
+                *id
+            })
+            .collect()
     }
 
     /// The Configuration.seq of `task`'s override (ActivityRecord.java:7697): numbered per size, 0 until the first change. Every copy of one override carries it: the item, IWindow.resized, relayout. They race on the app's main thread (AOSP orders them), and a seq-0 copy reads as older than a pending numbered one, so ActivityThread drops it and a layout runs on the old configuration; an item at seq 0 fares no better: handleActivityConfigurationChangedInner:7112 takes its own pending copy for newer and drops it.
@@ -283,6 +313,23 @@ mod tests {
         assert_eq!(t.config_seq(task), 1);
         t.set_size(task, size(900, 650));
         assert_eq!(t.config_seq(task), 2);
+    }
+
+    /// A new monitor becomes the display and renumbers every Task's override; the same monitor again changes nothing. A Task never sized keeps the opening size it opened at (960x600: 3/4 of the default 1280x800), not the new display's.
+    #[test]
+    fn set_display_renumbers_every_task_and_keeps_open_sizes() {
+        let t = tasks();
+        let sized = t.new_task(7);
+        let fresh = t.new_task(8);
+        t.set_size(sized, size(1000, 700));
+        let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0);
+        assert_eq!(t.set_display(monitor), vec![sized, fresh]);
+        assert_eq!(t.display(), monitor);
+        assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
+        assert_eq!(t.size(sized), size(1000, 700));
+        assert_eq!(t.size(fresh), size(960, 600));
+        assert_eq!(t.set_display(monitor), Vec::new());
+        assert_eq!(t.config_seq(sized), 2);
     }
 
     /// A Task that does not exist has no owner, takes no size, and has the display's size.

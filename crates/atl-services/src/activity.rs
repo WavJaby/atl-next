@@ -39,7 +39,7 @@ use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction:
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::parts::{
     ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo, ComponentInfo,
-    LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
+    ConfigurationChangeItem, LaunchActivityItem, PackageItemInfo, ResumeActivityItem,
 };
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
@@ -419,8 +419,6 @@ struct Inner {
     /// the activity lifecycle: records, launches and starts (activity_task.rs); the client controller forwards its acks here
     atm: Arc<ActivityTasks>,
     settings: SpIBinder,
-    /// the display the configuration of every started app is made from (display_model.rs)
-    display: DisplayModel,
     /// the Tasks: a launch that starts a Task creates it here and binds its activity's token to it (tasks.rs)
     tasks: Arc<Tasks<SpIBinder>>,
     /// what each activity reported (ReportedBuckets), shared with the activity client controller
@@ -454,7 +452,6 @@ impl ActivityManager {
     pub fn new(
         packages: Arc<Packages>,
         control: Arc<dyn ProcessControl>,
-        display: DisplayModel,
         tasks: Arc<Tasks<SpIBinder>>,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
@@ -472,7 +469,6 @@ impl ActivityManager {
                     atm: Arc::new(ActivityTasks::new(
                         Arc::clone(&packages),
                         Arc::clone(&tasks),
-                        display,
                         controller.clone(),
                     )),
                     packages,
@@ -480,7 +476,6 @@ impl ActivityManager {
                     state: Mutex::new(State::default()),
                     reporter: Reporter::new(),
                     settings: settings::new_binder(),
-                    display,
                     tasks,
                     buckets,
                 }
@@ -510,6 +505,36 @@ impl ActivityManager {
         Arc::clone(&self.inner.atm)
     }
 
+    /// The display changed (registry SET_DISPLAY): the new global configuration to every attached process, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
+    /// (WindowProcessController.dispatchConfiguration:1773: ConfigurationChangeItem, device 0). Needed: a Task's override leaves density to the global configuration (task_override), so without it
+    /// an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
+    pub(crate) fn global_configuration_changed(&self) -> usize {
+        let config = global_configuration(&self.inner.tasks.display());
+        let threads: Vec<_> = self
+            .inner
+            .state()
+            .processes
+            .iter()
+            .filter_map(|p| p.attached.as_ref().map(|a| a.thread.clone()))
+            .collect();
+        let mut told = 0;
+        for thread in threads {
+            let transaction = ClientTransaction {
+                items: vec![Some(ClientTransactionItem::ConfigurationChange(Box::new(
+                    ConfigurationChangeItem {
+                        configuration: config.clone(),
+                        device_id: 0,
+                    },
+                )))],
+            };
+            match thread.r#scheduleTransaction(Some(&transaction)) {
+                Ok(()) => told += 1,
+                Err(e) => log(format_args!("scheduleTransaction (global configuration): {e}")),
+            }
+        }
+        told
+    }
+
     /// Registry set_bounds changed `task`'s size.
     pub(crate) fn task_resized(&self, task: TaskId) {
         self.inner.task_resized(task);
@@ -526,11 +551,12 @@ impl Inner {
     /// Each activity is a record of the lifecycle machine (activity_task Owner): one started by startActivity gets the change as the launcher one does; the steps after a relaunch come from its phase.
     fn task_resized(&self, task: TaskId) {
         let size = self.tasks.size(task);
+        let display = self.tasks.display();
         let over = Configuration {
             seq: self.tasks.config_seq(task),
-            ..task_override(&self.display, size)
+            ..task_override(&display, size)
         };
-        let new = Config::from(&task_configuration(&self.display, size));
+        let new = Config::from(&task_configuration(&display, size));
         let task_rect = || Rect {
             left: 0,
             top: 0,
@@ -585,9 +611,9 @@ impl Inner {
                             Box::new(ActivityRelaunchItem {
                                 activity_token: Some(token.clone()),
                                 config: Some(MergedConfiguration {
-                                    global: global_configuration(&self.display),
+                                    global: global_configuration(&display),
                                     override_config: over.clone(),
-                                    merged: task_configuration(&self.display, size),
+                                    merged: task_configuration(&display, size),
                                 }),
                                 activity_window_info: window_info(),
                                 config_changes: changes as i32,
@@ -1029,7 +1055,7 @@ impl IActivityManager for ActivityManager {
             false,
             false,
             false,
-            Some(&global_configuration(&inner.display)),
+            Some(&global_configuration(&inner.tasks.display())),
             Some(&CompatibilityInfo::default()),
             None,
             Some(&core_settings),

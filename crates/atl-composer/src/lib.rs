@@ -41,7 +41,7 @@ pub mod start;
 #[cfg(feature = "converter")]
 pub mod surface_flinger;
 #[cfg(feature = "converter")]
-pub mod task_bounds;
+pub mod task_sender;
 #[cfg(feature = "converter")]
 pub mod ui_agent;
 #[cfg(feature = "converter")]

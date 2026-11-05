@@ -84,7 +84,9 @@ fn main() -> Result<()> {
     let agents = Arc::new(UiAgents::default());
     // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry; the activity service creates each launch's Task here
     let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
-    let activity = ActivityManager::new(packages.clone(), control, display, Arc::clone(&tasks));
+    // the display listeners of the apps (IDisplayManager.registerCallback): the display service takes them, the registry tells them of a change
+    let display_callbacks = Arc::new(atl_services::display::DisplayCallbacks::default());
+    let activity = ActivityManager::new(packages.clone(), control, Arc::clone(&tasks));
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()
     {
@@ -99,11 +101,14 @@ fn main() -> Result<()> {
     .context("addService activity_task")?;
     let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
-    binder::add_service(DISPLAY, atl_services::display::new_binder(display))
+    binder::add_service(DISPLAY, atl_services::display::new_binder(
+            Arc::clone(&tasks),
+            Arc::clone(&display_callbacks),
+        ))
         .context("addService display")?;
     binder::add_service(
         WINDOW,
-        atl_services::window::new_binder(display, Arc::clone(&agents), Arc::clone(&tasks)),
+        atl_services::window::new_binder(Arc::clone(&agents), Arc::clone(&tasks)),
     )
     .context("addService window")?;
     binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
@@ -132,6 +137,7 @@ fn main() -> Result<()> {
             Arc::clone(&agents),
             Arc::clone(&tasks),
             activity.clone(),
+            display_callbacks,
         ),
     )
     .context("addService compositor registry")?;

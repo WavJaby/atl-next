@@ -52,6 +52,8 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 /// The resize probe's size step, physical pixels per axis: the larger and the smaller size are WIDTH/HEIGHT +- this. The smaller content stays above the title bar's minimum width (WSLg: ~280 px).
 const RESIZE_STEP: u32 = 32;
+/// Idle ticks the gate client asks for outside a mirror pass (gate.rs , the same number).
+const IDLE_TICKS: u32 = 3;
 /// How long the client may take to reach READY (build excluded): mapping, the frames, the fd test.
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 /// How long an idle UI thread may take to answer a ping. The client answers within one main-loop pass (20 ms); real compositors wait seconds, so 1 s is a generous bound for a loaded machine.
@@ -449,6 +451,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         in_order && sizes.last() == Some(&smaller),
         "content follows the window: larger, then smaller probe size, the smaller last",
         &format!("sizes {sizes:?}"),
+    );
+    // a tick asked for outside a mirror pass comes (mirror::resync): the client asks for IDLE_TICKS (gate.rs), one at a time
+    let idle = client
+        .lines_with("IDLE_TICKS ")
+        .last()
+        .and_then(|l| l.strip_prefix("IDLE_TICKS ")?.parse::<u32>().ok());
+    report.check(
+        idle == Some(IDLE_TICKS),
+        "ticks asked for outside a mirror pass come (idle timer synced to the Looper)",
+        &format!("ticks {idle:?} of {IDLE_TICKS}"),
     );
 
     // gate 2: readback

@@ -27,7 +27,6 @@ use crate::activity_stack::{Command, Machine, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Target};
 use crate::config_diff::Config;
 use crate::counters;
-use crate::display_model::DisplayModel;
 use crate::manifest_flags;
 use crate::packages::{ActivityDecl, Packages};
 use crate::tasks::{TaskId, Tasks};
@@ -82,7 +81,6 @@ pub(crate) fn affinity_of(decl: &ActivityDecl, package: &str) -> String {
 pub struct ActivityTasks {
     packages: Arc<Packages>,
     tasks: Arc<Tasks<SpIBinder>>,
-    display: DisplayModel,
     /// the ActivityClientController every LaunchActivityItem names: ActivityClient routes its calls through it
     controller: SpIBinder,
     machine: Mutex<Lifecycle>,
@@ -96,13 +94,11 @@ impl ActivityTasks {
     pub(crate) fn new(
         packages: Arc<Packages>,
         tasks: Arc<Tasks<SpIBinder>>,
-        display: DisplayModel,
         controller: SpIBinder,
     ) -> Self {
         ActivityTasks {
             packages,
             tasks,
-            display,
             controller,
             machine: Mutex::new(Machine::new()),
             idents: AtomicI32::new(0),
@@ -147,7 +143,7 @@ impl ActivityTasks {
                 };
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
                     &self.packages,
-                    &self.display,
+                    &self.tasks.display(),
                     &self.controller,
                     p,
                     &launch.decl,
@@ -378,7 +374,7 @@ impl ActivityTasks {
 
     /// The configuration a launch carries (launch_item: the global configuration, no override): what the record's `reported` starts from.
     fn launch_config(&self) -> Config {
-        Config::from(&global_configuration(&self.display))
+        Config::from(&global_configuration(&self.tasks.display()))
     }
 
     /// The records of `task` with their owners, bottom -> top: what a configuration change of the Task is delivered to. A destroyed record is not on the stack, so not listed.

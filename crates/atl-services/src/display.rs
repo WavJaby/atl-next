@@ -11,7 +11,13 @@ use atl_parcelables::android::view::DisplayInfo;
 use atl_parcelables::parts::DisplayMode;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
+use std::sync::{Arc, Mutex};
+
+use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDisplayManagerCallback;
+use binder::Strong;
+
 use crate::display_model::DisplayModel;
+use crate::tasks::Tasks;
 use crate::{counters, permission};
 
 /// The interface name counters use.
@@ -32,8 +38,52 @@ const COLOR_MODE_DEFAULT: i32 = 0;
 /// The one mode the display has (DisplayInfo.modeId; a mode id is positive, INVALID_MODE_ID is not).
 const MODE_ID: i32 = 1;
 
+/// DisplayManagerGlobal.EVENT_DISPLAY_BASIC_CHANGED (DisplayManagerGlobal.java:123): the display's size, density or mode changed.
+const EVENT_DISPLAY_BASIC_CHANGED: i32 = 2;
+/// DisplayManagerGlobal.INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED (DisplayManagerGlobal.java:151): the mask bit a callback takes basic changes with (DisplayManagerService shouldSendEvent:4424).
+const INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED: i64 = 1 << 1;
+
+/// The registered IDisplayManagerCallbacks, one per process as DisplayManagerService's CallbackRecord (keyed by calling pid; a second registration of a pid replaces its mask), with the event mask each asked for.
+/// One CallbackRecord: the calling pid, the callback, the event mask.
+type CallbackRecord = (i32, Strong<dyn IDisplayManagerCallback>, i64);
+
+#[derive(Default)]
+pub struct DisplayCallbacks {
+    records: Mutex<Vec<CallbackRecord>>,
+}
+
+impl DisplayCallbacks {
+    fn register(&self, pid: i32, callback: &Strong<dyn IDisplayManagerCallback>, mask: i64) {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        match records.iter_mut().find(|r| r.0 == pid) {
+            Some(r) => r.2 = mask,
+            None => records.push((pid, callback.clone(), mask)),
+        }
+    }
+
+    /// Display 0 changed (Tasks::set_display): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). A dead callback fails its oneway send and stays (no death link yet: one record per pid, so at most one per process that ran). Returns the callbacks told.
+    pub fn display_changed(&self) -> usize {
+        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut told = 0;
+        for (_, callback, mask) in records.iter() {
+            if mask & INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED == 0 {
+                continue;
+            }
+            match callback.r#onDisplayEvent(DEFAULT_DISPLAY, EVENT_DISPLAY_BASIC_CHANGED) {
+                Ok(()) => told += 1,
+                Err(e) => {
+                    counters::count(INTERFACE, &format!("onDisplayEvent failed: {e}"));
+                }
+            }
+        }
+        told
+    }
+}
+
 struct DisplayManager {
-    model: DisplayModel,
+    /// the owner of the display values (tasks.rs Tasks::display): read at each call, never copied
+    tasks: Arc<Tasks<SpIBinder>>,
+    callbacks: Arc<DisplayCallbacks>,
 }
 
 impl Interface for DisplayManager {}
@@ -64,12 +114,47 @@ impl IDisplayManager for DisplayManager {
 
     /// DisplayManagerService.getDisplayInfo: the record of display 0 from the model; null for any other display (there is no other).
     fn r#getDisplayInfo(&self, display_id: i32) -> binder::Result<Option<DisplayInfo>> {
-        Ok((display_id == DEFAULT_DISPLAY).then(|| display_info(&self.model)))
+        Ok((display_id == DEFAULT_DISPLAY).then(|| display_info(&self.tasks.display())))
     }
 
     /// DisplayManagerService.getDisplayIds: display 0, whether or not disabled displays are asked for (the model has no other).
     fn r#getDisplayIds(&self, _include_disabled: bool) -> binder::Result<Option<Vec<i32>>> {
         Ok(Some(vec![DEFAULT_DISPLAY]))
+    }
+
+    /// DisplayManagerService.registerCallback: registerCallbackInternal with the added / changed / removed events. Only basic changes are ever sent (one display, never added or removed).
+    fn r#registerCallback(
+        &self,
+        callback: Option<&Strong<dyn IDisplayManagerCallback>>,
+    ) -> binder::Result<()> {
+        self.register(callback, INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED)
+    }
+
+    /// DisplayManagerService.registerCallbackWithEventMask:4735: null is IllegalArgumentException. The connection-changed bit needs MANAGE_DISPLAYS there; no event of it is ever sent here, so the mask is kept unchecked.
+    fn r#registerCallbackWithEventMask(
+        &self,
+        callback: Option<&Strong<dyn IDisplayManagerCallback>>,
+        mask: i64,
+    ) -> binder::Result<()> {
+        self.register(callback, mask)
+    }
+}
+
+impl DisplayManager {
+    fn register(
+        &self,
+        callback: Option<&Strong<dyn IDisplayManagerCallback>>,
+        mask: i64,
+    ) -> binder::Result<()> {
+        let callback = callback.ok_or_else(|| {
+            Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some("listener must not be null"),
+            )
+        })?;
+        self.callbacks
+            .register(ThreadState::get_calling_pid(), callback, mask);
+        Ok(())
     }
 }
 
@@ -128,7 +213,7 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
     }
 }
 
-/// A new display service binder answering from `model`.
-pub fn new_binder(model: DisplayModel) -> SpIBinder {
-    BnDisplayManager::new_binder(DisplayManager { model }, BinderFeatures::default()).as_binder()
+/// A new display service binder answering from the display  owns; callbacks registered with it go to  (the registry tells them of a change).
+pub fn new_binder(tasks: Arc<Tasks<SpIBinder>>, callbacks: Arc<DisplayCallbacks>) -> SpIBinder {
+    BnDisplayManager::new_binder(DisplayManager { tasks, callbacks }, BinderFeatures::default()).as_binder()
 }

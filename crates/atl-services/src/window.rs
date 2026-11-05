@@ -30,7 +30,6 @@ use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
 
-use crate::display_model::DisplayModel;
 use crate::tasks::{TaskId, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters, permission};
@@ -153,14 +152,12 @@ struct Window {
 }
 
 struct WindowManager {
-    model: DisplayModel,
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
 }
 
 /// The session openSession gives: the windows it added, and the display they lay out on.
 struct Session {
-    model: DisplayModel,
     agent: RegisteredAgent,
     tasks: Arc<Tasks<SpIBinder>>,
     windows: Mutex<Vec<Window>>,
@@ -221,7 +218,6 @@ impl IWindowManager for WindowManager {
     ) -> binder::Result<Option<Strong<dyn IWindowSession>>> {
         Ok(Some(BnWindowSession::new_binder(
             Session {
-                model: self.model,
                 agent: RegisteredAgent {
                     agents: Arc::clone(&self.agents),
                     uid: ThreadState::get_calling_uid(),
@@ -237,11 +233,12 @@ impl IWindowManager for WindowManager {
 impl Session {
     /// The display's frame: the insets' display frame and the global bounds. A window's frame is [`Session::task_rect`].
     fn display_rect(&self) -> Rect {
+        let display = self.tasks.display();
         Rect {
             left: 0,
             top: 0,
-            right: self.model.width,
-            bottom: self.model.height,
+            right: display.width,
+            bottom: display.height,
         }
     }
 
@@ -415,6 +412,7 @@ impl IWindowSession for Session {
             .iter()
             .find(|w| w.client == client)
             .and_then(|w| w.surface.clone());
+        let display = self.tasks.display();
         let size = self.tasks.size(task);
         let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
@@ -428,12 +426,12 @@ impl IWindowSession for Session {
                 seq,
             },
             merged_configuration: MergedConfiguration {
-                global: activity::global_configuration(&self.model),
+                global: activity::global_configuration(&display),
                 override_config: Configuration {
                     seq: self.tasks.config_seq(task),
-                    ..activity::task_override(&self.model, size)
+                    ..activity::task_override(&display, size)
                 },
-                merged: activity::task_configuration(&self.model, size),
+                merged: activity::task_configuration(&display, size),
             },
             surface_control: surface.unwrap_or_default(),
             insets_state: self.insets_state(),
@@ -480,15 +478,13 @@ impl IWindowSession for Session {
     }
 }
 
-/// A new window service binder: the one display's model, which every session lays out on, and the table of UI agents (system_services.rs gives it the registry's).
+/// A new window service binder: the Tasks (which own the display every session lays out on) and the table of UI agents (system_services.rs gives it the registry's).
 pub fn new_binder(
-    model: DisplayModel,
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
 ) -> SpIBinder {
     BnWindowManager::new_binder(
         WindowManager {
-            model,
             agents,
             tasks,
         },

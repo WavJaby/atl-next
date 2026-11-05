@@ -12,7 +12,9 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, check, service_names};
+use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, check, service_names};
+use crate::display::DisplayCallbacks;
+use crate::display_model::DisplayModel;
 use crate::counters;
 use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agent::UiAgents;
@@ -39,6 +41,9 @@ pub trait ICompositorRegistry: Interface {
         width: i32,
         height: i32,
     ) -> Result<(), StatusCode>;
+
+    /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
+    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -61,6 +66,10 @@ fn on_transact(
         let height: i32 = data.read()?;
         return service.set_bounds(ThreadState::get_calling_uid(), task, width, height);
     }
+    if code == SET_DISPLAY {
+        let display: String = data.read()?;
+        return service.set_display(ThreadState::get_calling_uid(), &display);
+    }
     if code != REGISTER {
         counters::count(INTERFACE, &format!("code {code}"));
         return Err(StatusCode::UNKNOWN_TRANSACTION);
@@ -80,6 +89,10 @@ fn on_transact(
 
 impl ICompositorRegistry for BpCompositorRegistry {
     fn set_bounds(&self, _: u32, _: i32, _: i32, _: i32) -> Result<(), StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
+    fn set_display(&self, _: u32, _: &str) -> Result<(), StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -106,6 +119,10 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.set_bounds(caller_uid, task, width, height)
     }
 
+    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
+        self.0.set_display(caller_uid, display)
+    }
+
     fn register(
         &self,
         caller_uid: u32,
@@ -129,9 +146,32 @@ struct Registry {
     tasks: Arc<Tasks<SpIBinder>>,
     /// the activities of the Tasks: a size change reaches their app threads (activity.rs task_resized)
     activities: ActivityManager,
+    /// the display service's callbacks: a display change reaches them (display.rs)
+    display_callbacks: Arc<DisplayCallbacks>,
 }
 
 impl Interface for Registry {}
+
+impl Registry {
+    /// `task`'s configuration changed (its size or the display): its activities get the change (activity.rs task_resized), then its windows `resized`, unless a relaunch holds them.
+    fn task_changed(&self, task: TaskId) {
+        self.activities.task_resized(task);
+        if self.activities.task_relaunching(task) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "services: resize of task {} held for the relaunch",
+                task.raw()
+            );
+            return;
+        }
+        let windows = crate::window::notify_resized(&self.tasks, task);
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: resized {windows} windows of task {}",
+            task.raw()
+        );
+    }
+}
 
 impl ICompositorRegistry for Registry {
     fn set_bounds(
@@ -165,21 +205,41 @@ impl ICompositorRegistry for Registry {
                 "services: task {} of uid {caller_uid} bounds {width}x{height}",
                 task.raw()
             );
-            self.activities.task_resized(task);
-            if self.activities.task_relaunching(task) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "services: resize of task {} held for the relaunch",
-                    task.raw()
-                );
-                return Ok(());
-            }
-            let windows = crate::window::notify_resized(&self.tasks, task);
+            self.task_changed(task);
+        }
+        Ok(())
+    }
+
+    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
+        // only an app with a window reports its monitor
+        if !self.tasks.owns_any(caller_uid) {
             let _ = writeln!(
                 std::io::stderr(),
-                "services: resized {windows} windows of task {}",
-                task.raw()
+                "services: display refused uid {caller_uid}: owns no task"
             );
+            return Err(StatusCode::PERMISSION_DENIED);
+        }
+        let model = DisplayModel::parse_arg(display).map_err(|why| {
+            let _ = writeln!(std::io::stderr(), "services: display refused: {why}");
+            StatusCode::BAD_VALUE
+        })?;
+        let tasks = self.tasks.set_display(model);
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: display {display} from uid {caller_uid}"
+        );
+        // AOSP's order: DisplayManagerService delivers the display event, then WindowManager's display change updates the global configuration (ActivityTaskManagerService.updateGlobalConfigurationLocked:4813: ConfigurationChangeItem to each process), then each activity's
+        let callbacks = self.display_callbacks.display_changed();
+        let processes = self.activities.global_configuration_changed();
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: display change told {callbacks} display callbacks, {processes} processes"
+        );
+        for task in tasks {
+            self.task_changed(task);
         }
         Ok(())
     }
@@ -216,12 +276,14 @@ pub fn new_binder(
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
     activities: ActivityManager,
+    display_callbacks: Arc<DisplayCallbacks>,
 ) -> SpIBinder {
     BnCompositorRegistry::new_binder(
         Registry {
             agents,
             tasks,
             activities,
+            display_callbacks,
         },
         BinderFeatures::default(),
     )

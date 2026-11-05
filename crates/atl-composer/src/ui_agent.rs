@@ -14,25 +14,25 @@ use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 use crate::host::Composer;
 use crate::input::Message;
 use crate::service;
-use crate::task_bounds::BoundsSender;
+use crate::task_sender::TaskSender;
 
 /// PixelFormat.RGBA_8888 (`HAL_PIXEL_FORMAT_RGBA_8888` = 1), the format of every window layer.
 const RGBA_8888: u32 = 1;
 
-/// The agent of this process: its windows are layers of its compositor, and their input channels go to the input thread. `bounds` takes the window's Task (TASK); None in headless
+/// The agent of this process: its windows are layers of its compositor, and their input channels go to the input thread. `sender` takes the window's Task (TASK); None in headless
 /// mode, which has no toplevel to size.
 struct UiAgent {
     composer: Arc<Composer>,
     input: Sender<Message>,
-    bounds: Option<Arc<BoundsSender>>,
+    sender: Option<Arc<TaskSender>>,
 }
 
 impl Interface for UiAgent {}
 
 impl IUiAgent for UiAgent {
     fn task(&self, task: i32) -> Result<(), StatusCode> {
-        if let Some(bounds) = &self.bounds {
-            bounds.set_task(task);
+        if let Some(sender) = &self.sender {
+            sender.set_task(task);
         }
         Ok(())
     }
@@ -70,17 +70,17 @@ impl IUiAgent for UiAgent {
     }
 }
 
-/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `bounds` the window's Task.
+/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task.
 pub fn new_binder(
     composer: Arc<Composer>,
     input: Sender<Message>,
-    bounds: Option<Arc<BoundsSender>>,
+    sender: Option<Arc<TaskSender>>,
 ) -> SpIBinder {
     BnUiAgent::new_binder(
         UiAgent {
             composer,
             input,
-            bounds,
+            sender,
         },
         BinderFeatures::default(),
     )

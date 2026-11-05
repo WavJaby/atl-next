@@ -6,13 +6,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use atl_platform_ui_api::{
-    Capture, FrameClock, FrameTick, InputEvent, InputSource, PhysSize, PointerPhase, PresentError,
-    Scale, Scene, UiError, Window, WindowAttributes,
+    Capture, FrameClock, FrameTick, InputEvent, InputSource, Monitor, PhysSize, PointerPhase,
+    PresentError, Scale, Scene, UiError, Window, WindowAttributes,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::input;
+use crate::mirror;
 use crate::pacing;
 use crate::scene;
 use crate::ui::GtkUi;
@@ -53,6 +54,9 @@ struct Shared {
     frame_requested: Cell<bool>,
     on_event: Slot<dyn FnMut(InputEvent)>,
     on_resize: Slot<dyn FnMut(PhysSize)>,
+    on_monitor: Slot<dyn FnMut(Monitor)>,
+    /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
+    monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The current tick presented a scene: the next is paced by the compositor's frame callback, else by the idle timer (pacing.rs).
     presented: Cell<bool>,
     /// The last tick's time, µs CLOCK_MONOTONIC: the idle grid's origin.
@@ -240,6 +244,8 @@ impl Window for GtkWindow {
             on_resize: Slot::new(),
             pointer_at: Cell::new((0.0, 0.0)),
             swiping: Cell::new(false),
+            on_monitor: Slot::new(),
+            monitor: RefCell::new(None),
             presented: Cell::new(false),
             last_tick_us: Cell::new(None),
             idle_timer: RefCell::new(None),
@@ -250,22 +256,12 @@ impl Window for GtkWindow {
         Self::wire_frame_clock(&window, &shared);
         Self::wire_pointer(&view, &shared);
         Self::wire_scroll(&view, &shared);
-        // the monitor the window is on (wl_surface.enter): logged per entry; the idle pacing reads its rate (monitor_interval_us). Delivery to Android's display follows the services' live display (not built).
-        window.connect_realize(|w| {
+        // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor); the idle pacing reads its rate (monitor_interval_us)
+        let entered = Rc::clone(&shared);
+        window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
-                surface.connect_enter_monitor(|_, m| {
-                    let g = m.geometry();
-                    tracing::info!(
-                        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}",
-                        m.connector().map(|c| c.to_string()).unwrap_or_default(),
-                        g.width(),
-                        g.height(),
-                        g.x(),
-                        g.y(),
-                        m.refresh_rate(),
-                        m.scale()
-                    );
-                });
+                let entered = Rc::clone(&entered);
+                surface.connect_enter_monitor(move |_, m| follow_monitor(&entered, m));
             }
         });
         // keyboard focus = the active toplevel (xdg_toplevel state `activated`); GTK notifies each change
@@ -288,6 +284,7 @@ impl Window for GtkWindow {
         this.set_title(&attributes.title);
         this.set_size(attributes.size);
         this.window.present();
+        mirror::resync();
         Ok(this)
     }
 
@@ -304,10 +301,13 @@ impl Window for GtkWindow {
             self.window
                 .set_default_size(width + chrome_w, height + chrome_h);
         }
+        // every GTK change this layer makes may attach a source (a layout or paint request of the frame clock): from outside a mirror pass it reaches the Looper only through a sync. The platform layer is the only GTK caller, so its entry points are the complete set.
+        mirror::resync();
     }
 
     fn set_title(&self, title: &str) {
         self.window.set_title(Some(title));
+        mirror::resync();
     }
 
     fn size(&self) -> PhysSize {
@@ -340,6 +340,7 @@ impl Window for GtkWindow {
             self.origin_logged.set(true);
             tracing::info!("atl-platform-ui: content origin x={x} y={y}");
         }
+        mirror::resync();
         Ok(())
     }
 
@@ -378,6 +379,66 @@ impl Window for GtkWindow {
     fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F) {
         self.shared.on_resize.set(Box::new(on_resize));
     }
+
+    fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F) {
+        self.shared.on_monitor.set(Box::new(on_monitor));
+        // a monitor entered before the callback was set is reported now
+        let current = self.shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
+        if let Some(m) = current {
+            report_monitor(&self.shared, &m);
+        }
+    }
+}
+
+/// The window entered `m`: it becomes the window's monitor, reported now and at each change of its scale, mode or rate (GdkMonitor `notify::scale` / `geometry` / `refresh-rate`). The previous monitor's handlers are disconnected.
+fn follow_monitor(shared: &Rc<Shared>, m: &gdk::Monitor) {
+    let previous = shared.monitor.borrow_mut().take();
+    if let Some((old, handlers)) = previous {
+        for handler in handlers {
+            old.disconnect(handler);
+        }
+    }
+    let handlers = ["scale", "geometry", "refresh-rate"]
+        .into_iter()
+        .map(|property| {
+            let weak = Rc::downgrade(shared);
+            m.connect_notify_local(Some(property), move |m, _| {
+                if let Some(shared) = weak.upgrade() {
+                    report_monitor(&shared, m);
+                }
+            })
+        })
+        .collect();
+    *shared.monitor.borrow_mut() = Some((m.clone(), handlers));
+    report_monitor(shared, m);
+}
+
+/// Logs `m` and hands it to the window's `on_monitor`. GDK's geometry is logical pixels; the mode is that times the (fractional) scale, as the host side computes it (atl-platform-host-linux).
+fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
+    let g = m.geometry();
+    tracing::info!(
+        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}",
+        m.connector().map(|c| c.to_string()).unwrap_or_default(),
+        g.width(),
+        g.height(),
+        g.x(),
+        g.y(),
+        m.refresh_rate(),
+        m.scale()
+    );
+    let Some(scale) = Scale::new(m.scale()) else {
+        return;
+    };
+    let physical = |logical: i32| (f64::from(logical.max(0)) * scale.get()).round() as u32;
+    let monitor = Monitor {
+        size: PhysSize {
+            width: physical(g.width()),
+            height: physical(g.height()),
+        },
+        refresh_hz: (m.refresh_rate() > 0).then(|| m.refresh_rate() as f32 / 1000.0),
+        scale,
+    };
+    shared.on_monitor.call(|f| f(monitor));
 }
 
 /// One requested tick of `window`. After a tick that presented (or before the first tick) GDK paces the next: the compositor's frame callback. Otherwise the timer ticks on the monitor's grid (pacing.rs: GDK's own fallback runs at 60 Hz).
@@ -391,6 +452,8 @@ fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
         if let Some(clock) = window.frame_clock() {
             clock.request_phase(gdk::FrameClockPhase::UPDATE);
         }
+        // the frame clock's own source, same as the timer below
+        mirror::resync();
         return;
     };
     let interval = monitor_interval_us(window);
@@ -409,6 +472,8 @@ fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
     if let Some(old) = shared.idle_timer.replace(Some(id)) {
         old.remove();
     }
+    // a request from outside a mirror pass (the app's vsync request, Java on the Looper): the new timeout reaches the Looper only through a sync (mirror::resync)
+    mirror::resync();
 }
 
 /// The refresh interval of the monitor `window` is on; GDK's own default (60 Hz) where the monitor reports none.
@@ -454,9 +519,6 @@ impl atl_platform_ui_api::FrameRequester for GtkFrameRequester {
                 request_frame(&window, &shared);
             }
         });
-        // Do not remove: the composer's binder calls are served on the UI thread's Looper, outside a mirror pass (mirror.rs). There `invoke` runs the closure in place and GLib writes no wakeup (the thread owns the context),
-        // so the timer source it adds never reaches the mirror's timerfd sync and the tick never comes. The wakeup makes the Looper run a pass, which re-syncs.
-        self.context.wakeup();
     }
 }
 

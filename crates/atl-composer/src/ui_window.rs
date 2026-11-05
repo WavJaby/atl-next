@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. Its frame clock ticks the compositor ([`UiFrames::tick`], no clock thread) and its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's opening size (DisplayModel::opening_size) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds (task_bounds.rs).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's opening size (DisplayModel::opening_size) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,10 +13,12 @@ use atl_platform_ui::{
     WindowAttributes,
 };
 
+use atl_services::display_model::DisplayModel;
+
 use crate::host::UiFrames;
 use crate::input::Message;
 use crate::sink::fnv1a64;
-use crate::task_bounds::BoundsSender;
+use crate::task_sender::TaskSender;
 
 /// Set by the window gates: each settled picture is read back and logged (`atl-composer: ui: capture ...`). Unset in normal runs: a readback is a GPU render plus a download on the UI thread.
 const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
@@ -29,8 +31,8 @@ struct Session {
     frames: Arc<UiFrames>,
     input: Sender<Message>,
     size: PhysSize,
-    /// the window's size changes go here (Task bounds in the services)
-    bounds: Arc<BoundsSender>,
+    /// the window's size and monitor changes go here (the Task's bounds and the display in the services)
+    sender: Arc<TaskSender>,
     window: Option<Rc<PlatformWindow>>,
 }
 
@@ -44,7 +46,7 @@ pub fn install(
     frames: UiFrames,
     input: Sender<Message>,
     size: PhysSize,
-    bounds: Arc<BoundsSender>,
+    sender: Arc<TaskSender>,
 ) {
     SESSION.with(|cell| {
         *cell.borrow_mut() = Some(Session {
@@ -52,7 +54,7 @@ pub fn install(
             frames: Arc::new(frames),
             input,
             size,
-            bounds,
+            sender,
             window: None,
         });
     });
@@ -153,8 +155,23 @@ fn open() {
                 );
             }
         });
-        let sizes = Arc::clone(&session.bounds);
-        window.on_resize(move |size| sizes.submit(size));
+        let sizes = Arc::clone(&session.sender);
+        window.on_resize(move |size| sizes.submit_size(size));
+        // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)
+        let monitors = Arc::clone(&session.sender);
+        let frames = Arc::clone(&session.frames);
+        window.on_monitor(move |m| {
+            let model = DisplayModel::from_monitor(
+                m.size.width,
+                m.size.height,
+                m.refresh_hz,
+                m.scale.get(),
+            );
+            if frames.set_display(model) {
+                tracing::info!("atl-composer: ui: display {}", model.to_arg());
+            }
+            monitors.submit_display(model);
+        });
         window.request_frame();
         session.window = Some(window);
     });

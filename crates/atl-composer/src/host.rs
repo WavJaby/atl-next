@@ -66,10 +66,14 @@ impl Frame {
 pub struct UiFrames {
     composer: Arc<Composer>,
     frames: SyncSender<Frame>,
-    interval_ns: i64,
 }
 
 impl UiFrames {
+    /// The window's monitor as the display ([]); true when it changed.
+    pub fn set_display(&self, display: DisplayModel) -> bool {
+        self.composer.set_display(display)
+    }
+
     /// The window clock is on demand, as SurfaceFlinger's EventThread is for an app (it sends vsync only to a connection that asked, `requestNextVsync` / `setVsyncRate`; Choreographer asks per frame, `scheduleVsyncLocked`):
     /// `request` is called whenever a client asks for vsync or sends work (a transaction, a destroyed layer), from any thread, and the UI thread then asks its clock for a tick. Without it nothing ticks.
     pub fn set_frame_requester(&self, request: Box<dyn Fn() + Send + Sync>) {
@@ -85,7 +89,8 @@ impl UiFrames {
 
     /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread, then the calls are queued for the deliver thread (a release follows the scene that shows its buffer).
     pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene)) {
-        let frame = self.composer.tick(time_ns, self.interval_ns);
+        let interval_ns = clock::interval_ns(self.composer.display().refresh_hz);
+        let frame = self.composer.tick(time_ns, interval_ns);
         if let Some(scene) = &frame.scene {
             present(scene);
         }
@@ -215,7 +220,8 @@ pub struct Composer {
     /// UI mode's clock restart (UiFrames::set_frame_requester): what [`Composer::notify`] calls besides `wake`.
     ui_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
     stop: AtomicBool,
-    display: DisplayModel,
+    /// the monitor the window is on (UI mode follows it: []); headless keeps the one it starts with
+    display: Mutex<DisplayModel>,
     /// The token `getPhysicalDisplayToken` hands out: any binder, named by nothing.
     display_token: SpIBinder,
 }
@@ -295,7 +301,7 @@ impl Composer {
             wake: Condvar::new(),
             ui_wake: OnceLock::new(),
             stop: AtomicBool::new(false),
-            display: config.display,
+            display: Mutex::new(config.display),
             display_token,
         })
     }
@@ -313,9 +319,19 @@ impl Composer {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The display this compositor answers with.
+    /// The display this compositor answers with now.
     pub fn display(&self) -> DisplayModel {
-        self.display
+        *self.display.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The window moved to another monitor, or its monitor changed (UI mode): the display answered from now on and the frame interval the next ticks carry. True when it changed.
+    pub fn set_display(&self, display: DisplayModel) -> bool {
+        let mut current = self.display.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == display {
+            return false;
+        }
+        *current = display;
+        true
     }
 
     /// `getMaxAcquiredBufferCount`.
@@ -466,13 +482,13 @@ impl Composer {
         probe.on_frame_tick(FrameTick {
             vsync_id: st.next_vsync_id + 1,
             timestamp: monotonic_ns(),
-            interval: clock::interval_ns(self.display.refresh_hz),
+            interval: clock::interval_ns(self.display().refresh_hz),
         });
         probe
             .latest_vsync_event_data()
             .cloned()
             .unwrap_or_else(|| VsyncEventData {
-                frame_interval: clock::interval_ns(self.display.refresh_hz),
+                frame_interval: clock::interval_ns(self.display().refresh_hz),
                 preferred_frame_timeline_index: 0,
                 frame_timelines: Vec::new(),
                 number_queued_buffers: 0,
@@ -516,7 +532,6 @@ impl Composer {
         Ok(UiFrames {
             composer: Arc::clone(self),
             frames,
-            interval_ns: clock::interval_ns(self.display.refresh_hz),
         })
     }
 
@@ -529,7 +544,7 @@ impl Composer {
     }
 
     fn run(&self, frames: SyncSender<Frame>) {
-        let interval = clock::interval_ns(self.display.refresh_hz);
+        let interval = clock::interval_ns(self.display().refresh_hz);
         let origin = monotonic_ns();
         loop {
             {

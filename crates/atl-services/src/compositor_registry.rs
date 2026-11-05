@@ -17,6 +17,8 @@ pub const DESCRIPTOR: &str = "atl.ICompositorRegistry";
 pub const REGISTER: u32 = 1;
 /// The transaction a UI-mode app process sends when its window's content size changes: the Task's number (the one its UI agent was named, ui_agent.rs TASK), then width and height (i32, physical pixels). The caller's uid must own that Task (tasks.rs). Reply: a status only.
 pub const SET_BOUNDS: u32 = 2;
+/// The transaction a UI-mode app process sends when the monitor its window is on changes (another monitor, or its scale or mode): the monitor as Android's display, a String16 in the `--display` form (display_model.rs `DisplayModel::to_arg`). The caller's uid must own a Task (an app with a window). Reply: a status only.
+pub const SET_DISPLAY: u32 = 3;
 /// The system property libgui appends to both service names (patches/aosp/frameworks/native libgui: `composerServiceName`).
 pub const SUFFIX_PROPERTY: &str = "ro.atl.surfaceflinger.suffix";
 /// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is.

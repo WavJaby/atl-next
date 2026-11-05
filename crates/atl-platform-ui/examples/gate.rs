@@ -63,6 +63,9 @@ const STRIDE_PAD_PIXELS: u32 = 16;
 const PAD_BYTE: u8 = 0xEE;
 /// One `poll` waits at most this long when nothing is ready.
 const PASS: Duration = Duration::from_millis(20);
+/// Phase 1b: ticks asked for one at a time with nothing presented (the idle timer paces each after the first), and how long each may take: a 60 Hz grid tick is due within 17 ms, so 1 s only fails a tick that never comes.
+const IDLE_TICKS: u32 = 3;
+const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
 const COMPOSITE_FRAMES: [u32; 5] = [100, 101, 102, 103, 104];
 
@@ -422,6 +425,21 @@ fn main() -> Result<()> {
     if let Some(e) = failure.borrow().as_ref() {
         bail!("{e}");
     }
+
+    // phase 1b: ticks requested from outside a mirror pass, as the app's vsync request comes from Java on the Looper. After a tick that presented nothing the idle timer paces the next, and its timeout reaches the Looper only through the mirror's resync: without it no tick comes.
+    let idle = Rc::new(Cell::new(0u32));
+    {
+        let idle = Rc::clone(&idle);
+        window.on_tick(move |_| idle.set(idle.get() + 1));
+    }
+    for want in 1..=IDLE_TICKS {
+        window.request_frame();
+        let wait = Instant::now() + IDLE_WAIT;
+        while idle.get() < want && Instant::now() < wait {
+            looper.poll(PASS)?;
+        }
+    }
+    emit(format_args!("IDLE_TICKS {}", idle.get()));
 
     // phase 2: the composite scene
     let (_fds, scene) = composite_scene(args.width, args.height)?;
