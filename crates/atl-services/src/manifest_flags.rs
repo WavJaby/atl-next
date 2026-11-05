@@ -213,6 +213,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), *v))
                 .collect(),
             activities: vec![],
+            receivers: vec![],
             requested_permissions: vec![],
             permissions: Vec::new(),
             libraries: vec![],

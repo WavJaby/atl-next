@@ -10,7 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use atl_services::packages::{
-    ActivityDecl, InstrumentationDecl, Manifest, MetaValue, PermissionDecl, UsesLibrary,
+    ActivityDecl, InstrumentationDecl, IntentFilterDecl, Manifest, MetaValue, PermissionDecl,
+    ReceiverDecl, UsesLibrary,
 };
 
 use crate::host_art;
@@ -253,6 +254,43 @@ fn is_launcher(element: &Element) -> bool {
     })
 }
 
+/// An `<intent-filter>` (ParsedIntentInfoUtils.parseIntentInfo, reduced): `<action>`, `<category>`, `<data android:scheme / android:mimeType>`; a kind the filter does not write stays None (IntentFilter's null list).
+fn intent_filter(f: &Element) -> IntentFilterDecl {
+    let names = |kind: &str, attr: &str| -> Option<Vec<String>> {
+        let v: Vec<String> = f
+            .children(kind)
+            .filter_map(|e| e.attr(attr).map(str::to_owned))
+            .collect();
+        (!v.is_empty()).then_some(v)
+    };
+    IntentFilterDecl {
+        actions: names("action", "name").unwrap_or_default(),
+        categories: names("category", "name"),
+        schemes: names("data", "scheme"),
+        types: names("data", "mimeType"),
+    }
+}
+
+/// Every `<receiver>` of `application`, in manifest order (ParsedActivityUtils.parseReceiver): `exported` unwritten = it has an intent filter.
+fn receivers(application: Option<&Element>, package: &str) -> Vec<ReceiverDecl> {
+    application
+        .into_iter()
+        .flat_map(|a| a.children("receiver"))
+        .filter_map(|r| {
+            let filters: Vec<IntentFilterDecl> =
+                r.children("intent-filter").map(intent_filter).collect();
+            Some(ReceiverDecl {
+                name: resolve_class(package, r.attr("name")?),
+                exported: r.bool_attr("exported", !filters.is_empty()),
+                enabled: r.bool_attr("enabled", true),
+                permission: r.attr("permission").map(str::to_owned),
+                process: process_attr(r, package),
+                filters,
+            })
+        })
+        .collect()
+}
+
 pub fn parse(text: &str) -> Result<Manifest> {
     let root = parse_tree(text)?;
     if root.name != "manifest" {
@@ -349,6 +387,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
         permissions: permissions(&root)?,
+        receivers: receivers(application, package),
         requested_permissions: root
             .children("uses-permission")
             .filter_map(|e| e.attr("name").map(str::to_owned))
@@ -646,6 +685,59 @@ mod tests {
         assert_eq!(m.activities[0].theme, 0x0103_012a);
         assert_eq!(m.activities[1].theme, 0);
         assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
+    }
+
+    /// `<receiver>`: exported unwritten = has a filter (ParsedActivityUtils:495-507), written wins; permission, process, filter parts as written, unwritten kinds None.
+    #[test]
+    fn receivers_follow_parse_receiver() {
+        let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
+  E: manifest (line=3)
+    A: package="com.example.r" (Raw: "com.example.r")
+      E: application (line=7)
+          E: receiver (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Plain" (Raw: ".Plain")
+          E: receiver (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Filtered" (Raw: ".Filtered")
+            A: http://schemas.android.com/apk/res/android:permission(0x01010006)="p.X" (Raw: "p.X")
+            A: http://schemas.android.com/apk/res/android:process(0x01010011)=":bg" (Raw: ":bg")
+              E: intent-filter (line=10)
+                  E: action (line=11)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="a.B" (Raw: "a.B")
+                  E: data (line=12)
+                    A: http://schemas.android.com/apk/res/android:scheme(0x01010027)="package" (Raw: "package")
+          E: receiver (line=13)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Closed" (Raw: ".Closed")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
+              E: intent-filter (line=14)
+                  E: action (line=15)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="a.C" (Raw: "a.C")
+"#;
+        let m = parse(text).expect("parse");
+        let shape: Vec<(&str, bool)> = m
+            .receivers
+            .iter()
+            .map(|r| (r.name.as_str(), r.exported))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("com.example.r.Plain", false),
+                ("com.example.r.Filtered", true),
+                ("com.example.r.Closed", false)
+            ]
+        );
+        let f = &m.receivers[1];
+        assert_eq!(f.permission.as_deref(), Some("p.X"));
+        assert_eq!(f.process.as_deref(), Some("com.example.r:bg"));
+        assert_eq!(
+            f.filters,
+            [IntentFilterDecl {
+                actions: vec!["a.B".into()],
+                categories: None,
+                schemes: Some(vec!["package".into()]),
+                types: None,
+            }]
+        );
     }
 
     /// An enabled MAIN + LAUNCHER `<activity-alias>` makes its target the launcher (the Fossify Calculator's launcher icons: 18 disabled aliases, one enabled, all to SplashActivity); a disabled alias counts for nothing.

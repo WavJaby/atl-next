@@ -10,6 +10,7 @@ mod app;
 mod arches;
 mod atld_run;
 mod binder;
+mod broadcast;
 mod build_pool;
 mod build_state;
 mod cdylib;
@@ -195,6 +196,10 @@ enum Test {
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
     App(app::Args),
+    /// Broadcast delivery P1: two fixture apps (xtask/testdata/broadcast) under atld; a runtime receiver, a sticky returned and replayed, an explicit manifest receiver cold-started headless, a denied sticky send, an unexported receiver skipped.
+    ///
+    /// Each check prints pass / FAIL; the services' counters are printed either way, the logs' tails on failure.
+    Broadcast(broadcast::Args),
     /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
     ///
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
@@ -296,6 +301,9 @@ fn main() -> Result<ExitCode> {
             test: Test::App(args),
         } => app::run(&root, &args),
         Command::Test {
+            test: Test::Broadcast(args),
+        } => broadcast::run(&root, &args),
+        Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
         Command::Test {
@@ -347,6 +355,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",
             Test::App(_) => "app",
+            Test::Broadcast(_) => "broadcast",
             Test::Instrument(_) => "instrument",
             Test::Cts(_) => "cts",
             Test::Composer(_) => "composer",

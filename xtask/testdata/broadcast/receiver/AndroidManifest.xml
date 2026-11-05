@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test broadcast`: the app with only a manifest receiver, no activity; it does not request BROADCAST_STICKY. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlbcastrecv"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL broadcast receiver">
+        <receiver android:name=".Recv" android:exported="true" />
+    </application>
+</manifest>

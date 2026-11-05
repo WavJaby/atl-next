@@ -376,6 +376,7 @@ mod tests {
             application_meta_data: vec![],
             application_booleans: std::collections::BTreeMap::new(),
             activities: Vec::new(),
+            receivers: Vec::new(),
             requested_permissions: Vec::new(),
             permissions: Vec::new(),
             libraries: Vec::new(),

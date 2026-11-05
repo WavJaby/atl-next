@@ -2,8 +2,9 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java, frameworks/base/services/core/java/com/android/server/am/ProcessList.java, frameworks/base/services/core/java/com/android/server/am/InstrumentationReporter.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderHelper.java, frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java, frameworks/base/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java, frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java
 //! IActivityManager + the ActivityTaskManager launch path + IActivityClientController, subset: a process the services started attaches (attachApplication -> bindApplication), finishes attaching
 //! (finishAttachApplication -> scheduleTransaction([LaunchActivityItem, ResumeActivityItem]) of its launcher activity), asks for the settings provider (getContentProvider) and its display (getDisplayId);
-//! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process), and the broadcast calls a test runner makes
-//! (broadcastIntentWithFeature, registerReceiverWithFeature: validated as AOSP does, then nothing is delivered).
+//! instrumentation runs (startInstrumentation, addInstrumentationResults, finishInstrumentation, a crash or kill of the instrumented process), and broadcasts, P1 (BroadcastController's IActivityManager
+//! half: registerReceiverWithFeature / unregisterReceiver, non-ordered broadcastIntentWithFeature to registered receivers and explicit-component manifest receivers, stickies, unbroadcastIntent;
+//! the rules are broadcast.rs, the sends broadcast_queue.rs). A manifest receiver whose process is not running gets it started headless (no activity launch); its deliveries wait for the attach.
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); a crash report (handleApplicationCrash) is logged; every other method is counted unimplemented (counters).
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
@@ -45,6 +46,8 @@ use binder::{
 };
 
 use crate::activity_task::ActivityTasks;
+use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
+use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
@@ -102,6 +105,16 @@ const INSTR_FLAG_ALWAYS_CHECK_SIGNATURE: i32 = 1 << 4;
 /// UserHandle.USER_CURRENT / USER_SYSTEM: `am instrument` sends USER_CURRENT, which UserController.handleIncomingUser resolves to the current user, always 0 here.
 const USER_CURRENT: i32 = -2;
 const USER_SYSTEM: i32 = 0;
+/// UserHandle.USER_CURRENT_OR_SELF.
+const USER_CURRENT_OR_SELF: i32 = -3;
+
+/// UserController.handleIncomingUser for the one user: the current-user aliases resolve to USER_SYSTEM; USER_ALL and explicit users stay.
+fn incoming_user(user_id: i32) -> i32 {
+    match user_id {
+        USER_CURRENT | USER_CURRENT_OR_SELF => USER_SYSTEM,
+        u => u,
+    }
+}
 
 /// Configuration.ORIENTATION_PORTRAIT / ORIENTATION_LANDSCAPE (Configuration.java:713-714) and DisplayMetrics.DENSITY_DEFAULT (160): the density a dpi is measured against.
 const ORIENTATION_PORTRAIT: i32 = 1;
@@ -310,6 +323,8 @@ struct ProcessRecord {
     launch_activity: bool,
     /// ProcessRecord.getActiveInstrumentation
     instr: Option<ActiveInstrumentation>,
+    /// finishAttachApplication handed its waiting broadcasts to the sender (BroadcastQueueImpl.onApplicationAttachedLocked); until then deliveries queue
+    broadcasts_attached: bool,
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -325,6 +340,51 @@ struct State {
     proc_start_seq_counter: i64,
     /// ActivityManagerService.mApplicationSharedMemoryReadOnlyFd's region
     shared_memory: Option<ApplicationSharedMemory>,
+    /// BroadcastController's registrations and stickies, and the deliveries waiting for a process to attach
+    broadcasts: Broadcasts<ReceiverHandle, Intent, Job>,
+}
+
+/// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`).
+#[derive(Clone)]
+struct ReceiverHandle(Strong<dyn IIntentReceiver>);
+
+impl PartialEq for ReceiverHandle {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.as_binder() == o.0.as_binder()
+    }
+}
+
+/// What the broadcast rules read of an Intent (broadcast::IntentKey); the categories as a set. resolvedType falls back to the Intent's own type (Intent.resolveTypeIfNeeded without a resolver).
+fn intent_key(intent: &Intent, resolved_type: Option<&str>) -> IntentKey {
+    let mut categories: Vec<String> = intent.categories.iter().flatten().cloned().collect();
+    categories.sort();
+    categories.dedup();
+    IntentKey {
+        action: intent.action.clone(),
+        data: intent.data.clone(),
+        r#type: intent.r#type.clone(),
+        identifier: intent.identifier.clone(),
+        package: intent.package.clone(),
+        component: intent
+            .component
+            .as_ref()
+            .map(|c| (c.package.clone(), c.class.clone())),
+        categories,
+        resolved_type: resolved_type
+            .map(str::to_owned)
+            .or_else(|| intent.r#type.clone()),
+    }
+}
+
+/// A registered IntentFilter in the rules' form: actions, categories, schemes, types (mDataTypes).
+fn filter_of(f: &IntentFilter) -> broadcast::Filter {
+    let flat = |v: &Vec<Option<String>>| v.iter().flatten().cloned().collect::<Vec<_>>();
+    broadcast::Filter {
+        actions: flat(&f.actions),
+        categories: f.categories.as_ref().map(flat),
+        schemes: f.data_schemes.as_ref().map(flat),
+        types: f.data_types.as_ref().map(flat),
+    }
 }
 
 /// InstrumentationReporter.Report: a status or the final report for a watcher.
@@ -409,6 +469,8 @@ struct Inner {
     tasks: Arc<Tasks<SpIBinder>>,
     /// what each activity reported (ReportedBuckets), shared with the activity client controller
     buckets: Arc<ReportedBuckets>,
+    /// the broadcast sender thread (broadcast_queue.rs)
+    broadcast_queue: broadcast_queue::Queue,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -466,6 +528,7 @@ impl ActivityManager {
                     settings: settings::new_binder(),
                     tasks,
                     buckets,
+                    broadcast_queue: broadcast_queue::Queue::new(),
                 }
             }),
         }
@@ -687,6 +750,7 @@ impl Inner {
             attached: None,
             launch_activity,
             instr,
+            broadcasts_attached: false,
         });
         Ok(())
     }
@@ -763,6 +827,7 @@ impl Inner {
         let mut pids = Vec::new();
         for mut rec in stopped {
             pids.push(rec.pid);
+            Self::broadcasts_died(st, rec.pid);
             if let Some(instr) = rec.instr.take() {
                 // the process is being killed with its package: the same CANCELED a crash reports (no further force stop: the package's processes are all gone)
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
@@ -836,6 +901,7 @@ impl Inner {
             if let Some(a) = &rec.attached {
                 self.atm.process_died(&a.thread.as_binder());
             }
+            Self::broadcasts_died(&mut st, pid);
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -858,6 +924,142 @@ impl Inner {
             }
         };
         self.kill(&pids);
+    }
+
+    /// BroadcastQueueImpl.onApplicationCleanupLocked + the ReceiverList cleanup of a dead process: its registrations and waiting deliveries go; dropped deliveries are counted.
+    fn broadcasts_died(st: &mut State, pid: i32) {
+        for _ in 0..st.broadcasts.process_died(pid) {
+            counters::count(AM, "broadcast dropped: its process died before attaching");
+        }
+    }
+
+    /// checkPermission(permission, pid, uid) against the uid's install-time grants.
+    fn holds(&self, uid: u32, perm: &str) -> bool {
+        self.permissions.check(uid, Some(perm))
+    }
+
+    /// The thread of `pid` once finishAttachApplication drained its waiting deliveries; None before.
+    fn thread_of(st: &State, pid: i32) -> Option<Strong<dyn IApplicationThread>> {
+        st.processes
+            .iter()
+            .find(|r| r.pid == pid && r.broadcasts_attached)
+            .and_then(|r| r.attached.as_ref().map(|a| a.thread.clone()))
+    }
+
+    /// One delivery for process `pid`: to the sender when it has attached, else queued until it does (BroadcastProcessQueue's pending cold start).
+    fn deliver_locked(&self, st: &mut State, pid: i32, job: Job) {
+        match Self::thread_of(st, pid) {
+            Some(thread) => self.broadcast_queue.enqueue(thread, job),
+            None => st.broadcasts.push_pending(pid, job),
+        }
+    }
+
+    /// The manifest receiver of an explicit-component broadcast (broadcastIntentLocked's collectReceiverComponents for a component, :1966-1982, then BroadcastSkipPolicy.shouldSkip and
+    /// BroadcastQueueImpl.scheduleReceiverColdLocked:992 / Warm:1066): its process, started headless when not running (`launch_activity` false), gets scheduleReceiver.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_to_component_locked(
+        &self,
+        st: &mut State,
+        intent: &Intent,
+        package: &str,
+        class: &str,
+        sender_uid: u32,
+        required: &[String],
+        result: (i32, Option<String>, Option<Bundle>),
+        user: i32,
+    ) {
+        let Some(p) = self.packages.by_name(package) else {
+            counters::count(
+                AM,
+                "broadcast to a component of an unknown package: no receiver",
+            );
+            return;
+        };
+        let Some(decl) = p.receivers.iter().find(|r| r.name == class && r.enabled) else {
+            counters::count(
+                AM,
+                "broadcast to a component that is no enabled <receiver>: no receiver",
+            );
+            return;
+        };
+        let component = format!("{package}/{class}");
+        let target = broadcast::ManifestReceiver {
+            component: &component,
+            permission: decl.permission.as_deref(),
+            exported: decl.exported,
+            uid: p.uid,
+        };
+        if let Some(why) = broadcast::skip_manifest(
+            &target,
+            sender_uid,
+            required,
+            |perm| self.holds(sender_uid, perm),
+            |perm| self.holds(p.uid, perm),
+        ) {
+            counters::count(
+                AM,
+                "broadcast skipped: Permission Denial (manifest receiver)",
+            );
+            log(format_args!("{why}"));
+            return;
+        }
+        let process_name = decl
+            .process
+            .as_deref()
+            .unwrap_or(p.process_name())
+            .to_owned();
+        let mut info = ActivityInfo {
+            component: ComponentInfo {
+                item: PackageItemInfo {
+                    name: Some(decl.name.clone()),
+                    package_name: Some(p.name.clone()),
+                    ..Default::default()
+                },
+                application_info: package::application_info(p, &self.packages),
+                process_name: Some(process_name.clone()),
+                enabled: true,
+                exported: decl.exported,
+                ..Default::default()
+            },
+            permission: decl.permission.clone(),
+            ..Default::default()
+        };
+        info.component.application_info.uid = p.uid as i32;
+        // the receiver's Intent carries its component (BroadcastRecord.getReceiverIntent: setComponent for a ResolveInfo)
+        let mut receiver_intent = intent.clone();
+        receiver_intent.component = Some(ComponentName {
+            package: p.name.clone(),
+            class: decl.name.clone(),
+        });
+        let job = Job::Manifest {
+            intent: receiver_intent,
+            info: Box::new(info),
+            result_code: result.0,
+            data: result.1,
+            extras: result.2,
+            user,
+        };
+        let running = st
+            .processes
+            .iter()
+            .find(|r| r.process_name == process_name && r.uid == p.uid)
+            .map(|r| r.pid);
+        let pid = match running {
+            Some(pid) => pid,
+            None => {
+                if let Err(e) = self.start_process_locked(st, p, &process_name, false, None) {
+                    // BroadcastQueueImpl:1037-1050: the start failed, the delivery fails
+                    counters::count(AM, "broadcast dropped: receiver process start failed");
+                    log(format_args!(
+                        "Unable to launch app {process_name} for broadcast {component}: {e}"
+                    ));
+                    return;
+                }
+                counters::count(AM, "broadcast cold start (scheduleReceiverColdLocked)");
+                st.processes.last().map(|r| r.pid).unwrap_or_default()
+            }
+        };
+        self.deliver_locked(st, pid, job);
     }
 
     /// getRecordForAppLOSP (:3369): the attached process whose IApplicationThread is `thread`.
@@ -1111,19 +1313,28 @@ impl IActivityManager for ActivityManager {
             return Ok(());
         };
         let (package, launch) = (rec.package.clone(), rec.launch_activity);
-        let thread = rec.attached.as_ref().map(|a| a.thread.clone());
-        let (Some(thread), true) = (thread, launch) else {
+        let Some(thread) = rec.attached.as_ref().map(|a| a.thread.clone()) else {
             return Ok(());
         };
         drop(st);
-        let Some(p) = inner.packages.by_name(&package) else {
-            return Ok(());
-        };
-        let Some(activity) = p.launch_activity() else {
-            return Ok(());
-        };
-        // the launch is the lifecycle's: a new Task, the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
-        inner.atm.launch_launcher(thread, uid, &package, activity);
+        if launch
+            && let Some(p) = inner.packages.by_name(&package)
+            && let Some(activity) = p.launch_activity()
+        {
+            // the launch is the lifecycle's: a new Task, the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
+            inner
+                .atm
+                .launch_launcher(thread.clone(), uid, &package, activity);
+        }
+        // :4933 mBroadcastQueue.onApplicationAttachedLocked, after the activity attach: the deliveries that waited for this process, in order
+        let mut st = inner.state();
+        for job in st.broadcasts.take_pending(pid) {
+            inner.broadcast_queue.enqueue(thread.clone(), job);
+        }
+        // from here deliveries go straight to the sender: none can pass the drained ones
+        if let Some(r) = st.processes.iter_mut().find(|r| r.pid == pid) {
+            r.broadcasts_attached = true;
+        }
         Ok(())
     }
 
@@ -1375,28 +1586,29 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.broadcastIntentWithFeature:14402 -> BroadcastController.broadcastIntentWithFeature:710-754: the Intent is verified as verifyBroadcastLocked does (:1878-1905: a null
-    /// Intent is a NullPointerException (`intent.getFlags()`), a file descriptor in the extras and FLAG_RECEIVER_BOOT_UPGRADE are IllegalArgumentExceptions), then broadcastIntentLocked would queue it for the
-    /// receivers. M2 / CTS minimum: no receiver is registered (registerReceiver is not implemented) and no manifest receiver is resolved, so every broadcast reaches nobody and the result is
-    /// BROADCAST_SUCCESS, as broadcastIntentLocked returns for a broadcast with no receivers; counted. Not modelled: the isolated-caller check (:715), the permission regimes of the options Bundle (:726),
-    /// the permission and app-op filters, sticky storage, the ordered result to `resultTo`.
+    /// Intent is a NullPointerException (`intent.getFlags()`), a file descriptor in the extras and FLAG_RECEIVER_BOOT_UPGRADE are IllegalArgumentExceptions), then broadcastIntentLocked:
+    /// a sticky is checked and stored (:1415-1495), an explicit component reaches its manifest receiver (:1516-1518, unless FLAG_RECEIVER_REGISTERED_ONLY), an intent without one the matching registered
+    /// receivers (:1520-1545); each passes BroadcastSkipPolicy (broadcast.rs) and is queued for its process (BroadcastQueueImpl, broadcast_queue.rs). Result BROADCAST_SUCCESS.
+    /// Not modelled, each counted when used: ordered delivery and `resultTo` (P2: sent unordered, no result), implicit manifest receivers (P2). Not modelled: the isolated-caller check (:715), the options
+    /// Bundle, excluded permissions / packages, app ops, protected-broadcast sender checks.
     fn r#broadcastIntentWithFeature(
         &self,
         _caller: Option<&Strong<dyn IApplicationThread>>,
         _calling_feature_id: Option<&str>,
         intent: Option<&Intent>,
-        _resolved_type: Option<&str>,
-        _result_to: Option<&Strong<dyn IIntentReceiver>>,
-        _result_code: i32,
-        _result_data: Option<&str>,
-        _result_extras: Option<&Bundle>,
-        _required_permissions: Option<&[Option<String>]>,
+        resolved_type: Option<&str>,
+        result_to: Option<&Strong<dyn IIntentReceiver>>,
+        result_code: i32,
+        result_data: Option<&str>,
+        result_extras: Option<&Bundle>,
+        required_permissions: Option<&[Option<String>]>,
         _excluded_permissions: Option<&[Option<String>]>,
         _excluded_packages: Option<&[Option<String>]>,
         _app_op: i32,
         _options: Option<&Bundle>,
-        _serialized: bool,
-        _sticky: bool,
-        _user_id: i32,
+        serialized: bool,
+        sticky: bool,
+        user_id: i32,
     ) -> binder::Result<i32> {
         let Some(intent) = intent else {
             return Err(Status::new_exception_str(
@@ -1412,27 +1624,189 @@ impl IActivityManager for ActivityManager {
                 "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
             ));
         }
-        counters::count(AM, "broadcastIntentWithFeature (no receivers: dropped)");
+        if serialized || result_to.is_some() {
+            counters::count(
+                AM,
+                "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
+            );
+        }
+        let inner = &self.inner;
+        let pid = ThreadState::get_calling_pid();
+        let uid = ThreadState::get_calling_uid();
+        let user = incoming_user(user_id);
+        let required: Vec<String> = required_permissions
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        if sticky {
+            let holds = inner.holds(uid, permission::BROADCAST_STICKY);
+            match broadcast::sticky_send(
+                holds,
+                pid,
+                uid,
+                !required.is_empty(),
+                intent.component.is_some(),
+            ) {
+                Ok(()) => {}
+                Err(StickyRefusal::Security(msg)) => {
+                    log(format_args!("{msg}"));
+                    return Err(security(&msg));
+                }
+                Err(StickyRefusal::CantHavePermission) => {
+                    log(format_args!(
+                        "Can't broadcast sticky intent and enforce permissions {required:?}"
+                    ));
+                    return Ok(broadcast::BROADCAST_STICKY_CANT_HAVE_PERMISSION);
+                }
+            }
+        }
+        let key = intent_key(intent, resolved_type);
+        let result = (
+            result_code,
+            result_data.map(str::to_owned),
+            result_extras.cloned(),
+        );
+        let mut st = inner.state();
+        if sticky {
+            st.broadcasts
+                .put_sticky(user, key.clone(), intent.clone(), uid);
+        }
+        let registered_only = intent.flags & broadcast::FLAG_RECEIVER_REGISTERED_ONLY != 0;
+        match &intent.component {
+            Some(c) if !registered_only => inner.deliver_to_component_locked(
+                &mut st,
+                intent,
+                &c.package,
+                &c.class,
+                uid,
+                &required,
+                result.clone(),
+                user,
+            ),
+            Some(_) => {}
+            None if !registered_only => {
+                counters::count(
+                    AM,
+                    "implicit broadcast: manifest receivers not resolved (P2)",
+                );
+            }
+            None => {}
+        }
+        if intent.component.is_none() {
+            for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
+                if let Some(why) = broadcast::skip_registered(
+                    &bf,
+                    uid,
+                    ruid,
+                    &required,
+                    |p| inner.holds(uid, p),
+                    |p| inner.holds(ruid, p),
+                ) {
+                    counters::count(AM, why.split(':').next().unwrap_or("skipped"));
+                    log(format_args!("{why}"));
+                    continue;
+                }
+                let job = Job::Registered {
+                    receiver: receiver.0,
+                    intent: intent.clone(),
+                    result_code: result.0,
+                    data: result.1.clone(),
+                    extras: result.2.clone(),
+                    initial_sticky: false,
+                    user,
+                };
+                inner.deliver_locked(&mut st, rpid, job);
+            }
+        }
         Ok(BROADCAST_SUCCESS)
     }
 
+    /// BroadcastController.unbroadcastIntent:1756-1790: the caller needs BROADCAST_STICKY (:1766-1772, SecurityException), then the sticky with an equal Intent (filterEquals) goes.
+    fn r#unbroadcastIntent(
+        &self,
+        _caller: Option<&Strong<dyn IApplicationThread>>,
+        intent: Option<&Intent>,
+        user_id: i32,
+    ) -> binder::Result<()> {
+        let pid = ThreadState::get_calling_pid();
+        let uid = ThreadState::get_calling_uid();
+        if !self.inner.holds(uid, permission::BROADCAST_STICKY) {
+            let msg = format!(
+                "Permission Denial: unbroadcastIntent() from pid={pid}, uid={uid} requires {}",
+                permission::BROADCAST_STICKY
+            );
+            log(format_args!("{msg}"));
+            return Err(security(&msg));
+        }
+        let Some(intent) = intent else {
+            return Ok(());
+        };
+        if intent.has_file_descriptors() {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
+        let key = intent_key(intent, None);
+        self.inner
+            .state()
+            .broadcasts
+            .remove_sticky(incoming_user(user_id), &key);
+        Ok(())
+    }
+
+    /// BroadcastController.unregisterReceiver:618 -> unregisterReceiverTraced:647: the receiver's registrations go (no current ordered broadcast exists to finish: P1 has none).
+    fn r#unregisterReceiver(
+        &self,
+        receiver: Option<&Strong<dyn IIntentReceiver>>,
+    ) -> binder::Result<()> {
+        if let Some(r) = receiver {
+            let removed = self
+                .inner
+                .state()
+                .broadcasts
+                .unregister(&ReceiverHandle(r.clone()));
+            if !removed {
+                counters::count(AM, "unregisterReceiver: not registered");
+            }
+        }
+        Ok(())
+    }
+
+    /// ActivityManagerService.finishReceiver: a manifest receiver of a non-ordered broadcast reports done (scheduleReceiver's assumeDelivered is false). Nothing waits on it in P1 (no timeouts, no
+    /// ordered queue): counted.
+    fn r#finishReceiver(
+        &self,
+        _who: Option<&SpIBinder>,
+        _result_code: i32,
+        _result_data: Option<&str>,
+        _map: Option<&Bundle>,
+        _abort_broadcast: bool,
+        _flags: i32,
+    ) -> binder::Result<()> {
+        counters::count(AM, "finishReceiver (non-ordered: nothing waits)");
+        Ok(())
+    }
+
     /// ActivityManagerService.registerReceiverWithFeature -> BroadcastController.registerReceiverWithFeature:249 -> registerReceiverWithFeatureTraced:296: the caller's process is looked up by its thread
-    /// (unknown: logged, null, :312-315); a caller package the process does not run is a SecurityException (:316-320; core uids, below 10000, are exempt: UserHandle.isCore). M2 / CTS minimum, the
-    /// counterpart of broadcastIntentWithFeature's: the registration is not kept (no broadcast is delivered to a registered receiver, so none is lost by that) and there is no sticky broadcast to answer
-    /// with, so the result is null; counted. The filter was decoded, so a filter with parts the codec does not model was refused before it got here.
+    /// (unknown: logged, null, :312-315); a caller package the process does not run is a SecurityException (:316-320; core uids, below 10000, are exempt: UserHandle.isCore). Then the export flags
+    /// (:428-472, broadcast::register_export), the matching stickies (:378-395, :474-509), the first of which is returned; a null receiver stops there (the sticky read). Else the registration is kept
+    /// (:530-579) and every matching sticky is queued to it as an initial sticky (:582-604); the first one the receiver may see (exported, or the sticky's sender is its uid / system) is returned.
+    /// The filter was decoded, so a filter with parts the codec does not model was refused before it got here. Not modelled: the protected-broadcast list (a missing export flag at targetSdk >= 34 is
+    /// counted, not refused), instant apps, MAX_RECEIVERS_ALLOWED_PER_APP, priorities.
     fn r#registerReceiverWithFeature(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
         caller_package: Option<&str>,
         _calling_feature_id: Option<&str>,
         _receiver_id: Option<&str>,
-        _receiver: Option<&Strong<dyn IIntentReceiver>>,
-        _filter: Option<&IntentFilter>,
-        _required_permission: Option<&str>,
-        _user_id: i32,
-        _flags: i32,
+        receiver: Option<&Strong<dyn IIntentReceiver>>,
+        filter: Option<&IntentFilter>,
+        required_permission: Option<&str>,
+        user_id: i32,
+        flags: i32,
     ) -> binder::Result<Option<Intent>> {
-        let st = self.inner.state();
+        let inner = &self.inner;
+        let mut st = inner.state();
         let Some(rec) = caller
             .and_then(|t| Inner::record_for_thread(&st, t))
             .and_then(|pid| st.processes.iter().find(|r| r.pid == pid))
@@ -1450,11 +1824,63 @@ impl IActivityManager for ActivityManager {
                 rec.process_name
             )));
         }
-        counters::count(
-            AM,
-            "registerReceiverWithFeature (registration not kept: no broadcast is delivered)",
-        );
-        Ok(None)
+        let (pid, uid, package) = (rec.pid, rec.uid, rec.package.clone());
+        let Some(filter) = filter else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("registerReceiver: null IntentFilter"),
+            ));
+        };
+        let target_sdk = inner.packages.by_name(&package).map_or(0, |p| p.target_sdk);
+        let export = broadcast::register_export(flags, receiver.is_some(), target_sdk)
+            .map_err(|m| illegal_argument(&m))?;
+        if export.flag_missing_unchecked {
+            counters::count(
+                AM,
+                "registerReceiver without RECEIVER_EXPORTED / NOT_EXPORTED at targetSdk >= 34 (protected-broadcast list not loaded: taken as exported)",
+            );
+        }
+        let user = incoming_user(user_id);
+        let filter = filter_of(filter);
+        let stickies = st.broadcasts.stickies(&filter, user);
+        let Some(receiver) = receiver else {
+            return Ok(stickies.into_iter().next().map(|s| s.intent));
+        };
+        let bf = BroadcastFilter {
+            filter,
+            package,
+            required_permission: required_permission.map(str::to_owned),
+            exported: export.exported,
+        };
+        let handle = ReceiverHandle(receiver.clone());
+        if !st
+            .broadcasts
+            .register(handle, pid, uid, user, bf)
+            .map_err(|m| illegal_argument(&m))?
+        {
+            counters::count(AM, "registerReceiver: filter already registered");
+        }
+        let mut first = None;
+        for s in stickies {
+            if first.is_none()
+                && (export.exported
+                    || s.calling_uid == uid
+                    || permission::is_system_or_root(s.calling_uid))
+            {
+                first = Some(s.intent.clone());
+            }
+            let job = Job::Registered {
+                receiver: receiver.clone(),
+                intent: s.intent,
+                result_code: 0,
+                data: None,
+                extras: None,
+                initial_sticky: true,
+                user: broadcast::USER_ALL,
+            };
+            inner.deliver_locked(&mut st, pid, job);
+        }
+        Ok(first)
     }
 }
 

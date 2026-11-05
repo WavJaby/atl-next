@@ -107,6 +107,9 @@ pub fn install_grants<'a>(
         .collect()
 }
 
+/// Manifest.permission.BROADCAST_STICKY: protectionLevel `normal` (core/res/AndroidManifest.xml:4917-4920) -> install-granted on request (`install_grants`).
+pub const BROADCAST_STICKY: &str = "android.permission.BROADCAST_STICKY";
+
 #[cfg(test)]
 mod tests {
     use super::*;

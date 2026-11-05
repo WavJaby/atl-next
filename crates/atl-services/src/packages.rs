@@ -55,6 +55,32 @@ pub struct ActivityDecl {
     pub meta_data: Vec<(String, MetaValue)>,
 }
 
+/// `<intent-filter>` of a component (ParsedIntentInfo's IntentFilter, reduced to what broadcast matching reads): actions, categories, `<data android:scheme>` and `<data android:mimeType>`.
+/// None = the filter names none (IntentFilter's null lists), which matchData treats differently from an empty list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentFilterDecl {
+    pub actions: Vec<String>,
+    pub categories: Option<Vec<String>>,
+    pub schemes: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
+}
+
+/// `<receiver>` (ParsedActivity built by ParsedActivityUtils.parseReceiver, reduced): class, exported, permission, process, filters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiverDecl {
+    /// `android:name`, resolved against the package name: the BroadcastReceiver class.
+    pub name: String,
+    /// `android:exported`; unwritten = whether it has an intent filter (ParsedActivityUtils: `exported` defaults to `intents.size() > 0`).
+    pub exported: bool,
+    /// `android:enabled` (default true).
+    pub enabled: bool,
+    /// `android:permission`: what a sender must hold (ActivityInfo.permission).
+    pub permission: Option<String>,
+    /// `android:process` resolved as the application's; None = the package's process.
+    pub process: Option<String>,
+    pub filters: Vec<IntentFilterDecl>,
+}
+
 /// What an APK's AndroidManifest.xml declares that the services use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -80,6 +106,9 @@ pub struct Manifest {
     pub application_booleans: BTreeMap<String, bool>,
     /// Every `<activity>`, in manifest order.
     pub activities: Vec<ActivityDecl>,
+    /// Every `<receiver>`, in manifest order.
+    #[serde(default)]
+    pub receivers: Vec<ReceiverDecl>,
     /// `<uses-permission android:name>`, in order.
     pub requested_permissions: Vec<String>,
     /// `<permission>` elements: the permissions the package defines (the platform's are framework-res's), the install-time grant rule's input (permission::install_grants).
@@ -303,6 +332,7 @@ mod tests {
                 application_meta_data: vec![],
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
+                receivers: vec![],
                 requested_permissions: vec![],
                 permissions: vec![],
                 libraries: vec![],
