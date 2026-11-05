@@ -24,7 +24,8 @@ import java.nio.ByteBuffer;
  * Layout: each widget's rectangle in the content (`layout`), the density. Software frame: `decor` drawn into a bitmap SETTLE_FRAMES after onResume, once the default-focus ripple has ended:
  * its FNV-1a 64 digest must equal the composer's first settled readback, and the text pixels inside the TextView and EditText are non-background (`pixels`).
  * Click: the Button's OnClickListener changes the TextView text, and the next layout differs inside the TextView (`changed`).
- * Focus: a touch on the EditText focuses it. Window: the focus starts a second activity (.Second, its own window and input channel), which finishes; a tap on the Button then still reaches Main (`click count=2`). List: a drag scrolls it (`list first`).
+ * Focus: a touch on the EditText focuses it. Window: the focus starts a second activity (.Second, its own window and input channel), which finishes; a tap on the Button then still reaches Main (`click count=2`).
+ * Hover and wheel reach the window as generic motion (`generic action=`); a wheel and a touchpad swipe scroll the list, the swipe flings (`list state=2`). List: a drag scrolls it (`list first= top=`), and its idle starts the cadence run.
  * When the scroll ends, the list redraws on FRAME_CALLBACKS frame callbacks (`frame`, the cadence gate: the window fixture's lines, under real redraws); the last one logs the `final frame`, the last readback's expectation.
  */
 public class Main extends Activity {
@@ -35,6 +36,8 @@ public class Main extends Activity {
     static final int SETTLE_FRAMES = 30;
     /** Frames after Main resumes again before the probe taps: 0.2 s at 60 Hz, past Second's destroy and window removal. */
     static final int BACK_FRAMES = 12;
+    /** MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE (API 34), written out. */
+    static final int CLASSIFICATION_TWO_FINGER_SWIPE = 3;
 
     private int frameCallbacks;
     private int settleFrames;
@@ -49,12 +52,24 @@ public class Main extends Activity {
     private boolean secondStarted;
     private int resumes;
     private int backFrames;
+    /** The last touch gesture was a touchpad swipe: its fling does not start the cadence run, the drag after it does. */
+    private boolean swipeGesture;
 
-    // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines)
+    // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines); `class` 3 = a touchpad swipe's fake finger (MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE)
     @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent e) {
-        Log.i(TAG, "touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY());
+        if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+            swipeGesture = e.getClassification() == CLASSIFICATION_TWO_FINGER_SWIPE;
+        }
+        Log.i(TAG, "touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY() + " class=" + e.getClassification());
         return super.dispatchTouchEvent(e);
+    }
+
+    // hover and wheel events (`generic action=` lines): HOVER_ENTER 9, HOVER_MOVE 7, HOVER_EXIT 10, SCROLL 8 with its AXIS_VSCROLL
+    @Override
+    public boolean dispatchGenericMotionEvent(android.view.MotionEvent e) {
+        Log.i(TAG, "generic action=" + e.getActionMasked() + " vscroll=" + e.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL) + " x=" + e.getX() + " y=" + e.getY());
+        return super.dispatchGenericMotionEvent(e);
     }
 
     @Override
@@ -76,7 +91,8 @@ public class Main extends Activity {
         list.setOnScrollListener(new AbsListView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(AbsListView view, int scrollState) {
-                if (scrollState == SCROLL_STATE_IDLE && view.getFirstVisiblePosition() > 0 && !cadenceStarted) {
+                Log.i(TAG, "list state=" + scrollState);
+                if (scrollState == SCROLL_STATE_IDLE && view.getFirstVisiblePosition() > 0 && !cadenceStarted && !swipeGesture) {
                     cadenceStarted = true;
                     postFrame();
                 }
@@ -84,7 +100,8 @@ public class Main extends Activity {
 
             @Override
             public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
-                Log.i(TAG, "list first=" + firstVisibleItem);
+                View top = view.getChildAt(0);
+                Log.i(TAG, "list first=" + firstVisibleItem + " top=" + (top == null ? 0 : top.getTop()));
             }
         });
         input.setOnFocusChangeListener(new View.OnFocusChangeListener() {

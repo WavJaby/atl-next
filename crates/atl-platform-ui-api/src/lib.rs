@@ -227,6 +227,10 @@ pub enum PointerPhase {
     Up(PointerButton),
     /// The pointer moved.
     Move,
+    /// The pointer came over the window content.
+    Enter,
+    /// The pointer left the window content; the position is the last one it had there.
+    Leave,
 }
 
 /// One pointer event.
@@ -240,6 +244,38 @@ pub struct PointerEvent {
     pub time_ms: u32,
 }
 
+/// What a scroll did. Deltas follow the toolkit's convention: positive scrolls toward the end of the content (down, right); the compositor has already applied the desktop's natural-scrolling setting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollKind {
+    /// A wheel turned, in notches (fractional for high-resolution wheels).
+    Wheel {
+        /// Horizontal notches.
+        dx: f64,
+        /// Vertical notches.
+        dy: f64,
+    },
+    /// Fingers moved on a touchpad (a continuous scroll), in physical pixels.
+    Swipe {
+        /// Horizontal distance.
+        dx: f64,
+        /// Vertical distance.
+        dy: f64,
+    },
+    /// The fingers of a [`ScrollKind::Swipe`] sequence lifted.
+    SwipeEnd,
+}
+
+/// One scroll event, at the pointer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollEvent {
+    /// What happened.
+    pub kind: ScrollKind,
+    /// The pointer position, in physical pixels of the window content.
+    pub position: PhysPoint,
+    /// Event time in milliseconds on the toolkit's clock.
+    pub time_ms: u32,
+}
+
 /// An input event of a window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
@@ -247,6 +283,8 @@ pub enum InputEvent {
     Pointer(PointerEvent),
     /// The window gained (`true`) or lost keyboard focus (the desktop's active toplevel). Android's window focus follows it; on loss, held keys are cancelled by their consumer.
     Focus(bool),
+    /// Wheel or touchpad scrolling.
+    Scroll(ScrollEvent),
 }
 
 /// The input of one window.

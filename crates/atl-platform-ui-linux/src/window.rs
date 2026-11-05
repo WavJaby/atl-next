@@ -60,6 +60,10 @@ struct Shared {
     /// The pending idle tick.
     idle_timer: RefCell<Option<glib::SourceId>>,
     stats: RefCell<pacing::TickStats>,
+    /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
+    pointer_at: Cell<(f64, f64)>,
+    /// A touchpad swipe is open: its end (GTK `scroll-end`) is reported; a wheel's is not.
+    swiping: Cell<bool>,
 }
 
 impl Shared {
@@ -135,11 +139,14 @@ impl GtkWindow {
             x: f64,
             y: f64,
         ) {
-            let scale = controller
-                .widget()
-                .and_then(|w| w.downcast::<SceneView>().ok())
-                .map_or(Scale::ONE, |v| v.scale());
-            let event = input::pointer(phase, x, y, scale, controller.current_event_time());
+            shared.pointer_at.set((x, y));
+            let event = input::pointer(
+                phase,
+                x,
+                y,
+                scale_of(controller),
+                controller.current_event_time(),
+            );
             shared.on_event.call(|f| f(event));
         }
         // button 0: every button
@@ -169,8 +176,56 @@ impl GtkWindow {
         let motion = gtk4::EventControllerMotion::new();
         let s = Rc::clone(shared);
         motion.connect_motion(move |c, x, y| emit(&s, c, PointerPhase::Move, x, y));
+        let s = Rc::clone(shared);
+        motion.connect_enter(move |c, x, y| emit(&s, c, PointerPhase::Enter, x, y));
+        let s = Rc::clone(shared);
+        motion.connect_leave(move |c| {
+            let (x, y) = s.pointer_at.get();
+            emit(&s, c, PointerPhase::Leave, x, y);
+        });
         view.add_controller(motion);
     }
+
+    /// Wheel and touchpad scrolling. Not KINETIC (Android flings itself from the swipe's own events, GestureConverter.cpp handleFling) and not DISCRETE (hi-res wheels report fractions).
+    /// The unit tells a wheel from fingers; GDK gives finger scrolling its own device, so `scroll-end` marks the fingers lifting (wl_pointer.axis_stop).
+    fn wire_scroll(view: &SceneView, shared: &Rc<Shared>) {
+        let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+        let s = Rc::clone(shared);
+        scroll.connect_scroll(move |c, dx, dy| {
+            let unit = match c.unit() {
+                gdk::ScrollUnit::Wheel => input::ScrollUnit::Wheel,
+                _ => input::ScrollUnit::Surface,
+            };
+            s.swiping.set(unit == input::ScrollUnit::Surface);
+            let event = input::scroll(
+                unit,
+                dx,
+                dy,
+                s.pointer_at.get(),
+                scale_of(c),
+                c.current_event_time(),
+            );
+            s.on_event.call(|f| f(event));
+            gtk4::glib::Propagation::Stop
+        });
+        let s = Rc::clone(shared);
+        scroll.connect_scroll_end(move |c| {
+            if s.swiping.replace(false) {
+                let event =
+                    input::swipe_end(s.pointer_at.get(), scale_of(c), c.current_event_time());
+                s.on_event.call(|f| f(event));
+            }
+        });
+        view.add_controller(scroll);
+    }
+}
+
+/// The scale of the controller's `SceneView` (1 before it is attached).
+fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
+    controller
+        .widget()
+        .and_then(|w| w.downcast::<SceneView>().ok())
+        .map_or(Scale::ONE, |v| v.scale())
 }
 
 impl Window for GtkWindow {
@@ -183,6 +238,8 @@ impl Window for GtkWindow {
             frame_requested: Cell::new(false),
             on_event: Slot::new(),
             on_resize: Slot::new(),
+            pointer_at: Cell::new((0.0, 0.0)),
+            swiping: Cell::new(false),
             presented: Cell::new(false),
             last_tick_us: Cell::new(None),
             idle_timer: RefCell::new(None),
@@ -192,6 +249,7 @@ impl Window for GtkWindow {
         let view = SceneView::new();
         Self::wire_frame_clock(&window, &shared);
         Self::wire_pointer(&view, &shared);
+        Self::wire_scroll(&view, &shared);
         // the monitor the window is on (wl_surface.enter): logged per entry; the idle pacing reads its rate (monitor_interval_us). Delivery to Android's display follows the services' live display (not built).
         window.connect_realize(|w| {
             if let Some(surface) = w.surface() {

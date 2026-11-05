@@ -61,10 +61,10 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         before != self.list.len()
     }
 
-    /// The window of a pointer event, given the buttons `held` before it: with none held the event starts a gesture (or is a hover) and goes to the top window, which the gesture keeps
-    /// until its last button is released (InputDispatcher's TouchState: later windows do not take a stream already going).
-    pub fn pointer_target(&mut self, held: i32) -> Option<(&K, &mut C)> {
-        if held == 0 {
+    /// The window of a pointer event, given whether a gesture (button held, swipe going) was open before it: without one the event starts a gesture (or is a hover or wheel) and goes to the top window,
+    /// which the gesture keeps until it ends (InputDispatcher's TouchState: later windows do not take a stream already going).
+    pub fn pointer_target(&mut self, in_gesture: bool) -> Option<(&K, &mut C)> {
+        if !in_gesture {
             self.gesture = self.list.last().map(|(k, _)| k.clone());
         }
         let key = self.gesture.as_ref()?;
@@ -133,40 +133,7 @@ impl InputSource for HeadlessInput {
     }
 }
 
-/// MotionEvent.BUTTON_PRIMARY, _SECONDARY, _TERTIARY, _BACK, _FORWARD (NDK input.h: one bit each).
-#[cfg(any(feature = "converter", test))]
-const BUTTON_PRIMARY: i32 = 1 << 0;
-#[cfg(any(feature = "converter", test))]
-const BUTTON_SECONDARY: i32 = 1 << 1;
-#[cfg(any(feature = "converter", test))]
-const BUTTON_TERTIARY: i32 = 1 << 2;
-#[cfg(any(feature = "converter", test))]
-const BUTTON_BACK: i32 = 1 << 3;
-#[cfg(any(feature = "converter", test))]
-const BUTTON_FORWARD: i32 = 1 << 4;
-
-/// The bit of `button` in a MotionEvent's button state. GDK numbers 8 and 9 are back and forward (X11 convention); other buttons have no bit.
-#[cfg(any(feature = "converter", test))]
-fn button_bit(button: PointerButton) -> i32 {
-    match button {
-        PointerButton::Primary => BUTTON_PRIMARY,
-        PointerButton::Secondary => BUTTON_SECONDARY,
-        PointerButton::Middle => BUTTON_TERTIARY,
-        PointerButton::Other(8) => BUTTON_BACK,
-        PointerButton::Other(9) => BUTTON_FORWARD,
-        PointerButton::Other(_) => 0,
-    }
-}
-
-/// The buttons held after `phase`: a press adds its button, a release removes it, a move keeps the set.
-#[cfg(any(feature = "converter", test))]
-fn held_after(held: i32, phase: PointerPhase) -> i32 {
-    match phase {
-        PointerPhase::Down(button) => held | button_bit(button),
-        PointerPhase::Up(button) => held & !button_bit(button),
-        PointerPhase::Move => held,
-    }
-}
+pub mod pointer;
 
 #[cfg(feature = "converter")]
 pub use publish::spawn;
@@ -181,63 +148,52 @@ mod publish {
     use std::time::Instant;
 
     use atl_libinput::{MotionEvent, Pointer, Publisher};
-    use atl_platform_ui::{InputEvent, InputSource, PointerEvent, PointerPhase};
+    use atl_platform_ui::{InputEvent, InputSource, PointerEvent};
     use binder::SpIBinder;
 
-    use super::{HeadlessInput, Message, Step, Windows, held_after};
+    use super::pointer::{self, Motion};
+    use super::{HeadlessInput, Message, Step, Windows};
 
-    /// MotionEvent.ACTION_DOWN, ACTION_UP, ACTION_MOVE (MotionEvent.java).
-    const ACTION_DOWN: i32 = 0;
-    const ACTION_UP: i32 = 1;
-    const ACTION_MOVE: i32 = 2;
-    /// InputDevice.SOURCE_MOUSE: a pointer device. Its DOWN/MOVE/UP reach View.onTouchEvent through View.dispatchPointerEvent.
-    const SOURCE_MOUSE: i32 = 0x0000_2002;
-    /// MotionEvent.TOOL_TYPE_MOUSE (NDK input.h AMOTION_EVENT_TOOL_TYPE_MOUSE = 3).
-    const TOOL_TYPE_MOUSE: i32 = 3;
-    /// The headless pointer device and the default display.
+    /// The pointer device (atl-services input.rs) and the default display.
     const DEVICE_ID: i32 = 1;
     const DISPLAY_ID: i32 = 0;
-    /// The script's one pointer.
+    /// The one pointer's id.
     const POINTER_ID: i32 = 0;
-    /// Event times are AOSP's ns, the script's are ms.
+    /// Event times are AOSP's ns, the platform's are ms.
     const NANOS_PER_MS: i64 = 1_000_000;
     /// The channel's name in AOSP's logs.
     const CHANNEL: &str = "atl-headless-pointer";
 
-    /// The MotionEvent of `e` as event `seq`: one pointer at its position, identity transform. `down_ms` is the gesture's down time, carried by every event of it; `buttons` the buttons held after `e`.
-    fn motion(e: &PointerEvent, seq: u32, down_ms: u32, buttons: i32) -> MotionEvent {
-        let action = match e.phase {
-            PointerPhase::Down(_) => ACTION_DOWN,
-            PointerPhase::Up(_) => ACTION_UP,
-            PointerPhase::Move => ACTION_MOVE,
-        };
+    /// `m` as the MotionEvent numbered `seq`: one pointer, identity transform.
+    fn motion(m: &Motion, seq: u32) -> MotionEvent {
         MotionEvent {
             seq,
             event_id: i32::try_from(seq).unwrap_or(i32::MAX),
             device_id: DEVICE_ID,
-            source: SOURCE_MOUSE,
+            source: m.source,
             display_id: DISPLAY_ID,
-            action,
-            action_button: 0,
-            flags: 0,
+            action: m.action,
+            action_button: m.action_button,
+            flags: m.flags,
             edge_flags: 0,
+            // no keyboard yet: no modifier can be down (the keys step publishes the meta state)
             meta_state: 0,
-            button_state: buttons,
-            classification: 0,
+            button_state: m.button_state,
+            classification: m.classification,
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             x_precision: 1.0,
             y_precision: 1.0,
             // a mouse hit-tests at the cursor (MotionEvent.getXDispatchLocation); its NaN check is `!=`, always true, so NaN hits no child
-            x_cursor: e.position.x as f32,
-            y_cursor: e.position.y as f32,
-            down_time: i64::from(down_ms) * NANOS_PER_MS,
-            event_time: i64::from(e.time_ms) * NANOS_PER_MS,
+            x_cursor: m.cursor.x as f32,
+            y_cursor: m.cursor.y as f32,
+            down_time: i64::from(m.down_ms) * NANOS_PER_MS,
+            event_time: i64::from(m.time_ms) * NANOS_PER_MS,
             pointers: vec![Pointer {
                 id: POINTER_ID,
-                tool_type: TOOL_TYPE_MOUSE,
-                x: e.position.x as f32,
-                y: e.position.y as f32,
-                axes: Vec::new(),
+                tool_type: m.tool_type,
+                x: m.at.x as f32,
+                y: m.at.y as f32,
+                axes: m.axes.clone(),
             }],
         }
     }
@@ -250,60 +206,56 @@ mod publish {
     /// AOSP's `DEAD_OBJECT` (= `-EPIPE`, utils/Errors.h): InputPublisher's status when the window's end of the channel is closed.
     const DEAD_OBJECT: i32 = -32;
 
-    /// The dispatch state: the windows' publishers by channel token, the gesture's down time, the last seq, the held buttons.
+    /// The dispatch state: the windows' publishers by channel token, the pointer, the last seq.
     #[derive(Default)]
     struct State {
         windows: RefCell<Windows<SpIBinder, Publisher>>,
-        down_ms: Cell<u32>,
+        pointer: RefCell<pointer::Pointer>,
         seq: Cell<u32>,
-        buttons: Cell<i32>,
     }
 
-    /// Publishes one injected event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
+    /// Publishes the MotionEvents of one event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
     /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
-        // focus is published per window by the per-window dispatcher (plan 8a), not by this single-channel path
-        let InputEvent::Pointer(e) = event else {
+        let mut pointer = state.pointer.borrow_mut();
+        let in_gesture = pointer.in_gesture();
+        let motions = pointer.translate(event);
+        if motions.is_empty() {
             return;
-        };
-        if matches!(e.phase, PointerPhase::Down(_)) {
-            state.down_ms.set(e.time_ms);
         }
-        let seq = next_seq(state.seq.get());
-        state.seq.set(seq);
-        let held = state.buttons.get();
-        let buttons = held_after(held, e.phase);
-        state.buttons.set(buttons);
-        let event_motion = motion(&e, seq, state.down_ms.get(), buttons);
         let mut windows = state.windows.borrow_mut();
-        let Some((token, publisher)) = windows.pointer_target(held) else {
-            tracing::warn!("input: no window takes event {seq}, dropped");
+        let Some((token, publisher)) = windows.pointer_target(in_gesture) else {
+            tracing::warn!("input: no window takes {} event(s), dropped", motions.len());
             return;
         };
-        if let Err(err) = publisher.publish_motion(&event_motion) {
-            tracing::warn!("input: publishing event {seq}: {err:?}");
-            if matches!(
-                err,
-                atl_libinput::Error::Status {
-                    status: DEAD_OBJECT,
-                    ..
+        for m in &motions {
+            let seq = next_seq(state.seq.get());
+            state.seq.set(seq);
+            if let Err(err) = publisher.publish_motion(&motion(m, seq)) {
+                tracing::warn!("input: publishing event {seq}: {err:?}");
+                if matches!(
+                    err,
+                    atl_libinput::Error::Status {
+                        status: DEAD_OBJECT,
+                        ..
+                    }
+                ) {
+                    let token = token.clone();
+                    windows.remove(&token);
                 }
-            ) {
-                let token = token.clone();
-                windows.remove(&token);
+                return;
             }
-            return;
         }
         loop {
             match publisher.receive_finished() {
                 Ok(Some(finished)) => tracing::debug!(
-                    "headless pointer: finished seq {} handled {}",
+                    "input: finished seq {} handled {}",
                     finished.seq,
                     finished.handled
                 ),
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::warn!("headless pointer: finished signal: {err:?}");
+                    tracing::warn!("input: finished signal: {err:?}");
                     break;
                 }
             }
@@ -354,7 +306,7 @@ mod publish {
 
     #[cfg(test)]
     mod tests {
-        use atl_platform_ui::{PhysPoint, PointerButton};
+        use atl_platform_ui::PhysPoint;
 
         use super::*;
 
@@ -364,24 +316,37 @@ mod publish {
             assert_eq!((next_seq(0), next_seq(1), next_seq(u32::MAX)), (1, 2, 1));
         }
 
-        /// An up at (260, 340) at 7 ms, the gesture down at 5 ms, as event 3. The expected action (ACTION_UP 1) and source (0x2002) are written out, not taken from the code.
+        /// A finger at (260, 340), cursor (250, 300), at 7 ms, the gesture down at 5 ms, as event 3: every field of the translation passes through, times become ns.
         #[test]
-        fn motion_is_one_mouse_pointer_at_the_position() {
-            let e = PointerEvent {
-                phase: PointerPhase::Up(PointerButton::Primary),
-                position: PhysPoint { x: 260.0, y: 340.0 },
+        fn motion_carries_the_translation() {
+            let m = Motion {
+                action: 1,
+                action_button: 0,
+                button_state: 0,
+                flags: 0x8,
+                classification: 3,
+                source: 0x2002,
+                tool_type: 1,
+                at: PhysPoint { x: 260.0, y: 340.0 },
+                cursor: PhysPoint { x: 250.0, y: 300.0 },
+                axes: vec![(2, 0.0)],
+                down_ms: 5,
                 time_ms: 7,
             };
-            let m = motion(&e, 3, 5, 0);
-            assert_eq!((m.seq, m.action, m.source), (3, 1, 0x0000_2002));
+            let m = motion(&m, 3);
+            assert_eq!(
+                (m.seq, m.action, m.source, m.flags, m.classification),
+                (3, 1, 0x2002, 0x8, 3)
+            );
+            assert_eq!((m.x_cursor, m.y_cursor), (250.0, 300.0));
             assert_eq!(
                 m.pointers,
                 vec![Pointer {
                     id: 0,
-                    tool_type: 3,
+                    tool_type: 1,
                     x: 260.0,
                     y: 340.0,
-                    axes: Vec::new()
+                    axes: vec![(2, 0.0)]
                 }]
             );
             assert_eq!(m.transform, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -398,29 +363,6 @@ mod tests {
     use atl_platform_ui::PointerEvent;
 
     use super::*;
-
-    /// Press and release move the held set by their button, a move keeps it, a second button stacks: primary 1, plus secondary 2 = 3, release primary = 2. Bits as NDK input.h (AMOTION_EVENT_BUTTON_*).
-    #[test]
-    fn held_buttons_follow_press_and_release() {
-        let held = held_after(0, PointerPhase::Down(PointerButton::Primary));
-        assert_eq!(held, 1);
-        assert_eq!(held_after(held, PointerPhase::Move), 1);
-        let both = held_after(held, PointerPhase::Down(PointerButton::Secondary));
-        assert_eq!(both, 3);
-        assert_eq!(
-            held_after(both, PointerPhase::Up(PointerButton::Primary)),
-            2
-        );
-        assert_eq!(held_after(2, PointerPhase::Up(PointerButton::Secondary)), 0);
-        assert_eq!(
-            held_after(0, PointerPhase::Down(PointerButton::Other(8))),
-            8
-        );
-        assert_eq!(
-            held_after(0, PointerPhase::Down(PointerButton::Other(3))),
-            0
-        );
-    }
 
     /// The script's items in order: kinds, positions and phases as written; a bad item refuses the whole script; an empty script has no steps.
     #[test]
@@ -451,21 +393,21 @@ mod tests {
     #[test]
     fn windows_route_to_the_top_and_keep_a_gesture() {
         let mut w = Windows::<u32, &str>::default();
-        assert!(w.pointer_target(0).is_none());
+        assert!(w.pointer_target(false).is_none());
         w.add(1, "main");
         w.add(2, "history");
-        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(2));
+        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(2));
         assert!(w.remove(&2));
         assert!(!w.remove(&2));
-        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(1));
-        // press on 1 (held 0 before), 3 comes up, the move with the button held stays on 1
-        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(1));
+        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
+        // press on 1 (no gesture before), 3 comes up, the move with the button held stays on 1
+        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
         w.add(3, "dialog");
-        assert_eq!(w.pointer_target(1).map(|(k, _)| *k), Some(1));
+        assert_eq!(w.pointer_target(true).map(|(k, _)| *k), Some(1));
         // the gesture's window goes: the rest of the gesture has no window; the next gesture starts on the top
         w.remove(&1);
-        assert!(w.pointer_target(1).is_none());
-        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(3));
+        assert!(w.pointer_target(true).is_none());
+        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(3));
     }
 
     /// The headless source runs the callback set by `on_events` once per injected event; with none set an event is dropped.

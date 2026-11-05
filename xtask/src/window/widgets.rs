@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
-//! The probe presses the header bar, then taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
+//! The probe presses the header bar, then taps the Button and the EditText, hovers, turns the wheel and swipes the touchpad over the ListView, and drags it, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
 //! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
-//! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), list, readback (the last readback is the fixture's final frame and differs from the first),
+//! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last readback is the fixture's final frame and differs from the first),
 //! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage), on-demand (the window clock stops once nothing asks for a frame).
 
 use std::path::Path;
@@ -49,6 +49,27 @@ const SCROLL_STEPS: u32 = 10;
 /// The expected geometry from the layout XML: `android:padding="16dp"`, the list's `android:layout_height="200dp"`.
 const PADDING_DP: f32 = 16.0;
 const LIST_DP: f32 = 200.0;
+/// The hover over the list: moved this far from the list's centre, in surface pixels.
+const HOVER_PX: f64 = 4.0;
+/// The wheel: notches down. 5 notches x AbsListView's 64dp vertical scroll factor (ViewConfiguration config_verticalScrollFactor) scrolls several rows, far enough that the swipe back up and its fling stay below the top.
+const WHEEL_NOTCHES: i32 = 5;
+/// The touchpad swipe toward the top: SWIPE_STEPS axis events of SWIPE_STEP_PX each, SWIPE_STEP_MS apart (600 px/s: above Android's minimum fling velocity of 50dp/s, ViewConfiguration MINIMUM_FLING_VELOCITY), then the fingers lift.
+const SWIPE_STEPS: u32 = 6;
+const SWIPE_STEP_PX: f64 = 6.0;
+const SWIPE_STEP_MS: u64 = 10;
+/// How long the swipe's fling may run before the list is idle again.
+const FLING_WAIT: Duration = Duration::from_secs(5);
+/// A list position's row weight: larger than any row height, so (first row, its offset) orders as one number.
+const LIST_ROW_SCALE: i64 = 100_000;
+/// MotionEvent actions and the touchpad swipe's classification (NDK input.h).
+const ACTION_DOWN: u32 = 0;
+const ACTION_UP: u32 = 1;
+const ACTION_MOVE: u32 = 2;
+const ACTION_HOVER_MOVE: u32 = 7;
+const ACTION_SCROLL: u32 = 8;
+const ACTION_HOVER_ENTER: u32 = 9;
+const ACTION_HOVER_EXIT: u32 = 10;
+const CLASS_SWIPE: u32 = 3;
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
@@ -90,13 +111,128 @@ fn widget(app: &str, name: &str) -> Result<Rect, String> {
     })
 }
 
-/// The top of the list's visible items, the largest the fixture logged.
-fn list_first(app: &str) -> u32 {
-    app.lines()
-        .filter_map(|l| l.split_once("AtlWindow: list first="))
-        .filter_map(|(_, v)| v.trim().parse::<u32>().ok())
-        .max()
+/// The list's scroll position on a `list first=N top=T` line: rows above plus the first row's offset, ordered like the scroll offset (first row index major, then how far it is scrolled out).
+fn list_position(line: &str) -> Option<i64> {
+    let (_, rest) = line.split_once("AtlWindow: list first=")?;
+    let first: i64 = rest.split_whitespace().next()?.parse().ok()?;
+    let top: i64 = word(rest, "top")?.parse().ok()?;
+    Some(first * LIST_ROW_SCALE - top)
+}
+
+/// The list position last logged before line `i`, 0 (the top) when none was.
+fn position_before(lines: &[&str], i: usize) -> i64 {
+    lines[..i]
+        .iter()
+        .rev()
+        .find_map(|l| list_position(l))
         .unwrap_or(0)
+}
+
+/// A fixture `touch` line's action and classification.
+fn touch(line: &str) -> Option<(u32, u32)> {
+    let (_, rest) = line.split_once("AtlWindow: touch ")?;
+    Some((
+        word(rest, "action")?.parse().ok()?,
+        word(rest, "class")?.parse().ok()?,
+    ))
+}
+
+/// A fixture `generic` line's action.
+fn generic(line: &str) -> Option<u32> {
+    let (_, rest) = line.split_once("AtlWindow: generic ")?;
+    word(rest, "action")?.parse().ok()
+}
+
+/// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap's enter is exited by its press, with no move: only the hover makes a 7.
+fn hover_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        if generic(l) != Some(ACTION_HOVER_ENTER) {
+            continue;
+        }
+        let mut moved = false;
+        for l in &lines[i + 1..] {
+            if touch(l).is_some() {
+                break;
+            }
+            match generic(l) {
+                Some(ACTION_HOVER_MOVE) => moved = true,
+                Some(ACTION_HOVER_EXIT) if moved => {
+                    return Ok(
+                        "hover enter, move, exit reached the window, no touch between".to_owned(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Err("no hover enter -> move -> exit sequence (generic action=9, 7, 10)".to_owned())
+}
+
+/// The wheel turned down over the list: ACTION_SCROLL (8) with a negative AXIS_VSCROLL (Android's positive is up), and the list then scrolled toward its end.
+fn wheel_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| generic(l) == Some(ACTION_SCROLL))
+        .ok_or("no ACTION_SCROLL reached the window (generic action=8)")?;
+    let vscroll: f32 = number(word(lines[i], "vscroll"), "vscroll")?;
+    if vscroll >= 0.0 {
+        return Err(format!(
+            "a wheel turned down gave AXIS_VSCROLL {vscroll}, want < 0"
+        ));
+    }
+    let before = position_before(&lines, i);
+    let end = lines
+        .iter()
+        .position(|l| touch(l).is_some_and(|(_, c)| c == CLASS_SWIPE))
+        .unwrap_or(lines.len());
+    let after = lines[i..end]
+        .iter()
+        .filter_map(|l| list_position(l))
+        .max()
+        .unwrap_or(before);
+    if after <= before {
+        return Err(format!(
+            "the wheel did not scroll the list: position {before} -> {after}"
+        ));
+    }
+    Ok(format!(
+        "AXIS_VSCROLL {vscroll}; list position {before} -> {after}"
+    ))
+}
+
+/// The touchpad swipe toward the top: its fake finger (class 3) goes DOWN, MOVEs, goes UP; the list moved toward its top while the fingers were down and flung after (`list state=2` after the UP).
+fn swipe_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let swipe = |action: u32, from: usize| {
+        lines[from..]
+            .iter()
+            .position(|l| touch(l) == Some((action, CLASS_SWIPE)))
+            .map(|p| p + from)
+    };
+    let down = swipe(ACTION_DOWN, 0).ok_or("no swipe DOWN (touch action=0 class=3)")?;
+    let up = swipe(ACTION_UP, down).ok_or("no swipe UP after its DOWN")?;
+    if swipe(ACTION_MOVE, down).is_none_or(|m| m > up) {
+        return Err("no swipe MOVE between its DOWN and UP".to_owned());
+    }
+    let (at_down, at_up) = (position_before(&lines, down), position_before(&lines, up));
+    if at_up >= at_down {
+        return Err(format!(
+            "the swipe toward the top did not scroll up: position {at_down} -> {at_up}"
+        ));
+    }
+    if !lines[up..]
+        .iter()
+        .any(|l| l.contains("AtlWindow: list state=2"))
+    {
+        return Err(format!(
+            "no fling after the swipe (list state=2); position {at_down} -> {at_up}"
+        ));
+    }
+    Ok(format!(
+        "fake finger DOWN, MOVE, UP; list position {at_down} -> {at_up}, then a fling"
+    ))
 }
 
 fn layout_check(app: &str) -> Result<String, String> {
@@ -271,13 +407,27 @@ fn window_check(app: &str) -> Result<String, String> {
     Ok("second window shown and closed; the tap after it reached Main (click 2)".to_owned())
 }
 
+/// The drag (the last plain touch DOWN, class 0) scrolled the list toward its end.
 fn list_check(app: &str) -> Result<String, String> {
-    match list_first(app) {
-        0 => Err("the drag did not scroll the list: first visible item stayed 0".to_owned()),
-        first => Ok(format!(
-            "drag scrolled the list: first visible item {first} of 50"
-        )),
+    let lines: Vec<&str> = app.lines().collect();
+    let down = lines
+        .iter()
+        .rposition(|l| touch(l) == Some((ACTION_DOWN, 0)))
+        .ok_or("no touch DOWN at all")?;
+    let before = position_before(&lines, down);
+    let after = lines[down..]
+        .iter()
+        .filter_map(|l| list_position(l))
+        .max()
+        .unwrap_or(before);
+    if after <= before {
+        return Err(format!(
+            "the drag did not scroll the list: position {before} -> {after}"
+        ));
     }
+    Ok(format!(
+        "drag scrolled the list: position {before} -> {after}"
+    ))
 }
 
 fn presents_check(app: &str) -> Result<String, String> {
@@ -319,6 +469,9 @@ pub fn checks(
         ("click", click_check(app)),
         ("focus", focus_check(app)),
         ("window", window_check(app)),
+        ("hover", hover_check(app)),
+        ("wheel", wheel_check(app)),
+        ("swipe", swipe_check(app)),
         ("list", list_check(app)),
         ("readback", readback_check(app)),
         ("presents", presents_check(app)),
@@ -359,7 +512,7 @@ fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))
 }
 
-/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, drags the ListView up, and waits for the readback of the final frame.
+/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, hovers over the ListView, turns the wheel down and swipes up over it, drags it up, and waits for the readback of the final frame.
 /// Each injection waits for its answer: the proxy's report for the header, the fixture's line for the rest. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
@@ -408,6 +561,48 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     tap(centre("button")?)?;
     wait_line(app_log, "AtlWindow: click count=2")?;
     let (x, y) = centre("list")?;
+    // hover, wheel and swipe over the list: each waits for its own check, and a miss leaves that check to fail alone (the drag and the cadence run after it still run)
+    inject(
+        &proxy,
+        vec![
+            PointerAction::Enter { x, y },
+            PointerAction::Motion {
+                x: x + HOVER_PX,
+                y: y + HOVER_PX,
+            },
+            PointerAction::Leave,
+        ],
+    )?;
+    wait_until(app_log, LINE_WAIT, |t| hover_check(t).is_ok());
+    inject(
+        &proxy,
+        vec![
+            PointerAction::Enter { x, y },
+            PointerAction::Wheel {
+                notches: WHEEL_NOTCHES,
+            },
+        ],
+    )?;
+    wait_until(app_log, LINE_WAIT, |t| wheel_check(t).is_ok());
+    for _ in 0..SWIPE_STEPS {
+        inject(
+            &proxy,
+            vec![PointerAction::Finger {
+                dx: 0.0,
+                dy: -SWIPE_STEP_PX,
+            }],
+        )?;
+        std::thread::sleep(Duration::from_millis(SWIPE_STEP_MS));
+    }
+    inject(&proxy, vec![PointerAction::FingerStop])?;
+    // the fling ends idle (state 0) before the drag
+    wait_until(app_log, FLING_WAIT, |t| {
+        swipe_check(t).is_ok()
+            && t.rfind("AtlWindow: list state=0") > t.rfind("AtlWindow: list state=2")
+    });
+    let drag_from = std::fs::read_to_string(app_log)
+        .map_err(|e| e.to_string())?
+        .len();
     let mut drag = vec![PointerAction::Enter { x, y }, press(true)];
     for step in 1..=SCROLL_STEPS {
         drag.push(PointerAction::Motion {
@@ -417,7 +612,10 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     }
     drag.push(press(false));
     inject(&proxy, drag)?;
-    if !wait_until(app_log, LINE_WAIT, |t| list_first(t) > 0) {
+    if !wait_until(app_log, LINE_WAIT, |t| {
+        t.get(drag_from..)
+            .is_some_and(|after| after.contains("AtlWindow: list first="))
+    }) {
         return Err("the list did not scroll after the drag".to_owned());
     }
     wait_line(app_log, FINAL_LINE)?;
@@ -450,6 +648,55 @@ mod tests {
         let leak = format!("{BUTTON}AtlWindow: touch action=0 x=86.0 y=-31.0\n{tap}");
         assert!(header_check(&leak).is_err());
         assert!(header_check(BUTTON).is_err());
+    }
+
+    /// Hover needs 9, 7, 10 with no touch between: a tap's 9, 10 alone fails, a touch between fails.
+    #[test]
+    fn hover_check_wants_enter_move_exit() {
+        let g = |a: u32| {
+            format!(
+                "AtlWindow: generic action={a} vscroll=0.0 x=1.0 y=2.0
+"
+            )
+        };
+        let tap = "AtlWindow: touch action=0 x=1.0 y=2.0 class=0
+";
+        assert!(hover_check(&[g(9), g(7), g(10)].concat()).is_ok());
+        assert!(hover_check(&[g(9), g(10)].concat()).is_err());
+        assert!(hover_check(&[g(9), g(7), tap.to_owned(), g(10)].concat()).is_err());
+    }
+
+    /// Wheel down: negative VSCROLL and the list position grows after it; swipe: class-3 DOWN, MOVE, UP, the position falls, then a fling.
+    #[test]
+    fn wheel_and_swipe_checks_follow_the_list() {
+        let pos = |first: u32, top: i32| {
+            format!(
+                "AtlWindow: list first={first} top={top}
+"
+            )
+        };
+        let scroll = |v: f32| {
+            format!(
+                "AtlWindow: generic action=8 vscroll={v} x=1.0 y=2.0
+"
+            )
+        };
+        let t = |a: u32| {
+            format!(
+                "AtlWindow: touch action={a} x=1.0 y=2.0 class=3
+"
+            )
+        };
+        assert!(wheel_check(&[pos(0, 0), scroll(-5.0), pos(6, -10)].concat()).is_ok());
+        assert!(wheel_check(&[pos(0, 0), scroll(5.0), pos(6, -10)].concat()).is_err());
+        assert!(wheel_check(&[pos(0, 0), scroll(-5.0)].concat()).is_err());
+        let fling = "AtlWindow: list state=2
+"
+        .to_owned();
+        let swipe = [pos(6, -10), t(0), t(2), pos(5, -3), t(1), fling.clone()].concat();
+        assert!(swipe_check(&swipe).is_ok());
+        assert!(swipe_check(&[pos(6, -10), t(0), t(2), pos(5, -3), t(1)].concat()).is_err());
+        assert!(swipe_check(&[pos(6, -10), t(0), t(2), pos(7, -3), t(1), fling].concat()).is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`.
 //!
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
-//! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, motion, button, each then `frame`) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
+//! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
@@ -55,10 +55,29 @@ const XDG_STATE_ACTIVATED: u32 = 4;
 const WL_SEAT: &str = "wl_seat";
 const WL_SEAT_GET_POINTER: u16 = 0;
 const WL_POINTER: &str = "wl_pointer";
+/// `wl_pointer` events (wayland.xml), with the version that introduced each one past v1.
 const WL_POINTER_ENTER: u16 = 0;
+const WL_POINTER_LEAVE: u16 = 1;
 const WL_POINTER_MOTION: u16 = 2;
 const WL_POINTER_BUTTON: u16 = 3;
+const WL_POINTER_AXIS: u16 = 4;
 const WL_POINTER_FRAME: u16 = 5;
+const WL_POINTER_AXIS_SOURCE: u16 = 6;
+const WL_POINTER_AXIS_STOP: u16 = 7;
+const WL_POINTER_AXIS_DISCRETE: u16 = 8;
+const WL_POINTER_AXIS_VALUE120: u16 = 9;
+/// frame, axis_source, axis_stop, axis_discrete: v5; axis_value120 (replacing axis_discrete): v8.
+const POINTER_V_FRAME: u32 = 5;
+const POINTER_V_VALUE120: u32 = 8;
+/// `wl_pointer.axis` axes and `axis_source` values (wayland.xml).
+const AXIS_VERTICAL: u32 = 0;
+const AXIS_HORIZONTAL: u32 = 1;
+const AXIS_SOURCE_WHEEL: u32 = 0;
+const AXIS_SOURCE_FINGER: u32 = 1;
+/// The `axis` value of one wheel notch: libinput's 15 degrees per detent, which compositors forward as the axis value.
+const WHEEL_NOTCH_VALUE: f64 = 15.0;
+/// `axis_value120` units per notch (wayland.xml: "a value of 120 is one logical scroll step").
+const VALUE120_PER_NOTCH: f64 = 120.0;
 /// wl_fixed is 24.8 signed.
 const FIXED_ONE: f64 = 256.0;
 /// `wl_shm.create_pool(new_id, fd, size)`, request 0.
@@ -100,6 +119,8 @@ struct Ids {
     interfaces: HashMap<u32, String>,
     /// The client's `wl_pointer` (from `wl_seat.get_pointer`).
     pointer: Option<u32>,
+    /// The version the client bound `wl_seat` at, which its `wl_pointer` inherits: events newer than it must not be sent.
+    seat_version: Option<u32>,
     /// The `wl_surface` of the first `xdg_surface`: the window.
     surface: Option<u32>,
     /// The window's shell roles: its first `xdg_surface` and that surface's `xdg_toplevel`, which [`Proxy::inject_configure`] addresses.
@@ -141,7 +162,11 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         let len = word(body, 4)? as usize;
         let text = body.get(8..8 + len)?;
         let name = String::from_utf8_lossy(text.strip_suffix(&[0]).unwrap_or(text)).into_owned();
-        let new_id = word(body, 8 + len.div_ceil(4) * 4 + 4)?;
+        let at = 8 + len.div_ceil(4) * 4;
+        let (version, new_id) = (word(body, at)?, word(body, at + 4)?);
+        if name == WL_SEAT {
+            ids.seat_version = Some(version);
+        }
         ids.interfaces.insert(new_id, name.clone());
         return Some(Event::Bound(name));
     }
@@ -241,11 +266,17 @@ fn forward(to: BorrowedFd<'_>, bytes: &[u8], fds: &mut Vec<OwnedFd>) -> Result<(
 }
 
 /// A pointer action the proxy injects; each is followed by its `frame`. Coordinates are surface-local, logical; `button` is a linux input code (BTN_LEFT = 0x110).
+/// Scrolls: `Wheel` turns `notches` vertical detents (positive = down) from a wheel source; `Finger` is one touchpad step of (`dx`, `dy`) surface pixels, `FingerStop` lifts the fingers (`axis_stop`).
+/// Scroll actions need `wl_seat` v5 (axis_source); a client bound lower gets none (dropped, reported on stderr).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PointerAction {
     Enter { x: f64, y: f64 },
+    Leave,
     Motion { x: f64, y: f64 },
     Button { button: u32, pressed: bool },
+    Wheel { notches: i32 },
+    Finger { dx: f64, dy: f64 },
+    FingerStop,
 }
 
 /// What the proxy writes to the client between two forwarded messages.
@@ -488,7 +519,7 @@ fn server_to_client(
         if items.is_empty() {
             continue;
         }
-        let (wm_base, pointer, surface, toplevel, xdg_surface) = {
+        let (wm_base, pointer, surface, toplevel, xdg_surface, seat_version) = {
             let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
             (
                 ids.id_of(WM_BASE),
@@ -496,6 +527,7 @@ fn server_to_client(
                 ids.surface,
                 ids.toplevel,
                 ids.xdg_surface,
+                ids.seat_version.unwrap_or(1),
             )
         };
         for item in items {
@@ -520,8 +552,18 @@ fn server_to_client(
                 },
                 Injection::Pointer { action, time_ms } => match (pointer, surface) {
                     (Some(pointer), Some(surface)) => {
-                        let _ = events.send((Instant::now(), Event::PointerInjected));
-                        pointer_bytes(pointer, surface, action, time_ms)
+                        match pointer_bytes(pointer, surface, seat_version, action, time_ms) {
+                            Some(bytes) => {
+                                let _ = events.send((Instant::now(), Event::PointerInjected));
+                                bytes
+                            }
+                            None => {
+                                eprintln!(
+                                    "wayland proxy: {action:?} dropped, the client bound wl_seat v{seat_version}"
+                                );
+                                continue;
+                            }
+                        }
                     }
                     _ => {
                         eprintln!(
@@ -602,35 +644,73 @@ fn fixed(v: f64) -> [u8; 4] {
     ((v * FIXED_ONE).round() as i32).to_ne_bytes()
 }
 
-/// A pointer action's `wl_pointer` events as a client receives them: the action's event, then `frame`, which GDK flushes the group on. The serial of enter and button is the timestamp.
-fn pointer_bytes(pointer: u32, surface: u32, action: PointerAction, time_ms: u32) -> Vec<u8> {
-    let (opcode, args): (u16, Vec<[u8; 4]>) = match action {
-        PointerAction::Enter { x, y } => (
-            WL_POINTER_ENTER,
-            vec![
-                time_ms.to_ne_bytes(),
-                surface.to_ne_bytes(),
-                fixed(x),
-                fixed(y),
-            ],
-        ),
-        PointerAction::Motion { x, y } => (
-            WL_POINTER_MOTION,
-            vec![time_ms.to_ne_bytes(), fixed(x), fixed(y)],
-        ),
-        PointerAction::Button { button, pressed } => (
-            WL_POINTER_BUTTON,
-            vec![
-                time_ms.to_ne_bytes(),
-                time_ms.to_ne_bytes(),
-                button.to_ne_bytes(),
-                u32::from(pressed).to_ne_bytes(),
-            ],
-        ),
+/// A pointer action's `wl_pointer` events as a client bound at `version` receives them: the action's events, then `frame` (v5+), which GDK flushes the group on. The serial of enter, leave and button is the timestamp.
+/// None for a scroll the version cannot carry (axis_source needs v5). A wheel notch carries `axis_value120` from v8, `axis_discrete` before.
+fn pointer_bytes(
+    pointer: u32,
+    surface: u32,
+    version: u32,
+    action: PointerAction,
+    time_ms: u32,
+) -> Option<Vec<u8>> {
+    let t = time_ms.to_ne_bytes();
+    let u = |v: u32| v.to_ne_bytes();
+    let ev = |opcode: u16, args: &[[u8; 4]]| event(pointer, opcode, &args.concat());
+    let scroll = matches!(
+        action,
+        PointerAction::Wheel { .. } | PointerAction::Finger { .. } | PointerAction::FingerStop
+    );
+    if scroll && version < POINTER_V_FRAME {
+        return None;
+    }
+    let mut out = match action {
+        PointerAction::Enter { x, y } => ev(WL_POINTER_ENTER, &[t, u(surface), fixed(x), fixed(y)]),
+        PointerAction::Leave => ev(WL_POINTER_LEAVE, &[t, u(surface)]),
+        PointerAction::Motion { x, y } => ev(WL_POINTER_MOTION, &[t, fixed(x), fixed(y)]),
+        PointerAction::Button { button, pressed } => {
+            ev(WL_POINTER_BUTTON, &[t, t, u(button), u(u32::from(pressed))])
+        }
+        PointerAction::Wheel { notches } => {
+            let mut out = ev(WL_POINTER_AXIS_SOURCE, &[u(AXIS_SOURCE_WHEEL)]);
+            out.extend(if version >= POINTER_V_VALUE120 {
+                let value120 = (f64::from(notches) * VALUE120_PER_NOTCH) as i32;
+                ev(
+                    WL_POINTER_AXIS_VALUE120,
+                    &[u(AXIS_VERTICAL), value120.to_ne_bytes()],
+                )
+            } else {
+                ev(
+                    WL_POINTER_AXIS_DISCRETE,
+                    &[u(AXIS_VERTICAL), notches.to_ne_bytes()],
+                )
+            });
+            out.extend(ev(
+                WL_POINTER_AXIS,
+                &[
+                    t,
+                    u(AXIS_VERTICAL),
+                    fixed(f64::from(notches) * WHEEL_NOTCH_VALUE),
+                ],
+            ));
+            out
+        }
+        PointerAction::Finger { dx, dy } => {
+            let mut out = ev(WL_POINTER_AXIS_SOURCE, &[u(AXIS_SOURCE_FINGER)]);
+            out.extend(ev(WL_POINTER_AXIS, &[t, u(AXIS_VERTICAL), fixed(dy)]));
+            out.extend(ev(WL_POINTER_AXIS, &[t, u(AXIS_HORIZONTAL), fixed(dx)]));
+            out
+        }
+        PointerAction::FingerStop => {
+            let mut out = ev(WL_POINTER_AXIS_SOURCE, &[u(AXIS_SOURCE_FINGER)]);
+            out.extend(ev(WL_POINTER_AXIS_STOP, &[t, u(AXIS_VERTICAL)]));
+            out.extend(ev(WL_POINTER_AXIS_STOP, &[t, u(AXIS_HORIZONTAL)]));
+            out
+        }
     };
-    let mut out = event(pointer, opcode, &args.concat());
-    out.extend(event(pointer, WL_POINTER_FRAME, &[]));
-    out
+    if version >= POINTER_V_FRAME {
+        out.extend(event(pointer, WL_POINTER_FRAME, &[]));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -712,9 +792,48 @@ mod tests {
         let mut want = msg(20, WL_POINTER_MOTION, &body);
         want.extend(msg(20, WL_POINTER_FRAME, &[]));
         assert_eq!(
-            pointer_bytes(20, 30, PointerAction::Motion { x: 2.5, y: -1.0 }, 5),
-            want
+            pointer_bytes(20, 30, 5, PointerAction::Motion { x: 2.5, y: -1.0 }, 5),
+            Some(want)
         );
+        // v4 has no frame event
+        assert_eq!(
+            pointer_bytes(20, 30, 4, PointerAction::Motion { x: 2.5, y: -1.0 }, 5),
+            Some(msg(20, WL_POINTER_MOTION, &body))
+        );
+    }
+
+    /// Two notches down: axis_source wheel (6: 0), then axis_value120 (9: axis 0, 240) at v8 or axis_discrete (8: axis 0, 2) at v5, then axis (4: time, axis 0, 30.0 = 0x1e00 in 24.8), then frame (5). Below v5 nothing.
+    #[test]
+    fn wheel_follows_the_seat_version() {
+        let tail = |mut v: Vec<u8>| {
+            let axis = [
+                5u32.to_ne_bytes(),
+                0u32.to_ne_bytes(),
+                0x1e00u32.to_ne_bytes(),
+            ]
+            .concat();
+            v.extend(msg(20, 4, &axis));
+            v.extend(msg(20, 5, &[]));
+            v
+        };
+        let source = msg(20, 6, &0u32.to_ne_bytes());
+        let mut v8 = source.clone();
+        v8.extend(msg(
+            20,
+            9,
+            &[0u32.to_ne_bytes(), 240i32.to_ne_bytes()].concat(),
+        ));
+        let mut v5 = source;
+        v5.extend(msg(
+            20,
+            8,
+            &[0u32.to_ne_bytes(), 2i32.to_ne_bytes()].concat(),
+        ));
+        let wheel = PointerAction::Wheel { notches: 2 };
+        assert_eq!(pointer_bytes(20, 30, 8, wheel, 5), Some(tail(v8)));
+        assert_eq!(pointer_bytes(20, 30, 5, wheel, 5), Some(tail(v5)));
+        assert_eq!(pointer_bytes(20, 30, 4, wheel, 5), None);
+        assert_eq!(pointer_bytes(20, 30, 4, PointerAction::FingerStop, 5), None);
     }
 
     #[test]
