@@ -60,6 +60,8 @@ const INPUT_METHOD: &str = "input_method";
 const CONTENT: &str = "content";
 /// Context.AUDIO_SERVICE.
 const AUDIO: &str = "audio";
+/// Context.USER_SERVICE.
+const USER: &str = "user";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -98,6 +100,7 @@ fn main() -> Result<()> {
     binder::add_service(CONTENT, atl_services::content::new_binder())
         .context("addService content")?;
     binder::add_service(AUDIO, atl_services::audio::new_binder()).context("addService audio")?;
+    binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
     let contents =
         std::fs::read(&a.keychars).with_context(|| format!("reading {}", a.keychars.display()))?;
     let name = a

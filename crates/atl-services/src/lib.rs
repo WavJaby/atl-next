@@ -47,4 +47,6 @@ mod token;
 #[cfg(feature = "converter")]
 pub mod ui_agent;
 #[cfg(feature = "converter")]
+pub mod user;
+#[cfg(feature = "converter")]
 pub mod window;
