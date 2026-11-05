@@ -24,6 +24,8 @@ pub struct Descriptor {
     pub reserved_size: i64,
     /// `additionalOptions` names: any is unrecognised (no option exists in our set).
     pub option_names: Vec<String>,
+    /// DRM modifiers the buffer may use, any one; empty = LINEAR only. Not in the AIDL: the modifier set is device policy the allocator adds.
+    pub modifiers: Vec<u64>,
 }
 
 /// Why a request cannot be served: `AllocationError::UNSUPPORTED` on the wire, and `isSupported()` = false (IAllocator.aidl: reject unrecognised usage and options).
@@ -37,6 +39,8 @@ pub enum Refusal {
     /// A reserved region was requested (`getReservedRegion` is not offered).
     ReservedRegion,
     UnrecognisedOption(String),
+    /// No modifier of the set is one the backend allocates (LINEAR only).
+    UnsupportedModifiers(Vec<u64>),
 }
 
 impl std::fmt::Display for Refusal {
@@ -47,6 +51,7 @@ impl std::fmt::Display for Refusal {
             Self::UnsupportedUsage(u) => write!(f, "usage bits {u:#x} are not supported"),
             Self::ReservedRegion => write!(f, "reserved regions are not supported"),
             Self::UnrecognisedOption(n) => write!(f, "unrecognised option {n}"),
+            Self::UnsupportedModifiers(m) => write!(f, "no supported modifier in {m:#x?}"),
         }
     }
 }
@@ -61,6 +66,8 @@ pub struct Checked {
     pub height: u32,
     pub usage: u64,
     pub format: &'static FormatInfo,
+    /// The allowed modifiers, never empty (an empty request means `[LINEAR]`).
+    pub modifiers: Vec<u64>,
 }
 
 impl Descriptor {
@@ -98,12 +105,21 @@ impl Descriptor {
         if let Some(n) = self.option_names.first() {
             return Err(Refusal::UnrecognisedOption(n.clone()));
         }
+        let modifiers = if self.modifiers.is_empty() {
+            vec![format::DRM_FORMAT_MOD_LINEAR]
+        } else {
+            self.modifiers.clone()
+        };
+        if !modifiers.contains(&format::DRM_FORMAT_MOD_LINEAR) {
+            return Err(Refusal::UnsupportedModifiers(modifiers));
+        }
         Ok(Checked {
             name: self.name_text(),
             width,
             height,
             usage: self.usage,
             format,
+            modifiers,
         })
     }
 }
@@ -122,7 +138,21 @@ mod tests {
             usage: 0x33 | usage::GPU_TEXTURE,
             reserved_size: 0,
             option_names: vec![],
+            modifiers: vec![],
         }
+    }
+
+    /// Empty = LINEAR; a set naming LINEAR is kept; a set without it is refused (the backend allocates LINEAR only).
+    #[test]
+    fn modifiers_default_to_linear() {
+        const X_TILED: u64 = (1 << 56) | 1; // I915_FORMAT_MOD_X_TILED (drm_fourcc.h: vendor INTEL = 1, value 1)
+        let c = ok().check().expect("accepted");
+        assert_eq!(c.modifiers, [format::DRM_FORMAT_MOD_LINEAR]);
+        let mut d = ok();
+        d.modifiers = vec![X_TILED, format::DRM_FORMAT_MOD_LINEAR];
+        assert_eq!(d.check().expect("accepted").modifiers, d.modifiers);
+        d.modifiers = vec![X_TILED];
+        assert_eq!(d.check(), Err(Refusal::UnsupportedModifiers(vec![X_TILED])));
     }
 
     #[test]

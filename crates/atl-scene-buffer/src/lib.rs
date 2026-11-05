@@ -10,6 +10,7 @@ use atl_compositor::parcel::FdObject;
 use atl_compositor::state::GraphicBuffer;
 use atl_gralloc::format::{self, COMPONENT_A, RGBA_8888, RGBX_8888};
 use atl_gralloc::handle::FD_DMABUF;
+use atl_gralloc::layout::Layout;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::fstat;
 use rustix::io::Errno;
@@ -67,6 +68,35 @@ fn borrow(obj: &FdObject) -> Result<BorrowedFd<'_>, String> {
     }
     // SAFETY: `FdObject::fd` is a descriptor open in this process (its doc), owned by the `Scene` the caller holds for the whole `present` call, so it stays open for the borrow; the borrow does not outlive `obj`.
     Ok(unsafe { BorrowedFd::borrow_raw(obj.fd) })
+}
+
+/// A buffer's dma-buf as an importer sees it: the plane fds and the layout gralloc's handle states (`atl_gralloc::layout`, the same values the mapper's metadata answers). For a dmabuf texture / EGL image import; the CPU reader is [`read_pixels`].
+#[derive(Debug)]
+pub struct DmabufView<'a> {
+    /// The layout.
+    pub layout: Layout,
+    /// One fd per plane, in `layout.planes` order.
+    pub fds: Vec<BorrowedFd<'a>>,
+}
+
+impl<'a> DmabufView<'a> {
+    /// The view of `buffer`, whose handle came from another process: its ints are validated as the mapper's import does, and each plane fd must exist.
+    pub fn of(buffer: &'a GraphicBuffer) -> Result<Self, String> {
+        let layout = atl_gralloc::layout::from_handle(buffer.fds.len(), &buffer.ints)
+            .map_err(|e| format!("not a gralloc handle: {e:?}"))?;
+        let fds = layout
+            .planes
+            .iter()
+            .map(|p| {
+                buffer
+                    .fds
+                    .get(p.fd_index)
+                    .ok_or_else(|| format!("plane fd {} is missing", p.fd_index))
+                    .and_then(borrow)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { layout, fds })
+    }
 }
 
 /// Whether a sync_file fence has signalled: it polls readable once it has (linux/sync_file.h). Never waits.
@@ -209,6 +239,41 @@ mod tests {
             fds: vec![FdObject::new(fd.as_raw_fd(), false)],
             ints: vec![],
         }
+    }
+
+    /// The view carries the allocator's fd and pitch from the handle ints, not the GraphicBuffer's own fields; a foreign handle is refused.
+    #[test]
+    fn dmabuf_view_reads_the_handle_layout() {
+        use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR};
+        use atl_gralloc::handle::Params;
+        let dmabuf = memfd_with(&[0; 64]);
+        let page = memfd_with(&[0; 8]);
+        // pitch 80 bytes for width 16: a padded row the allocator chose (20 pixels), different from the 16 a caller would assume
+        let params = Params {
+            width: 16,
+            height: 2,
+            pixel_format: RGBA_8888,
+            fourcc: DRM_FORMAT_ABGR8888,
+            pitch: 80,
+            size: 160,
+            usage: 0,
+            modifier: DRM_FORMAT_MOD_LINEAR,
+            id: 7,
+        };
+        let mut b = buffer(&dmabuf, 16, 2, 16);
+        b.fds.push(FdObject::new(page.as_raw_fd(), false));
+        b.ints = params.to_ints().to_vec();
+        let v = DmabufView::of(&b).expect("view");
+        assert_eq!(v.fds.len(), 1);
+        assert_eq!(v.fds[0].as_raw_fd(), dmabuf.as_raw_fd());
+        assert_eq!(v.layout.planes[0].stride_bytes, 80);
+        assert_eq!(v.layout.pixel_stride(), 20);
+        assert_eq!(
+            (v.layout.fourcc, v.layout.modifier),
+            (DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR)
+        );
+        b.ints[0] = 0;
+        assert!(DmabufView::of(&b).is_err(), "foreign magic");
     }
 
     /// 2x2 pixels in rows of 3 pixels (stride 12 bytes): the padding pixel of each row is part of the copy, so the row pitch survives.

@@ -24,6 +24,7 @@ required-features = ["converter"]
 
 [dependencies]
 anyhow.workspace = true
+atl-gralloc = { path = "../atl-gralloc" }
 clap.workspace = true
 rustix.workspace = true
 

@@ -46,6 +46,8 @@ const READY: Duration = Duration::from_secs(15);
 const PROBE_LIMIT: Duration = Duration::from_secs(30);
 /// The line the allocator prints when registered (crates/atl-gralloc-service/src/bin/allocator.rs).
 const READY_LINE: &str = "gralloc: ready";
+/// The prefix of the allocator's counter line (`Allocator::counters_line`).
+const COUNTERS_LINE: &str = "gralloc: counters ";
 
 /// Every case each probe role reports, in the order it reports them (crates/atl-gralloc-truth/src/bin/probe.rs). A missing one fails the stage.
 const WRITER_CASES: [&str; 9] = [
@@ -60,10 +62,11 @@ const WRITER_CASES: [&str; 9] = [
     // the line the probe prints last is a case of its own so a probe that died early is not mistaken for one that passed
     "end",
 ];
-const READER_CASES: [&str; 6] = [
+const READER_CASES: [&str; 7] = [
     "recv-handle",
     "describe-imported",
     "id-matches",
+    "layout-from-handle",
     "reads-identical-bytes",
     "write-back",
     "end",
@@ -280,6 +283,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let alloc_text = std::fs::read_to_string(&alloc_log).unwrap_or_default();
         if alloc_text.contains("panicked") {
             fails.push(format!("the allocator panicked:\n{}", alloc_text.trim()));
+        }
+        // the allocator prints its counters at start and on each change: the last line is the final value (vgem: >= 1, the probe allocation)
+        match alloc_text
+            .lines()
+            .rev()
+            .find(|l| l.starts_with(COUNTERS_LINE))
+        {
+            Some(line) => println!("{line}"),
+            None => fails.push(format!("the allocator printed no `{COUNTERS_LINE}` line")),
         }
         Ok(fails)
     })();

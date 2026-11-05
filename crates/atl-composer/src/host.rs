@@ -650,43 +650,48 @@ impl Composer {
 
     /// One call of the core into a client: `Ok` when it arrived, else why not.
     fn deliver(&self, call: &ClientCall) -> Result<(), String> {
-        let (listener, code, wire) =
-            match call {
-                ClientCall::TransactionCompleted { listener, stats } => {
-                    (listener, ON_TRANSACTION_COMPLETED, stats.encode_call())
-                }
-                ClientCall::ReleaseBuffer { listener, release } => {
-                    (listener, ON_RELEASE_BUFFER, release.encode_call())
-                }
-                // the layer's BufferReleaseChannel: one datagram on the producer's socket (BBQ reads it on its own thread)
-                ClientCall::ReleaseOnChannel { channel, release } => {
-                    let (datagram, fence) = release.channel_datagram();
-                    if fence.is_some() {
-                        return Err("a release fence: fences come with buffers".to_owned());
+        let (listener, code, wire) = match call {
+            ClientCall::TransactionCompleted { listener, stats } => {
+                (listener, ON_TRANSACTION_COMPLETED, stats.encode_call())
+            }
+            ClientCall::ReleaseBuffer { listener, release } => {
+                (listener, ON_RELEASE_BUFFER, release.encode_call())
+            }
+            // the layer's BufferReleaseChannel: one datagram on the producer's socket (BBQ reads it on its own thread)
+            ClientCall::ReleaseOnChannel { channel, release } => {
+                let (datagram, fence) = release.channel_datagram();
+                let held = |fd: i32, what: &str| {
+                    self.lock()
+                        .fds
+                        .get(&fd)
+                        .cloned()
+                        .ok_or_else(|| format!("{what} fd {fd} is not held"))
+                };
+                let socket = held(channel.fd, "release channel")?;
+                let fence = fence.map(|f| held(f.fd, "release fence")).transpose()?;
+                match vsync::send_datagram_with_fd(
+                    &*socket,
+                    &datagram,
+                    fence.as_deref().map(|f| f.as_fd()),
+                ) {
+                    Ok(()) => self.lock().stats.releases_on_channel += 1,
+                    // the queue that held the other end is gone (its BBQ was destroyed, or its process closed it): nobody is waiting for the release
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::NotConnected
+                        ) =>
+                    {
+                        self.lock().stats.releases_peer_gone += 1
                     }
-                    let socket =
-                        self.lock().fds.get(&channel.fd).cloned().ok_or_else(|| {
-                            format!("release channel fd {} is not held", channel.fd)
-                        })?;
-                    match vsync::send_datagram(&*socket, &datagram) {
-                        Ok(()) => self.lock().stats.releases_on_channel += 1,
-                        // the queue that held the other end is gone (its BBQ was destroyed, or its process closed it): nobody is waiting for the release
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionRefused
-                                    | std::io::ErrorKind::NotConnected
-                            ) =>
-                        {
-                            self.lock().stats.releases_peer_gone += 1
-                        }
-                        Err(e) => return Err(format!("release channel fd {}: {e}", channel.fd)),
-                    }
-                    return Ok(());
+                    Err(e) => return Err(format!("release channel fd {}: {e}", channel.fd)),
                 }
-            };
+                return Ok(());
+            }
+        };
         let wire = wire.map_err(|e| format!("encoding the call: {e}"))?;
         let binder = self
             .listener_binder(listener)

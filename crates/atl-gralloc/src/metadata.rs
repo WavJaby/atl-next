@@ -204,10 +204,10 @@ pub fn get_standard(view: &View<'_>, t: i64) -> Result<Vec<u8>, Unsupported> {
             e.i32(p.pixel_format);
         }
         ty::PIXEL_FORMAT_FOURCC => {
-            e.u32(p.fourcc);
+            e.u32(p.layout().fourcc);
         }
         ty::PIXEL_FORMAT_MODIFIER => {
-            e.u64(p.modifier);
+            e.u64(p.layout().modifier);
         }
         ty::USAGE => {
             e.u64(p.usage);
@@ -229,21 +229,26 @@ pub fn get_standard(view: &View<'_>, t: i64) -> Result<Vec<u8>, Unsupported> {
         }
         ty::PLANE_LAYOUTS => {
             let f = p.format();
-            let bpp = i64::from(f.bytes_per_pixel);
-            e.i64(1).i64(f.components.len() as i64);
-            for &(kind, offset, size) in f.components {
-                e.extendable(PLANE_LAYOUT_COMPONENT_TYPE_NAME, kind)
-                    .i64(offset)
-                    .i64(size);
+            let l = p.layout();
+            let bpp = i64::from(l.bytes_per_pixel);
+            e.i64(l.planes.len() as i64);
+            for plane in &l.planes {
+                e.i64(f.components.len() as i64);
+                for &(kind, offset, size) in f.components {
+                    e.extendable(PLANE_LAYOUT_COMPONENT_TYPE_NAME, kind)
+                        .i64(offset)
+                        .i64(size);
+                }
+                let stride = i64::from(plane.stride_bytes);
+                e.i64(plane.offset as i64) // offsetInBytes
+                    .i64(bpp * 8) // sampleIncrementInBits
+                    .i64(stride) // strideInBytes
+                    .i64(i64::from(l.width)) // widthInSamples
+                    .i64(i64::from(l.height)) // heightInSamples
+                    .i64(stride * i64::from(l.height)) // totalSizeInBytes
+                    .i64(1) // horizontalSubsampling
+                    .i64(1); // verticalSubsampling
             }
-            e.i64(0) // offsetInBytes
-                .i64(bpp * 8) // sampleIncrementInBits
-                .i64(i64::from(p.pitch)) // strideInBytes
-                .i64(i64::from(p.width)) // widthInSamples
-                .i64(i64::from(p.height)) // heightInSamples
-                .i64(i64::from(p.pitch) * i64::from(p.height)) // totalSizeInBytes
-                .i64(1) // horizontalSubsampling
-                .i64(1); // verticalSubsampling
         }
         // one rect per plane: the whole buffer
         ty::CROP => {

@@ -484,7 +484,10 @@ fn main() -> Result<()> {
         Err(PresentError::FenceNotSignalled { layer_id: 0 })
     );
     write(&fence_write, b"x")?;
-    let signalled = window.present(&scene).is_ok();
+    let accepted = window.present(&scene);
+    let signalled = accepted.is_ok();
+    // step 1 copies every buffer at present: no release point outlives it
+    let releases = accepted.map_or(usize::MAX, |p| p.releases.len());
     let mut bad = scene.clone();
     bad.quads[0].acquire_fence = None;
     bad.quads[0].buffer = Arc::new(GraphicBuffer {
@@ -496,7 +499,7 @@ fn main() -> Result<()> {
         Err(PresentError::Buffer { layer_id: 0, .. })
     );
     emit(format_args!(
-        "REFUSALS unsignalled-fence={unsignalled} signalled-fence={signalled} bad-stride={bad_refused}"
+        "REFUSALS unsignalled-fence={unsignalled} signalled-fence={signalled} bad-stride={bad_refused} releases={releases}"
     ));
 
     // phase 4: a watched fd is serviced on this thread, inside the Looper's poll

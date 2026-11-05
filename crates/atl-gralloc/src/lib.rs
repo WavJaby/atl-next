@@ -10,6 +10,7 @@
 pub mod descriptor;
 pub mod format;
 pub mod handle;
+pub mod layout;
 pub mod metadata;
 pub mod shared;
 pub mod usage;

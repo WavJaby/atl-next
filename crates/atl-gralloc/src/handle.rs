@@ -95,7 +95,7 @@ impl Params {
 
     /// Pixels from the start of one row to the next (`StandardMetadataType::STRIDE`, `AllocationResult.stride`).
     pub fn pixel_stride(&self) -> u32 {
-        self.pitch / self.format().bytes_per_pixel
+        self.layout().pixel_stride()
     }
 
     /// The handle's ints.

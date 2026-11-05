@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 
 pub use atl_compositor::scene::Scene;
 /// The value types the host side shares (a window's monitor is the same type atld reads).
@@ -57,6 +57,24 @@ pub enum PresentError {
         /// The quad's layer id.
         layer_id: i32,
     },
+}
+
+/// What [`Window::present`] produced: one release point per quad whose buffer the toolkit still reads after present returns.
+#[derive(Debug, Default)]
+pub struct Presented {
+    /// Release points; empty while present copies every buffer (step 1).
+    pub releases: Vec<QuadRelease>,
+}
+
+/// A buffer the toolkit releases later: the producer may reuse it once `release_fence` signals (`None` = now).
+#[derive(Debug)]
+pub struct QuadRelease {
+    /// The quad's layer id.
+    pub layer_id: i32,
+    /// The buffer's `GraphicBuffer::id`.
+    pub buffer_key: u64,
+    /// Signals when the toolkit's GPU reads of the buffer are done.
+    pub release_fence: Option<OwnedFd>,
 }
 
 /// The toolkit session. Thread-affine: the thread that attaches is the UI thread.
@@ -186,8 +204,8 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// The window is on screen: the compositor has configured it and a frame can be shown.
     fn is_mapped(&self) -> bool;
 
-    /// Shows `scene` (quad coordinates are physical pixels of the content area), replacing the previous one; takes effect at the next frame. The buffers are read before this returns, so the caller may reuse them immediately.
-    fn present(&self, scene: &Scene) -> Result<(), PresentError>;
+    /// Shows `scene` (quad coordinates are physical pixels of the content area), replacing the previous one; takes effect at the next frame. Returns the release points present produced; step 1 reads the buffers before returning and reports none, so the caller may reuse them immediately.
+    fn present(&self, scene: &Scene) -> Result<Presented, PresentError>;
 
     /// What the window content shows now, rendered by the toolkit's own renderer from the presented scene (the platform's screenshot: `UiAutomation.takeScreenshot`, tests).
     fn capture(&self) -> Result<Capture, UiError>;

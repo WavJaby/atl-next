@@ -13,6 +13,12 @@ pub const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
 /// DRM_FORMAT_XBGR8888, fourcc 'XB24' (drm_fourcc.h): ABGR8888 with the top byte, memory byte 3, unused.
 pub const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
 
+/// `DRM_FORMAT_MOD_LINEAR` (drm_fourcc.h `fourcc_mod_code(NONE, 0)`): rows at `pitch`, what the CPU path maps.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// `DRM_FORMAT_MOD_INVALID` (drm_fourcc.h `fourcc_mod_code(NONE, (1ULL << 56) - 1)`): "no modifier known".
+pub const DRM_FORMAT_MOD_INVALID: u64 = (1 << 56) - 1;
+
 /// What the allocator knows about a pixel format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatInfo {

@@ -9,9 +9,14 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
+use atl_gralloc::descriptor::{Checked, Descriptor};
+use atl_gralloc::format::{DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
+use atl_gralloc::usage;
 use gbm::{BufferObjectFlags, Device, Format};
 use rustix::fs::{SeekFrom, seek};
 
@@ -20,12 +25,47 @@ use crate::prime;
 /// Where DRM nodes live (the kernel's, `drm_core`).
 pub const DRM_DIR: &str = "/dev/dri";
 
-/// `DRM_FORMAT_MOD_LINEAR` and `DRM_FORMAT_MOD_INVALID` (drm_fourcc.h: `0` and `fourcc_mod_code(NONE, (1ULL << 56) - 1)`).
-const MOD_LINEAR: u64 = 0;
-const MOD_INVALID: u64 = (1 << 56) - 1;
-
 /// The size of the buffer a node is asked for to prove it allocates. Any valid size does; 64 x 64 is what the gate allocates.
-const PROBE_EDGE: u32 = 64;
+const PROBE_EDGE: i32 = 64;
+
+/// GBM flags per usage bit, OR'd over the request's usage. Empty now: every buffer is LINEAR (the only modifier `Checked` admits), which [`flags_for`] adds. Step 2 adds GPU_RENDER_TARGET / GPU_TEXTURE -> RENDERING here, with non-linear modifiers.
+const USAGE_FLAGS: &[(u64, BufferObjectFlags)] = &[];
+
+/// The GBM flags for a request: the usage table plus LINEAR when the modifier set allows only LINEAR.
+fn flags_for(usage: u64, modifiers: &[u64]) -> BufferObjectFlags {
+    let mut flags = USAGE_FLAGS
+        .iter()
+        .filter(|(bit, _)| usage & bit != 0)
+        .fold(BufferObjectFlags::empty(), |acc, (_, f)| acc | *f);
+    if modifiers == [DRM_FORMAT_MOD_LINEAR] {
+        flags |= BufferObjectFlags::LINEAR;
+    }
+    flags
+}
+
+/// The request a node must serve to be chosen: the window buffer shape the gate allocates.
+fn probe_request() -> Checked {
+    Descriptor {
+        name: b"probe".to_vec(),
+        width: PROBE_EDGE,
+        height: PROBE_EDGE,
+        layer_count: 1,
+        format: RGBA_8888,
+        usage: usage::CPU_MASK,
+        reserved_size: 0,
+        option_names: vec![],
+        modifiers: vec![],
+    }
+    .check()
+    .expect("the probe request is in the supported set")
+}
+
+/// Counters of the backend's fallbacks.
+#[derive(Debug, Default)]
+pub struct Counters {
+    /// LINEAR buffers the driver reported with modifier INVALID, stored as LINEAR. vgem does this (WSL); retired with the GBM modifier path (G5).
+    pub modifier_invalid_linear: AtomicU64,
+}
 
 /// One linear buffer.
 #[derive(Debug)]
@@ -70,9 +110,7 @@ impl fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 struct Request {
-    width: u32,
-    height: u32,
-    fourcc: u32,
+    checked: Checked,
     reply: Sender<Result<Dmabuf, BackendError>>,
 }
 
@@ -81,6 +119,7 @@ pub struct Backend {
     tx: Option<Sender<Request>>,
     thread: Option<JoinHandle<()>>,
     node: PathBuf,
+    counters: Arc<Counters>,
 }
 
 /// `renderD*` nodes in number order, then `card*` nodes (names sorted, which orders same-width numbers).
@@ -108,16 +147,15 @@ fn gbm_format(fourcc: u32) -> Result<Format, BackendError> {
         .map_err(|_| BackendError::Alloc(format!("fourcc {fourcc:#x} is not a DRM format")))
 }
 
+/// The one allocation entry: GBM flags from [`flags_for`], LINEAR only now (the CPU path maps the dma-buf and indexes it by pitch, the layout atl-gralloc's plane layout states).
 fn alloc(
     dev: &Device<std::fs::File>,
-    width: u32,
-    height: u32,
-    fourcc: u32,
+    c: &Checked,
+    counters: &Counters,
 ) -> Result<Dmabuf, BackendError> {
-    let format = gbm_format(fourcc)?;
-    // LINEAR: the CPU path maps the dma-buf and indexes it by pitch (the layout atl-gralloc's plane layout states)
+    let format = gbm_format(c.format.fourcc)?;
     let bo = dev
-        .create_buffer_object::<()>(width, height, format, BufferObjectFlags::LINEAR)
+        .create_buffer_object::<()>(c.width, c.height, format, flags_for(c.usage, &c.modifiers))
         .map_err(|e| BackendError::Alloc(e.to_string()))?;
     // not `bo.fd()`: that descriptor is read-only on some drivers (prime.rs)
     let fd = prime::export_dmabuf(dev.as_fd(), prime::gem_handle(&bo))
@@ -126,34 +164,43 @@ fn alloc(
     // a dma-buf reports its size by seeking to its end
     let size = seek(&fd, SeekFrom::End(0))
         .map_err(|e| BackendError::Alloc(format!("sizing the dma-buf: {e}")))?;
-    let m = u64::from(bo.modifier());
+    let mut modifier = u64::from(bo.modifier());
+    // vgem answers INVALID for the LINEAR buffer it was asked for; only then is INVALID read as LINEAR
+    if modifier == DRM_FORMAT_MOD_INVALID && c.modifiers == [DRM_FORMAT_MOD_LINEAR] {
+        counters
+            .modifier_invalid_linear
+            .fetch_add(1, Ordering::Relaxed);
+        modifier = DRM_FORMAT_MOD_LINEAR;
+    }
     Ok(Dmabuf {
         fd,
         pitch,
         size,
-        modifier: if m == MOD_INVALID { MOD_LINEAR } else { m },
+        modifier,
     })
 }
 
 /// Opens `node` and proves it allocates.
-fn open_node(node: &Path, fourcc: u32) -> Result<Device<std::fs::File>, String> {
+fn open_node(node: &Path, counters: &Counters) -> Result<Device<std::fs::File>, String> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(node)
         .map_err(|e| format!("{}: open: {e}", node.display()))?;
     let dev = Device::new(file).map_err(|e| format!("{}: gbm device: {e}", node.display()))?;
-    alloc(&dev, PROBE_EDGE, PROBE_EDGE, fourcc).map_err(|e| format!("{}: {e}", node.display()))?;
+    alloc(&dev, &probe_request(), counters).map_err(|e| format!("{}: {e}", node.display()))?;
     Ok(dev)
 }
 
 impl Backend {
-    /// Starts the GBM thread on `node`, or on the first node of `dir` that allocates a linear `probe_fourcc` buffer.
-    pub fn start(dir: &Path, node: Option<&Path>, probe_fourcc: u32) -> Result<Self, BackendError> {
+    /// Starts the GBM thread on `node`, or on the first node of `dir` that allocates the probe request (a linear RGBA_8888 buffer).
+    pub fn start(dir: &Path, node: Option<&Path>) -> Result<Self, BackendError> {
         let nodes = match node {
             Some(n) => vec![n.to_path_buf()],
             None => candidates(dir),
         };
+        let counters = Arc::new(Counters::default());
+        let thread_counters = Arc::clone(&counters);
         let (tx, rx) = channel::<Request>();
         let (ready_tx, ready_rx) = channel::<Result<PathBuf, BackendError>>();
         let thread = std::thread::Builder::new()
@@ -162,7 +209,7 @@ impl Backend {
                 let mut tried = Vec::new();
                 let mut found = None;
                 for n in nodes {
-                    match open_node(&n, probe_fourcc) {
+                    match open_node(&n, &thread_counters) {
                         Ok(dev) => {
                             found = Some((n, dev));
                             break;
@@ -176,7 +223,7 @@ impl Backend {
                 };
                 let _ = ready_tx.send(Ok(node));
                 while let Ok(r) = rx.recv() {
-                    let _ = r.reply.send(alloc(&dev, r.width, r.height, r.fourcc));
+                    let _ = r.reply.send(alloc(&dev, &r.checked, &thread_counters));
                 }
             })
             .map_err(|e| BackendError::Alloc(format!("starting the GBM thread: {e}")))?;
@@ -185,6 +232,7 @@ impl Backend {
                 tx: Some(tx),
                 thread: Some(thread),
                 node,
+                counters,
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -199,16 +247,19 @@ impl Backend {
         &self.node
     }
 
-    /// One linear buffer of `fourcc`.
-    pub fn allocate(&self, width: u32, height: u32, fourcc: u32) -> Result<Dmabuf, BackendError> {
+    /// The backend's fallback counters.
+    pub fn counters(&self) -> &Counters {
+        &self.counters
+    }
+
+    /// One buffer for `checked`.
+    pub fn allocate(&self, checked: &Checked) -> Result<Dmabuf, BackendError> {
         let (reply, answer) = channel();
         self.tx
             .as_ref()
             .ok_or(BackendError::Gone)?
             .send(Request {
-                width,
-                height,
-                fourcc,
+                checked: checked.clone(),
                 reply,
             })
             .map_err(|_| BackendError::Gone)?;
@@ -234,7 +285,7 @@ impl From<BackendError> for io::Error {
 
 #[cfg(test)]
 mod tests {
-    use atl_gralloc::format::DRM_FORMAT_ABGR8888;
+    use atl_gralloc::format::FormatInfo;
     use rustix::fs::{OFlags, fcntl_getfl};
 
     use super::*;
@@ -264,7 +315,7 @@ mod tests {
 
     #[test]
     fn an_empty_or_missing_directory_explains_itself() {
-        let e = Backend::start(Path::new("/nonexistent-dri"), None, DRM_FORMAT_ABGR8888)
+        let e = Backend::start(Path::new("/nonexistent-dri"), None)
             .err()
             .expect("no node");
         assert!(e.to_string().contains("no DRM node under /dev/dri"), "{e}");
@@ -273,30 +324,47 @@ mod tests {
 
     #[test]
     fn a_node_that_is_not_drm_is_reported_by_name() {
-        let e = Backend::start(
-            Path::new(DRM_DIR),
-            Some(Path::new("/dev/null")),
-            DRM_FORMAT_ABGR8888,
-        )
-        .err()
-        .expect("not drm");
+        let e = Backend::start(Path::new(DRM_DIR), Some(Path::new("/dev/null")))
+            .err()
+            .expect("not drm");
         assert!(e.to_string().contains("/dev/null"), "{e}");
+    }
+
+    /// LINEAR-only modifier sets get GBM LINEAR; any other set gets no LINEAR flag (the usage table is empty now).
+    #[test]
+    fn flags_follow_the_modifier_set() {
+        let any = usage::CPU_MASK | usage::GPU_TEXTURE;
+        assert_eq!(
+            flags_for(any, &[DRM_FORMAT_MOD_LINEAR]),
+            BufferObjectFlags::LINEAR
+        );
+        assert_eq!(
+            flags_for(any, &[DRM_FORMAT_MOD_LINEAR, 1]),
+            BufferObjectFlags::empty()
+        );
     }
 
     /// Allocates when the host has a DRM node that does (this machine: vgem); without one the failure must say how to get one.
     #[test]
     fn allocates_or_explains() {
-        match Backend::start(Path::new(DRM_DIR), None, DRM_FORMAT_ABGR8888) {
+        match Backend::start(Path::new(DRM_DIR), None) {
             Ok(b) => {
-                let d = b.allocate(64, 48, DRM_FORMAT_ABGR8888).expect("allocate");
+                let mut c = probe_request();
+                c.height = 48;
+                let d = b.allocate(&c).expect("allocate");
                 // a 64-pixel ABGR8888 row is 256 bytes; drivers may pad the pitch, never shrink it
                 assert!(d.pitch >= 256, "pitch {}", d.pitch);
                 assert!(d.size >= u64::from(d.pitch) * 48, "size {}", d.size);
-                assert_eq!(d.modifier, MOD_LINEAR);
+                assert_eq!(d.modifier, DRM_FORMAT_MOD_LINEAR);
                 // writable, whatever the driver exported (`read_write`)
                 let mode = fcntl_getfl(&d.fd).expect("flags") & OFlags::ACCMODE;
                 assert_ne!(mode, OFlags::RDONLY);
-                assert!(b.allocate(64, 48, 0).is_err(), "fourcc 0 is no format");
+                let no_format: &'static FormatInfo = Box::leak(Box::new(FormatInfo {
+                    fourcc: 0,
+                    ..*c.format
+                }));
+                c.format = no_format;
+                assert!(b.allocate(&c).is_err(), "fourcc 0 is no format");
             }
             Err(e) => assert!(e.to_string().contains("DRM"), "{e}"),
         }

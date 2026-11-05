@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! One allocation: a checked descriptor becomes a dma-buf from the backend, the shared metadata page, and the handle parameters (`atl_gralloc::handle::Params`) the mapper parses in the importing process.
 
+use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use atl_gralloc::descriptor::Checked;
 use atl_gralloc::handle::Params;
@@ -50,20 +51,37 @@ impl From<BackendError> for AllocError {
 pub struct Allocator {
     backend: Backend,
     counter: AtomicU32,
+    /// The `modifier_invalid_linear` value last printed.
+    counters_logged: AtomicU64,
     pid: u32,
 }
 
 impl Allocator {
     pub fn new(backend: Backend) -> Self {
+        // the probe allocation may already have counted; the start line prints that value
+        let at_start = backend
+            .counters()
+            .modifier_invalid_linear
+            .load(Ordering::Relaxed);
         Self {
             backend,
             counter: AtomicU32::new(1),
+            counters_logged: AtomicU64::new(at_start),
             pid: std::process::id(),
         }
     }
 
     pub fn backend(&self) -> &Backend {
         &self.backend
+    }
+
+    /// `gralloc: counters <name>=<n> ...`: printed at start and whenever a counter changes (the gate reads the last one).
+    pub fn counters_line(&self) -> String {
+        let c = self.backend.counters();
+        format!(
+            "gralloc: counters modifier_invalid_linear={}",
+            c.modifier_invalid_linear.load(Ordering::Relaxed)
+        )
     }
 
     /// A zero-filled memfd page initialised with `name`. Written with `pwrite`, so this process never maps it.
@@ -80,7 +98,16 @@ impl Allocator {
 
     /// Allocates one buffer for `d`.
     pub fn allocate(&self, d: &Checked) -> Result<Allocation, AllocError> {
-        let dmabuf = self.backend.allocate(d.width, d.height, d.format.fourcc)?;
+        let dmabuf = self.backend.allocate(d)?;
+        let n = self
+            .backend
+            .counters()
+            .modifier_invalid_linear
+            .load(Ordering::Relaxed);
+        if self.counters_logged.swap(n, Ordering::Relaxed) != n {
+            // stderr is the allocator's log (service.rs `log`); a failed write loses one diagnostic line, not the buffer
+            let _ = writeln!(std::io::stderr(), "{}", self.counters_line());
+        }
         let row = u64::from(d.width) * u64::from(d.format.bytes_per_pixel);
         if u64::from(dmabuf.pitch) < row || !dmabuf.pitch.is_multiple_of(d.format.bytes_per_pixel) {
             return Err(AllocError::Inconsistent("pitch"));
@@ -115,7 +142,7 @@ mod tests {
     use std::path::Path;
 
     use atl_gralloc::descriptor::Descriptor;
-    use atl_gralloc::format::{DRM_FORMAT_ABGR8888, RGBA_8888};
+    use atl_gralloc::format::RGBA_8888;
     use atl_gralloc::handle;
 
     use super::*;
@@ -131,6 +158,7 @@ mod tests {
             usage: 0x33,
             reserved_size: 0,
             option_names: vec![],
+            modifiers: vec![],
         }
         .check()
         .expect("valid")
@@ -148,7 +176,7 @@ mod tests {
     /// The round trip the importer does: ints from the allocation parse back, and ids differ per buffer. Needs a DRM node; without one the backend error must explain (see backend tests).
     #[test]
     fn allocation_round_trips_through_the_handle_ints() {
-        let Ok(backend) = Backend::start(Path::new(DRM_DIR), None, DRM_FORMAT_ABGR8888) else {
+        let Ok(backend) = Backend::start(Path::new(DRM_DIR), None) else {
             return;
         };
         let a = Allocator::new(backend);

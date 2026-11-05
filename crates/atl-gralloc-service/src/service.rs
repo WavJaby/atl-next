@@ -15,6 +15,7 @@ use atl_aidl::graphics_allocator::aidl::android::hardware::graphics::allocator::
     BnAllocator, IAllocator,
 };
 use atl_gralloc::descriptor::Descriptor;
+use atl_gralloc::format::DRM_FORMAT_MOD_LINEAR;
 use atl_gralloc::{handle, vintf};
 use binder::{BinderFeatures, Interface, ParcelFileDescriptor, SpIBinder, Status};
 
@@ -46,6 +47,8 @@ fn descriptor(info: &BufferDescriptorInfo) -> Descriptor {
             .iter()
             .map(|o| o.name.clone())
             .collect(),
+        // device policy, not AIDL: LINEAR only until the GBM modifier path (G5)
+        modifiers: vec![DRM_FORMAT_MOD_LINEAR],
     }
 }
 

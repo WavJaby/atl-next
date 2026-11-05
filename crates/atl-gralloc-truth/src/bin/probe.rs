@@ -85,6 +85,60 @@ unsafe extern "C" {
     fn AHardwareBuffer_sendHandleToUnixSocket(b: *const Buffer, socket: i32) -> i32;
     fn AHardwareBuffer_recvHandleFromUnixSocket(socket: i32, out: *mut *mut Buffer) -> i32;
     fn AHardwareBuffer_getId(b: *const Buffer, out: *mut u64) -> i32;
+    // vndk/hardware_buffer.h (LLNDK): the buffer's native_handle_t, owned by the buffer
+    fn AHardwareBuffer_getNativeHandle(b: *const Buffer) -> *const NativeHandle;
+}
+
+/// `native_handle_t` (cutils/native_handle.h): version, numFds, numInts, then `data[numFds + numInts]`.
+#[repr(C)]
+struct NativeHandle {
+    version: i32,
+    num_fds: i32,
+    num_ints: i32,
+    data: [i32; 0],
+}
+
+/// What a dma-buf importer reads: the layout accessor (`atl_gralloc::layout`, which `atl-scene-buffer`'s `DmabufView` carries) on the handle libui imported here, against libui's own `describe()` stride and the plane fd's real size.
+fn check_layout(b: *const Buffer, d: &Desc) -> Result<()> {
+    use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR};
+    // SAFETY: `b` is a live buffer; the handle it returns lives as long as `b`, which outlives this call.
+    let h = unsafe { AHardwareBuffer_getNativeHandle(b) };
+    ensure!(!h.is_null(), "getNativeHandle: null");
+    // SAFETY: `h` points to a native_handle_t whose header is three ints, valid while `b` lives.
+    let (num_fds, num_ints) = unsafe { ((*h).num_fds, (*h).num_ints) };
+    let (Ok(nf), Ok(ni)) = (usize::try_from(num_fds), usize::try_from(num_ints)) else {
+        bail!("handle counts {num_fds} / {num_ints}");
+    };
+    // SAFETY: `data` holds `numFds + numInts` ints after the header (native_handle.h), all within the handle's allocation.
+    let data = unsafe { std::slice::from_raw_parts((*h).data.as_ptr(), nf + ni) };
+    let layout = atl_gralloc::layout::from_handle(nf, &data[nf..])
+        .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+    ensure!(
+        layout.pixel_stride() == d.stride,
+        "layout stride {} pixels, describe() {}",
+        layout.pixel_stride(),
+        d.stride
+    );
+    ensure!(
+        (layout.fourcc, layout.modifier) == (DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR),
+        "fourcc {:#x} modifier {:#x}",
+        layout.fourcc,
+        layout.modifier
+    );
+    let plane = layout.planes[0];
+    let fd = data[plane.fd_index];
+    ensure!(fd >= 0, "plane fd {fd}");
+    // SAFETY: the handle's fds are open in this process while `b` lives (libui imported them); the borrow ends in this call.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let size = rustix::fs::fstat(fd)
+        .context("fstat of the plane fd")?
+        .st_size;
+    let need = plane.offset + u64::from(plane.stride_bytes) * u64::from(layout.height);
+    ensure!(
+        u64::try_from(size).is_ok_and(|s| s >= need),
+        "plane fd holds {size} bytes, the layout needs {need}"
+    );
+    Ok(())
 }
 
 /// `struct __android_log_message` is passed through untouched: only its address crosses, from liblog's stderr logger back to liblog.
@@ -439,6 +493,7 @@ fn reader(sock: OwnedFd) -> Result<bool> {
             Ok(())
         }),
     );
+    rep.check("layout-from-handle", check_layout(b, &d));
 
     {
         let l = Locked::new(b, CPU_READ_OFTEN);

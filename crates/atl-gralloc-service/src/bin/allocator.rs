@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use atl_gralloc::format::DRM_FORMAT_ABGR8888;
 use atl_gralloc::vintf;
 use atl_gralloc_service::allocator::Allocator;
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
@@ -29,8 +28,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    let backend = Backend::start(DRM_DIR.as_ref(), a.drm_node.as_deref(), DRM_FORMAT_ABGR8888)
-        .context("gralloc backend")?;
+    let backend =
+        Backend::start(DRM_DIR.as_ref(), a.drm_node.as_deref()).context("gralloc backend")?;
     let node = backend.node().to_owned();
     let allocator = Arc::new(Allocator::new(backend));
     ProcessState::start_thread_pool();
@@ -39,6 +38,7 @@ fn main() -> Result<()> {
         service::new_binder(allocator),
     )
     .context("addService (is the instance declared in the VINTF manifest?)")?;
+    writeln!(std::io::stderr(), "{}", allocator.counters_line())?;
     writeln!(std::io::stderr(), "gralloc: ready ({})", node.display())?;
     ProcessState::join_thread_pool();
     Ok(())

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use atl_platform_ui_api::{
     Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Locks, Monitor, PhysSize,
-    PointerPhase, PresentError, Scale, Scene, TouchPhase, UiError, Window, WindowAttributes,
+    PointerPhase, PresentError, Presented, Scale, Scene, TouchPhase, UiError, Window,
+    WindowAttributes,
 };
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
@@ -410,7 +411,7 @@ impl Window for GtkWindow {
         self.window.is_mapped() && self.window.surface().is_some_and(|s| s.is_mapped())
     }
 
-    fn present(&self, scene: &Scene) -> Result<(), PresentError> {
+    fn present(&self, scene: &Scene) -> Result<Presented, PresentError> {
         self.view.show_node(scene::build(scene)?);
         self.shared.presented.set(true);
         let origin = (!self.origin_logged.get() && self.is_mapped())
@@ -421,7 +422,8 @@ impl Window for GtkWindow {
             tracing::info!("atl-platform-ui: content origin x={x} y={y}");
         }
         mirror::resync();
-        Ok(())
+        // step 1: scene::build copied every buffer into a memory texture, so nothing is released later
+        Ok(Presented::default())
     }
 
     fn capture(&self) -> Result<Capture, UiError> {

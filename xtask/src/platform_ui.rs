@@ -513,6 +513,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "unsignalled fence and bad stride refused, signalled fence accepted",
         &refusals,
     );
+    report.check(
+        field(&refusals, "releases") == Some("0"),
+        "step-1 present reports no release points (buffers copied at present)",
+        &refusals,
+    );
     let fdwatch = client
         .lines_with("FDWATCH")
         .first()
