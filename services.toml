@@ -106,8 +106,12 @@ mirrors = [
 ]
 
 [window]
-src = ["crates/atl-services/src/window.rs"]
+src = [
+    "crates/atl-services/src/window.rs",
+    "crates/atl-services/src/window_layout.rs",
+]
 mirrors = [
+    "frameworks/base/core/java/android/view/Gravity.java#apply",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#openSession",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#hasNavigationBar",
     "frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java#setInTouchMode",
@@ -124,6 +128,21 @@ src = ["crates/atl-services/src/input_method.rs"]
 mirrors = [
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#addClient",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#startInputOrWindowGainedFocus",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#showSoftInput",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#hideSoftInput",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#getInputMethodList",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#getEnabledInputMethodList",
+]
+
+[notification]
+src = ["crates/atl-services/src/notification.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#enqueueToast",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#enqueueTextToast",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#cancelToast",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#finishToken",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#showNextToastLocked",
+    "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#areNotificationsEnabled",
 ]
 
 [content]
