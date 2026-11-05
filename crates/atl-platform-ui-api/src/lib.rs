@@ -163,6 +163,9 @@ pub trait Window: FrameClock + InputSource + Sized {
 
     /// What the window content shows now, rendered by the toolkit's own renderer from the presented scene (the platform's screenshot: `UiAutomation.takeScreenshot`, tests).
     fn capture(&self) -> Result<Capture, UiError>;
+
+    /// Calls `on_resize` with the content's size in physical pixels once it has one, then on each change. A tiling compositor resizes every window: the content follows the window, and the caller re-lays out and presents at the new size.
+    fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F);
 }
 
 /// Window content pixels, as [`Window::capture`] returns them.

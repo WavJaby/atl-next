@@ -49,6 +49,8 @@ pub struct Args {
 /// The window content size asked for, physical pixels. Wide enough that the title bar's minimum width does not enlarge the content (WSLg: ~280 px), and at least the composite scene's 256 x 192.
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
+/// The resize probe's size step, physical pixels per axis: the larger and the smaller size are WIDTH/HEIGHT +- this. The smaller content stays above the title bar's minimum width (WSLg: ~280 px).
+const RESIZE_STEP: u32 = 32;
 /// How long the client may take to reach READY (build excluded): mapping, the frames, the fd test.
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 /// How long an idle UI thread may take to answer a ping. The client answers within one main-loop pass (20 ms); real compositors wait seconds, so 1 s is a generous bound for a loaded machine.
@@ -338,6 +340,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .arg(&out_dir)
         .args(["--frames", &args.frames.to_string()])
         .args(["--width", &WIDTH.to_string(), "--height", &HEIGHT.to_string()])
+        .args(["--resize-step", &RESIZE_STEP.to_string()])
         .args(["--timeout-secs", &STARTUP_LIMIT.as_secs().to_string()])
         .env("WAYLAND_DISPLAY", &socket)
         .env("GDK_BACKEND", "wayland")
@@ -413,6 +416,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .is_none(),
         "no dmabuf global bound (step 1 is CPU only)",
         "",
+    );
+    // the content follows the window: the larger, then the smaller probe size is reported, the smaller last
+    let sizes: Vec<(u32, u32)> = client
+        .lines_with("RESIZED ")
+        .into_iter()
+        .filter_map(|l| {
+            let (w, h) = l.strip_prefix("RESIZED ")?.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .collect();
+    let larger = (WIDTH + RESIZE_STEP, HEIGHT + RESIZE_STEP);
+    let smaller = (WIDTH - RESIZE_STEP, HEIGHT - RESIZE_STEP);
+    let in_order = match (
+        sizes.iter().position(|s| *s == larger),
+        sizes.iter().position(|s| *s == smaller),
+    ) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    };
+    report.check(
+        in_order && sizes.last() == Some(&smaller),
+        "content follows the window: larger, then smaller probe size, the smaller last",
+        &format!("sizes {sizes:?}"),
     );
 
     // gate 2: readback

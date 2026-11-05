@@ -46,6 +46,9 @@ struct Args {
     /// Window content width in physical pixels.
     #[arg(long)]
     width: u32,
+    /// Size step of the resize probe (phase 2b): the content goes to width/height + step, then - step, per axis.
+    #[arg(long)]
+    resize_step: u32,
     /// Window content height in physical pixels.
     #[arg(long)]
     height: u32,
@@ -427,6 +430,27 @@ fn main() -> Result<()> {
         "COMPOSITE {}",
         save(&args.out, "composite.rgba", &window)?
     ));
+
+    // phase 2b: the content follows the window: set_size asks the platform for a larger, then a smaller size; each size the content gets is reported
+    let sizes: Rc<RefCell<Vec<PhysSize>>> = Rc::default();
+    {
+        let sizes = Rc::clone(&sizes);
+        window.on_resize(move |size| sizes.borrow_mut().push(size));
+    }
+    let step = args.resize_step;
+    for (width, height) in [
+        (args.width + step, args.height + step),
+        (args.width - step, args.height - step),
+    ] {
+        let want = PhysSize { width, height };
+        window.set_size(want);
+        spin(&looper, deadline, "the resized content", || {
+            sizes.borrow().last() == Some(&want)
+        })?;
+    }
+    for size in sizes.borrow().iter() {
+        emit(format_args!("RESIZED {}x{}", size.width, size.height));
+    }
 
     // phase 3: refusals
     let (_fd, mut scene) = frame_scene(args.width, args.height, 0)?;

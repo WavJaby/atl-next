@@ -48,6 +48,7 @@ struct Shared {
     on_tick: Slot<dyn FnMut(FrameTick)>,
     frame_requested: Cell<bool>,
     on_event: Slot<dyn FnMut(InputEvent)>,
+    on_resize: Slot<dyn FnMut(PhysSize)>,
 }
 
 /// A toplevel window on GTK4.
@@ -152,11 +153,14 @@ impl Window for GtkWindow {
             on_tick: Slot::new(),
             frame_requested: Cell::new(false),
             on_event: Slot::new(),
+            on_resize: Slot::new(),
         });
         let window = gtk4::Window::new();
         let view = SceneView::new();
         Self::wire_frame_clock(&window, &shared);
         Self::wire_pointer(&view, &shared);
+        let resized = Rc::clone(&shared);
+        view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));
         window.set_child(Some(&view));
         let this = GtkWindow {
             window,
@@ -252,6 +256,10 @@ impl Window for GtkWindow {
             .flat_map(|y| bytes[y * stride..y * stride + row].iter().copied())
             .collect();
         Ok(Capture { size, rgba })
+    }
+
+    fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F) {
+        self.shared.on_resize.set(Box::new(on_resize));
     }
 }
 

@@ -7,6 +7,9 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
+/// A content size change in physical pixels ([`SceneView::connect_allocation`]).
+type AllocateFn = Box<dyn FnMut(atl_platform_ui_api::PhysSize)>;
+
 mod imp {
     use super::*;
 
@@ -16,6 +19,10 @@ mod imp {
         pub node: RefCell<Option<gsk::RenderNode>>,
         /// The natural size in logical pixels (what the window asked for), 0 x 0 until set. The minimum is always 0, so the user can shrink the window.
         pub wanted: Cell<(i32, i32)>,
+        /// The last allocation reported to `on_allocate`, logical pixels: the same size is not reported twice.
+        pub allocated: Cell<(i32, i32)>,
+        /// Receives the content's size in physical pixels when a layout gives it a new one ([`super::SceneView::connect_allocation`]).
+        pub on_allocate: RefCell<Option<AllocateFn>>,
     }
 
     #[glib::object_subclass]
@@ -44,6 +51,22 @@ mod imp {
                 _ => height,
             };
             (0, natural, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            if width <= 0 || height <= 0 || self.allocated.get() == (width, height) {
+                return;
+            }
+            self.allocated.set((width, height));
+            let scale = self.obj().scale();
+            let physical = atl_platform_ui_api::PhysSize {
+                width: scale.to_physical(f64::from(width)).round() as u32,
+                height: scale.to_physical(f64::from(height)).round() as u32,
+            };
+            if let Some(on_allocate) = self.on_allocate.borrow_mut().as_mut() {
+                on_allocate(physical);
+            }
         }
 
         fn snapshot(&self, snapshot: &gtk4::Snapshot) {
@@ -85,6 +108,14 @@ impl SceneView {
     /// The node last shown, in physical pixels.
     pub fn node(&self) -> Option<gsk::RenderNode> {
         self.imp().node.borrow().clone()
+    }
+
+    /// Calls `on_allocate` with the content's size in physical pixels when a layout gives it a new one (not twice for the same size).
+    pub fn connect_allocation<F: FnMut(atl_platform_ui_api::PhysSize) + 'static>(
+        &self,
+        on_allocate: F,
+    ) {
+        *self.imp().on_allocate.borrow_mut() = Some(Box::new(on_allocate));
     }
 
     /// Sets the natural size, in logical pixels, and asks for a new layout.
