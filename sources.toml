@@ -10,9 +10,6 @@
 #             tree path to its git name and lists the tree's link/copy files
 #   projects  AOSP tree path -> commit the tag resolves to in that project
 #             (checkout src/aosp/<path>, patches patches/aosp/<path>/; `xtask fetch --add` adds rows)
-#   sparse    pinned tree path -> the only directories checked out (blob-less fetch + cone sparse
-#             checkout; fetch fails when one is absent at the pin): a prebuilts repository the build reads
-#             one version of
 # [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
 #   git       clone URL
 #   tag       release tag
@@ -191,14 +188,11 @@ libnativehelper = "5c36ece5ac42b20f0e384d9e57400f2f22aad9fb"
 platform_testing = "7b48625b052b94b1ef24573ef5e8ffa5e2ea9783"
 "prebuilts/bazel/common" = "e24e8ba7c6deed0e2e9c36ad6f255437acd98e0d"
 "prebuilts/build-tools" = "8c01d80d728e5bf542e7d754064994d3f1107a7d"
-"prebuilts/clang/host/linux-x86" = "2d4dcbff7cb42f360f368bacf51cfe711fd1cb0f"
-"prebuilts/go/linux-x86" = "f88af64a3b03b7ea14489d60349913a48a584ea3"
 "prebuilts/gradle-plugin" = "1165e66cd361b8af9155b4b4728cf5187e7442ef"
 "prebuilts/jdk/jdk21" = "9b7eccf2d3a4fa7ea1fec0fbdad592de208213e0"
 "prebuilts/manifest-merger" = "002531c4b5e93460408c49b63400f1f38082ea83"
 "prebuilts/misc" = "6e84ee6ddafe39d475876c511a516dbc9f2f19a6"
 "prebuilts/r8" = "318c3c8b381636efd5d7b00d085b07eeb5515949"
-"prebuilts/rust" = "3807eb51342e3949938eabd9f34a4d3d526cc5c3"
 "prebuilts/sdk" = "3b7daadc4e54d51439e5ae9b4dbd96cda8b6104e"
 "prebuilts/tools" = "8ee19a8c7e3c2ee80b91f6c46696314f8a3649ec"
 sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
@@ -243,14 +237,8 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 "tools/metalava" = "a2548e478c121d5801137d636f6e83af37eafc99"
 "tools/platform-compat" = "db0de6104d8527114a7ae441b0a9c35f885d2876"
 
-[aosp.sparse]
-# Soong's ClangDefaultVersion at the tag (build/soong/cc/config/global.go; `xtask soong` checks it) + the dirs the repo's Android.bp and Go plugin read; the full repository is ~18 GB
-"prebuilts/clang/host/linux-x86" = ["clang-r547379", "clang-stable", "llvm-binutils-stable", "soong"]
-# Soong's RustDefaultVersion at the tag (build/soong/rust/config/global.go): bionic's linker links a Rust staticlib
-"prebuilts/rust" = ["linux-x86/1.83.0", "linux-x86/stable", "bootstrap", "soong"]
-
 # Berberis (AOSP frameworks/libs/binary_translation): read-only reference for the identity engine's loader/thread design (owner O1, 2026-11-06), never built.
-# A git row, not an [aosp.projects] one, so it lands in src/berberis outside the AOSP tree the converter and Soong scan.
+# A git row, not an [aosp.projects] one, so it lands in src/berberis outside the AOSP tree the converter scans.
 [berberis]
 git = "https://android.googlesource.com/platform/frameworks/libs/binary_translation"
 tag = "android-16.0.0_r1"

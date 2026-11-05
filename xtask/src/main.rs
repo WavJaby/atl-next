@@ -53,7 +53,6 @@ mod run_apk;
 mod service_mirrors;
 mod services;
 mod slot;
-mod soong;
 mod sources;
 mod spdx;
 mod system;
@@ -106,14 +105,6 @@ enum Command {
     /// index; `--which` reads it. Names come from each module's literal `name:` only: a name built
     /// from variables is not indexed.
     Aosp(aosp::Args),
-    /// AOSP modules built by upstream Soong in the pinned subset tree (phase-1 route).
-    ///
-    /// The product (--device = AOSP device arch, --guest = AOSP native-bridge arch) is generated
-    /// from arches.toml into <tree>/device/atl/; TARGET_RELEASE follows the tag's BUILD_ID. Output in
-    /// <workspace>/out/aosp[/<task>]/<product>, one log per build under its logs/. With --fetch-missing a
-    /// failed build's missing modules and paths are pinned (sources.toml) and fetched, then it builds
-    /// again; every added project is printed with the log line that asked for it.
-    Soong(soong::Args),
     /// AOSP native modules built for this Linux host by our Blueprint converter (tools/bp2ninja).
     ///
     /// Runtime libraries come from each module's android source set compiled for glibc, build tools
@@ -237,7 +228,6 @@ fn main() -> Result<ExitCode> {
         Command::Deps(args) => deps::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
-        Command::Soong(args) => soong::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::MesaConfig(args) => mesa::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
@@ -308,7 +298,6 @@ fn main() -> Result<ExitCode> {
 fn verdict_name(command: &Command) -> Option<&'static str> {
     Some(match command {
         Command::Native(_) => "native",
-        Command::Soong(_) => "soong",
         Command::Check(_) => "check",
         Command::Land(_) => "land",
         Command::RunApk(_) => "run-apk",

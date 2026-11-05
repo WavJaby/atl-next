@@ -215,7 +215,6 @@ mod tests {
             commit: "c".into(),
             pin: Pin::Aosp(path.into()),
             licence_key: "aosp".into(),
-            sparse: Vec::new(),
         }
     }
 

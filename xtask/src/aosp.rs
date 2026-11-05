@@ -421,36 +421,6 @@ impl Index {
         (want, unresolved)
     }
 
-    /// (module, directory of each blueprint file defining it).
-    pub fn dirs_of<'a>(&'a self, names: &'a BTreeSet<String>) -> Vec<(&'a str, &'a str)> {
-        names
-            .iter()
-            .flat_map(|n| {
-                self.modules
-                    .get(n)
-                    .into_iter()
-                    .flatten()
-                    .map(move |d| (n.as_str(), parent_dir(&d.file)))
-            })
-            .collect()
-    }
-
-    /// `names` plus every `defaults` module they inherit from, transitively (any definition of a name).
-    pub fn with_defaults(&self, names: &BTreeSet<String>) -> BTreeSet<String> {
-        let mut seen = names.clone();
-        let mut todo: Vec<&str> = names.iter().map(String::as_str).collect();
-        while let Some(name) = todo.pop() {
-            for d in self.modules.get(name).into_iter().flatten() {
-                for parent in &d.defaults {
-                    if seen.insert(parent.clone()) {
-                        todo.push(parent);
-                    }
-                }
-            }
-        }
-        seen
-    }
-
     /// `license_kinds` of the `license` module a `licenses` entry in blueprint directory `from` (tree path) names (`license_of`).
     pub fn license_kinds_of(&self, reference: &str, from: &str) -> Result<&[String], String> {
         let def = self.license_of(reference, from)?;
@@ -494,21 +464,6 @@ impl Index {
             0 => "no license module of that name".to_owned(),
             n => format!("{n} license modules of that name, none enclosing it"),
         })
-    }
-
-    /// The project whose `soong_build` plugin registers a module type.
-    pub fn project_for_type(&self, module_type: &str) -> Result<&str, String> {
-        let projects = self
-            .module_types
-            .get(module_type)
-            .ok_or("no soong_build plugin registers it")?;
-        match (projects.len(), projects.first()) {
-            (1, Some(p)) => Ok(p),
-            _ => Err(format!(
-                "ambiguous: {}",
-                projects.iter().cloned().collect::<Vec<_>>().join(", ")
-            )),
-        }
     }
 }
 
@@ -1456,11 +1411,6 @@ func init() {
             modules,
             module_types,
         };
-        assert_eq!(
-            index.project_for_type("aidl_interface"),
-            Ok("system/tools/aidl")
-        );
-        assert!(index.project_for_type("cc_library").is_err());
         // source over prebuilt; one project despite two definitions
         assert_eq!(index.project_for("libc"), Ok("bionic"));
         assert_eq!(index.project_for(":libc{.tag}"), Ok("bionic"));
@@ -1580,41 +1530,5 @@ func init() {
         assert_eq!(index.project_for("libcom.x.Props"), Ok("sys/x"));
         assert_eq!(index.project_for("libplain"), Ok("plain"));
         assert!(index.project_for("libcom.y.Props").is_err());
-    }
-
-    #[test]
-    fn defaults_closure() {
-        let def = |defaults: &[&str]| Definition {
-            module_type: "java_defaults".into(),
-            project: "art".into(),
-            file: "art/Android.bp".into(),
-            namespace: None,
-            defaults: defaults.iter().map(|d| (*d).to_owned()).collect(),
-            license_kinds: None,
-        };
-        let index = Index {
-            modules: BTreeMap::from([
-                (
-                    "service-art".to_owned(),
-                    vec![def(&["service-art-defaults", "opt-defaults"])],
-                ),
-                (
-                    "service-art-defaults".to_owned(),
-                    vec![def(&["fw-defaults"])],
-                ),
-            ]),
-            module_types: BTreeMap::new(),
-        };
-        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
-        // missing ones (opt-defaults, fw-defaults) are still named: they are what the strict pass reports
-        assert_eq!(
-            index.with_defaults(&names(&["service-art"])),
-            names(&[
-                "fw-defaults",
-                "opt-defaults",
-                "service-art",
-                "service-art-defaults"
-            ])
-        );
     }
 }
