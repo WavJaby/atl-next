@@ -31,8 +31,7 @@ pub struct Runtime {
     /// The native build directory: the gates keep their work below it.
     pub out: PathBuf,
     pub java_out: PathBuf,
-    pub aapt2: PathBuf,
-    android_jar: PathBuf,
+    pub apk: ApkTools,
     servicemanager: PathBuf,
     services: PathBuf,
     binderd: PathBuf,
@@ -142,6 +141,36 @@ fn sdk_level(build_prop: &Path) -> Result<String> {
         .with_context(|| format!("no ro.build.version.sdk in {}", build_prop.display()))
 }
 
+/// What building an APK needs, and nothing of the runtime: aapt2 and d8 of the Java pipeline, the prebuilt JDK, the SDK's android.jar of the platform's API level. The static fixture gates use it without a staged ART.
+pub struct ApkTools {
+    pub aapt2: PathBuf,
+    android_jar: PathBuf,
+    pub jdk: PathBuf,
+    d8: PathBuf,
+}
+
+impl ApkTools {
+    /// `out` = the native build dir (its build.prop names the API level), `java_out` = the Java pipeline build dir, `host` = the arches.toml host row (its prebuilt JDK); every input checked to exist.
+    pub fn new(root: &Path, host: &str, out: &Path, java_out: &Path) -> Result<ApkTools> {
+        let layout = Layout::of(root)?;
+        let (d8, jdk) = host_art::java_tools(root, host, java_out)?;
+        let t = ApkTools {
+            aapt2: java_out.join("host/aapt2/aapt2"),
+            android_jar: farm::shared_tree(&layout)
+                .join("prebuilts/sdk")
+                .join(sdk_level(&out.join(host_art::BUILD_PROP))?)
+                .join("public/android.jar"),
+            jdk,
+            d8,
+        };
+        for p in [&t.aapt2, &t.android_jar, &t.d8] {
+            ensure!(p.is_file(), "missing input {}", p.display());
+        }
+        ensure!(t.jdk.is_dir(), "missing input {}", t.jdk.display());
+        Ok(t)
+    }
+}
+
 impl Runtime {
     /// Stages ART into `<out>/<stage>`, builds the cargo binaries, checks every input exists; the test fonts are written to `<out>/fonts`.
     pub fn new(
@@ -169,15 +198,13 @@ impl Runtime {
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let atld = cargo_bin(root, &out, "atld")?;
-        let aapt2 = java_out.join("host/aapt2/aapt2");
-        let android_jar = farm::shared_tree(&layout)
-            .join("prebuilts/sdk")
-            .join(sdk_level(&art.build_prop)?)
-            .join("public/android.jar");
+        let apk = ApkTools::new(root, host, &out, &java_out)?;
         let framework_res = java_out.join(FRAMEWORK_RES);
-        for p in [&aapt2, &android_jar, &framework_res] {
-            ensure!(p.is_file(), "missing input {}", p.display());
-        }
+        ensure!(
+            framework_res.is_file(),
+            "missing input {}",
+            framework_res.display()
+        );
         let fonts = out.join("fonts");
         std::fs::create_dir_all(&fonts)?;
         let font_xml = fonts.join("font_fallback.xml");
@@ -190,8 +217,7 @@ impl Runtime {
             art,
             out,
             java_out,
-            aapt2,
-            android_jar,
+            apk,
             servicemanager,
             services,
             binderd,
@@ -252,10 +278,12 @@ impl Runtime {
         self.app_seccomp = false;
         self
     }
+}
 
+impl ApkTools {
     /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar.
     /// `native` = (ABI, shared libraries): stored under `lib/<abi>/`, as an app's packager lays them out.
-    pub fn build_apk(
+    pub fn build(
         &self,
         fixture: &Path,
         work: &Path,
@@ -303,7 +331,7 @@ impl Runtime {
             host_art::collect(&gen_dir, "java", &mut sources)?;
         }
         let classpath = std::env::join_paths(std::iter::once(&self.android_jar).chain(class_jars))?;
-        let jdk_bin = self.art.jdk.join("bin");
+        let jdk_bin = self.jdk.join("bin");
         host_art::exec(
             Command::new(jdk_bin.join("javac"))
                 .args([
@@ -333,7 +361,7 @@ impl Runtime {
         let path = std::env::join_paths(std::iter::once(jdk_bin.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))?;
-        let mut d8 = Command::new(&self.art.d8);
+        let mut d8 = Command::new(&self.d8);
         d8.env("PATH", path).arg("--lib").arg(&self.android_jar);
         for lib in class_jars {
             d8.arg("--lib").arg(lib);
@@ -371,7 +399,9 @@ impl Runtime {
         }
         Ok(apk)
     }
+}
 
+impl Runtime {
     /// Starts atld for `run`, its stdout and stderr in `run.atld_log()`. The caller waits for it and ends it.
     pub fn start_atld(&self, run: &Run) -> Result<Child> {
         std::fs::create_dir_all(&run.scratch)?;

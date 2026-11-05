@@ -21,6 +21,7 @@ mod deps;
 mod farm;
 mod fetch;
 mod git;
+mod gles2_fixture;
 mod gralloc;
 mod host_art;
 mod ime_spike;
@@ -205,6 +206,10 @@ enum Test {
     JniFixture(jni_fixture::Args),
     /// IME spike (route R1): a fake input method on the headless labwc's `zwp_input_method_manager_v2` sends preedit + commit to a focused GtkText (xtask/testdata/ime-entry); `--break-commit` must fail.
     ImeSpike(ime_spike::Args),
+    /// The GLES2 test APK (xtask/testdata/gles2), shaped like Cut the Rope's path: GLSurfaceView + an NDK `.so` drawing with GLES2 only and reading pixels back. Static: `.so` DT_NEEDED and `gl*` imports equal the listed sets, manifest glEsVersion 2.0 + hardwareAccelerated, the library in `lib/<abi>/`.
+    ///
+    /// Controls run every time: each check rejects a broken copy of the real input. Needs the NDK, the Java pipeline's aapt2/d8 and a build.prop; no runtime.
+    Gles2Fixture(gles2_fixture::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -270,6 +275,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::ImeSpike(args),
         } => ime_spike::run(&root, &args),
+        Command::Test {
+            test: Test::Gles2Fixture(args),
+        } => gles2_fixture::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -299,6 +307,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::PlatformUi(_) => "platform-ui",
             Test::JniFixture(_) => "jni-fixture",
             Test::ImeSpike(_) => "ime-spike",
+            Test::Gles2Fixture(_) => "gles2-fixture",
         },
         _ => return None,
     })

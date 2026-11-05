@@ -69,8 +69,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
     let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
-    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
-    let m = manifest::read(&rt.aapt2, &apk)?;
+    let apk = rt
+        .apk
+        .build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
+    let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
         .map(|a| a.name.clone())

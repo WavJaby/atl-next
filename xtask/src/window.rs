@@ -1398,8 +1398,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::StartFinish => START_FIXTURE,
         _ => FIXTURE,
     };
-    let apk = rt.build_apk(&root.join(fixture), &work.join("apk"), &[], None)?;
-    let m = manifest::read(&rt.aapt2, &apk)?;
+    let apk = rt
+        .apk
+        .build(&root.join(fixture), &work.join("apk"), &[], None)?;
+    let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
         .map(|a| a.name.clone())

@@ -24,7 +24,7 @@ const PROPERTY_SERVICE: &str = "atl-property-service";
 /// The launcher package and its executable.
 const LAUNCHER: &str = "atl-app-launcher";
 /// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
-const BUILD_PROP: &str = "gen/build.prop";
+pub const BUILD_PROP: &str = "gen/build.prop";
 /// Where Android installs the ICU data ART's ICU opens (external/icu/icu4c/source/stubdata/Android.bp apex_icu.dat: prebuilt_etc of `icu*.dat`, sub_dir icu, in the com.android.i18n APEX).
 const ICU_DATA: &str = "external/icu/icu4c/source/stubdata";
 
@@ -112,6 +112,23 @@ fn boot_jars(java_out: &Path) -> Result<Vec<PathBuf>> {
     Ok(jars)
 }
 
+/// The Java pipeline's d8 in `java_out` and the prebuilt JDK of host arch `host` (its arches.toml `soong_prebuilt_os`); not checked to exist.
+pub fn java_tools(root: &Path, host: &str, java_out: &Path) -> Result<(PathBuf, PathBuf)> {
+    let arches = arches::load(root)?;
+    let os = arches
+        .get(host)
+        .and_then(|a| a.host.as_ref())
+        .and_then(|h| h.soong_prebuilt_os.as_deref())
+        .with_context(|| {
+            format!("{host}: no host row with soong_prebuilt_os (no prebuilt JDK or host ART)")
+        })?;
+    let layout = Layout::of(root)?;
+    Ok((
+        java_out.join("host/bin/d8"),
+        arches::java_tools(&farm::shared_tree(&layout), os).0,
+    ))
+}
+
 impl HostArt {
     /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build).
     pub fn new(
@@ -127,14 +144,11 @@ impl HostArt {
             .get(host)
             .filter(|a| a.host.is_some())
             .with_context(|| format!("{host}: not a host arch in {}", arches::FILE))?;
-        let host_row = arch.host.as_ref().context("checked above")?;
-        let os = host_row.soong_prebuilt_os.as_deref().with_context(|| {
-            format!("{host}: no soong_prebuilt_os (no prebuilt JDK or host ART)")
-        })?;
         let layout = Layout::of(root)?;
         let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
             workspace.join("out/java/build")
         })?;
+        let (d8, jdk) = java_tools(root, host, &java_out)?;
         let art = out.join(stage);
         let lib_path = stage_art(out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
         let h = HostArt {
@@ -145,8 +159,8 @@ impl HostArt {
             build_prop: out.join(BUILD_PROP),
             boot: boot_jars(&java_out)?,
             javac_boot: JAVAC_BOOT.iter().map(|j| java_out.join(j)).collect(),
-            d8: java_out.join("host/bin/d8"),
-            jdk: arches::java_tools(&farm::shared_tree(&layout), os).0,
+            d8,
+            jdk,
             cargo: out.join("cargo"),
             verbose,
         };

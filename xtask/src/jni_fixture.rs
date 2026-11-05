@@ -64,46 +64,69 @@ pub fn default_ndk(root: &Path) -> Result<PathBuf> {
     Ok(Layout::of(root)?.workspace().join("tools").join(NDK_DIR))
 }
 
+/// NDK clang for one guest arch at one API level, as an app's CMake/ndk-build drives it: `--target=<arches.toml clang triple><api>`.
+pub struct NdkTarget {
+    bin: PathBuf,
+    target: String,
+    /// The arch's `lib/<abi>/` name in an APK: its first arches.toml `android_abis` entry.
+    pub abi: String,
+    /// The NDK sysroot's per-triple lib dir (libc++_shared.so).
+    sysroot_lib: PathBuf,
+}
+
+/// Compiler flags of every fixture object: PIC, hidden by default (exports are JNIEXPORT), warnings fatal.
+pub const CFLAGS: &[&str] = &[
+    "-fPIC",
+    "-O2",
+    "-fvisibility=hidden",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-Wno-unused-parameter",
+];
+
+impl NdkTarget {
+    pub fn new(root: &Path, ndk: &Path, arch: &str, api: u32) -> Result<NdkTarget> {
+        let arches = arches::load(root)?;
+        let guest = arches
+            .get(arch)
+            .and_then(|a| a.guest.as_ref())
+            .with_context(|| format!("arches.toml has no [{arch}.guest] row"))?;
+        let tc = toolchain(ndk);
+        Ok(NdkTarget {
+            bin: tc.join("bin"),
+            target: format!("--target={}{api}", guest.clang),
+            abi: guest
+                .android_abis
+                .first()
+                .cloned()
+                .with_context(|| format!("arches.toml [{arch}.guest] has no android_abis"))?,
+            sysroot_lib: tc.join("sysroot/usr/lib").join(&guest.clang),
+        })
+    }
+
+    /// `tool` (`clang` / `clang++`) with the target set.
+    pub fn cmd(&self, tool: &str) -> Command {
+        let mut c = Command::new(self.bin.join(tool));
+        c.arg(&self.target);
+        c
+    }
+}
+
 /// Builds the fixture for `arch` at `api` into `out/android-<api>`.
 pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Result<Built> {
-    let arches = arches::load(root)?;
-    let guest = arches
-        .get(arch)
-        .and_then(|a| a.guest.as_ref())
-        .with_context(|| format!("arches.toml has no [{arch}.guest] row"))?;
-    let tc = toolchain(ndk);
-    let bin = tc.join("bin");
-    let target = format!("--target={}{api}", guest.clang);
+    let t = NdkTarget::new(root, ndk, arch, api)?;
     let dir = out.join(format!("android-{api}"));
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
     let src = root.join(SOURCES);
-    let common = [
-        "-shared",
-        "-fPIC",
-        "-O2",
-        "-fvisibility=hidden",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-Wno-unused-parameter",
-    ];
     let compile = |cc: &str, out_obj: &Path, file: &str, extra: &[&str]| {
         host_art::exec(
-            Command::new(bin.join(cc))
-                .arg(&target)
-                .args([
-                    "-c",
-                    "-fPIC",
-                    "-O2",
-                    "-fvisibility=hidden",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-Wno-unused-parameter",
-                ])
+            t.cmd(cc)
+                .arg("-c")
+                .args(CFLAGS)
                 .args(extra)
                 .arg(src.join(file))
                 .arg("-o")
@@ -113,9 +136,9 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
     };
     let sibling = dir.join(SIBLING);
     host_art::exec(
-        Command::new(bin.join("clang"))
-            .arg(&target)
-            .args(common)
+        t.cmd("clang")
+            .arg("-shared")
+            .args(CFLAGS)
             .arg(src.join("atl_jni_sibling.c"))
             .arg(format!("-Wl,-soname,{SIBLING}"))
             .arg("-o")
@@ -128,8 +151,7 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
     compile("clang++", &cxx_obj, "atl_jni_cxx.cpp", &["-std=c++17"])?;
     let lib = dir.join(LIB);
     host_art::exec(
-        Command::new(bin.join("clang++"))
-            .arg(&target)
+        t.cmd("clang++")
             .args(["-shared", "-static-libgcc"])
             .arg(&c_obj)
             .arg(&cxx_obj)
@@ -140,10 +162,7 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
     )?;
     std::fs::remove_file(&c_obj)?;
     std::fs::remove_file(&cxx_obj)?;
-    let cxx = tc
-        .join("sysroot/usr/lib")
-        .join(&guest.clang)
-        .join(CXX_SHARED);
+    let cxx = t.sysroot_lib.join(CXX_SHARED);
     let cxx_copy = dir.join(CXX_SHARED);
     std::fs::copy(&cxx, &cxx_copy).with_context(|| format!("copying {}", cxx.display()))?;
     Ok(Built {
@@ -154,15 +173,15 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
 }
 
 /// What the gate reads from one ELF.
-struct Shape {
-    needed: Vec<String>,
+pub struct Shape {
+    pub needed: Vec<String>,
     /// (file, version) pairs of the GNU verneed.
     verneed: BTreeSet<(String, String)>,
-    imports: BTreeSet<String>,
+    pub imports: BTreeSet<String>,
     pt_tls: bool,
 }
 
-fn shape(path: &Path) -> Result<Shape> {
+pub fn shape(path: &Path) -> Result<Shape> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let file = ElfFile64::<Endianness>::parse(&*data)
         .with_context(|| format!("{}: not a 64-bit ELF", path.display()))?;
@@ -361,13 +380,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 /// The libraries the M2 test APK carries in `lib/<abi>/`: the minSdk-21 variant, built into `out`.
 pub fn apk_libs(root: &Path, arch: &str, out: &Path) -> Result<(String, Vec<PathBuf>)> {
-    let arches = arches::load(root)?;
-    let abi = arches
-        .get(arch)
-        .and_then(|a| a.guest.as_ref())
-        .and_then(|g| g.android_abis.first().cloned())
-        .with_context(|| format!("arches.toml has no [{arch}.guest] android_abis"))?;
-    let built = build(root, &default_ndk(root)?, arch, EMULATED_TLS_API, out)?;
+    let ndk = default_ndk(root)?;
+    let abi = NdkTarget::new(root, &ndk, arch, EMULATED_TLS_API)?.abi;
+    let built = build(root, &ndk, arch, EMULATED_TLS_API, out)?;
     if built.libs.is_empty() {
         bail!("no fixture libraries built");
     }

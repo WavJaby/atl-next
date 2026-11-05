@@ -315,15 +315,41 @@ pub fn parse(text: &str) -> Result<Manifest> {
     })
 }
 
-/// `apk`'s manifest, through `aapt2`.
-pub fn read(aapt2: &Path, apk: &Path) -> Result<Manifest> {
-    let text = host_art::output(
+/// `apk`'s manifest as aapt2 prints it.
+fn dump(aapt2: &Path, apk: &Path) -> Result<String> {
+    host_art::output(
         Command::new(aapt2)
             .args(["dump", "xmltree", "--file", "AndroidManifest.xml"])
             .arg(apk),
         "aapt2 dump xmltree",
-    )?;
-    parse(&text).with_context(|| format!("the manifest of {}", apk.display()))
+    )
+}
+
+/// `apk`'s manifest, through `aapt2`.
+pub fn read(aapt2: &Path, apk: &Path) -> Result<Manifest> {
+    parse(&dump(aapt2, apk)?).with_context(|| format!("the manifest of {}", apk.display()))
+}
+
+/// The highest `<uses-feature android:glEsVersion>` (ConfigurationInfo.reqGlEsVersion: major << 16 | minor); None when no feature names one.
+/// Read by the static fixture gate only; the services do not consume it yet, so it is not a `Manifest` field.
+pub fn gl_es_version(aapt2: &Path, apk: &Path) -> Result<Option<i64>> {
+    gl_es_version_of(&dump(aapt2, apk)?)
+}
+
+fn gl_es_version_of(text: &str) -> Result<Option<i64>> {
+    let root = parse_tree(text)?;
+    let mut best = None;
+    for f in root.children("uses-feature") {
+        if let Some(v) = f.attr("glEsVersion") {
+            let n = match v.strip_prefix("0x") {
+                Some(h) => i64::from_str_radix(h, 16),
+                None => v.parse(),
+            }
+            .with_context(|| format!("glEsVersion={v}: not an integer"))?;
+            best = best.max(Some(n));
+        }
+    }
+    Ok(best)
 }
 
 #[cfg(test)]

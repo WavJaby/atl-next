@@ -172,7 +172,7 @@ fn built(rt: &Runtime, module: &str) -> Result<(PathBuf, Manifest), String> {
     if !apk.is_file() {
         return Err(format!("{} does not exist", apk.display()));
     }
-    let manifest = manifest::read(&rt.aapt2, &apk).map_err(|e| format!("{module}: {e:#}"))?;
+    let manifest = manifest::read(&rt.apk.aapt2, &apk).map_err(|e| format!("{module}: {e:#}"))?;
     Ok((apk, manifest))
 }
 
