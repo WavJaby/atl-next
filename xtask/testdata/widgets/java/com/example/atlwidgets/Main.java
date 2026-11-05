@@ -173,6 +173,13 @@ public class Main extends Activity {
         });
     }
 
+    /** The window's focus, as the input channel's focus event delivers it (ViewRootImpl onFocusEvent). */
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        Log.i(TAG, "window focus=" + hasFocus);
+    }
+
     /** Once: the geometry. */
     private void onFirstLayout() {
         if (laidOut) {

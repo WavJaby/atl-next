@@ -8,6 +8,7 @@ mod geometry;
 mod input;
 #[allow(unsafe_code)]
 mod mirror;
+mod pacing;
 mod scene;
 mod ui;
 mod view;

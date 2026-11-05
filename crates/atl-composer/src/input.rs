@@ -262,7 +262,10 @@ mod publish {
     /// Publishes one injected event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
     /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
-        let InputEvent::Pointer(e) = event;
+        // focus is published per window by the per-window dispatcher (plan 8a), not by this single-channel path
+        let InputEvent::Pointer(e) = event else {
+            return;
+        };
         if matches!(e.phase, PointerPhase::Down(_)) {
             state.down_ms.set(e.time_ms);
         }

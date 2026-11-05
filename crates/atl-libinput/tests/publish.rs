@@ -129,3 +129,24 @@ fn key_and_motion_reach_the_consumer_and_finish() {
     );
     assert_eq!(publisher.receive_finished().expect("receive none"), None);
 }
+
+/// A focus change crosses the channel as AOSP's FocusEvent (what ViewRootImpl turns into windowFocusChanged), gained then lost, in order.
+#[test]
+fn focus_reaches_the_consumer() {
+    let (ours, theirs) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+    )
+    .expect("socketpair");
+    let mut publisher = Publisher::new(ours, "focus").expect("publisher");
+    let mut consumer = Consumer::new(theirs, "focus").expect("consumer");
+    publisher.publish_focus(1, 1, true).expect("publish focus");
+    publisher.publish_focus(2, 2, false).expect("publish blur");
+    for (seq, has_focus) in [(1, true), (2, false)] {
+        let got = consumer.consume().expect("consume").expect("pending");
+        assert_eq!(got, Received::Focus { seq, has_focus });
+        consumer.finish(seq, true).expect("finish");
+    }
+}

@@ -22,6 +22,8 @@ const WOULD_BLOCK: i32 = -(Errno::AGAIN.raw_os_error());
 const KIND_KEY: i32 = 1;
 const KIND_MOTION: i32 = 2;
 const KIND_FINISHED: i32 = 3;
+/// A focus event (FocusEvent), consume() only.
+const KIND_FOCUS: i32 = 5;
 
 /// An AOSP call that failed: its `status_t`, or a null object where AOSP returns none.
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +184,14 @@ impl Publisher {
         status("InputPublisher::publishMotionEvent", s)
     }
 
+    /// Publishes a focus change (InputPublisher::publishFocusEvent): ViewRootImpl's onFocusEvent -> windowFocusChanged.
+    pub fn publish_focus(&mut self, seq: u32, event_id: i32, has_focus: bool) -> Result<(), Error> {
+        status(
+            "InputPublisher::publishFocusEvent",
+            ffi::publish_focus(self.0.pin_mut(), seq, event_id, has_focus),
+        )
+    }
+
     /// The next finished signal from the consumer (InputPublisher::receiveConsumerResponse); None when none is pending. Timeline responses are not returned.
     pub fn receive_finished(&mut self) -> Result<Option<Finished>, Error> {
         let mut message = ffi::new_message();
@@ -224,6 +234,8 @@ pub enum Received {
         tool_type: i32,
         vscroll: f32,
     },
+    /// A focus change (FocusEvent).
+    Focus { seq: u32, has_focus: bool },
     /// Any other message kind; `seq` is what the consumer must answer.
     Other { seq: u32 },
 }
@@ -268,6 +280,10 @@ impl Consumer {
                 y: message.y(),
                 tool_type: message.tool_type(),
                 vscroll: message.vscroll(),
+            },
+            KIND_FOCUS => Received::Focus {
+                seq,
+                has_focus: message.has_focus(),
             },
             _ => Received::Other { seq },
         }))

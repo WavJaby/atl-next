@@ -3,21 +3,25 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use atl_platform_ui_api::{
     Capture, FrameClock, FrameTick, InputEvent, InputSource, PhysSize, PointerPhase, PresentError,
     Scale, Scene, UiError, Window, WindowAttributes,
 };
 use gtk4::prelude::*;
-use gtk4::{gdk, graphene, gsk};
+use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::input;
+use crate::pacing;
 use crate::scene;
 use crate::ui::GtkUi;
 use crate::view::SceneView;
 
 /// GDK frame times are microseconds (`g_get_monotonic_time`), ticks are nanoseconds.
 const NS_PER_US: u64 = 1000;
+/// GDK's frame clock default when no refresh rate is known (60 Hz, in GDK's milli-Hz).
+const DEFAULT_REFRESH_MILLIHZ: i32 = 60_000;
 
 /// A callback slot that tolerates the callback replacing itself while it runs: it is taken out for the call and put back unless a new one was set.
 struct Slot<T: ?Sized>(RefCell<Option<Box<T>>>);
@@ -49,6 +53,31 @@ struct Shared {
     frame_requested: Cell<bool>,
     on_event: Slot<dyn FnMut(InputEvent)>,
     on_resize: Slot<dyn FnMut(PhysSize)>,
+    /// The current tick presented a scene: the next is paced by the compositor's frame callback, else by the idle timer (pacing.rs).
+    presented: Cell<bool>,
+    /// The last tick's time, µs CLOCK_MONOTONIC: the idle grid's origin.
+    last_tick_us: Cell<Option<i64>>,
+    /// The pending idle tick.
+    idle_timer: RefCell<Option<glib::SourceId>>,
+    stats: RefCell<pacing::TickStats>,
+}
+
+impl Shared {
+    /// One tick at `time_us`: a pending idle tick is dropped (this one replaces it), the tick is counted, and the callback runs.
+    fn tick(&self, time_us: i64, idle: bool) {
+        if let Some(id) = self.idle_timer.borrow_mut().take() {
+            id.remove();
+        }
+        self.last_tick_us.set(Some(time_us));
+        let report = self.stats.borrow_mut().count(idle, time_us);
+        if let Some((paced, idle_ticks, elapsed_us)) = report {
+            tracing::info!(
+                "atl-platform-ui: frame clock paced={paced} idle={idle_ticks} over_us={elapsed_us}"
+            );
+        }
+        let time_ns = u64::try_from(time_us).unwrap_or(0) * NS_PER_US;
+        self.on_tick.call(|f| f(FrameTick { time_ns }));
+    }
 }
 
 /// A toplevel window on GTK4.
@@ -77,6 +106,18 @@ impl GtkWindow {
         Some((shadow_x + f64::from(at.x()), shadow_y + f64::from(at.y())))
     }
 
+    /// The refresh interval of the monitor the window is on; GDK's own default (60 Hz) where the monitor reports none.
+    fn monitor_interval_us(&self) -> i64 {
+        let millihz = self
+            .window
+            .surface()
+            .and_then(|s| WidgetExt::display(&self.window).monitor_at_surface(&s))
+            .map_or(0, |m| m.refresh_rate());
+        pacing::interval_us(millihz)
+            .or_else(|| pacing::interval_us(DEFAULT_REFRESH_MILLIHZ))
+            .unwrap_or(1)
+    }
+
     fn wire_frame_clock(window: &gtk4::Window, shared: &Rc<Shared>) {
         let shared = Rc::clone(shared);
         window.connect_realize(move |window| {
@@ -87,8 +128,7 @@ impl GtkWindow {
             let on_update = Rc::clone(&shared);
             clock.connect_update(move |clock| {
                 if on_update.frame_requested.replace(false) {
-                    let time_ns = u64::try_from(clock.frame_time()).unwrap_or(0) * NS_PER_US;
-                    on_update.on_tick.call(|f| f(FrameTick { time_ns }));
+                    on_update.tick(clock.frame_time(), false);
                 }
             });
             // a frame asked for before the window had a clock
@@ -154,11 +194,40 @@ impl Window for GtkWindow {
             frame_requested: Cell::new(false),
             on_event: Slot::new(),
             on_resize: Slot::new(),
+            presented: Cell::new(false),
+            last_tick_us: Cell::new(None),
+            idle_timer: RefCell::new(None),
+            stats: RefCell::new(pacing::TickStats::default()),
         });
         let window = gtk4::Window::new();
         let view = SceneView::new();
         Self::wire_frame_clock(&window, &shared);
         Self::wire_pointer(&view, &shared);
+        // the monitor the window is on (wl_surface.enter): logged per entry; the idle pacing reads its rate (monitor_interval_us). Delivery to Android's display follows the services' live display (not built).
+        window.connect_realize(|w| {
+            if let Some(surface) = w.surface() {
+                surface.connect_enter_monitor(|_, m| {
+                    let g = m.geometry();
+                    tracing::info!(
+                        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}",
+                        m.connector().map(|c| c.to_string()).unwrap_or_default(),
+                        g.width(),
+                        g.height(),
+                        g.x(),
+                        g.y(),
+                        m.refresh_rate(),
+                        m.scale()
+                    );
+                });
+            }
+        });
+        // keyboard focus = the active toplevel (xdg_toplevel state `activated`); GTK notifies each change
+        let focused = Rc::clone(&shared);
+        window.connect_is_active_notify(move |w| {
+            let active = w.is_active();
+            tracing::info!("atl-platform-ui: focus {active}");
+            focused.on_event.call(|f| f(InputEvent::Focus(active)));
+        });
         let resized = Rc::clone(&shared);
         view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));
         window.set_child(Some(&view));
@@ -216,6 +285,7 @@ impl Window for GtkWindow {
 
     fn present(&self, scene: &Scene) -> Result<(), PresentError> {
         self.view.show_node(scene::build(scene)?);
+        self.shared.presented.set(true);
         let origin = (!self.origin_logged.get() && self.is_mapped())
             .then(|| self.content_origin())
             .flatten();
@@ -264,10 +334,31 @@ impl Window for GtkWindow {
 }
 
 impl FrameClock for GtkWindow {
+    /// After a tick that presented (or before the first tick) GDK paces the next: the compositor's frame callback. Otherwise the idle timer ticks on the monitor's grid (pacing.rs: GDK's own fallback runs at 60 Hz).
     fn request_frame(&self) {
         self.shared.frame_requested.set(true);
-        if let Some(clock) = self.window.frame_clock() {
-            clock.request_phase(gdk::FrameClockPhase::UPDATE);
+        let last = self.shared.last_tick_us.get();
+        let Some(last) = last.filter(|_| !self.shared.presented.replace(false)) else {
+            if let Some(clock) = self.window.frame_clock() {
+                clock.request_phase(gdk::FrameClockPhase::UPDATE);
+            }
+            return;
+        };
+        let interval = self.monitor_interval_us();
+        let now = glib::monotonic_time();
+        let at = pacing::next_grid_us(last, interval, now);
+        // whole ms, rounded up: the timer fires at or after the grid point, never before it (a point fired early would be computed again)
+        let delay_ms = u64::try_from((at - now + 999) / 1000).unwrap_or(0);
+        let shared = Rc::clone(&self.shared);
+        let id = glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+            // fired: the id is spent and must not be removed again
+            shared.idle_timer.borrow_mut().take();
+            if shared.frame_requested.replace(false) {
+                shared.tick(at, true);
+            }
+        });
+        if let Some(old) = self.shared.idle_timer.replace(Some(id)) {
+            old.remove();
         }
     }
 

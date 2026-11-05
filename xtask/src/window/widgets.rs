@@ -22,7 +22,7 @@ pub const FIXTURE: &str = "xtask/testdata/widgets";
 /// The sub-gates, in print order (each prints `window: <name>: pass|FAIL`).
 pub const SUB_NAMES: &[&str] = &[
     "probe", "layout", "text", "header", "click", "focus", "window", "list", "readback",
-    "presents", "cadence",
+    "presents", "cadence", "pacing", "window-focus",
 ];
 /// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
@@ -325,6 +325,8 @@ pub fn checks(
         readback_check(app),
         presents_check(app),
         cadence_check(after, display.refresh_hz),
+        pacing_check(app, display.refresh_hz),
+        window_focus_check(app),
     ]
 }
 
@@ -463,5 +465,69 @@ mod tests {
         assert!(readback_check(&log("aa", "bb", "bb")).is_ok());
         assert!(readback_check(&log("aa", "cc", "bb")).is_err());
         assert!(readback_check(&log("bb", "bb", "bb")).is_err());
+    }
+}
+
+/// The platform frame clock's stats line (atl-platform-ui-linux window.rs, every ~2 s of ticking).
+const PACING_LINE: &str = "atl-platform-ui: frame clock paced=";
+
+/// Sub-gate pacing: over the stats windows that had idle ticks (a tick after one that presented nothing), ticks come at the display rate within CADENCE_TOLERANCE, not at GDK's 60 Hz fallback.
+/// On a 60 Hz host the two agree, so there this proves the idle path runs and keeps the rate; telling them apart needs a faster monitor.
+fn pacing_check(app: &str, refresh_hz: f32) -> Result<String, String> {
+    let field = |l: &str, key: &str| -> Option<f64> {
+        l.split_whitespace()
+            .find_map(|w| w.strip_prefix(key))
+            .and_then(|v| v.parse().ok())
+    };
+    let (mut ticks, mut us, mut windows) = (0.0, 0.0, 0);
+    for line in app.lines().filter(|l| l.contains(PACING_LINE)) {
+        let (Some(paced), Some(idle), Some(over)) = (
+            field(line, "paced="),
+            field(line, "idle="),
+            field(line, "over_us="),
+        ) else {
+            return Err(format!("unreadable stats line: {line}"));
+        };
+        if idle > 0.0 {
+            ticks += paced + idle;
+            us += over;
+            windows += 1;
+        }
+    }
+    if windows == 0 {
+        return Err("no frame clock window with idle ticks".to_owned());
+    }
+    let rate = ticks / us * 1e6;
+    let want = f64::from(refresh_hz);
+    if (rate - want).abs() > super::CADENCE_TOLERANCE * want {
+        return Err(format!(
+            "{rate:.1} ticks/s over {windows} idle windows, display {want} Hz"
+        ));
+    }
+    Ok(format!(
+        "{rate:.1} ticks/s over {windows} idle windows, display {want} Hz"
+    ))
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::pacing_check;
+
+    /// 120 Hz display: 240 ticks in 2 s pass; GDK's 60 Hz fallback (121 ticks in 2 s) fails; no idle window fails.
+    #[test]
+    fn idle_ticks_at_the_display_rate() {
+        let line =
+            |p, i| format!("x atl-platform-ui: frame clock paced={p} idle={i} over_us=2000000\n");
+        assert!(pacing_check(&line(40, 200), 120.0).is_ok());
+        assert!(pacing_check(&line(1, 120), 120.0).is_err());
+        assert!(pacing_check(&line(240, 0), 120.0).is_err());
+    }
+}
+
+/// Sub-gate window-focus: the desktop's activation of the toplevel reached the app as window focus (GTK is-active -> InputEvent::Focus -> publishFocusEvent -> onWindowFocusChanged).
+fn window_focus_check(app: &str) -> Result<String, String> {
+    match rest_of(app, "AtlWindow: window focus=") {
+        Some("true") => Ok("the active toplevel gave the window focus".to_owned()),
+        other => Err(format!("window focus line {other:?}, want true")),
     }
 }

@@ -68,6 +68,10 @@ int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int
     return publisher.publisher.publishMotionEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, action_button, flags, edge_flags, meta_state, button_state, static_cast<android::MotionClassification>(classification), affine, x_precision, y_precision, x_cursor, y_cursor, affine, down_time, event_time, static_cast<uint32_t>(count), properties.data(), pointer_coords.data());
 }
 
+int32_t publish_focus(Publisher& publisher, uint32_t seq, int32_t event_id, bool has_focus) {
+    return publisher.publisher.publishFocusEvent(seq, event_id, has_focus);
+}
+
 int32_t receive_finished(Publisher& publisher, Message& out) {
     auto response = publisher.publisher.receiveConsumerResponse();
     if (!response.ok()) {
@@ -118,6 +122,9 @@ int32_t consume(Consumer& consumer, Message& out) {
         out.y_ = motion->getY(0);
         out.tool_type_ = static_cast<int32_t>(motion->getToolType(0));
         out.vscroll_ = motion->getAxisValue(AMOTION_EVENT_AXIS_VSCROLL, 0);
+    } else if (event->getType() == android::InputEventType::FOCUS) {
+        out.kind_ = 5;
+        out.has_focus_ = static_cast<const android::FocusEvent*>(event)->getHasFocus();
     } else {
         out.kind_ = 4;
     }

@@ -233,6 +233,8 @@ pub struct PointerEvent {
 pub enum InputEvent {
     /// Mouse or touchpad pointer. Touch, stylus, keys and gamepads are added by the slice that first consumes them.
     Pointer(PointerEvent),
+    /// The window gained (`true`) or lost keyboard focus (the desktop's active toplevel). Android's window focus follows it; on loss, held keys are cancelled by their consumer.
+    Focus(bool),
 }
 
 /// The input of one window.

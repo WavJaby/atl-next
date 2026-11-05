@@ -31,6 +31,7 @@ pub(crate) mod ffi {
         pub fn y(self: &Message) -> f32;
         pub fn tool_type(self: &Message) -> i32;
         pub fn vscroll(self: &Message) -> f32;
+        pub fn has_focus(self: &Message) -> bool;
 
         /// Takes `fd` (one SEQPACKET end) into an InputChannel named `name`; null when AOSP refuses it.
         pub fn new_publisher(fd: i32, name: &str) -> UniquePtr<Publisher>;
@@ -78,6 +79,13 @@ pub(crate) mod ffi {
             axis_pointers: &[u32],
             axis_ids: &[i32],
             axis_values: &[f32],
+        ) -> i32;
+        /// InputPublisher::publishFocusEvent.
+        pub fn publish_focus(
+            publisher: Pin<&mut Publisher>,
+            seq: u32,
+            event_id: i32,
+            has_focus: bool,
         ) -> i32;
         /// InputPublisher::receiveConsumerResponse into `out`; the status is WOULD_BLOCK when none is pending.
         pub fn receive_finished(publisher: Pin<&mut Publisher>, out: Pin<&mut Message>) -> i32;
