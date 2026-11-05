@@ -14,8 +14,9 @@ use atl_layout::Layout;
 
 use crate::git::git;
 
-/// Slots in the pool = the most full native builds at once. 2 is the owner's limit on this machine (at most two concurrent `xtask native` builds, CPU and disk); each slot is a whole out dir (7-8 GB), so one per worktree is too much.
-pub const SLOTS: u32 = 2;
+/// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (~9.3 GB), so one per worktree is too much; 3 fits the dev machine's free disk.
+/// Concurrent builds are a separate limit (CPU/RAM), [`crate::build_pool::TOKENS`]: a slot holder mostly edits and tests, and queues only for ninja.
+pub const SLOTS: u32 = 3;
 
 /// File in a checkout's git dir holding its slot number.
 const RECORD: &str = "atl-out-slot";
@@ -430,7 +431,9 @@ mod tests {
                 release: vec![held[1].clone()],
             }
         );
-        let all_live = [holder_at(1, "wt-a", true), holder_at(2, "wt-b", true)];
+        let all_live: Vec<Holder> = (1..=SLOTS)
+            .map(|n| holder_at(n, &format!("wt-{n}"), true))
+            .collect();
         assert!(plan_assign(record, None, &all_live, None, false).is_err());
     }
 

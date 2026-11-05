@@ -16,8 +16,8 @@ use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
-    arches, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages, patch,
-    provided_gate, providers, prune, slot, sources, system, triage, upstream, workspace,
+    arches, build_pool, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages,
+    patch, provided_gate, providers, prune, slot, sources, system, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -339,6 +339,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         c.start()?;
     }
     let log = out.join("ninja.log");
+    // only ninja queues for a machine-wide token (build_pool.rs); the gates below run after it is released
+    let token = build_pool::acquire(
+        &build_pool::dir(ws),
+        build_pool::TOKENS,
+        &build_pool::this_holder(root),
+        build_pool::POLL,
+        |line| println!("native: {line}"),
+    )?;
+    println!(
+        "native: build token {} of {}",
+        token.index,
+        build_pool::TOKENS
+    );
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
         .arg(&out)
@@ -347,6 +360,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
+    drop(token);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
