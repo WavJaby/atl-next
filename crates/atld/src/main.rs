@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_broker::control::{self, Request, Response, StartRequest};
-use atl_broker::{Broker, Mount, Process, Spawn, kill_sandbox};
+use atl_broker::{Broker, Link, Mount, Process, SHARED_STORAGE, Spawn, kill_sandbox};
 use atl_gralloc::vintf;
 use atl_property_service::Property;
 use atl_services::compositor_registry;
@@ -194,6 +194,10 @@ impl Root {
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
     }
+    /// The app's external root (`apps/<package>/external`): `data` is its Android/data/<package>, `obb` its Android/obb/<package> (the broker mounts both, app_spawn).
+    fn external(&self, package: &str) -> PathBuf {
+        self.root.join("apps").join(package).join("external")
+    }
 }
 
 /// `/system/framework/<file name of host>`: a link to `host` (the host's tree is visible in the sandbox), the sandbox path of the file.
@@ -301,6 +305,9 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
         );
         for d in [&app, &user, &user_de] {
             std::fs::create_dir_all(r.data().join(d))?;
+        }
+        for d in ["data", "obb"] {
+            std::fs::create_dir_all(r.external(name).join(d))?;
         }
         std::fs::copy(&source.apk, r.data().join(&app).join("base.apk"))
             .with_context(|| format!("copying {}", source.apk.display()))?;
@@ -465,6 +472,7 @@ impl Host {
                     writable: true,
                 },
             ],
+            links: vec![],
             devices: vec![],
             property_area: Some(self.process_properties(uid, name)?),
             program: self.launcher.clone(),
@@ -476,6 +484,26 @@ impl Host {
                 .append(true)
                 .open(self.root.log(name))?,
         })
+    }
+
+    /// A package's own external dirs, bound at Android/{data,obb}/<package> under the shared storage root, with /sdcard linked to that root: no permission needed, never the root itself (plan Storage/SAF).
+    fn external_storage(&self, spawn: &mut Spawn, package: &str) {
+        let external = self.root.external(package);
+        let shared = PathBuf::from(SHARED_STORAGE);
+        spawn.mounts.push(Mount {
+            host: external.join("data"),
+            at: shared.join("Android/data").join(package),
+            writable: true,
+        });
+        spawn.mounts.push(Mount {
+            host: external.join("obb"),
+            at: shared.join("Android/obb").join(package),
+            writable: true,
+        });
+        spawn.links.push(Link {
+            target: shared,
+            at: "/sdcard".into(),
+        });
     }
 
     /// Starts `spawn`; a thread reaps it. When it is the main process its end is atld's (`done`).
@@ -515,7 +543,7 @@ impl Host {
     /// The services' start request: ProcessList.startProcessLocked's Process.start, as an app process in the sandbox.
     fn start_app(self: &Arc<Self>, req: &StartRequest) -> Result<i32> {
         ensure!(req.uid >= AID_APP_START, "{}: not an app uid", req.uid);
-        let spawn = self.app_spawn(
+        let mut spawn = self.app_spawn(
             req.uid,
             &req.process_name,
             req.target_sdk,
@@ -523,6 +551,7 @@ impl Host {
             &req.entry_point,
             &req.args,
         )?;
+        self.external_storage(&mut spawn, &req.package);
         // the first process the services start is the main one when no command is
         let main = self.services_start_main && !self.main_claimed.swap(true, Ordering::SeqCst);
         let pid = self.start(spawn, main, true)?;
@@ -645,6 +674,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             } else {
                 vec![]
             },
+            links: vec![],
             devices: vec![],
             property_area: Some(r.properties()),
             program: program.to_owned(),
