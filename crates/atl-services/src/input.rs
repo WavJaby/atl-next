@@ -8,12 +8,13 @@ use atl_parcelables::android::view::{InputDevice, PointerIcon};
 use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
+use crate::counters;
 use crate::input_devices::{
     KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
     TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
 };
+use crate::permission::Permissions;
 use crate::ui_agent::{IUiAgent, UiAgents};
-use crate::{counters, permission};
 use std::sync::Arc;
 
 /// The interface name counters use.
@@ -24,6 +25,7 @@ const KEYBOARD_TYPE_ALPHABETIC: i32 = 2;
 const INVALID_DISPLAY: i32 = -1;
 
 struct InputManager {
+    permissions: Arc<Permissions>,
     devices: Vec<InputDevice>,
     /// The apps' UI agents: setPointerIcon goes to the caller's.
     agents: Arc<UiAgents>,
@@ -85,17 +87,21 @@ fn devices(virtual_map: &[u8], keyboard_map: &[u8]) -> Vec<InputDevice> {
 }
 
 impl IInputManager for InputManager {
-    /// Fail-closed like the other services' hooks (input_method.rs, window.rs): the permissions the stub names are held by root / system only.
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -158,11 +164,12 @@ impl IInputManager for InputManager {
     }
 }
 
-/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), and relaying pointer icons to `agents`. Fails when a map is not a Parcel-form blob.
+/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), relaying pointer icons to `agents` and checking @EnforcePermission against `permissions`. Fails when a map is not a Parcel-form blob.
 pub fn new_binder(
     virtual_map: &[u8],
     keyboard_map: &[u8],
     agents: Arc<UiAgents>,
+    permissions: Arc<Permissions>,
 ) -> Result<SpIBinder, String> {
     // the codec reads InputDevices against the virtual map (InputDevice.rs); the keyboard's is written only
     set_key_character_map(virtual_map).map_err(str::to_owned)?;
@@ -172,6 +179,7 @@ pub fn new_binder(
     let service = InputManager {
         devices: devices(virtual_map, keyboard_map),
         agents,
+        permissions,
     };
     Ok(BnInputManager::new_binder(service, BinderFeatures::default()).as_binder())
 }

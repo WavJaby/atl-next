@@ -8,27 +8,35 @@ use atl_aidl::aidl::android::media::IAudioService::{
 };
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::{counters, permission};
+use crate::counters;
+use crate::permission::Permissions;
+use std::sync::Arc;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAudioService";
 
-struct AudioService;
+struct AudioService {
+    permissions: Arc<Permissions>,
+}
 
 impl Interface for AudioService {}
 
 impl IAudioService for AudioService {
-    /// Fail-closed as the other services' hooks (input_method.rs): the permissions the stub names are held by root / system only (permission::holds).
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -54,6 +62,6 @@ impl IAudioService for AudioService {
 }
 
 /// The service's binder, for `addService`.
-pub fn new_binder() -> SpIBinder {
-    BnAudioService::new_binder(AudioService, BinderFeatures::default()).as_binder()
+pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
+    BnAudioService::new_binder(AudioService { permissions }, BinderFeatures::default()).as_binder()
 }

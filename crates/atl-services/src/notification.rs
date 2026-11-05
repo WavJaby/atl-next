@@ -16,8 +16,10 @@ use atl_aidl::aidl::android::app::INotificationManager::{
 use atl_aidl::mangled::_7_android_3_app_22_ITransientNotification as ITransientNotification;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
+use crate::counters;
+use crate::packages::Packages;
+use crate::permission::{self, Permissions};
 use crate::tasks::Tasks;
-use crate::{counters, permission};
 
 /// The interface name counters use.
 const INTERFACE: &str = "INotificationManager";
@@ -48,6 +50,8 @@ struct State {
 
 struct Inner {
     tasks: Arc<Tasks<SpIBinder>>,
+    permissions: Arc<Permissions>,
+    packages: Arc<Packages>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -152,17 +156,22 @@ struct NotificationManager(Arc<Inner>);
 impl Interface for NotificationManager {}
 
 impl INotificationManager for NotificationManager {
-    /// Fail-closed as the other services' hooks (clipboard.rs): root / system only.
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .0
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -176,7 +185,7 @@ impl INotificationManager for NotificationManager {
     }
 
     /// enqueueToast (:3969): queued per (pkg, token); a known one only takes the new duration (record.update). Refused (false, as AOSP): no package or TN, MAX_PACKAGE_TOASTS
-    /// already queued, or a caller with no Task to show it in. The package name is not checked against the caller's uid (AOSP: isCallerSameApp / checkCallerIsSameApp).
+    /// already queued, or a caller with no Task to show it in. A package not installed under the caller's uid -> SecurityException (checkCallerIsSameApp).
     fn r#enqueueToast(
         &self,
         pkg: Option<&str>,
@@ -192,6 +201,18 @@ impl INotificationManager for NotificationManager {
         };
         let inner = &self.0;
         let uid = ThreadState::get_calling_uid();
+        // checkCallerIsSameApp (enqueueToast -> checkCallerIsSystemOrSameApp unless system): the package must be installed under the caller's app id; AOSP throws SecurityException
+        if !permission::is_system_or_root(uid)
+            && !inner
+                .packages
+                .by_app_id(permission::app_id(uid))
+                .any(|p| p.manifest.package == pkg)
+        {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!("enqueueToast: package {pkg} is not uid {uid}'s")),
+            ));
+        }
         let head = {
             let mut st = inner.lock();
             if let Some(t) = st
@@ -285,10 +306,16 @@ impl INotificationManager for NotificationManager {
 }
 
 /// The service's binder, for `addService`; toast windows are bound into `tasks`.
-pub fn new_binder(tasks: Arc<Tasks<SpIBinder>>) -> SpIBinder {
+pub fn new_binder(
+    tasks: Arc<Tasks<SpIBinder>>,
+    permissions: Arc<Permissions>,
+    packages: Arc<Packages>,
+) -> SpIBinder {
     BnNotificationManager::new_binder(
         NotificationManager(Arc::new(Inner {
             tasks,
+            permissions,
+            packages,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
         })),

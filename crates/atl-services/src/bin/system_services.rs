@@ -21,6 +21,7 @@ use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
 use atl_services::package::PackageManager;
 use atl_services::packages::{Library, PackageRecord, Packages};
+use atl_services::permission::Permissions;
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agent::UiAgents;
 use binder::{BinderFeatures, ProcessState};
@@ -80,6 +81,8 @@ fn main() -> Result<()> {
         serde_json::from_str(&text).with_context(|| format!("parsing {}", a.packages.display()))?;
     let libraries: BTreeMap<String, Library> = a.shared_libraries.into_iter().collect();
     let packages = Arc::new(Packages::new(list, libraries));
+    // the install-time grants every service checks callers against (permission.rs, rule A)
+    let permissions = Arc::new(Permissions::new(Arc::clone(&packages)));
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     ProcessState::start_thread_pool();
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
@@ -88,7 +91,12 @@ fn main() -> Result<()> {
     let tasks = Arc::new(atl_services::tasks::Tasks::new(display));
     // the display listeners of the apps (IDisplayManager.registerCallback): the display service takes them, the registry tells them of a change
     let display_callbacks = Arc::new(atl_services::display::DisplayCallbacks::default());
-    let activity = ActivityManager::new(packages.clone(), control, Arc::clone(&tasks));
+    let activity = ActivityManager::new(
+        packages.clone(),
+        Arc::clone(&permissions),
+        control,
+        Arc::clone(&tasks),
+    );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()
     {
@@ -101,30 +109,62 @@ fn main() -> Result<()> {
         atl_services::activity_task::ActivityTaskService::new_binder(activity.activity_tasks()),
     )
     .context("addService activity_task")?;
-    let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
+    let pm = BnPackageManager::new_binder(
+        PackageManager::new(packages.clone(), Arc::clone(&permissions)),
+        BinderFeatures::default(),
+    );
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(
         DISPLAY,
-        atl_services::display::new_binder(Arc::clone(&tasks), Arc::clone(&display_callbacks)),
+        atl_services::display::new_binder(
+            Arc::clone(&tasks),
+            Arc::clone(&display_callbacks),
+            Arc::clone(&permissions),
+        ),
     )
     .context("addService display")?;
     binder::add_service(
         WINDOW,
-        atl_services::window::new_binder(Arc::clone(&agents), Arc::clone(&tasks)),
+        atl_services::window::new_binder(
+            Arc::clone(&agents),
+            Arc::clone(&tasks),
+            Arc::clone(&permissions),
+        ),
     )
     .context("addService window")?;
-    binder::add_service(INPUT_METHOD, atl_services::input_method::new_binder())
-        .context("addService input_method")?;
-    binder::add_service(CONTENT, atl_services::content::new_binder())
-        .context("addService content")?;
-    binder::add_service(AUDIO, atl_services::audio::new_binder()).context("addService audio")?;
+    binder::add_service(
+        INPUT_METHOD,
+        atl_services::input_method::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService input_method")?;
+    binder::add_service(
+        CONTENT,
+        atl_services::content::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService content")?;
+    binder::add_service(
+        AUDIO,
+        atl_services::audio::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService audio")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
-    binder::add_service(MOUNT, atl_services::storage::new_binder()).context("addService mount")?;
-    binder::add_service(CLIPBOARD, atl_services::clipboard::new_binder())
-        .context("addService clipboard")?;
+    binder::add_service(
+        MOUNT,
+        atl_services::storage::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService mount")?;
+    binder::add_service(
+        CLIPBOARD,
+        atl_services::clipboard::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService clipboard")?;
     binder::add_service(
         NOTIFICATION,
-        atl_services::notification::new_binder(Arc::clone(&tasks)),
+        atl_services::notification::new_binder(
+            Arc::clone(&tasks),
+            Arc::clone(&permissions),
+            Arc::clone(&packages),
+        ),
     )
     .context("addService notification")?;
     // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load)
@@ -140,6 +180,7 @@ fn main() -> Result<()> {
         &kcm("Virtual.kcm")?,
         &kcm("Generic.kcm")?,
         Arc::clone(&agents),
+        Arc::clone(&permissions),
     )
     .map_err(anyhow::Error::msg)?;
     binder::add_service(INPUT, input).context("addService input")?;

@@ -17,7 +17,8 @@ use atl_parcelables::parts::{PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
 use crate::packages::{InstrumentationDecl, LibraryNode, PackageRecord, Packages};
-use crate::{counters, manifest_flags, permission};
+use crate::permission::Permissions;
+use crate::{counters, manifest_flags};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPackageManager";
@@ -116,11 +117,15 @@ fn instrumentation_info(p: &PackageRecord, i: &InstrumentationDecl) -> Instrumen
 
 pub struct PackageManager {
     packages: Arc<Packages>,
+    permissions: Arc<Permissions>,
 }
 
 impl PackageManager {
-    pub fn new(packages: Arc<Packages>) -> Self {
-        PackageManager { packages }
+    pub fn new(packages: Arc<Packages>, permissions: Arc<Permissions>) -> Self {
+        PackageManager {
+            packages,
+            permissions,
+        }
     }
 
     /// The record `caller` may see under `name` in `user` (ComputerEngine.getApplicationInfoInternal:997 `!mUserManager.exists(userId) return null`; visibility per Packages::visible).
@@ -140,11 +145,15 @@ impl IPackageManager for PackageManager {
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(

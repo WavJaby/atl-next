@@ -380,6 +380,19 @@ impl Compositor {
         Ok(())
     }
 
+    /// The window manager placed layer `id` in its parent (WindowState.updateSurfacePosition -> Transaction.setPosition on the window's surface, applied at once as SurfaceFlinger applies a
+    /// transaction with no barrier). False: no layer has that id.
+    pub fn set_position(&mut self, id: i32, x: f32, y: f32) -> bool {
+        let Some(l) = self.layers.values_mut().find(|l| l.id == id) else {
+            return false;
+        };
+        if (l.x, l.y) != (x, y) {
+            (l.x, l.y) = (x, y);
+            self.dirty = true;
+        }
+        true
+    }
+
     /// The client dropped its last reference to the layer: it leaves the tree (its children with it) and the buffer it held is released.
     pub fn destroy_layer(&mut self, handle: BinderKey) -> Vec<ClientCall> {
         let mut calls = Vec::new();

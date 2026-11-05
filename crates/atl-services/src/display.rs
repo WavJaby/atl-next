@@ -20,9 +20,10 @@ use std::sync::{Arc, Mutex};
 use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDisplayManagerCallback;
 use binder::Strong;
 
+use crate::counters;
 use crate::display_model::DisplayModel;
+use crate::permission::Permissions;
 use crate::tasks::Tasks;
-use crate::{counters, permission};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IDisplayManager";
@@ -114,22 +115,27 @@ struct DisplayManager {
     /// the owner of the display values (tasks.rs Tasks::display): read at each call, never copied
     tasks: Arc<Tasks<SpIBinder>>,
     callbacks: Arc<DisplayCallbacks>,
+    permissions: Arc<Permissions>,
 }
 
 impl Interface for DisplayManager {}
 
 impl IDisplayManager for DisplayManager {
-    /// Fail-closed as the other services' hooks (activity.rs, package.rs): the permissions the stub names are held by root / system only (permission::holds).
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -244,9 +250,17 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
 }
 
 /// A new display service binder answering from the display  owns; callbacks registered with it go to  (the registry tells them of a change).
-pub fn new_binder(tasks: Arc<Tasks<SpIBinder>>, callbacks: Arc<DisplayCallbacks>) -> SpIBinder {
+pub fn new_binder(
+    tasks: Arc<Tasks<SpIBinder>>,
+    callbacks: Arc<DisplayCallbacks>,
+    permissions: Arc<Permissions>,
+) -> SpIBinder {
     BnDisplayManager::new_binder(
-        DisplayManager { tasks, callbacks },
+        DisplayManager {
+            tasks,
+            callbacks,
+            permissions,
+        },
         BinderFeatures::default(),
     )
     .as_binder()

@@ -37,6 +37,11 @@ impl IUiAgent for UiAgent {
         Ok(())
     }
 
+    fn window_position(&self, layer_id: i32, x: i32, y: i32) -> Result<(), StatusCode> {
+        self.composer
+            .set_layer_position(layer_id, x as f32, y as f32)
+    }
+
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode> {
         let (handle, layer_id) = self.composer.create_layer(layer_name, None)?;
         let display = self.composer.display();

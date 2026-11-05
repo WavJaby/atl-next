@@ -812,3 +812,29 @@ fn referenced_fds_follow_queue_layer_and_cache() {
     c.on_frame(40);
     assert!(c.referenced_fds().is_empty());
 }
+
+/// A second window of the app (a toast) is placed by the window manager, not by the app: set_position moves its root layer, the next scene shows it there; an unknown id is refused.
+#[test]
+fn window_manager_places_a_root_layer() {
+    let (window, toast) = (local(1), local(2));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(window, 1, None)).unwrap();
+    c.create_layer(spec(toast, 2, None)).unwrap();
+    show(&mut c, &window, 11, 960, 600);
+    show(&mut c, &toast, 12, 200, 48);
+    c.on_frame(1);
+    assert!(c.set_position(2, 380.0, 488.0));
+    assert!(!c.set_position(99, 0.0, 0.0));
+    assert!(c.wants_frame());
+    let scene = c.on_frame(2).scene.unwrap();
+    let toast_quad = scene.quads.iter().find(|q| q.layer_id == 2).unwrap();
+    assert_eq!(
+        toast_quad.dst,
+        FloatRect {
+            left: 380.0,
+            top: 488.0,
+            right: 580.0,
+            bottom: 536.0
+        }
+    );
+}

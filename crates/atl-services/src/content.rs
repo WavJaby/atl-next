@@ -19,8 +19,9 @@ use binder::{
     Status, StatusCode, Strong, ThreadState,
 };
 
+use crate::counters;
 use crate::observer_rules::{Watch, segments};
-use crate::{counters, permission};
+use crate::permission::Permissions;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IContentService";
@@ -43,6 +44,7 @@ fn alive(entry: &Entry) -> bool {
 
 /// ContentService's mRootNode, flattened: the registrations in the order they were made.
 struct ContentService {
+    permissions: Arc<Permissions>,
     observers: Mutex<Vec<Entry>>,
 }
 
@@ -71,17 +73,21 @@ fn resolve_user(requested: i32, caller_uid: u32) -> binder::Result<i32> {
 }
 
 impl IContentService for ContentService {
-    /// Fail-closed as the other services' hooks (input_method.rs): the sync permissions the stub names are held by root / system only (permission::holds).
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -213,9 +219,10 @@ impl IContentService for ContentService {
 }
 
 /// A new content service binder.
-pub fn new_binder() -> SpIBinder {
+pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
     BnContentService::new_binder(
         ContentService {
+            permissions,
             observers: Mutex::new(Vec::new()),
         },
         BinderFeatures::default(),

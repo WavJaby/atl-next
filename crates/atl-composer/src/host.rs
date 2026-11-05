@@ -423,6 +423,15 @@ impl Composer {
         Ok((sp, id))
     }
 
+    /// Places layer `id` at (`x`, `y`) in its parent: the window service's frame origin for a window (ui_agent WINDOW_POSITION). BAD_VALUE for an unknown layer.
+    pub fn set_layer_position(&self, id: i32, x: f32, y: f32) -> Result<(), StatusCode> {
+        if !self.lock().compositor.set_position(id, x, y) {
+            return Err(StatusCode::BAD_VALUE);
+        }
+        self.notify();
+        Ok(())
+    }
+
     /// The last reference to a layer's handle went away.
     fn layer_dropped(&self, key: u64) {
         let mut st = self.lock();

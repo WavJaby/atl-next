@@ -50,7 +50,7 @@ use crate::activity_task::ActivityTasks;
 use crate::config_diff::{self, Config, Delivery};
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
-use crate::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
+use crate::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::size_buckets::SizeBuckets;
@@ -418,6 +418,7 @@ impl Reporter {
 
 struct Inner {
     packages: Arc<Packages>,
+    permissions: Arc<Permissions>,
     control: Arc<dyn ProcessControl>,
     state: Mutex<State>,
     reporter: Reporter,
@@ -456,6 +457,7 @@ impl ActivityManager {
     /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there.
     pub fn new(
         packages: Arc<Packages>,
+        permissions: Arc<Permissions>,
         control: Arc<dyn ProcessControl>,
         tasks: Arc<Tasks<SpIBinder>>,
     ) -> Self {
@@ -477,6 +479,7 @@ impl ActivityManager {
                         controller.clone(),
                     )),
                     packages,
+                    permissions,
                     control,
                     state: Mutex::new(State::default()),
                     reporter: Reporter::new(),
@@ -904,11 +907,16 @@ impl IActivityManager for ActivityManager {
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .inner
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(security(&format!("{method}: caller lacks {permission:?}")))
@@ -933,13 +941,7 @@ impl IActivityManager for ActivityManager {
         let Ok(uid) = u32::try_from(uid) else {
             return Ok(DENIED);
         };
-        let grants: Vec<String> = self
-            .inner
-            .packages
-            .by_app_id(permission::app_id(uid))
-            .flat_map(|p| p.granted_permissions.iter().cloned())
-            .collect();
-        Ok(if permission::check(uid, permission, &grants) {
+        Ok(if self.inner.permissions.check(uid, permission) {
             GRANTED
         } else {
             DENIED

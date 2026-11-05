@@ -34,11 +34,47 @@ pub fn sees_all_packages(uid: u32) -> bool {
     app_id(uid) < FIRST_APPLICATION_UID
 }
 
-/// Whether `uid` holds `permissions` (all of them): granted to root / system; denied to every other uid. No M2 method carries @EnforcePermission (aidl lists none on the M2 subset of
-/// IActivityManager, IPackageManager, IActivityClientController), so no app permission is needed yet; an app-held permission (manifest + grants via PermissionController, plan Q5) comes with the first method that needs one.
-pub fn holds(uid: u32, permissions: &[&str]) -> bool {
-    let _ = permissions;
-    is_system_or_root(uid)
+/// An `@EnforcePermission` check (the generated stub's Single / AllOf / AnyOf; Single = a one-element AllOf): root / system hold everything (checkComponentPermission); any other uid
+/// holds a permission only when `granted` says so -- its install-time grants (rule A). `any` = AnyOf. No permission at all is held by nobody but root / system.
+pub fn holds(uid: u32, permissions: &[&str], any: bool, granted: impl Fn(&str) -> bool) -> bool {
+    if is_system_or_root(uid) {
+        return true;
+    }
+    if permissions.is_empty() {
+        return false;
+    }
+    if any {
+        permissions.iter().any(|p| granted(p))
+    } else {
+        permissions.iter().all(|p| granted(p))
+    }
+}
+
+/// The permission state every service consults: the install-time grants of the installed packages, by uid (a shared uid's packages pool their grants, as PMS's shared user does).
+pub struct Permissions {
+    packages: std::sync::Arc<crate::packages::Packages>,
+}
+
+impl Permissions {
+    pub fn new(packages: std::sync::Arc<crate::packages::Packages>) -> Self {
+        Permissions { packages }
+    }
+
+    fn granted(&self, uid: u32, permission: &str) -> bool {
+        self.packages
+            .by_app_id(app_id(uid))
+            .any(|p| p.granted_permissions.iter().any(|g| g == permission))
+    }
+
+    /// `holds` against `uid`'s grants.
+    pub fn holds(&self, uid: u32, permissions: &[&str], any: bool) -> bool {
+        holds(uid, permissions, any, |p| self.granted(uid, p))
+    }
+
+    /// `check` against `uid`'s grants.
+    pub fn check(&self, uid: u32, permission: Option<&str>) -> bool {
+        permission.is_some_and(|p| holds(uid, &[p], false, |p| self.granted(uid, p)))
+    }
 }
 
 /// PermissionInfo.PROTECTION_MASK_BASE and the two base types the install-time rule grants (PermissionInfo.java).
@@ -69,15 +105,6 @@ pub fn install_grants<'a>(
         })
         .cloned()
         .collect()
-}
-
-/// ActivityManager.checkComponentPermission for an exported, uid-less component (ActivityManagerService.checkPermissionForDevice:6193 -> checkComponentPermission): no permission -> denied;
-/// root / system -> granted; else granted only when `uid`'s install-time grants hold it.
-pub fn check(uid: u32, permission: Option<&str>, grants: &[String]) -> bool {
-    let Some(permission) = permission else {
-        return false;
-    };
-    is_system_or_root(uid) || grants.iter().any(|g| g == permission)
 }
 
 #[cfg(test)]
@@ -127,28 +154,25 @@ mod tests {
     }
 
     #[test]
-    fn check_denies_null_and_ungranted() {
-        let grants = vec!["android.permission.INTERNET".to_owned()];
-        assert!(!check(10_000, None, &grants));
-        assert!(!check(1000, None, &grants));
-        assert!(check(1000, Some("android.permission.READ_CONTACTS"), &[]));
-        assert!(check(10_000, Some("android.permission.INTERNET"), &grants));
-        assert!(!check(
-            10_000,
-            Some("android.permission.READ_CONTACTS"),
-            &grants
-        ));
+    fn app_holds_its_grants_all_or_any() {
+        let granted = |p: &str| p == "A";
+        assert!(holds(10_000, &["A"], false, granted));
+        assert!(!holds(10_000, &["A", "B"], false, granted));
+        assert!(holds(10_000, &["B", "A"], true, granted));
+        assert!(!holds(10_000, &["B"], true, granted));
+        assert!(!holds(10_000, &[], false, granted));
     }
 
     #[test]
-    fn system_and_root_in_any_user_only() {
+    fn system_and_root_in_any_user_hold_everything() {
         // uids: AID_ROOT, AID_SYSTEM, AID_SYSTEM in user 10 (10 * 100000 + 1000), AID_SHELL 2000, the first app uid, an app in user 10
-        assert!(holds(0, &["A"]));
-        assert!(holds(1000, &["A", "B"]));
-        assert!(holds(1_001_000, &["A"]));
-        assert!(!holds(2000, &["A"]));
-        assert!(!holds(10_000, &["A"]));
-        assert!(!holds(1_010_123, &[]));
+        let none = |_: &str| false;
+        assert!(holds(0, &["A"], false, none));
+        assert!(holds(1000, &["A", "B"], false, none));
+        assert!(holds(1_001_000, &["A"], true, none));
+        assert!(!holds(2000, &["A"], false, none));
+        assert!(!holds(10_000, &["A"], false, none));
+        assert!(!holds(1_010_123, &[], false, none));
         assert_eq!((app_id(1_010_123), user_id(1_010_123)), (10_123, 10));
     }
 

@@ -10,7 +10,9 @@ use atl_aidl::aidl::android::os::storage::IStorageManager::{
 use atl_parcelables::android::os::storage::StorageVolume;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::{counters, permission};
+use crate::counters;
+use crate::permission::Permissions;
+use std::sync::Arc;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IStorageManager";
@@ -23,22 +25,28 @@ const STATE_MOUNTED: &str = "mounted";
 /// UserHandle.USER_SYSTEM: the only user ATL has.
 const USER_SYSTEM: i32 = 0;
 
-struct StorageService;
+struct StorageService {
+    permissions: Arc<Permissions>,
+}
 
 impl Interface for StorageService {}
 
 impl IStorageManager for StorageService {
-    /// Fail-closed as the other services' hooks (package.rs): the permissions the stub names are held by root / system only.
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -92,8 +100,9 @@ fn primary() -> StorageVolume {
 }
 
 /// The service's binder, for `addService`.
-pub fn new_binder() -> SpIBinder {
-    BnStorageManager::new_binder(StorageService, BinderFeatures::default()).as_binder()
+pub fn new_binder(permissions: Arc<Permissions>) -> SpIBinder {
+    BnStorageManager::new_binder(StorageService { permissions }, BinderFeatures::default())
+        .as_binder()
 }
 
 #[cfg(test)]

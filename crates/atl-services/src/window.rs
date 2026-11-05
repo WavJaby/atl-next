@@ -30,9 +30,10 @@ use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
 
+use crate::permission::Permissions;
 use crate::tasks::{TaskId, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
-use crate::{activity, counters, permission};
+use crate::{activity, counters};
 
 /// The interface names counters use.
 const WINDOW_MANAGER: &str = "IWindowManager";
@@ -98,6 +99,23 @@ impl RegisteredAgent {
         }
     }
 
+    /// Places the window's layer `layer_id` at `origin` in its Task; false, counted, when no agent takes it.
+    fn place(&self, layer_id: i32, (x, y): (i32, i32)) -> bool {
+        let Some(agent) = self.agent("relayout") else {
+            return false;
+        };
+        match agent.window_position(layer_id, x, y) {
+            Ok(()) => true,
+            Err(e) => {
+                counters::count(
+                    WINDOW_SESSION,
+                    &format!("relayout: UI agent refused the window position: {e:?}"),
+                );
+                false
+            }
+        }
+    }
+
     /// Names the window's Task to the agent: the composer sends that Task's bounds with it (SET_BOUNDS). Counted when the agent refuses it.
     fn name_task(&self, task: TaskId) {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
@@ -150,6 +168,8 @@ struct Window {
     laid_out: bool,
     /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
     surface: Option<SurfaceControl>,
+    /// Where the agent placed the window's layer in its Task (a new layer sits at the origin): its frame's origin at the last relayout the agent took.
+    position: (i32, i32),
     /// The token of the input channel the agent took; None for a window without one.
     input: Option<SpIBinder>,
 }
@@ -157,6 +177,7 @@ struct Window {
 struct WindowManager {
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
+    permissions: Arc<Permissions>,
 }
 
 /// The session openSession gives: the windows it added, and the display they lay out on.
@@ -171,17 +192,21 @@ impl Interface for WindowManager {}
 impl Interface for Session {}
 
 impl IWindowManager for WindowManager {
-    /// Fail-closed as the other services' hooks (display.rs, activity.rs): the permissions the stub names are held by root / system only (permission::holds).
+    /// @EnforcePermission: root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
         &self,
         method: &str,
         permission: EnforcePermission<'_>,
     ) -> binder::Result<()> {
-        let perms: &[&str] = match &permission {
-            EnforcePermission::Single(p) => std::slice::from_ref(p),
-            EnforcePermission::AllOf(p) | EnforcePermission::AnyOf(p) => p,
+        let (perms, any): (&[&str], bool) = match &permission {
+            EnforcePermission::Single(p) => (std::slice::from_ref(p), false),
+            EnforcePermission::AllOf(p) => (p, false),
+            EnforcePermission::AnyOf(p) => (p, true),
         };
-        if permission::holds(ThreadState::get_calling_uid(), perms) {
+        if self
+            .permissions
+            .holds(ThreadState::get_calling_uid(), perms, any)
+        {
             return Ok(());
         }
         Err(Status::new_exception_str(
@@ -381,6 +406,7 @@ impl IWindowSession for Session {
             task,
             laid_out: false,
             surface: None,
+            position: (0, 0),
             input,
         });
         *out_input_channel = Some(channel);
@@ -439,22 +465,38 @@ impl IWindowSession for Session {
             record.surface = Some(surface.clone());
         }
         // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
-        let surface = self
-            .lock()
-            .iter()
-            .find(|w| w.client == client)
-            .and_then(|w| w.surface.clone());
+        let frame = window_frame(
+            attrs,
+            requested_width,
+            requested_height,
+            self.task_rect(task),
+        );
+        let (surface, placed) = {
+            let windows = self.lock();
+            let record = windows.iter().find(|w| w.client == client);
+            (
+                record.and_then(|w| w.surface.clone()),
+                record.map(|w| w.position),
+            )
+        };
+        // the window's layer goes to its frame's origin (WindowState.updateSurfacePosition), asked without the windows lock; a refused call is asked again at the next relayout
+        let origin = (frame.left, frame.top);
+        if let Some(layer_id) = surface
+            .as_ref()
+            .and_then(|s| s.native.as_ref())
+            .map(|n| n.layer_id)
+            && placed != Some(origin)
+            && self.agent.place(layer_id, origin)
+            && let Some(record) = self.lock().iter_mut().find(|w| w.client == client)
+        {
+            record.position = origin;
+        }
         let display = self.tasks.display();
         let size = self.tasks.size(task);
         let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
             frames: ClientWindowFrames {
-                frame: window_frame(
-                    attrs,
-                    requested_width,
-                    requested_height,
-                    self.task_rect(task),
-                ),
+                frame,
                 display_frame: self.display_rect(),
                 parent_frame: self.task_rect(task),
                 attached_frame: None,
@@ -516,9 +558,20 @@ impl IWindowSession for Session {
 }
 
 /// A new window service binder: the Tasks (which own the display every session lays out on) and the table of UI agents (system_services.rs gives it the registry's).
-pub fn new_binder(agents: Arc<UiAgents>, tasks: Arc<Tasks<SpIBinder>>) -> SpIBinder {
-    BnWindowManager::new_binder(WindowManager { agents, tasks }, BinderFeatures::default())
-        .as_binder()
+pub fn new_binder(
+    agents: Arc<UiAgents>,
+    tasks: Arc<Tasks<SpIBinder>>,
+    permissions: Arc<Permissions>,
+) -> SpIBinder {
+    BnWindowManager::new_binder(
+        WindowManager {
+            agents,
+            tasks,
+            permissions,
+        },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }
 
 /// `task` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
