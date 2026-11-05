@@ -47,8 +47,10 @@ import android.os.UserHandle;
 import android.text.InputType;
 import android.view.autofill.AutofillId;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.ImeTracker;
 import android.window.ImeOnBackInvokedDispatcher;
 import com.android.internal.inputmethod.InputBindResult;
+import com.android.internal.inputmethod.InputMethodInfoSafeList;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -237,6 +239,9 @@ public class ParcelTruth {
         check("EditorInfo:empty", new EditorInfo(), EditorInfo.CREATOR);
         check("InputBindResult:no-ime", InputBindResult.NO_IME, InputBindResult.CREATOR);
         checkImeDispatcher("ImeOnBackInvokedDispatcher");
+        // show/hideSoftInput's token and getInputMethodList's empty answer (atl-services input_method.rs)
+        checkImeToken("ImeTracker_Token");
+        check("InputMethodInfoSafeList:empty", InputMethodInfoSafeList.empty(), InputMethodInfoSafeList.CREATOR);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
@@ -271,6 +276,26 @@ public class ParcelTruth {
 
     /// ImeOnBackInvokedDispatcher carries its ResultReceiver's binder: Java Parcel -> codec -> Java Parcel with its objects (roundTripParcel); every byte consumed, Java reads it back,
     /// and the binder Java re-writes from the read value is the original one.
+    /// ImeTracker.Token carries a binder, so it goes through the parcel-copy path: the binder must come back the same object, the tag equal.
+    static void checkImeToken(String name) {
+        Binder binder = new Binder();
+        ImeTracker.Token t = new ImeTracker.Token(binder, "atl:parcel-truth");
+        Parcel in = written(t);
+        in.setDataPosition(0);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.view.inputmethod.ImeTracker$Token", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        ImeTracker.Token back = ImeTracker.Token.CREATOR.createFromParcel(out);
+        boolean ok = consumed && back.getBinder() == binder && t.getTag().equals(back.getTag());
+        result(ok, name, ok ? "binder and tag survived java -> rust -> java" : "sizes " + in.dataSize() + "/" + out.dataSize() + ", binder " + back.getBinder() + ", tag " + back.getTag());
+        in.recycle();
+        out.recycle();
+    }
+
     static void checkImeDispatcher(String name) {
         ImeOnBackInvokedDispatcher d = new ImeOnBackInvokedDispatcher(null);
         Parcel in = written(d);
