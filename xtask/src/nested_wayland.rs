@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_services::display_model::DisplayModel;
 
-/// One headless output, logical pixels before scale.
+/// One headless output: its mode in physical pixels (wlroots divides by the scale for the logical size).
 #[derive(Clone, Copy, Debug)]
 pub struct Output {
     pub width: i32,
@@ -186,12 +186,21 @@ impl NestedCompositor {
         })
     }
 
-    /// The gates' display on this compositor: the test display at the first output's rate, which this module set.
+    /// The gates' display on this compositor: the first output as Android's display (DisplayModel::from_monitor, as the app's window reports it once on that output). A different value given to atld would change the app's display when its window opens.
     pub fn display(&self) -> DisplayModel {
-        DisplayModel {
-            refresh_hz: self.outputs[0].refresh_mhz as f32 / 1000.0,
-            ..DisplayModel::default()
-        }
+        self.output_display(0)
+    }
+
+    /// Output `index` as Android's display: the mode this module set (`set_custom_mode`: physical pixels), its rate and scale.
+    pub fn output_display(&self, index: usize) -> DisplayModel {
+        let o = self.outputs[index];
+        let physical = |px: i32| u32::try_from(px).unwrap_or(0);
+        DisplayModel::from_monitor(
+            physical(o.width),
+            physical(o.height),
+            Some(o.refresh_mhz as f32 / 1000.0),
+            o.scale,
+        )
     }
 }
 
