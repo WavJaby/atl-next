@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! ATL's M2 system services in Rust (owner decision 2026-11-03: AOSP's Java system_server measured too costly; more services and methods later, per service).
+//! ATL's M2 system services in Rust (owner decision 2026-11-03: AOSP's Java system_server on ART would add resident memory, startup time and a large build closure; not measured; more services and methods later, per service).
 //! Each implements a converter-built AIDL stub (atl-aidl) and only the methods M2 needs; the rest keep the stub's default body (aidl `--rust_unimplemented_hook`), which lands in
 //! [`counters::unimplemented`]: counted per (interface, method) and answered UNKNOWN_TRANSACTION, what Java's Binder.onTransact gives an unknown code.
 //! `@EnforcePermission` methods ask [`permission::enforce`] first (fail-closed). Policy modules are plain Rust; the binder modules need feature `converter`.
