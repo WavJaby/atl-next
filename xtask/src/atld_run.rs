@@ -254,11 +254,13 @@ impl Runtime {
     }
 
     /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar.
+    /// `native` = (ABI, shared libraries): stored under `lib/<abi>/`, as an app's packager lays them out.
     pub fn build_apk(
         &self,
         fixture: &Path,
         work: &Path,
         class_jars: &[PathBuf],
+        native: Option<&(String, Vec<PathBuf>)>,
     ) -> Result<PathBuf> {
         if work.exists() {
             std::fs::remove_dir_all(work)?;
@@ -347,6 +349,26 @@ impl Runtime {
                 .arg("classes.dex"),
             "jar --update",
         )?;
+        if let Some((abi, libs)) = native {
+            let staged = work.join("native");
+            let dir = staged.join("lib").join(abi);
+            std::fs::create_dir_all(&dir)?;
+            for l in libs {
+                let name = l.file_name().context("native library name")?;
+                std::fs::copy(l, dir.join(name))
+                    .with_context(|| format!("copying {}", l.display()))?;
+            }
+            // stored, so the APK also loads with extractNativeLibs=false (page-aligned mapping is bridge-1 step 7)
+            host_art::exec(
+                Command::new(jdk_bin.join("jar"))
+                    .args(["--update", "--no-manifest", "--no-compress", "--file"])
+                    .arg(&apk)
+                    .arg("-C")
+                    .arg(&staged)
+                    .arg("lib"),
+                "jar --update lib",
+            )?;
+        }
         Ok(apk)
     }
 

@@ -659,7 +659,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the display this gate judges against: atld takes it as given and never asks the desktop
     let rt = rt.with_display(display.to_arg());
     let work = rt.out.join("composer");
-    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
+    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[], None)?;
     let m = manifest::read(&rt.aapt2, &apk)?;
     println!(
         "composer: built {} ({} versionCode {})",

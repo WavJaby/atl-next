@@ -479,7 +479,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("instrument");
     let mut cases = Vec::new();
     if args.case != CaseSet::Converter {
-        let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[test_base])?;
+        let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[test_base], None)?;
         let m = manifest::read(&rt.aapt2, &apk)?;
         for (label, class, expect) in [
             ("sample", SAMPLE_TEST, Expect::Sample),

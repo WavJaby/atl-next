@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, counter_lines};
-use crate::manifest;
+use crate::{jni_fixture, manifest};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -67,7 +67,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt
     };
     let work = rt.out.join("app");
-    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
+    // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
+    let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
+    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
     let m = manifest::read(&rt.aapt2, &apk)?;
     let activity = m
         .launch_activity()

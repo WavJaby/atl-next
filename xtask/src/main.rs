@@ -24,6 +24,7 @@ mod git;
 mod gralloc;
 mod host_art;
 mod instrument;
+mod jni_fixture;
 mod land;
 mod libcxx_gate;
 mod licence_gate;
@@ -191,6 +192,10 @@ enum Test {
     /// Runs crates/atl-platform-ui/examples/gate.rs in the gate's headless weston (`--hold-blocked`: on $WAYLAND_DISPLAY) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
     /// The compositor's own "not responding" reaction is not observable on WSLg: `--hold-blocked <s>` keeps the UI thread blocked for the Arch-laptop run to watch.
     PlatformUi(platform_ui::Args),
+    /// The bridge-1 JNI fixture (xtask/testdata/jni-test), NDK-built for minSdk 21 (emulated TLS) and 29 (ELF TLS): DT_NEEDED libc.so + libc++_shared.so, verneed libc.so/LIBC, the variant's TLS shape, and host glibc's loader refusing it on `LIBC`.
+    ///
+    /// Controls run every time: the probe loads a glibc library cleanly, and each variant fails the other's TLS expectation. Needs the NDK only, no native build.
+    JniFixture(jni_fixture::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -241,6 +246,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::PlatformUi(args),
         } => platform_ui::run(&root, &args),
+        Command::Test {
+            test: Test::JniFixture(args),
+        } => jni_fixture::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -268,6 +276,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Composer(_) => "composer",
             Test::Window(_) => "window",
             Test::PlatformUi(_) => "platform-ui",
+            Test::JniFixture(_) => "jni-fixture",
         },
         _ => return None,
     })
