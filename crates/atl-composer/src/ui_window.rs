@@ -4,7 +4,6 @@
 //! The window is the display: one per process, opened at install (the app's first traversal waits for a vsync, which this window's frame clock supplies).
 
 use std::cell::RefCell;
-use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -55,12 +54,11 @@ fn capture_report(window: &PlatformWindow, presented: u32) {
     let capture = match window.capture() {
         Ok(capture) => capture,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "atl-composer: ui: capture: {e}");
+            tracing::warn!("atl-composer: ui: capture: {e}");
             return;
         }
     };
-    let _ = writeln!(
-        std::io::stderr(),
+    tracing::info!(
         "atl-composer: ui: capture presented={presented} size={}x{} fnv1a64={:016x}",
         capture.size.width,
         capture.size.height,
@@ -75,7 +73,7 @@ fn open() {
         let Some(session) = slot.as_mut() else {
             return;
         };
-        let _ = writeln!(std::io::stderr(), "atl-composer: ui: opening the window");
+        tracing::info!("atl-composer: ui: opening the window");
         if session.window.is_some() {
             return;
         }
@@ -86,7 +84,7 @@ fn open() {
         let window = match PlatformWindow::create(&session.ui, &attributes) {
             Ok(window) => Rc::new(window),
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "atl-composer: ui window: {e}");
+                tracing::error!("atl-composer: ui window: {e}");
                 return;
             }
         };
@@ -105,20 +103,13 @@ fn open() {
             frames.tick(time_ns, |scene| {
                 presented += 1;
                 quiet_ticks = 0;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "atl-composer: ui: present n={presented} time_ns={time_ns}"
-                );
+                tracing::debug!("atl-composer: ui: present n={presented} time_ns={time_ns}");
                 if let Err(e) = shown.present(scene) {
-                    let _ = writeln!(std::io::stderr(), "atl-composer: ui present: {e}");
+                    tracing::warn!("atl-composer: ui present: {e}");
                 }
             });
             if tick_count == 0 {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "atl-composer: ui: first frame mapped={}",
-                    shown.is_mapped()
-                );
+                tracing::info!("atl-composer: ui: first frame mapped={}", shown.is_mapped());
             }
             if capture && presented > 0 && quiet_ticks == SETTLED_TICKS {
                 capture_report(&shown, presented);

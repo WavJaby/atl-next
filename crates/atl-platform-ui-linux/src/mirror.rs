@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::c_int;
-use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -21,7 +20,7 @@ use rustix::time::{
     timerfd_settime,
 };
 
-/// How often the counters are printed (`atl-platform-ui: mirror: ...` on stderr).
+/// How often the counters are logged (`atl-platform-ui: mirror: ...`, debug level).
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
 /// What the mirror did since install: the spike's measurements.
@@ -176,7 +175,7 @@ impl Mirror {
                 continue;
             }
             if let Err(e) = self.looper.add_fd(fd, looper_events(events)) {
-                writeln!(std::io::stderr(), "atl-platform-ui: mirror: {e}").ok();
+                tracing::warn!("atl-platform-ui: mirror: {e}");
                 continue;
             }
             self.registered.insert(fd, events);
@@ -239,19 +238,14 @@ impl Mirror {
             it_value: value,
         };
         if let Err(e) = timerfd_settime(&self.timer, TimerfdTimerFlags::empty(), &spec) {
-            writeln!(
-                std::io::stderr(),
-                "atl-platform-ui: mirror: timerfd_settime: {e}"
-            )
-            .ok();
+            tracing::warn!("atl-platform-ui: mirror: timerfd_settime: {e}");
         }
     }
 
     fn report(&self) {
         let s = &self.stats;
         let avg = s.sync_ns.checked_div(u128::from(s.syncs)).unwrap_or(0);
-        writeln!(
-            std::io::stderr(),
+        tracing::debug!(
             "atl-platform-ui: mirror: passes={} stale={} timer_fires={} syncs={} sync_avg_ns={avg} sync_max_ns={} fds={} fds_max={} adds={} removes={}",
             s.passes,
             s.stale,
@@ -262,8 +256,7 @@ impl Mirror {
             s.fds_max,
             s.adds,
             s.removes,
-        )
-        .ok();
+        );
     }
 }
 

@@ -36,6 +36,8 @@ toml = "1"
 toml_edit = "0.25"
 # no `attributes` (the #[instrument] macro): it is the only user of syn 2, the rest of the graph is on syn 3
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# the app process's log (atl-app-launcher trace.rs): stderr with a RUST_LOG filter; no ansi, the log files carry no colours
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 
 # Inherited by every crate via `[lints] workspace = true`; such a crate cannot add lints in its own
 # Cargo.toml, so crate-specific extras (`missing_docs` in `-api` crates, `forbid(unsafe_code)` in core

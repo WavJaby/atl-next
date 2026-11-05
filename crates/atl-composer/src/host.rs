@@ -4,7 +4,6 @@
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -327,10 +326,7 @@ impl Composer {
         st.stats.fds_taken += (st.fds.len() - held) as u64;
         let decoded = wire.and_then(|w| {
             TransactionState::decode_call(&w).map_err(|e| {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "composer: setTransactionState refused: {e}"
-                );
+                tracing::warn!("composer: setTransactionState refused: {e}");
                 StatusCode::BAD_VALUE
             })
         });
@@ -585,7 +581,7 @@ impl Composer {
         st.close_unreferenced();
         // the clock is about to park: nothing is left to count, so this is the line the gate reads
         if st.in_flight.is_empty() && !st.wants_frame() {
-            let _ = writeln!(std::io::stderr(), "{}", st.counters_line());
+            tracing::info!("{}", st.counters_line());
         }
     }
 
@@ -593,7 +589,7 @@ impl Composer {
         for call in calls {
             let delivered = self.deliver(&call);
             if let Err(why) = &delivered {
-                let _ = writeln!(std::io::stderr(), "composer: callback failed: {why}");
+                tracing::warn!("composer: callback failed: {why}");
             }
             let mut st = self.lock();
             if delivered.is_ok() {

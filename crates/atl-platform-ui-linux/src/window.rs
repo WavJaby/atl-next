@@ -2,7 +2,6 @@
 //! `GtkWindow`: a `GtkWindow` whose only content is the `SceneView`, with its GdkFrameClock as the `FrameClock` and pointer controllers as the `InputSource`.
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::rc::Rc;
 
 use atl_platform_ui_api::{
@@ -218,10 +217,7 @@ impl Window for GtkWindow {
             .flatten();
         if let Some((x, y)) = origin {
             self.origin_logged.set(true);
-            let _ = writeln!(
-                std::io::stderr(),
-                "atl-platform-ui: content origin x={x} y={y}"
-            );
+            tracing::info!("atl-platform-ui: content origin x={x} y={y}");
         }
         Ok(())
     }

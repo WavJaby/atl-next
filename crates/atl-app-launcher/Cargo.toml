@@ -27,6 +27,7 @@ atl-composer = { path = "../atl-composer" }
 # UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
 atl-platform-ui = { path = "../atl-platform-ui" }
 rustix.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

@@ -374,7 +374,10 @@ impl Runtime {
             cmd.args(["--display", display]);
         }
         if let Some(mode) = &self.ui {
-            cmd.args(["--ui", mode]).env("ATL_UI_CAPTURE", "1");
+            // the compositor logs each frame's `present` line at debug (atl-composer ui_window.rs): the UI runs that read them enable it
+            cmd.args(["--ui", mode])
+                .env("ATL_UI_CAPTURE", "1")
+                .env("RUST_LOG", "info,atl_composer=debug");
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);
