@@ -9,8 +9,12 @@ use atl_aidl::aidl::android::hardware::display::IDisplayManager::{
 };
 use atl_parcelables::android::view::DisplayInfo;
 use atl_parcelables::parts::DisplayMode;
-use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
+use binder::{
+    BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status,
+    StatusCode, ThreadState,
+};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDisplayManagerCallback;
@@ -43,29 +47,55 @@ const EVENT_DISPLAY_BASIC_CHANGED: i32 = 2;
 /// DisplayManagerGlobal.INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED (DisplayManagerGlobal.java:151): the mask bit a callback takes basic changes with (DisplayManagerService shouldSendEvent:4424).
 const INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED: i64 = 1 << 1;
 
-/// The registered IDisplayManagerCallbacks, one per process as DisplayManagerService's CallbackRecord (keyed by calling pid; a second registration of a pid replaces its mask), with the event mask each asked for.
-/// One CallbackRecord: the calling pid, the callback, the event mask.
-type CallbackRecord = (i32, Strong<dyn IDisplayManagerCallback>, i64);
+/// DisplayManagerService's CallbackRecord: the calling pid, the callback, the event mask, and its death link (CallbackRecord.binderDied -> onCallbackDied removes the record).
+struct CallbackRecord {
+    pid: i32,
+    callback: Strong<dyn IDisplayManagerCallback>,
+    mask: i64,
+    dead: Arc<AtomicBool>,
+    _death: DeathRecipient,
+}
 
+/// The registered IDisplayManagerCallbacks, one per process (keyed by calling pid; a second registration of a pid replaces its mask). A record whose process died is dropped at the next register or delivery.
 #[derive(Default)]
 pub struct DisplayCallbacks {
     records: Mutex<Vec<CallbackRecord>>,
 }
 
 impl DisplayCallbacks {
-    fn register(&self, pid: i32, callback: &Strong<dyn IDisplayManagerCallback>, mask: i64) {
+    /// Fails DEAD_OBJECT when the callback is already dead (AOSP: linkToDeath's RemoteException -> RuntimeException).
+    fn register(
+        &self,
+        pid: i32,
+        callback: &Strong<dyn IDisplayManagerCallback>,
+        mask: i64,
+    ) -> Result<(), StatusCode> {
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        match records.iter_mut().find(|r| r.0 == pid) {
-            Some(r) => r.2 = mask,
-            None => records.push((pid, callback.clone(), mask)),
+        records.retain(|r| !r.dead.load(Ordering::Acquire));
+        if let Some(r) = records.iter_mut().find(|r| r.pid == pid) {
+            r.mask = mask;
+            return Ok(());
         }
+        let dead = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dead);
+        let mut death = DeathRecipient::new(move || flag.store(true, Ordering::Release));
+        callback.as_binder().link_to_death(&mut death)?;
+        records.push(CallbackRecord {
+            pid,
+            callback: callback.clone(),
+            mask,
+            dead,
+            _death: death,
+        });
+        Ok(())
     }
 
-    /// Display 0 changed (Tasks::set_display): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). A dead callback fails its oneway send and stays (no death link yet: one record per pid, so at most one per process that ran). Returns the callbacks told.
+    /// Display 0 changed (Tasks::set_display): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each live callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). Returns the callbacks told.
     pub fn display_changed(&self) -> usize {
-        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        records.retain(|r| !r.dead.load(Ordering::Acquire));
         let mut told = 0;
-        for (_, callback, mask) in records.iter() {
+        for CallbackRecord { callback, mask, .. } in records.iter() {
             if mask & INTERNAL_EVENT_FLAG_DISPLAY_BASIC_CHANGED == 0 {
                 continue;
             }
@@ -153,8 +183,8 @@ impl DisplayManager {
             )
         })?;
         self.callbacks
-            .register(ThreadState::get_calling_pid(), callback, mask);
-        Ok(())
+            .register(ThreadState::get_calling_pid(), callback, mask)
+            .map_err(Status::from)
     }
 }
 
