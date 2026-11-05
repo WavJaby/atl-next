@@ -521,7 +521,7 @@ impl Runtime {
         std::fs::write(
             &platform,
             serde_json::to_vec_pretty(&manifest::read_permissions(
-                &self.aapt2,
+                &self.apk.aapt2,
                 &self.framework_res,
             )?)?,
         )?;
