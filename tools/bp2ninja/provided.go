@@ -53,7 +53,7 @@ func (g *Graph) checkDefines() {
 			switch {
 			case !ok || isRustType(t) || k == Headers:
 				g.problem("providers.toml: %s: defines on a %s, which compiles no C/C++", name, m.Type)
-			case strings.Contains(t, "_host") || !m.Props.boolean("device_supported", true):
+			case g.noDeviceVariant(m):
 				g.problem("providers.toml: %s: defines on a %s, which has no device variant", name, m.Type)
 			}
 		}

@@ -57,7 +57,7 @@ func (g *Graph) checkRustAndroid() {
 			switch {
 			case !isRustType(t):
 				g.problem("providers.toml: %s: rust_os on a %s, not a Rust module", name, m.Type)
-			case strings.Contains(t, "_host") || t == "rust_proc_macro" || !m.Props.boolean("device_supported", true):
+			case g.noDeviceVariant(m):
 				g.problem("providers.toml: %s: rust_os on a %s, which has no device variant", name, m.Type)
 			}
 		}

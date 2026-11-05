@@ -317,7 +317,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 				continue
 			}
 		}
-		if n := g.node(goal, Device, Shared, "goal"); n != nil {
+		if n := g.node(goal, g.ccGoalSide(goal), Shared, "goal"); n != nil {
 			ccGoals = append(ccGoals, n)
 		}
 	}

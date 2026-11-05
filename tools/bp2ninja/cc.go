@@ -212,6 +212,20 @@ func sortedKeys[V any](m map[string]V) []string {
 	return out
 }
 
+// noDeviceVariant: Soong registers the module host-only (`*_host` types, rust_proc_macro) or it opts out with `device_supported: false`.
+func (g *Graph) noDeviceVariant(m *Module) bool {
+	t := g.baseType(m.Type)
+	return strings.Contains(t, "_host") || t == "rust_proc_macro" || !m.Props.boolean("device_supported", true)
+}
+
+// ccGoalSide: a C/C++/Rust goal builds its device variant; a host-only one (aapt2's cc_binary_host) its host one -- a device variant would be a build tool linked as if shipped, its closure (libprotobuf-cpp-full) under the licence gate.
+func (g *Graph) ccGoalSide(goal string) Side {
+	if m := g.lookup(goal, Device); m != nil && g.noDeviceVariant(m) {
+		return Host
+	}
+	return Device
+}
+
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports
 // and NDK/LLNDK stubs lose to a source definition of the same name.
 func (g *Graph) lookup(ref string, side Side) *Module { return g.lookupWith(ref, side, isPrebuiltType) }

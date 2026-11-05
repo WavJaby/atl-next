@@ -136,3 +136,17 @@ cc_library {
 		}
 	}
 }
+
+// A host-only goal (aapt2 is a cc_binary_host) builds its host variant: a device one would put a build tool and its closure under the licence gate.
+func TestCcGoalSide(t *testing.T) {
+	g := graphFor(t, map[string]string{
+		"p/Android.bp": `cc_binary_host { name: "tool" }
+cc_library { name: "lib" }
+cc_library { name: "optout", device_supported: false }`,
+	})
+	for goal, want := range map[string]Side{"tool": Host, "lib": Device, "optout": Host} {
+		if got := g.ccGoalSide(goal); got != want {
+			t.Errorf("%s: side %v, want %v", goal, got, want)
+		}
+	}
+}
