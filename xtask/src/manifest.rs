@@ -155,6 +155,31 @@ fn config_changes(activity: &Element) -> Result<i32> {
     Ok((written | (!recreate & RECREATE_ON_CONFIG_CHANGES_MASK)) as i32)
 }
 
+/// `android:launchMode` as ActivityInfo.launchMode: the enum's value, which aapt2 prints as `(type 0x10)0x<n>`; unwritten = 0 (LAUNCH_MULTIPLE, `standard`).
+fn launch_mode(element: &Element) -> Result<i32> {
+    let Some(value) = element.attr("launchMode") else {
+        return Ok(0);
+    };
+    let hex = value
+        .strip_prefix("(type 0x10)0x")
+        .with_context(|| format!("launchMode {value:?} is not an enum value"))?;
+    let mode = u32::from_str_radix(hex, 16).with_context(|| format!("launchMode {value:?}"))?;
+    Ok(mode as i32)
+}
+
+/// `android:taskAffinity` as written; None = unwritten, the package name is the affinity (ActivityRecord's default).
+fn task_affinity(element: &Element) -> Option<String> {
+    element.attr("taskAffinity").map(str::to_owned)
+}
+
+/// `android:process` of an `<application>` or `<activity>` (ParsingUtils.buildProcessName: `:name` is private to the package); None = unwritten, the package's process.
+fn process_attr(element: &Element, package: &str) -> Option<String> {
+    element.attr("process").map(|p| match p.strip_prefix(':') {
+        Some(suffix) => format!("{package}:{suffix}"),
+        None => p.to_owned(),
+    })
+}
+
 /// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
 fn resolve_class(package: &str, name: &str) -> String {
     if name.starts_with('.') {
@@ -202,14 +227,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         None => min_sdk,
     };
     let application = root.children("application").next();
-    // `<application android:process>`: `:name` is private to the package, as ParsingUtils.buildProcessName makes it
-    let process_name =
-        application
-            .and_then(|a| a.attr("process"))
-            .map(|p| match p.strip_prefix(':') {
-                Some(suffix) => format!("{package}:{suffix}"),
-                None => p.to_owned(),
-            });
+    let process_name = application.and_then(|a| process_attr(a, package));
     // every `<activity>` in manifest order: its class, whether it handles MAIN + LAUNCHER, its boolean attributes (ParsedActivity's inputs)
     let mut activities: Vec<ActivityDecl> = application
         .into_iter()
@@ -224,6 +242,9 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 theme: theme(activity)?,
                 config_changes: config_changes(activity)?,
                 booleans: booleans(activity),
+                launch_mode: launch_mode(activity)?,
+                task_affinity: task_affinity(activity),
+                process: process_attr(activity, package),
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -250,6 +271,9 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 theme: theme(alias)?,
                 config_changes: config_changes(alias)?,
                 booleans: booleans(alias),
+                launch_mode: launch_mode(alias)?,
+                task_affinity: task_affinity(alias),
+                process: process_attr(alias, package),
             }),
         }
     }
@@ -382,6 +406,49 @@ mod tests {
     }
 
     /// `android:configChanges` as aapt2 prints it. getActivityConfigChanges: unwritten -> MCC | MNC (0x3, the default handled pair); 0xd80 (screenSize, smallestScreenSize, orientation, screenLayout... as written) keeps them; recreateOnConfigChanges=mcc (0x1) drops MCC.
+    #[test]
+    /// `launchMode`, `taskAffinity` and `process` of an `<activity>` as ActivityDecl holds them; unwritten = standard (0), no affinity written (the package name applies), no process written.
+    fn launch_mode_affinity_and_process_follow_the_manifest() {
+        let text = |attrs: &str| {
+            format!(
+                r#"  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: application (line=7)
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+{attrs}
+"#
+            )
+        };
+        let written = text(
+            r#"            A: http://schemas.android.com/apk/res/android:launchMode(0x0101001d)=(type 0x10)0x1
+            A: http://schemas.android.com/apk/res/android:taskAffinity(0x01010204)="com.example.tasks" (Raw: "com.example.tasks")
+            A: http://schemas.android.com/apk/res/android:process(0x01010584)=":remote" (Raw: ":remote")"#,
+        );
+        let a = &parse(&written).expect("parse").activities[0];
+        assert_eq!(
+            (
+                a.launch_mode,
+                a.task_affinity.as_deref(),
+                a.process.as_deref()
+            ),
+            (
+                1,
+                Some("com.example.tasks"),
+                Some("com.example.atltest:remote")
+            )
+        );
+        let plain = &parse(&text("")).expect("parse").activities[0];
+        assert_eq!(
+            (
+                plain.launch_mode,
+                plain.task_affinity.clone(),
+                plain.process.clone()
+            ),
+            (0, None, None)
+        );
+    }
+
     #[test]
     fn config_changes_follow_get_activity_config_changes() {
         let text = |attrs: &str| {

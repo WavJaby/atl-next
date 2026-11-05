@@ -226,6 +226,9 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))
                 .collect(),
+            launch_mode: 0,
+            task_affinity: None,
+            process: None,
         }
     }
 

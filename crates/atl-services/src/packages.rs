@@ -41,6 +41,15 @@ pub struct ActivityDecl {
     pub config_changes: i32,
     /// Its boolean attributes by name, only those the manifest wrote (`hardwareAccelerated`, ...); the flags they set are in manifest_flags.
     pub booleans: BTreeMap<String, bool>,
+    /// `android:launchMode` as ActivityInfo.launchMode: 0 = standard (LAUNCH_MULTIPLE), the default when the manifest does not write it.
+    #[serde(default)]
+    pub launch_mode: i32,
+    /// `android:taskAffinity`; None = the package name (ActivityRecord's default affinity).
+    #[serde(default)]
+    pub task_affinity: Option<String>,
+    /// `android:process` resolved the way the application's is (`:name` -> `<package>:name`); None = the package's process.
+    #[serde(default)]
+    pub process: Option<String>,
 }
 
 /// What an APK's AndroidManifest.xml declares that the services use.
@@ -365,6 +374,9 @@ mod tests {
             theme: 0,
             config_changes: 0,
             booleans: BTreeMap::new(),
+            launch_mode: 0,
+            task_affinity: None,
+            process: None,
         };
         let mut r = record("a", 10_001);
         assert!(r.launch_activity().is_none());

@@ -12,6 +12,7 @@ extern crate atl_parcelables;
 extern crate binder;
 
 pub mod activity_stack;
+pub mod activity_start;
 pub mod compositor_registry;
 pub mod config_diff;
 pub mod counters;
