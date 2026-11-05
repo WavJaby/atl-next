@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ use atl_services::display_model::DisplayModel;
 use crate::atld_run::{Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, totals};
 use crate::composer::{fnv1a64, word};
 use crate::manifest;
+use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -72,7 +74,8 @@ impl Stage {
     fn window_ms(self) -> u64 {
         match self {
             Stage::Resume => WINDOW_MS,
-            Stage::Frames | Stage::Input | Stage::Gtk => FRAMES_WINDOW_MS,
+            Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
+            Stage::Gtk => GTK_WINDOW_MS,
         }
     }
 
@@ -80,7 +83,7 @@ impl Stage {
     fn sub_names(self) -> &'static [&'static str] {
         match self {
             Stage::Resume => &[],
-            Stage::Gtk => &["mapped", "readback"],
+            Stage::Gtk => &["mapped", "readback", "touch", "pong"],
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -100,6 +103,25 @@ const LIMIT: Duration = Duration::from_secs(180);
 const WINDOW_MS: u64 = 2_000;
 /// The frames and input stages' watch after the marker: the first draw, then FRAME_CALLBACKS vsyncs (0.5 s at 60 Hz), with slack for a slow start; the input stage's touches come after the first draw, inside it.
 const FRAMES_WINDOW_MS: u64 = 5_000;
+/// The gtk stage's watch after the marker: the first draw, the pointer script, the probe's block and the pong after it.
+const GTK_WINDOW_MS: u64 = 10_000;
+/// The fixture's blocking touch: an UP past this view x sleeps the UI thread (Main.java BLOCK_MIN_X). The probe's click lands past it, under the window's decorations.
+const BLOCK_MIN_X: f32 = 500.0;
+const BTN_LEFT: u32 = 0x110;
+/// The probe's waits: the window's first configure, a pong, silence while the UI thread sleeps (the fixture sleeps 2 s), the pong after it.
+const ACK_WAIT: Duration = Duration::from_secs(60);
+const PONG_WAIT: Duration = Duration::from_secs(2);
+const SILENT_WAIT: Duration = Duration::from_millis(1000);
+const RESUME_WAIT: Duration = Duration::from_secs(4);
+/// The app's launcher binary (its command line names it); atld's apps are its descendants.
+const APP_LAUNCHER: &str = "atl-app-launcher";
+/// How long the apps get to exit after SIGTERM, before atld is killed.
+const STOP_WAIT: Duration = Duration::from_secs(3);
+/// Between the block's UP and the probe's ping, so the fixture is asleep when the ping is sent.
+const BLOCK_SETTLE: Duration = Duration::from_millis(500);
+/// The fixture's line once its view has drawn (Main.java Quadrants.onDraw), and the settle after it before the pointer script.
+const DRAW_LINE: &str = "onDraw reached";
+const INPUT_SETTLE: Duration = Duration::from_millis(500);
 /// The fixture's frame callbacks (Main.java FRAME_CALLBACKS): FRAME_CALLBACKS - 1 intervals, each one display period.
 const FRAME_CALLBACKS: usize = 31;
 /// The layer name of the fixture's window (Main.java WINDOW_TITLE, set by `Window.setTitle`): the compositor's report names the layer by it.
@@ -471,6 +493,179 @@ fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String>
     ))
 }
 
+/// Stops the app processes atld started, before atld is killed: an app whose atld dies under it aborts on its binder calls (DEAD_OBJECT, ~5 s after onResume). SIGTERM, then up to STOP_WAIT for them to exit.
+fn stop_apps(atld: u32) {
+    let apps: Vec<u32> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                c.windows(APP_LAUNCHER.len())
+                    .any(|w| w == APP_LAUNCHER.as_bytes())
+            })
+        })
+        .filter(|&pid| descends_from(pid, atld))
+        .collect();
+    for pid in &apps {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    let deadline = Instant::now() + STOP_WAIT;
+    while apps
+        .iter()
+        .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Whether `pid` is a descendant of `ancestor`, by the parent links in /proc.
+fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    while let Some(parent) = ppid(pid) {
+        if parent == ancestor {
+            return true;
+        }
+        if parent <= 1 {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+/// The parent of `pid`: the field after the command name's closing parenthesis in /proc/<pid>/stat.
+fn ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// The gtk stage's proxy: the app's Wayland connection goes through it, so the probe sees the pongs and injects the pointer.
+fn start_proxy() -> Result<Proxy> {
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?);
+    Proxy::start(
+        &crate::platform_ui::upstream_socket()?,
+        &runtime.join(format!("atl-window-gate-{}.sock", std::process::id())),
+    )
+}
+
+/// What the probe saw of the client's liveness.
+#[derive(Debug)]
+struct Liveness {
+    /// The pong to the first ping came within [`PONG_WAIT`].
+    answered: bool,
+    /// No pong to the second ping within [`SILENT_WAIT`], while the fixture's UI thread slept.
+    silent: bool,
+    /// Ms from the second ping to its pong, after the sleep (None: no pong within [`RESUME_WAIT`]).
+    resumed_ms: Option<u128>,
+}
+
+/// The gtk stage's probe, from the proxy's side: the window's configure is acked; a ping is answered; the pointer script goes in; then a click whose UP sleeps the UI thread (past BLOCK_MIN_X). A ping sent meanwhile gets no pong until the sleep ends.
+fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+    await_event(&proxy.events, ACK_WAIT, |e| {
+        matches!(e, ProxyEvent::Acked { .. })
+    })
+    .ok_or("the window never acked a configure")?;
+    // the fixture's first draw: its window takes input from then on (the headless stage injects after the first frame too)
+    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never drew")?;
+    std::thread::sleep(INPUT_SETTLE);
+    proxy.inject_ping(1).map_err(|e| e.to_string())?;
+    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
+        *e == ProxyEvent::Pong { serial: 1 }
+    })
+    .is_some();
+    let press = |pressed| PointerAction::Button {
+        button: BTN_LEFT,
+        pressed,
+    };
+    for action in [
+        PointerAction::Enter { x: 200.0, y: 300.0 },
+        press(true),
+        PointerAction::Motion { x: 260.0, y: 340.0 },
+        press(false),
+        PointerAction::Motion { x: 600.0, y: 100.0 },
+        press(true),
+        press(false),
+    ] {
+        proxy.inject_pointer(action).map_err(|e| e.to_string())?;
+    }
+    std::thread::sleep(BLOCK_SETTLE);
+    let sent = Instant::now();
+    proxy.inject_ping(2).map_err(|e| e.to_string())?;
+    let silent = await_event(&proxy.events, SILENT_WAIT, |e| {
+        *e == ProxyEvent::Pong { serial: 2 }
+    })
+    .is_none();
+    let resumed_ms = await_event(&proxy.events, RESUME_WAIT, |e| {
+        *e == ProxyEvent::Pong { serial: 2 }
+    })
+    .map(|at| at.duration_since(sent).as_millis());
+    Ok(Liveness {
+        answered,
+        silent,
+        resumed_ms,
+    })
+}
+
+/// Whether `needle` shows up in the file within `within` (polled: the app log is written by another process).
+fn wait_for_line(file: &Path, needle: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(file).is_ok_and(|text| text.contains(needle)) {
+            return true;
+        }
+        std::thread::sleep(POLL);
+    }
+    false
+}
+
+/// The arrival time of the first event `want` accepts within `within`; the events before it are dropped.
+fn await_event(
+    events: &Receiver<(Instant, ProxyEvent)>,
+    within: Duration,
+    want: impl Fn(&ProxyEvent) -> bool,
+) -> Option<Instant> {
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match events.recv_timeout(left) {
+            Ok((at, event)) if want(&event) => return Some(at),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Stage `gtk` sub-gate (c): the probe's verdict. The ping is answered, no pong comes while the UI thread sleeps, and the pong follows the sleep.
+fn pong_check(liveness: &Result<Liveness, String>) -> Result<String, String> {
+    let l = liveness.as_ref().map_err(Clone::clone)?;
+    if !l.answered {
+        return Err(format!("no pong to the first ping within {PONG_WAIT:?}"));
+    }
+    if !l.silent {
+        return Err(format!(
+            "a pong came within {SILENT_WAIT:?} of a ping sent while the UI thread slept"
+        ));
+    }
+    let resumed = l
+        .resumed_ms
+        .ok_or_else(|| format!("no pong within {RESUME_WAIT:?} after the sleep"))?;
+    Ok(format!(
+        "ping answered; no pong while the UI thread slept; pong {resumed} ms after its ping"
+    ))
+}
+
 /// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
 fn capture_line(app: &str) -> Result<&str, String> {
     app.lines()
@@ -583,8 +778,21 @@ fn touch_line(line: &str) -> Option<Touch> {
 
 /// Sub-gate (c): after the marker the fixture logs one touch per script item, in order, each with the item's action, x and y and one pointer; no other touch.
 fn input_check(after: &[&str], script: &str) -> Result<String, String> {
+    track_check(after, script, Some((0, 0)))
+}
+
+/// The pointer script's touches against the fixture's log: the actions and pointer counts in order, each position moved by one offset. `want_offset` is that offset (the headless pointer: none); None measures it from the first touch (the gtk window's view sits inside its decorations), and every touch must share it. Touches past BLOCK_MIN_X are the probe's block, not the script.
+fn track_check(
+    after: &[&str],
+    script: &str,
+    want_offset: Option<(i64, i64)>,
+) -> Result<String, String> {
     let want = script_touches(script)?;
-    let got: Vec<Touch> = after.iter().filter_map(|l| touch_line(l)).collect();
+    let got: Vec<Touch> = after
+        .iter()
+        .filter_map(|l| touch_line(l))
+        .filter(|t| t.x <= BLOCK_MIN_X)
+        .collect();
     if got.len() != want.len() {
         return Err(format!(
             "{} touch lines after the marker, the script has {}",
@@ -592,12 +800,23 @@ fn input_check(after: &[&str], script: &str) -> Result<String, String> {
             want.len()
         ));
     }
+    let moved = |g: &Touch, w: &Touch| ((g.x - w.x).round() as i64, (g.y - w.y).round() as i64);
+    let offset = want_offset.unwrap_or_else(|| {
+        got.first()
+            .zip(want.first())
+            .map_or((0, 0), |(g, w)| moved(g, w))
+    });
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        if g != w {
-            return Err(format!("touch {i}: got {g:?}, want {w:?}"));
+        if g.action != w.action || g.pointers != w.pointers || moved(g, w) != offset {
+            return Err(format!(
+                "touch {i}: got {g:?}, want {w:?} moved by {offset:?}"
+            ));
         }
     }
-    Ok(format!("{} touches as `{script}`", want.len()))
+    Ok(format!(
+        "{} touches as `{script}`, moved by {offset:?}",
+        want.len()
+    ))
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -615,9 +834,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
+    let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        Stage::Gtk => rt.with_ui("gtk"),
+        Stage::Gtk => {
+            let p = start_proxy()?;
+            let rt = rt.with_ui("gtk").with_wayland(&p.listen);
+            proxy = Some(p);
+            rt
+        }
         Stage::Resume | Stage::Frames => rt,
     };
     let work = rt.out.join("window");
@@ -648,6 +873,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let start_ms = now_ms();
     let started = Instant::now();
     let mut atld_child = rt.start_atld(&run)?;
+    // the probe drives the client through its proxy from here on
+    let probe = proxy.map(|p| {
+        let log = run.log(&m.name);
+        std::thread::spawn(move || drive(p, &log))
+    });
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let marker = marker(args.stage);
@@ -669,9 +899,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::thread::sleep(POLL);
     }
     if ended.is_none() {
+        stop_apps(atld_child.id());
         let _ = atld_child.kill();
         atld_child.wait()?;
     }
+    let liveness = match probe {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
+        None => Err("no probe: only the gtk stage runs one".to_owned()),
+    };
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
@@ -692,6 +929,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, DisplayModel::default()),
+            track_check(&after_marker(&app, marker), POINTER_SCRIPT, None),
+            pong_check(&liveness),
         ],
         _ => Vec::new(),
     };

@@ -260,7 +260,7 @@ fn build_client(root: &Path) -> Result<PathBuf> {
         .context("cargo reported no gate executable")
 }
 
-fn upstream_socket() -> Result<PathBuf> {
+pub(crate) fn upstream_socket() -> Result<PathBuf> {
     let display = std::env::var_os("WAYLAND_DISPLAY").context("WAYLAND_DISPLAY is not set")?;
     let display = PathBuf::from(display);
     if display.is_absolute() {

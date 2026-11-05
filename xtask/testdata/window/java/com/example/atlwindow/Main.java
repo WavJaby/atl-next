@@ -99,11 +99,21 @@ public class Main extends Activity {
             canvas.drawRect(halfWidth, halfHeight, right, bottom, paint);
         }
 
-        /** Logs each touch: the action, the pointer's x and y, the pointer count (xtask/src/window.rs input_check). */
+        /** Logs each touch: the action, the pointer's x and y, the pointer count (xtask/src/window.rs input_check). An UP past BLOCK_MIN_X sleeps BLOCK_MS on the UI thread: the gtk stage's liveness probe expects no pong meanwhile. */
         @Override
         public boolean onTouchEvent(MotionEvent event) {
             Log.i(TAG, "touch action=" + event.getActionMasked() + " x=" + event.getX() + " y=" + event.getY() + " pointers=" + event.getPointerCount());
+            if (event.getActionMasked() == MotionEvent.ACTION_UP && event.getX() > BLOCK_MIN_X) {
+                try {
+                    Thread.sleep(BLOCK_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             return true;
         }
+
+        static final float BLOCK_MIN_X = 500f;
+        static final long BLOCK_MS = 2000L;
     }
 }

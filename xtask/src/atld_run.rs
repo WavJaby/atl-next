@@ -47,6 +47,8 @@ pub struct Runtime {
     headless_pointer: Option<String>,
     /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
     ui: Option<String>,
+    /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
+    wayland: Option<PathBuf>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -176,6 +178,7 @@ impl Runtime {
             gralloc: None,
             headless_pointer: None,
             ui: None,
+            wayland: None,
         })
     }
 
@@ -202,6 +205,12 @@ impl Runtime {
     /// The app processes' UI mode (atld `--ui`, value `gtk`): every app process presents into a GTK window. Only the `gtk` window stage sets it.
     pub fn with_ui(mut self, mode: &str) -> Self {
         self.ui = Some(mode.to_owned());
+        self
+    }
+
+    /// Atld's WAYLAND_DISPLAY, an absolute socket path, which the app processes inherit: the window gate's proxy.
+    pub fn with_wayland(mut self, socket: &Path) -> Self {
+        self.wayland = Some(socket.to_owned());
         self
     }
 
@@ -336,6 +345,9 @@ impl Runtime {
         }
         if let Some(mode) = &self.ui {
             cmd.args(["--ui", mode]);
+        }
+        if let Some(socket) = &self.wayland {
+            cmd.env("WAYLAND_DISPLAY", socket);
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
