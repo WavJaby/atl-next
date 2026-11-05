@@ -58,6 +58,8 @@ const INPUT: &str = "input";
 const INPUT_METHOD: &str = "input_method";
 /// ContentResolver.CONTENT_SERVICE_NAME (ContentResolver.java:3925).
 const CONTENT: &str = "content";
+/// Context.AUDIO_SERVICE.
+const AUDIO: &str = "audio";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -93,6 +95,7 @@ fn main() -> Result<()> {
         .context("addService input_method")?;
     binder::add_service(CONTENT, atl_services::content::new_binder())
         .context("addService content")?;
+    binder::add_service(AUDIO, atl_services::audio::new_binder()).context("addService audio")?;
     let contents =
         std::fs::read(&a.keychars).with_context(|| format!("reading {}", a.keychars.display()))?;
     let name = a

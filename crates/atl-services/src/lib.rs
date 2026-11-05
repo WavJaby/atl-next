@@ -24,6 +24,8 @@ pub mod shared_memory;
 #[cfg(feature = "converter")]
 pub mod activity;
 #[cfg(feature = "converter")]
+pub mod audio;
+#[cfg(feature = "converter")]
 pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;

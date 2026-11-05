@@ -43,6 +43,9 @@ include_dirs = [
     "frameworks/native/libs/gui/aidl",
     "frameworks/native/libs/gui",
     "hardware/interfaces/graphics/common/aidl",
+    "frameworks/av/aidl",
+    "packages/modules/Bluetooth/framework/aidl-export",
+    "system/hardware/interfaces/media/aidl",
 ]
 types = [
     "android.hardware.display.IDisplayManager",
@@ -57,6 +60,7 @@ types = [
     "android.app.IActivityManager",
     "android.content.pm.IPackageManager",
     "android.content.IContentService",
+    "android.media.IAudioService",
     "android.app.IActivityClientController",
     "com.android.internal.view.IInputMethodManager",
     "android.hardware.input.IInputManager",
