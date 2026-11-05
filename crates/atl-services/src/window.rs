@@ -516,6 +516,15 @@ impl IWindowSession for Session {
             && let Some(record) = self.lock().iter_mut().find(|w| w.client == client)
         {
             record.position = origin;
+            // the line run-apk / a gate reads the placement from: the frame the layer now shows at, in its Task
+            activity::log(format_args!(
+                "window {} placed at {},{} size {}x{}",
+                record.title,
+                frame.left,
+                frame.top,
+                frame.right - frame.left,
+                frame.bottom - frame.top
+            ));
         }
         let display = self.tasks.display();
         let size = self.tasks.size(task);
