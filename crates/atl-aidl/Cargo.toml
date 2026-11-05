@@ -14,7 +14,7 @@ publish.workspace = true
 [package.metadata.atl]
 converter = ["device/libbinder_rs", "device/android.hardware.graphics.allocator-V2-rust"]
 
-# types: IServiceManager (libbinder's own AIDL), the M2 framework interfaces, and the M3 window path (IWindowManager, IWindowSession, IWindow, IDisplayManager; libgui's `android.gui` ISurfaceComposer and its client / display-event interfaces), IInputMethodManager (the input method service's startup call, input_method.rs), IInputManager (the input service, input.rs), compiled with their import closure.
+# types: IServiceManager (libbinder's own AIDL), the M2 framework interfaces, and the M3 window path (IWindowManager, IWindowSession, IWindow, IDisplayManager; libgui's `android.gui` ISurfaceComposer and its client / display-event interfaces), IInputMethodManager (the input method service's startup call, input_method.rs), IInputManager (the input service, input.rs), IStorageManager (the mount service, storage.rs; its IVoldTaskListener import is in system/vold/binder), compiled with their import closure.
 # A type another aidl_interface owns is imported at its latest frozen version, not compiled (bp2ninja aidlcrates.go): android.hardware.graphics.common (DisplayDecorationSupport, ...) is `android.hardware.graphics.common-V6-rust`. The interfaces owning a requested type are stood in for: `android.gui` brings its rust backend's `libgui_aidl_types_rs` (BitTube, LayerMetadata, VsyncEventData, ... as `todo!()` stubs).
 # Interfaces with @EnforcePermission methods (IPackageManager, IActivityManager, ...) get a required `enforce_permission` hook (patches/aosp/system/tools/aidl): their services must implement it.
 # include_dirs: libbinder's AIDL root, then frameworks/base's `framework-aidl-export-defaults` aidl.export_include_dirs (Android.bp) in its order, then frameworks/native/aidl/binder (PersistableBundle, which framework AIDL imports),
@@ -46,6 +46,7 @@ include_dirs = [
     "frameworks/av/aidl",
     "packages/modules/Bluetooth/framework/aidl-export",
     "system/hardware/interfaces/media/aidl",
+    "system/vold/binder",
 ]
 types = [
     "android.hardware.display.IDisplayManager",
@@ -57,6 +58,7 @@ types = [
     "android.gui.IDisplayEventConnection",
     "android.os.IServiceManager",
     "android.os.IUserManager",
+    "android.os.storage.IStorageManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.app.IActivityTaskManager",

@@ -28,6 +28,7 @@ use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
     DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
@@ -267,6 +268,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.view.DisplayInfo" => round_trip_as::<DisplayInfo>(input, mode),
         "android.graphics.Rect" => round_trip_as::<Rect>(input, mode),
+        "android.os.storage.StorageVolume" => round_trip_as::<StorageVolume>(input, mode),
         "android.view.WindowManager$LayoutParams" => {
             round_trip_as::<WindowManager_LayoutParams>(input, mode)
         }

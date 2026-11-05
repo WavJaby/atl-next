@@ -214,6 +214,100 @@ impl Part for Rect {
     }
 }
 
+/// android.os.storage.StorageVolume (os/storage/StorageVolume.java writeToParcel:546-565, StorageVolume(Parcel):158-175), field for field.
+/// `owner` is a UserHandle written by writeParcelable: class name (String16), then the int handle; null is String16 -1. `uuid` is StorageManager.convert's string behind an int flag, kept as read.
+/// The paths are non-null: `new File(null)` throws on the Java side, so a null path is refused and counted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StorageVolume {
+    pub id: Option<String>,
+    pub path: String,
+    pub internal_path: String,
+    pub description: Option<String>,
+    pub primary: bool,
+    pub removable: bool,
+    pub emulated: bool,
+    pub externally_managed: bool,
+    pub allow_mass_storage: bool,
+    pub max_file_size: i64,
+    pub owner: Option<i32>,
+    pub uuid: Option<String>,
+    pub fs_uuid: Option<String>,
+    pub state: Option<String>,
+}
+/// The class name writeParcelable writes for a UserHandle (android.os.UserHandle).
+const USER_HANDLE: &str = "android.os.UserHandle";
+impl Part for StorageVolume {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_str8(p, &self.id)?;
+        w_str8(p, &Some(self.path.clone()))?;
+        w_str8(p, &Some(self.internal_path.clone()))?;
+        w_str8(p, &self.description)?;
+        w_bool(p, self.primary)?;
+        w_bool(p, self.removable)?;
+        w_bool(p, self.emulated)?;
+        w_bool(p, self.externally_managed)?;
+        w_bool(p, self.allow_mass_storage)?;
+        w_i64(p, self.max_file_size)?;
+        match self.owner {
+            None => w_null(p)?,
+            Some(user) => {
+                w_str16(p, &Some(USER_HANDLE.to_owned()))?;
+                w_i32(p, user)?;
+            }
+        }
+        match &self.uuid {
+            None => w_bool(p, false)?,
+            Some(uuid) => {
+                w_bool(p, true)?;
+                w_str8(p, &Some(uuid.clone()))?;
+            }
+        }
+        w_str8(p, &self.fs_uuid)?;
+        w_str8(p, &self.state)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        let id = r_str8(p)?;
+        let path = r_str8(p)?.ok_or_else(|| crate::refuse("StorageVolume.path: null"))?;
+        let internal_path =
+            r_str8(p)?.ok_or_else(|| crate::refuse("StorageVolume.internalPath: null"))?;
+        let description = r_str8(p)?;
+        let primary = r_bool(p)?;
+        let removable = r_bool(p)?;
+        let emulated = r_bool(p)?;
+        let externally_managed = r_bool(p)?;
+        let allow_mass_storage = r_bool(p)?;
+        let max_file_size = r_i64(p)?;
+        let owner = match r_str16(p)? {
+            None => None,
+            Some(class) if class == USER_HANDLE => Some(r_i32(p)?),
+            Some(_) => return Err(crate::refuse("StorageVolume.owner: not a UserHandle")),
+        };
+        let uuid = if r_bool(p)? {
+            Some(r_str8(p)?.ok_or_else(|| crate::refuse("StorageVolume.uuid: null"))?)
+        } else {
+            None
+        };
+        let fs_uuid = r_str8(p)?;
+        let state = r_str8(p)?;
+        Ok(StorageVolume {
+            id,
+            path,
+            internal_path,
+            description,
+            primary,
+            removable,
+            emulated,
+            externally_managed,
+            allow_mass_storage,
+            max_file_size,
+            owner,
+            uuid,
+            fs_uuid,
+            state,
+        })
+    }
+}
+
 /// android.view.InsetsSource (view/InsetsSource.java writeToParcel:689-700, InsetsSource(Parcel):668-680): one inset source of an InsetsState, written as writeTypedObject inside it. Order:
 /// id, type, frame, visibleFrame (presence, Rect), visible, flags, sideHint, boundingRects (writeTypedArray: -1 null or count, each element with its own presence). Every field is modelled.
 /// A layout, not a codec: no .aidl declares InsetsSource (the converter takes codecs only for declared parcelables).

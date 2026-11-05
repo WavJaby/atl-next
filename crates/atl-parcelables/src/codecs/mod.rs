@@ -38,6 +38,9 @@ pub mod android {
     }
     pub mod os {
         pub mod Bundle;
+        pub mod storage {
+            pub mod StorageVolume;
+        }
     }
     pub mod util {
         pub mod MergedConfiguration;
