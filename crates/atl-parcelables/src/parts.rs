@@ -718,7 +718,9 @@ impl Part for ConfigurationChangeItem {
     }
     fn read(p: &In<'_>) -> Result<Self> {
         let configuration = r_typed(p)?.ok_or_else(|| {
-            crate::refuse("android.app.servertransaction.ConfigurationChangeItem.mConfiguration (null)")
+            crate::refuse(
+                "android.app.servertransaction.ConfigurationChangeItem.mConfiguration (null)",
+            )
         })?;
         Ok(ConfigurationChangeItem {
             configuration,

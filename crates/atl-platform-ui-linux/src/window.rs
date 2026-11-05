@@ -383,7 +383,12 @@ impl Window for GtkWindow {
     fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F) {
         self.shared.on_monitor.set(Box::new(on_monitor));
         // a monitor entered before the callback was set is reported now
-        let current = self.shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
+        let current = self
+            .shared
+            .monitor
+            .borrow()
+            .as_ref()
+            .map(|(m, _)| m.clone());
         if let Some(m) = current {
             report_monitor(&self.shared, &m);
         }

@@ -529,7 +529,9 @@ impl ActivityManager {
             };
             match thread.r#scheduleTransaction(Some(&transaction)) {
                 Ok(()) => told += 1,
-                Err(e) => log(format_args!("scheduleTransaction (global configuration): {e}")),
+                Err(e) => log(format_args!(
+                    "scheduleTransaction (global configuration): {e}"
+                )),
             }
         }
         told

@@ -479,18 +479,9 @@ impl IWindowSession for Session {
 }
 
 /// A new window service binder: the Tasks (which own the display every session lays out on) and the table of UI agents (system_services.rs gives it the registry's).
-pub fn new_binder(
-    agents: Arc<UiAgents>,
-    tasks: Arc<Tasks<SpIBinder>>,
-) -> SpIBinder {
-    BnWindowManager::new_binder(
-        WindowManager {
-            agents,
-            tasks,
-        },
-        BinderFeatures::default(),
-    )
-    .as_binder()
+pub fn new_binder(agents: Arc<UiAgents>, tasks: Arc<Tasks<SpIBinder>>) -> SpIBinder {
+    BnWindowManager::new_binder(WindowManager { agents, tasks }, BinderFeatures::default())
+        .as_binder()
 }
 
 /// `task` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.

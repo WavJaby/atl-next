@@ -101,11 +101,11 @@ fn main() -> Result<()> {
     .context("addService activity_task")?;
     let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
-    binder::add_service(DISPLAY, atl_services::display::new_binder(
-            Arc::clone(&tasks),
-            Arc::clone(&display_callbacks),
-        ))
-        .context("addService display")?;
+    binder::add_service(
+        DISPLAY,
+        atl_services::display::new_binder(Arc::clone(&tasks), Arc::clone(&display_callbacks)),
+    )
+    .context("addService display")?;
     binder::add_service(
         WINDOW,
         atl_services::window::new_binder(Arc::clone(&agents), Arc::clone(&tasks)),

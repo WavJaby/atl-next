@@ -215,5 +215,9 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
 
 /// A new display service binder answering from the display  owns; callbacks registered with it go to  (the registry tells them of a change).
 pub fn new_binder(tasks: Arc<Tasks<SpIBinder>>, callbacks: Arc<DisplayCallbacks>) -> SpIBinder {
-    BnDisplayManager::new_binder(DisplayManager { tasks, callbacks }, BinderFeatures::default()).as_binder()
+    BnDisplayManager::new_binder(
+        DisplayManager { tasks, callbacks },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }

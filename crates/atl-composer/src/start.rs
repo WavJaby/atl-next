@@ -120,8 +120,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         let frames = composer
             .start_ui(threads)
             .map_err(|e| format!("deliver thread: {e}"))?;
-        let sender =
-            TaskSender::spawn(threads).map_err(|e| format!("task sender thread: {e}"))?;
+        let sender = TaskSender::spawn(threads).map_err(|e| format!("task sender thread: {e}"))?;
         ui_window::install(ui, frames, input_tx.clone(), size, Arc::clone(&sender));
         Some(sender)
     } else {

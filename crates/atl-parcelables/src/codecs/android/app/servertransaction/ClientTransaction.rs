@@ -117,9 +117,11 @@ impl Part for ClientTransaction {
                         Box::new(ActivityConfigurationChangeItem::read(p)?),
                     ))
                 }
-                Some(CONFIGURATION_CHANGE_ITEM) => Some(ClientTransactionItem::ConfigurationChange(
-                    Box::new(ConfigurationChangeItem::read(p)?),
-                )),
+                Some(CONFIGURATION_CHANGE_ITEM) => {
+                    Some(ClientTransactionItem::ConfigurationChange(Box::new(
+                        ConfigurationChangeItem::read(p)?,
+                    )))
+                }
                 Some(ACTIVITY_RELAUNCH_ITEM) => Some(ClientTransactionItem::ActivityRelaunch(
                     Box::new(ActivityRelaunchItem::read(p)?),
                 )),

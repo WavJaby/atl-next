@@ -12,10 +12,12 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, check, service_names};
+use crate::compositor_registry::{
+    DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, check, service_names,
+};
+use crate::counters;
 use crate::display::DisplayCallbacks;
 use crate::display_model::DisplayModel;
-use crate::counters;
 use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agent::UiAgents;
 
