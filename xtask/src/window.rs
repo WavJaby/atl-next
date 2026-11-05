@@ -524,7 +524,7 @@ fn quadrant_pixels(width: u32, height: u32) -> Vec<u8> {
 /// Sub-gate (a): the first `composer: quad` line of the fixture's layer (the compositor's report of the first frame it got) is the display's size, and its digest is
 /// the digest of the quadrants (FNV-1a over [`quadrant_pixels`]).
 fn picture_check(app: &str, display: DisplayModel) -> Result<String, String> {
-    let (width, height) = (display.width as u32, display.height as u32);
+    let (width, height) = opening_size(display);
     let size = format!("{width}x{height}");
     let quad = app
         .lines()
@@ -533,7 +533,9 @@ fn picture_check(app: &str, display: DisplayModel) -> Result<String, String> {
         .ok_or_else(|| format!("no `composer: quad` line for layer {WINDOW_TITLE}"))?;
     let buffer = word(quad, "buffer").unwrap_or("none");
     if buffer != size {
-        return Err(format!("first frame is {buffer}, the display is {size}"));
+        return Err(format!(
+            "first frame is {buffer}, the opening size is {size}"
+        ));
     }
     let digest = word(quad, "digest").ok_or_else(|| format!("first frame unreadable: {quad}"))?;
     let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
@@ -572,12 +574,14 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
 
 /// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`).
 fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String> {
-    let (width, height) = (display.width as u32, display.height as u32);
+    let (width, height) = opening_size(display);
     let line = capture_line(app)?;
     let size = word(line, "size").unwrap_or("none");
     let want_size = format!("{width}x{height}");
     if size != want_size {
-        return Err(format!("readback is {size}, the display is {want_size}"));
+        return Err(format!(
+            "readback is {size}, the opening size is {want_size}"
+        ));
     }
     let digest = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
     let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
@@ -867,13 +871,13 @@ fn parse_wxh(text: &str) -> Option<(i32, i32)> {
 /// The Task's sizes at the two changes of a resize: grow, then shrink (the display's size is the window's first).
 type Steps = ((i32, i32), (i32, i32));
 
-/// The resize's steps from the Task's logged bounds. The services log a change only: a Task opens at the display's size (tasks.rs `size`), so the log is grow then shrink, and the display is the implicit first size.
+/// The resize's steps from the Task's logged bounds. The services log a change only: a Task opens at its opening size ([`opening_size`]), so the log is grow then shrink, and that is the implicit first size.
 /// Grow is over the display in both dimensions, shrink under it in both.
 fn resize_steps(bounds: &[(i32, i32)], display: (i32, i32)) -> Result<Steps, String> {
     // what follows is the burst's: burst_check reads it
     let &[grow, .., shrink] = bounds else {
         return Err(format!(
-            "the Task's bounds {bounds:?}, want grow then shrink (the display is the first size)"
+            "the Task's bounds {bounds:?}, want grow then shrink (the opening size is the first)"
         ));
     };
     if grow.0 <= display.0 || grow.1 <= display.1 {
@@ -1034,7 +1038,7 @@ fn resize_checks(
     display: DisplayModel,
     liveness: &Result<Liveness, String>,
 ) -> Vec<Result<String, String>> {
-    let steps = resize_steps(&task_bounds(services), (display.width, display.height));
+    let steps = resize_steps(&task_bounds(services), opening_size_i32(display));
     vec![
         configure_check(liveness),
         bounds_check(services, &steps),
@@ -1491,7 +1495,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 Stage::Declared | Stage::StartFinish => Lifecycle::Told,
                 _ => Lifecycle::Kept,
             };
-            let steps = resize_steps(&task_bounds(&services), (display.width, display.height));
+            let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
             let mut sub = resize_checks(&app, &services, display, &liveness);
             sub.push(
                 content_origin(&app).and_then(|origin| {
@@ -1562,6 +1566,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     println!("{}", verdict.line());
     Ok(ExitCode::FAILURE)
+}
+
+/// A new Task's window size: 3/4 of each display side, truncated -- AOSP desktop mode's default bounds (Shell DesktopModeUtils.kt:43-56, `persist.wm.debug.desktop_mode_initial_bounds_scale` default 75), stated here from AOSP, not read from the services.
+fn opening_size(display: DisplayModel) -> (u32, u32) {
+    let (w, h) = opening_size_i32(display);
+    (w as u32, h as u32)
+}
+
+fn opening_size_i32(display: DisplayModel) -> (i32, i32) {
+    (display.width * 3 / 4, display.height * 3 / 4)
 }
 
 #[cfg(test)]
@@ -1658,7 +1672,7 @@ mod tests {
     /// The first frame of the fixture's layer must be the quadrants at the display's size. The expected digest is FNV-1a over the bytes written out here, not over quadrant_pixels.
     /// The fixture's layout line (Main.java onSizeChanged) at `w`x`h`, with screenWidthDp `dp` and the 4x2 test display.
     fn layout(w: i32, h: i32, dp: i32) -> String {
-        format!("AtlWindow: size={w}x{h} screenWidthDp={dp} window={w}x{h} display=4x2")
+        format!("AtlWindow: size={w}x{h} screenWidthDp={dp} window={w}x{h} display=6x3")
     }
 
     /// The composer's readback line at `w`x`h`. Its digest is the gate's quadrant pattern, which the gtk stage checks against the live readback.
@@ -1667,7 +1681,7 @@ mod tests {
         format!("atl-composer: ui: capture presented=3 size={w}x{h} fnv1a64={digest:016x}")
     }
 
-    /// The services' log of a 4x2 display resized to 6x4 (grow) and 3x1 (shrink). A Task opens at the display's size, so only the changes are logged.
+    /// The services' log of a Task opened at 4x2 resized to 6x4 (grow) and 3x1 (shrink). A Task opens at its opening size, so only the changes are logged.
     const RESIZE_SERVICES: &str = "services: task 1 of uid 10123 bounds 6x4\nservices: resized 1 windows of task 1\nservices: task 1 of uid 10123 bounds 3x1\nservices: resized 1 windows of task 1";
 
     fn resize_run(
@@ -1675,9 +1689,10 @@ mod tests {
         services: &str,
         configured: Vec<bool>,
     ) -> Vec<Result<String, String>> {
+        // opens at 4x2: 3/4 of 6x3, truncated (opening_size)
         let display = DisplayModel {
-            width: 4,
-            height: 2,
+            width: 6,
+            height: 3,
             ..DisplayModel::default()
         };
         let liveness = Ok(Liveness {
@@ -1738,7 +1753,7 @@ mod tests {
         let moved = [
             layout(4, 2, 4),
             layout(6, 4, 6),
-            layout(3, 1, 3).replace("display=4x2", "display=8x4"),
+            layout(3, 1, 3).replace("display=6x3", "display=8x4"),
             readback(6, 4),
             readback(3, 1),
         ];
@@ -1846,9 +1861,10 @@ mod tests {
 
     #[test]
     fn picture_check_reads_the_first_frame_of_the_layer() {
+        // opens at 4x2: 3/4 of 6x3, truncated (opening_size)
         let display = DisplayModel {
-            width: 4,
-            height: 2,
+            width: 6,
+            height: 3,
             ..DisplayModel::default()
         };
         let (r, g, b, w): ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) = (
