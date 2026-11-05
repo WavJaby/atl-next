@@ -128,8 +128,11 @@ pub fn stage_mapper(root: &Path, out: &Path) -> Result<PathBuf> {
     let dir = out.join("gralloc/lib");
     std::fs::create_dir_all(&dir)?;
     let built = out.join("cargo/release/libatl_gralloc_mapper.so");
-    std::fs::copy(&built, dir.join(vintf::mapper_library_name()))
-        .with_context(|| format!("installing {}", built.display()))?;
+    // a running app maps this file: replace it by rename, never rewrite it in place (that changed pages under a live process)
+    let dst = dir.join(vintf::mapper_library_name());
+    let tmp = dir.join(format!(".{}.tmp", vintf::mapper_library_name()));
+    std::fs::copy(&built, &tmp).with_context(|| format!("installing {}", built.display()))?;
+    std::fs::rename(&tmp, &dst).with_context(|| format!("installing {}", dst.display()))?;
     Ok(dir)
 }
 
