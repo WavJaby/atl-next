@@ -9,6 +9,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::display_model::DisplayModel;
 
+/// `persist.wm.debug.desktop_mode_initial_bounds_scale`'s default, in percent (DesktopModeUtils.kt:43-44: `SystemProperties.getInt(..., 75) / 100f`). The debug property is not read: no product sets it.
+const INITIAL_BOUNDS_PERCENT: i32 = 75;
+
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(i32);
@@ -94,10 +97,15 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn display_size(&self) -> TaskSize {
+    /// A new Task's size: AOSP desktop mode's default bounds, `calculateDefaultDesktopTaskBounds` (Shell DesktopModeUtils.kt:49-56): each side of the display times
+    /// DESKTOP_MODE_INITIAL_BOUNDS_SCALE, truncated (`.toInt()`). Placement (centred there) is the compositor's: a toplevel has no position. Aspect-ratio and orientation rules of `calculateInitialBounds`
+    /// apply to non-resizable apps (size compat, plan density item 3b), not built.
+    fn initial_size(&self) -> TaskSize {
+        let scale =
+            |side: i32| (f64::from(side) * f64::from(INITIAL_BOUNDS_PERCENT) / 100.0) as i32;
         TaskSize {
-            width: self.display.width,
-            height: self.display.height,
+            width: scale(self.display.width).max(1),
+            height: scale(self.display.height).max(1),
         }
     }
 
@@ -122,23 +130,23 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.get(&task).map(|t| t.owner)
     }
 
-    /// The size of `task`: the one it was set to, else the display's (a Task that does not exist has the display's size too).
+    /// The size of `task`: the one it was set to, else the initial size (a Task that does not exist has it too).
     pub fn size(&self, task: TaskId) -> TaskSize {
         self.lock()
             .tasks
             .get(&task)
             .and_then(|t| t.size)
-            .unwrap_or_else(|| self.display_size())
+            .unwrap_or_else(|| self.initial_size())
     }
 
     /// Sets `task`'s size; true when it changed, so its windows need `resized`. False for the size it already has and for no Task (the registry checks the owner first).
     pub fn set_size(&self, task: TaskId, size: TaskSize) -> bool {
-        let display = self.display_size();
+        let initial = self.initial_size();
         let mut st = self.lock();
         let Some(record) = st.tasks.get_mut(&task) else {
             return false;
         };
-        if record.size.unwrap_or(display) == size {
+        if record.size.unwrap_or(initial) == size {
             return false;
         }
         record.size = Some(size);
@@ -213,19 +221,34 @@ mod tests {
         Tasks::new(DisplayModel::default())
     }
 
-    /// The display's size as a TaskSize: what a Task without a size has.
-    fn display_size() -> TaskSize {
+    /// What a Task without a size has: 3/4 of each side of the 1280x800 display (AOSP desktop default bounds, DesktopModeUtils.kt:49-56).
+    fn initial_size() -> TaskSize {
         TaskSize {
-            width: 1280,
-            height: 800,
+            width: 960,
+            height: 600,
         }
+    }
+
+    /// AOSP truncates each scaled side (`.toInt()`): 1366 x 0.75 = 1024.5 -> 1024, 2560x1600 -> 1920x1200.
+    #[test]
+    fn initial_size_is_three_quarters_truncated() {
+        let at = |width, height| {
+            Tasks::<Handle>::new(DisplayModel {
+                width,
+                height,
+                ..DisplayModel::default()
+            })
+            .size(TaskId(1))
+        };
+        assert_eq!(at(1366, 768), size(1024, 576));
+        assert_eq!(at(2560, 1600), size(1920, 1200));
     }
 
     fn size(width: i32, height: i32) -> TaskSize {
         TaskSize { width, height }
     }
 
-    /// Two Tasks of one app hold their own bounds: both start at the display's size, each keeps the size set for it, and no resize changes the display.
+    /// Two Tasks of one app hold their own bounds: both start at the initial size, each keeps the size set for it, and no resize changes the display.
     #[test]
     fn tasks_of_one_uid_hold_their_own_bounds() {
         let t = tasks();
@@ -233,8 +256,8 @@ mod tests {
         assert_ne!(main, second);
         assert_eq!(t.owner(main), Some(10_123));
         assert_eq!(t.owner(second), Some(10_123));
-        assert_eq!(t.size(main), display_size());
-        assert_eq!(t.size(second), display_size());
+        assert_eq!(t.size(main), initial_size());
+        assert_eq!(t.size(second), initial_size());
         assert!(t.set_size(main, size(352, 272)));
         assert!(t.set_size(second, size(288, 208)));
         assert_eq!(t.size(main), size(352, 272));
@@ -242,7 +265,7 @@ mod tests {
         assert_eq!(t.display(), DisplayModel::default());
     }
 
-    /// Setting the size a Task already has is no change; each change replaces the size, so the last one set is the one kept. Back to the display's size is a change: the entry is kept, not dropped.
+    /// Setting the size a Task already has is no change; each change replaces the size, so the last one set is the one kept. Back to the initial size is a change: the entry is kept, not dropped.
     #[test]
     fn set_size_reports_changes_and_keeps_the_last() {
         let t = tasks();
@@ -252,9 +275,9 @@ mod tests {
         assert!(t.set_size(task, size(800, 600)));
         assert!(!t.set_size(task, size(800, 600)));
         assert_eq!(t.size(task), size(800, 600));
-        assert!(t.set_size(task, display_size()));
-        assert_eq!(t.size(task), display_size());
-        assert!(!t.set_size(task, display_size()));
+        assert!(t.set_size(task, initial_size()));
+        assert_eq!(t.size(task), initial_size());
+        assert!(!t.set_size(task, initial_size()));
     }
 
     /// One number per size: 0 before the first change, up by one at each change, not at a size it already has; none for no Task.
@@ -278,7 +301,7 @@ mod tests {
         let ghost = TaskId::from_raw(99).expect("positive");
         assert_eq!(t.owner(ghost), None);
         assert!(!t.set_size(ghost, size(352, 272)));
-        assert_eq!(t.size(ghost), display_size());
+        assert_eq!(t.size(ghost), initial_size());
     }
 
     /// The wire form: zero and negative numbers name no Task; a Task's number round-trips.
