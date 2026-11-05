@@ -100,6 +100,10 @@ fn open() {
             let time_ns = i64::try_from(tick.time_ns).unwrap_or(i64::MAX);
             frames.tick(time_ns, |scene| {
                 presented += 1;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "atl-composer: ui: present n={presented} time_ns={time_ns}"
+                );
                 if let Err(e) = shown.present(scene) {
                     let _ = writeln!(std::io::stderr(), "atl-composer: ui present: {e}");
                 }

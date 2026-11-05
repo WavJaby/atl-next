@@ -230,19 +230,37 @@ impl Runtime {
             std::fs::create_dir_all(d)?;
         }
         let apk = work.join("base.apk");
-        host_art::exec(
-            Command::new(&self.aapt2)
-                .arg("link")
-                .arg("--manifest")
-                .arg(fixture.join("AndroidManifest.xml"))
-                .arg("-I")
-                .arg(&self.android_jar)
-                .arg("-o")
-                .arg(&apk),
-            "aapt2 link",
-        )?;
+        let gen_dir = work.join("gen");
+        let mut link = Command::new(&self.aapt2);
+        link.arg("link")
+            .arg("--manifest")
+            .arg(fixture.join("AndroidManifest.xml"))
+            .arg("-I")
+            .arg(&self.android_jar)
+            .arg("-o")
+            .arg(&apk);
+        // real resources (res/): compiled, linked, and R.java generated for javac
+        if fixture.join("res").is_dir() {
+            let compiled = work.join("res.zip");
+            host_art::exec(
+                Command::new(&self.aapt2)
+                    .arg("compile")
+                    .arg("--dir")
+                    .arg(fixture.join("res"))
+                    .arg("-o")
+                    .arg(&compiled),
+                "aapt2 compile",
+            )?;
+            std::fs::create_dir_all(&gen_dir)?;
+            // positional: `-R` would make it an overlay
+            link.arg(&compiled).arg("--java").arg(&gen_dir);
+        }
+        host_art::exec(&mut link, "aapt2 link")?;
         let mut sources = Vec::new();
         host_art::collect(&fixture.join("java"), "java", &mut sources)?;
+        if gen_dir.is_dir() {
+            host_art::collect(&gen_dir, "java", &mut sources)?;
+        }
         let classpath = std::env::join_paths(std::iter::once(&self.android_jar).chain(class_jars))?;
         let jdk_bin = self.art.jdk.join("bin");
         host_art::exec(

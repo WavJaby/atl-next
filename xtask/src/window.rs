@@ -23,6 +23,8 @@ use crate::composer::{fnv1a64, word};
 use crate::manifest;
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
+mod widgets;
+
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
@@ -58,6 +60,8 @@ enum Stage {
     Input,
     /// Resume in UI mode (`ro.atl.ui=gtk`): the app's window is a GTK window of its process. Spike stage: the verdict is the resume one, the mirror's counters are in the app log.
     Gtk,
+    /// The widget fixture in UI mode: layout, the text in the readback, a tap on the button, focus, a list drag, presents and cadence (xtask/src/window/widgets.rs).
+    Widgets,
 }
 
 impl Stage {
@@ -67,6 +71,7 @@ impl Stage {
             Stage::Frames => "frames",
             Stage::Input => "input",
             Stage::Gtk => "gtk",
+            Stage::Widgets => "widgets",
         }
     }
 
@@ -76,6 +81,7 @@ impl Stage {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk => GTK_WINDOW_MS,
+            Stage::Widgets => WIDGETS_WINDOW_MS,
         }
     }
 
@@ -84,6 +90,7 @@ impl Stage {
         match self {
             Stage::Resume => &[],
             Stage::Gtk => &["mapped", "readback", "touch", "pong"],
+            Stage::Widgets => widgets::SUB_NAMES,
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -105,6 +112,8 @@ const WINDOW_MS: u64 = 2_000;
 const FRAMES_WINDOW_MS: u64 = 5_000;
 /// The gtk stage's watch after the marker: the first draw, the pointer script, the probe's block and the pong after it.
 const GTK_WINDOW_MS: u64 = 10_000;
+/// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
+const WIDGETS_WINDOW_MS: u64 = 12_000;
 /// The fixture's blocking touch: an UP past this view x sleeps the UI thread (Main.java BLOCK_MIN_X). The probe's click lands past it, under the window's decorations.
 const BLOCK_MIN_X: f32 = 500.0;
 const BTN_LEFT: u32 = 0x110;
@@ -146,7 +155,9 @@ const TAIL: usize = 40;
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
     match stage {
-        Stage::Resume | Stage::Frames | Stage::Input | Stage::Gtk => "AtlWindow: onResume reached",
+        Stage::Resume | Stage::Frames | Stage::Input | Stage::Gtk | Stage::Widgets => {
+            "AtlWindow: onResume reached"
+        }
     }
 }
 
@@ -857,7 +868,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        Stage::Gtk => {
+        Stage::Gtk | Stage::Widgets => {
             let p = start_proxy()?;
             let rt = rt.with_ui("gtk").with_wayland(&p.listen);
             proxy = Some(p);
@@ -866,7 +877,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Resume | Stage::Frames => rt,
     };
     let work = rt.out.join("window");
-    let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
+    let fixture = if matches!(args.stage, Stage::Widgets) {
+        widgets::FIXTURE
+    } else {
+        FIXTURE
+    };
+    let apk = rt.build_apk(&root.join(fixture), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -894,9 +910,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let started = Instant::now();
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
+    let widget_stage = matches!(args.stage, Stage::Widgets);
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
-        std::thread::spawn(move || drive(p, &log))
+        std::thread::spawn(move || {
+            if widget_stage {
+                widgets::drive(p, &log)
+            } else {
+                drive(p, &log)
+            }
+        })
     });
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
@@ -946,6 +969,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ]
         }
         (Stage::Input, Some(_)) => vec![input_check(&after_marker(&app, marker), POINTER_SCRIPT)],
+        (Stage::Widgets, Some(_)) => widgets::checks(&app, &after_marker(&app, marker)),
         (Stage::Gtk, Some(_)) => vec![
             gtk_window_check(&app),
             gtk_capture_check(&app, DisplayModel::default()),

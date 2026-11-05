@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage widgets: the widget gate's app. Real resources (res/): a LinearLayout with a TextView, a Button, an EditText and a ListView, under the stock Material theme.
+     Software drawing (hardwareAccelerated off), so the window path needs no GPU; the gate checks layout, pixels, clicks, focus and the list's scroll. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwidgets"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="@string/app_name">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.Material">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

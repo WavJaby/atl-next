@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<resources>
+    <string name="app_name">ATL widgets test</string>
+    <string name="hello">Hello widgets</string>
+    <string name="press">Press me</string>
+    <string name="hint">Type here</string>
+</resources>
