@@ -25,7 +25,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 		t.Fatal(g.problems)
 	}
 	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"})
-	b, err := g.graphJSON([]*Node{goal}, "c++")
+	b, err := g.graphJSON([]*Node{goal}, "c++", "cc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 func TestGraphJSONArtifacts(t *testing.T) {
 	g, _ := rustGraph(t)
 	goal := g.node("libuser", Device, Shared, "goal")
-	b, err := g.graphJSON([]*Node{goal}, "c++")
+	b, err := g.graphJSON([]*Node{goal}, "c++", "cc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], shared_libs: ["libuser"], static_l
 	if goal == nil {
 		t.Fatal(g.problems)
 	}
-	b, err := g.graphJSON([]*Node{goal}, "c++")
+	b, err := g.graphJSON([]*Node{goal}, "c++", "cc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,5 +141,31 @@ cc_library { name: "libgoal", srcs: ["g.cc"], shared_libs: ["libuser"], static_l
 	}
 	if len(g.problems) != 0 || len(g.missing) != 0 {
 		t.Errorf("libnone's missing defaults counted: %v %v", g.problems, g.missing)
+	}
+}
+
+// The device record carries the libc provider (headers, library + its rpath), the platform defines and the stl, not a module's own flags.
+func TestDevicePlatform(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `cc_library { name: "libc", srcs: ["c.cc"] }`})
+	g.soong = SoongConfig{CStd: "gnu11", CppStd: "gnu++20", APILevel: "-D__ANDROID_API__=10000", SystemSharedLibs: []string{"libc", "libm", "libdl"}}
+	g.provided = map[string]Provided{"libc": {Libs: []string{"/c/lib/libatl_bionic.so"}, Include: []string{"/c/include"}}}
+	p := g.devicePlatform("clang-19")
+	if p.CC != "clang-19" {
+		t.Errorf("cc %q", p.CC)
+	}
+	for _, flags := range [][]string{p.C, p.Cxx} {
+		for _, want := range []string{androidDefine, lfs64Define, defaultSourceDefine, "-D__ANDROID_API__=10000", "/c/include"} {
+			if !slices.Contains(flags, want) {
+				t.Errorf("flags lack %s: %v", want, flags)
+			}
+		}
+	}
+	if !slices.Contains(p.Cxx, "-nostdinc++") {
+		t.Errorf("cxx lacks the stl flags: %v", p.Cxx)
+	}
+	// libc++ is the default stl of a shared module (stl.go)
+	want := slices.Concat([]string{"/c/lib/libatl_bionic.so", "-Wl,-rpath,/c/lib"}, stlLinkFlags("libc++"), systemLinkFlags)
+	if !slices.Equal(p.Link, want) {
+		t.Errorf("link %v, want %v", p.Link, want)
 	}
 }

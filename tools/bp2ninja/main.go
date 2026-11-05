@@ -365,7 +365,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	if err := os.WriteFile(filepath.Join(out, "problems.txt"), []byte(strings.Join(g.problems, "\n")+"\n"), 0o644); err != nil {
 		return err
 	}
-	graph, err := g.graphJSON(ccGoals, tools.CXX)
+	graph, err := g.graphJSON(ccGoals, tools.CXX, tools.CC)
 	if err != nil {
 		return err
 	}

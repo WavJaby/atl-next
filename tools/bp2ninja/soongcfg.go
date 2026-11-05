@@ -343,6 +343,10 @@ const androidDefine = "-D__ANDROID__"
 // Device code written against bionic uses them without a feature macro (libopenjdk's ojluni natives; their glibc host variant passes the same define). Device compiles only; xtask check step libcxx probes libc++ with it.
 const lfs64Define = "-D_LARGEFILE64_SOURCE"
 
+// defaultSourceDefine: bionic declares its BSD/misc interfaces (syscall, ...) whatever feature macros a unit sets (unistd.h `long syscall(long __number, ...);` unguarded); glibc only under __USE_MISC, which an explicit `#define _XOPEN_SOURCE 500` turns off unless _DEFAULT_SOURCE is set (features.h).
+// dEQP's deThreadUnix.c defines _XOPEN_SOURCE 500 and calls syscall(). Adds declarations only; a unit with no feature macro already gets _DEFAULT_SOURCE from glibc. Device compiles only.
+const defaultSourceDefine = "-D_DEFAULT_SOURCE"
+
 // apiLevel: the -D flag for __ANDROID_API__ = FutureApiLevelInt: Soong gives platform code the triple <arch>-linux-android<FutureApiLevelInt> (cc/compiler.go AddTargetFlags), from which clang defines it; a linux-gnu triple defines nothing.
 // The level names (`__ANDROID_API_U__`, …) come with atl-bionic's generated android/api-level.h, force-included into every device compile (deviceForced).
 // Stays even with __ANDROID__ defined: below 21 libc++'s locale_base_api/android.h pulls __posix_l_fallback.h, whose *_l definitions clash with glibc's.

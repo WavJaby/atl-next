@@ -28,6 +28,8 @@ type graphFile struct {
 	LinkDriver string `json:"link_driver"`
 	// the product variables this build sets (productvars.go), what an upstream built outside the converter for the same product is configured with (Mesa's platform-sdk-version)
 	ProductVariables map[string]Val `json:"product_variables"`
+	// the device platform flags (devicePlatform)
+	Device platform `json:"device"`
 }
 
 // artifact: one linkable output, as the converter's own links take it.
@@ -117,9 +119,42 @@ func (g *Graph) noneExports(name string, side Side) []string {
 	return append([]string{}, sortedKeys(dirs)...)
 }
 
-// graphJSON: graph.json for the emitted nodes and the goal nodes found; linkDriver: the cc link driver the build links with (Tools.CXX).
-func (g *Graph) graphJSON(goals []*Node, linkDriver string) ([]byte, error) {
-	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}, Artifacts: map[string]artifact{}, LinkDriver: linkDriver, ProductVariables: g.productVariables()}
+// platform: what every device module gets from the toolchain and its default system_shared_libs, without module flags or dependencies -- how a build outside the converter compiles and links device code (Mesa's meson, via xtask mesa-config).
+type platform struct {
+	CC   string   `json:"cc"` // the C compiler (Tools.CC); the C++ one is link_driver
+	C    []string `json:"c"`
+	Cxx  []string `json:"cxx"`
+	Link []string `json:"link"`
+}
+
+// devicePlatform: an empty shared device module's compile flags (compileFlags), plus the include dirs, defines and libraries of the default system_shared_libs' providers (the libc provider) and the link flags linkLibs ends with.
+func (g *Graph) devicePlatform(cc string) platform {
+	n := &Node{key: key{name: "platform", side: Device, kind: Shared}, mod: &Module{Name: "platform"}}
+	f := g.compileFlags(n)
+	var sys, link []string
+	for _, name := range g.soong.SystemSharedLibs {
+		p, ok := g.provided[name]
+		if !ok {
+			continue
+		}
+		for _, i := range p.Include {
+			sys = appendNew(appendNew(sys, "-isystem"), i)
+		}
+		for _, d := range p.Defines {
+			sys = appendNew(sys, "-D"+d)
+		}
+		for _, l := range p.Libs {
+			link = appendNew(appendNew(link, l), "-Wl,-rpath,"+filepath.Dir(l))
+		}
+	}
+	link = append(link, stlLinkFlags(g.stlOf(n))...)
+	link = append(link, systemLinkFlags...)
+	return platform{CC: cc, C: slices.Concat(f.c, sys), Cxx: slices.Concat(f.cxx, sys), Link: link}
+}
+
+// graphJSON: graph.json for the emitted nodes and the goal nodes found; linkDriver: the cc link driver the build links with (Tools.CXX); cc: Tools.CC.
+func (g *Graph) graphJSON(goals []*Node, linkDriver, cc string) ([]byte, error) {
+	f := graphFile{Goals: []string{}, Deps: map[string][]string{}, Dropped: map[string][]string{}, NoneExports: map[string][]string{}, Artifacts: map[string]artifact{}, LinkDriver: linkDriver, ProductVariables: g.productVariables(), Device: g.devicePlatform(cc)}
 	if f.ProductVariables == nil {
 		f.ProductVariables = map[string]Val{}
 	}

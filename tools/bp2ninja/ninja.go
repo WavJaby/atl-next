@@ -338,7 +338,7 @@ func (g *Graph) compileFlags(n *Node) langFlags {
 	c := slices.Concat(global, f.Conly[n.side], common, []string{"-std=" + cstd}, moduleFlags(p, "conlyflags"))
 	// android properties compiled against glibc: bionic's macros and declarations supplied (LFS64, compat dirs, forced api-level headers); the native bridge side compiles against bionic itself
 	if n.side == Device {
-		dev := []string{androidDefine, lfs64Define, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
+		dev := []string{androidDefine, lfs64Define, defaultSourceDefine, g.soong.APILevel, "-I" + filepath.Join(g.out, "compat", "device")}
 		for _, d := range g.defines[n.mod.Name] {
 			dev = append(dev, "-D"+d)
 		}
@@ -535,10 +535,13 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	// the C++ runtime the module's stl selects (stl.go); on glibc sides glibc's split of bionic's libc, and bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) as glibc's libresolv, needed only where used
 	libs = append(libs, stlLinkFlags(g.stlOf(n))...)
 	if n.side.glibc() {
-		libs = append(libs, "-lpthread", "-ldl", "-lrt", "-lm", "-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state")
+		libs = append(libs, systemLinkFlags...)
 	}
 	return libs, inputs
 }
+
+// systemLinkFlags: the glibc libraries every glibc-side link ends with (linkLibs, devicePlatform).
+var systemLinkFlags = []string{"-lpthread", "-ldl", "-lrt", "-lm", "-Wl,--push-state,--as-needed", "-lresolv", "-Wl,--pop-state"}
 
 // appendNew: list + s, unless list holds s already.
 func appendNew(list []string, s string) []string {

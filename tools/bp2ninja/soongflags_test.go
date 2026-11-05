@@ -428,7 +428,7 @@ func TestProbeCxxFlags(t *testing.T) {
 	g.soong.CppStd, g.soong.APILevel = "gnu++20", "-D__ANDROID_API__=10000"
 	compat := filepath.Join(g.out, "compat")
 	want := []string{"-nostdinc++", "-isystem", standInLibcxx, "-fPIC", "-w", "-O2", "-m64", "-fvisibility-inlines-hidden", "-Wno-error", "-std=gnu++20",
-		androidDefine, lfs64Define, "-D__ANDROID_API__=10000", "-I" + filepath.Join(compat, "device"), "-include", "android/versioning.h", "-include", "android/api-level.h",
+		androidDefine, lfs64Define, defaultSourceDefine, "-D__ANDROID_API__=10000", "-I" + filepath.Join(compat, "device"), "-include", "android/versioning.h", "-include", "android/api-level.h",
 		"-I" + filepath.Join(compat, "cxx"), "-idirafter", filepath.Join(compat, "libcxx"), "-fno-rtti", "-I" + g.abs("art/runtime"), "-fno-x"}
 	if got := g.probeCxxFlags("art/runtime"); !slices.Equal(got, want) {
 		t.Errorf("probe argv\n %q\nwant\n %q", got, want)
