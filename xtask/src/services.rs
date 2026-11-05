@@ -16,6 +16,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::{self, Request, Response};
 use atl_layout::Layout;
 use atl_services::native_libs::LIB_DIR_NAME;
@@ -183,11 +184,11 @@ pub fn stage(
             }],
         },
         uid: APP_UID,
-        source_dir: format!("/data/app/{APP}/base.apk"),
+        source_dir: format!("{DATA_APP}/{APP}/base.apk"),
         primary_cpu_abi: None,
-        native_library_dir: format!("/data/app/{APP}/{LIB_DIR_NAME}/{host_arch}"),
-        data_dir: format!("/data/user/0/{APP}"),
-        device_protected_data_dir: format!("/data/user_de/0/{APP}"),
+        native_library_dir: format!("{DATA_APP}/{APP}/{LIB_DIR_NAME}/{host_arch}"),
+        data_dir: format!("{DATA_USER}/0/{APP}"),
+        device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
     };
     let packages_file = test_root.join("packages.json");
     std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;

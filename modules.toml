@@ -28,12 +28,17 @@ uses = ["bionic"]
 [broker]
 crates = ["atl-broker"]
 exports = ["atl-broker"]
-uses = ["binder"]
+uses = ["binder", "android-paths"]
+
+# the Android filesystem layout inside the sandbox: the only home of Android path literals (xtask check step android-paths)
+[android-paths]
+crates = ["atl-android-paths"]
+exports = ["atl-android-paths"]
 
 # M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services"]
+uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "android-paths"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
@@ -62,7 +67,7 @@ uses = ["generators", "compositor"]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
-uses = ["aidl", "generators", "broker", "libinput"]
+uses = ["aidl", "generators", "broker", "libinput", "android-paths"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]
@@ -135,5 +140,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture
-uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for
+uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths"]

@@ -76,6 +76,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-android-paths"
+version = "0.0.0"
+
+[[package]]
 name = "atl-android-runtime"
 version = "0.0.0"
 
@@ -148,6 +152,7 @@ dependencies = [
 name = "atl-broker"
 version = "0.0.0"
 dependencies = [
+ "atl-android-paths",
  "atl-binderd",
  "libc",
  "rustix",
@@ -351,6 +356,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-aidl",
+ "atl-android-paths",
  "atl-bridgegen",
  "atl-broker",
  "atl-libinput",
@@ -366,6 +372,7 @@ name = "atld"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-binderd",
  "atl-broker",
  "atl-gralloc",
@@ -1729,6 +1736,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-binderd",
  "atl-broker",
  "atl-gralloc",

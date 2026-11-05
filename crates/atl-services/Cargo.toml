@@ -33,6 +33,7 @@ required-features = ["converter"]
 [dependencies]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }
+atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
 atl-libinput = { path = "../atl-libinput" }
 clap.workspace = true

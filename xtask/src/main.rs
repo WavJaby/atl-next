@@ -4,6 +4,7 @@
 // Terminal output is this tool's product, not logging.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod android_paths;
 mod aosp;
 mod app;
 mod arches;

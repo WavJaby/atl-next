@@ -17,6 +17,8 @@ use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+
+use atl_android_paths::PROPERTY_AREA;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -27,13 +29,8 @@ use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
-/// bionic's default property area path (`__system_properties_init` without `$ATL_PROP_AREA`): the sandbox's `/dev` is the broker's own, so the area is mounted there and no variable is needed.
-pub const PROPERTY_AREA: &str = "/dev/__properties__";
 /// The sandbox program.
 const BWRAP: &str = "bwrap";
-/// The shared storage root as the sandbox sees it (Environment's external storage, `/storage/emulated/0`): the path the mount service reports for the emulated primary (atl-services storage.rs),
-/// under which app_spawn mounts each package's Android/data and Android/obb and links `/sdcard` to it.
-pub const SHARED_STORAGE: &str = "/storage/emulated/0";
 
 /// One bind mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,14 +337,15 @@ fn read_info(mut f: io::PipeReader) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM};
 
     /// Spawn.links follow the mounts as bwrap `--symlink TARGET AT`: the app's /sdcard -> the shared storage root.
     #[test]
     fn links_follow_the_mounts() {
         let mut sp = spawn();
         sp.links.push(Link {
-            target: "/storage/emulated/0".into(),
-            at: "/sdcard".into(),
+            target: SHARED_STORAGE.into(),
+            at: SDCARD.into(),
         });
         let joined = s(&bwrap_args(&sp, &[], 9, None)).join(" ");
         assert!(joined.ends_with(
@@ -362,12 +360,12 @@ mod tests {
             mounts: vec![
                 Mount {
                     host: "/r/system".into(),
-                    at: "/system".into(),
+                    at: SYSTEM.into(),
                     writable: false,
                 },
                 Mount {
                     host: "/r/data".into(),
-                    at: "/data".into(),
+                    at: DATA.into(),
                     writable: true,
                 },
             ],

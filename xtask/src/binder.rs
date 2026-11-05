@@ -329,7 +329,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (mut sm, found) = start_servicemanager(&h, &test_root, &servicemanager, &service, &env)?;
     let list = h.service(&service, &env, &["list"], &log("list"))?;
     let absent = h.service(&service, &env, &["check", ABSENT], &log("absent"))?;
-    let services_fails = crate::services::stage(root, &out, &args.host, &h,&env, &service, &test_root)?;
+    let services_fails =
+        crate::services::stage(root, &out, &args.host, &h, &env, &service, &test_root)?;
 
     let _ = sm.kill();
     sm.wait()?;

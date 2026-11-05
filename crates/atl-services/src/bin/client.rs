@@ -327,7 +327,10 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
         format!("{ABSENT}: {unknown:?}"),
     );
     let map = Map {
-        entries: vec![(Some("/data/app/base.apk".into()), Some("PCL[]".into()))],
+        entries: vec![(
+            Some(format!("{}/base.apk", atl_android_paths::DATA_APP)),
+            Some("PCL[]".into()),
+        )],
     };
     let dex = pm.notifyDexLoad(Some(package), Some(&map), Some("x86_64"));
     r.check("notifyDexLoad", dex.is_ok(), format!("{dex:?}"));

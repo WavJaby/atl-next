@@ -84,7 +84,7 @@ pub fn check(root: &Path) -> Result<()> {
 }
 
 /// Tracked files plus new files not ignored -- what the next commit can contain.
-fn candidate_files(root: &Path) -> Result<Vec<String>> {
+pub fn candidate_files(root: &Path) -> Result<Vec<String>> {
     let out = Command::new("git")
         .args([
             "ls-files",

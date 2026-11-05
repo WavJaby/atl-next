@@ -348,7 +348,10 @@ mod tests {
         assert_eq!(lib.file, "/f/r.jar");
         assert_eq!(lib.dependencies, ["android.test.base", "android.test.mock"]);
         assert_eq!(
-            lib.to_arg(&name, "/system/framework/r.jar"),
+            lib.to_arg(
+                &name,
+                &format!("{}/r.jar", atl_android_paths::SYSTEM_FRAMEWORK)
+            ),
             "android.test.runner=/system/framework/r.jar,android.test.base,android.test.mock"
         );
         assert_eq!(

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Android path literals allowed outside crate atl-android-paths (xtask check step android-paths; xtask/src/android_paths.rs).
+# One [[allow]] row per (file, literal): `literal` as written between the quotes, `reason` why the layout module is not the source.
+# A row matching nothing fails the step.
+
+[[allow]]
+file = "crates/atl-services/src/storage.rs"
+literal = "/storage/emulated/0"
+reason = "test's expected value, from StorageManager's emulated primary path, independent of the constant under test"
+
+[[allow]]
+file = "crates/atl-bionic/src/progname.rs"
+literal = "/system/bin/app_process64"
+reason = "test input of the basename parser: any absolute path serves; no layout owns app_process"
+
+[[allow]]
+file = "crates/atl-native-bridge/src/exports.rs"
+literal = "/data/app/lib/x86_64/libatl-jni-test.so"
+reason = "test input of the native bridge's path classifier: a library path as libnativeloader passes one, never opened"

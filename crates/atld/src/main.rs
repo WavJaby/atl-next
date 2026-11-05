@@ -24,8 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FRAMEWORK};
 use atl_broker::control::{self, Request, Response, StartRequest};
-use atl_broker::{Broker, Link, Mount, Process, SHARED_STORAGE, Spawn, kill_sandbox};
+use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox};
 use atl_gralloc::vintf;
 use atl_property_service::Property;
 use atl_services::compositor_registry;
@@ -222,7 +223,7 @@ fn link_into_framework(r: &Root, host: &Path) -> Result<String> {
         name.to_string_lossy()
     );
     std::os::unix::fs::symlink(std::path::absolute(host)?, &at)?;
-    Ok(format!("/system/framework/{}", name.to_string_lossy()))
+    Ok(format!("{SYSTEM_FRAMEWORK}/{}", name.to_string_lossy()))
 }
 
 /// The system CA store below /system (cacerts.rs); the staged ART root's `etc/security/cacerts` links to it.
@@ -328,16 +329,16 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
         let libs = native_libs::extract(
             &source.apk,
             &r.data().join(&app),
-            &format!("/data/{app}"),
+            &format!("{DATA}/{app}"),
             &source.abis,
         )?;
         records.push(PackageRecord {
             uid: a.first_uid + u32::try_from(i)?,
-            source_dir: format!("/data/{app}/base.apk"),
+            source_dir: format!("{DATA}/{app}/base.apk"),
             primary_cpu_abi: libs.primary_cpu_abi,
             native_library_dir: libs.native_library_dir,
-            data_dir: format!("/data/{user}"),
-            device_protected_data_dir: format!("/data/{user_de}"),
+            data_dir: format!("{DATA}/{user}"),
+            device_protected_data_dir: format!("{DATA}/{user_de}"),
             manifest: source.manifest,
         });
     }
@@ -416,7 +417,7 @@ impl Host {
             ("ANDROID_ART_ROOT", art.join("com.android.art")),
             ("ANDROID_I18N_ROOT", art.join("com.android.i18n")),
             ("ANDROID_TZDATA_ROOT", art.join("com.android.tzdata")),
-            ("ANDROID_DATA", PathBuf::from("/data")),
+            ("ANDROID_DATA", PathBuf::from(DATA)),
             ("LD_BIND_NOW", PathBuf::from("1")),
         ]
         .into_iter()
@@ -485,12 +486,12 @@ impl Host {
             mounts: vec![
                 Mount {
                     host: self.root.system(),
-                    at: "/system".into(),
+                    at: SYSTEM.into(),
                     writable: false,
                 },
                 Mount {
                     host: self.root.data(),
-                    at: "/data".into(),
+                    at: DATA.into(),
                     writable: true,
                 },
             ],
@@ -524,7 +525,7 @@ impl Host {
         });
         spawn.links.push(Link {
             target: shared,
-            at: "/sdcard".into(),
+            at: SDCARD.into(),
         });
     }
 

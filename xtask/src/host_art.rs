@@ -354,7 +354,7 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
     };
     link(Path::new("."), &art.join("com.android.art"))?;
     link(
-        Path::new("/system/etc/security/cacerts"),
+        Path::new(atl_android_paths::SYSTEM_CACERTS),
         &art.join("etc/security/cacerts"),
     )?;
     for module in std::fs::read_dir(&device)? {

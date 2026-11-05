@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+atl-android-paths = { path = "../atl-android-paths" }
 atl-binderd = { path = "../atl-binderd" }
 libc.workspace = true
 rustix.workspace = true
