@@ -674,6 +674,14 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 		return nil
 	}
 	kind, ok := kindOf(g.baseType(m.Type), want)
+	// cc_test without gtest is a binary: Soong's testDecorator adds gtest libraries and flags only when gtest (default true) is set (cc/test.go linkerFlags, linkerDeps)
+	if g.baseType(m.Type) == "cc_test" {
+		kind, ok = Binary, !g.resolveDefaults(m, side, map[string]bool{}).boolean("gtest", true)
+		if !ok {
+			g.problem("%s: %s is a gtest cc_test (unsupported)", from, m.Name)
+			return nil
+		}
+	}
 	if !ok {
 		g.problem("%s: %s is a %s (unsupported)", from, m.Name, m.Type)
 		return nil
