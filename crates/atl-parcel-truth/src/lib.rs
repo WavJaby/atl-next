@@ -38,6 +38,7 @@ use atl_parcelables::android::view::{
 use atl_parcelables::android::window::{
     ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
 };
+use atl_parcelables::com::android::internal::inputmethod::InputBindResult;
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
@@ -274,6 +275,9 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.view.DisplayInfo" => round_trip_as::<DisplayInfo>(input, mode),
         "android.graphics.Rect" => round_trip_as::<Rect>(input, mode),
+        "com.android.internal.inputmethod.InputBindResult" => {
+            round_trip_as::<InputBindResult>(input, mode)
+        }
         "android.os.storage.StorageVolume" => round_trip_as::<StorageVolume>(input, mode),
         "android.view.WindowManager$LayoutParams" => {
             round_trip_as::<WindowManager_LayoutParams>(input, mode)

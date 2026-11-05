@@ -133,6 +133,8 @@ fn open() {
             let _ = input.send(Message::Event(event));
         });
         let shown = Rc::clone(&window);
+        // the scripted pointer (run-apk --pointer) starts at the first present, as the headless one at its first frame
+        let first_frame = session.input.clone();
         let frames = Arc::clone(&session.frames);
         let capture = std::env::var_os(CAPTURE_ENV).is_some();
         let (mut tick_count, mut presented, mut quiet_ticks) = (0u32, 0u32, 0u32);
@@ -152,6 +154,9 @@ fn open() {
             frames.tick(time_ns, |scene| {
                 presented += 1;
                 quiet_ticks = 0;
+                if presented == 1 {
+                    let _ = first_frame.send(Message::FirstFrame);
+                }
                 tracing::debug!("atl-composer: ui: present n={presented} time_ns={time_ns}");
                 if let Err(e) = shown.present(scene) {
                     tracing::warn!("atl-composer: ui present: {e}");

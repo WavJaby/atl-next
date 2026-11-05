@@ -70,6 +70,11 @@ const PROCESS_STATE_TOP: i32 = 2;
 const PROCESS_STATE_UNKNOWN: i32 = -1;
 /// Build.UNKNOWN: the serial apps targeting P+ get (ActivityManagerService attachApplicationLocked buildSerial).
 const BUILD_UNKNOWN: &str = "unknown";
+/// bindApplication's disabledCompatChanges (AppCompatCallbacks.install in handleBindApplication): Toast.CHANGE_TEXT_TOASTS_IN_THE_SYSTEM (Toast.java:124, 147798919). Enabled (AOSP's
+/// default for targetSdk > Q), a text toast goes to enqueueTextToast and SystemUI's ToastUI draws it; there is no SystemUI here, so every app takes the pre-R path: Toast.makeText builds
+/// the view (ToastPresenter.getTextToastView) and the app's own TN shows it through ToastPresenter as a TYPE_TOAST window (owner 2026-11-05: toast = in-window overlay by ToastPresenter).
+/// App-visible difference: Toast.getView() is non-null for text toasts. Delete this when a system UI renders enqueueTextToast.
+const DISABLED_COMPAT_CHANGES: [i64; 1] = [147_798_919];
 /// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
@@ -645,7 +650,7 @@ impl Inner {
     /// ActivityRecord.finishRelaunching: the relaunch of `token` ended, so what its Task's size did meanwhile is delivered now, and its windows, held back meanwhile, get the size unless another relaunch began.
     fn relaunch_finished(&self, token: &SpIBinder) {
         self.atm.update_owner(token, |o| o.relaunching = false);
-        let Some(task) = self.tasks.task_of_activity(Some(token)) else {
+        let Some(task) = self.tasks.task_of_token(Some(token)) else {
             return;
         };
         self.task_resized(task);
@@ -913,6 +918,34 @@ impl IActivityManager for ActivityManager {
         counters::unimplemented(AM, method)
     }
 
+    /// ActivityManagerService.checkPermissionForDevice (:6193-6200) -> checkComponentPermission: the install-time grants of `uid`'s packages (permission::check, rule A); one device.
+    /// Was unimplemented, whose empty reply reads 0 = PERMISSION_GRANTED: every check passed.
+    fn r#checkPermissionForDevice(
+        &self,
+        permission: Option<&str>,
+        _pid: i32,
+        uid: i32,
+        _device_id: i32,
+    ) -> binder::Result<i32> {
+        /// PackageManager.PERMISSION_GRANTED / PERMISSION_DENIED.
+        const GRANTED: i32 = 0;
+        const DENIED: i32 = -1;
+        let Ok(uid) = u32::try_from(uid) else {
+            return Ok(DENIED);
+        };
+        let grants: Vec<String> = self
+            .inner
+            .packages
+            .by_app_id(permission::app_id(uid))
+            .flat_map(|p| p.granted_permissions.iter().cloned())
+            .collect();
+        Ok(if permission::check(uid, permission, &grants) {
+            GRANTED
+        } else {
+            DENIED
+        })
+    }
+
     /// ActivityManagerService.handleApplicationCrash (AppErrors shows and records the report in AOSP): an app's uncaught exception as its process dies (RuntimeInit's
     /// KillApplicationHandler, which kills the process itself afterwards). Logged here with the process it came from; nothing else, as the process is already going down.
     fn r#handleApplicationCrash(
@@ -1064,7 +1097,7 @@ impl IActivityManager for ActivityManager {
             Some(BUILD_UNKNOWN),
             None,
             None,
-            Some(&[]),
+            Some(&DISABLED_COMPAT_CHANGES),
             Some(&[]),
             None,
             app_memory.as_ref(),

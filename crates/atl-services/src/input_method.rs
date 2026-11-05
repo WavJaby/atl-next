@@ -9,6 +9,10 @@
 use atl_aidl::aidl::com::android::internal::view::IInputMethodManager::{
     BnInputMethodManager, EnforcePermission, IInputMethodManager,
 };
+use atl_parcelables::android::view::inputmethod::ImeTracker_Token;
+use atl_parcelables::com::android::internal::inputmethod::{
+    InputBindResult, InputMethodInfoSafeList,
+};
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::{counters, permission};
@@ -56,13 +60,13 @@ impl IInputMethodManager for InputMethodManager {
         Ok(())
     }
 
-    /// InputMethodManagerService.startInputOrWindowGainedFocusAsync: AOSP binds the focused editor to the current IME and replies through client.onStartInputResult. No IME exists, so
-    /// nothing is bound and no result is sent: the client's async path does not wait for one (useAsyncShowHideMethod). Counted.
+    /// startInputOrWindowGainedFocusAsync (ZeroJankProxy.java:466-476, use_zero_jank_proxy on in the pinned release configs): AOSP always replies through client.onStartInputResult.
+    /// No IME exists, so nothing is bound and the reply is InputBindResult.NO_IME (what InputMethodManagerService answers with no current method) for the call's sequence. Counted.
     #[allow(clippy::too_many_arguments)]
     fn r#startInputOrWindowGainedFocusAsync(
         &self,
         _start_input_reason: i32,
-        _client: Option<&Strong<dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_18_IInputMethodClient>>,
+        client: Option<&Strong<dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_18_IInputMethodClient>>,
         _window_token: Option<&SpIBinder>,
         _start_input_flags: i32,
         _soft_input_mode: i32,
@@ -76,14 +80,69 @@ impl IInputMethodManager for InputMethodManager {
         _user_id: i32,
         _ime_dispatcher: Option<&atl_parcelables::android::window::ImeOnBackInvokedDispatcher>,
         _ime_requested_visible: bool,
-        _start_input_seq: i32,
+        start_input_seq: i32,
         _use_async_show_hide_method: bool,
     ) -> binder::Result<()> {
         counters::count(
             INTERFACE,
-            "startInputOrWindowGainedFocusAsync (not kept: no IME bridge)",
+            "startInputOrWindowGainedFocusAsync (answered NO_IME: no IME bridge)",
         );
+        if let Some(client) = client {
+            let res = InputBindResult::error(InputBindResult::ERROR_NO_IME);
+            if let Err(e) = client.r#onStartInputResult(Some(&res), start_input_seq) {
+                counters::count(INTERFACE, &format!("onStartInputResult refused: {e:?}"));
+            }
+        }
         Ok(())
+    }
+
+    /// showSoftInput: no IME window to show -> false (IMMS answers false when there is no current method).
+    #[allow(clippy::too_many_arguments)]
+    fn r#showSoftInput(
+        &self,
+        _client: Option<&Strong<dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_18_IInputMethodClient>>,
+        _window_token: Option<&SpIBinder>,
+        _stats_token: Option<&ImeTracker_Token>,
+        _flags: i32,
+        _last_click_tool_type: i32,
+        _result_receiver: Option<&atl_parcelables::android::os::ResultReceiver>,
+        _reason: i32,
+        _async: bool,
+    ) -> binder::Result<bool> {
+        counters::count(INTERFACE, "showSoftInput (false: no IME)");
+        Ok(false)
+    }
+
+    /// hideSoftInput: nothing shown -> false.
+    #[allow(clippy::too_many_arguments)]
+    fn r#hideSoftInput(
+        &self,
+        _client: Option<&Strong<dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_18_IInputMethodClient>>,
+        _window_token: Option<&SpIBinder>,
+        _stats_token: Option<&ImeTracker_Token>,
+        _flags: i32,
+        _result_receiver: Option<&atl_parcelables::android::os::ResultReceiver>,
+        _reason: i32,
+        _async: bool,
+    ) -> binder::Result<bool> {
+        counters::count(INTERFACE, "hideSoftInput (false: no IME)");
+        Ok(false)
+    }
+
+    /// getInputMethodList / getEnabledInputMethodList: no input methods, as InputMethodInfoSafeList.empty() (callers dereference it, so never null).
+    fn r#getInputMethodList(
+        &self,
+        _user_id: i32,
+        _direct_boot_awareness: i32,
+    ) -> binder::Result<Option<InputMethodInfoSafeList>> {
+        Ok(Some(InputMethodInfoSafeList))
+    }
+
+    fn r#getEnabledInputMethodList(
+        &self,
+        _user_id: i32,
+    ) -> binder::Result<Option<InputMethodInfoSafeList>> {
+        Ok(Some(InputMethodInfoSafeList))
     }
 }
 

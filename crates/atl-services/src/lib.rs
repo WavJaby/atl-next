@@ -27,6 +27,7 @@ pub mod process_control;
 pub mod shared_memory;
 pub mod size_buckets;
 pub mod tasks;
+pub mod window_layout;
 
 #[cfg(feature = "converter")]
 pub mod activity;
@@ -44,6 +45,8 @@ pub mod display;
 pub mod input;
 #[cfg(feature = "converter")]
 pub mod input_method;
+#[cfg(feature = "converter")]
+pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]

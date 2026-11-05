@@ -48,6 +48,7 @@ import android.text.InputType;
 import android.view.autofill.AutofillId;
 import android.view.inputmethod.EditorInfo;
 import android.window.ImeOnBackInvokedDispatcher;
+import com.android.internal.inputmethod.InputBindResult;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -234,6 +235,7 @@ public class ParcelTruth {
         // the focus path: InputMethodManager.startInputInner sends both on every window focus gain (atl-services input_method.rs)
         check("EditorInfo", editorInfo(), EditorInfo.CREATOR);
         check("EditorInfo:empty", new EditorInfo(), EditorInfo.CREATOR);
+        check("InputBindResult:no-ime", InputBindResult.NO_IME, InputBindResult.CREATOR);
         checkImeDispatcher("ImeOnBackInvokedDispatcher");
 
         selfTests(config, intent, entries);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <APK>`: any APK, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
-//! No probe and no injected input. The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
+//! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
@@ -46,6 +46,10 @@ pub struct Args {
     /// Deliberate-failure check: apps run without the app seccomp filter (atl-broker seccomp.rs). Without the filter the app's queued-work looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
+    /// A pointer script the app injects into its window from its first present (atl-composer `input::parse_script`): `down:X,Y up:X,Y` in the content's physical pixels, `wait:MS` between steps,
+    /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
+    #[arg(long, value_name = "SCRIPT")]
+    pointer: Option<String>,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -63,6 +67,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt.without_app_seccomp()
     } else {
         rt
+    };
+    let rt = match &args.pointer {
+        Some(script) => rt.with_headless_pointer(script),
+        None => rt,
     };
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
@@ -108,17 +116,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let hold_ms = args.hold.map(|s| s * MS_PER_S);
     let watch_ms = hold_ms.unwrap_or(window::WINDOW_MS);
+    // a pointer script runs from the first present: the run lasts at least its waits plus the watch, and faults count from the last resume to the run's end
+    let script_ms = args.pointer.as_deref().map_or(0, script_wait_ms);
     let started = Instant::now();
     let mut atld = rt.start_atld(&run)?;
     let mut ended = None;
     let mut complete = false;
     loop {
         let services = read(&services_log);
-        let done = last_resumed(&services).is_some_and(|r| {
-            window::now_ms() >= r.ms + watch_ms
-                && settled(&services)
-                && (hold_ms.is_some() || presented_since(&read(&app_log), r.ms) > 0)
-        });
+        let scripted = started.elapsed() >= Duration::from_millis(script_ms + watch_ms);
+        let done = scripted
+            && last_resumed(&services).is_some_and(|r| {
+                window::now_ms() >= r.ms + watch_ms
+                    && settled(&services)
+                    && (hold_ms.is_some() || presented_since(&read(&app_log), r.ms) > 0)
+            });
         if done {
             complete = true;
             break;
@@ -142,7 +154,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    let outcome = judge(&services, &app, complete, ended.is_some(), watch_ms);
+    let fault_ms = match (args.pointer.is_some(), last_resumed(&services)) {
+        (true, Some(r)) => watch_ms.max(window::now_ms().saturating_sub(r.ms)),
+        _ => watch_ms,
+    };
+    let outcome = judge(&services, &app, complete, ended.is_some(), fault_ms);
     match &outcome {
         Ok(s) => println!("run-apk: ok {s}"),
         Err(s) => {
@@ -160,6 +176,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The script's `wait:MS` items summed: how long it runs after the first present (a bad item is the app's to refuse, counted 0 here).
+fn script_wait_ms(script: &str) -> u64 {
+    script
+        .split_whitespace()
+        .filter_map(|item| item.strip_prefix("wait:")?.parse::<u64>().ok())
+        .sum()
 }
 
 /// Frames the app presented at or after `from_ms`: its present lines stamped no earlier (a line's stamp is its first field).
@@ -275,6 +299,12 @@ mod tests {
                         services: activity settled at=103.501\n";
         let err = judge(services, PRESENT, true, false, 2_000).unwrap_err();
         assert!(err.contains("no frame presented after org.x.Main"), "{err}");
+    }
+
+    #[test]
+    fn script_waits_are_summed() {
+        assert_eq!(script_wait_ms("wait:6000 down:1,2 up:1,2 wait:2500"), 8500);
+        assert_eq!(script_wait_ms("down:1,2 wait:x"), 0);
     }
 
     #[test]

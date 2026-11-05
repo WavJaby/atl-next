@@ -205,7 +205,7 @@ impl ActivityTasks {
     ) -> SpIBinder {
         let token = token::new();
         let task = self.tasks.new_task(uid);
-        self.tasks.bind_activity(token.clone(), task);
+        self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
             thread,
             uid,
@@ -285,7 +285,7 @@ impl ActivityTasks {
             return Ok(activity_start::START_CANCELED);
         };
         let token = token::new();
-        self.tasks.bind_activity(token.clone(), task);
+        self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
             thread: caller.clone(),
             uid: calling_uid,

@@ -70,8 +70,18 @@ pub struct Manifest {
     pub activities: Vec<ActivityDecl>,
     /// `<uses-permission android:name>`, in order.
     pub requested_permissions: Vec<String>,
+    /// `<permission>` elements: the permissions the package defines (the platform's are framework-res's), the install-time grant rule's input (permission::install_grants).
+    #[serde(default)]
+    pub permissions: Vec<PermissionDecl>,
     pub libraries: Vec<UsesLibrary>,
     pub instrumentation: Vec<InstrumentationDecl>,
+}
+
+/// `<permission android:name android:protectionLevel>` (ParsedPermissionUtils): the level as written, base type in the low 4 bits (PermissionInfo.PROTECTION_MASK_BASE).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDecl {
+    pub name: String,
+    pub protection_level: u32,
 }
 
 impl Manifest {
@@ -96,6 +106,9 @@ pub struct PackageRecord {
     pub data_dir: String,
     /// device-protected storage (ApplicationInfo.deviceProtectedDataDir: /data/user_de/<user>/<package>): the code cache dir, which graphics setup opens first
     pub device_protected_data_dir: String,
+    /// The install-time grants (the host's install step, permission::install_grants): what checkPermission answers GRANTED for this uid.
+    #[serde(default)]
+    pub granted_permissions: Vec<String>,
 }
 
 impl Deref for PackageRecord {
@@ -266,6 +279,7 @@ mod tests {
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
                 requested_permissions: vec![],
+                permissions: vec![],
                 libraries: vec![],
                 instrumentation: vec![],
             },
@@ -275,6 +289,7 @@ mod tests {
             native_library_dir: String::new(),
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
+            granted_permissions: vec![],
         }
     }
 

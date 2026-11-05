@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The headless pointer (M3 slice 5, sub-gate c): a script (atld `--headless-pointer`, delivered as `ro.atl.headless.pointer`) injected once the first frame reached the compositor.
-//! Items are `kind:x,y` separated by spaces, kind `down`, `move` or `up`, positions in physical pixels. [`HeadlessInput`] is the headless [`InputSource`] of the platform layer: the script's events go through it,
+//! Items are `kind:x,y` separated by spaces, kind `down`, `move` or `up`, positions in physical pixels, or `wait:MS` (the rest goes in that much later). UI mode runs the script from its first present (run-apk `--pointer`). [`HeadlessInput`] is the headless [`InputSource`] of the platform layer: the script's events go through it,
 //! and the publisher on the window's input channel (the server end the UI agent's INPUT_SERVER hands over) turns them into MotionEvents (converter-only [`spawn`]).
 //! The publisher is not Send: the input thread owns it and takes the channels and the first-frame signal in order.
 
@@ -13,7 +13,12 @@ use atl_platform_ui::{InputEvent, InputSource, PhysPoint, PointerButton, Pointer
 use binder::SpIBinder;
 
 /// One scripted step: the phase and the position it happens at.
-pub type Step = (PointerPhase, PhysPoint);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Step {
+    Pointer(PointerPhase, PhysPoint),
+    /// `wait:MS`: the steps after it go in this much later (run-apk interactions: a tap, then the next once the UI answered).
+    Wait(std::time::Duration),
+}
 
 /// What the input thread takes: a window's input channel (token + server end, from the UI agent) or its removal, an event, or the first frame reaching the compositor.
 #[cfg(feature = "converter")]
@@ -128,6 +133,12 @@ pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
             let (kind, at) = item
                 .split_once(':')
                 .ok_or_else(|| format!("script item {item:?}: want kind:x,y"))?;
+            if kind == "wait" {
+                let ms = at
+                    .parse::<u64>()
+                    .map_err(|_| format!("script item {item:?}: want wait:MS"))?;
+                return Ok(Step::Wait(std::time::Duration::from_millis(ms)));
+            }
             let (x, y) = at
                 .split_once(',')
                 .ok_or_else(|| format!("script item {item:?}: want kind:x,y"))?;
@@ -135,7 +146,11 @@ pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
                 "down" => PointerPhase::Down(PointerButton::Primary),
                 "move" => PointerPhase::Move,
                 "up" => PointerPhase::Up(PointerButton::Primary),
-                _ => return Err(format!("script item {item:?}: kind is down, move or up")),
+                _ => {
+                    return Err(format!(
+                        "script item {item:?}: kind is down, move, up or wait"
+                    ));
+                }
             };
             let coord = |v: &str| {
                 v.parse::<f64>()
@@ -143,7 +158,7 @@ pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
                     .filter(|c| c.is_finite())
                     .ok_or_else(|| format!("script item {item:?}: {v:?} is no finite number"))
             };
-            Ok((
+            Ok(Step::Pointer(
                 phase,
                 PhysPoint {
                     x: coord(x)?,
@@ -409,7 +424,7 @@ mod publish {
     }
 
     /// The input thread: takes each window's channel, and at the first frame injects the script through the headless source. The publisher stays on this thread (it is not Send).
-    fn dispatch(rx: Receiver<Message>, script: Vec<Step>) {
+    fn dispatch(rx: Receiver<Message>, tx: Sender<Message>, mut script: Vec<Step>) {
         let layout = KeyLayoutMap::load(KEY_LAYOUT)
             .inspect_err(|err| {
                 tracing::warn!("input: key layout {KEY_LAYOUT}: {err:?}; keys dropped")
@@ -437,17 +452,37 @@ mod publish {
                     publish_focus(&state);
                 }
                 Message::Event(event) => source.inject(event),
-                Message::FirstFrame => {
-                    for &(phase, position) in &script {
-                        let time_ms =
-                            u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-                        source.inject(InputEvent::Pointer(PointerEvent {
-                            phase,
-                            position,
-                            time_ms,
-                        }));
+                // once: the script's events come back as Message::Event from its own thread, so a wait never holds up the channels a later window brings
+                Message::FirstFrame if !script.is_empty() => {
+                    let steps = std::mem::take(&mut script);
+                    let tx = tx.clone();
+                    let run = move || {
+                        for step in steps {
+                            match step {
+                                Step::Wait(d) => thread::sleep(d),
+                                Step::Pointer(phase, position) => {
+                                    let time_ms = u32::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u32::MAX);
+                                    let event = InputEvent::Pointer(PointerEvent {
+                                        phase,
+                                        position,
+                                        time_ms,
+                                    });
+                                    if tx.send(Message::Event(event)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if let Err(err) = thread::Builder::new()
+                        .name("atl-input-script".to_owned())
+                        .spawn(run)
+                    {
+                        tracing::warn!("input: script thread: {err}");
                     }
                 }
+                Message::FirstFrame => {}
             }
         }
     }
@@ -455,9 +490,11 @@ mod publish {
     /// Starts the input thread with `script` (empty: nothing injected, channels still taken). The sender takes each window's channel and the first frame.
     pub fn spawn(script: Vec<Step>) -> Result<Sender<Message>, String> {
         let (tx, rx) = channel();
+        // the thread's own sender (for the script's events) keeps its loop open for the process's life; it ends with the process, as before
+        let own = tx.clone();
         thread::Builder::new()
             .name("atl-input".to_owned())
-            .spawn(move || dispatch(rx, script))
+            .spawn(move || dispatch(rx, own, script))
             .map_err(|e| format!("input thread: {e}"))?;
         Ok(tx)
     }
@@ -537,22 +574,30 @@ mod tests {
     #[test]
     fn parse_script_reads_the_items_in_order() {
         let want = vec![
-            (
+            Step::Pointer(
                 PointerPhase::Down(PointerButton::Primary),
                 PhysPoint { x: 200.0, y: 300.0 },
             ),
-            (PointerPhase::Move, PhysPoint { x: 260.0, y: 340.0 }),
-            (
+            Step::Pointer(PointerPhase::Move, PhysPoint { x: 260.0, y: 340.0 }),
+            Step::Wait(std::time::Duration::from_millis(1500)),
+            Step::Pointer(
                 PointerPhase::Up(PointerButton::Primary),
                 PhysPoint { x: 260.0, y: 340.0 },
             ),
         ];
         assert_eq!(
-            parse_script("down:200,300 move:260,340 up:260,340"),
+            parse_script("down:200,300 move:260,340 wait:1500 up:260,340"),
             Ok(want)
         );
         assert_eq!(parse_script(""), Ok(Vec::new()));
-        for bad in ["tap:1,2", "down:1", "down:1,nan", "down:a,2"] {
+        for bad in [
+            "tap:1,2",
+            "down:1",
+            "down:1,nan",
+            "down:a,2",
+            "wait:-1",
+            "wait:1.5",
+        ] {
             assert!(parse_script(bad).is_err(), "{bad}");
         }
     }

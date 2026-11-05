@@ -32,7 +32,7 @@ use atl_property_service::Property;
 use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
 use atl_services::native_libs::{self, SupportedAbi};
-use atl_services::packages::{Library, Manifest, PackageRecord};
+use atl_services::packages::{Library, Manifest, PackageRecord, PermissionDecl};
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -86,6 +86,10 @@ struct Args {
     /// A package to install (repeat): a JSON file `{"apk": <host path>, "manifest": {...}}` (atl_services::packages::Manifest, which xtask reads from the APK with aapt2).
     #[arg(long = "package", required = true)]
     packages: Vec<PathBuf>,
+    /// The platform's permission definitions (framework-res's `<permission>` elements): a JSON array of atl_services::packages::PermissionDecl, the install-time grant rule's platform half.
+    /// Omitted: only the packages' own definitions count, so no platform permission is granted.
+    #[arg(long)]
+    platform_permissions: Option<PathBuf>,
     /// The first app uid (AID_APP_START 10000 and above); the i-th package gets uid + i.
     #[arg(long)]
     first_uid: u32,
@@ -340,7 +344,31 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
             data_dir: format!("{DATA}/{user}"),
             device_protected_data_dir: format!("{DATA}/{user_de}"),
             manifest: source.manifest,
+            granted_permissions: vec![],
         });
+    }
+    // install-time grants over every definition: the platform's first, then the packages' (permission::install_grants)
+    let platform: Vec<PermissionDecl> = match &a.platform_permissions {
+        Some(file) => serde_json::from_str(
+            &std::fs::read_to_string(file)
+                .with_context(|| format!("reading {}", file.display()))?,
+        )
+        .with_context(|| format!("parsing {}", file.display()))?,
+        None => Vec::new(),
+    };
+    let grants: Vec<Vec<String>> = records
+        .iter()
+        .map(|p| {
+            let defs = platform.iter().map(|d| ("android", d)).chain(
+                records
+                    .iter()
+                    .flat_map(|o| o.permissions.iter().map(move |d| (o.name.as_str(), d))),
+            );
+            atl_services::permission::install_grants(&p.name, &p.requested_permissions, defs)
+        })
+        .collect();
+    for (record, granted) in records.iter_mut().zip(grants) {
+        record.granted_permissions = granted;
     }
     std::fs::write(
         r.root.join("packages.json"),

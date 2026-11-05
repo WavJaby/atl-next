@@ -54,6 +54,7 @@ pub mod android {
         pub mod PointerIcon;
         pub mod inputmethod {
             pub mod EditorInfo;
+            pub mod ImeTracker_Token;
         }
         pub mod SurfaceControl;
         pub mod WindowManager_LayoutParams;
@@ -72,5 +73,16 @@ pub mod java {
     }
     pub mod util {
         pub mod Map;
+    }
+}
+
+pub mod com {
+    pub mod android {
+        pub mod internal {
+            pub mod inputmethod {
+                pub mod InputBindResult;
+                pub mod InputMethodInfoSafeList;
+            }
+        }
     }
 }

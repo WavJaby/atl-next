@@ -9,7 +9,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, UsesLibrary};
+use atl_services::packages::{
+    ActivityDecl, InstrumentationDecl, Manifest, PermissionDecl, UsesLibrary,
+};
 
 use crate::host_art;
 
@@ -286,6 +288,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         application_theme: application.map_or(Ok(0), theme)?,
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
+        permissions: permissions(&root)?,
         requested_permissions: root
             .children("uses-permission")
             .filter_map(|e| e.attr("name").map(str::to_owned))
@@ -313,6 +316,19 @@ pub fn parse(text: &str) -> Result<Manifest> {
             })
             .collect(),
     })
+}
+
+/// The `<permission>` elements under the manifest root: name and `protectionLevel` (aapt2 prints the flags as hex; absent = 0, normal, as ParsedPermissionUtils defaults it).
+fn permissions(root: &Element) -> Result<Vec<PermissionDecl>> {
+    root.children("permission")
+        .filter_map(|e| Some((e, e.attr("name")?)))
+        .map(|(e, name)| {
+            Ok(PermissionDecl {
+                name: name.to_owned(),
+                protection_level: flags_attr(e, "protectionLevel")?,
+            })
+        })
+        .collect()
 }
 
 /// `apk`'s manifest as aapt2 prints it.
@@ -350,6 +366,12 @@ fn gl_es_version_of(text: &str) -> Result<Option<i64>> {
         }
     }
     Ok(best)
+}
+
+/// The permissions `apk` defines (framework-res: the platform's), through `aapt2`; only `<permission>` is read, so a manifest without the app fields (framework-res) parses.
+pub fn read_permissions(aapt2: &Path, apk: &Path) -> Result<Vec<PermissionDecl>> {
+    permissions(&parse_tree(&dump(aapt2, apk)?)?)
+        .with_context(|| format!("the permissions of {}", apk.display()))
 }
 
 #[cfg(test)]

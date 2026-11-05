@@ -45,6 +45,9 @@ const RELAYOUT_RES_FIRST_TIME: i32 = 1;
 const RELAYOUT_RES_SURFACE_CHANGED: i32 = 1 << 1;
 /// WindowManager.LayoutParams.INPUT_FEATURE_NO_INPUT_CHANNEL (WindowManager.java:4505): such a window gets no input channel.
 const INPUT_FEATURE_NO_INPUT_CHANNEL: i32 = 1 << 0;
+/// WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE and TYPE_TOAST (WindowManager.java).
+const FLAG_NOT_TOUCHABLE: i32 = 0x10;
+const TYPE_TOAST: i32 = 2005;
 /// InputTransport.cpp:95 SOCKET_BUFFER_SIZE: the send and receive buffers of both ends of a channel pair (InputChannel::openInputChannelPair, :370-375).
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024;
 /// CompatibilityInfo's scale of an app that needs no size compatibility: the value addToDisplay reports (outSizeCompatScale).
@@ -243,6 +246,7 @@ impl Session {
     }
 
     /// A window's frame: from the origin, the size of its Task (tasks.rs). Freeform, so it is the window's bounds, not the display's.
+    /// A toast is placed in it by its gravity (window_frame).
     fn task_rect(&self, task: TaskId) -> Rect {
         let size = self.tasks.size(task);
         Rect {
@@ -266,6 +270,30 @@ impl Session {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Window>> {
         // a poisoned list still holds the windows
         self.windows.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The frame relayout reports: the Task's rect, except a TYPE_TOAST window, which is its requested (measured) size placed by its gravity and x/y in the Task (window_layout::gravity_frame).
+fn window_frame(
+    attrs: Option<&WindowManager_LayoutParams>,
+    requested_width: i32,
+    requested_height: i32,
+    parent: Rect,
+) -> Rect {
+    let Some(a) = attrs.filter(|a| a.r#type == TYPE_TOAST) else {
+        return parent;
+    };
+    let (left, top, right, bottom) = crate::window_layout::gravity_frame(
+        a.gravity,
+        (requested_width, requested_height),
+        (a.x, a.y),
+        (parent.left, parent.top, parent.right, parent.bottom),
+    );
+    Rect {
+        left,
+        top,
+        right,
+        bottom,
     }
 }
 
@@ -317,7 +345,7 @@ impl IWindowSession for Session {
             );
             return Err(StatusCode::BAD_VALUE.into());
         };
-        let Some(task) = self.tasks.task_of_activity(attrs.token.as_ref()) else {
+        let Some(task) = self.tasks.task_of_token(attrs.token.as_ref()) else {
             counters::refused(
                 WINDOW_SESSION,
                 "addToDisplayAsUser: the window's token names no activity's Task",
@@ -325,7 +353,11 @@ impl IWindowSession for Session {
             return Ok(ADD_BAD_APP_TOKEN);
         };
         self.agent.name_task(task);
-        let (channel, input) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
+        // a FLAG_NOT_TOUCHABLE window (a toast) gets no input channel: InputDispatcher never picks it as a touch target (findTouchedWindowAtLocked skips NOT_TOUCHABLE), and the app's
+        // dispatcher here takes its windows as touch-modal top-down (atl-composer input Windows), so a channel would take every touch while the toast shows
+        let takes_input = attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0
+            && attrs.flags & FLAG_NOT_TOUCHABLE == 0;
+        let (channel, input) = if takes_input {
             let (server, client) = open_input_pair()?;
             // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
             let token = crate::token::new();
@@ -371,9 +403,9 @@ impl IWindowSession for Session {
     fn r#relayout(
         &self,
         window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
-        _attrs: Option<&WindowManager_LayoutParams>,
-        _requested_width: i32,
-        _requested_height: i32,
+        attrs: Option<&WindowManager_LayoutParams>,
+        requested_width: i32,
+        requested_height: i32,
         _view_visibility: i32,
         _flags: i32,
         seq: i32,
@@ -417,7 +449,12 @@ impl IWindowSession for Session {
         let surface_changed = created.is_some();
         *out_relayout_result = Some(WindowRelayoutResult {
             frames: ClientWindowFrames {
-                frame: self.task_rect(task),
+                frame: window_frame(
+                    attrs,
+                    requested_width,
+                    requested_height,
+                    self.task_rect(task),
+                ),
                 display_frame: self.display_rect(),
                 parent_frame: self.task_rect(task),
                 attached_frame: None,

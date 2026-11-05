@@ -68,6 +68,8 @@ const USER: &str = "user";
 const MOUNT: &str = "mount";
 /// Context.CLIPBOARD_SERVICE.
 const CLIPBOARD: &str = "clipboard";
+/// Context.NOTIFICATION_SERVICE (Toast.getService looks INotificationManager up by it).
+const NOTIFICATION: &str = "notification";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -120,6 +122,11 @@ fn main() -> Result<()> {
     binder::add_service(MOUNT, atl_services::storage::new_binder()).context("addService mount")?;
     binder::add_service(CLIPBOARD, atl_services::clipboard::new_binder())
         .context("addService clipboard")?;
+    binder::add_service(
+        NOTIFICATION,
+        atl_services::notification::new_binder(Arc::clone(&tasks)),
+    )
+    .context("addService notification")?;
     // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load)
     let kcm = |name: &str| -> anyhow::Result<Vec<u8>> {
         let path = a.keychars.join(name);

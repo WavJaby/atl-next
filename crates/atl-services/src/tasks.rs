@@ -52,8 +52,8 @@ struct State<C> {
     tasks: BTreeMap<TaskId, TaskRecord>,
     /// the last TaskId handed out
     last_id: i32,
-    /// activity token -> Task (ActivityRecord.task). A token is an identity: compared by equality.
-    activities: Vec<(C, TaskId)>,
+    /// WindowToken -> Task (an activity token: ActivityRecord.task; a toast token: the caller's Task). A token is an identity: compared by equality.
+    tokens: Vec<(C, TaskId)>,
     windows: Vec<WindowEntry<C>>,
     /// The last `ClientWindowFrames.seq` handed out, global across windows.
     seq: i32,
@@ -65,14 +65,14 @@ impl<C> State<C> {
             display,
             tasks: BTreeMap::new(),
             last_id: 0,
-            activities: Vec::new(),
+            tokens: Vec::new(),
             windows: Vec::new(),
             seq: 0,
         }
     }
 }
 
-/// The Tasks of the display: their owners and sizes, the activities bound to each, and the windows of each. `C` is the handle an activity or window is known by.
+/// The Tasks of the display: their owners and sizes, the window tokens bound to each, and the windows of each. `C` is the handle an activity or window is known by.
 pub struct Tasks<C> {
     state: Mutex<State<C>>,
 }
@@ -180,20 +180,36 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.get(&task).map_or(0, |r| r.config_seq)
     }
 
-    /// Names `task` as the Task of the activity `token` (ActivityRecord.task). A token bound again takes the new Task.
-    pub fn bind_activity(&self, token: C, task: TaskId) {
+    /// Names `task` as the Task of the WindowToken `token`: an activity's (ActivityRecord.task; ActivityRecord extends WindowToken) or a toast's (the notification service's
+    /// WindowManagerInternal.addWindowToken(TYPE_TOAST), placed in the caller's Task). A token bound again takes the new Task.
+    pub fn bind_token(&self, token: C, task: TaskId) {
         let mut st = self.lock();
-        match st.activities.iter_mut().find(|(t, _)| *t == token) {
+        match st.tokens.iter_mut().find(|(t, _)| *t == token) {
             Some(entry) => entry.1 = task,
-            None => st.activities.push((token, task)),
+            None => st.tokens.push((token, task)),
         }
     }
 
-    /// The Task of the activity `token`; None for no token, or one no activity was bound to (a window with it is refused).
-    pub fn task_of_activity(&self, token: Option<&C>) -> Option<TaskId> {
+    /// Forgets the WindowToken `token` (WindowManagerInternal.removeWindowToken): a window added with it later is refused.
+    pub fn unbind_token(&self, token: &C) {
+        self.lock().tokens.retain(|(t, _)| t != token);
+    }
+
+    /// The newest Task of the app `owner` (its uid): where a toast of that app shows. None when it has none.
+    pub fn newest_task_of(&self, owner: u32) -> Option<TaskId> {
+        self.lock()
+            .tasks
+            .iter()
+            .rev()
+            .find(|(_, t)| t.owner == owner)
+            .map(|(id, _)| *id)
+    }
+
+    /// The Task of the WindowToken `token`; None for no token, or one never bound (a window with it is refused).
+    pub fn task_of_token(&self, token: Option<&C>) -> Option<TaskId> {
         let token = token?;
         self.lock()
-            .activities
+            .tokens
             .iter()
             .find(|(t, _)| t == token)
             .map(|(_, task)| *task)
@@ -357,12 +373,12 @@ mod tests {
     fn activity_tokens_name_their_task() {
         let t = tasks();
         let (first, second) = (t.new_task(7), t.new_task(7));
-        t.bind_activity(1, first);
-        assert_eq!(t.task_of_activity(Some(&1)), Some(first));
-        assert_eq!(t.task_of_activity(None), None);
-        assert_eq!(t.task_of_activity(Some(&2)), None);
-        t.bind_activity(1, second);
-        assert_eq!(t.task_of_activity(Some(&1)), Some(second));
+        t.bind_token(1, first);
+        assert_eq!(t.task_of_token(Some(&1)), Some(first));
+        assert_eq!(t.task_of_token(None), None);
+        assert_eq!(t.task_of_token(Some(&2)), None);
+        t.bind_token(1, second);
+        assert_eq!(t.task_of_token(Some(&1)), Some(second));
     }
 
     /// A window belongs to the Task it was added under: two Tasks of one app list their own windows; a window added twice is kept once; a removed one is gone.

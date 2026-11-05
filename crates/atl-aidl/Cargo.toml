@@ -68,6 +68,8 @@ types = [
     "android.media.IAudioService",
     "android.app.IActivityClientController",
     "com.android.internal.view.IInputMethodManager",
+    "android.app.INotificationManager",
+    "android.app.ITransientNotification",
     "android.hardware.input.IInputManager",
     # test only (atl-aidl-probe --enforce): the smallest framework interface with @EnforcePermission methods
     "android.hardware.ISerialManager",

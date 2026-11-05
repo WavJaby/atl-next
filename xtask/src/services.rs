@@ -173,6 +173,7 @@ pub fn stage(
                 process: None,
             }],
             requested_permissions: vec![],
+            permissions: Vec::new(),
             libraries: vec![],
             // one instrumentation, targeting the package itself (client.rs INSTRUMENTATION)
             instrumentation: vec![InstrumentationDecl {
@@ -189,6 +190,7 @@ pub fn stage(
         native_library_dir: format!("{DATA_APP}/{APP}/{LIB_DIR_NAME}/{host_arch}"),
         data_dir: format!("{DATA_USER}/0/{APP}"),
         device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
+        granted_permissions: vec![],
     };
     let packages_file = test_root.join("packages.json");
     std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;

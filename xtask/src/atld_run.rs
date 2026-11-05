@@ -15,7 +15,7 @@ use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::host_art::{self, HostArt};
-use crate::{farm, packages, slot};
+use crate::{farm, manifest, packages, slot};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
@@ -516,6 +516,16 @@ impl Runtime {
             )?;
             cmd.arg("--package").arg(file);
         }
+        // the platform's permission definitions, read from framework-res's manifest as an app's are (aapt2): atld's install grants from them
+        let platform = run.scratch.join("platform-permissions.json");
+        std::fs::write(
+            &platform,
+            serde_json::to_vec_pretty(&manifest::read_permissions(
+                &self.aapt2,
+                &self.framework_res,
+            )?)?,
+        )?;
+        cmd.arg("--platform-permissions").arg(platform);
         for (name, lib) in &run.libraries {
             cmd.arg("--shared-library").arg(lib.to_arg(name, &lib.file));
         }

@@ -41,9 +41,104 @@ pub fn holds(uid: u32, permissions: &[&str]) -> bool {
     is_system_or_root(uid)
 }
 
+/// PermissionInfo.PROTECTION_MASK_BASE and the two base types the install-time rule grants (PermissionInfo.java).
+const PROTECTION_MASK_BASE: u32 = 0xf;
+const PROTECTION_NORMAL: u32 = 0;
+const PROTECTION_SIGNATURE: u32 = 2;
+
+/// The install-time grants of `package` (owner decision 2026-11-05, interim rule A; PermissionManagerServiceImpl.restorePermissionState): a requested permission is granted when its definition
+/// is NORMAL, or SIGNATURE and defined by `package` itself (same package -> same certificate). Every other requested permission (dangerous: runtime grant via PermissionController, not built;
+/// signature of another signer; undefined) is not. `definitions` = the platform's (framework-res) then each installed package's, as (defining package, declaration); the first definition wins (PMS keeps the first).
+pub fn install_grants<'a>(
+    package: &str,
+    requested: &[String],
+    definitions: impl IntoIterator<Item = (&'a str, &'a crate::packages::PermissionDecl)>,
+) -> Vec<String> {
+    let mut defined: std::collections::BTreeMap<&str, (&str, u32)> = Default::default();
+    for (owner, d) in definitions {
+        defined
+            .entry(d.name.as_str())
+            .or_insert((owner, d.protection_level & PROTECTION_MASK_BASE));
+    }
+    requested
+        .iter()
+        .filter(|p| match defined.get(p.as_str()) {
+            Some((_, PROTECTION_NORMAL)) => true,
+            Some((owner, PROTECTION_SIGNATURE)) => *owner == package,
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// ActivityManager.checkComponentPermission for an exported, uid-less component (ActivityManagerService.checkPermissionForDevice:6193 -> checkComponentPermission): no permission -> denied;
+/// root / system -> granted; else granted only when `uid`'s install-time grants hold it.
+pub fn check(uid: u32, permission: Option<&str>, grants: &[String]) -> bool {
+    let Some(permission) = permission else {
+        return false;
+    };
+    is_system_or_root(uid) || grants.iter().any(|g| g == permission)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packages::PermissionDecl;
+
+    fn decl(name: &str, level: u32) -> PermissionDecl {
+        PermissionDecl {
+            name: name.into(),
+            protection_level: level,
+        }
+    }
+
+    /// Levels as aapt2 prints framework-res's: INTERNET normal (0x0), READ_CONTACTS dangerous (0x1), WRITE_SECURE_SETTINGS signature|privileged (0x12); an app's own signature permission (0x2).
+    #[test]
+    fn install_grants_normal_and_own_signature_only() {
+        let platform = [
+            decl("android.permission.INTERNET", 0x0),
+            decl("android.permission.READ_CONTACTS", 0x1),
+            decl("android.permission.WRITE_SECURE_SETTINGS", 0x12),
+        ];
+        let own = [decl("org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION", 0x2)];
+        let other = [decl("org.y.SECRET", 0x2)];
+        let requested: Vec<String> = [
+            "android.permission.INTERNET",
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_SECURE_SETTINGS",
+            "org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            "org.y.SECRET",
+            "org.z.UNDEFINED",
+        ]
+        .map(String::from)
+        .into();
+        let defs = platform
+            .iter()
+            .map(|d| ("android", d))
+            .chain(own.iter().map(|d| ("org.x", d)))
+            .chain(other.iter().map(|d| ("org.y", d)));
+        assert_eq!(
+            install_grants("org.x", &requested, defs),
+            [
+                "android.permission.INTERNET",
+                "org.x.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+            ]
+        );
+    }
+
+    #[test]
+    fn check_denies_null_and_ungranted() {
+        let grants = vec!["android.permission.INTERNET".to_owned()];
+        assert!(!check(10_000, None, &grants));
+        assert!(!check(1000, None, &grants));
+        assert!(check(1000, Some("android.permission.READ_CONTACTS"), &[]));
+        assert!(check(10_000, Some("android.permission.INTERNET"), &grants));
+        assert!(!check(
+            10_000,
+            Some("android.permission.READ_CONTACTS"),
+            &grants
+        ));
+    }
 
     #[test]
     fn system_and_root_in_any_user_only() {
