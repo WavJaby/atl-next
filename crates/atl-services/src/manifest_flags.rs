@@ -205,6 +205,8 @@ mod tests {
             target_sdk,
             process_name: None,
             application_theme: 0,
+            application_class: None,
+            app_component_factory: None,
             application_booleans: application
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), *v))

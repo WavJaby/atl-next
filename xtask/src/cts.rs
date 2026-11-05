@@ -371,6 +371,8 @@ mod tests {
             target_sdk: 1,
             process_name: None,
             application_theme: 0,
+            application_class: None,
+            app_component_factory: None,
             application_booleans: std::collections::BTreeMap::new(),
             activities: Vec::new(),
             requested_permissions: Vec::new(),

@@ -51,8 +51,11 @@ pub fn application_info(p: &PackageRecord, packages: &Packages) -> ApplicationIn
         native_library_root_dir,
         native_library_root_requires_isa: true,
         primary_cpu_abi: p.primary_cpu_abi.clone(),
+        // PackageImpl.toAppInfoWithoutState: name = className = <application android:name>; appComponentFactory as written
+        class_name: p.manifest.application_class.clone(),
+        app_component_factory: p.manifest.app_component_factory.clone(),
         item: PackageItemInfo {
-            name: None,
+            name: p.manifest.application_class.clone(),
             package_name: Some(p.name.clone()),
             ..Default::default()
         },

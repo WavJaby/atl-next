@@ -286,6 +286,12 @@ pub fn parse(text: &str) -> Result<Manifest> {
         target_sdk,
         process_name,
         application_theme: application.map_or(Ok(0), theme)?,
+        application_class: application
+            .and_then(|a| a.attr("name"))
+            .map(|n| resolve_class(package, n)),
+        app_component_factory: application
+            .and_then(|a| a.attr("appComponentFactory"))
+            .map(|n| resolve_class(package, n)),
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
         permissions: permissions(&root)?,

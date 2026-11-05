@@ -153,6 +153,13 @@ impl IDisplayManager for DisplayManager {
         Ok((display_id == DEFAULT_DISPLAY).then(|| display_info(&self.tasks.display())))
     }
 
+    /// DisplayManagerService.getPreferredWideGamutColorSpaceIdInternal: mWideColorSpace's id, the second of SurfaceControl.getCompositionColorSpaces; a display with no wide-gamut
+    /// composition (the desktop surface is composited as sRGB) reports sRGB: ColorSpace.Named.SRGB, ordinal 0.
+    fn r#getPreferredWideGamutColorSpaceId(&self) -> binder::Result<i32> {
+        const COLOR_SPACE_SRGB: i32 = 0;
+        Ok(COLOR_SPACE_SRGB)
+    }
+
     /// DisplayManagerService.getDisplayIds: display 0, whether or not disabled displays are asked for (the model has no other).
     fn r#getDisplayIds(&self, _include_disabled: bool) -> binder::Result<Option<Vec<i32>>> {
         Ok(Some(vec![DEFAULT_DISPLAY]))

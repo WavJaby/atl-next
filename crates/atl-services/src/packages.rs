@@ -64,6 +64,12 @@ pub struct Manifest {
     pub process_name: Option<String>,
     /// `<application android:theme>` as a resource id (ApplicationInfo.theme); 0 = none written.
     pub application_theme: i32,
+    /// `<application android:name>`, resolved against the package (ApplicationInfo.className and .name): the Application subclass LoadedApk.makeApplication instantiates; None = android.app.Application.
+    #[serde(default)]
+    pub application_class: Option<String>,
+    /// `<application android:appComponentFactory>`, resolved (ApplicationInfo.appComponentFactory): the factory that instantiates the app's components; None = AppComponentFactory.
+    #[serde(default)]
+    pub app_component_factory: Option<String>,
     /// `<application>`'s boolean attributes by name, only those the manifest wrote; the flags they set are in manifest_flags.
     pub application_booleans: BTreeMap<String, bool>,
     /// Every `<activity>`, in manifest order.
@@ -276,6 +282,8 @@ mod tests {
                 target_sdk: 34,
                 process_name: None,
                 application_theme: 0,
+                application_class: None,
+                app_component_factory: None,
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
                 requested_permissions: vec![],
