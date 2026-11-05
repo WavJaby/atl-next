@@ -656,6 +656,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?;
+    // the display this gate judges against: atld takes it as given and never asks the desktop
+    let rt = rt.with_display(display.to_arg());
     let work = rt.out.join("composer");
     let apk = rt.build_apk(&root.join(FIXTURE), &work.join("apk"), &[])?;
     let m = manifest::read(&rt.aapt2, &apk)?;

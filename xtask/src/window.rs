@@ -161,6 +161,8 @@ const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
 const RESIZE_STEPS: [(i32, i32, u32); 2] = [(1600, 1000, 0xA7C0_0101), (960, 600, 0xA7C0_0102)];
 /// The fixture's layout line prefix (Main.java Quadrants.onSizeChanged): `AtlWindow: size=WxH screenWidthDp=N window=WxH display=WxH`.
 const LAYOUT_LINE: &str = "AtlWindow: size=";
+/// DisplayMetrics.DENSITY_DEFAULT: density 1 (dp = px) at this dpi; density = dpi / DENSITY_DEFAULT.
+const DENSITY_DEFAULT: i32 = 160;
 /// MotionEvent.ACTION_DOWN, ACTION_UP and ACTION_MOVE (AOSP MotionEvent.java): the action of each touch the fixture logs.
 const ACTION_DOWN: u32 = 0;
 const ACTION_UP: u32 = 1;
@@ -866,7 +868,7 @@ fn frame_check(app: &str, steps: &Result<Steps, String>) -> Result<String, Strin
     Ok("readbacks at grow and shrink are the quadrants at their sizes".to_owned())
 }
 
-/// Stage `resize` sub-gate (e): the display is the monitor's at every layout, the window's bounds are the layout's size, and screenWidthDp changes with each size.
+/// Stage `resize` sub-gate (e): the display is the monitor's at every layout, the window's bounds are the layout's size, screenWidthDp changes with each size and equals the layout's px over its density.
 fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
     let want = format!("{}x{}", display.width, display.height);
     let mut sizes: Vec<&str> = Vec::new();
@@ -890,6 +892,19 @@ fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
         {
             return Err(format!(
                 "screenWidthDp stayed {dp} while the layout went {prev_size} -> {size}"
+            ));
+        }
+        // the density math, from the spec: density = dpi / DENSITY_DEFAULT, dp = px / density (exact at the gate's 160 dpi)
+        let px: i32 = size
+            .split('x')
+            .next()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(-1);
+        let want_dp = px * DENSITY_DEFAULT / display.dpi;
+        if dp.parse::<i32>().ok() != Some(want_dp) {
+            return Err(format!(
+                "screenWidthDp {dp} at layout {size}, want {want_dp} at {} dpi",
+                display.dpi
             ));
         }
         if sizes.last() != Some(&size) {
@@ -1137,22 +1152,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk | Stage::Widgets | Stage::Resize => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
-            let rt = if args.hold.is_some() {
+            if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
                 let p = start_proxy()?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
                 proxy = Some(p);
                 rt
-            };
-            if matches!(args.stage, Stage::Widgets) {
-                rt.with_display(widgets::display(display).to_arg())
-            } else {
-                rt
             }
         }
         Stage::Resume | Stage::Frames => rt,
     };
+    // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
+    let shown = if matches!(args.stage, Stage::Widgets) {
+        widgets::display(display)
+    } else {
+        display
+    };
+    let rt = rt.with_display(shown.to_arg());
     let work_dir = if args.hold.is_some() {
         "window-hold"
     } else {
@@ -1390,6 +1407,30 @@ mod tests {
         assert_eq!(odd.len(), 5 * 3 * 4);
         assert_eq!(&odd[4..8], &r, "x = 1, y = 0");
         assert_eq!(&odd[8..12], &g, "x = 2, y = 0");
+    }
+
+    /// screenWidthDp is the layout's px over its density (dpi / 160): 320 dpi is density 2, so 1280, 1600 and 960 px are 640, 800 and 480 dp; one dp off fails.
+    #[test]
+    fn screen_width_is_px_over_density() {
+        let shown = |dp: [i32; 3]| {
+            ["1280x800", "1600x961", "960x561"]
+                .iter()
+                .zip(dp)
+                .map(|(size, dp)| {
+                    format!(
+                        "AtlWindow: size={size} screenWidthDp={dp} window={size} display=1280x800"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let at_320 = DisplayModel {
+            dpi: 320,
+            ..DisplayModel::default()
+        };
+        assert!(display_check(&shown([640, 800, 480]), at_320).is_ok());
+        let err = display_check(&shown([640, 801, 480]), at_320).expect_err("801 dp");
+        assert!(err.contains("want 800"), "{err}");
     }
 
     /// The first frame of the fixture's layer must be the quadrants at the display's size. The expected digest is FNV-1a over the bytes written out here, not over quadrant_pixels.
