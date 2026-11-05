@@ -199,6 +199,12 @@ impl IWindowManager for WindowManager {
         Ok(false)
     }
 
+    /// WindowManagerService.setInTouchMode:4045: records the mode and has the dispatcher tell the display's other windows (TouchModeEvent). The caller changes its own mode locally after the call
+    /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
+    fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
+        Ok(())
+    }
+
     /// WindowManagerService.getCurrentAnimatorScale:3687-3691 with the default setting 1.0f (:1052) and animations enabled.
     fn r#getCurrentAnimatorScale(&self) -> binder::Result<f32> {
         Ok(1.0)
