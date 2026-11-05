@@ -152,6 +152,21 @@ impl<K: Clone + PartialEq, O: Clone, L> Machine<K, O, L> {
         self.find(token).map(|(_, r)| r.finishing)
     }
 
+    /// The steps a relaunch of `token` ends with (the relaunch item runs the lifecycle again). A resumed record resumes: Resume, phase Resuming, its ack awaited as any resume.
+    /// Any other record keeps its phase, so no Resume: a paused or stopped activity is not resumed by a relaunch.
+    pub fn relaunch(&mut self, token: &K) -> Vec<Step<L>> {
+        let Some((_, record)) = self.find_mut(token) else {
+            return Vec::new();
+        };
+        match record.phase {
+            Phase::Resumed | Phase::Resuming => {
+                record.phase = Phase::Resuming;
+                vec![Step::Resume]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn find(&self, token: &K) -> Option<(TaskId, &Record<K, O, L>)> {
         self.tasks.iter().find_map(|(task, records)| {
             records
@@ -448,6 +463,22 @@ mod tests {
             vec![(OTHER, vec![Step::Launch("other"), Step::Resume])]
         );
         assert_eq!(m.phase(&SPLASH), Some(Phase::Resumed));
+    }
+
+    /// A relaunch resumes a resumed record only; a paused one keeps its phase and sends no Resume.
+    #[test]
+    fn relaunch_resumes_only_a_resumed_record() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, SPLASH, APP, "splash");
+        assert_eq!(m.relaunch(&SPLASH), vec![Step::Resume]);
+        assert_eq!(m.phase(&SPLASH), Some(Phase::Resuming));
+        m.resumed(&SPLASH);
+        m.push(t, MAIN, APP, "main");
+        m.paused(&SPLASH);
+        assert!(m.relaunch(&SPLASH).is_empty());
+        assert_eq!(m.phase(&SPLASH), Some(Phase::Paused));
+        assert!(m.relaunch(&UNKNOWN).is_empty());
     }
 
     #[test]

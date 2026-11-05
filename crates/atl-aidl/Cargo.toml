@@ -59,6 +59,7 @@ types = [
     "android.os.IUserManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
+    "android.app.IActivityTaskManager",
     "android.content.pm.IPackageManager",
     "android.content.IContentService",
     "android.media.IAudioService",

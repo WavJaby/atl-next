@@ -8,6 +8,8 @@
 use crate::counters;
 use crate::packages::ActivityDecl;
 
+/// ActivityManager.START_SUCCESS: the activity is started (the record is pushed and its launch sent).
+pub const START_SUCCESS: i32 = 0;
 /// ActivityManager.START_CANCELED: Instrumentation.execStartActivity throws "Activity could not be started" (Instrumentation.java:2452).
 pub const START_CANCELED: i32 = -96;
 /// ActivityManager.START_CLASS_NOT_FOUND: the explicit component's class is not in the package.
@@ -31,7 +33,7 @@ pub enum Refusal {
 /// The activity resultTo names, as the services know its owner: the owner's uid and package, and the affinity its task has (its manifest's taskAffinity, else the package name).
 #[derive(Debug, Clone, Copy)]
 pub struct Source<'a> {
-    pub uid: i32,
+    pub uid: u32,
     pub package: &'a str,
     pub affinity: &'a str,
 }
@@ -39,7 +41,7 @@ pub struct Source<'a> {
 /// One startActivity call, as the binder interface delivers it.
 #[derive(Debug, Clone, Copy)]
 pub struct Call<'a> {
-    pub calling_uid: i32,
+    pub calling_uid: u32,
     pub calling_package: &'a str,
     pub request_code: i32,
     pub flags: i32,
@@ -62,7 +64,7 @@ fn refused(code: i32, reason: &'static str) -> Refusal {
 }
 
 /// Validates one start. Ok: the declaration of the activity to start; the caller starts it in the source's task.
-pub fn check<'a>(call: &Call<'a>, target: Target<'a>) -> Result<&'a ActivityDecl, Refusal> {
+pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<&'a ActivityDecl, Refusal> {
     let Some(source) = call.source else {
         return Err(refused(START_CANCELED, "resultTo names no activity"));
     };
@@ -120,7 +122,7 @@ mod tests {
     use super::*;
 
     const PACKAGE: &str = "org.example.app";
-    const UID: i32 = 10_123;
+    const UID: u32 = 10_123;
     const MAIN: &str = "org.example.app.MainActivity";
     const SPLASH: &str = "org.example.app.SplashActivity";
     const OTHER_PACKAGE: &str = "org.example.other";

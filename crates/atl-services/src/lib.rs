@@ -29,6 +29,8 @@ pub mod tasks;
 #[cfg(feature = "converter")]
 pub mod activity;
 #[cfg(feature = "converter")]
+pub mod activity_task;
+#[cfg(feature = "converter")]
 pub mod audio;
 #[cfg(feature = "converter")]
 pub mod content;

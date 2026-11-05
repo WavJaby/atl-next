@@ -47,6 +47,8 @@ struct Args {
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
 const ACTIVITY: &str = "activity";
+/// Context.ACTIVITY_TASK_SERVICE (Context.java:4730).
+const ACTIVITY_TASK: &str = "activity_task";
 const PACKAGE: &str = "package";
 /// Context.DISPLAY_SERVICE.
 const DISPLAY: &str = "display";
@@ -86,6 +88,11 @@ fn main() -> Result<()> {
     }
     let am = BnActivityManager::new_binder(activity.clone(), BinderFeatures::default());
     binder::add_service(ACTIVITY, am.as_binder()).context("addService activity")?;
+    binder::add_service(
+        ACTIVITY_TASK,
+        atl_services::activity_task::ActivityTaskService::new_binder(activity.activity_tasks()),
+    )
+    .context("addService activity_task")?;
     let pm = BnPackageManager::new_binder(PackageManager::new(packages), BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(DISPLAY, atl_services::display::new_binder(display))

@@ -46,6 +46,7 @@ use binder::{
     ThreadState,
 };
 
+use crate::activity_task::ActivityTasks;
 use crate::config_diff::{self, Config, Delivery};
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
@@ -54,7 +55,7 @@ use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::size_buckets::SizeBuckets;
 use crate::tasks::{TaskId, TaskSize, Tasks};
-use crate::{counters, manifest_flags, package, settings, token};
+use crate::{counters, manifest_flags, package, settings};
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -224,12 +225,68 @@ impl From<&Configuration> for Config {
 
 /// ActivityTaskSupervisor.java:1034: the ResumeActivityItem realStartActivityLocked schedules after the launch (andResume), with the same token as the launch.
 /// isForward is the launch's (the transition is forward), no compat fake focus.
-fn resume_item(token: SpIBinder) -> ResumeActivityItem {
+pub(crate) fn resume_item(token: SpIBinder) -> ResumeActivityItem {
     ResumeActivityItem {
         activity_token: Some(token),
         proc_state: PROCESS_STATE_UNKNOWN,
         is_forward: true,
         should_send_compat_fake_focus: false,
+    }
+}
+
+/// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): the MAIN / LAUNCHER intent, the global configuration, the controller
+/// every activity names. Built by activity_task when the machine's Launch step is sent.
+pub(crate) fn launch_item(
+    packages: &Packages,
+    display: &DisplayModel,
+    controller: &SpIBinder,
+    p: &PackageRecord,
+    activity: &ActivityDecl,
+    token: SpIBinder,
+    ident: i32,
+) -> LaunchActivityItem {
+    let ai = package::application_info(p, packages);
+    let intent = Intent {
+        action: Some(ACTION_MAIN.into()),
+        categories: vec![Some(CATEGORY_LAUNCHER.into())],
+        flags: FLAG_ACTIVITY_NEW_TASK,
+        component: Some(ComponentName {
+            package: p.name.clone(),
+            class: activity.name.clone(),
+        }),
+        ..Default::default()
+    };
+    let info = ActivityInfo {
+        component: ComponentInfo {
+            item: PackageItemInfo {
+                name: Some(activity.name.clone()),
+                package_name: Some(p.name.clone()),
+                ..Default::default()
+            },
+            application_info: ai,
+            process_name: Some(p.process_name().to_owned()),
+            enabled: true,
+            exported: true,
+            ..Default::default()
+        },
+        theme: activity.theme,
+        flags: manifest_flags::activity_flags(p, activity),
+        config_changes: activity.config_changes,
+        ..Default::default()
+    };
+    LaunchActivityItem {
+        activity_token: Some(token),
+        ident,
+        cur_config: Some(global_configuration(display)),
+        override_config: Some(Configuration::default()),
+        device_id: DEVICE_ID_DEFAULT,
+        proc_state: PROCESS_STATE_TOP,
+        is_forward: true,
+        activity_client_controller: Some(controller.clone()),
+        activity_window_info: Some(ActivityWindowInfo::default()),
+        intent: Some(intent),
+        info: Some(info),
+        ..Default::default()
     }
 }
 
@@ -293,8 +350,6 @@ struct State {
     processes: Vec<ProcessRecord>,
     /// ProcessList.mProcStartSeqCounter: counts from 0, pre-incremented.
     proc_start_seq_counter: i64,
-    /// System.identityHashCode(r) stand-in for LaunchActivityItem.ident
-    next_ident: i32,
     /// ActivityManagerService.mApplicationSharedMemoryReadOnlyFd's region
     shared_memory: Option<ApplicationSharedMemory>,
     /// the activities launched and attached; a configuration change reaches each through its thread (task_resized)
@@ -375,7 +430,8 @@ struct Inner {
     control: Arc<dyn ProcessControl>,
     state: Mutex<State>,
     reporter: Reporter,
-    controller: SpIBinder,
+    /// the activity lifecycle: records, launches and starts (activity_task.rs); the client controller forwards its acks here
+    atm: Arc<ActivityTasks>,
     settings: SpIBinder,
     /// the display the configuration of every started app is made from (display_model.rs)
     display: DisplayModel,
@@ -391,11 +447,11 @@ pub struct ActivityManager {
     inner: Arc<Inner>,
 }
 
-fn log(msg: std::fmt::Arguments<'_>) {
+pub(crate) fn log(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "services: {msg}");
 }
 
-fn security(msg: &str) -> Status {
+pub(crate) fn security(msg: &str) -> Status {
     Status::new_exception_str(ExceptionCode::SECURITY, Some(msg))
 }
 
@@ -427,11 +483,16 @@ impl ActivityManager {
                 )
                 .as_binder();
                 Inner {
+                    atm: Arc::new(ActivityTasks::new(
+                        Arc::clone(&packages),
+                        Arc::clone(&tasks),
+                        display,
+                        controller.clone(),
+                    )),
                     packages,
                     control,
                     state: Mutex::new(State::default()),
                     reporter: Reporter::new(),
-                    controller,
                     settings: settings::new_binder(),
                     display,
                     tasks,
@@ -456,6 +517,11 @@ impl ActivityManager {
         self.inner
             .start_process_locked(&mut st, p, p.process_name(), true, None)
             .map_err(|e| format!("starting {package}: {e}"))
+    }
+
+    /// The lifecycle the activity_task service (IActivityTaskManager) is built on.
+    pub fn activity_tasks(&self) -> Arc<ActivityTasks> {
+        Arc::clone(&self.inner.atm)
     }
 
     /// Registry set_bounds changed `task`'s size.
@@ -496,7 +562,9 @@ impl Inner {
         {
             let mut st = self.state();
             for entry in st.activities.iter_mut() {
-                if self.tasks.task_of_activity(Some(&entry.token)) != Some(task) {
+                if self.tasks.task_of_activity(Some(&entry.token)) != Some(task)
+                    || !self.atm.contains(&entry.token)
+                {
                     continue;
                 }
                 let buckets = self.buckets.get(&entry.token);
@@ -531,24 +599,22 @@ impl Inner {
                     } => {
                         counters::count(AM, "configuration change relaunch (ActivityRelaunchItem)");
                         entry.relaunching = true;
-                        vec![
-                            Some(ClientTransactionItem::ActivityRelaunch(Box::new(
-                                ActivityRelaunchItem {
-                                    activity_token: Some(entry.token.clone()),
-                                    config: Some(MergedConfiguration {
-                                        global: global_configuration(&self.display),
-                                        override_config: over.clone(),
-                                        merged: task_configuration(&self.display, size),
-                                    }),
-                                    activity_window_info: window_info(),
-                                    config_changes: changes as i32,
-                                    preserve_window,
-                                },
-                            ))),
-                            Some(ClientTransactionItem::ResumeActivity(resume_item(
-                                entry.token.clone(),
-                            ))),
-                        ]
+                        // the lifecycle items after the relaunch come from the machine: Resume only for a resumed activity
+                        let mut items = vec![Some(ClientTransactionItem::ActivityRelaunch(
+                            Box::new(ActivityRelaunchItem {
+                                activity_token: Some(entry.token.clone()),
+                                config: Some(MergedConfiguration {
+                                    global: global_configuration(&self.display),
+                                    override_config: over.clone(),
+                                    merged: task_configuration(&self.display, size),
+                                }),
+                                activity_window_info: window_info(),
+                                config_changes: changes as i32,
+                                preserve_window,
+                            }),
+                        ))];
+                        items.extend(self.atm.relaunch_items(&entry.token));
+                        items
                     }
                 };
                 entry.reported = new.clone();
@@ -634,58 +700,6 @@ impl Inner {
 
     /// realStartActivityLocked (ActivityTaskSupervisor.java:1021-1029): the LaunchActivityItem of the package's launcher activity, under `token` (the one its ResumeActivityItem carries).
     /// ActivityInfo.flags are the activity's manifest flags (manifest_flags). Not sent yet (slice 7 needs them): results, new intents, saved state; the assist / shareable / fragment tokens stay null.
-    fn launch_item(
-        &self,
-        p: &PackageRecord,
-        activity: &ActivityDecl,
-        token: SpIBinder,
-        ident: i32,
-    ) -> LaunchActivityItem {
-        let ai = package::application_info(p, &self.packages);
-        let intent = Intent {
-            action: Some(ACTION_MAIN.into()),
-            categories: vec![Some(CATEGORY_LAUNCHER.into())],
-            flags: FLAG_ACTIVITY_NEW_TASK,
-            component: Some(ComponentName {
-                package: p.name.clone(),
-                class: activity.name.clone(),
-            }),
-            ..Default::default()
-        };
-        let info = ActivityInfo {
-            component: ComponentInfo {
-                item: PackageItemInfo {
-                    name: Some(activity.name.clone()),
-                    package_name: Some(p.name.clone()),
-                    ..Default::default()
-                },
-                application_info: ai,
-                process_name: Some(p.process_name().to_owned()),
-                enabled: true,
-                exported: true,
-                ..Default::default()
-            },
-            theme: activity.theme,
-            flags: manifest_flags::activity_flags(p, activity),
-            config_changes: activity.config_changes,
-            ..Default::default()
-        };
-        LaunchActivityItem {
-            activity_token: Some(token),
-            ident,
-            cur_config: Some(global_configuration(&self.display)),
-            override_config: Some(Configuration::default()),
-            device_id: DEVICE_ID_DEFAULT,
-            proc_state: PROCESS_STATE_TOP,
-            is_forward: true,
-            activity_client_controller: Some(self.controller.clone()),
-            activity_window_info: Some(ActivityWindowInfo::default()),
-            intent: Some(intent),
-            info: Some(info),
-            ..Default::default()
-        }
-    }
-
     /// ContentProviderHelper.getContentProviderImpl's result for the settings provider: ContentProviderRecord.newHolder (ContentProviderRecord.java:89-96) with noReleaseNeeded
     /// (:75, the provider runs as the system uid) and no connection object.
     fn settings_holder(&self) -> ContentProviderHolder {
@@ -1063,7 +1077,7 @@ impl IActivityManager for ActivityManager {
         let inner = &self.inner;
         let pid = ThreadState::get_calling_pid();
         let uid = ThreadState::get_calling_uid();
-        let mut st = inner.state();
+        let st = inner.state();
         let Some(rec) = st.processes.iter().find(|r| {
             r.pid == pid && r.uid == uid && r.start_seq == start_seq && r.attached.is_some()
         }) else {
@@ -1079,8 +1093,6 @@ impl IActivityManager for ActivityManager {
         let (Some(thread), true) = (thread, launch) else {
             return Ok(());
         };
-        st.next_ident += 1;
-        let ident = st.next_ident;
         drop(st);
         let Some(p) = inner.packages.by_name(&package) else {
             return Ok(());
@@ -1088,28 +1100,19 @@ impl IActivityManager for ActivityManager {
         let Some(activity) = p.launch_activity() else {
             return Ok(());
         };
-        // one token for both items: the app keys its activity record by it. The launch starts the app's Task (a new one: no launch yet names a caller's Task), and the activity's window names it by the token (window.rs).
-        let token = token::new();
-        let task = inner.tasks.new_task(uid);
-        inner.tasks.bind_activity(token.clone(), task);
-        // the app starts with the global configuration and no override (launch_item): what it holds
+        // the launch is the lifecycle's: a new Task, the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
+        let token = inner
+            .atm
+            .launch_launcher(thread.clone(), uid, &package, activity);
         inner.state().activities.push(ActivityEntry {
-            token: token.clone(),
+            token,
             pid,
-            thread: thread.clone(),
+            thread,
             reported: Config::from(&global_configuration(&inner.display)),
             declared: manifest_flags::real_config_changes(p, activity),
             relaunching: false,
         });
-        let transaction = ClientTransaction {
-            items: vec![
-                Some(ClientTransactionItem::LaunchActivity(Box::new(
-                    inner.launch_item(p, activity, token.clone(), ident),
-                ))),
-                Some(ClientTransactionItem::ResumeActivity(resume_item(token))),
-            ],
-        };
-        thread.r#scheduleTransaction(Some(&transaction))
+        Ok(())
     }
 
     /// ActivityManagerService.getContentProvider:7074 -> ContentProviderHelper.getContentProvider:134: a null caller is a SecurityException (:137-141), as is a callingPackage not
@@ -1502,13 +1505,71 @@ impl IActivityClientController for ActivityClientController {
         token: Option<&SpIBinder>,
         _handle_splash_screen_exit: bool,
     ) -> binder::Result<()> {
-        if token.is_some() {
+        if let Some(token) = token {
             log(format_args!(
                 "activity resumed at={}",
                 counters::wall_stamp()
             ));
+            if let Some(inner) = self.inner.upgrade() {
+                inner.atm.resumed(token);
+            }
         }
         Ok(())
+    }
+
+    /// ActivityClientController.activityPaused (synchronous): the pause ack moves the record on, and what that unblocks is sent by activity_task. Counted when no record has the token.
+    fn r#activityPaused(&self, token: Option<&SpIBinder>) -> binder::Result<()> {
+        let known = match (token, self.inner.upgrade()) {
+            (Some(token), Some(inner)) => inner.atm.paused(token),
+            _ => false,
+        };
+        if !known {
+            counters::count(ACC, "activityPaused: no such activity");
+        }
+        Ok(())
+    }
+
+    /// ActivityClientController.activityStopped (oneway): the stop ack. Counted when no record has the token.
+    fn r#activityStopped(
+        &self,
+        token: Option<&SpIBinder>,
+        _state: Option<&Bundle>,
+        _persistent_state: Option<&binder::PersistableBundle>,
+        _description: Option<&atl_parcelables::java::lang::CharSequence>,
+    ) -> binder::Result<()> {
+        let known = match (token, self.inner.upgrade()) {
+            (Some(token), Some(inner)) => inner.atm.stopped(token),
+            _ => false,
+        };
+        if !known {
+            counters::count(ACC, "activityStopped: no such activity");
+        }
+        Ok(())
+    }
+
+    /// ActivityClientController.activityDestroyed (oneway): nothing to do, the record left the stack when its Destroy was sent. Counted.
+    fn r#activityDestroyed(&self, _token: Option<&SpIBinder>) -> binder::Result<()> {
+        counters::count(ACC, "activityDestroyed (the record left at its Destroy)");
+        Ok(())
+    }
+
+    /// ActivityClientController.finishActivity (synchronous): the record is finishing, true when the token names one. finishTask (finishAndRemoveTask) is not modelled: refused, counted.
+    fn r#finishActivity(
+        &self,
+        token: Option<&SpIBinder>,
+        _code: i32,
+        _data: Option<&Intent>,
+        finish_task: i32,
+    ) -> binder::Result<bool> {
+        let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
+            counters::count(ACC, "finishActivity: no token");
+            return Ok(false);
+        };
+        if finish_task != 0 {
+            counters::count(ACC, "finishActivity (finishTask not modelled: refused)");
+            return Ok(false);
+        }
+        Ok(inner.atm.finish(token))
     }
 
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
