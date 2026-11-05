@@ -110,11 +110,11 @@ impl RegisteredAgent {
     }
 
     /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
-    fn give_input_server(&self, fd: OwnedFd) -> bool {
+    fn give_input_server(&self, token: SpIBinder, fd: OwnedFd) -> bool {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
             return false;
         };
-        match agent.input_server(fd) {
+        match agent.input_server(token, fd) {
             Ok(()) => true,
             Err(e) => {
                 counters::count(
@@ -123,6 +123,19 @@ impl RegisteredAgent {
                 );
                 false
             }
+        }
+    }
+
+    /// Tells the agent the window of input channel `token` is removed (WindowState.disposeInputChannel); counted when no agent takes it.
+    fn remove_input(&self, token: SpIBinder) {
+        let Some(agent) = self.agent("remove") else {
+            return;
+        };
+        if let Err(e) = agent.remove_input(token) {
+            counters::count(
+                WINDOW_SESSION,
+                &format!("remove: UI agent refused the input removal: {e:?}"),
+            );
         }
     }
 }
@@ -135,6 +148,8 @@ struct Window {
     laid_out: bool,
     /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
     surface: Option<SurfaceControl>,
+    /// The token of the input channel the agent took; None for a window without one.
+    input: Option<SpIBinder>,
 }
 
 struct WindowManager {
@@ -305,20 +320,22 @@ impl IWindowSession for Session {
             return Ok(ADD_BAD_APP_TOKEN);
         };
         self.agent.name_task(task);
-        let channel = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
+        let (channel, input) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
             let (server, client) = open_input_pair()?;
-            // the server end is the app's: its UI agent publishes the window's input on it (no system InputDispatcher)
-            self.agent.give_input_server(server);
-            InputChannel {
+            // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
+            let token = crate::token::new();
+            // the server end is the app's: its UI agent publishes the window's input on it (no system InputDispatcher), keyed by the token as AOSP's dispatcher keys a connection
+            let given = self.agent.give_input_server(token.clone(), server);
+            let channel = InputChannel {
                 core: Some(InputChannelCore {
                     name: attrs.title.clone(),
                     fd: Arc::new(client),
-                    // InputChannel.openInputChannelPair gives both ends a token; InputChannelCore reads it non-null (libinput readStrongBinder)
-                    token: Some(crate::token::new()),
+                    token: Some(token.clone()),
                 }),
-            }
+            };
+            (channel, given.then_some(token))
         } else {
-            InputChannel::default()
+            (InputChannel::default(), None)
         };
         self.tasks.add_window(task, window.as_binder());
         self.lock().push(Window {
@@ -327,6 +344,7 @@ impl IWindowSession for Session {
             task,
             laid_out: false,
             surface: None,
+            input,
         });
         *out_input_channel = Some(channel);
         *insets_state = Some(self.insets_state());
@@ -429,15 +447,27 @@ impl IWindowSession for Session {
         Ok(result)
     }
 
-    /// WindowManagerService.removeWindow: the window leaves the session. Its input channel's server end stays with the app until the process exits (no close signal: a known gap). A window the session does not hold is nothing to remove
-    /// (AOSP does nothing for an unknown window either).
+    /// WindowManagerService.removeWindow: the window leaves the session, and its input channel leaves the app's dispatcher (WindowState.removeImmediately -> disposeInputChannel -> InputDispatcher::removeInputChannel), asked
+    /// without the windows lock. A window the session does not hold is nothing to remove (AOSP does nothing for an unknown window either).
     fn r#remove(&self, client_token: Option<&SpIBinder>) -> binder::Result<()> {
         let Some(token) = client_token else {
             counters::refused(WINDOW_SESSION, "remove: no client token");
             return Err(StatusCode::BAD_VALUE.into());
         };
-        self.lock().retain(|w| w.client != *token);
+        let removed: Vec<SpIBinder> = {
+            let mut windows = self.lock();
+            let inputs = windows
+                .iter()
+                .filter(|w| w.client == *token)
+                .filter_map(|w| w.input.clone())
+                .collect();
+            windows.retain(|w| w.client != *token);
+            inputs
+        };
         self.tasks.remove_window(token);
+        for input in removed {
+            self.agent.remove_input(input);
+        }
         Ok(())
     }
 }

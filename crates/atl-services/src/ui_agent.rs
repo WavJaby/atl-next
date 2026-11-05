@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has three transactions. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
-//! INPUT_SERVER: a window's input channel server end (an fd, ParcelFileDescriptor) in, nothing out. TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has four transactions. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
+//! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) in, nothing out.
+//! REMOVE_INPUT: a removed window's input channel token in, nothing out: the agent drops that channel (WindowState.disposeInputChannel -> InputDispatcher::removeInputChannel). TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
 //! The app serves it (atl-composer `ui_agent`: the layer in its in-process compositor, the input server end to its input thread). This module holds the protocol on both sides and the table the registry fills per uid.
 //! The window service calls it through the proxy; the server object is only ever a remote one here, so `Binder<BnUiAgent>` delegates to the native object like any AIDL interface.
 
@@ -20,18 +21,22 @@ use crate::counters;
 pub const DESCRIPTOR: &str = "atl.IUiAgent";
 /// A window's SurfaceControl: the layer name in, the SurfaceControl out.
 pub const WINDOW_SURFACE: TransactionCode = 1;
-/// A window's input channel server end in; the agent publishes the window's input on it. Nothing out.
+/// A window's input channel token and server end in; the agent publishes the window's input on it. Nothing out.
 pub const INPUT_SERVER: TransactionCode = 2;
 /// A window's Task number in (TaskId::raw); nothing out. Sent when the window is added: the agent holds the number for its SET_BOUNDS.
 pub const TASK: TransactionCode = 3;
+/// A removed window's input channel token in; the agent drops that channel. Nothing out.
+pub const REMOVE_INPUT: TransactionCode = 4;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
 pub trait IUiAgent: Interface {
     /// A window's SurfaceControl: a new layer named `layer_name` in the app's compositor (the layer's handle and client come with it).
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode>;
-    /// A window's input channel server end: the app publishes the window's input on it from now on. The agent owns the fd.
-    fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode>;
+    /// A window's input channel, by its token, and its server end: the app publishes the window's input on it from now on. The agent owns the fd.
+    fn input_server(&self, token: SpIBinder, fd: OwnedFd) -> Result<(), StatusCode>;
+    /// The window of input channel `token` is removed: the agent drops the channel, and input goes to the windows left.
+    fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode>;
     /// The Task the app's window belongs to, by its number (tasks.rs TaskId::raw): the app's bounds go to it.
     fn task(&self, task: i32) -> Result<(), StatusCode>;
 }
@@ -56,8 +61,13 @@ fn on_transact(
             Part::write(&surface, reply)
         }
         INPUT_SERVER => {
+            let token: SpIBinder = data.read()?;
             let fd: ParcelFileDescriptor = data.read()?;
-            service.input_server(fd.into())
+            service.input_server(token, fd.into())
+        }
+        REMOVE_INPUT => {
+            let token: SpIBinder = data.read()?;
+            service.remove_input(token)
         }
         TASK => {
             let task: i32 = data.read()?;
@@ -79,11 +89,20 @@ impl IUiAgent for BpUiAgent {
         <SurfaceControl as Part>::read(reply.borrowed_ref())
     }
 
-    fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode> {
+    fn input_server(&self, token: SpIBinder, fd: OwnedFd) -> Result<(), StatusCode> {
         let binder = self.as_binder();
         let mut data = binder.prepare_transact()?;
+        data.write(&token)?;
         data.write(&ParcelFileDescriptor::new(fd))?;
         binder.submit_transact(INPUT_SERVER, data, 0)?;
+        Ok(())
+    }
+
+    fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(&token)?;
+        binder.submit_transact(REMOVE_INPUT, data, 0)?;
         Ok(())
     }
 
@@ -101,8 +120,12 @@ impl IUiAgent for Binder<BnUiAgent> {
         self.0.window_surface(layer_name)
     }
 
-    fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode> {
-        self.0.input_server(fd)
+    fn input_server(&self, token: SpIBinder, fd: OwnedFd) -> Result<(), StatusCode> {
+        self.0.input_server(token, fd)
+    }
+
+    fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode> {
+        self.0.remove_input(token)
     }
 
     fn task(&self, task: i32) -> Result<(), StatusCode> {

@@ -57,9 +57,15 @@ impl IUiAgent for UiAgent {
         })
     }
 
-    fn input_server(&self, fd: OwnedFd) -> Result<(), StatusCode> {
+    fn input_server(&self, token: SpIBinder, fd: OwnedFd) -> Result<(), StatusCode> {
         self.input
-            .send(Message::Window(fd))
+            .send(Message::Window { token, fd })
+            .map_err(|_| StatusCode::DEAD_OBJECT)
+    }
+
+    fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode> {
+        self.input
+            .send(Message::WindowRemoved(token))
             .map_err(|_| StatusCode::DEAD_OBJECT)
     }
 }

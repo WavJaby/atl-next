@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Rect;
+import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Choreographer;
@@ -23,7 +24,7 @@ import java.nio.ByteBuffer;
  * Layout: each widget's rectangle in the content (`layout`), the density. Software frame: `decor` drawn into a bitmap SETTLE_FRAMES after onResume, once the default-focus ripple has ended:
  * its FNV-1a 64 digest must equal the composer's first settled readback, and the text pixels inside the TextView and EditText are non-background (`pixels`).
  * Click: the Button's OnClickListener changes the TextView text, and the next layout differs inside the TextView (`changed`).
- * Focus: a touch on the EditText focuses it. List: a drag scrolls it (`list first`).
+ * Focus: a touch on the EditText focuses it. Window: the focus starts a second activity (.Second, its own window and input channel), which finishes; a tap on the Button then still reaches Main (`click count=2`). List: a drag scrolls it (`list first`).
  * When the scroll ends, the list redraws on FRAME_CALLBACKS frame callbacks (`frame`, the cadence gate: the window fixture's lines, under real redraws); the last one logs the `final frame`, the last readback's expectation.
  */
 public class Main extends Activity {
@@ -32,6 +33,8 @@ public class Main extends Activity {
     static final int FRAME_CALLBACKS = 31;
     /** Frames from onResume to the software frame: 0.5 s at 60 Hz, past the first frames and the default-focus ripple (the first readback waits 1/3 s after them). */
     static final int SETTLE_FRAMES = 30;
+    /** Frames after Main resumes again before the probe taps: 0.2 s at 60 Hz, past Second's destroy and window removal. */
+    static final int BACK_FRAMES = 12;
 
     private int frameCallbacks;
     private int settleFrames;
@@ -43,6 +46,9 @@ public class Main extends Activity {
     private EditText input;
     private ListView list;
     private Bitmap first;
+    private boolean secondStarted;
+    private int resumes;
+    private int backFrames;
 
     // every touch the window gets, before any view takes it: the probe's evidence that a touch reached the app (`touch action=` lines)
     @Override
@@ -85,6 +91,11 @@ public class Main extends Activity {
             @Override
             public void onFocusChange(View v, boolean hasFocus) {
                 Log.i(TAG, "focus input=" + hasFocus);
+                if (hasFocus && !secondStarted) {
+                    secondStarted = true;
+                    Log.i(TAG, "window second shown");
+                    startActivity(new Intent(Main.this, Second.class));
+                }
             }
         });
         button.setOnClickListener(new View.OnClickListener() {
@@ -105,7 +116,12 @@ public class Main extends Activity {
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume reached");
-        postSettle();
+        resumes++;
+        if (resumes == 1) {
+            postSettle();
+        } else {
+            postBack();
+        }
     }
 
     /** SETTLE_FRAMES frame callbacks, then the software frame (the expectation of the first readback) and the ink inside the text fields. */
@@ -121,6 +137,21 @@ public class Main extends Activity {
                 first = render();
                 Log.i(TAG, "software frame fnv1a64=" + digest(first) + " size=" + first.getWidth() + "x" + first.getHeight());
                 Log.i(TAG, "pixels label=" + ink(first, boundsOf(label)) + " input=" + ink(first, boundsOf(input)));
+            }
+        });
+    }
+
+    /** Back from Second: BACK_FRAMES frame callbacks (Second's window is removed after Main resumes: ActivityThread destroys it, then removes its decor), then the line the probe taps after. */
+    private void postBack() {
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            @Override
+            public void doFrame(long frameTimeNanos) {
+                backFrames++;
+                if (backFrames < BACK_FRAMES) {
+                    postBack();
+                } else {
+                    Log.i(TAG, "window second closed");
+                }
             }
         });
     }

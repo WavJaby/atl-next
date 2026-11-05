@@ -5,19 +5,74 @@
 //! The publisher is not Send: the input thread owns it and takes the channels and the first-frame signal in order.
 
 use std::cell::RefCell;
+#[cfg(feature = "converter")]
 use std::os::fd::OwnedFd;
 
 use atl_platform_ui::{InputEvent, InputSource, PhysPoint, PointerButton, PointerPhase};
+#[cfg(feature = "converter")]
+use binder::SpIBinder;
 
 /// One scripted step: the phase and the position it happens at.
 pub type Step = (PointerPhase, PhysPoint);
 
-/// What the input thread takes: a window's input channel server end (from the UI agent), or the first frame reaching the compositor.
+/// What the input thread takes: a window's input channel (token + server end, from the UI agent) or its removal, an event, or the first frame reaching the compositor.
+#[cfg(feature = "converter")]
 pub enum Message {
-    Window(OwnedFd),
+    Window {
+        token: SpIBinder,
+        fd: OwnedFd,
+    },
+    /// The window of this channel token was removed (WMS removeWindow): its channel is dropped.
+    WindowRemoved(SpIBinder),
     FirstFrame,
     /// A pointer event of the UI-mode window (its `on_events`), published like a scripted one.
     Event(InputEvent),
+}
+
+/// The app's input windows, bottom to top, each by its channel key `K` with its channel `C`, and the open pointer gesture's window: the part of AOSP's InputDispatcher that picks a window.
+/// Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top). Every window is taken as touch-modal and covering the pointer
+/// (activity windows fill the Task, dialogs are touch-modal: InputDispatcher `windowAcceptsTouchAt` takes a window without FLAG_NOT_TOUCH_MODAL wherever the touch is), so the topmost window
+/// is the touched one (`findTouchedWindowAtLocked`) and the focused one. Re-check when windows carry frames and flags here (popups are FLAG_NOT_TOUCH_MODAL).
+pub struct Windows<K, C> {
+    list: Vec<(K, C)>,
+    gesture: Option<K>,
+}
+
+impl<K, C> Default for Windows<K, C> {
+    fn default() -> Self {
+        Self {
+            list: Vec::new(),
+            gesture: None,
+        }
+    }
+}
+
+impl<K: PartialEq + Clone, C> Windows<K, C> {
+    /// `key`'s channel goes on top (a key added again replaces its old channel).
+    pub fn add(&mut self, key: K, channel: C) {
+        self.remove(&key);
+        self.list.push((key, channel));
+    }
+
+    /// Drops `key`'s channel; true when it was held. A gesture on it stays open with no window: its remaining events are dropped (InputDispatcher drops a stream whose touched window is gone).
+    pub fn remove(&mut self, key: &K) -> bool {
+        let before = self.list.len();
+        self.list.retain(|(k, _)| k != key);
+        before != self.list.len()
+    }
+
+    /// The window of a pointer event, given the buttons `held` before it: with none held the event starts a gesture (or is a hover) and goes to the top window, which the gesture keeps
+    /// until its last button is released (InputDispatcher's TouchState: later windows do not take a stream already going).
+    pub fn pointer_target(&mut self, held: i32) -> Option<(&K, &mut C)> {
+        if held == 0 {
+            self.gesture = self.list.last().map(|(k, _)| k.clone());
+        }
+        let key = self.gesture.as_ref()?;
+        self.list
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(k, c)| (&*k, c))
+    }
 }
 
 /// The script's steps, in order. A bad item (kind, shape, non-finite position) refuses the whole script; an empty script has no steps.
@@ -127,8 +182,9 @@ mod publish {
 
     use atl_libinput::{MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent, PointerPhase};
+    use binder::SpIBinder;
 
-    use super::{HeadlessInput, Message, Step, held_after};
+    use super::{HeadlessInput, Message, Step, Windows, held_after};
 
     /// MotionEvent.ACTION_DOWN, ACTION_UP, ACTION_MOVE (MotionEvent.java).
     const ACTION_DOWN: i32 = 0;
@@ -187,16 +243,20 @@ mod publish {
         last.wrapping_add(1).max(1)
     }
 
-    /// The dispatch state: the window's publisher (None until its channel arrives), the gesture's down time, the last seq.
+    /// AOSP's `DEAD_OBJECT` (= `-EPIPE`, utils/Errors.h): InputPublisher's status when the window's end of the channel is closed.
+    const DEAD_OBJECT: i32 = -32;
+
+    /// The dispatch state: the windows' publishers by channel token, the gesture's down time, the last seq, the held buttons.
     #[derive(Default)]
     struct State {
-        publisher: RefCell<Option<Publisher>>,
+        windows: RefCell<Windows<SpIBinder, Publisher>>,
         down_ms: Cell<u32>,
         seq: Cell<u32>,
         buttons: Cell<i32>,
     }
 
-    /// Publishes one injected event, then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
+    /// Publishes one injected event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
+    /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
         let InputEvent::Pointer(e) = event;
         if matches!(e.phase, PointerPhase::Down(_)) {
@@ -204,16 +264,27 @@ mod publish {
         }
         let seq = next_seq(state.seq.get());
         state.seq.set(seq);
-        let buttons = held_after(state.buttons.get(), e.phase);
+        let held = state.buttons.get();
+        let buttons = held_after(held, e.phase);
         state.buttons.set(buttons);
         let event_motion = motion(&e, seq, state.down_ms.get(), buttons);
-        let mut slot = state.publisher.borrow_mut();
-        let Some(publisher) = slot.as_mut() else {
-            tracing::warn!("headless pointer: no input channel yet, event {seq} dropped");
+        let mut windows = state.windows.borrow_mut();
+        let Some((token, publisher)) = windows.pointer_target(held) else {
+            tracing::warn!("input: no window takes event {seq}, dropped");
             return;
         };
         if let Err(err) = publisher.publish_motion(&event_motion) {
-            tracing::warn!("headless pointer: publishing event {seq}: {err:?}");
+            tracing::warn!("input: publishing event {seq}: {err:?}");
+            if matches!(
+                err,
+                atl_libinput::Error::Status {
+                    status: DEAD_OBJECT,
+                    ..
+                }
+            ) {
+                let token = token.clone();
+                windows.remove(&token);
+            }
             return;
         }
         loop {
@@ -241,10 +312,13 @@ mod publish {
         let started = Instant::now();
         for message in rx {
             match message {
-                Message::Window(fd) => match Publisher::new(fd, CHANNEL) {
-                    Ok(publisher) => *state.publisher.borrow_mut() = Some(publisher),
-                    Err(err) => tracing::warn!("headless pointer: input channel refused: {err:?}"),
+                Message::Window { token, fd } => match Publisher::new(fd, CHANNEL) {
+                    Ok(publisher) => state.windows.borrow_mut().add(token, publisher),
+                    Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
                 },
+                Message::WindowRemoved(token) => {
+                    state.windows.borrow_mut().remove(&token);
+                }
                 Message::Event(event) => source.inject(event),
                 Message::FirstFrame => {
                     for &(phase, position) in &script {
@@ -361,6 +435,28 @@ mod tests {
         for bad in ["tap:1,2", "down:1", "down:1,nan", "down:a,2"] {
             assert!(parse_script(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Main (1) opens a second window (2) and closes it: events go to 2 while it is on top, to 1 again after its removal (the Calculator History bug: the last-added channel kept every event).
+    /// A gesture keeps the window it started on when another window comes up mid-gesture, and is dropped (no window) when its window goes.
+    #[test]
+    fn windows_route_to_the_top_and_keep_a_gesture() {
+        let mut w = Windows::<u32, &str>::default();
+        assert!(w.pointer_target(0).is_none());
+        w.add(1, "main");
+        w.add(2, "history");
+        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(2));
+        assert!(w.remove(&2));
+        assert!(!w.remove(&2));
+        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(1));
+        // press on 1 (held 0 before), 3 comes up, the move with the button held stays on 1
+        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(1));
+        w.add(3, "dialog");
+        assert_eq!(w.pointer_target(1).map(|(k, _)| *k), Some(1));
+        // the gesture's window goes: the rest of the gesture has no window; the next gesture starts on the top
+        w.remove(&1);
+        assert!(w.pointer_target(1).is_none());
+        assert_eq!(w.pointer_target(0).map(|(k, _)| *k), Some(3));
     }
 
     /// The headless source runs the callback set by `on_events` once per injected event; with none set an event is dropped.

@@ -2,7 +2,7 @@
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
 //! The probe presses the header bar, then taps the Button and the EditText and drags the ListView, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
 //! Sub-gates ([`SUB_NAMES`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
-//! header (the press reached the client, no touch reached Android), click, focus, list, readback (the last readback is the fixture's final frame and differs from the first),
+//! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), list, readback (the last readback is the fixture's final frame and differs from the first),
 //! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage).
 
 use std::path::Path;
@@ -21,14 +21,17 @@ use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 pub const FIXTURE: &str = "xtask/testdata/widgets";
 /// The sub-gates, in print order (each prints `window: <name>: pass|FAIL`).
 pub const SUB_NAMES: &[&str] = &[
-    "probe", "layout", "text", "header", "click", "focus", "list", "readback", "presents",
-    "cadence",
+    "probe", "layout", "text", "header", "click", "focus", "window", "list", "readback",
+    "presents", "cadence",
 ];
 /// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
 /// The fixture's line after the cadence run: the picture the last readback must show.
 const FINAL_LINE: &str = "AtlWindow: final frame";
 const CAPTURE_LINE: &str = "atl-composer: ui: capture ";
+/// The fixture's lines around its second window (activity .Second, started by the EditText's focus; `closed` once Main is back and Second's window is gone).
+const SECOND_SHOWN: &str = "AtlWindow: window second shown";
+const SECOND_CLOSED: &str = "AtlWindow: window second closed";
 /// A surface point in the header bar: below the shadow's 12 px, above the content's origin (as the gtk stage's chrome press).
 const HEADER_POINT: (f64, f64) = (100.0, 20.0);
 /// How long a fixture line may take after the injection that should cause it.
@@ -256,6 +259,23 @@ fn focus_check(app: &str) -> Result<String, String> {
     }
 }
 
+/// The fixture started and finished its second activity, and the Button tap after the close reached Main (its second click).
+fn window_check(app: &str) -> Result<String, String> {
+    let at = |needle: &str| {
+        app.find(needle)
+            .ok_or_else(|| format!("no `{needle}` line"))
+    };
+    let (shown, closed, click) = (
+        at(SECOND_SHOWN)?,
+        at(SECOND_CLOSED)?,
+        at("AtlWindow: click count=2")?,
+    );
+    if !(shown < closed && closed < click) {
+        return Err("the second click came before the second window closed".to_owned());
+    }
+    Ok("second window shown and closed; the tap after it reached Main (click 2)".to_owned())
+}
+
 fn list_check(app: &str) -> Result<String, String> {
     match list_first(app) {
         0 => Err("the drag did not scroll the list: first visible item stayed 0".to_owned()),
@@ -300,6 +320,7 @@ pub fn checks(
         header_check(app),
         click_check(app),
         focus_check(app),
+        window_check(app),
         list_check(app),
         readback_check(app),
         presents_check(app),
@@ -339,7 +360,7 @@ fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))
 }
 
-/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, drags the ListView up, and waits for the readback of the final frame.
+/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, drags the ListView up, and waits for the readback of the final frame.
 /// Each injection waits for its answer: the proxy's report for the header, the fixture's line for the rest. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
@@ -383,6 +404,10 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     wait_line(app_log, "AtlWindow: click count=1")?;
     tap(centre("input")?)?;
     wait_line(app_log, "AtlWindow: focus input=true")?;
+    // the focus opened the second window; once it is closed, a tap must reach Main again
+    wait_line(app_log, SECOND_CLOSED)?;
+    tap(centre("button")?)?;
+    wait_line(app_log, "AtlWindow: click count=2")?;
     let (x, y) = centre("list")?;
     let mut drag = vec![PointerAction::Enter { x, y }, press(true)];
     for step in 1..=SCROLL_STEPS {
