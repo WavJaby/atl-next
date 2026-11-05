@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. Its frame clock ticks the compositor ([`UiFrames::tick`], no clock thread) and its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at the display's size (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds (task_bounds.rs).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's opening size (DisplayModel::opening_size) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds (task_bounds.rs).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -22,7 +22,7 @@ const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
 /// Ticks without a new scene after which the picture counts as settled: 1/3 s at 60 Hz, longer than the gaps between the frames of one app redraw.
 const SETTLED_TICKS: u32 = 20;
 
-/// The UI thread's session: the toolkit, the compositor's frame path, the input thread, the display's size and the window once it exists.
+/// The UI thread's session: the toolkit, the compositor's frame path, the input thread, the window's opening size and the window once it exists.
 struct Session {
     ui: PlatformUi,
     frames: Arc<UiFrames>,

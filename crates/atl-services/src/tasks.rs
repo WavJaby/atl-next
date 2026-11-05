@@ -9,9 +9,6 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::display_model::DisplayModel;
 
-/// `persist.wm.debug.desktop_mode_initial_bounds_scale`'s default, in percent (DesktopModeUtils.kt:43-44: `SystemProperties.getInt(..., 75) / 100f`). The debug property is not read: no product sets it.
-const INITIAL_BOUNDS_PERCENT: i32 = 75;
-
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(i32);
@@ -97,16 +94,10 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A new Task's size: AOSP desktop mode's default bounds, `calculateDefaultDesktopTaskBounds` (Shell DesktopModeUtils.kt:49-56): each side of the display times
-    /// DESKTOP_MODE_INITIAL_BOUNDS_SCALE, truncated (`.toInt()`). Placement (centred there) is the compositor's: a toplevel has no position. Aspect-ratio and orientation rules of `calculateInitialBounds`
-    /// apply to non-resizable apps (size compat, plan density item 3b), not built.
+    /// A new Task's size: the display's opening size ([`DisplayModel::opening_size`]), the one the composer opens the window at.
     fn initial_size(&self) -> TaskSize {
-        let scale =
-            |side: i32| (f64::from(side) * f64::from(INITIAL_BOUNDS_PERCENT) / 100.0) as i32;
-        TaskSize {
-            width: scale(self.display.width).max(1),
-            height: scale(self.display.height).max(1),
-        }
+        let (width, height) = self.display.opening_size();
+        TaskSize { width, height }
     }
 
     /// A new Task of the app `owner` (its uid). The launch that starts a Task calls it once.

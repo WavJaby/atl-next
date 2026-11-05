@@ -111,9 +111,11 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         compositor: Default::default(),
     });
     let bounds = if let Some(ui) = ui {
+        // the size the services give a new Task: the window opens at it, so its first bounds report changes nothing
+        let (width, height) = display.opening_size();
         let size = PhysSize {
-            width: u32::try_from(display.width).unwrap_or(0),
-            height: u32::try_from(display.height).unwrap_or(0),
+            width: u32::try_from(width).unwrap_or(1),
+            height: u32::try_from(height).unwrap_or(1),
         };
         let frames = composer
             .start_ui(threads)
