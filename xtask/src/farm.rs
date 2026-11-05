@@ -19,10 +19,17 @@ pub fn shared_tree(layout: &Layout) -> PathBuf {
     layout.src().join("aosp")
 }
 
-/// AOSP's virtual keyboard map (`frameworks/base/data/keyboards/Virtual.kcm`): the input service loads it through atl-libinput at start, the parcel gate hands its Parcel form to its driver.
-pub fn virtual_kcm(layout: &Layout) -> PathBuf {
-    shared_tree(layout).join("frameworks/base/data/keyboards/Virtual.kcm")
+/// AOSP's keyboard files (`frameworks/base/data/keyboards`), the ones [`KEYBOARD_FILES`] lists: the input service loads the `.kcm` maps through atl-libinput at start, the app's input thread the `.kl` layout; the parcel gate hands Virtual.kcm's Parcel form to its driver.
+pub fn keyboards(layout: &Layout) -> PathBuf {
+    shared_tree(layout).join("frameworks/base/data/keyboards")
 }
+
+/// The keyboard files the runtime uses and where each goes below /system (AOSP's own places: InputDevice.cpp getInputDeviceConfigurationFilePathByName, `usr/keylayout` / `usr/keychars`).
+pub const KEYBOARD_FILES: [(&str, &str); 3] = [
+    ("Virtual.kcm", "usr/keychars"),
+    ("Generic.kcm", "usr/keychars"),
+    ("Generic.kl", "usr/keylayout"),
+];
 
 /// The AOSP tree this repo checkout builds from: `src/aosp`, or, with task copies of AOSP projects, the link farm `src-wt/<task>/aosp-tree`, regenerated on every call (stale entries removed; deleted once no task copy is left).
 /// The farm: real directories along each edited project's ancestor path; every other entry an absolute link into `src/aosp`, the edited project an absolute link to its task copy; and the manifest's link/copy files landing in a real directory as relative links through the farm (a copyfile too), so they reach a task copy as well. Absolute = leaves the tree: the converter follows only those (bp2ninja walk.go).

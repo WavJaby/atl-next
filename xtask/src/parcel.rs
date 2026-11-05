@@ -243,7 +243,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the virtual keyboard's KeyCharacterMap in Parcel form, loaded by the same atl-libinput code the input service runs
     let keymap = out.join("parcel/Virtual.kcm.parcel");
     let to_parcel = packages::bin(root, &out, "atl-libinput", "atl-kcm-parcel")?;
-    let kcm = farm::virtual_kcm(&Layout::of(root)?);
+    let kcm = farm::keyboards(&Layout::of(root)?).join("Virtual.kcm");
     let status = Command::new(&to_parcel)
         .arg(&kcm)
         .arg(&keymap)

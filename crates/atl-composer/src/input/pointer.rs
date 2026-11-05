@@ -9,7 +9,7 @@
 //!   Android flings from the finger's own velocity (handleFling ignores the library's), so no fling is synthesized here.
 
 use atl_platform_ui::{InputEvent, PhysPoint, PointerButton, PointerPhase, ScrollKind};
-use atl_services::input_devices::{POINTER, SOURCE_MOUSE};
+use atl_services::input_devices::{POINTER, SOURCE_MOUSE, TOUCHPAD};
 
 /// MotionEvent actions (NDK input.h AMOTION_EVENT_ACTION_*).
 pub const ACTION_DOWN: i32 = 0;
@@ -151,7 +151,8 @@ impl Pointer {
         time_ms: u32,
     ) -> Motion {
         Motion {
-            device_id: POINTER,
+            // the touchpad's own gesture: GestureConverter reports its device's id
+            device_id: TOUCHPAD,
             action,
             action_button: 0,
             button_state: 0,
@@ -306,8 +307,8 @@ impl Pointer {
             }
             // window focus is the dispatcher's, not the pointer's
             InputEvent::Focus(_) => {}
-            // touch contacts are the touchscreen's (touch.rs)
-            InputEvent::Touch(_) => {}
+            // touch contacts are the touchscreen's (touch.rs), keys the keyboard's (key.rs)
+            InputEvent::Touch(_) | InputEvent::Key(_) => {}
         }
         out
     }
@@ -447,9 +448,10 @@ mod tests {
                 down.source,
                 down.first().tool_type,
                 down.classification,
-                down.flags
+                down.flags,
+                down.device_id
             ),
-            (0x2002, 1, 3, 0x8)
+            (0x2002, 1, 3, 0x8, TOUCHPAD)
         );
         assert_eq!(down.first().at, P);
         assert_eq!(down.first().axes, vec![(2, 1.0)]);

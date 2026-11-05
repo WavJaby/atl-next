@@ -10,6 +10,8 @@
 #include <input/InputConsumer.h>
 #include <input/InputTransport.h>
 #include <input/KeyCharacterMap.h>
+#include <input/KeyLayoutMap.h>
+#include <input/Keyboard.h>
 
 namespace atl::input {
 
@@ -67,6 +69,14 @@ public:
     std::shared_ptr<android::KeyCharacterMap> map;
 };
 
+// A KeyLayoutMap (.kl) as libinput loaded it.
+class KeyLayoutMap {
+public:
+    explicit KeyLayoutMap(std::shared_ptr<android::KeyLayoutMap> map);
+
+    std::shared_ptr<android::KeyLayoutMap> map;
+};
+
 std::unique_ptr<Message> new_message();
 // fd: one SEQPACKET end, owned from here on; null when AOSP refuses the channel.
 std::unique_ptr<Publisher> new_publisher(int32_t fd, rust::Str name);
@@ -83,5 +93,14 @@ int32_t finish(Consumer& consumer, uint32_t seq, bool handled);
 
 std::unique_ptr<KeyCharacterMap> load_kcm(rust::Str file_name, rust::Slice<const uint8_t> contents);
 rust::Vec<uint8_t> kcm_parcel_bytes(const KeyCharacterMap& map);
+
+// KeyLayoutMap::load of the file at `path`; null when libinput refuses it.
+std::unique_ptr<KeyLayoutMap> load_key_layout(rust::Str path);
+// KeyLayoutMap::mapKey(scan_code, usage 0): the status; the keycode and policy flags go to the out parameters.
+int32_t map_key(const KeyLayoutMap& map, int32_t scan_code, int32_t& key_code, uint32_t& flags);
+// android::updateMetaState (input/Keyboard.h).
+int32_t update_meta_state(int32_t key_code, bool down, int32_t old_meta_state);
+// android::normalizeMetaState (input/Keyboard.h).
+int32_t normalize_meta_state(int32_t meta_state);
 
 }  // namespace atl::input

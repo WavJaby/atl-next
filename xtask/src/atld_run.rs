@@ -40,7 +40,7 @@ pub struct Runtime {
     framework_res: PathBuf,
     font_xml: PathBuf,
     font_file: PathBuf,
-    /// AOSP's Virtual.kcm, linked into /system/usr/keychars (the input service loads it).
+    /// AOSP's keyboards dir: its [`farm::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
@@ -217,8 +217,11 @@ impl Runtime {
         std::fs::write(&font_xml, FONT_FALLBACK_XML)?;
         let font_file = farm::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
         ensure!(font_file.is_file(), "missing input {}", font_file.display());
-        let keychars = farm::virtual_kcm(&layout);
-        ensure!(keychars.is_file(), "missing input {}", keychars.display());
+        let keychars = farm::keyboards(&layout);
+        for (file, _) in farm::KEYBOARD_FILES {
+            let path = keychars.join(file);
+            ensure!(path.is_file(), "missing input {}", path.display());
+        }
         let native_bridge = crate::cdylib::stage(
             root,
             &out,
@@ -472,11 +475,12 @@ impl Runtime {
             .arg(format!("{}=etc/font_fallback.xml", self.font_xml.display()))
             .arg("--system-file")
             .arg(format!("{}=fonts/{FONT_FILE}", self.font_file.display()))
-            .arg("--system-file")
-            .arg(format!(
-                "{}=usr/keychars/Virtual.kcm",
-                self.keychars.display()
-            ))
+            .args(farm::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
+                [
+                    "--system-file".to_owned(),
+                    format!("{}={dir}/{file}", self.keychars.join(file).display()),
+                ]
+            }))
             .args(["--first-uid", &run.first_uid.to_string()])
             .args(["--log-tags", &run.log_tags]);
         if let Some(script) = &self.headless_pointer {

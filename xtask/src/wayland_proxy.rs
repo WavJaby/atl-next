@@ -55,7 +55,9 @@ const XDG_SURFACE_CONFIGURE: u16 = 0;
 const XDG_STATE_ACTIVATED: u32 = 4;
 const WL_SEAT: &str = "wl_seat";
 const WL_SEAT_GET_POINTER: u16 = 0;
+const WL_SEAT_GET_KEYBOARD: u16 = 1;
 const WL_SEAT_GET_TOUCH: u16 = 2;
+const WL_KEYBOARD_KEY: u16 = 3;
 /// `wl_seat.capabilities(caps)`, event 0; the touch bit (wayland.xml `wl_seat.capability`).
 const WL_SEAT_CAPABILITIES: u16 = 0;
 const SEAT_CAP_TOUCH: u32 = 4;
@@ -136,6 +138,8 @@ struct Ids {
     interfaces: HashMap<u32, String>,
     /// The client's `wl_pointer` (from `wl_seat.get_pointer`).
     pointer: Option<u32>,
+    /// The client's `wl_keyboard` (from `wl_seat.get_keyboard`): the compositor's, [`Proxy::inject_key`] writes on it.
+    keyboard: Option<u32>,
     /// The client's `wl_touch`, the proxy's own (see [`Proxy::inject_touch`]).
     touch: Option<u32>,
     /// The version the client bound `wl_seat` at, which its `wl_pointer` inherits: events newer than it must not be sent.
@@ -194,6 +198,10 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         let pointer = word(body, 0)?;
         ids.interfaces.insert(pointer, WL_POINTER.to_owned());
         ids.pointer = Some(pointer);
+        return None;
+    }
+    if ids.interfaces.get(&object).is_some_and(|i| i == WL_SEAT) && opcode == WL_SEAT_GET_KEYBOARD {
+        ids.keyboard = word(body, 0);
         return None;
     }
     if ids.interfaces.get(&object).is_some_and(|i| i == WL_SEAT) && opcode == WL_SEAT_GET_TOUCH {
@@ -322,6 +330,11 @@ enum Injection {
         action: PointerAction,
         time_ms: u32,
     },
+    Key {
+        code: u32,
+        pressed: bool,
+        time_ms: u32,
+    },
     Configure {
         width: i32,
         height: i32,
@@ -385,6 +398,16 @@ impl Proxy {
     pub fn inject_touch(&self, action: TouchAction) -> Result<()> {
         let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
         self.queue(Injection::Touch { action, time_ms })
+    }
+
+    /// Queues `wl_keyboard.key` of linux input `code` (KEY_A = 30) on the client's keyboard, which must hold focus (the window active: the compositor sent `enter`). Only the key: no `modifiers` event, so the client's xkb state does not see it as a modifier (the Android side derives meta from key transitions). The client's own repeat (`repeat_info`) runs while a key is held.
+    pub fn inject_key(&self, code: u32, pressed: bool) -> Result<()> {
+        let time_ms = u32::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.queue(Injection::Key {
+            code,
+            pressed,
+            time_ms,
+        })
     }
 
     /// Queues an xdg-shell configure of the window: `xdg_toplevel.configure(width, height, activated)`, then `xdg_surface.configure(serial)`, the order a compositor sends them.
@@ -598,11 +621,12 @@ fn server_to_client(
         if items.is_empty() {
             continue;
         }
-        let (wm_base, pointer, touch, surface, toplevel, xdg_surface, seat_version) = {
+        let (wm_base, pointer, keyboard, touch, surface, toplevel, xdg_surface, seat_version) = {
             let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
             (
                 ids.id_of(WM_BASE),
                 ids.pointer,
+                ids.keyboard,
                 ids.touch,
                 ids.surface,
                 ids.toplevel,
@@ -661,6 +685,28 @@ fn server_to_client(
                         eprintln!(
                             "wayland proxy: {action:?} dropped, the client has no touch and window surface yet"
                         );
+                        continue;
+                    }
+                },
+                Injection::Key {
+                    code,
+                    pressed,
+                    time_ms,
+                } => match keyboard {
+                    // serial = timestamp, as for the pointer; state 1 pressed, 0 released
+                    Some(keyboard) => event(
+                        keyboard,
+                        WL_KEYBOARD_KEY,
+                        &[
+                            time_ms.to_ne_bytes(),
+                            time_ms.to_ne_bytes(),
+                            code.to_ne_bytes(),
+                            u32::from(pressed).to_ne_bytes(),
+                        ]
+                        .concat(),
+                    ),
+                    None => {
+                        eprintln!("wayland proxy: key {code} dropped, the client has no keyboard");
                         continue;
                     }
                 },

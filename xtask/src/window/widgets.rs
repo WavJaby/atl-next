@@ -76,6 +76,11 @@ const ACTION_SCROLL: u32 = 8;
 const ACTION_HOVER_ENTER: u32 = 9;
 const ACTION_HOVER_EXIT: u32 = 10;
 const CLASS_SWIPE: u32 = 3;
+/// The keys the probe types (linux input codes, input-event-codes.h): Shift+A, a, then A held past the desktop's repeat delay.
+const KEY_A: u32 = 30;
+const KEY_LEFTSHIFT: u32 = 42;
+/// How long A is held: past labwc's default repeat delay (600 ms, wlroots keyboard default) plus a few repeats at its 25 Hz.
+const KEY_HOLD: Duration = Duration::from_millis(1000);
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +171,91 @@ fn cursor_check(app: &str) -> Result<String, String> {
         return Err("cursor lines out of order: want text then arrow, each then set".to_owned());
     }
     Ok("EditText -> text, back on the Button -> arrow, both set on the window".to_owned())
+}
+
+/// One `key action=` line of the fixture (Main.dispatchKeyEvent) as (action, code, scan, meta, repeat, flags, device, source, char, kbtype).
+fn key_line(line: &str) -> Option<[i64; 10]> {
+    let (_, rest) = line.split_once("AtlWindow: key ")?;
+    let mut out = [0; 10];
+    for (slot, name) in out.iter_mut().zip([
+        "action", "code", "scan", "meta", "repeat", "flags", "device", "source", "char", "kbtype",
+    ]) {
+        *slot = word(rest, name)?.parse().ok()?;
+    }
+    Some(out)
+}
+
+/// The keys the probe typed reached Main as AOSP would make them, and the device list has the physical keyboard and the touchpad.
+/// Expected values, all from AOSP sources: Generic.kl `key 30 A`, `key 42 SHIFT_LEFT`; KeyEvent KEYCODE_A 29, KEYCODE_SHIFT_LEFT 59, META_SHIFT_ON | META_SHIFT_LEFT_ON = 0x41, FLAG_LONG_PRESS 0x80;
+/// Generic.kcm `key A { base: 'a' shift, capslock: 'A' }` -> char 97 / 65, `type FULL` -> kbtype 4 (KeyCharacterMap.FULL); InputDevice SOURCE_KEYBOARD 0x101, SOURCE_MOUSE | SOURCE_TOUCHPAD = 0x2002 | 0x100008, KEYBOARD_TYPE_ALPHABETIC 2.
+/// Device ids are atl-services input_devices' (keyboard 2, touchpad 4).
+fn keys_check(app: &str) -> Result<String, String> {
+    let (keyboard, touchpad) = (
+        i64::from(input_devices::KEYBOARD),
+        i64::from(input_devices::TOUCHPAD),
+    );
+    for want in [
+        format!("AtlWindow: device id={keyboard} sources=257 kbtype=2"),
+        format!(
+            "AtlWindow: device id={touchpad} sources={}",
+            0x2002 | 0x10_0008
+        ),
+    ] {
+        if !app.contains(&want) {
+            return Err(format!("no `{want}` line"));
+        }
+    }
+    let keys: Vec<[i64; 10]> = app.lines().filter_map(key_line).collect();
+    if let Some(k) = keys.iter().find(|k| k[6] != keyboard || k[7] != 0x101) {
+        return Err(format!(
+            "key from device {} source {:#x}, want {keyboard} 0x101",
+            k[6], k[7]
+        ));
+    }
+    // (action, code, scan, meta, char) of the downs, repeats aside
+    let downs: Vec<(i64, i64, i64, i64)> = keys
+        .iter()
+        .filter(|k| k[0] == 0 && k[4] == 0)
+        .map(|k| (k[1], k[2], k[3], k[8]))
+        .collect();
+    let want_downs = [
+        (59, 42, 0x41, 0),
+        (29, 30, 0x41, 65),
+        (29, 30, 0, 97),
+        (29, 30, 0, 97),
+    ];
+    if downs != want_downs {
+        return Err(format!(
+            "first downs (code, scan, meta, char) {downs:?}, want {want_downs:?}"
+        ));
+    }
+    if let Some(k) = keys.iter().find(|k| k[1] == 29 && k[9] != 4) {
+        return Err(format!(
+            "A read through a map of type {}, want FULL 4 (Generic.kcm)",
+            k[9]
+        ));
+    }
+    let repeats: Vec<(i64, i64)> = keys
+        .iter()
+        .filter(|k| k[4] > 0)
+        .map(|k| (k[4], k[5] & 0x80))
+        .collect();
+    match repeats.first() {
+        Some(&(1, 0x80)) => {}
+        _ => {
+            return Err(format!(
+                "repeats (count, long-press flag) {repeats:?}, want the first (1, 0x80)"
+            ));
+        }
+    }
+    let ups = keys.iter().filter(|k| k[0] == 1).count();
+    if ups != want_downs.len() {
+        return Err(format!("{ups} key ups, want {}", want_downs.len()));
+    }
+    Ok(format!(
+        "Shift+A -> 'A' meta 0x41, a -> 'a', held A repeated {} times (first long-press); keyboard {keyboard} and touchpad {touchpad} listed",
+        repeats.len()
+    ))
 }
 
 /// The hover the probe makes over the list: HOVER_ENTER (9), HOVER_MOVE (7), HOVER_EXIT (10) in that order with no touch in between (input.h codes). A tap's enter is exited by its press, with no move: only the hover makes a 7.
@@ -563,6 +653,7 @@ pub fn checks(
         ("window", window_check(app)),
         ("window-focus", window_focus_check(app)),
         ("cursor", cursor_check(app)),
+        ("keys", keys_check(app)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
@@ -675,6 +766,22 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         ],
     )?;
     wait_until(app_log, LINE_WAIT, |t| cursor_check(t).is_ok());
+    // keys: Shift+A, a, then a held A (the client's own repeat runs while it is down)
+    let key = |code: u32, pressed: bool| proxy.inject_key(code, pressed).map_err(|e| e.to_string());
+    for (code, pressed) in [
+        (KEY_LEFTSHIFT, true),
+        (KEY_A, true),
+        (KEY_A, false),
+        (KEY_LEFTSHIFT, false),
+        (KEY_A, true),
+        (KEY_A, false),
+        (KEY_A, true),
+    ] {
+        key(code, pressed)?;
+    }
+    std::thread::sleep(KEY_HOLD);
+    key(KEY_A, false)?;
+    wait_until(app_log, LINE_WAIT, |t| keys_check(t).is_ok());
     let (x, y) = centre("list")?;
     // hover, wheel and swipe over the list: each waits for its own check, and a miss leaves that check to fail alone (the drag and the cadence run after it still run)
     inject(

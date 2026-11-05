@@ -16,6 +16,8 @@ pub(crate) mod ffi {
         pub type Message;
         /// AOSP KeyCharacterMap.
         pub type KeyCharacterMap;
+        /// AOSP KeyLayoutMap.
+        pub type KeyLayoutMap;
 
         pub fn new_message() -> UniquePtr<Message>;
         /// 0 none, 1 key, 2 motion, 3 finished signal, 4 other message.
@@ -101,5 +103,19 @@ pub(crate) mod ffi {
         pub fn load_kcm(file_name: &str, contents: &[u8]) -> UniquePtr<KeyCharacterMap>;
         /// KeyCharacterMap::writeToParcel: the Parcel bytes.
         pub fn kcm_parcel_bytes(map: &KeyCharacterMap) -> Vec<u8>;
+
+        /// KeyLayoutMap::load of the file at `path`; null when libinput refuses it.
+        pub fn load_key_layout(path: &str) -> UniquePtr<KeyLayoutMap>;
+        /// KeyLayoutMap::mapKey(scan_code, usage 0): the status; keycode and policy flags into the out parameters.
+        pub fn map_key(
+            map: &KeyLayoutMap,
+            scan_code: i32,
+            key_code: &mut i32,
+            flags: &mut u32,
+        ) -> i32;
+        /// android::updateMetaState.
+        pub fn update_meta_state(key_code: i32, down: bool, old_meta_state: i32) -> i32;
+        /// android::normalizeMetaState.
+        pub fn normalize_meta_state(meta_state: i32) -> i32;
     }
 }

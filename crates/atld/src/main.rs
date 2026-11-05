@@ -762,10 +762,10 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
-    // the virtual keyboard's map is a /system file (`--system-file`, usr/keychars); the services read it where it lies in the root
+    // the key maps are /system files (`--system-file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([
         "--keychars".into(),
-        r.system().join("usr/keychars/Virtual.kcm").into_os_string(),
+        r.system().join("usr/keychars").into_os_string(),
     ]);
     let mut services = host
         .broker

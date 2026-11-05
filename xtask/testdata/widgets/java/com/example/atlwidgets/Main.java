@@ -66,6 +66,23 @@ public class Main extends Activity {
         return super.dispatchTouchEvent(e);
     }
 
+    // every key the window gets (`key action=` lines): the KeyEvent's fields, the character its device's map gives (getUnicodeChar -> KeyCharacterMap.load(deviceId)), that map's keyboard type (FULL 4)
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent e) {
+        Log.i(TAG, "key action=" + e.getAction() + " code=" + e.getKeyCode() + " scan=" + e.getScanCode() + " meta=" + e.getMetaState()
+                + " repeat=" + e.getRepeatCount() + " flags=" + e.getFlags() + " device=" + e.getDeviceId() + " source=" + e.getSource()
+                + " char=" + e.getUnicodeChar() + " kbtype=" + e.getKeyCharacterMap().getKeyboardType());
+        return super.dispatchKeyEvent(e);
+    }
+
+    // the device list (`device id=` lines, once at onResume): ids and sources as InputManager reports them
+    static void logDevices() {
+        for (int id : android.view.InputDevice.getDeviceIds()) {
+            android.view.InputDevice d = android.view.InputDevice.getDevice(id);
+            Log.i(TAG, "device id=" + id + " sources=" + d.getSources() + " kbtype=" + d.getKeyboardType());
+        }
+    }
+
     // hover and wheel events (`generic action=` lines): HOVER_ENTER 9, HOVER_MOVE 7, HOVER_EXIT 10, SCROLL 8 with its AXIS_VSCROLL
     @Override
     public boolean dispatchGenericMotionEvent(android.view.MotionEvent e) {
@@ -136,6 +153,7 @@ public class Main extends Activity {
         Log.i(TAG, "onResume reached");
         resumes++;
         if (resumes == 1) {
+            logDevices();
             postSettle();
         } else {
             postBack();

@@ -95,6 +95,12 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         out
     }
 
+    /// The focused window's channel (keys go there), if one is focused and still held.
+    pub fn focused_channel(&mut self) -> Option<&mut C> {
+        let key = self.focused.clone()?;
+        self.channel(&key)
+    }
+
     /// The channel of `key`, if held.
     pub fn channel(&mut self, key: &K) -> Option<&mut C> {
         self.list.iter_mut().find(|(k, _)| k == key).map(|(_, c)| c)
@@ -172,6 +178,7 @@ impl InputSource for HeadlessInput {
     }
 }
 
+pub mod key;
 pub mod pointer;
 pub mod touch;
 
@@ -187,10 +194,11 @@ mod publish {
     use std::thread;
     use std::time::Instant;
 
-    use atl_libinput::{MotionEvent, Pointer, Publisher};
+    use atl_libinput::{KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent};
     use binder::SpIBinder;
 
+    use super::key::{self, Key};
     use super::pointer::{self, Motion};
     use super::touch;
     use super::{HeadlessInput, Message, Step, Windows};
@@ -202,8 +210,30 @@ mod publish {
     /// The channel's name in AOSP's logs.
     const CHANNEL: &str = "atl-headless-pointer";
 
-    /// `m` as the MotionEvent numbered `seq`, identity transform.
-    fn motion(m: &Motion, seq: u32) -> MotionEvent {
+    /// AOSP's key layout of a keyboard with no own files (KeyMap::load's Generic fallback), where the environment links it.
+    const KEY_LAYOUT: &str = "/system/usr/keylayout/Generic.kl";
+
+    /// `k` as the KeyEvent numbered `seq`.
+    fn key_event(k: &Key, seq: u32) -> KeyEvent {
+        KeyEvent {
+            seq,
+            event_id: i32::try_from(seq).unwrap_or(i32::MAX),
+            device_id: k.device_id,
+            source: k.source,
+            display_id: DISPLAY_ID,
+            action: k.action,
+            flags: k.flags,
+            key_code: k.key_code,
+            scan_code: k.scan_code,
+            meta_state: k.meta_state,
+            repeat_count: k.repeat_count,
+            down_time: i64::from(k.down_ms) * NANOS_PER_MS,
+            event_time: i64::from(k.time_ms) * NANOS_PER_MS,
+        }
+    }
+
+    /// `m` as the MotionEvent numbered `seq` with the keyboard's `meta_state`, identity transform.
+    fn motion(m: &Motion, seq: u32, meta_state: i32) -> MotionEvent {
         MotionEvent {
             seq,
             event_id: i32::try_from(seq).unwrap_or(i32::MAX),
@@ -214,8 +244,7 @@ mod publish {
             action_button: m.action_button,
             flags: m.flags,
             edge_flags: 0,
-            // no keyboard yet: no modifier can be down (the keys step publishes the meta state)
-            meta_state: 0,
+            meta_state,
             button_state: m.button_state,
             classification: m.classification,
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -248,23 +277,70 @@ mod publish {
     /// AOSP's `DEAD_OBJECT` (= `-EPIPE`, utils/Errors.h): InputPublisher's status when the window's end of the channel is closed.
     const DEAD_OBJECT: i32 = -32;
 
-    /// The dispatch state: the windows' publishers by channel token, the pointer, the last seq.
+    /// The dispatch state: the windows' publishers by channel token, the pointer, the keyboard and its layout (None: Generic.kl not loadable, keys dropped), the last seq.
     #[derive(Default)]
     struct State {
         windows: RefCell<Windows<SpIBinder, Publisher>>,
         pointer: RefCell<pointer::Pointer>,
         touch: RefCell<touch::Touch>,
+        keys: RefCell<key::Keys>,
+        layout: Option<KeyLayoutMap>,
         seq: Cell<u32>,
     }
 
-    /// Publishes the MotionEvents of one event to its window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
+    /// Publishes `keys` to the focused window (InputDispatcher sends keys to the focused window, none while the desktop window is inactive).
+    fn publish_keys(state: &State, keys: &[Key]) {
+        let mut windows = state.windows.borrow_mut();
+        let Some(publisher) = windows.focused_channel() else {
+            tracing::warn!(
+                "input: no focused window takes {} key(s), dropped",
+                keys.len()
+            );
+            return;
+        };
+        for k in keys {
+            let seq = next_seq(state.seq.get());
+            state.seq.set(seq);
+            if let Err(err) = publisher.publish_key(&key_event(k, seq)) {
+                tracing::warn!("input: publishing key {seq}: {err:?}");
+                return;
+            }
+        }
+    }
+
+    /// Publishes the events of one platform event: keys to the focused window, MotionEvents to the pointer's window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
     /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
         if let InputEvent::Focus(active) = event {
+            if !active {
+                // the window keeps its focus until its held keys are cancelled
+                let cancels = state
+                    .keys
+                    .borrow_mut()
+                    .cancel(atl_libinput::update_meta_state);
+                publish_keys(state, &cancels);
+            }
             state.windows.borrow_mut().set_active(active);
             publish_focus(state);
             return;
         }
+        if let InputEvent::Key(e) = event {
+            let Some(layout) = &state.layout else {
+                return;
+            };
+            let map = |scan: u32| {
+                layout
+                    .map_key(i32::try_from(scan).ok()?)
+                    .map(|(code, _)| code)
+            };
+            let k = state
+                .keys
+                .borrow_mut()
+                .translate(e, map, atl_libinput::update_meta_state);
+            publish_keys(state, k.as_slice());
+            return;
+        }
+        let meta_state = state.keys.borrow().meta_state();
         let mut pointer = state.pointer.borrow_mut();
         let mut touch = state.touch.borrow_mut();
         // one window holds every open gesture: InputDispatcher keeps a touched window per device, and all devices here start on the same top window
@@ -284,7 +360,7 @@ mod publish {
         for m in &motions {
             let seq = next_seq(state.seq.get());
             state.seq.set(seq);
-            if let Err(err) = publisher.publish_motion(&motion(m, seq)) {
+            if let Err(err) = publisher.publish_motion(&motion(m, seq, meta_state)) {
                 tracing::warn!("input: publishing event {seq}: {err:?}");
                 if matches!(
                     err,
@@ -334,7 +410,15 @@ mod publish {
 
     /// The input thread: takes each window's channel, and at the first frame injects the script through the headless source. The publisher stays on this thread (it is not Send).
     fn dispatch(rx: Receiver<Message>, script: Vec<Step>) {
-        let state = Rc::new(State::default());
+        let layout = KeyLayoutMap::load(KEY_LAYOUT)
+            .inspect_err(|err| {
+                tracing::warn!("input: key layout {KEY_LAYOUT}: {err:?}; keys dropped")
+            })
+            .ok();
+        let state = Rc::new(State {
+            layout,
+            ..State::default()
+        });
         let source = HeadlessInput::default();
         let publish_state = Rc::clone(&state);
         source.on_events(move |event| publish(&publish_state, event));

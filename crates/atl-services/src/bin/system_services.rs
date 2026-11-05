@@ -40,7 +40,7 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
-    /// AOSP's keychars/Virtual.kcm: loaded through libinput at start; its Parcel form goes with every InputDevice.
+    /// AOSP's keychars directory (/system/usr/keychars): Virtual.kcm (the virtual keyboard's map, also carried by the pointer devices) and Generic.kcm (the physical keyboard's), loaded through libinput at start.
     #[arg(long)]
     keychars: PathBuf,
 }
@@ -120,17 +120,21 @@ fn main() -> Result<()> {
     binder::add_service(MOUNT, atl_services::storage::new_binder()).context("addService mount")?;
     binder::add_service(CLIPBOARD, atl_services::clipboard::new_binder())
         .context("addService clipboard")?;
-    let contents =
-        std::fs::read(&a.keychars).with_context(|| format!("reading {}", a.keychars.display()))?;
-    let name = a
-        .keychars
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("the key map's file name")?;
-    let map = atl_libinput::KeyCharacterMap::load(name, &contents)
-        .with_context(|| format!("loading {}", a.keychars.display()))?;
-    let input = atl_services::input::new_binder(&map.parcel_bytes(), Arc::clone(&agents))
-        .map_err(anyhow::Error::msg)?;
+    // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load)
+    let kcm = |name: &str| -> anyhow::Result<Vec<u8>> {
+        let path = a.keychars.join(name);
+        let contents =
+            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let map = atl_libinput::KeyCharacterMap::load(name, &contents)
+            .with_context(|| format!("loading {}", path.display()))?;
+        Ok(map.parcel_bytes())
+    };
+    let input = atl_services::input::new_binder(
+        &kcm("Virtual.kcm")?,
+        &kcm("Generic.kcm")?,
+        Arc::clone(&agents),
+    )
+    .map_err(anyhow::Error::msg)?;
     binder::add_service(INPUT, input).context("addService input")?;
     binder::add_service(
         compositor_registry::SERVICE,

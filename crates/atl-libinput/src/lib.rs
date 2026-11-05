@@ -318,3 +318,36 @@ impl KeyCharacterMap {
         ffi::kcm_parcel_bytes(&self.0)
     }
 }
+
+/// AOSP's KeyLayoutMap: linux scan codes to Android keycodes, from a `.kl` file.
+pub struct KeyLayoutMap(cxx::UniquePtr<ffi::KeyLayoutMap>);
+
+impl KeyLayoutMap {
+    /// KeyLayoutMap::load of the file at `path` (libinput reads it).
+    pub fn load(path: &str) -> Result<Self, Error> {
+        let map = ffi::load_key_layout(path);
+        if map.is_null() {
+            return Err(Error::Null {
+                call: "KeyLayoutMap::load",
+            });
+        }
+        Ok(Self(map))
+    }
+
+    /// The keycode and policy flags of `scan_code` (KeyLayoutMap::mapKey, no HID usage); None for a code the layout does not list.
+    pub fn map_key(&self, scan_code: i32) -> Option<(i32, u32)> {
+        let (mut key_code, mut flags) = (0, 0);
+        (ffi::map_key(&self.0, scan_code, &mut key_code, &mut flags) == OK)
+            .then_some((key_code, flags))
+    }
+}
+
+/// android::updateMetaState: the meta state after `key_code` went down or up (modifier bits set or cleared, lock bits toggled on down), normalized.
+pub fn update_meta_state(key_code: i32, down: bool, old_meta_state: i32) -> i32 {
+    ffi::update_meta_state(key_code, down, old_meta_state)
+}
+
+/// android::normalizeMetaState: the side bits imply the generic one (SHIFT_LEFT_ON -> SHIFT_ON).
+pub fn normalize_meta_state(meta_state: i32) -> i32 {
+    ffi::normalize_meta_state(meta_state)
+}

@@ -134,8 +134,12 @@ pub fn stage(
     test_root: &Path,
 ) -> Result<Vec<String>> {
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
-    let keychars = farm::virtual_kcm(&Layout::of(root)?);
-    ensure!(keychars.is_file(), "missing input {}", keychars.display());
+    // the services read their .kcm maps from one directory: AOSP's keyboards dir holds both
+    let keychars = farm::keyboards(&Layout::of(root)?);
+    for (file, _) in farm::KEYBOARD_FILES {
+        let path = keychars.join(file);
+        ensure!(path.is_file(), "missing input {}", path.display());
+    }
     let client = packages::bin(root, out, PACKAGE, "atl-services-client")?;
     let services_log = test_root.join("services.log");
     // the installed package, as atld's install step would write it

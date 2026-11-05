@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use atl_platform_ui_api::{
-    Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Monitor, PhysSize,
+    Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Locks, Monitor, PhysSize,
     PointerPhase, PresentError, Scale, Scene, TouchPhase, UiError, Window, WindowAttributes,
 };
 use gtk4::glib::translate::ToGlibPtr;
@@ -265,6 +265,32 @@ impl GtkWindow {
         });
         view.add_controller(legacy);
     }
+
+    /// Keys of the toplevel (the window has keyboard focus): presses, GDK's synthesized repeats (the desktop's `repeat_info`), releases. The IME item puts its GtkIMContext on this controller, so keys it consumes never arrive here.
+    fn wire_keys(window: &gtk4::Window, shared: &Rc<Shared>) {
+        let keys = gtk4::EventControllerKey::new();
+        let send = |s: &Rc<Shared>, c: &gtk4::EventControllerKey, down: bool, keycode: u32| {
+            let locks = c
+                .current_event_device()
+                .map(|d| Locks {
+                    caps: d.is_caps_locked(),
+                    num: d.is_num_locked(),
+                    scroll: d.is_scroll_locked(),
+                })
+                .unwrap_or_default();
+            if let Some(event) = input::key(down, keycode, locks, c.current_event_time()) {
+                s.on_event.call(|f| f(event));
+            }
+        };
+        let s = Rc::clone(shared);
+        keys.connect_key_pressed(move |c, _, keycode, _| {
+            send(&s, c, true, keycode);
+            glib::Propagation::Stop
+        });
+        let s = Rc::clone(shared);
+        keys.connect_key_released(move |c, _, keycode, _| send(&s, c, false, keycode));
+        window.add_controller(keys);
+    }
 }
 
 /// The scale of the controller's `SceneView` (1 before it is attached).
@@ -301,6 +327,7 @@ impl Window for GtkWindow {
         Self::wire_pointer(&view, &shared);
         Self::wire_scroll(&view, &shared);
         Self::wire_touch(&view, &shared);
+        Self::wire_keys(&window, &shared);
         // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor); the idle pacing reads its rate (monitor_interval_us)
         let entered = Rc::clone(&shared);
         window.connect_realize(move |w| {

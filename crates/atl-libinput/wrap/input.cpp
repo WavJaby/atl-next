@@ -35,6 +35,8 @@ Consumer::Consumer(std::shared_ptr<android::InputChannel> channel) : consumer(st
 
 KeyCharacterMap::KeyCharacterMap(std::shared_ptr<android::KeyCharacterMap> map) : map(std::move(map)) {}
 
+KeyLayoutMap::KeyLayoutMap(std::shared_ptr<android::KeyLayoutMap> map) : map(std::move(map)) {}
+
 std::unique_ptr<Message> new_message() { return std::make_unique<Message>(); }
 
 std::unique_ptr<Publisher> new_publisher(int32_t fd, rust::Str name) {
@@ -156,5 +158,23 @@ rust::Vec<uint8_t> kcm_parcel_bytes(const KeyCharacterMap& map) {
     }
     return bytes;
 }
+
+std::unique_ptr<KeyLayoutMap> load_key_layout(rust::Str path) {
+    auto loaded = android::KeyLayoutMap::load(std::string(path.data(), path.size()));
+    if (!loaded.ok()) {
+        return nullptr;
+    }
+    return std::make_unique<KeyLayoutMap>(loaded.value());
+}
+
+int32_t map_key(const KeyLayoutMap& map, int32_t scan_code, int32_t& key_code, uint32_t& flags) {
+    return map.map->mapKey(scan_code, 0, &key_code, &flags);
+}
+
+int32_t update_meta_state(int32_t key_code, bool down, int32_t old_meta_state) {
+    return android::updateMetaState(key_code, down, old_meta_state);
+}
+
+int32_t normalize_meta_state(int32_t meta_state) { return android::normalizeMetaState(meta_state); }
 
 }  // namespace atl::input

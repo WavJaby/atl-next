@@ -333,11 +333,37 @@ pub struct TouchEvent {
     pub time_ms: u32,
 }
 
+/// One physical key press or release of the window's keyboard. No keysym or text: characters come from the Android key map, composed text from `TextInput`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyEvent {
+    /// Pressed (`true`) or released. A press of a key already down is the desktop's key repeat.
+    pub down: bool,
+    /// Linux input event code (`input-event-codes.h`, KEY_A = 30): the identity AOSP `.kl` key layouts key on. A non-Linux backend maps its scancodes to it.
+    pub scan_code: u32,
+    /// The keyboard's lock states at this event.
+    pub locks: Locks,
+    /// Event time in milliseconds on the toolkit's clock.
+    pub time_ms: u32,
+}
+
+/// Lock states of a keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Locks {
+    /// Caps Lock on.
+    pub caps: bool,
+    /// Num Lock on.
+    pub num: bool,
+    /// Scroll Lock on.
+    pub scroll: bool,
+}
+
 /// An input event of a window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
-    /// Mouse or touchpad pointer. Stylus, keys and gamepads are added by the slice that first consumes them.
+    /// Mouse or touchpad pointer. Stylus and gamepads are added by the slice that first consumes them.
     Pointer(PointerEvent),
+    /// A key of the window's keyboard, while the window has keyboard focus.
+    Key(KeyEvent),
     /// A touchscreen contact.
     Touch(TouchEvent),
     /// The window gained (`true`) or lost keyboard focus (the desktop's active toplevel). Android's window focus follows it; on loss, held keys are cancelled by their consumer.

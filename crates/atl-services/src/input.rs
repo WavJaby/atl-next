@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list (ids: input_devices.rs): the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD), the mouse and the touchscreen. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(VIRTUAL_KEYBOARD) (:365-376) takes the keyboard's native map from getInputDevice(-1), so the keyboard carries Virtual.kcm in Parcel form, loaded by AOSP's own libinput through atl-libinput (the environment supplies the file, rung 2). The pointer devices carry the same bytes: they have no keys, and a second map would be a second file. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
+//! The `input` service (Context.INPUT_SERVICE): the converter's IInputManager stub, serving the desktop's device list (ids: input_devices.rs): the virtual keyboard (id -1, KeyCharacterMap.VIRTUAL_KEYBOARD), the mouse, the physical keyboard, the touchscreen and the touchpad. Without this service InputManagerGlobal.getInstance() returns null and KeyCharacterMap.load NPEs at KeyCharacterMap.java:367 on the first options-panel prepare (PhoneWindow.java:843). KeyCharacterMap.load(deviceId) (:365-376) takes a device's native map from getInputDevice(deviceId): the virtual keyboard carries Virtual.kcm, the physical keyboard Generic.kcm (KeyMap::load's fallback for a keyboard with no own map; KeyEvent.getUnicodeChar of its keys reads it), both in Parcel form, loaded by AOSP's own libinput through atl-libinput (the environment supplies the files, rung 2). Devices without keys carry Virtual.kcm, as Android gives every device some map. Non-US layouts (AOSP overlay KCMs picked by the desktop's xkb layout) are not built: decided with the IME item. Read and not kept: device change listeners (no hot-plug yet). Every other method stays counted and answered UNKNOWN_TRANSACTION (the trait default).
 
 use atl_aidl::aidl::android::hardware::input::IInputManager::{
     BnInputManager, EnforcePermission, IInputManager,
@@ -9,7 +9,8 @@ use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
 use crate::input_devices::{
-    POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHSCREEN, TOUCHSCREEN, VIRTUAL_KEYBOARD,
+    KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
+    TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
 };
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{counters, permission};
@@ -30,10 +31,10 @@ struct InputManager {
 
 impl Interface for InputManager {}
 
-/// The desktop's devices; each carries the keyboard map (see the module doc).
-fn devices(map: &[u8]) -> Vec<InputDevice> {
+/// The desktop's devices with their key maps (see the module doc): `virtual_map` Virtual.kcm's Parcel form, `keyboard_map` Generic.kcm's.
+fn devices(virtual_map: &[u8], keyboard_map: &[u8]) -> Vec<InputDevice> {
     let base = InputDevice {
-        key_character_map: map.to_vec(),
+        key_character_map: virtual_map.to_vec(),
         generation: 1,
         usi_version_major: -1,
         usi_version_minor: -1,
@@ -58,10 +59,26 @@ fn devices(map: &[u8]) -> Vec<InputDevice> {
             ..base.clone()
         },
         InputDevice {
+            id: KEYBOARD,
+            name: Some("ATL keyboard".into()),
+            descriptor: Some("atl:keyboard".into()),
+            sources: SOURCE_KEYBOARD,
+            keyboard_type: KEYBOARD_TYPE_ALPHABETIC,
+            key_character_map: keyboard_map.to_vec(),
+            ..base.clone()
+        },
+        InputDevice {
             id: TOUCHSCREEN,
             name: Some("ATL touchscreen".into()),
             descriptor: Some("atl:touchscreen".into()),
             sources: SOURCE_TOUCHSCREEN,
+            ..base.clone()
+        },
+        InputDevice {
+            id: TOUCHPAD,
+            name: Some("ATL touchpad".into()),
+            descriptor: Some("atl:touchpad".into()),
+            sources: SOURCE_MOUSE | SOURCE_TOUCHPAD,
             ..base
         },
     ]
@@ -141,11 +158,19 @@ impl IInputManager for InputManager {
     }
 }
 
-/// A new input service binder serving the keyboard map `map`: the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), and relaying pointer icons to `agents`. Fails when `map` is not a Parcel-form blob.
-pub fn new_binder(map: &[u8], agents: Arc<UiAgents>) -> Result<SpIBinder, String> {
-    set_key_character_map(map).map_err(str::to_owned)?;
+/// A new input service binder serving the key maps `virtual_map` (Virtual.kcm) and `keyboard_map` (Generic.kcm), each the Parcel form of a KeyCharacterMap (atl-libinput `KeyCharacterMap::parcel_bytes`), and relaying pointer icons to `agents`. Fails when a map is not a Parcel-form blob.
+pub fn new_binder(
+    virtual_map: &[u8],
+    keyboard_map: &[u8],
+    agents: Arc<UiAgents>,
+) -> Result<SpIBinder, String> {
+    // the codec reads InputDevices against the virtual map (InputDevice.rs); the keyboard's is written only
+    set_key_character_map(virtual_map).map_err(str::to_owned)?;
+    if keyboard_map.is_empty() || !keyboard_map.len().is_multiple_of(4) {
+        return Err("keyboard key map: not a non-empty multiple of 4 bytes".to_owned());
+    }
     let service = InputManager {
-        devices: devices(map),
+        devices: devices(virtual_map, keyboard_map),
         agents,
     };
     Ok(BnInputManager::new_binder(service, BinderFeatures::default()).as_binder())

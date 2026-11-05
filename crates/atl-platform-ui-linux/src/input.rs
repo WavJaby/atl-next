@@ -2,8 +2,8 @@
 //! GTK pointer and scroll events as `InputEvent`s: the toolkit speaks logical pixels, button numbers and scroll units, the platform traits physical pixels, named buttons and scroll kinds.
 
 use atl_platform_ui_api::{
-    CursorShape, InputEvent, PhysPoint, PointerButton, PointerEvent, PointerPhase, Scale,
-    ScrollEvent, ScrollKind, TouchEvent, TouchPhase,
+    CursorShape, InputEvent, KeyEvent, Locks, PhysPoint, PointerButton, PointerEvent, PointerPhase,
+    Scale, ScrollEvent, ScrollKind, TouchEvent, TouchPhase,
 };
 
 /// GDK button numbers (`GDK_BUTTON_PRIMARY`, `_MIDDLE`, `_SECONDARY` = 1, 2, 3).
@@ -111,6 +111,20 @@ pub fn touch(phase: TouchPhase, id: u32, x: f64, y: f64, scale: Scale, time_ms: 
     })
 }
 
+/// The xkb keycode offset: a Wayland/X11 hardware keycode is the linux input code + 8 (xkbcommon's evdev rules).
+const XKB_EVDEV_OFFSET: u32 = 8;
+
+/// The key event of GDK hardware keycode `keycode` (xkb numbering); None for a code below the evdev offset (no linux key).
+pub fn key(down: bool, keycode: u32, locks: Locks, time_ms: u32) -> Option<InputEvent> {
+    let scan_code = keycode.checked_sub(XKB_EVDEV_OFFSET)?;
+    Some(InputEvent::Key(KeyEvent {
+        down,
+        scan_code,
+        locks,
+        time_ms,
+    }))
+}
+
 /// The CSS cursor name GDK takes (`gdk_cursor_new_from_name`) for `shape`.
 pub fn cursor_name(shape: CursorShape) -> &'static str {
     match shape {
@@ -149,6 +163,25 @@ fn physical((x, y): (f64, f64), scale: Scale) -> PhysPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// xkb keycode 38 is KEY_A 30 (xkbcommon evdev rules: `<AC01> = 38`, input-event-codes.h KEY_A 30); codes below 8 have no linux key.
+    #[test]
+    fn key_is_the_linux_code() {
+        let locks = Locks {
+            caps: true,
+            ..Locks::default()
+        };
+        assert_eq!(
+            key(true, 38, locks, 5),
+            Some(InputEvent::Key(KeyEvent {
+                down: true,
+                scan_code: 30,
+                locks,
+                time_ms: 5
+            }))
+        );
+        assert_eq!(key(false, 7, locks, 5), None);
+    }
 
     /// At 1.5x a pointer 10 logical pixels in is 15 physical pixels in (arithmetic); the phase and time pass through.
     #[test]
