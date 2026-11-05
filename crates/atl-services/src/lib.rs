@@ -33,6 +33,8 @@ pub mod activity_task;
 #[cfg(feature = "converter")]
 pub mod audio;
 #[cfg(feature = "converter")]
+pub mod clipboard;
+#[cfg(feature = "converter")]
 pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;

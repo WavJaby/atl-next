@@ -66,6 +66,8 @@ const AUDIO: &str = "audio";
 const USER: &str = "user";
 /// The name StorageManager looks IStorageManager up by (StorageManager.java:326).
 const MOUNT: &str = "mount";
+/// Context.CLIPBOARD_SERVICE.
+const CLIPBOARD: &str = "clipboard";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -111,6 +113,8 @@ fn main() -> Result<()> {
     binder::add_service(AUDIO, atl_services::audio::new_binder()).context("addService audio")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
     binder::add_service(MOUNT, atl_services::storage::new_binder()).context("addService mount")?;
+    binder::add_service(CLIPBOARD, atl_services::clipboard::new_binder())
+        .context("addService clipboard")?;
     let contents =
         std::fs::read(&a.keychars).with_context(|| format!("reading {}", a.keychars.display()))?;
     let name = a
