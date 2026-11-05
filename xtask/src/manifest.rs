@@ -155,16 +155,15 @@ fn config_changes(activity: &Element) -> Result<i32> {
     Ok((written | (!recreate & RECREATE_ON_CONFIG_CHANGES_MASK)) as i32)
 }
 
-/// `android:launchMode` as ActivityInfo.launchMode: the enum's value, which aapt2 prints as `(type 0x10)0x<n>`; unwritten = 0 (LAUNCH_MULTIPLE, `standard`).
+/// `android:launchMode` as ActivityInfo.launchMode. aapt2's xmltree prints the enum's value as a decimal (`launchMode(0x0101001d)=2` for singleTask; checked on prebuilts/sdk/tools aapt2 with a
+/// manifest declaring singleTask / singleTop / none); `(type 0x10)0x<n>` is not what this aapt2 prints. Unwritten = 0 (LAUNCH_MULTIPLE, `standard`).
 fn launch_mode(element: &Element) -> Result<i32> {
     let Some(value) = element.attr("launchMode") else {
         return Ok(0);
     };
-    let hex = value
-        .strip_prefix("(type 0x10)0x")
-        .with_context(|| format!("launchMode {value:?} is not an enum value"))?;
-    let mode = u32::from_str_radix(hex, 16).with_context(|| format!("launchMode {value:?}"))?;
-    Ok(mode as i32)
+    value
+        .parse::<i32>()
+        .with_context(|| format!("launchMode {value:?} is not an enum value"))
 }
 
 /// `android:taskAffinity` as written; None = unwritten, the package name is the affinity (ActivityRecord's default).
@@ -421,7 +420,7 @@ mod tests {
             )
         };
         let written = text(
-            r#"            A: http://schemas.android.com/apk/res/android:launchMode(0x0101001d)=(type 0x10)0x1
+            r#"            A: http://schemas.android.com/apk/res/android:launchMode(0x0101001d)=1
             A: http://schemas.android.com/apk/res/android:taskAffinity(0x01010204)="com.example.tasks" (Raw: "com.example.tasks")
             A: http://schemas.android.com/apk/res/android:process(0x01010584)=":remote" (Raw: ":remote")"#,
         );
