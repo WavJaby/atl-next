@@ -167,6 +167,15 @@ fn resolve_class(package: &str, name: &str) -> String {
 }
 
 /// The manifest of the text `aapt2 dump xmltree --file AndroidManifest.xml` printed.
+/// Whether an `<activity>` or `<activity-alias>` has an intent filter with ACTION_MAIN and CATEGORY_LAUNCHER.
+fn is_launcher(element: &Element) -> bool {
+    element.children("intent-filter").any(|f| {
+        let has =
+            |kind: &str, wanted: &str| f.children(kind).any(|e| e.attr("name") == Some(wanted));
+        has("action", ACTION_MAIN) && has("category", CATEGORY_LAUNCHER)
+    })
+}
+
 pub fn parse(text: &str) -> Result<Manifest> {
     let root = parse_tree(text)?;
     if root.name != "manifest" {
@@ -202,22 +211,16 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 None => p.to_owned(),
             });
     // every `<activity>` in manifest order: its class, whether it handles MAIN + LAUNCHER, its boolean attributes (ParsedActivity's inputs)
-    let activities = application
+    let mut activities: Vec<ActivityDecl> = application
         .into_iter()
         .flat_map(|a| a.children("activity"))
         .map(|activity| {
-            let launcher = activity.children("intent-filter").any(|f| {
-                let has = |kind: &str, wanted: &str| {
-                    f.children(kind).any(|e| e.attr("name") == Some(wanted))
-                };
-                has("action", ACTION_MAIN) && has("category", CATEGORY_LAUNCHER)
-            });
             let Some(name) = activity.attr("name") else {
                 return Ok(None);
             };
             Ok(Some(ActivityDecl {
                 name: resolve_class(package, name),
-                launcher,
+                launcher: is_launcher(activity),
                 theme: theme(activity)?,
                 config_changes: config_changes(activity)?,
                 booleans: booleans(activity),
@@ -227,6 +230,28 @@ pub fn parse(text: &str) -> Result<Manifest> {
         .into_iter()
         .flatten()
         .collect();
+    // an enabled `<activity-alias>` that is MAIN + LAUNCHER launches its target: PackageManager resolves the alias, and the record's real activity is the target (ActivityRecord.realActivity)
+    for alias in application
+        .into_iter()
+        .flat_map(|a| a.children("activity-alias"))
+    {
+        let target = alias
+            .attr("targetActivity")
+            .context("<activity-alias> without android:targetActivity")?;
+        if !alias.bool_attr("enabled", true) || !is_launcher(alias) {
+            continue;
+        }
+        let target = resolve_class(package, target);
+        match activities.iter_mut().find(|a| a.name == target) {
+            Some(decl) => decl.launcher = true,
+            None => activities.push(ActivityDecl {
+                name: target,
+                launcher: true,
+                theme: theme(alias)?,
+                booleans: booleans(alias),
+            }),
+        }
+    }
     Ok(Manifest {
         name: package.to_owned(),
         version_code: int(&root, "versionCode")?.unwrap_or(0),
@@ -400,6 +425,55 @@ mod tests {
         assert_eq!(m.activities[0].theme, 0x0103_012a);
         assert_eq!(m.activities[1].theme, 0);
         assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
+    }
+
+    /// An enabled MAIN + LAUNCHER `<activity-alias>` makes its target the launcher (the Fossify Calculator's launcher icons: 18 disabled aliases, one enabled, all to SplashActivity); a disabled alias counts for nothing.
+    #[test]
+    fn enabled_launcher_alias_names_its_target() {
+        let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
+  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: application (line=7)
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Splash" (Raw: ".Splash")
+          E: activity (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Other" (Raw: ".Other")
+          E: activity-alias (line=10)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Off" (Raw: ".Off")
+            A: http://schemas.android.com/apk/res/android:enabled(0x0101000e)=false
+            A: http://schemas.android.com/apk/res/android:targetActivity(0x01010202)=".Other" (Raw: ".Other")
+              E: intent-filter (line=11)
+                  E: action (line=12)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+                  E: category (line=13)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+          E: activity-alias (line=14)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Green" (Raw: ".Green")
+            A: http://schemas.android.com/apk/res/android:enabled(0x0101000e)=true
+            A: http://schemas.android.com/apk/res/android:targetActivity(0x01010202)=".Splash" (Raw: ".Splash")
+              E: intent-filter (line=15)
+                  E: action (line=16)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+                  E: category (line=17)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+"#;
+        let m = parse(text).expect("parse");
+        assert_eq!(
+            m.launch_activity().map(|a| a.name.as_str()),
+            Some("com.example.atltest.Splash")
+        );
+        let shape: Vec<(&str, bool)> = m
+            .activities
+            .iter()
+            .map(|a| (a.name.as_str(), a.launcher))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("com.example.atltest.Splash", true),
+                ("com.example.atltest.Other", false)
+            ]
+        );
     }
 
     /// A launcher activity named relative to the package, a private process, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
