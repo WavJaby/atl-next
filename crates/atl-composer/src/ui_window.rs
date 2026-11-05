@@ -17,8 +17,10 @@ use crate::host::UiFrames;
 use crate::input::Message;
 use crate::sink::fnv1a64;
 
-/// The frame whose readback the log names (`atl-composer: ui: capture ...`): the gate compares its digest with the fixture's expected pixels.
-const CAPTURE_FRAME: u32 = 30;
+/// Set by the window gates: each settled picture is read back and logged (`atl-composer: ui: capture ...`). Unset in normal runs: a readback is a GPU render plus a download on the UI thread.
+const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
+/// Ticks without a new scene after which the picture counts as settled: 1/3 s at 60 Hz, longer than the gaps between the frames of one app redraw.
+const SETTLED_TICKS: u32 = 20;
 
 /// The UI thread's session: the toolkit, the compositor's frame path, the input thread, the display's size and the window once it exists.
 struct Session {
@@ -47,7 +49,7 @@ pub fn install(ui: PlatformUi, frames: UiFrames, input: Sender<Message>, size: P
     open();
 }
 
-/// The readback of the window at [`CAPTURE_FRAME`]: its digest and size, and the frames presented so far, for the gate
+/// The readback of a settled window: its digest and size, and the frames presented so far, for the gate
 /// (`atl-composer: ui: capture`); the gate compares the digest with its own expectation.
 fn capture_report(window: &PlatformWindow, presented: u32) {
     let capture = match window.capture() {
@@ -95,11 +97,14 @@ fn open() {
         });
         let shown = Rc::clone(&window);
         let frames = Arc::clone(&session.frames);
-        let (mut tick_count, mut presented) = (0u32, 0u32);
+        let capture = std::env::var_os(CAPTURE_ENV).is_some();
+        let (mut tick_count, mut presented, mut quiet_ticks) = (0u32, 0u32, 0u32);
         window.on_tick(move |tick| {
             let time_ns = i64::try_from(tick.time_ns).unwrap_or(i64::MAX);
+            quiet_ticks = quiet_ticks.saturating_add(1);
             frames.tick(time_ns, |scene| {
                 presented += 1;
+                quiet_ticks = 0;
                 let _ = writeln!(
                     std::io::stderr(),
                     "atl-composer: ui: present n={presented} time_ns={time_ns}"
@@ -115,7 +120,7 @@ fn open() {
                     shown.is_mapped()
                 );
             }
-            if tick_count == CAPTURE_FRAME {
+            if capture && presented > 0 && quiet_ticks == SETTLED_TICKS {
                 capture_report(&shown, presented);
             }
             tick_count += 1;
