@@ -127,7 +127,7 @@ pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
 const WINDOWING_MODE_FREEFORM: i32 = 5;
 
 /// The override of a Task of `size` on `display` (TaskFragment.computeConfigResourceOverrides, TaskFragment.java:2408, for a FREEFORM Task): the bounds from the origin, the mode, and
-/// the dp of the bounds. A floating Task is not restricted to the stable (inset) area (TaskFragment.java:2510-2516), so the dp come from the bounds; the smallest width is min(w, h) / density (:2552-2560).
+/// the dp of the bounds. A floating Task is not restricted to the stable (inset) area (TaskFragment.java:2485), so the dp come from the bounds; the smallest width is min(w, h) / density (:2548-2552).
 /// Density stays the display's: a resize changes only screenWidthDp/HeightDp and what derives from them. screenLayout is left undefined (not computed yet).
 pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configuration {
     let density = display.dpi as f32 / DENSITY_DEFAULT;
