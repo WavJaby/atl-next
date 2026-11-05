@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use atl_broker::control::{self, Request, Response};
 use atl_layout::Layout;
+use atl_services::native_libs::LIB_DIR_NAME;
 use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
@@ -124,15 +125,22 @@ fn verdict(app: &Run, system: &Run, feature: &Run, info: &Run, services_log: &st
     fails
 }
 
-/// Runs the stage; the passes are printed, the failures returned.
+/// Runs the stage; the passes are printed, the failures returned. `host_arch`: the arches.toml `[host]` row the services run on; the record's native library dir is the one the installer gives a package without native code there (native_libs.rs: the first supported ISA, the host's).
 pub fn stage(
     root: &Path,
     out: &Path,
+    host_arch: &str,
     h: &Harness,
     env: &[(String, String)],
     service: &Path,
     test_root: &Path,
 ) -> Result<Vec<String>> {
+    let arches = crate::arches::load(root)?;
+    ensure!(
+        arches.get(host_arch).is_some_and(|a| a.host.is_some()),
+        "{host_arch}: no {} row with [host]",
+        crate::arches::FILE
+    );
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
     // the services read their .kcm maps from one directory: AOSP's keyboards dir holds both
     let keychars = farm::keyboards(&Layout::of(root)?);
@@ -177,7 +185,7 @@ pub fn stage(
         uid: APP_UID,
         source_dir: format!("/data/app/{APP}/base.apk"),
         primary_cpu_abi: None,
-        native_library_dir: format!("/data/app/{APP}/lib/x86_64"),
+        native_library_dir: format!("/data/app/{APP}/{LIB_DIR_NAME}/{host_arch}"),
         data_dir: format!("/data/user/0/{APP}"),
         device_protected_data_dir: format!("/data/user_de/0/{APP}"),
     };
