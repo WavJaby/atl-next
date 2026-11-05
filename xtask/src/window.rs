@@ -74,6 +74,8 @@ enum Stage {
     Relaunch,
     /// The resize stage on window-declared (the same resource, the resize bits declared): no relaunch, each change reaches onConfigurationChanged.
     Declared,
+    /// The declared stage on window-start: the launcher starts Main (startActivity) and finishes; Main resumes, and each resize reaches it as onConfigurationChanged.
+    StartFinish,
 }
 
 impl Stage {
@@ -87,6 +89,7 @@ impl Stage {
             Stage::Resize => "resize",
             Stage::Relaunch => "relaunch",
             Stage::Declared => "declared",
+            Stage::StartFinish => "start-finish",
         }
     }
 
@@ -97,7 +100,9 @@ impl Stage {
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
-            Stage::Resize | Stage::Relaunch | Stage::Declared => RESIZE_WINDOW_MS,
+            Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish => {
+                RESIZE_WINDOW_MS
+            }
         }
     }
 
@@ -107,7 +112,9 @@ impl Stage {
             Stage::Resume => &[],
             Stage::Gtk => &["mapped", "readback", "touch", "pong"],
             Stage::Widgets => widgets::SUB_NAMES,
-            Stage::Resize | Stage::Relaunch | Stage::Declared => RESIZE_SUB_NAMES,
+            Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish => {
+                RESIZE_SUB_NAMES
+            }
             Stage::Frames => &["picture", "cadence"],
             Stage::Input => &["touch"],
         }
@@ -119,6 +126,8 @@ const FIXTURE: &str = "xtask/testdata/window";
 /// The same app with a sw600dp resource (their java/ links to FIXTURE's): no configChanges; the resize bits declared.
 const SIZED_FIXTURE: &str = "xtask/testdata/window-sized";
 const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
+/// window-declared's Main behind a launcher that starts it and finishes (the stage start-finish).
+const START_FIXTURE: &str = "xtask/testdata/window-start";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
@@ -224,7 +233,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Widgets
         | Stage::Resize
         | Stage::Relaunch
-        | Stage::Declared => "AtlWindow: onResume reached",
+        | Stage::Declared
+        | Stage::StartFinish => "AtlWindow: onResume reached",
     }
 }
 
@@ -1329,7 +1339,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut proxy = None;
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
-        Stage::Gtk | Stage::Widgets | Stage::Resize | Stage::Relaunch | Stage::Declared => {
+        Stage::Gtk
+        | Stage::Widgets
+        | Stage::Resize
+        | Stage::Relaunch
+        | Stage::Declared
+        | Stage::StartFinish => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1359,6 +1374,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Widgets => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,
         Stage::Declared => DECLARED_FIXTURE,
+        Stage::StartFinish => START_FIXTURE,
         _ => FIXTURE,
     };
     let apk = rt.build_apk(&root.join(fixture), &work.join("apk"), &[])?;
@@ -1392,7 +1408,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let widget_stage = matches!(args.stage, Stage::Widgets);
     let resize_stage = matches!(
         args.stage,
-        Stage::Resize | Stage::Relaunch | Stage::Declared
+        Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish
     );
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
@@ -1462,10 +1478,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &liveness,
             widgets::display(display),
         ),
-        (Stage::Resize | Stage::Relaunch | Stage::Declared, Some(_)) => {
+        (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
             let want = match args.stage {
                 Stage::Relaunch => Lifecycle::Relaunches,
-                Stage::Declared => Lifecycle::Told,
+                Stage::Declared | Stage::StartFinish => Lifecycle::Told,
                 _ => Lifecycle::Kept,
             };
             let steps = resize_steps(&task_bounds(&services), (display.width, display.height));

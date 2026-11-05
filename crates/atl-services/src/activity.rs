@@ -333,18 +333,6 @@ struct Attached {
     _death: DeathRecipient,
 }
 
-/// An activity the services launched (ActivityRecord, reduced): the app thread it runs on and the merged configuration the app last got (ActivityRecord.mLastReportedConfiguration).
-struct ActivityEntry {
-    token: SpIBinder,
-    pid: i32,
-    thread: Strong<dyn IApplicationThread>,
-    reported: Config,
-    /// ActivityInfo.getRealConfigChanged: the CONFIG_* bits the activity handles itself
-    declared: u32,
-    /// a relaunch was sent and activityRelaunched has not come (ActivityRecord.mPendingRelaunchCount, at most 1 here: Delivery::Wait)
-    relaunching: bool,
-}
-
 #[derive(Default)]
 struct State {
     processes: Vec<ProcessRecord>,
@@ -352,8 +340,6 @@ struct State {
     proc_start_seq_counter: i64,
     /// ActivityManagerService.mApplicationSharedMemoryReadOnlyFd's region
     shared_memory: Option<ApplicationSharedMemory>,
-    /// the activities launched and attached; a configuration change reaches each through its thread (task_resized)
-    activities: Vec<ActivityEntry>,
 }
 
 /// InstrumentationReporter.Report: a status or the final report for a watcher.
@@ -537,7 +523,7 @@ impl ActivityManager {
 
 impl Inner {
     /// ActivityRecord.ensureActivityConfiguration for each activity of `task`, at the Task's size now. Reported is recorded before the send, as AOSP's mLastReportedConfiguration.
-    /// A relaunch resumes the activity: the services keep no activity state, and an activity of a live Task is taken as resumed.
+    /// Each activity is a record of the lifecycle machine (activity_task Owner): one started by startActivity gets the change as the launcher one does; the steps after a relaunch come from its phase.
     fn task_resized(&self, task: TaskId) {
         let size = self.tasks.size(task);
         let over = Configuration {
@@ -560,14 +546,9 @@ impl Inner {
         };
         let mut sends = Vec::new();
         {
-            let mut st = self.state();
-            for entry in st.activities.iter_mut() {
-                if self.tasks.task_of_activity(Some(&entry.token)) != Some(task)
-                    || !self.atm.contains(&entry.token)
-                {
-                    continue;
-                }
-                let buckets = self.buckets.get(&entry.token);
+            for (token, entry) in self.atm.records(task) {
+                let mut relaunching = entry.relaunching;
+                let buckets = self.buckets.get(&token);
                 let items = match config_diff::delivery(
                     &entry.reported,
                     &new,
@@ -587,7 +568,7 @@ impl Inner {
                         );
                         vec![Some(ClientTransactionItem::ActivityConfigurationChange(
                             Box::new(ActivityConfigurationChangeItem {
-                                activity_token: Some(entry.token.clone()),
+                                activity_token: Some(token.clone()),
                                 configuration: Some(over.clone()),
                                 activity_window_info: window_info(),
                             }),
@@ -598,11 +579,11 @@ impl Inner {
                         preserve_window,
                     } => {
                         counters::count(AM, "configuration change relaunch (ActivityRelaunchItem)");
-                        entry.relaunching = true;
+                        relaunching = true;
                         // the lifecycle items after the relaunch come from the machine: Resume only for a resumed activity
                         let mut items = vec![Some(ClientTransactionItem::ActivityRelaunch(
                             Box::new(ActivityRelaunchItem {
-                                activity_token: Some(entry.token.clone()),
+                                activity_token: Some(token.clone()),
                                 config: Some(MergedConfiguration {
                                     global: global_configuration(&self.display),
                                     override_config: over.clone(),
@@ -613,11 +594,14 @@ impl Inner {
                                 preserve_window,
                             }),
                         ))];
-                        items.extend(self.atm.relaunch_items(&entry.token));
+                        items.extend(self.atm.relaunch_items(&token));
                         items
                     }
                 };
-                entry.reported = new.clone();
+                self.atm.update_owner(&token, |o| {
+                    o.reported = new.clone();
+                    o.relaunching = relaunching;
+                });
                 sends.push((entry.thread.clone(), ClientTransaction { items }));
             }
         }
@@ -632,11 +616,7 @@ impl Inner {
 
     /// ActivityRecord.finishRelaunching: the relaunch of `token` ended, so what its Task's size did meanwhile is delivered now, and its windows, held back meanwhile, get the size unless another relaunch began.
     fn relaunch_finished(&self, token: &SpIBinder) {
-        let mut st = self.state();
-        if let Some(entry) = st.activities.iter_mut().find(|e| e.token == *token) {
-            entry.relaunching = false;
-        }
-        drop(st);
+        self.atm.update_owner(token, |o| o.relaunching = false);
         let Some(task) = self.tasks.task_of_activity(Some(token)) else {
             return;
         };
@@ -647,10 +627,7 @@ impl Inner {
     }
 
     fn task_relaunching(&self, task: TaskId) -> bool {
-        self.state()
-            .activities
-            .iter()
-            .any(|e| e.relaunching && self.tasks.task_of_activity(Some(&e.token)) == Some(task))
+        self.atm.task_relaunching(task)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -840,7 +817,9 @@ impl Inner {
                 return;
             };
             let mut rec = st.processes.remove(i);
-            st.activities.retain(|a| a.pid != pid);
+            if let Some(a) = &rec.attached {
+                self.atm.process_died(&a.thread.as_binder());
+            }
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -1101,17 +1080,7 @@ impl IActivityManager for ActivityManager {
             return Ok(());
         };
         // the launch is the lifecycle's: a new Task, the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
-        let token = inner
-            .atm
-            .launch_launcher(thread.clone(), uid, &package, activity);
-        inner.state().activities.push(ActivityEntry {
-            token,
-            pid,
-            thread,
-            reported: Config::from(&global_configuration(&inner.display)),
-            declared: manifest_flags::real_config_changes(p, activity),
-            relaunching: false,
-        });
+        inner.atm.launch_launcher(thread, uid, &package, activity);
         Ok(())
     }
 
@@ -1499,19 +1468,19 @@ impl IActivityClientController for ActivityClientController {
     }
 
     /// ActivityClientController.activityResumed:200-206 -> ActivityRecord.activityResumedLocked:6173, which finds the record by token, then clears its saved state, sets its splash-exit
-    /// animation and handles size compat. None of that state exists here yet: the resume is logged (`services: activity resumed at=<stamp>`), which run-apk and the window gates read as onResume.
+    /// animation and handles size compat. None of that state exists here yet: the resume is logged by activity_task (`services: activity resumed <class> at=<stamp>`), which run-apk reads as onResume of the last one.
     fn r#activityResumed(
         &self,
         token: Option<&SpIBinder>,
         _handle_splash_screen_exit: bool,
     ) -> binder::Result<()> {
         if let Some(token) = token {
-            log(format_args!(
-                "activity resumed at={}",
-                counters::wall_stamp()
-            ));
-            if let Some(inner) = self.inner.upgrade() {
-                inner.atm.resumed(token);
+            let known = self
+                .inner
+                .upgrade()
+                .is_some_and(|inner| inner.atm.resumed(token));
+            if !known {
+                counters::count(ACC, "activityResumed: no such activity");
             }
         }
         Ok(())

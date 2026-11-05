@@ -4,7 +4,7 @@
 //! as one ClientTransaction per command, under the machine lock (the sends are oneway, so none blocks). The accepted starts are checked by activity_start.
 //! activity.rs keeps the processes and forwards the client controller's acks here. Converter-gated: it speaks binder.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use atl_aidl::aidl::android::app::IActivityClientController::IActivityClientController;
@@ -22,18 +22,20 @@ use atl_parcelables::parts::{
 };
 use binder::{BinderFeatures, FromIBinder, Interface, SpIBinder, Status, Strong, ThreadState};
 
-use crate::activity::{launch_item, log, resume_item, security};
+use crate::activity::{global_configuration, launch_item, log, resume_item, security};
 use crate::activity_stack::{Command, Machine, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Target};
+use crate::config_diff::Config;
 use crate::counters;
 use crate::display_model::DisplayModel;
+use crate::manifest_flags;
 use crate::packages::{ActivityDecl, Packages};
-use crate::tasks::Tasks;
+use crate::tasks::{TaskId, Tasks};
 use crate::token;
 
 const ATM: &str = "IActivityTaskManager";
 
-/// What the machine keeps per activity: its app thread and the identity its starts are checked against.
+/// What the machine keeps per activity (ActivityRecord, reduced): its app thread, the identity its starts are checked against, and the configuration state a change is delivered by.
 #[derive(Clone)]
 pub(crate) struct Owner {
     pub thread: Strong<dyn IApplicationThread>,
@@ -41,6 +43,14 @@ pub(crate) struct Owner {
     pub package: String,
     /// the affinity of the activity's task: its taskAffinity, else the package name (see [`affinity_of`])
     pub affinity: String,
+    /// the activity's class name (ActivityDecl.name); the services' log names the activity by it
+    pub component: String,
+    /// the merged configuration the app last got (ActivityRecord.mLastReportedConfiguration); a configuration change is diffed against it (activity.rs task_resized)
+    pub reported: Config,
+    /// ActivityInfo.getRealConfigChanged: the CONFIG_* bits the activity handles itself
+    pub declared: u32,
+    /// a relaunch was sent and activityRelaunched has not come (ActivityRecord.mPendingRelaunchCount, at most 1 here: Delivery::Wait)
+    pub relaunching: bool,
 }
 
 /// What a Launch step is built from: the activity's package and declaration, and the LaunchActivityItem's ident.
@@ -78,6 +88,8 @@ pub struct ActivityTasks {
     machine: Mutex<Lifecycle>,
     /// LaunchActivityItem.ident: a stand-in for System.identityHashCode(r), unique per launch
     idents: AtomicI32,
+    /// the machine's settled state as last logged; written only under the machine lock (note_settle)
+    settled: AtomicBool,
 }
 
 impl ActivityTasks {
@@ -94,6 +106,7 @@ impl ActivityTasks {
             controller,
             machine: Mutex::new(Machine::new()),
             idents: AtomicI32::new(0),
+            settled: AtomicBool::new(true),
         }
     }
 
@@ -108,6 +121,19 @@ impl ActivityTasks {
 
     fn next_ident(&self) -> i32 {
         self.idents.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Logs each change of the machine's settled state: `activity unsettled` once a launch, start or lifecycle step is sent and not acknowledged, `activity settled` once all is. run-apk reads the last one.
+    /// Called under the machine lock, before the commands are sent, so the line precedes the acks it can cause.
+    fn note_settle(&self, m: &Lifecycle) {
+        let now = m.settled();
+        if self.settled.swap(now, Ordering::Relaxed) != now {
+            let state = if now { "settled" } else { "unsettled" };
+            log(format_args!(
+                "activity {state} at={}",
+                counters::wall_stamp()
+            ));
+        }
     }
 
     /// The transaction item of one step of `token`'s record. None: a launch of a package that is no longer installed (counted, never reached).
@@ -189,6 +215,13 @@ impl ActivityTasks {
             uid,
             package: package.to_owned(),
             affinity: affinity_of(decl, package),
+            component: decl.name.clone(),
+            reported: self.launch_config(),
+            declared: self
+                .packages
+                .by_name(package)
+                .map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
+            relaunching: false,
         };
         let launch = Launch {
             package: package.to_owned(),
@@ -197,6 +230,7 @@ impl ActivityTasks {
         };
         let mut m = self.machine();
         let commands = m.push(task, token.clone(), owner, launch);
+        self.note_settle(&m);
         self.send(commands);
         token
     }
@@ -261,6 +295,10 @@ impl ActivityTasks {
             uid: calling_uid,
             package: calling_package.to_owned(),
             affinity: affinity_of(decl, calling_package),
+            component: decl.name.clone(),
+            reported: self.launch_config(),
+            declared: package.map_or(0, |p| manifest_flags::real_config_changes(p, decl)),
+            relaunching: false,
         };
         let launch = Launch {
             package: calling_package.to_owned(),
@@ -268,15 +306,25 @@ impl ActivityTasks {
             ident: self.next_ident(),
         };
         let commands = m.push(task, token, owner, launch);
+        self.note_settle(&m);
         self.send(commands);
         Ok(activity_start::START_SUCCESS)
     }
 
-    /// ActivityClientController.activityResumed: the resume ack. An unknown token is ignored (the machine answers nothing for it).
-    pub(crate) fn resumed(&self, token: &SpIBinder) {
+    /// ActivityClientController.activityResumed: the resume ack, logged as `activity resumed <class> at=<stamp>` before the settled change it may cause. False when no record has the token (nothing logged).
+    pub(crate) fn resumed(&self, token: &SpIBinder) -> bool {
         let mut m = self.machine();
+        let Some(component) = m.owner(token).map(|o| o.component.clone()) else {
+            return false;
+        };
+        log(format_args!(
+            "activity resumed {component} at={}",
+            counters::wall_stamp()
+        ));
         let commands = m.resumed(token);
+        self.note_settle(&m);
         self.send(commands);
+        true
     }
 
     /// activityPaused (synchronous): the pause ack. False when no record has the token.
@@ -286,6 +334,7 @@ impl ActivityTasks {
             return false;
         }
         let commands = m.paused(token);
+        self.note_settle(&m);
         self.send(commands);
         true
     }
@@ -297,6 +346,7 @@ impl ActivityTasks {
             return false;
         }
         let commands = m.stopped(token);
+        self.note_settle(&m);
         self.send(commands);
         true
     }
@@ -306,6 +356,7 @@ impl ActivityTasks {
         let mut m = self.machine();
         match m.finish(token) {
             Some(commands) => {
+                self.note_settle(&m);
                 self.send(commands);
                 true
             }
@@ -313,19 +364,46 @@ impl ActivityTasks {
         }
     }
 
-    /// Whether the record is still on the stack: a destroyed activity takes no configuration change.
-    pub(crate) fn contains(&self, token: &SpIBinder) -> bool {
-        self.machine().phase(token).is_some()
-    }
-
     /// The items a relaunch of `token` ends with, decided by the machine from the record's phase (Resume only for a resumed record).
     pub(crate) fn relaunch_items(&self, token: &SpIBinder) -> Vec<Option<ClientTransactionItem>> {
         let mut m = self.machine();
-        m.relaunch(token)
+        let steps = m.relaunch(token);
+        self.note_settle(&m);
+        steps
             .into_iter()
             .filter_map(|step| self.item(token, step))
             .map(Some)
             .collect()
+    }
+
+    /// The configuration a launch carries (launch_item: the global configuration, no override): what the record's `reported` starts from.
+    fn launch_config(&self) -> Config {
+        Config::from(&global_configuration(&self.display))
+    }
+
+    /// The records of `task` with their owners, bottom -> top: what a configuration change of the Task is delivered to. A destroyed record is not on the stack, so not listed.
+    pub(crate) fn records(&self, task: TaskId) -> Vec<(SpIBinder, Owner)> {
+        self.machine()
+            .records(task)
+            .map(|(k, o)| (k.clone(), o.clone()))
+            .collect()
+    }
+
+    /// Changes the owner of `token`'s record; false when no record has it.
+    pub(crate) fn update_owner(&self, token: &SpIBinder, f: impl FnOnce(&mut Owner)) -> bool {
+        self.machine().owner_mut(token).map(f).is_some()
+    }
+
+    /// Whether a record of `task` waits for its relaunch.
+    pub(crate) fn task_relaunching(&self, task: TaskId) -> bool {
+        self.machine().records(task).any(|(_, o)| o.relaunching)
+    }
+
+    /// The process of `thread` died: its records leave the stack (Machine::drop_owned).
+    pub(crate) fn process_died(&self, thread: &SpIBinder) {
+        let mut m = self.machine();
+        m.drop_owned(|o| o.thread.as_binder() == *thread);
+        self.note_settle(&m);
     }
 }
 

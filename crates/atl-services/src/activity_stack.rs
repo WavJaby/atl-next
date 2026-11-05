@@ -148,6 +148,27 @@ impl<K: Clone + PartialEq, O: Clone, L> Machine<K, O, L> {
         self.find(token).map(|(task, _)| task)
     }
 
+    pub fn owner_mut(&mut self, token: &K) -> Option<&mut O> {
+        self.find_mut(token).map(|(_, r)| &mut r.owner)
+    }
+
+    /// The records of `task`, bottom -> top: their tokens and owners.
+    pub fn records(&self, task: TaskId) -> impl Iterator<Item = (&K, &O)> {
+        self.tasks
+            .get(&task)
+            .into_iter()
+            .flatten()
+            .map(|r| (&r.token, &r.owner))
+    }
+
+    /// The owner process died (ActivityManagerService.handleAppDiedLocked): its records leave the stack at once, nothing is sent; a Task left empty is dropped.
+    pub fn drop_owned(&mut self, dead: impl Fn(&O) -> bool) {
+        for records in self.tasks.values_mut() {
+            records.retain(|r| !dead(&r.owner));
+        }
+        self.tasks.retain(|_, records| !records.is_empty());
+    }
+
     pub fn is_finishing(&self, token: &K) -> Option<bool> {
         self.find(token).map(|(_, r)| r.finishing)
     }
@@ -165,6 +186,16 @@ impl<K: Clone + PartialEq, O: Clone, L> Machine<K, O, L> {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// At rest: no record is Created, Resuming, Pausing or Stopping, so nothing sent is still unacknowledged. The services log each change of this (activity_task.rs); run-apk waits for it.
+    pub fn settled(&self) -> bool {
+        self.tasks.values().flatten().all(|r| {
+            !matches!(
+                r.phase,
+                Phase::Created | Phase::Resuming | Phase::Pausing | Phase::Stopping
+            )
+        })
     }
 
     fn find(&self, token: &K) -> Option<(TaskId, &Record<K, O, L>)> {
@@ -479,6 +510,40 @@ mod tests {
         assert!(m.relaunch(&SPLASH).is_empty());
         assert_eq!(m.phase(&SPLASH), Some(Phase::Paused));
         assert!(m.relaunch(&UNKNOWN).is_empty());
+    }
+
+    /// A start is pending from its push until the new top is resumed and the paused record is stopped: the probe must not pass in between.
+    #[test]
+    fn settled_only_when_no_record_is_in_transit() {
+        let mut m = Machine::new();
+        assert!(m.settled());
+        m.push(task(1), SPLASH, APP, "splash");
+        assert!(!m.settled(), "launch sent, not acknowledged");
+        m.resumed(&SPLASH);
+        assert!(m.settled());
+        m.push(task(1), MAIN, APP, "main");
+        assert!(!m.settled(), "start pending: Splash pausing, Main resuming");
+        m.paused(&SPLASH);
+        m.resumed(&MAIN);
+        assert!(!m.settled(), "Splash still to be stopped");
+        m.stopped(&SPLASH);
+        assert!(m.settled());
+    }
+
+    /// A dead owner's records leave the stack and are no longer listed; the others stay.
+    #[test]
+    fn drop_owned_removes_only_the_dead_owners_records() {
+        let mut m = Machine::new();
+        m.push(task(1), SPLASH, APP, "splash");
+        m.push(task(2), OTHER, "other", "other");
+        assert_eq!(m.records(task(1)).count(), 1);
+        m.drop_owned(|o| *o == APP);
+        assert_eq!(m.records(task(1)).count(), 0);
+        assert!(m.phase(&SPLASH).is_none());
+        assert_eq!(
+            m.records(task(2)).map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![OTHER]
+        );
     }
 
     #[test]

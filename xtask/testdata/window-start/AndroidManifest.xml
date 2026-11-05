@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage start-finish: the launcher (.Start) starts .Main and finishes; Main is window-declared's activity (the resize bits declared), not the launcher, so each resize
+     reaches it only if an activity started by startActivity gets configuration changes. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL window test">
+        <activity android:name=".Start" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".Main" android:exported="false" android:hardwareAccelerated="false"
+            android:configChanges="screenSize|smallestScreenSize|orientation|screenLayout"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+    </application>
+</manifest>

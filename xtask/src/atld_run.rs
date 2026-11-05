@@ -551,15 +551,38 @@ pub fn counter_lines(services_log: &str) -> Vec<String> {
         .collect()
 }
 
-/// The line activity.rs writes when an app reports its resume: `ActivityClientController::activityResumed`, which ResumeActivityItem sends after onResume returns.
+/// The line activity_task.rs writes when an app reports its resume (`activityResumed`, sent after onResume returns): `services: activity resumed <class> at=<stamp>`.
 const RESUMED_PREFIX: &str = "services: activity resumed";
+/// The lines activity_task.rs writes on each change of the settled state (activity_stack::Machine::settled): nothing pending, or a start or lifecycle step still unacknowledged.
+const SETTLED_PREFIX: &str = "services: activity settled at=";
+const UNSETTLED_PREFIX: &str = "services: activity unsettled at=";
 
-/// onResume's time: the stamp of the first resume line of the services' log, None when no app has reported one.
-pub fn resumed_ms(services_log: &str) -> Option<u64> {
+/// The activity an app reported resumed last: its class name and onResume's time.
+pub struct Resumed {
+    pub class: String,
+    pub ms: u64,
+}
+
+/// The last resume line of the services' log, i.e. the activity the app is on now. None: no resume line, or its stamp does not parse.
+pub fn last_resumed(services_log: &str) -> Option<Resumed> {
+    let line = services_log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with(RESUMED_PREFIX))?;
+    let (class, stamp) = line[RESUMED_PREFIX.len()..].rsplit_once(" at=")?;
+    Some(Resumed {
+        class: class.trim().to_owned(),
+        ms: parse_stamp(stamp)?,
+    })
+}
+
+/// Whether the services are settled now: the last settled-state line says so. No such line (no launch yet) is not settled.
+pub fn settled(services_log: &str) -> bool {
     services_log
         .lines()
-        .find(|l| l.starts_with(RESUMED_PREFIX))
-        .and_then(|l| parse_stamp(l.rsplit_once(" at=")?.1))
+        .rev()
+        .find(|l| l.starts_with(SETTLED_PREFIX) || l.starts_with(UNSETTLED_PREFIX))
+        .is_some_and(|l| l.starts_with(SETTLED_PREFIX))
 }
 
 #[cfg(test)]
@@ -588,13 +611,26 @@ mod tests {
         assert!(counter_lines("nothing\n").is_empty());
     }
 
-    /// The resume line gives its stamp, the first one wins; a line without a parsable stamp, a line of another kind, and no line at all give None.
+    /// The last resume line gives the class and its stamp; a last line without a parsable stamp, a line of another kind, and no line at all give None.
     #[test]
-    fn resumed_ms_reads_the_first_resume_line() {
-        let log = "services: ready\nservices: activity resumed at=100.250\nservices: activity resumed at=101.000\n";
-        assert_eq!(resumed_ms(log), Some(100_250));
-        assert_eq!(resumed_ms("services: activity resumed\n"), None);
-        assert_eq!(resumed_ms("services: ready at=100.250\n"), None);
-        assert_eq!(resumed_ms("nothing\n"), None);
+    fn last_resumed_reads_the_last_resume_line() {
+        let log = "services: ready\nservices: activity resumed org.x.Splash at=100.250\nservices: activity unsettled at=100.300\nservices: activity resumed org.x.Main at=101.000\nservices: activity settled at=101.001\n";
+        let last = last_resumed(log).expect("two resume lines");
+        assert_eq!((last.class.as_str(), last.ms), ("org.x.Main", 101_000));
+        assert!(last_resumed("services: activity resumed org.x.Main\n").is_none());
+        assert!(last_resumed("services: ready at=100.250\n").is_none());
+        assert!(last_resumed("nothing\n").is_none());
+    }
+
+    /// The last settle line decides; a resume line alone is not settled.
+    #[test]
+    fn settled_is_the_last_settle_line() {
+        assert!(settled(
+            "services: activity unsettled at=1.0\nservices: activity settled at=2.0\n"
+        ));
+        assert!(!settled(
+            "services: activity settled at=1.0\nservices: activity unsettled at=2.0\n"
+        ));
+        assert!(!settled("services: activity resumed org.x.Main at=1.0\n"));
     }
 }

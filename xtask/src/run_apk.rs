@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <APK>`: any APK, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop.
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
-//! No probe and no injected input. Pass: the app reports its resume (`services: activity resumed`, sent after onResume returns), no fault in its log within the watch after that
-//! (window::fault_after), and at least one frame presented (`atl-composer: ui: present`). Without --hold the run ends once a frame is presented and the watch is over.
+//! No probe and no injected input. The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
+//! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
+//! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
+//! (--hold: the hold); a run that ends before its watch is over fails.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::atld_run::{MS_PER_S, Run, Runtime, resumed_ms, run_display};
+use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
 use crate::{manifest, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
@@ -97,12 +99,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let started = Instant::now();
     let mut atld = rt.start_atld(&run)?;
     let mut ended = None;
+    let mut complete = false;
     loop {
-        let done = resumed_ms(&read(&services_log)).is_some_and(|t| {
-            window::now_ms() >= t + watch_ms
-                && (hold_ms.is_some() || presented(&read(&app_log)) > 0)
+        let services = read(&services_log);
+        let done = last_resumed(&services).is_some_and(|r| {
+            window::now_ms() >= r.ms + watch_ms
+                && settled(&services)
+                && (hold_ms.is_some() || presented_since(&read(&app_log), r.ms) > 0)
         });
         if done {
+            complete = true;
             break;
         }
         if let Some(s) = atld.try_wait()? {
@@ -124,7 +130,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    let outcome = judge(&services, &app, ended.is_some(), watch_ms);
+    let outcome = judge(&services, &app, complete, ended.is_some(), watch_ms);
     match &outcome {
         Ok(s) => println!("run-apk: ok {s}"),
         Err(s) => {
@@ -144,32 +150,62 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// Frames the app presented: its present lines.
-fn presented(app_log: &str) -> usize {
-    app_log.lines().filter(|l| l.contains(PRESENT_LINE)).count()
+/// Frames the app presented at or after `from_ms`: its present lines stamped no earlier (a line's stamp is its first field).
+fn presented_since(app_log: &str, from_ms: u64) -> usize {
+    app_log
+        .lines()
+        .filter(|l| l.contains(PRESENT_LINE))
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .and_then(parse_stamp)
+                .is_some_and(|t| t >= from_ms)
+        })
+        .count()
 }
 
-/// The run's verdict over its two logs: onResume (the services' resume line), then no fault in the app log within `watch_ms` after it, then a presented frame.
+/// The run's verdict over its two logs, about the last activity the app resumed: the services are settled (nothing pending after that resume), no fault in the app log within
+/// `watch_ms` after it (`atld_exited` is a fault at the window's end), the watch was run to its end (`complete`), and a frame was presented after it.
 /// Ok: the pass line; Err: the first failed part.
-fn judge(services: &str, app: &str, atld_exited: bool, watch_ms: u64) -> Result<String, String> {
-    let Some(resumed) = resumed_ms(services) else {
+fn judge(
+    services: &str,
+    app: &str,
+    complete: bool,
+    atld_exited: bool,
+    watch_ms: u64,
+) -> Result<String, String> {
+    let Some(last) = last_resumed(services) else {
         return Err(
             "no activity resumed: the services log has no `services: activity resumed` line"
                 .to_owned(),
         );
     };
-    if let Some(fault) = window::fault_after(app, resumed, watch_ms, atld_exited) {
-        return Err(fault);
+    if !settled(services) {
+        return Err(format!(
+            "not settled after {}: a start or lifecycle step is still unacknowledged",
+            last.class
+        ));
     }
-    let frames = presented(app);
+    if let Some(fault) = window::fault_after(app, last.ms, watch_ms, atld_exited) {
+        return Err(format!("{fault} (last resumed: {})", last.class));
+    }
+    if !complete {
+        return Err(format!(
+            "the run ended before the {watch_ms} ms watch after {} was over",
+            last.class
+        ));
+    }
+    let frames = presented_since(app, last.ms);
     if frames == 0 {
         return Err(format!(
-            "no frame presented: the app log has no `{PRESENT_LINE}` line"
+            "no frame presented after {} resumed: the app log has no `{PRESENT_LINE}` line after it",
+            last.class
         ));
     }
     Ok(format!(
-        "onResume at {}, {frames} frame(s) presented, no fault in the {watch_ms} ms after it",
-        window::stamp_text(resumed)
+        "onResume of {} at {}, {frames} frame(s) presented after it, settled, no fault in the {watch_ms} ms after it",
+        last.class,
+        window::stamp_text(last.ms)
     ))
 }
 
@@ -177,43 +213,61 @@ fn judge(services: &str, app: &str, atld_exited: bool, watch_ms: u64) -> Result<
 mod tests {
     use super::*;
 
-    const RESUME: &str = "services: activity resumed at=100.000\n";
+    const RESUME: &str =
+        "services: activity resumed org.x.Main at=100.000\nservices: activity settled at=100.001\n";
     const PRESENT: &str = "100.900 D atl-composer: ui: present n=1 time_ns=1\n";
 
     #[test]
     fn judge_passes_a_resumed_presenting_app() {
         let app = format!("100.500 I tag: onCreate\n{PRESENT}");
-        assert!(judge(RESUME, &app, false, 2_000).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000).is_ok());
     }
 
     #[test]
     fn judge_fails_each_missing_or_broken_part() {
-        assert!(
-            judge("", PRESENT, false, 2_000)
-                .unwrap_err()
-                .contains("no activity resumed")
-        );
-        assert!(
-            judge(RESUME, "100.500 I tag: x\n", false, 2_000)
-                .unwrap_err()
-                .contains("no frame presented")
-        );
+        let err = |services: &str, app: &str, complete: bool, atld_exited: bool| {
+            judge(services, app, complete, atld_exited, 2_000).unwrap_err()
+        };
+        assert!(err("", PRESENT, true, false).contains("no activity resumed"));
+        assert!(err(RESUME, "100.500 I tag: x\n", true, false).contains("no frame presented"));
         let crashed = format!("{PRESENT}100.700 E AndroidRuntime: FATAL EXCEPTION: main\n");
+        assert!(err(RESUME, &crashed, true, false).contains("FATAL EXCEPTION"));
+        assert!(err(RESUME, PRESENT, true, true).contains("atld exited"));
+        assert!(err(RESUME, PRESENT, false, false).contains("ended before"));
+        let pending = "services: activity resumed org.x.Main at=100.000\nservices: activity unsettled at=100.500\n";
+        assert!(err(pending, PRESENT, true, false).contains("not settled"));
+    }
+
+    /// The shape of the r5 hold run: Splash resumes and presents, Main resumes 39 s later and dies 67 ms after that. Splash's watch is long over by then; the verdict is about Main.
+    #[test]
+    fn judge_checks_the_last_resumed_activity_of_the_hold_run() {
+        let services = "services: activity resumed org.fossify.math.activities.SplashActivity at=1793887559.475\n\
+                        services: activity unsettled at=1793887559.600\n\
+                        services: activity resumed org.fossify.math.activities.MainActivity at=1793887598.643\n\
+                        services: activity settled at=1793887598.644\n";
+        let app = "1793887559.900 D atl-composer: ui: present n=1 time_ns=1\n\
+                   1793887598.710 E AndroidRuntime: FATAL EXCEPTION: main\n";
+        let err = judge(services, app, true, false, 2_000).unwrap_err();
         assert!(
-            judge(RESUME, &crashed, false, 2_000)
-                .unwrap_err()
-                .contains("FATAL EXCEPTION")
+            err.contains("FATAL EXCEPTION") && err.contains("MainActivity"),
+            "{err}"
         );
-        assert!(
-            judge(RESUME, PRESENT, true, 2_000)
-                .unwrap_err()
-                .contains("atld exited")
-        );
+    }
+
+    /// A second activity that starts after the first watch and presents nothing is not a pass: the verdict is about it, and it has no frame.
+    #[test]
+    fn judge_refuses_a_second_activity_without_a_frame() {
+        let services = "services: activity resumed org.x.Splash at=100.000\n\
+                        services: activity unsettled at=103.000\n\
+                        services: activity resumed org.x.Main at=103.500\n\
+                        services: activity settled at=103.501\n";
+        let err = judge(services, PRESENT, true, false, 2_000).unwrap_err();
+        assert!(err.contains("no frame presented after org.x.Main"), "{err}");
     }
 
     #[test]
     fn judge_ignores_a_fault_after_the_watch() {
         let app = format!("{PRESENT}102.500 E AndroidRuntime: FATAL EXCEPTION: main\n");
-        assert!(judge(RESUME, &app, false, 2_000).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000).is_ok());
     }
 }
