@@ -41,6 +41,7 @@ mod platform_ui;
 mod provided_gate;
 mod providers;
 mod prune;
+mod run_apk;
 mod services;
 mod slot;
 mod sources;
@@ -130,6 +131,11 @@ enum Command {
     /// file has no notice at all. An unrecognised notice is reported, never guessed. The licence
     /// gate applies the same resolution to what a build links.
     Licence(notice::Args),
+    /// Runs any APK under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
+    ///
+    /// The package file is the APK's own manifest; the APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
+    /// `--hold SECS` keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Until GPU lands only apps with `android:hardwareAccelerated="false"` are supported (owner, 2026-11-05).
+    RunApk(run_apk::Args),
     /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).
     Test {
         #[command(subcommand)]
@@ -199,6 +205,7 @@ fn main() -> Result<ExitCode> {
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
+        Command::RunApk(args) => run_apk::run(&root, &args),
         Command::Test {
             test: Test::NativeLoad(args),
         } => native_load::run(&root, &args),
@@ -246,6 +253,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Native(_) => "native",
         Command::Check(_) => "check",
         Command::Land(_) => "land",
+        Command::RunApk(_) => "run-apk",
         Command::Test { test } => match test {
             Test::NativeLoad(_) => "native-load",
             Test::Parcel(_) => "parcel",

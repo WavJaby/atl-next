@@ -539,6 +539,17 @@ pub fn counter_lines(services_log: &str) -> Vec<String> {
         .collect()
 }
 
+/// The line activity.rs writes when an app reports its resume: `ActivityClientController::activityResumed`, which ResumeActivityItem sends after onResume returns.
+const RESUMED_PREFIX: &str = "services: activity resumed";
+
+/// onResume's time: the stamp of the first resume line of the services' log, None when no app has reported one.
+pub fn resumed_ms(services_log: &str) -> Option<u64> {
+    services_log
+        .lines()
+        .find(|l| l.starts_with(RESUMED_PREFIX))
+        .and_then(|l| parse_stamp(l.rsplit_once(" at=")?.1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +574,15 @@ mod tests {
             ]
         );
         assert!(counter_lines("nothing\n").is_empty());
+    }
+
+    /// The resume line gives its stamp, the first one wins; a line without a parsable stamp, a line of another kind, and no line at all give None.
+    #[test]
+    fn resumed_ms_reads_the_first_resume_line() {
+        let log = "services: ready\nservices: activity resumed at=100.250\nservices: activity resumed at=101.000\n";
+        assert_eq!(resumed_ms(log), Some(100_250));
+        assert_eq!(resumed_ms("services: activity resumed\n"), None);
+        assert_eq!(resumed_ms("services: ready at=100.250\n"), None);
+        assert_eq!(resumed_ms("nothing\n"), None);
     }
 }

@@ -122,12 +122,12 @@ const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
-const APP_UID: u32 = 10_123;
+pub(crate) const APP_UID: u32 = 10_123;
 /// How long a cold start may take to reach the marker (as `xtask test app`).
-const LIMIT: Duration = Duration::from_secs(180);
+pub(crate) const LIMIT: Duration = Duration::from_secs(180);
 /// How long the app must survive after the marker. The resume path (WindowManagerGlobal.addView, the window of the activity) runs right after onResume and fails within
 /// milliseconds when it fails, so two seconds leaves the failure time to show.
-const WINDOW_MS: u64 = 2_000;
+pub(crate) const WINDOW_MS: u64 = 2_000;
 /// The frames and input stages' watch after the marker: the first draw, then FRAME_CALLBACKS vsyncs (0.5 s at 60 Hz), with slack for a slow start; the input stage's touches come after the first draw, inside it.
 const FRAMES_WINDOW_MS: u64 = 5_000;
 /// The gtk stage's watch after the marker: the first draw, the pointer script, the probe's block and the pong after it.
@@ -210,9 +210,9 @@ const ACTION_MOVE: u32 = 2;
 /// The pointer count of each touch: the script has one pointer.
 const POINTERS: u32 = 1;
 /// How often the logs are read while waiting.
-const POLL: Duration = Duration::from_millis(50);
+pub(crate) const POLL: Duration = Duration::from_millis(50);
 /// Lines shown of a log on failure.
-const TAIL: usize = 40;
+pub(crate) const TAIL: usize = 40;
 
 /// What the stage waits for: the fixture's Log.i line (tag `AtlWindow`, Main.java), as the launcher's logger writes it (`<tag>: <message>`).
 fn marker(stage: Stage) -> &'static str {
@@ -229,14 +229,14 @@ fn marker(stage: Stage) -> &'static str {
 }
 
 /// The wall clock, ms since the epoch: the clock of the logcat stamps and of the services' `at=` stamps.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// `secs.mmm` for `ms` since the epoch: the form of a stamp (parse_stamp reads it back).
-fn stamp_text(ms: u64) -> String {
+pub(crate) fn stamp_text(ms: u64) -> String {
     format!("{}.{:03}", ms / MS_PER_S, ms % MS_PER_S)
 }
 
@@ -272,11 +272,24 @@ pub fn verdict(app_log: &str, marker: &str, atld_exited: bool, window_ms: u64) -
             fault: None,
         };
     };
-    let end = marker_ms + window_ms;
+    Verdict {
+        marker_ms: Some(marker_ms),
+        fault: fault_after(app_log, marker_ms, window_ms, atld_exited),
+    }
+}
+
+/// The first fault of an app log in [from_ms, from_ms + window_ms], the stamp `from_ms` taken as onResume's time (run-apk reads it from the services log). `atld_exited` is a fault at the window's end.
+pub(crate) fn fault_after(
+    app_log: &str,
+    from_ms: u64,
+    window_ms: u64,
+    atld_exited: bool,
+) -> Option<String> {
+    let end = from_ms + window_ms;
     let mut faults: Vec<(u64, String)> = app_log
         .lines()
         .filter_map(|l| Some((line_stamp(l)?, l)))
-        .filter(|(t, _)| (marker_ms..=end).contains(t))
+        .filter(|(t, _)| (from_ms..=end).contains(t))
         .filter_map(|(t, l)| {
             let what = if l.contains("FATAL EXCEPTION") {
                 "FATAL EXCEPTION"
@@ -287,17 +300,14 @@ pub fn verdict(app_log: &str, marker: &str, atld_exited: bool, window_ms: u64) -
             } else {
                 return None;
             };
-            Some((t, format!("{what} at +{} ms after onResume", t - marker_ms)))
+            Some((t, format!("{what} at +{} ms after onResume", t - from_ms)))
         })
         .collect();
     if atld_exited {
         faults.push((end, "atld exited inside the window".to_owned()));
     }
     faults.sort_by_key(|(t, _)| *t);
-    Verdict {
-        marker_ms: Some(marker_ms),
-        fault: faults.into_iter().next().map(|(_, f)| f),
-    }
+    faults.into_iter().next().map(|(_, f)| f)
 }
 
 /// One synthetic app log and what the verdict must say about it.
@@ -471,7 +481,7 @@ fn after_marker<'a>(app_log: &'a str, marker: &str) -> Vec<&'a str> {
         .collect()
 }
 
-fn tail(text: &str, n: usize) -> String {
+pub(crate) fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
@@ -572,7 +582,7 @@ fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String>
 }
 
 /// Stops the app processes atld started, before atld is killed: an app whose atld dies under it aborts on its binder calls (DEAD_OBJECT, ~5 s after onResume). SIGTERM, then up to STOP_WAIT for them to exit.
-fn stop_apps(atld: u32) {
+pub(crate) fn stop_apps(atld: u32) {
     let apps: Vec<u32> = std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
