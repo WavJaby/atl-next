@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Whether the services start an activity for a startActivity call: the accepted subset of ActivityStarter, pure (no binder), so the tests build without the converter feature.
-//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, with no result, in the caller's task and process, standard launch mode.
+//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, with no result, in the caller's task and process, standard launch mode,
+//! or singleTop / singleTask when no instance of the class is in that task (a new instance, as standard).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed), otherwise the START code AOSP returns for the case
 //! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `counters::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
-//! Refused, not modelled: implicit intents (intent filters), other packages, startActivityForResult, launch modes other than standard, other processes, intent flags except NEW_TASK.
+//! Refused, not modelled: implicit intents (intent filters), other packages, startActivityForResult, reusing a singleTop / singleTask instance, singleInstance, other processes, intent flags except NEW_TASK.
 
 use crate::counters;
 use crate::packages::ActivityDecl;
@@ -19,8 +20,10 @@ pub const START_INTENT_NOT_RESOLVED: i32 = -91;
 
 /// Intent.FLAG_ACTIVITY_NEW_TASK.
 const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
-/// ActivityInfo.LAUNCH_MULTIPLE: `standard`, the launch mode a manifest without `android:launchMode` gets.
+/// ActivityInfo.LAUNCH_MULTIPLE: `standard`, the launch mode a manifest without `android:launchMode` gets; LAUNCH_SINGLE_TOP / LAUNCH_SINGLE_TASK.
 const LAUNCH_MODE_STANDARD: i32 = 0;
+const LAUNCH_SINGLE_TOP: i32 = 1;
+const LAUNCH_SINGLE_TASK: i32 = 2;
 const INTERFACE: &str = "IActivityTaskManager";
 
 /// Why a start is refused. `Security` is thrown as a SecurityException; `Code` is returned as the startActivity result.
@@ -56,6 +59,8 @@ pub struct Call<'a> {
 pub struct Target<'a> {
     pub process: &'a str,
     pub decl: Option<&'a ActivityDecl>,
+    /// An activity of the component's class, not finishing, is in the source's task: what a singleTop / singleTask start would reuse.
+    pub in_task: bool,
 }
 
 fn refused(code: i32, reason: &'static str) -> Refusal {
@@ -93,16 +98,36 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<&'a ActivityDecl
             "class not declared by the package",
         ));
     };
-    if decl.launch_mode != LAUNCH_MODE_STANDARD {
-        return Err(refused(START_CANCELED, "launch mode other than standard"));
+    // singleTop / singleTask with no instance of the class in the source's task: ActivityStarter finds nothing to reuse (singleTop: no such top, singleTask: no such activity in the
+    // task of its affinity, checked below as for NEW_TASK, which singleTask implies) and starts a new instance on top, as standard. Reusing one (onNewIntent, clear-top) is not modelled.
+    match decl.launch_mode {
+        LAUNCH_MODE_STANDARD => {}
+        LAUNCH_SINGLE_TOP | LAUNCH_SINGLE_TASK if !target.in_task => {}
+        LAUNCH_SINGLE_TOP | LAUNCH_SINGLE_TASK => {
+            return Err(refused(
+                START_CANCELED,
+                "singleTop/singleTask instance already in the task (onNewIntent)",
+            ));
+        }
+        _ => {
+            return Err(refused(
+                START_CANCELED,
+                "launch mode singleInstance / singleInstancePerTask",
+            ));
+        }
     }
+    let flags = if decl.launch_mode == LAUNCH_SINGLE_TASK {
+        call.flags | FLAG_ACTIVITY_NEW_TASK
+    } else {
+        call.flags
+    };
     if decl.process.as_deref().is_some_and(|p| p != target.process) {
         return Err(refused(START_CANCELED, "activity in another process"));
     }
-    if call.flags & !FLAG_ACTIVITY_NEW_TASK != 0 {
+    if flags & !FLAG_ACTIVITY_NEW_TASK != 0 {
         return Err(refused(START_CANCELED, "intent flags other than NEW_TASK"));
     }
-    if call.flags & FLAG_ACTIVITY_NEW_TASK != 0 {
+    if flags & FLAG_ACTIVITY_NEW_TASK != 0 {
         let affinity = decl
             .task_affinity
             .as_deref()
@@ -160,6 +185,7 @@ mod tests {
         Target {
             process: PACKAGE,
             decl: Some(main),
+            in_task: false,
         }
     }
 
@@ -318,6 +344,7 @@ mod tests {
         let none = Target {
             process: PACKAGE,
             decl: None,
+            in_task: false,
         };
         assert_eq!(
             code_of(check(&c, none)),
@@ -329,14 +356,30 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_launch_mode_other_than_standard() {
+    fn single_top_and_task_start_new_unless_an_instance_is_in_the_task() {
         let mut main = decl(MAIN);
-        main.launch_mode = 1; // singleTop
+        for mode in [1, 2] {
+            // singleTop, singleTask (ActivityInfo LAUNCH_SINGLE_TOP / LAUNCH_SINGLE_TASK)
+            main.launch_mode = mode;
+            assert!(check(&call(), target(&main)).is_ok(), "mode {mode}");
+            let reuse = Target {
+                in_task: true,
+                ..target(&main)
+            };
+            assert_eq!(
+                code_of(check(&call(), reuse)),
+                Refusal::Code {
+                    code: START_CANCELED,
+                    reason: "singleTop/singleTask instance already in the task (onNewIntent)"
+                }
+            );
+        }
+        main.launch_mode = 3; // singleInstance
         assert_eq!(
             code_of(check(&call(), target(&main))),
             Refusal::Code {
                 code: START_CANCELED,
-                reason: "launch mode other than standard"
+                reason: "launch mode singleInstance / singleInstancePerTask"
             }
         );
     }

@@ -269,9 +269,17 @@ impl ActivityTasks {
             component,
             source: source_view,
         };
+        let in_task = match (&source, component) {
+            (Some((t, _)), Some((_, class))) => m.task_of(t).is_some_and(|task| {
+                m.records(task)
+                    .any(|(k, o)| o.component == class && m.is_finishing(k) == Some(false))
+            }),
+            _ => false,
+        };
         let target = Target {
             process: package.map_or("", |p| p.process_name()),
             decl,
+            in_task,
         };
         let decl = match activity_start::check(&call, target) {
             Ok(decl) => decl,
