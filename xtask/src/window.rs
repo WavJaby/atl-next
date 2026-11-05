@@ -24,7 +24,7 @@ use crate::atld_run::{
 };
 use crate::composer::{fnv1a64, word};
 use crate::manifest;
-use crate::nested_wayland::NestedCompositor;
+use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod widgets;
@@ -1360,10 +1360,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         Stage::Resume | Stage::Frames => rt,
     };
-    // the monitor's refresh rate (the gate's own compositor's, else the desktop's): atld answers with it, and the cadence checks below judge against it
-    let display = nested
-        .as_ref()
-        .map_or_else(run_display, NestedCompositor::display);
+    // the refresh rate atld answers with and the cadence checks judge against: the gate's own compositor's; headless stages (no window) take the same gate output's; only a hold asks the desktop
+    let display = match &nested {
+        Some(n) => n.display(),
+        None if args.hold.is_some() => run_display(),
+        None => GATE_OUTPUT.display(),
+    };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
     let shown = if matches!(args.stage, Stage::Widgets) {
         widgets::display(display)

@@ -191,15 +191,21 @@ impl NestedCompositor {
         self.output_display(0)
     }
 
-    /// Output `index` as Android's display: the mode this module set (`set_custom_mode`: physical pixels), its rate and scale.
+    /// Output `index` as Android's display (see [`Output::display`]).
     pub fn output_display(&self, index: usize) -> DisplayModel {
-        let o = self.outputs[index];
+        self.outputs[index].display()
+    }
+}
+
+impl Output {
+    /// This output as Android's display: the mode this module sets (`set_custom_mode`: physical pixels), its rate and scale. The headless window stages (no Wayland window) take [`GATE_OUTPUT`]'s, so they judge the same display as the stages on a compositor, whatever the desktop's monitor runs at.
+    pub fn display(&self) -> DisplayModel {
         let physical = |px: i32| u32::try_from(px).unwrap_or(0);
         DisplayModel::from_monitor(
-            physical(o.width),
-            physical(o.height),
-            Some(o.refresh_mhz as f32 / 1000.0),
-            o.scale,
+            physical(self.width),
+            physical(self.height),
+            Some(self.refresh_mhz as f32 / 1000.0),
+            self.scale,
         )
     }
 }
