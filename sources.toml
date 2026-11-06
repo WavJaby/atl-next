@@ -244,6 +244,14 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 "tools/metalava" = "a2548e478c121d5801137d636f6e83af37eafc99"
 "tools/platform-compat" = "db0de6104d8527114a7ae441b0a9c35f885d2876"
 
+# toolchain/llvm_android: read-only reference for the runtimes variants (xtask runtimes.rs mirrors its builders.py), never built.
+# clang-r547379/clang_source_info.md names 9596955b, the merge into llvm-r547379-release; no published branch or tag reaches
+# it, only its Gerrit change ref, so the change is the pin. Outside the AOSP tree like berberis.
+[llvm-android]
+git = "https://android.googlesource.com/toolchain/llvm_android"
+change = "25/3568025/1"
+commit = "9596955b7369d93bd2a505eefac28ff17912770c"
+
 # Berberis (AOSP frameworks/libs/binary_translation): read-only reference for the identity engine's loader/thread design (owner O1, 2026-11-06), never built.
 # A git row, not an [aosp.projects] one, so it lands in src/berberis outside the AOSP tree the converter scans.
 [berberis]

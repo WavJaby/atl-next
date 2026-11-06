@@ -35,9 +35,10 @@ pub const AOSP_MANIFEST_DIR: &str = "aosp-manifest";
 #[serde(deny_unknown_fields)]
 pub struct GitUpstream {
     pub git: String,
-    /// Exactly one of `tag` / `branch`: the ref the pin is read from (a branch only where upstream publishes no tag for the wanted build).
+    /// Exactly one of `tag` / `branch` / `change`: the ref the pin is read from (a branch only where upstream publishes no tag for the wanted build; `change` = Gerrit `<nn>/<change>/<patchset>` under `refs/changes/`, only where the commit is reachable from no published branch or tag).
     pub tag: Option<String>,
     pub branch: Option<String>,
+    pub change: Option<String>,
     pub commit: String,
     /// Cone-mode sparse directories; empty = whole tree. Set => partial (blob:none) clone.
     #[serde(default)]
@@ -45,12 +46,13 @@ pub struct GitUpstream {
 }
 
 impl GitUpstream {
-    /// Full ref name the pin is read from (`refs/tags/..` or `refs/heads/..`).
+    /// Full ref name the pin is read from (`refs/tags/..`, `refs/heads/..` or `refs/changes/..`).
     pub fn refname(&self) -> String {
-        match (&self.tag, &self.branch) {
-            (Some(t), _) => format!("refs/tags/{t}"),
-            (None, Some(b)) => format!("refs/heads/{b}"),
-            (None, None) => String::new(),
+        match (&self.tag, &self.branch, &self.change) {
+            (Some(t), _, _) => format!("refs/tags/{t}"),
+            (None, Some(b), _) => format!("refs/heads/{b}"),
+            (None, None, Some(c)) => format!("refs/changes/{c}"),
+            (None, None, None) => String::new(),
         }
     }
 }
@@ -187,9 +189,23 @@ fn validate(sources: &Sources) -> Result<()> {
         );
         ensure!(!up.git.is_empty(), "upstream `{name}`: empty git");
         ensure!(
-            matches!((&up.tag, &up.branch), (Some(r), None) | (None, Some(r)) if !r.is_empty()),
-            "upstream `{name}`: needs exactly one non-empty `tag` or `branch`"
+            matches!(
+                (&up.tag, &up.branch, &up.change),
+                (Some(r), None, None) | (None, Some(r), None) | (None, None, Some(r)) if !r.is_empty()
+            ),
+            "upstream `{name}`: needs exactly one non-empty `tag`, `branch` or `change`"
         );
+        if let Some(c) = &up.change {
+            let parts: Vec<&str> = c.split('/').collect();
+            ensure!(
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                    && parts[1].ends_with(parts[0]),
+                "upstream `{name}`: change `{c}` is not a Gerrit `<last two digits>/<change>/<patchset>`"
+            );
+        }
         for d in &up.sparse {
             ensure!(
                 is_tree_path(d),
@@ -266,6 +282,23 @@ mod tests {
             "{AOSP}[llvm]\ngit = \"g\"\ntag = \"t\"\ncommit = \"{SHA}\"\nsparse = [\"../x\"]\n"
         );
         assert!(err(&bad).contains("not a relative tree path"));
+    }
+
+    #[test]
+    fn gerrit_change_pin() {
+        // Gerrit shards change 3568025 under its last two digits: refs/changes/25/3568025/<patchset>.
+        let ok = format!("{AOSP}[x]\ngit = \"g\"\nchange = \"25/3568025/1\"\ncommit = \"{SHA}\"\n");
+        assert_eq!(
+            parse(&ok).unwrap().git["x"].refname(),
+            "refs/changes/25/3568025/1"
+        );
+        let shard =
+            format!("{AOSP}[x]\ngit = \"g\"\nchange = \"24/3568025/1\"\ncommit = \"{SHA}\"\n");
+        assert!(err(&shard).contains("not a Gerrit"));
+        let both = format!(
+            "{AOSP}[x]\ngit = \"g\"\ntag = \"t\"\nchange = \"25/3568025/1\"\ncommit = \"{SHA}\"\n"
+        );
+        assert!(err(&both).contains("exactly one"));
     }
 
     #[test]

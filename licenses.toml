@@ -823,6 +823,10 @@ reason = "Apache-2.0 header; the added note that poly1305-donna is public domain
 # Reference only (sources.toml): nothing of it is compiled, so no file reaches the checked set; its LICENSE is Apache-2.0.
 unlabelled = "Apache-2.0"
 
+[upstream.llvm-android]
+# Reference only (sources.toml): nothing of it is compiled, so no file reaches the checked set; its LICENSE is Apache-2.0.
+unlabelled = "Apache-2.0"
+
 [upstream.llvm-project]
 # llvm-project's LICENSE.TXT: Apache License v2.0 with LLVM Exceptions; runtime sources carry `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`.
 unlabelled = "Apache-2.0 WITH LLVM-exception"
