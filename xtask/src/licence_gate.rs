@@ -168,16 +168,98 @@ pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> 
             files.entry(f.to_path_buf()).or_insert(artifact);
         }
     }
+    judge_files(files, roots, out, licenses, &mut report)?;
+    for (build, loaded) in external {
+        check_external(&build, &loaded, roots, licenses, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// The licence gate over Mesa's own meson build dir `build` (inside `out`; mesa.rs `build_after_ninja`), its link outputs `artifacts` (build-relative), all of class `runtime`.
+/// Reached files over-count: Mesa's links run without `--trace`, so an artifact reaches every object of its link edge and of each build-dir input's edge (static archives, other Mesa libraries), transitively, loaded or not; then each object's depfile (`ninja -t deps`). Shared libraries among the inputs are their own artifacts (the converter's, gated by `check`), system files the platform's.
+pub fn check_mesa(
+    out: &Path,
+    build: &Path,
+    artifacts: &[&str],
+    roots: &[Root],
+    licenses: &Licenses,
+) -> Result<Report> {
+    let mut report = Report {
+        artifacts: artifacts.len(),
+        ..Report::default()
+    };
+    // build-relative object -> first artifact reaching it
+    let mut objects: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for artifact in artifacts {
+        let artifact = Path::new(*artifact);
+        let (mut todo, mut seen) = (vec![artifact.to_path_buf()], BTreeSet::new());
+        while let Some(t) = todo.pop() {
+            if !seen.insert(t.clone()) {
+                continue;
+            }
+            let query = ninja(build, &["-t", "query", &t.display().to_string()])?;
+            for input in edge_inputs(&query) {
+                if input.extension().is_some_and(|e| e == "o") {
+                    objects.entry(input).or_insert(artifact);
+                } else if !input.is_absolute() {
+                    // a static archive, the versioned file behind a `.so` symlink edge, a Mesa library linked into another (counted twice), a version script (no edge)
+                    todo.push(input);
+                }
+            }
+        }
+    }
+    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let mut files: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for (object, artifact) in &objects {
+        if !deps.contains_key(object) {
+            report
+                .unresolved
+                .push(format!("{}: no depfile record (Mesa)", object.display()));
+            continue;
+        }
+        for f in made_of(object, &deps) {
+            files.entry(build.join(f)).or_insert(artifact);
+        }
+    }
+    judge_files(files, roots, out, licenses, &mut report)?;
+    Ok(report)
+}
+
+/// `ninja -t query <target>`: every input of its edge, explicit and implicit (`| x`), order-only (`|| x`) skipped.
+fn edge_inputs(text: &str) -> Vec<PathBuf> {
+    let mut inputs = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            inputs = false;
+        } else if let Some(section) = line.strip_prefix("  ")
+            && !section.starts_with(' ')
+        {
+            inputs = section.starts_with("input:");
+        } else if inputs {
+            let input = line.trim();
+            if !input.starts_with("||") {
+                out.push(PathBuf::from(input.trim_start_matches('|').trim()));
+            }
+        }
+    }
+    out
+}
+
+/// `judge` over reached files (file -> first artifact reaching it), canonicalized first.
+fn judge_files(
+    files: BTreeMap<PathBuf, &Path>,
+    roots: &[Root],
+    out: &Path,
+    licenses: &Licenses,
+    report: &mut Report,
+) -> Result<()> {
     let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
     for (file, artifact) in files {
         let real = std::fs::canonicalize(&file).unwrap_or(file);
         placed.entry(real).or_insert(artifact);
     }
-    judge(placed, roots, out, licenses, &mut report)?;
-    for (build, loaded) in external {
-        check_external(&build, &loaded, roots, licenses, &mut report)?;
-    }
-    Ok(report)
+    judge(placed, roots, out, licenses, report)
 }
 
 /// The CMake/ninja build an archive outside this build's edges came from: the nearest ancestor below `out` holding `build.ninja` (the archive sits in its build dir, as `xtask runtimes` leaves it) or `build/build.ninja` (an install prefix beside its build dir, as `upstream::build` leaves it).
@@ -826,6 +908,20 @@ mod tests {
         let q = parse_query(text);
         assert_eq!(q[Path::new("/o/libx.a")], [PathBuf::from("/o/obj/a.cpp.o")]);
         assert_eq!(q[Path::new("/o/liby.a")], [PathBuf::from("/o/obj/b.c.o")]);
+    }
+
+    #[test]
+    fn edge_inputs_keep_implicit_drop_order_only() {
+        // ninja 1.12 `-t query` layout of a meson link edge (sampled from Mesa's build.ninja)
+        let text = "src/egl/libEGL_mesa.so.1.0.0:\n  input: cpp_LINKER\n    src/egl/a.c.o\n    src/util/libmesa_util.a\n    | /o/device/liblog/liblog.so\n    || src/gen.h\n  outputs:\n    src/egl/libEGL_mesa.so\n";
+        assert_eq!(
+            edge_inputs(text),
+            [
+                PathBuf::from("src/egl/a.c.o"),
+                PathBuf::from("src/util/libmesa_util.a"),
+                PathBuf::from("/o/device/liblog/liblog.so"),
+            ]
+        );
     }
 
     #[test]

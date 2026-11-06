@@ -90,7 +90,9 @@ rule ar
   command = rm -f $out && $ar crsD $out $in
   description = ar $out
 rule link
-  command = $cxx $mode -o $out $in $libs -Wl,--trace >$out.trace
+  command = $cxx $mode -o $out @$out.rsp $libs -Wl,--trace >$out.trace
+  rspfile = $out.rsp
+  rspfile_content = $in
   description = link $out
 rule aidl
   command = $aidl --lang=$lang $flags --ninja -d $dep -h $hdir -o $sdir $in

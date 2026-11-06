@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask native`: AOSP native modules built for this Linux host by our Blueprint converter (`tools/bp2ninja`, plan D7-2): builds the converter with the distro Go against the pinned `build/blueprint` (converter.rs),
-//! builds the providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`,
+//! builds the providers.toml modules provided outside the tree (`crate:` with cargo-c, `upstream:` by their recipe; `system:` resolved with pkg-config, system.rs), converts the goals' closure into ninja, builds it with `ninja -k 0`, then Mesa with its own meson build against those libraries (mesa.rs `build_after_ninja`; skipped when the goals lack them),
 //! summarises the failures by module and runs the provided gate (provided_gate.rs) and the table check: providers.toml rows the converter finds wrong, and `none` rows a still-built module needs (none_gate.rs). Either fails the run.
 //! After a clean build it builds the workspace packages that link converter modules the graph holds (packages.rs: the launcher against libsigchain, atl-aidl against libbinder_rs).
 
@@ -371,6 +371,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
+    // Mesa's own meson build against what ninja built (mesa.rs), still under the token: it compiles as much as a converter module
+    let mesa_step = crate::mesa::build_after_ninja(&out, &tree.join(crate::mesa::MESA_TREE))?;
     drop(token);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
@@ -379,10 +381,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
     let mut failed: Vec<Failure> = Vec::new();
+    let mesa_build = match mesa_step {
+        crate::mesa::Step::Failed(first) => {
+            failed.push(Failure::step("mesa", first));
+            None
+        }
+        crate::mesa::Step::Built(b) => Some(b),
+        crate::mesa::Step::Skipped => None,
+    };
     if let Some(first) = gate(&out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
-    if let Some(first) = licence_gate(root, &layout, &sources, &out, args.verbose)? {
+    if let Some(first) = licence_gate(
+        root,
+        &layout,
+        &sources,
+        &out,
+        mesa_build.as_deref(),
+        args.verbose,
+    )? {
         failed.push(Failure::step("licence gate", first));
     }
     let graph_file = out.join("graph.json");
@@ -830,13 +847,31 @@ fn licence_gate(
     layout: &Layout,
     sources: &sources::Sources,
     out: &Path,
+    mesa_build: Option<&Path>,
     verbose: bool,
 ) -> Result<Option<String>> {
     let licenses = licenses::load(root, &sources.upstream_names())?;
     let roots = licence_gate::roots(layout, &sources.checkouts(None));
-    let report = licence_gate::check(&std::fs::canonicalize(out)?, &roots, &licenses)?;
+    let out = std::fs::canonicalize(out)?;
+    let report = licence_gate::check(&out, &roots, &licenses)?;
+    let first = licence_report("licence gate", &report, verbose);
+    let Some(build) = mesa_build else {
+        return Ok(first);
+    };
+    let mesa = licence_gate::check_mesa(
+        &out,
+        &std::fs::canonicalize(build)?,
+        crate::mesa::OUTPUTS,
+        &roots,
+        &licenses,
+    )?;
+    Ok(first.or(licence_report("licence gate (Mesa)", &mesa, verbose)))
+}
+
+/// Prints a licence gate report under `label`; its first problem, None when it passes.
+fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> Option<String> {
     println!(
-        "native: licence gate: {} artifacts, {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
+        "native: {label}: {} artifacts, {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
         report.artifacts,
         report.checked,
         report.generated,
@@ -867,7 +902,7 @@ fn licence_gate(
         println!("native:   licence: stale {s} (its link did not run in this build: not checked)");
     }
     if report.ok() {
-        return Ok(None);
+        return None;
     }
     let first = report
         .denied
@@ -883,9 +918,7 @@ fn licence_gate(
         .chain(report.unresolved.iter().map(|u| format!("unresolved {u}")))
         .chain(report.stale.iter().map(|s| format!("stale {s}")))
         .next();
-    Ok(Some(
-        first.unwrap_or_else(|| "licence gate failed".to_owned()),
-    ))
+    Some(first.unwrap_or_else(|| format!("{label} failed")))
 }
 
 /// One converter round's output files.
@@ -947,7 +980,13 @@ mod tests {
     /// Each check `run` can fail by name exits nonzero alone; only none failed exits 0.
     #[test]
     fn verdict_fails_on_every_check() {
-        for check in ["ninja", "provided gate", "licence gate", "table check"] {
+        for check in [
+            "ninja",
+            "mesa",
+            "provided gate",
+            "licence gate",
+            "table check",
+        ] {
             assert_eq!(
                 verdict(vec![Failure::step(check, "x")]),
                 ExitCode::FAILURE,

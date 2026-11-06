@@ -71,6 +71,10 @@ mod generated {
     pub mod progname {
         include!(concat!(env!("OUT_DIR"), "/progname.rs"));
     }
+    /// bionic's `__assert`, exported as `atl_bionic___assert` (build.rs `RENAMED_IN_HOST`).
+    pub mod assert {
+        include!(concat!(env!("OUT_DIR"), "/assert.rs"));
+    }
     pub mod reserved_signals {
         include!(concat!(env!("OUT_DIR"), "/reserved_signals.rs"));
     }

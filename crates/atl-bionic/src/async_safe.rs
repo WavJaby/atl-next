@@ -374,6 +374,31 @@ fn log_fatal(msg: &[u8]) {
     crate::abort::set(Some(msg));
 }
 
+/// bionic's `__assert` up to the abort (the caller's): `file:line: assertion "msg" failed`, as `fatal` ends.
+pub fn assert_failed(file: &[u8], line: c_int, msg: &[u8]) {
+    let mut digits = [0u8; 12];
+    let n = {
+        let mut w: &mut [u8] = &mut digits;
+        let free = w.len();
+        // a c_int fits 11 bytes; writing into a slice cannot fail otherwise
+        let _ = std::io::Write::write_fmt(&mut w, format_args!("{line}"));
+        free - w.len()
+    };
+    let mut buf = [0u8; MESSAGE_MAX];
+    let mut out = Buffer::new(&mut buf);
+    for part in [
+        file,
+        b":",
+        &digits[..n],
+        b": assertion \"",
+        msg,
+        b"\" failed",
+    ] {
+        out.send(part);
+    }
+    log_fatal(out.text());
+}
+
 /// `fatal` of a fixed text (no format).
 pub(crate) fn fatal_text(prefix: &[u8], what: &[u8]) {
     let mut buf = [0u8; MESSAGE_MAX];

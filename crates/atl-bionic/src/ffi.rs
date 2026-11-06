@@ -413,6 +413,15 @@ pub unsafe extern "C" fn setprogname(name: *const c_char) {
     unsafe { program_invocation_short_name = name.add(offset) };
 }
 
+/// bionic's `__assert(file, line, msg)` (assert.cpp): fatal message, abort. Exported under its build.rs `RENAMED_IN_HOST` name: glibc's `__assert` takes `(assertion, file, line)`.
+#[unsafe(export_name = "atl_bionic___assert")]
+pub unsafe extern "C" fn __assert(file: *const c_char, line: c_int, msg: *const c_char) {
+    // SAFETY: bionic's contract, NUL-terminated strings; null prints as empty
+    let (file, msg) = unsafe { (c_str(file), c_str(msg)) };
+    async_safe::assert_failed(file.unwrap_or_default(), line, msg.unwrap_or_default());
+    std::process::abort()
+}
+
 // android/dlext.h (libdl) and libdl_android's exported-namespace lookup, through `linker`.
 
 #[unsafe(no_mangle)]

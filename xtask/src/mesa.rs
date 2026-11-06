@@ -134,20 +134,132 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(m) => m.clone(),
         None => Layout::of(root)?.src().join("aosp").join(MESA_TREE),
     };
+    configure(&read_graph(&args.out)?, &mesa, &args.dest)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Mesa's install dir in a converter out dir: [`build_after_ninja`] writes its config, build and outputs there.
+pub const OUT_SUBDIR: &str = "mesa";
+
+/// The Mesa libraries [`build_after_ninja`] builds, as Mesa's build dir names them (meson `-Degl-lib-suffix` & co.): the EGL / GLES fronts AOSP's loader opens by `ro.hardware.egl`, the dispatch table they share, the gallium driver.
+pub const OUTPUTS: &[&str] = &[
+    "src/egl/libEGL_mesa.so",
+    "src/mapi/es1api/libGLESv1_CM_mesa.so",
+    "src/mapi/es2api/libGLESv2_mesa.so",
+    "src/mapi/shared-glapi/libglapi.so",
+    "src/gallium/targets/dri/libgallium_dri.so",
+];
+
+pub fn read_graph(out: &Path) -> Result<Graph> {
+    let graph_file = out.join("graph.json");
+    serde_json::from_slice(
+        &std::fs::read(&graph_file).with_context(|| format!("read {}", graph_file.display()))?,
+    )
+    .with_context(|| format!("parse {}", graph_file.display()))
+}
+
+/// `xtask native`'s step after ninja (run under the build token): Mesa's meson build against the converter out dir `out`, in `<out>/mesa/build` (set up once; meson reconfigures itself when native.ini changes).
+/// Skipped with a printed reason when the goals did not build all of [`PC_MODULES`]' libraries. A failure carries the first error line (whole log: `<out>/mesa/ninja.log`).
+pub fn build_after_ninja(out: &Path, mesa: &Path) -> Result<Step> {
+    Ok(match build_or_skip(out, mesa)? {
+        None => Step::Skipped,
+        Some(Ok(build)) => Step::Built(build),
+        Some(Err(first)) => Step::Failed(first),
+    })
+}
+
+/// What [`build_after_ninja`] did.
+pub enum Step {
+    Skipped,
+    /// Mesa's build dir, holding every one of [`OUTPUTS`].
+    Built(PathBuf),
+    Failed(String),
+}
+
+fn build_or_skip(out: &Path, mesa: &Path) -> Result<Option<Result<PathBuf, String>>> {
+    let graph = read_graph(out)?;
+    let missing: Vec<&str> = PC_MODULES
+        .iter()
+        .filter(|(_, m)| graph.artifacts.get(*m).is_none_or(|a| !a.out.exists()))
+        .map(|(_, m)| *m)
+        .collect();
+    if !missing.is_empty() {
+        println!("native: mesa: skipped, the goals built none of {missing:?} (PC_MODULES)");
+        return Ok(None);
+    }
+    let dest = out.join(OUT_SUBDIR);
+    configure(&graph, mesa, &dest)?;
+    let build = dest.join("build");
+    let log = dest.join("ninja.log");
+    if !build.join("build.ninja").exists() {
+        let status = Command::new("meson")
+            .args(["setup", "--native-file"])
+            .arg(dest.join("native.ini"))
+            .arg(&build)
+            .arg(mesa)
+            .stdout(std::fs::File::create(dest.join("meson-setup.log"))?)
+            .stderr(std::process::Stdio::from(
+                std::fs::File::options()
+                    .append(true)
+                    .open(dest.join("meson-setup.log"))?,
+            ))
+            .status()
+            .context("running meson")?;
+        if !status.success() {
+            return Ok(Some(Err(format!(
+                "meson setup failed, see {}",
+                dest.join("meson-setup.log").display()
+            ))));
+        }
+    }
+    let status = Command::new("ninja")
+        .arg("-C")
+        .arg(&build)
+        .stdout(std::fs::File::create(&log)?)
+        .stderr(std::process::Stdio::from(
+            std::fs::File::options().append(true).open(&log)?,
+        ))
+        .status()
+        .context("running ninja for Mesa")?;
+    if !status.success() {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let first = text
+            .lines()
+            .find(|l| l.contains("error:") || l.starts_with("FAILED:"))
+            .unwrap_or("ninja failed; its log names no error line");
+        return Ok(Some(Err(format!("{first} (log {})", log.display()))));
+    }
+    let absent: Vec<&str> = OUTPUTS
+        .iter()
+        .copied()
+        .filter(|o| !build.join(o).exists())
+        .collect();
+    if !absent.is_empty() {
+        return Ok(Some(Err(format!(
+            "Mesa's build produced none of {absent:?}"
+        ))));
+    }
+    println!(
+        "native: mesa: {} libraries in {}",
+        OUTPUTS.len(),
+        build.display()
+    );
+    Ok(Some(Ok(build)))
+}
+
+/// Writes `<dest>/pkgconfig/*.pc`, the forced header and native.ini for `graph`, checking the options against `mesa`'s meson_options.txt. A file is rewritten only when its text changed, so meson does not reconfigure on an unchanged input.
+pub fn configure(graph: &Graph, mesa: &Path, dest: &Path) -> Result<()> {
     let options_file = mesa.join("meson_options.txt");
     let options = std::fs::read_to_string(&options_file)
         .with_context(|| format!("read {}", options_file.display()))?;
     check_options(&options)?;
-    let graph_file = args.out.join("graph.json");
-    let graph: Graph = serde_json::from_slice(
-        &std::fs::read(&graph_file).with_context(|| format!("read {}", graph_file.display()))?,
-    )
-    .with_context(|| format!("parse {}", graph_file.display()))?;
-    let pc_dir = args.dest.join("pkgconfig");
+    let pc_dir = dest.join("pkgconfig");
     std::fs::create_dir_all(&pc_dir)?;
     for (name, module) in PC_MODULES {
-        let text = pc_file(name, module, &graph)?;
-        std::fs::write(pc_dir.join(format!("{name}.pc")), text)?;
+        write_changed(
+            &pc_dir.join(format!("{name}.pc")),
+            &pc_file(name, module, graph)?,
+        )?;
     }
     for name in HOST_PC {
         let out = Command::new("pkg-config")
@@ -159,23 +271,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "pkg-config does not find host library `{name}` (HOST_PC)"
         );
         let dir = PathBuf::from(String::from_utf8(out.stdout)?.trim());
-        std::fs::copy(
-            dir.join(format!("{name}.pc")),
-            pc_dir.join(format!("{name}.pc")),
-        )?;
+        let text = std::fs::read_to_string(dir.join(format!("{name}.pc")))?;
+        write_changed(&pc_dir.join(format!("{name}.pc")), &text)?;
     }
-    let forced = args.dest.join(FORCED_HEADER);
-    std::fs::write(&forced, forced_header(&graph.device))?;
-    std::fs::write(
-        args.dest.join("native.ini"),
-        native_file(&pc_dir, &forced, &graph)?,
+    let forced = dest.join(FORCED_HEADER);
+    write_changed(&forced, &forced_header(&graph.device))?;
+    write_changed(
+        &dest.join("native.ini"),
+        &native_file(&pc_dir, &forced, graph)?,
     )?;
     println!(
         "mesa-config: {} .pc files + {FORCED_HEADER} + native.ini in {}",
         PC_MODULES.len(),
-        args.dest.display()
+        dest.display()
     );
-    Ok(ExitCode::SUCCESS)
+    Ok(())
+}
+
+fn write_changed(path: &Path, text: &str) -> Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() != Some(text) {
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Fails on an option name the pinned Mesa does not declare.
