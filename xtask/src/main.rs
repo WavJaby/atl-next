@@ -207,6 +207,7 @@ enum Test {
     /// The M2 gate: atld starts binderd, servicemanager, the M2 services and the test APK (xtask/testdata/app) through the broker; pass = its Activity.onCreate logs.
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
+    /// NativeBridge breaks: `ATL_NB_BREAK=<name>[,<name>]` in this run's environment; the run stages the core with it (names: atl-native-bridge build.rs `BREAKS`).
     App(app::Args),
     /// Broadcast delivery P1: two fixture apps (xtask/testdata/broadcast) under atld; a runtime receiver, a sticky returned and replayed, an explicit manifest receiver cold-started headless, a denied sticky send, an unexported receiver skipped.
     ///

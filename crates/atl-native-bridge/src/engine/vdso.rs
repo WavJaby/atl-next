@@ -61,7 +61,7 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     }
     // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope
     let host = super::bindings::target(&lib, &name).and_then(|t| t.address());
-    // deliberate break of the app gate's glesPbuffer (`--cfg atl_nb_gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
+    // deliberate break of the app gate's glesPbuffer (`ATL_NB_BREAK=gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
     #[cfg(atl_nb_gl_direct)]
     let bound = if name == "glClear" {
         host

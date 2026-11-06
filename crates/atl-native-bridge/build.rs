@@ -576,18 +576,59 @@ fn bindings_table(
     Ok(code)
 }
 
+/// `ATL_NB_BREAK=<name>[,<name>]` selects [`BREAKS`]. Read here, so the cfg reaches this package only; a global RUSTFLAGS cfg reached every crate and failed unrelated builds.
+/// Set it on the run that stages the core (`xtask test app`, atld_run.rs `cdylib::stage`, a plain `cargo build`): cargo rebuilds the core when the value changes, so that run's environment decides the artifact.
+const BREAK_ENV: &str = "ATL_NB_BREAK";
+/// The deliberate breaks: name -> the cfg it turns on. A break is a gate failing on purpose: red with it, green without.
+const BREAKS: &[(&str, &str)] = &[
+    // the app gate's `glesPbuffer` (engine/vdso.rs): glClear's stub bound to the front's raw address, no crossing
+    ("gl_direct", "atl_nb_gl_direct"),
+    // the app gate's `jitUpCall` (engine::x86_64): GS = the record, not ART's Thread*, while an up call's host target runs
+    ("foreign_gs", "atl_nb_foreign_gs"),
+    // gate 4.4 (engine/jni.rs): a guest env slot = the host function, no crossing
+    ("jni_direct", "atl_nb_jni_direct"),
+    // gate 4.4 (exports.rs): isNativeBridgeFunctionPointer answers false
+    ("nbfp_false", "atl_nb_nbfp_false"),
+    // spike gates g1/g2 (engine::x86_64): the host->guest crossing without its FS restore
+    ("no_fs_restore", "atl_nb_no_fs_restore"),
+    // g4 (tests/g4.rs): a syscall in the host target, must leave the band
+    ("g4_break", "atl_g4_break"),
+];
+
+/// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
+fn selected_breaks() -> Result<Vec<&'static str>> {
+    let Ok(value) = std::env::var(BREAK_ENV) else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            BREAKS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|&(_, cfg)| cfg)
+                .with_context(|| {
+                    let known: Vec<&str> = BREAKS.iter().map(|&(n, _)| n).collect();
+                    format!(
+                        "{BREAK_ENV}={name}: no such break (known: {})",
+                        known.join(", ")
+                    )
+                })
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
-    // `--cfg atl_nb_no_fs_restore`: deliberate break of spike gates g1/g2 (engine::x86_64: the host->guest crossing without its FS restore)
-    println!("cargo::rustc-check-cfg=cfg(atl_nb_no_fs_restore)");
-    // `--cfg atl_g4_break`: g4's deliberate break (tests/g4.rs: a syscall in the host target, must leave the band)
-    println!("cargo::rustc-check-cfg=cfg(atl_g4_break)");
-    // gate 4.4's deliberate breaks: `atl_nb_jni_direct` (engine/jni.rs: a guest env slot = the host function, no crossing), `atl_nb_nbfp_false` (exports.rs: isNativeBridgeFunctionPointer answers false)
-    println!("cargo::rustc-check-cfg=cfg(atl_nb_jni_direct)");
-    println!("cargo::rustc-check-cfg=cfg(atl_nb_nbfp_false)");
-    // `atl_nb_foreign_gs`: deliberate break of the app gate's `jitUpCall` (engine::x86_64: GS = the record, not ART's Thread*, while an up call's host target runs)
-    println!("cargo::rustc-check-cfg=cfg(atl_nb_foreign_gs)");
-    // `atl_nb_gl_direct`: deliberate break of the app gate's `glesPbuffer` (engine/vdso.rs: glClear's stub bound to the front's raw address, no crossing)
-    println!("cargo::rustc-check-cfg=cfg(atl_nb_gl_direct)");
+    // every break's cfg is declared, so an unselected one is no unexpected-cfg warning
+    for &(_, cfg) in BREAKS {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+    }
+    println!("cargo::rerun-if-env-changed={BREAK_ENV}");
+    for cfg in selected_breaks()? {
+        println!("cargo::rustc-cfg={cfg}");
+    }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;

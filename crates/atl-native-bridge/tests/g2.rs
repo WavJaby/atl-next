@@ -3,7 +3,7 @@
 //! Library: `libatl-jni-test.so` built by NDK r29 for android-29 (native ELF TLS: `__thread` through the guest's `__tls_get_addr`), linked against guest `libc++_shared.so`; it dlopens `libatl-jni-sibling.so` itself.
 //! Env: tests/common/mod.rs, plus `ATL_NB_TESTLIB`; SKIP without them. Its JNI functions are called with env = cls = NULL: the ones called use neither.
 //! Checks per call: the return value, then FS == host and the host probe. Calls: `tlsCounter` x2 (1 then 2: one guest TLS slot kept across crossings), `errnoRoundTrip` (ENOENT through guest errno), `dlopenSibling` (guest dlopen + dlsym from guest code: 42), `cppThrowCatch` (libc++ throw + unwind through guest `dl_iterate_phdr`: 1).
-//! Deliberate break: `RUSTFLAGS=--cfg=atl_nb_no_fs_restore` -> the first call's FS check fails. Control, every run: a library the guest cannot find gives NULL (the dlopen check responds).
+//! Deliberate break: `ATL_NB_BREAK=no_fs_restore` -> the first call's FS check fails. Control, every run: a library the guest cannot find gives NULL (the dlopen check responds).
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,

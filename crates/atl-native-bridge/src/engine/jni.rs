@@ -45,7 +45,7 @@ fn table(names: &[&str], specials: &[(usize, usize)], host: usize) -> Box<[usize
         .collect()
 }
 
-/// Deliberate break of gate 4.4 (`--cfg atl_nb_jni_direct`): the env's `NewStringUTF` slot is the host function itself, no crossing -> the guest calls ART on its own thread pointer with its own env.
+/// Deliberate break of gate 4.4 (`ATL_NB_BREAK=jni_direct`): the env's `NewStringUTF` slot is the host function itself, no crossing -> the guest calls ART on its own thread pointer with its own env.
 #[cfg(atl_nb_jni_direct)]
 fn direct_break(slot: usize, host: usize) -> Option<usize> {
     // SAFETY: `host` is a live host JNIEnv; slot within its table.
