@@ -17,9 +17,3 @@ reason = "car apps; the Car project is pinned only for the team modules framewor
 
 ["packages/modules/Virtualization/build/microdroid"]
 reason = "Microdroid VM images (android_filesystem); framework-minus-apex needs only Virtualization's framework stubs"
-
-["packages/modules/Virtualization/guest"]
-reason = "guest VM payloads and Trusty test VM images; framework-minus-apex needs only Virtualization's framework stubs"
-
-["packages/modules/Virtualization/tests"]
-reason = "AVF test VM images and test apps; framework-minus-apex needs only Virtualization's framework stubs"
