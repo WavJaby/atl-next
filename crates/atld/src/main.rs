@@ -481,6 +481,19 @@ struct Host {
     done: Sender<End>,
     /// atl-am (`--am`): what the control command `start` runs
     am: Option<PathBuf>,
+    /// The host paths every process of the runtime reads, at the same paths (ro_at_own_path): the LD_LIBRARY_PATH dirs, the ART root, the host files /system and /vendor link to.
+    shared_ro: Vec<Mount>,
+    /// The installed packages: an app process mounts its own directories (package_mounts).
+    packages: Vec<PackageRecord>,
+}
+
+/// A host path read-only at the same path in the sandbox: the runtime's shared host paths name themselves in both trees.
+fn ro_at_own_path(p: &Path) -> Mount {
+    Mount {
+        host: p.to_path_buf(),
+        at: p.to_path_buf(),
+        writable: false,
+    }
 }
 
 /// Why a run ends. An app process ending is not one: the services observe it (its binder death) and the run goes on, as system_server outlives its apps.
@@ -593,12 +606,9 @@ impl Host {
                     at: VENDOR.into(),
                     writable: false,
                 },
-                Mount {
-                    host: self.root.data(),
-                    at: DATA.into(),
-                    writable: true,
-                },
             ])
+            // the runtime's shared host paths; the package's own directories come with start_app (package_mounts)
+            .chain(self.shared_ro.iter().cloned())
             .collect(),
             links: vec![],
             // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
@@ -612,6 +622,30 @@ impl Host {
             stdout,
             stderr,
         })
+    }
+
+    /// A package's own directories (the install's records name them): its APK and native libraries read-only at /data/app/<package>, its data and device-protected data read-write. Never the whole /data.
+    fn package_mounts(&self, p: &PackageRecord) -> Result<Vec<Mount>> {
+        let app = Path::new(&p.source_dir)
+            .parent()
+            .with_context(|| format!("{}: no app directory", p.source_dir))?;
+        [
+            (app, false),
+            (Path::new(&p.data_dir), true),
+            (Path::new(&p.device_protected_data_dir), true),
+        ]
+        .into_iter()
+        .map(|(at, writable)| {
+            let rel = at
+                .strip_prefix(DATA)
+                .with_context(|| format!("{}: not below {DATA}", at.display()))?;
+            Ok(Mount {
+                host: self.root.data().join(rel),
+                at: at.to_path_buf(),
+                writable,
+            })
+        })
+        .collect()
     }
 
     /// A package's own external dirs, bound at Android/{data,obb}/<package> under the shared storage root, with /sdcard linked to that root: no permission needed, never the root itself (plan Storage/SAF).
@@ -680,6 +714,12 @@ impl Host {
             &req.args,
         )?;
         self.external_storage(&mut spawn, &req.package);
+        let record = self
+            .packages
+            .iter()
+            .find(|p| p.name == req.package)
+            .with_context(|| format!("{}: not an installed package", req.package))?;
+        spawn.mounts.extend(self.package_mounts(record)?);
         let pid = self.start(spawn, false, true)?;
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -859,6 +899,17 @@ fn run(a: &Args) -> Result<ExitCode> {
         broker
     };
     let lib = (OsString::from("LD_LIBRARY_PATH"), a.lib_path.clone());
+    // what the runtime's environment and partitions name, read-only at the same paths in every process: the LD_LIBRARY_PATH dirs and the ART root, and the host files
+    // /system and /vendor link to (boot jars, framework-res, shared libraries, --file sources)
+    let mut shared_ro: Vec<Mount> = atl_broker::library_path_mounts(&a.lib_path)?;
+    shared_ro.extend(atl_broker::tree_mounts(&a.art_root)?);
+    let linked: Vec<&Path> = std::iter::once(a.framework_res.as_path())
+        .chain(a.boot_jars.iter().map(PathBuf::as_path))
+        .chain(a.run_boot_jars.iter().map(PathBuf::as_path))
+        .chain(a.shared_libraries.iter().map(|(_, lib)| Path::new(&lib.file)))
+        .chain(a.files.iter().map(|(host, _)| host.as_path()))
+        .collect();
+    shared_ro.extend(linked.into_iter().map(ro_at_own_path));
     let system_spawn = |name: &str,
                         program: &Path,
                         args: Vec<OsString>,
@@ -870,18 +921,22 @@ fn run(a: &Args) -> Result<ExitCode> {
             uid: AID_SYSTEM,
             context_manager: cm,
             // the VINTF manifests are servicemanager's alone to read; the others reach HALs through it
-            mounts: if cm {
-                [("system", r.system()), ("vendor", r.vendor())]
-                    .into_iter()
-                    .map(|(at, host)| Mount {
-                        host,
-                        at: PathBuf::from("/").join(at),
-                        writable: false,
-                    })
-                    .collect()
-            } else {
-                vec![]
-            },
+            mounts: shared_ro
+                .iter()
+                .cloned()
+                .chain(if cm {
+                    [("system", r.system()), ("vendor", r.vendor())]
+                        .into_iter()
+                        .map(|(at, host)| Mount {
+                            host,
+                            at: PathBuf::from("/").join(at),
+                            writable: false,
+                        })
+                        .collect::<Vec<Mount>>()
+                } else {
+                    vec![]
+                })
+                .collect(),
             links: vec![],
             devices: vec![],
             property_area: Some(r.properties()),
@@ -928,6 +983,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         controlled: Mutex::new(BTreeSet::new()),
         done: done_tx,
         am: a.am.clone(),
+        shared_ro: shared_ro.clone(),
+        packages: records,
         root: Root {
             root: r.root.clone(),
         },

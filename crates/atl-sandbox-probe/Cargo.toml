@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-sandbox-probe"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

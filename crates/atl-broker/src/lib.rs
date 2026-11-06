@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-broker: the one launcher of sandboxed processes (plan Q5), binderd included: [`Broker::start`] runs it in [`Profile::BinderDaemon`] and holds its admin connection; every [`Broker::spawn`] gets its binderd control connection, registered tagged {uid, host pid}.
-//! M2 depth (owner Q4(a), 2026-10-31): bubblewrap with a user namespace mapping the process's uid and gid, a pid namespace, the host's root (Landlock narrows it in a later Q5 stage)
-//! with the caller's mounts over it (`/system`, `/data`, ...), a fresh `/dev` holding the property area at bionic's default path; Landlock comes with the Q5 stages. The app's seccomp filter is [`seccomp`] (bwrap `--seccomp`).
+//! App sandbox (Q5): bubblewrap with a user namespace mapping the process's uid and gid, a pid namespace, a minimal root ([`APP_ROOT_DIRS`] read-only, a private `/tmp`), the caller's mounts over it (`/system`, `/data`, ...),
+//! a fresh `/dev` holding the property area at bionic's default path. The stub (atl-sandbox-stub) applies Landlock with the grants bwrap recorded ([`bwrap::Access`]) before the program runs. The app's seccomp filter is [`seccomp`] (bwrap `--seccomp`).
 //!
 //! Tag pid: the host pid bwrap reports on `--info-fd` (`child-pid`), the namespace's first process, which the broker owns (killing it ends the sandbox: `--unshare-pid` makes it pid 1).
 //! Spawns are serialised by a lock in [`Broker`]: the control, info and seccomp fds are made inheritable just before the spawn and closed right after it, and a concurrent spawn would inherit them.
@@ -30,7 +30,7 @@ use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
-use bwrap::PROGRAM as BWRAP;
+use bwrap::{Access, PROGRAM as BWRAP};
 
 /// One bind mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +79,48 @@ pub fn to_log(log: File) -> io::Result<(Stdio, Stdio)> {
     Ok((log.try_clone()?.into(), log.into()))
 }
 
+/// Read-only mounts of a runtime tree at its own paths: `root`, and for each symlink under it the file or directory it resolves to. A staged library is often a link into the build tree, which a sandbox does not otherwise show.
+/// Symlinks are not followed while walking; a dangling link is skipped (the loader fails on it, as on a missing library).
+pub fn tree_mounts(root: &Path) -> io::Result<Vec<Mount>> {
+    let mut mounts = vec![Mount {
+        host: root.to_path_buf(),
+        at: root.to_path_buf(),
+        writable: false,
+    }];
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                dirs.push(entry.path());
+            } else if ft.is_symlink()
+                && let Ok(target) = std::fs::canonicalize(entry.path())
+            {
+                mounts.push(Mount {
+                    host: target.clone(),
+                    at: target,
+                    writable: false,
+                });
+            }
+        }
+    }
+    Ok(mounts)
+}
+
+/// [`tree_mounts`] of each existing directory of `path` (an LD_LIBRARY_PATH value).
+pub fn library_path_mounts(path: &OsStr) -> io::Result<Vec<Mount>> {
+    let mut mounts = Vec::new();
+    for dir in std::env::split_paths(path).filter(|d| d.is_dir()) {
+        mounts.extend(tree_mounts(&dir)?);
+    }
+    Ok(mounts)
+}
+
 /// What a sandbox is for: selects its namespaces, its filesystem view and its seccomp program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
-    /// An Android process ([`Spawn`]): its uid, the host's root with the caller's mounts, registered with binderd.
+    /// An Android process ([`Spawn`]): its uid, the minimal root with the caller's mounts, Landlock-confined by the stub, registered with binderd.
     App,
     /// binderd itself ([`Broker::start`]): every namespace, no capabilities, a root holding only its executable's ELF closure, the [`seccomp::binderd_filter`] allow-list.
     BinderDaemon,
@@ -107,7 +145,12 @@ pub enum RootEntry {
     Symlink { name: String, target: PathBuf },
 }
 
-/// The host's `/` (directories and symlinks; files at the root are not shown).
+/// The host directories an app sandbox shows, read-only at their own paths: `usr` (libraries, binaries, `usr/share`) and `etc` (the loader's cache, locale and config files).
+/// Nothing else of the host is shown: no `home` (the user's files), `run`, `var`, `opt`, `mnt`. `/tmp`, `/proc` and `/dev` are the sandbox's own.
+/// A row is a grant: add one only with the gate that needs it.
+pub const APP_ROOT_DIRS: &[&str] = &["usr", "etc"];
+
+/// The host's `/` as an app sandbox shows it: the directories in [`APP_ROOT_DIRS`], and every symlink (`lib` -> `usr/lib`, ...) recreated as it is.
 pub fn host_root() -> io::Result<Vec<RootEntry>> {
     let mut v = Vec::new();
     for e in std::fs::read_dir("/")? {
@@ -119,7 +162,7 @@ pub fn host_root() -> io::Result<Vec<RootEntry>> {
                 target: std::fs::read_link(e.path())?,
                 name,
             });
-        } else if ft.is_dir() {
+        } else if ft.is_dir() && APP_ROOT_DIRS.contains(&name.as_str()) {
             v.push(RootEntry::Dir(name));
         }
     }
@@ -133,14 +176,16 @@ fn key(e: &RootEntry) -> &str {
     }
 }
 
-/// bwrap's arguments for `spawn` over `root`, info on fd `info_fd`, the seccomp program on `seccomp_fd` when given, up to and including `--`.
+/// The app sandbox's bwrap arguments for `spawn` over `root` (up to and including `--`), info on fd `info_fd`, the seccomp program on `seccomp_fd` when given, and the stub `stub` and the program bound read-only to be exec'd.
+/// Returns the grants with them: every bind and fresh mount, which `stub_args` turns into the stub's Landlock rules, so no path is visible without one.
 /// A root entry a mount covers (its first path component) is left out, as are `/dev` and `/proc`, which the sandbox gets fresh.
 pub fn bwrap_args(
     spawn: &Spawn,
     root: &[RootEntry],
+    stub: &Path,
     info_fd: i32,
     seccomp_fd: Option<i32>,
-) -> Vec<OsString> {
+) -> (Vec<OsString>, Vec<(Access, PathBuf)>) {
     let mut a = bwrap::Args::new();
     a.unshare_user()
         .ids(spawn.uid)
@@ -149,7 +194,11 @@ pub fn bwrap_args(
         .info_fd(info_fd)
         .tmpfs("/")
         .dev("/dev")
-        .proc("/proc");
+        .grant(Access::Rw, "/dev")
+        .proc("/proc")
+        .grant(Access::Ro, "/proc")
+        .tmpfs("/tmp")
+        .grant(Access::Rw, "/tmp");
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
     }
@@ -166,7 +215,7 @@ pub fn bwrap_args(
         match e {
             RootEntry::Dir(n) if !covered(n) => {
                 let p = format!("/{n}");
-                a.bind(&p, &p);
+                a.ro_bind(&p, &p);
             }
             RootEntry::Symlink { name, target } if !covered(name) => {
                 a.symlink(target, format!("/{name}"));
@@ -174,6 +223,9 @@ pub fn bwrap_args(
             _ => {}
         }
     }
+    // the stub is exec'd by bwrap before it restricts itself, and the program by the stub after: both read-only
+    a.ro_bind(stub, stub);
+    a.ro_bind(&spawn.program, &spawn.program);
     for m in &spawn.mounts {
         a.mount(&m.host, &m.at, m.writable);
     }
@@ -189,7 +241,8 @@ pub fn bwrap_args(
     if let Some(dir) = &spawn.cwd {
         a.chdir(dir);
     }
-    a.end()
+    let grants = a.grants().to_vec();
+    (a.end(), grants)
 }
 
 /// bwrap's arguments for binderd ([`Profile::BinderDaemon`]): `files` (its executable's ELF closure, [`elf_closure`]) read-only at their own paths on an empty root, info on `info_fd`, the seccomp program on `seccomp_fd`, up to and including `--`.
@@ -211,12 +264,19 @@ pub fn binderd_args(files: &[PathBuf], info_fd: i32, seccomp_fd: i32) -> Vec<OsS
     a.end()
 }
 
-/// The sandbox stub's argv after its path: `--allow` each of `allow`, then `-- program`. The stub restricts itself with Landlock to read + execute on exactly those files and execs `program`, which inherits the domain.
-pub fn stub_args(allow: &[PathBuf], program: &Path) -> Vec<OsString> {
-    let mut v = Vec::with_capacity(allow.len() * 2 + 2);
-    for f in allow {
-        v.push("--allow".into());
-        v.push(f.into());
+/// The sandbox stub's argv after its path: each grant as `--ro` / `--rw` / `--device` PATH, then `-- program`. The stub restricts itself with Landlock to exactly those grants and execs `program`, which inherits the domain.
+pub fn stub_args(grants: &[(Access, PathBuf)], program: &Path) -> Vec<OsString> {
+    let mut v = Vec::with_capacity(grants.len() * 2 + 2);
+    for (access, path) in grants {
+        v.push(
+            match access {
+                Access::Ro => "--ro",
+                Access::Rw => "--rw",
+                Access::Dev => "--device",
+            }
+            .into(),
+        );
+        v.push(path.into());
     }
     v.push("--".into());
     v.push(program.into());
@@ -299,6 +359,8 @@ pub struct Broker {
     spawning: Mutex<()>,
     /// Whether apps get the app seccomp filter (seccomp.rs); off only for the `--no-app-seccomp` check.
     app_seccomp: bool,
+    /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
+    stub: PathBuf,
 }
 
 fn other(what: impl std::fmt::Display) -> io::Error {
@@ -371,7 +433,8 @@ impl Broker {
             }
         }
         let bwrap_args = binderd_args(&files, info_w.as_raw_fd(), seccomp.as_raw_fd());
-        let args = stub_args(&allow, program);
+        let grants: Vec<(Access, PathBuf)> = allow.iter().map(|f| (Access::Ro, f.clone())).collect();
+        let args = stub_args(&grants, program);
         let process = launch(
             Launch {
                 bwrap_args,
@@ -388,14 +451,15 @@ impl Broker {
             vec![info_w.into(), seccomp],
         )
         .map_err(|e| other(format!("starting binderd {}: {e}", program.display())))?;
-        Ok((Broker::new(admin), process))
+        Ok((Broker::new(admin, stub), process))
     }
 
-    fn new(admin: OwnedFd) -> Self {
+    fn new(admin: OwnedFd, stub: &Path) -> Self {
         Broker {
             admin,
             spawning: Mutex::new(()),
             app_seccomp: true,
+            stub: stub.to_path_buf(),
         }
     }
 
@@ -422,12 +486,16 @@ impl Broker {
             .app_seccomp
             .then(|| seccomp_memfd(Profile::App))
             .transpose()?;
-        let bwrap_args = bwrap_args(
+        let (bwrap_args, grants) = bwrap_args(
             &spawn,
             &host_root()?,
+            &self.stub,
             info_w.as_raw_fd(),
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
+        // the stub applies the grants, then execs the program with the spawn's arguments
+        let mut args = stub_args(&grants, &spawn.program);
+        args.extend(spawn.args.iter().cloned());
         let mut env = spawn.env;
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
         let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into()];
@@ -435,8 +503,8 @@ impl Broker {
         let Process { child, host_pid } = launch(
             Launch {
                 bwrap_args,
-                program: &spawn.program,
-                args: &spawn.args,
+                program: &self.stub,
+                args: &args,
                 env,
                 clear_env: false,
                 stdin: spawn.stdin.map_or_else(Stdio::null, Stdio::from),
@@ -509,7 +577,7 @@ mod tests {
             target: SHARED_STORAGE.into(),
             at: SDCARD.into(),
         });
-        let joined = s(&bwrap_args(&sp, &[], 9, None)).join(" ");
+        let joined = s(&bwrap_args(&sp, &[], Path::new("/b/stub"), 9, None).0).join(" ");
         assert!(joined.ends_with(
             "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"
         ));
@@ -550,29 +618,45 @@ mod tests {
 
     #[test]
     fn sandbox_shape() {
+        // host_root's rows for this test: etc and usr (APP_ROOT_DIRS), lib -> usr/lib, sorted by name
         let root = vec![
-            RootEntry::Dir("data".into()),
-            RootEntry::Dir("dev".into()),
-            RootEntry::Dir("home".into()),
+            RootEntry::Dir("etc".into()),
             RootEntry::Symlink {
                 name: "lib".into(),
                 target: "usr/lib".into(),
             },
-            RootEntry::Dir("proc".into()),
-            RootEntry::Dir("system".into()),
+            RootEntry::Dir("usr".into()),
         ];
-        // Golden argv, written from the profile (Q4(a)): uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc; then the seccomp program when given;
-        // the host's dirs bound and symlinks recreated, except what the sandbox replaces (dev, proc) or a mount covers (data, system); the mounts, the device nodes, the area at bionic's path; the end of options.
-        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc";
-        let tail = "--bind /home /home --symlink usr/lib /lib --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --";
+        // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc + private /tmp; then the seccomp program when given;
+        // the root's dirs read-only and its symlinks recreated; the stub and the program read-only, the mounts, the device nodes, the area at bionic's path; the end of options.
+        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc --tmpfs /tmp";
+        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /b/stub /b/stub --ro-bind /bin/true /bin/true --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --";
+        let stub = Path::new("/b/stub");
         assert_eq!(
-            s(&bwrap_args(&spawn(), &root, 9, None)).join(" "),
+            s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),
             format!("{head} {tail}")
         );
         assert_eq!(
-            s(&bwrap_args(&spawn(), &root, 9, Some(8))).join(" "),
+            s(&bwrap_args(&spawn(), &root, stub, 9, Some(8)).0).join(" "),
             format!("{head} --seccomp 8 {tail}")
         );
+        // the grants, in call order: the fresh /dev, /proc, /tmp; each bind at its sandbox path, the device and the area
+        let (_, grants) = bwrap_args(&spawn(), &root, stub, 9, None);
+        let want: Vec<(Access, &str)> = vec![
+            (Access::Rw, "/dev"),
+            (Access::Ro, "/proc"),
+            (Access::Rw, "/tmp"),
+            (Access::Ro, "/etc"),
+            (Access::Ro, "/usr"),
+            (Access::Ro, "/b/stub"),
+            (Access::Ro, "/bin/true"),
+            (Access::Ro, "/system"),
+            (Access::Rw, "/data"),
+            (Access::Dev, "/dev/dri"),
+            (Access::Ro, "/dev/__properties__"),
+        ];
+        let got: Vec<(Access, &Path)> = grants.iter().map(|(a, p)| (*a, p.as_path())).collect();
+        assert_eq!(got, want.iter().map(|(a, p)| (*a, Path::new(p))).collect::<Vec<_>>());
     }
 
     /// Golden argv of Profile::BinderDaemon, written from its spec (plan F1.2 B.3): every namespace incl. net, its own user namespace as nobody (65534), gone with the broker, its own session (no terminal ioctls), no capabilities;
@@ -586,13 +670,17 @@ mod tests {
         );
     }
 
-    /// The stub's argv: each allowed file, then `--` and the program (atl-sandbox-stub's usage line).
+    /// The stub's argv: each grant as its flag and path, then `--` and the program (atl-sandbox-stub's usage line).
     #[test]
     fn stub_argv() {
-        let allow: Vec<PathBuf> = vec!["/b/atl-binderd".into(), "/lib64/ld.so".into()];
+        let grants: Vec<(Access, PathBuf)> = vec![
+            (Access::Ro, "/b/atl-binderd".into()),
+            (Access::Rw, "/data/x".into()),
+            (Access::Dev, "/dev/dri".into()),
+        ];
         assert_eq!(
-            s(&stub_args(&allow, Path::new("/b/atl-binderd"))).join(" "),
-            "--allow /b/atl-binderd --allow /lib64/ld.so -- /b/atl-binderd"
+            s(&stub_args(&grants, Path::new("/b/atl-binderd"))).join(" "),
+            "--ro /b/atl-binderd --rw /data/x --device /dev/dri -- /b/atl-binderd"
         );
     }
 

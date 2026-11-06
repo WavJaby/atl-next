@@ -26,8 +26,8 @@ uses = ["bionic"]
 
 # the one launcher of sandboxed processes (plan Q5; M2 depth Q4(a): bwrap user + pid namespaces, /system and /data mounts), each registered with binderd; its `control` module is the protocol by which the services ask for process starts and kills
 [broker]
-# atl-sandbox-stub: the in-child stage bwrap runs before the program (Landlock, then exec)
-crates = ["atl-broker", "atl-sandbox-stub"]
+# atl-sandbox-stub: the in-child stage bwrap runs before the program (Landlock, then exec); atl-sandbox-probe: what an app process reaches (`xtask test sandbox`)
+crates = ["atl-broker", "atl-sandbox-stub", "atl-sandbox-probe"]
 exports = ["atl-broker"]
 uses = ["binder", "android-paths"]
 

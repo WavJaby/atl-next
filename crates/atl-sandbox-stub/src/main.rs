@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-sandbox-stub: the in-child launcher stage of a sandbox (plan Q5: "Landlock + seccomp are applied by our in-child launcher stub in every backend"). bwrap runs it in place of the program; it restricts itself with Landlock, then execs the program, which inherits the domain.
-//! Usage: `atl-sandbox-stub [--allow PATH]... -- PROGRAM [ARGS]...`. Every filesystem right is handled and only read + execute on each `--allow` file is granted; TCP bind/connect are handled with no rule (denied, ABI >= 4); abstract unix sockets and signals are scoped to the domain (ABI >= 6).
+//! Usage: `atl-sandbox-stub [--ro PATH | --rw PATH | --device PATH]... -- PROGRAM [ARGS]...`. Every filesystem right is handled; each path gets only its grant, and a path under no grant is refused. `--ro`: read, list, execute. `--rw`: also write, create, remove, rename. `--device`: rw plus the device ioctls (ABI >= 5).
+//! TCP bind/connect are handled with no rule (denied, ABI >= 4); abstract unix sockets and signals are scoped to the domain (ABI >= 6).
 //! Best effort over the kernel's ABI: the achieved ABI and enforcement are printed to stderr as `sandbox-stub: landlock abi=<n> ruleset=<status>`; a kernel that enforces nothing fails the start (exit 2) rather than run the program unconfined.
 #![forbid(unsafe_code)]
 
@@ -20,36 +21,58 @@ const WANT: ABI = ABI::V6;
 /// Exit status when the sandbox cannot be set up (bad arguments, no Landlock, exec failed).
 const SETUP_FAILED: u8 = 2;
 
+/// What a path is granted, one flag each (atl-broker's `bwrap::Access`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    Ro,
+    Rw,
+    Device,
+}
+
 struct Args {
-    allow: Vec<PathBuf>,
+    grants: Vec<(Grant, PathBuf)>,
     program: OsString,
     args: Vec<OsString>,
 }
 
 fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
-    let mut allow = Vec::new();
+    let mut grants = Vec::new();
     loop {
-        match it.next() {
-            Some(a) if a == "--allow" => {
-                allow.push(PathBuf::from(it.next().ok_or("--allow needs a path")?));
-            }
+        let flag = match it.next() {
             Some(a) if a == "--" => break,
-            Some(a) => return Err(format!("unknown argument {a:?}")),
+            Some(a) => a,
             None => return Err("missing `-- PROGRAM`".into()),
-        }
+        };
+        let grant = match flag.to_str() {
+            Some("--ro") => Grant::Ro,
+            Some("--rw") => Grant::Rw,
+            Some("--device") => Grant::Device,
+            _ => return Err(format!("unknown argument {flag:?}")),
+        };
+        let path = it.next().ok_or_else(|| format!("{flag:?} needs a path"))?;
+        grants.push((grant, PathBuf::from(path)));
     }
     let program = it.next().ok_or("missing PROGRAM after --")?;
     Ok(Args {
-        allow,
+        grants,
         program,
         args: it.collect(),
     })
 }
 
-/// Restricts this process: the ruleset above, `allow` read + execute.
-fn restrict(allow: &[PathBuf]) -> Result<(ABI, RulesetStatus), String> {
+/// Restricts this process: every filesystem right handled, each grant's rights on its path only.
+fn restrict(grants: &[(Grant, PathBuf)]) -> Result<(ABI, RulesetStatus), String> {
     let err = |e: landlock::RulesetError| e.to_string();
-    let file_rights = AccessFs::Execute | AccessFs::ReadFile;
+    let read = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
+    let write = read
+        | AccessFs::WriteFile
+        | AccessFs::Truncate
+        | AccessFs::MakeReg
+        | AccessFs::MakeDir
+        | AccessFs::MakeSym
+        | AccessFs::RemoveFile
+        | AccessFs::RemoveDir
+        | AccessFs::Refer;
     let mut created = Ruleset::default()
         .handle_access(AccessFs::from_all(WANT))
         .map_err(err)?
@@ -59,10 +82,15 @@ fn restrict(allow: &[PathBuf]) -> Result<(ABI, RulesetStatus), String> {
         .map_err(err)?
         .create()
         .map_err(err)?;
-    for p in allow {
+    for (grant, p) in grants {
+        let rights = match grant {
+            Grant::Ro => read,
+            Grant::Rw => write,
+            Grant::Device => write | AccessFs::IoctlDev,
+        };
         let fd = PathFd::new(p).map_err(|e| format!("{}: {e}", p.display()))?;
         created = created
-            .add_rule(PathBeneath::new(fd, file_rights))
+            .add_rule(PathBeneath::new(fd, rights))
             .map_err(err)?;
     }
     let status = created.restrict_self().map_err(err)?;
@@ -86,7 +114,7 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => return fail(&e),
     };
-    match restrict(&a.allow) {
+    match restrict(&a.grants) {
         Ok((abi, ruleset)) => {
             let _ = writeln!(
                 std::io::stderr(),

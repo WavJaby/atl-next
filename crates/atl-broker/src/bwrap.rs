@@ -3,14 +3,28 @@
 //! Flag meanings: bubblewrap's bwrap.c `usage()` / bwrap(1). Order matters to bwrap (mounts apply in argv order), so the builder keeps call order.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The sandbox program.
 pub const PROGRAM: &str = "bwrap";
 
-/// bwrap's options, in call order; [`Args::end`] closes them with `--`.
+/// What the sandbox may do at a path: the Landlock grant the stub applies (`atl-sandbox-stub --ro/--rw/--dev`). Each bind method records the grant its kind implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// read, list, execute
+    Ro,
+    /// Ro plus write, create, remove, rename
+    Rw,
+    /// Rw plus the device ioctls: a device node
+    Dev,
+}
+
+/// bwrap's options, in call order ([`Args::end`] closes them with `--`), and the grants of the paths they show: the mounts and the Landlock rules come from one list, so they cannot disagree.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Args(Vec<OsString>);
+pub struct Args {
+    argv: Vec<OsString>,
+    grants: Vec<(Access, PathBuf)>,
+}
 
 impl Args {
     pub fn new() -> Self {
@@ -18,8 +32,19 @@ impl Args {
     }
 
     fn word(&mut self, w: impl Into<OsString>) -> &mut Self {
-        self.0.push(w.into());
+        self.argv.push(w.into());
         self
+    }
+
+    /// Records `access` at `at` (a sandbox path) for a fresh mount bwrap makes itself (tmpfs, dev, proc): no bind method records those.
+    pub fn grant(&mut self, access: Access, at: impl AsRef<Path>) -> &mut Self {
+        self.grants.push((access, at.as_ref().to_path_buf()));
+        self
+    }
+
+    /// The grants recorded so far, in call order.
+    pub fn grants(&self) -> &[(Access, PathBuf)] {
+        &self.grants
     }
 
     fn pair(&mut self, flag: &str, a: impl Into<OsString>, b: impl Into<OsString>) -> &mut Self {
@@ -89,13 +114,15 @@ impl Args {
         self.word("--proc").word(at.as_ref())
     }
 
-    /// `--bind HOST AT` (writable).
+    /// `--bind HOST AT` (writable): grant Rw at AT.
     pub fn bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.grant(Access::Rw, at.as_ref());
         self.pair("--bind", host.as_ref(), at.as_ref())
     }
 
-    /// `--ro-bind HOST AT`.
+    /// `--ro-bind HOST AT`: grant Ro at AT.
     pub fn ro_bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.grant(Access::Ro, at.as_ref());
         self.pair("--ro-bind", host.as_ref(), at.as_ref())
     }
 
@@ -113,8 +140,9 @@ impl Args {
         }
     }
 
-    /// `--dev-bind HOST AT`: a bind that keeps device nodes usable.
+    /// `--dev-bind HOST AT`: a bind that keeps device nodes usable: grant Dev at AT.
     pub fn dev_bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.grant(Access::Dev, at.as_ref());
         self.pair("--dev-bind", host.as_ref(), at.as_ref())
     }
 
@@ -130,7 +158,7 @@ impl Args {
 
     /// The options and the closing `--`; the program and its arguments follow.
     pub fn end(mut self) -> Vec<OsString> {
-        self.0.push("--".into());
-        self.0
+        self.argv.push("--".into());
+        self.argv
     }
 }

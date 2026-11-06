@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! binderd runs inside the stub's Landlock domain (plan F1.2 B4 gate): `Broker::start` launches this test binary in binderd's place -- same bwrap argv, seccomp filter and stub -- and the probe reports what it can open.
-//! The stub executable is bound into binderd's root (bwrap must exec it) but is not in the `--allow` list, so only the domain can refuse it: probe `own=ok` (it answers at all) and `stub=err:EACCES`.
-//! Deliberate break: the broker also passes `--allow /` -> the stub opens -> this fails.
+//! The stub executable is bound into binderd's root (bwrap must exec it) but is not in the `--ro` grants, so only the domain can refuse it: probe `own=ok` (it answers at all) and `stub=err:EACCES`.
+//! Deliberate break: the broker also grants `--ro /` -> the stub opens -> this fails.
 //! Probe mode = `CARGO` unset: cargo sets it for every test run; Broker::start clears the environment (bwrap then adds only PWD). The probe stays inside binderd's seccomp allow-list: open, read, write, close, exit -- no stat (std's fs::read would statx).
 //! harness = false: a libtest harness would add calls outside that list.
 

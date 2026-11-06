@@ -15,6 +15,7 @@ mod arches;
 mod atld_run;
 mod binder;
 mod broadcast;
+mod sandbox;
 mod build_pool;
 mod build_state;
 mod bwrap_flags;
@@ -190,6 +191,8 @@ enum Test {
     NativeLoad(native_load::Args),
     /// AOSP servicemanager + `service list` / `check` through atl-binderd on libbinder's driver seam; binderd's counters must show the expected driver paths firing.
     Binder(binder::Args),
+    /// The app sandbox (plan Q5): a probe as an app process (uid 10123, the broker's App profile) reaches neither the real $HOME nor anything outside its data dir, and writes its own. Its deliberate break is by hand (sandbox.rs).
+    Sandbox(sandbox::Args),
     /// Parcel encodings vs ground truth: atl-aidl-probe through AOSP's C++ Parcel (its size check fires on a wrong size), then atl-parcelables' codecs vs Java's Parcelables on host ART, byte-equal both ways.
     Parcel(parcel::Args),
     /// atl-compositor's libgui wire codecs vs libgui's own C++ on host ART: Java-built Transactions marshalled by libgui decode and re-encode byte-equal in Rust, Rust's fully populated transaction survives libgui's reader and writer, Rust's callbacks run libgui's listener.
@@ -305,6 +308,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Binder(args),
         } => binder::run(&root, &args),
         Command::Test {
+            test: Test::Sandbox(args),
+        } => sandbox::run(&root, &args),
+        Command::Test {
             test: Test::App(args),
         } => app::run(&root, &args),
         Command::Test {
@@ -364,6 +370,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",
+            Test::Sandbox(_) => "sandbox",
             Test::App(_) => "app",
             Test::Broadcast(_) => "broadcast",
             Test::Instrument(_) => "instrument",

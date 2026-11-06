@@ -75,7 +75,7 @@ fn layout_mounts(root: &Path) -> Vec<Mount> {
         .collect()
 }
 
-/// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid`: no mounts, devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
+/// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid`: read-only mounts of the LD_LIBRARY_PATH dirs at their own paths (the runtime's shared host paths, as atld mounts them), no devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
 /// Variables `cmd` removes are not expressible (the sandbox inherits the broker's environment): an error.
 pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
     let mut env = Vec::new();
@@ -83,10 +83,17 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
         let v = v.with_context(|| format!("{k:?}: a removed variable has no Spawn form"))?;
         env.push((k.to_owned(), v.to_owned()));
     }
+    // the LD_LIBRARY_PATH trees, read-only at their own paths with what their links name (atl_broker::tree_mounts)
+    let mut mounts = Vec::new();
+    for (k, v) in &env {
+        if k == "LD_LIBRARY_PATH" {
+            mounts.extend(atl_broker::library_path_mounts(v)?);
+        }
+    }
     Ok(Spawn {
         uid,
         context_manager: false,
-        mounts: vec![],
+        mounts,
         links: vec![],
         devices: vec![],
         property_area: None,
@@ -165,7 +172,10 @@ fn service(
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 
 /// `child`'s exit status, or None after killing it at `limit`.
-fn wait_limited(child: &mut Child, limit: Duration) -> Result<Option<std::process::ExitStatus>> {
+pub(crate) fn wait_limited(
+    child: &mut Child,
+    limit: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
     let start = Instant::now();
     loop {
         if let Some(s) = child.try_wait()? {
@@ -246,7 +256,7 @@ pub(crate) fn start_servicemanager(
     cmd.envs(env.iter().cloned());
     let mut s = spawn_of(&cmd, AID_SYSTEM)?;
     s.context_manager = true;
-    s.mounts = layout_mounts(test_root);
+    s.mounts.extend(layout_mounts(test_root));
     (s.stdout, s.stderr) = to_log(std::fs::File::create(test_root.join("servicemanager.log"))?)?;
     let mut sm = b.spawn(s).context("spawning servicemanager")?;
 
