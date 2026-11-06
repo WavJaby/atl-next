@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage dialog: a dimming dialog with surfaceInsets and a popup near the bottom over a software window, full screen so the readback is the fixture's own picture. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atldialog"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL dialog test">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

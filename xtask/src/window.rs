@@ -28,6 +28,7 @@ use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
+mod dialog;
 mod ime;
 mod move_output;
 mod surface_view;
@@ -116,6 +117,8 @@ enum Stage {
     SurfaceView,
     /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the composer's readback as the quadrants.
     Hwui,
+    /// UI mode: a dimming dialog with surfaceInsets and a popup near the bottom over a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/dialog.rs).
+    Dialog,
 }
 
 impl Stage {
@@ -134,6 +137,7 @@ impl Stage {
             Stage::Move => "move",
             Stage::SurfaceView => "surface-view",
             Stage::Hwui => "hwui",
+            Stage::Dialog => "dialog",
         }
     }
 
@@ -142,7 +146,7 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView | Stage::Hwui => GTK_WINDOW_MS,
+            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Dialog => GTK_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -270,6 +274,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::StartFinish
         | Stage::Move => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
+        Stage::Dialog => dialog::MARKER,
     }
 }
 
@@ -1569,7 +1574,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move
-        | Stage::SurfaceView => {
+        | Stage::SurfaceView
+        | Stage::Dialog => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1634,6 +1640,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::StartFinish => START_FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
+        Stage::Dialog => dialog::FIXTURE,
         _ => FIXTURE,
     };
     let apk = rt
@@ -1688,6 +1695,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
             (Stage::Widgets, _, _) => widgets::drive(p, &log),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
+            (Stage::Dialog, _, _) => dialog::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 drive_resize(p, &log)
             }
@@ -1766,6 +1774,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
+        (Stage::Dialog, Some(_)) => dialog::checks(&app, &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);
             sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));
@@ -1825,7 +1834,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if !sub.is_empty()
         && matches!(
             args.stage,
-            Stage::Widgets | Stage::Gtk | Stage::Hwui | Stage::Ime | Stage::SurfaceView
+            Stage::Widgets
+                | Stage::Gtk
+                | Stage::Hwui
+                | Stage::Ime
+                | Stage::SurfaceView
+                | Stage::Dialog
         )
     {
         sub.push(("post-draw", post_draw_check(&app, &services)));

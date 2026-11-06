@@ -3,9 +3,11 @@
 //! The layer is made as createSurface makes one (`Composer::create_layer`, a root layer named after the window): the client is the one createConnection gives, the handle is the layer's.
 //! The SurfaceControl is libgui's parcel form (codecs/android/view/SurfaceControl.rs); the display's size, RGBA_8888, no transform hint.
 
+use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, Mutex, mpsc::Sender};
 
+use atl_compositor::model::ColorLayer;
 use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
 use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl;
 use atl_services::ui_agent::{BnUiAgent, IUiAgent};
@@ -27,6 +29,8 @@ struct UiAgent {
     sender: Option<Arc<TaskSender>>,
     /// the in-app input method (atl-ime) IMMS-lite binds (INPUT_METHOD); None in headless mode
     input_method: Option<SpIBinder>,
+    /// dim layers (DIM_LAYER) by the dimming window's layer id: the handle that keeps the layer alive, and its id
+    dims: Mutex<HashMap<i32, (SpIBinder, i32)>>,
 }
 
 impl Interface for UiAgent {}
@@ -89,6 +93,45 @@ impl IUiAgent for UiAgent {
         crate::ui_window::set_pointer_icon(kind);
         Ok(())
     }
+
+    /// WMS Dimmer: one colour layer per dimming window (Dimmer.java:169-173 makeDimLayer), a root at the Task origin like every window layer here, cropped to the Task
+    /// (DimmerAnimationHelper.java:286-287), relative z -1 to the window (:257), black at alpha `amount` (:293 setAlpha). Dropping the handle destroys the layer.
+    fn dim_layer(
+        &self,
+        layer_id: i32,
+        amount: f32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode> {
+        let mut dims = self
+            .dims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if amount <= 0.0 {
+            dims.remove(&layer_id);
+            return Ok(());
+        }
+        let dim_id = match dims.get(&layer_id) {
+            Some((_, id)) => *id,
+            None => {
+                let (handle, id) =
+                    self.composer
+                        .create_layer(&format!("Dim Layer for {layer_id}"), None, true)?;
+                dims.insert(layer_id, (handle, id));
+                id
+            }
+        };
+        self.composer.set_color_layer(
+            dim_id,
+            ColorLayer {
+                relative_to: layer_id,
+                z: -1,
+                color: [0.0; 3],
+                alpha: amount,
+                size: (width as f32, height as f32),
+            },
+        )
+    }
 }
 
 /// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod.
@@ -104,6 +147,7 @@ pub fn new_binder(
             input,
             sender,
             input_method,
+            dims: Mutex::default(),
         },
         BinderFeatures::default(),
     )

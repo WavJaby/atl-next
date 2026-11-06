@@ -49,8 +49,7 @@ const RELAYOUT_RES_FIRST_TIME: i32 = 1;
 const RELAYOUT_RES_SURFACE_CHANGED: i32 = 1 << 1;
 /// WindowManager.LayoutParams.INPUT_FEATURE_NO_INPUT_CHANNEL (WindowManager.java:4505): such a window gets no input channel.
 const INPUT_FEATURE_NO_INPUT_CHANNEL: i32 = 1 << 0;
-/// WindowManager.LayoutParams.TYPE_TOAST and the sub-window type range (WindowManager.java FIRST_SUB_WINDOW / LAST_SUB_WINDOW): a sub-window's token is its parent window's IWindow.
-const TYPE_TOAST: i32 = 2005;
+/// WindowManager.LayoutParams sub-window type range (WindowManager.java FIRST_SUB_WINDOW / LAST_SUB_WINDOW): a sub-window's token is its parent window's IWindow.
 const FIRST_SUB_WINDOW: i32 = 1000;
 const LAST_SUB_WINDOW: i32 = 1999;
 /// InputTransport.cpp:95 SOCKET_BUFFER_SIZE: the send and receive buffers of both ends of a channel pair (InputChannel::openInputChannelPair, :370-375).
@@ -119,6 +118,26 @@ impl RegisteredAgent {
                 );
                 false
             }
+        }
+    }
+
+    /// The dim behind window layer `layer_id` (WMS Dimmer): `amount` over `bounds` from the Task origin, 0 drops it. AOSP: WindowState.applyDims (WindowState.java:4980-4992) asks
+    /// the Task's Dimmer to dim below the window at mAttrs.dimAmount; Dimmer.java:169-173 makes the dim a colour layer child of its host (the Task), cropped and placed to the
+    /// host's bounds (DimmerAnimationHelper.java:286-287), relative -1 to the window (:257), alpha = amount (:293). Counted when refused.
+    fn dim(&self, layer_id: i32, amount: f32, bounds: &Rect) {
+        let Some(agent) = self.agent("relayout") else {
+            return;
+        };
+        if let Err(e) = agent.dim_layer(
+            layer_id,
+            amount,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+        ) {
+            counters::count(
+                WINDOW_SESSION,
+                &format!("relayout: UI agent refused the dim layer: {e:?}"),
+            );
         }
     }
 
@@ -310,28 +329,22 @@ impl Placement {
             gravity: a.gravity,
             x: a.x,
             y: a.y,
+            size: (a.width, a.height),
             requested: (0, 0),
             surface_inset: (a.surface_insets.left, a.surface_insets.top),
+            flags: a.flags,
+            dim_amount: a.dim_amount,
         }
     }
 }
 
 /// The frames of a window in a Task whose bounds are `task` (WindowLayout.computeFrames, WindowLayout.java:66-275, for a freeform window with no insets and no cutout):
-/// display frame = window bounds (:86-87, the Task's bounds) = parent frame (:90). The frame is the parent frame for a MATCH_PARENT window; a TYPE_TOAST window or a sub-window
-/// (a popup, whose parent fills the Task) is its requested size placed by gravity and x/y (:259 Gravity.apply; window_layout::gravity_frame).
-/// The same function answers relayout and `resized`, so a window's frames never depend on which of the two reported last.
+/// display frame = window bounds (:86-87, the Task's bounds) = parent frame (:90); the frame is window_layout::frame. The same function answers relayout and `resized`,
+/// so a window's frames never depend on which of the two reported last.
 fn client_frames(p: Placement, task: Rect, seq: i32) -> ClientWindowFrames {
-    let frame = if p.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&p.r#type) {
-        let (left, top, right, bottom) = crate::window_layout::gravity_frame(
-            p.gravity,
-            p.requested,
-            (p.x, p.y),
-            (task.left, task.top, task.right, task.bottom),
-        );
-        rect(left, top, right, bottom)
-    } else {
-        task.clone()
-    };
+    let (l, t, r, b) =
+        crate::window_layout::frame(&p, (task.left, task.top, task.right, task.bottom));
+    let frame = rect(l, t, r, b);
     ClientWindowFrames {
         frame,
         display_frame: task.clone(),
@@ -343,15 +356,15 @@ fn client_frames(p: Placement, task: Rect, seq: i32) -> ClientWindowFrames {
     }
 }
 
-/// Where a window's layer goes in its Task: the frame's origin less the surface insets (WindowState.transformFrameToSurfacePosition, WindowState.java:5190-5218: the surface
-/// extends past the frame by surfaceInsets, e.g. a dialog's shadow, so its top-left sits that far up and left of the frame).
-fn surface_origin(p: Placement, frame: &Rect) -> (i32, i32) {
-    (frame.left - p.surface_inset.0, frame.top - p.surface_inset.1)
-}
-
 /// A rect as `l,t wxh` for the diagnostic lines.
 fn show_rect(r: &Rect) -> String {
-    format!("{},{} {}x{}", r.left, r.top, r.right - r.left, r.bottom - r.top)
+    format!(
+        "{},{} {}x{}",
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top
+    )
 }
 
 /// AOSP InputChannel.openInputChannelPair (InputTransport.cpp:355-378): a SOCK_SEQPACKET pair, both ends with the buffer sizes above. The first fd is the server end, the second
@@ -528,12 +541,10 @@ impl IWindowSession for Session {
         };
         // relayout carries the LayoutParams only when they changed (ViewRootImpl sends null otherwise); WMS keeps the window's own (WindowState.mAttrs) and the requested size
         // (mRequestedWidth/Height), which `resized` lays out with again
+        let previous = self.tasks.placement(&client).unwrap_or_default();
         let placement = Placement {
             requested: (requested_width, requested_height),
-            ..attrs.map_or_else(
-                || self.tasks.placement(&client).unwrap_or_default(),
-                Placement::of,
-            )
+            ..attrs.map_or(previous, Placement::of)
         };
         self.tasks.set_placement(&client, placement);
         // The agent is another process, asked without the windows lock. A window gets its surface once; a failed call is asked again at the next relayout.
@@ -555,7 +566,7 @@ impl IWindowSession for Session {
         };
         // the window's layer goes to its surface origin (WindowState.updateSurfacePosition), asked without the windows lock; a refused call is asked again at the next relayout
         let frame = &frames.frame;
-        let origin = surface_origin(placement, frame);
+        let origin = crate::window_layout::surface_origin(&placement, (frame.left, frame.top));
         if let Some(layer_id) = surface
             .as_ref()
             .and_then(|s| s.native.as_ref())
@@ -576,6 +587,16 @@ impl IWindowSession for Session {
                 origin.0,
                 origin.1
             ));
+        }
+        // the dim follows every relayout (a resize relayouts too, with new Task bounds); a window that stopped dimming drops its dim layer
+        if let Some(layer_id) = surface
+            .as_ref()
+            .and_then(|s| s.native.as_ref())
+            .map(|n| n.layer_id)
+            && (placement.dim() > 0.0 || previous.dim() > 0.0)
+        {
+            self.agent
+                .dim(layer_id, placement.dim(), &frames.parent_frame);
         }
         let display = self.tasks.display();
         let size = self.tasks.size(task);
@@ -627,16 +648,22 @@ impl IWindowSession for Session {
             counters::refused(WINDOW_SESSION, "remove: no client token");
             return Err(StatusCode::BAD_VALUE.into());
         };
-        let removed: Vec<SpIBinder> = {
+        let (removed, layers): (Vec<SpIBinder>, Vec<i32>) = {
             let mut windows = self.lock();
-            let inputs = windows
-                .iter()
-                .filter(|w| w.client == *token)
-                .filter_map(|w| w.input.clone())
+            let mine = || windows.iter().filter(|w| w.client == *token);
+            let inputs = mine().filter_map(|w| w.input.clone()).collect();
+            let layers = mine()
+                .filter_map(|w| w.surface.as_ref()?.native.as_ref().map(|n| n.layer_id))
                 .collect();
             windows.retain(|w| w.client != *token);
-            inputs
+            (inputs, layers)
         };
+        // the dim goes with the window (Dimmer drops the dim layer of a window that no longer dims)
+        if self.tasks.placement(token).is_some_and(|p| p.dim() > 0.0) {
+            for layer_id in layers {
+                self.agent.dim(layer_id, 0.0, &rect(0, 0, 0, 0));
+            }
+        }
         self.tasks.remove_window(token);
         for input in removed {
             self.agent.remove_input(input);

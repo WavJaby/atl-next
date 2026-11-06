@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has eight transactions. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has nine transactions. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
+//! just below that layer (WMS Dimmer), amount <= 0 drops it. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
 //! REMOVE_INPUT: a removed window's input channel token in, nothing out: the agent drops that channel (WindowState.disposeInputChannel -> InputDispatcher::removeInputChannel). TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
@@ -37,6 +38,8 @@ pub const WINDOW_POSITION: TransactionCode = 6;
 pub const INPUT_METHOD: TransactionCode = 7;
 /// A post-draw Transaction in (its bytes, then each object: offset, kind, the binder or fd); the agent's composer applies it. Nothing out.
 pub const POST_DRAW_TRANSACTION: TransactionCode = 8;
+/// A dimming window's layer id, the dim amount (f32) and the dim bounds' width and height (i32, from the Task's origin) in; nothing out. Amount <= 0 drops the window's dim layer.
+pub const DIM_LAYER: TransactionCode = 9;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -57,6 +60,14 @@ pub trait IUiAgent: Interface {
     fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode>;
     /// A window's post-draw Transaction (IWindowSession.finishDrawing), as libgui parcelled it: the app's composer applies it, as WMS applies it to SurfaceFlinger.
     fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode>;
+    /// FLAG_DIM_BEHIND (WMS Dimmer): a black colour layer just below the window of layer `layer_id`, alpha `amount`, covering `width` x `height` from the Task's origin; `amount` <= 0 drops it.
+    fn dim_layer(
+        &self,
+        layer_id: i32,
+        amount: f32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -109,6 +120,13 @@ fn on_transact(
         POST_DRAW_TRANSACTION => {
             let t = read_transaction(data)?;
             service.post_draw_transaction(&t)
+        }
+        DIM_LAYER => {
+            let layer_id: i32 = data.read()?;
+            let amount: f32 = data.read()?;
+            let width: i32 = data.read()?;
+            let height: i32 = data.read()?;
+            service.dim_layer(layer_id, amount, width, height)
         }
         _ => {
             counters::count(INTERFACE, &format!("code {code}"));
@@ -167,6 +185,23 @@ impl IUiAgent for BpUiAgent {
         data.write(&x)?;
         data.write(&y)?;
         binder.submit_transact(WINDOW_POSITION, data, 0)?;
+        Ok(())
+    }
+
+    fn dim_layer(
+        &self,
+        layer_id: i32,
+        amount: f32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(&layer_id)?;
+        data.write(&amount)?;
+        data.write(&width)?;
+        data.write(&height)?;
+        binder.submit_transact(DIM_LAYER, data, 0)?;
         Ok(())
     }
 
@@ -269,6 +304,16 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode> {
         self.0.post_draw_transaction(t)
+    }
+
+    fn dim_layer(
+        &self,
+        layer_id: i32,
+        amount: f32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StatusCode> {
+        self.0.dim_layer(layer_id, amount, width, height)
     }
 }
 

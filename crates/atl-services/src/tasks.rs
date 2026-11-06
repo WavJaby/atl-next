@@ -41,16 +41,36 @@ struct TaskRecord {
 }
 
 /// What a window's frame and surface position are computed from (WindowState.mAttrs + mRequestedWidth/Height): set at addToDisplay, replaced by each relayout, read again by `resized`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Placement {
     pub r#type: i32,
     pub gravity: i32,
     pub x: i32,
     pub y: i32,
+    /// LayoutParams.width/height: a size, MATCH_PARENT (-1) or WRAP_CONTENT (-2)
+    pub size: (i32, i32),
     /// the size the client last asked for at relayout (its measured size); 0x0 before the first
     pub requested: (i32, i32),
     /// LayoutParams.surfaceInsets left/top: the surface extends past the frame by them (a dialog's shadow)
     pub surface_inset: (i32, i32),
+    /// LayoutParams.flags
+    pub flags: i32,
+    /// LayoutParams.dimAmount, used while FLAG_DIM_BEHIND is set
+    pub dim_amount: f32,
+}
+
+/// LayoutParams.FLAG_DIM_BEHIND (WindowManager.java): everything behind the window is dimmed by dimAmount.
+pub const FLAG_DIM_BEHIND: i32 = 0x2;
+
+impl Placement {
+    /// The dim behind the window: dimAmount while FLAG_DIM_BEHIND is set (WindowState.isDimming), else 0.
+    pub fn dim(&self) -> f32 {
+        if self.flags & FLAG_DIM_BEHIND != 0 {
+            self.dim_amount
+        } else {
+            0.0
+        }
+    }
 }
 
 /// One window of a Task: the client handle (what `remove` finds the window by), the Task it belongs to, and its placement.
