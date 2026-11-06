@@ -113,10 +113,13 @@ impl Step {
     /// Why the step has nothing to check here, when its input is absent: printed and counted, not a failure.
     fn skip(self, out: &Path) -> Option<String> {
         match self {
-            Step::ConverterPackages if !out.join("graph.json").is_file() => Some(format!(
-                "no {}: run `cargo xtask native` first",
-                out.join("graph.json").display()
-            )),
+            // both read a native out dir; a checkout without one (main's land verify) has nothing to check
+            Step::ConverterPackages | Step::GlProxies if !out.join("graph.json").is_file() => {
+                Some(format!(
+                    "no {}: run `cargo xtask native` first",
+                    out.join("graph.json").display()
+                ))
+            }
             _ => None,
         }
     }
