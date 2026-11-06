@@ -211,6 +211,18 @@ pub fn binderd_args(files: &[PathBuf], info_fd: i32, seccomp_fd: i32) -> Vec<OsS
     a.end()
 }
 
+/// The sandbox stub's argv after its path: `--allow` each of `allow`, then `-- program`. The stub restricts itself with Landlock to read + execute on exactly those files and execs `program`, which inherits the domain.
+pub fn stub_args(allow: &[PathBuf], program: &Path) -> Vec<OsString> {
+    let mut v = Vec::with_capacity(allow.len() * 2 + 2);
+    for f in allow {
+        v.push("--allow".into());
+        v.push(f.into());
+    }
+    v.push("--".into());
+    v.push(program.into());
+    v
+}
+
 /// The files `program` needs to start: itself, its interpreter (PT_INTERP, at the path it names), and every DT_NEEDED library, transitively, found in the interpreter's canonical directory (the loader's default search path holds it; no other is consulted).
 /// A library that is not there fails: a sandbox missing it would end binderd at start with only the loader's message.
 pub fn elf_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
@@ -339,8 +351,10 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
 
 impl Broker {
     /// Starts binderd (`program`) in [`Profile::BinderDaemon`] with its admin connection on stdin and its stderr (counters) to `log`, and the broker over the other end of that connection.
+    /// bwrap runs `stub` (atl-sandbox-stub), which applies Landlock (read + execute on binderd's ELF closure only) and execs binderd; both closures are bound, so the stub's own files are visible but not in the domain.
+    /// Order: bwrap installs seccomp, then execs the stub, so the seccomp filter sees the stub's calls (landlock_*, prctl) as well as binderd's.
     /// Dropping the Broker closes admin, which ends binderd; the returned process is bwrap, which exits with binderd's status.
-    pub fn start(program: &Path, log: File) -> io::Result<(Broker, Process)> {
+    pub fn start(program: &Path, stub: &Path, log: File) -> io::Result<(Broker, Process)> {
         let (admin, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -349,13 +363,20 @@ impl Broker {
         )?;
         let (info_r, info_w) = io::pipe()?;
         let seccomp = seccomp_memfd(Profile::BinderDaemon)?;
-        let files = elf_closure(program)?;
+        let allow = elf_closure(program)?;
+        let mut files = allow.clone();
+        for f in elf_closure(stub)? {
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
         let bwrap_args = binderd_args(&files, info_w.as_raw_fd(), seccomp.as_raw_fd());
+        let args = stub_args(&allow, program);
         let process = launch(
             Launch {
                 bwrap_args,
-                program,
-                args: &[],
+                program: stub,
+                args: &args,
                 env: vec![],
                 // binderd reads no variable; the host's would only widen what it sees
                 clear_env: true,
@@ -562,6 +583,16 @@ mod tests {
         assert_eq!(
             s(&binderd_args(&files, 9, 8)).join(" "),
             "--unshare-all --unshare-user --uid 65534 --gid 65534 --die-with-parent --new-session --cap-drop ALL --info-fd 9 --seccomp 8 --tmpfs / --ro-bind /b/atl-binderd /b/atl-binderd --ro-bind /lib64/ld.so /lib64/ld.so --"
+        );
+    }
+
+    /// The stub's argv: each allowed file, then `--` and the program (atl-sandbox-stub's usage line).
+    #[test]
+    fn stub_argv() {
+        let allow: Vec<PathBuf> = vec!["/b/atl-binderd".into(), "/lib64/ld.so".into()];
+        assert_eq!(
+            s(&stub_args(&allow, Path::new("/b/atl-binderd"))).join(" "),
+            "--allow /b/atl-binderd --allow /lib64/ld.so -- /b/atl-binderd"
         );
     }
 

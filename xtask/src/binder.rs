@@ -117,7 +117,7 @@ pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process
         .with_context(|| format!("spawning {}", cmd.get_program().display()))
 }
 
-/// atl-binderd, built into `out`'s cargo target dir as `xtask native` builds crates, started by the broker (its BinderDaemon sandbox) with its stderr (counters) in `log`.
+/// atl-binderd and atl-sandbox-stub, built into `out`'s cargo target dir as `xtask native` builds crates; binderd started by the broker (its BinderDaemon sandbox, Landlock through the stub) with its stderr (counters) in `log`.
 pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Broker, Process)> {
     let status = crate::cargo_command()
         .args([
@@ -125,16 +125,18 @@ pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Brok
             "--release",
             "-p",
             "atl-binderd",
-            "--bin",
-            "atl-binderd",
+            "-p",
+            "atl-sandbox-stub",
             "--target-dir",
         ])
         .arg(out.join("cargo"))
         .current_dir(root)
         .status()?;
     ensure!(status.success(), "building atl-binderd failed");
+    let bin = out.join("cargo/release");
     Broker::start(
-        &out.join("cargo/release/atl-binderd"),
+        &bin.join("atl-binderd"),
+        &bin.join("atl-sandbox-stub"),
         std::fs::File::create(log)?,
     )
     .context("starting atl-binderd")

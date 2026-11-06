@@ -13,5 +13,9 @@ landlock.workspace = true
 [dev-dependencies]
 atl-broker = { path = "../atl-broker" }
 
+[[test]]
+name = "binderd_domain"
+harness = false
+
 [lints]
 workspace = true

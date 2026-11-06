@@ -87,9 +87,10 @@ fn domain_refuses() {
     if abi >= 4 {
         assert_eq!(get("tcp"), format!("err:{EACCES}"), "{line}");
     } else {
+        // a skip is reported with a count, never folded into the pass
         let _ = writeln!(
             std::io::stderr(),
-            "landlock abi={abi}: TCP connect not enforceable on this kernel (tcp={})",
+            "landlock tcp: skipped: ABI {abi} < 4 (skipped=1, observed tcp={})",
             get("tcp")
         );
     }

@@ -49,6 +49,9 @@ struct Args {
     /// atl-binderd executable.
     #[arg(long)]
     binderd: PathBuf,
+    /// atl-sandbox-stub executable: the in-child stage that applies Landlock before binderd runs.
+    #[arg(long)]
+    sandbox_stub: PathBuf,
     /// AOSP servicemanager executable.
     #[arg(long)]
     servicemanager: PathBuf,
@@ -802,8 +805,11 @@ fn run(a: &Args) -> Result<ExitCode> {
     {
         bail!("--launch {p}: not an installed package");
     }
-    let (broker, mut binderd) =
-        Broker::start(&a.binderd, std::fs::File::create(r.log("binderd"))?)?;
+    let (broker, mut binderd) = Broker::start(
+        &a.binderd,
+        &a.sandbox_stub,
+        std::fs::File::create(r.log("binderd"))?,
+    )?;
     let broker = if a.no_app_seccomp {
         broker.without_app_seccomp()
     } else {

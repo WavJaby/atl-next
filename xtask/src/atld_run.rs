@@ -43,6 +43,7 @@ pub struct Runtime {
     /// atl-am, atld's `--am`: the control command `start`
     am: PathBuf,
     binderd: PathBuf,
+    sandbox_stub: PathBuf,
     atld: PathBuf,
     framework_res: PathBuf,
     font_xml: PathBuf,
@@ -325,6 +326,7 @@ impl Runtime {
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
         let am = packages::bin(root, &out, "atl-services", "atl-am")?;
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
+        let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
         let atld = cargo_bin(root, &out, "atld")?;
         let apk = ApkTools::new(root, host, &out, &java_out)?;
         let framework_res = java_out.join(FRAMEWORK_RES);
@@ -378,6 +380,7 @@ impl Runtime {
             services,
             am,
             binderd,
+            sandbox_stub,
             atld,
             framework_res,
             font_xml,
@@ -708,6 +711,8 @@ impl Runtime {
             .arg(&run.root)
             .arg("--binderd")
             .arg(&self.binderd)
+            .arg("--sandbox-stub")
+            .arg(&self.sandbox_stub)
             .arg("--servicemanager")
             .arg(&self.servicemanager)
             .arg("--services")

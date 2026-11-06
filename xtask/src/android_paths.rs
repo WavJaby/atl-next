@@ -33,7 +33,7 @@ struct Allow {
 }
 
 /// String literal contents on one source line, in order; none on a comment line.
-fn literals(line: &str) -> Vec<String> {
+pub(crate) fn literals(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = line.chars();
     while let Some(c) = chars.next() {

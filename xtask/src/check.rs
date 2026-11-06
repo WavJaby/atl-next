@@ -45,6 +45,8 @@ enum Step {
     Seam,
     /// Android path literals (`/system`, `/data`, ...) only in crate atl-android-paths, others allowed by android-paths.toml with a reason
     AndroidPaths,
+    /// bwrap flag literals only in atl-broker's bwrap.rs, besides the golden argv tests
+    BwrapFlags,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -59,7 +61,7 @@ enum Step {
     ConverterPackages,
 }
 
-const ALL: [Step; 13] = [
+const ALL: [Step; 14] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -67,6 +69,7 @@ const ALL: [Step; 13] = [
     Step::Drift,
     Step::Seam,
     Step::AndroidPaths,
+    Step::BwrapFlags,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -85,6 +88,7 @@ impl Step {
             Step::Drift => "drift",
             Step::Seam => "seam",
             Step::AndroidPaths => "android-paths",
+            Step::BwrapFlags => "bwrap-flags",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -185,6 +189,7 @@ impl Step {
             Step::Drift => patch::check(root),
             Step::Seam => crate::binder::seam_check(root),
             Step::AndroidPaths => crate::android_paths::check(root),
+            Step::BwrapFlags => crate::bwrap_flags::check(root),
             Step::Clippy => cargo(
                 root,
                 &[

@@ -17,6 +17,7 @@ mod binder;
 mod broadcast;
 mod build_pool;
 mod build_state;
+mod bwrap_flags;
 mod cdylib;
 mod check;
 mod composer;

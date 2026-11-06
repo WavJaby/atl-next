@@ -24,6 +24,10 @@ exceptions = [
 # one version of each crate in the graph
 multiple-versions = "deny"
 wildcards = "deny"
+# Exact-version skips only. cargo-deny `skip` takes no `wrappers`; the version pin is the narrowest scope.
+skip = [
+    { crate = "syn@2.0.119", reason = "build-time only: proc-macro dep of enumflags2_derive 0.7.12 <- enumflags2 <- landlock 0.4.7 (approved safe Landlock binding; own syscalls would be a second, unsafe copy). Delete when enumflags2_derive moves to syn 3." },
+]
 allow-wildcard-paths = true
 # Host toolkit / desktop-bus crates are reachable only through the platform layer: core crates depend
 # on the `atl-platform-*` facades. When a `-<os>` implementation crate is created, it is added to the
