@@ -152,7 +152,7 @@ fn normal(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Result
     });
     if let Some(rt) = run.rt_fallbacks {
         println!(
-            "rt: {rt} stream(s) ran without SCHED_FIFO/SCHED_RR (counted; rtkit absent on WSL)"
+            "rt: {rt} stream(s) ran without SCHED_FIFO/SCHED_RR (counted; no realtime grant from the session: rtkit absent, or the client not in an active local session)"
         );
     }
     if let Some(underruns) = run.underruns {
