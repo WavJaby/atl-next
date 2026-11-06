@@ -477,8 +477,29 @@ fn args(lang: Lang, t: &Target) -> Vec<String> {
     };
     let mut args = vec!["-x".to_owned(), x.to_owned(), std.to_owned()];
     args.push(format!("--target={}", t.triple));
+    if let Some(dir) = resource_dir() {
+        args.push(format!("-resource-dir={}", dir.display()));
+    }
     args.extend(t.args.iter().cloned());
     args
+}
+
+/// clang's resource dir (builtin headers: `stddef.h`, `stdarg.h` ...), from the clang binary `clang_sys::support::Clang::find` pairs with libclang (bindgen's lookup), `-print-resource-dir`.
+/// Why: a dlopened libclang derives it from its own path, which fails on some distros (Arch libclang 23: `/usr/include/signal.h: 'stddef.h' file not found`).
+/// `-resource-dir`, not bindgen's `-isystem <c_search_paths>`: those also carry the host's system dirs, which would leak glibc into `-nostdlibinc` (bionic) targets.
+/// None (no clang binary): libclang's own guess stands.
+fn resource_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let clang = clang_sys::support::Clang::find(None, &[])?;
+        let out = std::process::Command::new(&clang.path)
+            .arg("-print-resource-dir")
+            .output()
+            .ok()?;
+        let dir = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+        (out.status.success() && dir.join("include/stddef.h").is_file()).then_some(dir)
+    })
+    .as_deref()
 }
 
 /// The unit's errors as `file:line: text`.
@@ -1260,6 +1281,22 @@ fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
 #[cfg(test)]
 mod tests {
     use super::glob;
+
+    /// Every parse names clang's resource dir, so builtin headers resolve whatever libclang guesses.
+    #[test]
+    fn args_name_resource_dir() {
+        let t = super::Target {
+            arch: String::new(),
+            triple: "x86_64-linux-gnu".to_owned(),
+            args: vec![],
+        };
+        let args = super::args(crate::Lang::C, &t);
+        let dir = args
+            .iter()
+            .find_map(|a| a.strip_prefix("-resource-dir="))
+            .expect("no -resource-dir argument (is a clang binary on PATH?)");
+        assert!(std::path::Path::new(dir).join("include/stddef.h").is_file());
+    }
 
     #[test]
     fn globs() {

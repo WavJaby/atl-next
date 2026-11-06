@@ -14,6 +14,8 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 clang ={ version = "2.1", features = ["clang_10_0"] }
+# atl-bridgegen: `support::Clang::find` locates the clang binary paired with libclang (bindgen's route), for its resource dir
+clang-sys = "1.9"
 clap = { version = "4", features = ["derive"] }
 # C++ bridge of atl-libinput (AOSP libinput's public API). Not AOSP's 1.0.119: that predates edition 2024 and carries RUSTSEC-2026-0202 (fixed 1.0.195). From 1.0.198 cxxbridge-macro uses syn 3, the workspace's syn (no duplicate); from 1.0.190 it pulls foldhash (Zlib, see deny.toml exceptions)
 cxx = "1.0.205"

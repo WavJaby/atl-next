@@ -142,6 +142,7 @@ dependencies = [
  "anyhow",
  "atl-layout",
  "clang",
+ "clang-sys",
  "clap",
  "serde",
  "serde_json",
