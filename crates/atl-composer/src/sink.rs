@@ -39,23 +39,30 @@ impl<S: SceneSink> SceneSink for FirstFrame<S> {
 
 /// FNV-1a, 64 bit: the digest a quad's pixels are reported by (offset basis 0xcbf29ce484222325, prime 0x100000001b3). Not a security hash: a short, order-sensitive fingerprint both sides compute alike.
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a64_continue(FNV_OFFSET_BASIS, bytes)
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes` from state `h`: hashing the parts of a sequence in turn equals hashing the sequence.
+fn fnv1a64_continue(mut h: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes
-        .iter()
-        .fold(OFFSET_BASIS, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(PRIME);
+    }
+    h
 }
 
 /// The digest of `pixels` as the picture, not the memory: the rows of `width` pixels (4 bytes each) in order, without the padding up to the stride.
+/// Hashed row by row in place, never copied: this runs on the present thread, and a read longer than FRAMES_QUEUED periods holds the frame clock back (a missed vsync).
+/// Measured on a 1440x900 buffer, debug build: copying the rows then folding 80-137 ms (the frames stage's missed vsync at its first present), in place ~18 ms.
 pub fn pixels_digest(pixels: &Pixels) -> u64 {
     let row = pixels.width as usize * 4;
-    let rows: Vec<u8> = pixels
+    pixels
         .bytes
         .chunks(pixels.stride_bytes)
         .take(pixels.height as usize)
-        .flat_map(|r| r[..row].iter().copied())
-        .collect();
-    fnv1a64(&rows)
+        .fold(FNV_OFFSET_BASIS, |h, r| fnv1a64_continue(h, &r[..row]))
 }
 
 /// Writes `composer: scene` and `composer: quad` lines to `W`; the quad line carries the digest of its buffer ([`pixels_digest`]) or why the buffer could not be read.

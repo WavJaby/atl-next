@@ -23,6 +23,7 @@ use crate::atld_run::{
     Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, run_display, totals,
 };
 use crate::composer::{fnv1a64, word};
+use crate::cpu_pressure::{Sampler, Samples};
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
@@ -189,6 +190,9 @@ const WINDOW_TITLE: &str = "AtlWindowFixture";
 const CADENCE_TOLERANCE: f64 = 0.10;
 /// No single interval may exceed this many periods: a missed vsync shows as two.
 const CADENCE_MAX_PERIODS: f64 = 1.5;
+/// Host CPU stall share (PSI `some`, cpu_pressure) over a cadence window above which a failed cadence is undecidable rather than FAIL. 10%: over every share a quiet host showed
+/// (16 CPUs, load 7-15: 0-7% in 8 passing frames runs), under the 87-97% of a host oversubscribed twice (32 busy loops), where the app's first frames miss vsyncs.
+pub(crate) const STARVED_STALL_SHARE: f64 = 0.10;
 /// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
 const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
 /// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the opening size (DisplayModel::opening_size, 960x600 on the gates' 1280x800 display) and shrink under it in both dimensions.
@@ -1132,13 +1136,40 @@ fn frame_time(line: &str) -> Option<u64> {
 }
 
 /// Sub-gate (b): the first FRAME_CALLBACKS callbacks after the marker come once per display period. The mean interval is within CADENCE_TOLERANCE of the period, and no
-/// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's, so the mean does not depend on when the app ran its callbacks.
-fn cadence_check(after: &[&str], refresh_hz: f32) -> Result<String, String> {
+/// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's (the display clock's grid point each callback was scheduled for, not a wall-clock stamp of the app's own),
+/// so the mean does not depend on when the app ran its callbacks; a missed interval is a vsync the client did not ask for in time. A failed judgement while the host was starved
+/// ([`STARVED_STALL_SHARE`] over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
+pub(crate) fn cadence_check(
+    after: &[&str],
+    refresh_hz: f32,
+    pressure: &Samples,
+) -> Result<String, String> {
     let times: Vec<u64> = after
         .iter()
         .filter_map(|l| frame_time(l))
         .take(FRAME_CALLBACKS)
         .collect();
+    let share = match (times.first(), times.last()) {
+        (Some(&a), Some(&b)) => pressure.stall_share(a as i64, b as i64),
+        _ => None,
+    };
+    let stall = share.map_or_else(
+        || "cpu stall unknown".to_owned(),
+        |s| format!("cpu stall {:.0}%", s * 100.0),
+    );
+    match cadence_judge(&times, refresh_hz) {
+        Ok(msg) => Ok(format!("{msg}; {stall}")),
+        Err(e) => match share {
+            Some(s) if s > STARVED_STALL_SHARE => Err(format!(
+                "undecidable: {e}, but the host was starved ({stall} over the window, threshold {:.0}%); rerun on a quieter host",
+                STARVED_STALL_SHARE * 100.0
+            )),
+            _ => Err(format!("{e}; {stall}")),
+        },
+    }
+}
+
+fn cadence_judge(times: &[u64], refresh_hz: f32) -> Result<String, String> {
     if times.len() < FRAME_CALLBACKS {
         return Err(format!(
             "{} frame callbacks after the marker, want {FRAME_CALLBACKS}",
@@ -1323,6 +1354,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
+    // host CPU pressure through the run: the cadence checks tell a starved host from a client that missed frames
+    let sampler = Sampler::start();
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
@@ -1474,6 +1507,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
         None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
+    let pressure = sampler.stop();
     let app = read(&app_log);
     let services = read(&services_log);
     let all = events(&services);
@@ -1488,7 +1522,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 ("picture", picture_check(&app, display)),
                 (
                     "cadence",
-                    cadence_check(&after_marker(&app, marker), display.refresh_hz),
+                    cadence_check(&after_marker(&app, marker), display.refresh_hz, &pressure),
                 ),
             ]
         }
@@ -1499,9 +1533,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ),
             ("touch-mode", touch_mode_check(&services)),
         ],
-        (Stage::Widgets, Some(_)) => {
-            widgets::checks(&app, &after_marker(&app, marker), &liveness, display)
-        }
+        (Stage::Widgets, Some(_)) => widgets::checks(
+            &app,
+            &after_marker(&app, marker),
+            &liveness,
+            display,
+            &pressure,
+        ),
         (Stage::Move, Some(_)) => match moved {
             Some(moved) => move_output::checks(&app, &services, &liveness, display, moved),
             None => vec![("outputs", Err("no nested compositor".to_owned()))],
@@ -1950,7 +1988,7 @@ mod tests {
         let check = |times: &[u64], hz: f32| {
             let owned = lines(times);
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, hz)
+            cadence_check(&refs, hz, &Samples::default())
         };
         let steady: Vec<u64> = (0..31).map(|i| 5_000_000_000 + i * STEP).collect();
         let ok = check(&steady, 60.0);
@@ -1970,6 +2008,51 @@ mod tests {
         }
         assert!(check(&missed, 60.0).is_err(), "one interval of two periods");
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
+    }
+
+    /// The starvation rule: a client that skips every other vsync (the stage's deliberate-skip case) FAILs on a quiet host and is undecidable on a starved one; steady callbacks
+    /// PASS on both (a pass under load is a pass). Pressure samples bracket the window at the threshold's half and double.
+    #[test]
+    fn cadence_undecidable_only_when_starved() {
+        use crate::cpu_pressure::Sample;
+        const STEP: u64 = 16_666_667;
+        const T0: u64 = 5_000_000_000;
+        let pressure = |share: f64| {
+            let wall_ns = 2_000_000_000_i64;
+            Samples(vec![
+                Sample {
+                    at_ns: T0 as i64 - 1,
+                    stall_us: 0,
+                },
+                Sample {
+                    at_ns: T0 as i64 - 1 + wall_ns,
+                    stall_us: (share * wall_ns as f64 / 1e3) as u64,
+                },
+            ])
+        };
+        let run = |times: &[u64], p: &Samples| {
+            let owned: Vec<String> = times
+                .iter()
+                .map(|t| format!("1000.000 1 2 I AtlWindow: frame 1 time={t}"))
+                .collect();
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            cadence_check(&refs, 60.0, p)
+        };
+        let quiet = pressure(STARVED_STALL_SHARE / 2.0);
+        let starved = pressure(STARVED_STALL_SHARE * 2.0);
+        let steady: Vec<u64> = (0..31).map(|i| T0 + i * STEP).collect();
+        let skipping: Vec<u64> = (0..31).map(|i| T0 + i * 2 * STEP).collect();
+        assert!(run(&steady, &quiet).is_ok());
+        assert!(run(&steady, &starved).is_ok());
+        let fail = run(&skipping, &quiet).expect_err("skips on a quiet host");
+        assert!(!fail.starts_with("undecidable"), "{fail}");
+        let undecided = run(&skipping, &starved).expect_err("skips on a starved host");
+        assert!(undecided.starts_with("undecidable"), "{undecided}");
+        let unknown = run(&skipping, &Samples::default()).expect_err("no samples");
+        assert!(
+            !unknown.starts_with("undecidable"),
+            "no evidence decides FAIL: {unknown}"
+        );
     }
 
     /// The fixture's touch line reads as its action, x, y and pointer count; any other line is no touch.

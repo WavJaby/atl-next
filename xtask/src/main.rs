@@ -16,6 +16,7 @@ mod check;
 mod composer;
 mod compositor;
 mod converter;
+mod cpu_pressure;
 mod cts;
 mod cts_report;
 mod cts_table;

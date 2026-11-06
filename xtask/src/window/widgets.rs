@@ -16,6 +16,7 @@ use super::{
     content_origin, wait_for_line,
 };
 use crate::composer::word;
+use crate::cpu_pressure::Samples;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
 
@@ -636,6 +637,7 @@ pub fn checks(
     after: &[&str],
     probe: &Result<Liveness, String>,
     display: DisplayModel,
+    pressure: &Samples,
 ) -> Vec<Sub> {
     vec![
         (
@@ -661,7 +663,10 @@ pub fn checks(
         ("touch", touch_check(app)),
         ("readback", readback_check(app)),
         ("presents", presents_check(app)),
-        ("cadence", cadence_check(after, display.refresh_hz)),
+        (
+            "cadence",
+            cadence_check(after, display.refresh_hz, pressure),
+        ),
         ("on-demand", on_demand_check(app)),
     ]
 }
