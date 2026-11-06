@@ -110,7 +110,9 @@ pub fn current_outputs(out: &Path) -> Result<BTreeSet<PathBuf>> {
         &std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?,
     )
     .with_context(|| file.display().to_string())?;
-    let artifacts = graph["artifacts"].as_object().context("graph.json has no artifacts")?;
+    let artifacts = graph["artifacts"]
+        .as_object()
+        .context("graph.json has no artifacts")?;
     Ok(artifacts
         .iter()
         .filter(|(module, _)| module.starts_with("device/"))
@@ -151,11 +153,7 @@ fn artifacts(device: &Path, current: &BTreeSet<PathBuf>) -> Result<Vec<(PathBuf,
 }
 
 /// Checks every artifact under `device` that `current` names (`current_outputs`) against the `provided` libraries.
-pub fn check(
-    device: &Path,
-    provided: &[Exported],
-    current: &BTreeSet<PathBuf>,
-) -> Result<Report> {
+pub fn check(device: &Path, provided: &[Exported], current: &BTreeSet<PathBuf>) -> Result<Report> {
     if provided.is_empty() {
         bail!("no provided library to check against");
     }
@@ -292,7 +290,8 @@ mod tests {
 
     #[test]
     fn only_the_current_graphs_outputs_are_scanned() {
-        let root = std::env::temp_dir().join(format!("xtask-provided-stale-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("xtask-provided-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let device = root.join("device");
         std::fs::create_dir_all(device.join("libnew")).expect("test dir");

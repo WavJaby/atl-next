@@ -374,7 +374,10 @@ mod tests {
         std::fs::create_dir_all(&out).expect("test dir");
         std::fs::write(out.join("built-from"), "aaaa\n").expect("test record");
         let err = crate::build_state::ensure_matches("bbbb", &out).expect_err("another state");
-        assert!(format!("{err:#}").contains("was built from another source state"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("was built from another source state"),
+            "{err:#}"
+        );
         assert!(crate::build_state::ensure_matches("aaaa", &out).is_ok());
         std::fs::remove_dir_all(&out).expect("test dir cleanup");
     }

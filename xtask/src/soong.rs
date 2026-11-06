@@ -56,7 +56,10 @@ fn violations(rel: &str, text: &str) -> Vec<String> {
 /// `#` opens a comment only at line start (a trailing `#` may be part of code, e.g. a URL fragment).
 fn code_part(line: &str) -> &str {
     let t = line.trim_start();
-    if ["//", "#", "/*", "*", "<!--"].iter().any(|m| t.starts_with(m)) {
+    if ["//", "#", "/*", "*", "<!--"]
+        .iter()
+        .any(|m| t.starts_with(m))
+    {
         return "";
     }
     line.find(" //").map_or(line, |i| &line[..i])
@@ -84,7 +87,10 @@ mod tests {
         // expected counts read off the text: the shebang is a comment, line 2 invokes
         let sh = "#!/bin/sh\nbuild/soong/soong_ui.bash --make-mode\n";
         let found = violations("scripts/env/x.sh", sh);
-        assert_eq!(found, ["scripts/env/x.sh:2: build/soong/soong_ui.bash --make-mode"]);
+        assert_eq!(
+            found,
+            ["scripts/env/x.sh:2: build/soong/soong_ui.bash --make-mode"]
+        );
         assert_eq!(violations("a.mk", "lunch aosp_x86_64-userdebug\n").len(), 1);
         assert_eq!(violations("a.sh", "  lunch;\n").len(), 1);
     }
