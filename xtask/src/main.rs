@@ -34,6 +34,7 @@ mod git;
 mod git_dirs;
 mod gl_dispatch;
 mod gl_probe;
+mod gl_proxies;
 mod gles2_fixture;
 mod gralloc;
 mod host_art;

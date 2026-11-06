@@ -63,6 +63,8 @@ enum Step {
     Runtimes,
     /// clippy + unit tests on the packages that link converter modules (feature `converter`), against the native out dir's graph; skipped without one
     ConverterPackages,
+    /// the guest GL proxies cover the NDK maps and the host fronts export every bound stub (gl_proxies.rs), on the native out dir; skipped without its guest proxies and fronts
+    GlProxies,
 }
 
 const ALL: [Step; 16] = [
@@ -82,6 +84,7 @@ const ALL: [Step; 16] = [
     Step::Libcxx,
     Step::Runtimes,
     Step::ConverterPackages,
+    Step::GlProxies,
 ];
 
 impl Step {
@@ -103,6 +106,7 @@ impl Step {
             Step::Libcxx => "libcxx",
             Step::Runtimes => "runtimes",
             Step::ConverterPackages => "converter-packages",
+            Step::GlProxies => "gl-proxies",
         }
     }
 
@@ -129,6 +133,13 @@ impl Step {
                     unchecked.join(", ")
                 )
             }));
+        }
+        if self == Step::GlProxies {
+            let arches = arches::load(root)?;
+            let (arch, _) = arches::build_machine(root, &arches)?;
+            // reads built binaries: a slot from another source state would check stale proxies
+            crate::build_state::ensure_current(root, out)?;
+            return crate::gl_proxies::check(root, out, arch);
         }
         self.run_whole(root).map(|()| None)
     }
@@ -239,6 +250,7 @@ impl Step {
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
+            Step::GlProxies => unreachable!("run handles gl-proxies"),
         }
     }
 }
