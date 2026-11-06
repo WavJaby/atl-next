@@ -408,6 +408,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = gate(&out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
+    if let Some(first) = runpath_gate(&out)? {
+        failed.push(Failure::step("runpath gate", first));
+    }
     if let Some(first) = licence_gate(
         root,
         &layout,
@@ -1097,6 +1100,21 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
         println!("native:   gate: {v}");
     }
     Ok(report.violations.first().map(ToString::to_string))
+}
+
+/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (stale ones are the licence gate's to report); its first violation, None when it passes.
+fn runpath_gate(out: &Path) -> Result<Option<String>> {
+    let all = crate::licence_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
+    let (artifacts, _) = crate::licence_gate::fresh(out, all);
+    let (read, violations) = crate::runpath_gate::check(out, &artifacts)?;
+    println!(
+        "native: runpath gate: {read} artifacts, {} runpath entries",
+        violations.len()
+    );
+    for v in violations.iter().take(5) {
+        println!("native:   runpath: {v}");
+    }
+    Ok(violations.first().cloned())
 }
 
 /// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.

@@ -460,7 +460,14 @@ impl<'a> Selection<'a> {
     }
 
     /// cargo `sub` on the selected packages
-    fn cargo(&self, sub: &str) -> std::process::Command {
+    /// Links resolve the needs of converter libraries through the stage's dirs (binder::lib_env) as `-rpath-link`, link time only: those libraries carry no runpath (runpath_gate), and ld.bfd, unlike the converter's lld, wants every needed library's own needs found.
+    /// One global flag, not per-module build-script lines: `rustc-link-arg` reaches only its own package's links, never a dependent's.
+    fn cargo(&self, sub: &str) -> Result<std::process::Command> {
+        let stage = crate::binder::lib_env(self.out)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>()
+            .join(":");
         let mut cmd = crate::cargo_command();
         cmd.current_dir(self.root)
             .args([sub, "--release", "--locked"])
@@ -479,14 +486,22 @@ impl<'a> Selection<'a> {
                 "--config",
                 &format!("target.{}.linker={:?}", self.triple, self.graph.link_driver),
             ])
+            .args([
+                "--config",
+                &format!(
+                    "target.{}.rustflags=[{:?}]",
+                    self.triple,
+                    format!("-Clink-arg=-Wl,-rpath-link,{stage}")
+                ),
+            ])
             .env(NATIVE_OUT, self.out);
-        cmd
+        Ok(cmd)
     }
 
     /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature).
     fn lint(&self) -> Result<()> {
         let status = self
-            .cargo("clippy")
+            .cargo("clippy")?
             .args(["--lib", "--bins", "--", "-D", "warnings"])
             .status()
             .context("running cargo clippy (converter packages)")?;
@@ -498,11 +513,13 @@ impl<'a> Selection<'a> {
     /// Same target dir and flags as `build`. The converter's rlibs are device crates, built panic=abort, and stable libtest links only unwinding crates, so tests run with
     /// `-Z panic-abort-tests` as Soong builds device rust tests (build/soong/rust/test.go `compilerFlags`, under its global RUSTC_BOOTSTRAP). The bootstrap is set for this test build only:
     /// `build` and the clippy steps stay on stable, so an unstable feature in our code still fails there.
+    /// Test binaries run in the stage's library environment (binder::lib_env), as every runtime process: converter device libraries carry no runpath (runpath_gate), so their own needs are found only there.
     fn test(&self) -> Result<()> {
         let status = self
-            .cargo("test")
+            .cargo("test")?
             .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
             .env("RUSTC_BOOTSTRAP", "1")
+            .envs(crate::binder::lib_env(self.out)?)
             .status()
             .context("running cargo test (converter packages)")?;
         ensure!(status.success(), "tests of {} failed", self.names());
@@ -524,7 +541,7 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
         return Ok(Vec::new());
     }
     let status = sel
-        .cargo("build")
+        .cargo("build")?
         .status()
         .context("running cargo build (converter packages)")?;
     ensure!(status.success(), "building {} failed", sel.names());
