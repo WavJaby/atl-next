@@ -6,6 +6,7 @@
 // chain <shim> <exit status> <rounds>: the shim installs its own SIGSEGV handler with sigaction, then `rounds` null derefs in read (JIT-compiled: implicit null checks fault), then a native fault the shim's handler ends the process on.
 // crash <shim>: the shim raises SIGABRT in native code; the process must die of it (prints the number first).
 // media <lib> <shim> <mime>...: NDK AMediaCodec_createDecoderByType per mime (libmediandk, NEEDED by lib), prints 1 = codec created, 0 = null, -100 = libmediandk not loaded; a Codec2 abort ends the process, the lines before it are the measurement.
+// decode <lib> <shim> <clip> <pcm out>: one clip through the NDK extractor and decoder (stage 9): `nlt decode` is the step that failed (`error=`), else frames, bytes, channels, rate, and the store the process sees (`store=`, `declared=`, `instances=`).
 // overflow <rounds>: unbounded recursion in recurse, `rounds` times on the main thread (warms the JIT: compiled code checks the stack implicitly, a SIGSEGV on the guard page), then `rounds` times on a new thread; each catches StackOverflowError, prints its depth, and the process exits normally.
 
 import java.io.BufferedReader;
@@ -25,6 +26,7 @@ public class NativeLoad {
     static native int abortSignal();
     static native void raiseAbort();
     static native int createDecoder(String mime);
+    static native String decodeFile(String input, String output);
 
     static class Box {
         int v;
@@ -76,6 +78,10 @@ public class NativeLoad {
             for (int i = 3; i < a.length; i++) {
                 out("codec", a[i] + " " + createDecoder(a[i]));
             }
+            return;
+        }
+        if (mode.equals("decode")) {
+            out("decode", decodeFile(a[3], a[4]));
             return;
         }
         if (mode.equals("startreg")) {

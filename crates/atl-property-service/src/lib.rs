@@ -45,6 +45,8 @@ const CONSTANTS: &[(&str, &str)] = &[
     // the device's choice of Codec2 HAL, a vendor property on Android: AIDL (`IComponentStore` through servicemanager, frameworks/av codec2 HalSelection.cpp IsCodec2AidlHalSelected; the aidl_hal flag is on in our release).
     // Unset it reads "hidl", and Codec2Client::CacheServiceNames CHECK-aborts without hwservicemanager, which ATL has none of (measured 2026-11-06, native-load stage 8)
     ("media.c2.hal.selection", "aidl"),
+    // MediaExtractorFactory.cpp:47 defaults to true: extractors then run in a media.extractor process, which ATL does not serve. false loads them in-process, where the sandbox's plugin dirs are the only dependency (see native-load stage 9)
+    ("media.stagefright.extractremote", "false"),
 ];
 
 /// Why the default set or its area could not be built.

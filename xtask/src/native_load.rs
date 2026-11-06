@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in eight stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in nine stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg` must return 0, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) must register every entry.
@@ -20,6 +20,7 @@
 //! 8. media: NDK `AMediaCodec_createDecoderByType` for [`MEDIA_MIMES`], the run an app-uid binder process of its own binderd + AOSP servicemanager. A warning, not a failure, until the in-app Codec2 store exists (audio slice M1);
 //!    the detail is the first fatal line, else the last Codec2 line. Measured 2026-11-06: without `media.c2.hal.selection=aidl` (atl-property-service CONSTANTS) Codec2Client::CacheServiceNames takes the HIDL path and aborts
 //!    (`Check failed: serviceManager Hardware service manager is not running.`); with it the process exits 0, both codecs null (`No Codec2 services declared in the manifest.`), after MediaCodecList's 5 s wait for `media.player`.
+//! 9. decode: the clips of `audio.rs` (Ogg Vorbis, WAV PCM, from the game APKs) decoded one by one through the NDK extractor and codec, as stage 8 runs them. Frames, channels, rate and PCM bytes equal each container's; raw output equals the WAV data chunk; the process's Codec2 store is in-process (`store=local`, declared, instance `default`).
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -39,6 +40,8 @@ use object::{
 use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
 use crate::tree;
 use crate::verdict::{Failure, Verdict};
+
+mod audio;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -61,6 +64,12 @@ pub struct Args {
     /// Instead of the stages: check the load guard refuses broken inputs.
     #[arg(long)]
     self_test: bool,
+    /// Stage 9 decodes cheer.ogg truncated to half its bytes against the full file's expectation: the stage must fail.
+    #[arg(long)]
+    break_media: bool,
+    /// Stage 9's game APKs (assets/audio/cheer.ogg, assets/sound/game_music.ogg, assets/sounds/tap.wav). Default: <workspace>/apk.
+    #[arg(long)]
+    apks: Option<PathBuf>,
     /// Print every ART run's command, stdout and stderr.
     #[arg(long, short)]
     verbose: bool,
@@ -269,6 +278,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Ok(s) => report.pass("media", s),
         Err(e) => report.warn("media", e),
     }
+
+    // 9
+    let apks = match &args.apks {
+        Some(dir) => dir.clone(),
+        None => Layout::of(root)?.workspace().join("apk"),
+    };
+    match audio::run(&env, &fixture, &apks, &env.work.join("media"), args.break_media) {
+        Ok(s) => report.pass("decode", s),
+        Err(e) => report.fail("decode", e),
+    }
     Ok(report.finish())
 }
 
@@ -386,6 +405,8 @@ impl Env {
         }
         let test_root = self.work.join("binder");
         crate::binder::fresh_layout(&test_root)?;
+        let aosp = Layout::of(&self.root)?.src().join("aosp");
+        audio::stage_platform(&test_root.join("system"), &self.out, &aosp)?;
         let lib_env = crate::binder::lib_env(&self.out)?;
         let (broker, mut binderd) =
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
@@ -407,7 +428,8 @@ impl Env {
                 .collect::<Vec<_>>(),
         );
         let what = format!("{cmd:?}");
-        let run = crate::binder::spawn_piped(&broker, &cmd, AID_APP_START).and_then(|p| {
+        let mounts = crate::binder::layout_mounts(&test_root);
+        let run = crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
             let child = p.child;
             let pid = child.id().to_string();
             std::thread::spawn(move || {

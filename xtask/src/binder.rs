@@ -63,8 +63,8 @@ fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
     Ok(())
 }
 
-/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests.
-fn layout_mounts(root: &Path) -> Vec<Mount> {
+/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the platform files an app process reads (audio.rs `stage_platform`).
+pub(crate) fn layout_mounts(root: &Path) -> Vec<Mount> {
     ["system", "vendor", "odm"]
         .into_iter()
         .map(|d| Mount {
@@ -118,7 +118,13 @@ pub(crate) fn spawn_logged(b: &Broker, cmd: &Command, uid: u32, log: &Path) -> R
 
 /// [`spawn_of`] with stdout and stderr piped (read through `Process::child`, e.g. `wait_with_output`), started.
 pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process> {
+    spawn_piped_with(b, cmd, uid, Vec::new())
+}
+
+/// [`spawn_piped`] with `mounts` (`layout_mounts`: the test layout's /system, /vendor, /odm).
+pub(crate) fn spawn_piped_with(b: &Broker, cmd: &Command, uid: u32, mounts: Vec<Mount>) -> Result<Process> {
     let mut s = spawn_of(cmd, uid)?;
+    s.mounts = mounts;
     s.stdout = Stdio::piped();
     s.stderr = Stdio::piped();
     b.spawn(s)

@@ -69,6 +69,18 @@ fn local(name: Option<&str>) -> Option<SpIBinder> {
     LOCAL.lock().ok()?.get(name?).cloned()
 }
 
+/// The instances of `iface` this process serves (`iface/<instance>` names): servicemanager's declared list does not carry them (no VINTF entry), so getDeclaredInstances adds them.
+fn local_instances(iface: Option<&str>) -> Vec<String> {
+    let (Some(iface), Ok(served)) = (iface, LOCAL.lock()) else {
+        return Vec::new();
+    };
+    served
+        .keys()
+        .filter_map(|name| name.strip_prefix(iface)?.strip_prefix('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The real servicemanager, looked up at the first forwarded call; None (the call fails) when the process has no binder context object.
 fn real() -> binder::Result<&'static Strong<dyn IServiceManager>> {
     static REAL: OnceLock<Option<Strong<dyn IServiceManager>>> = OnceLock::new();
@@ -155,14 +167,27 @@ impl IServiceManager for View {
     }
 
     fn r#isDeclared(&self, name: Option<&str>) -> binder::Result<bool> {
-        real()?.r#isDeclared(name)
+        match local(name) {
+            Some(_) => Ok(true),
+            None => real()?.r#isDeclared(name),
+        }
     }
 
     fn r#getDeclaredInstances(
         &self,
         iface: Option<&str>,
     ) -> binder::Result<Option<Vec<Option<String>>>> {
-        real()?.r#getDeclaredInstances(iface)
+        let served = local_instances(iface);
+        if served.is_empty() {
+            return real()?.r#getDeclaredInstances(iface);
+        }
+        let mut found = real()?.r#getDeclaredInstances(iface)?.unwrap_or_default();
+        for instance in served {
+            if !found.iter().any(|f| f.as_deref() == Some(instance.as_str())) {
+                found.push(Some(instance));
+            }
+        }
+        Ok(Some(found))
     }
 
     fn r#updatableViaApex(&self, name: Option<&str>) -> binder::Result<Option<String>> {

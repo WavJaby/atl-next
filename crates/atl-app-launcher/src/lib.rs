@@ -121,6 +121,17 @@ fn install_service_view() -> Result<()> {
     Ok(())
 }
 
+/// Step 1c. The Codec2 store this process serves (atl-codec-store) through the view, right after it is installed: AOSP's Codec2 client finds `IComponentStore/default` by name, in-process, on every process.
+#[cfg(feature = "converter")]
+fn serve_codec_store() -> Result<()> {
+    atl_codec_store::serve().map_err(|e| anyhow!(e))
+}
+
+#[cfg(not(feature = "converter"))]
+fn serve_codec_store() -> Result<()> {
+    Ok(())
+}
+
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
 fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
@@ -156,6 +167,7 @@ fn run() -> Result<i32> {
         );
     }
     install_service_view()?;
+    serve_codec_store()?;
     let mut vm_options = launch.vm_options.clone();
     if launch.app {
         vm_options.extend(native_bridge_options(

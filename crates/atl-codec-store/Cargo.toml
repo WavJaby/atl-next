@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+# The Codec2 store an app process serves in-process (audio M1 step 2): AOSP's aidl ComponentStore over the platform store, as IComponentStore/default.
+# C++ is cxx glue (src/bridge.rs) plus wrap/store.{h,cpp}: the construction AOSP's default service does in hal/services/vendor.cpp, with the platform store where that file has its StoreImpl stub. No logic (project CLAUDE.md, C++ exception).
+[package]
+name = "atl-codec-store"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.atl]
+converter = ["device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+
+[features]
+converter = ["atl-service-view/converter"]
+
+[dependencies]
+atl-service-view = { path = "../atl-service-view" }
+cxx.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true
