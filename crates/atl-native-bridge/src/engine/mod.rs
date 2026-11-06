@@ -12,6 +12,7 @@ mod args;
 pub mod image;
 mod intercepts;
 pub mod jni;
+mod provider;
 pub mod signal;
 pub mod thread;
 pub mod vdso;
@@ -119,7 +120,7 @@ impl Guest {
         let thread = HostThread::leak();
         arch::set_bootstrap(Some(&raw mut *thread));
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
-        let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0) };
+        let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0, 0) };
         arch::set_bootstrap(None);
         // the linker ran on a temporary TCB in its own (now returned) frame; NBS leaves the main thread's static TLS to the host
         let tls = thread::static_tls()
@@ -144,7 +145,7 @@ impl Guest {
     /// `f` must be guest code with an integer signature of at most three arguments; pointer arguments must be valid for it.
     pub unsafe fn call(&mut self, f: usize, a: usize, b: usize, c: usize) -> usize {
         // SAFETY: caller contract; the record is this thread's.
-        unsafe { arch::call_guest(&mut *thread::attach_current(), f, a, b, c) }
+        unsafe { arch::call_guest(&mut *thread::attach_current(), f, a, b, c, 0) }
     }
 
     /// The calling thread's record (attached first if needed).

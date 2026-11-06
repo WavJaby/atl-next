@@ -87,6 +87,80 @@ fn bionic_thread(
     atl_bridgegen::rust::layout_module(&iface, &host.arch)
 }
 
+/// The guest libc stubs whose host is the process's bionic provider (`libatl_bionic`: the bionic-only API glibc lacks, implemented with bionic's signature from these same headers, atl-bionic build.rs `APIS`), by header relative to the AOSP tree.
+/// The one list: engine/vdso.rs binds exactly these names to the provider, typed by the header's signatures (`provider.rs`).
+const PROVIDER_APIS: &[(&str, &[&str])] = &[
+    (
+        "sys/system_properties.h",
+        &[
+            "__system_properties_init",
+            "__system_property_area_serial",
+            "__system_property_find",
+            "__system_property_foreach",
+            "__system_property_get",
+            "__system_property_read",
+            "__system_property_read_callback",
+            "__system_property_serial",
+            "__system_property_set",
+            "__system_property_wait",
+        ],
+    ),
+    (
+        "android/set_abort_message.h",
+        &["android_set_abort_message"],
+    ),
+    // a platform header: bionic/libc/platform
+    ("bionic/malloc.h", &["android_mallopt"]),
+];
+const PROVIDER_FILES: &[&str] = &[
+    "bionic/libc/include/sys/system_properties.h",
+    "bionic/libc/include/android/set_abort_message.h",
+    "bionic/libc/platform/bionic/malloc.h",
+];
+
+/// `provider.rs`: `NAMES` (every `PROVIDER_APIS` function) and per function its fn-pointer type from the guest's bionic view (`import_module`), parsed as bionic's C++ sources are.
+fn provider(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path) -> Result<String> {
+    // the platform level, as atl-bionic reads them: `__system_property_read_callback` sits behind an availability guard (26)
+    let mut target = buildscript::bionic_platform_target(
+        up,
+        host,
+        buildscript::future_level(up, host)?,
+        Some(&buildscript::libcxx_include_dir()?),
+    );
+    target
+        .args
+        .push(format!("-I{}", up.aosp("bionic/libc/platform").display()));
+    let unit = out.join("provider.cc");
+    let includes: String = PROVIDER_APIS
+        .iter()
+        .map(|(h, _)| format!("#include <{h}>\n"))
+        .collect();
+    std::fs::write(&unit, includes)?;
+    let also: Vec<PathBuf> = PROVIDER_FILES.iter().map(|h| up.aosp(h)).collect();
+    let src = Source {
+        path: &unit,
+        lang: Lang::Cxx,
+        also: &also,
+        macros: &[],
+    };
+    let iface = atl_bridgegen::interface(
+        "provider",
+        "bionic sys/system_properties.h + android/set_abort_message.h + bionic/malloc.h",
+        &src,
+        std::slice::from_ref(&target),
+    )
+    .context("provider API")?;
+    let functions: Vec<&str> = PROVIDER_APIS
+        .iter()
+        .flat_map(|(_, f)| f.iter().copied())
+        .collect();
+    let mut code = atl_bridgegen::rust::import_module(&iface, &host.arch, &functions, &[])?;
+    code.push_str(&format!(
+        "\n/// Every provider function, by C name.\npub const NAMES: &[&str] = &{functions:?};\n"
+    ));
+    Ok(code)
+}
+
 /// The JNI function tables, relative to the AOSP tree: `JNINativeInterface` (behind `JNIEnv`) and `JNIInvokeInterface` (behind `JavaVM`).
 const JNI_HEADER: &str = "libnativehelper/include_jni/jni.h";
 /// Their records, with the Rust module each one's slots go to.
@@ -208,12 +282,14 @@ fn main() -> Result<()> {
         bionic_thread(&up, &host, &out)?,
     )?;
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
+    std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)
         .chain(std::iter::once(&JNI_HEADER))
         .chain(INCLUDE_DIRS)
         .chain(THREAD_HEADERS)
         .chain(THREAD_INCLUDE_DIRS)
+        .chain(PROVIDER_FILES)
     {
         for p in up.rerun_paths(&format!("aosp/{rel}")) {
             println!("cargo::rerun-if-changed={}", p.display());

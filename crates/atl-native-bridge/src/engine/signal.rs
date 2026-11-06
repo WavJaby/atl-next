@@ -144,6 +144,7 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
             sig as usize,
             info as usize,
             uc as usize,
+            0,
         );
     }
 }

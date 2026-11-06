@@ -27,12 +27,13 @@ const GL_FRONTS: [&str; 3] = ["libEGL", "libGLESv1_CM", "libGLESv2"];
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
-/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file); libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
-const NB_LIBS: [(&str, &str); 5] = [
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file), plus NBS's original guest libraries an app links (`NATIVE_BRIDGE_ORIG_GUEST_LIBS`, native_bridge_support.mk: AOSP's own, built for the guest; liblog so far); libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
+const NB_LIBS: [(&str, &str); 6] = [
     ("libnative_bridge_guest_libc", "libc.so"),
     ("libm", "libm.so"),
     ("libdl", "libdl.so"),
     ("ld-android", "ld-android.so"),
+    ("liblog", "liblog.so"),
     (
         "libnative_bridge_vdso",
         atl_native_bridge::engine::VDSO_FILE,
@@ -540,15 +541,22 @@ impl Runtime {
     }
 }
 
+/// An APK's native libraries, stored under `lib/<abi>/` as an app's packager lays them out.
+pub struct NativeLibs {
+    pub abi: String,
+    pub libs: Vec<PathBuf>,
+    /// The API level they were compiled for (`--target=<triple><api>`); it becomes the manifest's minSdkVersion, as the Android Gradle plugin injects the module's minSdk (aapt2 `--min-sdk-version` only fills a missing attribute, ManifestFixer.cpp, so such a fixture's manifest leaves minSdkVersion out).
+    pub min_sdk: u32,
+}
+
 impl ApkTools {
-    /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar.
-    /// `native` = (ABI, shared libraries): stored under `lib/<abi>/`, as an app's packager lays them out.
+    /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar; `native` see [`NativeLibs`].
     pub fn build(
         &self,
         fixture: &Path,
         work: &Path,
         class_jars: &[PathBuf],
-        native: Option<&(String, Vec<PathBuf>)>,
+        native: Option<&NativeLibs>,
     ) -> Result<PathBuf> {
         if work.exists() {
             std::fs::remove_dir_all(work)?;
@@ -568,6 +576,9 @@ impl ApkTools {
             .arg(&self.android_jar)
             .arg("-o")
             .arg(&apk);
+        if let Some(n) = native {
+            link.arg("--min-sdk-version").arg(n.min_sdk.to_string());
+        }
         // real resources (res/): compiled, linked, and R.java generated for javac
         if fixture.join("res").is_dir() {
             let compiled = work.join("res.zip");
@@ -599,11 +610,11 @@ impl ApkTools {
             self.dex_into(&apk, work, &classes, &dex, class_jars, &sources)?;
         }
         let jdk_bin = self.jdk.join("bin");
-        if let Some((abi, libs)) = native {
+        if let Some(n) = native {
             let staged = work.join("native");
-            let dir = staged.join("lib").join(abi);
+            let dir = staged.join("lib").join(&n.abi);
             std::fs::create_dir_all(&dir)?;
-            for l in libs {
+            for l in &n.libs {
                 let name = l.file_name().context("native library name")?;
                 std::fs::copy(l, dir.join(name))
                     .with_context(|| format!("copying {}", l.display()))?;

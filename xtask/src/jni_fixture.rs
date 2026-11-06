@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test jni-fixture`: the bridge-1 JNI fixture (xtask/testdata/jni-test), a stand-in for third-party app native code, built with the NDK's clang against bionic + libc++_shared exactly as an app's CMake/ndk-build would.
 //! Two variants, because the TLS model depends on minSdk: [`EMULATED_TLS_API`] compiles `__thread` to emulated TLS (`__emutls_get_address` import, no PT_TLS), [`ELF_TLS_API`] (the first level with ELF TLS in bionic) to native TLS (`__tls_get_addr`, PT_TLS).
-//! The M2 test APK (`xtask test app`) packages the minSdk-21 variant into `lib/<abi>/` (the manifest's minSdk); the 29 variant is built and gated here only.
+//! The M2 test APK (`xtask test app --fixture-api`) packages either variant into `lib/<abi>/`, its API level as the APK's minSdk.
 //!
 //! Gate, per variant:
 //! - ELF: DT_NEEDED has `libc.so` (bionic's soname; glibc's is `libc.so.6`) and `libc++_shared.so`, the GNU verneed asks `libc.so` for version `LIBC`, the TLS shape is the variant's;
@@ -18,6 +18,7 @@ use atl_layout::Layout;
 use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
 use object::{Endianness, Object, ObjectSymbol, elf};
 
+use crate::atld_run::NativeLibs;
 use crate::{arches, host_art, provided_gate};
 
 #[derive(clap::Args)]
@@ -37,7 +38,7 @@ pub struct Args {
 const NDK_DIR: &str = "android-ndk-r30";
 /// The fixture's sources.
 const SOURCES: &str = "xtask/testdata/jni-test";
-/// minSdk of the M2 test APK (xtask/testdata/app/AndroidManifest.xml): bionic had no ELF TLS before 29, so clang emits emulated TLS.
+/// The emulated-TLS variant: bionic had no ELF TLS before 29, so clang emits emulated TLS below it.
 pub const EMULATED_TLS_API: u32 = 21;
 /// First API level whose bionic supports ELF TLS (Android 10); clang's default TLS model switches to native at this target.
 pub const ELF_TLS_API: u32 = 29;
@@ -156,6 +157,7 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
             .arg(&c_obj)
             .arg(&cxx_obj)
             .arg(format!("-Wl,-soname,{LIB}"))
+            .arg("-llog")
             .arg("-o")
             .arg(&lib),
         "NDK clang++ link",
@@ -399,15 +401,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
 }
 
-/// The libraries the M2 test APK carries in `lib/<abi>/`: the minSdk-21 variant, built into `out`.
-pub fn apk_libs(root: &Path, arch: &str, out: &Path) -> Result<(String, Vec<PathBuf>)> {
+/// The libraries the M2 test APK carries in `lib/<abi>/`: the `api` variant, built into `out`; `api` is also the APK's minSdk.
+pub fn apk_libs(root: &Path, arch: &str, api: u32, out: &Path) -> Result<NativeLibs> {
     let ndk = default_ndk(root)?;
-    let abi = NdkTarget::new(root, &ndk, arch, EMULATED_TLS_API)?.abi;
-    let built = build(root, &ndk, arch, EMULATED_TLS_API, out)?;
+    let abi = NdkTarget::new(root, &ndk, arch, api)?.abi;
+    let built = build(root, &ndk, arch, api, out)?;
     if built.libs.is_empty() {
         bail!("no fixture libraries built");
     }
-    Ok((abi, built.libs))
+    Ok(NativeLibs {
+        abi,
+        libs: built.libs,
+        min_sdk: api,
+    })
 }
 
 #[cfg(test)]

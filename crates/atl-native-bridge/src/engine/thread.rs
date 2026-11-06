@@ -113,7 +113,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
             // SAFETY: as above; `dtor` is the guest's `void (*)(void*)`, `ht` this thread's record.
             unsafe {
                 libc::pthread_setspecific(key, std::ptr::null());
-                arch::call_guest(&mut *ht, dtor, v as usize, 0, 0);
+                arch::call_guest(&mut *ht, dtor, v as usize, 0, 0, 0);
             }
         }
         if !ran {

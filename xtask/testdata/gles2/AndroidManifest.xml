@@ -6,7 +6,8 @@
     android:versionCode="1"
     android:versionName="1.0">
 
-    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <!-- minSdkVersion: the native library's API level, injected at link (atld_run.rs NativeLibs) -->
+    <uses-sdk android:targetSdkVersion="36" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
 
     <application android:label="ATL GLES2" android:hardwareAccelerated="true">

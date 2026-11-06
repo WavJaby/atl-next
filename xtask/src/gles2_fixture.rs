@@ -13,7 +13,7 @@ use std::process::{Command, ExitCode};
 use anyhow::Result;
 use atl_layout::Layout;
 
-use crate::atld_run::ApkTools;
+use crate::atld_run::{ApkTools, NativeLibs};
 use crate::jni_fixture::{self, CFLAGS, NdkTarget};
 use crate::{host_art, manifest, slot};
 
@@ -244,7 +244,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     fails.extend(imports);
 
     let tools = ApkTools::new(root, &args.host, &out, &java_out)?;
-    let native = (t.abi.clone(), vec![lib]);
+    let native = NativeLibs {
+        abi: t.abi.clone(),
+        libs: vec![lib],
+        min_sdk: MIN_SDK,
+    };
     let apk = tools.build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
     let m = manifest::read(&tools.aapt2, &apk)?;
     let am = ApkManifest {

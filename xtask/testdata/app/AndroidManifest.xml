@@ -6,7 +6,8 @@
     android:versionCode="1"
     android:versionName="1.0">
 
-    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <!-- minSdkVersion: the JNI fixture's API level (xtask test app, option fixture-api), injected at link (atld_run.rs NativeLibs) -->
+    <uses-sdk android:targetSdkVersion="36" />
 
     <application android:label="ATL test">
         <activity android:name=".Main" android:exported="true">

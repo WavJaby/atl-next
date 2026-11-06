@@ -84,6 +84,11 @@ impl Args {
         self.word("--dev").word(at.as_ref())
     }
 
+    /// `--dir AT`: an empty directory, owned and writable by the sandbox's uid.
+    pub fn dir(&mut self, at: impl AsRef<Path>) -> &mut Self {
+        self.word("--dir").word(at.as_ref())
+    }
+
     /// `--proc AT`: procfs of the sandbox's pid namespace.
     pub fn proc(&mut self, at: impl AsRef<Path>) -> &mut Self {
         self.word("--proc").word(at.as_ref())

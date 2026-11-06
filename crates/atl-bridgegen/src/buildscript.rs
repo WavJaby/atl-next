@@ -328,6 +328,27 @@ pub fn bionic_libc_target(up: &Upstreams, host: &HostArch, cxx_include: Option<&
     }
 }
 
+/// The level platform code is built for: bionic's `__ANDROID_API_FUTURE__` (Soong's FutureApiLevelInt, which the converter checks equal). Headers are read at it, so no declaration is hidden behind an availability guard.
+pub fn future_level(up: &Upstreams, host: &HostArch) -> Result<u64> {
+    let path = up.aosp("bionic/libc/include/android/api-level.h");
+    let src = Source::c(&path, &["__ANDROID_API_FUTURE__"]);
+    let target = bionic_libc_target(up, host, None);
+    let iface = crate::interface("api_level", "api-level.h", &src, &[target])?;
+    Ok(iface.arches[&host.arch].constants["__ANDROID_API_FUTURE__"].bits)
+}
+
+/// [`bionic_libc_target`] at API `level` (the triple's suffix): platform code's view at [`future_level`].
+pub fn bionic_platform_target(
+    up: &Upstreams,
+    host: &HostArch,
+    level: u64,
+    cxx: Option<&Path>,
+) -> Target {
+    let mut target = bionic_libc_target(up, host, cxx);
+    target.triple = format!("{}{level}", target.triple);
+    target
+}
+
 /// The host toolchain's libc++ include directory (where `<atomic>` lives), as clang itself finds it
 /// for the target cargo builds for.
 pub fn libcxx_include_dir() -> Result<PathBuf> {

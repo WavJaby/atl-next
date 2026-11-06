@@ -101,6 +101,8 @@ public class Main extends Activity {
         bridge1Call(jni, "sigsegvRecover", "sigsegvRecover");
         bridge1Call(jni, "nullFieldRead", "nullFieldRead");
         bridge1Call(jni, "jitUpCall", "jitUpCall");
+        bridge1Call(jni, "guestLog", "guestLog");
+        bridge1Call(jni, "propCallbacks", "propCallbacks");
     }
 
     /** The default TrustManagerFactory's issuers (Conscrypt: AndroidCAStore -> TrustedCertificateStore): "trusted <ROOT> of <n>", or why not. */

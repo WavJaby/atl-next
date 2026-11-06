@@ -30,6 +30,8 @@ use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
+/// Android's socket directory in every sandbox; liblog's logd socket lives in it (`/dev/socket/logdw`, logd_writer.cpp).
+const SOCKET_DIR: &str = "/dev/socket";
 use bwrap::PROGRAM as BWRAP;
 
 /// One bind mount into the sandbox.
@@ -149,6 +151,8 @@ pub fn bwrap_args(
         .info_fd(info_fd)
         .tmpfs("/")
         .dev("/dev")
+        // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs)
+        .dir(SOCKET_DIR)
         .proc("/proc");
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
@@ -509,7 +513,7 @@ mod tests {
         });
         let joined = s(&bwrap_args(&sp, &[], 9, None)).join(" ");
         assert!(joined.ends_with(
-            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"
+            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --chdir / --"
         ));
     }
 
@@ -559,10 +563,10 @@ mod tests {
             RootEntry::Dir("proc".into()),
             RootEntry::Dir("system".into()),
         ];
-        // Golden argv, written from the profile (Q4(a)): uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc; then the seccomp program when given;
-        // the host's dirs bound and symlinks recreated, except what the sandbox replaces (dev, proc) or a mount covers (data, system); the mounts, the device nodes, the area at bionic's path; the end of options.
-        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc";
-        let tail = "--bind /home /home --symlink usr/lib /lib --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --";
+        // Golden argv, written from the profile (Q4(a)): uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev with init's /dev/socket, and /proc; then the seccomp program when given;
+        // the host's dirs bound and symlinks recreated, except what the sandbox replaces (dev, proc) or a mount covers (data, system); the mounts, the device nodes, the area at bionic's path; cwd `/`; the end of options.
+        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc";
+        let tail = "--bind /home /home --symlink usr/lib /lib --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --chdir / --";
         assert_eq!(
             s(&bwrap_args(&spawn(), &root, 9, None)).join(" "),
             format!("{head} {tail}")

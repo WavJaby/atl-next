@@ -111,17 +111,17 @@ fn run() -> Result<(), String> {
     let empty = g4_guest_empty as *const () as usize;
     let base = band(runs(|| {
         // SAFETY: the guest loop touches no TLS; host_target, called on the guest FS, only does an atomic add.
-        unsafe { arch::call_guest(ht, lp, CALLS, target, 0) };
+        unsafe { arch::call_guest(ht, lp, CALLS, target, 0, 0) };
     }));
     HOST_CALLS.store(0, Ordering::Relaxed);
     let g2h = band(runs(|| {
         // SAFETY: as above; the thunk crosses back to crossed_target on the host FS.
-        unsafe { arch::call_guest(ht, lp, CALLS, thunk, 0) };
+        unsafe { arch::call_guest(ht, lp, CALLS, thunk, 0, 0) };
     }));
     let h2g = band(runs(|| {
         for _ in 0..CALLS {
             // SAFETY: the empty guest fn touches nothing.
-            unsafe { arch::call_guest(ht, empty, 0, 0, 0) };
+            unsafe { arch::call_guest(ht, empty, 0, 0, 0, 0) };
         }
     }));
     if arch::fs_base() != host {

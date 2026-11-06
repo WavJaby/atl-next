@@ -106,7 +106,7 @@ extern "C" fn run(start: *mut c_void) -> *mut c_void {
     let Start { routine, arg } = *unsafe { Box::from_raw(start.cast::<Start>()) };
     let ht = thread::attach_current();
     // SAFETY: the guest's `void* (*)(void*)`, this thread's record.
-    unsafe { arch::call_guest(&mut *ht, routine, arg, 0, 0) as *mut c_void }
+    unsafe { arch::call_guest(&mut *ht, routine, arg, 0, 0, 0) as *mut c_void }
 }
 
 /// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's runs at detach.

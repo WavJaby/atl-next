@@ -172,7 +172,7 @@ macro_rules! up_call {
 
 std::arch::global_asm!(
     concat!(
-        // atl_nb_call_guest(ht, f, a, b, c) -> f(a, b, c) on the guest thread pointer
+        // atl_nb_call_guest(ht, f, a, b, c, d) -> f(a, b, c, d) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
         ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_jni_up, atl_nb_jni_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
         ".text\n",
@@ -192,6 +192,7 @@ std::arch::global_asm!(
         "    mov %rdx, %rdi\n",
         "    mov %rcx, %rsi\n",
         "    mov %r8, %rdx\n",
+        "    mov %r9, %rcx\n",
         "    call *%rax\n",
         "    rdfsbase %rcx\n",
         "    mov %rcx, 16(%rbx)\n",
@@ -424,7 +425,14 @@ pub fn jni_stub(slot: usize) -> usize {
 }
 
 unsafe extern "C" {
-    fn atl_nb_call_guest(ht: *mut HostThread, f: usize, a: usize, b: usize, c: usize) -> usize;
+    fn atl_nb_call_guest(
+        ht: *mut HostThread,
+        f: usize,
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+    ) -> usize;
     static atl_nb_host_thunks: u8;
     static atl_nb_jni_stubs: u8;
     fn atl_nb_signal_entry(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void);
@@ -446,13 +454,20 @@ pub fn set_signal_handler(sig: usize, handler: usize) {
     atl_nb_signal_handlers[sig].store(handler, Ordering::Release);
 }
 
-/// Calls guest function `f(a, b, c)` on the guest thread pointer (none before the first crossing: the guest linker installs its own).
+/// Calls guest function `f(a, b, c, d)` on the guest thread pointer (none before the first crossing: the guest linker installs its own).
 ///
 /// # Safety
-/// `f` must be guest code taking up to three integer arguments, `ht` this thread's record.
-pub unsafe fn call_guest(ht: &mut HostThread, f: usize, a: usize, b: usize, c: usize) -> usize {
+/// `f` must be guest code taking up to four integer arguments, `ht` this thread's record.
+pub unsafe fn call_guest(
+    ht: &mut HostThread,
+    f: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> usize {
     // SAFETY: caller contract; the asm keeps callee-saved registers and restores GS/FS.
-    unsafe { atl_nb_call_guest(ht, f, a, b, c) }
+    unsafe { atl_nb_call_guest(ht, f, a, b, c, d) }
 }
 
 /// A guest-callable address that crosses to host function `target`; None when the thunks are used up.

@@ -40,7 +40,7 @@ fn crossing() -> Result<(), String> {
     unsafe { arch::init_tcb(tcb, &raw mut *ht) };
     ht.set_guest_fs(tcb);
     // SAFETY: read_fs takes three integers and touches no TLS.
-    let inside = unsafe { arch::call_guest(ht, read_fs as *const () as usize, 0, 0, 0) };
+    let inside = unsafe { arch::call_guest(ht, read_fs as *const () as usize, 0, 0, 0, 0) };
     if let Err(e) = probe(self0) {
         // SAFETY: `host` is this thread's own thread pointer, read above.
         unsafe { arch::set_fs_base(host) };

@@ -39,6 +39,12 @@ public final class AtlJniTest {
     /** dlopen("libatl-jni-sibling.so") + dlsym + call. */
     public static native int dlopenSibling();
 
+    /** __android_log_print(WARN, "AtlJniGuest", "guest liblog 42") through the guest's liblog; 1 = liblog's return. */
+    public static native int guestLog();
+
+    /** Guest callbacks of __system_property_read_callback / __system_property_foreach run on the caller's guest thread: 11 (atl_jni_test.c). */
+    public static native int propCallbacks();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

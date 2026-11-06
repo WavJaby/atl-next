@@ -38,6 +38,9 @@ pub struct Args {
     /// The test fonts' conf prefers the mono font for sans-serif, so the fonts sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     font_break: bool,
+    /// The bridge-1 JNI fixture variant packaged, by API level = the APK's minSdk: 21 = emulated TLS, 29 = ELF TLS (jni_fixture.rs).
+    #[arg(long, default_value_t = jni_fixture::EMULATED_TLS_API)]
+    fixture_api: u32,
 }
 
 /// The fixture's dir.
@@ -72,7 +75,12 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("sigsegvRecover", "1"),
     ("nullFieldRead", "caught"),
     ("jitUpCall", "8000000"),
+    ("guestLog", "1"),
+    // 10 (read_callback's guest callback ran once, on the caller's guest thread) + 1 (foreach's, every call): atl_jni_test.c propCallbacks
+    ("propCallbacks", "11"),
 ];
+/// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
+const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
 /// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
 const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";
 
@@ -92,6 +100,9 @@ fn bridge1_call_failures(app: &str) -> Vec<String> {
             other => Some(format!("bridge1 call {name}: want {want}, got {other:?}")),
         })
         .collect();
+    if !app.lines().any(|l| l.ends_with(GUEST_LOG)) {
+        whys.push(format!("guest liblog: no line ending {GUEST_LOG:?}"));
+    }
     let last = app.lines().rev().find_map(|l| l.split_once(BRIDGE1_DETACH));
     let balance = last.and_then(|(_, r)| {
         let (a, d) = r
@@ -153,6 +164,12 @@ fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
+    anyhow::ensure!(
+        [jni_fixture::EMULATED_TLS_API, jni_fixture::ELF_TLS_API].contains(&args.fixture_api),
+        "--fixture-api: {} or {}",
+        jni_fixture::EMULATED_TLS_API,
+        jni_fixture::ELF_TLS_API
+    );
     let rt = Runtime::new(
         root,
         &args.host,
@@ -172,7 +189,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
-    let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
+    let native = jni_fixture::apk_libs(
+        root,
+        &args.host,
+        args.fixture_api,
+        &work.join("jni-fixture"),
+    )?;
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
@@ -181,6 +203,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .launch_activity()
         .map(|a| a.name.clone())
         .context("the fixture has no launcher activity")?;
+    anyhow::ensure!(
+        i64::from(m.min_sdk) == i64::from(args.fixture_api),
+        "APK minSdk {} != --fixture-api {}",
+        m.min_sdk,
+        args.fixture_api
+    );
     println!(
         "app: built {} ({} versionCode {}, sdk {}..{}, launcher activity {})",
         apk.display(),
