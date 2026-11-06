@@ -116,6 +116,8 @@ impl Step {
     /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
     fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
         if self == Step::ConverterPackages {
+            // the packages link the slot's converter rlibs: a slot built before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do
+            crate::build_state::ensure_current(root, out)?;
             let unchecked = packages::check(root, out)?;
             return Ok((!unchecked.is_empty()).then(|| {
                 format!(
@@ -364,5 +366,16 @@ mod tests {
         std::fs::write(dir.join("graph.json"), b"{}").expect("test graph");
         assert!(Step::ConverterPackages.skip(&dir).is_none());
         std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
+
+    #[test]
+    fn a_slot_built_from_another_state_is_refused_by_name() {
+        let out = std::env::temp_dir().join(format!("xtask-check-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&out).expect("test dir");
+        std::fs::write(out.join("built-from"), "aaaa\n").expect("test record");
+        let err = crate::build_state::ensure_matches("bbbb", &out).expect_err("another state");
+        assert!(format!("{err:#}").contains("was built from another source state"), "{err:#}");
+        assert!(crate::build_state::ensure_matches("aaaa", &out).is_ok());
+        std::fs::remove_dir_all(&out).expect("test dir cleanup");
     }
 }
