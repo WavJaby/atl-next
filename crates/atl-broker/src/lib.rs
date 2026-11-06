@@ -110,13 +110,36 @@ pub fn tree_mounts(root: &Path) -> io::Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// [`tree_mounts`] of each existing directory of `path` (an LD_LIBRARY_PATH value).
+/// [`tree_mounts`] of each existing directory of `path` (an LD_LIBRARY_PATH value), and the RUNPATH closure of every ELF in them: a library the runtime dlopens from such a dir loads its own dependencies through its RUNPATH.
 pub fn library_path_mounts(path: &OsStr) -> io::Result<Vec<Mount>> {
     let mut mounts = Vec::new();
+    let mut elfs = Vec::new();
     for dir in std::env::split_paths(path).filter(|d| d.is_dir()) {
         mounts.extend(tree_mounts(&dir)?);
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let p = if entry.file_type()?.is_symlink() {
+                std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path())
+            } else {
+                entry.path()
+            };
+            if p.is_file() && is_elf(&p) {
+                elfs.push(p);
+            }
+        }
     }
+    mounts.extend(runpath_mounts_of(&elfs)?);
     Ok(mounts)
+}
+
+/// Whether `path` starts with the ELF magic.
+fn is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"\x7fELF"
 }
 
 /// What a sandbox is for: selects its namespaces, its filesystem view and its seccomp program.
@@ -151,6 +174,15 @@ pub enum RootEntry {
 /// Nothing else of the host is shown: no `home` (the user's files), `run`, `var`, `opt`, `mnt`. `/tmp`, `/proc` and `/dev` are the sandbox's own.
 /// A row is a grant: add one only with the gate that needs it.
 pub const APP_ROOT_DIRS: &[&str] = &["usr", "etc"];
+
+/// Host sysfs subtrees every sandbox shows read-only, the narrowest that work: libdrm finds a DRM device's PCI info through `/sys/dev/char` (links into `/sys/devices`). Without them Mesa falls back to a render node, whose dumb buffers EACCES.
+pub const SYSFS_DIRS: &[&str] = &["/sys/dev", "/sys/devices"];
+
+/// bwrap's argv limit: bubblewrap.c's "Exceeded maximum number of arguments", counted over bwrap's own arguments and the program's.
+pub const BWRAP_MAX_ARGS: usize = 9000;
+
+/// Where every app sandbox binds the stub that bwrap execs first (the broker's own path, not a host path).
+pub const SANDBOX_STUB_AT: &str = "/.atl-sandbox-stub";
 
 /// The host's `/` as an app sandbox shows it: the directories in [`APP_ROOT_DIRS`], and every symlink (`lib` -> `usr/lib`, ...) recreated as it is.
 pub fn host_root() -> io::Result<Vec<RootEntry>> {
@@ -204,14 +236,11 @@ pub fn bwrap_args(
     if let Some(fd) = seccomp_fd {
         a.seccomp(fd);
     }
+    // a root dir is left out only when a mount sits at exactly its path; a mount below it is bound over it, after it
     let covered = |name: &str| {
         name == "dev"
             || name == "proc"
-            || spawn.mounts.iter().any(|m| {
-                m.at.components()
-                    .nth(1)
-                    .is_some_and(|c| c.as_os_str() == name)
-            })
+            || spawn.mounts.iter().any(|m| m.at == Path::new("/").join(name))
     };
     for e in root {
         match e {
@@ -225,9 +254,9 @@ pub fn bwrap_args(
             _ => {}
         }
     }
-    // the stub is exec'd by bwrap before it restricts itself, and the program by the stub after: both read-only
-    a.ro_bind(stub, stub);
-    a.ro_bind(&spawn.program, &spawn.program);
+    for d in SYSFS_DIRS {
+        a.ro_bind(d, d);
+    }
     for m in &spawn.mounts {
         a.mount(&m.host, &m.at, m.writable);
     }
@@ -240,6 +269,10 @@ pub fn bwrap_args(
     if let Some(area) = &spawn.property_area {
         a.ro_bind(area, PROPERTY_AREA);
     }
+    // last: a directory mounted after these would shadow the files. The stub is exec'd by bwrap before it restricts itself, the program by the stub after: both read-only.
+    // The stub sits at SANDBOX_STUB_AT, which no host mount can cover (its host path lies under build trees that other mounts show).
+    a.ro_bind(stub, SANDBOX_STUB_AT);
+    a.ro_bind(&spawn.program, &spawn.program);
     if let Some(dir) = &spawn.cwd {
         a.chdir(dir);
     }
@@ -395,16 +428,24 @@ fn elf_runpath(path: &Path) -> io::Result<Vec<String>> {
 /// Read-only mounts of what `program`'s loader finds through RUNPATH: each object's own RUNPATH dirs ([`tree_mounts`]) and the DT_NEEDED libraries in them, followed in turn (a RUNPATH serves only the object that has it).
 /// `$ORIGIN` is the object's directory. LD_LIBRARY_PATH's dirs are the caller's environment (its Spawn env); the default search path is the interpreter's directory ([`elf_closure`]).
 pub fn runpath_mounts(program: &Path) -> io::Result<Vec<Mount>> {
+    runpath_mounts_of(&[program.to_path_buf()])
+}
+
+/// [`runpath_mounts`] of each of `roots`, one set: what each loads through RUNPATH, transitively.
+pub fn runpath_mounts_of(roots: &[PathBuf]) -> io::Result<Vec<Mount>> {
     let mut mounts = Vec::new();
     let mut dirs = std::collections::BTreeSet::new();
     let mut seen = std::collections::BTreeSet::new();
-    let mut queue = vec![program.to_path_buf()];
+    let mut queue = roots.to_vec();
     while let Some(obj) = queue.pop() {
         if !seen.insert(obj.clone()) {
             continue;
         }
         let origin = obj.parent().unwrap_or(Path::new("/")).to_string_lossy().into_owned();
-        let (_, needed) = elf_deps(&obj)?;
+        // not a 64-bit ELF: not loadable by this sandbox's loader path, so nothing to follow
+        let Ok((_, needed)) = elf_deps(&obj) else {
+            continue;
+        };
         for entry in elf_runpath(&obj)? {
             let dir = PathBuf::from(entry.replace("$ORIGIN", &origin));
             if !dir.is_dir() {
@@ -462,6 +503,13 @@ struct Launch<'a> {
 fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::Result<Process> {
     for fd in &inherit {
         fcntl_setfd(fd, FdFlags::empty())?;
+    }
+    // bwrap refuses an argv longer than this and then reports the program's exec as failed: say so here
+    let argc = l.bwrap_args.len() + 1 + l.args.len();
+    if argc > BWRAP_MAX_ARGS {
+        return Err(other(format!(
+            "{argc} arguments for bwrap, which accepts {BWRAP_MAX_ARGS} (bubblewrap.c): the sandbox shows too many paths"
+        )));
     }
     #[expect(
         clippy::disallowed_types,
@@ -555,6 +603,13 @@ impl Broker {
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
         spawn.mounts.extend(runpath_mounts(&spawn.program)?);
+        // a path the root already shows read-only at the same place is not mounted again, and none is mounted twice
+        let mut seen = std::collections::BTreeSet::new();
+        spawn.mounts.retain(|m| {
+            let in_root = m.host == m.at
+                && APP_ROOT_DIRS.iter().any(|d| m.at.starts_with(Path::new("/").join(d)));
+            !in_root && seen.insert((m.host.clone(), m.at.clone(), m.writable))
+        });
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -585,7 +640,7 @@ impl Broker {
         let Process { child, host_pid } = launch(
             Launch {
                 bwrap_args,
-                program: &self.stub,
+                program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
                 env,
                 clear_env: false,
@@ -661,7 +716,7 @@ mod tests {
         });
         let joined = s(&bwrap_args(&sp, &[], Path::new("/b/stub"), 9, None).0).join(" ");
         assert!(joined.ends_with(
-            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"
+            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --"
         ));
     }
 
@@ -713,7 +768,7 @@ mod tests {
         // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc + private /tmp; then the seccomp program when given;
         // the root's dirs read-only and its symlinks recreated; the stub and the program read-only, the mounts, the device nodes, the area at bionic's path; the end of options.
         let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc --tmpfs /tmp";
-        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /b/stub /b/stub --ro-bind /bin/true /bin/true --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --";
+        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --";
         let stub = Path::new("/b/stub");
         assert_eq!(
             s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),
@@ -731,15 +786,33 @@ mod tests {
             (Access::Rw, "/tmp"),
             (Access::Ro, "/etc"),
             (Access::Ro, "/usr"),
-            (Access::Ro, "/b/stub"),
-            (Access::Ro, "/bin/true"),
+            (Access::Ro, "/sys/dev"),
+            (Access::Ro, "/sys/devices"),
             (Access::Ro, "/system"),
             (Access::Rw, "/data"),
             (Access::Dev, "/dev/dri"),
             (Access::Ro, "/dev/__properties__"),
+            (Access::Ro, "/.atl-sandbox-stub"),
+            (Access::Ro, "/bin/true"),
         ];
         let got: Vec<(Access, &Path)> = grants.iter().map(|(a, p)| (*a, p.as_path())).collect();
         assert_eq!(got, want.iter().map(|(a, p)| (*a, Path::new(p))).collect::<Vec<_>>());
+    }
+
+    /// A mount below a root dir is bound over it, after it: the root dir stays bound (the covered check is exact-path only).
+    #[test]
+    fn nested_mount_keeps_the_root_dir() {
+        let mut sp = spawn();
+        sp.mounts.push(Mount {
+            host: "/r/fonts".into(),
+            at: "/usr/share/fonts".into(),
+            writable: false,
+        });
+        let (argv, _) = bwrap_args(&sp, &[RootEntry::Dir("usr".into())], Path::new("/b/stub"), 9, None);
+        let joined = s(&argv).join(" ");
+        let usr = joined.find("--ro-bind /usr /usr ").expect("the root dir is bound");
+        let fonts = joined.find("--ro-bind /r/fonts /usr/share/fonts").expect("the nested mount is bound");
+        assert!(usr < fonts, "{joined}");
     }
 
     /// Golden argv of Profile::BinderDaemon, written from its spec (plan F1.2 B.3): every namespace incl. net, its own user namespace as nobody (65534), gone with the broker, its own session (no terminal ioctls), no capabilities;

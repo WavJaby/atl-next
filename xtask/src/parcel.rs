@@ -276,8 +276,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
     );
     let what = format!("{cmd:?}");
-    let run =
-        binder::spawn_piped(&broker, &cmd, AID_APP_START).and_then(|p| art.finish(&what, p.child));
+    // the run reads its inputs by host path: the fixture's library dir, runtime and keymap, read-only at their own paths
+    let run = (|| -> Result<_> {
+        let mut s = binder::spawn_of(&cmd, AID_APP_START)?;
+        s.stdout = std::process::Stdio::piped();
+        s.stderr = std::process::Stdio::piped();
+        for p in [&lib, &runtime, &keymap] {
+            if p.is_dir() {
+                s.mounts.extend(atl_broker::tree_mounts(p)?);
+            } else {
+                s.mounts.push(atl_broker::Mount {
+                    host: p.clone(),
+                    at: p.clone(),
+                    writable: false,
+                });
+            }
+        }
+        let p = broker.spawn(s).context("spawning the parcel run")?;
+        art.finish(&what, p.child)
+    })();
     // the permission hook (atl-aidl-probe --enforce), a binder process too
     let mut enforce_cmd = Command::new(&probe);
     enforce_cmd.arg(ENFORCE);

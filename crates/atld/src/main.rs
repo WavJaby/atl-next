@@ -902,7 +902,12 @@ fn run(a: &Args) -> Result<ExitCode> {
     // /system and /vendor link to (boot jars, framework-res, shared libraries, --file sources)
     let mut shared_ro: Vec<Mount> = atl_broker::library_path_mounts(&a.lib_path)?;
     shared_ro.extend(atl_broker::tree_mounts(&a.art_root)?);
+    // by host path, read-only: the package records (--packages) and the system dir's keyboard maps (--keychars, under it)
+    let packages_json = r.root.join("packages.json");
+    let system_dir = r.system();
     let linked: Vec<&Path> = std::iter::once(a.framework_res.as_path())
+        .chain(std::iter::once(packages_json.as_path()))
+        .chain(std::iter::once(system_dir.as_path()))
         .chain(a.boot_jars.iter().map(PathBuf::as_path))
         .chain(a.run_boot_jars.iter().map(PathBuf::as_path))
         .chain(a.shared_libraries.iter().map(|(_, lib)| Path::new(&lib.file)))

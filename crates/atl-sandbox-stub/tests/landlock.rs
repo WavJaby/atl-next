@@ -51,10 +51,10 @@ fn domain_refuses() {
     let port = listener.local_addr().unwrap().port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atl-sandbox-stub"));
     for f in atl_broker::elf_closure(&exe).unwrap() {
-        cmd.arg("--allow").arg(f);
+        cmd.arg("--ro").arg(f);
     }
     let out = cmd
-        .arg("--allow")
+        .arg("--ro")
         .arg(&control)
         .arg("--")
         .arg(&exe)
