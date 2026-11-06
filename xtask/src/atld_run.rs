@@ -174,7 +174,7 @@ impl Run {
 const BROKER_CHILD_COMM: &str = atl_broker::bwrap::PROGRAM;
 
 /// atld's live children that did not come from the broker, as `<pid> <comm>`: every child of `atld` whose comm is not bwrap's. Read from `/proc/*/stat` (ppid, comm): `/proc/<pid>/task/*/children` needs CONFIG_PROC_CHILDREN, which the WSL kernel lacks.
-/// A process that exits between the directory listing and its stat read is skipped; atld is alive when this runs, so its sandboxes are too.
+/// A process that exits between the directory listing and its stat read is skipped; atld is alive when this runs, so its sandboxes are too. A child between fork and exec carries its forker's comm: match it by pid, not comm.
 pub fn children_outside_broker(atld: u32) -> Result<Vec<String>> {
     let mut outside = Vec::new();
     for e in std::fs::read_dir("/proc")? {
@@ -1046,9 +1046,12 @@ mod tests {
         let outside = children_outside_broker(std::process::id()).unwrap();
         let _ = child.kill();
         let _ = child.wait();
-        // contains, not equals: other tests of this process may have children of their own right now
+        // by pid, not comm: until exec completes a child shows its forker's comm (here the test thread's name); other tests' children are listed too
+        let pid = child.id().to_string();
         assert!(
-            outside.contains(&format!("{} sleep", child.id())),
+            outside
+                .iter()
+                .any(|l| l.split(' ').next() == Some(pid.as_str())),
             "{outside:?}"
         );
     }
