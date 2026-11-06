@@ -1,0 +1,433 @@
+// SPDX-License-Identifier: MIT
+//! `xtask test sensors`: the sensor service gate. The fixture APK (xtask/testdata/sensors) uses SensorManager in onCreate under atld, as `test app` runs its app; atld runs in a private user + mount namespace with a fake `/sys/bus` the gate writes (atld_run.rs `with_fake_sys_bus`), so the product reads its one fixed IIO path.
+//! Stage `empty`: no IIO device. Pass = the lookup (getSystemService + getDefaultSensor) within [`LOOKUP_LIMIT`], 0 sensors, default accelerometer null, registerListener false, no fault. Break `unregistered`: the services skip `sensorservice`, so SensorManager waits for it (60 tries, SensorManager.cpp `waitForSensorService`) and the lookup limit fails.
+//! Stage `iio`: one fake accelerometer. Pass = the sensor listed as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below from the written numbers, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
+//! Breaks `matrix` / `scale`: the gate writes an identity mount matrix / a doubled scale but expects the values of the real ones, so the value check must fail.
+//! Expected values (kernel sysfs-bus-iio): axis = raw x scale (offset 0), m/s²; device axis r = mount-matrix row r . sensor vector.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::window::{self, WINDOW_MS};
+use crate::{manifest, verdict};
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Stage {
+    Empty,
+    Iio,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Break {
+    /// stage empty: `sensorservice` not registered
+    Unregistered,
+    /// stage iio: identity mount matrix written, rotated values expected
+    Matrix,
+    /// stage iio: doubled scale written, real values expected
+    Scale,
+}
+
+#[derive(clap::Args)]
+pub struct Args {
+    /// The host arch (an arches.toml row with `[host]`): the default --out.
+    #[arg(long)]
+    host: String,
+    #[arg(long, value_enum)]
+    stage: Stage,
+    /// A deliberate break: the gate must then fail.
+    #[arg(long = "break", value_enum)]
+    break_: Option<Break>,
+    /// Native build directory (default: this checkout's slot).
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Java pipeline build directory (default: this checkout's slot).
+    #[arg(long)]
+    java_out: Option<PathBuf>,
+    /// Print the whole app log.
+    #[arg(long, short)]
+    verbose: bool,
+}
+
+const FIXTURE: &str = "xtask/testdata/sensors";
+/// The fixture's log tag, as the launcher's logger writes it.
+const TAG: &str = "AtlSensors: ";
+/// What onCreate logs last.
+const DONE: &str = "AtlSensors: done";
+const APP_UID: u32 = 10_124;
+/// A cold start (app.rs LIMIT).
+const LIMIT: Duration = Duration::from_secs(180);
+/// The lookup with the service present takes one binder round trip per call; without it SensorManager waits 60 x getService (>= 60 s). 10 s separates the two on a loaded machine.
+const LOOKUP_LIMIT_MS: u64 = 10_000;
+/// How long the gate waits for `done` after the lookup line (the fixture's own wait is 3 s).
+const AFTER_LOOKUP: Duration = Duration::from_secs(30);
+/// The fixture logs 5 events (Main.EVENTS); fewer within its 3 s wait fails.
+const MIN_EVENTS: usize = 5;
+/// float32 rounding of the Java log's decimal form.
+const TOLERANCE: f64 = 1e-4;
+/// How long after `done` the services' poll must have logged its stop (the poll sleeps one period, 20 ms at GAME).
+const STOP_WAIT: Duration = Duration::from_secs(5);
+const TAIL: usize = 40;
+
+/// The fake device's numbers.
+const RAW: [i64; 3] = [100, -200, 1000];
+/// One raw step: 1 mg in m/s² (standard gravity 9.80665 / 1000).
+const SCALE: f64 = 0.009_806_65;
+/// A 90° mounting: device x = sensor y, device y = -sensor x.
+const MATRIX: [[f64; 3]; 3] = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+const DEVICE_NAME: &str = "atl-fake-accel";
+
+fn matrix_text(m: &[[f64; 3]; 3]) -> String {
+    m.iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The values an app must see for RAW / SCALE / MATRIX.
+fn expected() -> [f64; 3] {
+    let s: Vec<f64> = RAW.iter().map(|r| *r as f64 * SCALE).collect();
+    let mut d = [0.0; 3];
+    for (r, row) in MATRIX.iter().enumerate() {
+        d[r] = row[0] * s[0] + row[1] * s[1] + row[2] * s[2];
+    }
+    d
+}
+
+/// The fake `/sys/bus`: `iio/devices/iio:device0` in stage iio, nothing in stage empty.
+fn write_sys_bus(dir: &Path, stage: Stage, brk: Option<Break>) -> Result<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    if stage == Stage::Empty {
+        return Ok(());
+    }
+    let dev = dir.join("iio/devices/iio:device0");
+    std::fs::create_dir_all(&dev)?;
+    let scale = if brk == Some(Break::Scale) {
+        2.0 * SCALE
+    } else {
+        SCALE
+    };
+    let matrix = if brk == Some(Break::Matrix) {
+        &IDENTITY
+    } else {
+        &MATRIX
+    };
+    let files = [
+        ("name", DEVICE_NAME.to_owned()),
+        ("in_accel_x_raw", RAW[0].to_string()),
+        ("in_accel_y_raw", RAW[1].to_string()),
+        ("in_accel_z_raw", RAW[2].to_string()),
+        ("in_accel_scale", format!("{scale}")),
+        ("in_accel_mount_matrix", matrix_text(matrix)),
+    ];
+    for (n, t) in files {
+        std::fs::write(dev.join(n), format!("{t}\n")).with_context(|| format!("writing {n}"))?;
+    }
+    Ok(())
+}
+
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The fixture's messages, in order.
+fn messages(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|l| l.split_once(TAG).map(|(_, m)| m.trim().to_owned()))
+        .collect()
+}
+
+fn field<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
+    msg.split(' ')
+        .find_map(|w| w.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+}
+
+/// The stage's checks over the fixture's messages and the services log; empty = pass.
+fn check(stage: Stage, msgs: &[String], services: &str) -> Vec<String> {
+    let mut whys = Vec::new();
+    let find = |p: &str| msgs.iter().find(|m| m.starts_with(p));
+    match find("lookup ")
+        .and_then(|m| field(m, "ms"))
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(ms) if ms <= LOOKUP_LIMIT_MS => {}
+        Some(ms) => whys.push(format!(
+            "lookup took {ms} ms (> {LOOKUP_LIMIT_MS}): SensorManager waited for sensorservice"
+        )),
+        None => whys.push("no lookup line: SensorManager stalled or the app died".to_owned()),
+    }
+    let n = find("list ")
+        .and_then(|m| field(m, "n"))
+        .and_then(|v| v.parse::<usize>().ok());
+    match stage {
+        Stage::Empty => {
+            if n != Some(0) {
+                whys.push(format!("sensor count {n:?}, want 0"));
+            }
+            if find("default null register=false").is_none() {
+                whys.push(format!(
+                    "want `default null register=false`, got {:?}",
+                    find("default")
+                ));
+            }
+        }
+        Stage::Iio => {
+            if n != Some(1) {
+                whys.push(format!("sensor count {n:?}, want 1"));
+            }
+            let d = find("default ");
+            let want = format!(
+                "default name={DEVICE_NAME} type=1 stringType=android.sensor.accelerometer"
+            );
+            if !d.is_some_and(|d| d.starts_with(&want)) {
+                whys.push(format!("want `{want} ...`, got {d:?}"));
+            }
+            if find("register=true").is_none() {
+                whys.push("registerListener did not return true".to_owned());
+            }
+            let want = expected();
+            let events: Vec<&String> = msgs.iter().filter(|m| m.starts_with("event ")).collect();
+            if events.len() < MIN_EVENTS {
+                whys.push(format!("{} events, want >= {MIN_EVENTS}", events.len()));
+            }
+            let mut last_ts = i64::MIN;
+            for e in &events {
+                let ts = field(e, "ts").and_then(|v| v.parse::<i64>().ok());
+                let now = field(e, "now").and_then(|v| v.parse::<i64>().ok());
+                let v: Option<Vec<f64>> =
+                    field(e, "v").map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+                let (Some(ts), Some(now), Some(v)) = (ts, now, v) else {
+                    whys.push(format!("unparsable event line {e:?}"));
+                    continue;
+                };
+                if ts <= last_ts {
+                    whys.push(format!("timestamp {ts} not after {last_ts}"));
+                }
+                last_ts = ts;
+                // delivered within a second of its stamp, on the same clock
+                if !(0..1_000_000_000).contains(&(now - ts)) {
+                    whys.push(format!(
+                        "timestamp {ts} not on the elapsedRealtimeNanos base (now {now})"
+                    ));
+                }
+                if v.len() != 3 || v.iter().zip(want).any(|(g, w)| (g - w).abs() > TOLERANCE) {
+                    whys.push(format!(
+                        "values {v:?}, want {want:?} (raw x scale through the mount matrix)"
+                    ));
+                }
+            }
+            if !services
+                .lines()
+                .any(|l| l.contains(&format!("sensor: {DEVICE_NAME}")) && l.ends_with("stopped"))
+            {
+                whys.push("the services' poll did not stop after unregisterListener".to_owned());
+            }
+        }
+    }
+    if find("done").is_none() {
+        whys.push("no done line".to_owned());
+    }
+    whys
+}
+
+pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let name = match args.stage {
+        Stage::Empty => "sensors-empty",
+        Stage::Iio => "sensors-iio",
+    };
+    let mut rt = Runtime::new(
+        root,
+        &args.host,
+        args.out.as_deref(),
+        args.java_out.as_deref(),
+        "sensors-art",
+        args.verbose,
+    )?
+    .with_gralloc(root)?
+    .with_gl_driver()?;
+    let work = rt.out.join("sensors");
+    let sys_bus = work.join("sys-bus");
+    write_sys_bus(&sys_bus, args.stage, args.break_)?;
+    rt = rt.with_fake_sys_bus(sys_bus.clone());
+    if args.break_ == Some(Break::Unregistered) {
+        rt = rt.without_sensor_service();
+    }
+    let apk = rt
+        .apk
+        .build(&root.join(FIXTURE), &work.join("apk"), &[], None)?;
+    let m = manifest::read(&rt.apk.aapt2, &apk)?;
+    let run = Run {
+        root: work.join("root"),
+        scratch: work.join("scratch"),
+        launch: Some(m.name.clone()),
+        packages: vec![(apk, m.clone())],
+        first_uid: APP_UID,
+        libraries: vec![],
+        shell: None,
+        log_tags: "*:i".to_owned(),
+    };
+    let mut child = rt.start_atld(&run)?;
+    let app_log = run.log(&m.name);
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let start = Instant::now();
+    let mut started_at: Option<Instant> = None;
+    let mut lookup_at: Option<Instant> = None;
+    let mut ended = None;
+    // until done; a start line without a lookup line within the limit is the stall (no need to sit out SensorManager's wait)
+    loop {
+        let msgs = messages(&read(&app_log));
+        if msgs.iter().any(|m| m == "done" || m.starts_with("done ")) {
+            break;
+        }
+        if started_at.is_none() && msgs.iter().any(|m| m == "start") {
+            started_at = Some(Instant::now());
+        }
+        if lookup_at.is_none() && msgs.iter().any(|m| m.starts_with("lookup ")) {
+            lookup_at = Some(Instant::now());
+        }
+        if let Some(t) = lookup_at
+            && t.elapsed() > AFTER_LOOKUP
+        {
+            break;
+        }
+        if let Some(t) = started_at
+            && lookup_at.is_none()
+            && t.elapsed() > Duration::from_millis(LOOKUP_LIMIT_MS)
+        {
+            break;
+        }
+        if let Some(s) = child.try_wait()? {
+            ended = Some(s);
+            break;
+        }
+        if run.app_ended() {
+            ended = Some(run.stop(&mut child)?);
+            break;
+        }
+        if start.elapsed() > LIMIT {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // the poll's stop line follows unregisterListener
+    let services_path = run.log("services");
+    let stop_deadline = Instant::now() + STOP_WAIT;
+    while args.stage == Stage::Iio
+        && Instant::now() < stop_deadline
+        && !read(&services_path).lines().any(|l| l.ends_with("stopped"))
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let app = read(&app_log);
+    let fault = fault(&app, ended.is_some());
+    if ended.is_none() {
+        run.stop(&mut child)?;
+    }
+    let services = read(&services_path);
+    if args.verbose {
+        println!("---- app log\n{app}");
+    }
+    for l in counter_lines(&services) {
+        println!("{name}: counter {l}");
+    }
+    let msgs = messages(&app);
+    let mut whys = check(args.stage, &msgs, &services);
+    if let Some(f) = fault {
+        whys.push(format!("the app faulted: {f}"));
+    }
+    if let Some(s) = ended {
+        whys.push(format!("atld or the app ended early: {s}"));
+    }
+    if whys.is_empty() {
+        for m in msgs
+            .iter()
+            .filter(|m| !m.starts_with("event "))
+            .chain(msgs.iter().find(|m| m.starts_with("event ")))
+        {
+            println!("{name}: {m}");
+        }
+        println!("{name}: pass");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for w in &whys {
+        println!("{name}: FAIL {w}");
+    }
+    println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
+    println!(
+        "---- services log (last {TAIL} lines)\n{}",
+        tail(&services, TAIL)
+    );
+    println!("{}", verdict::gate(name, &whys));
+    Ok(ExitCode::FAILURE)
+}
+
+/// The app's first fault up to `done` + WINDOW_MS (app.rs `fault`).
+fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
+    let marker_ms = window::verdict(app_log, DONE, atld_exited, WINDOW_MS).marker_ms?;
+    window::fault_after(app_log, 0, marker_ms + WINDOW_MS, marker_ms, atld_exited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_values_follow_the_iio_abi() {
+        // by hand: sensor = (0.980665, -1.96133, 9.80665); device x = sensor y, device y = -sensor x
+        let e = expected();
+        assert!((e[0] - -1.961_33).abs() < 1e-9);
+        assert!((e[1] - -0.980_665).abs() < 1e-9);
+        assert!((e[2] - 9.806_65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stall_and_wrong_values_fail() {
+        let empty_ok: Vec<String> = [
+            "lookup ms=12",
+            "list n=0",
+            "default null register=false",
+            "done",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(check(Stage::Empty, &empty_ok, "").is_empty());
+        let stalled: Vec<String> = vec![
+            "lookup ms=60123".into(),
+            "list n=0".into(),
+            "default null register=false".into(),
+            "done".into(),
+        ];
+        assert!(!check(Stage::Empty, &stalled, "").is_empty());
+        let ev = |ts: i64, v: &str| format!("event ts={ts} now={} v={v}", ts + 1000);
+        let mut iio: Vec<String> = vec![
+            "lookup ms=5".into(),
+            "list n=1".into(),
+            format!(
+                "default name={DEVICE_NAME} type=1 stringType=android.sensor.accelerometer minDelay=10000"
+            ),
+            "register=true".into(),
+        ];
+        for i in 0..5 {
+            iio.push(ev(100 + i, "-1.96133,-0.980665,9.80665"));
+        }
+        iio.push("done events=5".into());
+        let stopped = format!("sensor: {DEVICE_NAME} (handle 1) stopped");
+        assert_eq!(check(Stage::Iio, &iio, &stopped), Vec::<String>::new());
+        // the identity matrix's values
+        iio[4] = ev(100, "0.980665,-1.96133,9.80665");
+        assert!(!check(Stage::Iio, &iio, &stopped).is_empty());
+    }
+}

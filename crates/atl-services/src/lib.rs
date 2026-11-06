@@ -26,6 +26,7 @@ pub mod observer_rules;
 pub mod packages;
 pub mod permission;
 pub mod process_control;
+pub mod sensor;
 pub mod shared_memory;
 pub mod size_buckets;
 pub mod tasks;
@@ -55,6 +56,8 @@ pub mod notification;
 pub mod package;
 #[cfg(feature = "converter")]
 pub mod registry_service;
+#[cfg(feature = "converter")]
+pub mod sensor_wire;
 #[cfg(feature = "converter")]
 pub mod settings;
 #[cfg(feature = "converter")]

@@ -50,6 +50,9 @@ struct Args {
     /// Test only: a start that would reuse a singleTop / singleTask instance (onNewIntent) is refused, the deliberate break of the start-finish stage's new-intent sub-gate.
     #[arg(long)]
     no_new_intent: bool,
+    /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
+    #[arg(long)]
+    no_sensor_service: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -77,6 +80,8 @@ const MOUNT: &str = "mount";
 const CLIPBOARD: &str = "clipboard";
 /// Context.NOTIFICATION_SERVICE (Toast.getService looks INotificationManager up by it).
 const NOTIFICATION: &str = "notification";
+/// The name libsensor's SensorManager waits for (SensorManager.cpp `waitForSensorService`).
+const SENSOR: &str = "sensorservice";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -180,6 +185,19 @@ fn main() -> Result<()> {
         ),
     )
     .context("addService notification")?;
+    if !a.no_sensor_service {
+        // the machine's sensors through the platform layer, listed once at start
+        let source: Arc<dyn atl_platform_host::Sensors> =
+            Arc::new(atl_platform_host::PlatformSensors::default());
+        let hub = atl_services::sensor::SensorHub::new(source);
+        writeln!(
+            std::io::stderr(),
+            "sensor: {} sensors listed",
+            hub.sensor_list().len()
+        )?;
+        binder::add_service(SENSOR, atl_services::sensor_wire::new_binder(hub))
+            .context("addService sensorservice")?;
+    }
     // the bare file name is the load name the Parcel form carries (atl-libinput KeyCharacterMap::load)
     let kcm = |name: &str| -> anyhow::Result<Vec<u8>> {
         let path = a.keychars.join(name);

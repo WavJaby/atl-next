@@ -233,6 +233,26 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/input/InputManagerService.java#setPointerIcon",
 ]
 
+[sensorservice]
+src = ["crates/atl-services/src/sensor.rs", "crates/atl-services/src/sensor_wire.rs"]
+mirrors = [
+    "frameworks/native/services/sensorservice/SensorService.cpp#getSensorList",
+    "frameworks/native/services/sensorservice/SensorService.cpp#getDynamicSensorList",
+    "frameworks/native/services/sensorservice/SensorService.cpp#getRuntimeSensorList",
+    "frameworks/native/services/sensorservice/SensorService.cpp#createSensorEventConnection",
+    "frameworks/native/services/sensorservice/SensorService.cpp#isDataInjectionEnabled",
+    "frameworks/native/services/sensorservice/SensorService.cpp#enable",
+    "frameworks/native/services/sensorservice/SensorService.cpp#disable",
+    "frameworks/native/services/sensorservice/SensorService.cpp#setEventRate",
+    "frameworks/native/services/sensorservice/SensorEventConnection.cpp#getSensorChannel",
+    "frameworks/native/services/sensorservice/SensorEventConnection.cpp#enableDisable",
+    "frameworks/native/services/sensorservice/SensorEventConnection.cpp#setEventRate",
+    "frameworks/native/libs/sensor/ISensorServer.cpp",
+    "frameworks/native/libs/sensor/ISensorEventConnection.cpp",
+    "frameworks/native/libs/sensor/Sensor.cpp#flatten",
+    "frameworks/native/libs/sensor/BitTube.cpp",
+]
+
 ["atl.compositor_registry"]
 src = [
     "crates/atl-services/src/registry_service.rs",

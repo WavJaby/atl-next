@@ -56,6 +56,7 @@ mod providers;
 mod prune;
 mod run_apk;
 mod runtimes;
+mod sensors;
 mod service_mirrors;
 mod services;
 mod slot;
@@ -215,6 +216,8 @@ enum Test {
     ///
     /// The app then calls into WindowManager, which no service provides yet: its log after the marker and the services' counters that rose after it are printed.
     Window(window::Args),
+    /// The sensor service: a fixture (xtask/testdata/sensors) uses SensorManager under atld with a fake `/sys/bus` (private mount namespace). `--stage empty`: no sensor, no stall; `--stage iio`: a fake IIO accelerometer's events with hand-derived values. `--break` must turn it red.
+    Sensors(sensors::Args),
     /// The GTK platform layer (M3 slice 6) on a real Wayland compositor: a window maps, frame-clock ticks present scenes, GSK readback equals the pattern, a blocked UI thread answers no `xdg_wm_base` ping.
     ///
     /// Runs crates/atl-platform-ui/examples/gate.rs in the gate's headless weston (`--hold-blocked`: on $WAYLAND_DISPLAY) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
@@ -312,6 +315,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Window(args),
         } => window::run(&root, &args),
         Command::Test {
+            test: Test::Sensors(args),
+        } => sensors::run(&root, &args),
+        Command::Test {
             test: Test::PlatformUi(args),
         } => platform_ui::run(&root, &args),
         Command::Test {
@@ -356,6 +362,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Cts(_) => "cts",
             Test::Composer(_) => "composer",
             Test::Window(_) => "window",
+            Test::Sensors(_) => "sensors",
             Test::PlatformUi(_) => "platform-ui",
             Test::JniFixture(_) => "jni-fixture",
             Test::Gles2Fixture(_) => "gles2-fixture",

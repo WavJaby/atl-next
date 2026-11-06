@@ -67,8 +67,8 @@ uses = ["generators", "compositor", "libgui-parcel"]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
-# libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs)
-uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel"]
+# libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs); platform-host: the sensor service reads the machine's accelerometers through it (sensor.rs)
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel", "platform-host"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]

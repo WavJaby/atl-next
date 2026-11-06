@@ -393,6 +393,7 @@ dependencies = [
  "atl-broker",
  "atl-libgui-parcel",
  "atl-libinput",
+ "atl-platform-host",
  "clap",
  "rustix",
  "serde",

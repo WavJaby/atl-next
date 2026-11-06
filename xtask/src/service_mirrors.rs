@@ -210,7 +210,15 @@ pub fn declarations(text: &str, name: &str, is_type: bool) -> Vec<usize> {
                 })
         } else {
             l.match_indices(&format!("{name}(")).any(|(at, _)| {
-                let before = &l[..at];
+                let mut before = &l[..at];
+                // a C++ out-of-line definition `<type> Class::Inner::name(`: the qualifiers stand between the type and the name
+                while let Some(q) = before.strip_suffix("::") {
+                    let class = q.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+                    if class.len() == q.len() {
+                        return false;
+                    }
+                    before = class;
+                }
                 // the declared name follows whitespace, after a type token that is not a keyword
                 if !before.ends_with([' ', '\t']) || before.contains('=') {
                     return false;
@@ -436,6 +444,15 @@ class Outer {
         assert_eq!(declarations(JAVA, "Inner", true), vec![10]);
         assert!(declarations(JAVA, "Inne", true).is_empty());
         assert_eq!(declarations(JAVA, "Outer", true), vec![1]);
+    }
+
+    #[test]
+    fn cpp_out_of_line_definitions_count() {
+        let cpp = "status_t SensorService::SensorEventConnection::enableDisable(\n    return mService->enable(this);\n    err = SensorService::enable(x);\nVector<Sensor> SensorService::getSensorList(const String16& p) {\n";
+        assert_eq!(declarations(cpp, "enableDisable", false), vec![0]);
+        assert_eq!(declarations(cpp, "getSensorList", false), vec![3]);
+        // calls, qualified or not, are not declarations
+        assert!(declarations(cpp, "enable", false).is_empty());
     }
 
     #[test]

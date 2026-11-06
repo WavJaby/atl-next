@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! GDK, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs.
+//! Linux, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs (GDK), the accelerometers through IIO sysfs (iio.rs).
 //! GDK reports logical geometry and the refresh rate in milli-Hz (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts both.
 #![forbid(unsafe_code)]
+
+mod iio;
+pub use iio::IioSensors;
 
 use std::marker::PhantomData;
 

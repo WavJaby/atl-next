@@ -77,6 +77,10 @@ pub struct Runtime {
     ime_death_link: bool,
     /// A start may reuse a singleTop / singleTask instance unless this is cleared (`--no-new-intent`, the start-finish stage's deliberate break).
     new_intent: bool,
+    /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
+    sensor_service: bool,
+    /// A directory atld sees as `/sys/bus` (sensors gate: a fake IIO sysfs): atld then runs in a private user + mount namespace (`unshare -Urm`) with it bind-mounted there; the product reads the fixed path.
+    fake_sys_bus: Option<PathBuf>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -351,6 +355,8 @@ impl Runtime {
             app_seccomp: true,
             ime_death_link: true,
             new_intent: true,
+            sensor_service: true,
+            fake_sys_bus: None,
         })
     }
 
@@ -433,6 +439,18 @@ impl Runtime {
     /// The services refuse a start that would reuse an instance (atld `--no-new-intent`): the start-finish stage's new-intent sub-gate must then fail.
     pub fn without_new_intent(mut self) -> Self {
         self.new_intent = false;
+        self
+    }
+
+    /// The services do not register `sensorservice` (atld `--no-sensor-service`): SensorManager's wait must then be detected.
+    pub fn without_sensor_service(mut self) -> Self {
+        self.sensor_service = false;
+        self
+    }
+
+    /// atld (and so every process it starts) sees `dir` as `/sys/bus`.
+    pub fn with_fake_sys_bus(mut self, dir: PathBuf) -> Self {
+        self.fake_sys_bus = Some(dir);
         self
     }
 }
@@ -619,7 +637,26 @@ impl Runtime {
             lib_path.push(":");
             lib_path.push(dir);
         }
-        let mut cmd = Command::new(&self.atld);
+        // unshare and sh both exec (no --fork): the child's pid stays atld's, so stop() still reaches it
+        let mut cmd = match &self.fake_sys_bus {
+            None => Command::new(&self.atld),
+            Some(dir) => {
+                let mut c = Command::new("unshare");
+                c.args([
+                    "-Urm",
+                    "--",
+                    "sh",
+                    "-c",
+                    r#"mount --bind "$0" /sys/bus && exec "$@""#,
+                ])
+                .arg(dir)
+                .arg(&self.atld);
+                c
+            }
+        };
+        if !self.sensor_service {
+            cmd.arg("--no-sensor-service");
+        }
         let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
         for (host, at) in driver_files.chain(&self.fixture_files) {
             cmd.arg("--file").arg(format!("{}={at}", host.display()));

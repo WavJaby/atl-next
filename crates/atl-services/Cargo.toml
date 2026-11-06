@@ -43,6 +43,7 @@ atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-libinput = { path = "../atl-libinput" }
+atl-platform-host = { path = "../atl-platform-host" }
 clap.workspace = true
 rustix.workspace = true
 serde.workspace = true

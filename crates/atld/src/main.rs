@@ -134,6 +134,9 @@ struct Args {
     /// Test only: passed to the services (`--no-new-intent`), the deliberate break of the start-finish stage's new-intent sub-gate.
     #[arg(long)]
     no_new_intent: bool,
+    /// Test only: passed to the services (`--no-sensor-service`), the deliberate break of the sensors gate's empty stage.
+    #[arg(long)]
+    no_sensor_service: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -904,6 +907,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     if a.no_new_intent {
         services_args.push("--no-new-intent".into());
+    }
+    if a.no_sensor_service {
+        services_args.push("--no-sensor-service".into());
     }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([

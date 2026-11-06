@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The platform layer's host-side facade (atld, xtask): the `atl-platform-host-api` trait plus the implementation the target OS selects at compile time, under neutral names.
+//! The platform layer's host-side facade (atld, xtask, the system services): the `atl-platform-host-api` trait plus the implementation the target OS selects at compile time, under neutral names.
 //! Core crates depend on this crate only, so the choice of OS is made here and nowhere else (plan S1); `deny.toml` keeps GTK out of every other crate.
 #![forbid(unsafe_code)]
 
@@ -7,6 +7,8 @@ pub use atl_platform_host_api::*;
 
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
+#[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::IioSensors as PlatformSensors;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-host has no implementation for this target OS");
@@ -17,6 +19,8 @@ compile_error!("atl-platform-host has no implementation for this target OS");
 fn implements_the_api() {
     fn desktop<T: Desktop>() {}
     desktop::<PlatformDesktop>();
+    fn sensors<T: Sensors + Default>() {}
+    sensors::<PlatformSensors>();
 }
 
 /// The first monitor, from a connection let go at once; `None` where the desktop lists none. `Err`: no desktop answers.
