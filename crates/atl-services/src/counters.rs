@@ -38,6 +38,24 @@ pub fn wall_stamp() -> String {
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
+static SENT: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// Counts one outgoing call the services made (`call` on a client's binder, e.g. IInputMethod.bindInput), so `unimplemented` keeps meaning unimplemented. Written to stderr as
+/// `services: sent <interface>.<call> <n> at=<stamp>`; xtask reads it as the `sent` kind (atld_run.rs `events`).
+pub fn sent(interface: &'static str, call: &str) -> u64 {
+    let mut map = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.entry((interface, call.to_owned())).or_insert(0);
+    *n += 1;
+    let n = *n;
+    drop(map);
+    let _ = writeln!(
+        std::io::stderr(),
+        "services: sent {interface}.{call} {n} at={}",
+        wall_stamp()
+    );
+    n
+}
+
 static REFUSED: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
 
 /// Counts one call of `method` on `interface` that the service refuses (a request it cannot serve: a null argument, an unknown window). Each hit is also written to stderr as

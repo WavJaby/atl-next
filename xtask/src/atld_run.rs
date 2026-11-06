@@ -617,12 +617,13 @@ pub fn without_stamp(line: &str) -> &str {
     line.rsplit_once(" at=").map_or(line, |(head, _)| head)
 }
 
-/// Every counter line of the services' log, in log order: `services: unimplemented <interface>.<method> <n> at=<stamp>` and `services: refused <interface>.<method> <n> at=<stamp>`
+/// Every counter line of the services' log, in log order: `services: unimplemented|refused|sent <interface>.<method> <n> at=<stamp>`
 /// (atl_services::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
 pub fn events(services_log: &str) -> Vec<Event> {
-    const KINDS: [(&str, &str); 3] = [
+    const KINDS: [(&str, &str); 4] = [
         ("services: unimplemented ", "unimplemented"),
         ("services: refused ", "refused"),
+        ("services: sent ", "sent"),
         ("parcelables: refused ", "refused"),
     ];
     let mut out = Vec::new();
@@ -763,12 +764,14 @@ mod tests {
                    parcelables: refused android.os.Bundle (value type) 1 at=100.003\n\
                    parcelables: refused android.content.Intent.extras 2 at=100.004\n\
                    services: Failure reporting\n\
+                   services: sent IInputMethodManager.IInputMethod.bindInput 1 at=100.005\n\
                    services: unimplemented IPackageManager.getMoveStatus 9\n";
         assert_eq!(
             counter_lines(log),
             [
                 "refused android.content.Intent.extras x2",
                 "refused android.os.Bundle (value type) x1",
+                "sent IInputMethodManager.IInputMethod.bindInput x1",
                 "unimplemented IActivityManager.getProcessLimit x2",
             ]
         );

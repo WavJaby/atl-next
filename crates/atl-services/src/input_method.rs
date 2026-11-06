@@ -90,9 +90,9 @@ struct Remote<'a> {
 }
 
 fn sent(call: &str, r: binder::Result<()>) {
-    counters::count(INTERFACE, call);
+    counters::sent(INTERFACE, call);
     if let Err(e) = r {
-        counters::count(INTERFACE, &format!("{call} refused: {e:?}"));
+        counters::refused(INTERFACE, &format!("{call}: {e:?}"));
     }
 }
 
