@@ -12,9 +12,25 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# spike gate g1 (bridge-1 route N): maps the guest linker, runs its init through the crossing, probes the host after; needs a native-bridge build (`ATL_G1_NB`), skips without one
+# spike gates g1-g4 (bridge-1 route N), harness-less (main thread only, no runner threads touching TLS); env in tests/common/mod.rs, stages needing a native-bridge build skip without one
+# g1: guest linker init through the crossing, host intact after
 [[test]]
 name = "g1"
+harness = false
+
+# g2: guest dlopen of an NDK app library + native calls (TLS, errno, C++ throw, nested dlopen)
+[[test]]
+name = "g2"
+harness = false
+
+# g3: SIGSEGV in guest code reaches the host handler on host FS and resumes on guest FS
+[[test]]
+name = "g3"
+harness = false
+
+# g4: crossing cost, guest->host and host->guest, 10 runs
+[[test]]
+name = "g4"
 harness = false
 
 [dependencies]

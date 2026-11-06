@@ -18,6 +18,34 @@ use std::path::PathBuf;
 pub use arch::HostThread;
 use image::Image;
 
+/// Host `sigaction(sig)` through the engine's signal entry: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3).
+/// Step 4 puts this under ART's sigchain (its `sigaction` claim), not beside it.
+pub fn install_signal(
+    sig: i32,
+    handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void),
+) -> Result<(), String> {
+    let n = usize::try_from(sig)
+        .ok()
+        .filter(|&n| n > 0 && n < arch::SIGNALS)
+        .ok_or_else(|| format!("signal {sig} out of range"))?;
+    arch::set_signal_handler(n, handler as *const () as usize);
+    // SAFETY: a zeroed sigaction is a valid empty one; the entry point follows the SA_SIGINFO signature.
+    let rc = unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = arch::signal_entry();
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut())
+    };
+    if rc != 0 {
+        return Err(format!(
+            "sigaction({sig}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// What the guest process is made of.
 pub struct Config {
     /// the guest `linker64` (static-PIE)

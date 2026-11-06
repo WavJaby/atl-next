@@ -81,8 +81,10 @@ fn bionic_thread(
 }
 
 fn main() -> Result<()> {
-    // `--cfg atl_g1_break`: the deliberate break of spike gate g1 (engine::x86_64: the host->guest crossing without its FS restore)
-    println!("cargo::rustc-check-cfg=cfg(atl_g1_break)");
+    // `--cfg atl_nb_no_fs_restore`: deliberate break of spike gates g1/g2 (engine::x86_64: the host->guest crossing without its FS restore)
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_no_fs_restore)");
+    // `--cfg atl_g4_break`: g4's deliberate break (tests/g4.rs: a syscall in the host target, must leave the band)
+    println!("cargo::rustc-check-cfg=cfg(atl_g4_break)");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;

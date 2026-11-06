@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Spike gate g1 (bridge-1 route N): the identity crossing leaves the host thread intact, and the guest linker initialises through it.
-//! `harness = false`: runs on the process's main thread, no test-runner threads touching TLS while the crossing is under test.
-//! Build: `ATL_G1_NB=<out>/nb/x86_64 ATL_G1_LIBCXX=<dir of the guest libc++.so> cargo test -p atl-native-bridge --test g1`; stage 2 prints SKIP without them.
-//! Deliberate break: `RUSTFLAGS=--cfg=atl_g1_break` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
-//! Stage 2 also loads the bionic provider (`load_provider`) the engine binds property / abort-message stubs to.
+//! Build env: tests/common/mod.rs; stage 2 prints SKIP without a native-bridge build.
+//! Deliberate break: `RUSTFLAGS=--cfg=atl_nb_no_fs_restore` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
 //!
 //! Stages:
 //! - 0, always: the crossing installs a guest thread pointer for the call and restores the host's after; host probe after it.
@@ -15,49 +13,18 @@
     reason = "a harness-less gate: its verdict lines are its output"
 )]
 
+mod common;
+
 use std::ffi::{CStr, c_char};
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atl_native_bridge::engine::{Config, Guest, HostThread, arch, vdso};
+use atl_native_bridge::engine::{Guest, HostThread, arch, vdso};
+use common::{RTLD_NOW, need, probe};
 
-const RTLD_NOW: usize = 2;
 const ABORT_TEXT: &CStr = c"atl g1 abort probe";
 /// Words of the stand-in guest TCB of stage 0: covers glibc's `tcbhead_t` reads (`self` at 0x10) as zeros.
 const FAKE_TCB_WORDS: usize = 64;
-
-/// Host-side probe. Errors are static: on a guest thread pointer an allocation would itself crash.
-fn probe(self0: libc::pthread_t) -> Result<(), &'static str> {
-    // SAFETY: pthread_self has no preconditions.
-    if unsafe { libc::pthread_self() } != self0 {
-        return Err("pthread_self changed: the host thread pointer was not restored");
-    }
-    // SAFETY: this thread's errno slot.
-    unsafe { *libc::__errno_location() = 4242 };
-    // SAFETY: as above.
-    if unsafe { *libc::__errno_location() } != 4242 {
-        return Err("errno did not round-trip");
-    }
-    // SAFETY: plain malloc/free of a fresh block.
-    unsafe {
-        let p = libc::malloc(4096) as *mut u8;
-        if p.is_null() {
-            return Err("malloc failed");
-        }
-        p.write_bytes(0xa5, 4096);
-        libc::free(p.cast());
-    }
-    let mut buf = [0u8; 32];
-    // SAFETY: buf is 32 bytes, the format takes one int.
-    let n = unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), c"g1 %d".as_ptr(), 7) };
-    if n != 4 || &buf[..4] != b"g1 7" {
-        return Err("snprintf wrong");
-    }
-    // SAFETY: format without conversions.
-    unsafe { libc::printf(c"g1: host printf ok\n".as_ptr()) };
-    Ok(())
-}
 
 /// Stage 0's "guest": answers the thread pointer it runs on; inline asm only, no TLS.
 extern "C" fn read_fs(_: usize, _: usize, _: usize) -> usize {
@@ -65,8 +32,7 @@ extern "C" fn read_fs(_: usize, _: usize, _: usize) -> usize {
 }
 
 fn crossing() -> Result<(), String> {
-    // SAFETY: no preconditions.
-    let self0 = unsafe { libc::pthread_self() };
+    let self0 = common::self0();
     let host = arch::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
@@ -104,11 +70,6 @@ fn dlsym_ok(got: usize, want: usize, before: u32, after: u32) -> Result<(), Stri
         ));
     }
     Ok(())
-}
-
-fn need(img: &atl_native_bridge::engine::image::Image, name: &str) -> Result<usize, String> {
-    img.symbol(name)
-        .ok_or_else(|| format!("linker64 lacks {name}"))
 }
 
 /// The guest-dlsym proof on the initialised linker (atl-guest-dlsym reaches `strlen` through the GOT: it runs only after the linker relocated itself); returns the answered address.
@@ -180,40 +141,9 @@ fn abort_message() -> Result<String, String> {
     Err("no mapping holds bionic's abort-message magic".into())
 }
 
-/// The bionic provider every ART process has loaded (`libatl_bionic`): the engine binds the guest's property and abort-message stubs to it by name (engine/vdso.rs `PROVIDER`). xtask builds it next to the native-bridge output: `<out>/nb/<arch>` -> `<out>/crates/atl-bionic/lib`.
-fn load_provider(nb: &Path) -> Result<(), String> {
-    let lib = nb
-        .ancestors()
-        .nth(2)
-        .ok_or("ATL_G1_NB is not <out>/nb/<arch>")?
-        .join("crates/atl-bionic/lib/libatl_bionic.so.0.0.0");
-    let path =
-        std::ffi::CString::new(lib.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    // SAFETY: dlopen of a NUL-terminated path; its constructors are the provider's own.
-    let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if h.is_null() {
-        return Err(format!("dlopen {}: failed", lib.display()));
-    }
-    Ok(())
-}
-
-fn linker_init(nb: &Path, libcxx: &Path) -> Result<(), String> {
-    let cfg = Config {
-        linker: nb.join("native_bridge_guest_linker/linker64"),
-        vdso: nb.join("libnative_bridge_vdso/libnative_bridge_vdso.so"),
-        exe: nb.join("native_bridge_guest_app_process/app_process64"),
-        library_path: vec![
-            nb.join("libnative_bridge_guest_libc"),
-            nb.join("libm"),
-            nb.join("libdl"),
-            nb.join("ld-android"),
-            libcxx.to_path_buf(),
-        ],
-    };
-    load_provider(nb)?;
-    // SAFETY: no preconditions.
-    let self0 = unsafe { libc::pthread_self() };
-    let mut g = Guest::start(&cfg)?;
+fn linker_init(env: &common::Nb) -> Result<(), String> {
+    let self0 = common::self0();
+    let mut g = common::start(env)?;
     if let Err(e) = probe(self0) {
         g.force_host_fs();
         return Err(format!("after __linker_init: {e}"));
@@ -263,27 +193,14 @@ fn linker_init(nb: &Path, libcxx: &Path) -> Result<(), String> {
 
 /// Stage 2, or None when no native-bridge build is named.
 fn stage2() -> Option<Result<(), String>> {
-    let (Some(nb), Some(libcxx)) = (
-        std::env::var_os("ATL_G1_NB"),
-        std::env::var_os("ATL_G1_LIBCXX"),
-    ) else {
-        println!("g1: stage 2 SKIP (ATL_G1_NB / ATL_G1_LIBCXX unset: no native-bridge build)");
+    let Some(env) = common::nb_env() else {
+        println!("g1: stage 2 SKIP (ATL_NB / ATL_NB_LIBCXX unset: no native-bridge build)");
         return None;
     };
-    Some(linker_init(&PathBuf::from(nb), &PathBuf::from(libcxx)))
+    Some(linker_init(&env))
 }
 
 fn main() -> ExitCode {
     // every stage runs (a failed probe puts the host FS back), so the break shows in each stage's probe
-    let results = [Some(crossing()), stage2()];
-    let mut failed = false;
-    for e in results.into_iter().flatten().filter_map(Result::err) {
-        eprintln!("g1: FAILED: {e}");
-        failed = true;
-    }
-    if failed {
-        return ExitCode::FAILURE;
-    }
-    println!("g1: ok");
-    ExitCode::SUCCESS
+    common::verdict("g1", [Some(crossing()), stage2()])
 }

@@ -90,14 +90,14 @@ pub unsafe fn set_fs_base(v: usize) {
     unsafe { std::arch::asm!("wrfsbase {}", in(reg) v, options(nomem, nostack, preserves_flags)) };
 }
 
-#[cfg(not(atl_g1_break))]
+#[cfg(not(atl_nb_no_fs_restore))]
 macro_rules! restore_host_fs {
     () => {
         "    mov 8(%rbx), %rcx\n    wrfsbase %rcx\n"
     };
 }
-// g1's deliberate break: the crossing returns to the host on the guest's thread pointer
-#[cfg(atl_g1_break)]
+// deliberate break of gates g1/g2: the crossing returns to the host on the guest's thread pointer
+#[cfg(atl_nb_no_fs_restore)]
 macro_rules! restore_host_fs {
     () => {
         ""
@@ -118,7 +118,7 @@ std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c) -> f(a, b, c) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_signal_entry, atl_nb_signal_handlers\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
@@ -181,6 +181,32 @@ std::arch::global_asm!(
         "    ret\n",
         "9:  ud2\n",
         ".size atl_nb_cross_to_host, .-atl_nb_cross_to_host\n",
+        // signal entry: the kernel delivers on whatever FS the thread had (guest or host) and sigreturn does not restore FS base;
+        // GS != 0 = a crossing is active on this thread -> run the host handler on the record's host FS, put the interrupted FS back after
+        ".globl atl_nb_signal_entry\n",
+        ".type atl_nb_signal_entry,@function\n",
+        "atl_nb_signal_entry:\n",
+        "    push %rbx\n",
+        "    push %r12\n",
+        "    sub $8, %rsp\n",
+        "    rdfsbase %rbx\n",
+        "    rdgsbase %r12\n",
+        "    test %r12, %r12\n",
+        "    jz 1f\n",
+        "    mov 8(%r12), %r11\n",
+        "    test %r11, %r11\n",
+        "    jz 1f\n",
+        "    wrfsbase %r11\n",
+        "1:\n",
+        "    movslq %edi, %rax\n",
+        "    lea atl_nb_signal_handlers(%rip), %r11\n",
+        "    call *(%r11,%rax,8)\n",
+        "    wrfsbase %rbx\n",
+        "    add $8, %rsp\n",
+        "    pop %r12\n",
+        "    pop %rbx\n",
+        "    ret\n",
+        ".size atl_nb_signal_entry, .-atl_nb_signal_entry\n",
         ".p2align 3\n",
         ".globl atl_nb_host_thunks\n",
         "atl_nb_host_thunks:\n",
@@ -198,6 +224,23 @@ const _: () = assert!(THUNKS == 128 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 24
 unsafe extern "C" {
     fn atl_nb_call_guest(ht: *mut HostThread, f: usize, a: usize, b: usize, c: usize) -> usize;
     static atl_nb_host_thunks: u8;
+    fn atl_nb_signal_entry(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void);
+}
+
+/// Host signal handlers by signal number, read by `atl_nb_signal_entry` (0..=64; kernel `_NSIG` = 64).
+#[unsafe(no_mangle)]
+static atl_nb_signal_handlers: [AtomicUsize; SIGNALS] = [const { AtomicUsize::new(0) }; SIGNALS];
+pub const SIGNALS: usize = 65;
+
+/// The address to give host `sigaction` (SA_SIGINFO): calls `handler` on the host thread pointer whatever the interrupted code ran on, restores that one after.
+/// `handler` must be stored first (`set_signal_handler`); it may rewrite the ucontext, but must return (a longjmp out would leave the host FS on guest code).
+pub fn signal_entry() -> usize {
+    atl_nb_signal_entry as *const () as usize
+}
+
+/// Stores the host handler `signal_entry` calls for `sig`.
+pub fn set_signal_handler(sig: usize, handler: usize) {
+    atl_nb_signal_handlers[sig].store(handler, Ordering::Release);
 }
 
 /// Calls guest function `f(a, b, c)` on the guest thread pointer (none before the first crossing: the guest linker installs its own).

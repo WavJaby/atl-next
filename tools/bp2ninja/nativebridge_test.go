@@ -117,7 +117,7 @@ cc_binary {
 `})
 	nb := NativeBridge("x86_64")
 	g.soong.Flags.Triple[nb] = "x86_64-linux-android"
-	g.nbProvided = map[string]Provided{builtinsModule: {Libs: []string{"/rt/builtins.a"}}}
+	g.nbProvided = map[string]Provided{builtinsModule: {Lib: "/rt/builtins.a"}}
 	lib, bin := g.node("libz", nb, Shared, "goal"), g.node("linker", nb, Binary, "goal")
 	if lib == nil || bin == nil || len(g.problems) > 0 {
 		t.Fatalf("nodes %v %v, problems %q", lib, bin, g.problems)
