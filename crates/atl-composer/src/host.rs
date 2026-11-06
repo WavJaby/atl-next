@@ -23,6 +23,7 @@ use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
+use atl_services::counters;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
@@ -319,10 +320,11 @@ declare_binder_interface! {
 
 fn on_transact(
     _: &dyn ILayerHandle,
-    _: TransactionCode,
+    code: TransactionCode,
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
+    counters::count_unimplemented("ILayerHandle", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

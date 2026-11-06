@@ -4,6 +4,8 @@
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, declare_binder_interface};
 
+use crate::counters;
+
 pub trait IToken: Interface {}
 
 declare_binder_interface! {
@@ -15,10 +17,11 @@ declare_binder_interface! {
 
 fn on_transact(
     _: &dyn IToken,
-    _: TransactionCode,
+    code: TransactionCode,
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
+    counters::count_unimplemented("IToken", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 
