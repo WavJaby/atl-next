@@ -13,7 +13,7 @@
 #![cfg(soong)]
 #![forbid(unsafe_code)]
 
-mod aconfig;
+pub mod aconfig;
 pub mod codecs;
 mod opaque;
 pub mod parcel;

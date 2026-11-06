@@ -10,11 +10,11 @@ publish.workspace = true
 # Rust types of the unstructured (Java-only) parcelables framework AIDL names, for the converter's AIDL crates (atl-aidl `aidl.parcelables`).
 # The converter builds src/lib.rs as rust_library `libatl_parcelables` against these rustlibs, with its generated parcelables.rs (xtask packages.rs, bp2ninja aidlcrates.go).
 # Cargo builds an empty library: lib.rs is `#![cfg(soong)]`, a cfg only the converter passes.
-# aconfig: the framework flags the codecs' formats depend on (Intent: android.security.prevent_intent_redirect; LayoutParams: android.view.flags toolkit_set_frame_rate_read_only),
-# as aconfig evaluates them for the release (src/aconfig.rs).
+# aconfig: the framework flags the codecs' formats and the PackageManager's predictive-back default depend on (Intent: android.security.prevent_intent_redirect; LayoutParams: android.view.flags toolkit_set_frame_rate_read_only;
+# ApplicationInfo: com.android.window.flags predictive_back_default_enable_sdk_36), as aconfig evaluates them for the release (src/aconfig.rs).
 [package.metadata.atl.rust_library]
 rustlibs = ["libbinder_rs"]
-aconfig = ["android.security.flags-aconfig", "android.view.flags-aconfig", "android.view.inputmethod.flags-aconfig"]
+aconfig = ["android.security.flags-aconfig", "android.view.flags-aconfig", "android.view.inputmethod.flags-aconfig", "com.android.window.flags.window-aconfig"]
 
 [lints]
 workspace = true

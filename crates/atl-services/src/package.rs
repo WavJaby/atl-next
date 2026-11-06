@@ -86,6 +86,10 @@ pub fn application_info(p: &PackageRecord, packages: &Packages, flags: i64) -> A
         process_name: Some(p.process_name().to_owned()),
         theme: p.application_theme,
         flags: manifest_flags::application_flags(p),
+        private_flags_ext: manifest_flags::application_private_flags_ext(
+            p,
+            atl_parcelables::aconfig::PREDICTIVE_BACK_DEFAULT_ENABLE_SDK_36,
+        ),
         source_dir: Some(p.source_dir.clone()),
         public_source_dir: Some(p.source_dir.clone()),
         shared_library_files: (!library_files.is_empty()).then_some(library_files),

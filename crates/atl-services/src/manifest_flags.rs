@@ -3,7 +3,7 @@
 //! and ParsedActivityUtils.parseActivityOrReceiver:133-158 (an activity's; its `flag(FLAG, attr, sa)` is `getBoolean(attr, false)`, ComponentParseUtils.java:148). A boolean the manifest wrote decides its bit;
 //! an absent one takes AOSP's default, which may depend on targetSdkVersion or on the application's effective value of the same attribute.
 //! Only the plain booleans are mirrored. Not set here: bits of other elements (`<supports-screens>`, install state such as FLAG_SYSTEM, FLAG_STOPPED), `persistent` (gated by
-//! persistentWhenFeatureAvailable), the backup-agent booleans (killAfterRestore, restoreAnyVersion, fullBackupOnly), private flags, and visibleToInstantApps (it also marks the package).
+//! persistentWhenFeatureAvailable), the backup-agent booleans (killAfterRestore, restoreAnyVersion, fullBackupOnly), private flags except ApplicationInfo's predictive-back bit (application_private_flags_ext), and visibleToInstantApps (it also marks the package).
 
 use std::collections::BTreeMap;
 
@@ -168,6 +168,26 @@ pub fn activity_flags(m: &Manifest, a: &ActivityDecl) -> i32 {
         .fold(0, |flags, r| flags | r.flag)
 }
 
+/// ApplicationInfo.PRIVATE_FLAG_EXT_ENABLE_ON_BACK_INVOKED_CALLBACK (ApplicationInfo.java: `1 << 3`), a bit of privateFlagsExt.
+const PRIVATE_FLAG_EXT_ENABLE_ON_BACK_INVOKED_CALLBACK: i32 = 1 << 3;
+/// Build.VERSION_CODES.VANILLA_ICE_CREAM: without the attribute, predictive back is the default above it.
+const VANILLA_ICE_CREAM: i32 = 35;
+
+/// ApplicationInfo.privateFlagsExt's predictive-back bit (AppInfoUtils:114 over PackageImpl.isOnBackInvokedCallbackEnabled). `<application android:enableOnBackInvokedCallback>` written decides;
+/// absent, the default is targetSdk > 35 and `predictive_back_default` (the release value of predictive_back_default_enable_sdk_36, ParsingPackageUtils:2436).
+/// Without the bit Activity registers no default callback (Activity.java:1891) and KEYCODE_BACK takes the legacy Activity.onBackPressed path, so the app's OnBackInvokedCallback never runs.
+pub fn application_private_flags_ext(m: &Manifest, predictive_back_default: bool) -> i32 {
+    let enabled = match m.application_booleans.get("enableOnBackInvokedCallback") {
+        Some(written) => *written,
+        None => m.target_sdk > VANILLA_ICE_CREAM && predictive_back_default,
+    };
+    if enabled {
+        PRIVATE_FLAG_EXT_ENABLE_ON_BACK_INVOKED_CALLBACK
+    } else {
+        0
+    }
+}
+
 /// Build.VERSION_CODES.HONEYCOMB_MR2: apps below it predate the size bits, so they handle size changes.
 const HONEYCOMB_MR2: i32 = 13;
 
@@ -194,6 +214,31 @@ mod tests {
         };
         assert_eq!(real_config_changes(&manifest(12, &[]), &a), 0xC03);
         assert_eq!(real_config_changes(&manifest(13, &[]), &a), 0x3);
+    }
+
+    /// ParsingPackageUtils:2436: an absent attribute takes targetSdk > 35 and the release flag; a written one decides. 1 << 3 is PRIVATE_FLAG_EXT_ENABLE_ON_BACK_INVOKED_CALLBACK.
+    #[test]
+    fn predictive_back_bit_follows_target_sdk_flag_and_the_attribute() {
+        assert_eq!(
+            application_private_flags_ext(&manifest(36, &[]), true),
+            1 << 3
+        );
+        assert_eq!(application_private_flags_ext(&manifest(35, &[]), true), 0);
+        assert_eq!(application_private_flags_ext(&manifest(36, &[]), false), 0);
+        assert_eq!(
+            application_private_flags_ext(
+                &manifest(36, &[("enableOnBackInvokedCallback", false)]),
+                true
+            ),
+            0
+        );
+        assert_eq!(
+            application_private_flags_ext(
+                &manifest(28, &[("enableOnBackInvokedCallback", true)]),
+                false
+            ),
+            1 << 3
+        );
     }
 
     fn manifest(target_sdk: i32, application: &[(&str, bool)]) -> Manifest {

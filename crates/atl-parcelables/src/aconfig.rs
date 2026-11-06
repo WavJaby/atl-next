@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Release-config flags a codec's format depends on, as aconfig itself evaluated them: the converter puts the flag dump of each `aconfig` declarations module (Cargo.toml) in OUT_DIR as
+//! Release-config flags a codec's format or a PackageManager default depends on, as aconfig itself evaluated them: the converter puts the flag dump of each `aconfig` declarations module (Cargo.toml) in OUT_DIR as
 //! `<module>.aconfig.txt`, lines `<package>.<flag>:<permission>=<true|false>` (aconfig dump-cache). Only a READ_ONLY flag is a build constant (framework.jar compiles the same value in);
 //! a missing flag or a READ_WRITE one fails the build here, at compile time.
 
@@ -79,4 +79,17 @@ const VIEW_FLAGS: &str = include_str!(concat!(
 pub const TOOLKIT_SET_FRAME_RATE_READ_ONLY: bool = read_only_flag(
     VIEW_FLAGS,
     "android.view.flags.toolkit_set_frame_rate_read_only",
+);
+
+/// android.window.flags (core/java/android/window/flags/*.aconfig, module `com.android.window.flags.window-aconfig`, AconfigFlags.bp).
+const WINDOW_FLAGS: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/com.android.window.flags.window-aconfig.aconfig.txt"
+));
+
+/// `com.android.window.flags.Flags.predictiveBackDefaultEnableSdk36()` (ParsingPackageUtils:2436): an app with targetSdk > 35 that does not write
+/// enableOnBackInvokedCallback gets predictive back only while it is on (manifest_flags::application_private_flags_ext). Release bp2a sets it ENABLED (build/release/aconfig/bp2a/com.android.window.flags).
+pub const PREDICTIVE_BACK_DEFAULT_ENABLE_SDK_36: bool = read_only_flag(
+    WINDOW_FLAGS,
+    "com.android.window.flags.predictive_back_default_enable_sdk_36",
 );
