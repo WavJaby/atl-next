@@ -56,7 +56,11 @@ pub fn goals() -> Goals {
         "libgui_aidl_types_rs",
         "librustutils",
     ])
+    .with(Goals::host(&EXTRACTOR_PLUGINS))
 }
+
+/// The extractor plugins [`platform_rows`] places: every [`Runtime`] reads them, so [`goals`] builds them.
+const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
 
 /// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the libraries Mesa's Android platform links (mesa.rs PC_MODULES).
 pub fn gralloc_goals() -> Goals {
@@ -112,7 +116,7 @@ const NB_LIBS: [(&str, &str); 16] = [
 pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, String)>> {
     let data = aosp.join("frameworks/av/media/libstagefright/data");
     let mut rows = Vec::new();
-    for plugin in ["liboggextractor", "libwavextractor"] {
+    for plugin in EXTRACTOR_PLUGINS {
         rows.push((
             out.join("device").join(plugin).join(format!("{plugin}.so")),
             format!("{}/extractors/{plugin}.so", atl_android_paths::SYSTEM_LIB),
