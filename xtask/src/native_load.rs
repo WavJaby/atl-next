@@ -406,7 +406,7 @@ impl Env {
         let test_root = self.work.join("binder");
         crate::binder::fresh_layout(&test_root)?;
         let aosp = Layout::of(&self.root)?.src().join("aosp");
-        audio::stage_platform(&test_root.join("system"), &self.out, &aosp)?;
+        crate::binder::link_rows(&test_root, &crate::atld_run::platform_rows(&self.out, &aosp)?)?;
         let lib_env = crate::binder::lib_env(&self.out)?;
         let (broker, mut binderd) =
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;

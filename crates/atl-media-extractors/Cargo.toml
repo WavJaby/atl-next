@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+# The extractor plugins of an app process (audio M1): AOSP's MediaExtractorFactory::LoadExtractors, which only the media.extractor service calls at its start. The app runs with media.stagefright.extractremote=false, so without this call no extractor is ever registered.
+# C++ is a cxx forwarder (wrap/extractors.{h,cpp}): one call, no logic (project CLAUDE.md, C++ exception).
+[package]
+name = "atl-media-extractors"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.atl]
+converter = ["device/libstagefright"]
+
+[features]
+converter = []
+
+[dependencies]
+cxx.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true

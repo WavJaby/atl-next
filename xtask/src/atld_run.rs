@@ -107,6 +107,30 @@ const NB_LIBS: [(&str, &str); 16] = [
     ),
 ];
 
+/// The /system files of the media stack an app process reads: the extractor plugins (MediaExtractorFactory loads `lib64/extractors`) and AOSP's codec lists (`media_codecs.xml` is the software list; the Codec2 list is `media_codecs_c2.xml`, read from the parser's default search dirs, which include /system/etc).
+/// One list for every /system placement: atld `--file` rows (every [`Runtime`]) and native-load's test layout (binder.rs `link_rows`). Hard error when a host file is missing: xtask native builds them.
+pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let data = aosp.join("frameworks/av/media/libstagefright/data");
+    let mut rows = Vec::new();
+    for plugin in ["liboggextractor", "libwavextractor"] {
+        rows.push((
+            out.join("device").join(plugin).join(format!("{plugin}.so")),
+            format!("{}/extractors/{plugin}.so", atl_android_paths::SYSTEM_LIB),
+        ));
+    }
+    let system = atl_android_paths::SYSTEM;
+    rows.push((data.join("media_codecs_sw.xml"), format!("{system}/etc/media_codecs.xml")));
+    rows.push((data.join("media_codecs_google_c2.xml"), format!("{system}/etc/media_codecs_c2.xml")));
+    for (host, _) in &rows {
+        ensure!(
+            host.is_file(),
+            "missing input {} (the media stack's /system files: xtask native builds the plugins)",
+            host.display()
+        );
+    }
+    Ok(rows)
+}
+
 /// The staged runtime and the tools around it.
 pub struct Runtime {
     pub art: HostArt,
@@ -134,6 +158,8 @@ pub struct Runtime {
     fixture_files: Vec<(PathBuf, String)>,
     /// The native-bridge guest placed by atld `--file` ([`Runtime::with_native_bridge_guest`]): (host file, Android path).
     native_bridge_guest: Vec<(PathBuf, String)>,
+    /// The media stack's /system files ([`platform_rows`]), placed by every run.
+    platform_files: Vec<(PathBuf, String)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
@@ -418,6 +444,7 @@ impl Runtime {
         let fonts =
             crate::test_fonts::stage(&layout, &out.join("fonts"), crate::test_fonts::ROBOTO.2)?;
         let keychars = tree::keyboards(&layout);
+        let platform_files = platform_rows(&out, &layout.src().join("aosp"))?;
         for (file, _) in tree::KEYBOARD_FILES {
             let path = keychars.join(file);
             ensure!(path.is_file(), "missing input {}", path.display());
@@ -465,6 +492,7 @@ impl Runtime {
             gl_driver: None,
             fixture_files: Vec::new(),
             native_bridge_guest: Vec::new(),
+            platform_files,
             headless_pointer: None,
             display: None,
             ui: None,
@@ -828,7 +856,8 @@ impl Runtime {
         let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
         let placed = driver_files
             .chain(&self.native_bridge_guest)
-            .chain(&self.fixture_files);
+            .chain(&self.fixture_files)
+            .chain(&self.platform_files);
         for (host, at) in placed {
             cmd.arg("--file").arg(format!("{}={at}", host.display()));
         }

@@ -11,14 +11,14 @@ publish.workspace = true
 # Plain workspace builds and tests skip the executable and take the library. With it, in app mode, the process's SurfaceFlinger (atl-composer) runs in the launcher: its converter modules are linked here too
 # (a package's link arguments reach only its own links).
 [package.metadata.atl]
-converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk"]
+converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libstagefright"]
 
 [[bin]]
 name = "atl-app-launcher"
 required-features = ["converter"]
 
 [features]
-converter = ["atl-codec-store/converter", "atl-composer/converter", "atl-service-view/converter"]
+converter = ["atl-codec-store/converter", "atl-composer/converter", "atl-media-extractors/converter", "atl-service-view/converter"]
 
 [dependencies]
 anyhow.workspace = true
@@ -28,6 +28,8 @@ atl-composer = { path = "../atl-composer" }
 atl-service-view = { path = "../atl-service-view" }
 # the Codec2 store the process serves through the view (lib.rs step 1c)
 atl-codec-store = { path = "../atl-codec-store" }
+# the extractor plugins of the process, registered after the store (lib.rs step 1d)
+atl-media-extractors = { path = "../atl-media-extractors" }
 # UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
 atl-platform-ui = { path = "../atl-platform-ui" }
 rustix.workspace = true

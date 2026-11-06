@@ -63,7 +63,20 @@ fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
     Ok(())
 }
 
-/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the platform files an app process reads (audio.rs `stage_platform`).
+/// Links each (host file, absolute Android path) row below `root`, as atld's `system_layout` links its `--file` rows below the product root. The rows are `atld_run::platform_rows`.
+pub(crate) fn link_rows(root: &Path, rows: &[(PathBuf, String)]) -> Result<()> {
+    for (host, at) in rows {
+        let dst = root.join(at.trim_start_matches('/'));
+        ensure!(!dst.exists(), "two files at {}", dst.display());
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(std::path::absolute(host)?, &dst)?;
+    }
+    Ok(())
+}
+
+/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the /system rows an app process reads (`link_rows`).
 pub(crate) fn layout_mounts(root: &Path) -> Vec<Mount> {
     ["system", "vendor", "odm"]
         .into_iter()

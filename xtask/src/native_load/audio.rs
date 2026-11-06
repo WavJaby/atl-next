@@ -218,31 +218,6 @@ fn check(name: &str, exp: &Expected, line: &str, got: &BTreeMap<String, String>,
     Ok(format!("{name} {frames} frames {channels}ch {rate}Hz"))
 }
 
-/// The extractor plugins MediaExtractorFactory loads from `lib64/extractors` (AOSP module/extractors; built by `xtask native`).
-const PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
-
-/// The platform files an app process reads under /system, staged into `system` (the test layout's system dir, mounted at /system): the extractor plugins and AOSP's media_codecs*.xml, copied from the build output and the pinned tree.
-pub fn stage_platform(system: &Path, out: &Path, aosp: &Path) -> Result<()> {
-    let plugins = system.join("lib64/extractors");
-    std::fs::create_dir_all(&plugins).with_context(|| plugins.display().to_string())?;
-    for name in PLUGINS {
-        let from = out.join("device").join(name).join(format!("{name}.so"));
-        let to = plugins.join(format!("{name}.so"));
-        std::fs::copy(&from, &to).with_context(|| format!("{} -> {}", from.display(), to.display()))?;
-    }
-    let etc = system.join("etc");
-    std::fs::create_dir_all(&etc).with_context(|| etc.display().to_string())?;
-    let data = aosp.join("frameworks/av/media/libstagefright/data");
-    for entry in std::fs::read_dir(&data).with_context(|| data.display().to_string())? {
-        let from = entry?.path();
-        let name = from.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
-        if name.starts_with("media_codecs") && name.ends_with(".xml") {
-            std::fs::copy(&from, etc.join(&name)).with_context(|| name.clone())?;
-        }
-    }
-    Ok(())
-}
-
 /// Stage 9: every clip decoded and checked; Ok names the clips, Err the first clip that failed. `work` is the stage's directory.
 pub fn run(env: &Env, fixture: &Fixture, apks: &Path, work: &Path, break_media: bool) -> Result<String, String> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;

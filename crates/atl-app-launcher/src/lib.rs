@@ -132,6 +132,15 @@ fn serve_codec_store() -> Result<()> {
     Ok(())
 }
 
+/// Step 1d. The extractor plugins of this process (atl-media-extractors): AOSP's media.extractor service registers them at its start, and this process runs with extractremote=false, so it never runs that service.
+#[cfg(feature = "converter")]
+fn load_media_extractors() {
+    atl_media_extractors::load();
+}
+
+#[cfg(not(feature = "converter"))]
+fn load_media_extractors() {}
+
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
 fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
@@ -168,6 +177,7 @@ fn run() -> Result<i32> {
     }
     install_service_view()?;
     serve_codec_store()?;
+    load_media_extractors();
     let mut vm_options = launch.vm_options.clone();
     if launch.app {
         vm_options.extend(native_bridge_options(
