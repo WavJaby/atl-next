@@ -79,8 +79,8 @@ pub struct Runtime {
     new_intent: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
-    /// A directory atld sees as `/sys/bus` (sensors gate: a fake IIO sysfs): atld then runs in a private user + mount namespace (`unshare -Urm`) with it bind-mounted there; the product reads the fixed path.
-    fake_sys_bus: Option<PathBuf>,
+    /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
+    fake_devices: Option<(PathBuf, PathBuf)>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -356,7 +356,7 @@ impl Runtime {
             ime_death_link: true,
             new_intent: true,
             sensor_service: true,
-            fake_sys_bus: None,
+            fake_devices: None,
         })
     }
 
@@ -448,9 +448,9 @@ impl Runtime {
         self
     }
 
-    /// atld (and so every process it starts) sees `dir` as `/sys/bus`.
-    pub fn with_fake_sys_bus(mut self, dir: PathBuf) -> Self {
-        self.fake_sys_bus = Some(dir);
+    /// atld (and so every process it starts) sees `sys_bus` as `/sys/bus` and `udev_data` as `/run/udev/data` (the udev database: the host's must exist as the mount point).
+    pub fn with_fake_devices(mut self, sys_bus: PathBuf, udev_data: PathBuf) -> Self {
+        self.fake_devices = Some((sys_bus, udev_data));
         self
     }
 }
@@ -638,18 +638,19 @@ impl Runtime {
             lib_path.push(dir);
         }
         // unshare and sh both exec (no --fork): the child's pid stays atld's, so stop() still reaches it
-        let mut cmd = match &self.fake_sys_bus {
+        let mut cmd = match &self.fake_devices {
             None => Command::new(&self.atld),
-            Some(dir) => {
+            Some((sys_bus, udev_data)) => {
                 let mut c = Command::new("unshare");
                 c.args([
                     "-Urm",
                     "--",
                     "sh",
                     "-c",
-                    r#"mount --bind "$0" /sys/bus && exec "$@""#,
+                    r#"mount --bind "$0" /sys/bus && mount --bind "$1" /run/udev/data && shift && exec "$@""#,
                 ])
-                .arg(dir)
+                .arg(sys_bus)
+                .arg(udev_data)
                 .arg(&self.atld);
                 c
             }

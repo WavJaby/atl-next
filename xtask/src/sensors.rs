@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test sensors`: the sensor service gate. The fixture APK (xtask/testdata/sensors) uses SensorManager in onCreate under atld, as `test app` runs its app; atld runs in a private user + mount namespace with a fake `/sys/bus` the gate writes (atld_run.rs `with_fake_sys_bus`), so the product reads its one fixed IIO path.
+//! `xtask test sensors`: the sensor service gate. The fixture APK (xtask/testdata/sensors) uses SensorManager in onCreate under atld, as `test app` runs its app; atld runs in a private user + mount namespace with a fake `/sys/bus` and `/run/udev/data` the gate writes (atld_run.rs `with_fake_devices`), so the product reads its fixed IIO and udev paths.
 //! Stage `empty`: no IIO device. Pass = the lookup (getSystemService + getDefaultSensor) within [`LOOKUP_LIMIT`], 0 sensors, default accelerometer null, registerListener false, no fault. Break `unregistered`: the services skip `sensorservice`, so SensorManager waits for it (60 tries, SensorManager.cpp `waitForSensorService`) and the lookup limit fails.
-//! Stage `iio`: one fake accelerometer. Pass = the sensor listed as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below from the written numbers, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
-//! Breaks `matrix` / `scale`: the gate writes an identity mount matrix / a doubled scale but expects the values of the real ones, so the value check must fail.
-//! Expected values (kernel sysfs-bus-iio): axis = raw x scale (offset 0), m/s²; device axis r = mount-matrix row r . sensor vector.
+//! Stage `iio`: two fake accelerometers, the owner's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
+//! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
+//! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
+//! Expected values, computed here independently: axis = raw x scale (offset 0, kernel sysfs-bus-iio), m/s²; canonical r = mount-matrix row r . sensor vector (iio-sensor-proxy `apply_mount_matrix`); Android = (-x, -y, z) of canonical (iio.rs `to_android` derives it).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,8 +26,12 @@ pub enum Stage {
 pub enum Break {
     /// stage empty: `sensorservice` not registered
     Unregistered,
-    /// stage iio: identity mount matrix written, rotated values expected
-    Matrix,
+    /// stage iio: no udev entry for the display device (the decoy sysfs matrix applies), the hwdb matrix's values expected
+    Hwdb,
+    /// stage iio: no udev entry for the base device (it is listed), one sensor expected
+    Location,
+    /// stage iio: canonical (unconverted) values expected
+    Frame,
     /// stage iio: doubled scale written, real values expected
     Scale,
 }
@@ -72,14 +77,19 @@ const TOLERANCE: f64 = 1e-4;
 const STOP_WAIT: Duration = Duration::from_secs(5);
 const TAIL: usize = 40;
 
-/// The fake device's numbers.
-const RAW: [i64; 3] = [100, -200, 1000];
-/// One raw step: 1 mg in m/s² (standard gravity 9.80665 / 1000).
-const SCALE: f64 = 0.009_806_65;
-/// A 90° mounting: device x = sensor y, device y = -sensor x.
-const MATRIX: [[f64; 3]; 3] = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
-const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+/// The display device's reading: the owner's laptop upright, measured 2026-11-06 as (-0.06, -8.71, -3.74) m/s², here in steps of [`SCALE`]. Every axis is non-zero, so each axis's sign is checked.
+const RAW: [i64; 3] = [-6, -871, -374];
+/// One raw step, m/s²: the hundredths the measurement was read in.
+const SCALE: f64 = 0.01;
+/// The laptop's hwdb `ACCEL_MOUNT_MATRIX` (owner, 2026-11-06): z negated.
+const MATRIX: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]];
+/// A sysfs `in_accel_mount_matrix` the udev property must beat (an x/y swap: its values differ on every axis pair).
+const DECOY: [[f64; 3]; 3] = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
 const DEVICE_NAME: &str = "atl-fake-accel";
+const BASE_NAME: &str = "atl-fake-base-accel";
+/// The fake devices' char device numbers (sysfs `dev`), which key their udev entries.
+const DEVICE_DEV: &str = "250:0";
+const BASE_DEV: &str = "250:1";
 
 fn matrix_text(m: &[[f64; 3]; 3]) -> String {
     m.iter()
@@ -93,8 +103,8 @@ fn matrix_text(m: &[[f64; 3]; 3]) -> String {
         .join("; ")
 }
 
-/// The values an app must see for RAW / SCALE / MATRIX.
-fn expected() -> [f64; 3] {
+/// RAW / SCALE through MATRIX: the Linux canonical frame.
+fn canonical() -> [f64; 3] {
     let s: Vec<f64> = RAW.iter().map(|r| *r as f64 * SCALE).collect();
     let mut d = [0.0; 3];
     for (r, row) in MATRIX.iter().enumerate() {
@@ -103,37 +113,62 @@ fn expected() -> [f64; 3] {
     d
 }
 
-/// The fake `/sys/bus`: `iio/devices/iio:device0` in stage iio, nothing in stage empty.
-fn write_sys_bus(dir: &Path, stage: Stage, brk: Option<Break>) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)?;
+/// The values an app must see: canonical with x and y negated.
+fn expected() -> [f64; 3] {
+    let c = canonical();
+    [-c[0], -c[1], c[2]]
+}
+
+/// The fake `/sys/bus` and udev database (`/run/udev/data`): in stage iio `iio/devices/iio:device0` (display) and `iio:device1` (base) with their `c<dev>` entries; nothing in stage empty.
+fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) -> Result<()> {
+    for dir in [sys_bus, udev] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        std::fs::create_dir_all(dir)?;
     }
-    std::fs::create_dir_all(dir)?;
     if stage == Stage::Empty {
         return Ok(());
     }
-    let dev = dir.join("iio/devices/iio:device0");
-    std::fs::create_dir_all(&dev)?;
     let scale = if brk == Some(Break::Scale) {
         2.0 * SCALE
     } else {
         SCALE
     };
-    let matrix = if brk == Some(Break::Matrix) {
-        &IDENTITY
-    } else {
-        &MATRIX
-    };
-    let files = [
-        ("name", DEVICE_NAME.to_owned()),
-        ("in_accel_x_raw", RAW[0].to_string()),
-        ("in_accel_y_raw", RAW[1].to_string()),
-        ("in_accel_z_raw", RAW[2].to_string()),
-        ("in_accel_scale", format!("{scale}")),
-        ("in_accel_mount_matrix", matrix_text(matrix)),
+    let display_db = format!(
+        "E:ACCEL_MOUNT_MATRIX={}\nE:ACCEL_LOCATION=display\n",
+        matrix_text(&MATRIX)
+    );
+    let devices = [
+        ("iio:device0", DEVICE_NAME, DEVICE_DEV, display_db, brk == Some(Break::Hwdb)),
+        (
+            "iio:device1",
+            BASE_NAME,
+            BASE_DEV,
+            "E:ACCEL_LOCATION=base\n".to_owned(),
+            brk == Some(Break::Location),
+        ),
     ];
-    for (n, t) in files {
-        std::fs::write(dev.join(n), format!("{t}\n")).with_context(|| format!("writing {n}"))?;
+    for (id, name, dev_no, db, skip_db) in devices {
+        let dev = sys_bus.join("iio/devices").join(id);
+        std::fs::create_dir_all(&dev)?;
+        let files = [
+            ("name", name.to_owned()),
+            ("dev", dev_no.to_owned()),
+            ("in_accel_x_raw", RAW[0].to_string()),
+            ("in_accel_y_raw", RAW[1].to_string()),
+            ("in_accel_z_raw", RAW[2].to_string()),
+            ("in_accel_scale", format!("{scale}")),
+            ("in_accel_mount_matrix", matrix_text(&DECOY)),
+        ];
+        for (n, t) in files {
+            std::fs::write(dev.join(n), format!("{t}\n"))
+                .with_context(|| format!("writing {id}/{n}"))?;
+        }
+        if !skip_db {
+            std::fs::write(udev.join(format!("c{dev_no}")), db)
+                .with_context(|| format!("writing the udev entry of {id}"))?;
+        }
     }
     Ok(())
 }
@@ -156,7 +191,7 @@ fn field<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The stage's checks over the fixture's messages and the services log; empty = pass.
-fn check(stage: Stage, msgs: &[String], services: &str) -> Vec<String> {
+fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<String> {
     let mut whys = Vec::new();
     let find = |p: &str| msgs.iter().find(|m| m.starts_with(p));
     match find("lookup ")
@@ -189,16 +224,15 @@ fn check(stage: Stage, msgs: &[String], services: &str) -> Vec<String> {
                 whys.push(format!("sensor count {n:?}, want 1"));
             }
             let d = find("default ");
-            let want = format!(
+            let default = format!(
                 "default name={DEVICE_NAME} type=1 stringType=android.sensor.accelerometer"
             );
-            if !d.is_some_and(|d| d.starts_with(&want)) {
-                whys.push(format!("want `{want} ...`, got {d:?}"));
+            if !d.is_some_and(|d| d.starts_with(&default)) {
+                whys.push(format!("want `{default} ...`, got {d:?}"));
             }
             if find("register=true").is_none() {
                 whys.push("registerListener did not return true".to_owned());
             }
-            let want = expected();
             let events: Vec<&String> = msgs.iter().filter(|m| m.starts_with("event ")).collect();
             if events.len() < MIN_EVENTS {
                 whys.push(format!("{} events, want >= {MIN_EVENTS}", events.len()));
@@ -225,7 +259,7 @@ fn check(stage: Stage, msgs: &[String], services: &str) -> Vec<String> {
                 }
                 if v.len() != 3 || v.iter().zip(want).any(|(g, w)| (g - w).abs() > TOLERANCE) {
                     whys.push(format!(
-                        "values {v:?}, want {want:?} (raw x scale through the mount matrix)"
+                        "values {v:?}, want {want:?} (raw x scale through the mount matrix, then to the Android frame)"
                     ));
                 }
             }
@@ -260,8 +294,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gl_driver()?;
     let work = rt.out.join("sensors");
     let sys_bus = work.join("sys-bus");
-    write_sys_bus(&sys_bus, args.stage, args.break_)?;
-    rt = rt.with_fake_sys_bus(sys_bus.clone());
+    let udev = work.join("udev-data");
+    write_devices(&sys_bus, &udev, args.stage, args.break_)?;
+    rt = rt.with_fake_devices(sys_bus.clone(), udev);
     if args.break_ == Some(Break::Unregistered) {
         rt = rt.without_sensor_service();
     }
@@ -344,7 +379,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("{name}: counter {l}");
     }
     let msgs = messages(&app);
-    let mut whys = check(args.stage, &msgs, &services);
+    let want = if args.break_ == Some(Break::Frame) {
+        canonical()
+    } else {
+        expected()
+    };
+    let mut whys = check(args.stage, &msgs, &services, want);
     if let Some(f) = fault {
         whys.push(format!("the app faulted: {f}"));
     }
@@ -386,11 +426,11 @@ mod tests {
 
     #[test]
     fn expected_values_follow_the_iio_abi() {
-        // by hand: sensor = (0.980665, -1.96133, 9.80665); device x = sensor y, device y = -sensor x
+        // by hand: sensor = (-0.06, -8.71, -3.74); canonical (z negated) = (-0.06, -8.71, 3.74); Android = (0.06, 8.71, 3.74): upright y = +g, lid leaning back z > 0
         let e = expected();
-        assert!((e[0] - -1.961_33).abs() < 1e-9);
-        assert!((e[1] - -0.980_665).abs() < 1e-9);
-        assert!((e[2] - 9.806_65).abs() < 1e-9);
+        assert!((e[0] - 0.06).abs() < 1e-9);
+        assert!((e[1] - 8.71).abs() < 1e-9);
+        assert!((e[2] - 3.74).abs() < 1e-9);
     }
 
     #[test]
@@ -403,14 +443,15 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        assert!(check(Stage::Empty, &empty_ok, "").is_empty());
+        let want = expected();
+        assert!(check(Stage::Empty, &empty_ok, "", want).is_empty());
         let stalled: Vec<String> = vec![
             "lookup ms=60123".into(),
             "list n=0".into(),
             "default null register=false".into(),
             "done".into(),
         ];
-        assert!(!check(Stage::Empty, &stalled, "").is_empty());
+        assert!(!check(Stage::Empty, &stalled, "", want).is_empty());
         let ev = |ts: i64, v: &str| format!("event ts={ts} now={} v={v}", ts + 1000);
         let mut iio: Vec<String> = vec![
             "lookup ms=5".into(),
@@ -421,13 +462,13 @@ mod tests {
             "register=true".into(),
         ];
         for i in 0..5 {
-            iio.push(ev(100 + i, "-1.96133,-0.980665,9.80665"));
+            iio.push(ev(100 + i, "0.06,8.71,3.74"));
         }
         iio.push("done events=5".into());
         let stopped = format!("sensor: {DEVICE_NAME} (handle 1) stopped");
-        assert_eq!(check(Stage::Iio, &iio, &stopped), Vec::<String>::new());
-        // the identity matrix's values
-        iio[4] = ev(100, "0.980665,-1.96133,9.80665");
-        assert!(!check(Stage::Iio, &iio, &stopped).is_empty());
+        assert_eq!(check(Stage::Iio, &iio, &stopped, want), Vec::<String>::new());
+        // the canonical (unconverted) values
+        iio[4] = ev(100, "-0.06,-8.71,3.74");
+        assert!(!check(Stage::Iio, &iio, &stopped, want).is_empty());
     }
 }

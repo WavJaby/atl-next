@@ -49,7 +49,8 @@ pub struct Accelerometer {
     pub min_period: std::time::Duration,
 }
 
-/// The machine's motion sensors. Values are in the device frame of the machine's natural orientation (x right, y up the screen, z out of the screen), m/s², gravity included: the source has applied its scale and mounting.
+/// The machine's motion sensors. Values are Android's `SensorEvent` frame of the display's natural orientation (x right, y up the screen, z out of the screen; at rest the axis pointing up reads +g), m/s², gravity included: the source has applied its scale, mounting and frame conversion.
+/// Only sensors in the display count (a laptop base's accelerometer is not the display's without hinge-angle compensation). Values never follow the display rotation: apps remap with `Display.getRotation()`.
 pub trait Sensors: Send + Sync {
     /// The accelerometers present now; empty when there are none.
     fn accelerometers(&self) -> Vec<Accelerometer>;
