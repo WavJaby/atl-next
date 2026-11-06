@@ -21,6 +21,10 @@ clap = { version = "4", features = ["derive"] }
 cxx = "1.0.205"
 cxx-build = "1.0.205"
 errno = "0.3"
+# the desktop's font configuration (atl-platform-host-linux fonts.rs), linked: fontconfig is a required system library; deny.toml keeps it in the platform layer
+fontconfig = "0.11.0"
+# CLDR likely subtags (atl-fonts): AOSP's `und-<Script>` fallback langs -> the language a desktop font lists (`und-Hebr` -> `he`), from ICU4X's compiled data instead of a hand table
+icu_locale = "2"
 # SYS_* syscall numbers per target arch (atl-broker seccomp filter); the only use of libc is those constants
 landlock = "0.4.7"
 libc = "0.2"
@@ -34,6 +38,8 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 roxmltree = "0.21"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }
+# what a face is (atl-fonts): OS/2 weight + italic, post fixed pitch, fvar axes, name ID 6, cmap + hmtx for the font gate; fontations' parser of untrusted font files (ttf-parser: RUSTSEC-2026-0192 unmaintained)
+read-fonts = "0.46"
 seccompiler = "0.5"
 serde_json = "1"
 spdx = "0.13"

@@ -173,6 +173,21 @@ impl Step {
                     service_mirrors::FILE,
                     mirrors.len()
                 );
+                // fonts.toml: rows = AOSP's named families at the pin
+                let fonts =
+                    atl_fonts::Table::parse(&std::fs::read_to_string(root.join("fonts.toml"))?)?;
+                let aosp_fonts = layout
+                    .locate(Path::new("aosp/frameworks/base"))
+                    .dir
+                    .join("data/fonts/fonts.xml");
+                fonts.check_against_aosp(
+                    &std::fs::read_to_string(&aosp_fonts)
+                        .with_context(|| aosp_fonts.display().to_string())?,
+                )?;
+                eprintln!(
+                    "tables: fonts.toml ok ({} rows = AOSP's named families)",
+                    fonts.rows.len()
+                );
                 Ok(())
             }
             Step::Modules => {

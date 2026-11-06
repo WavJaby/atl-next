@@ -12,6 +12,7 @@ anyhow.workspace = true
 atl-binderd = { path = "../atl-binderd" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
+atl-fonts = { path = "../atl-fonts" }
 atl-gralloc = { path = "../atl-gralloc" }
 atl-platform-host = { path = "../atl-platform-host" }
 atl-property-service = { path = "../atl-property-service" }

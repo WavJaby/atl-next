@@ -36,10 +36,10 @@ uses = ["binder", "android-paths"]
 crates = ["atl-android-paths"]
 exports = ["atl-android-paths"]
 
-# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions)
+# M2 wiring: binderd, servicemanager, the services and the apps, each a process started through the broker; serves the services' process control; the install step reads the package records (services' plain types); the VINTF manifests declare the graphics HALs (gralloc's definitions); the system font files come from the desktop's fonts (fonts)
 [atld]
 crates = ["atld"]
-uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "android-paths"]
+uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "services", "android-paths", "fonts"]
 
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
@@ -114,7 +114,13 @@ uses = ["aidl", "platform-ui", "generators"]
 crates = ["atl-platform-types"]
 exports = ["atl-platform-types"]
 
-# the host half of the platform layer (plan S1 `atl-platform-host`): the desktop's monitors as atld and xtask read them (refresh rate so far); the GDK implementation is the second crate deny.toml lets depend on GTK
+# Android's system font list from the desktop's (plan C7): fonts.toml + AOSP's alias/fallback-order data + the platform layer's FontSource -> font_fallback.xml, fonts.xml and the font dirs to expose
+[fonts]
+crates = ["atl-fonts"]
+exports = ["atl-fonts"]
+uses = ["platform-host"]
+
+# the host half of the platform layer (plan S1 `atl-platform-host`): the desktop's monitors and fonts as atld and xtask read them (refresh rate so far); the GDK implementation is the second crate deny.toml lets depend on GTK
 [platform-host]
 crates = ["atl-platform-host-api", "atl-platform-host-linux", "atl-platform-host"]
 exports = ["atl-platform-host"]
@@ -151,5 +157,5 @@ exports = ["atl-layout"]
 
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for
-uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts: the tables step checks fonts.toml, the font gate reads the pinned fonts' tables
+uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts"]

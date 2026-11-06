@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FRAMEWORK, VENDOR};
+use atl_android_paths::{
+    DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
+};
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox, to_log};
 use atl_gralloc::vintf;
@@ -80,7 +82,10 @@ struct Args {
     /// The converter's build.prop: the property area's source, /system/build.prop.
     #[arg(long)]
     build_prop: PathBuf,
-    /// A file of /system or /vendor besides the framework's (repeat): `<host path>=<absolute Android path>`, linked there (the system fonts: /system/etc/font_fallback.xml, /system/fonts/<name>; the GL driver: /vendor/lib64/egl/<name>).
+    /// AOSP's font data dir (frameworks/base/data/fonts): its alias.json and fallback_order.json, read as-is; the fonts themselves are the desktop's.
+    #[arg(long)]
+    font_data: PathBuf,
+    /// A file of /system or /vendor besides the framework's (repeat): `<host path>=<absolute Android path>`, linked there (the GL driver: /vendor/lib64/egl/<name>).
     #[arg(long = "file", value_parser = partition_file)]
     files: Vec<(PathBuf, PathBuf)>,
     /// A shared library packages may `<uses-library>` (repeat): `<name>=<host jar>[,<dependency name>...]`, linked as /system/framework/<file name> and registered with the package manager
@@ -255,6 +260,33 @@ fn link_into_framework(r: &Root, host: &Path) -> Result<String> {
 
 /// The system CA store below /system (cacerts.rs); the staged ART root's `etc/security/cacerts` links to it.
 const CACERTS: &str = "etc/security/cacerts";
+
+/// The system font list from the desktop's (atl-fonts): `/system/etc/font_fallback.xml` (SystemFonts.FONTS_XML) and the legacy `/system/etc/fonts.xml`, each face named `<k>/<file>` below /system/fonts.
+/// Returns the host dirs of the faces: dir k is bound read-only at /system/fonts/<k> into every app (empty mount points made here, since /system is read-only inside).
+/// No sans-serif on the desktop fails the start: Typeface.setSystemFontMap needs DEFAULT_FAMILY.
+fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
+    let data = |f: &str| {
+        let p = a.font_data.join(f);
+        std::fs::read_to_string(&p).with_context(|| p.display().to_string())
+    };
+    let table = atl_fonts::Table::parse(atl_fonts::FONTS_TOML)?;
+    let src = atl_platform_host::PlatformFonts::new()?;
+    let model = atl_fonts::build(
+        &src,
+        &atl_fonts::FileReader,
+        &table,
+        atl_fonts::parse_aliases(&data("alias.json")?)?,
+        &atl_fonts::parse_order(&data("fallback_order.json")?)?,
+    )?;
+    let etc = r.system().join("etc");
+    std::fs::create_dir_all(&etc)?;
+    std::fs::write(etc.join("font_fallback.xml"), model.font_fallback_xml())?;
+    std::fs::write(etc.join("fonts.xml"), model.fonts_xml())?;
+    for k in 0..model.dirs.len() {
+        std::fs::create_dir_all(r.system().join("fonts").join(k.to_string()))?;
+    }
+    Ok(model.dirs)
+}
 
 /// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it; /system's CA store from the distro bundle.
 fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
@@ -434,6 +466,8 @@ struct Host {
     art_root: PathBuf,
     /// the boot classpath as the sandbox sees it
     boot: Vec<String>,
+    /// the desktop's font dirs, dir k bound at /system/fonts/<k> (font_layout)
+    fonts: Vec<PathBuf>,
     /// the default property set and the display model: what [`Host::process_properties`] builds an app process's area from
     defaults: Vec<Property>,
     display: DisplayModel,
@@ -540,12 +574,19 @@ impl Host {
         Ok(Spawn {
             uid,
             context_manager: false,
-            mounts: vec![
-                Mount {
-                    host: self.root.system(),
-                    at: SYSTEM.into(),
-                    writable: false,
-                },
+            mounts: [Mount {
+                host: self.root.system(),
+                at: SYSTEM.into(),
+                writable: false,
+            }]
+            .into_iter()
+            // the desktop's font dirs inside /system, after it (font_layout)
+            .chain(self.fonts.iter().enumerate().map(|(k, host)| Mount {
+                host: host.clone(),
+                at: Path::new(SYSTEM_FONTS).join(k.to_string()),
+                writable: false,
+            }))
+            .chain([
                 // as on Android, apps read /vendor: libEGL loads the GL driver from /vendor/lib64/egl into the app
                 Mount {
                     host: self.root.vendor(),
@@ -557,7 +598,8 @@ impl Host {
                     at: DATA.into(),
                     writable: true,
                 },
-            ],
+            ])
+            .collect(),
             links: vec![],
             // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
             devices: vec![PathBuf::from(DRM_DIR)],
@@ -788,6 +830,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(r.root.join("log"))?;
     let defaults = property_area(a, &r)?;
     let boot = system_layout(a, &r)?;
+    let fonts = font_layout(a, &r)?;
     vintf_layout(a, &r)?;
     let mut libraries = Vec::new();
     for (name, lib) in &a.shared_libraries {
@@ -877,6 +920,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         log_tags: a.log_tags.clone(),
         art_root: a.art_root.clone(),
         boot,
+        fonts,
         defaults,
         display,
         headless_pointer: a.headless_pointer.clone(),

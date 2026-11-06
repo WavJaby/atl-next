@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: MIT
+# The named Android font families and the desktop font each one follows (plan C7): atld asks the platform layer's FontSource (fontconfig on Linux) and writes /system/etc/font_fallback.xml + the legacy /system/etc/fonts.xml (crate atl-fonts).
+# One row per named family of AOSP's fonts.xml (frameworks/base/data/fonts/fonts.xml `<family name>`); `cargo xtask check` step `tables` fails when the two sets differ, and on a row naming a missing row.
+#
+# Row key: the Android family name (Typeface.create(name)).
+#   query    fontconfig family or generic to ask for; the head (first face of the desktop's sorted answer) is the candidate
+#   width    optional width to ask for (fontconfig scale: 100 normal, 75 condensed)
+#   accept   when the head counts as this family, else the row emits nothing and Typeface falls back to sans-serif, as on an AOSP device lacking it:
+#              required    always; no answer fails atld's start (sans-serif: Typeface.DEFAULT_FAMILY must exist)
+#              differs     the head is not row `from`'s head (a desktop without that generic answers its default)
+#              monospaced  the head's `post.isFixedPitch` is set
+#              narrower    the head's width is below 100
+#              named       the head's family equals `query` (ignoring case): an exact family, never a stand-in
+#   from     the row `differs` compares with
+#   none     instead of query/accept: why no desktop font maps (the row emits nothing)
+# Row order is the XML's: sans-serif first (FontListParser: the first family is also the default fallback).
+
+[sans-serif]
+query = "sans-serif"
+accept = "required"
+
+[serif]
+query = "serif"
+accept = "differs"
+from = "sans-serif"
+
+[monospace]
+query = "monospace"
+accept = "monospaced"
+
+[serif-monospace]
+query = "courier"
+accept = "differs"
+from = "monospace"
+
+[sans-serif-condensed]
+query = "sans-serif"
+width = 75
+accept = "narrower"
+
+[cursive]
+query = "cursive"
+accept = "differs"
+from = "sans-serif"
+
+[source-sans-pro]
+query = "Source Sans 3"
+accept = "named"
+
+[roboto-flex]
+query = "Roboto Flex"
+accept = "named"
+
+[casual]
+none = "no desktop generic for AOSP's casual (Coming Soon); fontconfig has no such alias"
+
+[sans-serif-smallcaps]
+none = "no desktop generic for small caps (AOSP: Carrois Gothic SC); fontconfig has no such alias"

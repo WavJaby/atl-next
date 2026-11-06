@@ -24,12 +24,6 @@ use crate::{manifest, packages, slot, tree};
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
 const GL_FRONTS: [&str; 3] = ["libEGL", "libGLESv1_CM", "libGLESv2"];
-/// The system fonts of the test layout (stand-in until the desktop's fonts come through the platform layer): ActivityThread.handleBindApplication loads `/system/etc/font_fallback.xml`
-/// (SystemFonts.FONTS_XML) and every file it names under `/system/fonts/` (SystemFonts.DEVICE_FONT_DIR), and Typeface needs a `sans-serif` family (Typeface.DEFAULT_FAMILY) to start.
-/// The one font in this tree that AOSP ships and licenses as Apache-2.0 with a Latin range, AOSP's own monospace font, serves as that family; the XML is FontListParser's format (fonts.xml's `<family name><font weight style>`).
-const FONT_FILE: &str = "DroidSansMono.ttf";
-const FONT_DIR: &str = "frameworks/base/data/fonts";
-const FONT_FALLBACK_XML: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<familyset version=\"23\">\n    <family name=\"sans-serif\">\n        <font weight=\"400\" style=\"normal\">DroidSansMono.ttf</font>\n    </family>\n</familyset>\n";
 
 /// The staged runtime and the tools around it.
 pub struct Runtime {
@@ -46,8 +40,8 @@ pub struct Runtime {
     sandbox_stub: PathBuf,
     atld: PathBuf,
     framework_res: PathBuf,
-    font_xml: PathBuf,
-    font_file: PathBuf,
+    /// The pinned test fonts atld reads as the desktop's (test_fonts.rs): its FONTCONFIG_FILE and `--font-data`.
+    fonts: crate::test_fonts::TestFonts,
     /// AOSP's keyboards dir: its [`tree::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
@@ -335,12 +329,8 @@ impl Runtime {
             "missing input {}",
             framework_res.display()
         );
-        let fonts = out.join("fonts");
-        std::fs::create_dir_all(&fonts)?;
-        let font_xml = fonts.join("font_fallback.xml");
-        std::fs::write(&font_xml, FONT_FALLBACK_XML)?;
-        let font_file = tree::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
-        ensure!(font_file.is_file(), "missing input {}", font_file.display());
+        let fonts =
+            crate::test_fonts::stage(&layout, &out.join("fonts"), crate::test_fonts::ROBOTO.2)?;
         let keychars = tree::keyboards(&layout);
         for (file, _) in tree::KEYBOARD_FILES {
             let path = keychars.join(file);
@@ -383,8 +373,7 @@ impl Runtime {
             sandbox_stub,
             atld,
             framework_res,
-            font_xml,
-            font_file,
+            fonts,
             keychars,
             gralloc: None,
             gl_driver: None,
@@ -427,6 +416,12 @@ impl Runtime {
             files.push((lib, format!("{system_lib}/{m}.so")));
         }
         self.gl_driver = Some((files, dirs));
+        Ok(self)
+    }
+
+    /// Restages the test fonts with `family` preferred for sans-serif (the font gate's deliberate break: the mono font).
+    pub fn with_sans_serif(mut self, layout: &Layout, family: &str) -> Result<Self> {
+        self.fonts = crate::test_fonts::stage(layout, &self.out.join("fonts"), family)?;
         Ok(self)
     }
 
@@ -653,13 +648,9 @@ impl Runtime {
             .iter()
             .map(|(file, _)| self.keychars.join(file))
             .collect();
-        let mut staged: Vec<&Path> = vec![
-            &self.art.lib_path,
-            &self.native_bridge,
-            &self.framework_res,
-            &self.font_xml,
-            &self.font_file,
-        ];
+        let mut staged: Vec<&Path> =
+            vec![&self.art.lib_path, &self.native_bridge, &self.framework_res];
+        staged.extend(self.fonts.files.iter().map(PathBuf::as_path));
         staged.extend(keychars.iter().map(PathBuf::as_path));
         staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
         if let Some((files, dirs)) = &self.gl_driver {
@@ -729,16 +720,10 @@ impl Runtime {
             .arg(&self.art.build_prop)
             .arg("--framework-res")
             .arg(&self.framework_res)
-            .arg("--file")
-            .arg(format!(
-                "{}=/system/etc/font_fallback.xml",
-                self.font_xml.display()
-            ))
-            .arg("--file")
-            .arg(format!(
-                "{}=/system/fonts/{FONT_FILE}",
-                self.font_file.display()
-            ))
+            .arg("--font-data")
+            .arg(&self.fonts.font_data)
+            // atld asks fontconfig for the desktop's fonts: here the pinned set (test_fonts.rs)
+            .env("FONTCONFIG_FILE", &self.fonts.conf)
             .args(tree::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
                 [
                     "--file".to_owned(),

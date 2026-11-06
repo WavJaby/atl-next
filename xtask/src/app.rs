@@ -3,6 +3,7 @@
 //! AOSP servicemanager, the M2 services (atl-system-services), then the services start the app through atld's process control (the broker's sandbox); ActivityThread attaches, is bound, launches the activity.
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
 //! Every run has the graphics allocator HAL (it must register with servicemanager, the VINTF-declared way) and the GL driver (`Runtime::with_gl_driver`).
+//! Fonts sub-gate ([`FONTS`]): the app's text advances equal the pinned test fonts' hmtx sums, i.e. atld's font list (atl-fonts via fontconfig) reached Typeface; `--font-break` must fail it.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines};
+use crate::test_fonts;
 use crate::window::{self, WINDOW_MS};
 use crate::{jni_fixture, manifest};
 
@@ -33,6 +35,9 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
+    /// The test fonts' conf prefers the mono font for sans-serif, so the fonts sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    font_break: bool,
 }
 
 /// The fixture's dir.
@@ -41,6 +46,12 @@ const FIXTURE: &str = "xtask/testdata/app";
 const MARKER: &str = "AtlTest: onCreate reached";
 /// Main.onCreate's CA line before [`MARKER`]: the default TrustManagerFactory trusts a distro root (atld's /system CA store, cacerts.rs); `cacerts: trusted ...` passes, `cacerts: FAIL ...` says why not.
 const CACERTS: &str = "AtlTest: cacerts: ";
+/// Main.onCreate's fonts line: `default=<adv> monospace=<adv>`, Typeface.DEFAULT's and MONOSPACE's advance of [`FONT_TEXT`] at text size 2048 (Main.FONT_SIZE), kerning/ligatures off.
+/// Pass: each equals the pinned font's hmtx sum (test_fonts.rs `advance`, read-fonts): Roboto for the default (atld's fonts.toml sans-serif row through fontconfig), Droid Sans Mono for monospace.
+const FONTS: &str = "AtlTest: fonts: ";
+const FONT_TEXT: &str = "Handgloves";
+/// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
+const FONT_SIZE: u16 = 2048;
 /// What Main.onCreate logs before MARKER when the bridge-1 fixture did not load; the gate wants it to carry the NativeBridge core's refusal (`atl_native_bridge::LOAD_REFUSED` + the library's path): proof that libnativeloader routed the library to our `loadLibrary`.
 const BRIDGE1: &str = "AtlTest: bridge1 not loaded: java.lang.UnsatisfiedLinkError";
 /// The fixture's file name in the APK (jni_fixture.rs LIB), which the refusal names.
@@ -56,8 +67,40 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// The fonts line against the pinned fonts' tables: one reason per mismatch.
+fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
+    let Some(line) = line else {
+        return Ok(vec!["no fonts line".into()]);
+    };
+    let mut whys = Vec::new();
+    for (key, font) in [
+        ("default", test_fonts::ROBOTO),
+        ("monospace", test_fonts::MONO),
+    ] {
+        let (want, upem) = test_fonts::advance(&test_fonts::file(layout, font), FONT_TEXT)?;
+        if upem != FONT_SIZE {
+            whys.push(format!(
+                "{}: unitsPerEm {upem}, the fixture measures at {FONT_SIZE}",
+                font.1
+            ));
+            continue;
+        }
+        let got = line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(&format!("{key}=")))
+            .and_then(|v| v.parse::<f32>().ok());
+        if got != Some(want as f32) {
+            whys.push(format!(
+                "{key}: advance {got:?}, want {want} ({} hmtx)",
+                font.1
+            ));
+        }
+    }
+    Ok(whys)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let _ = Layout::of(root)?;
+    let layout = Layout::of(root)?;
     let rt = Runtime::new(
         root,
         &args.host,
@@ -69,6 +112,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
     .with_gl_driver()?;
+    let rt = if args.font_break {
+        rt.with_sans_serif(&layout, test_fonts::MONO.2)?
+    } else {
+        rt
+    };
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
     let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
@@ -180,6 +228,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
         None => {}
     }
+    let fonts_line = app
+        .lines()
+        .find_map(|l| l.split_once(FONTS).map(|(_, r)| r.to_owned()));
+    if passed {
+        whys.extend(
+            font_check(&layout, fonts_line.as_deref())?
+                .into_iter()
+                .map(|w| format!("fonts: {w}")),
+        );
+    }
     if passed && !bridge1_ok {
         whys.push(format!(
             "bridge1: want UnsatisfiedLinkError with the NativeBridge refusal for {BRIDGE1_LIB}, got {:?}",
@@ -201,6 +259,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if passed && gralloc_ok {
         println!("app: cacerts {cacerts}");
+        println!(
+            "app: pass fonts {} = pinned hmtx",
+            fonts_line.unwrap_or_default()
+        );
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         println!("app: gralloc registered: {}", gralloc_log.trim());
         return Ok(ExitCode::SUCCESS);

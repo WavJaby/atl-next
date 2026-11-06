@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-fonts"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Android's system font list from the desktop's (plan C7): fonts.toml rows + AOSP's alias.json / fallback_order.json + the platform layer's FontSource -> /system/etc/font_fallback.xml and the legacy /system/etc/fonts.xml, and the font dirs the sandbox exposes. Core crate, no unsafe.
+
+[dependencies]
+atl-platform-host = { path = "../atl-platform-host" }
+icu_locale.workspace = true
+read-fonts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+roxmltree.workspace = true
+
+[lints]
+workspace = true

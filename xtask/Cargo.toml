@@ -13,6 +13,7 @@ atl-binderd = { path = "../crates/atl-binderd" }
 atl-android-paths = { path = "../crates/atl-android-paths" }
 atl-broker = { path = "../crates/atl-broker" }
 atl-gralloc = { path = "../crates/atl-gralloc" }
+atl-fonts = { path = "../crates/atl-fonts" }
 atl-layout = { path = "../crates/atl-layout" }
 atl-native-bridge = { path = "../crates/atl-native-bridge" }
 atl-platform-host = { path = "../crates/atl-platform-host" }
@@ -26,6 +27,7 @@ serde_json.workspace = true
 spdx.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+read-fonts.workspace = true
 
 [lints]
 workspace = true

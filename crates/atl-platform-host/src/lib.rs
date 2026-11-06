@@ -6,6 +6,8 @@
 pub use atl_platform_host_api::*;
 
 #[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::FcFonts as PlatformFonts;
+#[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::IioSensors as PlatformSensors;
@@ -21,6 +23,8 @@ fn implements_the_api() {
     desktop::<PlatformDesktop>();
     fn sensors<T: Sensors + Default>() {}
     sensors::<PlatformSensors>();
+    fn fonts<T: FontSource>() {}
+    fonts::<PlatformFonts>();
 }
 
 /// The first monitor, from a connection let go at once; `None` where the desktop lists none. `Err`: no desktop answers.

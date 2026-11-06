@@ -23,6 +23,8 @@ pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
 pub const VENDOR_BUILD_PROP: &str = "/vendor/build.prop";
 /// Framework jars and their libraries (`Environment.getRootDirectory()/framework`).
 pub const SYSTEM_FRAMEWORK: &str = "/system/framework";
+/// The system fonts (SystemFonts.DEVICE_FONT_DIR); the desktop's font dirs are bound read-only at `<k>/` below it.
+pub const SYSTEM_FONTS: &str = "/system/fonts";
 /// The CA store Conscrypt's `TrustedCertificateStore` reads (`$ANDROID_ROOT/etc/security/cacerts`).
 pub const SYSTEM_CACERTS: &str = "/system/etc/security/cacerts";
 /// AOSP's key layout for a keyboard with no own files (`KeyMap::load`'s `Generic` fallback under `$ANDROID_ROOT/usr/keylayout`), where the environment links it.

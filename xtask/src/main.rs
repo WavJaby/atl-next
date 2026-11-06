@@ -70,6 +70,7 @@ mod slot;
 mod sources;
 mod spdx;
 mod system;
+mod test_fonts;
 mod tree;
 mod tree_gate;
 mod triage;
