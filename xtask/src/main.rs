@@ -28,6 +28,7 @@ mod git;
 mod gles2_fixture;
 mod gralloc;
 mod host_art;
+mod host_disk;
 mod instrument;
 mod jni_fixture;
 mod land;

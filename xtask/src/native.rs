@@ -55,9 +55,20 @@ pub struct Args {
     /// Failure summary: every distinct error message, undefined symbol and failed dependency per module (default: the first few; ninja.log keeps the full output).
     #[arg(long, short)]
     verbose: bool,
+    /// WSL only: refuse to start when the Windows drive holding the distro's vhdx has less free space (GiB). 6: a full libandroid_runtime build from cold grows the vhdx by
+    /// several GiB, and a host drive that fills mid-build fails writes inside the distro (owner's hard stop).
+    #[arg(long, default_value_t = 6)]
+    host_free_stop_gib: u64,
+    /// WSL only: under this much free space (GiB) on that drive, a note asks to compact the vhdx (owner: compact when C: < 30 GB). Only a note, never a refusal.
+    #[arg(long, default_value_t = 30)]
+    host_free_compact_gib: u64,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    crate::host_disk::check(crate::host_disk::Limits {
+        stop_gib: args.host_free_stop_gib,
+        compact_gib: args.host_free_compact_gib,
+    })?;
     let arches = arches::load(root)?;
     let (pointer_bits, arch_variant, abi, prebuilt_os) = match arches.get(&args.host) {
         Some(a @ arches::Arch { host: Some(h), .. }) => (
