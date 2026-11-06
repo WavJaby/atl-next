@@ -250,7 +250,7 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 # Keep-sets of the prebuilts-audit "safe now" verdicts: each drops subtrees with no slot-1 read and no known consumer. Everything not named in a row's comment is kept (unmeasured dirs included).
 # Rows are hand-declared, not yet checked against build.ninja (audit Method); the fetch checks each dir exists at the pin.
 [aosp.sparse]
-"prebuilts/build-tools" = ["linux-arm64", "linux-x86/bin", "path", "tests"] # drops darwin-x86, linux_musl-x86, sysroots, common, linux-x86/{asan,lib64}
+"prebuilts/build-tools" = ["linux-arm64", "linux-x86/bin", "tests"] # drops darwin-x86, linux_musl-x86, sysroots, common, linux-x86/{asan,lib64}, path (Soong's PATH sandbox; 75 of its symlinks point into darwin-x86)
 "prebuilts/jdk/jdk21" = ["linux-x86"] # drops darwin-arm64, darwin-x86, windows-x86
 "external/cronet" = ["android", "stable", "test_runner"] # drops tot/ (0 reads; its 102 Android.bp are still parsed today)
 "packages/modules/NeuralNetworks" = ["apex", "extensions", "flags", "framework", "service", "shim_and_sl"] # drops runtime, tools, driver, common
