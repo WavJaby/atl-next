@@ -19,13 +19,13 @@ use crate::callbacks::{
     AcquireTimeOrFence, FrameEventHistoryStats, ListenerStats, NO_RELEASE_CALLBACK, ReleaseBuffer,
     ReleaseCallbackId, SurfaceStats, TransactionStats,
 };
-use crate::parcel::{BinderKey, FdObject, StrongBinder};
 use crate::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
-use crate::state::{
+use atl_libgui_parcel::parcel::{BinderKey, FdObject, StrongBinder};
+use atl_libgui_parcel::state::{
     BufferData, CallbackId, Fence, FloatRect, GraphicBuffer, LayerState, ListenerCallbacks, Rect,
     buffer_data_change, layer_flags, what,
 };
-use crate::transaction::TransactionState;
+use atl_libgui_parcel::transaction::TransactionState;
 
 /// A layer colour component meaning "no fill": RequestedLayerState sets r, g, b to -1 for `eNoColorFill`, and `fillsColor` needs all three >= 0.
 const NO_COLOR_FILL: f32 = -1.0;

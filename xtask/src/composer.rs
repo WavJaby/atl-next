@@ -88,13 +88,13 @@ fn check(name: &'static str, ok: bool, detail: impl Into<String>) -> Check {
 }
 
 /// `key=value` of a `composer: counters` line.
-fn field(line: &str, key: &str) -> Option<u64> {
+pub(crate) fn field(line: &str, key: &str) -> Option<u64> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
 }
 
 /// The last `composer: counters` line: the compositor prints one each time its clock goes idle, so the last is the state after everything.
-fn last_counters(app: &str) -> Option<&str> {
+pub(crate) fn last_counters(app: &str) -> Option<&str> {
     app.lines()
         .rev()
         .find(|l| l.contains("composer: counters "))

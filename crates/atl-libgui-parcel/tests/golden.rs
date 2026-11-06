@@ -3,9 +3,9 @@
 //! Java built it with real `SurfaceControl.Transaction` setters (values in CompositorTruth.java `Fixture`); the codec must decode it, and encode the state again byte for byte.
 //! Object fields (binder / cookie pointers) are those of the capturing process; they are carried, not interpreted.
 
-use atl_compositor::parcel::WireParcel;
-use atl_compositor::state::what;
-use atl_compositor::transaction::TransactionState;
+use atl_libgui_parcel::parcel::WireParcel;
+use atl_libgui_parcel::state::what;
+use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 
 const DUMP: &[u8] = include_bytes!("../testdata/transaction_libgui_writer.dump");
 
@@ -68,4 +68,39 @@ fn state_re_encodes_to_libgui_bytes() {
     assert_eq!(out.data(), &p.data()[..end], "the state's bytes");
     let objects: Vec<usize> = p.objects().iter().copied().filter(|o| *o < end).collect();
     assert_eq!(out.objects(), objects, "the state's object table");
+}
+
+/// The whole client Transaction (state + listener suffix) is libgui's bytes after Java's int, byte for byte; nothing is left over.
+#[test]
+fn client_transaction_reads_whole_and_re_encodes() {
+    let p = WireParcel::from_dump(DUMP).expect("dump parses");
+    let mut r = p.reader();
+    assert_eq!(r.read_i32().expect("leading int"), 1);
+    let t = Transaction::read(&mut r).expect("libgui's bytes decode");
+    r.finish()
+        .expect("the Transaction is the whole parcel after Java's int");
+    let mut out = WireParcel::new();
+    out.write_i32(1);
+    t.write(&mut out).expect("encodes");
+    assert_eq!(out.data(), p.data());
+    assert_eq!(out.objects(), p.objects());
+}
+
+/// IWindowSession.finishDrawing(IWindow, in Transaction, int seqId) (IWindowSession.aidl:140): the AIDL arg after a Transaction is read where the Transaction ends.
+/// The seqId value is arbitrary: any int must come back as written.
+#[test]
+fn seq_id_after_the_transaction_reads_back() {
+    const SEQ_ID: i32 = 0x1234_5678;
+    let (mut data, objects) = WireParcel::from_dump(DUMP)
+        .expect("dump parses")
+        .into_parts();
+    let transaction_len = data.len();
+    data.extend_from_slice(&SEQ_ID.to_le_bytes());
+    let p = WireParcel::from_wire(data, objects).expect("wire");
+    let end = Transaction::end_in(&p, 4).expect("frames");
+    assert_eq!(end, transaction_len);
+    let mut r = p.reader();
+    r.skip_to(end).expect("seek");
+    assert_eq!(r.read_i32().expect("seqId"), SEQ_ID);
+    r.finish().expect("nothing after seqId");
 }

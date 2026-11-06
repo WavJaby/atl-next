@@ -6,7 +6,7 @@
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, mpsc::Sender};
 
-use atl_parcelables::android::view::SurfaceControl;
+use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
 use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl;
 use atl_services::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
@@ -42,6 +42,10 @@ impl IUiAgent for UiAgent {
     fn window_position(&self, layer_id: i32, x: i32, y: i32) -> Result<(), StatusCode> {
         self.composer
             .set_layer_position(layer_id, x as f32, y as f32)
+    }
+
+    fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode> {
+        self.composer.apply_post_draw(t.clone())
     }
 
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode> {

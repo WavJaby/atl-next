@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Where a quad's buffer lands on the screen: the 2D map from buffer pixels to layer-stack pixels, pure arithmetic so it is tested without a display.
 
-use atl_compositor::state::FloatRect;
+use atl_libgui_parcel::state::FloatRect;
 
 /// `HAL_TRANSFORM_FLIP_H`, `_FLIP_V`, `_ROT_90` (system/graphics-base-v1.0.h: `1`, `2`, `4`).
 pub const FLIP_H: u32 = 1;

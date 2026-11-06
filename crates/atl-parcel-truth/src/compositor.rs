@@ -11,18 +11,18 @@ use atl_compositor::callbacks::{
     AcquireTimeOrFence, FrameEventHistoryStats, ListenerStats, NO_RELEASE_CALLBACK, ReleaseBuffer,
     ReleaseCallbackId, SurfaceStats, TransactionStats,
 };
-use atl_compositor::parcel::{
+use atl_libgui_parcel::parcel::{
     BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_HANDLE, FLAT_OBJECT_SIZE, FdObject, FlatObject,
     ParcelError, Reader, StrongBinder, WireParcel,
 };
-use atl_compositor::state::{
+use atl_libgui_parcel::state::{
     BlurRegion, BorderSettings, BufferData, BufferReleaseEndpoint, CallbackId, DisplayLuts,
     DisplayState, EdgeExtensionParameters, Fence, FloatRect, FocusRequest, HdrMetadata,
     InputApplicationInfo, InputWindowCommands, LayerState, ListenerCallbacks, LutEntry,
     NativeHandle, Rect, Region, SurfaceControlParcel, Transform2D, TrustedPresentationListener,
     TrustedPresentationThresholds, WindowInfo, buffer_data_change, what,
 };
-use atl_compositor::transaction::{TransactionState, UncacheBuffer};
+use atl_libgui_parcel::transaction::{TransactionState, UncacheBuffer};
 
 use crate::{
     GET_OBJECT_ARRAY_ELEMENT, JObject, JniEnv, byte_array, bytes, java_string, last_error,

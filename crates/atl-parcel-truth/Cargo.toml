@@ -21,6 +21,7 @@ converter = []
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 
 [build-dependencies]
 anyhow.workspace = true

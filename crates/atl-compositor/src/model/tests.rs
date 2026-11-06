@@ -2,8 +2,8 @@
 //! Model tests. Expected values are derived from the rules in the module docs (BBQ's accounting, SurfaceFlinger's z-order and release semantics), not from the model's own output.
 
 use super::*;
-use crate::parcel::{BINDER_TYPE_BINDER, FlatObject};
-use crate::state::{BufferReleaseEndpoint, GraphicBuffer};
+use atl_libgui_parcel::parcel::{BINDER_TYPE_BINDER, FlatObject};
+use atl_libgui_parcel::state::{BufferReleaseEndpoint, GraphicBuffer};
 
 fn local(cookie: u64) -> StrongBinder {
     StrongBinder {
@@ -343,7 +343,7 @@ fn buffer_cache_hit_miss_and_uncache() {
     assert_eq!(c.counters().cache_misses, 0);
     // uncache then reuse the id: a miss
     let mut t = tx(vec![]);
-    t.uncache_buffers = vec![crate::transaction::UncacheBuffer {
+    t.uncache_buffers = vec![atl_libgui_parcel::transaction::UncacheBuffer {
         token: listener,
         id: 401,
     }];
@@ -656,7 +656,7 @@ fn relative_layer_orders_against_its_anchor() {
     rel.surface = b;
     rel.what = what::E_RELATIVE_LAYER_CHANGED;
     rel.z = -5;
-    rel.relative_layer = Some(crate::state::SurfaceControlParcel {
+    rel.relative_layer = Some(atl_libgui_parcel::state::SurfaceControlParcel {
         client: local(50),
         handle: a,
         layer_id: 2,
@@ -788,7 +788,7 @@ fn colour_layer_fills_its_parent_crop_below_the_window() {
     colour.what = what::E_COLOR_CHANGED | what::E_RELATIVE_LAYER_CHANGED;
     colour.color = [0.25, 0.5, 0.75, 0.0];
     colour.z = i32::MIN;
-    colour.relative_layer = Some(crate::state::SurfaceControlParcel {
+    colour.relative_layer = Some(atl_libgui_parcel::state::SurfaceControlParcel {
         client: local(50),
         handle: window,
         layer_id: 1,
@@ -874,7 +874,7 @@ fn shutdown_releases_what_is_held() {
 /// The descriptors the core names, step by step: queued in a transaction, shown by a layer, kept by the client cache after the layer lets go, gone with the cache entry. Buffer id N carries fd 40 + N (`gbuf`).
 #[test]
 fn referenced_fds_follow_queue_layer_and_cache() {
-    use crate::transaction::UncacheBuffer;
+    use atl_libgui_parcel::transaction::UncacheBuffer;
     let (layer, listener) = (local(1), local(2));
     let mut c = Compositor::new(CompositorConfig::default());
     assert!(c.referenced_fds().is_empty());

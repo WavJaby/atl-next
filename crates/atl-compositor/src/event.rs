@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::parcel::{ParcelError, Reader, WireParcel};
+use atl_libgui_parcel::parcel::{ParcelError, Reader, WireParcel};
 
 /// `DisplayEventType::DISPLAY_EVENT_VSYNC` = fourcc('v','s','y','n') (c1 in the top byte).
 pub const DISPLAY_EVENT_VSYNC: u32 = u32::from_be_bytes(*b"vsyn");

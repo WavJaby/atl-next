@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-libgui-parcel"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+# parcel.rs, state.rs, transaction.rs translate AOSP's libgui C++ (Apache-2.0, attribution in each file); the rest is ours
+license = "MIT AND Apache-2.0"
+publish.workspace = true
+
+# libgui's Parcel formats over a plain bytes + object-table Parcel: layer_state_t, TransactionState, SurfaceComposerClient::Transaction (plan C3).
+# One decoder, two readers, as AOSP's libgui is shared by SurfaceFlinger and system_server: the in-app compositor (atl-compositor, atl-composer) applies the states,
+# the window service (atl-services) only frames a post-draw Transaction to forward it. Plain Rust, no binder, no unsafe (core crate).
+
+[dependencies]
+
+[lints]
+workspace = true

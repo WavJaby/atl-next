@@ -7,8 +7,8 @@
 //! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel (its server end goes to the app's UI agent), the insets, the frame, scale 1),
 //! relayout (WindowManagerService.relayoutWindow: the client frames, the merged configuration, the SurfaceControl the window's UI agent gives, the insets), remove (the window goes:
 //! its input channel's server end stays with the app: no close signal yet, a known gap). The frames are the Task's bounds (tasks.rs, freeform); the display frame is the display; no insets (the desktop shows no system bars).
-//! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION. finishDrawing stays one of them: its post-draw SurfaceControl.Transaction is
-//! not modelled (the composer, M3 slice 4), so the codec refuses it before the method runs.
+//! finishDrawing: the post-draw SurfaceControl.Transaction goes unchanged to the app's composer (Session::finishDrawing; what is not modelled is listed there).
+//! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -17,15 +17,17 @@ use atl_aidl::aidl::android::view::IWindowManager::{
     BnWindowManager, EnforcePermission, IWindowManager,
 };
 use atl_aidl::aidl::android::view::IWindowSession::{BnWindowSession, IWindowSession};
+use atl_libgui_parcel::transaction::Transaction;
 use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
     InputChannel, InsetsSourceControl_Array, InsetsState, SurfaceControl,
-    WindowManager_LayoutParams, WindowRelayoutResult,
+    SurfaceControl_Transaction, WindowManager_LayoutParams, WindowRelayoutResult,
 };
 use atl_parcelables::android::window::ClientWindowFrames;
 use atl_parcelables::codecs::android::view::InputChannel::InputChannelCore;
+use atl_parcelables::codecs::android::view::SurfaceControl_Transaction as SurfaceControl_Transaction_codec;
 use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
@@ -611,6 +613,40 @@ impl IWindowSession for Session {
         }
         Ok(())
     }
+
+    /// WindowManagerService.finishDrawingWindow (WindowManagerService.java:2879-2903) -> WindowState.finishDrawing (WindowState.java:5645-5703): with no sync active the post-draw Transaction
+    /// reaches WindowStateAnimator.finishDrawingLocked (:251-252), merged into the window's pending transaction, which the traversal requestTraversal asks for applies to SurfaceFlinger.
+    /// Here the app's composer is that SurfaceFlinger: the Transaction goes to it unchanged (bytes + objects, never decoded here) and applies with its next tick.
+    /// Not modelled: BLAST sync groups (mPrepareSyncSeqId, so `seq_id` is unread and no buffer is dropped as out of date), draw handlers, AsyncRotationController, the draw state machine
+    /// (mDrawState / commitFinishDrawingLocked) and `sanitize` (the composer only serves its own app). A window this session does not hold is ignored, counted (windowForClientLocked: null).
+    fn r#finishDrawing(
+        &self,
+        window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
+        post_draw: Option<&SurfaceControl_Transaction>,
+        _seq_id: i32,
+    ) -> binder::Result<()> {
+        let known = window.is_some_and(|w| {
+            let client = w.as_binder();
+            self.lock().iter().any(|x| x.client == client)
+        });
+        if !known {
+            counters::count(WINDOW_SESSION, "finishDrawing: not this session's window");
+            return Ok(());
+        }
+        let Some(t) = post_draw.filter(|t| t.present) else {
+            return Ok(());
+        };
+        let Some(agent) = self.agent.agent("finishDrawing") else {
+            return Ok(());
+        };
+        if let Err(e) = agent.post_draw_transaction(t) {
+            counters::count(
+                WINDOW_SESSION,
+                &format!("finishDrawing: UI agent refused the post-draw transaction: {e:?}"),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A new window service binder: the Tasks (which own the display every session lays out on) and the table of UI agents (system_services.rs gives it the registry's).
@@ -619,6 +655,8 @@ pub fn new_binder(
     tasks: Arc<Tasks<SpIBinder>>,
     permissions: Arc<Permissions>,
 ) -> SpIBinder {
+    // finishDrawing's Transaction codec finds where the Transaction ends with libgui's reader (atl-parcelables cannot link it)
+    SurfaceControl_Transaction_codec::set_framer(Transaction::frame);
     BnWindowManager::new_binder(
         WindowManager {
             agents,
@@ -632,7 +670,7 @@ pub fn new_binder(
 
 /// `task` changed size: each of its windows gets `IWindow.resized` (oneway) with the frames, merged configuration and insets of the new size. Returns the windows told.
 /// AOSP's WindowState.reportResized (WindowState.java:3584) sends the same call; it skips a relaunching activity (`inRelaunchingActivity`), so callers do too (activity.rs task_resized, relaunch_finished).
-/// forceLayout is set so the app relayouts with the new frames; reportDraw is false because finishDrawing is not modelled (module doc).
+/// forceLayout is set so the app relayouts with the new frames; reportDraw is false: no BLAST sync or draw state is modelled (Session::finishDrawing).
 pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
     let size = tasks.size(task);

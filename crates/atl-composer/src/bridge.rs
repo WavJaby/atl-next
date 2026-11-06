@@ -1,19 +1,48 @@
 // SPDX-License-Identifier: MIT
 //! libbinder Parcel <-> the core's `WireParcel`, through libbinder_rs's safe accessors only (patches/aosp/frameworks/native: `Parcel::data_with_objects`).
-//! In: the data with the binder objects renamed to keys ([`read_parcel`]; [`crate::wire`] for the byte work). Out: a `WireParcel`'s words written after the interface token `prepare_transact` already wrote,
+//! In: the data with the binder objects renamed to keys ([`read_parcel`]; [`atl_libgui_parcel::wire`] for the byte work). Out: a `WireParcel`'s words written after the interface token `prepare_transact` already wrote,
 //! each binder object as the real binder its key stands for ([`write_body`]). File descriptors are taken in (duplicated, kept by the compositor); none goes out yet (a callback never carries one without buffers).
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
-use atl_compositor::parcel::{BINDER_TYPE_BINDER, FLAT_OBJECT_SIZE, WireParcel};
+use atl_libgui_parcel::parcel::{BINDER_TYPE_BINDER, FLAT_OBJECT_SIZE, WireParcel};
 use atl_parcelables::java::io::FileDescriptor;
 use binder::binder_impl::{BorrowedParcel, Parcel};
 use binder::{SpIBinder, StatusCode, WpIBinder};
 
 use crate::objects::ObjectMap;
-use crate::wire::{ObjectKind, kind_at, scan_objects, set_binder_key, set_fd_number};
+use atl_libgui_parcel::wire::{ObjectKind, kind_at, scan_objects, set_binder_key, set_fd_number};
+
+/// The key that names `binder` in the core: its existing key, else a new one, the binder kept in `foreign` (see [`read_parcel`]).
+pub fn binder_key(
+    mut binder: SpIBinder,
+    objects: &mut ObjectMap<WpIBinder>,
+    foreign: &mut HashMap<u64, SpIBinder>,
+) -> u64 {
+    let weak = binder.downgrade();
+    match objects.find(&weak) {
+        Some(key) => key,
+        None => {
+            let key = objects.key_for(&weak);
+            foreign.insert(key, binder);
+            key
+        }
+    }
+}
+
+/// The fd object at `offset` of `bytes` renamed to `fd`'s number, which `fds` keeps (see [`read_parcel`]).
+pub fn take_fd(
+    bytes: &mut [u8],
+    offset: usize,
+    fd: Arc<OwnedFd>,
+    fds: &mut HashMap<i32, Arc<OwnedFd>>,
+) {
+    let number = fd.as_raw_fd();
+    set_fd_number(bytes, offset, number);
+    fds.insert(number, fd);
+}
 
 /// `data` as a `WireParcel` from its start (whatever the read position), the binder objects named by `objects`' keys (a binder not met before gets the next key).
 /// A binder met for the first time is a client's own (a listener: libgui's TransactionCompletedListener), not one of the compositor's (a layer handle is known from its creation): it is kept in `foreign`,
@@ -40,22 +69,11 @@ pub fn read_parcel(
                     .read::<FileDescriptor>()?
                     .fd
                     .ok_or(StatusCode::BAD_VALUE)?;
-                let number = fd.as_raw_fd();
-                set_fd_number(&mut bytes, offset, number);
-                fds.insert(number, fd);
+                take_fd(&mut bytes, offset, fd, fds);
                 continue;
             }
-            let mut binder: SpIBinder = data.read()?;
-            let weak = binder.downgrade();
-            let key = match objects.find(&weak) {
-                Some(key) => key,
-                None => {
-                    let key = objects.key_for(&weak);
-                    foreign.insert(key, binder);
-                    key
-                }
-            };
-            set_binder_key(&mut bytes, offset, key);
+            let binder: SpIBinder = data.read()?;
+            set_binder_key(&mut bytes, offset, binder_key(binder, objects, foreign));
         }
         Ok(())
     })();

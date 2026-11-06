@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
-use atl_compositor::state::FloatRect;
 use atl_gralloc::format::RGBA_8888;
+use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
     ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, PhysRect, PhysSize, PlatformUi,
     PlatformWindow, PresentError, Surrounding, TextInput, TextInputEvent, Ui, UiError, Window,

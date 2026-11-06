@@ -21,6 +21,7 @@ converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter"
 atl-aidl = { path = "../atl-aidl" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-compositor = { path = "../atl-compositor" }
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-ime = { path = "../atl-ime" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-ui = { path = "../atl-platform-ui" }

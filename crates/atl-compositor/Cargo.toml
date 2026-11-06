@@ -4,7 +4,7 @@ name = "atl-compositor"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
-# parcel.rs, layer_state.rs, transaction.rs, callbacks.rs, event.rs translate AOSP's libgui C++ (Apache-2.0, attribution in each file); model.rs, scene.rs are ours
+# callbacks.rs, event.rs translate AOSP's libgui C++ (Apache-2.0, attribution in each file); model.rs, scene.rs are ours
 license = "MIT AND Apache-2.0"
 publish.workspace = true
 
@@ -13,6 +13,7 @@ publish.workspace = true
 # The binder front-ends (service registration, libbinder_rs Parcel conversion) are M3 slice 4 and live elsewhere.
 
 [dependencies]
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 
 [lints]
 workspace = true

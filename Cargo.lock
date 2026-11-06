@@ -172,6 +172,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-compositor",
  "atl-ime",
+ "atl-libgui-parcel",
  "atl-libinput",
  "atl-platform-ui",
  "atl-scene-buffer",
@@ -183,6 +184,9 @@ dependencies = [
 [[package]]
 name = "atl-compositor"
 version = "0.0.0"
+dependencies = [
+ "atl-libgui-parcel",
+]
 
 [[package]]
 name = "atl-gralloc"
@@ -249,6 +253,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-libgui-parcel"
+version = "0.0.0"
+
+[[package]]
 name = "atl-libinput"
 version = "0.0.0"
 dependencies = [
@@ -285,6 +293,7 @@ dependencies = [
  "anyhow",
  "atl-bridgegen",
  "atl-compositor",
+ "atl-libgui-parcel",
 ]
 
 [[package]]
@@ -326,6 +335,7 @@ dependencies = [
  "anyhow",
  "atl-compositor",
  "atl-gralloc",
+ "atl-libgui-parcel",
  "atl-platform-ui-api",
  "atl-platform-ui-linux",
  "clap",
@@ -346,6 +356,7 @@ name = "atl-platform-ui-linux"
 version = "0.0.0"
 dependencies = [
  "atl-compositor",
+ "atl-libgui-parcel",
  "atl-platform-ui-api",
  "atl-scene-buffer",
  "glib-unix",
@@ -383,6 +394,7 @@ dependencies = [
  "atl-android-paths",
  "atl-bridgegen",
  "atl-broker",
+ "atl-libgui-parcel",
  "atl-libinput",
  "clap",
  "rustix",

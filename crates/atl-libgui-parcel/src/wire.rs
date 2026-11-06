@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! The byte-level half of turning a libbinder Parcel into the core's [`WireParcel`](atl_compositor::parcel::WireParcel): finding the objects in the data, and naming a binder object by a key.
+//! The byte-level half of turning a libbinder Parcel into the core's [`WireParcel`](crate::parcel::WireParcel): finding the objects in the data, and naming a binder object by a key.
 //! libbinder does not export its object table (`Parcel::ipcObjects` is private), only the data and the object count (patches/aosp/frameworks/native, `AParcel_getDataWithObjects`), so the offsets are found by their type words, as
 //! atl-parcel-truth's compositor.rs does for the same parcels, and checked against the count.
 //! Binder objects are renamed to canonical keys ([`set_binder_key`]): the object a process sends is the address of its own `IBinder`, and the core only needs a stable name for it (`BinderKey::Local`).
 
-use atl_compositor::parcel::{
+use crate::parcel::{
     BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_HANDLE, FLAT_OBJECT_SIZE, FlatObject,
     StrongBinder,
 };
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn canonical_binder_is_named_by_its_key() {
         let b = canonical_binder(42);
-        assert_eq!(b.key(), Some(atl_compositor::parcel::BinderKey::Local(42)));
+        assert_eq!(b.key(), Some(crate::parcel::BinderKey::Local(42)));
         assert_eq!(b.obj.binder, 42);
         assert!(!b.is_null());
     }

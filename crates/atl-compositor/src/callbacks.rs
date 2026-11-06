@@ -4,8 +4,8 @@
 //! What the compositor sends back to a client: `ITransactionCompletedListener.onTransactionCompleted` / `onReleaseBuffer` (hand-written C++, so raw one-way calls: interface token, then the arguments `SafeInterface` writes)
 //! and the `BufferReleaseChannel` datagram a buffer release travels in when the layer registered a channel.
 
-use crate::parcel::{FdObject, ParcelError, Reader, StrongBinder, WireParcel};
-use crate::state::{CallbackId, Fence, read_callback_ids, write_callback_ids};
+use atl_libgui_parcel::parcel::{FdObject, ParcelError, Reader, StrongBinder, WireParcel};
+use atl_libgui_parcel::state::{CallbackId, Fence, read_callback_ids, write_callback_ids};
 
 type R<T> = Result<T, ParcelError>;
 
@@ -349,12 +349,12 @@ impl ReleaseBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parcel::BinderKey;
+    use atl_libgui_parcel::parcel::BinderKey;
 
     fn handle(h: u32) -> StrongBinder {
         StrongBinder {
-            obj: crate::parcel::FlatObject {
-                ty: crate::parcel::BINDER_TYPE_HANDLE,
+            obj: atl_libgui_parcel::parcel::FlatObject {
+                ty: atl_libgui_parcel::parcel::BINDER_TYPE_HANDLE,
                 flags: 0,
                 binder: u64::from(h),
                 cookie: 0,

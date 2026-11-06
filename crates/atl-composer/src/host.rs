@@ -13,9 +13,13 @@ use std::time::Duration;
 use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
 use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData};
 use atl_compositor::model::{ClientCall, Compositor, CompositorConfig, FrameOutput, LayerSpec};
-use atl_compositor::parcel::{BinderKey, StrongBinder};
 use atl_compositor::scene::{Quad, Scene};
-use atl_compositor::transaction::TransactionState;
+use atl_libgui_parcel::parcel::WireParcel;
+use atl_libgui_parcel::parcel::{BinderKey, StrongBinder};
+use atl_libgui_parcel::transaction::{Transaction, TransactionState};
+use atl_libgui_parcel::wire::set_binder_key;
+use atl_parcelables::android::view::SurfaceControl_Transaction;
+use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
@@ -25,8 +29,8 @@ use rustix::time::{ClockId, clock_gettime};
 
 use crate::objects::ObjectMap;
 use crate::sink::SceneSink;
-use crate::wire::canonical_binder;
 use crate::{bridge, clock, listener, vsync};
+use atl_libgui_parcel::wire::canonical_binder;
 
 /// The physical display's id (`PhysicalDisplayId`): the one display, any stable number; the EventThread's events carry it.
 pub const DISPLAY_ID: u64 = 1;
@@ -109,6 +113,8 @@ pub struct ComposerConfig {
     pub display: DisplayModel,
     /// The core's settings.
     pub compositor: CompositorConfig,
+    /// Post-draw Transactions the window service forwards are applied. false = a gate's deliberate break only (`xtask test window --break-post-draw`): they are counted and dropped.
+    pub post_draw: bool,
 }
 
 /// What happened, for the log line and the tests: the visible record that the compositor ran.
@@ -138,6 +144,9 @@ pub struct Stats {
     pub fds_taken: u64,
     /// File descriptors closed because the core named them no longer.
     pub fds_closed: u64,
+    /// Post-draw Transactions forwarded by the window service (finishDrawing), and of those the ones queued for the core.
+    pub post_draw_received: u64,
+    pub post_draw_applied: u64,
 }
 
 struct State {
@@ -187,7 +196,7 @@ impl State {
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} fds_held={} fds_taken={} fds_closed={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -208,6 +217,8 @@ impl State {
             self.fds.len(),
             s.fds_taken,
             s.fds_closed,
+            s.post_draw_received,
+            s.post_draw_applied,
             ignored.join(","),
         )
     }
@@ -225,6 +236,8 @@ pub struct Composer {
     display: Mutex<DisplayModel>,
     /// The token `getPhysicalDisplayToken` hands out: any binder, named by nothing.
     display_token: SpIBinder,
+    /// ComposerConfig::post_draw.
+    post_draw: bool,
 }
 
 pub trait ILayerHandle: Interface {}
@@ -303,6 +316,7 @@ impl Composer {
             ui_wake: OnceLock::new(),
             stop: AtomicBool::new(false),
             display: Mutex::new(config.display),
+            post_draw: config.post_draw,
             display_token,
         })
     }
@@ -378,6 +392,62 @@ impl Composer {
             Ok(t) => {
                 st.stats.transactions += 1;
                 st.compositor.queue_transaction(t);
+                drop(st);
+                self.notify();
+                Ok(())
+            }
+            Err(e) => {
+                st.close_unreferenced();
+                Err(e)
+            }
+        }
+    }
+
+    /// A post-draw Transaction the window service forwards from the app's `IWindowSession.finishDrawing`, as libgui parcelled it (bytes + their objects), queued for the next tick as
+    /// `setTransactionState` would queue it. AOSP: WMS merges it into the window's sync / pending transaction (WindowStateAnimator.finishDrawingLocked:251-252) and the next traversal
+    /// applies that to SurfaceFlinger, whose `setTransactionState` this joins; `Transaction::into_state` is what that `apply` sends. Counted received and applied (dropped under the gate's break).
+    pub fn apply_post_draw(&self, t: SurfaceControl_Transaction) -> Result<(), StatusCode> {
+        let mut st = self.lock();
+        st.stats.post_draw_received += 1;
+        if !self.post_draw {
+            return Ok(());
+        }
+        let State {
+            objects,
+            foreign,
+            fds,
+            ..
+        } = &mut *st;
+        let held = fds.len();
+        let mut bytes = t.data;
+        let mut offsets = Vec::with_capacity(t.objects.len());
+        for (offset, object) in t.objects {
+            match object {
+                TransactionObject::Binder(Some(b)) => {
+                    set_binder_key(&mut bytes, offset, bridge::binder_key(b, objects, foreign));
+                }
+                // a null binder is no object in libbinder's table: the framer never lists one
+                TransactionObject::Binder(None) => return Err(StatusCode::BAD_VALUE),
+                TransactionObject::Fd(fd) => bridge::take_fd(&mut bytes, offset, fd, fds),
+            }
+            offsets.push(offset);
+        }
+        st.stats.fds_taken += (st.fds.len() - held) as u64;
+        let decoded = WireParcel::from_wire(bytes, offsets)
+            .and_then(|w| {
+                let mut r = w.reader();
+                let t = Transaction::read(&mut r)?;
+                r.finish()?;
+                Ok(t)
+            })
+            .map_err(|e| {
+                tracing::warn!("composer: post-draw Transaction refused: {e}");
+                StatusCode::BAD_VALUE
+            });
+        match decoded {
+            Ok(t) => {
+                st.stats.post_draw_applied += 1;
+                st.compositor.queue_transaction(t.into_state());
                 drop(st);
                 self.notify();
                 Ok(())

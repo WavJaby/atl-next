@@ -26,6 +26,8 @@ const REGISTRY_WAIT: Duration = Duration::from_secs(5);
 /// A deliberate-failure run's broken rule (set by xtask's window gate only): with [`BREAK_Z_ORDER`] siblings ignore their z (CompositorConfig::z_order).
 const BREAK_ENV: &str = "ATL_UI_BREAK";
 const BREAK_Z_ORDER: &str = "z-order";
+/// With it the window service's forwarded post-draw Transactions are dropped (ComposerConfig::post_draw).
+const BREAK_POST_DRAW: &str = "post-draw";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -116,6 +118,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             z_order: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_Z_ORDER),
             ..Default::default()
         },
+        post_draw: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_POST_DRAW),
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;

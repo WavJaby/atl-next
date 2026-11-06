@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has seven transactions. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has eight transactions. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
 //! REMOVE_INPUT: a removed window's input channel token in, nothing out: the agent drops that channel (WindowState.disposeInputChannel -> InputDispatcher::removeInputChannel). TASK: the window's Task number (i32, tasks.rs) in, nothing out; the agent names it in its SET_BOUNDS.
@@ -9,9 +9,10 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use atl_parcelables::android::view::SurfaceControl;
+use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
+use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
 use atl_parcelables::parts::Part;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, ParcelFileDescriptor, SpIBinder, StatusCode, declare_binder_interface};
@@ -34,6 +35,8 @@ pub const POINTER_ICON: TransactionCode = 5;
 pub const WINDOW_POSITION: TransactionCode = 6;
 /// Nothing in; the app's IInputMethod (null when it has none) out.
 pub const INPUT_METHOD: TransactionCode = 7;
+/// A post-draw Transaction in (its bytes, then each object: offset, kind, the binder or fd); the agent's composer applies it. Nothing out.
+pub const POST_DRAW_TRANSACTION: TransactionCode = 8;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -52,6 +55,8 @@ pub trait IUiAgent: Interface {
     fn window_position(&self, layer_id: i32, x: i32, y: i32) -> Result<(), StatusCode>;
     /// The app's in-app input method (IInputMethod), None when it serves none.
     fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode>;
+    /// A window's post-draw Transaction (IWindowSession.finishDrawing), as libgui parcelled it: the app's composer applies it, as WMS applies it to SurfaceFlinger.
+    fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode>;
 }
 
 declare_binder_interface! {
@@ -100,6 +105,10 @@ fn on_transact(
         INPUT_METHOD => {
             let method = service.input_method()?;
             reply.write(&method)
+        }
+        POST_DRAW_TRANSACTION => {
+            let t = read_transaction(data)?;
+            service.post_draw_transaction(&t)
         }
         _ => {
             counters::count(INTERFACE, &format!("code {code}"));
@@ -167,6 +176,66 @@ impl IUiAgent for BpUiAgent {
         let reply = binder.submit_transact(INPUT_METHOD, data, 0)?;
         reply.read()
     }
+
+    fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        write_transaction(&mut data.borrowed(), t)?;
+        binder.submit_transact(POST_DRAW_TRANSACTION, data, 0)?;
+        Ok(())
+    }
+}
+
+/// Object kinds in POST_DRAW_TRANSACTION.
+const OBJECT_BINDER: i32 = 0;
+const OBJECT_FD: i32 = 1;
+
+/// POST_DRAW_TRANSACTION's payload: the bytes, the object count, then per object its offset in the bytes, its kind and the binder (nullable) or fd (a duplicate: the Transaction keeps its own).
+fn write_transaction(
+    p: &mut BorrowedParcel<'_>,
+    t: &SurfaceControl_Transaction,
+) -> Result<(), StatusCode> {
+    p.write(&t.data)?;
+    p.write(&i32::try_from(t.objects.len()).map_err(|_| StatusCode::BAD_VALUE)?)?;
+    for (offset, object) in &t.objects {
+        p.write(&i32::try_from(*offset).map_err(|_| StatusCode::BAD_VALUE)?)?;
+        match object {
+            TransactionObject::Binder(b) => {
+                p.write(&OBJECT_BINDER)?;
+                p.write(b)?;
+            }
+            TransactionObject::Fd(fd) => {
+                p.write(&OBJECT_FD)?;
+                let dup = fd.try_clone().map_err(|_| StatusCode::BAD_VALUE)?;
+                p.write(&ParcelFileDescriptor::new(dup))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The other end of [`write_transaction`].
+fn read_transaction(p: &BorrowedParcel<'_>) -> Result<SurfaceControl_Transaction, StatusCode> {
+    let data: Vec<u8> = p.read()?;
+    let n = usize::try_from(p.read::<i32>()?).map_err(|_| StatusCode::BAD_VALUE)?;
+    let mut objects = Vec::new();
+    for _ in 0..n {
+        let offset = usize::try_from(p.read::<i32>()?).map_err(|_| StatusCode::BAD_VALUE)?;
+        let object = match p.read::<i32>()? {
+            OBJECT_BINDER => TransactionObject::Binder(p.read()?),
+            OBJECT_FD => {
+                let fd: ParcelFileDescriptor = p.read()?;
+                TransactionObject::Fd(Arc::new(fd.into()))
+            }
+            _ => return Err(StatusCode::BAD_VALUE),
+        };
+        objects.push((offset, object));
+    }
+    Ok(SurfaceControl_Transaction {
+        present: true,
+        data,
+        objects,
+    })
 }
 
 impl IUiAgent for Binder<BnUiAgent> {
@@ -196,6 +265,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode> {
         self.0.input_method()
+    }
+
+    fn post_draw_transaction(&self, t: &SurfaceControl_Transaction) -> Result<(), StatusCode> {
+        self.0.post_draw_transaction(t)
     }
 }
 

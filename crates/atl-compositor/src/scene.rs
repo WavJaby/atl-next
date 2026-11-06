@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::state::{Fence, FloatRect, GraphicBuffer};
+use atl_libgui_parcel::state::{Fence, FloatRect, GraphicBuffer};
 
 /// A descriptor named by a scene: open in this process while any [`Scene`] holding it lives (the front-end closes only descriptors the core no longer names). Opaque: only the platform's `-<os>` crate turns it into an OS handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -19,6 +19,7 @@ atl-platform-ui-linux = { path = "../atl-platform-ui-linux" }
 [dev-dependencies]
 anyhow.workspace = true
 atl-compositor = { path = "../atl-compositor" }
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-gralloc = { path = "../atl-gralloc" }
 clap.workspace = true
 rustix.workspace = true

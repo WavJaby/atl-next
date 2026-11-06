@@ -115,7 +115,7 @@ mod tests {
     use std::sync::Arc;
 
     use atl_compositor::scene::{BufferContent, Quad, SceneBuffer, SceneFd};
-    use atl_compositor::state::FloatRect;
+    use atl_libgui_parcel::state::FloatRect;
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::write;
 

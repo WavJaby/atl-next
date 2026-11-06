@@ -25,7 +25,7 @@ use atl_aidl::aidl::android::gui::Rotation::Rotation;
 use atl_aidl::aidl::android::gui::Size::Size;
 use atl_aidl::aidl::android::gui::StaticDisplayInfo::StaticDisplayInfo;
 use atl_compositor::event::ConnectionId;
-use atl_compositor::parcel::WireParcel;
+use atl_libgui_parcel::parcel::WireParcel;
 use atl_services::counters;
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};

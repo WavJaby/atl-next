@@ -7,7 +7,7 @@
 //! 4. self-tests: a corrupted re-encoding, swapped expected values and a dropped field must each be caught.
 //!
 //! The run is a binder process of a binderd this stage starts (libbinder opens the driver as soon as a parcel carries a binder).
-//! `--golden <dir>` writes the libgui-written dump (data and object table, `WireParcel::to_dump`) there: the file committed as crates/atl-compositor/testdata/transaction_libgui_writer.dump.
+//! `--golden <dir>` writes the libgui-written dump (data and object table, `WireParcel::to_dump`) there: the file committed as crates/atl-libgui-parcel/testdata/transaction_libgui_writer.dump.
 //! Needs the converter's ART and libgui in --out: `xtask native` with the M3 goals (libandroid_runtime libandroid libsigchain ...).
 
 use std::path::{Path, PathBuf};

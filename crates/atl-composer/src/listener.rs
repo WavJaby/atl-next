@@ -3,7 +3,7 @@
 //! proxy: libbinder_rs's `prepare_transact` needs a class associated with the binder, which `into_interface` does (and checks the descriptor against the listener's own).
 
 use atl_compositor::callbacks::LISTENER_DESCRIPTOR;
-use atl_compositor::parcel::WireParcel;
+use atl_libgui_parcel::parcel::WireParcel;
 use binder::binder_impl::{Binder, BorrowedParcel, FLAG_ONEWAY, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 

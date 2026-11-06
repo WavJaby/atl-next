@@ -62,6 +62,9 @@ pub struct Args {
     /// Deliberate break (stage surface-view): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
     #[arg(long)]
     break_z_order: bool,
+    /// Deliberate break (stages widgets, gtk, ime, surface-view): the composer drops the post-draw Transactions the window service forwards, so the post-draw check must fail.
+    #[arg(long)]
+    break_post_draw: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -1296,6 +1299,30 @@ fn touch_mode_check(services: &str) -> Result<String, String> {
     }
 }
 
+/// What the parcel codec counts a refused post-draw Transaction under (atl-parcelables SurfaceControl_Transaction.rs).
+const TRANSACTION_REFUSED: &str = "refused android.view.SurfaceControl.Transaction";
+
+/// Sub-gate: the app's finishDrawing Transactions reached its composer and were applied (window.rs Session::finishDrawing -> IUiAgent POST_DRAW_TRANSACTION -> Composer::apply_post_draw):
+/// none refused by the services' codec, at least one received (every first draw reports one: ViewRootImpl.reportDrawFinished), and every one received applied.
+fn post_draw_check(app: &str, services: &str) -> Result<String, String> {
+    let refused = services
+        .lines()
+        .filter(|l| l.contains(TRANSACTION_REFUSED))
+        .count();
+    let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
+    let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
+    let (received, applied) = (n("post_draw_received"), n("post_draw_applied"));
+    if refused == 0 && received > 0 && applied == received {
+        Ok(format!(
+            "{applied} post-draw transactions applied, 0 refused"
+        ))
+    } else {
+        Err(format!(
+            "post-draw: {refused} refused by the codec, {received} received, {applied} applied"
+        ))
+    }
+}
+
 /// The platform's log line of the content origin (atl-platform-ui `GtkWindow::present`), read by [`content_origin`].
 const CONTENT_ORIGIN_LINE: &str = "atl-platform-ui: content origin ";
 
@@ -1427,6 +1454,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
                 let rt = if args.break_z_order {
                     rt.with_ui_break("z-order")
+                } else if args.break_post_draw {
+                    rt.with_ui_break("post-draw")
                 } else {
                     rt
                 };
@@ -1617,6 +1646,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
         _ => Vec::new(),
     };
+    let mut sub = sub;
+    if !sub.is_empty()
+        && matches!(
+            args.stage,
+            Stage::Widgets | Stage::Gtk | Stage::Ime | Stage::SurfaceView
+        )
+    {
+        sub.push(("post-draw", post_draw_check(&app, &services)));
+    }
     let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
     for (name, result) in &sub {
         match result {

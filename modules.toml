@@ -49,7 +49,7 @@ uses = ["generators", "bionic", "composer", "platform-ui"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
@@ -59,15 +59,16 @@ crates = ["atl-android-runtime"]
 [aidl]
 crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]
 exports = ["atl-aidl"]
-# compositor: atl-parcel-truth's compositor.rs checks atl-compositor's codecs against libgui (test-only)
-uses = ["generators", "compositor"]
+# compositor, libgui-parcel: atl-parcel-truth's compositor.rs checks their codecs against libgui (test-only)
+uses = ["generators", "compositor", "libgui-parcel"]
 
 # the M2 system services in Rust (ActivityManager subset, PackageManager subset, the settings provider stub) on the aidl stubs; libbinder_rs and the codecs come from the converter, not cargo
 [services]
 crates = ["atl-services"]
 # the package record types (plain Rust, no converter) are what atld installs and xtask writes
 exports = ["atl-services"]
-uses = ["aidl", "generators", "broker", "libinput", "android-paths"]
+# libgui-parcel: finishDrawing frames the post-draw Transaction with libgui's reader to forward it (window.rs)
+uses = ["aidl", "generators", "broker", "libinput", "android-paths", "libgui-parcel"]
 
 # AOSP libinput as the converter builds it, reached through cxx adapters (wrap/input.cpp): the input publisher and the virtual keyboard's KeyCharacterMap; C++ only as the adapters the project CLAUDE.md allows
 [libinput]
@@ -75,10 +76,16 @@ crates = ["atl-libinput"]
 exports = ["atl-libinput"]
 uses = ["generators"]
 
-# the in-app compositor core (M3 slice 3): libgui's SurfaceFlinger-facing wire codecs over a bytes + object-table Parcel, layer tree, buffer cache, release / completion callbacks, vsync EventThread, the Scene for the platform layer; plain Rust, no binder or converter dependency
+# the in-app compositor core (M3 slice 3): layer tree, buffer cache, release / completion callbacks and their codecs, vsync EventThread, the Scene for the platform layer; plain Rust, no binder or converter dependency
 [compositor]
 crates = ["atl-compositor"]
 exports = ["atl-compositor"]
+uses = ["libgui-parcel"]
+
+# libgui's Parcel formats (bytes + object-table Parcel, layer_state_t, TransactionState, the client Transaction, flat-object scanning): one decoder shared by the composer and the window service, as libgui is by SurfaceFlinger and system_server; plain Rust
+[libgui-parcel]
+crates = ["atl-libgui-parcel"]
+exports = ["atl-libgui-parcel"]
 
 # gralloc (M3 slice 2): AOSP libui's Gralloc5 halves -- the AIDL IAllocator service (GBM on the host's DRM device) and the stable-C IMapper v5 library (mapper.atl.so, dma-buf mapping), agreeing through the core's handle / metadata / VINTF definitions; CPU access to a buffer's dma-buf (mmap + DMA_BUF_IOCTL_SYNC) is one crate the mapper and the Scene reader share; the truth crate is `xtask test gralloc`'s two-process client of AOSP's libui (test-only)
 [gralloc]
@@ -90,7 +97,7 @@ uses = ["aidl", "generators"]
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
-uses = ["compositor", "gralloc", "scene-buffer", "platform-types"]
+uses = ["compositor", "libgui-parcel", "gralloc", "scene-buffer", "platform-types"]
 
 # the app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method (platform-ui TextInput) to the focused field's InputConnection (aidl stubs); the text-index unit conversions
 [ime]

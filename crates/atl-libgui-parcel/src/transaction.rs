@@ -5,7 +5,8 @@
 
 use crate::parcel::{FdObject, ParcelError, Reader, StrongBinder, WireParcel};
 use crate::state::{
-    DisplayState, FrameTimelineInfo, InputWindowCommands, LayerState, ListenerCallbacks,
+    CallbackId, DisplayState, FrameTimelineInfo, InputWindowCommands, LayerState,
+    ListenerCallbacks, SurfaceControlParcel, read_callback_ids, write_callback_ids,
 };
 
 type R<T> = Result<T, ParcelError>;
@@ -202,6 +203,139 @@ impl TransactionState {
 impl Default for TransactionState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One listener entry of a client `Transaction`'s parcel: the listener, its callback ids, and the surfaces those callbacks cover (`CallbackInfo`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientCallbacks {
+    /// The `ITransactionCompletedListener` binder.
+    pub listener: StrongBinder,
+    /// Its callback ids.
+    pub callback_ids: Vec<CallbackId>,
+    /// The surfaces the callbacks cover (`SurfaceControl::writeToParcel` each).
+    pub surfaces: Vec<SurfaceControlParcel>,
+}
+
+/// `SurfaceComposerClient::Transaction` as it parcels (`Transaction::writeToParcel` / `readFromParcel`, SurfaceComposerClient.cpp:865-930): the `TransactionState`, then a uint32 count of
+/// listener entries. Java's `SurfaceControl.Transaction.writeToParcel` (SurfaceControl.java:5276-5283) writes its own non-null int before these bytes; that int is the caller's to read.
+/// The parcel carries no length: its end is known only by reading it whole, which is why the window service frames a post-draw Transaction with this same reader.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Transaction {
+    /// The state `setTransactionState` would send.
+    pub state: TransactionState,
+    /// `mListenerCallbacks`.
+    pub listener_callbacks: Vec<ClientCallbacks>,
+}
+
+impl Transaction {
+    /// `Transaction::readFromParcel`.
+    pub fn read(r: &mut Reader<'_>) -> R<Self> {
+        let state = TransactionState::read(r)?;
+        let n = r.read_count("listener count")?;
+        let listener_callbacks = (0..n)
+            .map(|_| {
+                let listener = r.read_strong_binder(true, "listener")?;
+                let callback_ids = read_callback_ids(r)?;
+                let m = r.read_count("surface count")?;
+                let surfaces = (0..m)
+                    .map(|_| SurfaceControlParcel::read(r))
+                    .collect::<R<Vec<_>>>()?;
+                Ok(ClientCallbacks {
+                    listener,
+                    callback_ids,
+                    surfaces,
+                })
+            })
+            .collect::<R<Vec<_>>>()?;
+        Ok(Self {
+            state,
+            listener_callbacks,
+        })
+    }
+
+    /// `Transaction::writeToParcel`.
+    pub fn write(&self, p: &mut WireParcel) -> R<()> {
+        self.state.write(p)?;
+        p.write_len(self.listener_callbacks.len(), "listener entries")?;
+        for l in &self.listener_callbacks {
+            p.write_strong_binder(&l.listener);
+            write_callback_ids(p, &l.callback_ids)?;
+            p.write_len(l.surfaces.len(), "surfaces")?;
+            for s in &l.surfaces {
+                s.write(p)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The state `Transaction::apply` sends (SurfaceComposerClient.cpp:1120-1145): each listener's callbacks go to the state when no surface is named, else to each named layer's state
+    /// (`TransactionState::getLayerState`, TransactionState.cpp:230-247: the layer's existing entry, else a new one for its handle and id), marked `eHasListenerCallbacksChanged`.
+    pub fn into_state(self) -> TransactionState {
+        let mut state = self.state;
+        state.has_listener_callbacks = !self.listener_callbacks.is_empty();
+        for l in self.listener_callbacks {
+            if l.callback_ids.is_empty() {
+                continue;
+            }
+            if l.surfaces.is_empty() {
+                state.listener_callbacks.push(ListenerCallbacks {
+                    listener: l.listener,
+                    callback_ids: l.callback_ids,
+                });
+                continue;
+            }
+            for sc in &l.surfaces {
+                let at = match state
+                    .composer_states
+                    .iter()
+                    .position(|s| s.surface == sc.handle)
+                {
+                    Some(at) => at,
+                    None => {
+                        let mut s = LayerState::new();
+                        s.surface = sc.handle;
+                        s.layer_id = sc.layer_id;
+                        state.composer_states.push(s);
+                        state.composer_states.len() - 1
+                    }
+                };
+                let s = &mut state.composer_states[at];
+                s.what |= crate::state::what::E_HAS_LISTENER_CALLBACKS_CHANGED;
+                s.listeners.push(ListenerCallbacks {
+                    listener: l.listener,
+                    callback_ids: l.callback_ids.clone(),
+                });
+            }
+        }
+        state
+    }
+
+    /// A Transaction inside a libbinder parcel's raw data (`data`, `object_count` objects inline, as `data_with_objects` gives them) starting at byte `start`: its end, and the offsets of the
+    /// objects inside it. For a reader that only forwards the bytes (the window service).
+    pub fn frame(
+        data: &[u8],
+        object_count: usize,
+        start: usize,
+    ) -> Result<(usize, Vec<usize>), String> {
+        let offsets = crate::wire::scan_objects(data, object_count).map_err(|e| e.to_string())?;
+        let p = WireParcel::from_wire(data.to_vec(), offsets).map_err(|e| e.to_string())?;
+        let end = Self::end_in(&p, start).map_err(|e| e.to_string())?;
+        let inside = p
+            .objects()
+            .iter()
+            .copied()
+            .filter(|&o| o >= start && o < end)
+            .collect();
+        Ok((end, inside))
+    }
+
+    /// Where a Transaction that starts at byte `start` of `p` ends: the position after reading it whole (the read is the only way to know, see [`Transaction`]).
+    pub fn end_in(p: &WireParcel, start: usize) -> R<usize> {
+        let mut r = p.reader();
+        r.skip_to(start)?;
+        Self::read(&mut r)?;
+        Ok(r.position())
     }
 }
 

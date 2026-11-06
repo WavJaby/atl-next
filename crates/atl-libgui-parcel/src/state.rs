@@ -393,13 +393,13 @@ impl CallbackId {
     }
 }
 
-pub(crate) fn write_callback_ids(p: &mut WireParcel, ids: &[CallbackId]) -> R<()> {
+pub fn write_callback_ids(p: &mut WireParcel, ids: &[CallbackId]) -> R<()> {
     p.write_len(ids.len(), "callback ids")?;
     ids.iter().for_each(|c| c.write_parcelable(p));
     Ok(())
 }
 
-pub(crate) fn read_callback_ids(r: &mut Reader<'_>) -> R<Vec<CallbackId>> {
+pub fn read_callback_ids(r: &mut Reader<'_>) -> R<Vec<CallbackId>> {
     let n = r.read_count("callback id count")?;
     (0..n).map(|_| CallbackId::read_parcelable(r)).collect()
 }

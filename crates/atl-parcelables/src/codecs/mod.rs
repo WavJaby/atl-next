@@ -59,6 +59,7 @@ pub mod android {
             pub mod SurroundingText;
         }
         pub mod SurfaceControl;
+        pub mod SurfaceControl_Transaction;
         pub mod WindowManager_LayoutParams;
         pub mod WindowRelayoutResult;
     }

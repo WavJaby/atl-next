@@ -5,7 +5,7 @@
 //!    `setTransactionState`) and `android.gui.ISurfaceComposer` / `ISurfaceComposerClient` / `IDisplayEventConnection` through the converter's stubs ([`service`]).
 //! 2. it hands both to the compositor registry in the system process (atl_services::compositor_registry), which registers them as `SurfaceFlinger<suffix>` / `SurfaceFlingerAIDL<suffix>`;
 //!    libgui's lookup appends the suffix it reads from the process's property area (patch to SurfaceComposerClient.cpp), so every process finds its own compositor.
-//! 3. libgui's binder calls arrive as local calls (the service is in the same process): parcels are converted to the core's `WireParcel` ([`bridge`], [`wire`]), the core decides, and its callbacks to
+//! 3. libgui's binder calls arrive as local calls (the service is in the same process): parcels are converted to the core's `WireParcel` ([`bridge`], atl-libgui-parcel `wire`), the core decides, and its callbacks to
 //!    libgui's `TransactionCompletedListener` go back the same way ([`listener`]). The vsync events go down a BitTube socketpair ([`vsync`]) to the client's DisplayEventReceiver.
 //!
 //! The modules without binder types are plain Rust with unit tests; the rest needs feature `converter` (`xtask native`) and is covered by `xtask test composer`.
@@ -27,7 +27,6 @@ pub mod input;
 pub mod objects;
 pub mod sink;
 pub mod vsync;
-pub mod wire;
 
 #[cfg(feature = "converter")]
 pub mod bridge;

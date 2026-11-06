@@ -13,6 +13,7 @@ publish.workspace = true
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
+atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 glib-unix.workspace = true

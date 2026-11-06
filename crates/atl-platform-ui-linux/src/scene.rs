@@ -5,7 +5,7 @@
 //! The widget scales the whole tree by 1 / scale into toolkit logical units when it draws; capture renders it as it is.
 
 use atl_compositor::scene::{Content, Quad, Scene};
-use atl_compositor::state::FloatRect;
+use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui_api::PresentError;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
