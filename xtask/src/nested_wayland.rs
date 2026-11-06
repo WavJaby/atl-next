@@ -131,9 +131,9 @@ impl NestedCompositor {
         Self::start_rc(work, &[GATE_OUTPUT], RC_XML)
     }
 
-    /// As [`start`](Self::start), but every window is maximized when it first maps ([`RC_XML_MAXIMIZE`]).
-    pub fn start_maximizing(work: &Path) -> Result<Self> {
-        Self::start_rc(work, &[GATE_OUTPUT], RC_XML_MAXIMIZE)
+    /// As [`start_with`](Self::start_with) on one output, but every window is maximized when it first maps ([`RC_XML_MAXIMIZE`]).
+    pub fn start_maximizing(work: &Path, output: Output) -> Result<Self> {
+        Self::start_rc(work, &[output], RC_XML_MAXIMIZE)
     }
 
     /// Starts labwc headless with `outputs` (left to right), config and log under `work`; returns once the outputs are configured and the seat has its pointer.

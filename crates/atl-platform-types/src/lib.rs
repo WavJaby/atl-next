@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 
 /// A length in physical (device) pixels: a window's content area, a buffer's extent, a monitor's mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysSize {
     /// Width in physical pixels.
     pub width: u32,

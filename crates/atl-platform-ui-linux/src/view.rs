@@ -17,8 +17,8 @@ mod imp {
     pub struct SceneView {
         /// The presented scene in physical pixels; `None` before the first present.
         pub node: RefCell<Option<gsk::RenderNode>>,
-        /// The natural size in logical pixels (what the window asked for), 0 x 0 until set. The minimum is always 0, so the user can shrink the window.
-        pub wanted: Cell<(i32, i32)>,
+        /// The natural size in physical pixels (what the window asked for), 0 x 0 until set; `measure` converts it at the current scale. The minimum is always 0, so the user can shrink the window.
+        pub wanted: Cell<atl_platform_ui_api::PhysSize>,
         /// The last allocation reported to `on_allocate`, logical pixels: the same size is not reported twice.
         pub allocated: Cell<(i32, i32)>,
         /// Receives the content's size in physical pixels when a layout gives it a new one ([`super::SceneView::connect_allocation`]).
@@ -45,11 +45,13 @@ mod imp {
 
     impl WidgetImpl for SceneView {
         fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
-            let (width, height) = self.wanted.get();
-            let natural = match orientation {
-                gtk4::Orientation::Horizontal => width,
-                _ => height,
+            let wanted = self.wanted.get();
+            let physical = match orientation {
+                gtk4::Orientation::Horizontal => wanted.width,
+                _ => wanted.height,
             };
+            // derived at each layout, never stored: the scale is not final until the surface has its fractional scale (GTK's integer scale_factor before it: 2 on a 1.6 output)
+            let natural = self.obj().scale().to_logical(f64::from(physical)).ceil() as i32;
             (0, natural, -1, -1)
         }
 
@@ -118,9 +120,15 @@ impl SceneView {
         *self.imp().on_allocate.borrow_mut() = Some(Box::new(on_allocate));
     }
 
-    /// Sets the natural size, in logical pixels, and asks for a new layout.
-    pub fn set_wanted(&self, width: i32, height: i32) {
-        self.imp().wanted.set((width, height));
+    /// Sets the natural size, in physical pixels, and asks for a new layout.
+    pub fn set_wanted(&self, size: atl_platform_ui_api::PhysSize) {
+        self.imp().wanted.set(size);
+        self.queue_resize();
+    }
+
+    /// The surface's scale changed: lay out again, so the natural size follows it and the next allocation is reported in the new physical pixels even at the same logical size.
+    pub fn rescale(&self) {
+        self.imp().allocated.set((0, 0));
         self.queue_resize();
     }
 

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::nested_wayland::{Arg, Ime, NestedCompositor, im_op};
+use crate::nested_wayland::{Arg, GATE_OUTPUT, Ime, NestedCompositor, Output, im_op};
 use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
 
@@ -44,6 +44,10 @@ pub struct Args {
     /// The gate's labwc maximizes the window when it maps (a binding configure size before READY, as a tiling compositor gives): the content must follow the granted size, set_size must not be waited for.
     #[arg(long)]
     maximized: bool,
+    /// The gate output's scale (fractional ones reach the client as `wp_fractional_scale_v1`): the content must still be the requested physical size (readback size checks).
+    /// Default fractional: the window stages run at 1 (GATE_OUTPUT), and a 1.6 output once gave 293 x 192 content for 320 x 240 (logical size fixed at GTK's integer scale 2 before the fractional one arrived, 2026-11-06).
+    #[arg(long, default_value_t = 1.6)]
+    scale: f64,
     /// Keep the captures in this directory instead of a temporary one.
     #[arg(long)]
     keep: Option<PathBuf>,
@@ -457,12 +461,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     // --hold-blocked is watched on the desktop's compositor; every other run maps in the gate's own (outlives the client: declared before it)
+    let output = Output {
+        scale: args.scale,
+        ..GATE_OUTPUT
+    };
     let nested = match args.hold_blocked {
         Some(_) => None,
-        None if args.maximized => {
-            Some(NestedCompositor::start_maximizing(&out_dir.join("nested"))?)
-        }
-        None => Some(NestedCompositor::start(&out_dir.join("nested"))?),
+        None if args.maximized => Some(NestedCompositor::start_maximizing(
+            &out_dir.join("nested"),
+            output,
+        )?),
+        None => Some(NestedCompositor::start_with(
+            &out_dir.join("nested"),
+            &[output],
+        )?),
     };
     let upstream = match &nested {
         Some(n) => n.socket.clone(),

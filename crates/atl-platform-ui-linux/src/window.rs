@@ -337,11 +337,19 @@ impl Window for GtkWindow {
         Self::wire_touch(&view, &shared);
         Self::wire_keys(&window, &shared);
         // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor); the idle pacing reads its rate (monitor_interval_us)
+        // and its scale (wp_fractional_scale_v1 preferred_scale arrives after realisation): the content's logical size is re-derived from the physical one
         let entered = Rc::clone(&shared);
+        let scaled = view.downgrade();
         window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
                 let entered = Rc::clone(&entered);
                 surface.connect_enter_monitor(move |_, m| follow_monitor(&entered, m));
+                let scaled = scaled.clone();
+                surface.connect_scale_notify(move |_| {
+                    if let Some(view) = scaled.upgrade() {
+                        view.rescale();
+                    }
+                });
             }
         });
         // keyboard focus = the active toplevel (xdg_toplevel state `activated`); GTK notifies each change
@@ -372,9 +380,9 @@ impl Window for GtkWindow {
 
     fn set_size(&self, size: PhysSize) {
         self.requested.set(size);
-        let (width, height) = (self.logical(size.width), self.logical(size.height));
-        self.view.set_wanted(width, height);
+        self.view.set_wanted(size);
         if self.is_mapped() {
+            let (width, height) = (self.logical(size.width), self.logical(size.height));
             // the window is the content plus the chrome around it: keep the chrome, change the content
             let (chrome_w, chrome_h) = (
                 self.window.width() - self.view.width(),
