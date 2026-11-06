@@ -93,7 +93,13 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
     }
 
     /// A launch on top of `task`: the record is added and its task advanced at once.
-    pub fn push(&mut self, task: TaskId, token: K, owner: O, launch: L) -> Vec<Command<K, O, L, I>> {
+    pub fn push(
+        &mut self,
+        task: TaskId,
+        token: K,
+        owner: O,
+        launch: L,
+    ) -> Vec<Command<K, O, L, I>> {
         self.tasks.entry(task).or_default().push(Record {
             token,
             owner,

@@ -121,12 +121,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::thread::sleep(Duration::from_millis(200));
     };
     let elapsed = start.elapsed();
-    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); atld exits when the app's main process dies
+    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the app's death ends the watch, atld outlives it
     let mut ended = ended;
     if passed && ended.is_none() {
         let watch = Instant::now();
         while ended.is_none() && watch.elapsed() < Duration::from_millis(WINDOW_MS) {
             ended = atld_child.try_wait()?;
+            if ended.is_none() && run.app_ended() {
+                ended = Some(run.stop(&mut atld_child)?);
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }

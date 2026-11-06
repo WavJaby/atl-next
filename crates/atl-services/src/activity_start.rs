@@ -173,7 +173,10 @@ pub fn check_shell(
     running: bool,
 ) -> Result<(), Refusal> {
     if calling_uid != SYSTEM_UID && calling_uid != SHELL_UID {
-        counters::refused(INTERFACE, "startActivity (no caller app, uid without START_ANY_ACTIVITY)");
+        counters::refused(
+            INTERFACE,
+            "startActivity (no caller app, uid without START_ANY_ACTIVITY)",
+        );
         return Err(Refusal::Security("startActivity: no caller app thread"));
     }
     let Some((_, class)) = component else {
@@ -183,13 +186,22 @@ pub fn check_shell(
         ));
     };
     let Some(launcher) = launcher else {
-        return Err(refused(START_CLASS_NOT_FOUND, "package not installed or without launcher"));
+        return Err(refused(
+            START_CLASS_NOT_FOUND,
+            "package not installed or without launcher",
+        ));
     };
     if class != launcher {
-        return Err(refused(START_CANCELED, "shell start of a class other than the launcher"));
+        return Err(refused(
+            START_CANCELED,
+            "shell start of a class other than the launcher",
+        ));
     }
     if flags != FLAG_ACTIVITY_NEW_TASK {
-        return Err(refused(START_CANCELED, "shell start without NEW_TASK alone"));
+        return Err(refused(
+            START_CANCELED,
+            "shell start without NEW_TASK alone",
+        ));
     }
     if running {
         return Err(refused(
@@ -271,29 +283,44 @@ mod tests {
             check_shell(uid, flags, Some((PACKAGE, class)), Some(MAIN), running)
         };
         assert_eq!(ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false), Ok(()));
-        assert_eq!(
-            ok(SYSTEM_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false),
-            Ok(())
-        );
+        assert_eq!(ok(SYSTEM_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false), Ok(()));
         assert!(matches!(
             ok(UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false),
             Err(Refusal::Security(_))
         ));
         assert!(matches!(
             ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, true),
-            Err(Refusal::Code { code: START_CANCELED, .. })
+            Err(Refusal::Code {
+                code: START_CANCELED,
+                ..
+            })
         ));
         assert!(matches!(
             ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, SPLASH, false),
-            Err(Refusal::Code { code: START_CANCELED, .. })
+            Err(Refusal::Code {
+                code: START_CANCELED,
+                ..
+            })
         ));
         assert!(matches!(
             ok(SHELL_UID, 0, MAIN, false),
-            Err(Refusal::Code { code: START_CANCELED, .. })
+            Err(Refusal::Code {
+                code: START_CANCELED,
+                ..
+            })
         ));
         assert!(matches!(
-            check_shell(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, Some((PACKAGE, MAIN)), None, false),
-            Err(Refusal::Code { code: START_CLASS_NOT_FOUND, .. })
+            check_shell(
+                SHELL_UID,
+                FLAG_ACTIVITY_NEW_TASK,
+                Some((PACKAGE, MAIN)),
+                None,
+                false
+            ),
+            Err(Refusal::Code {
+                code: START_CLASS_NOT_FOUND,
+                ..
+            })
         ));
     }
 

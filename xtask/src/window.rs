@@ -659,7 +659,10 @@ pub(crate) fn stop_apps(atld: u32) {
 
 /// Ime stage: atld outlived the killed app (owner decision 2026-11-06: an app's death is an event, not the run's end) and ended on the control socket's `stop` with status 0. In atld's
 /// log (main.rs): the first app's `process <pid> ended`, then the relaunch's `control: start ...: ok`, then `control: stop`; `stopped` is atld's exit after the gate stopped it.
-fn run_survives_check(atld_log: &str, stopped: Option<std::process::ExitStatus>) -> Result<String, String> {
+fn run_survives_check(
+    atld_log: &str,
+    stopped: Option<std::process::ExitStatus>,
+) -> Result<String, String> {
     let pid = atld_log
         .lines()
         .filter(|l| l.contains("started ") && l.contains("(package "))
@@ -696,7 +699,10 @@ fn new_intent_check(app: &str, services: &str) -> Result<String, String> {
         count(app, "AtlWindow: onCreate reached"),
     );
     if got == (1, 1, 0, 1) {
-        Ok("the second start reused Main: one onNewIntent, one delivery, no refusal, one onCreate".to_owned())
+        Ok(
+            "the second start reused Main: one onNewIntent, one delivery, no refusal, one onCreate"
+                .to_owned(),
+        )
     } else {
         Err(format!(
             "want 1 `{NEW_INTENT_APP}`, 1 delivery, 0 refused starts, 1 onCreate; got {got:?} (onNewIntent, deliveries, refusals, onCreate)"
@@ -1630,15 +1636,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Ime, _, Some(ime)) => ime::drive(
-                p,
-                &log,
-                ime,
-                ime_breaks,
-                atld_pid,
-                &services_log,
-                relaunch,
-            ),
+            (Stage::Ime, _, Some(ime)) => {
+                ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
+            }
             (Stage::Widgets, _, _) => widgets::drive(p, &log),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
@@ -1721,10 +1721,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);
-            sub.push((
-                "run",
-                run_survives_check(&read(&run.atld_log()), stopped),
-            ));
+            sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));
             sub
         }
         (Stage::Widgets, Some(_)) => widgets::checks(

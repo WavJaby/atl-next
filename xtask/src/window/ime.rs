@@ -273,10 +273,7 @@ fn death_check(services: &str) -> Result<String, String> {
         .lines()
         .filter(|l| l.contains(DEATH_COUNTER))
         .collect();
-    let removed: Vec<&str> = before
-        .lines()
-        .filter(|l| l.contains(DEATH_LINE))
-        .collect();
+    let removed: Vec<&str> = before.lines().filter(|l| l.contains(DEATH_LINE)).collect();
     let want = format!("{DEATH_LINE}{} ", super::APP_UID);
     match (counted.as_slice(), removed.as_slice()) {
         ([c], [r])

@@ -351,7 +351,7 @@ fn lifecycle(atld_log: &str, process: &str) -> Option<Lifecycle> {
     let line_of = |needle: &str| atld_log.lines().position(|l| l.contains(needle));
     let ended_at = line_of(&format!("process {pid} ended: "));
     let killed_at = line_of(&format!("killed process {pid}"));
-    let main_at = line_of("main process ended");
+    let main_at = line_of("command ended");
     Some(Lifecycle {
         pid,
         killed_by_services: killed_at.is_some(),
@@ -781,7 +781,7 @@ INSTRUMENTATION_CODE: -1
                    atld: killed process 77\n\
                    atld: process 77 ended: signal: 9 (SIGKILL)\n\
                    atld: process 80 ended: exit status: 0\n\
-                   atld: main process ended: exit status: 0\n";
+                   atld: command ended: exit status: 0\n";
         assert_eq!(
             lifecycle(log, "com.example.atlinstr"),
             Some(Lifecycle {
