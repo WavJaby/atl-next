@@ -41,6 +41,8 @@ pub struct CompositorConfig {
     pub max_acquired_buffer_count: u32,
     /// The layer stack the scene shows.
     pub layer_stack: u32,
+    /// Siblings are ordered by their z. false = a gate's deliberate break only (`xtask test window --stage surface-view --break-z-order`): creation order alone, so SurfaceViews leave their z side of the window and the readback check must fail.
+    pub z_order: bool,
 }
 
 impl Default for CompositorConfig {
@@ -48,6 +50,7 @@ impl Default for CompositorConfig {
         Self {
             max_acquired_buffer_count: 2,
             layer_stack: 0,
+            z_order: true,
         }
     }
 }
@@ -861,7 +864,7 @@ impl Compositor {
         for v in children.values_mut() {
             v.sort_by_key(|k| {
                 let l = &self.layers[k];
-                (l.z, l.seq)
+                (if self.config.z_order { l.z } else { 0 }, l.seq)
             });
         }
         let mut out = Vec::new();

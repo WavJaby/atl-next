@@ -54,6 +54,8 @@ pub struct Runtime {
     display: Option<String>,
     /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
     ui: Option<String>,
+    /// A composer rule a gate breaks on purpose (`ATL_UI_BREAK`, atl-composer start.rs), when [`Runtime::with_ui_break`] set it.
+    ui_break: Option<&'static str>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
@@ -259,6 +261,7 @@ impl Runtime {
             headless_pointer: None,
             display: None,
             ui: None,
+            ui_break: None,
             wayland: None,
             app_seccomp: true,
         })
@@ -293,6 +296,12 @@ impl Runtime {
     /// The app processes' UI mode (atld `--ui`, value `gtk`): every app process presents into a GTK window. Only the `gtk` window stage sets it.
     pub fn with_ui(mut self, mode: &str) -> Self {
         self.ui = Some(mode.to_owned());
+        self
+    }
+
+    /// The app processes' composer breaks `rule` (a deliberate-failure run): `ATL_UI_BREAK` in their environment.
+    pub fn with_ui_break(mut self, rule: &'static str) -> Self {
+        self.ui_break = Some(rule);
         self
     }
 
@@ -512,6 +521,9 @@ impl Runtime {
             cmd.args(["--ui", mode])
                 .env("ATL_UI_CAPTURE", "1")
                 .env("RUST_LOG", "info,atl_composer=debug");
+        }
+        if let Some(rule) = self.ui_break {
+            cmd.env("ATL_UI_BREAK", rule);
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);

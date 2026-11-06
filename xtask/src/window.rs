@@ -58,6 +58,9 @@ pub struct Args {
     /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-hold/root/log/`.
     #[arg(long, value_name = "SECONDS")]
     hold: Option<u64>,
+    /// Deliberate break (stage surface-view): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
+    #[arg(long)]
+    break_z_order: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1410,6 +1413,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
                 let p = start_proxy(&n.socket)?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
+                let rt = if args.break_z_order {
+                    rt.with_ui_break("z-order")
+                } else {
+                    rt
+                };
                 proxy = Some(p);
                 nested = Some(n);
                 rt

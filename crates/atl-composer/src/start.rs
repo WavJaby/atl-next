@@ -12,6 +12,7 @@ use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
+use atl_compositor::model::CompositorConfig;
 use atl_platform_ui::{PhysSize, PlatformUi};
 
 use crate::host::{Composer, ComposerConfig, ThreadHost};
@@ -22,6 +23,9 @@ use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
+/// A deliberate-failure run's broken rule (set by xtask's window gate only): with [`BREAK_Z_ORDER`] siblings ignore their z (CompositorConfig::z_order).
+const BREAK_ENV: &str = "ATL_UI_BREAK";
+const BREAK_Z_ORDER: &str = "z-order";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -108,7 +112,10 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let input_tx = input::spawn(script)?;
     let composer = Composer::new(ComposerConfig {
         display,
-        compositor: Default::default(),
+        compositor: CompositorConfig {
+            z_order: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_Z_ORDER),
+            ..Default::default()
+        },
     });
     let sender = if let Some(ui) = ui {
         // the size the services give a new Task: the window opens at it, so its first bounds report changes nothing
