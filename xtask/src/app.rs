@@ -52,10 +52,8 @@ const FONTS: &str = "AtlTest: fonts: ";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
-/// What Main.onCreate logs before MARKER when the bridge-1 fixture did not load; the gate wants it to carry the NativeBridge core's refusal (`atl_native_bridge::LOAD_REFUSED` + the library's path): proof that libnativeloader routed the library to our `loadLibrary`.
-const BRIDGE1: &str = "AtlTest: bridge1 not loaded: java.lang.UnsatisfiedLinkError";
-/// The fixture's file name in the APK (jni_fixture.rs LIB), which the refusal names.
-const BRIDGE1_LIB: &str = "libatl-jni-test.so";
+/// What Main.onCreate logs before MARKER once the bridge-1 fixture (`libatl-jni-test.so`, an x86_64 bionic library) loaded: libnativeloader routed it to the NativeBridge core, whose guest linker loaded it.
+const BRIDGE1: &str = "AtlTest: bridge1 loaded";
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -111,14 +109,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
-    .with_gl_driver()?;
+    .with_gl_driver()?
+    .with_native_bridge_guest(&args.host)?;
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
         rt
     };
     let work = rt.out.join("app");
-    // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
+    // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
     let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
     let apk = rt
         .apk
@@ -206,8 +205,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .find_map(|l| l.split_once(CACERTS).map(|(_, r)| r.to_owned()))
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
-    let bridge1_ok = bridge1
-        .is_some_and(|l| l.contains(atl_native_bridge::LOAD_REFUSED) && l.contains(BRIDGE1_LIB));
+    let bridge1_ok = bridge1.is_some();
     let mut whys = Vec::new();
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
@@ -240,7 +238,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if passed && !bridge1_ok {
         whys.push(format!(
-            "bridge1: want UnsatisfiedLinkError with the NativeBridge refusal for {BRIDGE1_LIB}, got {:?}",
+            "bridge1: want {BRIDGE1:?}, got {:?}",
             bridge1.or_else(|| app.lines().find(|l| l.contains("AtlTest: bridge1")))
         ));
     }
@@ -252,10 +250,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     if passed {
-        println!(
-            "app: pass bridge1 routed: {}",
-            bridge1.unwrap_or_default().trim()
-        );
+        println!("app: pass {}", bridge1.unwrap_or_default().trim());
     }
     if passed && gralloc_ok {
         println!("app: cacerts {cacerts}");

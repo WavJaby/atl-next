@@ -58,6 +58,24 @@ pub struct Config {
     pub library_path: Vec<PathBuf>,
 }
 
+impl Config {
+    /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`): the identity guest's ISA is the host's own.
+    pub fn installed() -> Config {
+        let isa = std::env::consts::ARCH;
+        let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
+        let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa));
+        Config {
+            linker: bin.join("linker64"),
+            vdso: lib.join(VDSO_FILE),
+            exe: bin.join("app_process64"),
+            library_path: vec![lib],
+        }
+    }
+}
+
+/// NBS's vdso file name (soname `linux-vdso.so.1`), installed among the guest libraries.
+pub const VDSO_FILE: &str = "libnative_bridge_vdso.so";
+
 /// A started guest: the linker initialised, its libraries constructed.
 pub struct Guest {
     pub linker: Image,
@@ -66,6 +84,9 @@ pub struct Guest {
     pub exe_entry: usize,
     thread: &'static mut HostThread,
 }
+
+// SAFETY: a Guest owns its mappings; its `HostThread` belongs to the starting thread, so a holder that moves it elsewhere must call guest code only on that thread (loader.rs checks the tid).
+unsafe impl Send for Guest {}
 
 impl Guest {
     /// Maps and initialises the guest. Returns right after the crossing back, before any allocation, so a probe can run on whatever thread pointer the crossing left.

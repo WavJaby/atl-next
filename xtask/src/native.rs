@@ -700,6 +700,11 @@ pub(crate) fn shell_env(
     Ok(CompilerCache::of(args, &workspace, view).map_or_else(Vec::new, |c| c.env().to_vec()))
 }
 
+/// Where `--native-bridge <arch>` put module `m`'s outputs.
+pub fn nb_module_dir(out: &Path, arch: &str, m: &str) -> PathBuf {
+    out.join(format!("{NB_DIR}{arch}/{m}"))
+}
+
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
 /// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).
 /// Direct mode, sccache's default, keys on the include paths, which name the out dir (`-I<out>/compat/device`, `-isystem <out>/gen/...`): measured 21% hits in a second out dir, every cross-out-dir lookup a miss. Do not drop the setting.

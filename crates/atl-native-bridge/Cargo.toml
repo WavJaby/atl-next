@@ -34,6 +34,7 @@ name = "g4"
 harness = false
 
 [dependencies]
+atl-android-paths = { path = "../atl-android-paths" }
 libc.workspace = true
 object.workspace = true
 

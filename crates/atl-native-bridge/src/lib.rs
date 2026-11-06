@@ -4,9 +4,9 @@
 //! - `exports`: `NativeBridgeItf` and the functions behind its entries, whose shells build.rs generates from native_bridge.h (atl-bridgegen).
 //! - `elf`: which libraries are ours to load: the host's ELF machine and a bionic marker.
 //! - `engine`: the identity engine (route N): guest bionic built for the host arch, run natively; crossings switch the thread pointer only.
+//! - `loader`: the process's guest, started by the first `loadLibrary`, and the libraries loaded into it.
 //!
-//! `loadLibrary` still answers `LOAD_REFUSED`: the engine runs the guest linker (spike gate g1) but is not routed to yet (step 4).
-//! Boundary crate: `unsafe` only in `exports`, `engine` and the generated shells.
+//! Boundary crate: `unsafe` only in `exports`, `engine`, `loader` and the generated shells.
 #![deny(unsafe_code)]
 
 pub mod elf;
@@ -14,8 +14,10 @@ pub mod elf;
 pub mod engine;
 #[allow(unsafe_code)]
 mod exports;
+#[allow(unsafe_code)]
+mod loader;
 
-pub use exports::{LOAD_REFUSED, VERSION};
+pub use exports::VERSION;
 
 /// The file ART opens (`-XX:NativeBridge=`, from property `ro.dalvik.vm.native.bridge`, atl-property-service): cargo's cdylib name for this crate, installed unrenamed (xtask `cdylib::stage`).
 pub const LIBRARY: &str = "libatl_native_bridge.so";

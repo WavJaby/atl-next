@@ -24,6 +24,20 @@ use crate::{manifest, packages, slot, tree};
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
 const GL_FRONTS: [&str; 3] = ["libEGL", "libGLESv1_CM", "libGLESv2"];
+/// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
+const NB_LINKER: &str = "native_bridge_guest_linker";
+const NB_EXE: &str = "native_bridge_guest_app_process";
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file); libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
+const NB_LIBS: [(&str, &str); 5] = [
+    ("libnative_bridge_guest_libc", "libc.so"),
+    ("libm", "libm.so"),
+    ("libdl", "libdl.so"),
+    ("ld-android", "ld-android.so"),
+    (
+        "libnative_bridge_vdso",
+        atl_native_bridge::engine::VDSO_FILE,
+    ),
+];
 
 /// The staged runtime and the tools around it.
 pub struct Runtime {
@@ -50,6 +64,8 @@ pub struct Runtime {
     gl_driver: Option<crate::mesa::Driver>,
     /// A gate's own test files placed by atld `--file` ([`Runtime::with_fixture_file`]): never shipped, so outside `refuse_test_only`.
     fixture_files: Vec<(PathBuf, String)>,
+    /// The native-bridge guest placed by atld `--file` ([`Runtime::with_native_bridge_guest`]): (host file, Android path).
+    native_bridge_guest: Vec<(PathBuf, String)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
@@ -378,6 +394,7 @@ impl Runtime {
             gralloc: None,
             gl_driver: None,
             fixture_files: Vec::new(),
+            native_bridge_guest: Vec::new(),
             headless_pointer: None,
             display: None,
             ui: None,
@@ -422,6 +439,37 @@ impl Runtime {
     /// Restages the test fonts with `family` preferred for sans-serif (the font gate's deliberate break: the mono font).
     pub fn with_sans_serif(mut self, layout: &Layout, family: &str) -> Result<Self> {
         self.fonts = crate::test_fonts::stage(layout, &self.out.join("fonts"), family)?;
+        Ok(self)
+    }
+
+    /// Also places the guest `xtask native --native-bridge <host>` built (the identity engine's guest has the host's ISA) where the NativeBridge core starts it (atl-native-bridge `Config::installed`): linker64 + app_process64 under `native_bridge_bin`, the guest libraries under `native_bridge_lib`.
+    pub fn with_native_bridge_guest(mut self, host: &str) -> Result<Self> {
+        let bin = atl_android_paths::native_bridge_bin(host);
+        let lib = atl_android_paths::native_bridge_lib(host);
+        let module =
+            |m: &str, file: &str| crate::native::nb_module_dir(&self.out, host, m).join(file);
+        let mut files = vec![
+            (module(NB_LINKER, "linker64"), format!("{bin}/linker64")),
+            (
+                module(NB_EXE, "app_process64"),
+                format!("{bin}/app_process64"),
+            ),
+            (
+                crate::runtimes::shared_libcxx(&self.out, host),
+                format!("{lib}/libc++.so"),
+            ),
+        ];
+        for (m, file) in NB_LIBS {
+            files.push((module(m, file), format!("{lib}/{file}")));
+        }
+        for (f, _) in &files {
+            ensure!(
+                f.is_file(),
+                "missing input {} (xtask native --native-bridge {host})",
+                f.display()
+            );
+        }
+        self.native_bridge_guest = files;
         Ok(self)
     }
 
@@ -657,6 +705,7 @@ impl Runtime {
             staged.extend(files.iter().map(|(f, _)| f.as_path()));
             staged.extend(dirs.iter().map(PathBuf::as_path));
         }
+        staged.extend(self.native_bridge_guest.iter().map(|(f, _)| f.as_path()));
         crate::licenses::refuse_test_only(&staged, &self.test_only)?;
         // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
         let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
@@ -692,7 +741,10 @@ impl Runtime {
             cmd.arg("--no-sensor-service");
         }
         let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
-        for (host, at) in driver_files.chain(&self.fixture_files) {
+        let placed = driver_files
+            .chain(&self.native_bridge_guest)
+            .chain(&self.fixture_files);
+        for (host, at) in placed {
             cmd.arg("--file").arg(format!("{}={at}", host.display()));
         }
         if let Some((allocator, _)) = &self.gralloc {

@@ -17,7 +17,7 @@ import javax.net.ssl.X509TrustManager;
  * The M2 gate: `xtask test app` (xtask/src/app.rs MARKER) waits for the onCreate line; two lines before it are checked too.
  * CA line (app.rs CACERTS): the default TrustManagerFactory trusts a distro root.
  * Fonts line (app.rs FONTS): the default and monospace typefaces' advance of one text, which the gate compares with the pinned fonts' hmtx tables.
- * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser); until bridge 1 loads bionic code, the NativeBridge core refuses and ART throws UnsatisfiedLinkError with its text.
+ * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser) through the NativeBridge core into its guest; a failed load logs ART's UnsatisfiedLinkError, which carries the core's reason.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
