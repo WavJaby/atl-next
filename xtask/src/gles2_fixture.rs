@@ -225,9 +225,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(w) => w.clone(),
         None => Layout::of(root)?.workspace().join("out/gles2-fixture"),
     };
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |w| {
-        w.join("out/native").join(&args.host)
-    })?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
     let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
         w.join("out/java/build")
     })?;

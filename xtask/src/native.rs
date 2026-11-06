@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
 use crate::aosp::{self, Index, Manifest, Prebuilts};
+use crate::build_state;
 use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
@@ -93,6 +94,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
         workspace.join("out").join("native").join(&args.host)
     })?;
+    // the state the crates will be built from, taken first; the record goes until they are
+    let state = build_state::of_checkout(root)?;
+    std::fs::create_dir_all(&out)?;
+    build_state::forget(&out)?;
     let tool_dir = out.join("bp2ninja");
     std::fs::create_dir_all(&out)?;
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
@@ -126,6 +131,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
     let crates = build_crates(root, &out, &providers)?;
+    // the runtime gates read the crates' artifacts from here (build_state::gate_out); ninja's later failures leave them current
+    build_state::record(&out, &state)?;
     let mut systems = BTreeMap::new();
     for (_, row) in providers::systems(&providers) {
         if systems.contains_key(row) {

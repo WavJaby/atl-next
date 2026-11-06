@@ -18,7 +18,6 @@ use anyhow::{Context, Result, ensure};
 use crate::binder;
 use crate::host_art::HostArt;
 use crate::parcel::truth_verdict;
-use crate::slot;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -62,9 +61,7 @@ const CASES: [&str; 9] = [
 ];
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        workspace.join("out/native").join(&args.host)
-    })?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
     let art = HostArt::new(
         root,
         &args.host,

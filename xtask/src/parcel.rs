@@ -19,7 +19,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::without_stamp;
 use crate::host_art::HostArt;
-use crate::{binder, farm, packages, slot};
+use crate::{binder, farm, packages};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -208,9 +208,7 @@ fn refusal_logged(stderr: &str) -> Option<String> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        workspace.join("out/native").join(&args.host)
-    })?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
     let probe = packages::bin(root, &out, PACKAGE, PROBE)?;
     let mut fails = verdict(
         &run_probe(&probe, &[])?,

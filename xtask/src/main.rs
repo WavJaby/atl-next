@@ -11,6 +11,7 @@ mod arches;
 mod atld_run;
 mod binder;
 mod build_pool;
+mod build_state;
 mod cdylib;
 mod check;
 mod composer;

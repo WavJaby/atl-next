@@ -33,9 +33,9 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
+use crate::farm;
 use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
 use crate::verdict::{Failure, Verdict};
-use crate::{farm, slot};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -264,9 +264,7 @@ const NO_AREA: &str = "no system property area";
 impl Env {
     fn new(root: &Path, args: &Args) -> Result<Self> {
         let layout = Layout::of(root)?;
-        let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-            workspace.join("out/native").join(&args.host)
-        })?;
+        let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
         let host = HostArt::new(
             root,
             &args.host,

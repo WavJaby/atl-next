@@ -16,8 +16,6 @@ use atl_layout::Layout;
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
-use crate::slot;
-
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
@@ -300,9 +298,7 @@ pub(crate) fn fresh_layout_with(root: &Path, vendor_hals: &str) -> Result<()> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
-        workspace.join("out/native").join(&args.host)
-    })?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
     let service = device.join("service/service");

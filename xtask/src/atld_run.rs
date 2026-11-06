@@ -188,9 +188,7 @@ impl Runtime {
         verbose: bool,
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
-        let out = slot::out_dir(root, out, "--out", |workspace| {
-            workspace.join("out/native").join(host)
-        })?;
+        let out = crate::build_state::gate_out(root, out, host)?;
         let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
             workspace.join("out/java/build")
         })?;
