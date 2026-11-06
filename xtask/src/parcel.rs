@@ -133,10 +133,11 @@ const CASES: [&str; 72] = [
     "summary",
 ];
 
-/// One probe run's result: exit success and stderr.
-fn run_probe(probe: &Path, args: &[&str]) -> Result<(bool, String)> {
+/// One probe run's result: exit success and stderr. `env` = the stage env (device-linked probe, no runpath: runpath_gate).
+fn run_probe(probe: &Path, env: &[(String, String)], args: &[&str]) -> Result<(bool, String)> {
     let out = Command::new(probe)
         .args(args)
+        .envs(env.iter().cloned())
         .output()
         .with_context(|| format!("running {}", probe.display()))?;
     Ok((
@@ -218,9 +219,10 @@ fn refusal_logged(stderr: &str) -> Option<String> {
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
     let probe = packages::bin(root, &out, PACKAGE, PROBE)?;
+    let stage = crate::binder::lib_env(&out)?;
     let mut fails = verdict(
-        &run_probe(&probe, &[])?,
-        &run_probe(&probe, &[WANT_BYTES, WRONG_BYTES])?,
+        &run_probe(&probe, &stage, &[])?,
+        &run_probe(&probe, &stage, &[WANT_BYTES, WRONG_BYTES])?,
     );
     if fails.is_empty() {
         println!("parcel: pass probe (round trip, and the size check fires on a wrong size)");
@@ -256,6 +258,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let status = Command::new(&to_parcel)
         .arg(&kcm)
         .arg(&keymap)
+        .envs(stage.iter().cloned())
         .status()
         .with_context(|| format!("running {}", to_parcel.display()))?;
     ensure!(
@@ -297,7 +300,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })();
     // the permission hook (atl-aidl-probe --enforce), a binder process too
     let mut enforce_cmd = Command::new(&probe);
-    enforce_cmd.arg(ENFORCE);
+    enforce_cmd.arg(ENFORCE).envs(stage.iter().cloned());
     let enforce = binder::spawn_piped(&broker, &enforce_cmd, AID_APP_START)
         .and_then(|p| Ok(p.child.wait_with_output()?));
     drop(broker);

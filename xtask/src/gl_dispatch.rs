@@ -40,11 +40,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ensure!(l.is_file(), "missing input {}", l.display());
     }
     let probe = build_probe(root, &out.join("cargo"))?;
+    // the probe dlopens the device libraries by path: their DT_NEEDED (libatl_bionic) resolve through the stage env only (runpath_gate)
+    let stage = crate::binder::lib_env(&out)?;
     let go = |mode: &str| -> Result<(bool, String)> {
         let o = Command::new(&probe)
             .args([egl.as_os_str(), gles.as_os_str()])
             .arg(size.to_string())
             .arg(mode)
+            .envs(stage.iter().cloned())
             .output()
             .context("running the probe")?;
         let text =

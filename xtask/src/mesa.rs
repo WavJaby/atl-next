@@ -231,12 +231,15 @@ fn build_or_skip(out: &Path, mesa: &Path) -> Result<Option<Result<PathBuf, Strin
     configure(&graph, mesa, &dest)?;
     let build = dest.join("build");
     let log = dest.join("ninja.log");
+    // device-linked, no runpath (runpath_gate): the sanity exe and Mesa's build-time executables find their libraries only through the stage env
+    let stage = crate::binder::lib_env(out)?;
     if !build.join("build.ninja").exists() {
         let status = Command::new("meson")
             .args(["setup", "--native-file"])
             .arg(dest.join("native.ini"))
             .arg(&build)
             .arg(mesa)
+            .envs(stage.clone())
             .stdout(std::fs::File::create(dest.join("meson-setup.log"))?)
             .stderr(std::process::Stdio::from(
                 std::fs::File::options()
@@ -255,6 +258,7 @@ fn build_or_skip(out: &Path, mesa: &Path) -> Result<Option<Result<PathBuf, Strin
     let status = Command::new("ninja")
         .arg("-C")
         .arg(&build)
+        .envs(stage)
         .stdout(std::fs::File::create(&log)?)
         .stderr(std::process::Stdio::from(
             std::fs::File::options().append(true).open(&log)?,
