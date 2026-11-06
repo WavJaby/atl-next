@@ -67,6 +67,9 @@ pub struct Args {
     /// Stage 9 decodes cheer.ogg truncated to half its bytes against the full file's expectation: the stage must fail.
     #[arg(long)]
     break_media: bool,
+    /// The property area names the DMABUF-heap tier whatever the probe found (atl-property-service `--linear-tier dmabuf-heap`): on a host without /dev/dma_heap/system stage 9 must fail (NO_MEMORY), which shows the probe's gralloc-BLOB tier is what keeps it working.
+    #[arg(long)]
+    break_linear_tier: bool,
     /// Stage 9's game APKs (assets/audio/cheer.ogg, assets/sound/game_music.ogg, assets/sounds/tap.wav). Default: <workspace>/apk.
     #[arg(long)]
     apks: Option<PathBuf>,
@@ -402,7 +405,7 @@ impl Env {
         let layout = Layout::of(root)?;
         let out =
             crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "native-load")?;
-        let host = HostArt::new(
+        let mut host = HostArt::new(
             root,
             &args.host,
             args.java_out.as_deref(),
@@ -410,6 +413,9 @@ impl Env {
             "native-load-art",
             args.verbose,
         )?;
+        if args.break_linear_tier {
+            host.linear_tier = Some("dmabuf-heap");
+        }
         let runtime = out.join(RUNTIME);
         ensure!(runtime.exists(), "missing input {}", runtime.display());
         let cpp = tree::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);

@@ -11,6 +11,9 @@ pub const NAME_MAX: usize = 127;
 /// Not a hardware limit: the backend still refuses what the GPU cannot hold.
 pub const DIMENSION_MAX: u32 = 16384;
 
+/// Largest BLOB (bytes): [`DIMENSION_MAX`] rows of [`format::BLOB_ROW_BYTES`] = 64 MiB, the backing buffer's largest shape. Codec2's linear blocks are KiB to a few MiB.
+pub const BLOB_MAX: u32 = DIMENSION_MAX * format::BLOB_ROW_BYTES;
+
 /// A request, as the AIDL parcelable carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Descriptor {
@@ -84,12 +87,16 @@ impl Descriptor {
 
     /// Checks the request against the supported set.
     pub fn check(&self) -> Result<Checked, Refusal> {
-        let dim = |v: i32| {
-            u32::try_from(v)
-                .ok()
-                .filter(|v| (1..=DIMENSION_MAX).contains(v))
+        let dim = |v: i32, max: u32| u32::try_from(v).ok().filter(|v| (1..=max).contains(v));
+        // a BLOB is width bytes x 1 (PixelFormat.aidl BLOB)
+        let (width_max, height_max) = if self.format == format::BLOB {
+            (BLOB_MAX, 1)
+        } else {
+            (DIMENSION_MAX, DIMENSION_MAX)
         };
-        let (Some(width), Some(height)) = (dim(self.width), dim(self.height)) else {
+        let (Some(width), Some(height)) =
+            (dim(self.width, width_max), dim(self.height, height_max))
+        else {
             return Err(Refusal::BadShape);
         };
         if self.layer_count != 1 {

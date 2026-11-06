@@ -58,6 +58,8 @@ types = [
     "android.gui.IDisplayEventConnection",
     "android.os.IServiceManager",
     "android.os.IUserManager",
+    # the processinfo service (process_info.rs): libmedia ProcessInfo asks it for a client's priority
+    "android.os.IProcessInfoService",
     "android.os.storage.IStorageManager",
     "android.content.IClipboard",
     "android.app.IApplicationThread",

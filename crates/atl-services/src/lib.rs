@@ -55,6 +55,8 @@ pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
+pub mod process_info;
+#[cfg(feature = "converter")]
 pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod sensor_wire;

@@ -206,6 +206,12 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playSoundEffect",
 ]
 
+[processinfo]
+src = ["crates/atl-services/src/process_info.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#getProcessStatesAndOomScoresForPIDs",
+]
+
 [user]
 src = ["crates/atl-services/src/user.rs"]
 mirrors = [

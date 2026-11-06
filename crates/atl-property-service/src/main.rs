@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use atl_property_service::LinearTier;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -18,13 +19,27 @@ struct Args {
     /// The area file to write.
     #[arg(long)]
     out: PathBuf,
+    /// Codec2's linear allocator tier instead of the probed one (`dmabuf-heap`, `gralloc-blob`): for a gate's break, e.g. the heap tier on a host without a heap must fail allocation.
+    #[arg(long, value_parser = ["dmabuf-heap", "gralloc-blob"])]
+    linear_tier: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let text = std::fs::read_to_string(&args.build_prop)
         .with_context(|| format!("reading {}", args.build_prop.display()))?;
-    let props = atl_property_service::defaults(&text)
+    let tier = match args.linear_tier.as_deref() {
+        Some("dmabuf-heap") => LinearTier::DmaBufHeap,
+        Some(_) => LinearTier::GrallocBlob,
+        None => LinearTier::probe(),
+    };
+    // the tier log line: which Codec2 linear allocator this host's apps get
+    writeln!(
+        std::io::stderr(),
+        "atl-property-service: linear allocator tier {}",
+        tier.name()
+    )?;
+    let props = atl_property_service::defaults(&text, tier)
         .with_context(|| args.build_prop.display().to_string())?;
     let bytes = atl_property_service::area(&props)?;
     let mut tmp = args.out.clone().into_os_string();

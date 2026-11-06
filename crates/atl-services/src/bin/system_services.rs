@@ -60,6 +60,8 @@ const ACTIVITY: &str = "activity";
 /// Context.ACTIVITY_TASK_SERVICE (Context.java:4730).
 const ACTIVITY_TASK: &str = "activity_task";
 const PACKAGE: &str = "package";
+/// AMS publishes ProcessInfoService as "processinfo" (ActivityManagerService.setSystemProcess).
+const PROCESS_INFO: &str = "processinfo";
 /// Context.DISPLAY_SERVICE.
 const DISPLAY: &str = "display";
 /// Context.WINDOW_SERVICE.
@@ -166,6 +168,8 @@ fn main() -> Result<()> {
     )
     .context("addService audio")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
+    binder::add_service(PROCESS_INFO, atl_services::process_info::new_binder())
+        .context("addService processinfo")?;
     binder::add_service(
         MOUNT,
         atl_services::storage::new_binder(Arc::clone(&permissions)),

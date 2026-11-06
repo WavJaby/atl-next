@@ -31,7 +31,7 @@ use atl_android_paths::{
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox, to_log};
 use atl_gralloc::vintf;
-use atl_property_service::Property;
+use atl_property_service::{LinearTier, Property};
 use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
 use atl_services::native_libs::{self, SupportedAbi};
@@ -452,7 +452,8 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
 /// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`).
-fn property_area(a: &Args, r: &Root) -> Result<Vec<Property>> {
+/// `tier`: the Codec2 linear allocator tier the host supports (atl_property_service::LinearTier::probe); its properties go into the set.
+fn property_area(a: &Args, r: &Root, tier: LinearTier) -> Result<Vec<Property>> {
     let mut text = std::fs::read_to_string(&a.build_prop)
         .with_context(|| format!("reading {}", a.build_prop.display()))?;
     let vendor = Path::new("vendor/build.prop");
@@ -461,7 +462,7 @@ fn property_area(a: &Args, r: &Root) -> Result<Vec<Property>> {
         text += &std::fs::read_to_string(host)
             .with_context(|| format!("reading {}", host.display()))?;
     }
-    let props = atl_property_service::defaults(&text)?;
+    let props = atl_property_service::defaults(&text, tier)?;
     std::fs::write(r.properties(), atl_property_service::area(&props)?)?;
     std::fs::create_dir(r.root.join("properties.d"))?;
     Ok(props)
@@ -496,6 +497,8 @@ struct Host {
     shared_ro: Vec<Mount>,
     /// With `--ui`: what each app's GTK side reads from the desktop, read-only at its own path (atl_platform_host::app_access): the compositor socket, fontconfig's file and font dirs. Headless: none.
     desktop_ro: Vec<Mount>,
+    /// The device nodes each app process may open (set where the tier is probed, `run`).
+    app_devices: Vec<PathBuf>,
     /// The installed packages: an app process mounts its own directories (package_mounts).
     packages: Vec<PackageRecord>,
 }
@@ -621,8 +624,7 @@ impl Host {
             .chain(self.desktop_ro.iter().cloned())
             .collect(),
             links: vec![],
-            // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
-            devices: vec![PathBuf::from(DRM_DIR)],
+            devices: self.app_devices.clone(),
             property_area: Some(self.process_properties(uid, name)?),
             rights: vec![],
             program: self.launcher.clone(),
@@ -881,7 +883,17 @@ fn run(a: &Args) -> Result<ExitCode> {
         root: std::path::absolute(&a.root)?,
     };
     std::fs::create_dir_all(r.root.join("log"))?;
-    let defaults = property_area(a, &r)?;
+    let tier = LinearTier::probe();
+    log(format_args!("linear allocator tier {}", tier.name()));
+    let defaults = property_area(a, &r, tier)?;
+    // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers.
+    // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
+    let app_devices = std::iter::once(PathBuf::from(DRM_DIR))
+        .chain(
+            (tier == LinearTier::DmaBufHeap)
+                .then(|| PathBuf::from(atl_property_service::DMA_HEAP_SYSTEM)),
+        )
+        .collect();
     let boot = system_layout(a, &r)?;
     let fonts = font_layout(a, &r)?;
     vintf_layout(a, &r)?;
@@ -992,6 +1004,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the services and every app process answer with this one display
     let display = a.display.unwrap_or_else(host_display);
     let host = Arc::new(Host {
+        app_devices,
         broker,
         launcher: a.launcher.clone(),
         lib: lib.clone(),

@@ -97,14 +97,54 @@ pub fn parse_build_prop(text: &str) -> Result<Vec<Property>, Error> {
     Ok(out)
 }
 
-/// The default set: `build_prop`'s properties, `CONSTANTS`, the ABI lists, then the fingerprint derived from them.
-pub fn defaults(build_prop: &str) -> Result<Vec<Property>, Error> {
+/// The DMABUF system heap: Codec2's default linear allocator without /dev/ion (frameworks/av C2Store.cpp `using_ion`, `fetchDmaBufAllocator`). A sandbox grants it only when present.
+pub const DMA_HEAP_SYSTEM: &str = "/dev/dma_heap/system";
+
+/// `debug.stagefright.c2-poolmask` with the BLOB bit: C2Store.cpp `GetCodec2PoolMask`'s default (1 << ION | 1 << BUFFERQUEUE, C2PlatformAllocatorStore ION = PLATFORM_START = 0x10, BUFFERQUEUE = 0x12) + 1 << BLOB (0x13); `GetPreferredLinearAllocatorId` then picks C2AllocatorBlob (gralloc BLOB buffers) for linear blocks.
+const POOLMASK_BLOB: &str = "0xd0000";
+
+/// Codec2's linear-block allocator tier (capability tiers, one module): the host's DMABUF system heap where it is openable, AOSP's default; else gralloc BLOB buffers, the baseline every host with our gralloc has. Same `C2Allocator` interface either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearTier {
+    /// DMABUF heap ioctl in the app process; the poolmask stays AOSP's default.
+    DmaBufHeap,
+    /// gralloc BLOB through the allocator service; the poolmask gets the BLOB bit.
+    GrallocBlob,
+}
+
+impl LinearTier {
+    /// Opens [`DMA_HEAP_SYSTEM`] read-only as C2DmaBufAllocator does (BufferAllocator `OpenDmabufHeap`, O_RDONLY): openable -> `DmaBufHeap`. Existence alone is not enough: a node the user may not open fails every allocation.
+    pub fn probe() -> Self {
+        if std::fs::File::open(DMA_HEAP_SYSTEM).is_ok() {
+            LinearTier::DmaBufHeap
+        } else {
+            LinearTier::GrallocBlob
+        }
+    }
+
+    /// The name the tier log line uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            LinearTier::DmaBufHeap => "dmabuf-heap",
+            LinearTier::GrallocBlob => "gralloc-blob",
+        }
+    }
+}
+
+/// The default set: `build_prop`'s properties, `CONSTANTS`, the linear allocator tier's properties, the ABI lists, then the fingerprint derived from them.
+pub fn defaults(build_prop: &str, tier: LinearTier) -> Result<Vec<Property>, Error> {
     let mut props = parse_build_prop(build_prop)?;
     props.extend(
         CONSTANTS
             .iter()
             .map(|(n, v)| ((*n).to_owned(), (*v).to_owned())),
     );
+    if tier == LinearTier::GrallocBlob {
+        props.push((
+            "debug.stagefright.c2-poolmask".to_owned(),
+            POOLMASK_BLOB.to_owned(),
+        ));
+    }
     for (name, value) in [
         ("ro.product.cpu.abilist", abis::ABILIST),
         ("ro.product.cpu.abilist32", abis::ABILIST32),
@@ -196,7 +236,7 @@ mod tests {
 
     #[test]
     fn defaults_readable_from_the_area() {
-        let bytes = area(&defaults(BUILD_PROP).unwrap()).unwrap();
+        let bytes = area(&defaults(BUILD_PROP, LinearTier::DmaBufHeap).unwrap()).unwrap();
         let w = words(&bytes);
         let a = Area::new(&w).unwrap();
         assert_eq!(read(&a, "ro.build.version.sdk").as_deref(), Some("36"));
@@ -209,6 +249,21 @@ mod tests {
         );
         // unset keys stay unset: their readers' defaults apply
         assert_eq!(read(&a, "ro.hw_timeout_multiplier"), None);
+        // the heap tier keeps AOSP's default poolmask
+        assert_eq!(read(&a, "debug.stagefright.c2-poolmask"), None);
+    }
+
+    /// property_get_int32 parses with strtoll base 0: 0xd0000 = 1<<16 | 1<<18 | 1<<19 (ION, BUFFERQUEUE, BLOB)
+    #[test]
+    fn blob_tier_sets_the_blob_bit() {
+        let props = defaults(BUILD_PROP, LinearTier::GrallocBlob).unwrap();
+        let mask = props
+            .iter()
+            .find(|(n, _)| n == "debug.stagefright.c2-poolmask")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        let mask = i64::from_str_radix(mask.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(mask, (1 << 0x10) | (1 << 0x12) | (1 << 0x13));
     }
 
     /// board_config.mk over arches.toml on an x86_64 host: CPU ABI x86_64, no 32-bit CPU ABI, bridged 64-bit arm64-v8a then riscv64, bridged 32-bit armeabi-v7a, armeabi, x86 (rows arm, x86).
@@ -237,7 +292,7 @@ mod tests {
         // a build.prop setting a constant: bionic's add refuses the second
         let dup = format!("{BUILD_PROP}ro.build.type=eng\n");
         assert_eq!(
-            area(&defaults(&dup).unwrap()),
+            area(&defaults(&dup, LinearTier::DmaBufHeap).unwrap()),
             Err(Error::Add {
                 name: "ro.build.type".into(),
                 error: AddError::Exists

@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! The pixel formats the allocator supports: a table keyed by `android.hardware.graphics.common.PixelFormat`.
 
+/// `PixelFormat.BLOB` (PixelFormat.aidl `BLOB = 0x21`): untyped bytes, width = size in bytes, height 1. Codec2's linear blocks on the gralloc tier (C2AllocatorBlob).
+pub const BLOB: i32 = 0x21;
+
+/// DRM_FORMAT_R8, fourcc 'R8  ' (drm_fourcc.h `fourcc_code('R', '8', ' ', ' ')`): one byte per pixel, a BLOB's backing.
+pub const DRM_FORMAT_R8: u32 = u32::from_le_bytes(*b"R8  ");
+
+/// Bytes per row of a BLOB's backing R8 buffer: n bytes are allocated as ceil(n / row) rows, so a BLOB's size is not bounded by a driver's maximum 2D width. One page: LINEAR rows of that width need no padding, so the rows are contiguous (the backend checks the pitch it gets).
+pub const BLOB_ROW_BYTES: u32 = 4096;
+
 /// `PixelFormat.RGBA_8888` (hardware/interfaces/graphics/common/aidl PixelFormat.aidl `RGBA_8888 = 0x1`).
 pub const RGBA_8888: i32 = 0x1;
 
@@ -37,6 +46,8 @@ pub const COMPONENT_R: i64 = 1 << 10;
 pub const COMPONENT_G: i64 = 1 << 11;
 pub const COMPONENT_B: i64 = 1 << 12;
 pub const COMPONENT_A: i64 = 1 << 30;
+/// `PlaneLayoutComponentType.RAW = 1 << 20`: bytes with no colour meaning (a BLOB's).
+pub const COMPONENT_RAW: i64 = 1 << 20;
 
 /// Supported formats. Add a row when a consumer first needs one (AGENTS.md "Rows are added when a consumer first needs them"): libui's software path (`Surface::lock`) allocates RGBA_8888, an opaque window's BLAST queue RGBX_8888. RGBX has no alpha component: byte 3 is padding, its value undefined.
 const FORMATS: &[FormatInfo] = &[
@@ -60,6 +71,13 @@ const FORMATS: &[FormatInfo] = &[
             (COMPONENT_G, 8, 8),
             (COMPONENT_B, 16, 8),
         ],
+    },
+    // Codec2's C2AllocatorBlob: atl-property-service sets the poolmask's BLOB bit on hosts without a DMABUF heap
+    FormatInfo {
+        pixel_format: BLOB,
+        fourcc: DRM_FORMAT_R8,
+        bytes_per_pixel: 1,
+        components: &[(COMPONENT_RAW, 0, 8)],
     },
 ];
 
@@ -89,6 +107,7 @@ mod tests {
         assert_eq!(lookup(RGBA_8888).map(|f| f.bytes_per_pixel), Some(4));
         assert_eq!(lookup(RGBX_8888).map(|f| f.bytes_per_pixel), Some(4));
         // RGB_565 (4) and BGRA_8888 (5) have no row yet
+        assert_eq!(lookup(BLOB).map(|f| f.fourcc), Some(DRM_FORMAT_R8));
         for f in [0, 4, 5, -1] {
             assert!(lookup(f).is_none(), "{f}");
         }

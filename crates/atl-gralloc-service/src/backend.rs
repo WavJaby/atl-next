@@ -15,7 +15,9 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
 use atl_gralloc::descriptor::{Checked, Descriptor};
-use atl_gralloc::format::{DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
+use atl_gralloc::format::{
+    BLOB, BLOB_ROW_BYTES, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, RGBA_8888,
+};
 use atl_gralloc::usage;
 use gbm::{BufferObjectFlags, Device, Format};
 use rustix::fs::{SeekFrom, seek};
@@ -154,13 +156,26 @@ fn alloc(
     counters: &Counters,
 ) -> Result<Dmabuf, BackendError> {
     let format = gbm_format(c.format.fourcc)?;
+    // a BLOB of n bytes: R8 rows of BLOB_ROW_BYTES, ceil(n / row) of them; reported as one row of n bytes
+    let blob = c.format.pixel_format == BLOB;
+    let (width, height) = if blob {
+        (BLOB_ROW_BYTES, c.width.div_ceil(BLOB_ROW_BYTES))
+    } else {
+        (c.width, c.height)
+    };
     let bo = dev
-        .create_buffer_object::<()>(c.width, c.height, format, flags_for(c.usage, &c.modifiers))
+        .create_buffer_object::<()>(width, height, format, flags_for(c.usage, &c.modifiers))
         .map_err(|e| BackendError::Alloc(e.to_string()))?;
+    if blob && bo.stride() != BLOB_ROW_BYTES {
+        return Err(BackendError::Alloc(format!(
+            "BLOB backing pitch {} != {BLOB_ROW_BYTES}: rows not contiguous",
+            bo.stride()
+        )));
+    }
     // not `bo.fd()`: that descriptor is read-only on some drivers (prime.rs)
     let fd = prime::export_dmabuf(dev.as_fd(), prime::gem_handle(&bo))
         .map_err(|e| BackendError::Alloc(format!("exporting the dma-buf: {e}")))?;
-    let pitch = bo.stride();
+    let pitch = if blob { c.width } else { bo.stride() };
     // a dma-buf reports its size by seeking to its end
     let size = seek(&fd, SeekFrom::End(0))
         .map_err(|e| BackendError::Alloc(format!("sizing the dma-buf: {e}")))?;

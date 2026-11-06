@@ -45,6 +45,8 @@ pub struct HostArt {
     /// The build directory's cargo target dir: launcher, property service, test libraries.
     pub cargo: PathBuf,
     pub verbose: bool,
+    /// atl-property-service `--linear-tier` for [`HostArt::compile`]'s area (a gate's break); None = the probed tier.
+    pub linear_tier: Option<&'static str>,
 }
 
 /// One ART run's result.
@@ -164,6 +166,7 @@ impl HostArt {
             jdk,
             cargo: out.join("cargo"),
             verbose,
+            linear_tier: None,
         };
         for p in [&h.build_prop, &h.d8, &h.jdk]
             .into_iter()
@@ -231,7 +234,8 @@ impl HostArt {
                 .arg("--build-prop")
                 .arg(&self.build_prop)
                 .arg("--out")
-                .arg(work.join("properties")),
+                .arg(work.join("properties"))
+                .args(self.linear_tier.iter().flat_map(|t| ["--linear-tier", t])),
             "atl-property-service",
         )?;
         let area = printed
