@@ -93,6 +93,9 @@ pub struct Args {
     /// Stage start-finish only: the services refuse a start that would reuse an instance (atld `--no-new-intent`), so the new-intent sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_new_intent: bool,
+    /// Stage widgets only: the back press is BTN_LEFT, so no back key comes and the mouse-buttons sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_mouse_back: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1731,6 +1734,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let atld_pid = atld_child.id();
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
+    let break_mouse_back = args.break_mouse_back;
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -1740,7 +1744,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::Ime, _, Some(ime)) => {
                 ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
             }
-            (Stage::Widgets, _, _) => widgets::drive(p, &log),
+            (Stage::Widgets, _, _) => widgets::drive(p, &log, break_mouse_back),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Dialog, _, _) => dialog::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {

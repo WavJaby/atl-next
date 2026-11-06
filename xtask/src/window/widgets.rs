@@ -82,6 +82,14 @@ const KEY_A: u32 = 30;
 const KEY_LEFTSHIFT: u32 = 42;
 /// How long A is held: past labwc's default repeat delay (600 ms, wlroots keyboard default) plus a few repeats at its 25 Hz.
 const KEY_HOLD: Duration = Duration::from_millis(1000);
+/// linux/input-event-codes.h BTN_SIDE and BTN_EXTRA: a mouse's back and forward side buttons (GDK 8 and 9, X11 numbering).
+const BTN_SIDE: u32 = 0x113;
+const BTN_EXTRA: u32 = 0x114;
+/// keycodes.h AKEYCODE_BACK and AKEYCODE_FORWARD: the KeyEvents the side buttons send.
+const KEYCODE_BACK: i64 = 4;
+const KEYCODE_FORWARD: i64 = 125;
+/// Main's OnBackInvokedCallback line: BACK reached the app's back dispatch.
+const BACK_CALLBACK_LINE: &str = "AtlWindow: back callback";
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +214,12 @@ fn keys_check(app: &str) -> Result<String, String> {
             return Err(format!("no `{want}` line"));
         }
     }
-    let keys: Vec<[i64; 10]> = app.lines().filter_map(key_line).collect();
+    // the mouse's button keys (source mouse) are buttons_check's, not the probe's typed keys
+    let keys: Vec<[i64; 10]> = app
+        .lines()
+        .filter_map(key_line)
+        .filter(|k| k[7] != SOURCE_MOUSE)
+        .collect();
     if let Some(k) = keys.iter().find(|k| k[6] != keyboard || k[7] != 0x101) {
         return Err(format!(
             "key from device {} source {:#x}, want {keyboard} 0x101",
@@ -256,6 +269,36 @@ fn keys_check(app: &str) -> Result<String, String> {
     Ok(format!(
         "Shift+A -> 'A' meta 0x41, a -> 'a', held A repeated {} times (first long-press); keyboard {keyboard} and touchpad {touchpad} listed",
         repeats.len()
+    ))
+}
+
+/// The mouse's side buttons (drive's last step): BTN_SIDE reached Main as KEYCODE_BACK down then up from the mouse (source mouse, the pointer's device, flags 0, no repeat), BTN_EXTRA as KEYCODE_FORWARD the same way, and the back callback ran once.
+/// Values: keycodes.h, atl-services input_devices. AOSP: CursorInputMapper's synthesizeButtonKeys, a key on each button-state change.
+fn buttons_check(app: &str) -> Result<String, String> {
+    let pointer = i64::from(input_devices::POINTER);
+    let got: Vec<(i64, i64, i64, i64, i64)> = app
+        .lines()
+        .filter_map(key_line)
+        .filter(|k| k[7] == SOURCE_MOUSE)
+        .map(|k| (k[0], k[1], k[6], k[4], k[5]))
+        .collect();
+    let want = [
+        (0, KEYCODE_BACK, pointer, 0, 0),
+        (1, KEYCODE_BACK, pointer, 0, 0),
+        (0, KEYCODE_FORWARD, pointer, 0, 0),
+        (1, KEYCODE_FORWARD, pointer, 0, 0),
+    ];
+    if got != want {
+        return Err(format!(
+            "mouse keys (action, code, device, repeat, flags) {got:?}, want {want:?}"
+        ));
+    }
+    let callbacks = app.lines().filter(|l| *l == BACK_CALLBACK_LINE).count();
+    if callbacks != 1 {
+        return Err(format!("{callbacks} back callbacks, want 1"));
+    }
+    Ok(format!(
+        "BTN_SIDE -> KEYCODE_BACK down and up from the mouse ({pointer}), the back callback ran once; BTN_EXTRA -> KEYCODE_FORWARD the same way"
     ))
 }
 
@@ -656,6 +699,7 @@ pub fn checks(
         ("window-focus", window_focus_check(app)),
         ("cursor", cursor_check(app)),
         ("keys", keys_check(app)),
+        ("mouse-buttons", buttons_check(app)),
         ("hover", hover_check(app)),
         ("wheel", wheel_check(app)),
         ("swipe", swipe_check(app)),
@@ -703,9 +747,9 @@ pub(super) fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))
 }
 
-/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, hovers over the ListView, turns the wheel down and swipes up over it, drags it up, and waits for the readback of the final frame.
+/// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, hovers over the ListView, turns the wheel down and swipes up over it, drags it up, waits for the readback of the final frame, and presses the mouse's back and forward side buttons over the label.
 /// Each injection waits for its answer: the proxy's report for the header, the fixture's line for the rest. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+pub fn drive(proxy: Proxy, app_log: &Path, break_mouse_back: bool) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -871,6 +915,21 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     }) {
         return Err("no readback after the final frame".to_owned());
     }
+    // the mouse's side buttons last, over the label (not clickable): BTN_SIDE is back, BTN_EXTRA forward; the break sends BTN_LEFT for the back press, so no back key comes
+    let (x, y) = centre("label")?;
+    let back = if break_mouse_back { BTN_LEFT } else { BTN_SIDE };
+    let button = |button: u32, pressed: bool| PointerAction::Button { button, pressed };
+    inject(
+        &proxy,
+        vec![
+            PointerAction::Enter { x, y },
+            button(back, true),
+            button(back, false),
+            button(BTN_EXTRA, true),
+            button(BTN_EXTRA, false),
+        ],
+    )?;
+    wait_until(app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
     Ok(Liveness {
         answered: false,
         silent: false,
@@ -885,6 +944,30 @@ mod tests {
 
     /// The Button at left 16, top 49, 88x48: centre (60, 73), as a real run logs it.
     const BUTTON: &str = "AtlWindow: layout button left=16 top=49 width=88 height=48\n";
+
+    /// One mouse key line as Main logs it (`key` format, source mouse).
+    fn mouse_key(action: u32, code: i64, device: i64) -> String {
+        format!(
+            "AtlWindow: key action={action} code={code} scan=0 meta=0 repeat=0 flags=0 device={device} source={SOURCE_MOUSE} char=0 kbtype=0\n"
+        )
+    }
+
+    /// Back and forward down and up from the pointer, and the back callback: the probe's last step passes; a missing back key or callback fails it.
+    #[test]
+    fn buttons_check_wants_back_and_forward_from_the_mouse() {
+        let pointer = i64::from(input_devices::POINTER);
+        let good = [
+            mouse_key(0, KEYCODE_BACK, pointer),
+            mouse_key(1, KEYCODE_BACK, pointer),
+            mouse_key(0, KEYCODE_FORWARD, pointer),
+            mouse_key(1, KEYCODE_FORWARD, pointer),
+        ]
+        .concat()
+            + "AtlWindow: back callback\n";
+        assert!(buttons_check(&good).is_ok());
+        assert!(buttons_check(&good.replace(&mouse_key(0, KEYCODE_BACK, pointer), "")).is_err());
+        assert!(buttons_check(&good.replace("AtlWindow: back callback\n", "")).is_err());
+    }
 
     #[test]
     fn header_check_wants_the_buttons_tap_first() {

@@ -94,6 +94,15 @@ public class Main extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "onCreate reached");
+        // BACK through the predictive-back path (OnBackInvokedCallback, what a targetSdk 36 app gets): the mouse's back button checks it (`back callback` line)
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                new android.window.OnBackInvokedCallback() {
+                    @Override
+                    public void onBackInvoked() {
+                        Log.i(TAG, "back callback");
+                    }
+                });
         setContentView(R.layout.main);
         label = (TextView) findViewById(R.id.label);
         button = (Button) findViewById(R.id.button);
