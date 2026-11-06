@@ -371,6 +371,8 @@ impl ApkTools {
             host_art::collect(&gen_dir, "java", &mut sources)?;
         }
         // no Java at all (a `hasCode="false"` app, e.g. a pure NativeActivity one): no classes.dex, as aapt2 + the NDK's packager leave it
+        let manifest = std::fs::read_to_string(fixture.join("AndroidManifest.xml"))?;
+        check_code_policy(&manifest, !sources.is_empty())?;
         if !sources.is_empty() {
             self.dex_into(&apk, work, &classes, &dex, class_jars, &sources)?;
         }
@@ -715,9 +717,41 @@ pub fn settled(services_log: &str) -> bool {
         .is_some_and(|l| l.starts_with(SETTLED_PREFIX))
 }
 
+/// AOSP's install-time code policy (ScanPackageUtils.assertCodePolicy): `<application android:hasCode>` (default true) needs a dex in the APK, else INSTALL_FAILED_INVALID_APK "code is missing". A fixture without Java must say hasCode="false", so a packaged fixture is one a real device installs.
+fn check_code_policy(manifest_xml: &str, has_dex: bool) -> Result<()> {
+    const ANDROID: &str = "http://schemas.android.com/apk/res/android";
+    let doc = roxmltree::Document::parse(manifest_xml)?;
+    let declared = doc
+        .descendants()
+        .find(|n| n.has_tag_name("application"))
+        .and_then(|a| a.attribute((ANDROID, "hasCode")))
+        .is_none_or(|v| v != "false");
+    anyhow::ensure!(
+        has_dex || !declared,
+        "the fixture has no Java but declares hasCode (default true): AOSP refuses the APK (ScanPackageUtils.assertCodePolicy: code is missing)"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// hasCode="false" packages without a dex; the default (absent) and "true" need one; with a dex every declaration passes (AOSP checks one direction only).
+    #[test]
+    fn code_policy_follows_has_code() {
+        let m = |attr: &str| {
+            format!(
+                "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"p\"><application {attr}/></manifest>"
+            )
+        };
+        assert!(check_code_policy(&m("android:hasCode=\"false\""), false).is_ok());
+        assert!(check_code_policy(&m(""), false).is_err());
+        assert!(check_code_policy(&m("android:hasCode=\"true\""), false).is_err());
+        for attr in ["", "android:hasCode=\"false\"", "android:hasCode=\"true\""] {
+            assert!(check_code_policy(&m(attr), true).is_ok());
+        }
+    }
 
     /// Both counter kinds, the last count per name wins, a name with spaces keeps them, other lines are ignored, and a counter line without a stamp is not one.
     #[test]
