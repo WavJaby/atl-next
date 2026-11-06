@@ -380,17 +380,14 @@ mod tests {
     #[test]
     fn aosp_sparse_rows_checked() {
         let row = |key: &str, dirs: &str| {
-            format!(
-                "{AOSP}\"external/cronet\" = \"{SHA}\"\n[aosp.sparse]\n\"{key}\" = [{dirs}]\n"
-            )
+            format!("{AOSP}\"external/cronet\" = \"{SHA}\"\n[aosp.sparse]\n\"{key}\" = [{dirs}]\n")
         };
         assert!(err(&row("external/icu", "\"stable\"")).contains("not a pinned"));
         assert!(err(&row("external/cronet", "")).contains("empty keep-set"));
         assert!(err(&row("external/cronet", "\"../x\"")).contains("not a relative tree path"));
         assert!(err(&row("external/cronet", "\"stable\", \"stable\"")).contains("listed twice"));
         assert!(
-            err(&row("external/cronet", "\"stable\", \"stable/tests\""))
-                .contains("inside another")
+            err(&row("external/cronet", "\"stable\", \"stable/tests\"")).contains("inside another")
         );
     }
 }

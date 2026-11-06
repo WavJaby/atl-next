@@ -405,9 +405,9 @@ fn decide(local: &Local, pin: &str, patch_branch: &str) -> Action {
     match local {
         Local::Missing => Action::Clone,
         Local::Unborn { files: false } => Action::Reclone,
-        Local::Unborn { files: true } => {
-            Action::Blocked("git repository without commits holding files; remove it by hand".into())
-        }
+        Local::Unborn { files: true } => Action::Blocked(
+            "git repository without commits holding files; remove it by hand".into(),
+        ),
         Local::Present {
             branch: Some(b), ..
         } if b == patch_branch => Action::PatchBranch,
@@ -448,7 +448,9 @@ fn inspect(dir: &Path) -> Result<Local> {
         &["status", "--porcelain", "--untracked-files=no"],
     )?
     .is_empty();
-    let sparse = if git(Some(dir), &["config", "--bool", "core.sparseCheckout"]).is_ok_and(|v| v == "true") {
+    let sparse = if git(Some(dir), &["config", "--bool", "core.sparseCheckout"])
+        .is_ok_and(|v| v == "true")
+    {
         git(Some(dir), &["sparse-checkout", "list"])?
             .lines()
             .map(str::to_owned)
@@ -464,8 +466,7 @@ fn inspect(dir: &Path) -> Result<Local> {
     })
 }
 
-/// A present checkout's keep-set must equal sources.toml's: cone patterns are fixed when the checkout
-/// is created, and a table change that the tree ignores would leave both disagreeing without a word.
+/// A present checkout's keep-set must equal sources.toml's: cone patterns are fixed when the checkout is created, and a table change that the tree ignores would leave both disagreeing without a word.
 fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
     let Local::Present { sparse, .. } = local else {
         return None;
@@ -736,9 +737,15 @@ mod tests {
         assert!(keep_mismatch(&present(&["b", "a"]), &strs(&["a", "b"])).is_none());
         assert!(keep_mismatch(&Local::Missing, &strs(&["a"])).is_none());
         let full = keep_mismatch(&present(&[]), &strs(&["a"])).unwrap();
-        assert!(full.contains("holds a full tree") && full.contains("wants a"), "{full}");
+        assert!(
+            full.contains("holds a full tree") && full.contains("wants a"),
+            "{full}"
+        );
         let other = keep_mismatch(&present(&["a"]), &strs(&["a", "b"])).unwrap();
-        assert!(other.contains("holds a,") && other.contains("wants a, b"), "{other}");
+        assert!(
+            other.contains("holds a,") && other.contains("wants a, b"),
+            "{other}"
+        );
     }
 
     #[test]
