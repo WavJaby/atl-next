@@ -26,6 +26,9 @@ pub struct Aosp {
     pub manifest: String,
     /// AOSP tree path -> pinned commit.
     pub projects: BTreeMap<String, String>,
+    /// AOSP tree path -> cone-mode keep-set. Absent = whole tree. Keys are `projects` keys.
+    #[serde(default)]
+    pub sparse: BTreeMap<String, Vec<String>>,
 }
 
 /// Directory of the manifest checkout under `src/`: outside the AOSP tree, which the converter scans.
@@ -118,7 +121,7 @@ impl Sources {
                 .map(|name| self.aosp_url(name)),
             rev: format!("refs/tags/{}", self.aosp.tag),
             commit: commit.clone(),
-            sparse: Vec::new(),
+            sparse: self.aosp.sparse.get(path).cloned().unwrap_or_default(),
             pin: Pin::Aosp(path.clone()),
             licence_key: "aosp".to_owned(),
         });
@@ -181,6 +184,30 @@ fn validate(sources: &Sources) -> Result<()> {
             is_commit(commit),
             "aosp project `{path}`: `{commit}` is not a full commit hash"
         );
+    }
+    for (path, dirs) in &aosp.sparse {
+        ensure!(
+            aosp.projects.contains_key(path),
+            "aosp.sparse `{path}`: not a pinned [aosp.projects] path"
+        );
+        ensure!(
+            !dirs.is_empty(),
+            "aosp.sparse `{path}`: empty keep-set (drop the row to keep the whole tree)"
+        );
+        for (i, d) in dirs.iter().enumerate() {
+            ensure!(
+                is_tree_path(d),
+                "aosp.sparse `{path}`: `{d}` is not a relative tree path"
+            );
+            let clash = dirs
+                .iter()
+                .enumerate()
+                .any(|(j, o)| i != j && (o == d || d.starts_with(&format!("{o}/"))));
+            ensure!(
+                !clash,
+                "aosp.sparse `{path}`: `{d}` is listed twice or inside another listed dir"
+            );
+        }
     }
     for (name, up) in &sources.git {
         ensure!(
@@ -334,5 +361,36 @@ mod tests {
     fn bad_upstream_name() {
         let text = format!("{AOSP}[Qemu]\ngit = \"g\"\ntag = \"v1\"\ncommit = \"{SHA}\"\n");
         assert!(err(&text).contains("name must be"));
+    }
+
+    #[test]
+    fn aosp_sparse_keep_set() {
+        let text = format!(
+            "{AOSP}\"external/cronet\" = \"{SHA}\"\n[aosp.sparse]\n\"external/cronet\" = [\"stable\", \"android/tools\"]\n"
+        );
+        let sources = parse(&text).unwrap();
+        let co = sources.checkouts(None);
+        let cronet = co.iter().find(|c| c.dir.ends_with("cronet")).unwrap();
+        assert_eq!(cronet.sparse, ["stable", "android/tools"]);
+        let other = format!("{AOSP}\"art\" = \"{SHA}\"\n");
+        let co = parse(&other).unwrap().checkouts(None);
+        assert!(co[0].sparse.is_empty());
+    }
+
+    #[test]
+    fn aosp_sparse_rows_checked() {
+        let row = |key: &str, dirs: &str| {
+            format!(
+                "{AOSP}\"external/cronet\" = \"{SHA}\"\n[aosp.sparse]\n\"{key}\" = [{dirs}]\n"
+            )
+        };
+        assert!(err(&row("external/icu", "\"stable\"")).contains("not a pinned"));
+        assert!(err(&row("external/cronet", "")).contains("empty keep-set"));
+        assert!(err(&row("external/cronet", "\"../x\"")).contains("not a relative tree path"));
+        assert!(err(&row("external/cronet", "\"stable\", \"stable\"")).contains("listed twice"));
+        assert!(
+            err(&row("external/cronet", "\"stable\", \"stable/tests\""))
+                .contains("inside another")
+        );
     }
 }

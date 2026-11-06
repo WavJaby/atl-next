@@ -243,7 +243,11 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let u = patch::Up::new(c, ctx.layout, ctx.root);
     patch::shared_allowed(&u, &ctx.main)?;
     let dir = u.checkout();
-    let action = decide(&inspect(dir)?, &c.commit, u.branch());
+    let local = inspect(dir)?;
+    let mut action = decide(&local, &c.commit, u.branch());
+    if let Some(why) = keep_mismatch(&local, &c.sparse) {
+        action = Action::Blocked(why);
+    }
     if ctx.execute {
         apply(&action, c, dir, &ctx.layout.git_dir(&c.dir))?;
     }
@@ -360,6 +364,8 @@ enum Local {
         head: String,
         branch: Option<String>,
         dirty: bool,
+        /// Cone-mode keep-set the checkout was created with; empty = full tree.
+        sparse: Vec<String>,
     },
 }
 
@@ -376,7 +382,7 @@ enum Action {
     PatchBranch,
     /// On a branch that is not ours.
     LeaveBranch(String),
-    Blocked(&'static str),
+    Blocked(String),
 }
 
 impl Action {
@@ -400,7 +406,7 @@ fn decide(local: &Local, pin: &str, patch_branch: &str) -> Action {
         Local::Missing => Action::Clone,
         Local::Unborn { files: false } => Action::Reclone,
         Local::Unborn { files: true } => {
-            Action::Blocked("git repository without commits holding files; remove it by hand")
+            Action::Blocked("git repository without commits holding files; remove it by hand".into())
         }
         Local::Present {
             branch: Some(b), ..
@@ -410,7 +416,7 @@ fn decide(local: &Local, pin: &str, patch_branch: &str) -> Action {
             branch: Some(b), ..
         } => Action::LeaveBranch(b.clone()),
         Local::Present { dirty: true, .. } => {
-            Action::Blocked("not at pin and has uncommitted changes")
+            Action::Blocked("not at pin and has uncommitted changes".into())
         }
         Local::Present { .. } => Action::MoveToPin,
     }
@@ -442,10 +448,44 @@ fn inspect(dir: &Path) -> Result<Local> {
         &["status", "--porcelain", "--untracked-files=no"],
     )?
     .is_empty();
+    let sparse = if git(Some(dir), &["config", "--bool", "core.sparseCheckout"]).is_ok_and(|v| v == "true") {
+        git(Some(dir), &["sparse-checkout", "list"])?
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Local::Present {
         head,
         branch,
         dirty,
+        sparse,
+    })
+}
+
+/// A present checkout's keep-set must equal sources.toml's: cone patterns are fixed when the checkout
+/// is created, and a table change that the tree ignores would leave both disagreeing without a word.
+fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
+    let Local::Present { sparse, .. } = local else {
+        return None;
+    };
+    let show = |v: &[String]| {
+        if v.is_empty() {
+            "a full tree".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    let (mut have, mut want) = (sparse.clone(), want.to_vec());
+    have.sort();
+    want.sort();
+    (have != want).then(|| {
+        format!(
+            "keep-set differs: checkout holds {}, sources.toml [aosp.sparse] wants {}; a keep-set is fixed at creation: delete the checkout at its pin and fetch again",
+            show(&have),
+            show(&want)
+        )
     })
 }
 
@@ -571,6 +611,13 @@ pub fn create_checkout(
     if let Some(want) = expect {
         ensure!(commit == want, "{refname} is {commit}, pin says {want}");
     }
+    // cone mode silently checks out nothing for a missing dir: name it before any file is written
+    if let Sparse::Cone(dirs) = sparse {
+        for d in dirs.iter() {
+            g(&["cat-file", "-e", &format!("{commit}:{d}")])
+                .with_context(|| format!("keep-set dir `{d}` is not in the tree at {commit}"))?;
+        }
+    }
     g(&[
         "-c",
         "advice.detachedHead=false",
@@ -677,6 +724,24 @@ mod tests {
     }
 
     #[test]
+    fn keep_set_must_match_the_table() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let present = |sparse: &[&str]| Local::Present {
+            head: "p".into(),
+            branch: None,
+            dirty: false,
+            sparse: strs(sparse),
+        };
+        assert!(keep_mismatch(&present(&[]), &strs(&[])).is_none());
+        assert!(keep_mismatch(&present(&["b", "a"]), &strs(&["a", "b"])).is_none());
+        assert!(keep_mismatch(&Local::Missing, &strs(&["a"])).is_none());
+        let full = keep_mismatch(&present(&[]), &strs(&["a"])).unwrap();
+        assert!(full.contains("holds a full tree") && full.contains("wants a"), "{full}");
+        let other = keep_mismatch(&present(&["a"]), &strs(&["a", "b"])).unwrap();
+        assert!(other.contains("holds a,") && other.contains("wants a, b"), "{other}");
+    }
+
+    #[test]
     fn peeled_commit_prefers_annotated_target() {
         // `git ls-remote` format: <sha>\t<ref>; an annotated tag also lists its target as `^{}`
         let out = "aaaa\trefs/tags/v1\nbbbb\trefs/tags/v1^{}\ncccc\trefs/tags/v10\n";
@@ -734,6 +799,7 @@ mod tests {
             head: head.into(),
             branch: branch.map(Into::into),
             dirty,
+            sparse: Vec::new(),
         };
         assert_eq!(decide(&Local::Missing, "p"), Action::Clone);
         assert_eq!(
