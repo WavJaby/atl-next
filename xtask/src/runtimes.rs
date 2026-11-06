@@ -82,6 +82,34 @@ const VARIANTS: &[Variant] = &[
         ],
         staged: LIBCXX_STAGED,
     },
+    // DeviceLibcxxBuilder, platform=True noexcept=False (builders.py:1045, cache entries 1158-1188, platform libs 1236): the libc++ every other platform module's static STL links (cc/stl.go
+    // libc++_static + libc++demangle). One difference: LIBCXX_ENABLE_SHARED stays OFF (builders.py:1176 sets ON): libc++.so links against bionic's libc.so, which this pre-converter build has not got.
+    Variant {
+        name: "libcxx",
+        runtimes: "libcxx;libcxxabi",
+        cache: &[
+            ("LIBCXXABI_ENABLE_SHARED", "OFF"),
+            ("LIBCXXABI_USE_LLVM_UNWINDER", "OFF"),
+            ("LIBCXXABI_NON_DEMANGLING_TERMINATE", "ON"),
+            ("LIBCXXABI_STATIC_DEMANGLE_LIBRARY", "ON"),
+            ("LIBCXX_ENABLE_SHARED", "OFF"),
+            ("LIBCXX_STATIC_OUTPUT_NAME", "c++_static"),
+            ("LIBCXX_ENABLE_ABI_LINKER_SCRIPT", "OFF"),
+            ("LIBCXX_ENABLE_STATIC_ABI_LIBRARY", "ON"),
+            ("LIBCXX_STATICALLY_LINK_ABI_IN_SHARED_LIBRARY", "ON"),
+            ("LIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY", "ON"),
+            ("LIBCXX_HAS_PTHREAD_LIB", "OFF"),
+            ("LIBCXX_HAS_RT_LIB", "OFF"),
+            ("LIBCXXABI_HAS_PTHREAD_LIB", "OFF"),
+        ],
+        cflags: "",
+        cxxflags: "-DHAS_THREAD_LOCAL",
+        modules: &[
+            ("libc++_static", "libc++_static.a"),
+            ("libc++demangle", "libc++demangle.a"),
+        ],
+        staged: LIBCXX_STAGED,
+    },
     // LibUnwindBuilder, is_exported=False: the hermetic copy every other module links
     Variant {
         name: "libunwind",

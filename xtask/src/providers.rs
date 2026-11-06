@@ -67,12 +67,15 @@ pub fn stand_ins(providers: &Providers) -> Vec<(&str, &str)> {
 }
 
 /// One module provided outside the tree (`crate:`, `upstream:` and `system:` providers), as `xtask native` hands it to the converter in `<out>/provided.json` (bp2ninja provided.go `Provided`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Provided {
     /// Absolute path of the shared object or archive dependents link.
     pub lib: PathBuf,
     /// Header dirs dependents get as `-isystem`.
     pub include: Vec<PathBuf>,
+    /// Header dirs dependents get as `-I` (Soong `export_include_dirs`): the guest libc++ prebuilts' (clangprebuilts.go androidLibcxxHeaderDirs), searched before bionic's `-isystem`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub export_include: Vec<PathBuf>,
     /// `NAME=VALUE` defines the headers depend on, given to dependents as `-D`.
     pub defines: Vec<String>,
 }

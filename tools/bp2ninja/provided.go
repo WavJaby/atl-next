@@ -16,7 +16,9 @@ type Provided struct {
 	Lib string `json:"lib"`
 	// header dirs dependents get as -isystem: searched after every -I, so compat/device keeps precedence over bionic's headers; system headers, as bionic's are
 	Include []string `json:"include"`
-	Defines []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
+	// header dirs dependents get as -I (Soong export_include_dirs): the guest libc++ runtimes' headers, as prebuilts/clang's soong/clangprebuilts.go exports them, ahead of bionic's -isystem
+	ExportInclude []string `json:"export_include,omitempty"`
+	Defines       []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
 }
 
 // Partial is a providers.toml row with `srcs`: the module is built from the tree without those sources, and links the provider's artifact (nil for `none`) first, as a provided shared library, for the symbols they defined.
@@ -178,6 +180,9 @@ func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 	}
 	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, provided: true}
 	g.nodes[k] = n
+	for _, dir := range p.ExportInclude {
+		n.exports = append(n.exports, "-I"+dir)
+	}
 	for _, dir := range p.Include {
 		n.exports = append(n.exports, "-isystem", dir)
 	}

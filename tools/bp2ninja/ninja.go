@@ -473,9 +473,15 @@ func (g *Graph) linkFlags(n *Node) []string {
 // linkLibs: provided shared objects, whole archives, the generated Rust staticlib, the static closure (provided archives included), shared libraries (also those static dependencies need), and the glibc system libraries bionic folds into libc.
 // Provided shared objects come first, so they lead the output's DT_NEEDED and the process's lookup order: their strong definitions beat weak fallbacks elsewhere (libbase's and libcutils' __system_property_*); xtask's provided gate checks the result. Soong links system_shared_libs last (LateSharedLibs), where bionic's libc has no fallbacks to beat.
 // An archive has no place in DT_NEEDED or the lookup order: its members are copied into the output, so it links in the group like any static library.
+// Bionic sides link as Soong does (cc.go depsToPaths: orderStaticModuleDeps(directStaticDeps, directSharedDeps)): only the module's own static and shared dependencies, whose static_libs and shared_libs it lists itself
+// (bionic's linker names libbase's liblog_for_runtime_apex; libbase's libc++_static would clash with the linker's libc++_static_noexcept). Rust crates still bring their cc libraries (Soong bundles them into the rlib).
 func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	var closure []*Node
-	staticClosure(n, map[*Node]bool{}, &closure)
+	if n.side.glibc() {
+		staticClosure(n, map[*Node]bool{}, &closure)
+	} else {
+		directStatic(n, &closure)
+	}
 	whole := map[*Node]bool{}
 	for _, d := range n.deps.whole {
 		whole[d] = true
@@ -513,7 +519,9 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		inputs = append(inputs, n.rustlib)
 	}
 	for _, d := range closure {
-		addShared(d.deps.shared)
+		if n.side.glibc() {
+			addShared(d.deps.shared)
+		}
 		if !whole[d] && d.kind == Static {
 			libs = append(libs, d.out)
 			inputs = append(inputs, d.out)
@@ -556,9 +564,9 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every
 	// one of them at load time (libselinux: distro lacks AOSP's LIBSELINUX_R version node -> load fails)
 	libs = append(libs, providedRpath...)
-	// the C++ runtime the module's stl selects (stl.go); on glibc sides glibc's split of bionic's libc, and bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) as glibc's libresolv, needed only where used
-	libs = append(libs, stlLinkFlags(g.stlOf(n))...)
+	// glibc sides: the C++ runtime the module's stl selects (stl.go; a bionic side links it as a dependency, bionicStlDeps), glibc's split of bionic's libc, and bionic's resolver API (b64_ntop -> __b64_ntop: libnetd_client) as glibc's libresolv, needed only where used
 	if n.side.glibc() {
+		libs = append(libs, stlLinkFlags(g.stlOf(n))...)
 		libs = append(libs, systemLinkFlags...)
 	}
 	return libs, inputs

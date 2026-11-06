@@ -101,6 +101,7 @@ fn provided(flags: &Flags, is_file: impl Fn(&Path) -> bool) -> Result<Provided> 
         lib,
         include,
         defines,
+        ..Provided::default()
     })
 }
 

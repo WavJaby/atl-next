@@ -26,6 +26,7 @@ pub struct Dep {
     pub min_reason: Option<String>,
     pub cargo: Option<String>,
     pub version: Option<String>,
+    pub rustup_target: Option<String>,
     pub scope: Vec<Scope>,
     pub used_by: Vec<String>,
 }
@@ -90,10 +91,17 @@ fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
 fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     let distro = dep.debian.is_some() || dep.arch.is_some();
     let cargo = dep.cargo.is_some() || dep.version.is_some();
+    let rustup = dep.rustup_target.is_some();
     ensure!(
-        distro != cargo,
-        "exactly one source: debian/arch, or cargo + version"
+        [distro, cargo, rustup].iter().filter(|s| **s).count() == 1,
+        "exactly one source: debian/arch, cargo + version, or rustup_target"
     );
+    if rustup {
+        ensure!(
+            dep.pkgconfig.is_none() && dep.min.is_none(),
+            "pkgconfig and min apply to distro rows only"
+        );
+    }
     if cargo {
         ensure!(
             dep.cargo.is_some() && dep.version.is_some(),
@@ -185,9 +193,10 @@ pub fn run(root: &Path, _args: &Args) -> Result<ExitCode> {
     let deps = load(root, &Consumers::new(&workspace::load(root)?, &sources))?;
     let distro = host_distro()?;
     let cargo_installed = cargo_installed()?;
+    let rustup_targets = rustup_targets(root)?;
     let mut problems = Vec::new();
     for (name, dep) in &deps {
-        if let Some(problem) = check_row(dep, distro, &cargo_installed)? {
+        if let Some(problem) = check_row(dep, distro, &cargo_installed, &rustup_targets)? {
             problems.push(format!("{name}: {problem}"));
         }
     }
@@ -211,7 +220,12 @@ fn check_row(
     dep: &Dep,
     distro: Distro,
     cargo_installed: &BTreeMap<String, String>,
+    rustup_targets: &BTreeSet<String>,
 ) -> Result<Option<String>> {
+    if let Some(target) = &dep.rustup_target {
+        return Ok((!rustup_targets.contains(target))
+            .then(|| format!("missing: rustup target add {target}")));
+    }
     if let (Some(krate), Some(version)) = (&dep.cargo, &dep.version) {
         return Ok(match cargo_installed.get(krate) {
             None => Some(format!(
@@ -300,6 +314,24 @@ fn cargo_installed() -> Result<BTreeMap<String, String>> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(parse_install_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The std targets installed for the pinned toolchain: rustup run in `root` reads rust-toolchain.toml.
+fn rustup_targets(root: &Path) -> Result<BTreeSet<String>> {
+    let out = Command::new("rustup")
+        .current_dir(root)
+        .args(["target", "list", "--installed"])
+        .output()
+        .context("running rustup target list --installed")?;
+    ensure!(
+        out.status.success(),
+        "rustup target list --installed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// `cargo install --list`: one `<crate> v<version>[+<build>][ (<source>)]:` line per crate, binaries

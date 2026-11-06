@@ -552,8 +552,8 @@ fn native_bridge_flags(
         .map(|b| {
             let p = Provided {
                 lib: b.archive,
-                include: b.include.into_iter().collect(),
-                defines: Vec::new(),
+                export_include: b.include.into_iter().collect(),
+                ..Provided::default()
             };
             (b.module, p)
         })
@@ -880,7 +880,7 @@ fn build_crates<'a>(
             Provided {
                 lib,
                 include,
-                defines: Vec::new(),
+                ..Provided::default()
             },
         );
     }

@@ -1114,6 +1114,31 @@ func (g *Graph) genDir(n *Node, sub string) string {
 	return filepath.Join(g.out, "gen", n.side.String(), n.name, sub)
 }
 
+// directStatic: Soong's static link set of a bionic node (ninja.go linkLibs): its own whole and static dependencies, plus the staticClosure of each Rust library among them.
+// A static library's whole_static_libs are members of its archive in Soong (library.go: their objects go into the .a), so they come along with it here, recursively.
+func directStatic(n *Node, out *[]*Node) {
+	seen := map[*Node]bool{}
+	var add func(d *Node)
+	add = func(d *Node) {
+		if seen[d] {
+			return
+		}
+		seen[d] = true
+		*out = append(*out, d)
+		for _, w := range d.deps.whole {
+			add(w)
+		}
+	}
+	for _, d := range slices.Concat(n.deps.whole, n.deps.static) {
+		add(d)
+	}
+	for _, d := range slices.Concat(n.deps.whole, n.deps.static) {
+		if d.rust != nil {
+			staticClosure(d, seen, out)
+		}
+	}
+}
+
 // staticClosure: archives a final link needs for n's static (and whole static) dependencies; through a Rust node also its library crates, whose cc libraries the final link takes (rust.go).
 func staticClosure(n *Node, seen map[*Node]bool, out *[]*Node) {
 	deps := slices.Concat(n.deps.whole, n.deps.static)

@@ -9,6 +9,7 @@
 #           min, min_reason     minimum upstream version and why: the pkg-config version for libraries,
 #                               else the package version without epoch and revision
 #   cargo   cargo, version      crate installed with `cargo install --locked`, exact version
+#   rustup  rustup_target       std of another rustc target for the rust-toolchain.toml toolchain (`rustup target add`)
 # Every row:
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
@@ -165,6 +166,12 @@ debian = "python3-venv"
 arch = "python"
 scope = ["build"]
 used_by = ["upstream:qemu"]
+
+# the native bridge side's Rust std: bp2ninja compiles its crates (libc's libicu4x_bionic) with --target = Soong rust/config RustTriple of the guest arch
+[rust-std-android-x86-64]
+rustup_target = "x86_64-linux-android"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 # xtask native's compiler cache (CompilerCache in native.rs): C/C++ compiles of the converter's builds, shared by every out dir
 [sccache]

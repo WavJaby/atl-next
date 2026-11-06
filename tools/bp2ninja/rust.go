@@ -25,6 +25,7 @@ import (
 //   - Device crates build for the host triple (rustc's default target), as cc device modules do: target_os is linux, not android. cc device compiles define __ANDROID__ (androidDefine); rustc's target_os is no define, so it stays linux.
 //     So a device crate takes the linux_glibc `target: {…}` blocks (rustOSSide), keeping device codegen flags (rustDeviceFlags) -- unlike cc, which keeps android blocks.
 //     cc device code is written against the Android userspace API, which this build provides, so android blocks stay right for it.
+//   - Native bridge crates link bionic: rustc --target <rust/config RustTriple> (rustSideFlags) with rustup's std for that target (`rustup target add`), so target_os is android and they keep their own android blocks.
 //     A Rust crate's blocks are a function of rustc's target_os: cargo_embargo generates `target: { android }` from `cfg(target_os = "android")`,
 //     so an android block names code the crate itself compiles out on linux (liblog_rust's default_log_impl -> android-only log_ffi; liblogger's android_logger; rustix).
 //   - Exception, providers.toml `rust_os = "android"` (g.rustAndroid): a device crate whose Android behaviour this runtime provides (system properties, liblog) takes the android blocks
@@ -34,7 +35,11 @@ import (
 //   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
 
 // rustOSSide: the side whose OS blocks a Rust module takes on side (flatten): rustc compiles for linux_glibc, so Host, but Device for a device variant of a rust_os = "android" row.
+// A native bridge side compiles for android, so it keeps its own blocks.
 func (g *Graph) rustOSSide(m *Module, side Side) Side {
+	if !side.glibc() {
+		return side
+	}
 	if side == Device && g.rustAndroid[m.Name] {
 		return Device
 	}
@@ -75,6 +80,18 @@ var rustGlobalFlags = []string{"-C", "opt-level=3", "-C", "relocation-model=pic"
 
 // rustDeviceFlags: rust/config/global.go deviceGlobalRustFlags that a stable rustc takes.
 var rustDeviceFlags = []string{"-C", "panic=abort"}
+
+// rustSideFlags: the codegen flags of every crate on side: global, device ones on android sides (Soong's native bridge variant is a device variant), a bionic side's --target.
+func (g *Graph) rustSideFlags(s Side) []string {
+	flags := append([]string{}, rustGlobalFlags...)
+	if s.android() {
+		flags = append(flags, rustDeviceFlags...)
+	}
+	if !s.glibc() {
+		flags = append(flags, "--target", g.soong.Flags.RustTriple[s])
+	}
+	return flags
+}
 
 // rustCrate is what a Rust node compiles.
 type rustCrate struct {
@@ -283,10 +300,7 @@ func (g *Graph) rustNode(n *Node) {
 		n.exports = append(n.exports, "-I"+g.abs(filepath.Join(m.Dir, d)))
 	}
 
-	r.flags = append(r.flags, rustGlobalFlags...)
-	if n.side == Device {
-		r.flags = append(r.flags, rustDeviceFlags...)
-	}
+	r.flags = append(r.flags, g.rustSideFlags(n.side)...)
 	if m.lints != nil {
 		// a workspace crate (aidlcrates.go): its lints, not capped; emitRust compiles it with clippy-driver
 		r.flags = append(r.flags, m.lints...)
@@ -649,10 +663,7 @@ func (g *Graph) rustStaticlib(b *strings.Builder, n *Node) (lib string, whole bo
 	}
 	g.genFile(src, strings.Join(lines, "\n")+"\n")
 	libs, inputs, linked := rustLibFlags(roots)
-	flags := append([]string{}, rustGlobalFlags...)
-	if n.side == Device {
-		flags = append(flags, rustDeviceFlags...)
-	}
+	flags := g.rustSideFlags(n.side)
 	flags = append(flags, "--cap-lints", "allow", "--crate-type=staticlib", "--crate-name=generated_rust_staticlib", "--edition="+rustDefaultEdition)
 	fmt.Fprintf(b, "build %s: rustc %s | %s\n  env = OUT_DIR=out\n  flags = %s\n  libs = %s\n  crates = %s\n", esc(lib), esc(src), join(inputs), shellQuote(flags), shellQuote(libs), shellQuote(linked))
 	return lib, whole

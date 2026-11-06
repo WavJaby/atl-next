@@ -35,6 +35,7 @@ func (g *Graph) bionicLinkDeps(n *Node, dep func([]string, Kind) []*Node) {
 	if n.kind != Static && n.kind != Shared && n.kind != Binary {
 		return
 	}
+	g.bionicStlDeps(n, dep)
 	if !n.props.boolean("no_libcrt", false) {
 		// a module naming it in static_libs links it once
 		n.deps.static = uniqueNodes(append(n.deps.static, dep([]string{builtinsModule}, Static)...))
@@ -55,6 +56,25 @@ func (g *Graph) bionicLinkDeps(n *Node, dep func([]string, Kind) []*Node) {
 		begin, end = []string{"crtbegin_dynamic"}, []string{"crtend_android"}
 	}
 	n.crtBegin, n.crtEnd = dep(begin, Static), dep(end, Static)
+}
+
+// bionicStlDeps: cc/stl.go deps for a Bionic device module outside the SDK: the selected libc++ (shared or static) + libc++demangle, and for a static binary libm, libc and the static unwinder
+// (staticUnwinder: libunwind). Their exports carry the libc++ headers (the runtimes build's include dir).
+func (g *Graph) bionicStlDeps(n *Node, dep func([]string, Kind) []*Node) {
+	sel := g.stlOf(n)
+	switch sel {
+	case "":
+		return
+	case "libc++":
+		n.deps.shared = append(n.deps.shared, dep([]string{sel}, Shared)...)
+	default:
+		n.deps.static = append(n.deps.static, dep([]string{sel}, Static)...)
+	}
+	late := []string{"libc++demangle"}
+	if n.staticBinary() {
+		late = append(late, "libm", "libc", "libunwind")
+	}
+	n.deps.static = uniqueNodes(append(n.deps.static, dep(late, Static)...))
 }
 
 // objectInputs: the object files a cc_object combines: its own, then those of the cc_objects its objs names.

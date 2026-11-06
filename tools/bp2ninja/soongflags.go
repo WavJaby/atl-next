@@ -34,6 +34,8 @@ type GlobalFlags struct {
 	NoToolchain map[Side]string
 	// per bionic Side (native bridge): the toolchain's ClangTriple, which AddTargetFlags (cc/compiler.go) suffixes with the API level as `-target`; glibc sides compile for the distro clang's default triple
 	Triple map[Side]string
+	// per bionic Side: rust/config's RustTriple, rustc's --target there (rust/compiler.go); its std is rustup's for that target (rust-toolchain.toml toolchain). Glibc sides compile for rustc's default host triple
+	RustTriple map[Side]string
 }
 
 // toolchainOS: the android.OsType identifier the side's toolchain factory is registered for (cc/config registerToolchainFactory); the host side is linux_glibc.
@@ -157,13 +159,13 @@ func readThirdParty(tree string) (ThirdParty, error) {
 
 func newGlobalFlags() GlobalFlags {
 	return GlobalFlags{Head: map[Side][]string{}, Tail: map[Side][]string{}, Conly: map[Side][]string{}, Cpp: map[Side][]string{}, As: map[Side][]string{},
-		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}, Triple: map[Side]string{}}
+		Yasm: map[Side][]string{}, NoToolchain: map[Side]string{}, Triple: map[Side]string{}, RustTriple: map[Side]string{}}
 }
 
 // readGlobalFlags: GlobalFlags for the device arch cfg (its arches.toml variant and Soong's feature list for it, DeviceArch).
 func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, error) {
 	g := newGlobalFlags()
-	ev, err := newSoongEval(tree)
+	ev, err := newSoongEval(tree, soongCcConfig)
 	if err != nil {
 		return g, err
 	}
@@ -285,6 +287,9 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 		}
 		g.Yasm[side] = strings.Fields(yasm)
 	}
+	if err := readRustTriples(tree, cfg, idents, archFields, g.RustTriple); err != nil {
+		return g, err
+	}
 	if g.External, err = get("${config.ExternalCflags}"); err != nil {
 		return g, err
 	}
@@ -309,6 +314,35 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 	}
 	g.Skipped = sortedKeys(skipped)
 	return g, nil
+}
+
+// readRustTriples: rust/config's RustTriple per bionic side, from the toolchain rust/config registers for (Android, arch) with the same arch fields cc's gets.
+func readRustTriples(tree string, cfg Config, idents map[Side]string, archFields func(Side) map[string]any, dst map[Side]string) error {
+	var ev *soongEval
+	for _, side := range cfg.sides() {
+		if side.glibc() {
+			continue
+		}
+		if ev == nil {
+			var err error
+			if ev, err = newSoongEval(tree, soongRustConfig); err != nil {
+				return err
+			}
+		}
+		tc, err := ev.toolchain(toolchainOS(side), idents[side], archFields(side))
+		if err != nil {
+			return err
+		}
+		t, err := ev.method(tc, "RustTriple")
+		if err != nil {
+			return err
+		}
+		if t == "" || strings.ContainsAny(t, " \t$") {
+			return fmt.Errorf("%s: RustTriple for %s is %q, not one literal word", ev.dir, idents[side], t)
+		}
+		dst[side] = t
+	}
+	return nil
 }
 
 // soongEval interprets the part of Go that build/soong/cc/config computes its flags with, as Soong would run it in this build:
@@ -336,8 +370,14 @@ var configDefaults = map[string]any{
 	"NoBionicPageSizeMacro": false,
 }
 
-func newSoongEval(tree string) (*soongEval, error) {
-	dir := filepath.Join(tree, "build/soong/cc/config")
+// soongCcConfig, soongRustConfig: the toolchain packages soongEval reads (both register their toolchains with registerToolchainFactory).
+const (
+	soongCcConfig   = "build/soong/cc/config"
+	soongRustConfig = "build/soong/rust/config"
+)
+
+func newSoongEval(tree, pkg string) (*soongEval, error) {
+	dir := filepath.Join(tree, pkg)
 	e := &soongEval{tree: tree, dir: dir, vars: map[string]any{}, funcs: map[string]*ast.FuncDecl{}, methods: map[string]map[string]*ast.FuncDecl{}, embeds: map[string][]string{},
 		statics: map[string]any{}, varFuncs: map[string]*ast.FuncLit{}, factory: map[[2]string]string{}}
 	entries, err := os.ReadDir(dir)

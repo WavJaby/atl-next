@@ -109,6 +109,7 @@ pub fn build(
                 lib,
                 include: vec![prefix.join("include")],
                 defines: defines.clone(),
+                ..Provided::default()
             },
         );
     }
