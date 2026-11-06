@@ -122,6 +122,20 @@ pub fn overlays_of(root: &Path) -> Result<Vec<Overlay>> {
     overlays(&layout, &crate::sources::load(root)?.checkouts(None))
 }
 
+/// The AOSP file `rel` (tree-relative) as the build reads it, for a reader outside the namespace: in its task copy when one covers it, else in the shared tree.
+pub fn build_file(root: &Path, rel: &str) -> Result<PathBuf> {
+    let layout = Layout::of(root)?;
+    Ok(overlays_of(root)?
+        .into_iter()
+        .find_map(|o| {
+            Path::new(rel)
+                .strip_prefix(&o.project)
+                .ok()
+                .map(|r| o.copy.join(r))
+        })
+        .unwrap_or_else(|| shared_tree(&layout).join(rel)))
+}
+
 /// Run the rest of this xtask invocation where the AOSP task copies are bound over `src/aosp`: Some(exit code) = re-executed inside the namespace, the caller returns it; None = continue here
 /// (no task copies, or already inside, the overlays verified). `shell` = the namespace's command is `$SHELL` instead (for `ninja` by hand), with `shell_env` in its environment (`native::shell_env`).
 pub fn enter(

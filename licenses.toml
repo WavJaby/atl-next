@@ -30,6 +30,7 @@ reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge,
 # SunPro: owner decision 2026-11-02 (fdlibm, via libcore's libfdlibm); Sun's all-permissive notice (use, copy, modify, distribute if the notice is kept), GPL-3-compatible.
 # Apache-2.0 WITH LLVM-exception: owner decision 2026-11-06 (llvm-project runtimes libc++/libc++abi/libunwind/compiler-rt builtins for the bionic targets); the exception only removes Apache-2.0 attribution duties for compiled-in runtime code, so it stays GPL-3-compatible as Apache-2.0 is.
 # BSL-1.0, HPND-sell-variant: accepted 2026-11-06 (Mesa: c11 threads emulation, loader_dri_helper); both permissive and on the FSF list of GPL-compatible licences.
+# TU-Berlin-2.0: proposed 2026-11-06, owner to confirm (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -54,6 +55,7 @@ allow = [
     "MPL-2.0",
     "SGI-B-2.0",
     "SunPro",
+    "TU-Berlin-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
@@ -851,66 +853,9 @@ reason = "no notice the phrase rules read; libFLAC source, Xiph BSD-3-Clause (ex
 licence = "BSD-3-Clause"
 reason = "no notice the phrase rules read; libFLAC source, Xiph BSD-3-Clause (external/flac/COPYING.Xiph)"
 
-# libgsm: its notice is the TU Berlin text in external/libgsm/COPYRIGHT ("Any use of this software is permitted provided that this notice is not removed"), no SPDX; AOSP's Android.bp declares the BSD kind, mapped here to BSD-3-Clause (owner to confirm)
-[upstream.aosp.paths."external/libgsm/inc/config.h"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/inc/gsm.h"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/inc/private.h"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/inc/proto.h"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/inc/unproto.h"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/add.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/decode.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/gsm_create.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/gsm_decode.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/gsm_destroy.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/gsm_option.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/long_term.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/rpe.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/short_term.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
-
-[upstream.aosp.paths."external/libgsm/src/table.c"]
-licence = "BSD-3-Clause"
-reason = "libgsm, TU Berlin notice (external/libgsm/COPYRIGHT), no SPDX; mapped to BSD-3-Clause, owner to confirm"
+[upstream.aosp.paths."external/libgsm/"]
+licence = "TU-Berlin-2.0"
+reason = "files point at external/libgsm/COPYRIGHT, whose text is SPDX TU-Berlin-2.0 (1994 terms + 2009 additional permission; spdx/license-list-data text compared 2026-11-06, line breaks only differ). AOSP's license module (external/libgsm/Android.bp:35-46) lists kinds 0BSD/Apache-2.0/BSD for the whole module, not this notice"
 
 [upstream.aosp.paths."external/libopus/celt/static_modes_fixed.h"]
 licence = "BSD-3-Clause"

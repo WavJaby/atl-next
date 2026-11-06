@@ -125,7 +125,8 @@ pub fn stage_mapper(root: &Path, out: &Path) -> Result<PathBuf> {
     )
 }
 
-fn append_lib_path(env: &mut [(String, String)], dir: &Path) {
+/// Appends `dir` (the staged mapper's) to `env`'s LD_LIBRARY_PATH.
+pub fn append_lib_path(env: &mut [(String, String)], dir: &Path) {
     for (k, v) in env.iter_mut() {
         if k == "LD_LIBRARY_PATH" {
             v.push(':');
@@ -186,6 +187,61 @@ pub fn goals() -> crate::gate_goals::Goals {
     ])
 }
 
+/// Starts the allocator as the system uid in binder.rs's harness (servicemanager up, the layout's /vendor manifest from `vintf::device_hals`), output to `log`; returns once it printed its ready line.
+/// `drm_node`: its `--drm-node`, bound into the sandbox when outside `/dev/dri`.
+pub fn start_allocator(
+    broker: &Broker,
+    allocator: &Path,
+    env: &[(String, String)],
+    log: &Path,
+    drm_node: Option<&Path>,
+) -> Result<Child> {
+    let mut cmd = Command::new(allocator);
+    if let Some(node) = drm_node {
+        cmd.arg("--drm-node").arg(node);
+    }
+    cmd.envs(env.iter().cloned());
+    let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
+    (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
+    // the DRM nodes it allocates on (the sandbox's /dev is otherwise minimal), and a --drm-node elsewhere
+    s.devices = std::iter::once(PathBuf::from(DRM_DIR))
+        .chain(
+            drm_node
+                .filter(|n| !n.starts_with(DRM_DIR))
+                .map(Path::to_path_buf),
+        )
+        .collect();
+    let Process {
+        child: mut alloc, ..
+    } = broker.spawn(s).context("starting the allocator")?;
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if text.contains(READY_LINE) {
+            return Ok(alloc);
+        }
+        if let Some(s) = alloc.try_wait()? {
+            bail!(
+                "the allocator exited {s} before it registered:\n{}",
+                text.trim()
+            );
+        }
+        if start.elapsed() > READY {
+            let _ = alloc.kill();
+            bail!(
+                "the allocator was not ready after {READY:?}:\n{}",
+                text.trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The allocator binary (`xtask native` builds it into the slot).
+pub fn allocator(root: &Path, out: &Path) -> Result<PathBuf> {
+    packages::bin(root, out, ALLOCATOR_PACKAGE, ALLOCATOR_BIN)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "gralloc")?;
     let device = out.join("device");
@@ -200,7 +256,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             out.display()
         );
     }
-    let allocator = packages::bin(root, &out, ALLOCATOR_PACKAGE, ALLOCATOR_BIN)?;
+    let allocator = allocator(root, &out)?;
     let probe = packages::bin(root, &out, PROBE_PACKAGE, PROBE_BIN)?;
     let mapper_dir = stage_mapper(root, &out)?;
 
@@ -218,48 +274,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "servicemanager did not come up: {}",
             found.1.trim()
         );
-        // the allocator, as the system uid
         let alloc_log = test_root.join("allocator.log");
-        let mut cmd = Command::new(&allocator);
-        if let Some(node) = &args.drm_node {
-            cmd.arg("--drm-node").arg(node);
-        }
-        cmd.envs(env.iter().cloned());
-        let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
-        (s.stdout, s.stderr) = to_log(std::fs::File::create(&alloc_log)?)?;
-        // the DRM nodes it allocates on (the sandbox's /dev is otherwise minimal), and a --drm-node elsewhere
-        s.devices = std::iter::once(PathBuf::from(DRM_DIR))
-            .chain(
-                args.drm_node
-                    .iter()
-                    .filter(|n| !n.starts_with(DRM_DIR))
-                    .cloned(),
-            )
-            .collect();
-        let Process {
-            child: mut alloc, ..
-        } = broker.spawn(s).context("starting the allocator")?;
-        let start = Instant::now();
-        loop {
-            let log = std::fs::read_to_string(&alloc_log).unwrap_or_default();
-            if log.contains(READY_LINE) {
-                break;
-            }
-            if let Some(s) = alloc.try_wait()? {
-                bail!(
-                    "the allocator exited {s} before it registered:\n{}",
-                    log.trim()
-                );
-            }
-            if start.elapsed() > READY {
-                let _ = alloc.kill();
-                bail!(
-                    "the allocator was not ready after {READY:?}:\n{}",
-                    log.trim()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let mut alloc = start_allocator(
+            &broker,
+            &allocator,
+            &env,
+            &alloc_log,
+            args.drm_node.as_deref(),
+        )?;
 
         // the two processes of the probe, joined by a unix socket
         let (a, b) = socketpair(

@@ -303,6 +303,47 @@ const AID_APP_START: u32 = 10_000;
 /// Stage 8's run limit: ART start (~1 s here) plus codec lookups; a hang (a wait for an absent service) ends as SIGTERM in the detail instead of a stuck gate.
 const MEDIA_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `xtask native` goals stages 8 + 9 need beyond the runtime's closure, besides the store's codecs ([`store_codecs`]): the binder harness's servicemanager + service, the in-process Codec2 store's server library, the extractor plugins.
+const GOALS: [&str; 5] = [
+    "servicemanager",
+    "service",
+    "libcodec2_aidl_noisurface",
+    "liboggextractor",
+    "libwavextractor",
+];
+
+/// The Codec2 store's soft-codec list (`emplace("lib….so")` in the store's constructor): the store aborts on a listed library it cannot load, so each is a goal.
+const C2_STORE_CPP: &str = "frameworks/av/media/codec2/vndk/C2Store.cpp";
+
+/// Module names the store source `src` emplaces, commented-out lines skipped.
+fn store_codecs(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix("emplace(\""))
+        .filter_map(|rest| rest.split_once(".so\""))
+        .map(|(m, _)| m.to_owned())
+        .collect()
+}
+
+/// Every goal stages 8 + 9 load, checked built in `out` (`device/<m>/<m>[.so]`); the error names what is missing and the build command.
+fn check_goals(out: &Path, host: &str, codecs: &[String]) -> Result<()> {
+    let missing: Vec<&str> = GOALS
+        .iter()
+        .copied()
+        .chain(codecs.iter().map(String::as_str))
+        .filter(|m| {
+            let dir = out.join("device").join(m);
+            !dir.join(m).is_file() && !dir.join(format!("{m}.so")).is_file()
+        })
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "native-load goals not built: {} (cargo xtask native --host {host} {})",
+        missing.join(" "),
+        missing.join(" ")
+    );
+    Ok(())
+}
+
 /// Stage 8's mimes: what games decode through SoundPool/MediaPlayer (Ogg Vorbis, WAV PCM).
 const MEDIA_MIMES: [&str; 2] = ["audio/vorbis", "audio/raw"];
 
@@ -370,6 +411,17 @@ impl Env {
         let cpp = tree::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
         let src =
             std::fs::read_to_string(&cpp).with_context(|| format!("reading {}", cpp.display()))?;
+        // the task copy's list when frameworks/av is edited (patches/aosp/frameworks/av 0002 drops the FDK codecs)
+        let store = tree::build_file(root, C2_STORE_CPP)?;
+        let store_src = std::fs::read_to_string(&store)
+            .with_context(|| format!("reading {}", store.display()))?;
+        let codecs = store_codecs(&store_src);
+        ensure!(
+            !codecs.is_empty(),
+            "{}: no emplace(\"lib….so\") line",
+            store.display()
+        );
+        check_goals(&out, &args.host, &codecs)?;
         Ok(Env {
             host,
             runtime,
@@ -401,22 +453,20 @@ impl Env {
     fn binder_art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
         let device = self.out.join("device");
         let servicemanager = device.join("servicemanager/servicemanager");
+        // both checked built by `check_goals`
         let service = device.join("service/service");
-        for b in [&servicemanager, &service] {
-            ensure!(
-                b.is_file(),
-                "{} missing: build servicemanager service",
-                b.display()
-            );
-        }
+        let allocator = crate::gralloc::allocator(&self.root, &self.out)?;
+        let mapper_dir = crate::gralloc::stage_mapper(&self.root, &self.out)?;
         let test_root = self.work.join("binder");
-        crate::binder::fresh_layout(&test_root)?;
+        // the graphics HALs declared as atld declares them: the codec list asks GraphicBufferMapper which pixel formats it supports (Codec2 buildMediaCodecList -> isHalPixelFormatSupported), fatal without a mapper
+        crate::binder::fresh_layout_with(&test_root, &atl_gralloc::vintf::device_hals())?;
         let aosp = Layout::of(&self.root)?.src().join("aosp");
         crate::binder::link_rows(
             &test_root,
             &crate::atld_run::platform_rows(&self.out, &aosp)?,
         )?;
-        let lib_env = crate::binder::lib_env(&self.out)?;
+        let mut lib_env = crate::binder::lib_env(&self.out)?;
+        crate::gralloc::append_lib_path(&mut lib_env, &mapper_dir);
         let (broker, mut binderd) =
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
         let (mut sm, found) = crate::binder::start_servicemanager(
@@ -427,7 +477,14 @@ impl Env {
             &lib_env,
         )?;
         ensure!(found.0, "servicemanager did not answer: {}", found.1);
-        let cmd = self.host.command(
+        let mut alloc = crate::gralloc::start_allocator(
+            &broker,
+            &allocator,
+            &lib_env,
+            &test_root.join("allocator.log"),
+            None,
+        )?;
+        let mut cmd = self.host.command(
             &fixture.java,
             &fixture.java.area.1,
             &[],
@@ -436,6 +493,9 @@ impl Env {
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>(),
         );
+        // libui dlopens the mapper by name (android_load_sphal_library)
+        let lib_path = format!("{}:{}", self.host.lib_path.display(), mapper_dir.display());
+        cmd.env("LD_LIBRARY_PATH", lib_path);
         let what = format!("{cmd:?}");
         let mounts = crate::binder::layout_mounts(&test_root);
         let run =
@@ -449,6 +509,8 @@ impl Env {
                 });
                 self.host.finish(&what, child)
             });
+        let _ = alloc.kill();
+        alloc.wait()?;
         let _ = sm.child.kill();
         sm.child.wait()?;
         drop(broker);
@@ -1297,6 +1359,13 @@ mod tests {
             ["libbase", "libc++", "libicuuc"]
         );
         assert!(duplicates(&maps[6..]).is_empty());
+    }
+
+    #[test]
+    fn store_codecs_skips_commented_lines() {
+        let src = "    emplace(\"libcodec2_soft_a.so\");\n    //emplace(\"libcodec2_soft_b.so\"); // gone\n  emplace(\"libcodec2_soft_c.so\");\n";
+        // a and c are emplaced; b's line is a comment
+        assert_eq!(store_codecs(src), ["libcodec2_soft_a", "libcodec2_soft_c"]);
     }
 
     #[test]
