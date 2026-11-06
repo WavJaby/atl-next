@@ -19,6 +19,10 @@ use crate::{arches, provided_gate};
 const FEATURE: &str = "converter";
 /// The environment variable naming the converter's build directory (atl-bridgegen converter.rs `NATIVE_OUT`).
 const NATIVE_OUT: &str = "ATL_NATIVE_OUT";
+/// Response file in the cargo target dir holding the stage's `-rpath-link` list (`Selection::cargo`).
+const RPATH_LINK_FILE: &str = "rpath-link.rsp";
+/// Deliberate break: set -> the list goes back into rustflags, so a device-set change must grow a new unit group.
+const FLAGS_BREAK: &str = "ATL_CARGO_FLAGS_BREAK";
 
 /// The suffix of a package's AIDL crate interface (`<package>-stubs`; atl-bridgegen converter.rs `AIDL_SUFFIX`): its crate `<package>_stubs` cannot clash with the package's own.
 const AIDL_SUFFIX: &str = "-stubs";
@@ -462,12 +466,23 @@ impl<'a> Selection<'a> {
     /// cargo `sub` on the selected packages
     /// Links resolve the needs of converter libraries through the stage's dirs (binder::lib_env) as `-rpath-link`, link time only: those libraries carry no runpath (runpath_gate), and ld.bfd, unlike the converter's lld, wants every needed library's own needs found.
     /// One global flag, not per-module build-script lines: `rustc-link-arg` reaches only its own package's links, never a dependent's.
+    /// The list goes through a response file the link driver expands: rustflags enter every unit's hash, so the list itself in them kept a whole new unit tree per device set.
+    /// cargo does not track the file, on purpose: -rpath-link only resolves needs at link time, nothing of it reaches the output, and a changed linked module reruns the build script (`link_lines`), so that relink reads the list written here.
     fn cargo(&self, sub: &str) -> Result<std::process::Command> {
         let stage = crate::binder::lib_env(self.out)?
             .into_iter()
             .map(|(_, v)| v)
             .collect::<Vec<_>>()
             .join(":");
+        let rpath_link = format!("-Wl,-rpath-link,{stage}");
+        let rsp = self.target.join(RPATH_LINK_FILE);
+        std::fs::create_dir_all(&self.target).with_context(|| self.target.display().to_string())?;
+        std::fs::write(&rsp, &rpath_link).with_context(|| rsp.display().to_string())?;
+        let link_arg = if std::env::var_os(FLAGS_BREAK).is_some() {
+            rpath_link
+        } else {
+            format!("@{}", rsp.display())
+        };
         let mut cmd = crate::cargo_command();
         cmd.current_dir(self.root)
             .args([sub, "--release", "--locked"])
@@ -491,7 +506,7 @@ impl<'a> Selection<'a> {
                 &format!(
                     "target.{}.rustflags=[{:?}]",
                     self.triple,
-                    format!("-Clink-arg=-Wl,-rpath-link,{stage}")
+                    format!("-Clink-arg={link_arg}")
                 ),
             ])
             .env(NATIVE_OUT, self.out);

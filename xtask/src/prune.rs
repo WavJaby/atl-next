@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::sources::{self, Sources};
@@ -39,16 +39,40 @@ fn parse(text: &str, sources: &Sources) -> Result<Prune> {
             "[{dir}]: not a relative tree path"
         );
         ensure!(
-            sources
-                .aosp
-                .projects
-                .keys()
-                .any(|p| dir == p || dir.starts_with(&format!("{p}/"))),
+            sources.aosp.projects.keys().any(|p| is_under(dir, p)),
             "[{dir}]: not inside a pinned AOSP project"
         );
+        if let Some((project, kept)) = dropped_by(dir, sources) {
+            bail!(
+                "[{dir}]: sources.toml [aosp.sparse] `{project}` drops it (keeps {}), so no checkout holds it: delete the row or widen the keep-set",
+                kept.join(", ")
+            );
+        }
         ensure!(!row.reason.trim().is_empty(), "[{dir}]: empty reason");
     }
     Ok(prune)
+}
+
+/// The sparse project and keep-set that leave `dir` out of the checkout, if any. Owner = deepest pinned project: AOSP projects nest, and an inner one is its own checkout whatever the outer keeps.
+/// A dir above a kept one survives (cone mode keeps the path down to it), so both directions count as kept.
+fn dropped_by<'a>(dir: &str, sources: &'a Sources) -> Option<(&'a str, &'a [String])> {
+    let (project, _) = sources
+        .aosp
+        .projects
+        .iter()
+        .filter(|(p, _)| is_under(dir, p))
+        .max_by_key(|(p, _)| p.len())?;
+    let kept = sources.aosp.sparse.get(project)?;
+    let inside = dir.strip_prefix(&format!("{project}/"))?;
+    let held = kept
+        .iter()
+        .any(|k| is_under(inside, k) || is_under(k, inside));
+    (!held).then_some((project.as_str(), kept.as_slice()))
+}
+
+/// `path` is `dir` or below it, by whole path components.
+fn is_under(path: &str, dir: &str) -> bool {
+    path == dir || path.starts_with(&format!("{dir}/"))
 }
 
 /// Put a marker in every pruned directory of `tree`, remove the ones whose row is gone. A pruned
@@ -109,6 +133,36 @@ mod tests {
         assert!(err("[\"system/apexd\"]\nreason = \"r\"\n").contains("not inside a pinned"));
         assert!(err("[\"../x\"]\nreason = \"r\"\n").contains("not a relative tree path"));
         assert!(err("[\"system/apex/tests\"]\nreason = \" \"\n").contains("empty reason"));
+    }
+
+    /// The fa0a06d class: `guest` is what the Virtualization keep-set drops, the row that once reached `native` before failing.
+    #[test]
+    fn rows_the_keep_set_drops_are_refused() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let sources: Sources = toml::from_str(&format!(
+            "[aosp]\nremote = \"https://h/\"\ntag = \"t\"\nmanifest = \"{SHA}\"\n\
+             [aosp.projects]\n\"m/Virt\" = \"{SHA}\"\n\"m/Virt/guest/inner\" = \"{SHA}\"\n\
+             [aosp.sparse]\n\"m/Virt\" = [\"build\", \"libs/a\"]\n"
+        ))
+        .unwrap();
+        let row = |dir: &str| parse(&format!("[\"{dir}\"]\nreason = \"r\"\n"), &sources);
+        let refused = format!("{:#}", row("m/Virt/guest").expect_err("dropped dir"));
+        assert!(refused.contains("[m/Virt/guest]"), "{refused}");
+        assert!(
+            refused.contains("[aosp.sparse] `m/Virt` drops it"),
+            "{refused}"
+        );
+        // a sibling sharing a kept dir's name prefix is not inside it
+        assert!(row("m/Virt/build2").is_err());
+        for kept in [
+            "m/Virt",             // the project root is always there
+            "m/Virt/build",       // a kept dir
+            "m/Virt/build/micro", // below one
+            "m/Virt/libs",        // above one
+            "m/Virt/guest/inner", // a nested project: its own checkout
+        ] {
+            assert!(row(kept).is_ok(), "{kept}");
+        }
     }
 
     #[test]
