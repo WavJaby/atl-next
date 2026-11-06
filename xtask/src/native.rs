@@ -17,14 +17,14 @@ use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
-    arches, build_pool, converter, deps, farm, fetch, licence_gate, licenses, none_gate, packages,
-    patch, provided_gate, providers, prune, slot, sources, system, triage, upstream, workspace,
+    arches, build_pool, converter, deps, fetch, licence_gate, licenses, none_gate, packages, patch,
+    provided_gate, providers, prune, slot, sources, system, tree, triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Android.bp module names to build (with their dependency closure).
-    #[arg(required = true)]
+    #[arg(required_unless_present = "shell")]
     goals: Vec<String>,
     /// The host arch (an arches.toml row with `[host]`); also Soong's arch name.
     #[arg(long)]
@@ -44,6 +44,9 @@ pub struct Args {
     /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
     #[arg(long)]
     no_compiler_cache: bool,
+    /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the slot; outside it ninja reads the unpatched src/aosp.
+    #[arg(long)]
+    pub shell: bool,
     /// Before building, convert again and again: pin and fetch the AOSP projects behind the modules and
     /// tree paths the converter reports missing (`missing.txt`, `missing-paths.txt`), until a round finds nothing new to fetch. Ninja
     /// runs once, after that.
@@ -91,22 +94,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
     let ws = layout.workspace();
     let cache = CompilerCache::of(args, ws);
-    // regenerated every round: --fetch-missing adds projects between rounds
-    let aosp_tree = || -> Result<std::path::PathBuf> {
-        let sources = sources::load(root)?;
-        let manifest = aosp::load(root, &sources.aosp)?;
-        farm::aosp_tree(&layout, &sources.checkouts(None), manifest.as_ref())
-    };
-    let tree = aosp_tree()?;
-    if tree != farm::shared_tree(&layout) {
-        println!("native: AOSP tree with task copies: {}", tree.display());
-    }
+    // the task copies are bound over it: main entered the namespace (tree::enter)
+    let tree = tree::shared_tree(&layout);
+    tree::verify(&tree::overlays_of(root)?)?;
     // go.work and the converter binary live in the build dir, so concurrent checkouts (each in its own dir) do not overwrite each other's converter
     let out = slot::out_dir(root, args.out.as_deref(), "--out", |workspace| {
         workspace.join("out").join("native").join(&args.host)
     })?;
     // the state the crates will be built from, taken first; the record goes until they are
-    let state = build_state::of_checkout(root)?;
+    let state = build_state::of_build(root)?;
     std::fs::create_dir_all(&out)?;
     build_state::forget(&out)?;
     let tool_dir = out.join("bp2ninja");
@@ -248,13 +244,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         round += 1;
         // the converter's tree scan skips the directories prune.rs marks (bp.go discover); the table is re-read every round
         let sources = sources::load(root)?;
-        prune::apply(&farm::shared_tree(&layout), &prune::load(root, &sources)?)?;
-        let round_tree = aosp_tree()?;
+        prune::apply(&tree, &prune::load(root, &sources)?)?;
         // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
-        let (jdk, build_tools) = arches::java_tools(&round_tree, &prebuilt_os);
+        let (jdk, build_tools) = arches::java_tools(&tree, &prebuilt_os);
         let status = Command::new(&converter)
             .arg("-tree")
-            .arg(&round_tree)
+            .arg(&tree)
             .arg("-jdk")
             .arg(&jdk)
             .arg("-build-tools")
@@ -477,7 +472,7 @@ fn verdict(failed: Vec<Failure>) -> ExitCode {
 const CACHE_SIZE: &str = "2G";
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
-/// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task-copy farm hits wherever the text is equal (measured with sccache 0.10).
+/// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).
 /// Direct mode, sccache's default, keys on the include paths, which name the out dir (`-I<out>/compat/device`, `-isystem <out>/gen/...`): measured 21% hits in a second out dir, every cross-out-dir lookup a miss. Do not drop the setting.
 /// It writes the depfile from its own preprocessor run, so `deps = gcc` sees this out dir's headers on a hit too. Compiles with debug info run uncached (bp2ninja `debugInfo`): a hit would carry the filling out dir's paths in DWARF.
 /// The one remaining difference from an uncached build: two sources with equal preprocessed text (empty `*_neon.cc` on x86, trivial generated AIDL/pbzero units) share an entry, so the local `STT_FILE` symbol may name the other source's basename; code, data and relocations are equal.

@@ -66,9 +66,22 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str) -> Result<Path
     Ok(out)
 }
 
+/// What a native build reads: the checkout's state, then each AOSP task copy bound over `src/aosp` (tree::overlays) as ` <project>=<its state>`, so a plain and a task build of one checkout differ.
+pub fn of_build(root: &Path) -> Result<String> {
+    with_overlays(root, &crate::tree::overlays_of(root)?)
+}
+
+fn with_overlays(root: &Path, overlays: &[crate::tree::Overlay]) -> Result<String> {
+    let mut s = of_checkout(root)?;
+    for o in overlays {
+        s.push_str(&format!(" {}={}", o.project, of_checkout(&o.copy)?));
+    }
+    Ok(s)
+}
+
 /// A gate's guard: `out` was built from the checkout at `root` as it is now.
 pub fn ensure_current(root: &Path, out: &Path) -> Result<()> {
-    ensure_matches(&of_checkout(root)?, out)
+    ensure_matches(&of_build(root)?, out)
 }
 
 fn ensure_matches(now: &str, out: &Path) -> Result<()> {
@@ -153,11 +166,24 @@ mod tests {
         let d = repo("guard");
         let out = d.with_extension("out");
         std::fs::create_dir_all(&out).unwrap();
+        // the fake repo has no sources.toml: the plain build's state, no overlays
+        let ensure_current = |d: &Path, out: &Path| ensure_matches(&with_overlays(d, &[])?, out);
         let e = ensure_current(&d, &out).expect_err("no record");
         assert!(format!("{e}").contains("run `cargo xtask native`"), "{e}");
         forget(&out).unwrap();
         record(&out, &of_checkout(&d).unwrap()).unwrap();
         ensure_current(&d, &out).expect("built from this state");
+        // the same checkout with a task copy bound: another build
+        let copy = repo("guard-copy");
+        let bound = [crate::tree::Overlay {
+            project: "p".into(),
+            git: None,
+            copy: copy.clone(),
+            target: d.join("p"),
+        }];
+        let e = ensure_matches(&with_overlays(&d, &bound).unwrap(), &out).expect_err("task build");
+        assert!(format!("{e}").contains(" p="), "{e}");
+        let _ = std::fs::remove_dir_all(&copy);
         std::fs::write(d.join("xtask/g.rs"), "gate edit").unwrap();
         ensure_current(&d, &out).expect("gate side is not native input");
         std::fs::write(d.join("crates/a.rs"), "edited").unwrap();

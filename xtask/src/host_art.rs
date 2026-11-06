@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::{arches, farm, packages, slot};
+use crate::{arches, packages, slot, tree};
 
 /// The boot classpath: the dex jars the Java pipeline's goal `platform-bootclasspath` built, one per line in BOOTCLASSPATH order (bp2ninja bootclasspath.go derives it as Soong's product config and derive_classpath do).
 const BOOTCLASSPATH: &str = "bootclasspath.txt";
@@ -125,7 +125,7 @@ pub fn java_tools(root: &Path, host: &str, java_out: &Path) -> Result<(PathBuf, 
     let layout = Layout::of(root)?;
     Ok((
         java_out.join("host/bin/d8"),
-        arches::java_tools(&farm::shared_tree(&layout), os).0,
+        arches::java_tools(&tree::shared_tree(&layout), os).0,
     ))
 }
 
@@ -150,7 +150,7 @@ impl HostArt {
         })?;
         let (d8, jdk) = java_tools(root, host, &java_out)?;
         let art = out.join(stage);
-        let lib_path = stage_art(out, &art, &farm::shared_tree(&layout), arch.pointer_bits)?;
+        let lib_path = stage_art(out, &art, &tree::shared_tree(&layout), arch.pointer_bits)?;
         let h = HostArt {
             art,
             lib_path,

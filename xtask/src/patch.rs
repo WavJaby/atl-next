@@ -15,7 +15,7 @@ use crate::git::{Ident, git, git_isolated, git_raw};
 use crate::licenses::{self, Licenses};
 use crate::prune::{self, Prune};
 use crate::sources::{self, Checkout, Pin, Sources};
-use crate::{aosp, farm, fetch, notice};
+use crate::{aosp, fetch, notice};
 
 /// Patch branch of a shared `src/` checkout; a task copy's is `atl-patches-<task>` (git branches are shared by a repository's worktrees).
 pub const BRANCH: &str = "atl-patches";
@@ -262,10 +262,6 @@ fn failures(root: &Path, args: &Args) -> Result<usize> {
         let picked = pick(&args.done)?;
         for u in &picked {
             report(u.name(), done(u, &layout, &licenses));
-        }
-        if picked.iter().any(|u| matches!(u.c.pin, Pin::Aosp(_))) {
-            // the farm follows the task copies left
-            farm::aosp_tree(&layout, &all, manifest.as_ref())?;
         }
     } else {
         for u in &ups {
@@ -743,6 +739,9 @@ fn done(u: &Up, layout: &Layout, licenses: &Licenses) -> Result<String> {
         );
     }
     remove_copy(&shared, &copy, &u.branch)?;
+    if let Pin::Aosp(p) = &u.c.pin {
+        crate::tree::remove_shadow(layout, p)?;
+    }
     layout.remove_empty_parents(&copy);
     Ok(format!("task copy removed; src/{} in use again", u.name()))
 }

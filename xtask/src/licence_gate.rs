@@ -574,7 +574,7 @@ pub fn roots(layout: &atl_layout::Layout, checkouts: &[crate::sources::Checkout]
             })
         })
         .collect();
-    if let Ok(dir) = std::fs::canonicalize(crate::farm::shared_tree(layout)) {
+    if let Ok(dir) = std::fs::canonicalize(crate::tree::shared_tree(layout)) {
         roots.push(Root {
             dir,
             key: licenses::AOSP.to_owned(),

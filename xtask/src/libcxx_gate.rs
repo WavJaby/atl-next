@@ -12,7 +12,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
-use crate::{aosp, arches, converter, farm, sources};
+use crate::{arches, converter, tree};
 
 /// The C++ compiler device compiles use (`xtask native --cxx` default).
 pub const CXX: &str = "clang++-19";
@@ -200,9 +200,9 @@ pub fn check(root: &Path) -> Result<()> {
     let layout = Layout::of(root)?;
     let arches = arches::load(root)?;
     let (name, arch) = arches::build_machine(root, &arches)?;
-    let sources = sources::load(root)?;
-    let manifest = aosp::load(root, &sources.aosp)?;
-    let tree = farm::aosp_tree(&layout, &sources.checkouts(None), manifest.as_ref())?;
+    // the task copies are bound over it: main runs `check` inside the namespace (tree::enter)
+    let tree = tree::shared_tree(&layout);
+    tree::verify(&tree::overlays_of(root)?)?;
     let libc = tree.join(BIONIC_INCLUDE);
     ensure!(
         libc.join("android/api-level.h").is_file(),

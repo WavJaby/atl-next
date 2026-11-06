@@ -14,7 +14,7 @@ use crate::aosp::{self, Manifest};
 use crate::git::{Ident, git, git_raw};
 use crate::licenses::{self, Licenses};
 use crate::sources::{self, Checkout, Pin, Sources};
-use crate::{farm, par, patch};
+use crate::{par, patch, tree};
 
 /// The trunk as fetch compares against it: what `src/` holds.
 pub const MAIN_REF: &str = "origin/main";
@@ -185,7 +185,7 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
     if args.execute
         && let Some(m) = &manifest
     {
-        let made = aosp::apply_links(&farm::shared_tree(&layout), m)?;
+        let made = aosp::apply_links(&tree::shared_tree(&layout), m)?;
         println!("fetch: {made} manifest link/copy files created");
     } else if !args.execute {
         println!(

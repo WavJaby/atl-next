@@ -25,7 +25,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::atld_run::without_stamp;
 use crate::binder::Harness;
-use crate::{farm, packages};
+use crate::{packages, tree};
 
 const PACKAGE: &str = "atl-services";
 /// The test package: an app uid (AID_APP_START 10000 + 123, any app id), its paths, launcher activity and start.
@@ -144,8 +144,8 @@ pub fn stage(
     );
     let host = packages::bin(root, out, PACKAGE, "atl-system-services")?;
     // the services read their .kcm maps from one directory: AOSP's keyboards dir holds both
-    let keychars = farm::keyboards(&Layout::of(root)?);
-    for (file, _) in farm::KEYBOARD_FILES {
+    let keychars = tree::keyboards(&Layout::of(root)?);
+    for (file, _) in tree::KEYBOARD_FILES {
         let path = keychars.join(file);
         ensure!(path.is_file(), "missing input {}", path.display());
     }

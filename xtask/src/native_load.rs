@@ -33,8 +33,8 @@ use object::{
     Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind,
 };
 
-use crate::farm;
 use crate::host_art::{ArtRun, HostArt, JavaFixture, exec};
+use crate::tree;
 use crate::verdict::{Failure, Verdict};
 
 #[derive(clap::Args)]
@@ -275,7 +275,7 @@ impl Env {
         )?;
         let runtime = out.join(RUNTIME);
         ensure!(runtime.exists(), "missing input {}", runtime.display());
-        let cpp = farm::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
+        let cpp = tree::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
         let src =
             std::fs::read_to_string(&cpp).with_context(|| format!("reading {}", cpp.display()))?;
         Ok(Env {

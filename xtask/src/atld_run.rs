@@ -15,7 +15,7 @@ use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::host_art::{self, HostArt};
-use crate::{farm, manifest, packages, slot};
+use crate::{manifest, packages, slot, tree};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
@@ -40,7 +40,7 @@ pub struct Runtime {
     framework_res: PathBuf,
     font_xml: PathBuf,
     font_file: PathBuf,
-    /// AOSP's keyboards dir: its [`farm::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
+    /// AOSP's keyboards dir: its [`tree::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
@@ -164,7 +164,7 @@ impl ApkTools {
         let (d8, jdk) = host_art::java_tools(root, host, java_out)?;
         let t = ApkTools {
             aapt2: java_out.join("host/aapt2/aapt2"),
-            android_jar: farm::shared_tree(&layout)
+            android_jar: tree::shared_tree(&layout)
                 .join("prebuilts/sdk")
                 .join(sdk_level(&out.join(host_art::BUILD_PROP))?)
                 .join("public/android.jar"),
@@ -215,10 +215,10 @@ impl Runtime {
         std::fs::create_dir_all(&fonts)?;
         let font_xml = fonts.join("font_fallback.xml");
         std::fs::write(&font_xml, FONT_FALLBACK_XML)?;
-        let font_file = farm::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
+        let font_file = tree::shared_tree(&layout).join(FONT_DIR).join(FONT_FILE);
         ensure!(font_file.is_file(), "missing input {}", font_file.display());
-        let keychars = farm::keyboards(&layout);
-        for (file, _) in farm::KEYBOARD_FILES {
+        let keychars = tree::keyboards(&layout);
+        for (file, _) in tree::KEYBOARD_FILES {
             let path = keychars.join(file);
             ensure!(path.is_file(), "missing input {}", path.display());
         }
@@ -504,7 +504,7 @@ impl Runtime {
             .arg(format!("{}=etc/font_fallback.xml", self.font_xml.display()))
             .arg("--system-file")
             .arg(format!("{}=fonts/{FONT_FILE}", self.font_file.display()))
-            .args(farm::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
+            .args(tree::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
                 [
                     "--system-file".to_owned(),
                     format!("{}={dir}/{file}", self.keychars.join(file).display()),

@@ -22,7 +22,6 @@ mod cts;
 mod cts_report;
 mod cts_table;
 mod deps;
-mod farm;
 mod fetch;
 mod git;
 mod gles2_fixture;
@@ -59,6 +58,8 @@ mod slot;
 mod sources;
 mod spdx;
 mod system;
+mod tree;
+mod tree_gate;
 mod triage;
 mod upstream;
 mod verdict;
@@ -115,7 +116,8 @@ enum Command {
     /// this checkout's build-output slot (`xtask slot`), else <workspace>/out/native/<host>; failures are summarised per module (`ninja -k 0`) against the goals: which failed modules each goal reaches, those with no failed dependency first (most modules waiting on them first), each with its cause (compiler `error:` lines, a link's undefined symbols).
     /// Gates over what was built, each failing the run: the provided gate (provided libraries win symbol lookup) and the licence gate (every source and header linked into a device artifact has a licence licenses.toml allows in the runtime).
     /// Preflight: every AOSP checkout and every upstream built for providers.toml must be its pin + patches/ (the drift test), since the build compiles checkouts as they are and never writes patches/.
-    /// Task copies (`xtask patch --edit`) replace their src/ checkout; with AOSP ones the converter reads the link farm src-wt/<task>/aosp-tree, regenerated every round.
+    /// Task copies (`xtask patch --edit`) replace their src/ checkout. With AOSP ones, `native` and `check` re-execute inside a mount namespace (`bwrap --dev-bind / /`) where each is bind-mounted over src/aosp/<project>, so the tree path is always src/aosp; the slot's `built-from` record names each bound copy and its state.
+    /// Risk: `ninja` run by hand outside the namespace reads the unpatched src/aosp; `native --shell <goal> --host <h>` opens $SHELL inside it.
     Native(native::Args),
     /// Mesa `platforms=android` build inputs from a converter out dir: pkg-config files for the AOSP libraries Mesa looks up, and a meson native file with the G1 options.
     ///
@@ -222,12 +224,27 @@ enum Test {
     ///
     /// Controls run every time: each check rejects a broken copy of the real input. Needs the NDK, the Java pipeline's aapt2/d8 and a build.prop; no runtime.
     Gles2Fixture(gles2_fixture::Args),
+    /// The task-copy namespace (task copies bound over src/aosp): javac accepts a bind-mounted `--patch-module=java.base` dir, the overlay check refuses a wrong copy or no namespace; with `--plain`/`--task`, two native out dirs' build.ninja differ only on bound projects' lines.
+    ///
+    /// Controls run every time: the symlinked (link-farm) shape must make javac fail. Needs the prebuilt JDK and bwrap; no native build unless comparing.
+    TaskBind(tree_gate::Args),
 }
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let root = repo_root()?;
     let name = verdict_name(&cli.command);
+    // the commands that read src/aosp see the task copies through it (tree.rs)
+    let shell = match &cli.command {
+        Command::Native(a) => Some(a.shell),
+        Command::Check(_) => Some(false),
+        _ => None,
+    };
+    if let Some(shell) = shell
+        && let Some(code) = tree::enter(&tree::overlays_of(&root)?, shell)?
+    {
+        return Ok(code);
+    }
     let result = match cli.command {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
@@ -289,6 +306,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Gles2Fixture(args),
         } => gles2_fixture::run(&root, &args),
+        Command::Test {
+            test: Test::TaskBind(args),
+        } => tree_gate::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -318,6 +338,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::PlatformUi(_) => "platform-ui",
             Test::JniFixture(_) => "jni-fixture",
             Test::Gles2Fixture(_) => "gles2-fixture",
+            Test::TaskBind(_) => "task-bind",
         },
         _ => return None,
     })
