@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use atl_aidl::aidl::com::android::internal::infra::IAndroidFuture::{
+    BnAndroidFuture, IAndroidFuture,
+};
 use atl_aidl::aidl::com::android::internal::inputmethod::IInputMethod::{
     BnInputMethod, IInputMethod,
 };
@@ -21,6 +24,10 @@ use atl_aidl::mangled::{
 use atl_parcelables::android::os::ResultReceiver;
 use atl_parcelables::android::view::InputChannel;
 use atl_parcelables::android::view::inputmethod::{EditorInfo, ImeTracker_Token, InputBinding};
+use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::{
+    FutureState, FutureValue,
+};
+use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_platform_ui::UiInvoker;
 use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
 
@@ -45,13 +52,56 @@ fn start_field(
         return;
     };
     let input_type = editor.map_or(0, |e| e.input_type);
+    let for_field = Arc::clone(invoker);
     invoker.invoke(Box::new(move || {
         field::start(Field {
             connection,
             session_id,
             input_type,
+            invoker: for_field,
         })
     }));
+}
+
+/// The pending side of a getSurroundingText AndroidFuture (AndroidFuture.writeToParcel's IAndroidFuture.Stub): the editor completes it with the done form; the value goes to the UI thread.
+struct SurroundingFuture {
+    invoker: Invoker,
+    session_id: i32,
+}
+
+impl Interface for SurroundingFuture {}
+
+impl IAndroidFuture for SurroundingFuture {
+    fn r#unimplemented(&self, method: &'static str) -> Status {
+        unserved(method)
+    }
+
+    fn r#complete(&self, result: Option<&AndroidFuture>) -> binder::Result<()> {
+        match result.map(|f| &f.state) {
+            Some(FutureState::Done(FutureValue::SurroundingText(text))) => {
+                let (text, session_id) = (text.clone(), self.session_id);
+                self.invoker
+                    .invoke(Box::new(move || field::surrounding(session_id, text)));
+            }
+            // RemoteInputConnectionImpl completes with null when the connection is inactive or the editor returns none
+            other => {
+                tracing::debug!("atl-ime: surrounding future completed without text: {other:?}")
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A new pending future for session `session_id`'s surrounding text, as the binder an AndroidFuture carries.
+pub(crate) fn surrounding_future(invoker: Invoker, session_id: i32) -> SpIBinder {
+    BnAndroidFuture::new_binder(
+        SurroundingFuture {
+            invoker,
+            session_id,
+        },
+        BinderFeatures::default(),
+    )
+    .as_binder()
 }
 
 struct InputMethod {
@@ -155,7 +205,7 @@ impl IInputMethodSession for Session {
         unserved(method)
     }
 
-    /// The editor's selection moved; the desktop side follows in plan step 6.
+    /// The editor's selection moved: the desktop input method's surrounding text is refreshed from the editor (field.rs).
     fn r#updateSelection(
         &self,
         _old_start: i32,
@@ -168,6 +218,7 @@ impl IInputMethodSession for Session {
         tracing::debug!(
             "atl-ime: updateSelection {new_start}..{new_end} composing {candidates_start}..{candidates_end}"
         );
+        self.invoker.invoke(Box::new(field::selection_changed));
         Ok(())
     }
 

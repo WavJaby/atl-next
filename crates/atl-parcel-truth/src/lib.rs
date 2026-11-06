@@ -30,7 +30,9 @@ use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
-use atl_parcelables::android::view::inputmethod::{EditorInfo, ImeTracker_Token, InputBinding};
+use atl_parcelables::android::view::inputmethod::{
+    EditorInfo, ImeTracker_Token, InputBinding, SurroundingText,
+};
 use atl_parcelables::android::view::{
     DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
     SurfaceControl, WindowManager_LayoutParams, WindowRelayoutResult,
@@ -38,6 +40,7 @@ use atl_parcelables::android::view::{
 use atl_parcelables::android::window::{
     ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
 };
+use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::{
     InputBindResult, InputConnectionCommandHeader, InputMethodInfoSafeList,
 };
@@ -287,6 +290,8 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.view.inputmethod.InputBinding" => round_trip_as::<InputBinding>(input, mode),
         "java.lang.CharSequence" => round_trip_as::<CharSequence>(input, mode),
+        "android.view.inputmethod.SurroundingText" => round_trip_as::<SurroundingText>(input, mode),
+        "com.android.internal.infra.AndroidFuture" => round_trip_as::<AndroidFuture>(input, mode),
         "com.android.internal.inputmethod.InputMethodInfoSafeList" => {
             round_trip_as::<InputMethodInfoSafeList>(input, mode)
         }

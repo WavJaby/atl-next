@@ -50,7 +50,9 @@ import android.view.autofill.AutofillId;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.ImeTracker;
 import android.view.inputmethod.InputBinding;
+import android.view.inputmethod.SurroundingText;
 import android.window.ImeOnBackInvokedDispatcher;
+import com.android.internal.infra.AndroidFuture;
 import com.android.internal.inputmethod.InputBindResult;
 import com.android.internal.inputmethod.InputConnectionCommandHeader;
 import com.android.internal.inputmethod.InputMethodInfoSafeList;
@@ -255,6 +257,16 @@ public class ParcelTruth {
         // every IRemoteInputConnection call the in-app IME makes (atl-ime)
         check("InputConnectionCommandHeader", new InputConnectionCommandHeader(3), InputConnectionCommandHeader.CREATOR);
         checkCharSequence("CharSequence", "仮名😀");
+        // getSurroundingText's answer (atl-ime field.rs): SurroundingText, and the done AndroidFuture carrying it (writeValue VAL_PARCELABLE, length-prefixed) or null
+        check("SurroundingText", new SurroundingText("仮名😀", 1, 4, 7), SurroundingText.CREATOR);
+        // AndroidFuture's constructor takes the main Looper's Handler (AndroidFuture.java:84, :114); the driver has no Looper otherwise
+        if (android.os.Looper.getMainLooper() == null) android.os.Looper.prepareMainLooper();
+        AndroidFuture<SurroundingText> surrounding = new AndroidFuture<>();
+        surrounding.complete(new SurroundingText("typed from code仮名", 17, 17, 0));
+        check("AndroidFuture:surrounding", surrounding, AndroidFuture.CREATOR);
+        AndroidFuture<SurroundingText> none = new AndroidFuture<>();
+        none.complete(null);
+        check("AndroidFuture:null", none, AndroidFuture.CREATOR);
         checkImeDispatcher("ImeOnBackInvokedDispatcher");
         // show/hideSoftInput's token and getInputMethodList's empty answer (atl-services input_method.rs)
         checkImeToken("ImeTracker_Token");

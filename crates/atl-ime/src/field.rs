@@ -5,14 +5,20 @@
 //! Mapping (IME study §7): preedit -> setComposingText(text, 1); preedit end / empty preedit -> setComposingText("", 1) (the composing text goes, a following commit replaces nothing);
 //! commit -> commitText(text, 1) (replaces the composing region, cursor after it); delete-surrounding -> deleteSurroundingTextInCodePoints (units.rs). newCursorPosition 1 = cursor right after the
 //! inserted text (InputConnection.setComposingText docs).
+//! Surrounding text (plan step 6): on start and on each updateSelection, getSurroundingText with a pending AndroidFuture; its completion (binder thread) comes back here and goes to
+//! TextInput.set_surrounding. Never a local copy of the editor's text: a mirror built from EditorInfo + own edits goes wrong as soon as keys or the app edit the field.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_22_IRemoteInputConnection as IRemoteInputConnection;
+use atl_parcelables::android::view::inputmethod::SurroundingText;
+use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::FutureState;
+use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::InputConnectionCommandHeader;
 use atl_parcelables::java::lang::CharSequence;
-use atl_platform_ui::{PlatformWindow, TextInput, TextInputEvent, Window};
+use atl_platform_ui::{PlatformWindow, Surrounding, TextInput, TextInputEvent, UiInvoker, Window};
 use binder::Strong;
 
 use crate::units;
@@ -22,7 +28,13 @@ pub(crate) struct Field {
     pub connection: Strong<dyn IRemoteInputConnection>,
     pub session_id: i32,
     pub input_type: i32,
+    /// For the surrounding text's answer, which arrives on a binder thread (method.rs `SurroundingFuture`).
+    pub invoker: Arc<dyn UiInvoker>,
 }
+
+/// UTF-16 units of text asked for on each side of the selection. Text-input v3 caps set_surrounding_text at 4000 bytes (text-input-unstable-v3.xml); a UTF-16 unit is at most 3 UTF-8 bytes
+/// (BMP 1 unit -> <= 3 bytes, a surrogate pair 2 units -> 4 bytes), so 2 x 600 units <= 3600 bytes, leaving room for a short selection. A longer one is GTK's to trim.
+const SURROUNDING_UNITS: i32 = 600;
 
 #[derive(Default)]
 struct State {
@@ -54,6 +66,71 @@ pub(crate) fn start(field: Field) {
             let input = window.text_input();
             input.set_content(purpose, hints);
             input.focus_in();
+        }
+    });
+    // outside the mutable borrow: the in-process editor may answer (and reach `surrounding`) before the call returns
+    selection_changed();
+}
+
+/// Asks the editor for the text around its selection (IRemoteInputConnection.getSurroundingText, oneway): the answer completes a pending AndroidFuture on a binder thread, and nothing waits for it.
+fn request_surrounding(field: &Field) {
+    let header = InputConnectionCommandHeader {
+        session_id: field.session_id,
+    };
+    let future = crate::method::surrounding_future(Arc::clone(&field.invoker), field.session_id);
+    let future = AndroidFuture::new(FutureState::Pending(Some(future)));
+    if let Err(e) = field.connection.r#getSurroundingText(
+        Some(&header),
+        SURROUNDING_UNITS,
+        SURROUNDING_UNITS,
+        0,
+        Some(&future),
+    ) {
+        tracing::warn!("atl-ime: getSurroundingText not sent: {e:?}");
+    }
+}
+
+/// The editor's selection moved (IInputMethodSession.updateSelection): its surrounding text is asked for again. No copy of the editor's text is kept here; the editor is the only one.
+pub(crate) fn selection_changed() {
+    STATE.with_borrow(|s| {
+        if let Some(field) = &s.field {
+            request_surrounding(field);
+        }
+    });
+}
+
+/// The editor's answer for session `session_id`: the window's TextInput gets it in the toolkit's units. An answer for an older session (the field restarted meanwhile) is dropped.
+pub(crate) fn surrounding(session_id: i32, text: SurroundingText) {
+    STATE.with_borrow(|s| {
+        let (Some(field), Some(window)) = (&s.field, &s.window) else {
+            return;
+        };
+        if field.session_id != session_id {
+            return;
+        }
+        let content = text.text.unwrap_or_default();
+        let index = |i: i32| usize::try_from(i).ok();
+        let bytes = index(text.selection_start)
+            .zip(index(text.selection_end))
+            .map(|(start, end)| units::selection_to_bytes(&content, start, end));
+        match bytes {
+            Some(Ok((cursor_byte, anchor_byte))) => {
+                tracing::info!(
+                    "atl-ime: surrounding {} bytes cursor {cursor_byte} anchor {anchor_byte}",
+                    content.len()
+                );
+                window.text_input().set_surrounding(&Surrounding {
+                    text: content,
+                    cursor_byte,
+                    anchor_byte,
+                });
+            }
+            other => tracing::warn!(
+                "atl-ime: surrounding selection {}..{} unusable in {} units: {other:?}",
+                text.selection_start,
+                text.selection_end,
+                content.encode_utf16().count()
+            ),
         }
     });
 }

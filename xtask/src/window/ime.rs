@@ -2,10 +2,14 @@
 //! Stage `ime` (IME plan step 5): the widgets fixture in UI mode on the gate's labwc, a fake desktop input method (nested_wayland `Ime`) on its seat. The probe taps the EditText; once the focus's second
 //! window has closed, Main's EditText holds the focus and the in-app input method (atl-ime) has started input for it, so the desktop input method is activated. The fake IME then sends a
 //! preedit, a commit and a delete-surrounding; the fixture logs each edit (`text input=<text> composing=<start>,<end>`, its TextWatcher).
-//! Sub-gates: activate (the IME was activated), preedit (the text holds the preedit as a composing span), commit (the commit replaced it, no composing span left), delete (the last char of the commit is gone).
-//! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail.
+//! Sub-gates: activate (the IME was activated), preedit (the text holds the preedit as a composing span), commit (the commit replaced it, no composing span left), surrounding (after the commit the IME
+//! holds the editor's text with the cursor at its end, in text-input v3 bytes: the getSurroundingText path, IME plan step 6), delete (the last char of the commit is gone: GTK turns the IME's byte
+//! count into chars against that surrounding).
+//! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail. `--break-ime-delete` sends the delete's byte count as after_length (after the cursor, where nothing is): the delete
+//! sub-gate must fail.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::nested_wayland::{Arg, Ime, im_op};
@@ -24,6 +28,26 @@ const COMMIT: &str = "仮名";
 const TEXT_LINE: &str = "AtlWindow: text input=";
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
+
+/// The surrounding text (text, cursor byte, anchor byte) the fake IME held after the commit: the probe thread's, for `checks` (Liveness is shared by every stage).
+static SURROUNDING: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
+
+/// The deliberate breaks.
+#[derive(Clone, Copy, Default)]
+pub struct Breaks {
+    pub commit: bool,
+    pub delete: bool,
+}
+
+/// Pumps until the IME's surrounding text is `text` (it follows the editor asynchronously) or the wait ends; the last one seen is kept for `checks`.
+fn wait_surrounding(ime: &mut Ime, text: &str) {
+    let deadline = Instant::now() + IME_WAIT;
+    while Instant::now() < deadline && ime.surrounding.as_ref().is_none_or(|s| s.0 != text) {
+        let _ = ime.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    *SURROUNDING.lock().unwrap_or_else(|e| e.into_inner()) = ime.surrounding.clone();
+}
 
 /// The fixture's text after the preedit: the cursor sits at the end of the setText text (TextView.setText puts the selection at the end), so the preedit is appended there.
 fn after_preedit() -> String {
@@ -74,7 +98,7 @@ pub fn drive(
     proxy: Proxy,
     app_log: &Path,
     mut ime: Ime,
-    break_commit: bool,
+    breaks: Breaks,
 ) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -121,7 +145,7 @@ pub fn drive(
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_preedit());
     ime.settle().map_err(|e| e.to_string())?;
-    if !break_commit {
+    if !breaks.commit {
         ime.send(im_op::COMMIT_STRING, &[Arg::S(COMMIT)]);
     }
     ime.send(
@@ -130,12 +154,14 @@ pub fn drive(
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_commit());
+    wait_surrounding(&mut ime, &after_commit());
     ime.settle().map_err(|e| e.to_string())?;
     // one char before the cursor, in bytes (text-input v3 counts bytes): the commit's last char
-    let last = COMMIT.chars().last().map_or(0, char::len_utf8);
+    let last = u32::try_from(COMMIT.chars().last().map_or(0, char::len_utf8)).unwrap_or(0);
+    let (before, after) = if breaks.delete { (0, last) } else { (last, 0) };
     ime.send(
         im_op::DELETE_SURROUNDING_TEXT,
-        &[Arg::U(u32::try_from(last).unwrap_or(0)), Arg::U(0)],
+        &[Arg::U(before), Arg::U(after)],
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_delete());
@@ -181,9 +207,29 @@ pub fn checks(app: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
                 "no composing span after a commit",
             ),
         ),
+        ("surrounding", surrounding_check()),
         (
             "delete",
             edit(after_delete(), &|c| c == "-1,-1", "no composing span"),
         ),
     ]
+}
+
+/// After the commit the IME holds the editor's whole text, cursor and anchor at its end: byte offset = the UTF-8 length (INITIAL 15 ASCII bytes + 仮名 2 x 3 bytes = 21).
+fn surrounding_check() -> Result<String, String> {
+    let want = after_commit();
+    let end = u32::try_from(want.len()).unwrap_or(u32::MAX);
+    match SURROUNDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        Some((text, cursor, anchor)) if text == want && cursor == end && anchor == end => {
+            Ok(format!("`{text}` cursor = anchor = byte {end}"))
+        }
+        Some((text, cursor, anchor)) => Err(format!(
+            "`{text}` cursor {cursor} anchor {anchor}, want `{want}` at byte {end}"
+        )),
+        None => Err("the IME never received a surrounding text".to_owned()),
+    }
 }

@@ -65,6 +65,9 @@ pub struct Args {
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
+    /// Stage ime only: the fake input method sends its delete as after_length (after the cursor, where nothing is), so the delete sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_ime_delete: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1489,7 +1492,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Ime, Some(n)) => Some(crate::nested_wayland::Ime::bind(n)?),
         _ => None,
     };
-    let break_ime_commit = args.break_ime_commit;
+    let ime_breaks = ime::Breaks {
+        commit: args.break_ime_commit,
+        delete: args.break_ime_delete,
+    };
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
@@ -1497,7 +1503,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let log = run.log(&m.name);
         let fake_ime = fake_ime.take();
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Ime, _, Some(ime)) => ime::drive(p, &log, ime, break_ime_commit),
+            (Stage::Ime, _, Some(ime)) => ime::drive(p, &log, ime, ime_breaks),
             (Stage::Widgets, _, _) => widgets::drive(p, &log),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {

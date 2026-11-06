@@ -5,6 +5,7 @@
 //! hintLocales LocaleList.writeToParcel (one String8 language-tag list; null is written as the empty list, so a read empty list stays ""), targetInputMethodUser UserHandle.writeToParcel
 //! (the user id, USER_NULL for null). The stylus-handwriting boolean exists only when READ_ONLY flag android.view.inputmethod.editorinfo_handwriting_enabled is true.
 
+use super::SurroundingText::SurroundingText;
 use crate::aconfig::EDITORINFO_HANDWRITING_ENABLED;
 use crate::codecs::android::os::Bundle::{Bundle, r_bundle, w_bundle};
 use crate::opaque::refuse;
@@ -66,15 +67,6 @@ impl Part for AutofillId {
             virtual_long,
         })
     }
-}
-
-/// android.view.inputmethod.SurroundingText (SurroundingText.java writeToParcel:128-133): text, selection start / end, offset.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SurroundingText {
-    pub text: Option<String>,
-    pub selection_start: i32,
-    pub selection_end: i32,
-    pub offset: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,10 +133,7 @@ impl Part for EditorInfo {
         }
         w_bool(p, self.initial_surrounding_text.is_some())?;
         if let Some(t) = &self.initial_surrounding_text {
-            w_char_sequence(p, &t.text)?;
-            w_i32(p, t.selection_start)?;
-            w_i32(p, t.selection_end)?;
-            w_i32(p, t.offset)?;
+            t.write(p)?;
         }
         w_str8(p, &self.hint_locales)?;
         w_str16_array(p, &self.content_mime_types)?;
@@ -182,12 +171,7 @@ impl Part for EditorInfo {
         let handwriting_gesture_preview_types = r_i32(p)?;
         let stylus_handwriting_enabled = EDITORINFO_HANDWRITING_ENABLED && r_bool(p)?;
         let initial_surrounding_text = if r_bool(p)? {
-            Some(SurroundingText {
-                text: r_char_sequence(p)?,
-                selection_start: r_i32(p)?,
-                selection_end: r_i32(p)?,
-                offset: r_i32(p)?,
-            })
+            Some(SurroundingText::read(p)?)
         } else {
             None
         };

@@ -42,6 +42,21 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> Result<usize, UnitError> {
     Ok(head.encode_utf16().count())
 }
 
+/// An Android selection (`SurroundingText` start / end, UTF-16 units into `text`) as the toolkit's surrounding (cursor byte, anchor byte).
+/// BaseInputConnection.getSurroundingText sorts start <= end, so the direction is lost: the cursor is taken as the end (where typing extends a selection), the anchor as the start.
+/// Text-input v3 counts delete_surrounding_text in bytes; GTK turns them into chars by walking this surrounding back / forward from `cursor_byte` (gtkimcontextwayland.c), so a wrong cursor byte
+/// deletes the wrong count: this conversion is where the delete's byte units are made right.
+pub fn selection_to_bytes(
+    text: &str,
+    start_utf16: usize,
+    end_utf16: usize,
+) -> Result<(usize, usize), UnitError> {
+    Ok((
+        utf16_to_byte(text, end_utf16)?,
+        utf16_to_byte(text, start_utf16)?,
+    ))
+}
+
 /// The UTF-16 index of the position `chars` chars into `text` (a preedit cursor in Java string units).
 pub fn chars_to_utf16(text: &str, chars: usize) -> Result<usize, UnitError> {
     let mut units = 0;
@@ -112,6 +127,23 @@ mod tests {
         assert_eq!(chars_to_utf16(EMOJI, 4), Err(UnitError::OutOfRange));
         // "かな": 2 chars, 1 unit each
         assert_eq!(chars_to_utf16("かな", 2), Ok(2));
+    }
+
+    #[test]
+    fn selection_to_bytes_by_hand() {
+        // the ime gate's text after its commit: "typed from code" (15 ASCII = 15 bytes, 15 units) + 仮 U+4EEE (E4 BB AE) + 名 U+540D (E5 90 8D): 21 bytes, 17 units
+        let committed = "typed from code仮名";
+        assert_eq!(selection_to_bytes(committed, 17, 17), Ok((21, 21)));
+        // a text-input v3 delete of 3 bytes before cursor 21 starts at byte 18 = the start of 名: one char, what GTK hands on
+        assert_eq!(selection_to_bytes(committed, 16, 16), Ok((18, 18)));
+        // selection over the emoji in "a😀b": units 1..3 = bytes 1..5, cursor at the end
+        assert_eq!(selection_to_bytes(EMOJI, 1, 3), Ok((5, 1)));
+        assert_eq!(
+            selection_to_bytes(EMOJI, 0, 2),
+            Err(UnitError::InsideChar),
+            "an end between D83D and DE00"
+        );
+        assert_eq!(selection_to_bytes(KANA, 0, 4), Err(UnitError::OutOfRange));
     }
 
     #[test]

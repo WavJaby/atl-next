@@ -31,7 +31,10 @@ use atl_parcelables::android::window::ImeOnBackInvokedDispatcher;
 use atl_parcelables::com::android::internal::inputmethod::{
     InputBindResult, InputMethodInfoSafeList,
 };
-use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
+use binder::{
+    BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
+    ThreadState,
+};
 
 use crate::counters;
 use crate::ime_bind::{self, Bind, ClientBind, Peer};
@@ -60,6 +63,8 @@ struct Client {
     pid: i32,
     method: Option<Strong<dyn IInputMethod>>,
     bind: ClientBind<Session, Start>,
+    /// The death link on `client`; held only so the link lives as long as the entry.
+    _death: DeathRecipient,
 }
 
 /// The service's state, shared with the session callbacks it hands out.
@@ -224,6 +229,7 @@ fn with_client(
         pid,
         method,
         bind,
+        ..
     } = c;
     let mut remote = Remote {
         state,
@@ -296,7 +302,8 @@ impl IInputMethodManager for InputMethodManager {
     }
 
     /// InputMethodManagerService.addClient (:1791-1805), as createRealInstance calls it (InputMethodManager.java:1652): the client is kept for its uid with a fresh bind state (a restarted app's
-    /// process replaces the old one's entry: AOSP drops a client on its binder's death). Counted.
+    /// process replaces the old one's entry). The client's binder death removes it (ClientController.addClient's death recipient -> removeClientAsBinder, ClientController.java:63-81, :108-113); a death of a replaced
+    /// client leaves its successor alone (pid check). Counted.
     fn r#addClient(
         &self,
         client: Option<&Strong<dyn IInputMethodClient>>,
@@ -308,12 +315,31 @@ impl IInputMethodManager for InputMethodManager {
             return Ok(());
         };
         let uid = ThreadState::get_calling_uid();
+        let pid = ThreadState::get_calling_pid();
+        let weak = Arc::downgrade(&self.state);
+        let mut death = DeathRecipient::new(move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let mut clients = state.clients();
+            if clients.get(&uid).is_some_and(|c| c.pid == pid) {
+                clients.remove(&uid);
+                counters::count(INTERFACE, "client died");
+            }
+        });
+        client.as_binder().link_to_death(&mut death).map_err(|e| {
+            Status::new_exception_str(
+                ExceptionCode::ILLEGAL_STATE,
+                Some(format!("linkToDeath: {e:?}")),
+            )
+        })?;
         let entry = Client {
             client,
             uid,
-            pid: ThreadState::get_calling_pid(),
+            pid,
             method: None,
             bind: ClientBind::default(),
+            _death: death,
         };
         self.state.clients().insert(uid, entry);
         Ok(())
