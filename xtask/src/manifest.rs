@@ -200,7 +200,7 @@ fn resolve_class(package: &str, name: &str) -> String {
 
 /// The `<meta-data>` children of `element` (ParsingPackageUtils.parseMetaData): `android:resource` -> its id; else `android:value` typed by how aapt2 printed it (ResourceValues.cpp BinaryPrimitive::PrettyPrint):
 /// quoted = string, `true`/`false` = boolean, a decimal / `0x%08x` / `#%08x` (color) = int, another number = float. A reference or other type AOSP drops (Slog.w, no Property); so does this.
-/// Known loss (measured, aapt2 of slot 3): a float with no fraction prints as an int (`2.0` -> `2`), so it reads as Int here where AOSP puts a Float; the libandroidfw reader (owner D3) has the type.
+/// Known loss (measured, aapt2 of slot 3): a float with no fraction prints as an int (`2.0` -> `2`), so it reads as Int here where AOSP puts a Float; the installer process (ParsingPackageUtils on the binary manifest) has the type.
 fn meta_data(element: &Element) -> Result<Vec<(String, MetaValue)>> {
     let mut out = Vec::new();
     for m in element.children("meta-data") {
