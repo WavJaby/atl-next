@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! Starting the compositor of an app process, and handing its two service objects and its UI agent (ui_agent.rs) to the registry in the system process (atl_services::compositor_registry has the protocol).
-//! Reads from the process's own property area what atld wrote there (`ro.atl.surfaceflinger.suffix`, `ro.atl.display`); a process without them is not an ATL app process and gets no compositor.
+//! Starting the compositor of an app process: its two service objects are served under AOSP's names by the process's service view (atl-service-view; libgui looks them up there), and its UI agent (ui_agent.rs)
+//! goes to the registry in the system process (atl_services::compositor_registry has the protocol). Reads from the process's own property area what atld wrote there (`ro.atl.display`); a process without it
+//! is not an ATL app process and gets no compositor.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use atl_services::compositor_registry::{
-    DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SUFFIX_PROPERTY,
+    DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
+    SURFACE_FLINGER_AIDL,
 };
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
@@ -84,20 +86,11 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
-/// The REGISTER transaction: the suffix, the two service binders, the UI agent.
-fn register(
-    suffix: &str,
-    surface_flinger: &SpIBinder,
-    surface_flinger_aidl: &SpIBinder,
-    ui_agent: &SpIBinder,
-) -> Result<(), String> {
+/// The REGISTER transaction: the UI agent.
+fn register(ui_agent: &SpIBinder) -> Result<(), String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
     let mut data = binder.prepare_transact().map_err(|e| e.to_string())?;
-    data.write(suffix).map_err(|e| e.to_string())?;
-    data.write(surface_flinger).map_err(|e| e.to_string())?;
-    data.write(surface_flinger_aidl)
-        .map_err(|e| e.to_string())?;
     data.write(ui_agent).map_err(|e| e.to_string())?;
     binder
         .submit_transact(REGISTER, data, 0)
@@ -109,7 +102,6 @@ fn register(
 /// Headless (`ui` None): the clock thread and the present thread come from `threads`, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit this UI thread attached): the window's frame clock drives the
 /// compositor and the display is a GTK window ([`ui_window`]); only the deliver thread comes from `threads`. The caller is the UI thread in UI mode.
 pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
-    let suffix = property(SUFFIX_PROPERTY)?;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
     let script = match optional_property(POINTER_PROPERTY)? {
         Some(script) => input::parse_script(&script)?,
@@ -158,7 +150,16 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
     let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender, input_method);
-    register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
-    // the registry holds the binders; the process holds the compositor (the clock or deliver thread does)
+    atl_service_view::serve(SURFACE_FLINGER, surface_flinger)?;
+    atl_service_view::serve(SURFACE_FLINGER_AIDL, surface_flinger_aidl)?;
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process"
+        );
+    }
+    register(&ui_agent)?;
+    // the service view holds the binders, the registry the agent; the process holds the compositor (the clock or deliver thread does)
     Ok(composer)
 }

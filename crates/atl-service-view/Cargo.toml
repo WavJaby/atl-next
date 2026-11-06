@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+# The process's own view of servicemanager (owner decision 2026-11-06, audio M0 option A/1): names this process serves are answered in-process, the rest forwarded.
+# C++ is cxx glue (src/bridge.rs) plus wrap/view.{h,cpp}: adapters that convert types and forward to libbinder's API, no logic (project CLAUDE.md, C++ exception). Compiled with the converter's libbinder_ndk argv (graph.json `cxx`).
+[package]
+name = "atl-service-view"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.atl]
+converter = ["device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+
+[features]
+converter = ["atl-aidl/converter"]
+
+[dependencies]
+atl-aidl = { path = "../atl-aidl" }
+cxx.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true

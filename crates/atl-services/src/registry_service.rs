@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The compositor registry service (compositor_registry.rs is the protocol). REGISTER takes the suffix, the two service binders and the app's UI agent (ui_agent.rs). The names are checked
-//! against the caller's uid, the services go to servicemanager, and the agent goes to the table the window service reads: constructor injection into [`Registry`], so the table is not part of the interface.
-//! The services run as the system uid, the only one servicemanager lets add services (patches/aosp/frameworks/native 0002); apps never get addService.
+//! The compositor registry service (compositor_registry.rs is the protocol). REGISTER takes the app's UI agent (ui_agent.rs), kept under the caller's uid in the table the window service reads:
+//! constructor injection into [`Registry`], so the table is not part of the interface.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -12,9 +11,7 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{
-    DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, check, service_names,
-};
+use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY};
 use crate::counters;
 use crate::display::DisplayCallbacks;
 use crate::display_model::DisplayModel;
@@ -25,15 +22,8 @@ use crate::ui_agent::UiAgents;
 const INTERFACE: &str = "ICompositorRegistry";
 
 pub trait ICompositorRegistry: Interface {
-    /// REGISTER once its arguments are read: `suffix` must be under `caller_uid` (compositor_registry::check). On success the two services and the agent are kept under it.
-    fn register(
-        &self,
-        caller_uid: u32,
-        suffix: &str,
-        surface_flinger: SpIBinder,
-        surface_flinger_aidl: SpIBinder,
-        ui_agent: SpIBinder,
-    ) -> Result<(), StatusCode>;
+    /// REGISTER once its argument is read: the agent is kept under `caller_uid`.
+    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode>;
 
     /// SET_BOUNDS once its arguments are read: Task `task` (its number, tasks.rs) is `width` x `height` physical pixels. The caller's uid must own the Task; a non-positive size is refused; a size change notifies the Task's windows.
     fn set_bounds(
@@ -55,7 +45,7 @@ declare_binder_interface! {
     }
 }
 
-/// REGISTER: the suffix, the two service binders, the UI agent; the calling uid is taken from the transaction.
+/// REGISTER: the UI agent; the calling uid is taken from the transaction.
 fn on_transact(
     service: &dyn ICompositorRegistry,
     code: TransactionCode,
@@ -76,17 +66,8 @@ fn on_transact(
         counters::count(INTERFACE, &format!("code {code}"));
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
-    let suffix: String = data.read()?;
-    let surface_flinger: SpIBinder = data.read()?;
-    let surface_flinger_aidl: SpIBinder = data.read()?;
     let ui_agent: SpIBinder = data.read()?;
-    service.register(
-        ThreadState::get_calling_uid(),
-        &suffix,
-        surface_flinger,
-        surface_flinger_aidl,
-        ui_agent,
-    )
+    service.register(ThreadState::get_calling_uid(), ui_agent)
 }
 
 impl ICompositorRegistry for BpCompositorRegistry {
@@ -98,14 +79,7 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn register(
-        &self,
-        _: u32,
-        _: &str,
-        _: SpIBinder,
-        _: SpIBinder,
-        _: SpIBinder,
-    ) -> Result<(), StatusCode> {
+    fn register(&self, _: u32, _: SpIBinder) -> Result<(), StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 }
@@ -125,21 +99,8 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.set_display(caller_uid, display)
     }
 
-    fn register(
-        &self,
-        caller_uid: u32,
-        suffix: &str,
-        surface_flinger: SpIBinder,
-        surface_flinger_aidl: SpIBinder,
-        ui_agent: SpIBinder,
-    ) -> Result<(), StatusCode> {
-        self.0.register(
-            caller_uid,
-            suffix,
-            surface_flinger,
-            surface_flinger_aidl,
-            ui_agent,
-        )
+    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
+        self.0.register(caller_uid, ui_agent)
     }
 }
 
@@ -246,28 +207,11 @@ impl ICompositorRegistry for Registry {
         Ok(())
     }
 
-    fn register(
-        &self,
-        caller_uid: u32,
-        suffix: &str,
-        surface_flinger: SpIBinder,
-        surface_flinger_aidl: SpIBinder,
-        ui_agent: SpIBinder,
-    ) -> Result<(), StatusCode> {
-        if let Err(why) = check(caller_uid, suffix) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: registry refused uid {caller_uid}: {why}"
-            );
-            return Err(StatusCode::PERMISSION_DENIED);
-        }
-        let (name, name_aidl) = service_names(suffix);
-        binder::add_service(&name, surface_flinger)?;
-        binder::add_service(&name_aidl, surface_flinger_aidl)?;
+    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
         self.agents.insert(caller_uid, ui_agent);
         let _ = writeln!(
             std::io::stderr(),
-            "services: registered {name}, {name_aidl}"
+            "services: registered the UI agent of uid {caller_uid}"
         );
         Ok(())
     }

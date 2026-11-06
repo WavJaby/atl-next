@@ -92,6 +92,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-composer",
  "atl-platform-ui",
+ "atl-service-view",
  "rustix",
  "tracing-subscriber",
 ]
@@ -177,6 +178,7 @@ dependencies = [
  "atl-libinput",
  "atl-platform-ui",
  "atl-scene-buffer",
+ "atl-service-view",
  "atl-services",
  "rustix",
  "tracing",
@@ -410,6 +412,17 @@ dependencies = [
  "atl-gralloc",
  "atl-gralloc-dmabuf",
  "rustix",
+]
+
+[[package]]
+name = "atl-service-view"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-aidl",
+ "atl-bridgegen",
+ "cxx",
+ "cxx-build",
 ]
 
 [[package]]

@@ -42,6 +42,9 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("sys.boot_completed", "1"),
     // the NativeBridge core (atl-native-bridge `LIBRARY`): AndroidRuntime::startVm turns it into `-XX:NativeBridge=` for zygote's children, as atl-app-launcher's app mode does
     ("ro.dalvik.vm.native.bridge", "libatl_native_bridge.so"),
+    // the device's choice of Codec2 HAL, a vendor property on Android: AIDL (`IComponentStore` through servicemanager, frameworks/av codec2 HalSelection.cpp IsCodec2AidlHalSelected; the aidl_hal flag is on in our release).
+    // Unset it reads "hidl", and Codec2Client::CacheServiceNames CHECK-aborts without hwservicemanager, which ATL has none of (measured 2026-11-06, native-load stage 8)
+    ("media.c2.hal.selection", "aidl"),
 ];
 
 /// Why the default set or its area could not be built.

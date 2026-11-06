@@ -3,6 +3,7 @@
 //! dalvikvm's start (art/dalvikvm/dalvikvm.cc) through the standard seams only: the JNI invocation API, liblog's logger API, bionic's API. Steps:
 //! 0. what bionic sets up on Android before any code runs: the main thread's alternate signal stack (`ffi::install_signal_stack`), and debuggerd_init's crash-signal disposition, so a crash ends the process with its own signal (`ffi::install_crash_handler`; no tombstone).
 //! 1. refuse to start without a property area: bionic's `__system_properties_init` maps `$ATL_PROP_AREA` (atl-bionic `AREA_ENV`), else `/dev/__properties__`; without it every property reads unset and the runtime runs on defaults no Android process sees.
+//!    Then (step 1b) the process's view of servicemanager (atl-service-view, feature `converter`): libbinder's default service manager, answering the names this process serves itself (its SurfaceFlinger) and forwarding the rest; it must precede any `defaultServiceManager()`.
 //! 2. `JNI_CreateJavaVM` through libnativehelper's JniInvocation, the VM options as dalvikvm takes them (`args`).
 //! 3. our logger via `__android_log_set_logger`, after the VM exists: ART's InitLogging (ART_TARGET_LINUX) installs libbase's StderrLogger through the same call (system/libbase/logging.cpp SetLogger), replacing any earlier one. The logger turns each message into a C6 record (`log`); liblog filters before calling it.
 //! 4. `android_set_application_target_sdk_version` (bionic's compat checks); ART calls it from VMRuntime.setTargetSdkVersion only under ART_TARGET_ANDROID.
@@ -11,8 +12,8 @@
 //! App mode (`--app`, an app process the broker starts) replaces step 5 with what zygote's child takes (ZygoteConnection.handleChildProc), app_process's native side included:
 //! 5a. libandroid_runtime around this VM (`AndroidRuntimeAttachInvokedVm`, patches/aosp/frameworks/base): the process's AndroidRuntime, its JavaVM, the framework's natives (startReg);
 //! 5b. libbinder's thread pool (`ABinderProcess_startThreadPool`, what AppRuntime::onZygoteInit does): after 5a, so its threads are made by javaCreateThreadEtc and attached to the VM, before any Java code can make a binder call;
-//! 5b'. the process's SurfaceFlinger (`atl_composer::start`, feature `converter`): the compositor libgui looks up by name, created before any Java code runs and registered through the system process (plan C3, amended 2026-11-04); a process atld did not
-//!      give the suffix and display properties has none and starts without, saying so;
+//! 5b'. the process's SurfaceFlinger (`atl_composer::start`, feature `converter`): the compositor libgui looks up by name, created before any Java code runs and served by the process's service view (step 1b); its UI agent goes to the system process's registry; a process atld did not
+//!      give the display property has none and starts without, saying so;
 //! 5c. `ZygoteInit.zygoteInit(targetSdk, no disabled changes, [class, args...], boot class loader)` and the Runnable it returns (RuntimeInit.applicationInit -> `class.main(args)`), as zygote runs it; an app's class is android.app.ActivityThread with `seq=<startSeq>`.
 //!
 //! The library holds all of it; the executable (`src/main.rs`, feature `converter`) only calls [`main`]. It needs a link no plain cargo build can make: DT_NEEDED on the converter's libsigchain ahead of libc, as the converter links dalvikvm's device variant,
@@ -105,6 +106,18 @@ fn start_compositor(vm: &ffi::Vm, ui: Option<atl_platform_ui::PlatformUi>) {
 #[cfg(not(feature = "converter"))]
 fn start_compositor(_vm: &ffi::Vm, _ui: Option<atl_platform_ui::PlatformUi>) {}
 
+/// Step 1b. The process's view of servicemanager (atl-service-view), before `JNI_CreateJavaVM`: nothing has called libbinder's `defaultServiceManager()` yet (the launcher reaches libbinder only from step 5b on),
+/// and libbinder aborts if the view comes after it. Every process gets it; one that never asks for a service never opens the driver.
+#[cfg(feature = "converter")]
+fn install_service_view() -> Result<()> {
+    atl_service_view::install().map_err(|e| anyhow!(e))
+}
+
+#[cfg(not(feature = "converter"))]
+fn install_service_view() -> Result<()> {
+    Ok(())
+}
+
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
 /// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
 fn start_ui() -> Result<atl_platform_ui::PlatformUi> {
@@ -139,6 +152,7 @@ fn run() -> Result<i32> {
             atl_bionic::AREA_ENV
         );
     }
+    install_service_view()?;
     let mut vm_options = launch.vm_options.clone();
     if launch.app {
         vm_options.extend(native_bridge_options(

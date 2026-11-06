@@ -18,7 +18,8 @@
 //!    Only the main thread has an alternate signal stack (the launcher's); on Android bionic gives every thread one, and ART's device variant (thread_android.cc) sets none up. Threads ART creates on glibc have none, so the kernel's signal frame and ART's handler run in the gap above the probe, which suffices (measured 2026-11-02, x86_64, gdb: SS_DISABLE on the new thread, fault at sp - 0x2000, all handled).
 //!    The stage guards that: a larger signal frame or handler would kill the process here first.
 //! 8. media: NDK `AMediaCodec_createDecoderByType` for [`MEDIA_MIMES`], the run an app-uid binder process of its own binderd + AOSP servicemanager. A warning, not a failure, until the in-app Codec2 store exists (audio slice M1);
-//!    the detail is the first fatal line. Measured 2026-11-06: MediaCodecList waits 5 s for `media.player`, then Codec2Client::CacheServiceNames (HIDL path, `media.c2.hal.selection` unset) aborts: `Check failed: serviceManager Hardware service manager is not running.`
+//!    the detail is the first fatal line, else the last Codec2 line. Measured 2026-11-06: without `media.c2.hal.selection=aidl` (atl-property-service CONSTANTS) Codec2Client::CacheServiceNames takes the HIDL path and aborts
+//!    (`Check failed: serviceManager Hardware service manager is not running.`); with it the process exits 0, both codecs null (`No Codec2 services declared in the manifest.`), after MediaCodecList's 5 s wait for `media.player`.
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
