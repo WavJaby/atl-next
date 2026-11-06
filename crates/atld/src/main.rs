@@ -297,7 +297,7 @@ fn system_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((PathBuf::from(host), at))
 }
 
-/// The install step, until the package manager installs from a real APK (owner D3: libandroidfw reads the manifest): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
+/// The install step, until the package manager installs from a real APK (the installer process: AOSP ParsingPackageUtils on ART, plan 4b): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
 /// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read.
 fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
     ensure!(
