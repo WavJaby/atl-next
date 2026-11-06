@@ -154,6 +154,10 @@ type Node struct {
 	rule     *genRule // Kind Gen only
 	// cc_object modules srcs name (`:bcm_object`)
 	objSrcs []*Node
+	// cc_object modules a cc_object's objs names: combined with its own objects by ld -r (bionic.go)
+	objDeps []*Node
+	// bionic sides: the crt objects linked before the inputs and after the libraries (bionic.go bionicLinkDeps)
+	crtBegin, crtEnd []*Node
 	// built outside ninja by xtask (provided.go): out and exports only, never in g.order
 	provided bool
 	// Rust nodes only (rust.go)
@@ -184,7 +188,9 @@ type Graph struct {
 	soong     SoongConfig
 	// the libc++ headers of the stl provider: -isystem of every libc++ C++ compile (stl.go libcxxProvider)
 	libcxx string
-	omit   map[string]bool
+	// bionic sides: compiler-rt's public headers (sanitizer/, xray/), which prebuilts/clang's resource dir carries and the distro clang's lacks (-clang-rt-include)
+	rtInclude string
+	omit      map[string]bool
 	// dependencies dropped by omit: "<side>/<module> <omitted module>"
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
@@ -737,7 +743,15 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 		if n.props.has("system_shared_libs") {
 			system = n.props.strs("system_shared_libs")
 		}
-		n.deps.shared = append(n.deps.shared, dep(system, Shared)...)
+		// cc/binary.go linkerDeps: a static binary links them statically
+		if n.staticBinary() {
+			n.deps.static = append(n.deps.static, dep(system, Static)...)
+		} else {
+			n.deps.shared = append(n.deps.shared, dep(system, Shared)...)
+		}
+	}
+	if !side.glibc() {
+		g.bionicLinkDeps(n, dep)
 	}
 	n.deps.shared = uniqueNodes(append(provided, n.deps.shared...))
 	// Soong's runtime_libs (cc/linker.go linkerDeps, minus exclude_runtime_libs; cc.go: shared variant, runtimeDepTag = installed with the module, never linked): built, and found at run time through linkLibs' rpath

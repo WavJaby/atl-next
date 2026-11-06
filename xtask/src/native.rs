@@ -561,7 +561,12 @@ fn native_bridge_flags(
     let file = out.join("nb-provided.json");
     std::fs::write(&file, serde_json::to_string_pretty(&provided)?)?;
     let mut flags = side;
-    flags.extend(["-nb-provided".to_owned(), file.display().to_string()]);
+    flags.extend([
+        "-nb-provided".to_owned(),
+        file.display().to_string(),
+        "-clang-rt-include".to_owned(),
+        runtimes::rt_include(root)?.display().to_string(),
+    ]);
     Ok(flags)
 }
 

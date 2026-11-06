@@ -48,7 +48,7 @@ func globTree(base, pattern, dir string) []string {
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
 // LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
 // Launcher: compiler cache prefixed to the cc rule only (empty = none), except compiles with debug info (debugInfo). Not yasm (sccache does not know it) nor rustc: sccache 0.10 refuses rustc's `-o`, keys Rust on the cwd (= the out dir, so no hit across out dirs) and restores the dep-info of the out dir that filled the entry.
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher string }
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)
@@ -90,10 +90,19 @@ rule ar
   command = rm -f $out && $ar crsD $out $in
   description = ar $out
 rule link
-  command = $cxx $mode -o $out @$out.rsp $libs -Wl,--trace >$out.trace
+  command = $cxx $mode -o $out $crtbegin @$out.rsp $libs $crtend -Wl,--trace >$out.trace
   rspfile = $out.rsp
   rspfile_content = $in
   description = link $out
+rule partial_ld
+  command = $cxx -fuse-ld=lld -nostdlib -no-pie -Wl,-r $in -o $out $mode
+  description = ld -r $out
+rule no_addrsig
+  command = $objcopy --remove-section=.llvm_addrsig $in $out
+  description = no addrsig $out
+rule prefix_symbols
+  command = $objcopy --prefix-symbols=$prefix $in $out
+  description = prefix symbols $out
 rule aidl
   command = $aidl --lang=$lang $flags --ninja -d $dep -h $hdir -o $sdir $in
   depfile = $dep
@@ -172,8 +181,8 @@ func (g *Graph) nodeOut(n *Node) string {
 func (g *Graph) emit(tools Tools) string {
 	var b strings.Builder
 	// rustfmt: bindgen.go's ${config.RustBin}/rustfmt, the toolchain's own beside rustc
-	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
-		esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher))
+	fmt.Fprintf(&b, "%sar = %s\ncxx = %s\nbison = %s\nflex = %s\nyasm = %s\nrustc = %s\nroot = %s\nclang = %s\nlibclang = %s\nrustfmt = %s\nlauncher = %s\nobjcopy = %s\n\n", header, esc(tools.AR), esc(tools.CXX), esc(tools.Bison),
+		esc(tools.Flex), esc(tools.Yasm), esc(tools.Rustc), esc(g.tree), esc(tools.CC), esc(tools.LibClang), esc(filepath.Join(filepath.Dir(tools.Rustc), "rustfmt")), esc(tools.Launcher), esc(filepath.Join(tools.LLVM, "bin", "llvm-objcopy")))
 	// before the cc edges: ninja needs a rule defined before its first use
 	b.WriteString(g.acfg.ninja())
 	b.WriteString(g.aidlPreNinja())
@@ -241,14 +250,11 @@ func (g *Graph) emit(tools Tools) string {
 		}
 		switch n.kind {
 		case Static:
-			fmt.Fprintf(&b, "build %s: ar %s\n", esc(n.out), join(n.objs))
 			if g.baseType(n.mod.Type) == "cc_object" {
-				// cc/object.go link: one object is copied to the module's output; several are combined with ld -r, not mirrored
-				if len(n.objs) == 1 {
-					fmt.Fprintf(&b, "build %s: cp %s\n", esc(g.objectOut(n)), esc(n.objs[0]))
-				} else {
-					fmt.Fprintf(&b, "build %s: fail\n  msg = %s\n", esc(g.objectOut(n)), shellQuote([]string{fmt.Sprintf("error: %s: cc_object output of %d objects (ld -r) is unsupported", n.mod.Name, len(n.objs))}))
-				}
+				fmt.Fprintf(&b, "build %s: ar %s\n", esc(n.out), join(g.objectInputs(n)))
+				g.emitObject(&b, n)
+			} else {
+				fmt.Fprintf(&b, "build %s: ar %s\n", esc(n.out), join(n.objs))
 			}
 		case Shared, Binary:
 			n.rustlib, n.rustlibWhole = g.rustStaticlib(&b, n)
@@ -257,7 +263,22 @@ func (g *Graph) emit(tools Tools) string {
 			if n.versionScript != "" {
 				inputs = append(inputs, n.versionScript)
 			}
-			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(n.out), join(n.objs), join(inputs), shellQuote(mode), shellQuote(libs))
+			begin, end := g.crtOuts(n.crtBegin), g.crtOuts(n.crtEnd)
+			inputs = append(inputs, begin...)
+			inputs = append(inputs, end...)
+			// prefix_symbols: the link writes the unprefixed output, objcopy the module's (bionic.go)
+			linkOut := n.out
+			prefix := n.props.str("prefix_symbols")
+			if prefix != "" && n.kind == Binary {
+				linkOut = filepath.Join(filepath.Dir(n.out), "unprefixed", filepath.Base(n.out))
+			}
+			fmt.Fprintf(&b, "build %s: link %s | %s\n  mode = %s\n  libs = %s\n", esc(linkOut), join(n.objs), join(inputs), shellQuote(mode), shellQuote(libs))
+			if len(begin)+len(end) > 0 {
+				fmt.Fprintf(&b, "  crtbegin = %s\n  crtend = %s\n", join(begin), join(end))
+			}
+			if linkOut != n.out {
+				fmt.Fprintf(&b, "build %s: prefix_symbols %s\n  prefix = %s\n", esc(n.out), esc(linkOut), shellQuote([]string{prefix}))
+			}
 		}
 	}
 	var defaults []string
@@ -291,7 +312,11 @@ type langFlags struct{ c, cxx, asm, yasm []string }
 // bionicTargetFlags: what Soong's device compile adds for a bionic side (cc/compiler.go): AddTargetFlags' `-target <ClangTriple><FutureApiLevelInt>` (clang then defines __ANDROID__ and __ANDROID_API__ itself), -nostdlibinc (bionic's headers come from libc's exports), and -D__ANDROID_NATIVE_BRIDGE__ for a native bridge target.
 func (g *Graph) bionicTargetFlags(s Side) []string {
 	level := strings.TrimPrefix(g.soong.APILevel, apiLevelPrefix)
-	return []string{"-target", g.soong.Flags.Triple[s] + level, "-nostdlibinc", "-D__ANDROID_NATIVE_BRIDGE__"}
+	out := []string{"-target", g.soong.Flags.Triple[s] + level, "-nostdlibinc", "-D__ANDROID_NATIVE_BRIDGE__"}
+	if g.rtInclude != "" {
+		out = append(out, "-isystem", g.rtInclude)
+	}
+	return out
 }
 
 func (g *Graph) compileFlags(n *Node) langFlags {
@@ -430,7 +455,11 @@ func (g *Graph) linkFlags(n *Node) []string {
 	}
 	// a bionic side links for its triple without the driver's C library, crt objects or runtimes (Soong's device link: -nostdlib, crt and runtimes as dependencies), and takes the packing Soong gives a device link: the loader is bionic's linker, which reads both
 	if !n.side.glibc() {
-		out = append(out, "-target", g.soong.Flags.Triple[n.side]+strings.TrimPrefix(g.soong.APILevel, apiLevelPrefix), "-nostdlib", "-Wl,--pack-dyn-relocs=android+relr")
+		out = append(out, g.bionicTarget(n.side)...)
+		out = append(out, "-nostdlib", "-Wl,--pack-dyn-relocs=android+relr")
+		if n.kind == Binary {
+			out = append(out, g.bionicBinaryFlags(n)...)
+		}
 	}
 	out = append(out, g.soong.Lldflags...)
 	out = append(out, "-Wl,--no-undefined")

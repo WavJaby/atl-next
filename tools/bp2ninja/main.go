@@ -41,6 +41,7 @@ func main() {
 	nbArch := flag.String("native-bridge", "", "guest arch of the native bridge side (arches.toml row with [guest]): android properties + target.native_bridge built against bionic into <out>/nb/<arch>; goals `nb:<module>` build there; empty = no native bridge side")
 	nbBits := flag.Int("native-bridge-bits", 0, "pointer width of -native-bridge (its arches.toml pointer_bits)")
 	nbProvidedFile := flag.String("nb-provided", "", "JSON file like -provided: the native bridge side's provided modules (the LLVM runtimes built for the guest: libc++_static_noexcept, libc++demangle_noexcept, libunwind, libclang_rt.builtins)")
+	rtInclude := flag.String("clang-rt-include", "", "compiler-rt's include dir (sanitizer/, xray/ headers) for the -native-bridge side's compiles: prebuilts/clang's resource dir carries it, the distro clang's lacks it (bionic's heap_tagging.cpp includes sanitizer/hwasan_interface.h)")
 	cc := flag.String("cc", "clang", "C compiler")
 	cxx := flag.String("cxx", "clang++", "C++ compiler and linker driver")
 	ar := flag.String("ar", "llvm-ar", "archiver")
@@ -145,7 +146,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -215,7 +216,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX); err != nil {
 		return err
 	}

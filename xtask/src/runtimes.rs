@@ -86,11 +86,14 @@ const VARIANTS: &[Variant] = &[
     Variant {
         name: "libunwind",
         runtimes: "libunwind",
+        // the HAS_*_LIB checks pass under STATIC_LIBRARY try-compiles and would make the archive name pthread / dl as dependent libraries (lld: "unable to find library from dependent library specifier"); bionic folds both into libc / libdl, where Android's own check finds no such library
         cache: &[
             ("LIBUNWIND_HIDE_SYMBOLS", "TRUE"),
             ("LIBUNWIND_ENABLE_SHARED", "FALSE"),
             ("LIBUNWIND_ENABLE_ASSERTIONS", "FALSE"),
             ("LIBUNWIND_USE_FRAME_HEADER_CACHE", "FALSE"),
+            ("LIBUNWIND_HAS_PTHREAD_LIB", "OFF"),
+            ("LIBUNWIND_HAS_DL_LIB", "OFF"),
         ],
         cflags: "-D_LIBUNWIND_USE_DLADDR=0",
         cxxflags: "-D_LIBUNWIND_USE_DLADDR=0",
@@ -106,6 +109,9 @@ const VARIANTS: &[Variant] = &[
             ("LIBUNWIND_ENABLE_SHARED", "FALSE"),
             ("LIBUNWIND_ENABLE_ASSERTIONS", "FALSE"),
             ("LIBUNWIND_USE_FRAME_HEADER_CACHE", "TRUE"),
+            // as the libunwind variant: bionic has no libpthread / libdl archive to name
+            ("LIBUNWIND_HAS_PTHREAD_LIB", "OFF"),
+            ("LIBUNWIND_HAS_DL_LIB", "OFF"),
         ],
         cflags: "-D_LIBUNWIND_USE_DLADDR=0",
         cxxflags: "-D_LIBUNWIND_USE_DLADDR=0",
@@ -141,6 +147,22 @@ pub struct Built {
     pub module: &'static str,
     pub archive: PathBuf,
     pub include: Option<PathBuf>,
+}
+
+/// compiler-rt's public headers in the pinned llvm-project (sanitizer/, xray/): what prebuilts/clang's resource dir carries beside clang's own; bionic compiles include them (bp2ninja -clang-rt-include).
+pub fn rt_include(root: &Path) -> Result<PathBuf> {
+    let sources = sources::load(root)?;
+    let c = sources
+        .checkouts(None)
+        .into_iter()
+        .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
+        .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
+    let dir = Layout::of(root)?
+        .locate(&c.dir)
+        .dir
+        .join("compiler-rt/include");
+    ensure!(dir.is_dir(), "{}: missing", dir.display());
+    Ok(dir)
 }
 
 /// The runtimes of guest `arch` built under `<out>/upstream/llvm-project/<arch>/` with compilers `cc` / `cxx`, against `bionic`: the include flags the converter's `-nb-exports libc_headers` prints. Fails unless the licence gate over what they compiled passes.

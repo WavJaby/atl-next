@@ -84,12 +84,65 @@ cc_library { name: "libdep", srcs: ["b.c"], system_shared_libs: [] }
 
 // A bionic side takes its provided modules from -nb-provided, not providers.toml.
 func TestNativeBridgeProvided(t *testing.T) {
-	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `cc_library { name: "libz", srcs: ["a.c"], static_libs: ["libclang_rt.builtins"], system_shared_libs: [] }`})
+	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `cc_library { name: "libz", srcs: ["a.c"], static_libs: ["libclang_rt.builtins"], system_shared_libs: [], nocrt: true }`})
 	nb := NativeBridge("x86_64")
 	g.provided = map[string]Provided{"libclang_rt.builtins": {Lib: "/glibc/builtins.a"}}
 	g.nbProvided = map[string]Provided{"libclang_rt.builtins": {Lib: "/rt/x86_64/libclang_rt.builtins.a"}}
 	n := g.node("libz", nb, Shared, "t")
 	if n == nil || len(n.deps.static) != 1 || n.deps.static[0].out != "/rt/x86_64/libclang_rt.builtins.a" {
 		t.Fatalf("nb static deps %+v, problems %q", n, g.problems)
+	}
+}
+
+// Soong's implicit bionic link deps (bionic.go): crt objects around a shared library's link, builtins last, a static-PIE binary with -shared + prefix_symbols, a cc_object's objs by ld -r.
+func TestBionicLinkDeps(t *testing.T) {
+	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `
+cc_defaults { name: "crt", system_shared_libs: [], stl: "none" }
+cc_object { name: "crtbrand", srcs: ["brand.S"], defaults: ["crt"] }
+cc_object { name: "crtbegin_so", srcs: ["begin_so.c"], objs: ["crtbrand"], defaults: ["crt"] }
+cc_object { name: "crtend_so", srcs: ["end_so.S"], defaults: ["crt"] }
+cc_object { name: "crt_pad_segment", srcs: ["pad.S"], defaults: ["crt"] }
+cc_library { name: "libz", srcs: ["a.c"], system_shared_libs: [], stl: "none" }
+cc_binary {
+    name: "linker",
+    srcs: ["l.c"],
+    static_executable: true,
+    ldflags: ["-shared"],
+    nocrt: true,
+    prefix_symbols: "__dl_",
+    static_libs: ["libz"],
+    system_shared_libs: [],
+    stl: "none",
+}
+`})
+	nb := NativeBridge("x86_64")
+	g.soong.Flags.Triple[nb] = "x86_64-linux-android"
+	g.nbProvided = map[string]Provided{builtinsModule: {Libs: []string{"/rt/builtins.a"}}}
+	lib, bin := g.node("libz", nb, Shared, "goal"), g.node("linker", nb, Binary, "goal")
+	if lib == nil || bin == nil || len(g.problems) > 0 {
+		t.Fatalf("nodes %v %v, problems %q", lib, bin, g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", LLVM: "/llvm"})
+	obj := func(name string) string { return filepath.Join(g.out, "nb", "x86_64", name, name+".o") }
+	for _, w := range []string{
+		"crtbegin = " + obj("crtbegin_so") + "\n",
+		"crtend = " + obj("crtend_so") + " " + obj("crt_pad_segment") + "\n",
+		": partial_ld ",
+		"build " + obj("crtbegin_so") + ": no_addrsig ",
+		"objcopy = /llvm/bin/llvm-objcopy\n",
+		": prefix_symbols ",
+		"prefix = __dl_\n",
+		"-Bstatic",
+	} {
+		if !strings.Contains(ninja, w) {
+			t.Errorf("ninja lacks %q", w)
+		}
+	}
+	if libs, _ := g.linkLibs(lib); !slices.Contains(libs, "/rt/builtins.a") {
+		t.Errorf("libz link libs lack builtins: %q", libs)
+	}
+	ld := g.linkFlags(bin)
+	if slices.Contains(ld, "-static") || !slices.Contains(ld, "-shared") || bin.crtBegin != nil {
+		t.Errorf("linker: -shared replaces -static, nocrt drops crt: %q, crt %v", ld, bin.crtBegin)
 	}
 }
