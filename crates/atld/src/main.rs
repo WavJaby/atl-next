@@ -614,6 +614,7 @@ impl Host {
             // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
             devices: vec![PathBuf::from(DRM_DIR)],
             property_area: Some(self.process_properties(uid, name)?),
+            rights: vec![],
             program: self.launcher.clone(),
             args: launcher_args,
             env: self.art_env(),
@@ -720,6 +721,7 @@ impl Host {
             .find(|p| p.name == req.package)
             .with_context(|| format!("{}: not an installed package", req.package))?;
         spawn.mounts.extend(self.package_mounts(record)?);
+        spawn.rights = atl_broker::rights_of(record.granted_permissions.as_slice());
         let pid = self.start(spawn, false, true)?;
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -765,6 +767,7 @@ impl Host {
                 links: vec![],
                 devices: vec![],
                 property_area: Some(self.root.properties()),
+                rights: vec![],
                 program: am.clone(),
                 args: vec!["start".into(), component.into()],
                 env: vec![self.lib.clone()],
@@ -940,6 +943,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             links: vec![],
             devices: vec![],
             property_area: Some(r.properties()),
+            rights: vec![],
             program: program.to_owned(),
             args,
             env: vec![lib.clone()],

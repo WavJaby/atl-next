@@ -63,6 +63,8 @@ pub struct Spawn {
     pub devices: Vec<PathBuf>,
     /// The property area file, mounted read-only at [`PROPERTY_AREA`].
     pub property_area: Option<PathBuf>,
+    /// What the app's manifest permissions give beyond its mounts ([`rights_of`]): [`Right::Net`] leaves TCP unrestricted; without it TCP is refused (Landlock ABI >= 4).
+    pub rights: Vec<Right>,
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
@@ -264,9 +266,12 @@ pub fn binderd_args(files: &[PathBuf], info_fd: i32, seccomp_fd: i32) -> Vec<OsS
     a.end()
 }
 
-/// The sandbox stub's argv after its path: each grant as `--ro` / `--rw` / `--device` PATH, then `-- program`. The stub restricts itself with Landlock to exactly those grants and execs `program`, which inherits the domain.
-pub fn stub_args(grants: &[(Access, PathBuf)], program: &Path) -> Vec<OsString> {
-    let mut v = Vec::with_capacity(grants.len() * 2 + 2);
+/// The sandbox stub's argv after its path: `--net` when `net` (TCP unrestricted), each grant as `--ro` / `--rw` / `--device` PATH, then `-- program`. The stub restricts itself with Landlock to exactly those grants and execs `program`, which inherits the domain.
+pub fn stub_args(grants: &[(Access, PathBuf)], net: bool, program: &Path) -> Vec<OsString> {
+    let mut v = Vec::with_capacity(grants.len() * 2 + 3);
+    if net {
+        v.push("--net".into());
+    }
     for (access, path) in grants {
         v.push(
             match access {
@@ -281,6 +286,25 @@ pub fn stub_args(grants: &[(Access, PathBuf)], program: &Path) -> Vec<OsString> 
     v.push("--".into());
     v.push(program.into());
     v
+}
+
+/// One row per manifest permission: what it gives the app process. Landlock restricts exactly the rights a ruleset handles, so `Net` is the only network row: TCP left unhandled (ABI >= 4), not a port list.
+pub const PERMISSION_RIGHTS: &[(&str, Right)] = &[("android.permission.INTERNET", Right::Net)];
+
+/// What a process's permissions give (PERMISSION_RIGHTS rows, in table order).
+pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
+    PERMISSION_RIGHTS
+        .iter()
+        .filter(|(p, _)| permissions.iter().any(|g| g.as_ref() == *p))
+        .map(|(_, r)| *r)
+        .collect()
+}
+
+/// A right a manifest permission gives an app process beyond its mounts (see [`Spawn::rights`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Right {
+    /// TCP bind and connect on any port: the Landlock network rights are left unhandled.
+    Net,
 }
 
 /// The files `program` needs to start: itself, its interpreter (PT_INTERP, at the path it names), and every DT_NEEDED library, transitively, found in the interpreter's canonical directory (the loader's default search path holds it; no other is consulted).
@@ -337,6 +361,62 @@ fn elf_deps(path: &Path) -> io::Result<(Option<PathBuf>, Vec<String>)> {
         }
     }
     Ok((interp, needed))
+}
+
+/// `path`'s search entries for its own DT_NEEDED: DT_RUNPATH, or DT_RPATH when it has no RUNPATH.
+fn elf_runpath(path: &Path) -> io::Result<Vec<String>> {
+    use object::read::elf::{Dyn, ElfFile64};
+    let data = std::fs::read(path)?;
+    let elf = ElfFile64::<object::Endianness>::parse(&*data)
+        .map_err(|e| other(format!("{}: {e}", path.display())))?;
+    let endian = elf.endian();
+    let bad = |e: object::Error| other(format!("{}: {e}", path.display()));
+    let sections = elf.elf_section_table();
+    let (mut runpath, mut rpath) = (Vec::new(), Vec::new());
+    if let Some((dynamic, link)) = sections.dynamic(endian, &*data).map_err(bad)? {
+        let strings = sections.strings(endian, &*data, link).map_err(bad)?;
+        for d in dynamic {
+            let tag = d.tag(endian);
+            if tag == object::elf::DT_RUNPATH || tag == object::elf::DT_RPATH {
+                let text = String::from_utf8_lossy(d.string(endian, strings).map_err(bad)?)
+                    .into_owned();
+                let list = if tag == object::elf::DT_RUNPATH {
+                    &mut runpath
+                } else {
+                    &mut rpath
+                };
+                list.extend(text.split(':').filter(|s| !s.is_empty()).map(str::to_owned));
+            }
+        }
+    }
+    Ok(if runpath.is_empty() { rpath } else { runpath })
+}
+
+/// Read-only mounts of what `program`'s loader finds through RUNPATH: each object's own RUNPATH dirs ([`tree_mounts`]) and the DT_NEEDED libraries in them, followed in turn (a RUNPATH serves only the object that has it).
+/// `$ORIGIN` is the object's directory. LD_LIBRARY_PATH's dirs are the caller's environment (its Spawn env); the default search path is the interpreter's directory ([`elf_closure`]).
+pub fn runpath_mounts(program: &Path) -> io::Result<Vec<Mount>> {
+    let mut mounts = Vec::new();
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = vec![program.to_path_buf()];
+    while let Some(obj) = queue.pop() {
+        if !seen.insert(obj.clone()) {
+            continue;
+        }
+        let origin = obj.parent().unwrap_or(Path::new("/")).to_string_lossy().into_owned();
+        let (_, needed) = elf_deps(&obj)?;
+        for entry in elf_runpath(&obj)? {
+            let dir = PathBuf::from(entry.replace("$ORIGIN", &origin));
+            if !dir.is_dir() {
+                continue;
+            }
+            if dirs.insert(dir.clone()) {
+                mounts.extend(tree_mounts(&dir)?);
+            }
+            queue.extend(needed.iter().map(|n| dir.join(n)).filter(|lib| lib.is_file()));
+        }
+    }
+    Ok(mounts)
 }
 
 /// `child-pid` of bwrap's `--info-fd` JSON (`{"child-pid": N, ...}`, bwrap.c).
@@ -434,7 +514,7 @@ impl Broker {
         }
         let bwrap_args = binderd_args(&files, info_w.as_raw_fd(), seccomp.as_raw_fd());
         let grants: Vec<(Access, PathBuf)> = allow.iter().map(|f| (Access::Ro, f.clone())).collect();
-        let args = stub_args(&grants, program);
+        let args = stub_args(&grants, false, program);
         let process = launch(
             Launch {
                 bwrap_args,
@@ -470,9 +550,11 @@ impl Broker {
     }
 
     /// Starts `spawn` in its sandbox and registers its control connection with binderd once bwrap reports the host pid.
-    pub fn spawn(&self, spawn: Spawn) -> io::Result<Process> {
+    pub fn spawn(&self, mut spawn: Spawn) -> io::Result<Process> {
         // a panic elsewhere leaves nothing half-done here: the guard only orders spawns
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
+        // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
+        spawn.mounts.extend(runpath_mounts(&spawn.program)?);
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -494,7 +576,7 @@ impl Broker {
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
         // the stub applies the grants, then execs the program with the spawn's arguments
-        let mut args = stub_args(&grants, &spawn.program);
+        let mut args = stub_args(&grants, spawn.rights.contains(&Right::Net), &spawn.program);
         args.extend(spawn.args.iter().cloned());
         let mut env = spawn.env;
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
@@ -602,6 +684,7 @@ mod tests {
             links: vec![],
             devices: vec!["/dev/dri".into()],
             property_area: Some("/r/properties".into()),
+            rights: vec![],
             program: "/bin/true".into(),
             args: vec![],
             env: vec![],
@@ -679,9 +762,16 @@ mod tests {
             (Access::Dev, "/dev/dri".into()),
         ];
         assert_eq!(
-            s(&stub_args(&grants, Path::new("/b/atl-binderd"))).join(" "),
+            s(&stub_args(&grants, false, Path::new("/b/atl-binderd"))).join(" "),
             "--ro /b/atl-binderd --rw /data/x --device /dev/dri -- /b/atl-binderd"
         );
+        assert_eq!(
+            s(&stub_args(&grants, true, Path::new("/b/atl-binderd"))).join(" "),
+            "--net --ro /b/atl-binderd --rw /data/x --device /dev/dri -- /b/atl-binderd"
+        );
+        // INTERNET is one table row; no permission gives no right
+        assert_eq!(rights_of(&["android.permission.INTERNET"]), vec![Right::Net]);
+        assert!(rights_of::<&str>(&[]).is_empty());
     }
 
     /// The closure of this test binary (dynamically linked like binderd): itself first, then the interpreter its PT_INTERP names, and glibc's libc.so.6 (every glibc program needs it) from the interpreter's directory.
