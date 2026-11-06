@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines};
 use crate::window::{self, WINDOW_MS};
 use crate::{jni_fixture, manifest};
 
@@ -121,6 +121,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::thread::sleep(Duration::from_millis(200));
     };
     let elapsed = start.elapsed();
+    // while atld runs with everything started: each child of it must be a broker launch (plan F1.2 B.4, runtime side of the clippy gate)
+    let outside = match ended {
+        None => Some(children_outside_broker(atld_child.id())?),
+        Some(_) => None,
+    };
     // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the app's death ends the watch, atld outlives it
     let mut ended = ended;
     if passed && ended.is_none() {
@@ -162,6 +167,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if passed && !cacerts.starts_with("trusted ") {
         whys.push(format!("CA store: {cacerts}"));
+    }
+    match &outside {
+        Some(o) => {
+            println!("app: counter children_outside_broker {}", o.len());
+            if !o.is_empty() {
+                whys.push(format!("atld children outside the broker: {o:?}"));
+            }
+        }
+        None if passed => whys.push(
+            "children_outside_broker not measured: atld had ended before the snapshot".into(),
+        ),
+        None => {}
     }
     if passed && !bridge1_ok {
         whys.push(format!(

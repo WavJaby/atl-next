@@ -158,6 +158,45 @@ impl Run {
     }
 }
 
+/// The program name ([`atl_broker::bwrap::PROGRAM`]) every process atld starts runs as: the broker launches nothing else.
+const BROKER_CHILD_COMM: &str = atl_broker::bwrap::PROGRAM;
+
+/// atld's live children that did not come from the broker, as `<pid> <comm>`: every child of `atld` whose comm is not bwrap's. Read from `/proc/*/stat` (ppid, comm): `/proc/<pid>/task/*/children` needs CONFIG_PROC_CHILDREN, which the WSL kernel lacks.
+/// A process that exits between the directory listing and its stat read is skipped; atld is alive when this runs, so its sandboxes are too.
+pub fn children_outside_broker(atld: u32) -> Result<Vec<String>> {
+    let mut outside = Vec::new();
+    for e in std::fs::read_dir("/proc")? {
+        let e = e?;
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        let Some((comm, ppid)) = stat_comm_ppid(&stat) else {
+            continue;
+        };
+        if ppid == atld && comm != BROKER_CHILD_COMM {
+            outside.push(format!("{pid} {comm}"));
+        }
+    }
+    Ok(outside)
+}
+
+/// `/proc/<pid>/stat`'s comm and ppid: `pid (comm) state ppid ...`, comm between the first `(` and the last `)` (it may hold either).
+fn stat_comm_ppid(stat: &str) -> Option<(&str, u32)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?;
+    let ppid = stat
+        .get(close + 1..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((comm, ppid))
+}
+
 /// atld main.rs CONTROL_SOCKET, below the root.
 const CONTROL_SOCKET: &str = "control.sock";
 /// How long a control command may take: `start` waits for atl-am's startActivity round trip.
@@ -939,6 +978,26 @@ fn check_code_policy(manifest_xml: &str, has_dex: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// proc(5) stat lines: comm may hold spaces and parens (the last `)` ends it); the 4th field is ppid. And the live check: this test process's own child, `sleep`, is outside the broker.
+    #[test]
+    fn children_by_ppid() {
+        assert_eq!(stat_comm_ppid("42 (bwrap) S 7 42 42 0"), Some(("bwrap", 7)));
+        assert_eq!(stat_comm_ppid("9 (a) b) R 1 9"), Some(("a) b", 1)));
+        assert_eq!(stat_comm_ppid("garbage"), None);
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let outside = children_outside_broker(std::process::id()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        // contains, not equals: other tests of this process may have children of their own right now
+        assert!(
+            outside.contains(&format!("{} sleep", child.id())),
+            "{outside:?}"
+        );
+    }
 
     /// hasCode="false" packages without a dex; the default (absent) and "true" need one; with a dex every declaration passes (AOSP checks one direction only).
     #[test]
