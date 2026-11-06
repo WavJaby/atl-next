@@ -36,8 +36,8 @@ pub enum Fault {
     BadHandshake,
     /// A control request on a thread connection or the reverse.
     WrongConnection,
-    /// An ioctl the driver does not implement (`Request::Unsupported`).
-    UnsupportedIoctl,
+    /// An ioctl the driver does not implement (`Request::Unsupported`), by request code: the log names which.
+    UnsupportedIoctl(u32),
     /// A malformed admin registration.
     BadRegistration,
     /// More than `MAX_QUEUED` replies waiting for a peer that does not read: its process is dropped.
@@ -368,8 +368,8 @@ impl Server {
             (true, Request::SetContextMgr { ptr, cookie, flags }) => {
                 st(self.core.set_context_manager(proc, ptr, cookie, flags))
             }
-            (true, Request::Unsupported { .. }) => {
-                self.fault(Fault::UnsupportedIoctl);
+            (true, Request::Unsupported { ioctl }) => {
+                self.fault(Fault::UnsupportedIoctl(ioctl));
                 Reply::Status(-SysErrno::INVAL.raw_os_error())
             }
             (true, Request::NewThread) => {

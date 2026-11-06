@@ -27,7 +27,8 @@ fn main() -> ExitCode {
         let _ = writeln!(err, "binderd: ignored {k:?} {n}");
     }
     for (k, n) in server.faults() {
-        let _ = writeln!(err, "binderd: fault {k:?} {n}");
+        // hex: an ioctl code reads as its _IOC fields
+        let _ = writeln!(err, "binderd: fault {k:x?} {n}");
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,

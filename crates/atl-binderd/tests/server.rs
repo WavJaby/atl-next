@@ -182,7 +182,7 @@ fn control_requests() {
         (
             f[&Fault::BadHandshake],
             f[&Fault::BadVersion],
-            f[&Fault::UnsupportedIoctl]
+            f[&Fault::UnsupportedIoctl(0x4004_6210)]
         ),
         (2, 1, 1)
     );
@@ -407,5 +407,5 @@ fn overflow_drops_process() {
     assert!(sent < TRIES, "never dropped");
     let s = h.stop();
     assert_eq!(s.faults()[&Fault::Overflow], 1);
-    assert!(s.faults()[&Fault::UnsupportedIoctl] > MAX_QUEUED as u64);
+    assert!(s.faults()[&Fault::UnsupportedIoctl(0)] > MAX_QUEUED as u64);
 }

@@ -38,10 +38,15 @@ const ABSENT: &str = "android.hardware.atltest.IAbsent/default";
 /// How long servicemanager may take to answer its first `service check` (a cold start reads VINTF and starts its Looper: well under a second measured; 10 s leaves room for a loaded machine).
 const STARTUP: Duration = Duration::from_secs(10);
 /// binderd counter lines this workload must produce (atl-binderd main.rs prints them; any nonzero count): servicemanager's nodes carry TXN_SECURITY_CTX (`becomeContextManager`, and `setRequestingSid` on its services), and libbinder sends BINDER_ENABLE_ONEWAY_SPAM_DETECTION at open (ProcessState.cpp `open_driver`). Measured 2026-11-02: 3 and 4.
+/// 0x40046210 = _IOW('b', 16, __u32) = BINDER_ENABLE_ONEWAY_SPAM_DETECTION (uapi binder.h), once per process open (9 in this workload, 2026-11-06). Left unsupported on purpose:
+/// EINVAL is what a kernel without the feature answers, libbinder tolerates it (logs only when binderfs advertises `features/oneway_spam_detection`), and accepting it
+/// without BR_ONEWAY_SPAM_SUSPECT (async-space accounting binderd lacks) would claim a detection that never runs.
 const MUST_FIRE: &[&str] = &[
     "binderd: ignored TxnSecurityCtx ",
-    "binderd: fault UnsupportedIoctl ",
+    "binderd: fault UnsupportedIoctl(40046210) ",
 ];
+/// Every fault line not in MUST_FIRE fails the gate.
+const FAULT_PREFIX: &str = "binderd: fault ";
 
 /// The test /system, /vendor, /odm under `root`: an empty framework manifest (/system/etc/vintf/manifest.xml) and device manifests (/vendor, /odm), libvintf's default paths (system/libvintf/include/vintf/constants.h). /vendor declares `vendor_hals`.
 fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
@@ -227,6 +232,12 @@ fn verdict(
             fails.push(format!("binderd counter missing: {want}"));
         }
     }
+    // a protocol fault this workload does not cause is a bug in a peer or binderd, even when the calls pass
+    for line in counters.lines().filter(|l| l.starts_with(FAULT_PREFIX)) {
+        if !MUST_FIRE.iter().any(|want| line.starts_with(want)) {
+            fails.push(format!("unexpected binderd fault: {line}"));
+        }
+    }
     fails
 }
 
@@ -372,7 +383,17 @@ mod tests {
         );
         let found = (true, format!("Service {MANAGER}: found\n"));
         let absent = (true, format!("Service {ABSENT}: not found\n"));
-        let counters = "binderd: ignored TxnSecurityCtx 1\nbinderd: fault UnsupportedIoctl 2\n";
+        let counters =
+            "binderd: ignored TxnSecurityCtx 1\nbinderd: fault UnsupportedIoctl(40046210) 2\n";
+        // another fault, or another unsupported ioctl, fails even with the expected ones present
+        for extra in [
+            "binderd: fault BadHandshake 1\n",
+            "binderd: fault UnsupportedIoctl(c0306201) 1\n",
+        ] {
+            let v = verdict(&list, &found, &absent, &format!("{counters}{extra}"));
+            assert_eq!(v.len(), 1, "{extra}: {v:?}");
+            assert!(v[0].starts_with("unexpected binderd fault"), "{v:?}");
+        }
         assert!(verdict(&list, &found, &absent, counters).is_empty());
         assert_eq!(
             verdict(&(true, String::new()), &found, &absent, counters).len(),
