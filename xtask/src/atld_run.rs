@@ -37,6 +37,8 @@ pub fn goals() -> Goals {
         "servicemanager",
         "framework-res",
         "platform-bootclasspath",
+        // the APEX jars' JNI libraries (libframework-connectivity-tiramisu-jni: TrafficStats' static init aborts ZygoteInit without it)
+        "platform-bootclasspath-jni",
         "libart",
         "libnativehelper",
         "libjavacore",
