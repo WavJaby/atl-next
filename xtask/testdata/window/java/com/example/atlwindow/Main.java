@@ -106,7 +106,8 @@ public class Main extends Activity {
             super.onDraw(canvas);
             if (!drawn) {
                 drawn = true;
-                Log.i(TAG, "onDraw reached");
+                // hardware=true: a RecordingCanvas, so hwui's RenderThread draws it (stage hwui checks this)
+                Log.i(TAG, "onDraw reached hardware=" + canvas.isHardwareAccelerated());
             }
             int halfWidth = getWidth() / 2;
             int halfHeight = getHeight() / 2;

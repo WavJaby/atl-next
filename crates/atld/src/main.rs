@@ -567,7 +567,8 @@ impl Host {
                 },
             ],
             links: vec![],
-            devices: vec![],
+            // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
+            devices: vec![PathBuf::from(DRM_DIR)],
             property_area: Some(self.process_properties(uid, name)?),
             program: self.launcher.clone(),
             args: launcher_args,

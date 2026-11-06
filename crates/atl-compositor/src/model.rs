@@ -43,6 +43,8 @@ pub struct CompositorConfig {
     pub layer_stack: u32,
     /// Siblings are ordered by their z. false = a gate's deliberate break only (`xtask test window --stage surface-view --break-z-order`): creation order alone, so SurfaceViews leave their z side of the window and the readback check must fail.
     pub z_order: bool,
+    /// Queued buffers are latched. false = a gate's deliberate break only (`xtask test window --stage hwui --break-queue`): every buffer a transaction carries is dropped unlatched, as if the producer never queued it, so no frame reaches the scene and the readback check must fail.
+    pub latch_buffers: bool,
 }
 
 impl Default for CompositorConfig {
@@ -51,6 +53,7 @@ impl Default for CompositorConfig {
             max_acquired_buffer_count: 2,
             layer_stack: 0,
             z_order: true,
+            latch_buffers: true,
         }
     }
 }
@@ -664,7 +667,7 @@ impl Compositor {
             // listener callbacks are answered per transaction (see `complete`)
             handled |= what::E_HAS_LISTENER_CALLBACKS_CHANGED;
         }
-        if w & what::E_BUFFER_CHANGED != 0 {
+        if w & what::E_BUFFER_CHANGED != 0 && self.config.latch_buffers {
             handled |= what::E_BUFFER_CHANGED;
             (previous_frame_number, frame_number) =
                 self.apply_buffer(key, s.buffer_data.as_ref(), calls);

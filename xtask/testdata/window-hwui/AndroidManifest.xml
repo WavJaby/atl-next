@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage hwui: the window fixture (java/ links to window's) hardware accelerated. No hardwareAccelerated attribute: targetSdk >= 14 defaults it on (ActivityInfo.FLAG_HARDWARE_ACCELERATED), so ViewRootImpl draws through hwui's RenderThread and EGL. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL hwui window test">
+        <activity android:name=".Main" android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

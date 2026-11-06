@@ -65,6 +65,12 @@ pub struct Args {
     /// Deliberate break (stages widgets, gtk, ime, surface-view): the composer drops the post-draw Transactions the window service forwards, so the post-draw check must fail.
     #[arg(long)]
     break_post_draw: bool,
+    /// Deliberate break (any UI stage; made for hwui): the composer latches no queued buffer, as if hwui never queued its frame, so the readback check must fail.
+    #[arg(long)]
+    break_queue: bool,
+    /// Deliberate break (stage hwui): the expected quadrants have red and blue swapped, so the readback check must fail (it compares channel order exactly).
+    #[arg(long)]
+    break_swap_rb: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -108,6 +114,8 @@ enum Stage {
     Move,
     /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/surface_view.rs).
     SurfaceView,
+    /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the composer's readback as the quadrants.
+    Hwui,
 }
 
 impl Stage {
@@ -125,6 +133,7 @@ impl Stage {
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
             Stage::SurfaceView => "surface-view",
+            Stage::Hwui => "hwui",
         }
     }
 
@@ -133,7 +142,7 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView => GTK_WINDOW_MS,
+            Stage::Gtk | Stage::SurfaceView | Stage::Hwui => GTK_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -154,6 +163,10 @@ const SIZED_FIXTURE: &str = "xtask/testdata/window-sized";
 const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
 /// window-declared's Main behind a launcher that starts it and finishes (the stage start-finish).
 const START_FIXTURE: &str = "xtask/testdata/window-start";
+/// FIXTURE hardware accelerated (the stage hwui).
+const HWUI_FIXTURE: &str = "xtask/testdata/window-hwui";
+/// The fixture's first onDraw on hwui's RecordingCanvas (Canvas.isHardwareAccelerated).
+const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
 const GTK_PRESENTED: u32 = 2;
 /// The test app's uid: AID_APP_START + 123, any app id (as `xtask test app`).
@@ -248,6 +261,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Frames
         | Stage::Input
         | Stage::Gtk
+        | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
         | Stage::Resize
@@ -617,6 +631,11 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
 
 /// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`).
 fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String> {
+    capture_check(app, display, false)
+}
+
+/// [`gtk_capture_check`]; `swap_rb` = the hwui stage's deliberate break: the expectation's R and B bytes swapped.
+fn capture_check(app: &str, display: DisplayModel, swap_rb: bool) -> Result<String, String> {
     let (width, height) = opening_size(display);
     let line = capture_line(app)?;
     let size = word(line, "size").unwrap_or("none");
@@ -628,7 +647,15 @@ fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String>
     }
     let digest = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
     let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
-    let want = fnv1a64(&quadrant_pixels(width, height));
+    let mut pixels = quadrant_pixels(width, height);
+    if swap_rb {
+        pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|p| p.swap(0, 2));
+    }
+    let want = fnv1a64(&pixels);
     if got != want {
         return Err(format!(
             "readback digest {got:016x}, the quadrants {want:016x}"
@@ -1235,6 +1262,22 @@ fn lifecycle_check(
 }
 
 /// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
+/// Stage `hwui`: the fixture drew on hwui's RecordingCanvas. Else the first onDraw line, or that none came, plus hwui's own fatal line (EglManager's `LOG_ALWAYS_FATAL` text names the failing EGL call and its error).
+fn hardware_check(app: &str) -> Result<String, String> {
+    if app.contains(HARDWARE_DRAW_LINE) {
+        return Ok("onDraw on hwui's RecordingCanvas".to_owned());
+    }
+    let draw = app
+        .lines()
+        .find(|l| l.contains(DRAW_LINE))
+        .unwrap_or("no onDraw line");
+    let fatal = app
+        .lines()
+        .find(|l| l.contains(" F ") || l.contains("Failed to") || l.contains("EGL"))
+        .unwrap_or("no fatal line");
+    Err(format!("{draw}; {fatal}"))
+}
+
 fn capture_line(app: &str) -> Result<&str, String> {
     app.lines()
         .find(|l| l.contains("atl-composer: ui: capture "))
@@ -1518,6 +1561,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
+        | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
         | Stage::Resize
@@ -1547,6 +1591,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     rt.with_ui_break("z-order")
                 } else if args.break_post_draw {
                     rt.with_ui_break("post-draw")
+                } else if args.break_queue {
+                    rt.with_ui_break("queue")
                 } else {
                     rt
                 };
@@ -1587,6 +1633,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
+        Stage::Hwui => HWUI_FIXTURE,
         _ => FIXTURE,
     };
     let apk = rt
@@ -1756,6 +1803,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
             sub
         }
+        (Stage::Hwui, Some(_)) => vec![
+            ("mapped", gtk_window_check(&app)),
+            ("hardware", hardware_check(&app)),
+            ("readback", capture_check(&app, display, args.break_swap_rb)),
+        ],
         (Stage::Gtk, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("readback", gtk_capture_check(&app, display)),
@@ -1773,7 +1825,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if !sub.is_empty()
         && matches!(
             args.stage,
-            Stage::Widgets | Stage::Gtk | Stage::Ime | Stage::SurfaceView
+            Stage::Widgets | Stage::Gtk | Stage::Hwui | Stage::Ime | Stage::SurfaceView
         )
     {
         sub.push(("post-draw", post_draw_check(&app, &services)));

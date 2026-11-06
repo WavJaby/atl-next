@@ -28,6 +28,8 @@ const BREAK_ENV: &str = "ATL_UI_BREAK";
 const BREAK_Z_ORDER: &str = "z-order";
 /// With it the window service's forwarded post-draw Transactions are dropped (ComposerConfig::post_draw).
 const BREAK_POST_DRAW: &str = "post-draw";
+/// With it no queued buffer is latched (CompositorConfig::latch_buffers).
+const BREAK_QUEUE: &str = "queue";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -116,6 +118,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         display,
         compositor: CompositorConfig {
             z_order: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_Z_ORDER),
+            latch_buffers: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_QUEUE),
             ..Default::default()
         },
         post_draw: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_POST_DRAW),
