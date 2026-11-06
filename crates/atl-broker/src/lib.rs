@@ -177,9 +177,6 @@ pub enum RootEntry {
 /// A row is a grant: add one only with the gate that needs it.
 pub const APP_ROOT_DIRS: &[&str] = &["usr", "etc"];
 
-/// Host sysfs subtrees every sandbox shows read-only, the narrowest that work: libdrm finds a DRM device's PCI info through `/sys/dev/char` (links into `/sys/devices`). Without them Mesa falls back to a render node, whose dumb buffers EACCES.
-pub const SYSFS_DIRS: &[&str] = &["/sys/dev", "/sys/devices", "/sys/class/drm"];
-
 /// bwrap's argv limit: bubblewrap.c's "Exceeded maximum number of arguments", counted over bwrap's own arguments and the program's.
 pub const BWRAP_MAX_ARGS: usize = 9000;
 
@@ -260,9 +257,6 @@ pub fn bwrap_args(
             }
             _ => {}
         }
-    }
-    for d in SYSFS_DIRS {
-        a.ro_bind(d, d);
     }
     for m in &spawn.mounts {
         a.mount(&m.host, &m.at, m.writable);
@@ -429,6 +423,67 @@ fn elf_runpath(path: &Path) -> io::Result<Vec<String>> {
         }
     }
     Ok(if runpath.is_empty() { rpath } else { runpath })
+}
+
+/// The sysfs a process with DRM nodes `devices` (nodes, or dirs of them) reads, and no more: libdrm (drmGetDevice2, xf86drm.c) and Mesa's loader resolve a node's `/sys/dev/char/<major>:<minor>` link into its device's dir under `/sys/devices` and read its `uevent`, PCI ids and `subsystem` link name there;
+/// `/sys/class/drm/<node>` is the same link by name. Returns that device dir read-only at its own path, and the two links recreated as the host has them. Without them Mesa falls back to the render node alone, whose dumb buffers EACCES.
+pub fn drm_sysfs(devices: &[PathBuf]) -> io::Result<(Vec<Mount>, Vec<Link>)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut nodes = Vec::new();
+    for d in devices {
+        if d.is_dir() {
+            for e in std::fs::read_dir(d)? {
+                nodes.push(e?.path());
+            }
+        } else {
+            nodes.push(d.clone());
+        }
+    }
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut links = Vec::new();
+    for n in nodes {
+        let meta = std::fs::metadata(&n)?;
+        if !meta.file_type().is_char_device() {
+            continue;
+        }
+        let rdev = meta.rdev();
+        let by_id = PathBuf::from(format!(
+            "/sys/dev/char/{}:{}",
+            rustix::fs::major(rdev),
+            rustix::fs::minor(rdev)
+        ));
+        let Ok(target) = std::fs::read_link(&by_id) else {
+            continue;
+        };
+        let node_dir = std::fs::canonicalize(&by_id)?;
+        // .../<device>/drm/<node>: the device's dir holds what libdrm reads; a node outside a drm/ dir is shown alone
+        let dev_dir = match node_dir.parent() {
+            Some(p) if p.file_name() == Some(OsStr::new("drm")) => {
+                p.parent().unwrap_or(p).to_path_buf()
+            }
+            _ => node_dir.clone(),
+        };
+        dirs.insert(dev_dir);
+        links.push(Link { target, at: by_id });
+        if let Some(name) = node_dir.file_name() {
+            let by_name = Path::new("/sys/class/drm").join(name);
+            if let Ok(target) = std::fs::read_link(&by_name) {
+                links.push(Link {
+                    target,
+                    at: by_name,
+                });
+            }
+        }
+    }
+    let mounts = dirs
+        .into_iter()
+        .map(|d| Mount {
+            host: d.clone(),
+            at: d,
+            writable: false,
+        })
+        .collect();
+    Ok((mounts, links))
 }
 
 /// Read-only mounts of what `program`'s loader finds through RUNPATH: each object's own RUNPATH dirs ([`tree_mounts`]) and the DT_NEEDED libraries in them, followed in turn (a RUNPATH serves only the object that has it).
@@ -619,6 +674,10 @@ impl Broker {
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
         spawn.mounts.extend(runpath_mounts(&spawn.program)?);
+        // the sysfs of its DRM nodes only (drm_sysfs)
+        let (sys_mounts, sys_links) = drm_sysfs(&spawn.devices)?;
+        spawn.mounts.extend(sys_mounts);
+        spawn.links.extend(sys_links);
         // the trees of the LD_LIBRARY_PATH the process starts with: a library the loader finds there loads its own RUNPATH dirs too (library_path_mounts)
         for (k, v) in &spawn.env {
             if k == "LD_LIBRARY_PATH" {
@@ -790,9 +849,9 @@ mod tests {
             RootEntry::Dir("usr".into()),
         ];
         // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev (with init's /dev/socket) and /proc, a private /tmp; then the seccomp program when given;
-        // the root's dirs read-only and its symlinks recreated; the sysfs subtrees read-only; the mounts, the device nodes, the area at bionic's path; the stub and the program read-only; cwd `/`; the end of options.
+        // the root's dirs read-only and its symlinks recreated; the mounts, the device nodes, the area at bionic's path; the stub and the program read-only; cwd `/`; the end of options.
         let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc --tmpfs /tmp";
-        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /sys/class/drm /sys/class/drm --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
+        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
         let stub = Path::new("/b/stub");
         assert_eq!(
             s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),
@@ -810,9 +869,6 @@ mod tests {
             (Access::Rw, "/tmp"),
             (Access::Ro, "/etc"),
             (Access::Ro, "/usr"),
-            (Access::Ro, "/sys/dev"),
-            (Access::Ro, "/sys/devices"),
-            (Access::Ro, "/sys/class/drm"),
             (Access::Ro, SYSTEM),
             (Access::Rw, DATA),
             (Access::Dev, "/dev/dri"),

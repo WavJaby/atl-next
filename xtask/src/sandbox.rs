@@ -2,19 +2,23 @@
 //! `xtask test sandbox`: what an app process can reach (plan Q5). atl-sandbox-probe runs as uid 10123 through the broker's App profile, as an app does (bwrap, the stub's Landlock grants, the app seccomp filter), twice: without INTERNET, then with it (rights from atl_broker::rights_of).
 //! Its world: a file in the real $HOME it must not read, a name in $HOME it must not create, its own data dir (/data/user/0/<PACKAGE>) as its only writable mount, and a TCP connect to a loopback listener the gate holds (the sandbox shares the host's loopback).
 //! Pass, both runs: the $HOME file and the new $HOME name refused (ENOENT or EACCES), a write to /usr refused, the own data dir written and read back. The TCP connect is refused without INTERNET and succeeds with it.
+//! The UI baseline grants (each a grant class every UI app gets, not a manifest right), each with one shown and one refused path: the compositor socket (atl_platform_host::app_access::socket_of; a second socket beside it refused), the fontconfig file (config_file_of; a file beside it refused),
+//! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/devices/system/cpu/online` refused). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
 //! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
 //! Deliberate break, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. The gate removes the two $HOME names it makes.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use atl_android_paths::DATA;
-use atl_broker::{Broker, Mount, rights_of, to_log};
+use atl_broker::{Broker, Mount, drm_sysfs, rights_of, to_log};
+use atl_platform_host::app_access;
 
 use crate::binder;
 use crate::verdict;
@@ -39,6 +43,10 @@ const OUTSIDE: &str = "/usr/atl-sandbox-probe";
 const LIMIT: Duration = Duration::from_secs(60);
 /// The permission of the INTERNET run (its row in atl_broker's PERMISSION_RIGHTS).
 const INTERNET: &str = "android.permission.INTERNET";
+/// The DRM nodes the probe gets, as atld's app processes do (atld DRM_DIR).
+const DRM_DIR: &str = "/dev/dri";
+/// A host sysfs file outside every DRM device's dir: the probe must not read it.
+const SYS_OTHER: &str = "/sys/devices/system/cpu/online";
 /// The Landlock ABI that enforces the network rights; below it TCP is not restricted, so the net check is not judged.
 const NET_ABI: u32 = 4;
 /// errno values (asm-generic/errno-base.h) a refusal may carry.
@@ -86,16 +94,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
+    let ui = Ui::make(&work.join("ui"))?;
     let runs = [
         (
             "no INTERNET",
-            probe_once(&broker, &probe, &work, &secret, &created, port, false),
+            probe_once(&broker, &probe, &work, &secret, &created, port, &ui, false),
         ),
         (
             "INTERNET",
-            probe_once(&broker, &probe, &work, &secret, &created, port, true),
+            probe_once(&broker, &probe, &work, &secret, &created, port, &ui, true),
         ),
     ];
+    drop(ui);
     // the gate's own names in $HOME and its listener, whatever the probes did
     let _ = fs::remove_file(&secret);
     let _ = fs::remove_file(&created);
@@ -124,7 +134,66 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The UI grants' world: two listening sockets (one granted as the compositor's), a fontconfig file and a file beside it, and the DRM sysfs the probe's nodes give it.
+struct Ui {
+    socket: PathBuf,
+    other_socket: PathBuf,
+    fontconf: PathBuf,
+    sibling: PathBuf,
+    sysfs: PathBuf,
+    /// The grants, as atld makes them for a `--ui` app (atld desktop_mounts): read-only at their own paths.
+    mounts: Vec<Mount>,
+    _listeners: [UnixListener; 2],
+}
+
+impl Ui {
+    fn make(dir: &Path) -> Result<Ui> {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir)?;
+        let socket = dir.join("wayland-probe");
+        let other_socket = dir.join("other-probe");
+        let listeners = [
+            UnixListener::bind(&socket)?,
+            UnixListener::bind(&other_socket)?,
+        ];
+        let fontconf = dir.join("fonts.conf");
+        let sibling = dir.join("fonts-sibling.conf");
+        fs::write(&fontconf, b"<fontconfig/>\n")?;
+        fs::write(&sibling, b"<fontconfig/>\n")?;
+        let granted_socket = app_access::socket_of(Some(socket.clone().into()), None)
+            .context("socket_of refused the gate's socket")?;
+        let granted_conf = app_access::config_file_of(Some(fontconf.clone().into()))
+            .context("config_file_of refused the gate's file")?;
+        let (sys_mounts, _) = drm_sysfs(&[PathBuf::from(DRM_DIR)])?;
+        let sysfs = sys_mounts
+            .first()
+            .map(|m| m.host.join("uevent"))
+            .context("no DRM device dir under /sys for /dev/dri")?;
+        let mounts = [granted_socket, granted_conf]
+            .into_iter()
+            .map(|p| Mount {
+                host: p.clone(),
+                at: p,
+                writable: false,
+            })
+            .collect();
+        Ok(Ui {
+            socket,
+            other_socket,
+            fontconf,
+            sibling,
+            sysfs,
+            mounts,
+            _listeners: listeners,
+        })
+    }
+}
+
 /// One probe run as an app process, with or without INTERNET's rights.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's world, each a distinct check input"
+)]
 fn probe_once(
     broker: &Broker,
     probe: &Path,
@@ -132,6 +201,7 @@ fn probe_once(
     secret: &Path,
     created: &Path,
     port: u16,
+    ui: &Ui,
     internet: bool,
 ) -> Result<Probed> {
     let own_dir = format!("{DATA}/user/0/{PACKAGE}");
@@ -143,13 +213,21 @@ fn probe_once(
         .arg(created)
         .arg(OUTSIDE)
         .arg(&own)
-        .arg(port.to_string());
+        .arg(port.to_string())
+        .arg(&ui.socket)
+        .arg(&ui.other_socket)
+        .arg(&ui.fontconf)
+        .arg(&ui.sibling)
+        .arg(&ui.sysfs)
+        .arg(SYS_OTHER);
     let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
     spawn.mounts.push(Mount {
         host: host_own,
         at: own_dir.into(),
         writable: true,
     });
+    spawn.mounts.extend(ui.mounts.iter().cloned());
+    spawn.devices = vec![PathBuf::from(DRM_DIR)];
     // the rights come from the manifest permissions, as the app process's own do (atl-broker PERMISSION_RIGHTS)
     spawn.rights = if internet {
         rights_of(&[INTERNET])
@@ -221,6 +299,24 @@ fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
         ),
         succeeded("own-write", "the app's own data dir is not writable"),
         succeeded("own-read", "the app's own data dir is not readable"),
+        succeeded("socket", "the granted compositor socket does not connect"),
+        refused(
+            "socket-other",
+            HOME_REFUSED,
+            "a host socket beside the compositor's connects",
+        ),
+        succeeded("fontconf", "the granted fontconfig file is not readable"),
+        refused(
+            "fontconf-sibling",
+            HOME_REFUSED,
+            "a file beside the fontconfig file is readable",
+        ),
+        succeeded("drm-sysfs", "the DRM device's sysfs is not readable"),
+        refused(
+            "sys-other",
+            HOME_REFUSED,
+            "sysfs outside the DRM device is readable",
+        ),
     ]
     .into_iter()
     .flatten()

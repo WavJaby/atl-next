@@ -3,6 +3,7 @@
 //! GDK reports logical geometry and the refresh rate in milli-Hz (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts both.
 #![forbid(unsafe_code)]
 
+pub mod app_access;
 mod fonts;
 mod iio;
 pub use fonts::FcFonts;

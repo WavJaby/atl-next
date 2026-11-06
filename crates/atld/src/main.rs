@@ -288,6 +288,17 @@ fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
     Ok(model.dirs)
 }
 
+/// The desktop paths a UI app reads (atl_platform_host::app_access), read-only at their own paths. No compositor socket is an error: a UI run without one cannot show a window.
+fn desktop_mounts() -> Result<Vec<Mount>> {
+    use atl_platform_host::app_access;
+    let socket = app_access::wayland_socket()
+        .context("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)")?;
+    Ok(std::iter::once(socket)
+        .chain(app_access::fontconfig_paths()?)
+        .map(|p| ro_at_own_path(&p))
+        .collect())
+}
+
 /// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it; /system's CA store from the distro bundle.
 fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
     let framework = r.system().join("framework");
@@ -483,6 +494,8 @@ struct Host {
     am: Option<PathBuf>,
     /// The host paths every process of the runtime reads, at the same paths (ro_at_own_path): the LD_LIBRARY_PATH dirs, the ART root, the host files /system and /vendor link to.
     shared_ro: Vec<Mount>,
+    /// With `--ui`: what each app's GTK side reads from the desktop, read-only at its own path (atl_platform_host::app_access): the compositor socket, fontconfig's file and font dirs. Headless: none.
+    desktop_ro: Vec<Mount>,
     /// The installed packages: an app process mounts its own directories (package_mounts).
     packages: Vec<PackageRecord>,
 }
@@ -605,6 +618,7 @@ impl Host {
             ])
             // the runtime's shared host paths; the package's own directories come with start_app (package_mounts)
             .chain(self.shared_ro.iter().cloned())
+            .chain(self.desktop_ro.iter().cloned())
             .collect(),
             links: vec![],
             // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers
@@ -993,6 +1007,11 @@ fn run(a: &Args) -> Result<ExitCode> {
         done: done_tx,
         am: a.am.clone(),
         shared_ro: shared_ro.clone(),
+        desktop_ro: if a.ui.is_some() {
+            desktop_mounts()?
+        } else {
+            vec![]
+        },
         packages: records,
         root: Root {
             root: r.root.clone(),

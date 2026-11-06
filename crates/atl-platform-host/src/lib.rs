@@ -11,6 +11,9 @@ pub use atl_platform_host_linux::FcFonts as PlatformFonts;
 pub use atl_platform_host_linux::GdkDesktop as PlatformDesktop;
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::IioSensors as PlatformSensors;
+/// What an app process's UI side reads from the desktop, as host paths the broker shows read-only at their own place: `wayland_socket()` (the compositor's) and `fontconfig_paths()` (config file + font dirs).
+#[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::app_access;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-host has no implementation for this target OS");
