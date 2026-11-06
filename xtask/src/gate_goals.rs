@@ -51,8 +51,11 @@ pub fn nb_key(arch: &str, module: &str) -> String {
     format!("nb:{arch}:{module}")
 }
 
+/// A gate module's `goals`.
+type GoalsOf = fn() -> Goals;
+
 /// Every gate that reads a native out dir: `xtask test <name>`, `xtask run-apk`, and the `xtask check` steps that read built files.
-pub const GATES: &[(&str, fn() -> Goals)] = &[
+pub const GATES: &[(&str, GoalsOf)] = &[
     ("app", crate::app::goals),
     ("binder", crate::binder::goals),
     ("broadcast", crate::broadcast::goals),
