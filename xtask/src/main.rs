@@ -13,6 +13,7 @@ mod aosp;
 mod app;
 mod arches;
 mod atld_run;
+mod audio_pcm;
 mod binder;
 mod broadcast;
 mod build_pool;
@@ -238,6 +239,10 @@ enum Test {
     /// Runs crates/atl-platform-ui/examples/gate.rs in the gate's headless weston (`--hold-blocked`: on $WAYLAND_DISPLAY) through a Wayland proxy that injects the pings; the module doc of xtask/src/platform_ui.rs lists the gates and the evidence tier of each.
     /// The compositor's own "not responding" reaction is not observable on WSLg: `--hold-blocked <s>` keeps the UI thread blocked for the Arch-laptop run to watch.
     PlatformUi(platform_ui::Args),
+    /// The PCM output of atl-platform-ui-linux (plan A0) on PipeWire: a 1 kHz tone played to a null sink the run makes the default, recorded from its monitor, checked for frequency, level and duration. `--break zeros` and `--break no-target` must turn it red.
+    ///
+    /// The client is crates/atl-platform-ui/examples/audio_pcm.rs; the module doc of xtask/src/audio_pcm.rs lists the gates and the environment it changes (restored on every exit). Needs pipewire, pw-cli, pw-metadata and pw-record on PATH.
+    AudioPcm(audio_pcm::Args),
     /// The bridge-1 JNI fixture (xtask/testdata/jni-test), NDK-built for minSdk 21 (emulated TLS) and 29 (ELF TLS): DT_NEEDED libc.so + libc++_shared.so, verneed libc.so/LIBC, the variant's TLS shape, and host glibc's loader refusing it on `LIBC`.
     ///
     /// Controls run every time: the probe loads a glibc library cleanly, and each variant fails the other's TLS expectation. Needs the NDK only, no native build.
@@ -347,6 +352,9 @@ fn main() -> Result<ExitCode> {
             test: Test::PlatformUi(args),
         } => platform_ui::run(&root, &args),
         Command::Test {
+            test: Test::AudioPcm(args),
+        } => audio_pcm::run(&root, &args),
+        Command::Test {
             test: Test::JniFixture(args),
         } => jni_fixture::run(&root, &args),
         Command::Test {
@@ -391,6 +399,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Window(_) => "window",
             Test::Sensors(_) => "sensors",
             Test::PlatformUi(_) => "platform-ui",
+            Test::AudioPcm(_) => "audio-pcm",
             Test::JniFixture(_) => "jni-fixture",
             Test::Gles2Fixture(_) => "gles2-fixture",
             Test::TaskBind(_) => "task-bind",

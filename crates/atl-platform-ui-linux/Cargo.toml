@@ -9,7 +9,8 @@ publish.workspace = true
 
 # The Linux implementation of atl-platform-ui-api on GTK4 (M3 slice 6): the only crate allowed to depend on GTK (deny.toml `wrappers`), and with the `cfg(target_os)` that selects it living in the facade.
 # One thread: GLib's default main context is mirrored into the Android Looper of the thread that attached (`mirror.rs`; the Looper polls it), so a blocked UI thread answers no `xdg_wm_base.ping`.
-# `unsafe` only in `mirror` (raw g_main_context calls) and `dmabuf` (GDK borrows the dmabuf texture's fds: gtk4-rs marks the builder unsafe); the read-fence ioctl is atl-gralloc-dmabuf's.
+# `unsafe` only in `mirror` (raw g_main_context calls), `dmabuf` (GDK borrows the dmabuf texture's fds: gtk4-rs marks the builder unsafe) and `audio` (PipeWire: the thread-loop constructor pipewire-rs marks unsafe, `sched_getscheduler`); the read-fence ioctl is atl-gralloc-dmabuf's.
+# PipeWire (plan A0, `audio`): the PCM output's safe bindings, the only crate allowed to depend on them (deny.toml `wrappers`).
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
@@ -20,6 +21,8 @@ atl-platform-ui-api = { path = "../atl-platform-ui-api" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 glib-unix.workspace = true
 gtk4.workspace = true
+libc.workspace = true
+pipewire = { workspace = true, features = ["v0_3_49"] }
 rustix.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true

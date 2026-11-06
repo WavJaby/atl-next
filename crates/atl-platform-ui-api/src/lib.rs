@@ -2,6 +2,7 @@
 //! The app-process half of the platform layer as traits (plan S1 `atl-platform-ui`; M3 slice 6).
 //! * [`Ui`]: the toolkit session. Thread-affine: the thread that attaches is the UI thread, which is also the Android Looper's thread (plan Q6, owner 2026-11-05). The Looper is the outer loop: its poll runs the toolkit's fds through the [`Looper`] seam, so a UI thread that stops polling answers no compositor ping and the desktop shows its own "not responding" dialog.
 //! * [`Window`]: a toplevel the compositor's [`Scene`] is presented into; [`FrameClock`] and [`InputSource`] are the display's vsync and pointer events of that window.
+//! * [`audio`]: the PCM output (plan A0): [`audio::AudioHost`] connects to the audio server, [`audio::PcmOutput`] is one stream on it.
 //!
 //! Sizes cross this boundary in physical pixels with an explicit [`Scale`]; no logical-pixel type exists here, because the compositor's layer stack and the app's buffers are physical and a toolkit's logical unit is an implementation detail of the `-<os>` crate.
 //! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Window callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the UI thread from inside the Looper's poll. The [`Looper`] seam takes boxed callbacks: one erasure, because the launcher's callback is a C function pointer.
@@ -10,6 +11,7 @@
 
 use std::os::fd::{OwnedFd, RawFd};
 
+pub mod audio;
 pub use atl_compositor::scene::Scene;
 /// The value types the host side shares (a window's monitor is the same type atld reads).
 pub use atl_platform_types::{Monitor, PhysSize, Rotation, Scale};

@@ -8,6 +8,7 @@ pub use atl_platform_ui_api::*;
 #[cfg(target_os = "linux")]
 pub use atl_platform_ui_linux::{
     GtkTextInput as PlatformTextInput, GtkUi as PlatformUi, GtkWindow as PlatformWindow,
+    PipeWireHost as PlatformAudioHost, PipeWireOutput as PlatformPcmOutput,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -23,7 +24,11 @@ fn implements_the_api() {
     >() {
     }
     fn text_input<T: TextInput>() {}
+    fn audio_host<T: audio::AudioHost<Output = PlatformPcmOutput>>() {}
+    fn pcm_output<T: audio::PcmOutput>() {}
     ui::<PlatformUi>();
     window::<PlatformWindow>();
     text_input::<PlatformTextInput>();
+    audio_host::<PlatformAudioHost>();
+    pcm_output::<PlatformPcmOutput>();
 }

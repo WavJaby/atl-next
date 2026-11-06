@@ -11,7 +11,8 @@ publish.workspace = true
 anyhow.workspace = true
 atl-layout = { path = "../atl-layout" }
 clang.workspace = true
-clang-sys.workspace = true
+# runtime: libclang is loaded per thread (front.rs new_clang). Set here, not left to bindgen's build-dependency feature (pipewire-sys), so every unit of this crate has the loader whatever else the graph builds
+clang-sys = { workspace = true, features = ["runtime"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

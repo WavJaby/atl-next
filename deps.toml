@@ -234,6 +234,23 @@ arch = "openssl"
 scope = ["test"]
 used_by = ["crate:atld"]
 
+# the PCM output (plan A0, atl-platform-ui-linux audio.rs): pipewire-sys's build script resolves libpipewire-0.3 through pkg-config; min = the crate's `v0_3_49` feature (Buffer::requested)
+[pipewire]
+debian = "libpipewire-0.3-dev"
+arch = "pipewire"
+pkgconfig = "libpipewire-0.3"
+min = "0.3.49"
+min_reason = "pipewire crate feature v0_3_49: Buffer::requested, the frames the graph asks for in each process callback"
+scope = ["build", "runtime"]
+used_by = ["crate:atl-platform-ui-linux"]
+
+# the audio gate's tools (xtask test audio-pcm): the private server with no session manager (pipewire), the null sink and default-sink metadata (pw-cli, pw-metadata), the monitor recording (pw-record)
+[pipewire-bin]
+debian = "pipewire-bin"
+arch = "pipewire"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 # resolves deps.toml pkgconfig modules: versions (xtask deps) and providers.toml system: rows (xtask native)
 [pkgconf]
 debian = "pkgconf"

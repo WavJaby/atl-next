@@ -70,12 +70,20 @@ static CLANG: Mutex<()> = Mutex::new(());
 /// Prefix of the probe variables that evaluate requested macros; nothing in a C header uses it.
 const MACRO_PROBE: &str = "__atl_bridgegen_macro_";
 
+/// A `Clang` for this thread. clang-sys loads libclang per thread once its `runtime` feature is on, and bindgen turns that feature on for the whole build (pipewire-sys's bindings, plan A0), so each thread loads it before `Clang::new`.
+fn new_clang() -> Result<Clang> {
+    if !clang_sys::is_loaded() {
+        clang_sys::load().map_err(|e| anyhow!("libclang: {e}"))?;
+    }
+    Clang::new().map_err(|e| anyhow!("libclang: {e}"))
+}
+
 /// The source's records, functions, typedefs and constants as each target sees them.
 pub fn parse(src: &Source, targets: &[Target]) -> Result<BTreeMap<String, ArchView>> {
     let _one_at_a_time = CLANG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let clang = new_clang()?;
     let index = Index::new(&clang, false, false);
     targets
         .iter()
@@ -93,7 +101,7 @@ pub fn resolve_include(lang: Lang, target: &Target, name: &str) -> Result<PathBu
     let _one_at_a_time = CLANG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let clang = new_clang()?;
     let index = Index::new(&clang, false, false);
     let probe = std::env::temp_dir().join(match lang {
         Lang::C => "__atl_bridgegen_include.c",
@@ -172,7 +180,7 @@ pub fn probe_includes(
     let _one_at_a_time = CLANG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let clang = new_clang()?;
     let index = Index::new(&clang, false, false);
     let path = probe_path(lang, "__atl_bridgegen_probe");
     // file contents for macro definitions, shared by the probes
@@ -218,7 +226,7 @@ pub fn source_errors(lang: Lang, target: &Target, units: &[String]) -> Result<Ve
     let _one_at_a_time = CLANG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let clang = new_clang()?;
     let index = Index::new(&clang, false, false);
     let path = probe_path(lang, "__atl_bridgegen_errors");
     units
@@ -286,7 +294,7 @@ pub fn resolve_includes(
     let _one_at_a_time = CLANG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let clang = Clang::new().map_err(|e| anyhow!("libclang: {e}"))?;
+    let clang = new_clang()?;
     let index = Index::new(&clang, false, false);
     let path = probe_path(lang, "__atl_bridgegen_resolve");
     let text: String = names

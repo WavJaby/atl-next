@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The platform layer's app-process side as traits (plan S1 `atl-platform-ui`, M3 slice 6): toolkit session and main loop (`Ui`), window with the compositor's `Scene` presented into it (`Window`), the display's frame clock (`FrameClock`) and pointer input (`InputSource`).
+# The platform layer's app-process side as traits (plan S1 `atl-platform-ui`, M3 slice 6): toolkit session and main loop (`Ui`), window with the compositor's `Scene` presented into it (`Window`), the display's frame clock (`FrameClock`) and pointer input (`InputSource`); and the PCM audio output (`audio`, plan A0).
 # Shaped by the one implementation, GTK4 on Linux (atl-platform-ui-linux): sizes are physical pixels plus a scale (GTK speaks logical units), the whole session is thread-affine (GLib and the Android Looper share the UI thread, plan Q6), callbacks run inside the Looper's poll (`Looper` seam).
 # No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-ui` facade, not this crate or the implementation directly.
 
