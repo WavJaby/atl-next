@@ -48,6 +48,9 @@ public final class AtlJniTest {
     /** GLES2 through the GL proxies: pixels equal to the scene (4096 = all of a 64x64 pbuffer), -1 on an EGL or GL error (atl_jni_test.c). */
     public static native int glesPbuffer();
 
+    /** After glesPbuffer: 1 when /proc/self/maps names the host driver ("mesa"), 0 when not, -1 when unreadable (atl_jni_test.c). */
+    public static native int mesaMapped();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

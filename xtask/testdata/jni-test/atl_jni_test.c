@@ -284,3 +284,17 @@ JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
     eglTerminate(dpy);
     return matches;
 }
+
+// After glesPbuffer: 1 when the process maps the host GL driver (a /proc/self/maps line naming "mesa", e.g. libEGL_mesa.so), 0 when not, -1 when maps cannot be read: the guest's GL reached the real driver, not a stand-in.
+JNI_FN(jint, mesaMapped)(JNIEnv *env, jclass cls)
+{
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (f == NULL)
+        return -1;
+    char line[4096];
+    jint found = 0;
+    while (!found && fgets(line, sizeof(line), f) != NULL)
+        found = strstr(line, "mesa") != NULL;
+    fclose(f);
+    return found;
+}

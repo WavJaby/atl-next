@@ -104,6 +104,7 @@ public class Main extends Activity {
         bridge1Call(jni, "guestLog", "guestLog");
         bridge1Call(jni, "propCallbacks", "propCallbacks");
         bridge1Call(jni, "glesPbuffer", "glesPbuffer");
+        bridge1Call(jni, "mesaMapped", "mesaMapped");
     }
 
     /** The default TrustManagerFactory's issuers (Conscrypt: AndroidCAStore -> TrustedCertificateStore): "trusted <ROOT> of <n>", or why not. */

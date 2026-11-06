@@ -80,6 +80,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("propCallbacks", "11"),
     // GLES2 through the GL proxies: 64x64 pixels that equal the scene's geometry (jni-test atl_jni_test.c glesPbuffer)
     ("glesPbuffer", "4096"),
+    // after glesPbuffer, the process maps the host driver (a /proc/self/maps line naming "mesa"): the proxies reached Mesa, not a stand-in
+    ("mesaMapped", "1"),
 ];
 /// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
