@@ -38,6 +38,9 @@ pub struct Args {
     /// Instead of the run: the verdict on synthetic logs (what the gate must pass and must fail). Needs no device.
     #[arg(long)]
     self_test: bool,
+    /// Deliberate failure: the compositor is not served by the process's service view (atl-composer `BREAK_NO_SERVE`); the run must fail, libgui left waiting for `SurfaceFlinger`.
+    #[arg(long)]
+    break_view: bool,
     /// liblog tag filter of the app (ANDROID_LOG_TAGS).
     #[arg(long, default_value = "*:i")]
     log_tags: String,
@@ -669,6 +672,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?;
     // the display this gate judges against: atld takes it as given and never asks the desktop
     let rt = rt.with_display(display.to_arg());
+    let rt = if args.break_view {
+        rt.with_ui_break("no-serve")
+    } else {
+        rt
+    };
     let work = rt.out.join("composer");
     let apk = rt
         .apk

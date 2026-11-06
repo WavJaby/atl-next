@@ -34,6 +34,8 @@ const BREAK_POST_DRAW: &str = "post-draw";
 const BREAK_QUEUE: &str = "queue";
 /// With it a tick's calls go out before the window painted (ComposerConfig::release_after_paint).
 const BREAK_RELEASE_BEFORE_PAINT: &str = "release-before-paint";
+/// With it the compositor is not served by the service view (xtask composer `--break-view`): libgui's lookup must then fail the gate.
+const BREAK_NO_SERVE: &str = "no-serve";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -150,9 +152,12 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
     let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender, input_method);
-    atl_service_view::serve(SURFACE_FLINGER, surface_flinger)?;
-    atl_service_view::serve(SURFACE_FLINGER_AIDL, surface_flinger_aidl)?;
-    {
+    if std::env::var(BREAK_ENV).as_deref() == Ok(BREAK_NO_SERVE) {
+        // the deliberate failure: the binders die with this frame, nothing serves the names
+        drop((surface_flinger, surface_flinger_aidl));
+    } else {
+        atl_service_view::serve(SURFACE_FLINGER, surface_flinger)?;
+        atl_service_view::serve(SURFACE_FLINGER_AIDL, surface_flinger_aidl)?;
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr(),

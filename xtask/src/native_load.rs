@@ -372,10 +372,10 @@ impl Env {
         let test_root = self.work.join("binder");
         crate::binder::fresh_layout(&test_root)?;
         let lib_env = crate::binder::lib_env(&self.out)?;
-        let (mut binderd, harness) =
+        let (broker, mut binderd) =
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
         let (mut sm, found) = crate::binder::start_servicemanager(
-            &harness,
+            &broker,
             &test_root,
             &servicemanager,
             &service,
@@ -392,7 +392,8 @@ impl Env {
                 .collect::<Vec<_>>(),
         );
         let what = format!("{cmd:?}");
-        let run = harness.spawn(cmd, AID_APP_START, false).and_then(|child| {
+        let run = crate::binder::spawn_piped(&broker, &cmd, AID_APP_START).and_then(|p| {
+            let child = p.child;
             let pid = child.id().to_string();
             std::thread::spawn(move || {
                 std::thread::sleep(MEDIA_LIMIT);
@@ -401,10 +402,10 @@ impl Env {
             });
             self.host.finish(&what, child)
         });
-        let _ = sm.kill();
-        sm.wait()?;
-        drop(harness);
-        binderd.wait()?;
+        let _ = sm.child.kill();
+        sm.child.wait()?;
+        drop(broker);
+        binderd.child.wait()?;
         run
     }
 
