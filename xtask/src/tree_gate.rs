@@ -60,7 +60,8 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
         .as_ref()
         .and_then(|h| h.soong_prebuilt_os.as_deref())
         .with_context(|| format!("{name}: no soong_prebuilt_os"))?;
-    let javac = crate::arches::java_tools(&tree::shared_tree(&layout), os)
+    let jdk = crate::deps::aosp_project(root, "jdk")?;
+    let javac = crate::arches::java_tools(&tree::shared_tree(&layout), os, &jdk)
         .0
         .join("bin/javac");
     ensure!(

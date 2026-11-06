@@ -34,15 +34,15 @@ pub struct Args {
     /// `nb:` goals against bionic into `<out>/nb/<arch>`.
     #[arg(long)]
     native_bridge: Option<String>,
-    /// C compiler (deps.toml row `clang`).
-    #[arg(long, default_value = "clang-19")]
-    cc: String,
-    /// C++ compiler and link driver (deps.toml row `clang`).
-    #[arg(long, default_value = crate::libcxx_gate::CXX)]
-    cxx: String,
-    /// Archiver (deps.toml row `llvm`).
-    #[arg(long, default_value = "llvm-ar-19")]
-    ar: String,
+    /// C compiler (default: deps.toml row `clang`'s binary).
+    #[arg(long)]
+    cc: Option<String>,
+    /// C++ compiler and link driver (default: deps.toml row `clang-cxx`'s binary).
+    #[arg(long)]
+    cxx: Option<String>,
+    /// Archiver (default: deps.toml row `llvm`'s binary).
+    #[arg(long)]
+    ar: Option<String>,
     /// Compiler cache run in front of every C/C++ compile (deps.toml row `sccache`); its cache `<workspace>/cache/sccache` is shared by every out dir and checkout.
     #[arg(long, default_value = "sccache")]
     compiler_cache: String,
@@ -70,6 +70,14 @@ pub struct Args {
     /// WSL only: under this much free space (GiB) on that drive, a note asks to compact the vhdx (owner: compact when C: < 30 GB). Only a note, never a refusal.
     #[arg(long, default_value_t = 30)]
     host_free_compact_gib: u64,
+}
+
+/// A tool flag's value, else the binary of its deps.toml row.
+fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> {
+    match flag {
+        Some(name) => Ok(name.clone()),
+        None => deps::binary(root, row),
+    }
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -162,14 +170,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let libcxx = PathBuf::from(
         crate::host_art::output(
-            Command::new(&converter).args(["-libcxx-headers", "-cxx", &args.cxx]),
+            Command::new(&converter).args([
+                "-libcxx-headers",
+                "-cxx",
+                &flag_or_row(&args.cxx, root, "clang-cxx")?,
+            ]),
             "bp2ninja -libcxx-headers",
         )?
         .trim(),
     );
     let toolchain = upstream::Toolchain {
-        cc: &args.cc,
-        cxx: &args.cxx,
+        cc: &flag_or_row(&args.cc, root, "clang")?,
+        cxx: &flag_or_row(&args.cxx, root, "clang-cxx")?,
         libcxx: &libcxx,
     };
     let checkouts = sources.checkouts(None);
@@ -238,8 +250,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         serde_json::to_string_pretty(&aidl_crates)?,
     )?;
     let rust = rust_toolchain(root)?;
-    let libclang = libclang_dir(&args.cc)?;
-    let llvm = llvm_prefix(&args.cc)?;
+    let libclang = libclang_dir(&flag_or_row(&args.cc, root, "clang")?)?;
+    let llvm = llvm_prefix(&flag_or_row(&args.cc, root, "clang")?)?;
     let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
@@ -252,7 +264,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let sources = sources::load(root)?;
         prune::apply(&tree, &prune::load(root, &sources)?)?;
         // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
-        let (jdk, build_tools) = arches::java_tools(&tree, &prebuilt_os);
+        let (jdk, build_tools) =
+            arches::java_tools(&tree, &prebuilt_os, &deps::aosp_project(root, "jdk")?);
         let status = Command::new(&converter)
             .arg("-tree")
             .arg(&tree)
@@ -272,11 +285,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 "-abi",
                 &abi,
                 "-cc",
-                &args.cc,
+                &flag_or_row(&args.cc, root, "clang")?,
                 "-cxx",
-                &args.cxx,
+                &flag_or_row(&args.cxx, root, "clang-cxx")?,
                 "-ar",
-                &args.ar,
+                &flag_or_row(&args.ar, root, "llvm")?,
                 "-omit",
                 &omit,
                 "-rust-android",
@@ -556,7 +569,14 @@ fn native_bridge_flags(
     // the JSON is the last line; the converter reports Soong's dropped global flags before it
     let bionic: Vec<String> = serde_json::from_str(printed.lines().last().unwrap_or_default())
         .context("bp2ninja -nb-exports output")?;
-    let built = runtimes::build_guest(root, arch, &args.cc, &args.cxx, out, &bionic)?;
+    let built = runtimes::build_guest(
+        root,
+        arch,
+        &flag_or_row(&args.cc, root, "clang")?,
+        &flag_or_row(&args.cxx, root, "clang-cxx")?,
+        out,
+        &bionic,
+    )?;
     let builtins = built
         .iter()
         .find(|b| b.module == runtimes::BUILTINS)
@@ -660,7 +680,10 @@ fn runtimes_pass2(
     let built = runtimes::build_shared(
         root,
         &p.arch,
-        (&args.cc, &args.cxx),
+        (
+            &flag_or_row(&args.cc, root, "clang")?,
+            &flag_or_row(&args.cxx, root, "clang-cxx")?,
+        ),
         out,
         &p.bionic,
         &libs,

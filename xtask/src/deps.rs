@@ -7,9 +7,11 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_layout::Layout;
 use serde::Deserialize;
 
 use crate::sources::{self, Sources};
+use crate::tree;
 use crate::workspace::{self, Workspace};
 
 pub const FILE: &str = "deps.toml";
@@ -27,6 +29,9 @@ pub struct Dep {
     pub cargo: Option<String>,
     pub version: Option<String>,
     pub rustup_target: Option<String>,
+    pub aosp: Option<String>,
+    pub binary: Option<String>,
+    pub version_arg: Option<String>,
     pub scope: Vec<Scope>,
     pub used_by: Vec<String>,
 }
@@ -44,6 +49,8 @@ pub struct Consumers {
     pub crates: BTreeSet<String>,
     pub upstreams: BTreeSet<String>,
     pub xtask: BTreeSet<String>,
+    /// `[aosp.projects]` paths of sources.toml: what an `aosp` row may name.
+    pub projects: BTreeSet<String>,
 }
 
 impl Consumers {
@@ -52,6 +59,7 @@ impl Consumers {
             crates: workspace.crates.clone(),
             upstreams: sources.upstream_names(),
             xtask: crate::subcommands(),
+            projects: sources.aosp.projects.keys().cloned().collect(),
         }
     }
 
@@ -76,6 +84,30 @@ pub fn load(root: &Path, consumers: &Consumers) -> Result<Deps> {
     parse(&text, consumers).with_context(|| format!("in {FILE}"))
 }
 
+/// One row, unvalidated: xtask code reads the `binary` or `aosp` value it needs. `xtask check` (tables)
+/// validates the whole file.
+pub fn row(root: &Path, name: &str) -> Result<Dep> {
+    let text =
+        std::fs::read_to_string(root.join(FILE)).with_context(|| format!("reading {FILE}"))?;
+    let mut deps: Deps = toml::from_str(&text).with_context(|| format!("in {FILE}"))?;
+    deps.remove(name)
+        .with_context(|| format!("{FILE}: no row `{name}`"))
+}
+
+/// The executable row `name` declares (`binary`): the name xtask runs.
+pub fn binary(root: &Path, name: &str) -> Result<String> {
+    row(root, name)?
+        .binary
+        .with_context(|| format!("{FILE}: row `{name}` names no binary"))
+}
+
+/// The AOSP tree path row `name` declares (`aosp`).
+pub fn aosp_project(root: &Path, name: &str) -> Result<String> {
+    row(root, name)?
+        .aosp
+        .with_context(|| format!("{FILE}: row `{name}` is not an aosp row"))
+}
+
 fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
     let deps: Deps = toml::from_str(text)?;
     for (name, dep) in &deps {
@@ -92,10 +124,21 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     let distro = dep.debian.is_some() || dep.arch.is_some();
     let cargo = dep.cargo.is_some() || dep.version.is_some();
     let rustup = dep.rustup_target.is_some();
+    let aosp = dep.aosp.is_some();
     ensure!(
-        [distro, cargo, rustup].iter().filter(|s| **s).count() == 1,
-        "exactly one source: debian/arch, cargo + version, or rustup_target"
+        [distro, cargo, rustup, aosp].iter().filter(|s| **s).count() == 1,
+        "exactly one source: debian/arch, cargo + version, rustup_target, or aosp"
     );
+    if let Some(project) = &dep.aosp {
+        ensure!(
+            consumers.projects.contains(project),
+            "aosp `{project}`: not a [aosp.projects] path in sources.toml"
+        );
+        ensure!(
+            dep.pkgconfig.is_none() && dep.min.is_none() && dep.version_arg.is_none(),
+            "aosp rows take no pkgconfig, min or version_arg: the pin is the version"
+        );
+    }
     if rustup {
         ensure!(
             dep.pkgconfig.is_none() && dep.min.is_none(),
@@ -116,6 +159,34 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
             is_exact_version(version),
             "version `{version}` is not an exact x.y.z"
         );
+    }
+    match &dep.binary {
+        None => ensure!(dep.version_arg.is_none(), "version_arg needs binary"),
+        Some(binary) => {
+            ensure!(
+                distro || aosp,
+                "binary applies to distro and aosp rows only"
+            );
+            if distro {
+                ensure!(
+                    is_bin_name(binary),
+                    "binary `{binary}` is not a bare executable name"
+                );
+                ensure!(
+                    dep.min.is_some(),
+                    "binary needs min: the version its binary reports is checked against it"
+                );
+                ensure!(
+                    dep.pkgconfig.is_none(),
+                    "binary and pkgconfig are exclusive"
+                );
+            } else {
+                ensure!(
+                    sources::is_tree_path(binary),
+                    "binary `{binary}` is not a path inside the project"
+                );
+            }
+        }
     }
     ensure!(
         dep.min.is_some() == dep.min_reason.is_some(),
@@ -139,6 +210,13 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     Ok(())
 }
 
+/// A bare executable name: `ld.lld`, `clang++-19`, `pkg-config`.
+fn is_bin_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
 fn is_exact_version(s: &str) -> bool {
     parse_version(s).is_some_and(|parts| parts.len() == 3)
 }
@@ -157,6 +235,31 @@ fn version_at_least(have: &[u64], min: &[u64]) -> bool {
             .collect::<Vec<_>>()
     };
     pad(have) >= pad(min)
+}
+
+/// The first dotted number in a version line: `go version go1.24.4 linux/amd64` -> `1.24.4`,
+/// `Debian clang version 19.1.7 (3+b1)` -> `19.1.7`. A bare integer (`2025`) is not a version.
+fn first_version(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let starts =
+            b[i].is_ascii_digit() && (i == 0 || !(b[i - 1].is_ascii_digit() || b[i - 1] == b'.'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let end = i + b[i..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit() || **c == b'.')
+            .count();
+        let run = text[i..end].trim_end_matches('.');
+        if run.contains('.') && parse_version(run).is_some() {
+            return Some(run);
+        }
+        i = end;
+    }
+    None
 }
 
 /// Upstream part of a distro package version: epoch (`1:`) and revision / pkgrel (last `-…`) dropped,
@@ -194,9 +297,10 @@ pub fn run(root: &Path, _args: &Args) -> Result<ExitCode> {
     let distro = host_distro()?;
     let cargo_installed = cargo_installed()?;
     let rustup_targets = rustup_targets(root)?;
+    let tree = tree::shared_tree(&Layout::of(root)?);
     let mut problems = Vec::new();
     for (name, dep) in &deps {
-        if let Some(problem) = check_row(dep, distro, &cargo_installed, &rustup_targets)? {
+        if let Some(problem) = check_row(dep, distro, &cargo_installed, &rustup_targets, &tree)? {
             problems.push(format!("{name}: {problem}"));
         }
     }
@@ -221,7 +325,11 @@ fn check_row(
     distro: Distro,
     cargo_installed: &BTreeMap<String, String>,
     rustup_targets: &BTreeSet<String>,
+    tree: &Path,
 ) -> Result<Option<String>> {
+    if let Some(project) = &dep.aosp {
+        return Ok(aosp_problem(tree, project, dep.binary.as_deref()));
+    }
     if let Some(target) = &dep.rustup_target {
         return Ok((!rustup_targets.contains(target))
             .then(|| format!("missing: rustup target add {target}")));
@@ -245,6 +353,14 @@ fn check_row(
     let Some(installed) = package_version(distro, package)? else {
         return Ok(Some(format!("package {package} not installed")));
     };
+    if let Some(binary) = &dep.binary {
+        let min = dep
+            .min
+            .as_deref()
+            .context("binary row without min (tables check)")?;
+        let arg = dep.version_arg.as_deref().unwrap_or("--version");
+        return binary_problem(binary, arg, min);
+    }
     let Some(min) = &dep.min else { return Ok(None) };
     if let Some(module) = &dep.pkgconfig {
         let ok = Command::new("pkg-config")
@@ -261,6 +377,44 @@ fn check_row(
         (Some(h), Some(m)) if version_at_least(&h, &m)
     );
     Ok((!ok).then(|| format!("{package} {installed} older than {min}")))
+}
+
+/// An `aosp` row: its project is in the pinned tree (`fetch` puts it at the pin), and so is its binary.
+fn aosp_problem(tree: &Path, project: &str, binary: Option<&str>) -> Option<String> {
+    let dir = tree.join(project);
+    if !dir.is_dir() {
+        return Some(format!(
+            "{} missing: cargo xtask fetch --execute",
+            dir.display()
+        ));
+    }
+    let path = dir.join(binary?);
+    (!path.exists()).then(|| format!("{} missing from the pinned tree", path.display()))
+}
+
+/// A distro row's binary: runs `<binary> <version_arg>` and compares the first dotted number it prints
+/// with `min`. The binary's own report, not the package version, is what xtask gets.
+fn binary_problem(binary: &str, version_arg: &str, min: &str) -> Result<Option<String>> {
+    let out = match Command::new(binary).arg(version_arg).output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(format!("`{binary}` not on PATH")));
+        }
+        Err(e) => return Err(e).with_context(|| format!("running `{binary} {version_arg}`")),
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let Some(have) = first_version(&text) else {
+        return Ok(Some(format!("`{binary} {version_arg}` prints no version")));
+    };
+    let ok = matches!(
+        (parse_version(have), parse_version(min)),
+        (Some(h), Some(m)) if version_at_least(&h, &m)
+    );
+    Ok((!ok).then(|| format!("`{binary}` is {have}, needs at least {min}")))
 }
 
 fn host_distro() -> Result<Distro> {
@@ -359,6 +513,7 @@ mod tests {
             crates: set(&["xtask"]),
             upstreams: set(&["aosp"]),
             xtask: set(&["check"]),
+            projects: set(&["prebuilts/jdk/jdk21", "prebuilts/r8"]),
         }
     }
 
@@ -417,6 +572,37 @@ mod tests {
     }
 
     #[test]
+    fn binary_rows() {
+        let no_min = format!("[x]\ndebian = \"x\"\nbinary = \"x\"\n{USED}");
+        assert!(err(&no_min).contains("binary needs min"));
+        let path = format!(
+            "[x]\ndebian = \"x\"\nbinary = \"bin/x\"\nmin = \"1\"\nmin_reason = \"r\"\n{USED}"
+        );
+        assert!(err(&path).contains("not a bare executable name"));
+        let cargo = format!("[x]\ncargo = \"x\"\nversion = \"1.0.0\"\nbinary = \"x\"\n{USED}");
+        assert!(err(&cargo).contains("binary applies to distro and aosp rows only"));
+        let args = format!("[x]\ndebian = \"x\"\nversion_arg = \"version\"\n{USED}");
+        assert!(err(&args).contains("version_arg needs binary"));
+    }
+
+    #[test]
+    fn aosp_rows() {
+        let ok = format!(
+            "[jdk]\naosp = \"prebuilts/jdk/jdk21\"\nbinary = \"linux-x86/bin/javac\"\n{USED}"
+        );
+        assert!(parse(&ok, &consumers()).is_ok());
+        let unknown = format!("[jdk]\naosp = \"prebuilts/gone\"\n{USED}");
+        assert!(err(&unknown).contains("not a [aosp.projects] path"));
+        let pinned = format!(
+            "[jdk]\naosp = \"prebuilts/jdk/jdk21\"\nmin = \"21.0.4\"\nmin_reason = \"r\"\n{USED}"
+        );
+        assert!(err(&pinned).contains("the pin is the version"));
+        let escaping =
+            format!("[jdk]\naosp = \"prebuilts/jdk/jdk21\"\nbinary = \"../javac\"\n{USED}");
+        assert!(err(&escaping).contains("not a path inside the project"));
+    }
+
+    #[test]
     fn upstream_version_strips_epoch_revision_suffix() {
         // Debian: [epoch:]upstream[-revision]; Arch: upstream-pkgrel
         assert_eq!(upstream_version("1:2.47.3-0+deb13u1"), "2.47.3");
@@ -432,6 +618,60 @@ mod tests {
         assert!(version_at_least(&v("4.18"), &v("4.18.0")));
         assert!(!version_at_least(&v("4.9"), &v("4.18")));
         assert!(parse_version("4.18-rc1").is_none());
+    }
+
+    #[test]
+    fn first_version_of_each_tools_output() {
+        // first line of each tool's version output on the build host, 2026-11-07
+        for (line, want) in [
+            ("Debian clang version 19.1.7 (3+b1)", "19.1.7"),
+            ("Debian LLD 19.1.7 (compatible with GNU linkers)", "19.1.7"),
+            ("go version go1.24.4 linux/amd64", "1.24.4"),
+            ("cmake version 3.31.6", "3.31.6"),
+            ("Python 3.13.5", "3.13.5"),
+            ("bison (GNU Bison) 3.8.2", "3.8.2"),
+            ("bubblewrap 0.12.0", "0.12.0"),
+            ("unshare from util-linux 2.41.5", "2.41.5"),
+            ("sccache 0.10.0", "0.10.0"),
+        ] {
+            assert_eq!(first_version(line), Some(want), "{line}");
+        }
+        assert_eq!(first_version("no version in 2026-11-07"), None);
+    }
+
+    #[test]
+    fn binary_problem_names_the_row() {
+        let missing = binary_problem("atl-no-such-binary", "--version", "1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing, "`atl-no-such-binary` not on PATH");
+        // git is on every build host (the repo needs it); no real git meets 999.0
+        let low = binary_problem("git", "--version", "999.0")
+            .unwrap()
+            .unwrap();
+        assert!(
+            low.starts_with("`git` is ") && low.ends_with("needs at least 999.0"),
+            "{low}"
+        );
+        assert_eq!(binary_problem("git", "--version", "0.1").unwrap(), None);
+    }
+
+    #[test]
+    fn aosp_problem_checks_project_then_binary() {
+        let tree = std::env::temp_dir().join(format!("xtask-deps-aosp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tree);
+        let problem = aosp_problem(&tree, "prebuilts/r8", Some("d8")).unwrap();
+        assert!(problem.contains("fetch --execute"), "{problem}");
+        std::fs::create_dir_all(tree.join("prebuilts/r8")).unwrap();
+        let problem = aosp_problem(&tree, "prebuilts/r8", Some("d8")).unwrap();
+        assert!(
+            problem.contains("missing from the pinned tree"),
+            "{problem}"
+        );
+        std::fs::write(tree.join("prebuilts/r8/d8"), "").unwrap();
+        assert_eq!(aosp_problem(&tree, "prebuilts/r8", Some("d8")), None);
+        assert_eq!(aosp_problem(&tree, "prebuilts/r8", None), None);
+        std::fs::remove_dir_all(&tree).unwrap();
     }
 
     #[test]

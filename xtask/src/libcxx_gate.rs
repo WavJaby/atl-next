@@ -14,9 +14,6 @@ use atl_layout::Layout;
 
 use crate::{arches, converter, tree};
 
-/// The C++ compiler device compiles use (`xtask native --cxx` default).
-pub const CXX: &str = "clang++-19";
-
 /// The tree dir whose device C++ command line the probe takes: libart's, the device build's main libc++ user (a platform dir: no ExternalCflags).
 const PROBE_DIR: &str = "art/runtime";
 
@@ -197,6 +194,8 @@ struct ProbeFlags {
 
 /// The step: the distro libc++ as device compiles of the build machine's arch see it.
 pub fn check(root: &Path) -> Result<()> {
+    // the C++ driver: deps.toml row clang-cxx's binary, native's --cxx default
+    let cxx = crate::deps::binary(root, "clang-cxx")?;
     let layout = Layout::of(root)?;
     let arches = arches::load(root)?;
     let (name, arch) = arches::build_machine(root, &arches)?;
@@ -242,7 +241,7 @@ pub fn check(root: &Path) -> Result<()> {
             "-device-cxx-flags",
             PROBE_DIR,
             "-cxx",
-            CXX,
+            &cxx,
         ])
         .arg("-provided")
         .arg(&provided)
@@ -257,7 +256,7 @@ pub fn check(root: &Path) -> Result<()> {
         serde_json::from_slice(&o.stdout).context("parsing bp2ninja -device-cxx-flags output")?;
     let d = compare(
         &Inputs {
-            cxx: CXX,
+            cxx: &cxx,
             argv: &flags.argv,
             android: &flags.android,
             probe: PROBE,
@@ -266,7 +265,7 @@ pub fn check(root: &Path) -> Result<()> {
     )?;
     let seen = judge(&d)?;
     eprintln!(
-        "libcxx: {CXX} with {name}'s device C++ flags ({} args, {PROBE_DIR}) +/- {}: macros differ only by {seen:?}, {}-byte probe objects identical",
+        "libcxx: {cxx} with {name}'s device C++ flags ({} args, {PROBE_DIR}) +/- {}: macros differ only by {seen:?}, {}-byte probe objects identical",
         flags.argv.len() - 1,
         flags.android,
         d.object_len
@@ -279,6 +278,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The driver native would compile with (deps.toml row clang-cxx).
+    fn cxx_row() -> String {
+        crate::deps::binary(&crate::repo_root().unwrap(), "clang-cxx").unwrap()
+    }
+
     /// A fake libc++: one header `<fake>` the probe includes, shaped by `body`.
     fn fake(name: &str, body: &str) -> (PathBuf, Diff) {
         let work = std::env::temp_dir().join(format!("xtask-libcxx-{name}-{}", std::process::id()));
@@ -288,7 +292,7 @@ mod tests {
         std::fs::write(inc.join("fake"), body).unwrap();
         let d = compare(
             &Inputs {
-                cxx: CXX,
+                cxx: &cxx_row(),
                 argv: &fake_argv(&inc, &[ANDROID]),
                 android: ANDROID,
                 probe: FAKE_PROBE,
@@ -319,7 +323,7 @@ mod tests {
         for extra in [&[][..], &[ANDROID, ANDROID][..]] {
             let e = compare(
                 &Inputs {
-                    cxx: CXX,
+                    cxx: &cxx_row(),
                     argv: &fake_argv(&inc, extra),
                     android: ANDROID,
                     probe: FAKE_PROBE,
