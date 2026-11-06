@@ -36,6 +36,19 @@ const NEW_STRING_UTF: usize = 167;
 type GetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type GetInteger64v = unsafe extern "C" fn(u32, *mut i64);
 
+#[cfg(feature = "undefined-gl")]
+unsafe extern "C" {
+    fn glClear(mask: u32);
+}
+
+/// Never called; its reference keeps glClear an undefined dynamic symbol (feature `undefined-gl`).
+#[cfg(feature = "undefined-gl")]
+#[unsafe(no_mangle)]
+pub extern "C" fn atl_gl_probe_undefined_gl() {
+    // SAFETY: never called; only the link-time reference matters.
+    unsafe { glClear(0) }
+}
+
 unsafe extern "C" fn no_op(_: u32, _: *mut i64) {}
 
 /// eglGetProcAddress(NAME), or null.

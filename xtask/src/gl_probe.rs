@@ -2,6 +2,8 @@
 //! `xtask test gl`: GLES on the real driver in an app process -- AOSP's libEGL / libGLESv2 fronts (slow binding, patches 0009 + 0010) over Mesa, placed as for an app (`Runtime::with_gl_driver`).
 //! The fixture (xtask/testdata/gl-probe) runs as a plain app process (`--run-class`): Probe.java makes a GLES3 pbuffer with the framework's EGL14 / GLES20, clears it, reads it back;
 //! its JNI library (jni/, a cargo package of its own for `unsafe`, placed as [`LIB`] in /system's library dir) calls [`EXTENSION`] through eglGetProcAddress.
+//! 0. elf: no Mesa object (mesa::OUTPUTS) has an undefined gl*/egl* dynamic symbol or a dynamic relocation naming one -- such a reference would bind to AOSP's fronts, which call back into Mesa (recursion).
+//!    Break: the probe library built with feature `undefined-gl` (imports glClear) must fail it.
 //! 1. candidates: Mesa's dispatch names (its generated glapi_mapi_tmp.h string pool) that Mesa's API XML enables for ES2+ (`es2="..."`), minus AOSP's entries.in: every name that reaches
 //!    eglGetProcAddress's extension-slot path, where 0010 returns the driver's address instead of the asm forwarder. [`EXTENSION`] must be one; the count is printed.
 //! 2. pixels: every pixel of the [`SIZE`] pbuffer equals [`CLEAR`]: GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) of c / 255 gives c back, so the bytes are the expectation.
@@ -80,7 +82,37 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if ok { "is one" } else { "is NOT one" }
     );
     let work = rt.out.join("gl");
-    let lib = build_lib(root, &work.join("cargo"))?;
+    let build = rt.out.join(mesa::OUT_SUBDIR).join("build");
+    let mut found = Vec::new();
+    for o in mesa::OUTPUTS {
+        found.extend(gl_imports(&build.join(o))?);
+    }
+    ok &= found.is_empty();
+    println!(
+        "gl: {} elf: {} Mesa objects: {}",
+        verdict(found.is_empty()),
+        mesa::OUTPUTS.len(),
+        if found.is_empty() {
+            "no undefined gl*/egl* symbol, no dynamic relocation naming one (none binds back to AOSP's fronts)".to_owned()
+        } else {
+            found.join("; ")
+        }
+    );
+    let lib = build_lib(root, &work.join("cargo"), &[])?;
+    // deliberate break: the probe library built with an undefined glClear
+    let broken = build_lib(root, &work.join("cargo-undefined-gl"), &[UNDEFINED_GL])?;
+    let hits = gl_imports(&broken)?;
+    let fired = !hits.is_empty();
+    ok &= fired;
+    println!(
+        "gl: {} break elf: {}",
+        verdict(fired),
+        if fired {
+            format!("fails as it must: {}", hits.join("; "))
+        } else {
+            "PASSED on a library importing glClear".to_owned()
+        }
+    );
     let lib_at = format!("{}/{LIB}", atl_android_paths::SYSTEM_LIB);
     let rt = rt.with_fixture_file(lib, &lib_at);
     let apk = rt
@@ -178,16 +210,57 @@ fn verdict(ok: bool) -> &'static str {
 }
 
 /// Builds the JNI library into `target`; returns the .so.
-fn build_lib(root: &Path, target: &Path) -> Result<PathBuf> {
+fn build_lib(root: &Path, target: &Path, features: &[&str]) -> Result<PathBuf> {
     let status = Command::new(env!("CARGO"))
         .args(["build", "--release", "--quiet", "--manifest-path"])
         .arg(root.join(FIXTURE).join("jni/Cargo.toml"))
+        .arg(format!("--features={}", features.join(",")))
         .arg("--target-dir")
         .arg(target)
         .status()
         .context("running cargo for the gl-probe library")?;
     ensure!(status.success(), "building the gl-probe library failed");
     Ok(target.join("release").join(LIB))
+}
+
+/// The fixture feature that makes the library import glClear.
+const UNDEFINED_GL: &str = "undefined-gl";
+
+/// A GL/EGL entry-point name: what AOSP's fronts export, so a reference to one from inside the driver resolves to the fronts and recurses.
+fn gl_name(name: &str) -> bool {
+    name.starts_with("gl") || name.starts_with("egl")
+}
+
+/// `path`'s undefined gl*/egl* dynamic symbols and dynamic relocations naming a gl*/egl* symbol, as `file: kind name` lines.
+fn gl_imports(path: &Path) -> Result<Vec<String>> {
+    use object::{Object, ObjectSymbol, ObjectSymbolTable, RelocationTarget};
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let file =
+        object::File::parse(&*data).with_context(|| format!("parsing {}", path.display()))?;
+    let short = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let mut out = Vec::new();
+    for s in file.dynamic_symbols() {
+        if let Ok(n) = s.name()
+            && s.is_undefined()
+            && gl_name(n)
+        {
+            out.push(format!("{short}: undefined {n}"));
+        }
+    }
+    let table = file.dynamic_symbol_table();
+    for (_, r) in file.dynamic_relocations().into_iter().flatten() {
+        if let (RelocationTarget::Symbol(i), Some(t)) = (r.target(), &table)
+            && let Ok(n) = t
+                .symbol_by_index(i)
+                .and_then(|s| s.name().map(str::to_owned))
+            && gl_name(&n)
+        {
+            out.push(format!("{short}: relocation {n}"));
+        }
+    }
+    Ok(out)
 }
 
 /// The texts of the probe's `gl-probe: ` log lines.
