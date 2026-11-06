@@ -119,6 +119,11 @@ fn is_row_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether a `run-apk` argument names a row. A row name holds no `.`, `/` or `\`, so every other argument is a file path: a bare name is never read as a file.
+pub fn names_row(arg: &str) -> bool {
+    !arg.contains(['.', '/', '\\'])
+}
+
 /// At least two dotted segments, each starting with a letter.
 fn is_package(s: &str) -> bool {
     let segments: Vec<&str> = s.split('.').collect();
@@ -382,7 +387,7 @@ mod tests {
         );
         let github = "[material-catalog]\n\
             package = \"io.material.catalog\"\n\
-            version_name = \"1.14.0\"\n\
+            version_name = \"1.0\"\n\
             version_code = 1\n\
             url = \"https://github.com/o/r/releases/download/1.14.1/catalog-debug.apk\"\n\
             sha256 = \"fe8658062885413953798af76e2df85b4d65f9c756f233268dc5e607d7435e09\"\n\
@@ -398,6 +403,24 @@ mod tests {
             .contains("url must be")
         );
         assert!(parse(&github.replace("/1.14.1/", "/1.14.0/")).is_ok());
+    }
+
+    /// Shipped row names pass the argument rule, paths fail it: the split `run-apk` makes between a row and a file.
+    #[test]
+    fn arguments_are_rows_or_paths() {
+        let table = parse(include_str!("../../test-apks.toml")).expect("test-apks.toml");
+        for name in table.keys() {
+            assert!(names_row(name), "{name}");
+        }
+        for path in [
+            "./fossify-math",
+            "fossify-math.apk",
+            "out/app",
+            "dir\\app",
+            "/abs/app",
+        ] {
+            assert!(!names_row(path), "{path}");
+        }
     }
 
     #[test]

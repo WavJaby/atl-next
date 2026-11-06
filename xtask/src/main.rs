@@ -174,9 +174,9 @@ enum Command {
     /// Per service, most churn first; per entry lines added + deleted, of the whole file or of the named declaration's body (overloads together), GONE when it vanished. Read-only.
     /// The src/aosp checkouts are shallow (pinned tag only): fetch the other tag there blobless, or pass `--repo <project>=<git dir>` holding both; a missing revision fails with the command it needs.
     UpgradeDiff(service_mirrors::Args),
-    /// Runs a test APK row (test-apks.toml) under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
+    /// Runs a test APK row (test-apks.toml), or an APK file given by path, under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
     ///
-    /// The row's file comes from `<workspace>/cache/test-apks`, downloaded and verified on first use; the package file is the APK's own manifest, which must match the row. The APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
+    /// A row's file comes from `<workspace>/cache/test-apks`, downloaded and verified on first use; the package file is the APK's own manifest, which must match the row. A path runs unpinned: no row checks its bytes, signer or identity. The APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
     /// Without `--hold` the window maps in the gate's headless compositor (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Hardware acceleration is the APK's own setting: the pinned official builds run with it on.
     RunApk(run_apk::Args),
     /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask run-apk <ROW>`: a test APK row of test-apks.toml, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
+//! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
 use crate::nested_wayland::NestedCompositor;
@@ -23,8 +23,10 @@ const STAGE: &str = "window-art";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// A row of test-apks.toml: its pinned APK is downloaded and verified into `<workspace>/cache/test-apks` on first use.
-    row: String,
+    /// A row of test-apks.toml (lowercase letters, digits, `-`): its pinned APK is downloaded and verified into `<workspace>/cache/test-apks` on first use.
+    /// Any other argument is a file path (it holds `.`, `/` or `\`), relative to the current directory: that APK runs unpinned, no row checks it.
+    #[arg(value_name = "ROW|PATH")]
+    target: String,
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
@@ -53,7 +55,7 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let (row, apk_file) = test_apks::ensure(root, &args.row)?;
+    let (pin, apk_file) = source(root, &args.target)?;
     let rt = Runtime::new(
         root,
         &args.host,
@@ -91,13 +93,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = work.join("base.apk");
     std::fs::copy(&apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
-    test_apks::check_identity(
-        &args.row,
-        &row,
-        &m.name,
-        m.version_code,
-        m.version_name.as_deref(),
-    )?;
+    if let Some(row) = &pin {
+        test_apks::check_identity(
+            &args.target,
+            row,
+            &m.name,
+            m.version_code,
+            m.version_name.as_deref(),
+        )?;
+    }
     let activity = m
         .launch_activity()
         .map(|a| a.name.clone())
@@ -110,6 +114,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         m.min_sdk,
         m.target_sdk
     );
+    if pin.is_none() {
+        println!(
+            "run-apk: UNPINNED: {} is not a row of {}; no sha256, size or signer check ran",
+            apk_file.display(),
+            test_apks::FILE
+        );
+    }
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
@@ -189,6 +200,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The APK to run: a row's pinned file (verified by `test_apks::ensure`), or the file a path names, which no row pins.
+fn source(root: &Path, target: &str) -> Result<(Option<test_apks::Row>, PathBuf)> {
+    if test_apks::names_row(target) {
+        let (row, file) = test_apks::ensure(root, target)?;
+        return Ok((Some(row), file));
+    }
+    let file = PathBuf::from(target);
+    ensure!(
+        file.is_file(),
+        "{target}: not a file (an argument holding `.`, `/` or `\\` is a path)"
+    );
+    Ok((None, file))
 }
 
 /// The script's `wait:MS` items summed: how long it runs after the first present (a bad item is the app's to refuse, counted 0 here).
