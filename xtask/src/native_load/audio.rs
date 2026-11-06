@@ -191,7 +191,9 @@ fn decode(
             let why = run
                 .stderr
                 .lines()
-                .find(|l| l.contains("Check failed") || l.contains(" F "))
+                .find(|l| {
+                    l.contains("Check failed") || l.contains(" F ") || l.contains("NO_MEMORY")
+                })
                 .unwrap_or("no decode line");
             format!("no decode line, {}: {}", run.status, why.trim())
         })?;
@@ -304,7 +306,12 @@ pub fn run(
         std::fs::write(&input, input_bytes).map_err(|e| format!("{}: {e}", input.display()))?;
         let output = work.join(format!("{}.pcm", clip.name));
         let (line, got) = decode(env, fixture, &input, &output)?;
-        let pcm = std::fs::read(&output).map_err(|e| format!("{}: {e}", output.display()))?;
+        // a decode that reports error= may have written no PCM: check() names that error, not the missing file
+        let pcm = match std::fs::read(&output) {
+            Ok(pcm) => pcm,
+            Err(_) if got.contains_key("error") => Vec::new(),
+            Err(e) => return Err(format!("{}: {e}", output.display())),
+        };
         parts.push(check(clip.name, &exp, &line, &got, &pcm)?);
     }
     Ok(parts.join("; "))

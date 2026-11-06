@@ -526,14 +526,19 @@ impl Env {
         }
         let run =
             crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
-                let child = p.child;
-                let pid = child.id().to_string();
+                // Kills the sandbox (kill_sandbox, as atld stops one), not bwrap: a hung run ends at MEDIA_LIMIT with SIGKILL, and a finished one cancels the timer.
+                let (done, ended) = std::sync::mpsc::channel::<()>();
+                let host_pid = p.host_pid;
                 std::thread::spawn(move || {
-                    std::thread::sleep(MEDIA_LIMIT);
-                    // no unsafe in xtask: kill(1); a pid already reaped by then is not reused within one test run in practice
-                    let _ = Command::new("kill").arg(&pid).status();
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        ended.recv_timeout(MEDIA_LIMIT)
+                    {
+                        let _ = atl_broker::kill_sandbox(host_pid);
+                    }
                 });
-                self.host.finish(&what, child)
+                let run = self.host.finish(&what, p.child);
+                drop(done);
+                run
             });
         let _ = alloc.kill();
         alloc.wait()?;
