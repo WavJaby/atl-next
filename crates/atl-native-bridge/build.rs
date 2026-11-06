@@ -586,6 +586,8 @@ fn main() -> Result<()> {
     println!("cargo::rustc-check-cfg=cfg(atl_nb_nbfp_false)");
     // `atl_nb_foreign_gs`: deliberate break of the app gate's `jitUpCall` (engine::x86_64: GS = the record, not ART's Thread*, while an up call's host target runs)
     println!("cargo::rustc-check-cfg=cfg(atl_nb_foreign_gs)");
+    // `atl_nb_gl_direct`: deliberate break of the app gate's `glesPbuffer` (engine/vdso.rs: glClear's stub bound to the front's raw address, no crossing)
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_gl_direct)");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
