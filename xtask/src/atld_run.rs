@@ -23,17 +23,24 @@ use crate::{manifest, packages, slot, tree};
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
-const GL_FRONTS: [&str; 3] = ["libEGL", "libGLESv1_CM", "libGLESv2"];
+const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"];
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
-/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file), plus NBS's original guest libraries an app links (`NATIVE_BRIDGE_ORIG_GUEST_LIBS`, native_bridge_support.mk: AOSP's own, built for the guest; liblog so far); libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
-const NB_LIBS: [(&str, &str); 6] = [
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), and the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
+const NB_LIBS: [(&str, &str); 13] = [
     ("libnative_bridge_guest_libc", "libc.so"),
     ("libm", "libm.so"),
     ("libdl", "libdl.so"),
     ("ld-android", "ld-android.so"),
     ("liblog", "liblog.so"),
+    ("libcutils", "libcutils.so"),
+    ("libutils", "libutils.so"),
+    ("libnative_bridge_guest_libEGL", "libEGL.so"),
+    ("libnative_bridge_guest_libGLESv1_CM", "libGLESv1_CM.so"),
+    ("libnative_bridge_guest_libGLESv2", "libGLESv2.so"),
+    ("libnative_bridge_guest_libGLESv3", "libGLESv3.so"),
+    ("libnative_bridge_guest_libnativewindow", "libnativewindow.so"),
     (
         "libnative_bridge_vdso",
         atl_native_bridge::engine::VDSO_FILE,
