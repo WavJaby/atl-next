@@ -18,17 +18,22 @@ use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
     arches, build_pool, converter, deps, fetch, licence_gate, licenses, none_gate, packages, patch,
-    provided_gate, providers, prune, slot, sources, system, tree, triage, upstream, workspace,
+    provided_gate, providers, prune, runtimes, slot, sources, system, tree, triage, upstream,
+    workspace,
 };
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Android.bp module names to build (with their dependency closure).
+    /// Android.bp module names to build (with their dependency closure); `nb:<module>` = its native bridge variant (needs --native-bridge).
     #[arg(required_unless_present = "shell")]
     goals: Vec<String>,
     /// The host arch (an arches.toml row with `[host]`); also Soong's arch name.
     #[arg(long)]
     host: String,
+    /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts
+    /// `nb:` goals against bionic into `<out>/nb/<arch>`.
+    #[arg(long)]
+    native_bridge: Option<String>,
     /// C compiler (deps.toml row `clang`).
     #[arg(long, default_value = "clang-19")]
     cc: String,
@@ -234,6 +239,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&args.cc)?;
     let llvm = llvm_prefix(&args.cc)?;
+    let nb_flags = native_bridge_flags(root, &arches, args, &converter, &tree, &out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
@@ -296,6 +302,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-release")
             .arg(&release)
             .args(cache.iter().flat_map(CompilerCache::converter_args))
+            .args(&nb_flags)
             .args(&args.goals)
             .args(&aidl_goals)
             .status()
@@ -486,6 +493,77 @@ fn verdict(failed: Vec<Failure>) -> ExitCode {
 /// Size limit of the compiler cache (sccache evicts least recently used entries past it).
 /// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries): 2 GB keeps ~25 such generations (main + task branches whose flags, pins or patches differ) and leaves room for the goal closure to grow several-fold before this needs a new measurement.
 const CACHE_SIZE: &str = "2G";
+
+/// The converter's goal prefix for a native bridge variant (tools/bp2ninja cc.go nbGoalPrefix).
+const NB_GOAL: &str = "nb:";
+
+/// Converter flags of the native bridge side, empty without --native-bridge: the guest row's arch + pointer width, and `-nb-provided` = the guest LLVM runtimes,
+/// built (runtimes.rs) against the include flags the converter evaluates for bionic's `libc_headers` on that side (`-nb-exports`), so they see the headers the guest libc is compiled with.
+fn native_bridge_flags(
+    root: &Path,
+    arches: &arches::Arches,
+    args: &Args,
+    converter: &Path,
+    tree: &Path,
+    out: &Path,
+    llvm: &Path,
+) -> Result<Vec<String>> {
+    let Some(arch) = &args.native_bridge else {
+        ensure!(
+            !args.goals.iter().any(|g| g.starts_with(NB_GOAL)),
+            "{NB_GOAL} goals need --native-bridge"
+        );
+        return Ok(Vec::new());
+    };
+    let row = arches
+        .get(arch)
+        .filter(|a| a.guest.is_some())
+        .with_context(|| format!("--native-bridge {arch}: no [guest] row in {}", arches::FILE))?;
+    let host_bits = arches
+        .get(&args.host)
+        .context("run checked the host row")?
+        .pointer_bits;
+    let side = vec![
+        "-native-bridge".to_owned(),
+        arch.clone(),
+        "-native-bridge-bits".to_owned(),
+        row.pointer_bits.to_string(),
+    ];
+    let printed = crate::host_art::output(
+        Command::new(converter)
+            .arg("-tree")
+            .arg(tree)
+            .arg("-out")
+            .arg(out)
+            .args(["-arch", &args.host, "-pointer-bits", &host_bits.to_string()])
+            // the ART plugin config is read on every run
+            .arg("-llvm")
+            .arg(llvm)
+            .args(&side)
+            .args(["-nb-exports", "libc_headers"]),
+        "bp2ninja -nb-exports libc_headers",
+    )?;
+    // the JSON is the last line; the converter reports Soong's dropped global flags before it
+    let bionic: Vec<String> = serde_json::from_str(printed.lines().last().unwrap_or_default())
+        .context("bp2ninja -nb-exports output")?;
+    let built = runtimes::build_guest(root, arch, &args.cc, &args.cxx, out, &bionic)?;
+    let provided: BTreeMap<&str, Provided> = built
+        .into_iter()
+        .map(|b| {
+            let p = Provided {
+                lib: b.archive,
+                include: b.include.into_iter().collect(),
+                defines: Vec::new(),
+            };
+            (b.module, p)
+        })
+        .collect();
+    let file = out.join("nb-provided.json");
+    std::fs::write(&file, serde_json::to_string_pretty(&provided)?)?;
+    let mut flags = side;
+    flags.extend(["-nb-provided".to_owned(), file.display().to_string()]);
+    Ok(flags)
+}
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
 /// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).

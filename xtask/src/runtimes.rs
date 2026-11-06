@@ -1,29 +1,21 @@
 // SPDX-License-Identifier: MIT
 //! LLVM runtimes for a bionic guest arch, built from the pinned llvm-project (sources.toml: the tree of android-16's clang-r547379) by LLVM's own CMake runtimes build, run as-is (CLAUDE.md).
 //! Each variant mirrors one runtime builder of AOSP's toolchain/llvm_android `src/llvm_android/builders.py` (at 9596955b, the revision clang-r547379's clang_source_info.md names): same runtimes, same cache entries, same output names, so the archives are the modules prebuilts/clang's Android.bp declares.
-//! Differences from that build, each because we have no NDK-style sysroot yet: headers come straight from bionic's `libc_headers` export dirs (`-nostdlibinc`), and try-compiles stop at a static library (no libc to link); no LTO / AutoFDO / debug info.
-//! Output: `<out>/upstream/llvm-project/<arch>/<variant>/` (CMake build dir, `build.log`), then the licence gate over every object those builds compiled.
+//! Differences from that build, each because we have no NDK-style sysroot yet: headers come straight from bionic's `libc_headers` export dirs as the converter evaluates them for the guest (`-nostdlibinc`), and try-compiles stop at a static library (no libc to link); no LTO / AutoFDO / debug info.
+//! Output: `<out>/upstream/llvm-project/<arch>/<variant>/` (CMake build dir, `build.log`), then the licence gate over every object those builds compiled. Run by `xtask native --native-bridge <arch>`, whose converter run links the archives (-nb-provided).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::{arches, licence_gate, licenses, slot, sources, upstream};
+use crate::{arches, licence_gate, licenses, sources, upstream};
 
 /// Upstream name in sources.toml.
 const UPSTREAM: &str = "llvm-project";
 
 /// Android API level the platform is compiled for: `__ANDROID_API_FUTURE__` (bionic `api-level.h`), what Soong appends to a platform module's clang triple. Without it clang leaves `__ANDROID_API__` unset and bionic hides every `__INTRODUCED_IN` symbol (measured: libc++abi's `aligned_alloc` undeclared).
 const PLATFORM_API: &str = "10000";
-
-/// bionic `libc_headers` + `libc_uapi_headers` export_system_include_dirs (bionic/libc/Android.bp), relative to bionic/libc; the arch block adds `kernel/uapi/asm-<kernel_arch>`.
-const BIONIC_INCLUDES: &[&str] = &[
-    "include",
-    "kernel/uapi",
-    "kernel/android/scsi",
-    "kernel/android/uapi",
-];
 
 /// One CMake runtimes build and the Android.bp modules its archives are.
 struct Variant {
@@ -144,37 +136,27 @@ const VARIANTS: &[Variant] = &[
     },
 ];
 
-#[derive(clap::Args)]
-pub struct Args {
-    /// Guest arch (an arches.toml row with `[guest]`).
-    #[arg(long, default_value = "x86_64")]
-    arch: String,
-    /// C compiler (deps.toml row `clang`).
-    #[arg(long, default_value = "clang-19")]
-    cc: String,
-    /// C++ compiler (deps.toml row `clang`).
-    #[arg(long, default_value = crate::libcxx_gate::CXX)]
-    cxx: String,
-    /// Build directory root (default: this checkout's slot, as `xtask native`).
-    #[arg(long)]
-    out: Option<PathBuf>,
-}
-
-/// A built module: its archive.
+/// A built module: its archive, and the headers dir dependents compile against (libc++'s staged `include/c++/v1`).
 pub struct Built {
     pub module: &'static str,
     pub archive: PathBuf,
+    pub include: Option<PathBuf>,
 }
 
-pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
+/// The runtimes of guest `arch` built under `<out>/upstream/llvm-project/<arch>/` with compilers `cc` / `cxx`, against `bionic`: the include flags the converter's `-nb-exports libc_headers` prints. Fails unless the licence gate over what they compiled passes.
+pub fn build_guest(
+    root: &Path,
+    arch: &str,
+    cc: &str,
+    cxx: &str,
+    out: &Path,
+    bionic: &[String],
+) -> Result<Vec<Built>> {
     let arches = arches::load(root)?;
-    let arch = arches
-        .get(&args.arch)
-        .with_context(|| format!("{}: no row in {}", args.arch, arches::FILE))?;
-    let guest = arch
-        .guest
-        .as_ref()
-        .with_context(|| format!("{}: no [guest] in {}", args.arch, arches::FILE))?;
+    let guest = arches
+        .get(arch)
+        .and_then(|a| a.guest.as_ref())
+        .with_context(|| format!("{arch}: no [guest] row in {}", arches::FILE))?;
     let layout = Layout::of(root)?;
     let sources = sources::load(root)?;
     let checkouts = sources.checkouts(None);
@@ -183,35 +165,25 @@ pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
         .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
         .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
     let src = layout.locate(&c.dir).dir;
-    let libc = layout.locate(Path::new("aosp/bionic/libc")).dir;
-    let (host, _) = arches::build_machine(root, &arches)?;
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |w| {
-        w.join("out").join("native").join(host)
-    })?;
-    let base = out.join("upstream").join(UPSTREAM).join(&args.arch);
+    let base = out.join("upstream").join(UPSTREAM).join(arch);
     let triple = format!("{}{PLATFORM_API}", guest.clang);
-    let mut includes = String::from("-nostdlibinc");
-    for d in BIONIC_INCLUDES
-        .iter()
-        .map(|d| libc.join(d))
-        .chain([libc.join(format!("kernel/uapi/asm-{}", arch.kernel_arch))])
-    {
-        ensure!(
-            d.is_dir(),
-            "{}: missing (xtask fetch --execute)",
-            d.display()
-        );
-        includes.push_str(&format!(" -isystem {}", d.display()));
-    }
+    ensure!(
+        bionic.iter().any(|f| f == "-isystem"),
+        "libc_headers exports no include dir: {bionic:?}"
+    );
+    let includes = std::iter::once("-nostdlibinc")
+        .chain(bionic.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut built = Vec::new();
     for v in VARIANTS {
         let dir = base.join(v.name);
-        println!("runtimes: {} {} -> {}", args.arch, v.name, dir.display());
+        println!("runtimes: {arch} {} -> {}", v.name, dir.display());
         built.extend(build(
             &src.join("runtimes"),
             &dir,
             v,
-            args,
+            (cc, cxx),
             &triple,
             &includes,
         )?);
@@ -253,18 +225,15 @@ pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
         ok &= r.ok();
     }
     println!("runtimes: verdict {}", if ok { "PASS" } else { "FAIL" });
-    Ok(if ok {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    })
+    ensure!(ok, "runtimes {arch}: licence gate failed");
+    Ok(built)
 }
 
 fn build(
     src: &Path,
     dir: &Path,
     v: &Variant,
-    args: &Args,
+    (cc, cxx): (&str, &str),
     triple: &str,
     includes: &str,
 ) -> Result<Vec<Built>> {
@@ -273,9 +242,9 @@ fn build(
     let cxxflags = format!("{includes} {}", v.cxxflags);
     let mut cache: Vec<(&str, &str)> = vec![
         ("CMAKE_BUILD_TYPE", "Release"),
-        ("CMAKE_C_COMPILER", &args.cc),
-        ("CMAKE_CXX_COMPILER", &args.cxx),
-        ("CMAKE_ASM_COMPILER", &args.cc),
+        ("CMAKE_C_COMPILER", cc),
+        ("CMAKE_CXX_COMPILER", cxx),
+        ("CMAKE_ASM_COMPILER", cc),
         ("CMAKE_C_COMPILER_TARGET", triple),
         ("CMAKE_CXX_COMPILER_TARGET", triple),
         ("CMAKE_ASM_COMPILER_TARGET", triple),
@@ -300,7 +269,16 @@ fn build(
             let archive = find(&build, file)?.with_context(|| {
                 format!("runtimes {}: no {file}* under {}", v.name, build.display())
             })?;
-            Ok(Built { module, archive })
+            let include = v
+                .staged
+                .first()
+                .map(|(d, _)| build.join(d))
+                .filter(|_| module.starts_with("libc++"));
+            Ok(Built {
+                module,
+                archive,
+                include,
+            })
         })
         .collect()
 }

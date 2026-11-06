@@ -66,6 +66,7 @@ func main() {
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
 	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory -cxx searches (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs); takes no other flag")
+	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
 	flag.Parse()
 	if *libcxxHeaders {
 		dir, err := libcxxProvider(*cxx)
@@ -76,7 +77,7 @@ func main() {
 		fmt.Println(dir)
 		return
 	}
-	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || (flag.NArg() == 0) == (*cxxProbe == "") {
+	if *tree == "" || *out == "" || *arch == "" || (*bits != 32 && *bits != 64) || (flag.NArg() == 0) == (*cxxProbe == "" && *nbExports == "") || (*nbExports != "" && *nbArch == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -144,7 +145,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -203,7 +204,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -284,6 +285,18 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	g.checkRustAndroid()
 	g.checkDefines()
+	if nbExports != "" {
+		n := g.node(nbExports, NativeBridge(cfg.NativeBridge), Headers, "goal")
+		if n == nil {
+			return fmt.Errorf("-nb-exports %s: no native bridge variant: %s", nbExports, strings.Join(g.problems, "; "))
+		}
+		b, err := json.Marshal(n.exports)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
 	// Java tools given: Java goals are built (java.go)
 	if js.tools.JDK != "" {
 		if err := g.initJava(js.tools); err != nil {

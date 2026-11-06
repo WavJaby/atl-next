@@ -126,10 +126,6 @@ enum Command {
     ///
     /// Writes only under --dest; the out dir is read. Mesa's meson is then run as-is with `--native-file <dest>/native.ini`.
     MesaConfig(mesa::Args),
-    /// LLVM runtimes (libc++ noexcept, libunwind, libunwind-exported, compiler-rt builtins) for a bionic guest arch, by LLVM's CMake runtimes build of the pinned llvm-project, then the licence gate over everything they compiled.
-    ///
-    /// Variants mirror AOSP toolchain/llvm_android builders.py; output under <out>/upstream/llvm-project/<arch>/. Prints each Android.bp module with its archive and a PASS/FAIL verdict.
-    Runtimes(runtimes::Args),
     /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
     ///
     /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`.
@@ -267,7 +263,6 @@ fn main() -> Result<ExitCode> {
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::MesaConfig(args) => mesa::run(&root, &args),
-        Command::Runtimes(args) => runtimes::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),
