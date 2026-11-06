@@ -315,6 +315,29 @@ impl Index {
         }
     }
 
+    /// An index of plain modules: (name, module type, tree path of its blueprint file).
+    #[cfg(test)]
+    pub(crate) fn of_modules(defs: &[(&str, &str, &str)]) -> Index {
+        let mut modules: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
+        for (name, module_type, file) in defs {
+            modules
+                .entry((*name).to_owned())
+                .or_default()
+                .push(Definition {
+                    module_type: (*module_type).into(),
+                    project: parent_dir(file).into(),
+                    file: (*file).into(),
+                    namespace: None,
+                    defaults: vec![],
+                    license_kinds: None,
+                });
+        }
+        Index {
+            modules,
+            module_types: BTreeMap::new(),
+        }
+    }
+
     pub fn read(file: &Path) -> Result<Index> {
         let text = std::fs::read_to_string(file)
             .with_context(|| format!("no index {}: xtask aosp --index", file.display()))?;

@@ -10,8 +10,12 @@
 # [upstream.<name>]   a sources.toml upstream (`aosp`: every AOSP project, paths relative to the tree root)
 #   unlabelled     licence of its files that carry no licence header, from the upstream's LICENSE text. Not for `aosp`: an AOSP file's is derived from its Soong package, the nearest directory at or above it whose Android.bp declares a licence -- the kinds of that package's `license` modules and of every `license` module its `licenses` / `default_applicable_licenses` name, wherever defined (exactly one `SPDX-license-identifier-<id>` kind -> <id>; several kinds, none up to the project root, or an unresolvable reference -> no default)
 #   [upstream.<name>.paths."<path prefix>"]   licence (SPDX expression; LicenseRef-<name> for one the SPDX list lacks) + reason, for files whose notice the phrase rules cannot read; longest prefix wins, before any tag or notice
-# `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`).
+# [test_only.<module>]  an Android.bp test program (cc_test / cc_benchmark, checked against the AOSP module index) built only to test, never shipped: its device artifact is outside every [artifact.*] (CLAUDE.md: the gate's set is what reaches a shipped binary, like the NDK test fixtures). `reason`: what it tests. Its build dir may not be bound into a runtime root (atld_run refuses it).
+# `xtask native`'s licence gate applies this to every source and header linked into a device artifact (all `runtime`), test-only ones aside.
 # Rows are added when a compiled set first needs them.
+
+[test_only.deqp-binary]
+reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge, plan S11), run from the build dir; carries vulkancts and glslang (Bison parser) sources no runtime library links"
 
 [artifact.runtime]
 # BSD-2-Clause, BSD-3-Clause, ISC, public domain: owner decision 2026-10-31; all on the FSF list of GPL-3-compatible licences, so within a future qemu-bridge list.

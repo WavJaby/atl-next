@@ -36,6 +36,8 @@ pub struct Root {
 #[derive(Debug, Default)]
 pub struct Report {
     pub artifacts: usize,
+    /// Artifacts of `[test_only]` modules, not checked: never shipped.
+    pub test_only: usize,
     /// Files whose licence was resolved and checked.
     pub checked: usize,
     pub generated: usize,
@@ -55,14 +57,25 @@ impl Report {
 }
 
 /// Runs the gate over the build directory `out` (canonical). It runs after failed builds too, to report them: a state the build left behind is a report line, never an error.
-pub fn check(out: &Path, roots: &[Root], licenses: &Licenses) -> Result<Report> {
+/// Artifacts in `test_only` (licenses::test_only_outputs) are skipped: what they alone reach ships nowhere.
+pub fn check(
+    out: &Path,
+    roots: &[Root],
+    licenses: &Licenses,
+    test_only: &BTreeSet<PathBuf>,
+) -> Result<Report> {
     let device = out.join("device");
     let mut artifacts: Vec<PathBuf> = lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
         .map(PathBuf::from)
         .filter(|p| p.starts_with(&device) && p.is_file())
         .collect();
-    let stale = relinked(out, &artifacts);
     let mut report = Report::default();
+    artifacts.retain(|a| {
+        let keep = !test_only.contains(a);
+        report.test_only += usize::from(!keep);
+        keep
+    });
+    let stale = relinked(out, &artifacts);
     artifacts.retain(|a| {
         let keep = !stale.contains(a);
         if !keep {
@@ -787,7 +800,12 @@ mod tests {
             &["aosp".to_owned()].into(),
         )
         .unwrap();
-        let report = check(&std::fs::canonicalize(&out).unwrap(), &roots, &licenses);
+        let report = check(
+            &std::fs::canonicalize(&out).unwrap(),
+            &roots,
+            &licenses,
+            &BTreeSet::new(),
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
         let report = report.expect("the gate reports a stale artifact, it does not fail");
         assert_eq!(report.stale, [lib.display().to_string()]);
@@ -818,7 +836,13 @@ mod tests {
             key: "aosp".into(),
             prefix: PathBuf::new(),
         }];
-        check(&std::fs::canonicalize(out).unwrap(), &roots, &licenses).unwrap()
+        check(
+            &std::fs::canonicalize(out).unwrap(),
+            &roots,
+            &licenses,
+            &BTreeSet::new(),
+        )
+        .unwrap()
     }
 
     /// bp2ninja's Rust shape (rustc rule with dep-info depfile + `$crates`, a generated staticlib of `extern crate` roots): `device/libr.so` links `main.cpp.o` and `librustlibs.a`, built by rustc from root.rs (MIT) over the rlib `libdep.rlib` from dep.rs (LicenseRef-Bad) + its module dep_mod.rs (MIT).

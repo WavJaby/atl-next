@@ -28,6 +28,9 @@ pub struct Licenses {
     pub artifact: BTreeMap<String, Artifact>,
     #[serde(default)]
     pub upstream: BTreeMap<String, Upstream>,
+    /// Android.bp test modules never shipped (module name -> row): their device artifacts are outside every `[artifact.*]`.
+    #[serde(default)]
+    pub test_only: BTreeMap<String, TestOnly>,
     #[serde(skip)]
     pub(crate) aosp_index: AospIndex,
 }
@@ -65,6 +68,68 @@ impl AospIndex {
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
     pub allow: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestOnly {
+    /// What the program tests, and why it never ships.
+    pub reason: String,
+}
+
+/// Soong module types of test programs: what a `[test_only]` row may name (a library could be linked into a shipped artifact).
+const TEST_MODULE_TYPES: &[&str] = &["cc_test", "cc_benchmark"];
+
+/// Each `[test_only]` module's definitions in the AOSP module index: at least one, all of a test program type.
+pub fn check_test_only(licenses: &Licenses) -> Result<()> {
+    if licenses.test_only.is_empty() {
+        return Ok(());
+    }
+    let index = licenses.aosp_index.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+    for module in licenses.test_only.keys() {
+        let defs = index.definitions_of(module);
+        ensure!(
+            !defs.is_empty(),
+            "[test_only.{module}]: no such module in the AOSP tree"
+        );
+        for (ty, file) in defs {
+            ensure!(
+                TEST_MODULE_TYPES.contains(&ty),
+                "[test_only.{module}]: {file} defines it as {ty}, not a test program ({TEST_MODULE_TYPES:?})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The device artifacts of `[test_only]` modules in the converter build `out` (its graph.json `artifacts."device/<module>".out`); modules this build does not make are absent.
+pub fn test_only_outputs(licenses: &Licenses, out: &Path) -> Result<BTreeSet<PathBuf>> {
+    let file = out.join("graph.json");
+    let graph: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?,
+    )
+    .with_context(|| file.display().to_string())?;
+    Ok(licenses
+        .test_only
+        .keys()
+        .filter_map(|m| graph["artifacts"][format!("device/{m}")]["out"].as_str())
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Refuses host paths bound into a runtime root (`staged`: files, library dirs) that are, lie in, or contain the build dir of a test-only artifact: test programs never ship.
+pub fn refuse_test_only(staged: &[&Path], test_only: &BTreeSet<PathBuf>) -> Result<()> {
+    for s in staged {
+        for t in test_only {
+            let dir = t.parent().unwrap_or(t);
+            ensure!(
+                !s.starts_with(dir) && !dir.starts_with(s),
+                "{}: a test-only output ([test_only] in {FILE}) staged into a runtime root",
+                s.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +343,12 @@ pub(crate) fn parse(text: &str, upstreams: &BTreeSet<String>) -> Result<Licenses
             ensure!(!entry.reason.trim().is_empty(), "{at}: empty reason");
         }
     }
+    for (module, row) in &licenses.test_only {
+        ensure!(
+            !row.reason.trim().is_empty(),
+            "[test_only.{module}]: empty reason"
+        );
+    }
     check_bridge_superset(&licenses)?;
     Ok(licenses)
 }
@@ -344,6 +415,44 @@ mod tests {
     }
 
     const RUNTIME_MIT: &str = "[artifact.runtime]\nallow = [\"MIT\"]\n";
+
+    /// A row must name a test program the tree defines; a library (could be linked into a shipped artifact) or an unknown name fails.
+    #[test]
+    fn test_only_rows_checked_against_the_index() {
+        let with = |module: &str| {
+            let mut l = parse(
+                &format!("{RUNTIME_MIT}[test_only.{module}]\nreason = \"conformance runner\"\n"),
+                &upstreams(),
+            )
+            .unwrap();
+            l.aosp_index = AospIndex::of(crate::aosp::Index::of_modules(&[
+                ("deqp-binary", "cc_test", "external/deqp/Android.bp"),
+                ("libdeqp", "cc_library_static", "external/deqp/Android.bp"),
+            ]));
+            check_test_only(&l).map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(with("deqp-binary"), Ok(()));
+        assert!(with("libdeqp").unwrap_err().contains("not a test program"));
+        assert!(with("nosuch").unwrap_err().contains("no such module"));
+        assert!(
+            err(&format!("{RUNTIME_MIT}[test_only.x]\nreason = \" \"\n")).contains("empty reason")
+        );
+    }
+
+    /// The staging guard fires on the artifact, a file beside it and a dir holding it; an unrelated path passes.
+    #[test]
+    fn test_only_outputs_refused_in_a_runtime_root() {
+        let t: BTreeSet<PathBuf> = [PathBuf::from("/o/device/deqp-binary/deqp-binary64")].into();
+        for bad in [
+            "/o/device/deqp-binary/deqp-binary64",
+            "/o/device/deqp-binary/data/x",
+            "/o/device",
+        ] {
+            let e = refuse_test_only(&[Path::new(bad)], &t).unwrap_err();
+            assert!(format!("{e}").contains("test-only output"), "{bad}");
+        }
+        assert!(refuse_test_only(&[Path::new("/o/device/libui/libui.so")], &t).is_ok());
+    }
 
     #[test]
     fn runtime_bridge_and_unlabelled() {

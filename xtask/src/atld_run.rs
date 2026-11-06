@@ -60,6 +60,8 @@ pub struct Runtime {
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
     app_seccomp: bool,
+    /// The build's `[test_only]` artifacts (licenses.toml): never bound into the runtime root.
+    test_only: std::collections::BTreeSet<PathBuf>,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -242,7 +244,11 @@ impl Runtime {
                 isa: host.to_owned(),
             })
             .collect();
+        let licenses =
+            crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
+        let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
         Ok(Runtime {
+            test_only,
             native_bridge,
             abis,
             art,
@@ -470,6 +476,20 @@ impl Runtime {
             std::fs::remove_dir_all(&run.root)
                 .with_context(|| format!("removing {}", run.root.display()))?;
         }
+        let keychars: Vec<PathBuf> = farm::KEYBOARD_FILES
+            .iter()
+            .map(|(file, _)| self.keychars.join(file))
+            .collect();
+        let mut staged: Vec<&Path> = vec![
+            &self.art.lib_path,
+            &self.native_bridge,
+            &self.framework_res,
+            &self.font_xml,
+            &self.font_file,
+        ];
+        staged.extend(keychars.iter().map(PathBuf::as_path));
+        staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
+        crate::licenses::refuse_test_only(&staged, &self.test_only)?;
         // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
         let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
         lib_path.push(":");

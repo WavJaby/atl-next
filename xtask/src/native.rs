@@ -853,7 +853,12 @@ fn licence_gate(
     let licenses = licenses::load(root, &sources.upstream_names())?;
     let roots = licence_gate::roots(layout, &sources.checkouts(None));
     let out = std::fs::canonicalize(out)?;
-    let report = licence_gate::check(&out, &roots, &licenses)?;
+    licenses::check_test_only(&licenses)?;
+    let test_only = licenses::test_only_outputs(&licenses, &out)?
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect();
+    let report = licence_gate::check(&out, &roots, &licenses, &test_only)?;
     let first = licence_report("licence gate", &report, verbose);
     let Some(build) = mesa_build else {
         return Ok(first);
@@ -871,8 +876,9 @@ fn licence_gate(
 /// Prints a licence gate report under `label`; its first problem, None when it passes.
 fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> Option<String> {
     println!(
-        "native: {label}: {} artifacts, {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
+        "native: {label}: {} artifacts ({} test-only skipped), {} files checked, not checked: {} generated, {} system, {} stale artifacts; {} licences denied, {} files unresolved",
         report.artifacts,
+        report.test_only,
         report.checked,
         report.generated,
         report.system,
