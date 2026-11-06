@@ -1,33 +1,84 @@
 // SPDX-License-Identifier: MIT
-//! Transactions the services do not implement, counted per (interface, method). Each count also goes to stderr as `services: unimplemented <interface>.<method> <n> at=<stamp>`,
-//! `<stamp>` being [`wall_stamp`] (the app log's clock; xtask's atld_run.rs `events` reads the lines). A process killed at the end of a test prints no summary.
+//! Counted calls the services log, one stderr line each: `services: <kind> <interface>.<method> <n> at=<stamp>`. The kind says what the call got:
+//! `unimplemented` (no implementation: UNKNOWN_TRANSACTION), `answered` (served, but worth a count: a no-op, a null by design, a drop), `refused` (a request the service cannot serve), `sent` (an outgoing call).
+//! `<stamp>` is [`wall_stamp`], the app log's clock; xtask's atld_run.rs `events` reads the lines. A process killed at the end of a test prints no summary.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Mutex;
 
-static COUNTS: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
+/// What a counted call got: the label after `services: ` on its line. xtask's atld_run.rs `events` parses these spellings (its KINDS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    Unimplemented,
+    Answered,
+    Refused,
+    Sent,
+}
 
-/// Counts one call of `method` on `interface` and returns the new count.
-pub fn count(interface: &'static str, method: &str) -> u64 {
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Unimplemented => "unimplemented",
+            Kind::Answered => "answered",
+            Kind::Refused => "refused",
+            Kind::Sent => "sent",
+        }
+    }
+}
+
+static COUNTS: Mutex<BTreeMap<(Kind, &'static str, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// One counted line, without its newline.
+fn line(kind: Kind, interface: &str, method: &str, n: u64, stamp: &str) -> String {
+    format!(
+        "services: {} {interface}.{method} {n} at={stamp}",
+        kind.label()
+    )
+}
+
+/// Counts one call of `method` on `interface` under `kind`, writes its line, returns the new count.
+fn emit(kind: Kind, interface: &'static str, method: &str) -> u64 {
     // a poisoned map still counts: it holds plain numbers
     let mut map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-    let n = map.entry((interface, method.to_owned())).or_insert(0);
+    let n = map.entry((kind, interface, method.to_owned())).or_insert(0);
     *n += 1;
     let n = *n;
     drop(map);
     let _ = writeln!(
         std::io::stderr(),
-        "services: unimplemented {interface}.{method} {n} at={}",
-        wall_stamp()
+        "{}",
+        line(kind, interface, method, n, &wall_stamp())
     );
     n
 }
 
-/// The counts so far.
-pub fn counts() -> Vec<(&'static str, String, u64)> {
+/// A call the service does not implement. Counted; the caller answers UNKNOWN_TRANSACTION.
+pub fn count_unimplemented(interface: &'static str, method: &str) -> u64 {
+    emit(Kind::Unimplemented, interface, method)
+}
+
+/// A call the service served that is worth a count: a no-op, a null by design, a drop, a relaunch. Never unimplemented.
+pub fn answered(interface: &'static str, method: &str) -> u64 {
+    emit(Kind::Answered, interface, method)
+}
+
+/// Counts one outgoing call the services made (`call` on a client's binder, e.g. IInputMethod.bindInput), so `unimplemented` keeps meaning unimplemented.
+pub fn sent(interface: &'static str, call: &str) -> u64 {
+    emit(Kind::Sent, interface, call)
+}
+
+/// Counts one call of `method` on `interface` that the service refuses (a request it cannot serve: a null argument, an unknown window).
+pub fn refused(interface: &'static str, method: &str) -> u64 {
+    emit(Kind::Refused, interface, method)
+}
+
+/// The counts so far, in key order: (kind, interface, method, count).
+pub fn counts() -> Vec<(Kind, &'static str, String, u64)> {
     let map = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-    map.iter().map(|((i, m), n)| (*i, m.clone(), *n)).collect()
+    map.iter()
+        .map(|((kind, interface, method), n)| (*kind, *interface, method.clone(), *n))
+        .collect()
 }
 
 /// The wall clock as logcat stamps lines (`secs.mmm`): the clock of the app's log, which the window gate orders counter lines against.
@@ -38,47 +89,11 @@ pub fn wall_stamp() -> String {
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
-static SENT: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
-
-/// Counts one outgoing call the services made (`call` on a client's binder, e.g. IInputMethod.bindInput), so `unimplemented` keeps meaning unimplemented. Written to stderr as
-/// `services: sent <interface>.<call> <n> at=<stamp>`; xtask reads it as the `sent` kind (atld_run.rs `events`).
-pub fn sent(interface: &'static str, call: &str) -> u64 {
-    let mut map = SENT.lock().unwrap_or_else(|e| e.into_inner());
-    let n = map.entry((interface, call.to_owned())).or_insert(0);
-    *n += 1;
-    let n = *n;
-    drop(map);
-    let _ = writeln!(
-        std::io::stderr(),
-        "services: sent {interface}.{call} {n} at={}",
-        wall_stamp()
-    );
-    n
-}
-
-static REFUSED: Mutex<BTreeMap<(&'static str, String), u64>> = Mutex::new(BTreeMap::new());
-
-/// Counts one call of `method` on `interface` that the service refuses (a request it cannot serve: a null argument, an unknown window). Each hit is also written to stderr as
-/// `services: refused <interface>.<method> <n> at=<stamp>`; xtask reads these lines as the `refused` kind (atld_run.rs `events`), next to the parcelables' refusals.
-pub fn refused(interface: &'static str, method: &str) -> u64 {
-    let mut map = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    let n = map.entry((interface, method.to_owned())).or_insert(0);
-    *n += 1;
-    let n = *n;
-    drop(map);
-    let _ = writeln!(
-        std::io::stderr(),
-        "services: refused {interface}.{method} {n} at={}",
-        wall_stamp()
-    );
-    n
-}
-
 /// The stubs' `unimplemented` hook: counted, then UNKNOWN_TRANSACTION (frameworks/base core/java/android/os/Binder.java onTransact returns false for a code it does not know,
 /// which the caller sees as UNKNOWN_TRANSACTION; a Java proxy then reads an empty reply: no exception, a null / zero result).
 #[cfg(feature = "converter")]
 pub fn unimplemented(interface: &'static str, method: &str) -> binder::Status {
-    count(interface, method);
+    count_unimplemented(interface, method);
     binder::StatusCode::UNKNOWN_TRANSACTION.into()
 }
 
@@ -87,14 +102,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_per_interface_and_method() {
-        assert_eq!(count("ITest", "a"), 1);
-        assert_eq!(count("ITest", "a"), 2);
-        assert_eq!(count("ITest", "b"), 1);
-        assert_eq!(count("IOther", "a"), 1);
+    fn counts_per_kind_interface_and_method() {
+        assert_eq!(count_unimplemented("ITest", "a"), 1);
+        assert_eq!(count_unimplemented("ITest", "a"), 2);
+        assert_eq!(count_unimplemented("ITest", "b"), 1);
+        assert_eq!(count_unimplemented("IOther", "a"), 1);
+        assert_eq!(answered("ITest", "a"), 1);
         let c = counts();
-        assert!(c.contains(&("ITest", "a".to_owned(), 2)));
-        assert!(c.contains(&("IOther", "a".to_owned(), 1)));
+        assert!(c.contains(&(Kind::Unimplemented, "ITest", "a".to_owned(), 2)));
+        assert!(c.contains(&(Kind::Answered, "ITest", "a".to_owned(), 1)));
+    }
+
+    /// The spellings xtask's atld_run.rs `events` parses: one format across the two crates.
+    #[test]
+    fn labels_are_the_xtask_prefixes() {
+        assert_eq!(Kind::Unimplemented.label(), "unimplemented");
+        assert_eq!(Kind::Answered.label(), "answered");
+        assert_eq!(Kind::Refused.label(), "refused");
+        assert_eq!(Kind::Sent.label(), "sent");
+    }
+
+    #[test]
+    fn line_is_the_xtask_format() {
+        assert_eq!(
+            line(
+                Kind::Answered,
+                "IInputMethodManager",
+                "addClient",
+                2,
+                "100.000"
+            ),
+            "services: answered IInputMethodManager.addClient 2 at=100.000"
+        );
     }
 
     /// The stamp is logcat's shape: `secs.mmm`, three digits of milliseconds.

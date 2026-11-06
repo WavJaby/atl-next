@@ -86,7 +86,7 @@ impl State {
         clients.remove(&uid);
         let left = clients.len();
         drop(clients);
-        counters::count(INTERFACE, "client died");
+        counters::answered(INTERFACE, "client died");
         let _ = writeln!(
             std::io::stderr(),
             "services: input_method client uid={uid} pid={pid} died; entry removed, {left} clients left"
@@ -140,7 +140,7 @@ impl Peer for Remote<'_> {
             .and_then(|agent| agent.input_method().ok().flatten())
             .and_then(|b| b.into_interface::<dyn IInputMethod>().ok());
         let Some(method) = method else {
-            counters::count(INTERFACE, "bind: the app serves no input method");
+            counters::answered(INTERFACE, "bind: the app serves no input method");
             return false;
         };
         sent(
@@ -241,7 +241,7 @@ fn with_client(
 ) {
     let mut clients = state.clients();
     let Some(c) = clients.get_mut(&uid) else {
-        counters::count(INTERFACE, "call for a client never added");
+        counters::answered(INTERFACE, "call for a client never added");
         return;
     };
     let Client {
@@ -277,7 +277,7 @@ impl IInputMethodSessionCallback for SessionCallback {
 
     fn r#sessionCreated(&self, session: Option<&Session>) -> binder::Result<()> {
         let Some(session) = session.cloned() else {
-            counters::count(INTERFACE, "sessionCreated with no session");
+            counters::answered(INTERFACE, "sessionCreated with no session");
             return Ok(());
         };
         with_client(&self.state, self.uid, |bind, remote| {
@@ -331,7 +331,7 @@ impl IInputMethodManager for InputMethodManager {
         _input_connection: Option<&Strong<dyn IRemoteInputConnection>>,
         _untrusted_display_id: i32,
     ) -> binder::Result<()> {
-        counters::count(INTERFACE, "addClient");
+        counters::answered(INTERFACE, "addClient");
         let Some(client) = client.cloned() else {
             return Ok(());
         };
@@ -390,7 +390,7 @@ impl IInputMethodManager for InputMethodManager {
         _use_async_show_hide_method: bool,
     ) -> binder::Result<()> {
         let Some(client) = client else {
-            counters::count(
+            counters::answered(
                 INTERFACE,
                 "startInputOrWindowGainedFocusAsync with no client",
             );
@@ -431,7 +431,7 @@ impl IInputMethodManager for InputMethodManager {
         _reason: i32,
         _async: bool,
     ) -> binder::Result<bool> {
-        counters::count(INTERFACE, "showSoftInput (false: no IME)");
+        counters::answered(INTERFACE, "showSoftInput (false: no IME)");
         Ok(false)
     }
 
@@ -447,7 +447,7 @@ impl IInputMethodManager for InputMethodManager {
         _reason: i32,
         _async: bool,
     ) -> binder::Result<bool> {
-        counters::count(INTERFACE, "hideSoftInput (false: no IME)");
+        counters::answered(INTERFACE, "hideSoftInput (false: no IME)");
         Ok(false)
     }
 
@@ -462,7 +462,7 @@ impl IInputMethodManager for InputMethodManager {
             >,
         >,
     > {
-        counters::count(INTERFACE, "getImeTrackerService (null: no IME tracker)");
+        counters::answered(INTERFACE, "getImeTrackerService (null: no IME tracker)");
         Ok(None)
     }
 

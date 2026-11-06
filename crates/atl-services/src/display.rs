@@ -103,7 +103,7 @@ impl DisplayCallbacks {
             match callback.r#onDisplayEvent(DEFAULT_DISPLAY, EVENT_DISPLAY_BASIC_CHANGED) {
                 Ok(()) => told += 1,
                 Err(e) => {
-                    counters::count(INTERFACE, &format!("onDisplayEvent failed: {e}"));
+                    counters::answered(INTERFACE, &format!("onDisplayEvent failed: {e}"));
                 }
             }
         }

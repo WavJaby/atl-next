@@ -36,7 +36,7 @@ fn on_transact(
     if code == SET_TRANSACTION_STATE {
         return service.set_transaction_state(data);
     }
-    counters::count(INTERFACE, &format!("code {code}"));
+    counters::count_unimplemented(INTERFACE, &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

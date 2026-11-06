@@ -71,7 +71,7 @@ impl RegisteredAgent {
     /// The app's UI agent; None, counted under `call`, when the app registered no agent or it is not an IUiAgent.
     fn agent(&self, call: &str) -> Option<Strong<dyn IUiAgent>> {
         let Some(binder) = self.agents.get(self.uid) else {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("{call}: no UI agent registered for the app's uid"),
             );
@@ -80,7 +80,7 @@ impl RegisteredAgent {
         match binder.into_interface() {
             Ok(agent) => Some(agent),
             Err(e) => {
-                counters::count(
+                counters::answered(
                     WINDOW_SESSION,
                     &format!("{call}: registered UI agent is not an IUiAgent: {e:?}"),
                 );
@@ -95,7 +95,7 @@ impl RegisteredAgent {
         match agent.window_surface(title) {
             Ok(surface) => Some(surface),
             Err(e) => {
-                counters::count(
+                counters::answered(
                     WINDOW_SESSION,
                     &format!("relayout: UI agent refused the window surface: {e:?}"),
                 );
@@ -112,7 +112,7 @@ impl RegisteredAgent {
         match agent.window_position(layer_id, x, y) {
             Ok(()) => true,
             Err(e) => {
-                counters::count(
+                counters::answered(
                     WINDOW_SESSION,
                     &format!("relayout: UI agent refused the window position: {e:?}"),
                 );
@@ -134,7 +134,7 @@ impl RegisteredAgent {
             bounds.right - bounds.left,
             bounds.bottom - bounds.top,
         ) {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("relayout: UI agent refused the dim layer: {e:?}"),
             );
@@ -147,7 +147,7 @@ impl RegisteredAgent {
             return;
         };
         if let Err(e) = agent.task(task.raw()) {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("addToDisplayAsUser: UI agent refused the task: {e:?}"),
             );
@@ -162,7 +162,7 @@ impl RegisteredAgent {
         match agent.input_server(token, fd, flags) {
             Ok(()) => true,
             Err(e) => {
-                counters::count(
+                counters::answered(
                     WINDOW_SESSION,
                     &format!("addToDisplayAsUser: UI agent refused the input server end: {e:?}"),
                 );
@@ -177,7 +177,7 @@ impl RegisteredAgent {
             return;
         };
         if let Err(e) = agent.remove_input(token) {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("remove: UI agent refused the input removal: {e:?}"),
             );
@@ -253,7 +253,7 @@ impl IWindowManager for WindowManager {
     /// (ViewRootImpl.ensureTouchMode:7233-7242), and an error there is a RuntimeException in the app. No other app window shares this display process's input: accept.
     fn r#setInTouchMode(&self, _in_touch: bool, _display_id: i32) -> binder::Result<()> {
         // counted: the window gate's input stage requires this line (xtask window.rs touch_mode_check)
-        counters::count(WINDOW_MANAGER, "setInTouchMode (answered)");
+        counters::answered(WINDOW_MANAGER, "setInTouchMode (answered)");
         Ok(())
     }
 
@@ -497,7 +497,7 @@ impl IWindowSession for Session {
         ));
         // WMS dispatches the app's visibility to its windows (WindowState's app visibility): ViewRootImpl draws only while its app is visible, and it starts out not.
         if let Err(e) = window.r#dispatchAppVisibility(true) {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("addToDisplayAsUser: dispatchAppVisibility refused: {e:?}"),
             );
@@ -687,7 +687,7 @@ impl IWindowSession for Session {
             self.lock().iter().any(|x| x.client == client)
         });
         if !known {
-            counters::count(WINDOW_SESSION, "finishDrawing: not this session's window");
+            counters::answered(WINDOW_SESSION, "finishDrawing: not this session's window");
             return Ok(());
         }
         let Some(t) = post_draw.filter(|t| t.present) else {
@@ -697,7 +697,7 @@ impl IWindowSession for Session {
             return Ok(());
         };
         if let Err(e) = agent.post_draw_transaction(t) {
-            counters::count(
+            counters::answered(
                 WINDOW_SESSION,
                 &format!("finishDrawing: UI agent refused the post-draw transaction: {e:?}"),
             );
@@ -747,7 +747,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
         {
             Ok(window) => window,
             Err(e) => {
-                counters::count(
+                counters::answered(
                     WINDOW_SESSION,
                     &format!("resized: client is not an IWindow: {e:?}"),
                 );
@@ -769,7 +769,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
             false,
             None,
         ) {
-            counters::count(WINDOW_SESSION, &format!("resized: IWindow refused: {e:?}"));
+            counters::answered(WINDOW_SESSION, &format!("resized: IWindow refused: {e:?}"));
         }
     }
     clients.len()

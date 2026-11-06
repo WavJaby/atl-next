@@ -196,7 +196,7 @@ impl IHandWritten for SensorServer {
                 let mode: i32 = data.read()?;
                 // SensorService::createSensorEventConnection (:1581): a mode other than NORMAL needs the service in that injection mode, which it never is -> null
                 if mode != MODE_NORMAL {
-                    counters::count(SERVER, &format!("createSensorEventConnection mode {mode}"));
+                    counters::answered(SERVER, &format!("createSensorEventConnection mode {mode}"));
                     return reply.write(&None::<SpIBinder>);
                 }
                 let channel = Channel::open().map_err(|_| StatusCode::NO_MEMORY)?;
@@ -213,7 +213,7 @@ impl IHandWritten for SensorServer {
             | ENABLE_REPLAY_DATA_INJECTION
             | ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION => reply.write(&0i32),
             _ => {
-                counters::count(SERVER, &format!("code {code}"));
+                counters::count_unimplemented(SERVER, &format!("code {code}"));
                 Err(StatusCode::UNKNOWN_TRANSACTION)
             }
         }
@@ -277,7 +277,7 @@ impl IConnection for EventConnection {
             }
             _ => {
                 // FLUSH_SENSOR (flush-complete meta events), CONFIGURE_CHANNEL (direct channels only: INVALID_OPERATION in AOSP too)
-                counters::count(CONNECTION, &format!("code {code}"));
+                counters::count_unimplemented(CONNECTION, &format!("code {code}"));
                 Err(StatusCode::UNKNOWN_TRANSACTION)
             }
         }

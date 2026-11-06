@@ -138,7 +138,7 @@ impl IInputManager for InputManager {
             >,
         >,
     ) -> binder::Result<()> {
-        counters::count(INTERFACE, "registerInputDevicesChangedListener (not kept)");
+        counters::answered(INTERFACE, "registerInputDevicesChangedListener (not kept)");
         Ok(())
     }
 
@@ -157,7 +157,7 @@ impl IInputManager for InputManager {
             .get(ThreadState::get_calling_uid())
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok());
         let (Some(icon), Some(agent)) = (icon, agent) else {
-            counters::count(INTERFACE, "setPointerIcon (no icon or no UI agent)");
+            counters::answered(INTERFACE, "setPointerIcon (no icon or no UI agent)");
             return Ok(false);
         };
         Ok(agent.pointer_icon(icon.kind).is_ok())
