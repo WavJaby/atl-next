@@ -3,9 +3,9 @@
 //! The bracket makes CPU caches coherent; it does not wait for GPU rendering (WSL software drivers return before the render lands) -- the producer must finish or fence before queueBuffer, and a reader waits on the acquire fence first.
 
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 
-use rustix::ioctl::{self, Setter, opcode};
+use rustix::ioctl::{self, Setter, Updater, opcode};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
 /// `struct dma_buf_sync` (linux/dma-buf.h): `__u64 flags`.
@@ -39,6 +39,35 @@ pub fn begin_cpu_access(fd: BorrowedFd<'_>, direction: u64) -> io::Result<()> {
 /// Ends CPU access that began with `direction`: the kernel makes the CPU's writes visible to the device.
 pub fn end_cpu_access(fd: BorrowedFd<'_>, direction: u64) -> io::Result<()> {
     sync(fd, SYNC_END | direction)
+}
+
+/// `struct dma_buf_export_sync_file` (linux/dma-buf.h, kernel 6.0+): `__u32 flags; __s32 fd;`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// The fences of `fd`'s implicit-sync reservation as one sync_file (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` = `_IOWR('b', 2, struct dma_buf_export_sync_file)`).
+/// `direction` = the access the caller is about to make: `SYNC_WRITE` waits for every reader and writer (what a producer reusing the buffer needs), `SYNC_READ` only for writers. A dma-buf with no fences gives an already-signalled sync_file; a non-dma-buf fd fails with ENOTTY.
+pub fn export_sync_file(fd: BorrowedFd<'_>, direction: u64) -> io::Result<OwnedFd> {
+    let flags =
+        u32::try_from(direction).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut arg = DmaBufExportSyncFile { flags, fd: -1 };
+    // SAFETY: the opcode is DMA_BUF_IOCTL_EXPORT_SYNC_FILE (`_IOWR('b', 2, struct dma_buf_export_sync_file)`); the kernel reads `flags` and writes `fd` of the `#[repr(C)]` mirror above, which outlives the call.
+    let req = unsafe {
+        Updater::<{ opcode::read_write::<DmaBufExportSyncFile>(b'b', 2) }, DmaBufExportSyncFile>::new(
+            &mut arg,
+        )
+    };
+    // SAFETY: `req` is a well-formed request (above).
+    unsafe { ioctl::ioctl(fd, req) }.map_err(io::Error::from)?;
+    if arg.fd < 0 {
+        return Err(io::Error::other("the kernel returned no sync_file"));
+    }
+    // SAFETY: on success the kernel installed a new descriptor `arg.fd` in this process that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
 }
 
 /// A shared, read-write mapping of a file descriptor, unmapped on drop.

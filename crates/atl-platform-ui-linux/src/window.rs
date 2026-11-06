@@ -2,12 +2,14 @@
 //! `GtkWindow`: a `GtkWindow` whose only content is the `SceneView`, with its GdkFrameClock as the `FrameClock` and pointer controllers as the `InputSource`.
 
 use std::cell::{Cell, RefCell};
+use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::time::Duration;
 
+use atl_gralloc_dmabuf::{SYNC_WRITE, export_sync_file};
 use atl_platform_ui_api::{
-    Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Locks, Monitor, PhysSize,
-    PointerPhase, PresentError, Presented, Scale, Scene, TouchPhase, UiError, Window,
+    Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Locks, Monitor, Painted,
+    PhysSize, PointerPhase, PresentError, QuadRelease, Scale, Scene, TouchPhase, UiError, Window,
     WindowAttributes,
 };
 use gtk4::glib::translate::ToGlibPtr;
@@ -73,6 +75,64 @@ struct Shared {
     swiping: Cell<bool>,
     /// Contact ids of the touch sequences down.
     touch_ids: RefCell<input::TouchIds>,
+    on_painted: Slot<dyn FnMut(Painted)>,
+    /// The buffers the presented scene samples.
+    shown: RefCell<Vec<scene::Shown>>,
+    /// Buffers a present replaced: GSK may still draw them until the next paint; released at its after-paint.
+    retired: RefCell<Vec<scene::Shown>>,
+    /// A present waits for its paint: the next after-paint reports.
+    paint_pending: Cell<bool>,
+    releases: RefCell<ReleaseStats>,
+}
+
+/// What the after-paint release did, for the gate: buffers released, of those with an exported read fence, and exports that failed (released with no fence).
+#[derive(Default)]
+struct ReleaseStats {
+    painted: u64,
+    released: u64,
+    fenced: u64,
+    unfenced: u64,
+}
+
+impl Shared {
+    /// After-paint of a frame that followed a present: the buffers that frame no longer shows go back, each with the reservation fences of its dma-buf as release fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` for a write: every pending GPU read of it, by this paint or an earlier one; design §3.4).
+    /// A driver that attaches no implicit fences (WSL: GSK on llvmpipe, which finishes rendering before the swap) yields an already-signalled fence.
+    fn painted(&self) {
+        if !self.paint_pending.replace(false) {
+            return;
+        }
+        let retired = std::mem::take(&mut *self.retired.borrow_mut());
+        let mut stats = self.releases.borrow_mut();
+        stats.painted += 1;
+        let releases = retired
+            .into_iter()
+            .map(|s| {
+                stats.released += 1;
+                let release_fence = match export_sync_file(s.dmabuf.as_fd(), SYNC_WRITE) {
+                    Ok(fence) => {
+                        stats.fenced += 1;
+                        Some(fence)
+                    }
+                    Err(e) => {
+                        stats.unfenced += 1;
+                        tracing::warn!(
+                            "atl-platform-ui: layer {} buffer {:#x}: no read fence: {e}",
+                            s.layer_id,
+                            s.buffer_key
+                        );
+                        None
+                    }
+                };
+                QuadRelease {
+                    layer_id: s.layer_id,
+                    buffer_key: s.buffer_key,
+                    release_fence,
+                }
+            })
+            .collect();
+        drop(stats);
+        self.on_painted.call(|f| f(Painted { releases }));
+    }
 }
 
 impl Shared {
@@ -85,8 +145,13 @@ impl Shared {
         self.last_tick_us.set(Some(time_us));
         let report = self.stats.borrow_mut().count(idle, time_us);
         if let Some((paced, idle_ticks, elapsed_us)) = report {
+            let r = self.releases.borrow();
             tracing::info!(
-                "atl-platform-ui: frame clock paced={paced} idle={idle_ticks} over_us={elapsed_us}"
+                "atl-platform-ui: frame clock paced={paced} idle={idle_ticks} over_us={elapsed_us} painted={} released={} fenced={} unfenced={}",
+                r.painted,
+                r.released,
+                r.fenced,
+                r.unfenced
             );
         }
         let time_ns = u64::try_from(time_us).unwrap_or(0) * NS_PER_US;
@@ -134,6 +199,8 @@ impl GtkWindow {
                     on_update.tick(clock.frame_time(), false);
                 }
             });
+            let on_after_paint = Rc::clone(&shared);
+            clock.connect_after_paint(move |_| on_after_paint.painted());
             // a frame asked for before the window had a clock
             if shared.frame_requested.get() {
                 clock.request_phase(gdk::FrameClockPhase::UPDATE);
@@ -328,6 +395,11 @@ impl Window for GtkWindow {
             last_tick_us: Cell::new(None),
             idle_timer: RefCell::new(None),
             stats: RefCell::new(pacing::TickStats::default()),
+            on_painted: Slot::new(),
+            shown: RefCell::default(),
+            retired: RefCell::default(),
+            paint_pending: Cell::new(false),
+            releases: RefCell::default(),
         });
         let window = gtk4::Window::new();
         let view = SceneView::new();
@@ -443,8 +515,25 @@ impl Window for GtkWindow {
             .is_some_and(|t| t.state().intersects(fixed))
     }
 
-    fn present(&self, scene: &Scene) -> Result<Presented, PresentError> {
-        self.view.show_node(scene::build(scene)?);
+    fn present(&self, scene: &Scene) -> Result<(), PresentError> {
+        let (node, shown) = scene::build(&WidgetExt::display(&self.window), scene)?;
+        self.view.show_node(node);
+        // a buffer still in the new scene stays shown; the rest is retired until the paint that stops drawing it
+        let old = std::mem::replace(&mut *self.shared.shown.borrow_mut(), shown);
+        let still = |s: &scene::Shown| {
+            self.shared
+                .shown
+                .borrow()
+                .iter()
+                .any(|n| n.buffer_key == s.buffer_key)
+        };
+        let gone: Vec<_> = old.into_iter().filter(|s| !still(s)).collect();
+        let mut retired = self.shared.retired.borrow_mut();
+        // retired by an earlier present of this frame and shown again: not released
+        retired.retain(|s| !still(s));
+        retired.extend(gone);
+        drop(retired);
+        self.shared.paint_pending.set(true);
         self.shared.presented.set(true);
         let origin = (!self.origin_logged.get() && self.is_mapped())
             .then(|| self.content_origin())
@@ -454,8 +543,11 @@ impl Window for GtkWindow {
             tracing::info!("atl-platform-ui: content origin x={x} y={y}");
         }
         mirror::resync();
-        // step 1: scene::build copied every buffer into a memory texture, so nothing is released later
-        Ok(Presented::default())
+        Ok(())
+    }
+
+    fn on_painted<F: FnMut(Painted) + 'static>(&self, on_painted: F) {
+        self.shared.on_painted.set(Box::new(on_painted));
     }
 
     fn capture(&self) -> Result<Capture, UiError> {

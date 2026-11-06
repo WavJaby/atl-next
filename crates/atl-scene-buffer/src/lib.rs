@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Reading a Scene buffer's pixels on the CPU. The only `unsafe` is borrowing a quad's descriptor; mapping and the dma-buf CPU-access bracket are atl-gralloc-dmabuf's.
+//! A Scene buffer as an importer sees it ([`DmabufView`]: the window's dmabuf texture) and as the CPU reads it ([`read_pixels`]: the headless sink's readback, the CPU reference of tests); the acquire-fence poll the compositor latches by ([`fence_signalled`]).
+//! The only `unsafe` is borrowing a quad's descriptor; mapping and the dma-buf CPU-access bracket are atl-gralloc-dmabuf's.
 //! A quad's buffer is a gralloc handle (`atl-gralloc` `handle`): fd 0 is the dma-buf (or, in tests and for software producers, any mappable file such as a memfd) holding linear RGBA_8888 or RGBX_8888 rows of `stride` pixels.
-//! Step 1 maps it, brackets the read with the CPU-access sync, and copies the rows out; step 2 hands the dma-buf to the compositor as a texture instead. The sync does not wait for GPU rendering: the acquire fence does ([`fence_signalled`] before [`read_pixels`]).
+//! The CPU-access sync does not wait for GPU rendering: the acquire fence does (the compositor latches only signalled buffers).
 
 use std::io;
 use std::os::fd::BorrowedFd;

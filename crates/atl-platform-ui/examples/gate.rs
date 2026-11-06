@@ -3,10 +3,11 @@
 //! The harness reads this program's stdout (one `KEY value...` line per event) and the raw RGBA captures it writes to `--out`; it checks them against its own implementation of the pattern below, not against this program.
 //!
 //! Phases, in order:
-//! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
+//! Buffers are real dma-bufs from gralloc's GBM backend (WSL: vgem), linear, with handle ints as the allocator writes them: the window imports them as dmabuf textures.
+//! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with at least `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
 //! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`. Then the resize probe: `set_size` larger then smaller, each size the content gets as `RESIZED`; on a
 //!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
-//! 3. refusals: an unsignalled acquire fence and a bad-stride buffer are refused, the signalled fence is accepted.
+//! 3. refusals + release: a handle whose pitch is shorter than a row and one with a fourcc the table does not have are refused (never a CPU fallback); a scene that replaces the frame buffer releases it at the next paint, with a read fence (`RELEASES`).
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
 //! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
 
@@ -14,15 +15,19 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
-use atl_gralloc::format::RGBA_8888;
+use atl_gralloc::descriptor::Checked;
+use atl_gralloc::format::{self, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
+use atl_gralloc::handle::Params;
+use atl_gralloc_dmabuf::{Mapping, SYNC_WRITE, begin_cpu_access, end_cpu_access};
+use atl_gralloc_service::backend::Backend;
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
     ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, PhysRect, PhysSize, PlatformUi,
@@ -44,7 +49,6 @@ use clap::Parser;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::io::{read, write};
-use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use rustix::time::Timespec;
 
 #[derive(Parser)]
@@ -82,6 +86,12 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 const FIXED_TICKS: u32 = 2;
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
 const COMPOSITE_FRAMES: [u32; 5] = [100, 101, 102, 103, 104];
+/// Phase 3's two full-window buffers: the first is shown, then replaced by the second (distinct from every other buffer id, so a release names one buffer).
+const RELEASE_FRAMES: [u32; 2] = [200, 201];
+/// Where gralloc's backend looks for a DRM node that allocates.
+const DRM_DIR: &str = "/dev/dri";
+/// Size of the stand-in metadata page fd: one 4 KiB page, what the mapper's page is (present only checks the fd exists).
+const METADATA_PAGE_BYTES: u64 = 4096;
 /// The composite scene's colour layers (layer 5 opaque, layer 6 at alpha 0.5): components that are whole multiples of 1/255 (51, 102, 153; 255, 0, 0), so the harness expects exact bytes.
 const COMPOSITE_COLOUR: [f32; 3] = [0.2, 0.4, 0.6];
 const COMPOSITE_FADED_COLOUR: [f32; 3] = [1.0, 0.0, 0.0];
@@ -103,37 +113,68 @@ fn emit(line: std::fmt::Arguments<'_>) {
     let _ = out.flush();
 }
 
-/// A memfd holding `width` x `height` pixels of `frame`'s pattern in rows of `width + STRIDE_PAD_PIXELS`, as a gralloc-shaped buffer. The fd must outlive the present call.
-fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Arc<SceneBuffer>)> {
-    let stride = width + STRIDE_PAD_PIXELS;
-    let mut bytes = Vec::with_capacity(stride as usize * height as usize * 4);
+/// The GBM backend of gralloc's allocator, started once on the first DRM node that allocates.
+fn backend() -> Result<&'static Backend> {
+    static BACKEND: OnceLock<Backend> = OnceLock::new();
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let started = Backend::start(Path::new(DRM_DIR), None).context("gralloc GBM backend")?;
+    Ok(BACKEND.get_or_init(|| started))
+}
+
+/// A gralloc dma-buf holding `width` x `height` pixels of `frame`'s pattern: allocated `STRIDE_PAD_PIXELS` wider than shown, so every row has padding of 0xEE after it, and described by handle ints as the allocator writes them. The fd must outlive the present call.
+fn pattern_buffer(width: u32, height: u32, frame: u32) -> Result<([OwnedFd; 2], Arc<SceneBuffer>)> {
+    let info = format::lookup(RGBA_8888).context("RGBA_8888 row")?;
+    let checked = Checked {
+        name: "gate".to_owned(),
+        width: width + STRIDE_PAD_PIXELS,
+        height,
+        usage: 0,
+        format: info,
+        modifiers: vec![DRM_FORMAT_MOD_LINEAR],
+    };
+    let d = backend()?.allocate(&checked)?;
+    let pitch = d.pitch as usize;
+    let mut bytes = vec![PAD_BYTE; pitch * height as usize];
     for y in 0..height {
-        for x in 0..stride {
-            if x < width {
-                bytes.extend_from_slice(&pattern(x, y, frame));
-            } else {
-                bytes.extend_from_slice(&[PAD_BYTE; 4]);
-            }
+        for x in 0..width {
+            let at = y as usize * pitch + x as usize * 4;
+            bytes[at..at + 4].copy_from_slice(&pattern(x, y, frame));
         }
     }
-    let fd = memfd_create("gate-buffer", MemfdFlags::CLOEXEC)?;
-    ftruncate(&fd, bytes.len() as u64)?;
-    let mut rest = &bytes[..];
-    while !rest.is_empty() {
-        let n = write(&fd, rest)?;
-        rest = &rest[n..];
-    }
+    let map = Mapping::new(d.fd.as_fd(), bytes.len())?;
+    begin_cpu_access(d.fd.as_fd(), SYNC_WRITE)?;
+    map.write(0, &bytes);
+    end_cpu_access(d.fd.as_fd(), SYNC_WRITE)?;
+    // the handle's second fd is the mapper's metadata page (`handle::FD_PAGE`); present never reads it
+    let page = memfd_create("gate-page", MemfdFlags::CLOEXEC)?;
+    ftruncate(&page, METADATA_PAGE_BYTES)?;
+    let params = Params {
+        width,
+        height,
+        pixel_format: RGBA_8888,
+        fourcc: info.fourcc,
+        pitch: d.pitch,
+        size: d.size,
+        usage: 0,
+        modifier: d.modifier,
+        id: u64::from(frame),
+    };
     let buffer = SceneBuffer {
         width: width as i32,
         height: height as i32,
-        stride: stride as i32,
+        stride: (d.pitch / 4) as i32,
         format: RGBA_8888,
         usage: 0,
         id: u64::from(frame),
-        fds: vec![SceneFd::new(fd.as_raw_fd())],
-        ints: vec![],
+        fds: vec![
+            SceneFd::new(d.fd.as_raw_fd()),
+            SceneFd::new(page.as_raw_fd()),
+        ],
+        ints: params.to_ints().to_vec(),
     };
-    Ok((fd, Arc::new(buffer)))
+    Ok(([d.fd, page], Arc::new(buffer)))
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> FloatRect {
@@ -191,7 +232,7 @@ fn scene_of(quads: Vec<Quad>) -> Scene {
 }
 
 /// The frame series' scene: one full-window quad; odd frames are flagged opaque (the `X8` texture path), even ones not.
-fn frame_scene(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Scene)> {
+fn frame_scene(width: u32, height: u32, frame: u32) -> Result<([OwnedFd; 2], Scene)> {
     let (fd, buffer) = pattern_buffer(width, height, frame)?;
     let mut q = quad(
         0,
@@ -215,7 +256,7 @@ fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
     let mut fds = Vec::new();
     let mut buffer = |w, h, f| -> Result<Arc<SceneBuffer>> {
         let (fd, b) = pattern_buffer(w, h, f)?;
-        fds.push(fd);
+        fds.extend(fd);
         Ok(b)
     };
     let [f0, f1, f2, f3, f4] = COMPOSITE_FRAMES;
@@ -546,37 +587,59 @@ fn main() -> Result<()> {
         emit(format_args!("RESIZED {}x{}", size.width, size.height));
     }
 
-    // phase 3: refusals
-    let (_fd, mut scene) = frame_scene(args.width, args.height, 0)?;
-    let (fence_read, fence_write) = socketpair(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    content(&mut scene.quads[0]).acquire_fence = Some(SceneFd::new(fence_read.as_raw_fd()));
-    let unsignalled = matches!(
-        window.present(&scene),
-        Err(PresentError::FenceNotSignalled { layer_id: 0 })
-    );
-    write(&fence_write, b"x")?;
-    let accepted = window.present(&scene);
-    let signalled = accepted.is_ok();
-    // step 1 copies every buffer at present: no release point outlives it
-    let releases = accepted.map_or(usize::MAX, |p| p.releases.len());
-    let mut bad = scene.clone();
-    let b = content(&mut bad.quads[0]);
-    b.acquire_fence = None;
-    b.buffer = Arc::new(SceneBuffer {
-        stride: 1,
-        ..(*b.buffer).clone()
+    // phase 3: refusals, then the release of a replaced buffer at the paint after its replacement
+    let (_fd, scene) = frame_scene(args.width, args.height, RELEASE_FRAMES[0])?;
+    let refused = |ints: &dyn Fn(&mut Params)| -> Result<bool> {
+        let mut bad = scene.clone();
+        let b = content(&mut bad.quads[0]);
+        let mut p = Params::from_handle(b.buffer.fds.len(), &b.buffer.ints)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        ints(&mut p);
+        b.buffer = Arc::new(SceneBuffer {
+            ints: p.to_ints().to_vec(),
+            ..(*b.buffer).clone()
+        });
+        Ok(matches!(
+            window.present(&bad),
+            Err(PresentError::Buffer { layer_id: 0, .. })
+        ))
+    };
+    let short_pitch = refused(&|p| p.pitch = p.width * 4 - 4)?;
+    let bad_fourcc = refused(&|p| p.fourcc = u32::from_le_bytes(*b"ZZ99"))?;
+    let painted: Rc<RefCell<Vec<(u64, bool)>>> = Rc::default();
+    let seen = Rc::clone(&painted);
+    window.on_painted(move |p| {
+        seen.borrow_mut().extend(
+            p.releases
+                .into_iter()
+                .map(|r| (r.buffer_key, r.release_fence.is_some())),
+        )
     });
-    let bad_refused = matches!(
-        window.present(&bad),
-        Err(PresentError::Buffer { layer_id: 0, .. })
-    );
+    window.present(&scene)?;
+    spin(&looper, deadline, "the first release scene's paint", || {
+        // the frame series' last buffer goes back once this scene is painted
+        !painted.borrow().is_empty()
+    })?;
+    painted.borrow_mut().clear();
+    let (_fd2, replacing) = frame_scene(args.width, args.height, RELEASE_FRAMES[1])?;
+    window.present(&replacing)?;
+    let early = painted.borrow().len();
+    spin(
+        &looper,
+        deadline,
+        "the release of the replaced buffer",
+        || !painted.borrow().is_empty(),
+    )?;
+    let released = painted.borrow().clone();
+    let keys: Vec<String> = released.iter().map(|(k, _)| k.to_string()).collect();
     emit(format_args!(
-        "REFUSALS unsignalled-fence={unsignalled} signalled-fence={signalled} bad-stride={bad_refused} releases={releases}"
+        "REFUSALS short-pitch={short_pitch} bad-fourcc={bad_fourcc}"
+    ));
+    emit(format_args!(
+        "RELEASES before-paint={early} released={} fenced={} keys={}",
+        released.len(),
+        released.iter().filter(|(_, f)| *f).count(),
+        keys.join(",")
     ));
 
     // phase 4: a watched fd is serviced on this thread, inside the Looper's poll

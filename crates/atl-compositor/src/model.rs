@@ -167,6 +167,8 @@ pub struct Counters {
     pub buffers_acquired: u64,
     /// Transaction-completed stats sent.
     pub completions_sent: u64,
+    /// Ticks a transaction queue waited at its front because a buffer's acquire fence had not signalled.
+    pub fence_waits: u64,
 }
 
 impl Counters {
@@ -311,6 +313,13 @@ pub struct Compositor {
     frame: u64,
     dirty: bool,
     counters: Counters,
+    /// Whether the acquire fence with this descriptor number has signalled (never waits); see [`Compositor::with_fence_probe`].
+    fence_signalled: fn(i32) -> bool,
+}
+
+/// The probe of a compositor whose producers fence nothing (the model tests): every fence counts as signalled.
+fn every_fence_signalled(_fd: i32) -> bool {
+    true
 }
 
 impl Compositor {
@@ -325,7 +334,15 @@ impl Compositor {
             frame: 0,
             dirty: false,
             counters: Counters::default(),
+            fence_signalled: every_fence_signalled,
         }
+    }
+
+    /// Latches a buffer only once its acquire fence has signalled, as SurfaceFlinger does (`transactionReadyBufferCheck`, SurfaceFlinger.cpp: an unsignalled `acquireFence` makes the transaction `NotReady` unless latch-unsignaled is configured, which is off by default):
+    /// the transaction stays queued, the layer keeps showing its latched buffer, and every tick checks again. `probe` reads the fence descriptor the core names, which its owner keeps open while it does ([`Compositor::referenced_fds`]).
+    pub fn with_fence_probe(mut self, probe: fn(i32) -> bool) -> Self {
+        self.fence_signalled = probe;
+        self
     }
 
     /// The settings.
@@ -550,6 +567,18 @@ impl Compositor {
         })
     }
 
+    /// Whether `t` carries a buffer whose acquire fence has not signalled ([`Compositor::with_fence_probe`]).
+    fn fence_pending(&self, t: &TransactionState) -> bool {
+        t.composer_states.iter().any(|s| {
+            s.what & what::E_BUFFER_CHANGED != 0
+                && s.buffer_data
+                    .as_ref()
+                    .and_then(|b| b.acquire_fence.as_ref())
+                    .and_then(|f| f.0)
+                    .is_some_and(|f| !(self.fence_signalled)(f.fd))
+        })
+    }
+
     /// One frame tick at `now_ns`: apply what is due, answer callbacks, and build the scene if anything visible changed.
     pub fn on_frame(&mut self, now_ns: i64) -> FrameOutput {
         self.frame += 1;
@@ -562,6 +591,10 @@ impl Compositor {
         for token in tokens {
             while let Some(front) = self.queues.get(&token).and_then(VecDeque::front) {
                 if self.blocked(front) {
+                    break;
+                }
+                if self.fence_pending(front) {
+                    self.counters.fence_waits += 1;
                     break;
                 }
                 let t = self.queues.get_mut(&token).and_then(VecDeque::pop_front);

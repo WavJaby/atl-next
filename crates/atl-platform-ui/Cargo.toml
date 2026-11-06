@@ -21,6 +21,8 @@ anyhow.workspace = true
 atl-compositor = { path = "../atl-compositor" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-gralloc = { path = "../atl-gralloc" }
+atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
+atl-gralloc-service = { path = "../atl-gralloc-service" }
 clap.workspace = true
 rustix.workspace = true
 

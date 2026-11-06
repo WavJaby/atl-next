@@ -1,41 +1,34 @@
 // SPDX-License-Identifier: MIT
 //! A compositor `Scene` as one GSK render node tree, in physical pixels of the window content.
 //! A colour quad is one colour node over its visible rectangle, the layer alpha as the colour's alpha (GSK colours are straight, like the layer's).
-//! Per buffer quad, bottom first: scissor (`clip` cut with the destination) -> opacity (layer alpha) -> buffer-to-screen transform (crop, flips, rotation, scale: `geometry`) -> crop to `src` -> the buffer as a `GdkMemoryTexture` (RGBA_8888 premultiplied; `X8` when the layer is flagged opaque).
+//! Per buffer quad, bottom first: scissor (`clip` cut with the destination) -> opacity (layer alpha) -> buffer-to-screen transform (crop, flips, rotation, scale: `geometry`) -> crop to `src` -> the buffer as a `GdkDmabufTexture` (`dmabuf`; read without alpha when the layer is flagged opaque).
 //! The widget scales the whole tree by 1 / scale into toolkit logical units when it draws; capture renders it as it is.
+
+use std::os::fd::OwnedFd;
 
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui_api::PresentError;
+use atl_scene_buffer::DmabufView;
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, graphene, gsk};
+use gtk4::{gdk, graphene, gsk};
 
-use atl_scene_buffer::{self as buffer, Pixels};
-
+use crate::dmabuf;
 use crate::geometry::{Placement, placement, visible};
 
 fn graphene_rect(r: &FloatRect) -> graphene::Rect {
     graphene::Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top)
 }
 
-fn texture(pixels: Pixels, opaque: bool) -> Result<gdk::Texture, String> {
-    let format = if opaque {
-        gdk::MemoryFormat::R8g8b8x8
-    } else {
-        gdk::MemoryFormat::R8g8b8a8Premultiplied
-    };
-    let (width, height) = (
-        i32::try_from(pixels.width).map_err(|e| e.to_string())?,
-        i32::try_from(pixels.height).map_err(|e| e.to_string())?,
-    );
-    Ok(gdk::MemoryTexture::new(
-        width,
-        height,
-        format,
-        &glib::Bytes::from_owned(pixels.bytes),
-        pixels.stride_bytes,
-    )
-    .upcast())
+/// A buffer the built tree samples: what the window releases once a later painted frame no longer shows it.
+#[derive(Debug)]
+pub struct Shown {
+    /// The quad's layer id.
+    pub layer_id: i32,
+    /// The buffer's `GraphicBuffer::id`.
+    pub buffer_key: u64,
+    /// A dup of its first plane's dma-buf: the read fence is exported from it.
+    pub dmabuf: OwnedFd,
 }
 
 /// `place` as a GSK transform. GSK composes the last call first, so the builder order is the reverse of the order the steps apply in; only translate / scale / rotate are used (see `Placement`).
@@ -57,8 +50,12 @@ fn gsk_transform(place: &Placement) -> gsk::Transform {
 /// GSK rotates positive angles clockwise on its y-down plane, like cairo.
 const CLOCKWISE_QUARTER_TURN_DEGREES: f32 = 90.0;
 
-/// The node of one quad, `None` when nothing of it shows (empty rectangles, scissored away).
-fn quad_node(quad: &Quad) -> Result<Option<gsk::RenderNode>, PresentError> {
+/// The node of one quad, `None` when nothing of it shows (empty rectangles, scissored away); a buffer quad's buffer is added to `shown`.
+fn quad_node(
+    display: &gdk::Display,
+    quad: &Quad,
+    shown: &mut Vec<Shown>,
+) -> Result<Option<gsk::RenderNode>, PresentError> {
     let b = match &quad.content {
         Content::Buffer(b) => b,
         // the layer alpha is the colour's own: no opacity node
@@ -76,22 +73,26 @@ fn quad_node(quad: &Quad) -> Result<Option<gsk::RenderNode>, PresentError> {
         layer_id: quad.layer_id,
         reason,
     };
-    if let Some(fence) = &b.acquire_fence
-        && !buffer::fence_signalled(fence).map_err(fail)?
-    {
-        return Err(PresentError::FenceNotSignalled {
-            layer_id: quad.layer_id,
-        });
-    }
     let Some(place) = placement(&b.src, &quad.dst, b.buffer_transform) else {
         return Ok(None);
     };
-    let Some(shown) = visible(&quad.dst, quad.clip.as_ref()) else {
+    let Some(visible_rect) = visible(&quad.dst, quad.clip.as_ref()) else {
         return Ok(None);
     };
-    let pixels = buffer::read_pixels(&b.buffer).map_err(fail)?;
-    let (width, height) = (pixels.width as f32, pixels.height as f32);
-    let texture = texture(pixels, b.opaque).map_err(fail)?;
+    let view = DmabufView::of(&b.buffer).map_err(fail)?;
+    let texture = dmabuf::texture(display, &view, b.opaque).map_err(fail)?;
+    let first = view
+        .fds
+        .first()
+        .ok_or_else(|| fail("no plane".to_owned()))?;
+    shown.push(Shown {
+        layer_id: quad.layer_id,
+        buffer_key: b.buffer.id,
+        dmabuf: first
+            .try_clone_to_owned()
+            .map_err(|e| fail(format!("dup: {e}")))?,
+    });
+    let (width, height) = (view.layout.width as f32, view.layout.height as f32);
     let whole = graphene::Rect::new(0.0, 0.0, width, height);
     let sampled = gsk::TextureScaleNode::new(&texture, &whole, gsk::ScalingFilter::Linear);
     let cropped = gsk::ClipNode::new(&sampled, &graphene_rect(&b.src));
@@ -101,21 +102,21 @@ fn quad_node(quad: &Quad) -> Result<Option<gsk::RenderNode>, PresentError> {
         node = gsk::OpacityNode::new(&node, quad.alpha).upcast();
     }
     Ok(Some(
-        gsk::ClipNode::new(&node, &graphene_rect(&shown)).upcast(),
+        gsk::ClipNode::new(&node, &graphene_rect(&visible_rect)).upcast(),
     ))
 }
 
-/// The render node of `scene` in physical pixels. Fails without side effects on the first unreadable buffer.
-pub fn build(scene: &Scene) -> Result<gsk::RenderNode, PresentError> {
-    let children = scene
-        .quads
-        .iter()
-        .map(quad_node)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    Ok(gsk::ContainerNode::new(&children).upcast())
+/// The render node of `scene` in physical pixels of `display`, with the buffers it samples. Fails without side effects on the first buffer that cannot be imported.
+pub fn build(
+    display: &gdk::Display,
+    scene: &Scene,
+) -> Result<(gsk::RenderNode, Vec<Shown>), PresentError> {
+    let mut shown = Vec::new();
+    let mut children = Vec::new();
+    for quad in &scene.quads {
+        children.extend(quad_node(display, quad, &mut shown)?);
+    }
+    Ok((gsk::ContainerNode::new(&children).upcast(), shown))
 }
 
 #[cfg(test)]

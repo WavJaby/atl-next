@@ -174,7 +174,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 );
             }
         } else {
-            for (what, r) in [("pixels", &pixels), ("extension", &ext)] {
+            let driver = judge_driver(&lines);
+            for (what, r) in [
+                ("pixels", &pixels),
+                ("extension", &ext),
+                ("driver", &driver),
+            ] {
                 ok &= r.is_ok();
                 println!(
                     "gl: {} {what}: {}",
@@ -292,6 +297,24 @@ fn judge_pixels(lines: &[String]) -> Result<String, String> {
     }
 }
 
+/// The DRM driver in use: `drm <node>=<modalias> ...`, the /dev/dri nodes the probe holds after eglInitialize. Mesa's Android platform opens one for every driver it loads, and with software rendering
+/// forced it takes only vgem / virtio_gpu and loads kms_swrast on it (`platform_android.c` droid_probe_device); a pure software rasteriser holds none. So: at least one node, each with a known kernel driver.
+fn judge_driver(lines: &[String]) -> Result<String, String> {
+    let line = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("drm "))
+        .ok_or_else(|| no_line("drm", lines))?;
+    let nodes: Vec<&str> = line.split_whitespace().filter(|n| *n != "none").collect();
+    let unknown = nodes
+        .iter()
+        .any(|n| n.ends_with("=unknown") || n.ends_with("=unreadable"));
+    match (nodes.is_empty(), unknown) {
+        (true, _) => Err("no DRM node open after eglInitialize: not a DRI driver".to_owned()),
+        (false, true) => Err(format!("kernel driver unknown: {line}")),
+        (false, false) => Ok(format!("DRI driver on {line}")),
+    }
+}
+
 /// `ext <EXTENSION> <v> glGetIntegerv <w> from <file>`: v == w > 0, and the address in a Mesa object.
 fn judge_extension(lines: &[String]) -> Result<String, String> {
     let line = lines
@@ -380,6 +403,14 @@ mod tests {
 
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn driver_needs_a_known_drm_node() {
+        assert!(judge_driver(&lines(&["drm /dev/dri/card0=platform:vgem"])).is_ok());
+        assert!(judge_driver(&lines(&["drm none"])).is_err());
+        assert!(judge_driver(&lines(&["drm /dev/dri/card0=unreadable"])).is_err());
+        assert!(judge_driver(&lines(&["renderer x"])).is_err());
     }
 
     #[test]

@@ -4,14 +4,14 @@
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
-//! 3. **refusals + loop**: an unsignalled acquire fence and a bad stride are refused, a signalled fence accepted; a watched fd's callback ran on the UI thread inside the Looper's poll.
+//! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
 //! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the UI thread is blocked (`block`) for the ping timeout plus a margin: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //! 5. **text input**: a fake input method (`nested_wayland::Ime`, input-method v2 on labwc's seat) is bound, then the client focuses its window's `TextInput` with a content type and surrounding text. Checks: the IME is activated; it receives the content type and surrounding text as text-input v3 numbers them; its preedit, commit and delete_surrounding_text (protocol units: UTF-8 bytes) reach the client as `TextInputEvent`s (GTK units: chars). Expected values are worked out from the encodings in the constants below. `--break-ime-commit` skips the commit_string, so the commit check must fail.
 //!    Evidence tier: isolated runtime, real compositor relay (wlroots) and GTK's own Wayland IM module; a desktop IME (fcitx5) and the candidate popup at the cursor rect stay laptop checks.
 //!
-//! The client runs with GSK_RENDERER=cairo by default: the cairo renderer presents through wl_shm, which is what WSLg offers (no zwp_linux_dmabuf); the proxy confirms a wl_shm pool was created.
-//! Needs `labwc` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
+//! The client runs with GSK_RENDERER=ngl: it imports the gralloc dma-bufs (vgem on WSL) through EGL; its own window buffers still reach the compositor through wl_shm (Mesa's software EGL on a display with no zwp_linux_dmabuf), which the proxy confirms.
+//! Needs a DRM node gralloc allocates on, `labwc` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
+use crate::gdk_dmabuf;
 use crate::nested_wayland::{Arg, GATE_OUTPUT, Ime, NestedCompositor, Output, im_op};
 use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
@@ -32,8 +33,8 @@ pub struct Args {
     /// Frames the client presents, one per frame-clock tick.
     #[arg(long, default_value_t = 8)]
     frames: u32,
-    /// GSK renderer the client runs with (GSK_RENDERER); `cairo` presents through wl_shm.
-    #[arg(long, default_value = "cairo")]
+    /// GSK renderer the client runs with (GSK_RENDERER). `ngl` imports the dma-bufs through EGL; `cairo` would download them through mmap, which the dmabuf gate fails.
+    #[arg(long, default_value = "ngl")]
     gsk_renderer: String,
     /// How long a compositor waits for a pong before it calls a client unresponsive, in ms (mutter's check-alive timeout: 5 s).
     #[arg(long, default_value_t = 5000)]
@@ -509,17 +510,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .env("WAYLAND_DISPLAY", &socket)
         .env("GDK_BACKEND", "wayland")
         .env("GSK_RENDERER", &args.gsk_renderer)
+        .env("GDK_DEBUG", gdk_dmabuf::GDK_DEBUG)
         // the sandbox has no accessibility bus; GTK warns about it on every start
         .env("GTK_A11Y", "none")
         // GTK picks its IM module from the display (Wayland: text-input v3, which reaches gate 5's IME); a desktop GTK_IM_MODULE (ibus) would bypass it
         .env_remove("GTK_IM_MODULE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(if args.verbose {
-            Stdio::inherit()
-        } else {
-            Stdio::from(std::fs::File::create(&stderr_file)?)
-        })
+        // always a file: the dmabuf gate reads GTK's debug lines from it (--verbose prints it at the end)
+        .stderr(Stdio::from(std::fs::File::create(&stderr_file)?))
         .spawn()
         .with_context(|| format!("starting {}", exe.display()))?;
     let stdout = child.stdout.take().context("client stdout")?;
@@ -580,7 +579,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         probe
             .find(|e| matches!(e, Event::Bound(n) if n.starts_with("zwp_linux_dmabuf")))
             .is_none(),
-        "no dmabuf global bound (step 1 is CPU only)",
+        "no zwp_linux_dmabuf global bound (the window's own buffers go through wl_shm; scene dma-bufs are imported client-side)",
         "",
     );
     // the content follows the window: the larger, then the smaller probe size is reported, the smaller last
@@ -718,16 +717,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .map(|l| l.to_string())
         .unwrap_or_default();
     report.check(
-        ["unsignalled-fence", "signalled-fence", "bad-stride"]
+        ["short-pitch", "bad-fourcc"]
             .iter()
             .all(|k| field(&refusals, k) == Some("true")),
-        "unsignalled fence and bad stride refused, signalled fence accepted",
+        "a handle with a short pitch or an unknown fourcc is refused",
         &refusals,
     );
+    // the client shows buffer RELEASE_FRAMES[0] (200), then replaces it with 201: exactly 200 goes back, at the paint after the replacement, with a read fence
+    let releases = client
+        .lines_with("RELEASES")
+        .first()
+        .map(|l| l.to_string())
+        .unwrap_or_default();
     report.check(
-        field(&refusals, "releases") == Some("0"),
-        "step-1 present reports no release points (buffers copied at present)",
-        &refusals,
+        field(&releases, "before-paint") == Some("0")
+            && field(&releases, "released") == Some("1")
+            && field(&releases, "fenced") == Some("1")
+            && field(&releases, "keys") == Some("200"),
+        "the replaced buffer is released at the next paint, with a read fence, and only it",
+        &releases,
+    );
+    let gtk_log = std::fs::read_to_string(&stderr_file).unwrap_or_default();
+    if args.verbose {
+        eprint!("{gtk_log}");
+    }
+    let dmabuf = gdk_dmabuf::Verdict::of(&gtk_log);
+    report.check(
+        dmabuf.ok(),
+        "GTK imported every buffer as a dmabuf texture (GDK_DEBUG=dmabuf), never an mmap download",
+        &dmabuf.to_string(),
     );
     let fdwatch = client
         .lines_with("FDWATCH")

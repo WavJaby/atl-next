@@ -4,7 +4,7 @@
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -15,9 +15,10 @@ use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData
 use atl_compositor::model::{
     ClientCall, ColorLayer, Compositor, CompositorConfig, FrameOutput, LayerSpec,
 };
-use atl_compositor::scene::{Quad, Scene};
+use atl_compositor::scene::{Quad, Scene, SceneFd};
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_libgui_parcel::parcel::{BinderKey, StrongBinder};
+use atl_libgui_parcel::parcel::{BinderKey, FdObject, StrongBinder};
+use atl_libgui_parcel::state::Fence;
 use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
@@ -47,10 +48,20 @@ pub trait ThreadHost: Send + Sync {
 /// Ticks' output queued for the present thread: one sink read longer than a period is absorbed; a sink slower than the clock for longer than this holds the clock back, so the queue cannot grow without bound.
 const FRAMES_QUEUED: usize = 2;
 
+/// The core's fence probe: the descriptor is one of `State::fds`, open while the core names it. A fence that cannot be polled counts as signalled: waiting on it would stall the layer forever.
+fn acquire_signalled(fd: i32) -> bool {
+    atl_scene_buffer::fence_signalled(&SceneFd::new(fd)).unwrap_or_else(|e| {
+        tracing::warn!("composer: acquire fence {fd}: {e}");
+        true
+    })
+}
+
 /// What one tick hands the present thread.
 struct Frame {
     scene: Option<Scene>,
     calls: Vec<ClientCall>,
+    /// Release fences the window exported for this frame's releases, by descriptor number (the number the call's `release_fence` names); closed once the calls are delivered.
+    fences: HashMap<i32, OwnedFd>,
 }
 
 impl Frame {
@@ -73,6 +84,8 @@ impl Frame {
 pub struct UiFrames {
     composer: Arc<Composer>,
     frames: SyncSender<Frame>,
+    /// Ticks' calls waiting for the window's paint, oldest first: a release among them names a buffer the window drew until that paint.
+    unpainted: Mutex<VecDeque<Vec<ClientCall>>>,
 }
 
 impl UiFrames {
@@ -94,17 +107,58 @@ impl UiFrames {
         self.composer.lock().wants_frame()
     }
 
-    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread, then the calls are queued for the deliver thread (a release follows the scene that shows its buffer).
-    pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene)) {
+    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread and says whether the window will paint it.
+    /// The calls (the releases of the buffers the new scene replaced, the transaction callbacks) then wait for that paint ([`UiFrames::painted`]), as SurfaceFlinger sends them after composition; with nothing to paint they go now, in order behind any still waiting.
+    pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene) -> bool) {
         let interval_ns = clock::interval_ns(self.composer.display().refresh_hz);
         let frame = self.composer.tick(time_ns, interval_ns);
-        if let Some(scene) = &frame.scene {
-            present(scene);
+        let painting =
+            frame.scene.as_ref().is_some_and(present) && self.composer.release_after_paint;
+        let mut unpainted = self.unpainted.lock().unwrap_or_else(|e| e.into_inner());
+        if painting || !unpainted.is_empty() {
+            unpainted.push_back(frame.calls);
+            return;
         }
+        drop(unpainted);
+        self.send(frame.calls, HashMap::new());
+    }
+
+    /// The window painted: every waiting tick's calls go to the deliver thread, a release carrying the read fence the window exported for its buffer (`fences`: buffer id -> sync_file; none = released already).
+    pub fn painted(&self, fences: Vec<(u64, OwnedFd)>) {
+        let waiting =
+            std::mem::take(&mut *self.unpainted.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut fences: HashMap<u64, OwnedFd> = fences.into_iter().collect();
+        for mut calls in waiting {
+            let mut held = HashMap::new();
+            for call in &mut calls {
+                let release = match call {
+                    ClientCall::ReleaseBuffer { release, .. }
+                    | ClientCall::ReleaseOnChannel { release, .. } => release,
+                    ClientCall::TransactionCompleted { .. } => continue,
+                };
+                if let Some(fence) = fences.remove(&release.callback_id.buffer_id) {
+                    let fd = fence.as_raw_fd();
+                    release.release_fence = Fence(Some(FdObject {
+                        fd,
+                        flags: 0,
+                        cookie: 0,
+                    }));
+                    held.insert(fd, fence);
+                }
+            }
+            self.send(calls, held);
+        }
+        // a fence whose buffer the core released in no waiting tick (the layer still holds it in another place) is dropped: closing a sync_file does not signal or cancel it
+        let mut st = self.composer.lock();
+        st.stats.releases_fenced_unmatched += fences.len() as u64;
+    }
+
+    fn send(&self, calls: Vec<ClientCall>, fences: HashMap<i32, OwnedFd>) {
         // an error means the deliver thread is gone: the process is ending
         let _ = self.frames.send(Frame {
             scene: None,
-            calls: frame.calls,
+            calls,
+            fences,
         });
     }
 }
@@ -117,6 +171,9 @@ pub struct ComposerConfig {
     pub compositor: CompositorConfig,
     /// Post-draw Transactions the window service forwards are applied. false = a gate's deliberate break only (`xtask test window --break-post-draw`): they are counted and dropped.
     pub post_draw: bool,
+    /// UI mode holds a tick's calls until the window painted its scene ([`UiFrames::tick`]). false = a gate's deliberate break only (`xtask test window --break-release-before-paint`): they go at once, so a release
+    /// reaches the producer while the window may still draw the buffer, and the read fence the paint exports finds no release to ride (`releases_fenced_unmatched`).
+    pub release_after_paint: bool,
 }
 
 /// What happened, for the log line and the tests: the visible record that the compositor ran.
@@ -142,6 +199,10 @@ pub struct Stats {
     pub releases_on_channel: u64,
     /// Releases whose channel had no reader any more (counted apart: nobody was waiting).
     pub releases_peer_gone: u64,
+    /// Releases sent with the read fence the window exported at its paint.
+    pub releases_fenced: u64,
+    /// Read fences the window exported for a buffer no waiting release named (dropped).
+    pub releases_fenced_unmatched: u64,
     /// File descriptors taken out of transaction parcels.
     pub fds_taken: u64,
     /// File descriptors closed because the core named them no longer.
@@ -198,7 +259,7 @@ impl State {
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -216,6 +277,9 @@ impl State {
             s.callbacks_failed,
             s.releases_on_channel,
             s.releases_peer_gone,
+            s.releases_fenced,
+            s.releases_fenced_unmatched,
+            c.fence_waits,
             self.fds.len(),
             s.fds_taken,
             s.fds_closed,
@@ -240,6 +304,8 @@ pub struct Composer {
     display_token: SpIBinder,
     /// ComposerConfig::post_draw.
     post_draw: bool,
+    /// ComposerConfig::release_after_paint.
+    release_after_paint: bool,
 }
 
 pub trait ILayerHandle: Interface {}
@@ -301,7 +367,7 @@ impl Composer {
             BnLayerHandle::new_binder(handle, BinderFeatures::default()).as_binder();
         Arc::new(Composer {
             state: Mutex::new(State {
-                compositor: Compositor::new(config.compositor),
+                compositor: Compositor::new(config.compositor).with_fence_probe(acquire_signalled),
                 events: EventThread::new(DISPLAY_ID),
                 objects: ObjectMap::new(),
                 foreign: HashMap::new(),
@@ -319,6 +385,7 @@ impl Composer {
             stop: AtomicBool::new(false),
             display: Mutex::new(config.display),
             post_draw: config.post_draw,
+            release_after_paint: config.release_after_paint,
             display_token,
         })
     }
@@ -625,6 +692,7 @@ impl Composer {
         Ok(UiFrames {
             composer: Arc::clone(self),
             frames,
+            unpainted: Mutex::default(),
         })
     }
 
@@ -685,7 +753,11 @@ impl Composer {
         }
         let mut all = std::mem::take(&mut st.pending_calls);
         all.extend(calls);
-        let frame = Frame { scene, calls: all };
+        let frame = Frame {
+            scene,
+            calls: all,
+            fences: HashMap::new(),
+        };
         st.in_flight.push_back(frame.fds());
         frame
     }
@@ -696,20 +768,22 @@ impl Composer {
             if let Some(scene) = &frame.scene {
                 sink.present(scene);
             }
-            self.deliver_frame(frame.calls);
+            self.deliver_frame(frame.calls, &frame.fences);
         }
     }
 
-    /// UI mode's deliver thread: each frame's calls, after the UI thread showed its scene.
+    /// UI mode's deliver thread: each frame's calls, after the UI thread painted its scene.
     fn deliver_frames(&self, frames: Receiver<Frame>) {
         for frame in frames {
-            self.deliver_frame(frame.calls);
+            self.deliver_frame(frame.calls, &frame.fences);
+            let fenced = frame.fences.len() as u64;
+            self.lock().stats.releases_fenced += fenced;
         }
     }
 
     /// One frame's calls into the clients, then the bookkeeping that frees its descriptors.
-    fn deliver_frame(&self, calls: Vec<ClientCall>) {
-        self.deliver_all(calls);
+    fn deliver_frame(&self, calls: Vec<ClientCall>, fences: &HashMap<i32, OwnedFd>) {
+        self.deliver_all(calls, fences);
         let mut st = self.lock();
         st.in_flight.pop_front();
         // the calls are delivered (a release channel is written): what the core names no longer can be closed
@@ -726,9 +800,9 @@ impl Composer {
         }
     }
 
-    fn deliver_all(&self, calls: Vec<ClientCall>) {
+    fn deliver_all(&self, calls: Vec<ClientCall>, fences: &HashMap<i32, OwnedFd>) {
         for call in calls {
-            let delivered = self.deliver(&call);
+            let delivered = self.deliver(&call, fences);
             if let Err(why) = &delivered {
                 tracing::warn!("composer: callback failed: {why}");
             }
@@ -741,8 +815,8 @@ impl Composer {
         }
     }
 
-    /// One call of the core into a client: `Ok` when it arrived, else why not.
-    fn deliver(&self, call: &ClientCall) -> Result<(), String> {
+    /// One call of the core into a client: `Ok` when it arrived, else why not. A release fence is one of the frame's own `fences`, else a descriptor the composer holds.
+    fn deliver(&self, call: &ClientCall, fences: &HashMap<i32, OwnedFd>) -> Result<(), String> {
         let (listener, code, wire) = match call {
             ClientCall::TransactionCompleted { listener, stats } => {
                 (listener, ON_TRANSACTION_COMPLETED, stats.encode_call())
@@ -761,12 +835,15 @@ impl Composer {
                         .ok_or_else(|| format!("{what} fd {fd} is not held"))
                 };
                 let socket = held(channel.fd, "release channel")?;
-                let fence = fence.map(|f| held(f.fd, "release fence")).transpose()?;
-                match vsync::send_datagram_with_fd(
-                    &*socket,
-                    &datagram,
-                    fence.as_deref().map(|f| f.as_fd()),
-                ) {
+                let composer_fence = fence
+                    .filter(|f| !fences.contains_key(&f.fd))
+                    .map(|f| held(f.fd, "release fence"))
+                    .transpose()?;
+                let fence = fence
+                    .and_then(|f| fences.get(&f.fd))
+                    .map(|f| f.as_fd())
+                    .or(composer_fence.as_deref().map(|f| f.as_fd()));
+                match vsync::send_datagram_with_fd(&*socket, &datagram, fence) {
                     Ok(()) => self.lock().stats.releases_on_channel += 1,
                     // the queue that held the other end is gone (its BBQ was destroyed, or its process closed it): nobody is waiting for the release
                     Err(e)

@@ -30,6 +30,8 @@ const BREAK_Z_ORDER: &str = "z-order";
 const BREAK_POST_DRAW: &str = "post-draw";
 /// With it no queued buffer is latched (CompositorConfig::latch_buffers).
 const BREAK_QUEUE: &str = "queue";
+/// With it a tick's calls go out before the window painted (ComposerConfig::release_after_paint).
+const BREAK_RELEASE_BEFORE_PAINT: &str = "release-before-paint";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -122,6 +124,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             ..Default::default()
         },
         post_draw: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_POST_DRAW),
+        release_after_paint: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_RELEASE_BEFORE_PAINT),
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;

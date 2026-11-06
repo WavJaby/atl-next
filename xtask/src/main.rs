@@ -24,6 +24,7 @@ mod cts_report;
 mod cts_table;
 mod deps;
 mod fetch;
+mod gdk_dmabuf;
 mod git;
 mod git_dirs;
 mod gl_dispatch;

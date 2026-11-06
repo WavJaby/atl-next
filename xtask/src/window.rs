@@ -72,6 +72,9 @@ pub struct Args {
     /// Deliberate break (stage hwui): the expected quadrants have red and blue swapped, so the readback check must fail (it compares channel order exactly).
     #[arg(long)]
     break_swap_rb: bool,
+    /// Deliberate break (any UI stage that replaces buffers): the composer sends a tick's releases before the window painted, so the release check must fail.
+    #[arg(long)]
+    break_release_before_paint: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -1461,6 +1464,35 @@ fn post_draw_check(app: &str, services: &str) -> Result<String, String> {
     }
 }
 
+/// GTK's own debug output in the app log (GDK_DEBUG=dmabuf, set for every UI run): every scene buffer imported as a dmabuf texture, none downloaded through mmap (`gdk_dmabuf`).
+fn dmabuf_check(app: &str) -> Result<String, String> {
+    let v = crate::gdk_dmabuf::Verdict::of(app);
+    if v.ok() {
+        Ok(v.to_string())
+    } else {
+        Err(format!("dmabuf present: {v}"))
+    }
+}
+
+/// The release of a replaced buffer waited for the window's paint: every read fence a paint exported rode a release (none unmatched), and when buffers went back at all, at least one carried its fence.
+/// A release sent before the paint (`--break-release-before-paint`) leaves the fence of that paint with no release to ride.
+fn release_check(app: &str) -> Result<String, String> {
+    let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
+    let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
+    let (released, fenced, unmatched) = (
+        n("buffers_released"),
+        n("releases_fenced"),
+        n("releases_fenced_unmatched"),
+    );
+    let summary =
+        format!("{released} released, {fenced} with a read fence, {unmatched} fences unmatched");
+    if unmatched == 0 && (released == 0 || fenced > 0) {
+        Ok(summary)
+    } else {
+        Err(format!("release before paint: {summary}"))
+    }
+}
+
 /// The platform's log line of the content origin (atl-platform-ui `GtkWindow::present`), read by [`content_origin`].
 const CONTENT_ORIGIN_LINE: &str = "atl-platform-ui: content origin ";
 
@@ -1599,6 +1631,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     rt.with_ui_break("post-draw")
                 } else if args.break_queue {
                     rt.with_ui_break("queue")
+                } else if args.break_release_before_paint {
+                    rt.with_ui_break("release-before-paint")
                 } else {
                     rt
                 };
@@ -1843,6 +1877,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         )
     {
         sub.push(("post-draw", post_draw_check(&app, &services)));
+        sub.push(("dmabuf", dmabuf_check(&app)));
+        sub.push(("release", release_check(&app)));
     }
     let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
     for (name, result) in &sub {

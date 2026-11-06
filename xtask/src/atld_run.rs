@@ -713,9 +713,11 @@ impl Runtime {
         }
         if let Some(mode) = &self.ui {
             // the compositor logs each frame's `present` line at debug (atl-composer ui_window.rs): the UI runs that read them enable it
+            // GTK's dmabuf debug lines: the window gate's import verdict (gdk_dmabuf.rs)
             cmd.args(["--ui", mode])
                 .env("ATL_UI_CAPTURE", "1")
-                .env("RUST_LOG", "info,atl_composer=debug");
+                .env("RUST_LOG", "info,atl_composer=debug")
+                .env("GDK_DEBUG", crate::gdk_dmabuf::GDK_DEBUG);
         }
         if let Some(rule) = self.ui_break {
             cmd.env("ATL_UI_BREAK", rule);

@@ -43,30 +43,24 @@ pub enum UiError {
 /// Why [`Window::present`] refused a [`Scene`]; the window keeps showing its previous scene.
 #[derive(Debug, thiserror::Error)]
 pub enum PresentError {
-    /// A quad's buffer cannot be read as pixels (unsupported format, no fd, geometry that does not fit the fd, mapping failure).
-    #[error("layer {layer_id}: buffer unreadable: {reason}")]
+    /// A quad's buffer cannot be imported (not a gralloc handle, a format/modifier the display cannot import, the toolkit refused the dma-buf).
+    #[error("layer {layer_id}: buffer not importable: {reason}")]
     Buffer {
         /// The quad's layer id.
         layer_id: i32,
         /// What is wrong with the buffer.
         reason: String,
     },
-    /// A quad's acquire fence has not signalled. Step 1 presents CPU-written buffers and never waits on the UI thread; the caller presents again after the fence signals.
-    #[error("layer {layer_id}: acquire fence not signalled")]
-    FenceNotSignalled {
-        /// The quad's layer id.
-        layer_id: i32,
-    },
 }
 
-/// What [`Window::present`] produced: one release point per quad whose buffer the toolkit still reads after present returns.
+/// One frame the toolkit painted after a [`Window::present`]: the buffers that frame no longer shows, which the toolkit read up to that frame.
 #[derive(Debug, Default)]
-pub struct Presented {
-    /// Release points; empty while present copies every buffer (step 1).
+pub struct Painted {
+    /// One per buffer shown before and not in the painted scene.
     pub releases: Vec<QuadRelease>,
 }
 
-/// A buffer the toolkit releases later: the producer may reuse it once `release_fence` signals (`None` = now).
+/// A buffer the toolkit stopped showing: the producer may reuse it once `release_fence` signals (`None` = now).
 #[derive(Debug)]
 pub struct QuadRelease {
     /// The quad's layer id.
@@ -213,8 +207,12 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// ends, and the content keeps the configured size. Otherwise (a floating window) the request is the window's own size to set.
     fn is_size_fixed(&self) -> bool;
 
-    /// Shows `scene` (quad coordinates are physical pixels of the content area), replacing the previous one; takes effect at the next frame. Returns the release points present produced; step 1 reads the buffers before returning and reports none, so the caller may reuse them immediately.
-    fn present(&self, scene: &Scene) -> Result<Presented, PresentError>;
+    /// Shows `scene` (quad coordinates are physical pixels of the content area; every acquire fence has signalled: the compositor latches only those), replacing the previous one; takes effect at the next frame.
+    /// The toolkit reads the buffers on its GPU while it paints, and keeps every buffer of the shown scene until a later scene replaces it: [`on_painted`](Window::on_painted) reports when it stops.
+    fn present(&self, scene: &Scene) -> Result<(), PresentError>;
+
+    /// Calls `on_painted` once after each frame the toolkit painted following a present (the frame clock's after-paint), replacing the previous callback. Nothing painted, no call: a hidden window keeps its buffers.
+    fn on_painted<F: FnMut(Painted) + 'static>(&self, on_painted: F);
 
     /// What the window content shows now, rendered by the toolkit's own renderer from the presented scene (the platform's screenshot: `UiAutomation.takeScreenshot`, tests).
     fn capture(&self) -> Result<Capture, UiError>;

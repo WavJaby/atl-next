@@ -158,8 +158,12 @@ fn open() {
                     let _ = first_frame.send(Message::FirstFrame);
                 }
                 tracing::debug!("atl-composer: ui: present n={presented} time_ns={time_ns}");
-                if let Err(e) = shown.present(scene) {
-                    tracing::warn!("atl-composer: ui present: {e}");
+                match shown.present(scene) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("atl-composer: ui present: {e}");
+                        false
+                    }
                 }
             });
             if tick_count == 0 {
@@ -178,6 +182,16 @@ fn open() {
                     "atl-composer: ui: clock stopped ticks={tick_count} unwanted={unwanted}"
                 );
             }
+        });
+        // a paint ends the GPU reads of the buffers it stopped showing: their releases go out now, with the read fences
+        let painted = Arc::clone(&session.frames);
+        window.on_painted(move |p| {
+            painted.painted(
+                p.releases
+                    .into_iter()
+                    .filter_map(|r| r.release_fence.map(|f| (r.buffer_key, f)))
+                    .collect(),
+            )
         });
         let sizes = Arc::clone(&session.sender);
         window.on_resize(move |size| sizes.submit_size(size));

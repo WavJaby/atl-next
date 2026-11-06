@@ -940,3 +940,55 @@ fn window_manager_places_a_root_layer() {
         }
     );
 }
+
+/// The fence the probe below reports unsignalled while [`FENCE_OPEN`] is false.
+const UNSIGNALLED_FENCE_FD: i32 = 77;
+static FENCE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn probe(fd: i32) -> bool {
+    fd != UNSIGNALLED_FENCE_FD || FENCE_OPEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A buffer whose acquire fence has not signalled is not latched (SurfaceFlinger `transactionReadyBufferCheck`): the transaction waits, the layer keeps showing its buffer and nothing is released, and the clock keeps asking for ticks.
+/// Once the fence signals, the next tick latches it and releases the previous buffer.
+#[test]
+fn unsignalled_acquire_fence_waits_and_keeps_the_shown_buffer() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default()).with_fence_probe(probe);
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 401, 1, 8, 8, false, 1,
+    )]));
+    c.on_frame(10);
+    let mut fenced = buffer_state(&layer, &listener, 402, 2, 8, 8, false, 2);
+    if let Some(bd) = fenced.buffer_data.as_mut() {
+        bd.acquire_fence = Some(Fence(Some(FdObject {
+            fd: UNSIGNALLED_FENCE_FD,
+            flags: 0,
+            cookie: 0,
+        })));
+    }
+    c.queue_transaction(tx(vec![fenced]));
+    for now in [20, 30] {
+        let out = c.on_frame(now);
+        assert!(out.scene.is_none(), "the shown buffer stays: no new scene");
+        assert!(releases(&out.calls).is_empty());
+        assert_eq!(c.pending_transactions(), 1);
+        assert!(c.wants_frame(), "the next tick checks again");
+    }
+    assert_eq!(c.counters().fence_waits, 2);
+    FENCE_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let out = c.on_frame(40);
+    assert_eq!(
+        out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
+        2
+    );
+    assert_eq!(
+        releases(&out.calls),
+        [ReleaseCallbackId {
+            buffer_id: 401,
+            frame_number: 1
+        }]
+    );
+}

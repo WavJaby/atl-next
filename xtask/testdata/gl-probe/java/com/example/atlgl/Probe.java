@@ -25,6 +25,32 @@ public class Probe {
         Log.i(TAG, text);
     }
 
+    /// The DRM nodes this process holds open, each with its kernel driver (sysfs `device/uevent` MODALIAS): Mesa's DRI drivers open one (WSL: kms_swrast on vgem, platform_android.c), a pure software rasteriser none. "none" when there is none.
+    static String drmNodes() {
+        StringBuilder out = new StringBuilder();
+        java.io.File[] fds = new java.io.File("/proc/self/fd").listFiles();
+        for (java.io.File fd : fds == null ? new java.io.File[0] : fds) {
+            String target;
+            try {
+                target = fd.getCanonicalPath();
+            } catch (java.io.IOException e) {
+                continue;
+            }
+            if (!target.startsWith("/dev/dri/")) continue;
+            String node = target.substring("/dev/dri/".length());
+            String driver = "unknown";
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/sys/class/drm/" + node + "/device/uevent"))) {
+                for (String l; (l = r.readLine()) != null;) {
+                    if (l.startsWith("MODALIAS=")) driver = l.substring("MODALIAS=".length());
+                }
+            } catch (java.io.IOException e) {
+                driver = "unreadable";
+            }
+            out.append(out.length() == 0 ? "" : " ").append(target).append('=').append(driver);
+        }
+        return out.length() == 0 ? "none" : out.toString();
+    }
+
     static void check(boolean ok, String what) {
         if (!ok) {
             say("FAIL " + what + ": egl error 0x" + Integer.toHexString(EGL14.eglGetError()));
@@ -42,6 +68,7 @@ public class Probe {
         EGLDisplay d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
         int[] version = new int[2];
         check(EGL14.eglInitialize(d, version, 0, version, 1), "eglInitialize");
+        say("drm " + drmNodes());
         int[] attrs = {EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
             EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8, EGL14.EGL_NONE};
         EGLConfig[] config = new EGLConfig[1];
