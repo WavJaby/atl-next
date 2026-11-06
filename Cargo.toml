@@ -22,6 +22,7 @@ cxx = "1.0.205"
 cxx-build = "1.0.205"
 errno = "0.3"
 # SYS_* syscall numbers per target arch (atl-broker seccomp filter); the only use of libc is those constants
+landlock = "0.4.7"
 libc = "0.2"
 # libgbm bindings; no wayland / egl import and no drm crate (its 0.14 pins a second rustix): the allocator creates linear buffers and exports them itself (atl-gralloc-service `prime`)
 gbm = { version = "0.18", default-features = false }

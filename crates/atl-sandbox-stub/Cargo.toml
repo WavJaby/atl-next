@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-sandbox-stub"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+landlock.workspace = true
+
+[dev-dependencies]
+atl-broker = { path = "../atl-broker" }
+
+[lints]
+workspace = true
