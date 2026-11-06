@@ -47,6 +47,9 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("media.c2.hal.selection", "aidl"),
     // MediaExtractorFactory.cpp:47 defaults to true: extractors then run in a media.extractor process, which ATL does not serve. false loads them in-process, where the sandbox's plugin dirs are the only dependency (see native-load stage 9)
     ("media.stagefright.extractremote", "false"),
+    // libcutils ashmem-dev.cpp __has_memfd_support: memfd only when both are true, else it opens /dev/ashmem, which Linux lacks (Codec2's FMQ and input buffers then fail NO_MEMORY, measured 2026-11-07, native-load stage 9). Every Treble device (Android 8+) sets ro.treble.enabled=true
+    ("ro.treble.enabled", "true"),
+    ("sys.use_memfd", "true"),
 ];
 
 /// Why the default set or its area could not be built.

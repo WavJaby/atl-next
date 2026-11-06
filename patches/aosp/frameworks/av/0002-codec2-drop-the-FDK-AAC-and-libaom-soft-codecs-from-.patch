@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 20:50:27 +0800
+Subject: [PATCH] codec2: drop the FDK-AAC and libaom soft codecs from the
+ store list
+
+C2PlatformComponentStore lists the soft codec libraries AOSP ships. ATL
+does not ship FDK-AAC (owner licence decision N3) nor libaom (owner
+decision 2026-11-07: AOM Patent License 1.0, doubtful compatibility
+with the GPL-3 QEMU bridge), so libcodec2_soft_aacdec.so,
+libcodec2_soft_aacenc.so and libcodec2_soft_av1enc.so (libaom's only
+user) are removed from the list. AV1 decode stays (gav1, dav1d). Every
+other listed library is built by ATL. ComponentModule::init keeps its
+fatal dlopen check: a listed library that is missing is a build error,
+not a skipped codec.
+
+Upstream-Status: Pending
+Patch-Reason: FDK-AAC and libaom are excluded by licence (owner N3, owner 2026-11-07); the list is compiled into C2Store.cpp, so only the list can drop the entries, and a stub .so would be a second implementation
+---
+SPDX-License-Identifier: Apache-2.0
+ media/codec2/vndk/C2Store.cpp | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/media/codec2/vndk/C2Store.cpp b/media/codec2/vndk/C2Store.cpp
+index 7ca86c161f86d538feac38faf27f5ee34be635ca..c0ec896db7ab9dad476bf2c35d53c92e479de076 100644
+--- a/media/codec2/vndk/C2Store.cpp
++++ b/media/codec2/vndk/C2Store.cpp
+@@ -1175,8 +1175,7 @@ C2PlatformComponentStore::C2PlatformComponentStore()
+     };
+ 
+     // TODO: move this also into a .so so it can be updated
+-    emplace("libcodec2_soft_aacdec.so");
+-    emplace("libcodec2_soft_aacenc.so");
++    // ATL does not ship FDK-AAC (owner N3): libcodec2_soft_aacdec/aacenc are not listed
+     emplace("libcodec2_soft_amrnbdec.so");
+     emplace("libcodec2_soft_amrnbenc.so");
+     emplace("libcodec2_soft_amrwbdec.so");
+@@ -1184,7 +1183,7 @@ C2PlatformComponentStore::C2PlatformComponentStore()
+     //emplace("libcodec2_soft_av1dec_aom.so"); // deprecated for the gav1 implementation
+     emplace("libcodec2_soft_av1dec_gav1.so");
+     emplace("libcodec2_soft_av1dec_dav1d.so");
+-    emplace("libcodec2_soft_av1enc.so");
++    // ATL does not ship libaom (owner 2026-11-07): libcodec2_soft_av1enc is not listed
+     emplace("libcodec2_soft_avcdec.so");
+     emplace("libcodec2_soft_avcenc.so");
+     emplace("libcodec2_soft_flacdec.so");

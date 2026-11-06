@@ -121,14 +121,15 @@ fn install_service_view() -> Result<()> {
     Ok(())
 }
 
-/// Step 1c. The Codec2 store this process serves (atl-codec-store) through the view, right after it is installed: AOSP's Codec2 client finds `IComponentStore/default` by name, in-process, on every process.
+/// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for).
 #[cfg(feature = "converter")]
-fn serve_codec_store() -> Result<()> {
-    atl_codec_store::serve().map_err(|e| anyhow!(e))
+fn serve_media_services() -> Result<()> {
+    atl_codec_store::serve().map_err(|e| anyhow!(e))?;
+    atl_resource_manager::serve().map_err(|e| anyhow!(e))
 }
 
 #[cfg(not(feature = "converter"))]
-fn serve_codec_store() -> Result<()> {
+fn serve_media_services() -> Result<()> {
     Ok(())
 }
 
@@ -176,7 +177,7 @@ fn run() -> Result<i32> {
         );
     }
     install_service_view()?;
-    serve_codec_store()?;
+    serve_media_services()?;
     load_media_extractors();
     let mut vm_options = launch.vm_options.clone();
     if launch.app {

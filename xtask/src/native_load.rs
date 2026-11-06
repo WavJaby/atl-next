@@ -288,7 +288,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &env,
         &fixture,
         &apks,
-        &env.work.join("media"),
+        &env.work.join(CLIP_DIR),
         args.break_media,
     ) {
         Ok(s) => report.pass("decode", s),
@@ -303,11 +303,12 @@ const AID_APP_START: u32 = 10_000;
 /// Stage 8's run limit: ART start (~1 s here) plus codec lookups; a hang (a wait for an absent service) ends as SIGTERM in the detail instead of a stuck gate.
 const MEDIA_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `xtask native` goals stages 8 + 9 need beyond the runtime's closure, besides the store's codecs ([`store_codecs`]): the binder harness's servicemanager + service, the in-process Codec2 store's server library, the extractor plugins.
-const GOALS: [&str; 5] = [
+/// `xtask native` goals stages 8 + 9 need beyond the runtime's closure, besides the store's codecs ([`store_codecs`]): the binder harness's servicemanager + service, the in-process Codec2 store's server library and resource manager, the extractor plugins.
+const GOALS: [&str; 6] = [
     "servicemanager",
     "service",
     "libcodec2_aidl_noisurface",
+    "libresourcemanagerservice",
     "liboggextractor",
     "libwavextractor",
 ];
@@ -343,6 +344,9 @@ fn check_goals(out: &Path, host: &str, codecs: &[String]) -> Result<()> {
     );
     Ok(())
 }
+
+/// Stage 9's clip dir below the work dir: the clips extracted from the APKs and the decoder's .pcm output beside each.
+const CLIP_DIR: &str = "media";
 
 /// Stage 8's mimes: what games decode through SoundPool/MediaPlayer (Ogg Vorbis, WAV PCM).
 const MEDIA_MIMES: [&str; 2] = ["audio/vorbis", "audio/raw"];
@@ -411,7 +415,7 @@ impl Env {
         let cpp = tree::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
         let src =
             std::fs::read_to_string(&cpp).with_context(|| format!("reading {}", cpp.display()))?;
-        // the task copy's list when frameworks/av is edited (patches/aosp/frameworks/av 0002 drops the FDK codecs)
+        // the task copy's list when frameworks/av is edited (patches/aosp/frameworks/av 0002 drops the FDK-AAC and libaom codecs)
         let store = tree::build_file(root, C2_STORE_CPP)?;
         let store_src = std::fs::read_to_string(&store)
             .with_context(|| format!("reading {}", store.display()))?;
@@ -497,7 +501,23 @@ impl Env {
         let lib_path = format!("{}:{}", self.host.lib_path.display(), mapper_dir.display());
         cmd.env("LD_LIBRARY_PATH", lib_path);
         let what = format!("{cmd:?}");
-        let mounts = crate::binder::layout_mounts(&test_root);
+        // the sandbox shows only what is mounted: the slot read-only at its own path (boot jars, fixture dex + shim, property area, extracted clips, launcher), the staged ART root with what its links name (ICU / tzdata files link out of the slot), ANDROID_DATA writable inside the slot
+        let mut mounts = crate::binder::layout_mounts(&test_root)?;
+        mounts.push(atl_broker::Mount {
+            host: self.out.clone(),
+            at: self.out.clone(),
+            writable: false,
+        });
+        mounts.extend(atl_broker::tree_mounts(&self.host.art)?);
+        // writable: ANDROID_DATA, and the decode stage's clip dir (its .pcm output)
+        for dir in [fixture.java.work.join("data"), self.work.join(CLIP_DIR)] {
+            std::fs::create_dir_all(&dir)?;
+            mounts.push(atl_broker::Mount {
+                host: dir.clone(),
+                at: dir,
+                writable: true,
+            });
+        }
         let run =
             crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
                 let child = p.child;

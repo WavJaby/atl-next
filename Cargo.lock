@@ -110,6 +110,7 @@ dependencies = [
  "atl-composer",
  "atl-media-extractors",
  "atl-platform-ui",
+ "atl-resource-manager",
  "atl-service-view",
  "rustix",
  "tracing-subscriber",
@@ -436,6 +437,17 @@ dependencies = [
  "atl-bionic",
  "clap",
  "toml",
+]
+
+[[package]]
+name = "atl-resource-manager"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-service-view",
+ "cxx",
+ "cxx-build",
 ]
 
 [[package]]

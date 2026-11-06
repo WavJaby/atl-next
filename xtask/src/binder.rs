@@ -76,16 +76,20 @@ pub(crate) fn link_rows(root: &Path, rows: &[(PathBuf, String)]) -> Result<()> {
     Ok(())
 }
 
-/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the /system rows an app process reads (`link_rows`).
-pub(crate) fn layout_mounts(root: &Path) -> Vec<Mount> {
-    ["system", "vendor", "odm"]
-        .into_iter()
-        .map(|d| Mount {
-            host: root.join(d),
+/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the /system rows an app process reads (`link_rows`), with the host files those rows link to at their own paths (`atl_broker::tree_mounts`), which the sandbox otherwise does not show.
+pub(crate) fn layout_mounts(root: &Path) -> Result<Vec<Mount>> {
+    let mut mounts = Vec::new();
+    for d in ["system", "vendor", "odm"] {
+        let dir = root.join(d);
+        mounts.push(Mount {
+            host: dir.clone(),
             at: PathBuf::from("/").join(d),
             writable: false,
-        })
-        .collect()
+        });
+        // tree_mounts' first entry is `dir` at its host path: the Android path above replaces it
+        mounts.extend(atl_broker::tree_mounts(&dir)?.into_iter().skip(1));
+    }
+    Ok(mounts)
 }
 
 /// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid`: read-only mounts of the LD_LIBRARY_PATH dirs at their own paths (the runtime's shared host paths, as atld mounts them), no devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
@@ -134,7 +138,7 @@ pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process
     spawn_piped_with(b, cmd, uid, Vec::new())
 }
 
-/// [`spawn_piped`] with `mounts` (`layout_mounts`: the test layout's /system, /vendor, /odm).
+/// [`spawn_piped`] with `mounts` added to [`spawn_of`]'s (e.g. `layout_mounts`: the test layout's /system, /vendor, /odm).
 pub(crate) fn spawn_piped_with(
     b: &Broker,
     cmd: &Command,
@@ -142,7 +146,7 @@ pub(crate) fn spawn_piped_with(
     mounts: Vec<Mount>,
 ) -> Result<Process> {
     let mut s = spawn_of(cmd, uid)?;
-    s.mounts = mounts;
+    s.mounts.extend(mounts);
     s.stdout = Stdio::piped();
     s.stderr = Stdio::piped();
     b.spawn(s)
@@ -281,7 +285,7 @@ pub(crate) fn start_servicemanager(
     cmd.envs(env.iter().cloned());
     let mut s = spawn_of(&cmd, AID_SYSTEM)?;
     s.context_manager = true;
-    s.mounts.extend(layout_mounts(test_root));
+    s.mounts.extend(layout_mounts(test_root)?);
     (s.stdout, s.stderr) = to_log(std::fs::File::create(test_root.join("servicemanager.log"))?)?;
     let mut sm = b.spawn(s).context("spawning servicemanager")?;
 

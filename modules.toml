@@ -44,7 +44,7 @@ uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "ser
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "bionic", "composer", "platform-ui", "service-view", "codec-store", "media-extractors"]
+uses = ["generators", "bionic", "composer", "platform-ui", "service-view", "codec-store", "resource-manager", "media-extractors"]
 
 # the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger; later Codec2, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]
@@ -62,6 +62,12 @@ uses = ["generators"]
 [codec-store]
 crates = ["atl-codec-store"]
 exports = ["atl-codec-store"]
+uses = ["service-view", "generators"]
+
+# the media resource manager the app process serves through the view (audio M1): AOSP's ResourceManagerService built as-is, as media.resource_manager (MediaCodec waits for it); cxx adapter in wrap/rms.cpp
+[resource-manager]
+crates = ["atl-resource-manager"]
+exports = ["atl-resource-manager"]
 uses = ["service-view", "generators"]
 
 # the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The process's own view of servicemanager (owner decision 2026-11-06): libbinder's default service manager becomes an in-process `android.os.IServiceManager` that answers the names this process
 //! serves itself ([`serve`]) and forwards every other call to the real servicemanager (the binder context object, through binderd). One mechanism for every service an app process must find by a fixed
-//! name it cannot register: its SurfaceFlinger (atl-composer), later the Codec2 store and `media.player`. Other processes never see these names: servicemanager stays one namespace of system services.
+//! name it cannot register: its SurfaceFlinger (atl-composer), the Codec2 store, the media resource manager (made at first lookup, [`serve_lazy`]), later `media.player`. Other processes never see these names: servicemanager stays one namespace of system services.
 //! Native lookups only (`defaultServiceManager()`: libbinder, libbinder_ndk, libbinder_rs); Java's ServiceManager reads the context object itself and sees the real one.
 //! [`install`] must run before anything calls `defaultServiceManager()` (atl-app-launcher: before `JNI_CreateJavaVM`). The real servicemanager is looked up at the first forwarded call, so a process
 //! without a binder driver installs the view and never opens one unless it asks for a service.
@@ -19,7 +19,7 @@ extern crate rustutils;
 mod bridge;
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use atl_aidl::aidl::android::os::ConnectionInfo::ConnectionInfo;
 use atl_aidl::aidl::android::os::IClientCallback::IClientCallback;
@@ -35,7 +35,19 @@ use binder::{BinderFeatures, ExceptionCode, FromIBinder, SpIBinder, Status, Stat
 /// The installed view; set once by [`install`].
 static VIEW: OnceLock<Strong<dyn IServiceManager>> = OnceLock::new();
 /// The names this process serves.
-static LOCAL: Mutex<BTreeMap<String, SpIBinder>> = Mutex::new(BTreeMap::new());
+static LOCAL: Mutex<BTreeMap<String, Arc<Entry>>> = Mutex::new(BTreeMap::new());
+
+/// One served name: the binder, made at the first lookup for a [`serve_lazy`] name. Made outside the table lock, since a maker may itself look services up (ResourceManagerService's constructor asks for `batterystats`).
+struct Entry {
+    made: OnceLock<Option<SpIBinder>>,
+    make: fn() -> Option<SpIBinder>,
+}
+
+impl Entry {
+    fn binder(&self) -> Option<SpIBinder> {
+        self.made.get_or_init(self.make).clone()
+    }
+}
 
 /// Makes this process's view libbinder's default service manager. Call once, before any `defaultServiceManager()`: libbinder aborts the process if one already ran (IServiceManager.cpp `setDefaultServiceManager`).
 pub fn install() -> Result<(), String> {
@@ -53,6 +65,29 @@ pub fn install() -> Result<(), String> {
 
 /// Serves `service` as `name` to this process's lookups; a later `serve` of the same name replaces it. Refused before [`install`]: nothing would see it.
 pub fn serve(name: &str, service: SpIBinder) -> Result<(), String> {
+    let made = OnceLock::new();
+    let _ = made.set(Some(service));
+    insert(
+        name,
+        Entry {
+            made,
+            make: || None,
+        },
+    )
+}
+
+/// Serves `name` with the binder `make` returns at the first lookup that needs it (getService / checkService); a None from `make` answers that and every later lookup as absent. For a service whose construction itself talks to the real servicemanager, so a process that never asks for it (or has no binder driver) never pays for it. isDeclared and getDeclaredInstances answer without making it. Refused before [`install`].
+pub fn serve_lazy(name: &str, make: fn() -> Option<SpIBinder>) -> Result<(), String> {
+    insert(
+        name,
+        Entry {
+            made: OnceLock::new(),
+            make,
+        },
+    )
+}
+
+fn insert(name: &str, entry: Entry) -> Result<(), String> {
     if VIEW.get().is_none() {
         return Err(format!(
             "{name}: the service view is not installed (atl-app-launcher installs it)"
@@ -61,12 +96,17 @@ pub fn serve(name: &str, service: SpIBinder) -> Result<(), String> {
     LOCAL
         .lock()
         .map_err(|_| "service view table poisoned".to_owned())?
-        .insert(name.to_owned(), service);
+        .insert(name.to_owned(), Arc::new(entry));
     Ok(())
 }
 
-fn local(name: Option<&str>) -> Option<SpIBinder> {
+fn entry(name: Option<&str>) -> Option<Arc<Entry>> {
     LOCAL.lock().ok()?.get(name?).cloned()
+}
+
+/// A served name's binder, made now for a lazy one (outside the table lock).
+fn local(name: Option<&str>) -> Option<SpIBinder> {
+    entry(name)?.binder()
 }
 
 /// The instances of `iface` this process serves (`iface/<instance>` names): servicemanager's declared list does not carry them (no VINTF entry), so getDeclaredInstances adds them.
@@ -167,7 +207,7 @@ impl IServiceManager for View {
     }
 
     fn r#isDeclared(&self, name: Option<&str>) -> binder::Result<bool> {
-        match local(name) {
+        match entry(name) {
             Some(_) => Ok(true),
             None => real()?.r#isDeclared(name),
         }
