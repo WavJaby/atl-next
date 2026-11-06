@@ -27,7 +27,9 @@ use atl_parcelables::android::app::{
     ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
     ContentProviderHolder,
 };
-use atl_parcelables::android::content::pm::{ApplicationInfo, ProviderInfo, ProviderInfoList};
+use atl_parcelables::android::content::pm::{
+    ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
+};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;

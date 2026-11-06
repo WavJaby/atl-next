@@ -444,6 +444,7 @@ mod tests {
                 permissions: vec![],
                 libraries: vec![],
                 instrumentation: vec![],
+                receivers: vec![],
             },
             uid: 10_001,
             source_dir: String::new(),
