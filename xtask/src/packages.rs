@@ -531,20 +531,21 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
     Ok(built)
 }
 
-/// `xtask check` step converter-packages: clippy on the converter packages of `out`'s graph.json, as `build` lints them; nothing when the graph selects none.
-pub fn lint(root: &Path, out: &Path) -> Result<()> {
+/// `xtask check` step converter-packages: clippy on the converter packages of `out`'s graph.json, as `build` lints them. Returns the packages it could not lint, each with the
+/// module the graph lacks (a slot behind the checkout): the converter feature links converter outputs, so without them nothing compiles those modules, and `check` names
+/// the step skipped rather than reporting it passed.
+pub fn lint(root: &Path, out: &Path) -> Result<Vec<String>> {
     let packages = workspace_packages(root)?;
     let sel = Selection::new(root, out, &packages)?;
-    for (p, m) in &sel.skipped {
-        println!(
-            "converter-packages: {} not linted: the graph lacks {m}",
-            p.name
-        );
+    let unlinted = sel
+        .skipped
+        .iter()
+        .map(|(p, m)| format!("{} (the graph lacks {m})", p.name))
+        .collect();
+    if !sel.selected.is_empty() {
+        sel.lint()?;
     }
-    if sel.selected.is_empty() {
-        return Ok(());
-    }
-    sel.lint()
+    Ok(unlinted)
 }
 
 /// Executable `bin` of `package`, built as `build` builds it; fails when the graph lacks the package's modules.

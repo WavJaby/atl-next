@@ -105,7 +105,21 @@ impl Step {
         }
     }
 
-    fn run(self, root: &Path, out: &Path) -> Result<()> {
+    /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
+    fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
+        if self == Step::ConverterPackages {
+            let unlinted = packages::lint(root, out)?;
+            return Ok((!unlinted.is_empty()).then(|| {
+                format!(
+                    "not linted: {}: run `cargo xtask native` first",
+                    unlinted.join(", ")
+                )
+            }));
+        }
+        self.run_whole(root).map(|()| None)
+    }
+
+    fn run_whole(self, root: &Path) -> Result<()> {
         match self {
             Step::Fmt => cargo(root, &["fmt", "--all", "--check"]),
             Step::Spdx => spdx::check(root),
@@ -192,7 +206,7 @@ impl Step {
             Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
-            Step::ConverterPackages => packages::lint(root, out),
+            Step::ConverterPackages => unreachable!("run handles converter-packages"),
         }
     }
 }
@@ -214,9 +228,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(why) = step.skip(&out) {
             eprintln!("== check: {} skipped: {why}", step.name());
             skipped.push(step.name());
-        } else if let Err(e) = step.run(root, &out) {
-            eprintln!("== check: {} FAILED: {e:#}", step.name());
-            failures.push(Failure::step(step.name(), format!("{e:#}")));
+        } else {
+            match step.run(root, &out) {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    eprintln!("== check: {} skipped: {why}", step.name());
+                    skipped.push(step.name());
+                }
+                Err(e) => {
+                    eprintln!("== check: {} FAILED: {e:#}", step.name());
+                    failures.push(Failure::step(step.name(), format!("{e:#}")));
+                }
+            }
         }
     }
     let verdict = Verdict {
