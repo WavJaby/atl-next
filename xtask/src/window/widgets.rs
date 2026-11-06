@@ -90,6 +90,8 @@ const KEYCODE_BACK: i64 = 4;
 const KEYCODE_FORWARD: i64 = 125;
 /// Main's OnBackInvokedCallback line: BACK reached the app's back dispatch.
 const BACK_CALLBACK_LINE: &str = "AtlWindow: back callback";
+/// KeyEvent.FLAG_CANCELED: ViewRootImpl.doOnBackKeyEvent cancels a back UP after its dispatch (ViewRootImpl.java:7750-7753), so the UP reaches Main canceled. Forward has no such dispatch: flags 0.
+const FLAG_CANCELED: i64 = 0x20;
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
@@ -272,7 +274,7 @@ fn keys_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The mouse's side buttons (drive's last step): BTN_SIDE reached Main as KEYCODE_BACK down then up from the mouse (source mouse, the pointer's device, flags 0, no repeat), BTN_EXTRA as KEYCODE_FORWARD the same way, and the back callback ran once.
+/// The mouse's side buttons (drive's last step): BTN_SIDE reached Main as KEYCODE_BACK down then up from the mouse (source mouse, the pointer's device, no repeat; the up FLAG_CANCELED by the back dispatch), BTN_EXTRA as KEYCODE_FORWARD the same way (flags 0), and the back callback ran once.
 /// Values: keycodes.h, atl-services input_devices. AOSP: CursorInputMapper's synthesizeButtonKeys, a key on each button-state change.
 fn buttons_check(app: &str) -> Result<String, String> {
     let pointer = i64::from(input_devices::POINTER);
@@ -284,7 +286,7 @@ fn buttons_check(app: &str) -> Result<String, String> {
         .collect();
     let want = [
         (0, KEYCODE_BACK, pointer, 0, 0),
-        (1, KEYCODE_BACK, pointer, 0, 0),
+        (1, KEYCODE_BACK, pointer, 0, FLAG_CANCELED),
         (0, KEYCODE_FORWARD, pointer, 0, 0),
         (1, KEYCODE_FORWARD, pointer, 0, 0),
     ];
@@ -293,7 +295,10 @@ fn buttons_check(app: &str) -> Result<String, String> {
             "mouse keys (action, code, device, repeat, flags) {got:?}, want {want:?}"
         ));
     }
-    let callbacks = app.lines().filter(|l| *l == BACK_CALLBACK_LINE).count();
+    let callbacks = app
+        .lines()
+        .filter(|l| l.contains(BACK_CALLBACK_LINE))
+        .count();
     if callbacks != 1 {
         return Err(format!("{callbacks} back callbacks, want 1"));
     }
@@ -946,27 +951,38 @@ mod tests {
     const BUTTON: &str = "AtlWindow: layout button left=16 top=49 width=88 height=48\n";
 
     /// One mouse key line as Main logs it (`key` format, source mouse).
-    fn mouse_key(action: u32, code: i64, device: i64) -> String {
+    fn mouse_key(action: u32, code: i64, device: i64, flags: i64) -> String {
         format!(
-            "AtlWindow: key action={action} code={code} scan=0 meta=0 repeat=0 flags=0 device={device} source={SOURCE_MOUSE} char=0 kbtype=0\n"
+            "AtlWindow: key action={action} code={code} scan=0 meta=0 repeat=0 flags={flags} device={device} source={SOURCE_MOUSE} char=0 kbtype=0\n"
         )
     }
 
-    /// Back and forward down and up from the pointer, and the back callback: the probe's last step passes; a missing back key or callback fails it.
+    /// Back and forward down and up from the pointer, and the back callback: the probe's last step passes; a missing back key, an uncanceled back up or a missing callback fails it.
     #[test]
     fn buttons_check_wants_back_and_forward_from_the_mouse() {
         let pointer = i64::from(input_devices::POINTER);
+        let back_up = mouse_key(1, KEYCODE_BACK, pointer, FLAG_CANCELED);
         let good = [
-            mouse_key(0, KEYCODE_BACK, pointer),
-            mouse_key(1, KEYCODE_BACK, pointer),
-            mouse_key(0, KEYCODE_FORWARD, pointer),
-            mouse_key(1, KEYCODE_FORWARD, pointer),
+            mouse_key(0, KEYCODE_BACK, pointer, 0),
+            back_up.clone(),
+            mouse_key(0, KEYCODE_FORWARD, pointer, 0),
+            mouse_key(1, KEYCODE_FORWARD, pointer, 0),
         ]
         .concat()
             + "AtlWindow: back callback\n";
         assert!(buttons_check(&good).is_ok());
-        assert!(buttons_check(&good.replace(&mouse_key(0, KEYCODE_BACK, pointer), "")).is_err());
+        assert!(buttons_check(&good.replace(&mouse_key(0, KEYCODE_BACK, pointer, 0), "")).is_err());
+        assert!(
+            buttons_check(&good.replace(&back_up, &mouse_key(1, KEYCODE_BACK, pointer, 0)))
+                .is_err()
+        );
         assert!(buttons_check(&good.replace("AtlWindow: back callback\n", "")).is_err());
+        // logcat prefixes every line of a real run
+        let logcat = good.replace(
+            "AtlWindow: back callback\n",
+            "1793995016.872 5227.437     2     2 I liblog/AtlWindow: back callback\n",
+        );
+        assert!(buttons_check(&logcat).is_ok());
     }
 
     #[test]
