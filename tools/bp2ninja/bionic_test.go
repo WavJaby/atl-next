@@ -4,6 +4,7 @@ package main
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -45,6 +46,28 @@ cc_library_shared { name: "libnone", srcs: ["a.c"], stl: "none" }
 		if !slices.Equal(got[Shared], c.want.shared) || !slices.Equal(got[Static], c.want.static) {
 			t.Errorf("%s: shared %q static %q, want %q %q", c.name, got[Shared], got[Static], c.want.shared, c.want.static)
 		}
+	}
+}
+
+// Soong puts a static library's whole_static_libs into its own archive (library.go), so whole-linking it whole-links them too (bionic libc: libc_common_shared -> libc_common -> libc_freebsd_ldexp, whose ldexp nothing in libc references).
+func TestNestedWholeArchive(t *testing.T) {
+	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `
+cc_library_shared { name: "libz", srcs: ["a.c"], whole_static_libs: ["libw"], system_shared_libs: [], stl: "none", nocrt: true, no_libcrt: true }
+cc_library_static { name: "libw", srcs: ["a.c"], whole_static_libs: ["libv"], system_shared_libs: [], stl: "none" }
+cc_library_static { name: "libv", srcs: ["a.c"], system_shared_libs: [], stl: "none" }
+`})
+	n := g.node("libz", NativeBridge("x86_64"), Shared, "t")
+	if n == nil {
+		t.Fatalf("no node, problems %q", g.problems)
+	}
+	// outputs are assigned at emit time
+	for _, d := range []*Node{n.deps.whole[0], n.deps.whole[0].deps.whole[0]} {
+		d.out = "/o/" + d.name + ".a"
+	}
+	libs, _ := g.linkLibs(n)
+	start, end := slices.Index(libs, "-Wl,--whole-archive"), slices.Index(libs, "-Wl,--no-whole-archive")
+	if start < 0 || end != start+3 || !strings.HasSuffix(libs[start+1], "/libw.a") || !strings.HasSuffix(libs[start+2], "/libv.a") {
+		t.Errorf("libs %q: want libw.a, libv.a whole", libs)
 	}
 }
 

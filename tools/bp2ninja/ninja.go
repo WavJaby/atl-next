@@ -482,10 +482,20 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	} else {
 		directStatic(n, &closure)
 	}
+	// a whole dependency's own whole_static_libs are objects of its archive in Soong (library.go), so they are whole-linked with it, recursively
 	whole := map[*Node]bool{}
-	for _, d := range n.deps.whole {
-		whole[d] = true
+	var wholeOrder []*Node
+	var addWhole func(list []*Node)
+	addWhole = func(list []*Node) {
+		for _, d := range list {
+			if !whole[d] {
+				whole[d] = true
+				wholeOrder = append(wholeOrder, d)
+				addWhole(d.deps.whole)
+			}
+		}
 	}
+	addWhole(n.deps.whole)
 	shared := map[*Node]bool{}
 	var sharedOrder []*Node
 	addShared := func(list []*Node) {
@@ -499,7 +509,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	addShared(n.deps.shared)
 	// rlibs link through the generated staticlib (rust.go rustStaticlib)
 	var wholeLibs []string
-	for _, d := range n.deps.whole {
+	for _, d := range wholeOrder {
 		if d.rust == nil {
 			wholeLibs = append(wholeLibs, d.out)
 		}
