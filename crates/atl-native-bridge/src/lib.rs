@@ -3,12 +3,15 @@
 //!
 //! - `exports`: `NativeBridgeItf` and the functions behind its entries, whose shells build.rs generates from native_bridge.h (atl-bridgegen).
 //! - `elf`: which libraries are ours to load: the host's ELF machine and a bionic marker.
+//! - `engine`: the identity engine (route N): guest bionic built for the host arch, run natively; crossings switch the thread pointer only.
 //!
-//! Step 2 of bridge 1: routing only. `loadLibrary` answers `LOAD_REFUSED`; the engine behind it comes with step 3.
-//! Boundary crate: `unsafe` only in `exports` and the generated shells.
+//! `loadLibrary` still answers `LOAD_REFUSED`: the engine runs the guest linker (spike gate g1) but is not routed to yet (step 4).
+//! Boundary crate: `unsafe` only in `exports`, `engine` and the generated shells.
 #![deny(unsafe_code)]
 
 pub mod elf;
+#[allow(unsafe_code)]
+pub mod engine;
 #[allow(unsafe_code)]
 mod exports;
 

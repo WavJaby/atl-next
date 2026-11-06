@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT
+//! Identity engine (bridge-1 route N): bionic built for the host arch in its upstream native-bridge mode, run natively; a crossing switches the thread pointer only.
+//! `Guest::start` does what the kernel does for a dynamic executable whose interpreter is the guest linker (fs/binfmt_elf.c): maps `linker64` and the NB vdso, builds the argument block (`args`), and runs the linker's `__linker_init` through the crossing.
+//! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
+//! One thread so far: its `HostThread` is the record step 4.2's attach makes per thread.
+
+/// The crossing of the host arch (FS on x86_64; `tpidr_el0` / `tp` modules for arm64 / riscv64 later).
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_64.rs"]
+pub mod arch;
+mod args;
+pub mod image;
+pub mod vdso;
+
+use std::path::PathBuf;
+
+pub use arch::HostThread;
+use image::Image;
+
+/// What the guest process is made of.
+pub struct Config {
+    /// the guest `linker64` (static-PIE)
+    pub linker: PathBuf,
+    /// NBS `libnative_bridge_vdso.so`
+    pub vdso: PathBuf,
+    /// the guest main executable the linker loads (argv[1])
+    pub exe: PathBuf,
+    /// the guest's `LD_LIBRARY_PATH` (bionic default namespace search path without a linker config)
+    pub library_path: Vec<PathBuf>,
+}
+
+/// A started guest: the linker initialised, its libraries constructed.
+pub struct Guest {
+    pub linker: Image,
+    pub vdso: Image,
+    /// the main executable's entry `__linker_init` returned
+    pub exe_entry: usize,
+    thread: &'static mut HostThread,
+}
+
+impl Guest {
+    /// Maps and initialises the guest. Returns right after the crossing back, before any allocation, so a probe can run on whatever thread pointer the crossing left.
+    pub fn start(cfg: &Config) -> Result<Guest, String> {
+        if !arch::supported() {
+            return Err(
+                "FSGSBASE not available (HWCAP2_FSGSBASE): no user-mode thread-pointer switch"
+                    .into(),
+            );
+        }
+        let linker = Image::map(&cfg.linker)?;
+        vdso::bind_linker(&linker)?;
+        linker.seal()?;
+        let vdso = Image::map(&cfg.vdso)?;
+        vdso::bind(&vdso)?;
+        vdso.seal()?;
+        let init = linker
+            .symbol("__dl___linker_init")
+            .ok_or("linker64 has no __dl___linker_init")?;
+        let block = args::build(cfg, &linker, &vdso)?;
+        let thread = HostThread::leak();
+        // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
+        let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0) };
+        Ok(Guest {
+            linker,
+            vdso,
+            exe_entry,
+            thread,
+        })
+    }
+
+    /// Calls guest `f(a, b, c)` on the guest thread pointer.
+    ///
+    /// # Safety
+    /// `f` must be guest code with an integer signature of at most three arguments; pointer arguments must be valid for it.
+    pub unsafe fn call(&mut self, f: usize, a: usize, b: usize, c: usize) -> usize {
+        // SAFETY: caller contract.
+        unsafe { arch::call_guest(self.thread, f, a, b, c) }
+    }
+
+    /// The record of the thread that started the guest.
+    pub fn thread(&self) -> &HostThread {
+        self.thread
+    }
+
+    /// Puts the host thread pointer back. Only for a probe that found the crossing left the guest's in place (g1's break).
+    pub fn force_host_fs(&self) {
+        // SAFETY: host_fs is the value the crossing read on this thread before entering the guest.
+        unsafe { arch::set_fs_base(self.thread.host_fs()) }
+    }
+}

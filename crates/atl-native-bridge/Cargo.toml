@@ -8,11 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 # `libatl_native_bridge.so`: the NativeBridge core ART loads with `-XX:NativeBridge=libatl_native_bridge.so` (libnativebridge `LoadNativeBridge`: a plain file name, opened by `dlopen` through LD_LIBRARY_PATH, then `dlsym("NativeBridgeItf")`).
-# Boundary crate: `unsafe` only in `exports` (the C ABI and raw pointer conversion) and the generated shells; ELF classification (`elf`) is safe.
+# Boundary crate: `unsafe` only in `exports` (the C ABI and raw pointer conversion), the generated shells and `engine` (mapping, the crossing asm, guest calls); ELF classification (`elf`) is safe.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# spike gate g1 (bridge-1 route N): maps the guest linker, runs its init through the crossing, probes the host after; needs a native-bridge build (`ATL_G1_NB`), skips without one
+[[test]]
+name = "g1"
+harness = false
+
 [dependencies]
+libc.workspace = true
 object.workspace = true
 
 [build-dependencies]

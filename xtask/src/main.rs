@@ -42,6 +42,7 @@ mod mesa;
 mod modules;
 mod native;
 mod native_load;
+mod ndk_surface;
 mod nested_wayland;
 mod none_gate;
 mod notice;

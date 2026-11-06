@@ -17,9 +17,9 @@ use crate::providers::{Partial, Provided};
 use crate::sources::Pin;
 use crate::verdict::{Failure, Verdict};
 use crate::{
-    arches, build_pool, converter, deps, fetch, licence_gate, licenses, none_gate, packages, patch,
-    provided_gate, providers, prune, runtimes, slot, sources, system, tree, triage, upstream,
-    workspace,
+    arches, build_pool, converter, deps, fetch, licence_gate, licenses, ndk_surface, none_gate,
+    packages, patch, provided_gate, providers, prune, runtimes, slot, sources, system, tree,
+    triage, upstream, workspace,
 };
 
 #[derive(clap::Args)]
@@ -376,7 +376,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )
     .with_context(|| format!("parsing {}", graph_file.display()))?;
     if let Some(p) = &nb.pass2 {
-        runtimes_pass2(root, args, &out, &graph, p)?;
+        runtimes_pass2(root, args, &out, &tree, &graph, p)?;
     }
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
@@ -578,7 +578,7 @@ fn native_bridge_flags(
     provided.insert(
         runtimes::SHARED_LIBCXX,
         Provided {
-            libs: vec![runtimes::shared_libcxx(out, arch)],
+            lib: runtimes::shared_libcxx(out, arch),
             export_include: vec![libcxx_include],
             ..Provided::default()
         },
@@ -625,6 +625,7 @@ fn runtimes_pass2(
     root: &Path,
     args: &Args,
     out: &Path,
+    tree: &Path,
     graph: &triage::Graph,
     p: &Pass2,
 ) -> Result<()> {
@@ -652,7 +653,7 @@ fn runtimes_pass2(
         "ninja for runtimes pass 2 (guest libc) failed: {}",
         log.display()
     );
-    runtimes::build_shared(
+    let built = runtimes::build_shared(
         root,
         &p.arch,
         (&args.cc, &args.cxx),
@@ -661,6 +662,19 @@ fn runtimes_pass2(
         &libs,
         &p.builtins,
     )?;
+    // it linked against the real libs, not the NDK stubs llvm_android uses: no binding outside the stub surface (ndk_surface.rs)
+    let (n, bad) = ndk_surface::check(&built.lib, tree, &p.arch)?;
+    println!(
+        "native: ndk-surface gate: {} bindings, {} outside the NDK stubs",
+        n,
+        bad.len()
+    );
+    ensure!(
+        bad.is_empty(),
+        "{}: binds outside the NDK stub surface: {}",
+        built.lib.display(),
+        bad.join(", ")
+    );
     Ok(())
 }
 

@@ -31,6 +31,8 @@ fn on_panic(field: &str, ret: &Ty) -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    // `--cfg atl_g1_break`: the deliberate break of spike gate g1 (engine::x86_64: the host->guest crossing without its FS restore)
+    println!("cargo::rustc-check-cfg=cfg(atl_g1_break)");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
