@@ -3,7 +3,7 @@
 //! - javac: a source under a `--patch-module=java.base` directory compiles when the directory is a bind mount; the control, the same directory reached through a symlink (the removed link farm's shape), fails with "package exists in another module".
 //! - verify: run inside a namespace with the right copy bound passes; the wrong copy bound, and no namespace at all, both fail.
 //! - git: a worktree bound over its own shared checkout answers `git status` at both paths when the git dir is in the store (`<root>/.git-dirs`, atl_layout::git_store); the control, the same with an in-tree git dir, fails (the bind hides the worktree's admin dir).
-//! - compiler cache: with a plain view's sccache server running, a compile in the namespace through the task view's socket yields the task copy's object; the control (the plain server) yields the unpatched one.
+//! - compiler cache: with a plain view's sccache server running, a compile in the namespace through the task view's socket yields the task copy's object; the control (the plain server) yields the unpatched one. A copy re-created under its path: the server started before it must not see the new copy (control); a new cache's server must.
 //! - `--plain <out> --task <out>`: the two native out dirs' build.ninja differ only on lines naming a bound project (`src/aosp/<project>/`); one other differing line fails.
 
 use std::collections::BTreeSet;
@@ -256,7 +256,7 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
 }
 
 /// The sccache server runs the compiler, so it must see the build's view. With a plain build's server running on the same cache dir, a compile inside the namespace through the task view's
-/// socket must yield the task copy's object (its tag string); the control sends the same compile to the plain server (the shared server before per-view sockets) and must get the unpatched one.
+/// socket must yield the task copy's object (its tag string); the control sends the same compile to the plain server and must get the unpatched one.
 fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
     const SRC: &str = "probe.c";
     let tag = |name: &str| format!("ATL_TASK_BIND_{name}_{}", std::process::id());
@@ -308,13 +308,34 @@ fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
             has(&o, "PATCHED"),
             "task build's compile through the compiler cache yielded the unpatched object (server outside the build's view)"
         );
+        // re-created copy: the task cache's server still holds the deleted directory, so its compile cannot see the new copy (control)
+        std::fs::remove_dir_all(copy)?;
+        std::fs::create_dir_all(copy)?;
+        std::fs::write(
+            copy.join(SRC),
+            format!("const char t[] = \"{}\";\n", tag("RECREATED")),
+        )?;
+        let stale = compile(&task, true, "stale.o").ok();
+        ensure!(
+            !stale.as_deref().is_some_and(|o| has(o, "RECREATED")),
+            "control: the server started before the copy was re-created compiled the new copy, so the probe does not show staleness"
+        );
+        // a new cache (a new build) starts its own server in its own namespace and must see the new copy
+        let fresh = CompilerCache::for_view(
+            "sccache",
+            scratch.join("sccache"),
+            &tree::describe(&task_ov),
+        );
+        let o = compile(&fresh, true, "fresh.o")?;
+        ensure!(
+            has(&o, "RECREATED"),
+            "a new build's compile yielded an object of the copy before its re-creation: the server predates it"
+        );
         Ok(())
     })();
-    plain.stop();
-    task.stop();
     result?;
     println!(
-        "task-bind: PASS compiler cache: task view's server compiles the task copy; control via the plain server gets the unpatched one"
+        "task-bind: PASS compiler cache: task view's server compiles the task copy; control via the plain server gets the unpatched one; after a copy re-creation, the old server is stale (control) and a new cache's server sees the new copy"
     );
     Ok(())
 }

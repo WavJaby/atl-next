@@ -706,8 +706,9 @@ pub(crate) fn shell_env(
 /// It writes the depfile from its own preprocessor run, so `deps = gcc` sees this out dir's headers on a hit too. Compiles with debug info run uncached (bp2ninja `debugInfo`): a hit would carry the filling out dir's paths in DWARF.
 /// The one remaining difference from an uncached build: two sources with equal preprocessed text (empty `*_neon.cc` on x86, trivial generated AIDL/pbzero units) share an entry, so the local `STT_FILE` symbol may name the other source's basename; code, data and relocations are equal.
 /// Its server is this cache's own: a socket inside the cache dir, so a user's own sccache server (another dir, another size) is never the one answering.
-/// One server per source view: the server, not the client, runs the preprocessor and the compiler, so it reads sources in its own mount namespace. A server shared with a task build (tree.rs namespace) compiled the unpatched `src/aosp` -> wrong objects.
-/// The socket is keyed by the overlay set (`tree::describe`); a server started inside a namespace only ever serves clients of that same view. Do not share one socket across views.
+/// One server per build: the server, not the client, runs the preprocessor and the compiler, so it reads sources in the mount namespace it started in.
+/// A copy removed and re-created under its path (patch --done, --edit) leaves an older server on the deleted directory: compiles then fail with `no such file`. So the socket carries the view (`tree::describe`) and a token unique to each cache, and `Drop` stops it with the build.
+/// Do not share one socket across builds or views.
 /// The on-disk entries stay shared: sccache 0.10 c.rs `hash_key` keys on compiler digest + common/arch args (-D yes, -I/-isystem no) + 7 whitelisted env vars + the preprocessed text, so a differing patched file gives a differing key.
 #[derive(Debug, PartialEq)]
 pub(crate) struct CompilerCache {
@@ -728,17 +729,21 @@ impl CompilerCache {
         })
     }
 
-    /// The cache in `dir` as seen from source view `view` (task-bind gate: a scratch dir).
+    /// A new cache in `dir` as seen from source view `view` (task-bind gate: a scratch dir). Its server is shared with no other cache.
     pub(crate) fn for_view(launcher: &str, dir: PathBuf, view: &str) -> Self {
         Self {
             launcher: launcher.into(),
-            socket: dir.join(format!("server-{:016x}.sock", fnv1a(view.as_bytes()))),
+            socket: dir.join(format!(
+                "server-{:016x}-{:016x}.sock",
+                fnv1a(view.as_bytes()),
+                build_token()
+            )),
             dir,
         }
     }
 
-    /// Stops this view's server (task-bind gate cleanup; builds leave theirs running).
-    pub(crate) fn stop(&self) {
+    /// Stops this cache's server. Runs on `Drop`: a build's server ends with the build.
+    fn stop(&self) {
         let _ = Command::new(&self.launcher)
             .arg("--stop-server")
             .envs(self.env())
@@ -788,6 +793,26 @@ impl CompilerCache {
         );
         Ok(())
     }
+}
+
+impl Drop for CompilerCache {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Differs between processes and between calls (pid + clock): the socket name must never name an earlier build's server.
+fn build_token() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+    fnv1a(
+        &[
+            u64::from(std::process::id()).to_le_bytes(),
+            now.to_le_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 /// Prints the table check's problems; the first one, None when there are none.
@@ -1353,15 +1378,17 @@ nope
         let env: BTreeMap<_, _> = on.env().into_iter().collect();
         assert_eq!(env["SCCACHE_DIR"], "/ws/cache/sccache");
         assert_eq!(env["SCCACHE_DIRECT"], "false");
-        // FNV-1a 64 offset basis = hash of the empty view (the plain build)
-        assert_eq!(
-            env["SCCACHE_SERVER_UDS"],
-            "/ws/cache/sccache/server-cbf29ce484222325.sock"
-        );
+        // view hash = FNV-1a 64 offset basis for the empty view (the plain build); then this cache's token
+        let uds = env["SCCACHE_SERVER_UDS"].to_string_lossy().into_owned();
+        assert!(uds.starts_with("/ws/cache/sccache/server-cbf29ce484222325-"));
+        assert!(uds.ends_with(".sock"));
         // another source view -> another server, same on-disk cache
         let task = CompilerCache::of(&parse(&[]), ws, "bionic=/ws/src-wt/t/bionic").unwrap();
         assert_ne!(task.socket, on.socket);
         assert_eq!(task.dir, on.dir);
+        // the same view again -> still another server: no build inherits an earlier build's
+        let again = CompilerCache::of(&parse(&[]), ws, "").unwrap();
+        assert_ne!(again.socket, on.socket);
         let other =
             CompilerCache::of(&parse(&["--compiler-cache", "/opt/sccache"]), ws, "").unwrap();
         assert_eq!(other.converter_args(), ["-launcher", "/opt/sccache"]);
