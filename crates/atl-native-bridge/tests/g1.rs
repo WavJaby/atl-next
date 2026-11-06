@@ -36,9 +36,11 @@ fn crossing() -> Result<(), String> {
     let host = arch::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
+    // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
+    unsafe { arch::init_tcb(tcb, &raw mut *ht) };
     ht.set_guest_fs(tcb);
     // SAFETY: read_fs takes three integers and touches no TLS.
-    let inside = unsafe { arch::call_guest(ht, read_fs as *const () as usize, 0, 0, 0) };
+    let inside = unsafe { arch::call_guest(ht, read_fs as *const () as usize, 0, 0, 0, 0) };
     if let Err(e) = probe(self0) {
         // SAFETY: `host` is this thread's own thread pointer, read above.
         unsafe { arch::set_fs_base(host) };

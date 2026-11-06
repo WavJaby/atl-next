@@ -33,7 +33,13 @@ fn on_panic(field: &str, ret: &Ty) -> Result<String> {
 /// What a guest thread is made of, relative to the AOSP tree: the thread record (`pthread_internal_t`) and its per-thread libc state (`bionic_tls`) -- the engine builds one per guest thread, as the NBS linker's `__libc_init_main_thread_early` reuses `__native_bridge_get_host_pthread()`'s answer as both -- and the static-TLS description the linker hands the host (`__native_bridge_config_static_tls`).
 const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/bionic/pthread_internal.h",
+    // pthread_attr_t: the intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate)
+    "bionic/libc/include/bits/pthread_types.h",
+    // struct sigaction / sigset_t: guest sigaction's host side converts them (engine/signal.rs layout gate)
+    "bionic/libc/include/bits/signal_types.h",
     "bionic/libc/private/bionic_tls.h",
+    // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE
+    "bionic/libc/platform/bionic/tls_defines.h",
     "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
 ];
 /// Their include directories: `bionic/…`, `private/…`, `platform/bionic/…` (bionic/libc), `async_safe/log.h`, `native_bridge_support/linker/…`.
@@ -68,7 +74,8 @@ fn bionic_thread(
         path: &unit,
         lang: Lang::Cxx,
         also: &also,
-        macros: &[],
+        // the guest TCB slot that holds the engine's per-thread record (x86_64 crossing: guest->host and signal entries find it there)
+        macros: &["TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE"],
     };
     let iface = atl_bridgegen::interface(
         "bionic_thread",
@@ -80,11 +87,147 @@ fn bionic_thread(
     atl_bridgegen::rust::layout_module(&iface, &host.arch)
 }
 
+/// The guest libc stubs whose host is the process's bionic provider (`libatl_bionic`: the bionic-only API glibc lacks, implemented with bionic's signature from these same headers, atl-bionic build.rs `APIS`), by header relative to the AOSP tree.
+/// The one list: engine/vdso.rs binds exactly these names to the provider, typed by the header's signatures (`provider.rs`).
+const PROVIDER_APIS: &[(&str, &[&str])] = &[
+    (
+        "sys/system_properties.h",
+        &[
+            "__system_properties_init",
+            "__system_property_area_serial",
+            "__system_property_find",
+            "__system_property_foreach",
+            "__system_property_get",
+            "__system_property_read",
+            "__system_property_read_callback",
+            "__system_property_serial",
+            "__system_property_set",
+            "__system_property_wait",
+        ],
+    ),
+    (
+        "android/set_abort_message.h",
+        &["android_set_abort_message"],
+    ),
+    // a platform header: bionic/libc/platform
+    ("bionic/malloc.h", &["android_mallopt"]),
+];
+const PROVIDER_FILES: &[&str] = &[
+    "bionic/libc/include/sys/system_properties.h",
+    "bionic/libc/include/android/set_abort_message.h",
+    "bionic/libc/platform/bionic/malloc.h",
+];
+
+/// `provider.rs`: `NAMES` (every `PROVIDER_APIS` function) and per function its fn-pointer type from the guest's bionic view (`import_module`), parsed as bionic's C++ sources are.
+fn provider(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path) -> Result<String> {
+    // the platform level, as atl-bionic reads them: `__system_property_read_callback` sits behind an availability guard (26)
+    let mut target = buildscript::bionic_platform_target(
+        up,
+        host,
+        buildscript::future_level(up, host)?,
+        Some(&buildscript::libcxx_include_dir()?),
+    );
+    target
+        .args
+        .push(format!("-I{}", up.aosp("bionic/libc/platform").display()));
+    let unit = out.join("provider.cc");
+    let includes: String = PROVIDER_APIS
+        .iter()
+        .map(|(h, _)| format!("#include <{h}>\n"))
+        .collect();
+    std::fs::write(&unit, includes)?;
+    let also: Vec<PathBuf> = PROVIDER_FILES.iter().map(|h| up.aosp(h)).collect();
+    let src = Source {
+        path: &unit,
+        lang: Lang::Cxx,
+        also: &also,
+        macros: &[],
+    };
+    let iface = atl_bridgegen::interface(
+        "provider",
+        "bionic sys/system_properties.h + android/set_abort_message.h + bionic/malloc.h",
+        &src,
+        std::slice::from_ref(&target),
+    )
+    .context("provider API")?;
+    let functions: Vec<&str> = PROVIDER_APIS
+        .iter()
+        .flat_map(|(_, f)| f.iter().copied())
+        .collect();
+    let mut code = atl_bridgegen::rust::import_module(&iface, &host.arch, &functions, &[])?;
+    code.push_str(&format!(
+        "\n/// Every provider function, by C name.\npub const NAMES: &[&str] = &{functions:?};\n"
+    ));
+    Ok(code)
+}
+
+/// The JNI function tables, relative to the AOSP tree: `JNINativeInterface` (behind `JNIEnv`) and `JNIInvokeInterface` (behind `JavaVM`).
+const JNI_HEADER: &str = "libnativehelper/include_jni/jni.h";
+/// Their records, with the Rust module each one's slots go to.
+const JNI_TABLES: &[(&str, &str)] = &[("JNINativeInterface", "env"), ("JNIInvokeInterface", "vm")];
+
+/// `jni_tables.rs`: per table, `SLOTS` (field name by slot, in jni.h's order) and one `usize` constant per field = its slot; every field a pointer-sized slot at slot * pointer size, else the build fails (the engine's tables and its stub array index by slot).
+fn jni_tables(up: &Upstreams, target: &Target) -> Result<String> {
+    let path = up.file(&format!("aosp/{JNI_HEADER}"))?;
+    let src = Source {
+        path: &path,
+        lang: Lang::C,
+        also: &[],
+        macros: &[],
+    };
+    let iface = atl_bridgegen::interface("jni", JNI_HEADER, &src, std::slice::from_ref(target))
+        .context(JNI_HEADER)?;
+    let view = iface
+        .arches
+        .get(&target.arch)
+        .context("jni.h: no view of the host arch")?;
+    let mut out = format!("// generated by build.rs from {JNI_HEADER} (host view), do not edit\n");
+    for (record, module) in JNI_TABLES {
+        let rec = view
+            .records
+            .get(*record)
+            .with_context(|| format!("jni.h lacks {record}"))?;
+        let word = rec.align;
+        ensure!(
+            rec.size == word * rec.fields.len() as u64,
+            "{record}: size {} is not {} slots of {word} bytes",
+            rec.size,
+            rec.fields.len()
+        );
+        out.push_str(&format!(
+            "/// `{record}` slots.\n#[allow(non_upper_case_globals, dead_code)]\npub mod {module} {{\n    pub const SLOTS: [&str; {}] = [\n",
+            rec.fields.len()
+        ));
+        for f in &rec.fields {
+            out.push_str(&format!("        {:?},\n", f.name));
+        }
+        out.push_str("    ];\n");
+        for (slot, f) in rec.fields.iter().enumerate() {
+            ensure!(
+                f.offset == slot as u64 * word
+                    && matches!(f.ty.resolved(), Ty::Pointer { bits, .. } if u64::from(*bits) == word * 8),
+                "{record}.{}: not a pointer at slot {slot} (offset {}, {:?})",
+                f.name,
+                f.offset,
+                f.ty
+            );
+            out.push_str(&format!("    pub const {}: usize = {slot};\n", f.name));
+        }
+        out.push_str("}\n");
+    }
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     // `--cfg atl_nb_no_fs_restore`: deliberate break of spike gates g1/g2 (engine::x86_64: the host->guest crossing without its FS restore)
     println!("cargo::rustc-check-cfg=cfg(atl_nb_no_fs_restore)");
     // `--cfg atl_g4_break`: g4's deliberate break (tests/g4.rs: a syscall in the host target, must leave the band)
     println!("cargo::rustc-check-cfg=cfg(atl_g4_break)");
+    // gate 4.4's deliberate breaks: `atl_nb_jni_direct` (engine/jni.rs: a guest env slot = the host function, no crossing), `atl_nb_nbfp_false` (exports.rs: isNativeBridgeFunctionPointer answers false)
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_jni_direct)");
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_nbfp_false)");
+    // `atl_nb_foreign_gs`: deliberate break of the app gate's `jitUpCall` (engine::x86_64: GS = the record, not ART's Thread*, while an up call's host target runs)
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_foreign_gs)");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
@@ -138,11 +281,15 @@ fn main() -> Result<()> {
         out.join("bionic_thread.rs"),
         bionic_thread(&up, &host, &out)?,
     )?;
+    std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
+    std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)
+        .chain(std::iter::once(&JNI_HEADER))
         .chain(INCLUDE_DIRS)
         .chain(THREAD_HEADERS)
         .chain(THREAD_INCLUDE_DIRS)
+        .chain(PROVIDER_FILES)
     {
         for p in up.rerun_paths(&format!("aosp/{rel}")) {
             println!("cargo::rerun-if-changed={}", p.display());

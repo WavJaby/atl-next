@@ -40,6 +40,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "stage",
         "atld's own `app --uid` argument, not bwrap's",
     ),
+    (
+        "xtask/src/atld_run.rs",
+        "build",
+        "aapt2 compile's `--dir`, not bwrap's",
+    ),
 ];
 
 /// The `--name` literals of `text` (bwrap.rs).

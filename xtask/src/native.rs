@@ -408,6 +408,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = gate(&out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
+    if let Some(first) = runpath_gate(&out)? {
+        failed.push(Failure::step("runpath gate", first));
+    }
     if let Some(first) = licence_gate(
         root,
         &layout,
@@ -698,6 +701,11 @@ pub(crate) fn shell_env(
 ) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
     let workspace = Layout::of(repo)?.workspace().to_path_buf();
     Ok(CompilerCache::of(args, &workspace, view).map_or_else(Vec::new, |c| c.env().to_vec()))
+}
+
+/// Where `--native-bridge <arch>` put module `m`'s outputs.
+pub fn nb_module_dir(out: &Path, arch: &str, m: &str) -> PathBuf {
+    out.join(format!("{NB_DIR}{arch}/{m}"))
 }
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
@@ -1092,6 +1100,22 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
         println!("native:   gate: {v}");
     }
     Ok(report.violations.first().map(ToString::to_string))
+}
+
+/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (stale ones are the licence gate's to report), plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
+fn runpath_gate(out: &Path) -> Result<Option<String>> {
+    let all = crate::licence_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
+    let (mut artifacts, _) = crate::licence_gate::fresh(out, all);
+    artifacts.extend(crate::runpath_gate::package_libs(&out.join("crates"))?);
+    let (read, violations) = crate::runpath_gate::check(out, &artifacts)?;
+    println!(
+        "native: runpath gate: {read} artifacts, {} runpath entries",
+        violations.len()
+    );
+    for v in violations.iter().take(5) {
+        println!("native:   runpath: {v}");
+    }
+    Ok(violations.first().cloned())
 }
 
 /// The licence gate (licence_gate.rs) over the device artifacts ninja produced, failed ones aside; false on a denied or unresolved file or a stale artifact.

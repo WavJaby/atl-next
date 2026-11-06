@@ -296,6 +296,7 @@ name = "atl-native-bridge"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-android-paths",
  "atl-bridgegen",
  "libc",
  "object",

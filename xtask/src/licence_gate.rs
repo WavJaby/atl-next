@@ -64,25 +64,16 @@ pub fn check(
     licenses: &Licenses,
     test_only: &BTreeSet<PathBuf>,
 ) -> Result<Report> {
-    let device = out.join("device");
-    let mut artifacts: Vec<PathBuf> = lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
-        .map(PathBuf::from)
-        .filter(|p| p.starts_with(&device) && p.is_file())
-        .collect();
+    let mut artifacts = link_outputs(out, &[out.join("device")])?;
     let mut report = Report::default();
     artifacts.retain(|a| {
         let keep = !test_only.contains(a);
         report.test_only += usize::from(!keep);
         keep
     });
-    let stale = relinked(out, &artifacts);
-    artifacts.retain(|a| {
-        let keep = !stale.contains(a);
-        if !keep {
-            report.stale.push(a.display().to_string());
-        }
-        keep
-    });
+    let stale;
+    (artifacts, stale) = fresh(out, artifacts);
+    report.stale = stale.iter().map(|a| a.display().to_string()).collect();
     report.artifacts = artifacts.len();
     // object -> first artifact loading it
     let mut objects: BTreeMap<PathBuf, &Path> = BTreeMap::new();
@@ -533,6 +524,20 @@ fn trace_of(artifact: &Path) -> PathBuf {
     let mut name = artifact.as_os_str().to_owned();
     name.push(".trace");
     PathBuf::from(name)
+}
+
+/// The link outputs of this out dir's build.ninja under any of `under` that exist (`ninja -t targets rule link`): the current graph's artifacts, not leftovers of an earlier goal set.
+pub(crate) fn link_outputs(out: &Path, under: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    Ok(lines(&ninja(out, &["-t", "targets", "rule", "link"])?)
+        .map(PathBuf::from)
+        .filter(|p| under.iter().any(|u| p.starts_with(u)) && p.is_file())
+        .collect())
+}
+
+/// `artifacts` split into (fresh, stale): stale = a failed build left an earlier link's output (`relinked`).
+pub(crate) fn fresh(out: &Path, artifacts: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let stale = relinked(out, &artifacts);
+    artifacts.into_iter().partition(|a| !stale.contains(a))
 }
 
 /// The artifacts whose link edge ninja would run (dry run, `-k 0`: past edges that would fail): those a failed build left as an earlier link's output.

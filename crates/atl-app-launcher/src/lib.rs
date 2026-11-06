@@ -6,6 +6,8 @@
 //!    Then (step 1b) the process's view of servicemanager (atl-service-view, feature `converter`): libbinder's default service manager, answering the names this process serves itself (its SurfaceFlinger) and forwarding the rest; it must precede any `defaultServiceManager()`.
 //! 2. `JNI_CreateJavaVM` through libnativehelper's JniInvocation, the VM options as dalvikvm takes them (`args`).
 //! 3. our logger via `__android_log_set_logger`, after the VM exists: ART's InitLogging (ART_TARGET_LINUX) installs libbase's StderrLogger through the same call (system/libbase/logging.cpp SetLogger), replacing any earlier one. The logger turns each message into a C6 record (`log`); liblog filters before calling it.
+//!
+//! 3'. app mode: `/dev/socket/logdw` served into the same sink (`logdw`), for the native-bridge guest's own liblog, which writes to logd.
 //! 4. `android_set_application_target_sdk_version` (bionic's compat checks); ART calls it from VMRuntime.setTargetSdkVersion only under ART_TARGET_ANDROID.
 //! 5. `main(String[])` of the class, then detach + DestroyJavaVM and `_exit` with dalvikvm's status.
 //!
@@ -25,6 +27,7 @@ mod args;
 #[allow(unsafe_code)]
 mod ffi;
 mod log;
+mod logdw;
 #[allow(unsafe_code)]
 mod looper;
 mod trace;
@@ -161,6 +164,17 @@ fn run() -> Result<i32> {
     }
     let vm = rt.create_vm(&vm_options)?;
     rt.install_logger();
+    if launch.app {
+        // before any app code, so the guest's liblog finds the socket on its first write
+        if let Err(e) = logdw::start() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "atl-app-launcher: no {}: {e:#}; liblog writes from the native-bridge guest are lost",
+                logdw::PATH
+            );
+        }
+    }
     rt.set_target_sdk(launch.target_sdk);
     let Some(class) = &launch.class else {
         bail!("Class name required");

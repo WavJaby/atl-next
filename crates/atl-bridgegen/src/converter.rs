@@ -146,7 +146,7 @@ impl Converter {
                         shared_name(&a.out).with_context(|| format!("{m}: {}", a.out.display()))?;
                     lines.push(format!("cargo::rustc-link-search=native={}", dir.display()));
                     lines.push(format!("cargo::rustc-link-lib=dylib={name}"));
-                    // RUNPATH, not RPATH: LD_LIBRARY_PATH still overrides it, as for the converter's links
+                    // RUNPATH, not RPATH: LD_LIBRARY_PATH still overrides it. Unlike converter device links, which carry none (xtask runpath_gate).
                     lines.push(format!(
                         "cargo::rustc-link-arg=-Wl,--enable-new-dtags,-rpath,{}",
                         dir.display()

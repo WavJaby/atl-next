@@ -46,7 +46,7 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 			if n.name == goal {
 				flags = g.compileFlags(n).cxx
 				// first although libuser names libother before it
-				if l, _ := g.linkLibs(n); l[0] != lib || !slices.Contains(l, "-Wl,-rpath,/prefix/lib") {
+				if l, _ := g.linkLibs(n); l[0] != lib || hasRpath(l) {
 					t.Errorf("%s: link libs %q", goal, l)
 				}
 			}
@@ -78,7 +78,8 @@ cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "li
 		"libz":          {Lib: "/usr/lib/libz.so"},
 		"libdl_android": {Lib: ext},
 	}
-	if g.node("libgui", Device, Shared, "goal") == nil {
+	// host side: only host links carry an rpath (linkLibs), so the order is a host property
+	if g.node("libgui", Host, Shared, "goal") == nil {
 		t.Fatalf("problems %v", g.problems)
 	}
 	for _, n := range g.order {
@@ -138,7 +139,7 @@ cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
 		l, _ := g.linkLibs(n)
 		switch n.name {
 		case "librt":
-			if l[0] != lib || !slices.Contains(l, "-Wl,-rpath,/crates/lib") {
+			if l[0] != lib || hasRpath(l) {
 				t.Errorf("librt link libs %q", l)
 			}
 		case "libsk":
@@ -235,7 +236,7 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 	}
 	libs := ninja[strings.Index(ninja, "liba.so: link"):]
 	libs = libs[strings.Index(libs, "libs = ")+len("libs = "):]
-	if !strings.HasPrefix(libs, "/c/lib/libatl_bionic.so ") || !strings.Contains(libs, " -Wl,-rpath,/c/lib ") {
+	if !strings.HasPrefix(libs, "/c/lib/libatl_bionic.so ") || strings.Contains(libs, "-rpath,") {
 		t.Errorf("liba libs %q", libs[:strings.Index(libs, "\n")])
 	}
 	// bionic's headers as system headers; not where libc is declined, which still gets api-level.h, forced from compat/device (TestWriteCompat)

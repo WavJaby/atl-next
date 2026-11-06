@@ -164,7 +164,7 @@ func TestDevicePlatform(t *testing.T) {
 		t.Errorf("cxx lacks the stl flags: %v", p.Cxx)
 	}
 	// libc++ is the default stl of a shared module (stl.go)
-	want := slices.Concat([]string{"/c/lib/libatl_bionic.so", "-Wl,-rpath,/c/lib"}, stlLinkFlags("libc++"), systemLinkFlags)
+	want := slices.Concat([]string{"/c/lib/libatl_bionic.so"}, stlLinkFlags("libc++"), systemLinkFlags)
 	if !slices.Equal(p.Link, want) {
 		t.Errorf("link %v, want %v", p.Link, want)
 	}

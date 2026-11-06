@@ -30,6 +30,8 @@ use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
+/// Android's socket directory in every sandbox; liblog's logd socket lives in it (`/dev/socket/logdw`, logd_writer.cpp).
+const SOCKET_DIR: &str = "/dev/socket";
 use bwrap::{Access, PROGRAM as BWRAP};
 
 /// One bind mount into the sandbox.
@@ -68,7 +70,7 @@ pub struct Spawn {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
-    /// The working directory inside the sandbox (bwrap `--chdir`); None = bwrap's default (the caller's directory when the sandbox shows it).
+    /// The working directory inside the sandbox (bwrap `--chdir`); None = `/`, as an Android app process has: the broker's own cwd is no app's business, and ART's non-zygote native-bridge init makes `./code_cache` (runtime.cc `PreInitializeNativeBridge(".")`), which landed in the caller's checkout.
     pub cwd: Option<PathBuf>,
     /// The process's fd 0; None = /dev/null. The system services get their [`control`] connection here (an inherited fd would need `unsafe` to adopt; stdin does not).
     pub stdin: Option<OwnedFd>,
@@ -229,6 +231,8 @@ pub fn bwrap_args(
         .tmpfs("/")
         .dev("/dev")
         .grant(Access::Rw, "/dev")
+        // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs)
+        .dir(SOCKET_DIR)
         .proc("/proc")
         .grant(Access::Ro, "/proc")
         .tmpfs("/tmp")
@@ -273,9 +277,8 @@ pub fn bwrap_args(
     // The stub sits at SANDBOX_STUB_AT, which no host mount can cover (its host path lies under build trees that other mounts show).
     a.ro_bind(stub, SANDBOX_STUB_AT);
     a.ro_bind(&spawn.program, &spawn.program);
-    if let Some(dir) = &spawn.cwd {
-        a.chdir(dir);
-    }
+    // the cwd defaults to `/`: the caller's directory is not necessarily shown in the sandbox
+    a.chdir(spawn.cwd.as_deref().unwrap_or(Path::new("/")));
     let grants = a.grants().to_vec();
     (a.end(), grants)
 }
@@ -716,7 +719,7 @@ mod tests {
         });
         let joined = s(&bwrap_args(&sp, &[], Path::new("/b/stub"), 9, None).0).join(" ");
         assert!(joined.ends_with(
-            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --"
+            "--ro-bind /r/system /system --bind /r/data /data --symlink /storage/emulated/0 /sdcard --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --"
         ));
     }
 
@@ -765,10 +768,10 @@ mod tests {
             },
             RootEntry::Dir("usr".into()),
         ];
-        // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc + private /tmp; then the seccomp program when given;
-        // the root's dirs read-only and its symlinks recreated; the stub and the program read-only, the mounts, the device nodes, the area at bionic's path; the end of options.
-        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc --tmpfs /tmp";
-        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --";
+        // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev (with init's /dev/socket) and /proc, a private /tmp; then the seccomp program when given;
+        // the root's dirs read-only and its symlinks recreated; the sysfs subtrees read-only; the mounts, the device nodes, the area at bionic's path; the stub and the program read-only; cwd `/`; the end of options.
+        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc --tmpfs /tmp";
+        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
         let stub = Path::new("/b/stub");
         assert_eq!(
             s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),

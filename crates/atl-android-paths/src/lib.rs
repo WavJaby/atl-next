@@ -13,6 +13,19 @@ pub const SYSTEM_LIB: &str = if cfg!(target_pointer_width = "64") {
 } else {
     "/system/lib"
 };
+/// The platform's executables.
+pub const SYSTEM_BIN: &str = "/system/bin";
+
+/// Guest native libraries of native-bridge ISA `isa` (Soong installs a `native_bridge_supported` module's bridge variant under `lib64/<NativeBridgeRelativePath>`, the guest arch name): the guest linker's default search path.
+pub fn native_bridge_lib(isa: &str) -> String {
+    format!("{SYSTEM_LIB}/{isa}")
+}
+
+/// Guest executables of native-bridge ISA `isa` (`bin/<NativeBridgeRelativePath>`): its `linker64` and `app_process64`.
+pub fn native_bridge_bin(isa: &str) -> String {
+    format!("{SYSTEM_BIN}/{isa}")
+}
+
 /// libEGL's Loader.cpp `VENDOR_LIB_EGL_DIR` for the process's pointer width: where it looks for `lib{EGL,GLESv1_CM,GLESv2}_<ro.hardware.egl>.so`.
 pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
     "/vendor/lib64/egl"

@@ -95,6 +95,23 @@ fn run(env: &common::Nb) -> Result<(), String> {
         }
         println!("g2: {name} = {got}, FS host after");
     }
+    // isNativeBridgeFunctionPointer's question (loader.rs `is_guest_code`: guest `__loader_dladdr` != 0): a guest function yes, a host one no.
+    // The app gate cannot break it: ART trampolines every native of a bridged namespace without asking (jni_internal.cc RegisterNatives).
+    let dladdr = need(&g.linker, "__dl___loader_dladdr")?;
+    let guest_fn = sym(&mut g, dlsym, h, &format!("{PREFIX}tlsCounter"))?;
+    let mut info = [0usize; 4];
+    for (what, addr, want) in [
+        ("guest", guest_fn, true),
+        ("host", run as *const () as usize, false),
+    ] {
+        // SAFETY: int __loader_dladdr(const void*, Dl_info*); `info` is a Dl_info-sized buffer.
+        let got = unsafe { g.call(dladdr, addr, info.as_mut_ptr() as usize, 0) } != 0;
+        host_intact(&g, self0, host, "dladdr")?;
+        if got != want {
+            return Err(format!("dladdr({what} fn) = {got}, want {want}"));
+        }
+    }
+    println!("g2: dladdr: guest fn yes, host fn no");
     println!(
         "g2: ok: dlopen({LIB:?}) = {h:#x}, {} calls, guest FS {:#x}",
         CALLS.len(),

@@ -9,8 +9,13 @@ import (
 	"testing"
 )
 
+// hasRpath: a link line names a run-time search path (-rpath-link is link time only and lands in no output).
+func hasRpath(libs []string) bool {
+	return slices.ContainsFunc(libs, func(s string) bool { return strings.Contains(s, "-rpath,") })
+}
+
 // The libartpalette shape (art/libartpalette/Android.bp): the android block's runtime_libs names libartpalette-system, which providers.toml's `module:` row stands libartpalette_fake (stem libartpalette-system) in for; dalvikvm's lib64 suffix.
-// Soong: stem + suffix name the output (and so the soname); a runtime lib is built but never linked, and found through the dependent's rpath (the build tree's stand-in for installing it beside it).
+// Soong: stem + suffix name the output (and so the soname); a runtime lib is built but never linked; on a device side it is found through the stage, not an rpath.
 func TestStemSuffixRuntimeLibs(t *testing.T) {
 	const bp = `
 cc_library { name: "libpal", srcs: ["p.cc"], target: { android: { runtime_libs: ["libpal-system", "libgone"], exclude_runtime_libs: ["libgone"] } } }
@@ -42,8 +47,9 @@ cc_binary { name: "vm", srcs: ["v.cc"], shared_libs: ["libpal"], multilib: { lib
 		if slices.Contains(libs, fake) || slices.Contains(inputs, fake) {
 			t.Errorf("runtime lib linked: %q", libs)
 		}
-		if !slices.Contains(libs, "-Wl,-rpath,"+filepath.Dir(fake)) {
-			t.Errorf("no rpath to the runtime lib: %q", libs)
+		// device: no rpath at all (Soong: host only); the stage's LD_LIBRARY_PATH finds the runtime lib
+		if hasRpath(libs) {
+			t.Errorf("device link carries an rpath: %q", libs)
 		}
 	}
 

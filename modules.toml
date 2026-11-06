@@ -144,11 +144,11 @@ crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
-# the NativeBridge core ART loads (`-XX:NativeBridge=`, plan S11 NB): which app libraries are bridged (`elf`) and the NativeBridgeCallbacks shells generated from native_bridge.h; bridge 1 routing so far, engines behind it later
+# the NativeBridge core ART loads (`-XX:NativeBridge=`, plan S11 NB): which app libraries are bridged (`elf`) and the NativeBridgeCallbacks shells generated from native_bridge.h; bridge 1's identity engine loads them into its guest (Android paths: the installed guest)
 [native-bridge]
 crates = ["atl-native-bridge", "atl-guest-dlsym"]
 exports = ["atl-native-bridge"]
-uses = ["generators"]
+uses = ["generators", "android-paths"]
 
 [generators]
 crates = ["atl-bridgegen"]

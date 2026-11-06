@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: MIT
 //! The C ABI of `libatl_native_bridge.so`: `NativeBridgeItf` and the functions behind its entries.
 //! The entry shells are generated from native_bridge.h (build.rs, atl-bridgegen `Table`): each has the header's exact signature and calls the function of the same name below inside `catch_unwind`. The functions below turn raw pointers into safe types at their first line (thin-shell pattern, AGENTS.md); their signatures are checked by the compiler at the shells' calls.
-//! Step 2 (routing only): `isSupported` classifies, `loadLibrary` refuses with `LOAD_REFUSED` + the path; the namespace API (v3+) is unused by our libnativeloader (`ART_TARGET_LINUX`: path-only calls, bridge-1 plan section 2) and answers failure.
+//! `isSupported` classifies, `loadLibrary` / `unloadLibrary` go to the process's guest (loader.rs); the namespace API (v3+) is unused by our libnativeloader (`ART_TARGET_LINUX`: path-only calls, bridge-1 plan section 2) and answers failure.
 //! Names are the header's field names, hence the lint allowance.
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, OsStr, c_char, c_void};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::elf::{self, Verdict};
+use crate::engine::Config;
+use crate::engine::arch::Down;
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
-    native_bridge_namespace_t, siginfo_t,
+    kJNICallTypeCriticalNative, kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,
 };
+use crate::loader;
 use object::elf as obj_elf;
 
 /// The interface version we implement: the pinned header's last entry, `isNativeBridgeFunctionPointer`, is v8's (libnativebridge `IDENTIFY_NATIVELY_BRIDGED_FUNCTION_POINTERS_VERSION`). A header with more entries fails to build here first (a shell without a function below).
 pub const VERSION: u32 = 8;
-
-/// The text of `loadLibrary`'s refusal; ART's `UnsatisfiedLinkError` carries it (`NativeBridgeGetError`).
-pub const LOAD_REFUSED: &str = "atl-native-bridge: loading bionic libraries is not implemented yet";
 
 /// What libnativebridge `dlsym`s (`kNativeBridgeInterfaceSymbol`).
 #[unsafe(no_mangle)]
@@ -55,6 +57,8 @@ pub unsafe fn initialize(
     _private_dir: *const c_char,
     _instruction_set: *const c_char,
 ) -> bool {
+    // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs
+    crate::engine::signal::rewrap_all();
     true
 }
 
@@ -62,21 +66,52 @@ pub unsafe fn initialize(
 /// `libpath` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
     // SAFETY: the header's contract for `libpath`.
-    let path = unsafe { str_arg(libpath) };
-    fail(format!(
-        "{LOAD_REFUSED}: {}",
-        path.map_or("(null)".into(), CStr::to_string_lossy)
-    ));
-    std::ptr::null_mut()
+    let Some(path) = (unsafe { str_arg(libpath) }) else {
+        fail("loadLibrary: null path".into());
+        return std::ptr::null_mut();
+    };
+    let path = Path::new(OsStr::from_bytes(path.to_bytes()));
+    // a rewrap point (engine/signal.rs): host handlers installed since the last one
+    crate::engine::signal::rewrap_all();
+    match loader::load(path, &Config::installed) {
+        Ok(h) => h as *mut c_void,
+        Err(e) => {
+            fail(format!("atl-native-bridge: {e}"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
+/// Pre-v7 entry, not called by ART 16: the Regular call type (as berberis forwards it).
+///
+/// # Safety
+/// `name` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn getTrampoline(
-    _handle: *mut c_void,
-    _name: *const c_char,
-    _shorty: *const c_char,
-    _len: u32,
+    handle: *mut c_void,
+    name: *const c_char,
+    shorty: *const c_char,
+    len: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // SAFETY: same contract.
+    unsafe { getTrampolineWithJNICallType(handle, name, shorty, len, kJNICallTypeRegular) }
+}
+
+/// What a JNI function's first argument is: ART calls `JNI_OnLoad` with a JavaVM (java_vm_ext.cc `LoadNativeLibrary`, through `getTrampolineWithJNICallType` like any method); `@CriticalNative` methods get no env; every other method a JNIEnv.
+fn down_kind(name: Option<&CStr>, jni_call_type: u32) -> Down {
+    if name == Some(c"JNI_OnLoad") {
+        Down::Vm
+    } else if jni_call_type == kJNICallTypeCriticalNative {
+        Down::Plain
+    } else {
+        Down::Env
+    }
+}
+
+/// The trampoline of guest function `f`, or null with the reason for `getError`.
+fn trampoline(f: usize, kind: Down) -> *mut c_void {
+    loader::trampoline(f, kind)
+        .map_err(fail)
+        .map_or(std::ptr::null_mut(), |t| t as *mut c_void)
 }
 
 /// # Safety
@@ -109,9 +144,15 @@ pub unsafe fn getSignalHandler(
     None
 }
 
-/// Nothing is ever loaded, so no handle is ours.
-pub unsafe fn unloadLibrary(_handle: *mut c_void) -> i32 {
-    -1
+/// Guest `dlclose`; 0 or -1 with the text for `getError`.
+pub unsafe fn unloadLibrary(handle: *mut c_void) -> i32 {
+    match loader::unload(handle as usize) {
+        Ok(()) => 0,
+        Err(e) => {
+            fail(format!("atl-native-bridge: {e}"));
+            -1
+        }
+    }
 }
 
 /// The thread's last failure text; empty when none (libnativeloader `strdup`s it, so never null).
@@ -165,28 +206,43 @@ pub unsafe fn getExportedNamespace(_name: *const c_char) -> *mut native_bridge_n
 
 pub unsafe fn preZygoteFork() {}
 
+/// Guest `dlsym` -> a down trampoline whose crossing hands the guest its own env/vm (engine/jni.rs); arguments otherwise pass through (identity ABI), so the shorty is not read.
+///
+/// # Safety
+/// `name` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn getTrampolineWithJNICallType(
-    _handle: *mut c_void,
-    _name: *const c_char,
+    handle: *mut c_void,
+    name: *const c_char,
     _shorty: *const c_char,
     _len: u32,
-    _jni_call_type: u32,
+    jni_call_type: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // SAFETY: the header's contract.
+    let Some(name) = (unsafe { str_arg(name) }) else {
+        return std::ptr::null_mut();
+    };
+    loader::symbol(handle as usize, name).map_or(std::ptr::null_mut(), |f| {
+        trampoline(f, down_kind(Some(name), jni_call_type))
+    })
 }
 
+/// `RegisterNatives` with a guest pointer (jni_internal.cc, after `isNativeBridgeFunctionPointer`): the same trampoline as a looked-up method.
 pub unsafe fn getTrampolineForFunctionPointer(
-    _method: *const c_void,
+    method: *const c_void,
     _shorty: *const c_char,
     _len: u32,
-    _jni_call_type: u32,
+    jni_call_type: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    trampoline(method as usize, down_kind(None, jni_call_type))
 }
 
-/// Nothing is loaded, so no pointer is a bridged function.
-pub unsafe fn isNativeBridgeFunctionPointer(_method: *const c_void) -> bool {
-    false
+/// Whether `method` is guest code: inside an object the guest linker loaded.
+pub unsafe fn isNativeBridgeFunctionPointer(method: *const c_void) -> bool {
+    // deliberate break of gate 4.4: ART then registers the guest pointer as host code
+    if cfg!(atl_nb_nbfp_false) {
+        return false;
+    }
+    loader::is_guest_code(method as usize)
 }
 
 #[cfg(test)]
@@ -194,7 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_routes_and_refuses() {
+    fn table_routes_without_a_guest() {
         let itf = &NativeBridgeItf;
         assert_eq!(itf.version, VERSION);
         let path = c"/data/app/lib/x86_64/libatl-jni-test.so";
@@ -202,9 +258,10 @@ mod tests {
         unsafe {
             assert!(itf.isCompatibleWith.unwrap()(3));
             assert!(!itf.isCompatibleWith.unwrap()(VERSION + 1));
+            // no guest installed on a build host: the start fails and says why
             assert!(itf.loadLibrary.unwrap()(path.as_ptr(), 2).is_null());
             let err = CStr::from_ptr(itf.getError.unwrap()()).to_str().unwrap();
-            assert_eq!(err, format!("{LOAD_REFUSED}: {}", path.to_str().unwrap()));
+            assert!(err.contains("guest start failed"), "{err}");
             // a glibc object (this test binary) is not ours
             assert!(!itf.isSupported.unwrap()(c"/proc/self/exe".as_ptr()));
             assert!(!itf.isSupported.unwrap()(std::ptr::null()));

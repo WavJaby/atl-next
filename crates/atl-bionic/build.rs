@@ -515,23 +515,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The level platform code is built for: bionic's `__ANDROID_API_FUTURE__` (Soong's FutureApiLevelInt,
-/// which the converter checks equal). Headers are read at it, so no declaration is hidden behind an
-/// availability guard.
-fn future_level(up: &Upstreams, host: &HostArch) -> Result<u64> {
-    let path = up.aosp("bionic/libc/include/android/api-level.h");
-    let src = Source::c(&path, &["__ANDROID_API_FUTURE__"]);
-    let target = buildscript::bionic_libc_target(up, host, None);
-    let iface = atl_bridgegen::interface("api_level", "api-level.h", &src, &[target])?;
-    Ok(iface.arches[&host.arch].constants["__ANDROID_API_FUTURE__"].bits)
-}
-
-/// bionic's view at the platform level, with a C++ library first for C++ sources.
-fn bionic_target(up: &Upstreams, host: &HostArch, level: u64, cxx: Option<&Path>) -> Target {
-    let mut target = buildscript::bionic_libc_target(up, host, cxx);
-    target.triple = format!("{}{level}", target.triple);
-    target
-}
+use buildscript::{bionic_platform_target as bionic_target, future_level};
 
 /// What selects the second view headers are read in (`shape::Inputs::gnu`): clang++ predefines it, so
 /// every device C++ unit sees both libcs' `__USE_GNU` sections.

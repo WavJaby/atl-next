@@ -539,6 +539,15 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		}
 	}
 	libs = append(libs, "-Wl,--end-group")
+	// Soong gives only host binaries an rpath (cc/linker.go linkerFlags: `ctx.Host() && !ctx.Windows() && !staticLib` -> RpathFlags, $ORIGIN-relative); device and native-bridge ones get none, the linker's search path (here LD_LIBRARY_PATH over the stage) finds their libraries.
+	// A build-tree rpath on an android side would let a library missing from the stage load silently from the tree; xtask's runpath gate fails on one.
+	// The converter links with lld, which needs no search path for a needed library's own needs; an outside ld.bfd link (Rust packages) gets the stage's dirs as -rpath-link (xtask packages.rs).
+	addRpath := func(list []string, dir string) []string {
+		if n.side.android() {
+			return list
+		}
+		return appendNew(list, "-Wl,-rpath,"+dir)
+	}
 	var provided, providedRpath []string
 	// several provided modules may share an artifact (one crate providing two rows: atl-bionic is libc, libasync_safe, libdl_android), linked once
 	seenLib := map[string]bool{}
@@ -546,16 +555,15 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		if d.provided && !seenLib[d.out] {
 			seenLib[d.out] = true
 			provided = append(provided, d.out)
-			providedRpath = append(providedRpath, "-Wl,-rpath,"+filepath.Dir(d.out))
+			providedRpath = addRpath(providedRpath, filepath.Dir(d.out))
 			inputs = append(inputs, d.out)
 		}
 	}
 	libs = append(provided, libs...)
 	for _, d := range sharedOrder {
 		if d.kind == Shared && !d.provided {
-			// absolute build-tree rpath: build tools (aidl) run from here; installed runtime
-			// libraries get their search path from the install layout, not from this
-			libs = append(libs, d.out, "-Wl,-rpath,"+filepath.Dir(d.out))
+			// host: absolute build-tree rpath, build tools (aidl) run from here
+			libs = addRpath(append(libs, d.out), filepath.Dir(d.out))
 			inputs = append(inputs, d.out)
 		}
 	}
@@ -566,10 +574,10 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	}
 	for _, d := range runtime {
 		if !d.provided {
-			libs = appendNew(libs, "-Wl,-rpath,"+filepath.Dir(d.out))
+			libs = addRpath(libs, filepath.Dir(d.out))
 			continue
 		}
-		providedRpath = appendNew(providedRpath, "-Wl,-rpath,"+filepath.Dir(d.out))
+		providedRpath = addRpath(providedRpath, filepath.Dir(d.out))
 	}
 	// provided dirs search after the tree's: a system provider's dir (/usr/lib/<triple>) holds distro builds
 	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every

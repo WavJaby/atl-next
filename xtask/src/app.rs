@@ -38,6 +38,9 @@ pub struct Args {
     /// The test fonts' conf prefers the mono font for sans-serif, so the fonts sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     font_break: bool,
+    /// The bridge-1 JNI fixture variant packaged, by API level = the APK's minSdk: 21 = emulated TLS, 29 = ELF TLS (jni_fixture.rs).
+    #[arg(long, default_value_t = jni_fixture::EMULATED_TLS_API)]
+    fixture_api: u32,
 }
 
 /// The fixture's dir.
@@ -52,10 +55,70 @@ const FONTS: &str = "AtlTest: fonts: ";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
-/// What Main.onCreate logs before MARKER when the bridge-1 fixture did not load; the gate wants it to carry the NativeBridge core's refusal (`atl_native_bridge::LOAD_REFUSED` + the library's path): proof that libnativeloader routed the library to our `loadLibrary`.
-const BRIDGE1: &str = "AtlTest: bridge1 not loaded: java.lang.UnsatisfiedLinkError";
-/// The fixture's file name in the APK (jni_fixture.rs LIB), which the refusal names.
-const BRIDGE1_LIB: &str = "libatl-jni-test.so";
+/// What Main.onCreate logs before MARKER once the bridge-1 fixture (`libatl-jni-test.so`, an x86_64 bionic library) loaded: libnativeloader routed it to the NativeBridge core, whose guest linker loaded it.
+const BRIDGE1: &str = "AtlTest: bridge1 loaded";
+/// Main.bridge1Calls' lines: `AtlTest: bridge1 call <name> = <value>`.
+const BRIDGE1_CALL: &str = "AtlTest: bridge1 call ";
+/// (call, expected value), from the fixture's sources (xtask/testdata/jni-test, AtlJniTest.java): `tlsCounter` is a `__thread` counter per thread (1, 2, untouched by threadSum's worker: 3, a fresh Java thread's own: 1); threadSum = 1 + .. + 100; errno ENOENT = 2; atl_jni_sibling.c's answer 42; RegisterNatives' `registeredAnswer` 7; `sigsegvRecover` 1 (guest handler + siglongjmp ran); `nullFieldRead` "caught" (ART's null check still first, guest handler installed); `jitUpCall` 8000000 (AtlJniTest.UP_CALLS up-calls into JIT-compiled jitWork; derivation there).
+const BRIDGE1_CALLS: &[(&str, &str)] = &[
+    ("tlsCounter#1", "1"),
+    ("tlsCounter#2", "2"),
+    ("threadSum", "5050"),
+    ("tlsCounter#3", "3"),
+    ("tlsCounterFreshThread", "1"),
+    ("errnoRoundTrip", "2"),
+    ("cppThrowCatch", "1"),
+    ("dlopenSibling", "42"),
+    ("greet", "hello, bridge1"),
+    ("callJavaAdd", "5"),
+    ("registeredAnswer", "7"),
+    ("sigsegvRecover", "1"),
+    ("nullFieldRead", "caught"),
+    ("jitUpCall", "8000000"),
+    ("guestLog", "1"),
+    // 10 (read_callback's guest callback ran once, on the caller's guest thread) + 1 (foreach's, every call): atl_jni_test.c propCallbacks
+    ("propCallbacks", "11"),
+];
+/// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
+const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
+/// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
+const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";
+
+/// Every bridge-1 call whose line is missing or wrong, then the thread balance.
+fn bridge1_call_failures(app: &str) -> Vec<String> {
+    let got = |name: &str| {
+        app.lines().find_map(|l| {
+            let (_, r) = l.split_once(BRIDGE1_CALL)?;
+            let (n, v) = r.split_once(" = ")?;
+            (n == name).then(|| v.trim_end().to_owned())
+        })
+    };
+    let mut whys: Vec<String> = BRIDGE1_CALLS
+        .iter()
+        .filter_map(|&(name, want)| match got(name) {
+            Some(v) if v == want => None,
+            other => Some(format!("bridge1 call {name}: want {want}, got {other:?}")),
+        })
+        .collect();
+    if !app.lines().any(|l| l.ends_with(GUEST_LOG)) {
+        whys.push(format!("guest liblog: no line ending {GUEST_LOG:?}"));
+    }
+    let last = app.lines().rev().find_map(|l| l.split_once(BRIDGE1_DETACH));
+    let balance = last.and_then(|(_, r)| {
+        let (a, d) = r
+            .trim_end()
+            .trim_end_matches(')')
+            .split_once(", detached ")?;
+        Some((a.parse::<u32>().ok()?, d.parse::<u32>().ok()?))
+    });
+    match balance {
+        Some((a, d)) if a == d + 1 => {}
+        other => whys.push(format!(
+            "bridge1 threads: want attached = detached + 1 (the main thread), got {other:?}"
+        )),
+    }
+    whys
+}
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -101,6 +164,12 @@ fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
+    anyhow::ensure!(
+        [jni_fixture::EMULATED_TLS_API, jni_fixture::ELF_TLS_API].contains(&args.fixture_api),
+        "--fixture-api: {} or {}",
+        jni_fixture::EMULATED_TLS_API,
+        jni_fixture::ELF_TLS_API
+    );
     let rt = Runtime::new(
         root,
         &args.host,
@@ -111,15 +180,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
-    .with_gl_driver()?;
+    .with_gl_driver()?
+    .with_native_bridge_guest(&args.host)?;
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
         rt
     };
     let work = rt.out.join("app");
-    // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
-    let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
+    // the bridge-1 JNI fixture rides along in lib/<abi>/ (jni_fixture.rs); the NativeBridge core loads it into the guest
+    let native = jni_fixture::apk_libs(
+        root,
+        &args.host,
+        args.fixture_api,
+        &work.join("jni-fixture"),
+    )?;
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
@@ -128,6 +203,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .launch_activity()
         .map(|a| a.name.clone())
         .context("the fixture has no launcher activity")?;
+    anyhow::ensure!(
+        i64::from(m.min_sdk) == i64::from(args.fixture_api),
+        "APK minSdk {} != --fixture-api {}",
+        m.min_sdk,
+        args.fixture_api
+    );
     println!(
         "app: built {} ({} versionCode {}, sdk {}..{}, launcher activity {})",
         apk.display(),
@@ -206,8 +287,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .find_map(|l| l.split_once(CACERTS).map(|(_, r)| r.to_owned()))
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
-    let bridge1_ok = bridge1
-        .is_some_and(|l| l.contains(atl_native_bridge::LOAD_REFUSED) && l.contains(BRIDGE1_LIB));
+    let bridge1_ok = bridge1.is_some();
     let mut whys = Vec::new();
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
@@ -240,9 +320,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if passed && !bridge1_ok {
         whys.push(format!(
-            "bridge1: want UnsatisfiedLinkError with the NativeBridge refusal for {BRIDGE1_LIB}, got {:?}",
+            "bridge1: want {BRIDGE1:?}, got {:?}",
             bridge1.or_else(|| app.lines().find(|l| l.contains("AtlTest: bridge1")))
         ));
+    }
+    if passed && bridge1_ok {
+        whys.extend(bridge1_call_failures(&app));
     }
     if !whys.is_empty() {
         for why in &whys {
@@ -252,10 +335,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     if passed {
-        println!(
-            "app: pass bridge1 routed: {}",
-            bridge1.unwrap_or_default().trim()
-        );
+        println!("app: pass {}", bridge1.unwrap_or_default().trim());
     }
     if passed && gralloc_ok {
         println!("app: cacerts {cacerts}");

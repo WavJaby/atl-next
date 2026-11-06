@@ -16,35 +16,12 @@ pub static UNBOUND: AtomicU32 = AtomicU32::new(0);
 /// Names left unbound, for the startup report.
 pub static UNBOUND_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// The host function of guest stub `name`: glibc's own where the contract is the C one (memory, allocation, time). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
-/// Stubs whose host is the bionic-only API glibc lacks: the process's bionic provider (`libatl_bionic`, loaded in every ART process) exports each under its bionic name with bionic's signature, so the guest shares the host's one property store and abort message. Resolved by name at bind time; glibc defines none of them, so `RTLD_DEFAULT` cannot answer a glibc function of different ABI.
-const PROVIDER: &[&str] = &[
-    "__system_properties_init",
-    "__system_property_area_serial",
-    "__system_property_find",
-    "__system_property_foreach",
-    "__system_property_get",
-    "__system_property_read",
-    "__system_property_read_callback",
-    "__system_property_serial",
-    "__system_property_set",
-    "__system_property_wait",
-    "android_mallopt",
-    "android_set_abort_message",
-];
-
-fn provider_fn(name: &str) -> Option<usize> {
-    if !PROVIDER.contains(&name) {
-        return None;
-    }
-    let c = std::ffi::CString::new(name).ok()?;
-    // SAFETY: dlsym of a NUL-terminated name in the global scope.
-    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
-    (!p.is_null()).then_some(p as usize)
-}
-
+/// The host function of guest stub `name`: the bionic provider's (provider.rs), our own (intercepts.rs, signal.rs), else glibc's own where the contract is the C one (memory, allocation, time). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
 fn host_fn(name: &str) -> Option<usize> {
-    if let Some(p) = provider_fn(name) {
+    if let Some(p) = super::provider::host_fn(name)
+        .or_else(|| super::intercepts::host_fn(name))
+        .or_else(|| super::signal::host_fn(name))
+    {
         return Some(p);
     }
     Some(match name {
@@ -63,12 +40,6 @@ fn host_fn(name: &str) -> Option<usize> {
         "clock_getres" => libc::clock_getres as *const () as usize,
         "gettimeofday" => libc::gettimeofday as *const () as usize,
         "time" => libc::time as *const () as usize,
-        // keys and their values live host-side (NBS intercepts all four); `pthread_key_t` is 4 bytes in both libcs.
-        // A key destructor is guest code that glibc would call at thread exit on the host FS: thread exit through the crossing is step 4.2, the main thread never runs them (exit() skips TSD destructors).
-        "pthread_key_create" => libc::pthread_key_create as *const () as usize,
-        "pthread_key_delete" => libc::pthread_key_delete as *const () as usize,
-        "pthread_getspecific" => libc::pthread_getspecific as *const () as usize,
-        "pthread_setspecific" => libc::pthread_setspecific as *const () as usize,
         _ => return None,
     })
 }
@@ -128,15 +99,7 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     }
 }
 
-/// A host entry the guest reached that this engine cannot serve: name it and abort.
-#[allow(
-    clippy::print_stderr,
-    reason = "inside a guest call, before any logger: stderr is the one channel left"
-)]
-fn unsupported(what: &str) -> ! {
-    eprintln!("atl-native-bridge: {what}");
-    std::process::abort();
-}
+use super::unsupported;
 
 extern "C" fn post_init() {
     unsupported(

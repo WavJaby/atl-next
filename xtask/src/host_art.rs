@@ -321,8 +321,27 @@ impl HostArt {
     }
 }
 
+/// The lib dirs of the providers `xtask native` built outside the tree: `<out>/crates/<crate>/lib`, `<out>/upstream/<name>/prefix/lib`.
+fn provided_lib_dirs(out: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for (parent, sub) in [("crates", "lib"), ("upstream", "prefix/lib")] {
+        let Ok(entries) = std::fs::read_dir(out.join(parent)) else {
+            continue;
+        };
+        for e in entries {
+            let d = e?.path().join(sub);
+            if d.is_dir() {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
 /// Stages the converter's ART in `out` as an ART root at `art`, laid out as Android installs it and rebuilt every run (links only); returns its library dir.
-/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH. Their own RUNPATHs reach the rest.
+/// - lib<64|"">: every shared library the converter linked (<out>/device/*/*.so), one dir as Android's APEX lib dirs. The build tree has none: the launcher dlopens libnativehelper, libnativehelper libart.so and libcore System.loadLibrary's libjavacore by name, found on Android through the linker's default search path, here through LD_LIBRARY_PATH.
+///   Plus the provided libraries built outside the tree (<out>/crates/*/lib, <out>/upstream/*/prefix/lib: libatl_bionic as libc, BoringSSL), installed beside them as Android installs libc: converter outputs carry no runpath (runpath_gate), so this dir is the only place their needs are found. System providers stay in the distro's default path.
 ///   libhwui dlopens libandroid by name too (HardwareBufferHelpers, HardwareRenderer, HintSessionWrapper), with no DT_NEEDED on it, so no dependency closure builds it: required here.
 /// - com.android.art -> the root (ANDROID_ART_ROOT); com.android.i18n/etc/icu/<ICU_DATA's icu*.dat>; an empty com.android.tzdata.
 /// - etc/security/cacerts -> /system/etc/security/cacerts (dangling outside the sandbox): Conscrypt's system CA dir is `$ANDROID_ROOT/etc/security/cacerts` when no APEX one exists; atld writes /system's from the distro bundle.
@@ -366,6 +385,16 @@ fn stage_art(out: &Path, art: &Path, tree: &Path, pointer_bits: u32) -> Result<P
             let f = f?.path();
             if f.extension().is_some_and(|e| e == "so") && f.is_file() {
                 let name = f.file_name().context("a file name")?;
+                link(&f, &lib.join(name))?;
+            }
+        }
+    }
+    for provider in provided_lib_dirs(out)? {
+        for f in std::fs::read_dir(&provider)? {
+            let f = f?.path();
+            let name = f.file_name().context("a file name")?;
+            // the soname file (libatl_bionic.so.0.0.0) is what DT_NEEDED names
+            if name.to_string_lossy().contains(".so") && f.is_file() {
                 link(&f, &lib.join(name))?;
             }
         }

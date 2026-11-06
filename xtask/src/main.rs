@@ -63,6 +63,7 @@ mod provided_gate;
 mod providers;
 mod prune;
 mod run_apk;
+mod runpath_gate;
 mod runtimes;
 mod sensors;
 mod service_mirrors;
