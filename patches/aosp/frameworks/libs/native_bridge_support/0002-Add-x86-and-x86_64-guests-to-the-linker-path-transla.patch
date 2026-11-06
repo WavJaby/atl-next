@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 09:44:08 +0800
+Subject: [PATCH] Add x86 and x86_64 guests to the linker path translation
+
+Native bridge libraries of an x86 or x86_64 guest reside in $LIB/$ABI
+like those of the translated arches: /system/lib/x86/ and
+/system/lib64/x86_64/.
+
+Upstream-Status: Pending
+Patch-Reason: upstream lists only the guest arches Berberis translates; ATL bridges same-arch bionic, and the table is compiled into the guest linker, which no launcher, loader or environment setting can extend
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/linker/linker_translate_path.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/android_api/linker/linker_translate_path.cpp b/android_api/linker/linker_translate_path.cpp
+index 6f69645233cf6c289a9be6f3515b82e98e19b295..b4f71c616f8b9bcbfd7c5959e0a3e1d7cfe57cfc 100644
+--- a/android_api/linker/linker_translate_path.cpp
++++ b/android_api/linker/linker_translate_path.cpp
+@@ -55,6 +55,16 @@
+   { "/system/lib64/" name, "/system/lib64/riscv64/" name }
+ #define APEX_LIB(apex, name) \
+   { "/apex/" apex "/lib64/" name, "/system/lib64/riscv64/" name }
++#elif defined(__i386__)
++#define SYSTEM_LIB(name) \
++  { "/system/lib/" name, "/system/lib/x86/" name }
++#define APEX_LIB(apex, name) \
++  { "/apex/" apex "/lib/" name, "/system/lib/x86/" name }
++#elif defined(__x86_64__)
++#define SYSTEM_LIB(name) \
++  { "/system/lib64/" name, "/system/lib64/x86_64/" name }
++#define APEX_LIB(apex, name) \
++  { "/apex/" apex "/lib64/" name, "/system/lib64/x86_64/" name }
+ #else
+ #error "Unknown guest arch"
+ #endif

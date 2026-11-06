@@ -48,8 +48,9 @@ func selectSTL(prop string, set, static bool) (string, error) {
 }
 
 // stlOf: n's selected C++ standard library; a bad stl value is a problem and selects none.
+// Static = Soong's ctx.static(): a static library, or a static_executable binary (binary.go static()); glibc sides link every binary dynamically (staticBinary), so only bionic ones.
 func (g *Graph) stlOf(n *Node) string {
-	sel, err := selectSTL(n.props.str("stl"), n.props.has("stl"), n.kind == Static)
+	sel, err := selectSTL(n.props.str("stl"), n.props.has("stl"), n.kind == Static || n.staticBinary())
 	if err != nil {
 		g.problem("%s: %v", n.name, err)
 		return ""

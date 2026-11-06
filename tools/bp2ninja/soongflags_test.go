@@ -463,3 +463,113 @@ func TestGlobalFlagsOrder(t *testing.T) {
 		t.Errorf("asm %q", f.asm)
 	}
 }
+
+// rustToolchain, rustX86_64, rustArm64: excerpts of the pinned android-16.0.0_r1 build/soong/rust/config toolchain.go, x86_64_device.go, arm64_device.go, constructs as upstream writes them.
+const rustToolchain = `package config
+
+type toolchainBase struct {
+}
+
+func (toolchainBase) RustTriple() string {
+	panic("toolchainBase does not define a triple.")
+}
+
+type toolchain64Bit struct {
+	toolchainBase
+}
+
+func toolchainBaseFactory() Toolchain {
+	return &toolchainBase{}
+}
+
+var toolchainFactories = make(map[android.OsType]map[android.ArchType]toolchainFactory)
+
+func registerToolchainFactory(os android.OsType, arch android.ArchType, factory toolchainFactory) {
+	if toolchainFactories[os] == nil {
+		toolchainFactories[os] = make(map[android.ArchType]toolchainFactory)
+	}
+	toolchainFactories[os][arch] = factory
+}
+`
+
+const rustX86_64 = `package config
+
+func init() {
+	registerToolchainFactory(android.Android, android.X86_64, x86_64ToolchainFactory)
+}
+
+type toolchainX86_64 struct {
+	toolchain64Bit
+	toolchainRustFlags string
+}
+
+func (t *toolchainX86_64) RustTriple() string {
+	return "x86_64-linux-android"
+}
+
+func x86_64ToolchainFactory(arch android.Arch) Toolchain {
+	return &toolchainX86_64{}
+}
+`
+
+const rustArm64 = `package config
+
+func init() {
+	registerToolchainFactory(android.Android, android.Arm64, Arm64ToolchainFactory)
+}
+
+type toolchainArm64 struct {
+	toolchain64Bit
+	toolchainRustFlags string
+}
+
+func (t *toolchainArm64) RustTriple() string {
+	return "aarch64-linux-android"
+}
+
+func Arm64ToolchainFactory(arch android.Arch) Toolchain {
+	return &toolchainArm64{}
+}
+`
+
+// Expected triples are the literals rust/config's (Android, arch) toolchains return (x86_64_device.go, arm64_device.go); only bionic sides take one: device and host are glibc here.
+func TestReadRustTriples(t *testing.T) {
+	tree := flagsTree(t, flagsGlobal)
+	for p, text := range map[string]string{
+		"build/soong/rust/config/toolchain.go":     rustToolchain,
+		"build/soong/rust/config/x86_64_device.go": rustX86_64,
+		"build/soong/rust/config/arm64_device.go":  rustArm64,
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(tree, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tree, p), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fields := func(Side) map[string]any {
+		return map[string]any{"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)}
+	}
+	for guest, want := range map[string]string{"x86_64": "x86_64-linux-android", "arm64": "aarch64-linux-android"} {
+		nb := NativeBridge(guest)
+		cfg := Config{Arch: "x86_64", PointerBits: 64, NativeBridge: guest, NativeBridgeBits: 64}
+		idents := map[Side]string{Device: "X86_64", Host: "X86_64", nb: map[string]string{"x86_64": "X86_64", "arm64": "Arm64"}[guest]}
+		got := map[Side]string{}
+		if err := readRustTriples(tree, cfg, idents, fields, got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[nb] != want {
+			t.Errorf("guest %s: triples %v, want only %s", guest, got, want)
+		}
+	}
+	// a triple that is not one literal word is an error, never passed on
+	bad := strings.Replace(rustArm64, `"aarch64-linux-android"`, `"${config.Triple}"`, 1)
+	if err := os.WriteFile(filepath.Join(tree, "build/soong/rust/config/arm64_device.go"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nb := NativeBridge("arm64")
+	cfg := Config{Arch: "x86_64", PointerBits: 64, NativeBridge: "arm64", NativeBridgeBits: 64}
+	if err := readRustTriples(tree, cfg, map[Side]string{Device: "X86_64", Host: "X86_64", nb: "Arm64"}, fields, map[Side]string{}); err == nil || !strings.Contains(err.Error(), "not one literal word") {
+		t.Errorf("non-literal triple: err %v", err)
+	}
+}
