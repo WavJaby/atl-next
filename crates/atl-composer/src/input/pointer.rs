@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Mouse and touchpad input as Android MotionEvents: the part of AOSP's input pipeline between the device and the window (CursorInputMapper, GestureConverter, PointerChoreographer, InputDispatcher's hover synthesis) for one pointer.
 //! Pure: [`Pointer::translate`] turns one platform event into the [`Motion`]s Android would deliver, in order; the publisher stamps seq and ids and writes them.
-//! * Buttons: DOWN then BUTTON_PRESS per button, BUTTON_RELEASE then UP (CursorInputMapper.cpp sync); a button with no Android bit is ignored.
+//! * Buttons: DOWN then BUTTON_PRESS per button, BUTTON_RELEASE then UP (CursorInputMapper.cpp sync). DOWN and UP follow primary, secondary and tertiary only (isPointerDown); back and forward only press. A button with no Android bit is ignored. Back and forward also send a key ([`button_keys`]).
 //! * Hover: no button held -> HOVER_MOVE, with HOVER_ENTER first and HOVER_EXIT on leave or before a press (InputDispatcher synthesizes enter/exit per window; we are the dispatcher).
 //! * Wheel -> ACTION_SCROLL, AXIS_VSCROLL = -dy (positive = toward the user's "up", MotionEvent.AXIS_VSCROLL javadoc), AXIS_HSCROLL = dx.
 //! * Touchpad swipe -> one fake finger (GestureConverter.cpp handleScroll): DOWN at the cursor, MOVE per delta, UP at the end; TWO_FINGER_SWIPE, IS_GENERATED_GESTURE, pressure 1, source SOURCE_MOUSE (GestureConverter.h SOURCE; mouse|touchpad is only the device's sources, and SOURCE_CLASS_POSITION on an event makes MotionEvent skip the view offset: shouldDisregardTransformation),
@@ -10,6 +10,8 @@
 
 use atl_platform_ui::{InputEvent, PhysPoint, PointerButton, PointerPhase, ScrollKind};
 use atl_services::input_devices::{POINTER, SOURCE_MOUSE, TOUCHPAD};
+
+use super::key::{self, Key};
 
 /// MotionEvent actions (NDK input.h AMOTION_EVENT_ACTION_*).
 pub const ACTION_DOWN: i32 = 0;
@@ -41,6 +43,11 @@ const BUTTON_SECONDARY: i32 = 1 << 1;
 const BUTTON_TERTIARY: i32 = 1 << 2;
 const BUTTON_BACK: i32 = 1 << 3;
 const BUTTON_FORWARD: i32 = 1 << 4;
+/// AOSP isPointerDown (TouchCursorInputMapperCommon.cpp): the buttons that make the gesture (DOWN, UP, MOVE with a button held). Back and forward only press.
+const PRESS_BUTTONS: i32 = BUTTON_PRIMARY | BUTTON_SECONDARY | BUTTON_TERTIARY;
+/// KeyEvent keycodes of the back and forward buttons (keycodes.h AKEYCODE_BACK, AKEYCODE_FORWARD).
+pub const KEYCODE_BACK: i32 = 4;
+pub const KEYCODE_FORWARD: i32 = 125;
 
 /// The bit of `button` in a MotionEvent's button state. GDK numbers 8 and 9 are back and forward (X11 convention); other buttons have no bit.
 fn button_bit(button: PointerButton) -> i32 {
@@ -52,6 +59,44 @@ fn button_bit(button: PointerButton) -> i32 {
         PointerButton::Other(9) => BUTTON_FORWARD,
         PointerButton::Other(_) => 0,
     }
+}
+
+/// The KeyEvent keycode a button bit sends (AOSP synthesizeButtonKeys: BUTTON_BACK -> KEYCODE_BACK, BUTTON_FORWARD -> KEYCODE_FORWARD); other bits send none.
+fn button_keycode(bit: i32) -> Option<i32> {
+    match bit {
+        BUTTON_BACK => Some(KEYCODE_BACK),
+        BUTTON_FORWARD => Some(KEYCODE_FORWARD),
+        _ => None,
+    }
+}
+
+/// The keys of the back and forward buttons in `motions` (AOSP synthesizeButtonKeys, TouchCursorInputMapperCommon.cpp): a press's DOWN goes before the event's motions, a release's UP after them.
+/// Device and source are the pointer's (AOSP's NotifyKeyArgs takes the mapper's), flags 0, downTime the event time (AOSP passes `when`).
+pub fn button_keys(motions: &[Motion], meta_state: i32) -> (Vec<Key>, Vec<Key>) {
+    let (mut downs, mut ups) = (Vec::new(), Vec::new());
+    for m in motions {
+        let Some(key_code) = button_keycode(m.action_button) else {
+            continue;
+        };
+        let (action, keys) = match m.action {
+            ACTION_BUTTON_PRESS => (key::ACTION_DOWN, &mut downs),
+            ACTION_BUTTON_RELEASE => (key::ACTION_UP, &mut ups),
+            _ => continue,
+        };
+        keys.push(Key {
+            action,
+            flags: 0,
+            key_code,
+            scan_code: 0,
+            meta_state,
+            repeat_count: 0,
+            down_ms: m.time_ms,
+            time_ms: m.time_ms,
+            device_id: m.device_id,
+            source: m.source,
+        });
+    }
+    (downs, ups)
 }
 
 /// One pointer of a MotionEvent.
@@ -108,9 +153,9 @@ pub struct Pointer {
 }
 
 impl Pointer {
-    /// A gesture is open (a button held or a swipe going): its events stay with the window it started on.
+    /// A gesture is open (a primary, secondary or tertiary button held, or a swipe going): its events stay with the window it started on.
     pub fn in_gesture(&self) -> bool {
-        self.buttons != 0 || self.swipe.is_some()
+        self.buttons & PRESS_BUTTONS != 0 || self.swipe.is_some()
     }
 
     fn mouse(
@@ -121,7 +166,7 @@ impl Pointer {
         axes: Vec<(i32, f32)>,
         time_ms: u32,
     ) -> Motion {
-        let in_gesture = self.buttons != 0 || action == ACTION_UP;
+        let in_gesture = self.buttons & PRESS_BUTTONS != 0 || action == ACTION_UP;
         Motion {
             device_id: POINTER,
             action,
@@ -199,7 +244,9 @@ impl Pointer {
             InputEvent::Pointer(e) => {
                 let t = e.time_ms;
                 match e.phase {
-                    PointerPhase::Enter | PointerPhase::Move if self.buttons != 0 => {
+                    PointerPhase::Enter | PointerPhase::Move
+                        if self.buttons & PRESS_BUTTONS != 0 =>
+                    {
                         self.at = Some(e.position);
                         out.push(self.mouse(ACTION_MOVE, 0, e.position, Vec::new(), t));
                     }
@@ -238,12 +285,12 @@ impl Pointer {
                         self.at = Some(e.position);
                         self.end_swipe(&mut out, t);
                         self.exit_hover(&mut out, e.position, t);
-                        if self.buttons == 0 {
+                        // the first press-type button starts the gesture (CursorInputMapper downChanged); back and forward alone only press
+                        let starts = bit & PRESS_BUTTONS != 0 && self.buttons & PRESS_BUTTONS == 0;
+                        self.buttons |= bit;
+                        if starts {
                             self.down_ms = t;
-                            self.buttons = bit;
                             out.push(self.mouse(ACTION_DOWN, 0, e.position, Vec::new(), t));
-                        } else {
-                            self.buttons |= bit;
                         }
                         out.push(self.mouse(ACTION_BUTTON_PRESS, bit, e.position, Vec::new(), t));
                     }
@@ -255,7 +302,7 @@ impl Pointer {
                         self.at = Some(e.position);
                         self.buttons &= !bit;
                         out.push(self.mouse(ACTION_BUTTON_RELEASE, bit, e.position, Vec::new(), t));
-                        if self.buttons == 0 {
+                        if bit & PRESS_BUTTONS != 0 && self.buttons & PRESS_BUTTONS == 0 {
                             out.push(self.mouse(ACTION_UP, 0, e.position, Vec::new(), t));
                         }
                     }
@@ -380,6 +427,93 @@ mod tests {
             p.translate(pointer(PointerPhase::Down(PointerButton::Other(6)), 9))
                 .is_empty()
         );
+    }
+
+    /// The back button alone (GDK 8): BUTTON_PRESS with BUTTON_BACK and no DOWN (isPointerDown leaves it out), so no gesture opens. Its key: KEYCODE_BACK DOWN from the mouse, then the UP with the release.
+    /// Keycode and action values from keycodes.h and input.h; the mouse's ids and source from atl-services input_devices.
+    #[test]
+    fn back_button_alone_presses_and_sends_back() {
+        let mut p = Pointer::default();
+        let press = p.translate(pointer(PointerPhase::Down(PointerButton::Other(8)), 3));
+        assert_eq!(
+            press
+                .iter()
+                .map(|m| (m.action, m.action_button, m.button_state))
+                .collect::<Vec<_>>(),
+            [(ACTION_BUTTON_PRESS, 8, 8)]
+        );
+        assert!(!p.in_gesture());
+        let (downs, ups) = button_keys(&press, 0x41);
+        assert!(ups.is_empty());
+        assert_eq!(
+            downs
+                .iter()
+                .map(|k| {
+                    (
+                        k.action,
+                        k.key_code,
+                        k.source,
+                        k.device_id,
+                        k.flags,
+                        k.meta_state,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(0, 4, SOURCE_MOUSE, POINTER, 0, 0x41)]
+        );
+        let release = p.translate(pointer(PointerPhase::Up(PointerButton::Other(8)), 5));
+        assert_eq!(
+            release.iter().map(|m| m.action).collect::<Vec<_>>(),
+            [ACTION_BUTTON_RELEASE]
+        );
+        let (downs, ups) = button_keys(&release, 0x41);
+        assert!(downs.is_empty());
+        assert_eq!(
+            ups.iter()
+                .map(|k| (k.action, k.key_code))
+                .collect::<Vec<_>>(),
+            [(1, 4)]
+        );
+    }
+
+    /// Back and forward inside a primary gesture: the gesture keeps its DOWN and UP; each side button sends its key with its press (DOWN) or release (UP).
+    /// The primary's UP comes only when the last press-type button goes (forward still held here).
+    #[test]
+    fn back_and_forward_inside_a_primary_gesture() {
+        let mut p = Pointer::default();
+        p.translate(pointer(PointerPhase::Down(PointerButton::Primary), 1));
+        let back = p.translate(pointer(PointerPhase::Down(PointerButton::Other(8)), 2));
+        assert_eq!(
+            back.iter().map(|m| m.action).collect::<Vec<_>>(),
+            [ACTION_BUTTON_PRESS]
+        );
+        let (downs, _) = button_keys(&back, 0);
+        assert_eq!(downs.iter().map(|k| k.key_code).collect::<Vec<_>>(), [4]);
+        let forward = p.translate(pointer(PointerPhase::Down(PointerButton::Other(9)), 3));
+        let (downs, _) = button_keys(&forward, 0);
+        assert_eq!(downs.iter().map(|k| k.key_code).collect::<Vec<_>>(), [125]);
+        let back_up = p.translate(pointer(PointerPhase::Up(PointerButton::Other(8)), 4));
+        assert_eq!(
+            back_up.iter().map(|m| m.action).collect::<Vec<_>>(),
+            [ACTION_BUTTON_RELEASE]
+        );
+        assert!(p.in_gesture());
+        let (_, ups) = button_keys(&back_up, 0);
+        assert_eq!(ups.iter().map(|k| k.key_code).collect::<Vec<_>>(), [4]);
+        let primary_up = p.translate(pointer(PointerPhase::Up(PointerButton::Primary), 5));
+        assert_eq!(
+            primary_up.iter().map(|m| m.action).collect::<Vec<_>>(),
+            [ACTION_BUTTON_RELEASE, ACTION_UP]
+        );
+        assert!(!p.in_gesture());
+    }
+
+    /// Only back and forward send keys: a primary press sends none.
+    #[test]
+    fn primary_press_sends_no_key() {
+        let mut p = Pointer::default();
+        let press = p.translate(pointer(PointerPhase::Down(PointerButton::Primary), 1));
+        assert_eq!(button_keys(&press, 0), (Vec::new(), Vec::new()));
     }
 
     /// A second button while one is held is only a BUTTON_PRESS; releasing the first keeps the gesture (no UP).

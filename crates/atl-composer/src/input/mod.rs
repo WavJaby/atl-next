@@ -361,6 +361,9 @@ mod publish {
 
     /// Publishes `keys` to the focused window (InputDispatcher sends keys to the focused window, none while the desktop window is inactive).
     fn publish_keys(state: &State, keys: &[Key]) {
+        if keys.is_empty() {
+            return;
+        }
         let mut windows = state.windows.borrow_mut();
         let Some(publisher) = windows.focused_channel() else {
             tracing::warn!(
@@ -412,14 +415,26 @@ mod publish {
             return;
         }
         let meta_state = state.keys.borrow().meta_state();
-        let mut pointer = state.pointer.borrow_mut();
-        let mut touch = state.touch.borrow_mut();
-        // one window holds every open gesture: InputDispatcher keeps a touched window per device, and all devices here start on the same top window
-        let in_gesture = pointer.in_gesture() || touch.in_gesture();
-        let motions = match event {
-            InputEvent::Touch(e) => touch.translate(e),
-            other => pointer.translate(other),
+        let (in_gesture, motions) = {
+            let mut pointer_state = state.pointer.borrow_mut();
+            let mut touch = state.touch.borrow_mut();
+            // one window holds every open gesture: InputDispatcher keeps a touched window per device, and all devices here start on the same top window
+            let in_gesture = pointer_state.in_gesture() || touch.in_gesture();
+            let motions = match event {
+                InputEvent::Touch(e) => touch.translate(e),
+                other => pointer_state.translate(other),
+            };
+            (in_gesture, motions)
         };
+        // AOSP synthesizeButtonKeys: a back or forward button's DOWN goes before the event's motions, its UP after them
+        let (downs, ups) = pointer::button_keys(&motions, meta_state);
+        publish_keys(state, &downs);
+        publish_motions(state, &motions, in_gesture, meta_state);
+        publish_keys(state, &ups);
+    }
+
+    /// Publishes `motions` to the pointer's window, then drains the finished signals the channel holds.
+    fn publish_motions(state: &State, motions: &[Motion], in_gesture: bool, meta_state: i32) {
         if motions.is_empty() {
             return;
         }
@@ -432,7 +447,7 @@ mod publish {
             tracing::warn!("input: no window takes {} event(s), dropped", motions.len());
             return;
         };
-        for m in &motions {
+        for m in motions {
             let seq = next_seq(state.seq.get());
             state.seq.set(seq);
             if let Err(err) = publisher.publish_motion(&motion(m, seq, meta_state, origin)) {
