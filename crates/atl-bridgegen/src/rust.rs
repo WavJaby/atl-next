@@ -58,6 +58,12 @@ fn record_item(
     record: &Record,
     opaque: &mut BTreeSet<String>,
 ) -> Result<()> {
+    if let Some(f) = record.fields.iter().find(|f| f.bits.is_some()) {
+        bail!(
+            "{name}.{}: a bit-field has no repr(C) Rust type; read its layout through `layout_module`",
+            f.name
+        );
+    }
     // rustc's own layout rules would give natural alignment; clang's attributes are carried over
     // and the asserts below prove the result
     let repr = if record.packed {
@@ -474,6 +480,27 @@ pub fn layout_module(iface: &Interface, arch: &str) -> Result<String> {
                 f.offset
             )?;
         }
+        let bit_fields: Vec<_> = record
+            .fields
+            .iter()
+            .filter_map(|f| f.bits.map(|b| (f, b)))
+            .collect();
+        if !bit_fields.is_empty() {
+            writeln!(
+                out,
+                "    /// Bit-fields: (shift, width) inside the storage unit at the field's offset constant.\n    pub mod bits {{"
+            )?;
+            for (f, b) in bit_fields {
+                writeln!(
+                    out,
+                    "        pub const {}: (u32, u32) = ({}, {});",
+                    ident(&f.name),
+                    b.shift,
+                    b.width
+                )?;
+            }
+            writeln!(out, "    }}")?;
+        }
         writeln!(out, "}}\n")?;
     }
     Ok(out)
@@ -584,6 +611,20 @@ fn rust_ty(ty: &Ty, opaque: &mut BTreeSet<String>) -> Result<String> {
         Ty::Float { bits: 32 } => "f32".to_owned(),
         Ty::Float { bits: 64 } => "f64".to_owned(),
         Ty::Float { bits } => bail!("no Rust type for a {bits}-bit float"),
+        // ABI-identical to a non-null pointer to the referent
+        Ty::Reference {
+            bits,
+            pointee,
+            is_const,
+        } => rust_ty(
+            &Ty::Pointer {
+                bits: *bits,
+                pointee: pointee.clone(),
+                is_const: *is_const,
+                nullability: Nullability::NonNull,
+            },
+            opaque,
+        )?,
         Ty::Pointer {
             pointee,
             is_const,

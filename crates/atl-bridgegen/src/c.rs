@@ -291,6 +291,7 @@ impl Printer<'_> {
             Ty::Record { name } => {
                 bail!("record {name} by value: the C printer declares records only behind pointers")
             }
+            Ty::Reference { .. } => bail!("C has no references"),
             Ty::Pointer {
                 pointee,
                 is_const,
@@ -383,6 +384,10 @@ impl Printer<'_> {
         ensure!(
             !record.packed && !record.aligned,
             "{name}: the C printer prints no record attributes (packed / aligned)"
+        );
+        ensure!(
+            record.fields.iter().all(|f| f.bits.is_none()),
+            "{name}: the C printer prints no bit-fields"
         );
         let kw = keyword(record.kind);
         let (mut text, ty) = if tagged {

@@ -60,6 +60,12 @@ impl HostThread {
     }
 }
 
+/// The x86-64 TCB word the ABI fixes: `%fs:0` holds the thread pointer itself (TLS variant II; bionic `TLS_SLOT_SELF` = 0, `__init_tcb`), so `mov %fs:0` yields the TCB address.
+pub fn init_tcb(tp: usize) {
+    // SAFETY: `tp` is the start of a guest TCB inside a live static-TLS block (thread::alloc_static_tls).
+    unsafe { (tp as *mut usize).write(tp) };
+}
+
 /// Whether the CPU and kernel let user code run `rdfsbase`/`wrfsbase` (else they fault with SIGILL).
 pub fn supported() -> bool {
     const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;

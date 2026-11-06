@@ -17,7 +17,36 @@ pub static UNBOUND: AtomicU32 = AtomicU32::new(0);
 pub static UNBOUND_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The host function of guest stub `name`: glibc's own where the contract is the C one (memory, allocation, time). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
+/// Stubs whose host is the bionic-only API glibc lacks: the process's bionic provider (`libatl_bionic`, loaded in every ART process) exports each under its bionic name with bionic's signature, so the guest shares the host's one property store and abort message. Resolved by name at bind time; glibc defines none of them, so `RTLD_DEFAULT` cannot answer a glibc function of different ABI.
+const PROVIDER: &[&str] = &[
+    "__system_properties_init",
+    "__system_property_area_serial",
+    "__system_property_find",
+    "__system_property_foreach",
+    "__system_property_get",
+    "__system_property_read",
+    "__system_property_read_callback",
+    "__system_property_serial",
+    "__system_property_set",
+    "__system_property_wait",
+    "android_mallopt",
+    "android_set_abort_message",
+];
+
+fn provider_fn(name: &str) -> Option<usize> {
+    if !PROVIDER.contains(&name) {
+        return None;
+    }
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: dlsym of a NUL-terminated name in the global scope.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    (!p.is_null()).then_some(p as usize)
+}
+
 fn host_fn(name: &str) -> Option<usize> {
+    if let Some(p) = provider_fn(name) {
+        return Some(p);
+    }
     Some(match name {
         "memcpy" => libc::memcpy as *const () as usize,
         "memset" => libc::memset as *const () as usize,
@@ -34,6 +63,12 @@ fn host_fn(name: &str) -> Option<usize> {
         "clock_getres" => libc::clock_getres as *const () as usize,
         "gettimeofday" => libc::gettimeofday as *const () as usize,
         "time" => libc::time as *const () as usize,
+        // keys and their values live host-side (NBS intercepts all four); `pthread_key_t` is 4 bytes in both libcs.
+        // A key destructor is guest code that glibc would call at thread exit on the host FS: thread exit through the crossing is step 4.2, the main thread never runs them (exit() skips TSD destructors).
+        "pthread_key_create" => libc::pthread_key_create as *const () as usize,
+        "pthread_key_delete" => libc::pthread_key_delete as *const () as usize,
+        "pthread_getspecific" => libc::pthread_getspecific as *const () as usize,
+        "pthread_setspecific" => libc::pthread_setspecific as *const () as usize,
         _ => return None,
     })
 }
@@ -117,18 +152,17 @@ extern "C" fn call_guest() {
 extern "C" fn trace() {}
 
 /// `__native_bridge_get_host_pthread()`: the bionic thread record the guest main thread reuses (NBS linker `__libc_init_main_thread_early`: `__init_tcb(temp_tcb, host_thread)`, then `TLS_SLOT_BIONIC_TLS = host_thread->bionic_tls`).
-/// berberis answers host `pthread_self()` because its host is bionic; ours is glibc, so the record must be a bionic `pthread_internal_t` the engine builds -- with its layout generated from `pthread_internal.h`, which atl-bridgegen cannot parse yet (bit-fields, C++ references).
-/// Measured 2026-11-06 with a zeroed 64 KiB block instead: the linker reaches linker_main (ld.config warning), then faults in `ScopedTrace` reading through the null `bionic_tls`.
+/// Built by `thread::current` (our host is glibc, so the record is ours, not host `pthread_self()` as berberis's bionic host answers).
 extern "C" fn get_host_pthread() -> usize {
-    unsupported(
-        "__native_bridge_get_host_pthread: no bionic thread record yet (pthread_internal_t layout not generated)",
-    )
+    super::thread::current()
 }
 
-/// `__native_bridge_config_static_tls(const NativeBridgeStaticTlsConfig*)`: how the host creates guest static TLS for new threads (step 4.2); recorded only.
+/// `__native_bridge_config_static_tls(const NativeBridgeStaticTlsConfig*)`: how the host creates guest static TLS, for the main thread too (NBS: "the host will replace the guest main thread's static TLS"): `thread::configure`; `Guest::start` then installs it.
 pub static STATIC_TLS_CONFIGS: AtomicU32 = AtomicU32::new(0);
-extern "C" fn config_static_tls(_config: *const c_void) {
+extern "C" fn config_static_tls(config: *const c_void) {
     STATIC_TLS_CONFIGS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the linker passes its `NativeBridgeStaticTlsConfig` (NBS __libc_init_main_thread_final).
+    unsafe { super::thread::configure(config.cast()) };
 }
 
 /// x86_64 `movabs $imm64, %r11; jmp *%r11`: 13 bytes.

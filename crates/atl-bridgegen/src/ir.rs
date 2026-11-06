@@ -74,8 +74,21 @@ pub struct Constant {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Field {
     pub name: String,
+    /// Byte offset; of a bit-field, its storage unit's (a `ty`-sized unit at a multiple of that size).
     pub offset: u64,
     pub ty: Ty,
+    /// A bit-field's place in its storage unit; `None` for an ordinary field. Unnamed bit-fields
+    /// (`int : 0`) only pad and are not fields.
+    pub bits: Option<BitField>,
+}
+
+/// A bit-field inside its storage unit, as clang lays it out (Itanium / SysV, little-endian: bit 0 is the
+/// unit's least significant bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BitField {
+    /// Bits below the field within the unit.
+    pub shift: u32,
+    pub width: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -109,6 +122,13 @@ pub enum Ty {
         /// `const` pointee.
         is_const: bool,
         nullability: Nullability,
+    },
+    /// A C++ reference (`T&`, `T&&`): passed and stored as a pointer of this arch's width.
+    Reference {
+        bits: u32,
+        pointee: Box<Ty>,
+        /// `const` referent.
+        is_const: bool,
     },
     /// A record defined by this interface, by value.
     Record {

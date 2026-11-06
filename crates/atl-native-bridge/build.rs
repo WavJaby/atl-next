@@ -30,6 +30,56 @@ fn on_panic(field: &str, ret: &Ty) -> Result<String> {
     .to_owned())
 }
 
+/// What a guest thread is made of, relative to the AOSP tree: the thread record (`pthread_internal_t`) and its per-thread libc state (`bionic_tls`) -- the engine builds one per guest thread, as the NBS linker's `__libc_init_main_thread_early` reuses `__native_bridge_get_host_pthread()`'s answer as both -- and the static-TLS description the linker hands the host (`__native_bridge_config_static_tls`).
+const THREAD_HEADERS: &[&str] = &[
+    "bionic/libc/bionic/pthread_internal.h",
+    "bionic/libc/private/bionic_tls.h",
+    "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
+];
+/// Their include directories: `bionic/…`, `private/…`, `platform/bionic/…` (bionic/libc), `async_safe/log.h`, `native_bridge_support/linker/…`.
+const THREAD_INCLUDE_DIRS: &[&str] = &[
+    "bionic/libc",
+    "bionic/libc/async_safe/include",
+    "frameworks/libs/native_bridge_support/android_api/linker/include",
+];
+
+/// `layout_module` of `THREAD_HEADERS` in the guest's bionic view (the identity engine: the host arch).
+/// C++: the bionic headers are C++-only (classes, `_Atomic` next to `<atomic>`), parsed with libc++ first as
+/// bionic's own C++ sources are.
+fn bionic_thread(
+    up: &Upstreams,
+    host: &buildscript::HostArch,
+    out: &std::path::Path,
+) -> Result<String> {
+    let mut target =
+        buildscript::bionic_libc_target(up, host, Some(&buildscript::libcxx_include_dir()?));
+    target.args.extend(
+        THREAD_INCLUDE_DIRS
+            .iter()
+            .map(|d| format!("-I{}", up.aosp(d).display())),
+    );
+    let unit = out.join("bionic_thread.cc");
+    std::fs::write(
+        &unit,
+        "#include \"bionic/pthread_internal.h\"\n#include \"native_bridge_support/linker/static_tls_config.h\"\n",
+    )?;
+    let also: Vec<PathBuf> = THREAD_HEADERS.iter().map(|h| up.aosp(h)).collect();
+    let src = Source {
+        path: &unit,
+        lang: Lang::Cxx,
+        also: &also,
+        macros: &[],
+    };
+    let iface = atl_bridgegen::interface(
+        "bionic_thread",
+        "bionic/libc/{bionic/pthread_internal.h,private/bionic_tls.h} + native_bridge_support static_tls_config.h",
+        &src,
+        std::slice::from_ref(&target),
+    )
+    .context("bionic thread record")?;
+    atl_bridgegen::rust::layout_module(&iface, &host.arch)
+}
+
 fn main() -> Result<()> {
     // `--cfg atl_g1_break`: the deliberate break of spike gate g1 (engine::x86_64: the host->guest crossing without its FS restore)
     println!("cargo::rustc-check-cfg=cfg(atl_g1_break)");
@@ -82,8 +132,16 @@ fn main() -> Result<()> {
     );
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     std::fs::write(out.join("native_bridge.rs"), code)?;
+    std::fs::write(
+        out.join("bionic_thread.rs"),
+        bionic_thread(&up, &host, &out)?,
+    )?;
     println!("cargo::rerun-if-changed={}", arches.display());
-    for rel in std::iter::once(&HEADER).chain(INCLUDE_DIRS) {
+    for rel in std::iter::once(&HEADER)
+        .chain(INCLUDE_DIRS)
+        .chain(THREAD_HEADERS)
+        .chain(THREAD_INCLUDE_DIRS)
+    {
         for p in up.rerun_paths(&format!("aosp/{rel}")) {
             println!("cargo::rerun-if-changed={}", p.display());
         }

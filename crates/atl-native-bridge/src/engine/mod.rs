@@ -10,6 +10,7 @@
 pub mod arch;
 mod args;
 pub mod image;
+pub mod thread;
 pub mod vdso;
 
 use std::path::PathBuf;
@@ -60,6 +61,12 @@ impl Guest {
         let thread = HostThread::leak();
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
         let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0) };
+        // the linker ran on a temporary TCB in its own (now returned) frame; NBS leaves the main thread's static TLS to the host
+        let tls = thread::static_tls()
+            .ok_or("the guest linker reported no static TLS (__native_bridge_config_static_tls)")?;
+        let tp = thread::alloc_static_tls(&tls)?;
+        arch::init_tcb(tp);
+        thread.set_guest_fs(tp);
         Ok(Guest {
             linker,
             vdso,

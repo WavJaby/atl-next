@@ -2,13 +2,13 @@
 //! Spike gate g1 (bridge-1 route N): the identity crossing leaves the host thread intact, and the guest linker initialises through it.
 //! `harness = false`: runs on the process's main thread, no test-runner threads touching TLS while the crossing is under test.
 //! Build: `ATL_G1_NB=<out>/nb/x86_64 ATL_G1_LIBCXX=<dir of the guest libc++.so> cargo test -p atl-native-bridge --test g1`; stage 2 prints SKIP without them.
-//! Deliberate break: `RUSTFLAGS=--cfg=atl_g1_break` drops the crossing's FS restore -> stage 0's probe fails (exit 1).
+//! Deliberate break: `RUSTFLAGS=--cfg=atl_g1_break` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
+//! Stage 2 also loads the bionic provider (`load_provider`) the engine binds property / abort-message stubs to.
 //!
 //! Stages:
 //! - 0, always: the crossing installs a guest thread pointer for the call and restores the host's after; host probe after it.
 //! - 2, with a native-bridge build: `__linker_init` loads NBS `app_process64` and its closure and returns; host probe; initialised = `__loader_dlopen("libc.so")` non-NULL and guest `getpid` = host pid (bionic caches it in the guest TCB).
-//!   Then the guest-dlsym proof: linker64's `dlsym` (crate atl-guest-dlsym, what Rust's panic_abort calls for `android_set_abort_message`) answers the linker's own function and counts the hit, a name it does not answer fails the same check (its break), and calling the answer leaves the text in an `[anon:abort message]` mapping.
-//!   Blocked: the linker's first host call, `__native_bridge_get_host_pthread`, needs a bionic `pthread_internal_t` the engine cannot build yet (engine/vdso.rs `get_host_pthread`); the process aborts there.
+//!   Then the guest-dlsym proof: linker64's `dlsym` (crate atl-guest-dlsym, what Rust's panic_abort calls for `android_set_abort_message`) answers the linker's own function and counts the hit, a name it does not answer fails the same check (its break), and calling the answer leaves the text in bionic's abort-message mapping.
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,
@@ -143,23 +143,58 @@ fn dlsym_proof(g: &mut Guest) -> Result<usize, String> {
     Ok(got)
 }
 
-/// The text of the `[anon:abort message]` mapping (bionic android_set_abort_message.cpp: magic1, magic2, size, then the text).
+/// bionic android_set_abort_message.cpp `fill_abort_message_magic`: the two words a crash reporter finds the message by.
+const ABORT_MAGIC: [u64; 2] = [0xb18e40886ac388f0, 0xc6dfba755a1de0b5];
+
+/// The text of bionic's abort-message mapping (magic_abort_msg_t: magic1, magic2, abort_msg_t.size, then the text), found by its magic as debuggerd does: the mapping is named `[anon:abort message]` only where the kernel has `CONFIG_ANON_VMA_NAME` (WSL2's 6.6 kernel does not).
 fn abort_message() -> Result<String, String> {
     let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| e.to_string())?;
-    let line = maps
-        .lines()
-        .find(|l| l.ends_with("[anon:abort message]"))
-        .ok_or("no [anon:abort message] mapping")?;
-    let start = usize::from_str_radix(line.split('-').next().unwrap_or(""), 16)
-        .map_err(|e| e.to_string())?;
     // magic_abort_msg_t: two u64 magics + abort_msg_t.size
     const TEXT_OFFSET: usize = 24;
-    // SAFETY: the mapping is readable and holds a NUL-terminated text at TEXT_OFFSET (strcpy in bionic).
-    Ok(
-        unsafe { CStr::from_ptr((start + TEXT_OFFSET) as *const c_char) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    for line in maps.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // private anonymous read-write mappings (bionic mmaps it MAP_ANONYMOUS | MAP_PRIVATE): no path, or a name only
+        if f.len() < 5 || f[1] != "rw-p" || f.get(5).is_some_and(|p| p.starts_with('/')) {
+            continue;
+        }
+        let Some((Ok(start), Ok(end))) = f[0]
+            .split_once('-')
+            .map(|(s, e)| (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)))
+        else {
+            continue;
+        };
+        if end - start <= TEXT_OFFSET {
+            continue;
+        }
+        // SAFETY: the start of a readable mapping of this process.
+        let head = unsafe { std::slice::from_raw_parts(start as *const u64, 2) };
+        if head == ABORT_MAGIC {
+            // SAFETY: bionic strcpy'd a NUL-terminated text at TEXT_OFFSET.
+            return Ok(
+                unsafe { CStr::from_ptr((start + TEXT_OFFSET) as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Err("no mapping holds bionic's abort-message magic".into())
+}
+
+/// The bionic provider every ART process has loaded (`libatl_bionic`): the engine binds the guest's property and abort-message stubs to it by name (engine/vdso.rs `PROVIDER`). xtask builds it next to the native-bridge output: `<out>/nb/<arch>` -> `<out>/crates/atl-bionic/lib`.
+fn load_provider(nb: &Path) -> Result<(), String> {
+    let lib = nb
+        .ancestors()
+        .nth(2)
+        .ok_or("ATL_G1_NB is not <out>/nb/<arch>")?
+        .join("crates/atl-bionic/lib/libatl_bionic.so.0.0.0");
+    let path =
+        std::ffi::CString::new(lib.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: dlopen of a NUL-terminated path; its constructors are the provider's own.
+    let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if h.is_null() {
+        return Err(format!("dlopen {}: failed", lib.display()));
+    }
+    Ok(())
 }
 
 fn linker_init(nb: &Path, libcxx: &Path) -> Result<(), String> {
@@ -175,6 +210,7 @@ fn linker_init(nb: &Path, libcxx: &Path) -> Result<(), String> {
             libcxx.to_path_buf(),
         ],
     };
+    load_provider(nb)?;
     // SAFETY: no preconditions.
     let self0 = unsafe { libc::pthread_self() };
     let mut g = Guest::start(&cfg)?;
@@ -225,27 +261,29 @@ fn linker_init(nb: &Path, libcxx: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run() -> Result<(), String> {
-    crossing()?;
+/// Stage 2, or None when no native-bridge build is named.
+fn stage2() -> Option<Result<(), String>> {
     let (Some(nb), Some(libcxx)) = (
         std::env::var_os("ATL_G1_NB"),
         std::env::var_os("ATL_G1_LIBCXX"),
     ) else {
         println!("g1: stage 2 SKIP (ATL_G1_NB / ATL_G1_LIBCXX unset: no native-bridge build)");
-        return Ok(());
+        return None;
     };
-    linker_init(&PathBuf::from(nb), &PathBuf::from(libcxx))
+    Some(linker_init(&PathBuf::from(nb), &PathBuf::from(libcxx)))
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => {
-            println!("g1: ok");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("g1: FAILED: {e}");
-            ExitCode::FAILURE
-        }
+    // every stage runs (a failed probe puts the host FS back), so the break shows in each stage's probe
+    let results = [Some(crossing()), stage2()];
+    let mut failed = false;
+    for e in results.into_iter().flatten().filter_map(Result::err) {
+        eprintln!("g1: FAILED: {e}");
+        failed = true;
     }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    println!("g1: ok");
+    ExitCode::SUCCESS
 }

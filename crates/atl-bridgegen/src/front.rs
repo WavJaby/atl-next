@@ -14,7 +14,9 @@ use clang::{
     Type, TypeKind, Unsaved,
 };
 
-use crate::ir::{ArchView, CInt, Constant, Field, Nullability, Record, RecordKind, Signature, Ty};
+use crate::ir::{
+    ArchView, BitField, CInt, Constant, Field, Nullability, Record, RecordKind, Signature, Ty,
+};
 
 /// One target to parse the source for.
 pub struct Target {
@@ -524,12 +526,15 @@ fn errors(tu: &TranslationUnit) -> Result<()> {
     Ok(())
 }
 
-/// The files whose declarations belong to the interface: the source and `Source::also`.
-struct Owned<'tu> {
+/// What every type question of one translation unit needs: the files whose declarations belong to the
+/// interface (the source and `Source::also`), and the target's pointer width as clang reports it.
+struct Unit<'tu> {
     files: Vec<File<'tu>>,
+    /// Bits of a data pointer on this target (clang's TargetInfo): a C++ reference is passed and stored as one.
+    pointer_bits: u32,
 }
 
-impl Owned<'_> {
+impl Unit<'_> {
     /// By the file of the entity's own location (a declaration's name). Not libclang's "in main file",
     /// which says no for `bool f(void);` when `bool` is stdbool.h's macro.
     fn owns(&self, e: &Entity) -> bool {
@@ -548,7 +553,7 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
         .parse()
         .map_err(|e| anyhow!("libclang could not parse: {e:?}"))?;
     errors(&tu)?;
-    let owned = Owned {
+    let unit = Unit {
         files: std::iter::once(src.path)
             .chain(src.also.iter().map(PathBuf::as_path))
             .map(|p| {
@@ -556,6 +561,7 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
                     .with_context(|| format!("{} is not included by the source", p.display()))
             })
             .collect::<Result<_>>()?,
+        pointer_bits: u32::try_from(tu.get_target().pointer_width)?,
     };
 
     let mut view = ArchView {
@@ -567,10 +573,10 @@ fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
         strings: BTreeMap::new(),
         typedefs: BTreeMap::new(),
         includes: includes(&tu, src.path)?,
-        function_macros: function_macros(&tu, &owned)?,
+        function_macros: function_macros(&tu, &unit)?,
     };
-    decls(&tu.get_entity(), &owned, &mut view)?;
-    let macros = macro_names(&tu, &owned, src.macros)?;
+    decls(&tu.get_entity(), &unit, &mut view)?;
+    let macros = macro_names(&tu, &unit, src.macros)?;
     if !macros.is_empty() {
         for (name, value) in macro_values(index, src, &macros, t)? {
             insert_value(&mut view, name, value)?;
@@ -598,17 +604,17 @@ fn includes(tu: &TranslationUnit, path: &Path) -> Result<Vec<String>> {
 }
 
 /// The interface's declarations among `parent`'s children; `extern "C"` blocks are looked into, named namespaces for their functions only (`namespaced_functions`).
-fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
+fn decls(parent: &Entity, unit: &Unit, view: &mut ArchView) -> Result<()> {
     for e in parent.get_children() {
         if e.get_kind() == EntityKind::LinkageSpec {
-            decls(&e, owned, view)?;
+            decls(&e, unit, view)?;
             continue;
         }
-        if !owned.owns(&e) {
+        if !unit.owns(&e) {
             continue;
         }
         if e.get_kind() == EntityKind::Namespace {
-            namespaced_functions(&e, "", owned, view)?;
+            namespaced_functions(&e, "", unit, view)?;
             continue;
         }
         match e.get_kind() {
@@ -619,11 +625,11 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
                 if !e.is_anonymous()
                     && let Some(name) = e.get_name()
                 {
-                    record(&e, &name, owned, &mut view.records)?;
+                    record(&e, &name, unit, &mut view.records)?;
                     // C++ `static constexpr` members
                     for m in e.get_children() {
                         if m.get_kind() == EntityKind::VarDecl
-                            && let Some((member, value)) = var_constant(&m, owned)?
+                            && let Some((member, value)) = var_constant(&m, unit)?
                         {
                             insert_value(view, format!("{name}::{member}"), value)?;
                         }
@@ -641,16 +647,16 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
                     && d.is_definition()
                     && d.is_anonymous()
                 {
-                    record(&d, &name, owned, &mut view.records)?;
+                    record(&d, &name, unit, &mut view.records)?;
                 }
-                let target = typedef_target(&under, &name, owned).with_context(|| name.clone())?;
+                let target = typedef_target(&under, &name, unit).with_context(|| name.clone())?;
                 view.typedefs.insert(name, target);
             }
             EntityKind::EnumDecl => {
                 let int = e
                     .get_enum_underlying_type()
                     .context("enum without underlying type")?;
-                let ty = ty(&int, owned)?.resolved().clone();
+                let ty = ty(&int, unit)?.resolved().clone();
                 for c in e.get_children() {
                     if c.get_kind() != EntityKind::EnumConstantDecl {
                         continue;
@@ -671,11 +677,11 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
                 }
                 view.functions.insert(
                     name.clone(),
-                    signature(&t, owned).with_context(|| name.clone())?,
+                    signature(&t, unit).with_context(|| name.clone())?,
                 );
             }
             EntityKind::VarDecl => {
-                if let Some((name, value)) = var_constant(&e, owned)? {
+                if let Some((name, value)) = var_constant(&e, unit)? {
                     insert_value(view, name, value)?;
                 }
             }
@@ -687,26 +693,21 @@ fn decls(parent: &Entity, owned: &Owned, view: &mut ArchView) -> Result<()> {
 
 /// Functions of the named namespace `ns` (nested in `outer`, `a::`), keyed by qualified name (`android::egl_get_init_count`): C++ linkage, so printers keep the namespace and exports carry the mangled name.
 /// Only functions: no consumer reads a namespaced record, typedef or constant yet. Anonymous namespaces give internal linkage, never interface.
-fn namespaced_functions(
-    ns: &Entity,
-    outer: &str,
-    owned: &Owned,
-    view: &mut ArchView,
-) -> Result<()> {
+fn namespaced_functions(ns: &Entity, outer: &str, unit: &Unit, view: &mut ArchView) -> Result<()> {
     let Some(name) = ns.get_name() else {
         return Ok(());
     };
     let scope = format!("{outer}{name}::");
     for e in ns.get_children() {
-        if !owned.owns(&e) {
+        if !unit.owns(&e) {
             continue;
         }
         match e.get_kind() {
-            EntityKind::Namespace => namespaced_functions(&e, &scope, owned, view)?,
+            EntityKind::Namespace => namespaced_functions(&e, &scope, unit, view)?,
             EntityKind::FunctionDecl if e.get_linkage() != Some(Linkage::Internal) => {
                 let name = format!("{scope}{}", e.get_name().context("unnamed function")?);
                 let t = e.get_type().with_context(|| format!("{name}: no type"))?;
-                let sig = signature(&t, owned).with_context(|| name.clone())?;
+                let sig = signature(&t, unit).with_context(|| name.clone())?;
                 // one key per name: an overload set would need the signature in the key
                 if let Some(old) = view.functions.insert(name.clone(), sig.clone())
                     && old != sig
@@ -735,7 +736,7 @@ fn record_kind(k: EntityKind) -> RecordKind {
 }
 
 /// A `const` variable clang can evaluate (C++ `constexpr`): an integer, or a `const char[]` string.
-fn var_constant(e: &Entity, owned: &Owned) -> Result<Option<(String, MacroValue)>> {
+fn var_constant(e: &Entity, unit: &Unit) -> Result<Option<(String, MacroValue)>> {
     let Some(t) = e.get_type() else {
         return Ok(None);
     };
@@ -758,7 +759,7 @@ fn var_constant(e: &Entity, owned: &Owned) -> Result<Option<(String, MacroValue)
         }
         _ => return Ok(None),
     };
-    let ty = ty(&t, owned)
+    let ty = ty(&t, unit)
         .with_context(|| name.clone())?
         .resolved()
         .clone();
@@ -802,13 +803,13 @@ fn insert_constant(
 }
 
 /// The function-like macros the interface's files define, as written.
-fn function_macros(tu: &TranslationUnit, owned: &Owned) -> Result<BTreeMap<String, String>> {
+fn function_macros(tu: &TranslationUnit, unit: &Unit) -> Result<BTreeMap<String, String>> {
     let mut texts = BTreeMap::new();
     let mut out = BTreeMap::new();
     for e in tu.get_entity().get_children() {
         if e.get_kind() != EntityKind::MacroDefinition
             || !e.is_function_like_macro()
-            || !owned.owns(&e)
+            || !unit.owns(&e)
         {
             continue;
         }
@@ -824,7 +825,7 @@ fn function_macros(tu: &TranslationUnit, owned: &Owned) -> Result<BTreeMap<Strin
 }
 
 /// Requested macro names with globs expanded over the object-like macros the interface's files define.
-fn macro_names(tu: &TranslationUnit, owned: &Owned, requested: &[&str]) -> Result<Vec<String>> {
+fn macro_names(tu: &TranslationUnit, unit: &Unit, requested: &[&str]) -> Result<Vec<String>> {
     let defined: Vec<String> = tu
         .get_entity()
         .get_children()
@@ -832,7 +833,7 @@ fn macro_names(tu: &TranslationUnit, owned: &Owned, requested: &[&str]) -> Resul
         .filter(|e| {
             e.get_kind() == EntityKind::MacroDefinition
                 && !e.is_function_like_macro()
-                && owned.owns(e)
+                && unit.owns(e)
         })
         .filter_map(|e| e.get_name())
         .collect();
@@ -903,7 +904,10 @@ fn macro_values(
         .parse()
         .map_err(|e| anyhow!("libclang could not parse the macro probe: {e:?}"))?;
     errors(&tu).context("evaluating macros")?;
-    let none = Owned { files: Vec::new() };
+    let none = Unit {
+        files: Vec::new(),
+        pointer_bits: u32::try_from(tu.get_target().pointer_width)?,
+    };
     let mut out = Vec::new();
     for e in tu.get_entity().get_children() {
         let Some(name) = e
@@ -950,7 +954,7 @@ fn macro_values(
 fn record(
     e: &Entity,
     name: &str,
-    owned: &Owned,
+    unit: &Unit,
     records: &mut BTreeMap<String, Record>,
 ) -> Result<()> {
     if records.contains_key(name) {
@@ -977,13 +981,13 @@ fn record(
     for c in &children {
         let (field, ft) = match c.get_kind() {
             EntityKind::FieldDecl => {
+                // an unnamed bit-field (`int : 0`, `int : 3`) only pads: clang's offsets of the named ones carry its effect
+                if c.is_bit_field() && c.get_name().is_none_or(|n| n.is_empty()) {
+                    continue;
+                }
                 let field = c
                     .get_name()
                     .with_context(|| format!("{name}: unnamed field"))?;
-                ensure!(
-                    !c.is_bit_field(),
-                    "{name}.{field}: bit-fields are not supported"
-                );
                 let ft = c
                     .get_type()
                     .with_context(|| format!("{name}.{field}: no type"))?;
@@ -999,7 +1003,28 @@ fn record(
             }
             _ => continue,
         };
-        let offset = field_offset(&t, c, &field).with_context(|| format!("{name}.{field}"))?;
+        let bit_offset =
+            field_bit_offset(&t, c, &field).with_context(|| format!("{name}.{field}"))?;
+        let (offset, bits) = if c.is_bit_field() {
+            let unit_bytes = ft
+                .get_canonical_type()
+                .get_sizeof()
+                .map_err(|err| anyhow!("{name}.{field}: sizeof: {err:?}"))?
+                as u64;
+            let width = c
+                .get_bit_field_width()
+                .with_context(|| format!("{name}.{field}: no bit-field width"))?
+                as u64;
+            let unit = storage_unit(bit_offset, width, unit_bytes)
+                .with_context(|| format!("{name}.{field}"))?;
+            (unit.0, Some(unit.1))
+        } else {
+            ensure!(
+                bit_offset % 8 == 0,
+                "{name}.{field}: offset is not whole bytes"
+            );
+            (bit_offset / 8, None)
+        };
         let ty = match inline_record(&ft) {
             Some(d) => {
                 let rec = if d.is_anonymous() {
@@ -1012,15 +1037,16 @@ fn record(
                 } else {
                     d.get_name().context("nested record without name")?
                 };
-                record(&d, &rec, owned, records)?;
+                record(&d, &rec, unit, records)?;
                 Ty::Record { name: rec }
             }
-            None => self::ty(&ft, owned).with_context(|| format!("{name}.{field}"))?,
+            None => self::ty(&ft, unit).with_context(|| format!("{name}.{field}"))?,
         };
         fields.push(Field {
             name: field,
             offset,
             ty,
+            bits,
         });
     }
     records.insert(
@@ -1049,10 +1075,10 @@ fn inline_record<'tu>(ft: &Type<'tu>) -> Option<Entity<'tu>> {
     (d.is_anonymous() || is_record(parent.get_kind())).then_some(d)
 }
 
-/// Byte offset of a member in its parent. An anonymous member has no name to ask clang about; its
-/// first leaf field is reachable by name from the parent (C11 anonymous members) and sits at the
-/// member's own offset.
-fn field_offset(parent: &Type, member: &Entity, name: &str) -> Result<u64> {
+/// Bit offset of a member in its parent, as clang laid it out. An anonymous member has no name to ask
+/// clang about; its first leaf field is reachable by name from the parent (C11 anonymous members) and
+/// sits at the member's own offset.
+fn field_bit_offset(parent: &Type, member: &Entity, name: &str) -> Result<u64> {
     let leaf = if member.get_kind() == EntityKind::FieldDecl {
         name.to_owned()
     } else {
@@ -1061,8 +1087,30 @@ fn field_offset(parent: &Type, member: &Entity, name: &str) -> Result<u64> {
     let bits = parent
         .get_offsetof(&leaf)
         .map_err(|err| anyhow!("offsetof({leaf}): {err:?}"))?;
-    ensure!(bits % 8 == 0, "offset is not whole bytes");
-    Ok((bits / 8) as u64)
+    Ok(bits as u64)
+}
+
+/// A bit-field at clang's `bit_offset` as (byte offset of its storage unit, place in it). The unit is
+/// the declared type's size, at a multiple of that size (Itanium C++ ABI / SysV psABI: a bit-field of
+/// type T lies within one T-sized, T-aligned unit; clang moves one that would straddle to the next).
+/// Only a packed record or a 32-bit `long long` (4-aligned) can straddle; that fails here rather than
+/// inventing a unit.
+fn storage_unit(bit_offset: u64, width: u64, unit_bytes: u64) -> Result<(u64, BitField)> {
+    ensure!(unit_bytes > 0, "bit-field of a zero-sized type");
+    let unit_bits = unit_bytes * 8;
+    let offset = bit_offset / unit_bits * unit_bytes;
+    let shift = bit_offset - offset * 8;
+    ensure!(
+        shift + width <= unit_bits,
+        "bit-field at bit {bit_offset}, width {width}, straddles its {unit_bytes}-byte storage unit"
+    );
+    Ok((
+        offset,
+        BitField {
+            shift: u32::try_from(shift)?,
+            width: u32::try_from(width)?,
+        },
+    ))
 }
 
 fn first_leaf(record: &Entity) -> Option<String> {
@@ -1079,13 +1127,13 @@ fn first_leaf(record: &Entity) -> Option<String> {
 }
 
 /// What typedef `name` stands for; `typedef struct { … } name;` is the record known by `name`.
-fn typedef_target(under: &Type, name: &str, owned: &Owned) -> Result<Ty> {
+fn typedef_target(under: &Type, name: &str, unit: &Unit) -> Result<Ty> {
     let c = under.get_canonical_type();
     if c.get_kind() == TypeKind::Record
         && let Some(d) = c.get_declaration()
         && d.is_anonymous()
     {
-        return Ok(if owned.owns(&d) && c.get_sizeof().is_ok() {
+        return Ok(if unit.owns(&d) && c.get_sizeof().is_ok() {
             Ty::Record {
                 name: name.to_owned(),
             }
@@ -1096,17 +1144,17 @@ fn typedef_target(under: &Type, name: &str, owned: &Owned) -> Result<Ty> {
             }
         });
     }
-    ty(under, owned)
+    ty(under, unit)
 }
 
-fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
+fn ty(t: &Type, unit: &Unit) -> Result<Ty> {
     // sugar: `struct x` looks through to the named type; a typedef name is kept, also when it is reached
     // through sugar libclang does not expose (C++ `using std::atomic_uint_least32_t;`: a using-type
     // with no declaration, only the typedef's name)
     if t.get_kind() == TypeKind::Unexposed
         && let Some(name) = t.get_typedef_name()
     {
-        let target = ty(&t.get_canonical_type(), owned).with_context(|| name.clone())?;
+        let target = ty(&t.get_canonical_type(), unit).with_context(|| name.clone())?;
         return Ok(Ty::Typedef {
             name,
             ty: Box::new(target),
@@ -1116,7 +1164,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
         let named = t
             .get_elaborated_type()
             .context("elaborated type without named type")?;
-        return ty(&named, owned);
+        return ty(&named, unit);
     }
     if let Some(decl) = t.get_declaration()
         && matches!(
@@ -1129,7 +1177,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
             .get_typedef_underlying_type()
             .with_context(|| format!("{name}: no underlying type"))?;
         return Ok(Ty::Typedef {
-            ty: Box::new(typedef_target(&under, &name, owned).with_context(|| name.clone())?),
+            ty: Box::new(typedef_target(&under, &name, unit).with_context(|| name.clone())?),
             name,
         });
     }
@@ -1179,7 +1227,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
             let int = decl
                 .get_enum_underlying_type()
                 .context("enum without underlying type")?;
-            ty(&int, owned)?.resolved().clone()
+            ty(&int, unit)?.resolved().clone()
         }
         TypeKind::Pointer => {
             // the written pointee keeps typedef names and nullability; the canonical one is the fallback
@@ -1190,7 +1238,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
             Ty::Pointer {
                 bits: bits()?,
                 is_const: pointee.is_const_qualified(),
-                pointee: Box::new(ty(&pointee, owned)?),
+                pointee: Box::new(ty(&pointee, unit)?),
                 nullability,
             }
         }
@@ -1199,7 +1247,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
             let name = decl
                 .get_name()
                 .with_context(|| format!("anonymous record {}", c.get_display_name()))?;
-            if owned.owns(&decl) && c.get_sizeof().is_ok() {
+            if unit.owns(&decl) && c.get_sizeof().is_ok() {
                 Ty::Record { name }
             } else {
                 Ty::Opaque {
@@ -1208,8 +1256,24 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
                 }
             }
         }
+        TypeKind::LValueReference | TypeKind::RValueReference => {
+            // clang's sizeof of a reference type is its referent's; the ABI passes and stores a pointer
+            let pointee = t
+                .get_pointee_type()
+                .or_else(|| c.get_pointee_type())
+                .context("reference without referent")?;
+            #[cfg(not(atl_bridgegen_break))]
+            let bits = unit.pointer_bits;
+            #[cfg(atl_bridgegen_break)]
+            let bits = bits()?;
+            Ty::Reference {
+                bits,
+                is_const: pointee.is_const_qualified(),
+                pointee: Box::new(ty(&pointee, unit)?),
+            }
+        }
         TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype => {
-            Ty::Function(Box::new(signature(t, owned)?))
+            Ty::Function(Box::new(signature(t, unit)?))
         }
         TypeKind::ConstantArray => {
             // the written element type keeps typedef names
@@ -1219,7 +1283,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
                 .context("array without element type")?;
             let len = c.get_size().context("array without length")?;
             Ty::Array {
-                elem: Box::new(ty(&elem, owned)?),
+                elem: Box::new(ty(&elem, unit)?),
                 len: len as u64,
             }
         }
@@ -1227,7 +1291,7 @@ fn ty(t: &Type, owned: &Owned) -> Result<Ty> {
     })
 }
 
-fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
+fn signature(t: &Type, unit: &Unit) -> Result<Signature> {
     let c = t.get_canonical_type();
     let ret = t
         .get_result_type()
@@ -1237,7 +1301,7 @@ fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
     // C's unprototyped function
     if c.get_kind() == TypeKind::FunctionNoPrototype {
         return Ok(Signature {
-            ret: ty(&ret, owned)?,
+            ret: ty(&ret, unit)?,
             params: Vec::new(),
             variadic: false,
         });
@@ -1250,17 +1314,14 @@ fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
     let adjusted = c.get_argument_types().unwrap_or_default();
     // C11 6.7.6.3p7: a parameter written as an array (`GLuint range[2]`, `char *const argv[]`) is a pointer; the canonical type is the adjusted one
     let adjusted_param = |i: usize| -> Result<Ty> {
-        ty(
-            adjusted.get(i).context("no adjusted parameter type")?,
-            owned,
-        )
+        ty(adjusted.get(i).context("no adjusted parameter type")?, unit)
     };
     let param = |(i, p): (usize, &Type)| -> Result<Ty> {
         // an array without a size has no type of its own here, only its adjusted one
         if p.get_kind() == TypeKind::IncompleteArray {
             return adjusted_param(i);
         }
-        let written = ty(p, owned)?;
+        let written = ty(p, unit)?;
         // a typedef of an array keeps its name: printers map the ones they know (`va_list`, an array on x86-64) as a whole
         if !matches!(written, Ty::Array { .. }) {
             return Ok(written);
@@ -1268,7 +1329,7 @@ fn signature(t: &Type, owned: &Owned) -> Result<Signature> {
         adjusted_param(i)
     };
     Ok(Signature {
-        ret: ty(&ret, owned)?,
+        ret: ty(&ret, unit)?,
         params: params
             .iter()
             .enumerate()

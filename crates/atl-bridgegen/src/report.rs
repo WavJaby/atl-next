@@ -65,6 +65,11 @@ fn record_differences(ra: &Record, rb: &Record, a: &str, b: &str) -> Vec<String>
                 "{}: offset {} on {a}, {} on {b}",
                 fa.name, fa.offset, fb.offset
             ));
+        } else if fa.bits != fb.bits {
+            d.push(format!(
+                "{}: bits {:?} on {a}, {:?} on {b}",
+                fa.name, fa.bits, fb.bits
+            ));
         } else if !same_ty(&fa.ty, &fb.ty) {
             d.push(format!("{}: type differs", fa.name));
         }
@@ -85,6 +90,18 @@ fn same_ty(a: &Ty, b: &Ty) -> bool {
                 ..
             },
             Ty::Pointer {
+                bits: bb,
+                pointee: pb,
+                ..
+            },
+        ) => ba == bb && same_ty(pa, pb),
+        (
+            Ty::Reference {
+                bits: ba,
+                pointee: pa,
+                ..
+            },
+            Ty::Reference {
                 bits: bb,
                 pointee: pb,
                 ..
