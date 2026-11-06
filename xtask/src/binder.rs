@@ -135,7 +135,12 @@ pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process
 }
 
 /// [`spawn_piped`] with `mounts` (`layout_mounts`: the test layout's /system, /vendor, /odm).
-pub(crate) fn spawn_piped_with(b: &Broker, cmd: &Command, uid: u32, mounts: Vec<Mount>) -> Result<Process> {
+pub(crate) fn spawn_piped_with(
+    b: &Broker,
+    cmd: &Command,
+    uid: u32,
+    mounts: Vec<Mount>,
+) -> Result<Process> {
     let mut s = spawn_of(cmd, uid)?;
     s.mounts = mounts;
     s.stdout = Stdio::piped();

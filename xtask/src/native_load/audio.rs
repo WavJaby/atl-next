@@ -57,17 +57,29 @@ fn ogg(bytes: &[u8]) -> Result<Expected> {
         );
         let granule = u64::from_le_bytes(bytes[pos + 6..pos + 14].try_into()?);
         let nseg = bytes[pos + 26] as usize;
-        ensure!(bytes.len() >= pos + 27 + nseg, "truncated segment table at byte {pos}");
-        let data_len: usize = bytes[pos + 27..pos + 27 + nseg].iter().map(|&s| s as usize).sum();
+        ensure!(
+            bytes.len() >= pos + 27 + nseg,
+            "truncated segment table at byte {pos}"
+        );
+        let data_len: usize = bytes[pos + 27..pos + 27 + nseg]
+            .iter()
+            .map(|&s| s as usize)
+            .sum();
         let start = pos + 27 + nseg;
-        ensure!(bytes.len() >= start + data_len, "truncated page at byte {pos}");
+        ensure!(
+            bytes.len() >= start + data_len,
+            "truncated page at byte {pos}"
+        );
         if ident.is_none() {
             let p = &bytes[start..start + data_len];
             ensure!(
                 p.len() >= 16 && p[0] == 1 && &p[1..7] == b"vorbis",
                 "first packet is not a Vorbis identification header"
             );
-            ident = Some((u64::from(p[11]), u64::from(u32::from_le_bytes(p[12..16].try_into()?))));
+            ident = Some((
+                u64::from(p[11]),
+                u64::from(u32::from_le_bytes(p[12..16].try_into()?)),
+            ));
         }
         if granule != NO_GRANULE {
             last = Some(granule);
@@ -76,7 +88,12 @@ fn ogg(bytes: &[u8]) -> Result<Expected> {
     }
     let (channels, rate) = ident.context("no Ogg pages")?;
     let frames = last.context("no page with a granule position")?;
-    Ok(Expected { channels, rate, frames, wav_data: None })
+    Ok(Expected {
+        channels,
+        rate,
+        frames,
+        wav_data: None,
+    })
 }
 
 /// RIFF WAVE, PCM: channels and rate from fmt, frames = data bytes / (channels x bits / 8).
@@ -107,7 +124,10 @@ fn wav(bytes: &[u8]) -> Result<Expected> {
     ensure!(tag == 1, "not PCM: format tag {tag}");
     let data = data.context("no data chunk")?;
     let frame = usize::from(channels) * usize::from(bits) / 8;
-    ensure!(frame > 0 && data.len() % frame == 0, "data chunk is not whole frames");
+    ensure!(
+        frame > 0 && data.len() % frame == 0,
+        "data chunk is not whole frames"
+    );
     Ok(Expected {
         channels: u64::from(channels),
         rate: u64::from(rate),
@@ -144,7 +164,12 @@ fn asset(apks: &Path, clip: &Clip) -> Result<Vec<u8>> {
 }
 
 /// The shim's `nlt decode` line as key=value pairs. An `error=` token (its own text may contain spaces) fails the clip.
-fn decode(env: &Env, fixture: &Fixture, input: &Path, output: &Path) -> Result<(String, BTreeMap<String, String>), String> {
+fn decode(
+    env: &Env,
+    fixture: &Fixture,
+    input: &Path,
+    output: &Path,
+) -> Result<(String, BTreeMap<String, String>), String> {
     // NativeLoad.java: the runtime and the shim load first (a[1], a[2]), then the clip and the PCM output (a[3], a[4])
     let args = [
         env.runtime.display().to_string(),
@@ -177,7 +202,13 @@ fn decode(env: &Env, fixture: &Fixture, input: &Path, output: &Path) -> Result<(
 }
 
 /// One clip's verdict: the decode's frames, channels, rate, PCM encoding and byte count against the container's; the store the process saw; raw output equal to the WAV data chunk.
-fn check(name: &str, exp: &Expected, line: &str, got: &BTreeMap<String, String>, pcm: &[u8]) -> Result<String, String> {
+fn check(
+    name: &str,
+    exp: &Expected,
+    line: &str,
+    got: &BTreeMap<String, String>,
+    pcm: &[u8],
+) -> Result<String, String> {
     if got.contains_key("error") {
         return Err(format!("{name}: {line}"));
     }
@@ -186,31 +217,52 @@ fn check(name: &str, exp: &Expected, line: &str, got: &BTreeMap<String, String>,
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| format!("{name}: no {key} in `{line}`"))
     };
-    let (frames, bytes, channels, rate) = (num("frames")?, num("bytes")?, num("channels")?, num("rate")?);
+    let (frames, bytes, channels, rate) = (
+        num("frames")?,
+        num("bytes")?,
+        num("channels")?,
+        num("rate")?,
+    );
     let pcm_enc = num("pcm")?;
     let mut bad = Vec::new();
     if frames != exp.frames {
         bad.push(format!("frames {frames} != container {}", exp.frames));
     }
     if channels != exp.channels || rate != exp.rate {
-        bad.push(format!("{channels}ch {rate}Hz != container {}ch {}Hz", exp.channels, exp.rate));
+        bad.push(format!(
+            "{channels}ch {rate}Hz != container {}ch {}Hz",
+            exp.channels, exp.rate
+        ));
     }
     if pcm_enc != 2 {
         bad.push(format!("pcm encoding {pcm_enc}, expected 16-bit (2)"));
     }
     if bytes != frames * channels * 2 || pcm.len() as u64 != bytes {
-        bad.push(format!("bytes {bytes} (file {}) != frames x channels x 2", pcm.len()));
+        bad.push(format!(
+            "bytes {bytes} (file {}) != frames x channels x 2",
+            pcm.len()
+        ));
     }
-    if num("declared")? != 1 || !got.get("instances").is_some_and(|i| i.split(',').any(|n| n == "default")) {
-        bad.push(format!("store not declared with instance default: `{line}`"));
+    if num("declared")? != 1
+        || !got
+            .get("instances")
+            .is_some_and(|i| i.split(',').any(|n| n == "default"))
+    {
+        bad.push(format!(
+            "store not declared with instance default: `{line}`"
+        ));
     }
     if got.get("store").map(String::as_str) != Some("local") {
         bad.push(format!("store is {:?}, expected local", got.get("store")));
     }
-    if let Some(wav) = &exp.wav_data {
-        if wav.as_slice() != pcm {
-            bad.push(format!("PCM differs from the WAV data chunk ({} vs {} bytes)", pcm.len(), wav.len()));
-        }
+    if let Some(wav) = &exp.wav_data
+        && wav.as_slice() != pcm
+    {
+        bad.push(format!(
+            "PCM differs from the WAV data chunk ({} vs {} bytes)",
+            pcm.len(),
+            wav.len()
+        ));
     }
     if !bad.is_empty() {
         return Err(format!("{name}: {}", bad.join("; ")));
@@ -219,14 +271,24 @@ fn check(name: &str, exp: &Expected, line: &str, got: &BTreeMap<String, String>,
 }
 
 /// Stage 9: every clip decoded and checked; Ok names the clips, Err the first clip that failed. `work` is the stage's directory.
-pub fn run(env: &Env, fixture: &Fixture, apks: &Path, work: &Path, break_media: bool) -> Result<String, String> {
+pub fn run(
+    env: &Env,
+    fixture: &Fixture,
+    apks: &Path,
+    work: &Path,
+    break_media: bool,
+) -> Result<String, String> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let mut parts = Vec::new();
     for clip in &CLIPS {
         let full = asset(apks, clip).map_err(|e| format!("{e:#}"))?;
         let exp = expected(clip, &full).map_err(|e| format!("{e:#}"))?;
         let truncated = break_media && clip.name == "cheer.ogg";
-        let input_bytes = if truncated { &full[..full.len() / 2] } else { &full[..] };
+        let input_bytes = if truncated {
+            &full[..full.len() / 2]
+        } else {
+            &full[..]
+        };
         let input = work.join(clip.name);
         std::fs::write(&input, input_bytes).map_err(|e| format!("{}: {e}", input.display()))?;
         let output = work.join(format!("{}.pcm", clip.name));

@@ -119,8 +119,14 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
         ));
     }
     let system = atl_android_paths::SYSTEM;
-    rows.push((data.join("media_codecs_sw.xml"), format!("{system}/etc/media_codecs.xml")));
-    rows.push((data.join("media_codecs_google_c2.xml"), format!("{system}/etc/media_codecs_c2.xml")));
+    rows.push((
+        data.join("media_codecs_sw.xml"),
+        format!("{system}/etc/media_codecs.xml"),
+    ));
+    rows.push((
+        data.join("media_codecs_google_c2.xml"),
+        format!("{system}/etc/media_codecs_c2.xml"),
+    ));
     for (host, _) in &rows {
         ensure!(
             host.is_file(),

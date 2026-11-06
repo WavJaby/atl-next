@@ -183,7 +183,10 @@ impl IServiceManager for View {
         }
         let mut found = real()?.r#getDeclaredInstances(iface)?.unwrap_or_default();
         for instance in served {
-            if !found.iter().any(|f| f.as_deref() == Some(instance.as_str())) {
+            if !found
+                .iter()
+                .any(|f| f.as_deref() == Some(instance.as_str()))
+            {
                 found.push(Some(instance));
             }
         }

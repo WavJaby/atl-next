@@ -284,7 +284,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(dir) => dir.clone(),
         None => Layout::of(root)?.workspace().join("apk"),
     };
-    match audio::run(&env, &fixture, &apks, &env.work.join("media"), args.break_media) {
+    match audio::run(
+        &env,
+        &fixture,
+        &apks,
+        &env.work.join("media"),
+        args.break_media,
+    ) {
         Ok(s) => report.pass("decode", s),
         Err(e) => report.fail("decode", e),
     }
@@ -406,7 +412,10 @@ impl Env {
         let test_root = self.work.join("binder");
         crate::binder::fresh_layout(&test_root)?;
         let aosp = Layout::of(&self.root)?.src().join("aosp");
-        crate::binder::link_rows(&test_root, &crate::atld_run::platform_rows(&self.out, &aosp)?)?;
+        crate::binder::link_rows(
+            &test_root,
+            &crate::atld_run::platform_rows(&self.out, &aosp)?,
+        )?;
         let lib_env = crate::binder::lib_env(&self.out)?;
         let (broker, mut binderd) =
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
@@ -429,16 +438,17 @@ impl Env {
         );
         let what = format!("{cmd:?}");
         let mounts = crate::binder::layout_mounts(&test_root);
-        let run = crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
-            let child = p.child;
-            let pid = child.id().to_string();
-            std::thread::spawn(move || {
-                std::thread::sleep(MEDIA_LIMIT);
-                // no unsafe in xtask: kill(1); a pid already reaped by then is not reused within one test run in practice
-                let _ = Command::new("kill").arg(&pid).status();
+        let run =
+            crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
+                let child = p.child;
+                let pid = child.id().to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(MEDIA_LIMIT);
+                    // no unsafe in xtask: kill(1); a pid already reaped by then is not reused within one test run in practice
+                    let _ = Command::new("kill").arg(&pid).status();
+                });
+                self.host.finish(&what, child)
             });
-            self.host.finish(&what, child)
-        });
         let _ = sm.child.kill();
         sm.child.wait()?;
         drop(broker);
