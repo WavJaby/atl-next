@@ -115,6 +115,7 @@ mod tests {
             ]
             .into(),
             none_exports: [("device/libnone".to_owned(), s(&["n/include"]))].into(),
+            artifacts: std::collections::BTreeMap::new(),
         }
     }
 

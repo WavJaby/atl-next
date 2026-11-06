@@ -239,7 +239,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rust = rust_toolchain(root)?;
     let libclang = libclang_dir(&args.cc)?;
     let llvm = llvm_prefix(&args.cc)?;
-    let nb_flags = native_bridge_flags(root, &arches, args, &converter, &tree, &out, &llvm)?;
+    let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
@@ -302,7 +302,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-release")
             .arg(&release)
             .args(cache.iter().flat_map(CompilerCache::converter_args))
-            .args(&nb_flags)
+            .args(&nb.flags)
             .args(&args.goals)
             .args(&aidl_goals)
             .status()
@@ -369,6 +369,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         token.index,
         build_pool::TOKENS
     );
+    let graph_file = out.join("graph.json");
+    let graph: triage::Graph = serde_json::from_str(
+        &std::fs::read_to_string(&graph_file)
+            .with_context(|| format!("reading {}", graph_file.display()))?,
+    )
+    .with_context(|| format!("parsing {}", graph_file.display()))?;
+    if let Some(p) = &nb.pass2 {
+        runtimes_pass2(root, args, &out, &graph, p)?;
+    }
     let status = Command::new("ninja")
         .args(["-k", "0", "-C"])
         .arg(&out)
@@ -408,12 +417,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )? {
         failed.push(Failure::step("licence gate", first));
     }
-    let graph_file = out.join("graph.json");
-    let graph: triage::Graph = serde_json::from_str(
-        &std::fs::read_to_string(&graph_file)
-            .with_context(|| format!("reading {}", graph_file.display()))?,
-    )
-    .with_context(|| format!("parsing {}", graph_file.display()))?;
     if status.success() {
         println!("native: built -> {}", out.display());
         for built in packages::build(root, &out)? {
@@ -507,13 +510,16 @@ fn native_bridge_flags(
     tree: &Path,
     out: &Path,
     llvm: &Path,
-) -> Result<Vec<String>> {
+) -> Result<NbSide> {
     let Some(arch) = &args.native_bridge else {
         ensure!(
             !args.goals.iter().any(|g| g.starts_with(NB_GOAL)),
             "{NB_GOAL} goals need --native-bridge"
         );
-        return Ok(Vec::new());
+        return Ok(NbSide {
+            flags: Vec::new(),
+            pass2: None,
+        });
     };
     let row = arches
         .get(arch)
@@ -547,17 +553,36 @@ fn native_bridge_flags(
     let bionic: Vec<String> = serde_json::from_str(printed.lines().last().unwrap_or_default())
         .context("bp2ninja -nb-exports output")?;
     let built = runtimes::build_guest(root, arch, &args.cc, &args.cxx, out, &bionic)?;
-    let provided: BTreeMap<&str, Provided> = built
+    let builtins = built
+        .iter()
+        .find(|b| b.module == runtimes::BUILTINS)
+        .map(|b| b.lib.clone())
+        .context("runtimes built no compiler-rt builtins")?;
+    let libcxx_include = built
+        .iter()
+        .find(|b| b.module == runtimes::STATIC_LIBCXX)
+        .and_then(|b| b.include.clone())
+        .context("runtimes built no libc++ headers")?;
+    let mut provided: BTreeMap<&str, Provided> = built
         .into_iter()
         .map(|b| {
             let p = Provided {
-                lib: b.archive,
+                lib: b.lib,
                 export_include: b.include.into_iter().collect(),
                 ..Provided::default()
             };
             (b.module, p)
         })
         .collect();
+    // pass 2's output, built before ninja links any of its dependents (run)
+    provided.insert(
+        runtimes::SHARED_LIBCXX,
+        Provided {
+            libs: vec![runtimes::shared_libcxx(out, arch)],
+            export_include: vec![libcxx_include],
+            ..Provided::default()
+        },
+    );
     let file = out.join("nb-provided.json");
     std::fs::write(&file, serde_json::to_string_pretty(&provided)?)?;
     let mut flags = side;
@@ -566,9 +591,81 @@ fn native_bridge_flags(
         file.display().to_string(),
         "-clang-rt-include".to_owned(),
         runtimes::rt_include(root)?.display().to_string(),
+        "-bionic-static-rust".to_owned(),
+        root.join(GUEST_DLSYM).display().to_string(),
     ]);
-    Ok(flags)
+    Ok(NbSide {
+        flags,
+        pass2: Some(Pass2 {
+            arch: arch.clone(),
+            bionic,
+            builtins,
+        }),
+    })
 }
+
+/// crates/atl-guest-dlsym's crate root, which the converter compiles for the guest (`-bionic-static-rust`).
+const GUEST_DLSYM: &str = "crates/atl-guest-dlsym/src/lib.rs";
+
+/// The native bridge side's converter flags, and what runtimes pass 2 needs (none without --native-bridge).
+struct NbSide {
+    flags: Vec<String>,
+    pass2: Option<Pass2>,
+}
+
+/// Runtimes pass 2 inputs known before the converter runs: the guest arch, bionic's include flags, pass 1's builtins archive.
+struct Pass2 {
+    arch: String,
+    bionic: Vec<String>,
+    builtins: PathBuf,
+}
+
+/// Runtimes pass 2 (runtimes.rs SHARED): ninja builds the guest libc it links against, the converter's `runtimes::SYSROOT_MODULES` (graph.json artifacts), then CMake builds `libc++.so`. Runs before the main ninja run, which links its dependents.
+fn runtimes_pass2(
+    root: &Path,
+    args: &Args,
+    out: &Path,
+    graph: &triage::Graph,
+    p: &Pass2,
+) -> Result<()> {
+    let libs = runtimes::SYSROOT_MODULES
+        .iter()
+        .map(|m| {
+            let dir = format!("{NB_DIR}{}/{m}", p.arch);
+            graph
+                .artifact_out(&dir)
+                .map(PathBuf::from)
+                .with_context(|| format!("runtimes pass 2: no graph.json artifact {dir}: add a {NB_GOAL} goal that links it"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let log = out.join("ninja-pass2.log");
+    let status = Command::new("ninja")
+        .args(["-C"])
+        .arg(out)
+        .args(&libs)
+        .stdout(std::fs::File::create(&log)?)
+        .stderr(std::fs::File::create(out.join("ninja-pass2.err"))?)
+        .status()
+        .context("running ninja for the guest libc")?;
+    ensure!(
+        status.success(),
+        "ninja for runtimes pass 2 (guest libc) failed: {}",
+        log.display()
+    );
+    runtimes::build_shared(
+        root,
+        &p.arch,
+        (&args.cc, &args.cxx),
+        out,
+        &p.bionic,
+        &libs,
+        &p.builtins,
+    )?;
+    Ok(())
+}
+
+/// The converter's module directory prefix of the native bridge side (tools/bp2ninja Side.String: `nb/<arch>`).
+const NB_DIR: &str = "nb/";
 
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
 /// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).

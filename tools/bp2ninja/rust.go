@@ -72,6 +72,9 @@ func (g *Graph) checkRustAndroid() {
 // rustDefaultEdition:rust/config/global.go DefaultEdition, the edition of a crate without `edition`.
 const rustDefaultEdition = "2021"
 
+// bionicStaticRustEdition: the edition of -bionic-static-rust, the workspace's (Cargo.toml workspace.package.edition).
+const bionicStaticRustEdition = "2024"
+
 // rustStdlibs: rust/config/global.go Stdlibs (+ the sysroot crates a module may name in rustlibs): built into the sysroot, so a reference to one is dropped.
 var rustStdlibs = map[string]bool{"libstd": true, "libcore": true, "liballoc": true, "libproc_macro": true, "libtest": true}
 
@@ -661,8 +664,19 @@ func (g *Graph) rustStaticlib(b *strings.Builder, n *Node) (lib string, whole bo
 	for _, r := range roots {
 		lines = append(lines, "extern crate "+r.name+";")
 	}
-	g.genFile(src, strings.Join(lines, "\n")+"\n")
 	libs, inputs, linked := rustLibFlags(roots)
+	// rustup's std (panic_abort) references dlsym, which a static bionic executable has no libdl for; Android's patched std does not (crates/atl-guest-dlsym says why and when to delete this)
+	if g.bionicStaticRust != "" && n.staticBinary() {
+		const crate = "atl_guest_dlsym"
+		rlib := filepath.Join(dir, "lib"+crate+".rlib")
+		rflags := append(g.rustSideFlags(n.side), "--crate-type=rlib", "--crate-name="+crate, "--edition="+bionicStaticRustEdition)
+		fmt.Fprintf(b, "build %s: rustc %s\n  env = OUT_DIR=out\n  flags = %s\n  libs =\n  crates =\n", esc(rlib), esc(g.bionicStaticRust), shellQuote(rflags))
+		lines = append(lines, "extern crate "+crate+";")
+		libs = append(libs, "--extern", crate+"="+rlib)
+		inputs = append(inputs, rlib)
+		linked = append(linked, rlib)
+	}
+	g.genFile(src, strings.Join(lines, "\n")+"\n")
 	flags := g.rustSideFlags(n.side)
 	flags = append(flags, "--cap-lints", "allow", "--crate-type=staticlib", "--crate-name=generated_rust_staticlib", "--edition="+rustDefaultEdition)
 	fmt.Fprintf(b, "build %s: rustc %s | %s\n  env = OUT_DIR=out\n  flags = %s\n  libs = %s\n  crates = %s\n", esc(lib), esc(src), join(inputs), shellQuote(flags), shellQuote(libs), shellQuote(linked))

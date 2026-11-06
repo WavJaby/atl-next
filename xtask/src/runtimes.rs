@@ -2,7 +2,8 @@
 //! LLVM runtimes for a bionic guest arch, built from the pinned llvm-project (sources.toml: the tree of android-16's clang-r547379) by LLVM's own CMake runtimes build, run as-is (CLAUDE.md).
 //! Each variant mirrors one runtime builder of AOSP's toolchain/llvm_android `src/llvm_android/builders.py` (at 9596955b, the revision clang-r547379's clang_source_info.md names): same runtimes, same cache entries, same output names, so the archives are the modules prebuilts/clang's Android.bp declares.
 //! Differences from that build, each because we have no NDK-style sysroot yet: headers come straight from bionic's `libc_headers` export dirs as the converter evaluates them for the guest (`-nostdlibinc`), and try-compiles stop at a static library (no libc to link); no LTO / AutoFDO / debug info.
-//! Output: `<out>/upstream/llvm-project/<arch>/<variant>/` (CMake build dir, `build.log`), then the licence gate over every object those builds compiled. Run by `xtask native --native-bridge <arch>`, whose converter run links the archives (-nb-provided).
+//! Output: `<out>/upstream/llvm-project/<arch>/<variant>/` (CMake build dir, `build.log`), then the licence gate over every object those builds compiled. Run by `xtask native --native-bridge <arch>` in two passes: the static runtimes before the converter, whose run links them (-nb-provided);
+//! `libc++.so` (SHARED) after the converter's ninja built the guest libc it links against, before the ninja run that links its dependents.
 
 use std::path::{Path, PathBuf};
 
@@ -83,7 +84,7 @@ const VARIANTS: &[Variant] = &[
         staged: LIBCXX_STAGED,
     },
     // DeviceLibcxxBuilder, platform=True noexcept=False (builders.py:1045, cache entries 1158-1188, platform libs 1236): the libc++ every other platform module's static STL links (cc/stl.go
-    // libc++_static + libc++demangle). One difference: LIBCXX_ENABLE_SHARED stays OFF (builders.py:1176 sets ON): libc++.so links against bionic's libc.so, which this pre-converter build has not got.
+    // libc++_static + libc++demangle). Its libc++.so comes from SHARED (pass 2): it links against bionic's libc.so, which this pre-converter build has not got.
     Variant {
         name: "libcxx",
         runtimes: "libcxx;libcxxabi",
@@ -105,7 +106,7 @@ const VARIANTS: &[Variant] = &[
         cflags: "",
         cxxflags: "-DHAS_THREAD_LOCAL",
         modules: &[
-            ("libc++_static", "libc++_static.a"),
+            (STATIC_LIBCXX, "libc++_static.a"),
             ("libc++demangle", "libc++demangle.a"),
         ],
         staged: LIBCXX_STAGED,
@@ -137,13 +138,15 @@ const VARIANTS: &[Variant] = &[
             ("LIBUNWIND_ENABLE_SHARED", "FALSE"),
             ("LIBUNWIND_ENABLE_ASSERTIONS", "FALSE"),
             ("LIBUNWIND_USE_FRAME_HEADER_CACHE", "TRUE"),
+            // the file name Soong gives the prebuilt (its module name): every link passes -Wl,--exclude-libs,libunwind.a (cc/config/global.go), which would make libc.so's unwinder exports local (measured: libc++.so's _Unwind_* undefined)
+            ("LIBUNWIND_STATIC_OUTPUT_NAME", "unwind-exported"),
             // as the libunwind variant: bionic has no libpthread / libdl archive to name
             ("LIBUNWIND_HAS_PTHREAD_LIB", "OFF"),
             ("LIBUNWIND_HAS_DL_LIB", "OFF"),
         ],
         cflags: "-D_LIBUNWIND_USE_DLADDR=0",
         cxxflags: "-D_LIBUNWIND_USE_DLADDR=0",
-        modules: &[("libunwind-exported", "libunwind.a")],
+        modules: &[("libunwind-exported", "libunwind-exported.a")],
         staged: &[],
     },
     // BuiltinsBuilder, is_exported=False (the -exported copy exists for arm and x86 only, prebuilts/clang Android.bp)
@@ -165,15 +168,132 @@ const VARIANTS: &[Variant] = &[
         ],
         cflags: "",
         cxxflags: "",
-        modules: &[("libclang_rt.builtins", "libclang_rt.builtins-")],
+        modules: &[(BUILTINS, "libclang_rt.builtins-")],
         staged: &[],
     },
 ];
 
-/// A built module: its archive, and the headers dir dependents compile against (libc++'s staged `include/c++/v1`).
+/// Pass 2, after the converter's ninja built the guest libc: the shared half of DeviceLibcxxBuilder platform=True noexcept=False (builders.py:1176 `LIBCXX_ENABLE_SHARED` ON), the `libc++` module dynamic-STL platform modules link (cc/stl.go).
+/// A build dir of its own, so pass 1's libc++_static.a, which the converter's links already took, is never rebuilt. builders.py links it against its sysroot (`CMAKE_SYSROOT`, 1156): the NDK's libc/libm/libdl stubs + crt objects; ours holds the converter-built guest ones (`sysroot`).
+const SHARED: Variant = Variant {
+    name: "libcxx-shared",
+    runtimes: "libcxx;libcxxabi",
+    cache: &[
+        ("LIBCXXABI_ENABLE_SHARED", "OFF"),
+        ("LIBCXXABI_USE_LLVM_UNWINDER", "OFF"),
+        ("LIBCXXABI_NON_DEMANGLING_TERMINATE", "ON"),
+        ("LIBCXXABI_STATIC_DEMANGLE_LIBRARY", "ON"),
+        ("LIBCXX_ENABLE_SHARED", "ON"),
+        // pass 1 built the archive
+        ("LIBCXX_ENABLE_STATIC", "OFF"),
+        ("LIBCXX_ENABLE_ABI_LINKER_SCRIPT", "OFF"),
+        ("LIBCXX_ENABLE_STATIC_ABI_LIBRARY", "ON"),
+        ("LIBCXX_STATICALLY_LINK_ABI_IN_SHARED_LIBRARY", "ON"),
+        ("LIBCXX_HAS_PTHREAD_LIB", "OFF"),
+        ("LIBCXX_HAS_RT_LIB", "OFF"),
+        ("LIBCXXABI_HAS_PTHREAD_LIB", "OFF"),
+        // the STATIC_LIBRARY try-compiles pass these checks too, and the link would name the libraries (measured: -latomic -lgcc -lgcc_s unresolved); bionic has none, compiler-rt's builtins (linked) carry the atomics and personality helpers
+        ("LIBCXX_HAS_ATOMIC_LIB", "OFF"),
+        ("LIBCXX_HAS_GCC_LIB", "OFF"),
+        ("LIBCXX_HAS_GCC_S_LIB", "OFF"),
+        ("LIBCXXABI_HAS_GCC_LIB", "OFF"),
+        ("LIBCXXABI_HAS_GCC_S_LIB", "OFF"),
+        // soname `libc++.so`, not `libc++.so.1`: what CMake's Android platform module sets (Modules/Platform/Android.cmake), which CMAKE_SYSTEM_NAME Linux does not load
+        ("CMAKE_PLATFORM_NO_VERSIONED_SONAME", "ON"),
+    ],
+    cflags: "",
+    cxxflags: "-DHAS_THREAD_LOCAL",
+    modules: &[(SHARED_LIBCXX, "libc++.so")],
+    staged: LIBCXX_STAGED,
+};
+
+/// Module names other code looks up in what the runtimes build: compiler-rt's builtins (pass 2 links them), the static libc++ (whose headers the shared one exports too), the shared libc++.
+pub const BUILTINS: &str = "libclang_rt.builtins";
+pub const STATIC_LIBCXX: &str = "libc++_static";
+pub const SHARED_LIBCXX: &str = "libc++";
+
+/// The guest libraries and objects pass 2 links against (`sysroot`): converter modules of the native bridge side, which the converter's ninja builds before pass 2 (native.rs).
+pub const SYSROOT_MODULES: &[&str] = &["libc", "libm", "libdl", "crtbegin_so", "crtend_so"];
+
+/// Where pass 2 puts `libc++.so`, known before it runs: the converter's graph names it as an input of the modules that link `libc++`. `build_shared` fails unless the build put it there.
+pub fn shared_libcxx(out: &Path, arch: &str) -> PathBuf {
+    out.join("upstream")
+        .join(UPSTREAM)
+        .join(arch)
+        .join(SHARED.name)
+        .join("build/lib/libc++.so")
+}
+
+/// Pass 2: `libc++.so` for guest `arch`, linked against `libs` (the SYSROOT_MODULES outputs) and pass 1's compiler-rt `builtins` archive; licence gate over what it compiled.
+pub fn build_shared(
+    root: &Path,
+    arch: &str,
+    (cc, cxx): (&str, &str),
+    out: &Path,
+    bionic: &[String],
+    libs: &[PathBuf],
+    builtins: &Path,
+) -> Result<Built> {
+    let arches = arches::load(root)?;
+    let guest = arches
+        .get(arch)
+        .and_then(|a| a.guest.as_ref())
+        .with_context(|| format!("{arch}: no [guest] row in {}", arches::FILE))?;
+    let src = llvm_src(root)?;
+    let base = out.join("upstream").join(UPSTREAM).join(arch);
+    // the sysroot layout clang's Android toolchain searches for libraries and crt objects: <sysroot>/usr/lib/<triple>
+    let sysroot = base.join("sysroot");
+    let lib_dir = sysroot.join("usr/lib").join(&guest.clang);
+    if sysroot.exists() {
+        std::fs::remove_dir_all(&sysroot)?;
+    }
+    std::fs::create_dir_all(&lib_dir)?;
+    for l in libs {
+        let name = l.file_name().context("sysroot input has no file name")?;
+        std::os::unix::fs::symlink(l, lib_dir.join(name))
+            .with_context(|| format!("sysroot {}", l.display()))?;
+    }
+    let dir = base.join(SHARED.name);
+    println!("runtimes: {arch} {} -> {}", SHARED.name, dir.display());
+    let sysroot_s = sysroot.display().to_string();
+    // builders.py's ldflags (1121-1133): -nostdlib++ -unwindlib=none (libc.so exports the unwinder), packed relocations. -nodefaultlibs + the explicit libs take the place of the first two and of clang's default rtlib: the distro clang defaults to libgcc for Android, prebuilts/clang to its own builtins
+    let ldflags = "-nodefaultlibs -Wl,--pack-dyn-relocs=android+relr";
+    let stdlibs = format!("-lc -lm -ldl {}", builtins.display());
+    let link: &[(&str, &str)] = &[
+        ("CMAKE_SYSROOT", &sysroot_s),
+        ("CMAKE_SHARED_LINKER_FLAGS", ldflags),
+        ("CMAKE_CXX_STANDARD_LIBRARIES", &stdlibs),
+    ];
+    let built = build(
+        &src.join("runtimes"),
+        &dir,
+        &SHARED,
+        (cc, cxx),
+        &format!("{}{PLATFORM_API}", guest.clang),
+        &includes(bionic)?,
+        link,
+    )?
+    .pop()
+    .context("libcxx-shared builds one module")?;
+    let want = shared_libcxx(out, arch);
+    ensure!(
+        built.lib == want,
+        "libc++.so at {}, the converter was told {}",
+        built.lib.display(),
+        want.display()
+    );
+    println!("runtimes: {:<26} {}", built.module, built.lib.display());
+    ensure!(
+        gate(root, &base, &[&SHARED])?,
+        "runtimes {arch}: licence gate failed"
+    );
+    Ok(built)
+}
+
+/// A built module: its archive or shared object, and the headers dir dependents compile against (libc++'s staged `include/c++/v1`).
 pub struct Built {
     pub module: &'static str,
-    pub archive: PathBuf,
+    pub lib: PathBuf,
     pub include: Option<PathBuf>,
 }
 
@@ -207,24 +327,10 @@ pub fn build_guest(
         .get(arch)
         .and_then(|a| a.guest.as_ref())
         .with_context(|| format!("{arch}: no [guest] row in {}", arches::FILE))?;
-    let layout = Layout::of(root)?;
-    let sources = sources::load(root)?;
-    let checkouts = sources.checkouts(None);
-    let c = checkouts
-        .iter()
-        .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
-        .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
-    let src = layout.locate(&c.dir).dir;
+    let src = llvm_src(root)?;
     let base = out.join("upstream").join(UPSTREAM).join(arch);
     let triple = format!("{}{PLATFORM_API}", guest.clang);
-    ensure!(
-        bionic.iter().any(|f| f == "-isystem"),
-        "libc_headers exports no include dir: {bionic:?}"
-    );
-    let includes = std::iter::once("-nostdlibinc")
-        .chain(bionic.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let includes = includes(bionic)?;
     let mut built = Vec::new();
     for v in VARIANTS {
         let dir = base.join(v.name);
@@ -236,16 +342,56 @@ pub fn build_guest(
             (cc, cxx),
             &triple,
             &includes,
+            &[],
         )?);
     }
     for b in &built {
-        println!("runtimes: {:<26} {}", b.module, b.archive.display());
+        println!("runtimes: {:<26} {}", b.module, b.lib.display());
     }
-    // licence gate: every source and header the runtimes builds compiled
+    ensure!(
+        gate(root, &base, &VARIANTS.iter().collect::<Vec<_>>())?,
+        "runtimes {arch}: licence gate failed"
+    );
+    Ok(built)
+}
+
+/// The pinned llvm-project checkout.
+fn llvm_src(root: &Path) -> Result<PathBuf> {
+    let sources = sources::load(root)?;
+    let c = sources
+        .checkouts(None)
+        .into_iter()
+        .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
+        .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
+    Ok(Layout::of(root)?.locate(&c.dir).dir)
+}
+
+/// The C/C++ include flags of every guest runtimes compile: bionic's (`bionic`, the converter's `libc_headers` exports) instead of the host's.
+fn includes(bionic: &[String]) -> Result<String> {
+    ensure!(
+        bionic.iter().any(|f| f == "-isystem"),
+        "libc_headers exports no include dir: {bionic:?}"
+    );
+    Ok(std::iter::once("-nostdlibinc")
+        .chain(bionic.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// Licence gate over every source and header the `variants` builds under `base` compiled; prints a line per variant and the verdict.
+fn gate(root: &Path, base: &Path, variants: &[&Variant]) -> Result<bool> {
+    let layout = Layout::of(root)?;
+    let sources = sources::load(root)?;
+    let checkouts = sources.checkouts(None);
+    let c = checkouts
+        .iter()
+        .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
+        .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
+    let src = layout.locate(&c.dir).dir;
     let licenses = licenses::load(root, &sources.upstream_names())?;
     let roots = licence_gate::roots(&layout, &checkouts);
     let mut ok = true;
-    for v in VARIANTS {
+    for v in variants {
         let build = std::fs::canonicalize(base.join(v.name).join("build"))?;
         let canon_src = std::fs::canonicalize(&src)?;
         let staged: Vec<licence_gate::Staged> = v
@@ -275,10 +421,10 @@ pub fn build_guest(
         ok &= r.ok();
     }
     println!("runtimes: verdict {}", if ok { "PASS" } else { "FAIL" });
-    ensure!(ok, "runtimes {arch}: licence gate failed");
-    Ok(built)
+    Ok(ok)
 }
 
+/// One variant's CMake build; `link` = cache entries of a build that links against the guest libc (pass 2), empty otherwise.
 fn build(
     src: &Path,
     dir: &Path,
@@ -286,6 +432,7 @@ fn build(
     (cc, cxx): (&str, &str),
     triple: &str,
     includes: &str,
+    link: &[(&str, &str)],
 ) -> Result<Vec<Built>> {
     let build = dir.join("build");
     let cflags = format!("{includes} {}", v.cflags);
@@ -300,7 +447,7 @@ fn build(
         ("CMAKE_ASM_COMPILER_TARGET", triple),
         // cross build for a Linux kernel; `Android` would make CMake look for an NDK
         ("CMAKE_SYSTEM_NAME", "Linux"),
-        // no bionic libc to link try-compiles against yet
+        // pass 1 has no bionic libc to link try-compiles against; pass 2 keeps the feature checks pass 1 got
         ("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY"),
         ("CMAKE_C_FLAGS", &cflags),
         ("CMAKE_CXX_FLAGS", &cxxflags),
@@ -311,12 +458,13 @@ fn build(
     ];
     cache.extend(NO_TESTS);
     cache.extend(v.cache);
+    cache.extend(link);
     upstream::cmake(src, &build, &cache, &dir.join("build.log"), false)
         .with_context(|| format!("runtimes {}", v.name))?;
     v.modules
         .iter()
         .map(|(module, file)| {
-            let archive = find(&build, file)?.with_context(|| {
+            let lib = find(&build, file)?.with_context(|| {
                 format!("runtimes {}: no {file}* under {}", v.name, build.display())
             })?;
             let include = v
@@ -326,14 +474,14 @@ fn build(
                 .filter(|_| module.starts_with("libc++"));
             Ok(Built {
                 module,
-                archive,
+                lib,
                 include,
             })
         })
         .collect()
 }
 
-/// The one `*.a` under `dir` whose name is `prefix` (or starts with it, for a prefix ending in `-`).
+/// The one `*.a` / `*.so` under `dir` whose name is `prefix` (or starts with it, for a prefix ending in `-`).
 fn find(dir: &Path, prefix: &str) -> Result<Option<PathBuf>> {
     let mut hits = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -344,7 +492,7 @@ fn find(dir: &Path, prefix: &str) -> Result<Option<PathBuf>> {
             if e.file_type()?.is_dir() {
                 stack.push(p);
             } else if let Some(n) = p.file_name().and_then(|n| n.to_str())
-                && n.ends_with(".a")
+                && (n.ends_with(".a") || n.ends_with(".so"))
                 && (n == prefix || (prefix.ends_with('-') && n.starts_with(prefix)))
             {
                 hits.push(p);

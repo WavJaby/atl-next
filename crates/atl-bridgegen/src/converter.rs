@@ -23,6 +23,8 @@ pub enum Kind {
     Rlib,
     Shared,
     Binary,
+    /// a cc_object's object file (xtask native's runtimes pass 2 links crtbegin_so)
+    Object,
 }
 
 /// One graph.json artifact (bp2ninja graph.go `artifact`).
@@ -152,6 +154,9 @@ impl Converter {
                 }
                 Kind::Binary => {
                     bail!("{m}: a binary links into nothing")
+                }
+                Kind::Object => {
+                    bail!("{m}: a crt object is the guest toolchain's, not a cargo package's")
                 }
             }
         }

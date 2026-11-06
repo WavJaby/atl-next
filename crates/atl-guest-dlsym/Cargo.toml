@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-guest-dlsym"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Guest-side only: bp2ninja compiles src/lib.rs for the guest triple into the Rust staticlib of every static bionic executable (`-bionic-static-rust`, rust.go rustStaticlib). Cargo builds it for the host only to lint it.
+# Boundary crate: the C ABI `dlsym` export.
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true

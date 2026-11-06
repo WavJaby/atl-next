@@ -14,6 +14,22 @@ pub struct Graph {
     pub dropped: BTreeMap<String, Vec<String>>,
     /// `none` module directory (`<side>/<name>`) -> tree-relative directories its headers come from
     pub none_exports: BTreeMap<String, Vec<String>>,
+    /// module directory -> its linkable output (graph.go artifact; only `out` is read here)
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, ArtifactOut>,
+}
+
+/// The part of a graph.json artifact `xtask native` reads before ninja: its output path.
+#[derive(serde::Deserialize)]
+pub struct ArtifactOut {
+    pub out: String,
+}
+
+impl Graph {
+    /// The output of module directory `dir`, if the graph has it as an artifact.
+    pub fn artifact_out(&self, dir: &str) -> Option<&str> {
+        self.artifacts.get(dir).map(|a| a.out.as_str())
+    }
 }
 
 /// One failed module: its failed steps and their causes.
@@ -535,6 +551,7 @@ error: aborting due to 1 previous error
                 .collect(),
             dropped: BTreeMap::new(),
             none_exports: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
         }
     }
 

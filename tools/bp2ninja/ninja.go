@@ -48,7 +48,8 @@ func globTree(base, pattern, dir string) []string {
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
 // LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
 // Launcher: compiler cache prefixed to the cc rule only (empty = none), except compiles with debug info (debugInfo). Not yasm (sccache does not know it) nor rustc: sccache 0.10 refuses rustc's `-o`, keys Rust on the cwd (= the out dir, so no hit across out dirs) and restores the dep-info of the out dir that filled the entry.
-type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude string }
+// BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib).
+type Tools struct{ CC, CXX, AR, Bison, Flex, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust string }
 
 func esc(s string) string {
 	return strings.NewReplacer("$", "$$", " ", "$ ", ":", "$:", "\n", "$\n").Replace(s)

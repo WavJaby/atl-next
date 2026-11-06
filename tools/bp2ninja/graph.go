@@ -34,7 +34,7 @@ type graphFile struct {
 
 // artifact: one linkable output, as the converter's own links take it.
 type artifact struct {
-	Kind string `json:"kind"` // rlib | shared | binary (Kind.String)
+	Kind string `json:"kind"` // rlib | shared | binary (Kind.String) | object (a cc_object's object file: crtbegin_so, which xtask's guest libc++ link takes)
 	Out  string `json:"out"`
 	// rlib only: its crate name, the -L dependency= dirs of its crate closure (crateDirs), the cc link driver arguments a final link of it needs (rustCcLibs; none without cc libraries) and their dirs (rustLinkDirs: -L native=)
 	Crate  string   `json:"crate,omitempty"`
@@ -55,6 +55,8 @@ func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
 		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx}, n.out != ""
 	case n.kind == Binary:
 		return artifact{Kind: n.kind.String(), Out: n.out}, n.out != ""
+	case n.kind == Static && n.mod != nil && g.baseType(n.mod.Type) == "cc_object":
+		return artifact{Kind: "object", Out: g.objectOut(n)}, true
 	}
 	return artifact{}, false
 }

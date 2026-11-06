@@ -190,7 +190,9 @@ type Graph struct {
 	libcxx string
 	// bionic sides: compiler-rt's public headers (sanitizer/, xray/), which prebuilts/clang's resource dir carries and the distro clang's lacks (-clang-rt-include)
 	rtInclude string
-	omit      map[string]bool
+	// crate root linked into the Rust staticlib of every static bionic executable (-bionic-static-rust, rust.go rustStaticlib); empty = none
+	bionicStaticRust string
+	omit             map[string]bool
 	// dependencies dropped by omit: "<side>/<module> <omitted module>"
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)

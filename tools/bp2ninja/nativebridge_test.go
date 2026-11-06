@@ -146,3 +146,36 @@ cc_binary {
 		t.Errorf("linker: -shared replaces -static, nocrt drops crt: %q, crt %v", ld, bin.crtBegin)
 	}
 }
+
+// -bionic-static-rust: a static bionic binary's Rust staticlib carries the guest dlsym crate (rustup std references dlsym; crates/atl-guest-dlsym); a shared library's does not. A cc_object is a graph.json "object" artifact (xtask runtimes pass 2 links crtbegin_so).
+func TestBionicStaticRust(t *testing.T) {
+	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `
+rust_ffi_static { name: "libffi", crate_name: "ffi", srcs: ["lib.rs"] }
+cc_object { name: "crtbegin_so", srcs: ["begin_so.c"], system_shared_libs: [], stl: "none" }
+cc_binary { name: "linker", srcs: ["l.c"], static_executable: true, static_libs: ["libffi"], system_shared_libs: [], stl: "none" }
+cc_library_shared { name: "libuser", srcs: ["u.c"], static_libs: ["libffi"], system_shared_libs: [], stl: "none" }
+`})
+	nb := NativeBridge("x86_64")
+	g.soong.Flags.Triple[nb] = "x86_64-linux-android"
+	g.soong.Flags.RustTriple[nb] = "x86_64-linux-android"
+	g.bionicStaticRust = "/ws/crates/atl-guest-dlsym/src/lib.rs"
+	bin, lib, obj := g.node("linker", nb, Binary, "goal"), g.node("libuser", nb, Shared, "goal"), g.node("crtbegin_so", nb, Static, "goal")
+	if bin == nil || lib == nil || obj == nil {
+		t.Fatalf("nodes %v %v %v, problems %q", bin, lib, obj, g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", LLVM: "/llvm"})
+	dir := func(m string) string { return filepath.Join(g.out, "nb/x86_64", m, "generated_rust_staticlib") }
+	rlib := filepath.Join(dir("linker"), "libatl_guest_dlsym.rlib")
+	if e := ninjaEdgeVars(ninja, rlib); e == nil || !strings.Contains(e[""], g.bionicStaticRust) || !strings.Contains(e["flags"], "--crate-name=atl_guest_dlsym") {
+		t.Errorf("dlsym rlib step %v", e)
+	}
+	if body := g.genFiles[filepath.Join(dir("linker"), "librustlibs.rs")]; !strings.Contains(body, "extern crate atl_guest_dlsym;") {
+		t.Errorf("linker staticlib root %q", body)
+	}
+	if body := g.genFiles[filepath.Join(dir("libuser"), "librustlibs.rs")]; strings.Contains(body, "atl_guest_dlsym") {
+		t.Errorf("shared library staticlib root %q", body)
+	}
+	if a, ok := g.artifactOf(obj); !ok || a.Kind != "object" || a.Out != filepath.Join(g.out, "nb/x86_64/crtbegin_so/crtbegin_so.o") {
+		t.Errorf("crtbegin_so artifact %v %v", a, ok)
+	}
+}
