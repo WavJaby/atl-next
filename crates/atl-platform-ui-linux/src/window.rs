@@ -170,6 +170,8 @@ pub struct GtkWindow {
     /// The content origin is logged once, at the first present with the window mapped.
     origin_logged: Cell<bool>,
     text_input: GtkTextInput,
+    /// The output-transform listener (outputs.rs): removed with the window, so a closed window leaves no callback behind.
+    _output_follow: outputs::Follow,
 }
 
 impl GtkWindow {
@@ -404,7 +406,7 @@ impl Window for GtkWindow {
         });
         // the output transform is not GDK's (outputs.rs): its change re-reports the window's monitor
         let rotated = Rc::downgrade(&shared);
-        outputs::follow(move || {
+        let output_follow = outputs::follow(move || {
             let Some(shared) = rotated.upgrade() else {
                 return;
             };
@@ -448,6 +450,7 @@ impl Window for GtkWindow {
         window.set_child(Some(&view));
         let text_input = GtkTextInput::new(&view);
         let this = GtkWindow {
+            _output_follow: output_follow,
             window,
             view,
             requested: Cell::new(attributes.size),

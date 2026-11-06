@@ -169,8 +169,8 @@ fn dispatch(conn: &Connection) {
     }
 }
 
-/// Starts following the outputs (once per process) and calls `on_change` on the main context at each transform change.
-pub(crate) fn follow(on_change: impl Fn() + 'static) {
+/// Starts following the outputs (once per process) and registers `on_change` for the main context at each transform change. The listener stays until the returned [`Follow`] drops.
+pub(crate) fn follow(on_change: impl Fn() + 'static) -> Follow {
     OUTPUTS.with_borrow_mut(|o| {
         o.get_or_insert_with(|| match connect() {
             Ok(outputs) => Some(outputs),
@@ -182,7 +182,25 @@ pub(crate) fn follow(on_change: impl Fn() + 'static) {
             }
         });
     });
-    LISTENERS.with_borrow_mut(|l| l.push(Rc::new(on_change)));
+    listen(on_change)
+}
+
+/// A registered transform listener, removed when dropped: a closed window's callback must not stay in [`LISTENERS`].
+pub(crate) struct Follow {
+    listener: Rc<dyn Fn()>,
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        LISTENERS.with_borrow_mut(|l| l.retain(|f| !Rc::ptr_eq(f, &self.listener)));
+    }
+}
+
+/// Registers `on_change` without starting the connection (the part of [`follow`] a test can run without a compositor).
+fn listen(on_change: impl Fn() + 'static) -> Follow {
+    let listener: Rc<dyn Fn()> = Rc::new(on_change);
+    LISTENERS.with_borrow_mut(|l| l.push(Rc::clone(&listener)));
+    Follow { listener }
 }
 
 /// The rotation of the output named `connector`; with no name to match, the one output's when there is exactly one; else none.
@@ -222,5 +240,16 @@ mod tests {
         assert_eq!(q(Transform::Flipped90), 3);
         assert_eq!(q(Transform::Flipped180), 2);
         assert_eq!(q(Transform::Flipped270), 1);
+    }
+
+    /// Windows that open and close leave no listener behind: five listeners opened, then dropped, are back at the baseline. Without the drop the list keeps all five.
+    #[test]
+    fn dropped_follows_leave_no_listener() {
+        let count = || LISTENERS.with_borrow(|l| l.len());
+        let base = count();
+        let follows: Vec<Follow> = (0..5).map(|_| listen(|| {})).collect();
+        assert_eq!(count(), base + 5);
+        drop(follows);
+        assert_eq!(count(), base);
     }
 }
