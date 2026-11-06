@@ -689,6 +689,13 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// The environment `native --shell` gives the shell: the compiler cache's variables for source view `view` (`tree::describe`), the ones every ninja run in that view gets (`CompilerCache::env`).
+/// Without them a hand-run `ninja` reads no `SCCACHE_SERVER_UDS` and reaches another view's server, which compiles that view's sources (measured: the shared `server.sock`).
+pub(crate) fn shell_env(args: &Args, repo: &Path, view: &str) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
+    let workspace = Layout::of(repo)?.workspace().to_path_buf();
+    Ok(CompilerCache::of(args, &workspace, view).map_or_else(Vec::new, |c| c.env().to_vec()))
+}
+
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
 /// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).
 /// Direct mode, sccache's default, keys on the include paths, which name the out dir (`-I<out>/compat/device`, `-isystem <out>/gen/...`): measured 21% hits in a second out dir, every cross-out-dir lookup a miss. Do not drop the setting.

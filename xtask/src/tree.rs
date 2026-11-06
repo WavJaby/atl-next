@@ -123,8 +123,12 @@ pub fn overlays_of(root: &Path) -> Result<Vec<Overlay>> {
 }
 
 /// Run the rest of this xtask invocation where the AOSP task copies are bound over `src/aosp`: Some(exit code) = re-executed inside the namespace, the caller returns it; None = continue here
-/// (no task copies, or already inside, the overlays verified). `shell` = the namespace's command is `$SHELL` instead (for `ninja` by hand).
-pub fn enter(overlays: &[Overlay], shell: bool) -> Result<Option<ExitCode>> {
+/// (no task copies, or already inside, the overlays verified). `shell` = the namespace's command is `$SHELL` instead (for `ninja` by hand), with `shell_env` in its environment (`native::shell_env`).
+pub fn enter(
+    overlays: &[Overlay],
+    shell: bool,
+    shell_env: &[(&'static str, std::ffi::OsString)],
+) -> Result<Option<ExitCode>> {
     let want = describe(overlays);
     match std::env::var(ENV) {
         Ok(had) => {
@@ -150,7 +154,8 @@ pub fn enter(overlays: &[Overlay], shell: bool) -> Result<Option<ExitCode>> {
     let mut cmd = Command::new(bwrap::PROGRAM);
     cmd.args(namespace_args(overlays).end()).env(ENV, &want);
     if shell {
-        cmd.arg(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
+        cmd.envs(shell_env.iter().cloned())
+            .arg(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
     } else {
         cmd.arg(std::env::current_exe().context("finding xtask's executable")?)
             .args(std::env::args_os().skip(1))
