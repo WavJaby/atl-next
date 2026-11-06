@@ -16,6 +16,8 @@ const RTLD_NOLOAD: c_int = 4;
 // matched by soname: NativeLoad.java has System.load-ed it by full path just before
 const RUNTIME: &[u8] = b"libandroid_runtime.so\0";
 const START_REG: &[u8] = b"_ZN7android14AndroidRuntime8startRegEP7_JNIEnv\0";
+// NEEDED by libandroid_runtime: loaded with it
+const MEDIANDK: &[u8] = b"libmediandk.so\0";
 
 unsafe extern "C" {
     fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
@@ -145,5 +147,57 @@ pub extern "C" fn Java_NativeLoad_raiseAbort(_env: JniEnv, _class: *mut c_void) 
     // SAFETY: raise only sends a signal
     unsafe {
         libc::raise(libc::SIGABRT);
+    }
+}
+
+// ---- stage 8: media probe
+
+type GetUtf = unsafe extern "C" fn(JniEnv, *mut c_void, *mut u8) -> *const c_char;
+type ReleaseUtf = unsafe extern "C" fn(JniEnv, *mut c_void, *const c_char);
+type CreateDecoder = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type DeleteCodec = unsafe extern "C" fn(*mut c_void) -> c_int;
+/// JNINativeInterface slots of GetStringUTFChars / ReleaseStringUTFChars (jni.h function table order).
+const GET_STRING_UTF_CHARS: usize = 169;
+const RELEASE_STRING_UTF_CHARS: usize = 170;
+
+fn mediandk_sym(name: &[u8]) -> *mut c_void {
+    // SAFETY: NUL-terminated constants; RTLD_NOLOAD only looks up an already loaded object.
+    unsafe {
+        let h = dlopen(MEDIANDK.as_ptr().cast(), RTLD_NOW | RTLD_NOLOAD);
+        if h.is_null() {
+            return std::ptr::null_mut();
+        }
+        dlsym(h, name.as_ptr().cast())
+    }
+}
+
+/// `static native int createDecoder(String mime)`: AMediaCodec_createDecoderByType(mime); 1 = created (and deleted), 0 = null, -100 = libmediandk or its symbols not found.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_NativeLoad_createDecoder(
+    env: JniEnv,
+    _class: *mut c_void,
+    mime: *mut c_void,
+) -> c_int {
+    let create = mediandk_sym(b"AMediaCodec_createDecoderByType\0");
+    let delete = mediandk_sym(b"AMediaCodec_delete\0");
+    if create.is_null() || delete.is_null() {
+        return -100;
+    }
+    // SAFETY: env is the calling thread's JNIEnv (a pointer to the function table); mime is a live jstring; the symbols have the NDK signatures above.
+    unsafe {
+        let table = *(env as *const *const *mut c_void);
+        let get: GetUtf = std::mem::transmute(*table.add(GET_STRING_UTF_CHARS));
+        let release: ReleaseUtf = std::mem::transmute(*table.add(RELEASE_STRING_UTF_CHARS));
+        let create: CreateDecoder = std::mem::transmute(create);
+        let delete: DeleteCodec = std::mem::transmute(delete);
+        let s = get(env, mime, std::ptr::null_mut());
+        let codec = create(s);
+        release(env, mime, s);
+        if codec.is_null() {
+            0
+        } else {
+            delete(codec);
+            1
+        }
     }
 }

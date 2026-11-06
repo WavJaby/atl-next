@@ -5,6 +5,7 @@
 // walk calls through each slot as relocated at run time and stops at the first negative return, as register_jni_procs does; call registers the given functions, then runs the native calls.
 // chain <shim> <exit status> <rounds>: the shim installs its own SIGSEGV handler with sigaction, then `rounds` null derefs in read (JIT-compiled: implicit null checks fault), then a native fault the shim's handler ends the process on.
 // crash <shim>: the shim raises SIGABRT in native code; the process must die of it (prints the number first).
+// media <lib> <shim> <mime>...: NDK AMediaCodec_createDecoderByType per mime (libmediandk, NEEDED by lib), prints 1 = codec created, 0 = null, -100 = libmediandk not loaded; a Codec2 abort ends the process, the lines before it are the measurement.
 // overflow <rounds>: unbounded recursion in recurse, `rounds` times on the main thread (warms the JIT: compiled code checks the stack implicitly, a SIGSEGV on the guard page), then `rounds` times on a new thread; each catches StackOverflowError, prints its depth, and the process exits normally.
 
 import java.io.BufferedReader;
@@ -23,6 +24,7 @@ public class NativeLoad {
     static native void nativeFault();
     static native int abortSignal();
     static native void raiseAbort();
+    static native int createDecoder(String mime);
 
     static class Box {
         int v;
@@ -69,6 +71,12 @@ public class NativeLoad {
         }
         if (!load(a[2])) {
             System.exit(1);
+        }
+        if (mode.equals("media")) {
+            for (int i = 3; i < a.length; i++) {
+                out("codec", a[i] + " " + createDecoder(a[i]));
+            }
+            return;
         }
         if (mode.equals("startreg")) {
             out("startreg", startReg());

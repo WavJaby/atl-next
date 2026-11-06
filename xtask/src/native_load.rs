@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in seven stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in eight stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg` must return 0, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) must register every entry.
@@ -17,6 +17,8 @@
 //!    JIT-compiled code checks the stack implicitly: a probe `ART_STACK_OVERFLOW_GAP` (8 KiB, art.go) below sp hits the guard page, a SIGSEGV ART's fault handler turns into the error.
 //!    Only the main thread has an alternate signal stack (the launcher's); on Android bionic gives every thread one, and ART's device variant (thread_android.cc) sets none up. Threads ART creates on glibc have none, so the kernel's signal frame and ART's handler run in the gap above the probe, which suffices (measured 2026-11-02, x86_64, gdb: SS_DISABLE on the new thread, fault at sp - 0x2000, all handled).
 //!    The stage guards that: a larger signal frame or handler would kill the process here first.
+//! 8. media: NDK `AMediaCodec_createDecoderByType` for [`MEDIA_MIMES`], the run an app-uid binder process of its own binderd + AOSP servicemanager. A warning, not a failure, until the in-app Codec2 store exists (audio slice M1);
+//!    the detail is the first fatal line. Measured 2026-11-06: MediaCodecList waits 5 s for `media.player`, then Codec2Client::CacheServiceNames (HIDL path, `media.c2.hal.selection` unset) aborts: `Check failed: serviceManager Hardware service manager is not running.`
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -240,7 +242,53 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Ok(s) => report.pass("overflow", s),
         Err(e) => report.fail("overflow", e),
     }
+
+    // 8
+    let media_args: Vec<String> = base
+        .iter()
+        .cloned()
+        .chain(MEDIA_MIMES.iter().map(|m| (*m).to_owned()))
+        .collect();
+    let media = env.binder_art(&fixture, "media", &media_args)?;
+    match media_result(&media) {
+        Ok(s) => report.pass("media", s),
+        Err(e) => report.warn("media", e),
+    }
     Ok(report.finish())
+}
+
+/// Stage 8's binder uid: AID_APP_START (libcutils android_filesystem_config.h), the first app uid, as an app process has.
+const AID_APP_START: u32 = 10_000;
+
+/// Stage 8's run limit: ART start (~1 s here) plus codec lookups; a hang (a wait for an absent service) ends as SIGTERM in the detail instead of a stuck gate.
+const MEDIA_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Stage 8's mimes: what games decode through SoundPool/MediaPlayer (Ogg Vorbis, WAV PCM).
+const MEDIA_MIMES: [&str; 2] = ["audio/vorbis", "audio/raw"];
+
+/// Stage 8: every mime's decoder created. A warning until the in-app Codec2 store exists (audio M1); the detail carries how it failed: the codec lines, the exit, the Codec2 log line.
+fn media_result(run: &ArtRun) -> Result<String, String> {
+    let codecs: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("nlt codec "))
+        .collect();
+    if run.ok && codecs.len() == MEDIA_MIMES.len() && codecs.iter().all(|c| c.ends_with(" 1")) {
+        return Ok(codecs.join("; "));
+    }
+    // the first fatal line is the cause; ART's thread dump after it repeats the stack
+    let lines = || run.stderr.lines();
+    let why = lines()
+        .find(|l| l.contains("Check failed") || l.contains(" F liblog/Codec2"))
+        .or_else(|| lines().rev().find(|l| l.contains("Codec2")))
+        .unwrap_or("no Codec2 log line");
+    let why = why.split_once(" F ").map_or(why, |(_, rest)| rest);
+    Err(format!(
+        "codecs [{}], {}: {}",
+        codecs.join("; "),
+        run.status,
+        why.trim()
+    ))
 }
 
 // ---- inputs --------------------------------------------------------------------------------------
@@ -250,6 +298,9 @@ struct Env {
     runtime: PathBuf,
     /// gRegJNI's entry count in the pinned source ([`reg_jni_entries`]).
     reg_jni_entries: usize,
+    /// The workspace and the native build directory: binderd's build (stage 8).
+    root: PathBuf,
+    out: PathBuf,
     work: PathBuf,
 }
 
@@ -283,6 +334,8 @@ impl Env {
             runtime,
             reg_jni_entries: reg_jni_entries(&src).with_context(|| cpp.display().to_string())?,
             work: out.join("native-load"),
+            root: root.to_owned(),
+            out,
         })
     }
 
@@ -300,6 +353,58 @@ impl Env {
     /// NativeLoad.java `mode args`, started by the launcher over the fixture's property area.
     fn art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
         self.launch(fixture, &fixture.java.area.1, &[], mode, args)
+    }
+
+    /// `art`, run as an app-uid binder process of a binderd and AOSP servicemanager started for it (binder.rs harness), as an app process is: media code opens the driver and asks servicemanager before any codec lookup (without one, ProcessState waits for the context object forever, measured 2026-11-06).
+    /// Killed after [`MEDIA_LIMIT`].
+    fn binder_art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
+        let device = self.out.join("device");
+        let servicemanager = device.join("servicemanager/servicemanager");
+        let service = device.join("service/service");
+        for b in [&servicemanager, &service] {
+            ensure!(
+                b.is_file(),
+                "{} missing: build servicemanager service",
+                b.display()
+            );
+        }
+        let test_root = self.work.join("binder");
+        crate::binder::fresh_layout(&test_root)?;
+        let lib_env = crate::binder::lib_env(&self.out)?;
+        let (mut binderd, harness) =
+            crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
+        let (mut sm, found) = crate::binder::start_servicemanager(
+            &harness,
+            &test_root,
+            &servicemanager,
+            &service,
+            &lib_env,
+        )?;
+        ensure!(found.0, "servicemanager did not answer: {}", found.1);
+        let cmd = self.host.command(
+            &fixture.java,
+            &fixture.java.area.1,
+            &[],
+            "NativeLoad",
+            &std::iter::once(mode.to_owned())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        let what = format!("{cmd:?}");
+        let run = harness.spawn(cmd, AID_APP_START, false).and_then(|child| {
+            let pid = child.id().to_string();
+            std::thread::spawn(move || {
+                std::thread::sleep(MEDIA_LIMIT);
+                // no unsafe in xtask: kill(1); a pid already reaped by then is not reused within one test run in practice
+                let _ = Command::new("kill").arg(&pid).status();
+            });
+            self.host.finish(&what, child)
+        });
+        let _ = sm.kill();
+        sm.wait()?;
+        drop(harness);
+        binderd.wait()?;
+        run
     }
 
     /// `art` with the property-area variable set to `area` and the extra VM options `vm`.
