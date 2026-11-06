@@ -5,6 +5,8 @@
 
 /// `ANDROID_ROOT` on a device: the platform partition, bound read-only.
 pub const SYSTEM: &str = "/system";
+/// The vendor partition (`Environment.getVendorDirectory()`), bound read-only: the GL driver (libEGL's Loader.cpp `/vendor/lib64/egl`), /vendor/build.prop.
+pub const VENDOR: &str = "/vendor";
 /// Framework jars and their libraries (`Environment.getRootDirectory()/framework`).
 pub const SYSTEM_FRAMEWORK: &str = "/system/framework";
 /// The CA store Conscrypt's `TrustedCertificateStore` reads (`$ANDROID_ROOT/etc/security/cacerts`).

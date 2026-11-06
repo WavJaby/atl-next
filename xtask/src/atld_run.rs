@@ -19,6 +19,8 @@ use crate::{manifest, packages, slot, tree};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
+/// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
+const GL_FRONTS: [&str; 3] = ["libEGL", "libGLESv1_CM", "libGLESv2"];
 /// The system fonts of the test layout (stand-in until the desktop's fonts come through the platform layer): ActivityThread.handleBindApplication loads `/system/etc/font_fallback.xml`
 /// (SystemFonts.FONTS_XML) and every file it names under `/system/fonts/` (SystemFonts.DEVICE_FONT_DIR), and Typeface needs a `sans-serif` family (Typeface.DEFAULT_FAMILY) to start.
 /// The one font in this tree that AOSP ships and licenses as Apache-2.0 with a Latin range, AOSP's own monospace font, serves as that family; the XML is FontListParser's format (fonts.xml's `<family name><font weight style>`).
@@ -290,8 +292,20 @@ impl Runtime {
     }
 
     /// Also places the GL driver `xtask native` built (Mesa for the Android platform, mesa.rs `driver`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop.
+    /// Also the fronts at Loader.cpp's `SYSTEM_LIB_PATH` (`/system/lib64` in LP64): it dlopens them there as the "wrapper" libraries (`load_wrapper`) and aborts without them; the links name the files already loaded, so glibc returns the loaded copy (same inode).
     pub fn with_gl_driver(mut self) -> Result<Self> {
-        self.gl_driver = Some(crate::mesa::driver(&self.out)?);
+        let (mut files, dirs) = crate::mesa::driver(&self.out)?;
+        let system_lib = if cfg!(target_pointer_width = "64") {
+            "/system/lib64"
+        } else {
+            "/system/lib"
+        };
+        for m in GL_FRONTS {
+            let lib = self.out.join("device").join(m).join(format!("{m}.so"));
+            ensure!(lib.is_file(), "missing input {}", lib.display());
+            files.push((lib, format!("{system_lib}/{m}.so")));
+        }
+        self.gl_driver = Some((files, dirs));
         Ok(self)
     }
 

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FRAMEWORK};
+use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FRAMEWORK, VENDOR};
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox};
 use atl_gralloc::vintf;
@@ -529,6 +529,12 @@ impl Host {
                 Mount {
                     host: self.root.system(),
                     at: SYSTEM.into(),
+                    writable: false,
+                },
+                // as on Android, apps read /vendor: libEGL loads the GL driver from /vendor/lib64/egl into the app
+                Mount {
+                    host: self.root.vendor(),
+                    at: VENDOR.into(),
                     writable: false,
                 },
                 Mount {
