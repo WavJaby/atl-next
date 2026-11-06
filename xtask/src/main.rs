@@ -68,6 +68,7 @@ mod service_mirrors;
 mod services;
 mod slot;
 mod sources;
+mod soong;
 mod spdx;
 mod system;
 mod test_fonts;

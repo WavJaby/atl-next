@@ -47,6 +47,8 @@ enum Step {
     AndroidPaths,
     /// bwrap flag literals only in atl-broker's bwrap.rs, besides the golden argv tests
     BwrapFlags,
+    /// tracked code never invokes Soong (`soong_ui`, `lunch`; Soong retired a84d9b6): comments and Markdown pass
+    Soong,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -61,7 +63,7 @@ enum Step {
     ConverterPackages,
 }
 
-const ALL: [Step; 14] = [
+const ALL: [Step; 15] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -70,6 +72,7 @@ const ALL: [Step; 14] = [
     Step::Seam,
     Step::AndroidPaths,
     Step::BwrapFlags,
+    Step::Soong,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -89,6 +92,7 @@ impl Step {
             Step::Seam => "seam",
             Step::AndroidPaths => "android-paths",
             Step::BwrapFlags => "bwrap-flags",
+            Step::Soong => "soong",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -205,6 +209,7 @@ impl Step {
             Step::Seam => crate::binder::seam_check(root),
             Step::AndroidPaths => crate::android_paths::check(root),
             Step::BwrapFlags => crate::bwrap_flags::check(root),
+            Step::Soong => crate::soong::check(root),
             Step::Clippy => cargo(
                 root,
                 &[
