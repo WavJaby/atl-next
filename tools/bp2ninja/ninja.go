@@ -492,19 +492,14 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	}
 	libs = append(libs, "-Wl,--end-group")
 	var provided, providedRpath []string
-	// several provided modules may share an artifact (one crate providing two rows), linked once
+	// several provided modules may share an artifact (one crate providing two rows: atl-bionic is libc, libasync_safe, libdl_android), linked once
 	seenLib := map[string]bool{}
 	for _, d := range sharedOrder {
-		if !d.provided {
-			continue
-		}
-		for _, l := range d.libs {
-			if !seenLib[l] {
-				seenLib[l] = true
-				provided = append(provided, l)
-				providedRpath = append(providedRpath, "-Wl,-rpath,"+filepath.Dir(l))
-				inputs = append(inputs, l)
-			}
+		if d.provided && !seenLib[d.out] {
+			seenLib[d.out] = true
+			provided = append(provided, d.out)
+			providedRpath = append(providedRpath, "-Wl,-rpath,"+filepath.Dir(d.out))
+			inputs = append(inputs, d.out)
 		}
 	}
 	libs = append(provided, libs...)
@@ -526,9 +521,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 			libs = appendNew(libs, "-Wl,-rpath,"+filepath.Dir(d.out))
 			continue
 		}
-		for _, l := range d.libs {
-			providedRpath = appendNew(providedRpath, "-Wl,-rpath,"+filepath.Dir(l))
-		}
+		providedRpath = appendNew(providedRpath, "-Wl,-rpath,"+filepath.Dir(d.out))
 	}
 	// provided dirs search after the tree's: a system provider's dir (/usr/lib/<triple>) holds distro builds
 	// of libraries the tree also builds (libz, libselinux, libpng, ...); searched first, it shadows every

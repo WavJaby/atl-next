@@ -156,8 +156,6 @@ type Node struct {
 	objSrcs []*Node
 	// built outside ninja by xtask (provided.go): out and exports only, never in g.order
 	provided bool
-	// provided nodes: every artifact a dependent links, in order (out is the first)
-	libs []string
 	// Rust nodes only (rust.go)
 	rust *rustCrate
 	// final cc links: the generated staticlib holding the link's Rust (rust.go rustStaticlib), "" = none; whole: linked whole

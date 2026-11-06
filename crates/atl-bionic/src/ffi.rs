@@ -659,3 +659,10 @@ pub unsafe extern "C" fn async_safe_fatal_no_abort(format: *const c_char, mut ar
     let format = unsafe { c_str(format) }.unwrap_or_default();
     async_safe::fatal(None, format, &mut CArgs(&mut args), &ERRORS);
 }
+
+/// bionic private `__get_tls()` (build.rs `TLS_HEADER`, declared there by hand: bionic's is an inline asm
+/// read, no declaration to check against): this thread's slot 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn __get_tls() -> *mut *mut c_void {
+    crate::tls::slot_zero()
+}

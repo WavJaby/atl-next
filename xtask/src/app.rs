@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::window::{self, WINDOW_MS};
 use crate::{jni_fixture, manifest};
 
 #[derive(clap::Args)]
@@ -68,7 +69,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?;
     let rt = if args.gralloc {
-        rt.with_gralloc(root)?
+        rt.with_gralloc(root)?.with_gl_driver()?
     } else {
         rt
     };
@@ -119,11 +120,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::thread::sleep(Duration::from_millis(200));
     };
     let elapsed = start.elapsed();
+    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); atld exits when the app's main process dies
+    let mut ended = ended;
+    if passed && ended.is_none() {
+        let watch = Instant::now();
+        while ended.is_none() && watch.elapsed() < Duration::from_millis(WINDOW_MS) {
+            ended = atld_child.try_wait()?;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     if ended.is_none() {
         let _ = atld_child.kill();
         atld_child.wait()?;
     }
     let app = read(&app_log);
+    let fault = fault(&app, ended.is_some());
     let services_log = read(&run.log("services"));
     if args.verbose {
         println!("---- app log\n{app}");
@@ -142,6 +153,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let bridge1_ok = bridge1
         .is_some_and(|l| l.contains(atl_native_bridge::LOAD_REFUSED) && l.contains(BRIDGE1_LIB));
     let mut whys = Vec::new();
+    if let Some(f) = &fault {
+        whys.push(format!("the app faulted: {f}"));
+        println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
+    }
     if passed && !cacerts.starts_with("trusted ") {
         whys.push(format!("CA store: {cacerts}"));
     }
@@ -201,4 +216,48 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         crate::verdict::gate("app", std::slice::from_ref(&why))
     );
     Ok(ExitCode::FAILURE)
+}
+
+/// The app's first fault up to the watch's end (marker + WINDOW_MS), from the log's start: the app's other threads run before onCreate (hwui's RenderThread made its EGL context 50 ms before the marker when it aborted, round-4 run). None without a marker.
+fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
+    let marker_ms = window::verdict(app_log, MARKER, atld_exited, WINDOW_MS).marker_ms?;
+    window::fault_after(app_log, 0, marker_ms + WINDOW_MS, atld_exited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::stamp_text;
+
+    const T: u64 = 1_000_000;
+
+    fn line(at: u64, prio: &str, text: &str) -> String {
+        format!(
+            "{} 34636.4 2 14 {prio} liblog/Tag: {text}\n",
+            stamp_text(at)
+        )
+    }
+
+    #[test]
+    fn clean_run_has_no_fault() {
+        assert_eq!(fault(&line(T, "I", MARKER), false), None);
+    }
+
+    #[test]
+    fn abort_before_the_marker_is_a_fault() {
+        // the round-4 shape: RenderThread's F line, then the main thread's marker
+        let log = line(
+            T - 50,
+            "F",
+            "HWUI: Failed to create context, error = EGL_BAD_ATTRIBUTE",
+        ) + &line(T, "I", MARKER);
+        assert!(fault(&log, false).is_some_and(|f| f.contains("fatal log line")));
+    }
+
+    #[test]
+    fn death_inside_the_watch_is_a_fault() {
+        assert!(fault(&line(T, "I", MARKER), true).is_some());
+        let crash = line(T, "I", MARKER) + &line(T + 100, "E", "FATAL EXCEPTION: main");
+        assert!(fault(&crash, false).is_some());
+    }
 }

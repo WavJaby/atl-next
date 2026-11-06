@@ -266,6 +266,18 @@ const APIS: &[Api] = &[
         include_dirs: &[],
         kept: DECLARATIONS,
     },
+    // bionic's thread-pointer slot numbers, per arch; `bionic/tls.h` (TLS_HEADER) includes it. The GL
+    // fronts (frameworks/native opengl hooks.h) keep the per-thread dispatch table in TLS_SLOT_OPENGL_API.
+    Api {
+        name: "tls_defines",
+        source: "bionic/libc/platform/bionic/tls_defines.h",
+        lang: Lang::C,
+        header: Some("bionic/tls_defines.h"),
+        functions: &[],
+        macros: &["MIN_TLS_SLOT", "MAX_TLS_SLOT", "TLS_SLOT_*"],
+        include_dirs: &[],
+        kept: DECLARATIONS,
+    },
 ];
 
 /// bionic API declared in a header the host also has, as (API row, host header): the row's header is
@@ -408,11 +420,13 @@ const FORWARDED_MACROS: &[&str] = &[
 /// tracing_perfetto_internal.cpp: `__system_property_find` / `__system_property_serial`).
 const SUBSTITUTES: &[&str] = &["sys/_system_properties.h", "sys/endian.h", "sys/limits.h"];
 
-/// bionic platform-private headers AOSP code includes, forwarded as they are (bionic's file by absolute path), per host arch (arches.toml row) where their meaning on glibc was checked.
-/// `bionic/tls.h`, x86_64: `__get_tls()` reads `%fs:0`, which glibc sets to its TCB self pointer as bionic does. AOSP's GL fronts keep the per-thread dispatch table in slot TLS_SLOT_OPENGL_API (4, tls_defines.h) = `%fs:32`, glibc x86_64 tcbhead_t `sysinfo`, a field glibc keeps for layout and writes only on i386 (NEED_DL_SYSINFO); tests/tls_slot.rs measures that.
-/// The GL trampolines (GLES2/gl2.cpp `CALL_GL_API_INTERNAL_CALL`) read that offset by inline asm, so the slot must sit at the thread pointer: a header returning a separate per-thread array would leave them reading a different word.
-/// Other hosts: glibc's thread-pointer layout differs (aarch64 `tp + 32` lies in the executable's TLS block), so no row until designed; their GL fronts fail to compile here.
-const PLATFORM_FORWARDS: &[(&str, &str)] = &[("x86_64", "bionic/tls.h")];
+/// bionic's private `bionic/tls.h`, replaced: bionic's reads the thread pointer by inline asm, which on glibc is glibc's TCB. Ours declares `__get_tls()` out of line -> `crate::tls`, one per-thread slot array in this library, so every DSO sees the same one (a header-inline `thread_local` would give each DSO its own).
+/// `__set_tls` is not declared: only bionic's own startup sets the thread pointer.
+/// Only reader so far: frameworks/native opengl hooks.h (get_tls_hooks), built with `USE_SLOW_BINDING` (patches/) so no GL trampoline reads the thread pointer directly.
+const TLS_HEADER: (&str, &str) = (
+    "bionic/tls.h",
+    "#pragma once\n#include <sys/cdefs.h>\n__BEGIN_DECLS\nvoid** __get_tls(void);\n__END_DECLS\n#include <bionic/tls_defines.h>\n",
+);
 
 /// Generated files: path relative to OUT_DIR -> text.
 type Outputs = Vec<(PathBuf, String)>;
@@ -762,15 +776,7 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
             .to_string();
         wrappers.push((name.clone(), shape::print_forward(file, &source)?));
     }
-    for (arch, name) in PLATFORM_FORWARDS {
-        if host.arch != *arch {
-            continue;
-        }
-        let source = format!("bionic/libc/platform/{name}");
-        let file = up.aosp(&source);
-        ensure!(file.is_file(), "{}: missing", file.display());
-        wrappers.push(((*name).to_owned(), shape::print_forward(&file, &source)?));
-    }
+    wrappers.push((TLS_HEADER.0.to_owned(), TLS_HEADER.1.to_owned()));
     let host_inputs = host_probes
         .values()
         .chain(host_gnu.values())

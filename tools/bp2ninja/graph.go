@@ -143,9 +143,7 @@ func (g *Graph) devicePlatform(cc string) platform {
 		for _, d := range p.Defines {
 			sys = appendNew(sys, "-D"+d)
 		}
-		for _, l := range p.Libs {
-			link = appendNew(appendNew(link, l), "-Wl,-rpath,"+filepath.Dir(l))
-		}
+		link = appendNew(appendNew(link, p.Lib), "-Wl,-rpath,"+filepath.Dir(p.Lib))
 	}
 	link = append(link, stlLinkFlags(g.stlOf(n))...)
 	link = append(link, systemLinkFlags...)

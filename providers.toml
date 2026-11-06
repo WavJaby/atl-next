@@ -8,7 +8,6 @@
 #             system:<deps.toml row>    a host system library, linked as installed; the row needs `pkgconfig` and `used_by` containing `upstream:aosp`. `xtask native` resolves it with pkg-config (system.rs): its one `-l` library found in its `-L` dirs then its `libdir` (`lib<name>.so`), its `-I` dirs, its `-D` defines; anything else fails the run
 #             module:<Android.bp module> another tree module, built wherever this one is named; the only provider, no `srcs`. The converter fails unless it exists and installs under this row's key (its stem + suffix)
 #             none                      nothing on this host: a dependency on it is dropped (the module's API has no meaning on a glibc desktop, or the system C library covers it)
-#             [<provider>, ...]         several (not `none`), linked in this order: the module's API split between them (a host library and our crate adding what it lacks)
 #   reason    why AOSP's own module is not used (on a `rust_os` row: why the crate needs its Android behaviour here; on a `defines` row: what the macros switch and why)
 #   rust_os   instead of `provider` and `srcs`: "android", the only value; the tree builds the module, its device variant taking the Android.bp `target` blocks of android (not linux_glibc, every other Rust crate's: rustc compiles for the host triple) and `--cfg atl_android_userspace`,
 #             which the crate's patch in patches/aosp adds to exactly the `target_os = "android"` gates whose Android behaviour this runtime provides (system properties from atl-bionic, liblog). The converter fails unless the module is a Rust module with a device variant.
@@ -17,7 +16,7 @@
 #   srcs      optional: only these sources of the module (paths relative to its directory, as its Android.bp writes them; no globs) are replaced, the rest is still built from AOSP source. `none` drops them; any other provider is linked into the module first, for their symbols.
 #             The converter fails when a listed file is not one of the module's sources at the pin (where the goals build it; elsewhere, when the file does not exist).
 # Artifacts are not listed: they follow from the provider (cargo-c output, the upstream recipe's install, pkg-config).
-# `crate:`, `upstream:` and `system:` modules are provided: `xtask native` builds or resolves each provider once, before the converter, and hands it one entry per module (<out>/provided.json: its providers' artifacts in order, include dirs, defines); dependents link the artifacts first and get the headers as -isystem. The tree module's export_header_lib_headers still reach dependents as the tree exports them (an -I is searched before every -isystem).
+# `crate:`, `upstream:` and `system:` modules are provided: `xtask native` builds or resolves each provider once, before the converter, and hands it one entry per module (<out>/provided.json: its provider's artifact, include dirs, defines); dependents link the artifact first (one shared by several rows, once) and get the headers as -isystem. The tree module's export_header_lib_headers still reach dependents as the tree exports them (an -I is searched before every -isystem).
 # Rows are added when their provider exists, or when a build first trips over a module that must not be built.
 
 # bionic is an android build's C library; on glibc the system's libc, kernel headers, libm and libdl take its place (its headers on the include path shadow glibc's)
@@ -75,7 +74,23 @@ reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsam
 provider = "module:libartpalette_fake"
 reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (owner 2026-11-02)"
 
-# GL: no row. AOSP's libEGL / libGLES* fronts are built from the tree and load Mesa built for the Android platform as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06).
+# GL: AOSP's libEGL / libGLES* fronts are built from the tree and load Mesa built for the Android platform as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06); only their GL dispatch binding differs.
+["libEGL"]
+defines = ["USE_SLOW_BINDING=1"]
+reason = "GL dispatch through getGlThreadSpecific() -> __get_tls() (atl-bionic's per-thread slot array) instead of per-arch asm reading the thread pointer, which on glibc is glibc's TCB (patches/aosp/frameworks/native 0009 makes the macro settable, 0010 has eglGetProcAddress return the driver entry instead of the asm extension forwarders; precondition: one GL driver per process). Rung 4 because: as-is (1) the asm reads a glibc TCB field; no environment setting (2) or supplied definition (3) reaches inline asm or a hard #define. Cost: one indirect call per GL call (G1 measurement)"
+
+["libGLESv1_CM"]
+defines = ["USE_SLOW_BINDING=1"]
+reason = "as libEGL: CALL_GL_API through getGlThreadSpecific() (GLES_CM/gl.cpp), not the thread-pointer asm"
+
+["libGLESv2"]
+defines = ["USE_SLOW_BINDING=1"]
+reason = "as libEGL: CALL_GL_API through getGlThreadSpecific() (GLES2/gl2.cpp), not the thread-pointer asm"
+
+["libGLESv3"]
+defines = ["USE_SLOW_BINDING=1"]
+reason = "as libEGL: CALL_GL_API through getGlThreadSpecific() (GLES2/gl2.cpp), not the thread-pointer asm"
+
 # Vulkan loader: the host's (the Khronos loader), owner decision 2026-10-31; AOSP's libvulkan replaces it at G4 (O2).
 
 ["libvulkan"]

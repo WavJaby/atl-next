@@ -18,7 +18,7 @@ cc_library { name: "libuser", srcs: ["u.cc"], shared_libs: ["libother", "libcryp
 cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 `})
 	lib := "/prefix/lib/libcrypto.so"
-	g.provided = map[string]Provided{"libcrypto": {Libs: []string{lib}, Include: []string{"/prefix/include"}, Defines: []string{"PFX=X"}}}
+	g.provided = map[string]Provided{"libcrypto": {Lib: lib, Include: []string{"/prefix/include"}, Defines: []string{"PFX=X"}}}
 	for _, goal := range []string{"libuser", "libstat"} {
 		if g.node(goal, Device, Shared, "goal") == nil {
 			t.Fatalf("%s: problems %v", goal, g.problems)
@@ -63,18 +63,20 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 	}
 }
 
-// A row with several providers (a host library + a crate shared by two rows): every artifact first on the link line, in the row's order; one shared by two modules is linked once.
-func TestSeveralProviders(t *testing.T) {
+// Two rows provided by one crate (atl-bionic: libasync_safe + libdl_android) plus a system library: provided artifacts first on the link line; the shared one linked once.
+func TestSharedProviderArtifact(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
-cc_library_shared { name: "libEGL", srcs: ["e.cc"] }
-cc_library_shared { name: "libGLESv2", srcs: ["g.cc"] }
+cc_library_shared { name: "libasync_safe", srcs: ["a.cc"] }
+cc_library_shared { name: "libz", srcs: ["z.cc"] }
+cc_library_shared { name: "libdl_android", srcs: ["d.cc"] }
 cc_library_shared { name: "libbase", srcs: ["b.cc"] }
-cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "libEGL", "libGLESv2"] }
+cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "libasync_safe", "libz", "libdl_android"] }
 `})
 	ext := "/crates/lib/libshared_ext.so"
 	g.provided = map[string]Provided{
-		"libEGL":    {Libs: []string{"/usr/lib/libEGL.so", ext}},
-		"libGLESv2": {Libs: []string{"/usr/lib/libGLESv2.so", ext}},
+		"libasync_safe": {Lib: ext},
+		"libz":          {Lib: "/usr/lib/libz.so"},
+		"libdl_android": {Lib: ext},
 	}
 	if g.node("libgui", Device, Shared, "goal") == nil {
 		t.Fatalf("problems %v", g.problems)
@@ -84,7 +86,7 @@ cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "li
 			continue
 		}
 		l, inputs := g.linkLibs(n)
-		want := []string{"/usr/lib/libEGL.so", ext, "/usr/lib/libGLESv2.so"}
+		want := []string{ext, "/usr/lib/libz.so"}
 		if !slices.Equal(l[:len(want)], want) {
 			t.Errorf("link libs %q", l)
 		}
@@ -99,12 +101,6 @@ cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "li
 			t.Errorf("%s not linked exactly once: %q", ext, inputs)
 		}
 	}
-	// an archive is linked where it is named, so it is never one of several
-	g.provided["libbase"] = Provided{Libs: []string{"/x/libbase.a", ext}}
-	g.providedNode("libbase", Device, g.provided["libbase"])
-	if !slices.ContainsFunc(g.problems, func(p string) bool { return strings.Contains(p, "one an archive") }) {
-		t.Errorf("problems %v", g.problems)
-	}
 }
 
 // A `srcs` row: the module is still built from the tree, without the listed files (both the plain srcs and target-block ones), and links its provider first; a `none` row links nothing. A listed file that is no source of the module fails the conversion.
@@ -117,7 +113,7 @@ cc_library_shared { name: "libunbuilt", srcs: ["u.cc"] }
 	lib := "/crates/lib/libatl_stubs.so"
 	g := graphFor(t, files)
 	g.partial = map[string]Partial{
-		"librt":      {Srcs: []string{"drop.cc", "dev.cc"}, Provider: &Provided{Libs: []string{lib}}},
+		"librt":      {Srcs: []string{"drop.cc", "dev.cc"}, Provider: &Provided{Lib: lib}},
 		"libsk":      {Srcs: []string{"raw.cc"}},
 		"libunbuilt": {Srcs: []string{"u.cc"}},
 	}
@@ -179,7 +175,7 @@ cc_binary_host { name: "tool", srcs: ["t.cc"] }
 	// bionic.go's default and the providers.toml rows
 	g.soong = SoongConfig{CStd: "gnu11", CppStd: "gnu++20", APILevel: "-D__ANDROID_API__=10000", SystemSharedLibs: []string{"libc", "libm", "libdl"}}
 	g.omit = map[string]bool{"libm": true, "libdl": true}
-	g.provided = map[string]Provided{"libc": {Libs: []string{"/c/lib/libatl_bionic.so"}, Include: []string{"/c/include"}}}
+	g.provided = map[string]Provided{"libc": {Lib: "/c/lib/libatl_bionic.so", Include: []string{"/c/include"}}}
 	for _, goal := range []string{"liba", "libuser", "libnolibc"} {
 		g.node(goal, Device, Shared, "goal")
 	}

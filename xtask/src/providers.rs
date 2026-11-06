@@ -23,15 +23,13 @@ pub fn omitted(providers: &Providers) -> Vec<&str> {
         .collect()
 }
 
-/// `(module, name)` for each `<kind>:<name>` provider of each row.
+/// `(module, name)` for each row whose provider is `<kind>:<name>`.
 fn of_kind<'a>(providers: &'a Providers, kind: &str) -> Vec<(&'a str, &'a str)> {
     providers
         .iter()
-        .flat_map(|(module, row)| {
-            row.provider.iter().filter_map(move |p| {
-                let (k, name) = p.split_once(':')?;
-                (k == kind).then_some((module.as_str(), name))
-            })
+        .filter_map(|(module, row)| {
+            let (k, name) = row.provider.as_deref()?.split_once(':')?;
+            (k == kind).then_some((module.as_str(), name))
         })
         .collect()
 }
@@ -71,37 +69,12 @@ pub fn stand_ins(providers: &Providers) -> Vec<(&str, &str)> {
 /// One module provided outside the tree (`crate:`, `upstream:` and `system:` providers), as `xtask native` hands it to the converter in `<out>/provided.json` (bp2ninja provided.go `Provided`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Provided {
-    /// Absolute paths of the shared objects or archives dependents link, in this order: one per provider of the row.
-    pub libs: Vec<PathBuf>,
+    /// Absolute path of the shared object or archive dependents link.
+    pub lib: PathBuf,
     /// Header dirs dependents get as `-isystem`.
     pub include: Vec<PathBuf>,
     /// `NAME=VALUE` defines the headers depend on, given to dependents as `-D`.
     pub defines: Vec<String>,
-}
-
-impl Provided {
-    /// The row's providers together, in the row's order: their libraries, include dirs and defines.
-    pub fn join(parts: Vec<Provided>) -> Provided {
-        let mut out = Provided {
-            libs: Vec::new(),
-            include: Vec::new(),
-            defines: Vec::new(),
-        };
-        for p in parts {
-            out.libs.extend(p.libs);
-            for i in p.include {
-                if !out.include.contains(&i) {
-                    out.include.push(i);
-                }
-            }
-            for d in p.defines {
-                if !out.defines.contains(&d) {
-                    out.defines.push(d);
-                }
-            }
-        }
-        out
-    }
 }
 
 /// One `srcs` row as `xtask native` hands it to the converter in `<out>/srcs.json` (bp2ninja provided.go `Partial`): the module is built from the tree without these sources, linking the provider's artifact if it has one.
@@ -119,9 +92,8 @@ pub type Providers = BTreeMap<String, Provider>;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
-    /// One provider, or several linked in this order (written as a string or a list); empty on a `rust_os` row.
-    #[serde(default, deserialize_with = "one_or_many")]
-    pub provider: Vec<String>,
+    /// None on a `rust_os` or `defines` row.
+    pub provider: Option<String>,
     pub reason: String,
     /// Empty = the whole module.
     #[serde(default)]
@@ -208,21 +180,8 @@ pub fn rust_android(providers: &Providers) -> Vec<&str> {
 impl Provider {
     /// `provider = "none"`.
     pub fn is_none(&self) -> bool {
-        self.provider == [NONE]
+        self.provider.as_deref() == Some(NONE)
     }
-}
-
-fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match OneOrMany::deserialize(d)? {
-        OneOrMany::One(p) => vec![p],
-        OneOrMany::Many(ps) => ps,
-    })
 }
 
 /// What a provider may name: workspace crates, sources.toml git upstreams, deps.toml rows.
@@ -268,14 +227,14 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     ensure!(!row.reason.trim().is_empty(), "empty reason");
     if row.rust_os.is_some() {
         ensure!(
-            row.provider.is_empty() && row.srcs.is_empty() && row.defines.is_empty(),
+            row.provider.is_none() && row.srcs.is_empty() && row.defines.is_empty(),
             "rust_os: the tree builds the module, so the row has no provider, srcs or defines"
         );
         return Ok(());
     }
     if !row.defines.is_empty() {
         ensure!(
-            row.provider.is_empty() && row.srcs.is_empty(),
+            row.provider.is_none() && row.srcs.is_empty(),
             "defines: the tree builds the module, so the row has no provider or srcs"
         );
         let mut seen = BTreeSet::new();
@@ -303,26 +262,15 @@ fn validate(module: &str, row: &Provider, targets: &Targets) -> Result<()> {
     if row.is_none() {
         return Ok(());
     }
+    let Some(p) = &row.provider else {
+        bail!("no provider (a row without one needs rust_os or defines)")
+    };
+    // another tree module is the whole library: no sources of the replaced module left
     ensure!(
-        !row.provider.is_empty(),
-        "empty provider list (a row without one needs rust_os or defines)"
+        !(p.starts_with("module:") && !row.srcs.is_empty()),
+        "a module: provider takes no srcs"
     );
-    // another tree module is the whole library: nothing to join it with, no sources of the replaced module left
-    if row.provider.iter().any(|p| p.starts_with("module:")) {
-        ensure!(
-            row.provider.len() == 1 && row.srcs.is_empty(),
-            "a module: provider is the row's only provider, without srcs"
-        );
-    }
-    let mut seen = BTreeSet::new();
-    for p in &row.provider {
-        ensure!(seen.insert(p), "provider `{p}` listed twice");
-        ensure!(
-            p != NONE,
-            "`{NONE}` provides nothing, so it is never one of several providers"
-        );
-        validate_one(module, p, targets)?;
-    }
+    validate_one(module, p, targets)?;
     Ok(())
 }
 
@@ -481,59 +429,16 @@ mod tests {
         );
         assert!(err("[x]\nprovider = \"module:x\"\nreason = \"r\"\n").contains("not another"));
         assert!(
-            err("[x]\nprovider = [\"module:y\", \"crate:atl-nativeloader\"]\nreason = \"r\"\n")
-                .contains("only provider")
-        );
-        assert!(
             err("[x]\nprovider = \"module:y\"\nsrcs = [\"a.cc\"]\nreason = \"r\"\n")
-                .contains("only provider")
+                .contains("takes no srcs")
         );
     }
 
     #[test]
-    fn several_providers() {
-        let text =
-            "[libEGL]\nprovider = [\"system:egl\", \"crate:atl-nativeloader\"]\nreason = \"r\"\n";
-        let providers = parsed(text).unwrap();
-        assert_eq!(systems(&providers), [("libEGL", "egl")]);
-        assert_eq!(super::crates(&providers), [("libEGL", "atl-nativeloader")]);
-        assert!(super::omitted(&providers).is_empty());
-        // each one is checked
-        assert!(
-            err("[x]\nprovider = [\"system:egl\", \"crate:gone\"]\nreason = \"r\"\n")
-                .contains("no workspace crate")
-        );
-        assert!(
-            err("[x]\nprovider = [\"system:egl\", \"system:egl\"]\nreason = \"r\"\n")
-                .contains("listed twice")
-        );
-        assert!(
-            err("[x]\nprovider = [\"system:egl\", \"none\"]\nreason = \"r\"\n")
-                .contains("never one of several")
-        );
-        assert!(err("[x]\nprovider = []\nreason = \"r\"\n").contains("empty provider list"));
-    }
-
-    #[test]
-    fn joined_in_row_order() {
-        let p = |lib: &str, include: &[&str], defines: &[&str]| Provided {
-            libs: vec![PathBuf::from(lib)],
-            include: include.iter().map(PathBuf::from).collect(),
-            defines: defines.iter().map(|d| (*d).to_owned()).collect(),
-        };
-        let joined = Provided::join(vec![
-            p("/a/liba.so", &["/inc"], &["A=1"]),
-            p("/b/libb.so", &["/inc", "/b/inc"], &["A=1", "B"]),
-        ]);
-        assert_eq!(
-            joined.libs,
-            [PathBuf::from("/a/liba.so"), PathBuf::from("/b/libb.so")]
-        );
-        assert_eq!(
-            joined.include,
-            [PathBuf::from("/inc"), PathBuf::from("/b/inc")]
-        );
-        assert_eq!(joined.defines, ["A=1", "B"]);
+    fn one_provider_per_row() {
+        // a list is not a provider: the multi-provider form is gone
+        assert!(!err("[x]\nprovider = [\"system:egl\"]\nreason = \"r\"\n").is_empty());
+        assert!(err("[x]\nreason = \"r\"\n").contains("no provider"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ mod cts_table;
 mod deps;
 mod fetch;
 mod git;
+mod gl_dispatch;
 mod gles2_fixture;
 mod gralloc;
 mod host_art;
@@ -228,6 +229,10 @@ enum Test {
     ///
     /// Controls run every time: the symlinked (link-farm) shape must make javac fail. Needs the prebuilt JDK and bwrap; no native build unless comparing.
     TaskBind(tree_gate::Args),
+    /// AOSP's GL fronts (USE_SLOW_BINDING) dispatch each thread's GL calls through its own hooks table, libEGL -> libGLESv2, via atl-bionic's `__get_tls()`; prints the per-call cost.
+    ///
+    /// Control every run: a libGLESv2 with its own atl-bionic copy (dlmopen) must fail. Needs libEGL + libGLESv2 in --out; no driver.
+    GlDispatch(gl_dispatch::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -309,6 +314,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::TaskBind(args),
         } => tree_gate::run(&root, &args),
+        Command::Test {
+            test: Test::GlDispatch(args),
+        } => gl_dispatch::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -339,6 +347,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::JniFixture(_) => "jni-fixture",
             Test::Gles2Fixture(_) => "gles2-fixture",
             Test::TaskBind(_) => "task-bind",
+            Test::GlDispatch(_) => "gl-dispatch",
         },
         _ => return None,
     })

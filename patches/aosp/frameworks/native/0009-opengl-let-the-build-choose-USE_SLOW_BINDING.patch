@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 08:53:36 +0800
+Subject: [PATCH] opengl: let the build choose USE_SLOW_BINDING
+
+hooks.h hard-defines USE_SLOW_BINDING 0. Guard it with #ifndef so a
+build can select the generic GL dispatch (CALL_GL_API through
+getGlThreadSpecific) instead of the per-arch trampolines.
+
+Upstream-Status: Pending
+Patch-Reason: on glibc the thread pointer is glibc's TCB, so the trampolines' inline-asm read of TP + TLS_SLOT_OPENGL_API hits a glibc field; the generic path reads the slot through __get_tls(), which atl-bionic supplies as a per-thread array on every arch. A loader or environment cannot change a hard #define.
+---
+SPDX-License-Identifier: Apache-2.0
+ opengl/libs/hooks.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/opengl/libs/hooks.h b/opengl/libs/hooks.h
+index 86fec21bae5e94f10950cfd8842ca1103c2bd37a..5165042f652b311da1c95612edabbb8617f14921 100644
+--- a/opengl/libs/hooks.h
++++ b/opengl/libs/hooks.h
+@@ -34,7 +34,9 @@
+ #include <GLES3/gl32.h>
+ 
+ // set to 1 for debugging
++#ifndef USE_SLOW_BINDING
+ #define USE_SLOW_BINDING    0
++#endif
+ 
+ #undef NELEM
+ #define NELEM(x)            (sizeof(x)/sizeof(*(x)))

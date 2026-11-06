@@ -244,7 +244,7 @@ func TestWriteCompat(t *testing.T) {
 		write(filepath.Join(tree, h.path), "tree "+h.name)
 	}
 	write(filepath.Join(gen, "android/api-level.h"), "generated")
-	provided := map[string]Provided{"libc": {Libs: []string{"x.so"}, Include: []string{other, gen}}}
+	provided := map[string]Provided{"libc": {Lib: "x.so", Include: []string{other, gen}}}
 	if err := writeCompat(tree, out, provided); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestWriteCompatIncremental(t *testing.T) {
 	}
 	headers(tree)
 	write(filepath.Join(gen, "android/api-level.h"), "generated")
-	provided := map[string]Provided{"libc": {Libs: []string{"x.so"}, Include: []string{other, gen}}}
+	provided := map[string]Provided{"libc": {Lib: "x.so", Include: []string{other, gen}}}
 	if err := writeCompat(tree, out, provided); err != nil {
 		t.Fatal(err)
 	}

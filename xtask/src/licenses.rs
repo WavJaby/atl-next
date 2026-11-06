@@ -85,7 +85,10 @@ pub fn check_test_only(licenses: &Licenses) -> Result<()> {
     if licenses.test_only.is_empty() {
         return Ok(());
     }
-    let index = licenses.aosp_index.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let index = licenses
+        .aosp_index
+        .get()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     for module in licenses.test_only.keys() {
         let defs = index.definitions_of(module);
         ensure!(

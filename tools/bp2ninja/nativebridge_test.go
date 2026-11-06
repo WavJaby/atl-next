@@ -44,7 +44,7 @@ cc_library { name: "libdep", srcs: ["b.c"], system_shared_libs: [] }
 	nb := NativeBridge("x86_64")
 	g.soong.APILevel = apiLevelPrefix + "10000"
 	g.soong.Flags.Triple[nb] = "x86_64-linux-android"
-	g.provided = map[string]Provided{"libdep": {Libs: []string{"/sys/libdep.so"}}}
+	g.provided = map[string]Provided{"libdep": {Lib: "/sys/libdep.so"}}
 	g.nbProvided = map[string]Provided{}
 	dev, n := g.node("libz", Device, Shared, "t"), g.node("libz", nb, Shared, "t")
 	if dev == nil || n == nil {
@@ -86,10 +86,10 @@ cc_library { name: "libdep", srcs: ["b.c"], system_shared_libs: [] }
 func TestNativeBridgeProvided(t *testing.T) {
 	g := graphForCfg(t, nbCfg, map[string]string{"p/Android.bp": `cc_library { name: "libz", srcs: ["a.c"], static_libs: ["libclang_rt.builtins"], system_shared_libs: [] }`})
 	nb := NativeBridge("x86_64")
-	g.provided = map[string]Provided{"libclang_rt.builtins": {Libs: []string{"/glibc/builtins.a"}}}
-	g.nbProvided = map[string]Provided{"libclang_rt.builtins": {Libs: []string{"/rt/x86_64/libclang_rt.builtins.a"}}}
+	g.provided = map[string]Provided{"libclang_rt.builtins": {Lib: "/glibc/builtins.a"}}
+	g.nbProvided = map[string]Provided{"libclang_rt.builtins": {Lib: "/rt/x86_64/libclang_rt.builtins.a"}}
 	n := g.node("libz", nb, Shared, "t")
-	if n == nil || len(n.deps.static) != 1 || n.deps.static[0].libs[0] != "/rt/x86_64/libclang_rt.builtins.a" {
+	if n == nil || len(n.deps.static) != 1 || n.deps.static[0].out != "/rt/x86_64/libclang_rt.builtins.a" {
 		t.Fatalf("nb static deps %+v, problems %q", n, g.problems)
 	}
 }

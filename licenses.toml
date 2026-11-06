@@ -79,6 +79,18 @@ reason = "glgen2/glgen.py output (Apache-2.0 tool, AOSP), no notice; package sou
 licence = "Apache-2.0"
 reason = "glgen2/glgen.py output (Apache-2.0 tool, AOSP), no notice; package sources Apache-2.0"
 
+[upstream.aosp.paths."frameworks/native/opengl/libs/entries.in"]
+licence = "Apache-2.0"
+reason = "glgen2/glgen.py output (Apache-2.0 tool, AOSP): hooks.h's gl_hooks_t GL_ENTRY list, no notice; package sources Apache-2.0"
+
+[upstream.aosp.paths."frameworks/native/opengl/libs/entries_gles1.in"]
+licence = "Apache-2.0"
+reason = "glgen2/glgen.py output (Apache-2.0 tool, AOSP): the GLES1-only GL_ENTRY list, no notice; package sources Apache-2.0"
+
+[upstream.aosp.paths."frameworks/native/opengl/libs/platform_entries.in"]
+licence = "Apache-2.0"
+reason = "EGL platform entry list of AOSP libEGL (hooks.h platform_impl_t), no notice; written by AOSP alongside egl_platform_entries.cpp (Apache-2.0)"
+
 [upstream.aosp.paths."frameworks/native/opengl/include/GLES3/gl3ext.h"]
 licence = "SGI-B-2.0"
 reason = "Khronos' GLES3 extension header: \"This document is licensed under the SGI Free Software B License Version 2.0\" (lines 7-8); a pointer notice the phrase rules do not read"

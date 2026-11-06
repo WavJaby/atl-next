@@ -82,6 +82,9 @@ mod generated {
     pub mod prop_format {
         include!(concat!(env!("OUT_DIR"), "/prop_area.rs"));
     }
+    pub mod tls_defines {
+        include!(concat!(env!("OUT_DIR"), "/tls_defines.rs"));
+    }
     /// `struct timespec`'s layout, the same in bionic and the host libc.
     pub mod timespec {
         include!(concat!(env!("OUT_DIR"), "/timespec.rs"));
@@ -108,3 +111,4 @@ pub use store::AREA_ENV;
 #[allow(unsafe_code)]
 #[cfg_attr(not(atl_bionic_api = "pthread"), allow(dead_code))]
 mod thread;
+mod tls;

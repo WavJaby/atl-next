@@ -62,6 +62,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
+    .with_gl_driver()?
     .with_ui("gtk");
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()

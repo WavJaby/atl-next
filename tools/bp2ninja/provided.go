@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 )
 
 // Provided is a module providers.toml gives to providers outside the tree (`crate:`, `upstream:` and `system:`), built or resolved by xtask before the converter runs: it replaces the tree's definition, and dependents link its artifacts and get its headers and defines, as from a module the converter built.
 type Provided struct {
-	// absolute paths dependents link, in order, one per provider of the row: shared objects (.so), or one archive (.a)
-	Libs []string `json:"libs"`
+	// absolute path dependents link: a shared object (.so) or an archive (.a)
+	Lib string `json:"lib"`
 	// header dirs dependents get as -isystem: searched after every -I, so compat/device keeps precedence over bionic's headers; system headers, as bionic's are
 	Include []string `json:"include"`
 	Defines []string `json:"defines"` // NAME=VALUE its headers depend on, given to dependents as -D (BoringSSL's symbol prefix)
@@ -44,32 +43,40 @@ func parseDefines(list string) (map[string][]string, error) {
 }
 
 // checkDefines: every `defines` row names a cc module with a device variant (a Rust, header-only or host-only module never compiles with them: the field would be silently dead).
+// A name may also carry modules that compile nothing of their own (libEGL's ndk_library stub beside its cc_library_shared): the row needs one module under it that compiles C/C++ on the device side.
 // A row naming no module at all is reported with the other providers.toml rows.
 func (g *Graph) checkDefines() {
 	for _, name := range sortedKeys(keysOf(g.defines)) {
+		var why []string
+		compiled := false
 		for _, m := range g.mods[Device][name] {
 			t := g.baseType(m.Type)
 			k, ok := kindOf(t, Shared)
 			switch {
 			case !ok || isRustType(t) || k == Headers:
-				g.problem("providers.toml: %s: defines on a %s, which compiles no C/C++", name, m.Type)
+				why = append(why, fmt.Sprintf("a %s, which compiles no C/C++", m.Type))
 			case g.noDeviceVariant(m):
-				g.problem("providers.toml: %s: defines on a %s, which has no device variant", name, m.Type)
+				why = append(why, fmt.Sprintf("a %s, which has no device variant", m.Type))
+			default:
+				compiled = true
 			}
+		}
+		if !compiled && len(why) > 0 {
+			g.problem("providers.toml: %s: defines on %s", name, strings.Join(why, "; "))
 		}
 	}
 }
 
-// checkLibs: every provided entry names at least one artifact (xtask writes one per provider of its row).
+// checkLibs: every provided entry names its artifact.
 func checkLibs(provided map[string]Provided, partial map[string]Partial) error {
 	for m, p := range provided {
-		if len(p.Libs) == 0 {
-			return fmt.Errorf("%s: no libs", m)
+		if p.Lib == "" {
+			return fmt.Errorf("%s: no lib", m)
 		}
 	}
 	for m, p := range partial {
-		if p.Provider != nil && len(p.Provider.Libs) == 0 {
-			return fmt.Errorf("%s: srcs provider without libs", m)
+		if p.Provider != nil && p.Provider.Lib == "" {
+			return fmt.Errorf("%s: srcs provider without lib", m)
 		}
 	}
 	return nil
@@ -116,7 +123,7 @@ func (g *Graph) partialProvider(n *Node) *Node {
 	if !ok || part.Provider == nil || !n.side.glibc() {
 		return nil
 	}
-	lib := filepath.Base(part.Provider.Libs[0])
+	lib := filepath.Base(part.Provider.Lib)
 	return g.providedNode(strings.TrimSuffix(lib, filepath.Ext(lib)), n.side, *part.Provider)
 }
 
@@ -162,18 +169,14 @@ func keysOf[T any](m map[string]T) map[string]bool {
 // Its only edges: the tree module's export_header_lib_headers, which still reach its dependents -- header-only tree modules the provider's headers include as the replaced ones did (async_safe/log.h -> liblog_headers' android/log.h).
 func (g *Graph) providedNode(name string, side Side, p Provided) *Node {
 	kind := Shared
-	if strings.HasSuffix(p.Libs[0], ".a") {
+	if strings.HasSuffix(p.Lib, ".a") {
 		kind = Static
 	}
 	k := key{name, side, kind}
 	if n, ok := g.nodes[k]; ok {
 		return n
 	}
-	// an archive is linked where it is named, in the static group: several artifacts are linked first, as shared objects only
-	if len(p.Libs) > 1 && slices.ContainsFunc(p.Libs, func(l string) bool { return strings.HasSuffix(l, ".a") }) {
-		g.problem("providers.toml: %s: several providers, one an archive: %s", name, strings.Join(p.Libs, ", "))
-	}
-	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Libs[0], libs: p.Libs, provided: true}
+	n := &Node{key: k, mod: &Module{Name: name}, props: newObj(), out: p.Lib, provided: true}
 	g.nodes[k] = n
 	for _, dir := range p.Include {
 		n.exports = append(n.exports, "-isystem", dir)

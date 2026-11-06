@@ -183,28 +183,93 @@ pub fn check(
     }
     judge_files(files, roots, out, licenses, &mut report)?;
     for (build, loaded) in external {
-        check_external(&build, &loaded, roots, licenses, &mut report)?;
+        check_external(
+            &build,
+            out,
+            Reach::Members(&loaded),
+            roots,
+            licenses,
+            &mut report,
+        )?;
     }
     Ok(report)
 }
 
-/// The licence gate over Mesa's own meson build dir `build` (inside `out`; mesa.rs `build_after_ninja`), its link outputs `artifacts` (build-relative), all of class `runtime`.
-/// Reached files over-count: Mesa's links run without `--trace`, so an artifact reaches every object of its link edge and of each build-dir input's edge (static archives, other Mesa libraries), transitively, loaded or not; then each object's depfile (`ninja -t deps`). Shared libraries among the inputs are their own artifacts (the converter's, gated by `check`), system files the platform's.
-pub fn check_mesa(
+/// The licence gate over an external build inside `out` that makes shipped artifacts itself (Mesa's meson build dir, mesa.rs `build_after_ninja`): its link outputs `artifacts` (build-relative), all of class `runtime`.
+pub fn check_build_outputs(
     out: &Path,
     build: &Path,
     artifacts: &[&str],
     roots: &[Root],
     licenses: &Licenses,
 ) -> Result<Report> {
+    let artifacts: Vec<&Path> = artifacts.iter().map(Path::new).collect();
     let mut report = Report {
         artifacts: artifacts.len(),
         ..Report::default()
     };
-    // build-relative object -> first artifact reaching it
-    let mut objects: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    check_external(
+        build,
+        out,
+        Reach::Links(&artifacts),
+        roots,
+        licenses,
+        &mut report,
+    )?;
+    Ok(report)
+}
+
+/// What of an external ninja build reaches a shipped artifact.
+enum Reach<'a> {
+    /// Archive members a converter link loaded (`--trace`): (archive, member, artifact). Mapped to objects by archive file name (an install copies the archive under the same name).
+    Members(&'a [(&'a Path, &'a str, &'a Path)]),
+    /// The build's own link outputs (build-relative). Over-counts: those links run without `--trace`, so an artifact reaches every object of its link edge and of each build-dir input's edge (static archives, other libraries of the build), transitively, loaded or not. Shared libraries among the inputs are their own artifacts or the converter's, system files the platform's.
+    Links(&'a [&'a Path]),
+}
+
+/// One external ninja build: what reaches shipped artifacts (`reach`) -> objects through the build's own edges -> each object's depfile (`ninja -t deps`) -> judged; files under `out` (the converter's out dir, which holds the build) count as generated.
+fn check_external(
+    build: &Path,
+    out: &Path,
+    reach: Reach,
+    roots: &[Root],
+    licenses: &Licenses,
+    report: &mut Report,
+) -> Result<()> {
+    let objects = match reach {
+        Reach::Members(loaded) => member_objects(build, loaded, report)?,
+        Reach::Links(artifacts) => link_objects(build, artifacts)?,
+    };
+    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let abs = |f: &Path| {
+        let p = if f.is_absolute() {
+            f.to_path_buf()
+        } else {
+            build.join(f)
+        };
+        std::fs::canonicalize(&p).unwrap_or(p)
+    };
+    let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for (object, artifact) in &objects {
+        if !deps.contains_key(object) {
+            report.unresolved.push(format!(
+                "{}: no depfile record in {}",
+                object.display(),
+                build.display()
+            ));
+            continue;
+        }
+        for f in made_of(object, &deps) {
+            placed.entry(abs(f)).or_insert(artifact);
+        }
+    }
+    judge(placed, roots, out, licenses, report)
+}
+
+/// `Reach::Links`: build-relative object -> first artifact reaching it.
+fn link_objects<'a>(build: &Path, artifacts: &[&'a Path]) -> Result<BTreeMap<PathBuf, &'a Path>> {
+    let mut objects = BTreeMap::new();
     for artifact in artifacts {
-        let artifact = Path::new(*artifact);
         let (mut todo, mut seen) = (vec![artifact.to_path_buf()], BTreeSet::new());
         while let Some(t) = todo.pop() {
             if !seen.insert(t.clone()) {
@@ -213,29 +278,59 @@ pub fn check_mesa(
             let query = ninja(build, &["-t", "query", &t.display().to_string()])?;
             for input in edge_inputs(&query) {
                 if input.extension().is_some_and(|e| e == "o") {
-                    objects.entry(input).or_insert(artifact);
+                    objects.entry(input).or_insert(*artifact);
                 } else if !input.is_absolute() {
-                    // a static archive, the versioned file behind a `.so` symlink edge, a Mesa library linked into another (counted twice), a version script (no edge)
+                    // a static archive, the versioned file behind a `.so` symlink edge, a library of the build linked into another (counted twice), a version script (no edge)
                     todo.push(input);
                 }
             }
         }
     }
-    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
-    let mut files: BTreeMap<PathBuf, &Path> = BTreeMap::new();
-    for (object, artifact) in &objects {
-        if !deps.contains_key(object) {
-            report
-                .unresolved
-                .push(format!("{}: no depfile record (Mesa)", object.display()));
+    Ok(objects)
+}
+
+/// `Reach::Members`: object (as the build's edges name it) -> first artifact loading it.
+fn member_objects<'a>(
+    build: &Path,
+    loaded: &[(&Path, &str, &'a Path)],
+    report: &mut Report,
+) -> Result<BTreeMap<PathBuf, &'a Path>> {
+    let targets: Vec<PathBuf> = lines(&ninja(build, &["-t", "targets", "all"])?)
+        .filter_map(|l| l.rsplit_once(": ").map(|(t, _)| build.join(t)))
+        .collect();
+    let mut objects = BTreeMap::new();
+    for (archive, member, artifact) in loaded {
+        let named: Vec<&PathBuf> = targets
+            .iter()
+            .filter(|t| t.file_name() == archive.file_name())
+            .collect();
+        let [made] = named[..] else {
+            report.unresolved.push(format!(
+                "{}: {} edges of {} make an archive of this name (in {})",
+                archive.display(),
+                named.len(),
+                build.display(),
+                artifact.display()
+            ));
             continue;
-        }
-        for f in made_of(object, &deps) {
-            files.entry(build.join(f)).or_insert(artifact);
-        }
+        };
+        let query = ninja(build, &["-t", "query", &made.display().to_string()])?;
+        let objs: Vec<PathBuf> = parse_query(&query).into_values().flatten().collect();
+        let Some(object) = objs
+            .into_iter()
+            .find(|o| o.file_name().is_some_and(|n| n == *member))
+        else {
+            report.unresolved.push(format!(
+                "{}: member {member} is none of its inputs in {} (in {})",
+                archive.display(),
+                build.display(),
+                artifact.display()
+            ));
+            continue;
+        };
+        objects.entry(object).or_insert(*artifact);
     }
-    judge_files(files, roots, out, licenses, &mut report)?;
-    Ok(report)
+    Ok(objects)
 }
 
 /// `ninja -t query <target>`: every input of its edge, explicit and implicit (`| x`), order-only (`|| x`) skipped.
@@ -283,71 +378,6 @@ fn external_build(archive: &Path, out: &Path) -> Option<PathBuf> {
         .take_while(|a| *a != out)
         .flat_map(|a| [a.to_path_buf(), a.join("build")])
         .find(|d| d.join("build.ninja").is_file())
-}
-
-/// Archive members loaded from one external build, mapped to their objects through that build's own edges (by archive file name: an install copies the archive under the same name) and depfiles, then judged; files under `build` count as generated.
-fn check_external(
-    build: &Path,
-    loaded: &[(&Path, &str, &Path)],
-    roots: &[Root],
-    licenses: &Licenses,
-    report: &mut Report,
-) -> Result<()> {
-    let targets: Vec<PathBuf> = lines(&ninja(build, &["-t", "targets", "all"])?)
-        .filter_map(|l| l.rsplit_once(": ").map(|(t, _)| build.join(t)))
-        .collect();
-    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
-    let abs = |f: &Path| {
-        let p = if f.is_absolute() {
-            f.to_path_buf()
-        } else {
-            build.join(f)
-        };
-        std::fs::canonicalize(&p).unwrap_or(p)
-    };
-    let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
-    for (archive, member, artifact) in loaded {
-        let named: Vec<&PathBuf> = targets
-            .iter()
-            .filter(|t| t.file_name() == archive.file_name())
-            .collect();
-        let [made] = named[..] else {
-            report.unresolved.push(format!(
-                "{}: {} edges of {} make an archive of this name (in {})",
-                archive.display(),
-                named.len(),
-                build.display(),
-                artifact.display()
-            ));
-            continue;
-        };
-        let query = ninja(build, &["-t", "query", &made.display().to_string()])?;
-        let objs: Vec<PathBuf> = parse_query(&query).into_values().flatten().collect();
-        let Some(object) = objs
-            .iter()
-            .find(|o| o.file_name().is_some_and(|n| n == *member))
-        else {
-            report.unresolved.push(format!(
-                "{}: member {member} is none of its inputs in {} (in {})",
-                archive.display(),
-                build.display(),
-                artifact.display()
-            ));
-            continue;
-        };
-        let Some(files) = deps.get(object) else {
-            report.unresolved.push(format!(
-                "{}: no depfile record in {}",
-                object.display(),
-                build.display()
-            ));
-            continue;
-        };
-        for f in files {
-            placed.entry(abs(f)).or_insert(artifact);
-        }
-    }
-    judge(placed, roots, build, licenses, report)
 }
 
 /// A directory a build copies source files into (CMake header staging: libc++'s `include/c++/v1`), and where they come from.

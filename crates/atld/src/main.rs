@@ -76,9 +76,9 @@ struct Args {
     /// The converter's build.prop: the property area's source, /system/build.prop.
     #[arg(long)]
     build_prop: PathBuf,
-    /// A file of /system besides the framework's (repeat): `<host path>=<path below /system>`, linked there (the system fonts: etc/font_fallback.xml, fonts/<name>).
-    #[arg(long = "system-file", value_parser = system_file)]
-    system_files: Vec<(PathBuf, PathBuf)>,
+    /// A file of /system or /vendor besides the framework's (repeat): `<host path>=<absolute Android path>`, linked there (the system fonts: /system/etc/font_fallback.xml, /system/fonts/<name>; the GL driver: /vendor/lib64/egl/<name>).
+    #[arg(long = "file", value_parser = partition_file)]
+    files: Vec<(PathBuf, PathBuf)>,
     /// A shared library packages may `<uses-library>` (repeat): `<name>=<host jar>[,<dependency name>...]`, linked as /system/framework/<file name> and registered with the package manager
     /// (SystemConfig's `<library name file dependency>`).
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
@@ -248,10 +248,10 @@ fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
         .map(|jar| link_into_framework(r, jar))
         .collect::<Result<Vec<_>>>()?;
     cacerts::write_store(&cacerts::distro_bundle()?, &r.system().join(CACERTS))?;
-    for (host, at) in &a.system_files {
-        let at = r.system().join(at);
-        ensure!(!at.exists(), "two /system files at {}", at.display());
-        std::fs::create_dir_all(at.parent().context("a path below /system")?)?;
+    for (host, at) in &a.files {
+        let at = r.root.join(at);
+        ensure!(!at.exists(), "two files at {}", at.display());
+        std::fs::create_dir_all(at.parent().context("a path below a partition")?)?;
         std::os::unix::fs::symlink(std::path::absolute(host)?, &at)?;
     }
     Ok(boot)
@@ -279,22 +279,29 @@ fn vintf_layout(a: &Args, r: &Root) -> Result<()> {
     Ok(())
 }
 
-/// `--system-file`'s `<host path>=<path below /system>`; the second must be relative and stay below /system.
-fn system_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
+/// Partitions `--file` may place files in: the root's `system` and `vendor` (Root::system, Root::vendor).
+const FILE_PARTITIONS: &[&str] = &["system", "vendor"];
+
+/// `--file`'s `<host path>=<absolute path below a FILE_PARTITIONS partition>` -> (host, path relative to the root).
+fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     let (host, at) = s
         .split_once('=')
-        .ok_or_else(|| format!("{s}: not <host path>=<path below /system>"))?;
-    let at = PathBuf::from(at);
-    if at
-        .components()
-        .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
-            "{}: not a relative path below /system",
-            at.display()
-        ));
+        .ok_or_else(|| format!("{s}: not <host path>=</system or /vendor path>"))?;
+    let rel = Path::new(at)
+        .strip_prefix("/")
+        .map_err(|_| format!("{at}: not an absolute path"))?;
+    let below = rel.components().count() > 1
+        && rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && rel
+            .components()
+            .next()
+            .is_some_and(|p| FILE_PARTITIONS.iter().any(|f| p.as_os_str() == *f));
+    if !below {
+        return Err(format!("{at}: not a file path below /system or /vendor"));
     }
-    Ok((PathBuf::from(host), at))
+    Ok((PathBuf::from(host), rel.to_path_buf()))
 }
 
 /// The install step, until the package manager installs from a real APK (the installer process: AOSP ParsingPackageUtils on ART, plan 4b): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
@@ -378,9 +385,16 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
 }
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
+/// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`).
 fn property_area(a: &Args, r: &Root) -> Result<Vec<Property>> {
-    let text = std::fs::read_to_string(&a.build_prop)
+    let mut text = std::fs::read_to_string(&a.build_prop)
         .with_context(|| format!("reading {}", a.build_prop.display()))?;
+    let vendor = Path::new("vendor/build.prop");
+    if let Some((host, _)) = a.files.iter().find(|(_, at)| at == vendor) {
+        text.push('\n');
+        text += &std::fs::read_to_string(host)
+            .with_context(|| format!("reading {}", host.display()))?;
+    }
     let props = atl_property_service::defaults(&text)?;
     std::fs::write(r.properties(), atl_property_service::area(&props)?)?;
     std::fs::create_dir(r.root.join("properties.d"))?;
@@ -791,7 +805,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
-    // the key maps are /system files (`--system-file`, usr/keychars); the services read them where they lie in the root
+    // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([
         "--keychars".into(),
         r.system().join("usr/keychars").into_os_string(),

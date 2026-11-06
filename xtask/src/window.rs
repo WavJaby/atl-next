@@ -267,6 +267,13 @@ fn line_stamp(line: &str) -> Option<u64> {
     parse_stamp(line.split_whitespace().next()?)
 }
 
+/// A logcat line's priority letter: the field before the tag (the first field ending in `:`). `F` = LOG_ALWAYS_FATAL / abort message / ART's abort dump, written just before the process aborts.
+fn priority(line: &str) -> Option<&str> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let tag = fields.iter().position(|f| f.ends_with(':'))?;
+    fields.get(tag.checked_sub(1)?).copied()
+}
+
 /// onResume's time: the first stamped app-log line that contains the marker.
 fn marker_stamp(app_log: &str, marker: &str) -> Option<u64> {
     app_log
@@ -315,6 +322,8 @@ pub(crate) fn fault_after(
         .filter_map(|(t, l)| {
             let what = if l.contains("FATAL EXCEPTION") {
                 "FATAL EXCEPTION"
+            } else if priority(l) == Some("F") {
+                "a fatal log line (an abort)"
             } else if l.contains("Sending signal") {
                 "the process was killed"
             } else if l.contains(UNSERVED_WAIT) {
@@ -364,6 +373,17 @@ fn self_cases() -> Vec<SelfCase> {
         case(
             "crash inside the window",
             mark.clone() + &crash_at(T + 500),
+            false,
+            true,
+            true,
+        ),
+        case(
+            "native abort inside the window",
+            mark.clone()
+                + &format!(
+                    "{} 2 14 F liblog/OpenGLRenderer: EglManager: eglCreateContext failed: EGL_BAD_ATTRIBUTE\n",
+                    stamp_text(T + 300)
+                ),
             false,
             true,
             true,
@@ -1411,7 +1431,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "window-art",
         args.verbose,
     )?
-    .with_gralloc(root)?;
+    .with_gralloc(root)?
+    .with_gl_driver()?;
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }

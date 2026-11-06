@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Probe of `xtask test gl-dispatch`: a cargo package (not a workspace member; it needs `unsafe` for dlopen and raw GL tables); built by xtask at test time, never shipped.
+[package]
+name = "gl-dispatch-probe"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2.191"
+
+# its own workspace: the repo's does not list testdata
+[workspace]

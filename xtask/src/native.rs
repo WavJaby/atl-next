@@ -148,7 +148,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .as_deref()
             .context("providers.toml checked the pkgconfig")?;
         let p = system::resolve(row, pkg)?;
-        println!("native: system {row} (pkg-config {pkg}) -> {}", libs(&p));
+        println!(
+            "native: system {row} (pkg-config {pkg}) -> {}",
+            p.lib.display()
+        );
         systems.insert(row, p);
     }
     let libcxx = PathBuf::from(
@@ -182,33 +185,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .into_iter()
         .map(|(m, _)| m)
         .collect();
-    for (module, row) in providers.iter().filter(|(m, row)| {
-        !row.is_none() && !row.provider.is_empty() && !stood.contains(m.as_str())
-    }) {
-        let parts = row
-            .provider
-            .iter()
-            .map(|p| {
-                let part = match p.split_once(':') {
-                    Some(("crate", name)) => crates.get(name),
-                    Some(("system", name)) => systems.get(name),
-                    Some(("upstream", _)) => upstreams.get(module),
-                    _ => None,
-                };
-                part.cloned()
-                    .with_context(|| format!("{module}: provider {p} was not built"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let p = Provided::join(parts);
+    for (module, row) in providers
+        .iter()
+        .filter(|(m, row)| !row.is_none() && !stood.contains(m.as_str()))
+    {
+        let Some(provider) = &row.provider else {
+            continue;
+        };
+        let p = match provider.split_once(':') {
+            Some(("crate", name)) => crates.get(name),
+            Some(("system", name)) => systems.get(name),
+            Some(("upstream", _)) => upstreams.get(module),
+            _ => None,
+        }
+        .cloned()
+        .with_context(|| format!("{module}: provider {provider} was not built"))?;
         let part = if row.srcs.is_empty() {
             ""
         } else {
             " (its srcs row)"
         };
         println!(
-            "native: provided {module}{part} = {} -> {}",
-            row.provider.join(" + "),
-            libs(&p)
+            "native: provided {module}{part} = {provider} -> {}",
+            p.lib.display()
         );
         provided.insert(module.as_str(), p);
     }
@@ -377,7 +376,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let provided_libs: BTreeSet<&Path> = provided
         .values()
         .chain(partial.values().filter_map(|p| p.provider.as_ref()))
-        .flat_map(|p| p.libs.iter().map(PathBuf::as_path))
+        .map(|p| p.lib.as_path())
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
     let mut failed: Vec<Failure> = Vec::new();
@@ -796,22 +795,13 @@ fn build_crates<'a>(
         built.insert(
             krate,
             Provided {
-                libs: vec![lib],
+                lib,
                 include,
                 defines: Vec::new(),
             },
         );
     }
     Ok(built)
-}
-
-/// A provided entry's libraries, for progress lines.
-fn libs(p: &Provided) -> String {
-    p.libs
-        .iter()
-        .map(|l| l.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" + ")
 }
 
 /// The provided gate (provided_gate.rs) over the device artifacts ninja produced; false on a violation.
@@ -863,7 +853,7 @@ fn licence_gate(
     let Some(build) = mesa_build else {
         return Ok(first);
     };
-    let mesa = licence_gate::check_mesa(
+    let mesa = licence_gate::check_build_outputs(
         &out,
         &std::fs::canonicalize(build)?,
         crate::mesa::OUTPUTS,

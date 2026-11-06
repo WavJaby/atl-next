@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 08:53:36 +0800
+Subject: [PATCH] EGL: return the driver entry from eglGetProcAddress with slow
+ binding
+
+Under USE_SLOW_BINDING the extension forwarders (getProcAddress.cpp
+__glExtFwd*) still read TP + TLS_SLOT_OPENGL_API in inline asm, with no
+generic variant. Return the driver's address instead of the forwarder.
+
+Precondition: one GL driver per process. The forwarder only switches
+the extension entry per bound context's connection; both GLESv1 and
+GLESv2 hooks get the same addr here, so with one driver the result is
+the same function. Re-check when a second driver (ANGLE for ES1) loads.
+
+Upstream-Status: Inappropriate [glibc hosts only]
+Patch-Reason: the forwarders are naked per-arch asm reading the thread pointer, which on glibc is glibc's TCB; no loader or environment setting reaches them, and a generic C forwarder cannot pass arbitrary arguments through.
+---
+SPDX-License-Identifier: Apache-2.0
+ opengl/libs/EGL/egl_platform_entries.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/opengl/libs/EGL/egl_platform_entries.cpp b/opengl/libs/EGL/egl_platform_entries.cpp
+index 6713a5c69d27618157c7b0da495f96c332cd021c..99a6e194ec5baf39d3079dfaa862899adf47b7c7 100644
+--- a/opengl/libs/EGL/egl_platform_entries.cpp
++++ b/opengl/libs/EGL/egl_platform_entries.cpp
+@@ -1243,7 +1243,9 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddressImpl(const char* procn
+                     // Track the top most entry point return the extension forwarder
+                     cnx->hooks[egl_connection_t::GLESv1_INDEX]->ext.extensions[slot] =
+                             cnx->hooks[egl_connection_t::GLESv2_INDEX]->ext.extensions[slot] = addr;
++#if !USE_SLOW_BINDING
+                     addr = gExtensionForwarders[slot];
++#endif
+ 
+                     // Remember the slot for this extension
+                     extensionSlotMap[name] = slot;
+@@ -1275,7 +1277,9 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddressImpl(const char* procn
+         // Track the top most entry point and return the extension forwarder
+         cnx->hooks[egl_connection_t::GLESv1_INDEX]->ext.extensions[ext_slot] =
+                 cnx->hooks[egl_connection_t::GLESv2_INDEX]->ext.extensions[ext_slot] = addr;
++#if !USE_SLOW_BINDING
+         addr = gExtensionForwarders[ext_slot];
++#endif
+     }
+ 
+     pthread_mutex_unlock(&sExtensionMapMutex);

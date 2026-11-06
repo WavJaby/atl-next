@@ -44,6 +44,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
+    /// The GL driver (mesa.rs `driver`), when [`Runtime::with_gl_driver`] asked for it: files placed by atld `--file`, library dirs joining the library path.
+    gl_driver: Option<(Vec<(PathBuf, String)>, Vec<PathBuf>)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
@@ -244,8 +246,7 @@ impl Runtime {
                 isa: host.to_owned(),
             })
             .collect();
-        let licenses =
-            crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
+        let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
         let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
         Ok(Runtime {
             test_only,
@@ -264,6 +265,7 @@ impl Runtime {
             font_file,
             keychars,
             gralloc: None,
+            gl_driver: None,
             headless_pointer: None,
             display: None,
             ui: None,
@@ -284,6 +286,12 @@ impl Runtime {
         )?;
         let lib = crate::gralloc::stage_mapper(root, &self.out)?;
         self.gralloc = Some((allocator, lib));
+        Ok(self)
+    }
+
+    /// Also places the GL driver `xtask native` built (Mesa for the Android platform, mesa.rs `driver`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop.
+    pub fn with_gl_driver(mut self) -> Result<Self> {
+        self.gl_driver = Some(crate::mesa::driver(&self.out)?);
         Ok(self)
     }
 
@@ -476,7 +484,7 @@ impl Runtime {
             std::fs::remove_dir_all(&run.root)
                 .with_context(|| format!("removing {}", run.root.display()))?;
         }
-        let keychars: Vec<PathBuf> = farm::KEYBOARD_FILES
+        let keychars: Vec<PathBuf> = tree::KEYBOARD_FILES
             .iter()
             .map(|(file, _)| self.keychars.join(file))
             .collect();
@@ -489,6 +497,10 @@ impl Runtime {
         ];
         staged.extend(keychars.iter().map(PathBuf::as_path));
         staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
+        if let Some((files, dirs)) = &self.gl_driver {
+            staged.extend(files.iter().map(|(f, _)| f.as_path()));
+            staged.extend(dirs.iter().map(PathBuf::as_path));
+        }
         crate::licenses::refuse_test_only(&staged, &self.test_only)?;
         // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
         let mut lib_path = std::ffi::OsString::from(self.art.lib_path.as_os_str());
@@ -498,7 +510,14 @@ impl Runtime {
             lib_path.push(":");
             lib_path.push(dir);
         }
+        for dir in self.gl_driver.iter().flat_map(|(_, dirs)| dirs) {
+            lib_path.push(":");
+            lib_path.push(dir);
+        }
         let mut cmd = Command::new(&self.atld);
+        for (host, at) in self.gl_driver.iter().flat_map(|(files, _)| files) {
+            cmd.arg("--file").arg(format!("{}={at}", host.display()));
+        }
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);
         }
@@ -520,14 +539,23 @@ impl Runtime {
             .arg(&self.art.build_prop)
             .arg("--framework-res")
             .arg(&self.framework_res)
-            .arg("--system-file")
-            .arg(format!("{}=etc/font_fallback.xml", self.font_xml.display()))
-            .arg("--system-file")
-            .arg(format!("{}=fonts/{FONT_FILE}", self.font_file.display()))
+            .arg("--file")
+            .arg(format!(
+                "{}=/system/etc/font_fallback.xml",
+                self.font_xml.display()
+            ))
+            .arg("--file")
+            .arg(format!(
+                "{}=/system/fonts/{FONT_FILE}",
+                self.font_file.display()
+            ))
             .args(tree::KEYBOARD_FILES.iter().flat_map(|(file, dir)| {
                 [
-                    "--system-file".to_owned(),
-                    format!("{}={dir}/{file}", self.keychars.join(file).display()),
+                    "--file".to_owned(),
+                    format!(
+                        "{}=/system/{dir}/{file}",
+                        self.keychars.join(file).display()
+                    ),
                 ]
             }))
             .args(["--first-uid", &run.first_uid.to_string()])

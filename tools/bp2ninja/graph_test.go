@@ -148,7 +148,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], shared_libs: ["libuser"], static_l
 func TestDevicePlatform(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `cc_library { name: "libc", srcs: ["c.cc"] }`})
 	g.soong = SoongConfig{CStd: "gnu11", CppStd: "gnu++20", APILevel: "-D__ANDROID_API__=10000", SystemSharedLibs: []string{"libc", "libm", "libdl"}}
-	g.provided = map[string]Provided{"libc": {Libs: []string{"/c/lib/libatl_bionic.so"}, Include: []string{"/c/include"}}}
+	g.provided = map[string]Provided{"libc": {Lib: "/c/lib/libatl_bionic.so", Include: []string{"/c/include"}}}
 	p := g.devicePlatform("clang-19")
 	if p.CC != "clang-19" {
 		t.Errorf("cc %q", p.CC)
