@@ -168,7 +168,7 @@ impl IContentService for ContentService {
     ) -> binder::Result<()> {
         let target = resolve_user(user_handle, ThreadState::get_calling_uid())?;
         if (flags & NOTIFY_SYNC_TO_NETWORK) != 0 {
-            counters::count(
+            counters::answered(
                 INTERFACE,
                 "notifyChange sync to network (not kept: no SyncManager)",
             );

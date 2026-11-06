@@ -877,7 +877,7 @@ impl Runtime {
     }
 }
 
-/// One service counter: what it counts (`unimplemented` call or `refused` parcelable), its name and its total.
+/// One service counter: its kind (`unimplemented`, `answered`, `refused`, `sent`), its name and its total.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counter {
     pub kind: String,
@@ -911,11 +911,12 @@ pub fn without_stamp(line: &str) -> &str {
     line.rsplit_once(" at=").map_or(line, |(head, _)| head)
 }
 
-/// Every counter line of the services' log, in log order: `services: unimplemented|refused|sent <interface>.<method> <n> at=<stamp>`
+/// Every counter line of the services' log, in log order: `services: unimplemented|answered|refused|sent <interface>.<method> <n> at=<stamp>`
 /// (atl_services::counters), and `parcelables: refused <what> <n> at=<stamp>` (atl_parcelables `refuse`). A line without a parsable stamp is not one.
 pub fn events(services_log: &str) -> Vec<Event> {
-    const KINDS: [(&str, &str); 4] = [
+    const KINDS: [(&str, &str); 5] = [
         ("services: unimplemented ", "unimplemented"),
+        ("services: answered ", "answered"),
         ("services: refused ", "refused"),
         ("services: sent ", "sent"),
         ("parcelables: refused ", "refused"),
@@ -1068,7 +1069,7 @@ mod tests {
         }
     }
 
-    /// Both counter kinds, the last count per name wins, a name with spaces keeps them, other lines are ignored, and a counter line without a stamp is not one.
+    /// Every counter kind, the last count per name wins, a name with spaces keeps them, other lines are ignored, and a counter line without a stamp is not one.
     #[test]
     fn counter_lines_take_the_last_count_of_each_kind() {
         let log = "services: ready\n\
@@ -1079,10 +1080,13 @@ mod tests {
                    parcelables: refused android.content.Intent.extras 2 at=100.004\n\
                    services: Failure reporting\n\
                    services: sent IInputMethodManager.IInputMethod.bindInput 1 at=100.005\n\
+                   services: answered IInputMethodManager.addClient 1 at=100.006\n\
+                   services: answered IInputMethodManager.addClient 2 at=100.007\n\
                    services: unimplemented IPackageManager.getMoveStatus 9\n";
         assert_eq!(
             counter_lines(log),
             [
+                "answered IInputMethodManager.addClient x2",
                 "refused android.content.Intent.extras x2",
                 "refused android.os.Bundle (value type) x1",
                 "sent IInputMethodManager.IInputMethod.bindInput x1",

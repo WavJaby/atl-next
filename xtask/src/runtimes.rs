@@ -5,6 +5,7 @@
 //! Output: `<out>/upstream/llvm-project/<arch>/<variant>/` (CMake build dir, `build.log`), then the licence gate over every object those builds compiled. Run by `xtask native --native-bridge <arch>` in two passes: the static runtimes before the converter, whose run links them (-nb-provided);
 //! `libc++.so` (SHARED) after the converter's ninja built the guest libc it links against, before the ninja run that links its dependents.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -501,4 +502,149 @@ fn find(dir: &Path, prefix: &str) -> Result<Option<PathBuf>> {
     }
     ensure!(hits.len() <= 1, "several {prefix}: {hits:?}");
     Ok(hits.pop())
+}
+
+/// Builder classes of AOSP's llvm_android `builders.py` whose literal defines the variants above mirror:
+/// variant name -> class. `builtins` is not mapped: BuiltinsBuilder sets none of its defines as literals.
+const MIRRORS: &[(&str, &str)] = &[
+    ("libcxx-noexcept", "DeviceLibcxxBuilder"),
+    ("libcxx", "DeviceLibcxxBuilder"),
+    ("libcxx-shared", "DeviceLibcxxBuilder"),
+    ("libunwind", "LibUnwindBuilder"),
+    ("libunwind-exported", "LibUnwindBuilder"),
+];
+
+/// The pinned llvm_android checkout's builder script (sources.toml `llvm-android`), relative to `src/`.
+const BUILDERS_PY: &str = "llvm-android/src/llvm_android/builders.py";
+
+/// Per key, the values that `defines['K'] = 'V'` lines of class `class` set literally. A line whose value is a
+/// condition (`'A' if c else 'B'`) is not literal and is skipped.
+fn literal_defines(text: &str, class: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let header = format!("class {class}(");
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut inside = false;
+    for line in text.lines() {
+        // a column-0 line (class, def, import, comment) ends the previous class body
+        if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            inside = line.starts_with(&header);
+            continue;
+        }
+        let Some((key, value)) = line
+            .trim_start()
+            .strip_prefix("defines['")
+            .and_then(|rest| rest.split_once("'] = '"))
+            .and_then(|(key, rest)| Some((key, rest.strip_suffix('\'')?)))
+        else {
+            continue;
+        };
+        if inside && !value.contains('\'') {
+            out.entry(key.to_owned())
+                .or_default()
+                .insert(value.to_owned());
+        }
+    }
+    out
+}
+
+/// The variant's defines against its class: a define the class sets literally must have that value among its
+/// literal values. Returns the problems and the count of defines the class does not set literally (not judged).
+fn mirror_problems(
+    variant: &Variant,
+    class: &str,
+    upstream: &BTreeMap<String, BTreeSet<String>>,
+) -> (Vec<String>, usize) {
+    let mut problems = Vec::new();
+    let mut unjudged = 0;
+    for &(key, value) in variant.cache {
+        match upstream.get(key) {
+            None => unjudged += 1,
+            Some(values) if values.contains(value) => {}
+            Some(values) => problems.push(format!(
+                "`{}`: {key}={value} here, but {class} sets {key} to {values:?}",
+                variant.name
+            )),
+        }
+    }
+    (problems, unjudged)
+}
+
+/// `xtask check` step `runtimes`: each mirrored variant agrees with builders.py on every define that builders.py
+/// sets as a literal. A changed upstream value, or a value that differs here, is named by its define.
+pub fn check(root: &Path) -> Result<()> {
+    let path = Layout::of(root)?.src().join(BUILDERS_PY);
+    ensure!(
+        path.is_file(),
+        "{} is not fetched (cargo xtask fetch --execute)",
+        path.display()
+    );
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut problems = Vec::new();
+    let mut unjudged = 0;
+    for &(name, class) in MIRRORS {
+        let variant = VARIANTS
+            .iter()
+            .chain(std::iter::once(&SHARED))
+            .find(|v| v.name == name)
+            .with_context(|| format!("MIRRORS names no variant `{name}`"))?;
+        let (found, not_literal) = mirror_problems(variant, class, &literal_defines(&text, class));
+        problems.extend(found);
+        unjudged += not_literal;
+    }
+    ensure!(
+        problems.is_empty(),
+        "runtimes.rs differs from builders.py:\n  {}",
+        problems.join("\n  ")
+    );
+    eprintln!(
+        "runtimes: {} variants match builders.py ({unjudged} defines not set as literals upstream, not judged)",
+        MIRRORS.len()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    // builders.py's shape: a class with literal and conditional defines, a second class, a column-0 def
+    const SAMPLE: &str = "class Other(base):\n    defines['OTHER_ONLY'] = 'ON'\n\nclass DeviceLibcxxBuilder(base):\n    def f(self):\n        defines['LIBCXX_ENABLE_SHARED'] = 'ON'\n        defines['LIBCXXABI_ENABLE_SHARED'] = 'OFF'\n        if self.p:\n            defines['LIBCXX_ENABLE_SHARED'] = 'OFF'\n        defines['LIBUNWIND_HIDE_SYMBOLS'] = 'TRUE' if x else 'FALSE'\n\ndef top():\n    defines['TOP_ONLY'] = 'ON'\n";
+
+    #[test]
+    fn literal_defines_of_one_class() {
+        let d = literal_defines(SAMPLE, "DeviceLibcxxBuilder");
+        assert_eq!(
+            d.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["LIBCXXABI_ENABLE_SHARED", "LIBCXX_ENABLE_SHARED"]
+        );
+        assert_eq!(
+            d["LIBCXX_ENABLE_SHARED"],
+            BTreeSet::from(["ON".to_owned(), "OFF".to_owned()])
+        );
+    }
+
+    #[test]
+    fn drift_names_the_define() {
+        let upstream = literal_defines(SAMPLE, "DeviceLibcxxBuilder");
+        let ours = Variant {
+            name: "test",
+            runtimes: "",
+            cache: &[
+                ("LIBCXX_ENABLE_SHARED", "ON"),
+                ("LIBCXXABI_ENABLE_SHARED", "ON"),
+                ("LIBCXX_NOT_IN_CLASS", "OFF"),
+            ],
+            cflags: "",
+            cxxflags: "",
+            modules: &[],
+            staged: &[],
+        };
+        let (problems, not_literal) = mirror_problems(&ours, "DeviceLibcxxBuilder", &upstream);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("LIBCXXABI_ENABLE_SHARED=ON"),
+            "{problems:?}"
+        );
+        assert_eq!(not_literal, 1);
+    }
 }

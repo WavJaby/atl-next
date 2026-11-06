@@ -56,7 +56,7 @@ impl IAudioService for AudioService {
 
     /// The click sound: nothing plays yet. Counted, so a run shows the call.
     fn r#playSoundEffect(&self, _effect_type: i32, _user_id: i32) -> binder::Result<()> {
-        counters::count(INTERFACE, "playSoundEffect");
+        counters::answered(INTERFACE, "playSoundEffect");
         Ok(())
     }
 }

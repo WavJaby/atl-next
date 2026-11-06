@@ -123,9 +123,10 @@ pub fn java_tools(root: &Path, host: &str, java_out: &Path) -> Result<(PathBuf, 
             format!("{host}: no host row with soong_prebuilt_os (no prebuilt JDK or host ART)")
         })?;
     let layout = Layout::of(root)?;
+    let jdk = crate::deps::aosp_project(root, "jdk")?;
     Ok((
         java_out.join("host/bin/d8"),
-        arches::java_tools(&tree::shared_tree(&layout), os).0,
+        arches::java_tools(&tree::shared_tree(&layout), os, &jdk).0,
     ))
 }
 

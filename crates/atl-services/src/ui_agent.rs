@@ -129,7 +129,7 @@ fn on_transact(
             service.dim_layer(layer_id, amount, width, height)
         }
         _ => {
-            counters::count(INTERFACE, &format!("code {code}"));
+            counters::count_unimplemented(INTERFACE, &format!("code {code}"));
             Err(StatusCode::UNKNOWN_TRANSACTION)
         }
     }

@@ -28,6 +28,7 @@ use atl_aidl::aidl::android::os::IServiceManager::{BnServiceManager, IServiceMan
 use atl_aidl::aidl::android::os::Service::Service;
 use atl_aidl::aidl::android::os::ServiceDebugInfo::ServiceDebugInfo;
 use atl_aidl::aidl::android::os::ServiceWithMetadata::ServiceWithMetadata;
+use atl_services::counters;
 use binder::unstable_api::{AsNative, new_spibinder};
 use binder::{BinderFeatures, ExceptionCode, FromIBinder, SpIBinder, Status, StatusCode, Strong};
 
@@ -88,7 +89,8 @@ struct View;
 impl binder::Interface for View {}
 
 impl IServiceManager for View {
-    fn r#unimplemented(&self, _method: &'static str) -> Status {
+    fn r#unimplemented(&self, method: &'static str) -> Status {
+        counters::count_unimplemented("IServiceManager", method);
         Status::from(StatusCode::UNKNOWN_TRANSACTION)
     }
 

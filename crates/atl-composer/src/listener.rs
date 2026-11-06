@@ -4,6 +4,7 @@
 
 use atl_compositor::callbacks::LISTENER_DESCRIPTOR;
 use atl_libgui_parcel::parcel::WireParcel;
+use atl_services::counters;
 use binder::binder_impl::{Binder, BorrowedParcel, FLAG_ONEWAY, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
@@ -21,10 +22,11 @@ declare_binder_interface! {
 /// The listener lives in libgui; this side never serves it.
 fn on_transact(
     _: &dyn ITransactionCompletedListener,
-    _: TransactionCode,
+    code: TransactionCode,
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
+    counters::count_unimplemented("ITransactionCompletedListener", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

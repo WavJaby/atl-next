@@ -59,11 +59,13 @@ enum Step {
     Converter,
     /// the distro libc++ headers under the converter's device C++ flags: -D__ANDROID__ changes no macro beyond the expected and no object byte
     Libcxx,
+    /// AOSP llvm_android's builders.py agrees with runtimes.rs on every define it sets as a literal
+    Runtimes,
     /// clippy + unit tests on the packages that link converter modules (feature `converter`), against the native out dir's graph; skipped without one
     ConverterPackages,
 }
 
-const ALL: [Step; 15] = [
+const ALL: [Step; 16] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -78,6 +80,7 @@ const ALL: [Step; 15] = [
     Step::Test,
     Step::Converter,
     Step::Libcxx,
+    Step::Runtimes,
     Step::ConverterPackages,
 ];
 
@@ -98,6 +101,7 @@ impl Step {
             Step::Test => "test",
             Step::Converter => "converter",
             Step::Libcxx => "libcxx",
+            Step::Runtimes => "runtimes",
             Step::ConverterPackages => "converter-packages",
         }
     }
@@ -233,6 +237,7 @@ impl Step {
             Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
+            Step::Runtimes => crate::runtimes::check(root),
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
         }
     }

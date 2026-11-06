@@ -48,7 +48,7 @@ const MODE_ID: i32 = 0;
 const DENSITY_DEFAULT_DPI: f32 = 160.0;
 
 fn unimplemented(interface: &'static str, method: &str) -> Status {
-    counters::count(interface, method);
+    counters::count_unimplemented(interface, method);
     StatusCode::UNKNOWN_TRANSACTION.into()
 }
 

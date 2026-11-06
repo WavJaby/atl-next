@@ -1201,7 +1201,7 @@ fn burst_check(app: &str, services: &str, steps: &Result<Steps, String>) -> Resu
     Ok(format!("bounds {burst:?}, laid out at {want:?}"))
 }
 
-/// The last value of a services counter (`services: unimplemented <interface>.<method> N at=T`); 0 if it never counted.
+/// The last value of a services counter (`services: <kind> <interface>.<method> N at=T`); 0 if it never counted.
 fn counter(services: &str, method: &str) -> u32 {
     services
         .lines()
@@ -2151,7 +2151,7 @@ mod tests {
     #[test]
     fn lifecycle_check_tells_the_three_lives_apart() {
         let steps: Result<Steps, String> = Ok(((6, 4), (3, 1)));
-        let count = |name: &str, n: u32| format!("services: unimplemented I.{name} {n} at=1\n");
+        let count = |name: &str, n: u32| format!("services: answered I.{name} {n} at=1\n");
         let create = format!("{CREATE_LINE}\n");
         let grown = format!("{LAYOUT_LINE}6x4 x\n");
         let told = |dp: i32| format!("{CHANGED_LINE} screenWidthDp={dp}\n");
@@ -2163,7 +2163,7 @@ mod tests {
         assert!(check(&twice, &sent, Lifecycle::Kept).is_err());
 
         let relaunched = format!(
-            "{}services: unimplemented {RELAUNCHED_COUNTER}1 at=1\n",
+            "{}services: answered {RELAUNCHED_COUNTER}1 at=1\n",
             count(RELAUNCH_COUNTER, 1)
         );
         assert!(check(&twice, &relaunched, Lifecycle::Relaunches).is_ok());
@@ -2216,12 +2216,12 @@ mod tests {
         assert!(burst_check(&layout(last), &uncoalesced, &steps).is_err());
     }
 
-    /// An unanswered setInTouchMode counts under its bare name (counters::unimplemented): only the answered line passes.
+    /// An unanswered setInTouchMode counts under its bare name (counters::count_unimplemented): only the answered line passes.
     #[test]
     fn touch_mode_check_needs_the_answered_line() {
-        let line = |m: &str| format!("services: unimplemented IWindowManager.{m} 1 at=1.000");
-        assert!(touch_mode_check(&line("setInTouchMode (answered)")).is_ok());
-        assert!(touch_mode_check(&line("setInTouchMode")).is_err());
+        let line = |kind: &str, m: &str| format!("services: {kind} IWindowManager.{m} 1 at=1.000");
+        assert!(touch_mode_check(&line("answered", "setInTouchMode (answered)")).is_ok());
+        assert!(touch_mode_check(&line("unimplemented", "setInTouchMode")).is_err());
         assert!(touch_mode_check("").is_err());
     }
 

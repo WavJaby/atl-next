@@ -146,7 +146,7 @@ impl ActivityTasks {
         Some(match step {
             Step::Launch(launch) => {
                 let Some(p) = self.packages.by_name(&launch.package) else {
-                    counters::count(ATM, "launch of a package not installed");
+                    counters::answered(ATM, "launch of a package not installed");
                     return None;
                 };
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(

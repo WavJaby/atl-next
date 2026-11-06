@@ -50,7 +50,7 @@ uses = ["generators", "bionic", "composer", "platform-ui", "service-view"]
 [service-view]
 crates = ["atl-service-view"]
 exports = ["atl-service-view"]
-uses = ["aidl", "generators"]
+uses = ["aidl", "generators", "services"]
 
 # the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules
 [composer]

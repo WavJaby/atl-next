@@ -10,6 +10,7 @@ use atl_services::compositor_registry::{
     DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
     SURFACE_FLINGER_AIDL,
 };
+use atl_services::counters;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
@@ -51,10 +52,11 @@ declare_binder_interface! {
 /// The registry lives in the system process; this side only calls it.
 fn on_transact(
     _: &dyn IRegistry,
-    _: TransactionCode,
+    code: TransactionCode,
     _: &BorrowedParcel<'_>,
     _: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
+    counters::count_unimplemented("IRegistry", &format!("code {code}"));
     Err(StatusCode::UNKNOWN_TRANSACTION)
 }
 

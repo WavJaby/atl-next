@@ -74,7 +74,7 @@ impl Inner {
                 return;
             };
             if let Err(e) = callback.r#show(Some(&window_token)) {
-                counters::count(INTERFACE, &format!("toast show refused: {e:?}"));
+                counters::answered(INTERFACE, &format!("toast show refused: {e:?}"));
                 self.remove(id);
                 continue;
             }
@@ -92,7 +92,7 @@ impl Inner {
                     inner.cancel(id);
                 });
             if spawned.is_err() {
-                counters::count(INTERFACE, "toast timer: no thread");
+                counters::answered(INTERFACE, "toast timer: no thread");
             }
             return;
         }
@@ -120,7 +120,7 @@ impl Inner {
             (t, i == 0)
         };
         if let Err(e) = toast.callback.r#hide() {
-            counters::count(INTERFACE, &format!("toast hide refused: {e:?}"));
+            counters::answered(INTERFACE, &format!("toast hide refused: {e:?}"));
         }
         let inner = Arc::clone(self);
         let window_token = toast.window_token.clone();
@@ -131,7 +131,7 @@ impl Inner {
                 inner.finish(|w| *w == window_token);
             });
         if spawned.is_err() {
-            counters::count(INTERFACE, "toast token timer: no thread");
+            counters::answered(INTERFACE, "toast token timer: no thread");
         }
         if was_head {
             self.show_next();
@@ -243,7 +243,7 @@ impl INotificationManager for NotificationManager {
             });
             st.queue.len() == 1
         };
-        counters::count(INTERFACE, "enqueueToast (queued)");
+        counters::answered(INTERFACE, "enqueueToast (queued)");
         if head {
             inner.show_next();
         }

@@ -253,6 +253,9 @@ pub fn sum_counters(per_module: &[Vec<Counter>]) -> Vec<Counter> {
     out
 }
 
+/// Counter kinds the ranked list shows: calls the services could not serve (unimplemented) and parcelables they refused (codec gaps). The other kinds (answered, sent) are served calls, summed per kind only.
+const ACTIONABLE: [&str; 2] = ["unimplemented", "refused"];
+
 /// The one-screen summary: a table row per module, the totals, then the `top` counters.
 pub fn summary(report: &Report, top: usize) -> Vec<String> {
     let width = report
@@ -292,14 +295,28 @@ pub fn summary(report: &Report, top: usize) -> Vec<String> {
         sum(|m| m.ignored),
         sum(|m| m.total)
     ));
-    if !report.counters.is_empty() {
+    // what the services could not serve or refused is work to do; served calls are totals, not ranked
+    let actionable = |c: &&Counter| ACTIONABLE.contains(&c.kind.as_str());
+    let ranked: Vec<&Counter> = report.counters.iter().filter(actionable).collect();
+    if !ranked.is_empty() {
         lines.push(format!(
-            "top counters (of {}, summed over the modules):",
-            report.counters.len()
+            "top counters (unimplemented and refused; of {}, summed over the modules):",
+            ranked.len()
         ));
-        for c in report.counters.iter().take(top) {
+        for c in ranked.iter().take(top) {
             lines.push(format!("  {:>6}  {} {}", c.count, c.kind, c.name));
         }
+    }
+    let mut served: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    for c in report.counters.iter().filter(|c| !actionable(c)) {
+        let e = served.entry(c.kind.as_str()).or_default();
+        e.0 += c.count;
+        e.1 += 1;
+    }
+    for (kind, (total, names)) in served {
+        lines.push(format!(
+            "{kind} (not ranked): {total} calls over {names} names"
+        ));
     }
     lines
 }
@@ -580,6 +597,33 @@ mod tests {
         );
         assert!(lines.last().is_some_and(|l| l.ends_with("refused x")));
         assert!(!lines.iter().any(|l| l.ends_with("unimplemented y")));
+    }
+
+    /// Served calls (answered, sent) are totals per kind, never ranked: the ranked list holds only what the services could not serve or refused.
+    #[test]
+    fn served_counters_are_totals_not_ranked() {
+        let mut r = report(vec![module("Alpha", State::Ran, &[])]);
+        let c = |kind: &str, name: &str, count| Counter {
+            kind: kind.into(),
+            name: name.into(),
+            count,
+        };
+        r.counters = vec![
+            c("answered", "a", 90),
+            c("answered", "b", 10),
+            c("unimplemented", "y", 1),
+        ];
+        let lines = summary(&r, 5);
+        assert!(lines.iter().any(|l| l.ends_with("unimplemented y")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("answered a") || l.contains("answered b"))
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("answered (not ranked): 100 calls over 2 names")
+        );
     }
 
     /// A BUILD_FAIL detail loses the workspace prefix of its paths; a path outside the workspace keeps its own.

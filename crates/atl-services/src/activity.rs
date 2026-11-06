@@ -695,11 +695,11 @@ impl Inner {
                 ) {
                     Delivery::Nothing => continue,
                     Delivery::Wait => {
-                        counters::count(AM, "configuration change waits for the relaunch");
+                        counters::answered(AM, "configuration change waits for the relaunch");
                         continue;
                     }
                     Delivery::Send => {
-                        counters::count(
+                        counters::answered(
                             AM,
                             "configuration change sent (ActivityConfigurationChangeItem)",
                         );
@@ -715,7 +715,10 @@ impl Inner {
                         changes,
                         preserve_window,
                     } => {
-                        counters::count(AM, "configuration change relaunch (ActivityRelaunchItem)");
+                        counters::answered(
+                            AM,
+                            "configuration change relaunch (ActivityRelaunchItem)",
+                        );
                         relaunching = true;
                         // the lifecycle items after the relaunch come from the machine: Resume only for a resumed activity
                         let mut items = vec![Some(ClientTransactionItem::ActivityRelaunch(
@@ -987,7 +990,7 @@ impl Inner {
     /// BroadcastQueueImpl.onApplicationCleanupLocked + the ReceiverList cleanup of a dead process: its registrations and waiting deliveries go; dropped deliveries are counted.
     fn broadcasts_died(st: &mut State, pid: i32) {
         for _ in 0..st.broadcasts.process_died(pid) {
-            counters::count(AM, "broadcast dropped: its process died before attaching");
+            counters::answered(AM, "broadcast dropped: its process died before attaching");
         }
     }
 
@@ -1027,14 +1030,14 @@ impl Inner {
         user: i32,
     ) {
         let Some(p) = self.packages.by_name(package) else {
-            counters::count(
+            counters::answered(
                 AM,
                 "broadcast to a component of an unknown package: no receiver",
             );
             return;
         };
         let Some(decl) = p.receivers.iter().find(|r| r.name == class && r.enabled) else {
-            counters::count(
+            counters::answered(
                 AM,
                 "broadcast to a component that is no enabled <receiver>: no receiver",
             );
@@ -1054,7 +1057,7 @@ impl Inner {
             |perm| self.holds(sender_uid, perm),
             |perm| self.holds(p.uid, perm),
         ) {
-            counters::count(
+            counters::answered(
                 AM,
                 "broadcast skipped: Permission Denial (manifest receiver)",
             );
@@ -1111,13 +1114,13 @@ impl Inner {
             None => {
                 if let Err(e) = self.start_process_locked(st, p, &process_name, false, None) {
                     // BroadcastQueueImpl:1037-1050: the start failed, the delivery fails
-                    counters::count(AM, "broadcast dropped: receiver process start failed");
+                    counters::answered(AM, "broadcast dropped: receiver process start failed");
                     log(format_args!(
                         "Unable to launch app {process_name} for broadcast {component}: {e}"
                     ));
                     return;
                 }
-                counters::count(AM, "broadcast cold start (scheduleReceiverColdLocked)");
+                counters::answered(AM, "broadcast cold start (scheduleReceiverColdLocked)");
                 st.processes.last().map(|r| r.pid).unwrap_or_default()
             }
         };
@@ -1498,7 +1501,7 @@ impl IActivityManager for ActivityManager {
             ),
         ] {
             if flags & flag != 0 {
-                counters::count(AM, &format!("startInstrumentation ({what} ignored)"));
+                counters::answered(AM, &format!("startInstrumentation ({what} ignored)"));
             }
         }
 
@@ -1553,14 +1556,14 @@ impl IActivityManager for ActivityManager {
         let default_process = match decl.target_processes.as_deref() {
             None => target.process_name().to_owned(),
             Some("*") => {
-                counters::count(AM, "startInstrumentation (targetProcesses=*)");
+                counters::answered(AM, "startInstrumentation (targetProcesses=*)");
                 target.process_name().to_owned()
             }
             Some(list) => {
                 let mut names = list.split(',');
                 let first = names.next().unwrap_or_default().to_owned();
                 if names.next().is_some() {
-                    counters::count(AM, "startInstrumentation (more than one target process)");
+                    counters::answered(AM, "startInstrumentation (more than one target process)");
                 }
                 first
             }
@@ -1687,7 +1690,7 @@ impl IActivityManager for ActivityManager {
             ));
         }
         if serialized || result_to.is_some() {
-            counters::count(
+            counters::answered(
                 AM,
                 "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
             );
@@ -1749,7 +1752,7 @@ impl IActivityManager for ActivityManager {
             ),
             Some(_) => {}
             None if !registered_only => {
-                counters::count(
+                counters::answered(
                     AM,
                     "implicit broadcast: manifest receivers not resolved (P2)",
                 );
@@ -1766,7 +1769,7 @@ impl IActivityManager for ActivityManager {
                     |p| inner.holds(uid, p),
                     |p| inner.holds(ruid, p),
                 ) {
-                    counters::count(AM, why.split(':').next().unwrap_or("skipped"));
+                    counters::answered(AM, why.split(':').next().unwrap_or("skipped"));
                     log(format_args!("{why}"));
                     continue;
                 }
@@ -1828,7 +1831,7 @@ impl IActivityManager for ActivityManager {
                 .broadcasts
                 .unregister(&ReceiverHandle(r.clone()));
             if !removed {
-                counters::count(AM, "unregisterReceiver: not registered");
+                counters::answered(AM, "unregisterReceiver: not registered");
             }
         }
         Ok(())
@@ -1845,7 +1848,7 @@ impl IActivityManager for ActivityManager {
         _abort_broadcast: bool,
         _flags: i32,
     ) -> binder::Result<()> {
-        counters::count(AM, "finishReceiver (non-ordered: nothing waits)");
+        counters::answered(AM, "finishReceiver (non-ordered: nothing waits)");
         Ok(())
     }
 
@@ -1897,7 +1900,7 @@ impl IActivityManager for ActivityManager {
         let export = broadcast::register_export(flags, receiver.is_some(), target_sdk)
             .map_err(|m| illegal_argument(&m))?;
         if export.flag_missing_unchecked {
-            counters::count(
+            counters::answered(
                 AM,
                 "registerReceiver without RECEIVER_EXPORTED / NOT_EXPORTED at targetSdk >= 34 (protected-broadcast list not loaded: taken as exported)",
             );
@@ -1920,7 +1923,7 @@ impl IActivityManager for ActivityManager {
             .register(handle, pid, uid, user, bf)
             .map_err(|m| illegal_argument(&m))?
         {
-            counters::count(AM, "registerReceiver: filter already registered");
+            counters::answered(AM, "registerReceiver: filter already registered");
         }
         let mut first = None;
         for s in stickies {
@@ -2011,7 +2014,7 @@ impl IActivityClientController for ActivityClientController {
                 .upgrade()
                 .is_some_and(|inner| inner.atm.resumed(token));
             if !known {
-                counters::count(ACC, "activityResumed: no such activity");
+                counters::answered(ACC, "activityResumed: no such activity");
             }
         }
         Ok(())
@@ -2024,7 +2027,7 @@ impl IActivityClientController for ActivityClientController {
             _ => false,
         };
         if !known {
-            counters::count(ACC, "activityPaused: no such activity");
+            counters::answered(ACC, "activityPaused: no such activity");
         }
         Ok(())
     }
@@ -2042,14 +2045,14 @@ impl IActivityClientController for ActivityClientController {
             _ => false,
         };
         if !known {
-            counters::count(ACC, "activityStopped: no such activity");
+            counters::answered(ACC, "activityStopped: no such activity");
         }
         Ok(())
     }
 
     /// ActivityClientController.activityDestroyed (oneway): nothing to do, the record left the stack when its Destroy was sent. Counted.
     fn r#activityDestroyed(&self, _token: Option<&SpIBinder>) -> binder::Result<()> {
-        counters::count(ACC, "activityDestroyed (the record left at its Destroy)");
+        counters::answered(ACC, "activityDestroyed (the record left at its Destroy)");
         Ok(())
     }
 
@@ -2062,11 +2065,11 @@ impl IActivityClientController for ActivityClientController {
         finish_task: i32,
     ) -> binder::Result<bool> {
         let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
-            counters::count(ACC, "finishActivity: no token");
+            counters::answered(ACC, "finishActivity: no token");
             return Ok(false);
         };
         if finish_task != 0 {
-            counters::count(ACC, "finishActivity (finishTask not modelled: refused)");
+            counters::answered(ACC, "finishActivity (finishTask not modelled: refused)");
             return Ok(false);
         }
         Ok(inner.atm.finish(token))
@@ -2080,10 +2083,10 @@ impl IActivityClientController for ActivityClientController {
     /// ActivityClientController.activityRelaunched (ActivityThread.reportRelaunch): the relaunch ended. Oneway, so a token-less call is only counted.
     fn r#activityRelaunched(&self, token: Option<&SpIBinder>) -> binder::Result<()> {
         let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
-            counters::count(ACC, "activityRelaunched: no token");
+            counters::answered(ACC, "activityRelaunched: no token");
             return Ok(());
         };
-        counters::count(ACC, "activityRelaunched");
+        counters::answered(ACC, "activityRelaunched");
         inner.relaunch_finished(token);
         Ok(())
     }
@@ -2095,10 +2098,10 @@ impl IActivityClientController for ActivityClientController {
         sizes: Option<&SizeConfigurationBuckets>,
     ) -> binder::Result<()> {
         let Some(token) = token else {
-            counters::count(ACC, "reportSizeConfigurations: no token");
+            counters::answered(ACC, "reportSizeConfigurations: no token");
             return Ok(());
         };
-        counters::count(ACC, "reportSizeConfigurations (kept per activity)");
+        counters::answered(ACC, "reportSizeConfigurations (kept per activity)");
         self.buckets.set(token, sizes.map(SizeBuckets::from));
         Ok(())
     }
@@ -2110,7 +2113,7 @@ impl IActivityClientController for ActivityClientController {
         _token: Option<&SpIBinder>,
         _values: Option<&ActivityManager_TaskDescription>,
     ) -> binder::Result<()> {
-        counters::count(ACC, "setTaskDescription (not kept: no recents)");
+        counters::answered(ACC, "setTaskDescription (not kept: no recents)");
         Ok(())
     }
 }

@@ -5,21 +5,32 @@
 #
 # Row key: logical name. A row has exactly one source:
 #   distro  debian, arch        package name per distro (Arch: x86_64 only); absent = not packaged there
-#           pkgconfig           libraries only: pkg-config module; their versions are checked through it
-#           min, min_reason     minimum upstream version and why: the pkg-config version for libraries,
-#                               else the package version without epoch and revision
 #   cargo   cargo, version      crate installed with `cargo install --locked`, exact version
 #   rustup  rustup_target       std of another rustc target for the rust-toolchain.toml toolchain (`rustup target add`)
+#   aosp    aosp                tree path of a [aosp.projects] entry in sources.toml: the pinned copy in src/aosp
+# Fields:
+#   binary        executable xtask runs: a bare name on PATH (distro), a path inside the project (aosp, optional)
+#   version_arg   argument that prints the version (default `--version`; go: `version`)
+#   pkgconfig     libraries only: pkg-config module; its version is checked through it
+#   min, min_reason
+#                 distro row with binary: the binary's reported version (first dotted number of
+#                 `<binary> <version_arg>`) must be >= min. Other distro rows: pkg-config or package version.
+#                 aosp rows take no min: the pin is the version. A min without an upstream requirement records
+#                 the version observed on 2026-11-07 (min_reason says so): older is untested.
 # Every row:
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
 #            upstream:<sources.toml name or aosp>, xtask:<subcommand>
-# Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check).
+# Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle,
+# the Android SDK and apkeep (their only callers are test-APK scripts outside the repo, so no consumer to check).
 # Rows are added when a consumer first needs them.
 
 [bison]
 debian = "bison"
 arch = "bison"
+binary = "bison"
+min = "3.8.2"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
@@ -27,6 +38,9 @@ used_by = ["xtask:native"]
 [bubblewrap]
 debian = "bubblewrap"
 arch = "bubblewrap"
+binary = "bwrap"
+min = "0.12.0"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["runtime", "test"]
 used_by = ["crate:atl-broker", "xtask:test"]
 
@@ -47,23 +61,57 @@ used_by = ["xtask:check"]
 [clang]
 debian = "clang-19"
 arch = "clang"
+binary = "clang-19"
+min = "19.1.7"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# the C++ driver: native's --cxx default and the libc++ gate (libcxx_gate.rs); same package as `clang`
+[clang-cxx]
+debian = "clang-19"
+arch = "clang"
+binary = "clang++-19"
+min = "19.1.7"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["build"]
+used_by = ["xtask:native", "xtask:check"]
 
 # CMake only for upstream BoringSSL (CLAUDE.md); its CMakeLists.txt needs 3.22
 [cmake]
 debian = "cmake"
 arch = "cmake"
+binary = "cmake"
 min = "3.22"
 min_reason = "BoringSSL CMakeLists.txt: cmake_minimum_required(VERSION 3.22)"
 scope = ["build"]
 used_by = ["upstream:boringssl"]
 
+# the Java pipeline's d8: a bash script that runs r8.jar with `java` on PATH, so it runs with the `jdk` row's JDK first on PATH (atld_run.rs)
+[d8]
+aosp = "prebuilts/r8"
+binary = "d8"
+scope = ["build"]
+used_by = ["xtask:native", "xtask:run-apk"]
+
 [flex]
 debian = "flex"
 arch = "flex"
+binary = "flex"
+min = "2.6.4"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# build_pool.rs test: a killed holder frees its token, the holder being flock(1)
+[flock]
+debian = "util-linux"
+arch = "util-linux"
+binary = "flock"
+min = "2.41.5"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["test"]
+used_by = ["xtask:check"]
 
 # Mesa's GBM: the gralloc allocator service creates linear dma-bufs through libgbm on the host's DRM device (the gbm crate links it); the dev package carries gbm.pc and the lib link name. Arch ships libgbm in mesa.
 [gbm]
@@ -76,14 +124,21 @@ used_by = ["crate:atl-gralloc-service"]
 [git]
 debian = "git"
 arch = "git"
+binary = "git"
+min = "2.47.3"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build", "test"]
 used_by = ["xtask:aosp", "xtask:check", "xtask:fetch", "xtask:patch"]
 
 
-# Go builds the converter (tools/bp2ninja), the one Go program allowed (CLAUDE.md)
+# Go builds the converter (tools/bp2ninja), the one Go program allowed (CLAUDE.md); gofmt is the same package's and runs beside go (converter.rs)
 [go]
 debian = "golang-1.24-go"
 arch = "go"
+binary = "go"
+version_arg = "version"
+min = "1.24.4"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
@@ -96,6 +151,12 @@ min = "4.14"
 min_reason = "workspace Cargo.toml gtk4 feature v4_14: GDK_MEMORY_R8G8B8X8 and the other X8 formats, which opaque layers are uploaded as"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-platform-ui-linux"]
+
+# the one JDK: AOSP's prebuilt JDK 21 (pinned). Used by the converter's host Java tools, the test pipeline's javac and jar, and the Gradle test-APK builds outside the repo (JAVA_HOME). The per-OS subdirectory comes from arches.toml `soong_prebuilt_os`.
+[jdk]
+aosp = "prebuilts/jdk/jdk21"
+scope = ["build"]
+used_by = ["xtask:native", "xtask:run-apk"]
 
 # xtask native: rust_bindgen's bindgen loads the libclang of the `clang` row's clang (libclang_dir)
 [libclang]
@@ -131,18 +192,38 @@ used_by = ["upstream:aosp"]
 [lld]
 debian = "lld-19"
 arch = "lld"
+binary = "ld.lld"
+min = "19.1.7"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# the archiver (native --ar default; the converter's ninja rules run it)
 [llvm]
 debian = "llvm-19"
 arch = "llvm"
+binary = "llvm-ar-19"
+min = "19.1.7"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+# Mesa's build: meson_version '>= 1.1.0' (external/mesa3d/meson.build:9); mesa.rs runs `meson setup` with platforms=android
+[meson]
+debian = "meson"
+arch = "meson"
+binary = "meson"
+min = "1.1.0"
+min_reason = "Mesa meson.build:9: meson_version '>= 1.1.0'"
 scope = ["build"]
 used_by = ["xtask:native"]
 
 [ninja]
 debian = "ninja-build"
 arch = "ninja"
+binary = "ninja"
+min = "1.12.1"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
@@ -157,8 +238,21 @@ used_by = ["crate:atld"]
 [pkgconf]
 debian = "pkgconf"
 arch = "pkgconf"
+binary = "pkg-config"
+min = "1.8.1"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:deps", "xtask:native"]
+
+# AOSP genrule scripts run under it (tools/bp2ninja/genrule.go)
+[python3]
+debian = "python3"
+arch = "python"
+binary = "python3"
+min = "3.13.5"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 [python3-venv]
 debian = "python3-venv"
@@ -173,12 +267,43 @@ rustup_target = "x86_64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# the headless gates' nested compositor (nested_wayland.rs:5-8: labwc over sway)
+[labwc]
+debian = "labwc"
+binary = "labwc"
+min = "0.8"
+min_reason = "nested_wayland.rs:10: labwc >= 0.8"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 # xtask native's compiler cache (CompilerCache in native.rs): C/C++ compiles of the converter's builds, shared by every out dir
 [sccache]
 debian = "sccache"
 arch = "sccache"
+binary = "sccache"
+min = "0.10.0"
+min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# ChildGuard (nested_wayland.rs): `setpriv --pdeathsig TERM` ends the child when xtask dies
+[setpriv]
+debian = "util-linux"
+arch = "util-linux"
+binary = "setpriv"
+min = "2.41.5"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["test"]
+used_by = ["xtask:test"]
+
+[unshare]
+debian = "util-linux"
+arch = "util-linux"
+binary = "unshare"
+min = "2.41.5"
+min_reason = "observed 2026-11-07; older is untested"
+scope = ["runtime", "test"]
+used_by = ["xtask:run-apk"]
 
 [vulkan]
 debian = "libvulkan-dev"
@@ -191,6 +316,7 @@ used_by = ["upstream:aosp"]
 [yasm]
 debian = "yasm"
 arch = "yasm"
+binary = "yasm"
 min = "1.2.0"
 min_reason = "libjpeg-turbo BUILDING.md: if using Yasm, 1.2.0 or later is required"
 scope = ["build"]

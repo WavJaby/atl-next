@@ -32,12 +32,12 @@ const TEXT_LINE: &str = "AtlWindow: text input=";
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
 
-/// The services' client-death counter (counters::count's line: `services: unimplemented <interface>.<name> <n> at=...`) and removal line (input_method.rs State::client_died).
-const DEATH_COUNTER: &str = "unimplemented IInputMethodManager.client died";
+/// The services' client-death counter (counters::answered's line: `services: answered <interface>.<name> <n> at=...`) and removal line (input_method.rs State::client_died).
+const DEATH_COUNTER: &str = "answered IInputMethodManager.client died";
 const DEATH_LINE: &str = "services: input_method client uid=";
 const NONE_LEFT: &str = "entry removed, 0 clients left";
 /// The relaunched process's client: the second addClient, then the second onBindMethod (the counters' running counts, counters.rs line format).
-const READDED_LINE: &str = "unimplemented IInputMethodManager.addClient 2 ";
+const READDED_LINE: &str = "answered IInputMethodManager.addClient 2 ";
 const REBOUND_LINE: &str = "sent IInputMethodManager.IInputMethodClient.onBindMethod 2 ";
 
 /// The surrounding text (text, cursor byte, anchor byte) the fake IME held after the commit: the probe thread's, for `checks` (Liveness is shared by every stage).

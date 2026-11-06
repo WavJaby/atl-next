@@ -426,6 +426,7 @@ dependencies = [
  "anyhow",
  "atl-aidl",
  "atl-bridgegen",
+ "atl-services",
  "cxx",
  "cxx-build",
 ]

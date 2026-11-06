@@ -63,7 +63,7 @@ fn on_transact(
         return service.set_display(ThreadState::get_calling_uid(), &display);
     }
     if code != REGISTER {
-        counters::count(INTERFACE, &format!("code {code}"));
+        counters::count_unimplemented(INTERFACE, &format!("code {code}"));
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
     let ui_agent: SpIBinder = data.read()?;

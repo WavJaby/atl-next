@@ -63,7 +63,7 @@ impl Queue {
             .spawn(move || {
                 for (thread, job) in rx {
                     if let Err(e) = deliver(&thread, &job) {
-                        counters::count(BQ, "delivery failed (the app is not killed)");
+                        counters::answered(BQ, "delivery failed (the app is not killed)");
                         log(format_args!("Failed to schedule broadcast: {e}"));
                     }
                 }
@@ -92,7 +92,7 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
             initial_sticky,
             user,
         } => {
-            counters::count(BQ, "scheduleRegisteredReceiver");
+            counters::answered(BQ, "scheduleRegisteredReceiver");
             thread.r#scheduleRegisteredReceiver(
                 Some(receiver),
                 Some(intent),
@@ -116,7 +116,7 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
             extras,
             user,
         } => {
-            counters::count(BQ, "scheduleReceiver");
+            counters::answered(BQ, "scheduleReceiver");
             thread.r#scheduleReceiver(
                 Some(intent),
                 Some(info),

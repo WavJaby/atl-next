@@ -150,13 +150,10 @@ fn kernel_arch_matches(android_bp: &str, arches: &Arches) -> Result<()> {
 const SOONG_CONFIG_GO: &str = "aosp/build/soong/android/config.go";
 /// Tree-relative directory of the prebuilt build tools, one subdirectory per PrebuiltOS.
 const BUILD_TOOLS: &str = "prebuilts/build-tools";
-/// Soong's JDK (build/soong/java/config: prebuilts/jdk/jdk21), one subdirectory per PrebuiltOS.
-pub const JDK: &str = "prebuilts/jdk/jdk21";
-
-/// The converter's Java tools in AOSP tree `tree` for PrebuiltOS `os`: the JDK home and the prebuilt build tools' bin (soong_zip, ...), as Soong's ANDROID_JAVA_HOME and prebuilt Go tools.
-pub fn java_tools(tree: &Path, os: &str) -> (PathBuf, PathBuf) {
+/// The converter's Java tools in AOSP tree `tree` for PrebuiltOS `os`: the JDK home and the prebuilt build tools' bin (soong_zip, ...), as Soong's ANDROID_JAVA_HOME and prebuilt Go tools. `jdk` is deps.toml row `jdk`'s AOSP path (Soong's prebuilts/jdk/jdk21, one subdirectory per PrebuiltOS).
+pub fn java_tools(tree: &Path, os: &str, jdk: &str) -> (PathBuf, PathBuf) {
     (
-        tree.join(JDK).join(os),
+        tree.join(jdk).join(os),
         tree.join(BUILD_TOOLS).join(os).join("bin"),
     )
 }

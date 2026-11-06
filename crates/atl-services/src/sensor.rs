@@ -207,7 +207,7 @@ impl Channel {
         match rustix::net::send(&self.send, event, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
             Ok(_) => true,
             Err(rustix::io::Errno::AGAIN) => {
-                counters::count(INTERFACE, "event dropped: channel full");
+                counters::answered(INTERFACE, "event dropped: channel full");
                 true
             }
             Err(_) => {
@@ -411,7 +411,7 @@ impl SensorHub {
                     }
                 }
                 Err(e) => {
-                    counters::count(INTERFACE, &format!("source read failed: {e}"));
+                    counters::answered(INTERFACE, &format!("source read failed: {e}"));
                 }
             }
             std::thread::sleep(Duration::from_nanos(u64::try_from(period).unwrap_or(0)));
