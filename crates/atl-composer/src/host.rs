@@ -14,7 +14,7 @@ use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
 use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData};
 use atl_compositor::model::{ClientCall, Compositor, CompositorConfig, FrameOutput, LayerSpec};
 use atl_compositor::parcel::{BinderKey, StrongBinder};
-use atl_compositor::scene::Scene;
+use atl_compositor::scene::{Quad, Scene};
 use atl_compositor::transaction::TransactionState;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
@@ -56,7 +56,8 @@ impl Frame {
             _ => None,
         });
         buffers
-            .flat_map(|q| q.buffer.fds.iter().map(|f| f.raw()))
+            .filter_map(Quad::buffer)
+            .flat_map(|b| b.buffer.fds.iter().map(|f| f.raw()))
             .chain(channels)
             .collect()
     }
@@ -388,11 +389,12 @@ impl Composer {
         }
     }
 
-    /// `createSurface`: a layer with a new handle. `parent` is the handle of the parent layer (null: a root). Returns the handle and the layer id.
+    /// `createSurface`: a layer with a new handle. `parent` is the handle of the parent layer (null: a root); `fills_color` as [`LayerSpec::fills_color`]. Returns the handle and the layer id.
     pub fn create_layer(
         self: &Arc<Self>,
         name: &str,
         parent: Option<&mut SpIBinder>,
+        fills_color: bool,
     ) -> Result<(SpIBinder, i32), StatusCode> {
         let key_cell = Arc::new(AtomicU64::new(0));
         let handle = Handle {
@@ -411,6 +413,7 @@ impl Composer {
             id,
             name: name.to_owned(),
             parent,
+            fills_color,
         });
         if created.is_err() {
             st.objects.remove(key);

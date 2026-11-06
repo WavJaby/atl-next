@@ -174,6 +174,7 @@ pub fn stage(
                 launch_mode: 0,
                 task_affinity: None,
                 process: None,
+                meta_data: vec![],
             }],
             requested_permissions: vec![],
             permissions: Vec::new(),

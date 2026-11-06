@@ -20,12 +20,15 @@ use crate::callbacks::{
     ReleaseCallbackId, SurfaceStats, TransactionStats,
 };
 use crate::parcel::{BinderKey, FdObject, StrongBinder};
-use crate::scene::{Quad, Scene, SceneBuffer, SceneFd};
+use crate::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
 use crate::state::{
     BufferData, CallbackId, Fence, FloatRect, GraphicBuffer, LayerState, ListenerCallbacks, Rect,
     buffer_data_change, layer_flags, what,
 };
 use crate::transaction::TransactionState;
+
+/// A layer colour component meaning "no fill": RequestedLayerState sets r, g, b to -1 for `eNoColorFill`, and `fillsColor` needs all three >= 0.
+const NO_COLOR_FILL: f32 = -1.0;
 
 /// `ui::Transform::ROT_90`, the one buffer-transform bit that swaps width and height.
 const BUFFER_TRANSFORM_ROT_90: u32 = 4;
@@ -60,6 +63,9 @@ pub struct LayerSpec {
     pub name: String,
     /// The parent layer's handle; `None` for a root.
     pub parent: Option<BinderKey>,
+    /// The layer fills its bounds with its colour while it has no buffer: created as an effect (colour) layer, `createSurface` flags `eFXSurfaceEffect` without `eNoColorFill`
+    /// (SurfaceFlinger::createLayer gives every other kind `eNoColorFill`, RequestedLayerState then sets colour -1 = no fill). Its colour starts black.
+    pub fills_color: bool,
 }
 
 /// Why the model refused a request.
@@ -123,6 +129,8 @@ pub struct Counters {
     pub cache_misses: u64,
     /// `eMatrixChanged` with rotation or shear (only scale is applied).
     pub matrix_rotation_ignored: u64,
+    /// Scenes that skipped a colour layer with no crop on it or any ancestor: SurfaceFlinger bounds it by the display, which this model does not know.
+    pub unbounded_color_skipped: u64,
     /// Transactions with a desired present time (applied at the next tick regardless).
     pub desired_present_time_ignored: u64,
     /// Display states (one display, one layer stack: not applied).
@@ -194,6 +202,8 @@ struct Layer {
     destination_frame: Option<Rect>,
     buffer_transform: u32,
     held: Option<Held>,
+    /// r, g, b as `eColorChanged` set them; a component < 0 = no colour fill (RequestedLayerState's encoding).
+    color: [f32; 3],
     release_channel: Option<FdObject>,
     latched_this_frame: bool,
     seq: u64,
@@ -371,6 +381,11 @@ impl Compositor {
                 destination_frame: None,
                 buffer_transform: 0,
                 held: None,
+                color: if spec.fills_color {
+                    [0.0; 3]
+                } else {
+                    [NO_COLOR_FILL; 3]
+                },
                 release_channel: None,
                 latched_this_frame: false,
                 seq: self.next_seq,
@@ -509,7 +524,9 @@ impl Compositor {
         self.queues.retain(|_, q| !q.is_empty());
         self.complete(applied, now_ns, &mut calls);
         let scene = if std::mem::take(&mut self.dirty) {
-            Some(self.build_scene())
+            let (scene, unbounded) = self.build_scene();
+            self.counters.unbounded_color_skipped += unbounded;
+            Some(scene)
         } else {
             None
         };
@@ -595,6 +612,10 @@ impl Compositor {
             if w & what::E_REPARENT != 0 {
                 l.parent = s.parent.as_ref().and_then(|p| p.handle.key());
                 handled |= what::E_REPARENT;
+            }
+            if w & what::E_COLOR_CHANGED != 0 {
+                l.color = [s.color[0], s.color[1], s.color[2]];
+                handled |= what::E_COLOR_CHANGED;
             }
             if w & what::E_ALPHA_CHANGED != 0 {
                 l.alpha = s.color[3];
@@ -881,16 +902,35 @@ impl Compositor {
         }
     }
 
-    fn build_scene(&self) -> Scene {
+    /// The scene, and how many colour layers it skipped for having no bounds ([`Counters::unbounded_color_skipped`]).
+    fn build_scene(&self) -> (Scene, u64) {
         let mut quads = Vec::new();
+        let mut unbounded = 0;
         for key in self.z_order() {
             let l = &self.layers[&key];
-            let (Some(held), Some(g)) = (&l.held, self.geometry(key, 0)) else {
+            let Some(g) = self.geometry(key, 0) else {
                 continue;
             };
             if g.hidden || g.alpha <= 0.0 || g.layer_stack != self.config.layer_stack {
                 continue;
             }
+            let Some(held) = &l.held else {
+                // LayerSnapshot::fillsColor: no buffer, every component >= 0; the bounds are the crops of the layer and its ancestors (geomLayerBounds)
+                if l.color.iter().all(|&c| c >= 0.0) {
+                    match g.clip {
+                        Some(bounds) => quads.push(Quad {
+                            layer_id: l.id,
+                            name: l.name.clone(),
+                            content: Content::Color(l.color),
+                            dst: bounds,
+                            clip: g.clip,
+                            alpha: g.alpha,
+                        }),
+                        None => unbounded += 1,
+                    }
+                }
+                continue;
+            };
             let (bw, bh) = (held.buffer.width as f32, held.buffer.height as f32);
             let src = l.buffer_crop.map_or(
                 FloatRect {
@@ -932,22 +972,27 @@ impl Compositor {
             quads.push(Quad {
                 layer_id: l.id,
                 name: l.name.clone(),
-                buffer: Arc::clone(&held.buffer),
-                frame_number: held.frame_number,
-                acquire_fence: held.acquire_fence,
-                src,
+                content: Content::Buffer(BufferContent {
+                    buffer: Arc::clone(&held.buffer),
+                    frame_number: held.frame_number,
+                    acquire_fence: held.acquire_fence,
+                    src,
+                    opaque: l.flags & layer_flags::OPAQUE != 0,
+                    buffer_transform: l.buffer_transform,
+                }),
                 dst: g.map(local),
                 clip: g.clip,
                 alpha: g.alpha,
-                opaque: l.flags & layer_flags::OPAQUE != 0,
-                buffer_transform: l.buffer_transform,
             });
         }
-        Scene {
-            frame: self.frame,
-            layer_stack: self.config.layer_stack,
-            quads,
-        }
+        (
+            Scene {
+                frame: self.frame,
+                layer_stack: self.config.layer_stack,
+                quads,
+            },
+            unbounded,
+        )
     }
 }
 

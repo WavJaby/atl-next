@@ -29,7 +29,7 @@ pub struct InstrumentationDecl {
 }
 
 /// `<activity>` (ParsedActivity, reduced): its class resolved against the package, whether it handles MAIN + LAUNCHER, and its boolean attributes as written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityDecl {
     /// `android:name`, resolved against the package name: the Activity class.
     pub name: String,
@@ -50,6 +50,9 @@ pub struct ActivityDecl {
     /// `android:process` resolved the way the application's is (`:name` -> `<package>:name`); None = the package's process.
     #[serde(default)]
     pub process: Option<String>,
+    /// `<activity>`'s `<meta-data>` in manifest order, typed as `<application>`'s (e.g. NativeActivity's `android.app.lib_name`).
+    #[serde(default)]
+    pub meta_data: Vec<(String, MetaValue)>,
 }
 
 /// What an APK's AndroidManifest.xml declares that the services use.
@@ -423,6 +426,7 @@ mod tests {
             launch_mode: 0,
             task_affinity: None,
             process: None,
+            meta_data: vec![],
         };
         let mut r = record("a", 10_001);
         assert!(r.launch_activity().is_none());

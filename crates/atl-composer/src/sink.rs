@@ -4,7 +4,7 @@
 
 use std::io::Write;
 
-use atl_compositor::scene::Scene;
+use atl_compositor::scene::{Content, Scene};
 use atl_scene_buffer::Pixels;
 
 /// Called on the present thread (never the clock thread: a sink may take longer than a period), once per tick that changed anything visible.
@@ -77,24 +77,33 @@ impl<W: Write + Send> SceneSink for ReportSink<W> {
             scene.quads.len()
         );
         for q in &scene.quads {
-            let b = &q.buffer;
-            let what = match atl_scene_buffer::read_pixels(b) {
-                Ok(p) => format!("digest={:016x}", pixels_digest(&p)),
-                Err(e) => format!("unreadable={e:?}"),
+            let content = match &q.content {
+                Content::Buffer(c) => {
+                    let b = &c.buffer;
+                    let what = match atl_scene_buffer::read_pixels(b) {
+                        Ok(p) => format!("digest={:016x}", pixels_digest(&p)),
+                        Err(e) => format!("unreadable={e:?}"),
+                    };
+                    format!(
+                        "buffer={}x{} frame_number={} dst={},{},{},{} {what}",
+                        b.width,
+                        b.height,
+                        c.frame_number,
+                        q.dst.left,
+                        q.dst.top,
+                        q.dst.right,
+                        q.dst.bottom
+                    )
+                }
+                Content::Color([r, g, b]) => format!(
+                    "color={r},{g},{b} alpha={} dst={},{},{},{}",
+                    q.alpha, q.dst.left, q.dst.top, q.dst.right, q.dst.bottom
+                ),
             };
             let _ = writeln!(
                 self.0,
-                "composer: quad frame={} layer={} name={} buffer={}x{} frame_number={} dst={},{},{},{} {what}",
-                scene.frame,
-                q.layer_id,
-                q.name,
-                b.width,
-                b.height,
-                q.frame_number,
-                q.dst.left,
-                q.dst.top,
-                q.dst.right,
-                q.dst.bottom
+                "composer: quad frame={} layer={} name={} {content}",
+                scene.frame, q.layer_id, q.name
             );
         }
     }
@@ -105,7 +114,7 @@ mod tests {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::sync::Arc;
 
-    use atl_compositor::scene::{Quad, SceneBuffer, SceneFd};
+    use atl_compositor::scene::{BufferContent, Quad, SceneBuffer, SceneFd};
     use atl_compositor::state::FloatRect;
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::write;
@@ -141,47 +150,58 @@ mod tests {
         fd
     }
 
-    /// A scene with one quad whose buffer is a memfd of 2x1 pixels: the report names the layer, the buffer, the placement and the digest of those 8 bytes.
+    /// A scene with one quad whose buffer is a memfd of 2x1 pixels: the report names the layer, the buffer, the placement and the digest of those 8 bytes; a colour quad's line names its colour and alpha.
     #[test]
     fn report_has_one_line_per_quad_with_its_digest() {
         let pixels = [10u8, 20, 30, 255, 40, 50, 60, 255];
         let fd = memfd_with(&pixels);
+        let dst = FloatRect {
+            left: 1.0,
+            top: 2.0,
+            right: 3.0,
+            bottom: 3.0,
+        };
         let quad = Quad {
             layer_id: 7,
             name: "child".into(),
-            buffer: Arc::new(SceneBuffer {
-                width: 2,
-                height: 1,
-                stride: 2,
-                format: 1,
-                usage: 0,
-                id: 5,
-                fds: vec![SceneFd::new(fd.as_raw_fd())],
-                ints: vec![],
+            content: Content::Buffer(BufferContent {
+                buffer: Arc::new(SceneBuffer {
+                    width: 2,
+                    height: 1,
+                    stride: 2,
+                    format: 1,
+                    usage: 0,
+                    id: 5,
+                    fds: vec![SceneFd::new(fd.as_raw_fd())],
+                    ints: vec![],
+                }),
+                frame_number: 3,
+                acquire_fence: None,
+                src: FloatRect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 2.0,
+                    bottom: 1.0,
+                },
+                opaque: false,
+                buffer_transform: 0,
             }),
-            frame_number: 3,
-            acquire_fence: None,
-            src: FloatRect {
-                left: 0.0,
-                top: 0.0,
-                right: 2.0,
-                bottom: 1.0,
-            },
-            dst: FloatRect {
-                left: 1.0,
-                top: 2.0,
-                right: 3.0,
-                bottom: 3.0,
-            },
+            dst,
             clip: None,
             alpha: 1.0,
-            opaque: false,
-            buffer_transform: 0,
+        };
+        let colour = Quad {
+            layer_id: 8,
+            name: "bg".into(),
+            content: Content::Color([0.5, 0.25, 1.0]),
+            dst,
+            clip: Some(dst),
+            alpha: 0.5,
         };
         let scene = Scene {
             frame: 9,
             layer_stack: 0,
-            quads: vec![quad],
+            quads: vec![quad, colour],
         };
         let mut sink = ReportSink(Vec::new());
         sink.present(&scene);
@@ -190,7 +210,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "composer: scene frame=9 quads=1\ncomposer: quad frame=9 layer=7 name=child buffer=2x1 frame_number=3 dst=1,2,3,3 digest={digest:016x}\n"
+                "composer: scene frame=9 quads=2\ncomposer: quad frame=9 layer=7 name=child buffer=2x1 frame_number=3 dst=1,2,3,3 digest={digest:016x}\ncomposer: quad frame=9 layer=8 name=bg color=0.5,0.25,1 alpha=0.5 dst=1,2,3,3\n"
             )
         );
     }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The compositor's output for one frame: z-ordered textured quads with final geometry. One plain struct; the platform layer (M3 slice 6) maps each quad to a window texture.
+//! The compositor's output for one frame: z-ordered quads (textured or solid colour) with final geometry. One plain struct; the platform layer (M3 slice 6) maps each quad to a window texture.
 //! No parcel type crosses this seam: buffers and fences are [`SceneBuffer`] / [`SceneFd`], opaque descriptors the compositor's front-end owns and the platform's `-<os>` crate resolves.
 
 use std::sync::Arc;
@@ -64,13 +64,9 @@ impl SceneBuffer {
     }
 }
 
-/// One layer's buffer, placed on the screen.
+/// A buffer layer's content: the buffer and how it is sampled.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Quad {
-    /// The layer id the buffer belongs to.
-    pub layer_id: i32,
-    /// The layer name (diagnostics).
-    pub name: String,
+pub struct BufferContent {
     /// The buffer to sample.
     pub buffer: Arc<SceneBuffer>,
     /// BufferQueue frame number of the buffer (BBQ's own counter).
@@ -79,16 +75,46 @@ pub struct Quad {
     pub acquire_fence: Option<SceneFd>,
     /// The part of the buffer shown, in buffer pixels (the buffer crop, or the whole buffer).
     pub src: FloatRect,
-    /// Where `src` lands on the screen, in layer-stack pixels, before `clip`.
+    /// The layer is flagged opaque: alpha channel to be ignored.
+    pub opaque: bool,
+    /// `bufferTransform`: HAL transform bits (flip H = 1, flip V = 2, rotate 90 = 4) the platform applies to the sampled `src`.
+    pub buffer_transform: u32,
+}
+
+/// What a quad shows: a buffer, or a solid colour (SurfaceFlinger's `fillsColor`: a layer with no buffer and colour components >= 0, LayerSnapshot.cpp).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Content {
+    /// The layer's latched buffer.
+    Buffer(BufferContent),
+    /// Straight (non-premultiplied) r, g, b in [0, 1]; the quad's `alpha` is its opacity.
+    Color([f32; 3]),
+}
+
+/// One layer's content, placed on the screen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Quad {
+    /// The layer id the content belongs to.
+    pub layer_id: i32,
+    /// The layer name (diagnostics).
+    pub name: String,
+    /// What the quad shows.
+    pub content: Content,
+    /// Where the content lands on the screen, in layer-stack pixels, before `clip`: a buffer's `src` mapped, a colour layer's bounds (its clip).
     pub dst: FloatRect,
     /// The scissor, in layer-stack pixels: every ancestor's and the layer's own crop; `None` when nothing crops.
     pub clip: Option<FloatRect>,
     /// Combined alpha of the layer and its ancestors, in (0, 1].
     pub alpha: f32,
-    /// The layer is flagged opaque: alpha channel to be ignored.
-    pub opaque: bool,
-    /// `bufferTransform`: HAL transform bits (flip H = 1, flip V = 2, rotate 90 = 4) the platform applies to the sampled `src`.
-    pub buffer_transform: u32,
+}
+
+impl Quad {
+    /// The buffer content, `None` for a colour quad.
+    pub fn buffer(&self) -> Option<&BufferContent> {
+        match &self.content {
+            Content::Buffer(b) => Some(b),
+            Content::Color(_) => None,
+        }
+    }
 }
 
 /// What to draw for one frame of one layer stack, bottom to top.

@@ -297,6 +297,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 launch_mode: launch_mode(activity)?,
                 task_affinity: task_affinity(activity),
                 process: process_attr(activity, package),
+                meta_data: meta_data(activity)?,
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -326,6 +327,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 launch_mode: launch_mode(alias)?,
                 task_affinity: task_affinity(alias),
                 process: process_attr(alias, package),
+                meta_data: meta_data(alias)?,
             }),
         }
     }

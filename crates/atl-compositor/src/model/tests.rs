@@ -42,6 +42,7 @@ fn spec(handle: StrongBinder, id: i32, parent: Option<BinderKey>) -> LayerSpec {
         id,
         name: format!("layer{id}"),
         parent,
+        fills_color: false,
     }
 }
 
@@ -276,7 +277,10 @@ fn backpressure_latches_one_buffer_per_tick() {
         "the second buffer waits for the next tick"
     );
     assert!(releases(&out.calls).is_empty());
-    assert_eq!(out.scene.unwrap().quads[0].frame_number, 1);
+    assert_eq!(
+        out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
+        1
+    );
     let out = c.on_frame(20);
     assert_eq!(c.pending_transactions(), 0);
     assert_eq!(
@@ -286,7 +290,10 @@ fn backpressure_latches_one_buffer_per_tick() {
             frame_number: 1
         }]
     );
-    assert_eq!(out.scene.unwrap().quads[0].frame_number, 2);
+    assert_eq!(
+        out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
+        2
+    );
 }
 
 /// Without backpressure the later buffer replaces the earlier one within the tick, and the replaced buffer is still released.
@@ -310,7 +317,10 @@ fn without_backpressure_the_replaced_buffer_is_released_in_the_same_tick() {
             frame_number: 1
         }]
     );
-    assert_eq!(out.scene.unwrap().quads[0].frame_number, 2);
+    assert_eq!(
+        out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
+        2
+    );
 }
 
 /// Cache protocol: the first send carries the buffer, later ones only the id; a miss releases the buffer by its cached id at once.
@@ -329,7 +339,7 @@ fn buffer_cache_hit_miss_and_uncache() {
         &layer, &listener, 401, 2, 8, 8, true, 2,
     )]));
     let out = c.on_frame(20);
-    assert_eq!(out.scene.unwrap().quads[0].buffer.id, 401);
+    assert_eq!(out.scene.unwrap().quads[0].buffer().unwrap().buffer.id, 401);
     assert_eq!(c.counters().cache_misses, 0);
     // uncache then reuse the id: a miss
     let mut t = tx(vec![]);
@@ -435,10 +445,14 @@ fn ignored_state_is_counted_by_name() {
     c.create_layer(spec(layer, 7, None)).unwrap();
     let mut s = LayerState::new();
     s.surface = layer;
-    s.what = what::E_COLOR_CHANGED | what::E_CORNER_RADIUS_CHANGED | what::E_POSITION_CHANGED;
+    s.what =
+        what::E_SHADOW_RADIUS_CHANGED | what::E_CORNER_RADIUS_CHANGED | what::E_POSITION_CHANGED;
     c.queue_transaction(tx(vec![s.clone(), s]));
     c.on_frame(1);
-    assert_eq!(c.counters().ignored.get("E_COLOR_CHANGED"), Some(&2));
+    assert_eq!(
+        c.counters().ignored.get("E_SHADOW_RADIUS_CHANGED"),
+        Some(&2)
+    );
     assert_eq!(
         c.counters().ignored.get("E_CORNER_RADIUS_CHANGED"),
         Some(&2)
@@ -705,7 +719,7 @@ fn quad_geometry_from_crop_destination_and_transform() {
         }
     );
     assert_eq!(
-        by(1).src,
+        by(1).buffer().unwrap().src,
         FloatRect {
             left: 0.0,
             top: 0.0,
@@ -733,7 +747,95 @@ fn quad_geometry_from_crop_destination_and_transform() {
         },
         "rot90 swaps"
     );
-    assert_eq!(by(3).buffer_transform, 4);
+    assert_eq!(by(3).buffer().unwrap().buffer_transform, 4);
+}
+
+/// SurfaceView's background (SurfaceView.java updateSurface + updateRelativeZ): an effect layer, child of a cropped container, ordered relative to the window at Integer.MIN_VALUE, coloured by setColor.
+/// The scene shows it as a colour quad over the container's crop, below the window; with no crop anywhere it is skipped and counted; created without the effect flag it never fills.
+#[test]
+fn colour_layer_fills_its_parent_crop_below_the_window() {
+    let (window, container, background, plain, bare) =
+        (local(1), local(2), local(3), local(4), local(5));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(window, 1, None)).unwrap();
+    c.create_layer(spec(container, 2, Some(key(&window))))
+        .unwrap();
+    c.create_layer(LayerSpec {
+        fills_color: true,
+        ..spec(background, 3, Some(key(&container)))
+    })
+    .unwrap();
+    // a buffer-state layer under the same crop, coloured: never fills (createLayer gave it eNoColorFill), until setColor makes every component >= 0
+    c.create_layer(spec(plain, 4, Some(key(&container))))
+        .unwrap();
+    c.create_layer(LayerSpec {
+        fills_color: true,
+        ..spec(bare, 5, None)
+    })
+    .unwrap();
+    let mut crop = LayerState::new();
+    crop.surface = container;
+    crop.what = what::E_POSITION_CHANGED | what::E_CROP_CHANGED;
+    (crop.x, crop.y) = (10.0, 20.0);
+    crop.crop = FloatRect {
+        left: 0.0,
+        top: 0.0,
+        right: 30.0,
+        bottom: 40.0,
+    };
+    let mut colour = LayerState::new();
+    colour.surface = background;
+    colour.what = what::E_COLOR_CHANGED | what::E_RELATIVE_LAYER_CHANGED;
+    colour.color = [0.25, 0.5, 0.75, 0.0];
+    colour.z = i32::MIN;
+    colour.relative_layer = Some(crate::state::SurfaceControlParcel {
+        client: local(50),
+        handle: window,
+        layer_id: 1,
+        name: "window".into(),
+        transform_hint: 0,
+        width: 0,
+        height: 0,
+        format: 0,
+    });
+    c.queue_transaction(tx(vec![crop, colour]));
+    show(&mut c, &window, 11, 64, 64);
+    let scene = c.on_frame(1).scene.unwrap();
+    let names: Vec<i32> = scene.quads.iter().map(|q| q.layer_id).collect();
+    assert_eq!(
+        names,
+        [3, 1],
+        "background below the window; layer 4 has no fill, layer 5 no bounds"
+    );
+    let bounds = FloatRect {
+        left: 10.0,
+        top: 20.0,
+        right: 40.0,
+        bottom: 60.0,
+    };
+    assert_eq!(scene.quads[0].content, Content::Color([0.25, 0.5, 0.75]));
+    assert_eq!(
+        (scene.quads[0].dst, scene.quads[0].clip),
+        (bounds, Some(bounds))
+    );
+    assert_eq!(
+        scene.quads[0].alpha, 1.0,
+        "eColorChanged leaves the alpha alone"
+    );
+    assert_eq!(c.counters().unbounded_color_skipped, 1);
+    let mut lit = LayerState::new();
+    lit.surface = plain;
+    lit.what = what::E_COLOR_CHANGED;
+    lit.color = [1.0, 0.0, 0.0, 0.0];
+    c.queue_transaction(tx(vec![lit]));
+    let scene = c.on_frame(2).scene.unwrap();
+    assert!(
+        scene
+            .quads
+            .iter()
+            .any(|q| q.layer_id == 4 && q.content == Content::Color([1.0, 0.0, 0.0])),
+        "setColor with components >= 0 makes a bufferless layer fill (RequestedLayerState::fillsColor)"
+    );
 }
 
 #[test]

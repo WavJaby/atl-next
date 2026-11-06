@@ -162,6 +162,7 @@ mod tests {
             launch_mode: LAUNCH_MODE_STANDARD,
             task_affinity: None,
             process: None,
+            meta_data: vec![],
         }
     }
 

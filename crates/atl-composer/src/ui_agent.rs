@@ -43,7 +43,7 @@ impl IUiAgent for UiAgent {
     }
 
     fn window_surface(&self, layer_name: &str) -> Result<SurfaceControl, StatusCode> {
-        let (handle, layer_id) = self.composer.create_layer(layer_name, None)?;
+        let (handle, layer_id) = self.composer.create_layer(layer_name, None, false)?;
         let display = self.composer.display();
         Ok(SurfaceControl {
             name: Some(layer_name.to_owned()),

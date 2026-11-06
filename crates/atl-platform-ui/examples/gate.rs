@@ -4,7 +4,7 @@
 //!
 //! Phases, in order:
 //! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
-//! 2. one composite scene (crop, flips, rotation, scissor, opacity: [`composite_scene`]) captured to `composite.rgba`.
+//! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`.
 //! 3. refusals: an unsignalled acquire fence and a bad-stride buffer are refused, the signalled fence is accepted.
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
 //! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_compositor::scene::{Quad, Scene, SceneBuffer, SceneFd};
+use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
 use atl_compositor::state::FloatRect;
 use atl_gralloc::format::RGBA_8888;
 use atl_platform_ui::{
@@ -79,6 +79,9 @@ const IDLE_TICKS: u32 = 3;
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
 const COMPOSITE_FRAMES: [u32; 5] = [100, 101, 102, 103, 104];
+/// The composite scene's colour layers (layer 5 opaque, layer 6 at alpha 0.5): components that are whole multiples of 1/255 (51, 102, 153; 255, 0, 0), so the harness expects exact bytes.
+const COMPOSITE_COLOUR: [f32; 3] = [0.2, 0.4, 0.6];
+const COMPOSITE_FADED_COLOUR: [f32; 3] = [1.0, 0.0, 0.0];
 
 /// The pattern both sides compute: pixel (`x`, `y`) of frame `f` is R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255.
 fn pattern(x: u32, y: u32, f: u32) -> [u8; 4] {
@@ -143,15 +146,36 @@ fn quad(layer_id: i32, buffer: Arc<SceneBuffer>, src: FloatRect, dst: FloatRect)
     Quad {
         layer_id,
         name: format!("layer-{layer_id}"),
-        buffer,
-        frame_number: 1,
-        acquire_fence: None,
-        src,
+        content: Content::Buffer(BufferContent {
+            buffer,
+            frame_number: 1,
+            acquire_fence: None,
+            src,
+            opaque: false,
+            buffer_transform: 0,
+        }),
         dst,
         clip: None,
         alpha: 1.0,
-        opaque: false,
-        buffer_transform: 0,
+    }
+}
+
+/// The buffer content of a quad [`quad`] made.
+fn content(q: &mut Quad) -> &mut BufferContent {
+    match &mut q.content {
+        Content::Buffer(b) => b,
+        Content::Color(_) => unreachable!("quad() makes buffer quads"),
+    }
+}
+
+fn colour_quad(layer_id: i32, rgb: [f32; 3], dst: FloatRect, alpha: f32) -> Quad {
+    Quad {
+        layer_id,
+        name: format!("colour-{layer_id}"),
+        content: Content::Color(rgb),
+        dst,
+        clip: Some(dst),
+        alpha,
     }
 }
 
@@ -172,16 +196,18 @@ fn frame_scene(width: u32, height: u32, frame: u32) -> Result<(OwnedFd, Scene)> 
         rect(0.0, 0.0, width as f32, height as f32),
         rect(0.0, 0.0, width as f32, height as f32),
     );
-    q.opaque = frame % 2 == 1;
+    content(&mut q).opaque = frame % 2 == 1;
     Ok((fd, scene_of(vec![q])))
 }
 
-/// Five layers, bottom first. Coordinates are physical pixels of a window of at least 256 x 192.
+/// Seven layers, bottom first (5 and 6 are colour layers, listed after 4). Coordinates are physical pixels of a window of at least 256 x 192.
 /// 0. frame 100 over the whole window;
 /// 1. frame 101, 48 x 32 buffer, crop (8,4)-(40,28), FLIP_H, at (20,30)-(52,54);
 /// 2. frame 102, 40 x 24 buffer, ROT_90 (clockwise), at (100,10)-(124,50);
 /// 3. frame 103, 48 x 32 buffer at (150,60)-(198,92) scissored to (160,70)-(190,85);
-/// 4. frame 104, 40 x 40 buffer at (30,100)-(70,140), alpha 0.5.
+/// 4. frame 104, 40 x 40 buffer at (30,100)-(70,140), alpha 0.5;
+/// 5. colour [`COMPOSITE_COLOUR`] at (200,100)-(240,140);
+/// 6. colour [`COMPOSITE_FADED_COLOUR`] at (80,150)-(120,180), alpha 0.5.
 fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
     let mut fds = Vec::new();
     let mut buffer = |w, h, f| -> Result<Arc<SceneBuffer>> {
@@ -202,7 +228,7 @@ fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
         rect(8.0, 4.0, 40.0, 28.0),
         rect(20.0, 30.0, 52.0, 54.0),
     );
-    flipped.buffer_transform = 1;
+    content(&mut flipped).buffer_transform = 1;
     layers.push(flipped);
     let mut rotated = quad(
         2,
@@ -210,7 +236,7 @@ fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
         rect(0.0, 0.0, 40.0, 24.0),
         rect(100.0, 10.0, 124.0, 50.0),
     );
-    rotated.buffer_transform = 4;
+    content(&mut rotated).buffer_transform = 4;
     layers.push(rotated);
     let mut scissored = quad(
         3,
@@ -228,6 +254,18 @@ fn composite_scene(width: u32, height: u32) -> Result<(Vec<OwnedFd>, Scene)> {
     );
     faded.alpha = 0.5;
     layers.push(faded);
+    layers.push(colour_quad(
+        5,
+        COMPOSITE_COLOUR,
+        rect(200.0, 100.0, 240.0, 140.0),
+        1.0,
+    ));
+    layers.push(colour_quad(
+        6,
+        COMPOSITE_FADED_COLOUR,
+        rect(80.0, 150.0, 120.0, 180.0),
+        0.5,
+    ));
     Ok((fds, scene_of(layers)))
 }
 
@@ -487,7 +525,7 @@ fn main() -> Result<()> {
         SocketFlags::CLOEXEC,
         None,
     )?;
-    scene.quads[0].acquire_fence = Some(SceneFd::new(fence_read.as_raw_fd()));
+    content(&mut scene.quads[0]).acquire_fence = Some(SceneFd::new(fence_read.as_raw_fd()));
     let unsignalled = matches!(
         window.present(&scene),
         Err(PresentError::FenceNotSignalled { layer_id: 0 })
@@ -498,10 +536,11 @@ fn main() -> Result<()> {
     // step 1 copies every buffer at present: no release point outlives it
     let releases = accepted.map_or(usize::MAX, |p| p.releases.len());
     let mut bad = scene.clone();
-    bad.quads[0].acquire_fence = None;
-    bad.quads[0].buffer = Arc::new(SceneBuffer {
+    let b = content(&mut bad.quads[0]);
+    b.acquire_fence = None;
+    b.buffer = Arc::new(SceneBuffer {
         stride: 1,
-        ..(*bad.quads[0].buffer).clone()
+        ..(*b.buffer).clone()
     });
     let bad_refused = matches!(
         window.present(&bad),

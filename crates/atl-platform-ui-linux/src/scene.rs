@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! A compositor `Scene` as one GSK render node tree, in physical pixels of the window content.
-//! Per quad, bottom first: scissor (`clip` cut with the destination) -> opacity (layer alpha) -> buffer-to-screen transform (crop, flips, rotation, scale: `geometry`) -> crop to `src` -> the buffer as a `GdkMemoryTexture` (RGBA_8888 premultiplied; `X8` when the layer is flagged opaque).
+//! A colour quad is one colour node over its visible rectangle, the layer alpha as the colour's alpha (GSK colours are straight, like the layer's).
+//! Per buffer quad, bottom first: scissor (`clip` cut with the destination) -> opacity (layer alpha) -> buffer-to-screen transform (crop, flips, rotation, scale: `geometry`) -> crop to `src` -> the buffer as a `GdkMemoryTexture` (RGBA_8888 premultiplied; `X8` when the layer is flagged opaque).
 //! The widget scales the whole tree by 1 / scale into toolkit logical units when it draws; capture renders it as it is.
 
-use atl_compositor::scene::{Quad, Scene};
+use atl_compositor::scene::{Content, Quad, Scene};
 use atl_compositor::state::FloatRect;
 use atl_platform_ui_api::PresentError;
 use gtk4::prelude::*;
@@ -58,29 +59,42 @@ const CLOCKWISE_QUARTER_TURN_DEGREES: f32 = 90.0;
 
 /// The node of one quad, `None` when nothing of it shows (empty rectangles, scissored away).
 fn quad_node(quad: &Quad) -> Result<Option<gsk::RenderNode>, PresentError> {
+    let b = match &quad.content {
+        Content::Buffer(b) => b,
+        // the layer alpha is the colour's own: no opacity node
+        Content::Color([r, g, b]) => {
+            let Some(shown) = visible(&quad.dst, quad.clip.as_ref()) else {
+                return Ok(None);
+            };
+            let rgba = gdk::RGBA::new(*r, *g, *b, quad.alpha);
+            return Ok(Some(
+                gsk::ColorNode::new(&rgba, &graphene_rect(&shown)).upcast(),
+            ));
+        }
+    };
     let fail = |reason: String| PresentError::Buffer {
         layer_id: quad.layer_id,
         reason,
     };
-    if let Some(fence) = &quad.acquire_fence
+    if let Some(fence) = &b.acquire_fence
         && !buffer::fence_signalled(fence).map_err(fail)?
     {
         return Err(PresentError::FenceNotSignalled {
             layer_id: quad.layer_id,
         });
     }
-    let Some(place) = placement(&quad.src, &quad.dst, quad.buffer_transform) else {
+    let Some(place) = placement(&b.src, &quad.dst, b.buffer_transform) else {
         return Ok(None);
     };
     let Some(shown) = visible(&quad.dst, quad.clip.as_ref()) else {
         return Ok(None);
     };
-    let pixels = buffer::read_pixels(&quad.buffer).map_err(fail)?;
+    let pixels = buffer::read_pixels(&b.buffer).map_err(fail)?;
     let (width, height) = (pixels.width as f32, pixels.height as f32);
-    let texture = texture(pixels, quad.opaque).map_err(fail)?;
+    let texture = texture(pixels, b.opaque).map_err(fail)?;
     let whole = graphene::Rect::new(0.0, 0.0, width, height);
     let sampled = gsk::TextureScaleNode::new(&texture, &whole, gsk::ScalingFilter::Linear);
-    let cropped = gsk::ClipNode::new(&sampled, &graphene_rect(&quad.src));
+    let cropped = gsk::ClipNode::new(&sampled, &graphene_rect(&b.src));
     let placed = gsk::TransformNode::new(&cropped, Some(&gsk_transform(&place)));
     let mut node: gsk::RenderNode = placed.upcast();
     if quad.alpha < 1.0 {

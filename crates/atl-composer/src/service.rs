@@ -19,7 +19,7 @@ use atl_aidl::aidl::android::gui::IDisplayEventConnection::{
 };
 use atl_aidl::aidl::android::gui::ISurfaceComposer::{BnSurfaceComposer, ISurfaceComposer};
 use atl_aidl::aidl::android::gui::ISurfaceComposerClient::{
-    BnSurfaceComposerClient, ISurfaceComposerClient,
+    BnSurfaceComposerClient, ISurfaceComposerClient, eFXSurfaceEffect, eFXSurfaceMask, eNoColorFill,
 };
 use atl_aidl::aidl::android::gui::Rotation::Rotation;
 use atl_aidl::aidl::android::gui::Size::Size;
@@ -214,19 +214,21 @@ impl ISurfaceComposerClient for Client {
         unimplemented(CLIENT, method)
     }
 
-    /// SurfaceFlinger::createLayer: a layer named `name` with a new handle; `flags` (layer type, hidden, opaque ...) arrive again as layer state in the transactions, and `metadata` has no reader yet.
+    /// SurfaceFlinger::createLayer: a layer named `name` with a new handle. Of `flags`, the layer type decides whether it fills with colour (an effect layer without `eNoColorFill`; createLayer adds that flag to every other type);
+    /// hidden, opaque ... arrive again as layer state in the transactions, and `metadata` has no reader yet.
     fn r#createSurface(
         &self,
         name: Option<&str>,
-        _flags: i32,
+        flags: i32,
         parent: Option<&SpIBinder>,
         _metadata: Option<&LayerMetadata>,
     ) -> binder::Result<Option<CreateSurfaceResult>> {
         let name = name.unwrap_or_default();
         let mut parent = parent.cloned();
+        let fills_color = flags & eFXSurfaceMask == eFXSurfaceEffect && flags & eNoColorFill == 0;
         let (handle, id) = self
             .composer
-            .create_layer(name, parent.as_mut())
+            .create_layer(name, parent.as_mut(), fills_color)
             .map_err(Status::from)?;
         Ok(Some(CreateSurfaceResult {
             handle: Some(handle),

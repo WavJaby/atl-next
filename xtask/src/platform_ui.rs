@@ -3,7 +3,7 @@
 //! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates 1-4 run in any compositor, gate 5 only in the gate's labwc. Gates:
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
-//!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
+//!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + loop**: an unsignalled acquire fence and a bad stride are refused, a signalled fence accepted; a watched fd's callback ran on the UI thread inside the Looper's poll.
 //! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the UI thread is blocked (`block`) for the ping timeout plus a margin: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
@@ -232,6 +232,23 @@ fn composite_pixel(x: u32, y: u32) -> ([u8; 4], bool) {
                 blend(over[0], under[0]),
                 blend(over[1], under[1]),
                 blend(over[2], under[2]),
+                255,
+            ],
+            true,
+        );
+    }
+    // layer 5: colour (0.2, 0.4, 0.6) at (200,100)-(240,140), opaque: k/255 components, so exact bytes
+    if (200..240).contains(&x) && (100..140).contains(&y) {
+        return ([51, 102, 153, 255], false);
+    }
+    // layer 6: colour (1, 0, 0) at (80,150)-(120,180), alpha 0.5 over layer 0
+    if (80..120).contains(&x) && (150..180).contains(&y) {
+        let half = |o: u8, u: u8| ((u16::from(o) + u16::from(u)) / 2) as u8;
+        return (
+            [
+                half(255, under[0]),
+                half(0, under[1]),
+                half(0, under[2]),
                 255,
             ],
             true,
@@ -608,7 +625,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let (bad, first) = compare(&got, composite_pixel);
         report.check(
             bad == 0,
-            "composite readback (crop, FLIP_H, ROT_90, scissor, alpha)",
+            "composite readback (crop, FLIP_H, ROT_90, scissor, alpha, colour layers)",
             &format!("{bad} pixels differ {}", first.unwrap_or_default()),
         );
     } else {

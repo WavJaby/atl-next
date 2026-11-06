@@ -29,6 +29,8 @@ use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod move_output;
+mod native_activity;
+mod surface_view;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -81,6 +83,10 @@ enum Stage {
     StartFinish,
     /// Two outputs, the second at scale 1.6: the first goes off, the window moves, and Android's density follows (xtask/src/window/move_output.rs).
     Move,
+    /// Headless: a pure native app on the framework's NativeActivity; its library's callbacks, CPU-drawn frame and AInputQueue touches (xtask/src/window/native_activity.rs).
+    NativeActivity,
+    /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/surface_view.rs).
+    SurfaceView,
 }
 
 impl Stage {
@@ -96,6 +102,8 @@ impl Stage {
             Stage::Declared => "declared",
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
+            Stage::NativeActivity => "native-activity",
+            Stage::SurfaceView => "surface-view",
         }
     }
 
@@ -103,8 +111,8 @@ impl Stage {
     fn window_ms(self) -> u64 {
         match self {
             Stage::Resume => WINDOW_MS,
-            Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk => GTK_WINDOW_MS,
+            Stage::Frames | Stage::Input | Stage::NativeActivity => FRAMES_WINDOW_MS,
+            Stage::Gtk | Stage::SurfaceView => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -225,6 +233,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move => "AtlWindow: onResume reached",
+        Stage::NativeActivity => native_activity::MARKER,
+        Stage::SurfaceView => surface_view::MARKER,
     }
 }
 
@@ -510,16 +520,16 @@ fn quadrant_pixels(width: u32, height: u32) -> Vec<u8> {
     pixels
 }
 
-/// Sub-gate (a): the first `composer: quad` line of the fixture's layer (the compositor's report of the first frame it got) is the display's size, and its digest is
+/// Sub-gate (a): the first `composer: quad` line of the fixture's layer `title` (the compositor's report of the first frame it got) is the opening size, and its digest is
 /// the digest of the quadrants (FNV-1a over [`quadrant_pixels`]).
-fn picture_check(app: &str, display: DisplayModel) -> Result<String, String> {
+fn picture_check(app: &str, display: DisplayModel, title: &str) -> Result<String, String> {
     let (width, height) = opening_size(display);
     let size = format!("{width}x{height}");
     let quad = app
         .lines()
         .filter(|l| l.starts_with("composer: quad "))
-        .find(|l| word(l, "name") == Some(WINDOW_TITLE))
-        .ok_or_else(|| format!("no `composer: quad` line for layer {WINDOW_TITLE}"))?;
+        .find(|l| word(l, "name") == Some(title))
+        .ok_or_else(|| format!("no `composer: quad` line for layer {title}"))?;
     let buffer = word(quad, "buffer").unwrap_or("none");
     if buffer != size {
         return Err(format!(
@@ -651,7 +661,7 @@ fn start_proxy(upstream: &Path) -> Result<Proxy> {
 }
 
 /// What the probe saw of the client: its liveness (gtk, widgets), or the acks of the injected configures (resize, where the liveness fields stay at their defaults).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Liveness {
     /// The pong to the first ping came within [`PONG_WAIT`].
     answered: bool,
@@ -1379,20 +1389,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // declared before atld, so dropped after it; a hold keeps the desktop's compositor
     let mut nested = None;
     let rt = match args.stage {
-        Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
+        Stage::Input | Stage::NativeActivity => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
         | Stage::Widgets
         | Stage::Resize
         | Stage::Relaunch
         | Stage::Declared
         | Stage::StartFinish
-        | Stage::Move => {
+        | Stage::Move
+        | Stage::SurfaceView => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
                 let outputs: &[Output] = match args.stage {
                     Stage::Widgets => &[widgets::OUTPUT],
+                    Stage::SurfaceView => &[surface_view::OUTPUT],
                     Stage::Move => &move_output::OUTPUTS,
                     _ => &[GATE_OUTPUT],
                 };
@@ -1429,11 +1441,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Relaunch => SIZED_FIXTURE,
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
+        Stage::NativeActivity => native_activity::FIXTURE,
+        Stage::SurfaceView => surface_view::FIXTURE,
         _ => FIXTURE,
+    };
+    let native = match args.stage {
+        Stage::NativeActivity => {
+            let (abi, lib) = native_activity::build_lib(
+                root,
+                &native_activity::default_ndk(root)?,
+                &work.join("lib"),
+            )?;
+            Some((abi, vec![lib]))
+        }
+        _ => None,
     };
     let apk = rt
         .apk
-        .build(&root.join(fixture), &work.join("apk"), &[], None)?;
+        .build(&root.join(fixture), &work.join("apk"), &[], native.as_ref())?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -1466,6 +1491,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let log = run.log(&m.name);
         std::thread::spawn(move || match (stage, outputs) {
             (Stage::Widgets, _) => widgets::drive(p, &log),
+            (Stage::SurfaceView, _) => surface_view::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _) => {
                 drive_resize(p, &log)
             }
@@ -1519,7 +1545,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sub: Vec<Sub> = match (args.stage, v.marker_ms) {
         (Stage::Frames, Some(_)) => {
             vec![
-                ("picture", picture_check(&app, display)),
+                ("picture", picture_check(&app, display, WINDOW_TITLE)),
                 (
                     "cadence",
                     cadence_check(&after_marker(&app, marker), display.refresh_hz, &pressure),
@@ -1533,6 +1559,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ),
             ("touch-mode", touch_mode_check(&services)),
         ],
+        (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
+        (Stage::NativeActivity, Some(_)) => {
+            native_activity::checks(&app, &after_marker(&app, marker), display)
+        }
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
             &after_marker(&app, marker),
@@ -1954,24 +1984,25 @@ mod tests {
             )
         };
         let good = format!("{:016x}", fnv1a64(&picture));
-        assert!(picture_check(&quad(WINDOW_TITLE, "4x2", good.clone()), display).is_ok());
+        let t = WINDOW_TITLE;
+        assert!(picture_check(&quad(t, "4x2", good.clone()), display, t).is_ok());
         assert!(
-            picture_check(&quad("other", "4x2", good.clone()), display).is_err(),
+            picture_check(&quad("other", "4x2", good.clone()), display, t).is_err(),
             "another layer's frame is not the fixture's"
         );
         assert!(
-            picture_check(&quad(WINDOW_TITLE, "4x3", good.clone()), display).is_err(),
+            picture_check(&quad(t, "4x3", good.clone()), display, t).is_err(),
             "a buffer of the wrong size"
         );
         let red = format!("{:016x}", fnv1a64(&r.repeat(8)));
         assert!(
-            picture_check(&quad(WINDOW_TITLE, "4x2", red), display).is_err(),
+            picture_check(&quad(t, "4x2", red), display, t).is_err(),
             "all red is not the quadrants"
         );
         let unreadable = format!(
             "composer: quad frame=1 layer=2 name={WINDOW_TITLE} buffer=4x2 unreadable=no dma-buf\n"
         );
-        assert!(picture_check(&unreadable, display).is_err());
+        assert!(picture_check(&unreadable, display, t).is_err());
     }
 
     /// Callbacks one display period apart pass. A mean off by a fifth, too few callbacks, and one missed vsync (one interval of two periods, the mean still within tolerance) fail.

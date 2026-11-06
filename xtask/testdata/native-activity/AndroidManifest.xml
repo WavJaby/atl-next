@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage native-activity:a pure native app (hasCode false), the framework's NativeActivity loading jni/atl_native_activity.c through the android.app.lib_name meta-data (not the default "main"). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlnative"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <!-- hardwareAccelerated false: ActivityThread.handleLaunchActivity preloads hwui (HardwareRenderer.preload, RenderThread EGL) for FLAG_HARDWARE_ACCELERATED activities even when the window's surface is taken; this fixture draws with the CPU and needs no GPU -->
+    <application android:label="AtlNativeActivity" android:hasCode="false" android:hardwareAccelerated="false">
+        <activity android:name="android.app.NativeActivity" android:label="AtlNativeActivity" android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="atl-native-activity" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

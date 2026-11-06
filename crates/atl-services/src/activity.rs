@@ -26,9 +26,7 @@ use atl_parcelables::android::app::{
     ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
     ContentProviderHolder,
 };
-use atl_parcelables::android::content::pm::{
-    ActivityInfo, ApplicationInfo, ProviderInfo, ProviderInfoList,
-};
+use atl_parcelables::android::content::pm::{ApplicationInfo, ProviderInfo, ProviderInfoList};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
 use atl_parcelables::android::content::{ComponentName, Intent, IntentFilter};
 use atl_parcelables::android::graphics::Rect;
@@ -55,7 +53,7 @@ use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::size_buckets::SizeBuckets;
 use crate::tasks::{TaskId, TaskSize, Tasks};
-use crate::{counters, manifest_flags, package, settings};
+use crate::{counters, package, settings};
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -260,24 +258,7 @@ pub(crate) fn launch_item(
         }),
         ..Default::default()
     };
-    let info = ActivityInfo {
-        component: ComponentInfo {
-            item: PackageItemInfo {
-                name: Some(activity.name.clone()),
-                package_name: Some(p.name.clone()),
-                ..Default::default()
-            },
-            application_info: ai,
-            process_name: Some(p.process_name().to_owned()),
-            enabled: true,
-            exported: true,
-            ..Default::default()
-        },
-        theme: activity.theme,
-        flags: manifest_flags::activity_flags(p, activity),
-        config_changes: activity.config_changes,
-        ..Default::default()
-    };
+    let info = package::activity_info(p, activity, ai, package::STOCK_PM_FLAGS);
     LaunchActivityItem {
         activity_token: Some(token),
         ident,

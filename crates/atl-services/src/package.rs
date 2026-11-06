@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
-//! IPackageManager, subset: getApplicationInfo, getPackageInfo, hasSystemFeature, getPackagesForUid, notifyDexLoad, getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures.
+//! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, hasSystemFeature, getPackagesForUid, notifyDexLoad, getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures.
 //! Every other method is counted unimplemented (counters).
-//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted except GET_META_DATA (application meta-data): the records carry no components or signatures, and `sharedLibraryFiles` is always filled.
+//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted except GET_META_DATA (application and activity meta-data): the records carry no signatures and of the components only activities, and `sharedLibraryFiles` is always filled.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -10,15 +10,17 @@ use std::sync::Arc;
 use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, IPackageManager};
 use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::{
-    ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
+    ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
 };
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::os::Bundle::Value;
 use atl_parcelables::java::util::Map;
-use atl_parcelables::parts::{PackageItemInfo, SharedLibraryInfo};
+use atl_parcelables::parts::{ComponentInfo, PackageItemInfo, SharedLibraryInfo};
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
-use crate::packages::{InstrumentationDecl, LibraryNode, MetaValue, PackageRecord, Packages};
+use crate::packages::{
+    ActivityDecl, InstrumentationDecl, LibraryNode, MetaValue, PackageRecord, Packages,
+};
 use crate::permission::{self, Permissions};
 use crate::{counters, manifest_flags};
 
@@ -140,6 +142,36 @@ fn instrumentation_info(p: &PackageRecord, i: &InstrumentationDecl) -> Instrumen
     }
 }
 
+/// PackageInfoUtils.generateActivityInfo, reduced to what the record holds: the component's names, its application (`ai`, already built for the caller's flags), process, theme, flags, configChanges;
+/// GET_META_DATA adds the `<activity>`'s own meta-data, null when it has none (as the application's). Both the launch (LaunchActivityItem.info) and getActivityInfo answer with it.
+pub fn activity_info(
+    p: &PackageRecord,
+    activity: &ActivityDecl,
+    ai: ApplicationInfo,
+    flags: i64,
+) -> ActivityInfo {
+    ActivityInfo {
+        component: ComponentInfo {
+            item: PackageItemInfo {
+                name: Some(activity.name.clone()),
+                package_name: Some(p.name.clone()),
+                meta_data: (flags & GET_META_DATA != 0 && !activity.meta_data.is_empty())
+                    .then(|| meta_bundle(&activity.meta_data)),
+                ..Default::default()
+            },
+            application_info: ai,
+            process_name: Some(p.process_name().to_owned()),
+            enabled: true,
+            exported: true,
+            ..Default::default()
+        },
+        theme: activity.theme,
+        flags: manifest_flags::activity_flags(p, activity),
+        config_changes: activity.config_changes,
+        ..Default::default()
+    }
+}
+
 pub struct PackageManager {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
@@ -201,6 +233,26 @@ impl IPackageManager for PackageManager {
         Ok(self
             .visible(name, user)
             .map(|p| application_info(p, &self.packages, flags)))
+    }
+
+    /// ComputerEngine.getActivityInfoInternal: null for an unknown user, package or class (ApplicationPackageManager then throws NameNotFoundException); the ApplicationInfo inside is built with the same flags.
+    fn r#getActivityInfo(
+        &self,
+        component: Option<&ComponentName>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ActivityInfo>> {
+        let Some(c) = component else {
+            return Ok(None);
+        };
+        let Some(p) = self.visible(Some(&c.package), user) else {
+            return Ok(None);
+        };
+        Ok(p.manifest
+            .activities
+            .iter()
+            .find(|a| a.name == c.class)
+            .map(|a| activity_info(p, a, application_info(p, &self.packages, flags), flags)))
     }
 
     /// ComputerEngine.getPackageInfo:1581: null as getApplicationInfo; the PackageInfo carries the ApplicationInfo, the version and the requested permissions.

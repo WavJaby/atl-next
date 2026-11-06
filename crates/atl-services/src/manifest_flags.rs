@@ -233,6 +233,7 @@ mod tests {
             launch_mode: 0,
             task_affinity: None,
             process: None,
+            meta_data: vec![],
         }
     }
 

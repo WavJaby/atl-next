@@ -355,57 +355,17 @@ impl ApkTools {
         }
         host_art::exec(&mut link, "aapt2 link")?;
         let mut sources = Vec::new();
-        host_art::collect(&fixture.join("java"), "java", &mut sources)?;
+        if fixture.join("java").is_dir() {
+            host_art::collect(&fixture.join("java"), "java", &mut sources)?;
+        }
         if gen_dir.is_dir() {
             host_art::collect(&gen_dir, "java", &mut sources)?;
         }
-        let classpath = std::env::join_paths(std::iter::once(&self.android_jar).chain(class_jars))?;
-        let jdk_bin = self.jdk.join("bin");
-        host_art::exec(
-            Command::new(jdk_bin.join("javac"))
-                .args([
-                    "-source",
-                    "8",
-                    "-target",
-                    "8",
-                    "-Xlint:-options",
-                    "-bootclasspath",
-                ])
-                .arg(&classpath)
-                .arg("-d")
-                .arg(&classes)
-                .args(&sources),
-            "javac",
-        )?;
-        let jar = work.join("classes.jar");
-        host_art::exec(
-            Command::new(jdk_bin.join("jar"))
-                .arg("cf")
-                .arg(&jar)
-                .arg("-C")
-                .arg(&classes)
-                .arg("."),
-            "jar",
-        )?;
-        let path = std::env::join_paths(std::iter::once(jdk_bin.clone()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))?;
-        let mut d8 = Command::new(&self.d8);
-        d8.env("PATH", path).arg("--lib").arg(&self.android_jar);
-        for lib in class_jars {
-            d8.arg("--lib").arg(lib);
+        // no Java at all (a `hasCode="false"` app, e.g. a pure NativeActivity one): no classes.dex, as aapt2 + the NDK's packager leave it
+        if !sources.is_empty() {
+            self.dex_into(&apk, work, &classes, &dex, class_jars, &sources)?;
         }
-        host_art::exec(d8.arg("--output").arg(&dex).arg(&jar), "d8")?;
-        // the dex stored, as the platform's packagers store it (ART maps an uncompressed dex in place)
-        host_art::exec(
-            Command::new(jdk_bin.join("jar"))
-                .args(["--update", "--no-manifest", "--no-compress", "--file"])
-                .arg(&apk)
-                .arg("-C")
-                .arg(&dex)
-                .arg("classes.dex"),
-            "jar --update",
-        )?;
+        let jdk_bin = self.jdk.join("bin");
         if let Some((abi, libs)) = native {
             let staged = work.join("native");
             let dir = staged.join("lib").join(abi);
@@ -427,6 +387,66 @@ impl ApkTools {
             )?;
         }
         Ok(apk)
+    }
+
+    /// Compiles `sources` (javac -> jar -> d8) and stores the dex in `apk` as `classes.dex`.
+    fn dex_into(
+        &self,
+        apk: &Path,
+        work: &Path,
+        classes: &Path,
+        dex: &Path,
+        class_jars: &[PathBuf],
+        sources: &[PathBuf],
+    ) -> Result<()> {
+        let classpath = std::env::join_paths(std::iter::once(&self.android_jar).chain(class_jars))?;
+        let jdk_bin = self.jdk.join("bin");
+        host_art::exec(
+            Command::new(jdk_bin.join("javac"))
+                .args([
+                    "-source",
+                    "8",
+                    "-target",
+                    "8",
+                    "-Xlint:-options",
+                    "-bootclasspath",
+                ])
+                .arg(&classpath)
+                .arg("-d")
+                .arg(classes)
+                .args(sources),
+            "javac",
+        )?;
+        let jar = work.join("classes.jar");
+        host_art::exec(
+            Command::new(jdk_bin.join("jar"))
+                .arg("cf")
+                .arg(&jar)
+                .arg("-C")
+                .arg(classes)
+                .arg("."),
+            "jar",
+        )?;
+        let path = std::env::join_paths(std::iter::once(jdk_bin.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))?;
+        let mut d8 = Command::new(&self.d8);
+        d8.env("PATH", path).arg("--lib").arg(&self.android_jar);
+        for lib in class_jars {
+            d8.arg("--lib").arg(lib);
+        }
+        host_art::exec(d8.arg("--output").arg(dex).arg(&jar), "d8")?;
+        // the dex stored, as the platform's packagers store it (ART maps an uncompressed dex in place)
+        host_art::exec(
+            Command::new(jdk_bin.join("jar"))
+                .args(["--update", "--no-manifest", "--no-compress", "--file"])
+                .arg(apk)
+                .arg("-C")
+                .arg(dex)
+                .arg("classes.dex"),
+            "jar --update",
+        )?;
+        Ok(())
     }
 }
 
