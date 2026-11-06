@@ -551,7 +551,9 @@ mod publish {
                 down_ms: 5,
                 time_ms: 7,
             };
-            let m = motion(&m, 3);
+            // AMETA_SHIFT_ON | AMETA_SHIFT_LEFT_ON (android/input.h): the keyboard's meta state rides on the motion
+            let m = motion(&m, 3, 0x41);
+            assert_eq!(m.meta_state, 0x41);
             assert_eq!(
                 (
                     m.seq,

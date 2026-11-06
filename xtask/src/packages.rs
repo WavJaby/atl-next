@@ -4,7 +4,7 @@
 //! The converter defines an unstable aidl_interface `<package>-stubs` over them (bp2ninja `-aidl-crates`, aidlcrates.go; a missing dir or type = converter error), every `xtask native` adds its `-rust` rlib and the package's other modules to the goals, and the package links `device/<package>-stubs-rust` (crate `<package>_stubs`) like a `converter` module.
 //! `[package.metadata.atl.rust_library]` (`rustlibs`, optional `aconfig`) makes the converter build the package's `src/lib.rs` as rust_library `lib<crate>` with those rustlibs and the package's edition (Soong's `additional_rustlibs` crate of an aidl_interface), the flag dumps of the `aconfig` declarations in its OUT_DIR, and our lints (`lint_flags`, through clippy-driver, never capped); cargo builds it only as an empty library (`#![cfg(...)]`-gated), so it needs no feature. Only an aidl crate's `parcelables` reaches it.
 //! The build is the converter's way of linking: cargo's linker is graph.json `link_driver` (rlib link arguments are its arguments), `panic = "abort"` as the converter's device crates (a crate of the other strategy fails the link), release, `target_dir(out)` (a no-op when current).
-//! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted. `xtask check` step converter-packages runs that clippy (`lint`) against an existing out dir.
+//! Then clippy, warnings denied, on the same packages and feature: `xtask check` lints without it, so this is where the converter-linked code is linted. `xtask check` step converter-packages runs that clippy plus the packages' unit tests (`check`) against an existing out dir: step test runs without the feature too.
 //! Checked after: each executable's DT_NEEDED starts with the package's shared modules in the order named. libsigchain leading the launcher's is what makes ld.so's breadth-first global lookup find its `sigaction` / `signal` before libc's for every library loaded later, as for the converter's dalvikvm.
 
 use std::collections::BTreeMap;
@@ -483,7 +483,7 @@ impl<'a> Selection<'a> {
         cmd
     }
 
-    /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature); tests stay with `xtask check`.
+    /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature).
     fn lint(&self) -> Result<()> {
         let status = self
             .cargo("clippy")
@@ -491,6 +491,21 @@ impl<'a> Selection<'a> {
             .status()
             .context("running cargo clippy (converter packages)")?;
         ensure!(status.success(), "clippy on {} failed", self.names());
+        Ok(())
+    }
+
+    /// Unit tests with feature `converter` on: `xtask check` step test runs without it, so `#[cfg(test)]` code in converter-gated modules (atl-services `package`, ...) runs only here.
+    /// Same target dir and flags as `build`. The converter's rlibs are device crates, built panic=abort, and stable libtest links only unwinding crates, so tests run with
+    /// `-Z panic-abort-tests` as Soong builds device rust tests (build/soong/rust/test.go `compilerFlags`, under its global RUSTC_BOOTSTRAP). The bootstrap is set for this test build only:
+    /// `build` and the clippy steps stay on stable, so an unstable feature in our code still fails there.
+    fn test(&self) -> Result<()> {
+        let status = self
+            .cargo("test")
+            .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
+            .env("RUSTC_BOOTSTRAP", "1")
+            .status()
+            .context("running cargo test (converter packages)")?;
+        ensure!(status.success(), "tests of {} failed", self.names());
         Ok(())
     }
 }
@@ -531,10 +546,10 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
     Ok(built)
 }
 
-/// `xtask check` step converter-packages: clippy on the converter packages of `out`'s graph.json, as `build` lints them. Returns the packages it could not lint, each with the
+/// `xtask check` step converter-packages: clippy (as `build` lints them) then unit tests on the converter packages of `out`'s graph.json. Returns the packages it could not check, each with the
 /// module the graph lacks (a slot behind the checkout): the converter feature links converter outputs, so without them nothing compiles those modules, and `check` names
 /// the step skipped rather than reporting it passed.
-pub fn lint(root: &Path, out: &Path) -> Result<Vec<String>> {
+pub fn check(root: &Path, out: &Path) -> Result<Vec<String>> {
     let packages = workspace_packages(root)?;
     let sel = Selection::new(root, out, &packages)?;
     let unlinted = sel
@@ -544,6 +559,7 @@ pub fn lint(root: &Path, out: &Path) -> Result<Vec<String>> {
         .collect();
     if !sel.selected.is_empty() {
         sel.lint()?;
+        sel.test()?;
     }
     Ok(unlinted)
 }

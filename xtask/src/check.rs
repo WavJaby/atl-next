@@ -55,7 +55,7 @@ enum Step {
     Converter,
     /// the distro libc++ headers under the converter's device C++ flags: -D__ANDROID__ changes no macro beyond the expected and no object byte
     Libcxx,
-    /// clippy on the packages that link converter modules (feature `converter`), against the native out dir's graph; skipped without one
+    /// clippy + unit tests on the packages that link converter modules (feature `converter`), against the native out dir's graph; skipped without one
     ConverterPackages,
 }
 
@@ -108,11 +108,11 @@ impl Step {
     /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
     fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
         if self == Step::ConverterPackages {
-            let unlinted = packages::lint(root, out)?;
-            return Ok((!unlinted.is_empty()).then(|| {
+            let unchecked = packages::check(root, out)?;
+            return Ok((!unchecked.is_empty()).then(|| {
                 format!(
-                    "not linted: {}: run `cargo xtask native` first",
-                    unlinted.join(", ")
+                    "not checked: {}: run `cargo xtask native` first",
+                    unchecked.join(", ")
                 )
             }));
         }

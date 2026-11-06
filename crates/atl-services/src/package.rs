@@ -172,6 +172,20 @@ pub fn activity_info(
     }
 }
 
+/// getActivityInfo after the visibility check: `class` of `p` with its ApplicationInfo built for the same `flags`; None for a class `p` does not declare.
+fn find_activity_info(
+    p: &PackageRecord,
+    packages: &Packages,
+    class: &str,
+    flags: i64,
+) -> Option<ActivityInfo> {
+    p.manifest
+        .activities
+        .iter()
+        .find(|a| a.name == class)
+        .map(|a| activity_info(p, a, application_info(p, packages, flags), flags))
+}
+
 pub struct PackageManager {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
@@ -245,14 +259,9 @@ impl IPackageManager for PackageManager {
         let Some(c) = component else {
             return Ok(None);
         };
-        let Some(p) = self.visible(Some(&c.package), user) else {
-            return Ok(None);
-        };
-        Ok(p.manifest
-            .activities
-            .iter()
-            .find(|a| a.name == c.class)
-            .map(|a| activity_info(p, a, application_info(p, &self.packages, flags), flags)))
+        Ok(self
+            .visible(Some(&c.package), user)
+            .and_then(|p| find_activity_info(p, &self.packages, &c.class, flags)))
     }
 
     /// ComputerEngine.getPackageInfo:1581: null as getApplicationInfo; the PackageInfo carries the ApplicationInfo, the version and the requested permissions.
@@ -379,5 +388,116 @@ impl IPackageManager for PackageManager {
         } else {
             SIGNATURE_UNKNOWN_PACKAGE
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::packages::Manifest;
+
+    fn activity(name: &str, meta_data: Vec<(String, MetaValue)>) -> ActivityDecl {
+        ActivityDecl {
+            name: name.into(),
+            launcher: false,
+            theme: 0,
+            config_changes: 0,
+            booleans: BTreeMap::new(),
+            launch_mode: 0,
+            task_affinity: None,
+            process: None,
+            meta_data,
+        }
+    }
+
+    /// One package: `<application>` meta-data `app.key`, activity `a.Native` with NativeActivity-style meta-data of every MetaValue type, activity `a.Bare` with none.
+    fn record() -> PackageRecord {
+        let native_meta = vec![
+            (
+                "android.app.lib_name".into(),
+                MetaValue::String("native-lib".into()),
+            ),
+            ("flag".into(), MetaValue::Bool(true)),
+            ("res".into(), MetaValue::Int(0x7f01_0001)),
+            ("scale".into(), MetaValue::Float(1.5)),
+        ];
+        PackageRecord {
+            manifest: Manifest {
+                name: "a".into(),
+                version_code: 1,
+                version_name: None,
+                min_sdk: 21,
+                target_sdk: 34,
+                process_name: None,
+                application_theme: 0,
+                application_class: None,
+                app_component_factory: None,
+                application_meta_data: vec![("app.key".into(), MetaValue::String("v".into()))],
+                application_booleans: BTreeMap::new(),
+                activities: vec![
+                    activity("a.Native", native_meta),
+                    activity("a.Bare", vec![]),
+                ],
+                requested_permissions: vec![],
+                permissions: vec![],
+                libraries: vec![],
+                instrumentation: vec![],
+            },
+            uid: 10_001,
+            source_dir: String::new(),
+            primary_cpu_abi: None,
+            native_library_dir: "/data/app/a/lib/x86_64".into(),
+            data_dir: String::new(),
+            device_protected_data_dir: String::new(),
+            granted_permissions: vec![],
+        }
+    }
+
+    /// The bundle's entries by key: a Bundle is an ArrayMap, iterated in key-hash order, not insertion order.
+    fn entries(b: &Option<Bundle>) -> Option<Vec<(String, Value)>> {
+        b.as_ref().map(|b| {
+            let mut e = b.entries().expect("bundle decodes");
+            e.sort_by(|x, y| x.0.cmp(&y.0));
+            e
+        })
+    }
+
+    /// PackageInfoUtils.generateActivityInfo:590-595: GET_META_DATA -> the `<activity>`'s meta-data, an empty one coerced to null; without the flag null. The ApplicationInfo inside follows the same
+    /// flags (:381 nulls application meta-data without GET_META_DATA). Values typed as ParsingPackageUtils.parseMetaData does (string, boolean, int/resource id, float).
+    /// The visibility / user check before it needs a binder calling uid (`/dev/binder`), so the test starts after it.
+    #[test]
+    fn get_activity_info_meta_data() {
+        let p = record();
+        let packages = Packages::new(vec![p.clone()], BTreeMap::new());
+        let get = |class: &str, flags| find_activity_info(&p, &packages, class, flags);
+        let with = get("a.Native", GET_META_DATA).expect("a.Native exists");
+        assert_eq!(
+            entries(&with.component.item.meta_data),
+            Some(vec![
+                (
+                    "android.app.lib_name".into(),
+                    Value::String(Some("native-lib".into()))
+                ),
+                ("flag".into(), Value::Bool(true)),
+                ("res".into(), Value::Int(0x7f01_0001)),
+                ("scale".into(), Value::Float(1.5)),
+            ])
+        );
+        assert_eq!(
+            entries(&with.component.application_info.item.meta_data),
+            Some(vec![("app.key".into(), Value::String(Some("v".into())))])
+        );
+        let without = get("a.Native", 0).expect("a.Native exists");
+        assert!(without.component.item.meta_data.is_none());
+        assert!(without.component.application_info.item.meta_data.is_none());
+        let bare = get("a.Bare", GET_META_DATA).expect("a.Bare exists");
+        assert!(
+            bare.component.item.meta_data.is_none(),
+            "empty meta-data -> null"
+        );
+        // ComputerEngine.getActivityInfoInternal: null for a class the package does not declare
+        assert!(get("a.Missing", GET_META_DATA).is_none());
     }
 }
