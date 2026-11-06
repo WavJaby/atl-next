@@ -142,8 +142,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
     let crates = build_crates(root, &out, &providers)?;
-    // the runtime gates read the crates' artifacts from here (build_state::gate_out); ninja's later failures leave them current
-    build_state::record(&out, &state)?;
     let mut systems = BTreeMap::new();
     for (_, row) in providers::systems(&providers) {
         if systems.contains_key(row) {
@@ -405,6 +403,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
         }
+        // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
+        build_state::record(&out, &state)?;
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }

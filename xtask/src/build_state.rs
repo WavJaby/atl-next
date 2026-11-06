@@ -2,8 +2,8 @@
 //! The source state a native out dir was built from, so a runtime gate refuses artifacts from another tree (a rebase without `xtask native` once cost a whole round).
 //!
 //! The state is the checkout's working tree as git sees it (tracked + untracked, ignored excluded), hashed through a scratch index: `git add -A` into a copy of the index,
-//! `git write-tree`. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once the crates are built
-//! (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
+//! `git write-tree`. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
+//! packages succeeded (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
