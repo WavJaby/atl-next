@@ -66,7 +66,7 @@ pub struct Spawn {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
-    /// The working directory inside the sandbox (bwrap `--chdir`); None = bwrap's default (the caller's directory when the sandbox shows it).
+    /// The working directory inside the sandbox (bwrap `--chdir`); None = `/`, as an Android app process has: the broker's own cwd is no app's business, and ART's non-zygote native-bridge init makes `./code_cache` (runtime.cc `PreInitializeNativeBridge(".")`), which landed in the caller's checkout.
     pub cwd: Option<PathBuf>,
     /// The process's fd 0; None = /dev/null. The system services get their [`control`] connection here (an inherited fd would need `unsafe` to adopt; stdin does not).
     pub stdin: Option<OwnedFd>,
@@ -186,9 +186,7 @@ pub fn bwrap_args(
     if let Some(area) = &spawn.property_area {
         a.ro_bind(area, PROPERTY_AREA);
     }
-    if let Some(dir) = &spawn.cwd {
-        a.chdir(dir);
-    }
+    a.chdir(spawn.cwd.as_deref().unwrap_or(Path::new("/")));
     a.end()
 }
 

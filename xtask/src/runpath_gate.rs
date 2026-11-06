@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Gate after `xtask native`'s build: no converter-built device or native-bridge artifact carries a DT_RUNPATH or DT_RPATH.
+//! Gate after `xtask native`'s build: no converter-built device or native-bridge artifact, nor converter-built Rust package library, carries a DT_RUNPATH or DT_RPATH.
 //! Soong gives only host binaries an rpath (build/soong/cc/linker.go linkerFlags: `ctx.Host() && !ctx.Windows() && !staticLib` -> RpathFlags, `$ORIGIN`-relative); device and native-bridge ones get none, so the linker's search path decides (here LD_LIBRARY_PATH over the stage, bionic's linker config for guests).
 //! Why a gate: an absolute build-tree runpath lets a library missing from the stage load silently from the build tree, so a runtime gate passes on a stage that would fail installed (seen: leaving `libc++.so` out of the guest stage stayed green).
 
@@ -25,6 +25,28 @@ pub fn check(out: &Path, artifacts: &[PathBuf]) -> Result<(usize, Vec<String>)> 
         violations.extend(paths.into_iter().map(|p| format!("{name}: {p}")));
     }
     Ok((read, violations))
+}
+
+/// The files in `<crates>/<package>/lib/` (converter-built Rust packages' installed libraries); none when `crates` does not exist yet.
+pub fn package_libs(crates: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let Ok(packages) = std::fs::read_dir(crates) else {
+        return Ok(out);
+    };
+    for p in packages {
+        let lib = p?.path().join("lib");
+        let Ok(files) = std::fs::read_dir(&lib) else {
+            continue;
+        };
+        for f in files {
+            let f = f?.path();
+            if f.is_file() {
+                out.push(f);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// The DT_RUNPATH / DT_RPATH entries of an ELF (either class); None for a file that is not ELF.

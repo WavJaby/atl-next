@@ -1102,10 +1102,11 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     Ok(report.violations.first().map(ToString::to_string))
 }
 
-/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (stale ones are the licence gate's to report); its first violation, None when it passes.
+/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (stale ones are the licence gate's to report), plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
 fn runpath_gate(out: &Path) -> Result<Option<String>> {
     let all = crate::licence_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
-    let (artifacts, _) = crate::licence_gate::fresh(out, all);
+    let (mut artifacts, _) = crate::licence_gate::fresh(out, all);
+    artifacts.extend(crate::runpath_gate::package_libs(&out.join("crates"))?);
     let (read, violations) = crate::runpath_gate::check(out, &artifacts)?;
     println!(
         "native: runpath gate: {read} artifacts, {} runpath entries",
