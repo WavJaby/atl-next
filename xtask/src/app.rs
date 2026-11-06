@@ -78,6 +78,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("guestLog", "1"),
     // 10 (read_callback's guest callback ran once, on the caller's guest thread) + 1 (foreach's, every call): atl_jni_test.c propCallbacks
     ("propCallbacks", "11"),
+    // GLES2 through the GL proxies: 64x64 pixels that equal the scene's geometry (jni-test atl_jni_test.c glesPbuffer)
+    ("glesPbuffer", "4096"),
 ];
 /// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
@@ -100,6 +102,9 @@ fn bridge1_call_failures(app: &str) -> Vec<String> {
             other => Some(format!("bridge1 call {name}: want {want}, got {other:?}")),
         })
         .collect();
+    if app.contains("called unimplemented OpenGL ES API") {
+        whys.push("GL: the front reports an unimplemented OpenGL ES API call".to_owned());
+    }
     if !app.lines().any(|l| l.ends_with(GUEST_LOG)) {
         whys.push(format!("guest liblog: no line ending {GUEST_LOG:?}"));
     }

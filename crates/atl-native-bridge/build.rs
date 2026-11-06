@@ -218,6 +218,198 @@ fn jni_tables(up: &Upstreams, target: &Target) -> Result<String> {
     Ok(out)
 }
 
+/// The guest proxy libraries (NBS `libnative_bridge_guest_*`): soname, and the NBS directory whose `stubs_arm64.cc` (arch-neutral, LP64) is the library's symbol set.
+const PROXY_LIBS: &[(&str, &str)] = &[
+    ("libEGL.so", "libEGL"),
+    ("libGLESv1_CM.so", "libGLESv1_CM"),
+    ("libGLESv2.so", "libGLESv2"),
+    ("libGLESv3.so", "libGLESv3"),
+    ("libnativewindow.so", "libnativewindow"),
+];
+/// The libc stub list whose count sizes the thunk pool (NBS, x86_64 entries).
+const LIBC_STUBS: &str = "frameworks/libs/native_bridge_support/android_api/libc/stubs_x86_64.cpp";
+/// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
+const PROTOTYPE_HEADERS: &[&str] = &[
+    "EGL/egl.h",
+    "EGL/eglext.h",
+    "GLES/gl.h",
+    "GLES/glext.h",
+    "GLES2/gl2.h",
+    "GLES2/gl2ext.h",
+    "GLES3/gl3.h",
+    "GLES3/gl31.h",
+    "GLES3/gl32.h",
+];
+const PROTOTYPE_INCLUDES: &[&str] = &["frameworks/native/opengl/include"];
+/// Functions whose prototype alone does not say what the binding does: `glGetPointerv` answers a wrapped GL_DEBUG_CALLBACK_FUNCTION, `glGetVkProcAddrNV` is refused (GS2.2).
+const ANNOTATED: &[&str] = &["glGetPointerv", "glGetPointervKHR", "glGetVkProcAddrNV"];
+
+/// Every `.h` under `dir`, recursively, in sorted order.
+fn headers_under(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| dir.display().to_string())?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            headers_under(&p, out)?;
+        } else if p.extension().is_some_and(|x| x == "h") {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// A fn-pointer type: a pointer to a function.
+fn is_fn_ptr(t: &Ty) -> bool {
+    matches!(t.resolved(), Ty::Pointer { pointee, .. } if matches!(pointee.resolved(), Ty::Function(_)))
+}
+
+/// `proxy_table.rs` (module `proxy`): per guest proxy library, its NBS stub names in list order, each with the entry it binds.
+/// `Entry::Generic` binds the host front's symbol of that name through the generic crossing; `Entry::Trap(i)` binds `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
+/// The prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
+fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path) -> Result<String> {
+    let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
+    for &(soname, dir) in PROXY_LIBS {
+        let rel = format!("frameworks/libs/native_bridge_support/android_api/{dir}/stubs_arm64.cc");
+        let path = up.aosp(&rel);
+        let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+        let names: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("DEFINE_INTERCEPTABLE_STUB_FUNCTION(")?.strip_suffix(");"))
+            .map(str::to_owned)
+            .collect();
+        ensure!(!names.is_empty(), "{soname}: no stubs in {}", path.display());
+        for p in up.rerun_paths(&format!("aosp/{rel}")) {
+            println!("cargo::rerun-if-changed={}", p.display());
+        }
+        lists.push((soname, names));
+    }
+    let libc_text = std::fs::read_to_string(up.aosp(LIBC_STUBS))?;
+    let libc_stubs = libc_text
+        .lines()
+        .filter(|l| l.starts_with("DEFINE_INTERCEPTABLE_STUB_FUNCTION("))
+        .count();
+    for p in up.rerun_paths(&format!("aosp/{LIBC_STUBS}")) {
+        println!("cargo::rerun-if-changed={}", p.display());
+    }
+
+    let unit = out.join("proxy_prototypes.cc");
+    let mut text = String::from("#define EGL_EGLEXT_PROTOTYPES\n#define GL_GLEXT_PROTOTYPES\n");
+    for h in PROTOTYPE_HEADERS {
+        text.push_str(&format!("#include <{h}>\n"));
+    }
+    std::fs::write(&unit, text)?;
+    let includes: Vec<String> = PROTOTYPE_INCLUDES
+        .iter()
+        .map(|d| format!("-I{}", up.aosp(d).display()))
+        .collect();
+    let mut guest = buildscript::bionic_platform_target(
+        up,
+        host,
+        buildscript::future_level(up, host)?,
+        Some(&buildscript::libcxx_include_dir()?),
+    );
+    guest.arch = "guest".to_owned();
+    guest.args.extend(includes.iter().cloned());
+    let host_view = Target {
+        arch: "host".to_owned(),
+        triple: buildscript::clang_triple_from_cargo()?,
+        args: includes,
+    };
+    // declarations count only from the files named here (`Source::also`): every header of the tree
+    let root = up.aosp("frameworks/native/opengl/include");
+    let mut also = Vec::new();
+    for dir in ["EGL", "GLES", "GLES2", "GLES3", "KHR"] {
+        headers_under(&root.join(dir), &mut also)?;
+    }
+    println!("cargo::rerun-if-changed={}", root.display());
+    let src = Source {
+        path: &unit,
+        lang: Lang::Cxx,
+        also: &also,
+        macros: &[],
+    };
+    let iface = atl_bridgegen::interface(
+        "proxy_prototypes",
+        "EGL and GLES headers, guest and host views",
+        &src,
+        &[guest, host_view],
+    )
+    .context("GL prototypes")?;
+    let guest_view = iface.arches.get("guest").context("no guest view")?;
+    let host_ir = iface.arches.get("host").context("no host view")?;
+
+    // identity: every stub name both views declare must agree (pass-through only where proven)
+    let diffs = atl_bridgegen::report::compare_functions(&iface, "guest", "host");
+    let mut broken = Vec::new();
+    for (_, names) in &lists {
+        for name in names {
+            if !guest_view.functions.contains_key(name) || !host_ir.functions.contains_key(name) {
+                continue;
+            }
+            if let Some(d) = diffs.iter().find(|d| &d.name == name).filter(|d| !d.identical) {
+                broken.push(format!("{name}: {}", d.differences.join("; ")));
+            }
+        }
+    }
+    ensure!(
+        broken.is_empty(),
+        "{} stub prototype(s) differ between the guest and host views: {}",
+        broken.len(),
+        broken.join(" | ")
+    );
+
+    let mut traps: Vec<(String, String, &'static str)> = Vec::new();
+    let mut code = String::from(
+        "// generated by build.rs (atl-native-bridge) from the NBS stub lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Entry, Lib};\n\npub const LIBS: &[Lib] = &[\n",
+    );
+    let mut total = 0usize;
+    for (soname, names) in &lists {
+        code.push_str(&format!(
+            "    Lib {{\n        soname: {soname:?},\n        stubs: &[\n"
+        ));
+        for name in names {
+            total += 1;
+            let mut trap = |why: &'static str| {
+                traps.push(((*soname).to_owned(), name.clone(), why));
+                format!("Entry::Trap({})", traps.len() - 1)
+            };
+            let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
+                    trap("pending: annotated, GS2.2")
+                }
+                (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => trap("pending: fn-return, GS2.2"),
+                (Some(sig), Some(_)) if sig.params.iter().any(|p| is_fn_ptr(p)) => {
+                    trap("pending: callback-param, GS2.2")
+                }
+                (Some(_), Some(_)) => "Entry::Generic".to_owned(),
+                _ if *soname == "libnativewindow.so" => {
+                    trap("pending: nativewindow prototypes not in the EGL/GLES set")
+                }
+                _ => trap("unbound: no prototype in the EGL/GLES headers"),
+            };
+            code.push_str(&format!("            ({name:?}, {entry}),\n"));
+        }
+        code.push_str("        ],\n    },\n");
+    }
+    code.push_str("];\n\n");
+    code.push_str(&format!(
+        "/// Stub names over all lists; the libc stubs (`LIBC_STUB_COUNT`) bind from the same pool.\npub const STUB_COUNT: usize = {total};\npub const LIBC_STUB_COUNT: usize = {libc_stubs};\n\n"
+    ));
+    code.push_str("/// Per `Entry::Trap(i)`: library, name, why trapped.\npub const TRAP_NAMES: &[(&str, &str, &str)] = &[\n");
+    for (lib, name, why) in &traps {
+        code.push_str(&format!("    ({lib:?}, {name:?}, {why:?}),\n"));
+    }
+    code.push_str("];\n\n/// `trap::<i>` per `Entry::Trap(i)`.\npub const TRAPS: &[extern \"C\" fn()] = &[\n");
+    for i in 0..traps.len() {
+        code.push_str(&format!("    super::trap::<{i}>,\n"));
+    }
+    code.push_str("];\n");
+    Ok(code)
+}
+
 fn main() -> Result<()> {
     // `--cfg atl_nb_no_fs_restore`: deliberate break of spike gates g1/g2 (engine::x86_64: the host->guest crossing without its FS restore)
     println!("cargo::rustc-check-cfg=cfg(atl_nb_no_fs_restore)");
@@ -283,6 +475,10 @@ fn main() -> Result<()> {
     )?;
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
     std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
+    std::fs::write(
+        out.join("proxy_table.rs"),
+        proxy_table(&up, &host, &out)?,
+    )?;
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)
         .chain(std::iter::once(&JNI_HEADER))

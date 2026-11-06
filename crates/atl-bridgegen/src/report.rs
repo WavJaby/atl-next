@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::ir::{Interface, Record, Signature, Ty};
+use crate::ir::{ArchView, Interface, Record, Signature, Ty};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecordDiff {
@@ -120,4 +120,154 @@ fn same_sig(a: &Signature, b: &Signature) -> bool {
         && a.params.len() == b.params.len()
         && same_ty(&a.ret, &b.ret)
         && a.params.iter().zip(&b.params).all(|(x, y)| same_ty(x, y))
+}
+
+/// One function that `a` or `b` declares, compared as a prototype.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FunctionDiff {
+    pub name: String,
+    pub identical: bool,
+    /// Why not, one line per difference.
+    pub differences: Vec<String>,
+}
+
+/// Every function of `a` and `b`, compared: return and parameter classes, widths, signedness and
+/// function-pointer-ness. A pointer to a record that is incomplete in either view is an opaque handle
+/// and agrees with any pointer of the same width.
+pub fn compare_functions(iface: &Interface, a: &str, b: &str) -> Vec<FunctionDiff> {
+    let (Some(va), Some(vb)) = (iface.arches.get(a), iface.arches.get(b)) else {
+        return Vec::new();
+    };
+    let names: std::collections::BTreeSet<&String> =
+        va.functions.keys().chain(vb.functions.keys()).collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let differences = match (va.functions.get(name), vb.functions.get(name)) {
+                (Some(sa), Some(sb)) => sig_differences(sa, sb, va, vb),
+                (Some(_), None) => vec![format!("only on {a}")],
+                (None, _) => vec![format!("only on {b}")],
+            };
+            FunctionDiff {
+                name: name.clone(),
+                identical: differences.is_empty(),
+                differences,
+            }
+        })
+        .collect()
+}
+
+fn sig_differences(a: &Signature, b: &Signature, va: &ArchView, vb: &ArchView) -> Vec<String> {
+    let mut d = Vec::new();
+    if a.variadic != b.variadic {
+        d.push("variadic differs".to_owned());
+    }
+    if a.params.len() != b.params.len() {
+        d.push(format!(
+            "{} parameters on one view, {} on the other",
+            a.params.len(),
+            b.params.len()
+        ));
+        return d;
+    }
+    if let Some(x) = ty_difference(&a.ret, &b.ret, va, vb) {
+        d.push(format!("return: {x}"));
+    }
+    for (i, (x, y)) in a.params.iter().zip(&b.params).enumerate() {
+        if let Some(x) = ty_difference(x, y, va, vb) {
+            d.push(format!("parameter {i}: {x}"));
+        }
+    }
+    d
+}
+
+/// None when `a` (of view `va`) and `b` (of `vb`) agree in the ABI; else what differs.
+fn ty_difference(a: &Ty, b: &Ty, va: &ArchView, vb: &ArchView) -> Option<String> {
+    let (a, b) = (a.resolved(), b.resolved());
+    match (a, b) {
+        (Ty::Void, Ty::Void) | (Ty::Bool, Ty::Bool) => None,
+        (
+            Ty::Int {
+                bits: ba,
+                signed: sa,
+                ..
+            },
+            Ty::Int {
+                bits: bb,
+                signed: sb,
+                ..
+            },
+        ) => (ba != bb || sa != sb)
+            .then(|| format!("integer {ba} bits signed={sa} vs {bb} bits signed={sb}")),
+        (Ty::Float { bits: ba }, Ty::Float { bits: bb }) => {
+            (ba != bb).then(|| format!("float {ba} vs {bb} bits"))
+        }
+        (
+            Ty::Pointer {
+                bits: ba,
+                pointee: pa,
+                ..
+            },
+            Ty::Pointer {
+                bits: bb,
+                pointee: pb,
+                ..
+            },
+        ) => {
+            if ba != bb {
+                return Some(format!("pointer {ba} vs {bb} bits"));
+            }
+            if is_opaque(pa) || is_opaque(pb) {
+                return None;
+            }
+            ty_difference(pa, pb, va, vb).map(|d| format!("pointer to {d}"))
+        }
+        // a pointer and an integer of its width share the INTEGER class (SysV: one register, same bits); a function pointer is not an integer
+        (
+            Ty::Pointer {
+                bits: bp,
+                pointee,
+                ..
+            },
+            Ty::Int { bits: bi, .. },
+        )
+        | (
+            Ty::Int { bits: bi, .. },
+            Ty::Pointer {
+                bits: bp,
+                pointee,
+                ..
+            },
+        ) => {
+            if matches!(pointee.resolved(), Ty::Function(_)) {
+                Some("function pointer vs integer".to_owned())
+            } else {
+                (bp != bi).then(|| format!("pointer {bp} bits vs integer {bi} bits"))
+            }
+        }
+        (Ty::Function(sa), Ty::Function(sb)) => {
+            let d = sig_differences(sa, sb, va, vb);
+            (!d.is_empty()).then(|| format!("function: {}", d.join("; ")))
+        }
+        (Ty::Record { name: na }, Ty::Record { name: nb }) => {
+            let (Some(ra), Some(rb)) = (va.records.get(na), vb.records.get(nb)) else {
+                return Some(format!("record {na} / {nb} missing on a view"));
+            };
+            (ra.size != rb.size || ra.align != rb.align).then(|| {
+                format!(
+                    "record {na}: size {} align {} vs size {} align {}",
+                    ra.size, ra.align, rb.size, rb.align
+                )
+            })
+        }
+        (Ty::Opaque { name: na, .. }, Ty::Opaque { name: nb, .. }) => {
+            (na != nb).then(|| format!("opaque {na} vs {nb}"))
+        }
+        _ => Some(format!("{a:?} vs {b:?}")),
+    }
+}
+
+/// A type with no layout in this view: `void`, or a record defined only as a tag. Behind a pointer it is an opaque handle.
+fn is_opaque(t: &Ty) -> bool {
+    matches!(t.resolved(), Ty::Void | Ty::Opaque { .. })
 }

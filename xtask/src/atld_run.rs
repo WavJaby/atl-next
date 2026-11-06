@@ -28,12 +28,15 @@ const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
 /// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), and the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
-const NB_LIBS: [(&str, &str); 13] = [
+const NB_LIBS: [(&str, &str); 16] = [
     ("libnative_bridge_guest_libc", "libc.so"),
     ("libm", "libm.so"),
     ("libdl", "libdl.so"),
     ("ld-android", "ld-android.so"),
     ("liblog", "liblog.so"),
+    ("libbase", "libbase.so"),
+    ("libvndksupport", "libvndksupport.so"),
+    ("libdl_android", "libdl_android.so"),
     ("libcutils", "libcutils.so"),
     ("libutils", "libutils.so"),
     ("libnative_bridge_guest_libEGL", "libEGL.so"),

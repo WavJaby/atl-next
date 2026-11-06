@@ -13,6 +13,7 @@ pub mod image;
 mod intercepts;
 pub mod jni;
 mod provider;
+mod proxy;
 pub mod signal;
 pub mod thread;
 pub mod vdso;

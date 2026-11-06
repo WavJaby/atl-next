@@ -2,6 +2,8 @@
 // bridge-1 fixture, C side. Uses the bionic-only surface on purpose (errno through __errno, bionic pthread/dlopen, __thread) so a glibc host cannot satisfy it.
 // Java side: xtask/testdata/app/java/atl/bridge1/testlib/AtlJniTest.java. C++ side: atl_jni_cxx.cpp. Built by xtask/src/jni_fixture.rs.
 #include <android/log.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -198,4 +200,87 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
     if ((*env)->RegisterNatives(env, cls, k_methods, 1) != JNI_OK)
         return JNI_ERR;
     return JNI_VERSION_1_6;
+}
+
+// GLES2 through the GL proxies (libEGL and libGLESv2 are DT_NEEDED: the guest stubs bind to the host fronts). A 64x64 pbuffer: blue clear, red clear inside [8,56)^2 under a scissor, one green quad over [16,48)^2 (edges on pixel boundaries, so no partial pixels), read back.
+// Returns the pixels that equal the scene's expectation (4096 = all), -1 on an EGL or GL error. The expectation is the geometry, not the driver's output.
+#define GLES_W 64
+#define GLES_H 64
+static const char *gles_vs = "attribute vec2 pos;\nvoid main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+static const char *gles_fs = "precision mediump float;\nvoid main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+static GLuint gles_shader(GLenum type, const char *src)
+{
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    return ok ? s : 0;
+}
+
+JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
+{
+    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, NULL, NULL))
+        return -1;
+    const EGLint cfg_attr[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
+    EGLConfig cfg;
+    EGLint n = 0;
+    if (!eglChooseConfig(dpy, cfg_attr, &cfg, 1, &n) || n < 1)
+        return -1;
+    const EGLint pb_attr[] = { EGL_WIDTH, GLES_W, EGL_HEIGHT, GLES_H, EGL_NONE };
+    EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pb_attr);
+    const EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (surf == EGL_NO_SURFACE || ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, surf, surf, ctx))
+        return -1;
+
+    glViewport(0, 0, GLES_W, GLES_H);
+    glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(8, 8, 48, 48);
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    static const GLfloat quad[] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, -0.5f, 0.5f, 0.5f, -0.5f, 0.5f };
+    GLuint vs = gles_shader(GL_VERTEX_SHADER, gles_vs);
+    GLuint fs = gles_shader(GL_FRAGMENT_SHADER, gles_fs);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glBindAttribLocation(prog, 0, "pos");
+    glLinkProgram(prog);
+    glUseProgram(prog);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glEnableVertexAttribArray(0);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    static unsigned char px[GLES_W * GLES_H * 4];
+    glReadPixels(0, 0, GLES_W, GLES_H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (glGetError() != GL_NO_ERROR)
+        return -1;
+    jint matches = 0;
+    for (int y = 0; y < GLES_H; y++) {
+        for (int x = 0; x < GLES_W; x++) {
+            unsigned char want[4] = { 0, 0, 255, 255 };
+            if (x >= 8 && x < 56 && y >= 8 && y < 56) {
+                want[0] = 255;
+                want[2] = 0;
+            }
+            if (x >= 16 && x < 48 && y >= 16 && y < 48) {
+                want[0] = 0;
+                want[1] = 255;
+            }
+            if (memcmp(&px[(y * GLES_W + x) * 4], want, 4) == 0)
+                matches++;
+        }
+    }
+    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(dpy, ctx);
+    eglDestroySurface(dpy, surf);
+    eglTerminate(dpy);
+    return matches;
 }

@@ -45,6 +45,9 @@ public final class AtlJniTest {
     /** Guest callbacks of __system_property_read_callback / __system_property_foreach run on the caller's guest thread: 11 (atl_jni_test.c). */
     public static native int propCallbacks();
 
+    /** GLES2 through the GL proxies: pixels equal to the scene (4096 = all of a 64x64 pbuffer), -1 on an EGL or GL error (atl_jni_test.c). */
+    public static native int glesPbuffer();
+
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
 

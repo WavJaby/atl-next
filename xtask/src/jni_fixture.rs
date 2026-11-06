@@ -158,6 +158,8 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
             .arg(&cxx_obj)
             .arg(format!("-Wl,-soname,{LIB}"))
             .arg("-llog")
+            .arg("-lEGL")
+            .arg("-lGLESv2")
             .arg("-o")
             .arg(&lib),
         "NDK clang++ link",

@@ -77,23 +77,29 @@ fn page_of(a: usize) -> usize {
 }
 
 extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol: *const c_char) {
-    // SAFETY: NUL-terminated literals of the guest libc's stub table (INIT_INTERCEPTABLE_STUB_FUNCTION).
+    // SAFETY: NUL-terminated literals of the guest's stub tables (INIT_INTERCEPTABLE_STUB_FUNCTION).
     let (lib, name) = unsafe { (CStr::from_ptr(library), CStr::from_ptr(symbol)) };
     let name = name.to_string_lossy();
+    let lib = lib.to_string_lossy();
     let addr = addr as usize;
     // SAFETY: as patch_stub.
     if unsafe { std::slice::from_raw_parts(addr as *const u8, 2) } != arch::STUB_PREFIX {
         // the exported entry (`jmp name_stub`) or a variable: reaches the host through the stub
         return;
     }
-    match host_fn(&name).and_then(arch::bind) {
+    // a proxy library's stub resolves by (library, name) (proxy.rs), never by the global scope; libc's by name
+    let host = match super::proxy::target(&lib, &name) {
+        Some(t) => t.address(),
+        None => host_fn(&name),
+    };
+    match host.and_then(arch::bind) {
         Some(thunk) if patch_stub(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);
         }
         _ => {
             UNBOUND.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut v) = UNBOUND_NAMES.lock() {
-                v.push(format!("{}:{name}", lib.to_string_lossy()));
+                v.push(format!("{lib}:{name}"));
             }
         }
     }
