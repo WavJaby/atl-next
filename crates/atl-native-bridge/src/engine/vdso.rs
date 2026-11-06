@@ -44,7 +44,7 @@ fn provider_fn(name: &str) -> Option<usize> {
 }
 
 fn host_fn(name: &str) -> Option<usize> {
-    if let Some(p) = provider_fn(name) {
+    if let Some(p) = provider_fn(name).or_else(|| super::intercepts::host_fn(name)) {
         return Some(p);
     }
     Some(match name {
@@ -63,12 +63,6 @@ fn host_fn(name: &str) -> Option<usize> {
         "clock_getres" => libc::clock_getres as *const () as usize,
         "gettimeofday" => libc::gettimeofday as *const () as usize,
         "time" => libc::time as *const () as usize,
-        // keys and their values live host-side (NBS intercepts all four); `pthread_key_t` is 4 bytes in both libcs.
-        // A key destructor is guest code that glibc would call at thread exit on the host FS: thread exit through the crossing is step 4.2, the main thread never runs them (exit() skips TSD destructors).
-        "pthread_key_create" => libc::pthread_key_create as *const () as usize,
-        "pthread_key_delete" => libc::pthread_key_delete as *const () as usize,
-        "pthread_getspecific" => libc::pthread_getspecific as *const () as usize,
-        "pthread_setspecific" => libc::pthread_setspecific as *const () as usize,
         _ => return None,
     })
 }
@@ -128,15 +122,7 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     }
 }
 
-/// A host entry the guest reached that this engine cannot serve: name it and abort.
-#[allow(
-    clippy::print_stderr,
-    reason = "inside a guest call, before any logger: stderr is the one channel left"
-)]
-fn unsupported(what: &str) -> ! {
-    eprintln!("atl-native-bridge: {what}");
-    std::process::abort();
-}
+use super::unsupported;
 
 extern "C" fn post_init() {
     unsupported(

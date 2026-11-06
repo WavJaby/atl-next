@@ -33,6 +33,8 @@ fn on_panic(field: &str, ret: &Ty) -> Result<String> {
 /// What a guest thread is made of, relative to the AOSP tree: the thread record (`pthread_internal_t`) and its per-thread libc state (`bionic_tls`) -- the engine builds one per guest thread, as the NBS linker's `__libc_init_main_thread_early` reuses `__native_bridge_get_host_pthread()`'s answer as both -- and the static-TLS description the linker hands the host (`__native_bridge_config_static_tls`).
 const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/bionic/pthread_internal.h",
+    // pthread_attr_t: the intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate)
+    "bionic/libc/include/bits/pthread_types.h",
     "bionic/libc/private/bionic_tls.h",
     "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
 ];

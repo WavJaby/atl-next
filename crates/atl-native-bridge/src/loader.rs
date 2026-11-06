@@ -2,13 +2,13 @@
 //! The process's guest and the libraries ART asked it to load (NativeBridgeCallbacks `loadLibrary` / `unloadLibrary` / trampolines).
 //! The guest starts on the first `loadLibrary`, not at `initialize`: a process without bridged libraries maps nothing (bridge1-step4-plan section 1).
 //! Libraries go into the guest linker's default namespace, whose search path is the guest's own libraries plus the directory of every library loaded so far (`__loader_android_update_LD_LIBRARY_PATH`): an APK's `lib/<abi>/` holds the library's `DT_NEEDED` siblings (`libc++_shared.so`) and what it `dlopen`s by name.
-//! One thread so far: guest code runs only on the thread that started the guest (per-thread attach = step 4.2); another thread gets an error, never a crossing on a foreign record.
+//! Any thread: guest calls attach the calling thread first (engine thread.rs). The lock serialises the guest linker's entry points, as bionic's own `g_dl_mutex` would.
 
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::engine::{Config, Guest};
+use crate::engine::{Config, Guest, arch};
 
 /// bionic `RTLD_NOW` (dlfcn.h): what the guest dlopen gets whatever ART's flag; `RTLD_LOCAL` = 0.
 const RTLD_NOW: usize = 2;
@@ -16,22 +16,16 @@ const RTLD_NOW: usize = 2;
 struct Process {
     guest: Guest,
     dlopen: usize,
+    dlsym: usize,
     dlclose: usize,
     dlerror: usize,
     update_path: usize,
-    /// the thread that started the guest
-    tid: i32,
     base_path: Vec<PathBuf>,
     lib_dirs: Vec<PathBuf>,
 }
 
 /// None = not started; Some(Err) = the start failed (kept: a second start would map the guest twice).
 static PROCESS: Mutex<Option<Result<Process, String>>> = Mutex::new(None);
-
-fn tid() -> i32 {
-    // SAFETY: plain syscall.
-    unsafe { libc::gettid() }
-}
 
 fn linker_fn(g: &Guest, name: &str) -> Result<usize, String> {
     g.linker
@@ -46,14 +40,14 @@ fn start(cfg: &Config) -> Result<Process, String> {
         dlclose: linker_fn(&guest, "__dl___loader_dlclose")?,
         dlerror: linker_fn(&guest, "__dl___loader_dlerror")?,
         update_path: linker_fn(&guest, "__dl___loader_android_update_LD_LIBRARY_PATH")?,
+        dlsym: linker_fn(&guest, "__dl___loader_dlsym")?,
         guest,
-        tid: tid(),
         base_path: cfg.library_path.clone(),
         lib_dirs: Vec::new(),
     })
 }
 
-/// Runs `f` on the guest, on its own thread only. `cfg` starts it when absent; without one, no guest is an error.
+/// Runs `f` on the guest. `cfg` starts it when absent; without one, no guest is an error.
 fn with<T>(
     cfg: Option<&dyn Fn() -> Config>,
     f: impl FnOnce(&mut Process) -> Result<T, String>,
@@ -69,13 +63,6 @@ fn with<T>(
         return Err("no guest".into());
     };
     let p = p.as_mut().map_err(|e| format!("guest start failed: {e}"))?;
-    if p.tid != tid() {
-        return Err(format!(
-            "guest code on thread {} (started on {}): per-thread attach is not implemented",
-            tid(),
-            p.tid
-        ));
-    }
     f(p)
 }
 
@@ -132,6 +119,32 @@ pub fn load(path: &Path, cfg: &dyn Fn() -> Config) -> Result<usize, String> {
         }
         Ok(h)
     })
+}
+
+/// Guest `dlsym(handle, name)`; None when absent (or no guest).
+pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
+    let r = with(None, |p| {
+        // SAFETY: void* __loader_dlsym(void*, const char*, const void* caller); `handle` came from `load`.
+        Ok(unsafe {
+            p.guest
+                .call(p.dlsym, handle, name.as_ptr() as usize, p.guest.exe_entry)
+        })
+    });
+    r.ok().filter(|&f| f != 0)
+}
+
+/// A host-callable trampoline into guest function `f` (one per function: ART may ask again for the same symbol).
+pub fn trampoline(f: usize) -> Result<usize, String> {
+    static STUBS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    let mut stubs = STUBS
+        .lock()
+        .map_err(|_| "trampolines poisoned".to_owned())?;
+    if let Some(&(_, t)) = stubs.iter().find(|&&(g, _)| g == f) {
+        return Ok(t);
+    }
+    let t = arch::down(f)?;
+    stubs.push((f, t));
+    Ok(t)
 }
 
 /// Guest `dlclose(handle)`: 0 or the linker's error.

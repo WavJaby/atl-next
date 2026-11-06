@@ -15,7 +15,7 @@ use crate::elf::{self, Verdict};
 use crate::engine::Config;
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
-    native_bridge_namespace_t, siginfo_t,
+    kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,
 };
 use crate::loader;
 use object::elf as obj_elf;
@@ -77,13 +77,38 @@ pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
     }
 }
 
+/// Pre-v7 entry, not called by ART 16: the Regular call type (as berberis forwards it).
+///
+/// # Safety
+/// `name` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn getTrampoline(
-    _handle: *mut c_void,
-    _name: *const c_char,
-    _shorty: *const c_char,
-    _len: u32,
+    handle: *mut c_void,
+    name: *const c_char,
+    shorty: *const c_char,
+    len: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // SAFETY: same contract.
+    unsafe { getTrampolineWithJNICallType(handle, name, shorty, len, kJNICallTypeRegular) }
+}
+
+/// Symbols ART calls with a JavaVM, not a JNIEnv: no trampoline until the guest JavaVM table exists (bridge1-step4-plan 4.4). ART treats a missing `JNI_OnLoad` as none.
+const NEEDS_GUEST_VM: &[&CStr] = &[c"JNI_OnLoad"];
+
+/// The trampoline of guest `name` in `handle`, or null.
+///
+/// # Safety
+/// `name` is null or a NUL-terminated string.
+unsafe fn trampoline(handle: *mut c_void, name: *const c_char) -> *mut c_void {
+    // SAFETY: caller contract.
+    let Some(name) = (unsafe { str_arg(name) }) else {
+        return std::ptr::null_mut();
+    };
+    if NEEDS_GUEST_VM.contains(&name) {
+        return std::ptr::null_mut();
+    }
+    loader::symbol(handle as usize, name)
+        .and_then(|f| loader::trampoline(f).map_err(fail).ok())
+        .map_or(std::ptr::null_mut(), |t| t as *mut c_void)
 }
 
 /// # Safety
@@ -178,14 +203,19 @@ pub unsafe fn getExportedNamespace(_name: *const c_char) -> *mut native_bridge_n
 
 pub unsafe fn preZygoteFork() {}
 
+/// Every call type gets the same trampoline: the identity crossing passes the arguments through (the JNIEnv too, for now: the guest env table is 4.4).
+///
+/// # Safety
+/// `name` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn getTrampolineWithJNICallType(
-    _handle: *mut c_void,
-    _name: *const c_char,
+    handle: *mut c_void,
+    name: *const c_char,
     _shorty: *const c_char,
     _len: u32,
     _jni_call_type: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // SAFETY: the header's contract.
+    unsafe { trampoline(handle, name) }
 }
 
 pub unsafe fn getTrampolineForFunctionPointer(

@@ -54,6 +54,57 @@ const FONT_TEXT: &str = "Handgloves";
 const FONT_SIZE: u16 = 2048;
 /// What Main.onCreate logs before MARKER once the bridge-1 fixture (`libatl-jni-test.so`, an x86_64 bionic library) loaded: libnativeloader routed it to the NativeBridge core, whose guest linker loaded it.
 const BRIDGE1: &str = "AtlTest: bridge1 loaded";
+/// Main.bridge1Calls' lines: `AtlTest: bridge1 call <name> = <value>`.
+const BRIDGE1_CALL: &str = "AtlTest: bridge1 call ";
+/// (call, expected value), from the fixture's sources (xtask/testdata/jni-test, AtlJniTest.java): `tlsCounter` is a `__thread` counter per thread (1, 2, untouched by threadSum's worker: 3, a fresh Java thread's own: 1); threadSum = 1 + .. + 100; errno ENOENT = 2; atl_jni_sibling.c's answer 42; RegisterNatives' `registeredAnswer` 7.
+const BRIDGE1_CALLS: &[(&str, &str)] = &[
+    ("tlsCounter#1", "1"),
+    ("tlsCounter#2", "2"),
+    ("threadSum", "5050"),
+    ("tlsCounter#3", "3"),
+    ("tlsCounterFreshThread", "1"),
+    ("errnoRoundTrip", "2"),
+    ("cppThrowCatch", "1"),
+    ("dlopenSibling", "42"),
+    ("greet", "hello, bridge1"),
+    ("callJavaAdd", "5"),
+    ("registeredAnswer", "7"),
+];
+/// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
+const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";
+
+/// Every bridge-1 call whose line is missing or wrong, then the thread balance.
+fn bridge1_call_failures(app: &str) -> Vec<String> {
+    let got = |name: &str| {
+        app.lines().find_map(|l| {
+            let (_, r) = l.split_once(BRIDGE1_CALL)?;
+            let (n, v) = r.split_once(" = ")?;
+            (n == name).then(|| v.trim_end().to_owned())
+        })
+    };
+    let mut whys: Vec<String> = BRIDGE1_CALLS
+        .iter()
+        .filter_map(|&(name, want)| match got(name) {
+            Some(v) if v == want => None,
+            other => Some(format!("bridge1 call {name}: want {want}, got {other:?}")),
+        })
+        .collect();
+    let last = app.lines().rev().find_map(|l| l.split_once(BRIDGE1_DETACH));
+    let balance = last.and_then(|(_, r)| {
+        let (a, d) = r
+            .trim_end()
+            .trim_end_matches(')')
+            .split_once(", detached ")?;
+        Some((a.parse::<u32>().ok()?, d.parse::<u32>().ok()?))
+    });
+    match balance {
+        Some((a, d)) if a == d + 1 => {}
+        other => whys.push(format!(
+            "bridge1 threads: want attached = detached + 1 (the main thread), got {other:?}"
+        )),
+    }
+    whys
+}
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -241,6 +292,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "bridge1: want {BRIDGE1:?}, got {:?}",
             bridge1.or_else(|| app.lines().find(|l| l.contains("AtlTest: bridge1")))
         ));
+    }
+    if passed && bridge1_ok {
+        whys.extend(bridge1_call_failures(&app));
     }
     if !whys.is_empty() {
         for why in &whys {

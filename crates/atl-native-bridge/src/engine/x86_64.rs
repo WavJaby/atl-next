@@ -118,7 +118,7 @@ std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c) -> f(a, b, c) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_signal_entry, atl_nb_signal_handlers\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_cross_to_guest, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
@@ -181,6 +181,81 @@ std::arch::global_asm!(
         "    ret\n",
         "9:  ud2\n",
         ".size atl_nb_cross_to_host, .-atl_nb_cross_to_host\n",
+        // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = host return, then the caller's stack args.
+        // Same shadow-stack frame as the up direction (3 words): host return, guest target (while calling), the GS the caller had (0 outermost, the record when nested inside an up call).
+        // Argument registers, %al and stack args reach the guest untouched; only %r10/%r11 (and %rcx after the call, not a return register) are scratch.
+        ".globl atl_nb_cross_to_guest\n",
+        ".type atl_nb_cross_to_guest,@function\n",
+        "atl_nb_cross_to_guest:\n",
+        // the record always comes from host TLS (attach; FS is the host's here, nested or not): an incoming GS base is not trusted (a nonzero one that was no record trapped, app run 2026-11-06)
+        // slot for the caller's GS, then every argument register saved around the call; 9 pushes + 128 keep the call 16-aligned
+        "    push $0\n",
+        "    push %r10\n",
+        "    push %rdi\n",
+        "    push %rsi\n",
+        "    push %rdx\n",
+        "    push %rcx\n",
+        "    push %r8\n",
+        "    push %r9\n",
+        "    push %rax\n",
+        "    sub $128, %rsp\n",
+        "    movdqu %xmm0, 0(%rsp)\n",
+        "    movdqu %xmm1, 16(%rsp)\n",
+        "    movdqu %xmm2, 32(%rsp)\n",
+        "    movdqu %xmm3, 48(%rsp)\n",
+        "    movdqu %xmm4, 64(%rsp)\n",
+        "    movdqu %xmm5, 80(%rsp)\n",
+        "    movdqu %xmm6, 96(%rsp)\n",
+        "    movdqu %xmm7, 112(%rsp)\n",
+        "    call *atl_nb_attach_fn(%rip)\n",
+        "    mov %rax, %r11\n",
+        "    movdqu 0(%rsp), %xmm0\n",
+        "    movdqu 16(%rsp), %xmm1\n",
+        "    movdqu 32(%rsp), %xmm2\n",
+        "    movdqu 48(%rsp), %xmm3\n",
+        "    movdqu 64(%rsp), %xmm4\n",
+        "    movdqu 80(%rsp), %xmm5\n",
+        "    movdqu 96(%rsp), %xmm6\n",
+        "    movdqu 112(%rsp), %xmm7\n",
+        "    rdgsbase %rax\n",
+        "    mov %rax, 192(%rsp)\n",
+        "    add $128, %rsp\n",
+        "    pop %rax\n",
+        "    pop %r9\n",
+        "    pop %r8\n",
+        "    pop %rcx\n",
+        "    pop %rdx\n",
+        "    pop %rsi\n",
+        "    pop %rdi\n",
+        "    pop %r10\n",
+        // [rsp] = the caller's GS; GS = the record from here on
+        "    wrgsbase %r11\n",
+        "    mov %gs:0, %r11\n",
+        "    cmp %gs:24, %r11\n",
+        "    jae 9f\n",
+        "    pop 16(%r11)\n",
+        "    pop 0(%r11)\n",
+        "    mov %r10, 8(%r11)\n",
+        "    rdfsbase %r10\n",
+        "    mov %r10, %gs:8\n",
+        "    add $24, %r11\n",
+        "    mov %r11, %gs:0\n",
+        "    mov %gs:16, %r10\n",
+        "    wrfsbase %r10\n",
+        "    call *-16(%r11)\n",
+        "    rdfsbase %r10\n",
+        "    mov %r10, %gs:16\n",
+        "    mov %gs:0, %r11\n",
+        "    sub $24, %r11\n",
+        "    mov %r11, %gs:0\n",
+        "    mov %gs:8, %r10\n",
+        "    wrfsbase %r10\n",
+        "    push 0(%r11)\n",
+        "    mov 16(%r11), %r10\n",
+        "    wrgsbase %r10\n",
+        "    ret\n",
+        "9:  ud2\n",
+        ".size atl_nb_cross_to_guest, .-atl_nb_cross_to_guest\n",
         // signal entry: the kernel delivers on whatever FS the thread had (guest or host) and sigreturn does not restore FS base;
         // GS != 0 = a crossing is active on this thread -> run the host handler on the record's host FS, put the interrupted FS back after
         ".globl atl_nb_signal_entry\n",
@@ -261,6 +336,88 @@ pub fn bind(target: usize) -> Option<usize> {
     atl_nb_host_targets[i].store(target, Ordering::Release);
     let base = (&raw const atl_nb_host_thunks) as usize;
     Some(base + i * THUNK_BYTES)
+}
+
+/// What `atl_nb_cross_to_guest` calls on a thread's first down call (GS = 0): its record, attached on demand (thread.rs `attach_current`).
+#[unsafe(no_mangle)]
+static atl_nb_attach_fn: extern "C" fn() -> *mut HostThread = attach_entry;
+
+extern "C" fn attach_entry() -> *mut HostThread {
+    super::thread::attach_current()
+}
+
+unsafe extern "C" {
+    fn atl_nb_cross_to_guest();
+}
+
+/// Down stub: `movabs $target, %r10; movabs $atl_nb_cross_to_guest, %r11; jmp *%r11` (10 + 10 + 3 bytes).
+const DOWN_STUB: usize = 24;
+
+/// Bytes of a down stub calling guest `target` from host code on any thread.
+fn down_stub(target: usize) -> [u8; DOWN_STUB] {
+    let mut s = [0xcc; DOWN_STUB];
+    s[0..2].copy_from_slice(&[0x49, 0xba]);
+    s[2..10].copy_from_slice(&target.to_le_bytes());
+    s[10..12].copy_from_slice(&[0x49, 0xbb]);
+    s[12..20].copy_from_slice(&(atl_nb_cross_to_guest as *const () as usize).to_le_bytes());
+    s[20..23].copy_from_slice(&[0x41, 0xff, 0xe3]);
+    s
+}
+
+/// The down-stub pool: one memfd mapped twice, RW for writing and RX for running (no page is ever writable and executable, and a stub in use never changes protection), grown by a chunk at a time.
+struct Pool {
+    rw: usize,
+    rx: usize,
+    used: usize,
+}
+const CHUNK: usize = 64 * 1024;
+
+static POOL: std::sync::Mutex<Option<Pool>> = std::sync::Mutex::new(None);
+
+fn new_chunk() -> Result<Pool, String> {
+    // SAFETY: memfd + two shared mappings of CHUNK bytes; the fd is closed once mapped (the mappings keep the file).
+    unsafe {
+        let fd = libc::memfd_create(c"atl-nb-down".as_ptr(), libc::MFD_CLOEXEC);
+        if fd < 0 || libc::ftruncate(fd, CHUNK as libc::off_t) != 0 {
+            return Err(format!(
+                "down stubs: memfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let map = |prot| libc::mmap(std::ptr::null_mut(), CHUNK, prot, libc::MAP_SHARED, fd, 0);
+        let rw = map(libc::PROT_READ | libc::PROT_WRITE);
+        let rx = map(libc::PROT_READ | libc::PROT_EXEC);
+        libc::close(fd);
+        if rw == libc::MAP_FAILED || rx == libc::MAP_FAILED {
+            return Err(format!(
+                "down stubs: mmap: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Pool {
+            rw: rw as usize,
+            rx: rx as usize,
+            used: 0,
+        })
+    }
+}
+
+/// A host-callable address that runs guest function `target` on the calling thread's guest thread pointer (attaching the thread first if needed), every argument as the caller passed it.
+pub fn down(target: usize) -> Result<usize, String> {
+    let mut pool = POOL.lock().map_err(|_| "down stubs: poisoned".to_owned())?;
+    if pool.as_ref().is_none_or(|p| p.used + DOWN_STUB > CHUNK) {
+        // the full chunk stays mapped: its stubs are in use
+        *pool = Some(new_chunk()?);
+    }
+    let Some(p) = pool.as_mut() else {
+        return Err("down stubs: no pool".into());
+    };
+    let bytes = down_stub(target);
+    // SAFETY: `used + DOWN_STUB <= CHUNK` bytes into the RW view; the RX view shows the same page.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (p.rw + p.used) as *mut u8, DOWN_STUB) };
+    let at = p.rx + p.used;
+    p.used += DOWN_STUB;
+    Ok(at)
 }
 
 /// x86_64 `movabs $imm64, %r11` opcode bytes (REX.W+B, B8+r): the NBS x86_64 interceptable stub starts with it, then `jmp *%r11`.
