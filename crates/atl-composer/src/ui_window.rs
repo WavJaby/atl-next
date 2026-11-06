@@ -80,6 +80,33 @@ pub fn install(
     open();
 }
 
+/// Window pixels each capture also reads, `x,y;x,y` (origin top-left, as the capture): one `atl-composer: ui: capture pixel` line each. Set by the window gate's stage gles2 (xtask/src/window/gles2.rs), which checks the composed picture at points it chose.
+const PIXELS_ENV: &str = "ATL_UI_CAPTURE_PIXELS";
+
+/// [`PIXELS_ENV`]'s points; a pair that does not parse is dropped, so the gate that wanted its line fails on the missing line.
+fn pixel_points() -> Vec<(u32, u32)> {
+    let Some(text) = std::env::var_os(PIXELS_ENV) else {
+        return Vec::new();
+    };
+    text.to_string_lossy()
+        .split(';')
+        .filter_map(|pair| {
+            let (x, y) = pair.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// `(x, y)` of a capture (rows top to bottom, no padding) as RRGGBBAA; None outside it.
+fn pixel_rgba(rgba: &[u8], width: u32, height: u32, x: u32, y: u32) -> Option<String> {
+    if x >= width || y >= height {
+        return None;
+    }
+    let i = (y as usize * width as usize + x as usize) * 4;
+    let [r, g, b, a]: [u8; 4] = rgba.get(i..i + 4)?.try_into().ok()?;
+    Some(format!("{r:02x}{g:02x}{b:02x}{a:02x}"))
+}
+
 /// The readback of a settled window: its digest and size, and the frames presented so far, for the gate
 /// (`atl-composer: ui: capture`); the gate compares the digest with its own expectation.
 fn capture_report(window: &PlatformWindow, presented: u32) {
@@ -96,6 +123,17 @@ fn capture_report(window: &PlatformWindow, presented: u32) {
         capture.size.height,
         fnv1a64(&capture.rgba)
     );
+    let (width, height) = (capture.size.width, capture.size.height);
+    for (x, y) in pixel_points() {
+        match pixel_rgba(&capture.rgba, width, height, x, y) {
+            Some(rgba) => tracing::info!(
+                "atl-composer: ui: capture pixel presented={presented} x={x} y={y} rgba={rgba}"
+            ),
+            None => tracing::warn!(
+                "atl-composer: ui: capture pixel x={x} y={y} is outside the {width}x{height} capture"
+            ),
+        }
+    }
 }
 
 /// Whether the window clock asks for another tick: only while the compositor wants one (a vsync request, a queued transaction or buffer, calls to deliver: UiFrames::wants_frame) or a gate's readback waits for the picture to settle.

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test gles2-fixture`: the GLES2 test APK (xtask/testdata/gles2), shaped like Cut the Rope's draw path: an Activity with a Java `GLSurfaceView` (EGL14 from the framework), its renderer calling an NDK-built `.so` that draws with GLES2 only and reads back pixels.
 //! The library stands in for a game's native renderer (libctro imports ~39 `gl*` from libGLESv2, no `egl*`); built with NDK clang as jni_fixture.rs builds its fixture, arch from arches.toml.
-//! Static gate (runtime use waits for bridge-1 N4 + GPU G3):
+//! Static gate, then the runtime use (`xtask test window --stage gles2`, GS2.5: [`apk_libs`] builds the library it puts in the APK):
 //! - `.so`: DT_NEEDED is exactly [`NEEDED`]; the `gl*` imports are exactly [`GL_IMPORTS`] (the calls atl_gles2.c makes); no `egl*` import.
 //! - APK: built with the runtime gates' builder; manifest `<uses-feature glEsVersion>` = [`GL_ES_2`], `<application hardwareAccelerated="true">`, minSdk = [`MIN_SDK`]; the library stored in `lib/<abi>/`.
+//! - Main.java's PROBES rows equal [`PROBES`], the window stage's expectation (two copies, one checked against the other).
 //! - controls, so a pass means something: each check rejects a broken copy of the real input (an extra `libEGL.so`, a missing or extra GL call, an `egl*` import, glEsVersion 3.0, hardwareAccelerated false).
 
 use std::collections::BTreeSet;
@@ -39,7 +40,7 @@ pub struct Args {
     work: Option<PathBuf>,
 }
 
-const FIXTURE: &str = "xtask/testdata/gles2";
+pub(crate) const FIXTURE: &str = "xtask/testdata/gles2";
 const SOURCE: &str = "jni/atl_gles2.c";
 /// `System.loadLibrary("atl-gles2")` in Main.java.
 const LIB: &str = "libatl-gles2.so";
@@ -80,6 +81,18 @@ const GL_IMPORTS: &[&str] = &[
     "glViewport",
 ];
 
+/// Main.java's table, read by the static gate; the window stage (window/gles2.rs) reads the composed picture at these probes.
+const MAIN_JAVA: &str = "java/com/example/atlgles2/Main.java";
+/// The expected pixels (x, y in GL window coordinates, origin bottom-left; 0xRRGGBBAA) worked out in Main.java's PROBES comment, not by running the scene. Mirrored in Main.java; [`probe_failures`] checks the mirror.
+pub(crate) const PROBES: [(u32, u32, u32); 6] = [
+    (8, 8, 0xff0000ff),
+    (24, 56, 0x4080c0ff),
+    (40, 40, 0x00ff00ff),
+    (56, 40, 0x0000ffff),
+    (40, 56, 0xffffffff),
+    (56, 56, 0xffff00ff),
+];
+
 /// Builds the library into `dir`; its path.
 fn build_lib(root: &Path, t: &NdkTarget, dir: &Path) -> Result<PathBuf> {
     if dir.exists() {
@@ -100,6 +113,43 @@ fn build_lib(root: &Path, t: &NdkTarget, dir: &Path) -> Result<PathBuf> {
         "NDK clang atl_gles2.c",
     )?;
     Ok(lib)
+}
+
+/// The library for `arch` (an arches.toml row with `[guest]`), built with NDK `ndk` into `out`: the `lib/<abi>/` entry of the APK.
+pub(crate) fn apk_libs(root: &Path, ndk: &Path, arch: &str, out: &Path) -> Result<NativeLibs> {
+    let t = NdkTarget::new(root, ndk, arch, MIN_SDK)?;
+    let lib = build_lib(root, &t, out)?;
+    Ok(NativeLibs {
+        abi: t.abi.clone(),
+        libs: vec![lib],
+        min_sdk: MIN_SDK,
+    })
+}
+
+/// Main.java's PROBES rows, in order (`{x, y, 0xRRGGBBAA},`); a row that does not parse is dropped and then named by [`probe_failures`].
+fn java_probes(java: &str) -> Vec<(u32, u32, u32)> {
+    java.lines()
+        .filter_map(|line| {
+            let row = line.trim().strip_prefix('{')?.strip_suffix("},")?;
+            let mut f = row.split(',').map(str::trim);
+            let x = f.next()?.parse().ok()?;
+            let y = f.next()?.parse().ok()?;
+            let rgba = u32::from_str_radix(f.next()?.strip_prefix("0x")?, 16).ok()?;
+            f.next().is_none().then_some((x, y, rgba))
+        })
+        .collect()
+}
+
+/// Main.java's table must equal [`PROBES`] row for row: the window stage judges the composed picture against [`PROBES`], the app against Main.java.
+fn probe_failures(java: &str) -> Vec<String> {
+    let got = java_probes(java);
+    if got == PROBES {
+        vec![]
+    } else {
+        vec![format!(
+            "Main.java PROBES {got:x?}, gles2_fixture::PROBES {PROBES:x?}"
+        )]
+    }
 }
 
 fn needed_failures(needed: &[String]) -> Vec<String> {
@@ -234,9 +284,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
         w.join("out/java/build")
     })?;
-    let t = NdkTarget::new(root, &ndk, &args.arch, MIN_SDK)?;
-    let lib = build_lib(root, &t, &work.join("lib"))?;
-    let shape = jni_fixture::shape(&lib)?;
+    let native = apk_libs(root, &ndk, &args.arch, &work.join("lib"))?;
+    let shape = jni_fixture::shape(&work.join("lib").join(LIB))?;
     let mut fails = needed_failures(&shape.needed);
     let imports = import_failures(&shape.imports);
     if fails.is_empty() && imports.is_empty() {
@@ -247,13 +296,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
     }
     fails.extend(imports);
+    fails.extend(probe_failures(&std::fs::read_to_string(
+        root.join(FIXTURE).join(MAIN_JAVA),
+    )?));
 
     let tools = ApkTools::new(root, &args.host, &out, &java_out)?;
-    let native = NativeLibs {
-        abi: t.abi.clone(),
-        libs: vec![lib],
-        min_sdk: MIN_SDK,
-    };
     let apk = tools.build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
     let m = manifest::read(&tools.aapt2, &apk)?;
     let am = ApkManifest {
@@ -262,7 +309,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         min_sdk: m.min_sdk,
     };
     let mf = manifest_failures(&am);
-    let entry = format!("lib/{}/{LIB}", t.abi);
+    let entry = format!("lib/{}/{LIB}", native.abi);
     let has_lib = apk_entries(&tools.jdk, &apk)?.contains(&entry);
     if !has_lib {
         fails.push(format!("{} lacks {entry}", apk.display()));
@@ -313,6 +360,15 @@ mod tests {
         assert!(import_failures(&imports()).is_empty());
         assert!(manifest_failures(&m).is_empty());
         assert!(control_failures(&needed, &imports(), &m).is_empty());
+    }
+
+    /// Main.java's table is the gate's table; a changed row is named.
+    #[test]
+    fn probe_table_is_the_java_one() {
+        let java = include_str!("../testdata/gles2/java/com/example/atlgles2/Main.java");
+        assert!(probe_failures(java).is_empty());
+        let broken = java.replace("{24, 56, 0x4080c0ff}", "{24, 56, 0x4080c0fe}");
+        assert_eq!(probe_failures(&broken).len(), 1);
     }
 
     #[test]

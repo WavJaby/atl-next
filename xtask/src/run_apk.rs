@@ -115,6 +115,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     .with_gralloc(root)?
     .with_gl_driver()?
+    .with_native_bridge_guest(&args.host)?
     .with_ui("gtk");
     let rt = if args.no_app_seccomp {
         rt.without_app_seccomp()

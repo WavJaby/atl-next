@@ -182,6 +182,8 @@ pub struct Runtime {
     ui: Option<String>,
     /// A composer rule a gate breaks on purpose (`ATL_UI_BREAK`, atl-composer start.rs), when [`Runtime::with_ui_break`] set it.
     ui_break: Option<&'static str>,
+    /// Window pixels each capture reads back (`ATL_UI_CAPTURE_PIXELS`, atl-composer ui_window.rs), when [`Runtime::with_ui_pixels`] set them.
+    ui_pixels: Vec<(u32, u32)>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
@@ -507,6 +509,7 @@ impl Runtime {
             display: None,
             ui: None,
             ui_break: None,
+            ui_pixels: Vec::new(),
             wayland: None,
             app_seccomp: true,
             ime_death_link: true,
@@ -613,6 +616,12 @@ impl Runtime {
     /// The app processes' composer breaks `rule` (a deliberate-failure run): `ATL_UI_BREAK` in their environment.
     pub fn with_ui_break(mut self, rule: &'static str) -> Self {
         self.ui_break = Some(rule);
+        self
+    }
+
+    /// The composed picture at these window pixels (origin top-left): each capture logs them (`ATL_UI_CAPTURE_PIXELS`). Only the gles2 stage sets them.
+    pub fn with_ui_pixels(mut self, points: Vec<(u32, u32)>) -> Self {
+        self.ui_pixels = points;
         self
     }
 
@@ -924,6 +933,14 @@ impl Runtime {
                 .env("ATL_UI_CAPTURE", "1")
                 .env("RUST_LOG", "info,atl_composer=debug")
                 .env("GDK_DEBUG", crate::gdk_dmabuf::GDK_DEBUG);
+        }
+        if !self.ui_pixels.is_empty() {
+            let pairs: Vec<String> = self
+                .ui_pixels
+                .iter()
+                .map(|(x, y)| format!("{x},{y}"))
+                .collect();
+            cmd.env("ATL_UI_CAPTURE_PIXELS", pairs.join(";"));
         }
         if let Some(rule) = self.ui_break {
             cmd.env("ATL_UI_BREAK", rule);

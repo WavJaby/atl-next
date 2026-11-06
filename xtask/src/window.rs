@@ -9,6 +9,7 @@
 //! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
 //! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
 //! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
+//! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,11 +25,13 @@ use crate::atld_run::{
 };
 use crate::composer::{fnv1a64, word};
 use crate::cpu_pressure::{Sampler, Samples};
+use crate::gles2_fixture;
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod dialog;
+mod gles2;
 mod ime;
 mod move_output;
 mod surface_view;
@@ -60,7 +63,7 @@ pub struct Args {
     /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-hold/root/log/`.
     #[arg(long, value_name = "SECONDS")]
     hold: Option<u64>,
-    /// Deliberate break (stage surface-view): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
+    /// Deliberate break (stages surface-view and gles2): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
     #[arg(long)]
     break_z_order: bool,
     /// Deliberate break (stages widgets, gtk, ime, surface-view): the composer drops the post-draw Transactions the window service forwards, so the post-draw check must fail.
@@ -128,6 +131,8 @@ enum Stage {
     Hwui,
     /// UI mode: a dimming dialog with surfaceInsets and a popup near the bottom over a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/dialog.rs).
     Dialog,
+    /// The GLES2 fixture in UI mode, its `.so` a guest library through the native bridge: the app's readback and the composer's readback at its probes are the expectation (xtask/src/window/gles2.rs; GS2.5).
+    Gles2,
 }
 
 impl Stage {
@@ -147,6 +152,7 @@ impl Stage {
             Stage::SurfaceView => "surface-view",
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
+            Stage::Gles2 => "gles2",
         }
     }
 
@@ -155,7 +161,9 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Dialog => GTK_WINDOW_MS,
+            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Dialog | Stage::Gles2 => {
+                GTK_WINDOW_MS
+            }
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -286,6 +294,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Move => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::Dialog => dialog::MARKER,
+        Stage::Gles2 => gles2::MARKER,
     }
 }
 
@@ -1573,9 +1582,11 @@ fn hold_report(app_log: &Path, marker: &str, secs: u64, atld_exited: bool) -> Ex
     }
 }
 
-/// Native goals (gate_goals.rs): the runtime with gralloc.
+/// Native goals (gate_goals.rs): the runtime with gralloc, the GL driver and the native-bridge guest, as [`run`] stages it.
 pub fn goals() -> crate::gate_goals::Goals {
-    crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
+    crate::atld_run::goals()
+        .with(crate::atld_run::gralloc_goals())
+        .with(crate::atld_run::nb_guest_goals())
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -1596,7 +1607,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?;
+    .with_gl_driver()?
+    // the native-bridge guest: every window stage carries it, as `app` does (the GLES2 fixture's library is a guest library)
+    .with_native_bridge_guest(&args.host)?;
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }
@@ -1621,7 +1634,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::StartFinish
         | Stage::Move
         | Stage::SurfaceView
-        | Stage::Dialog => {
+        | Stage::Dialog
+        | Stage::Gles2 => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1667,6 +1681,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
     let rt = rt.with_display(display.to_arg());
+    // the composed picture at the GLES2 probes: each capture logs its pixels there (window/gles2.rs)
+    let rt = match args.stage {
+        Stage::Gles2 => rt.with_ui_pixels(gles2::composer_points(display)),
+        _ => rt,
+    };
     let rt = if args.break_ime_death {
         rt.without_ime_death_link()
     } else {
@@ -1691,11 +1710,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::SurfaceView => surface_view::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
+        Stage::Gles2 => gles2_fixture::FIXTURE,
         _ => FIXTURE,
+    };
+    // the GLES2 fixture's library is built for the host arch (the identity guest), as its static gate builds it
+    let native = match args.stage {
+        Stage::Gles2 => Some(gles2_fixture::apk_libs(
+            root,
+            &crate::jni_fixture::default_ndk(root)?,
+            &args.host,
+            &work.join("gles2-lib"),
+        )?),
+        _ => None,
     };
     let apk = rt
         .apk
-        .build(&root.join(fixture), &work.join("apk"), &[], None)?;
+        .build(&root.join(fixture), &work.join("apk"), &[], native.as_ref())?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -1747,6 +1777,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::Widgets, _, _) => widgets::drive(p, &log, break_mouse_back),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Dialog, _, _) => dialog::drive(p, &log),
+            (Stage::Gles2, _, _) => gles2::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 drive_resize(p, &log)
             }
@@ -1826,6 +1857,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => dialog::checks(&app, &liveness),
+        (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);
             sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));
