@@ -697,13 +697,20 @@ fn made_of<'a>(output: &'a Path, deps: &'a BTreeMap<PathBuf, Vec<PathBuf>>) -> B
 pub fn roots(layout: &atl_layout::Layout, checkouts: &[crate::sources::Checkout]) -> Vec<Root> {
     let mut roots: Vec<Root> = checkouts
         .iter()
-        .filter_map(|c| {
-            let dir = std::fs::canonicalize(layout.locate(&c.dir).dir).ok()?;
-            Some(Root {
-                dir,
-                key: c.licence_key.clone(),
-                prefix: c.licence_prefix(),
-            })
+        .flat_map(|c| {
+            let located = layout.locate(&c.dir);
+            // A task copy is bound over its shared-tree place in the build namespace, so depfiles also name files by the shared path -> both places are this project
+            let shared = located.task.as_ref().map(|_| layout.src().join(&c.dir));
+            [Some(located.dir), shared]
+                .into_iter()
+                .flatten()
+                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                .map(|dir| Root {
+                    dir,
+                    key: c.licence_key.clone(),
+                    prefix: c.licence_prefix(),
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
     if let Ok(dir) = std::fs::canonicalize(crate::tree::shared_tree(layout)) {

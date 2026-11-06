@@ -285,6 +285,40 @@ macro_rules! ndk {
     };
 }
 
+const CUTILS: &[u8] = b"libcutils.so\0";
+/// Region size of the ashmem probe: several pages plus a remainder, so a size rounded to pages or read from the wrong place shows. `ashmem=` reports it back; xtask compares with ASHMEM_PROBE_SIZE in native_load/audio.rs.
+const ASHMEM_PROBE_SIZE: usize = 3 * 4096 + 100;
+type AshmemCreate = unsafe extern "C" fn(*const c_char, usize) -> c_int;
+type AshmemSize = unsafe extern "C" fn(c_int) -> c_int;
+
+/// libcutils' shared memory as Codec2 uses it (FMQ, linear blocks): create a region, map it, write + read back, size from ashmem_get_size_region. `ashmem=<size>`, else `error=ashmem:<step>`.
+fn ashmem_probe(out: &mut Vec<String>) -> Result<(), String> {
+    let create = lib_sym::<AshmemCreate>(CUTILS, b"ashmem_create_region\0").ok_or("error=ashmem:symbol")?;
+    let size_of = lib_sym::<AshmemSize>(CUTILS, b"ashmem_get_size_region\0").ok_or("error=ashmem:symbol")?;
+    // SAFETY: NUL-terminated name; the libcutils functions have the signatures above; the mapping is private to this block and unmapped before the fd closes.
+    unsafe {
+        let fd = create(c"nlt-ashmem".as_ptr(), ASHMEM_PROBE_SIZE);
+        if fd < 0 {
+            return Err("error=ashmem:create".into());
+        }
+        let size = size_of(fd);
+        let p = libc::mmap(std::ptr::null_mut(), ASHMEM_PROBE_SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+        let mapped = p != libc::MAP_FAILED && {
+            let last = p.cast::<u8>().add(ASHMEM_PROBE_SIZE - 1);
+            last.write_volatile(0x5a);
+            let ok = last.read_volatile() == 0x5a;
+            libc::munmap(p, ASHMEM_PROBE_SIZE);
+            ok
+        };
+        libc::close(fd);
+        if !mapped {
+            return Err("error=ashmem:map".into());
+        }
+        out.push(format!("ashmem={size}"));
+    }
+    Ok(())
+}
+
 /// AMediaFormat's int32 `key`, None when absent.
 fn int_key(get: FormatInt, fmt: *mut c_void, key: &CStr) -> Option<i32> {
     let mut v = 0i32;
@@ -514,7 +548,7 @@ pub extern "C" fn Java_NativeLoad_decodeFile(
     let (input, output) = (java_string(env, input), java_string(env, output));
     let mut out = Vec::new();
     store_probe(&mut out);
-    if let Err(e) = decode(&input, &output, &mut out) {
+    if let Err(e) = ashmem_probe(&mut out).and_then(|()| decode(&input, &output, &mut out)) {
         out.push(e);
     }
     let text = CString::new(out.join(" ")).unwrap_or_default();

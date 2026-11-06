@@ -180,6 +180,8 @@ fn decode(
     let run = env
         .binder_art(fixture, "decode", &args)
         .map_err(|e| format!("{e:#}"))?;
+    // the process's log beside its PCM: a hang or abort is diagnosed from it
+    let _ = std::fs::write(output.with_extension("pcm.log"), &run.stderr);
     let line = run
         .stdout
         .lines()
@@ -201,7 +203,10 @@ fn decode(
     Ok((line, pairs))
 }
 
-/// One clip's verdict: the decode's frames, channels, rate, PCM encoding and byte count against the container's; the store the process saw; raw output equal to the WAV data chunk.
+/// The shim's ashmem probe region size (shim ASHMEM_PROBE_SIZE: 3 pages + 100 bytes, so page rounding shows).
+const ASHMEM_PROBE_SIZE: u64 = 3 * 4096 + 100;
+
+/// One clip's verdict: the ashmem probe's region size; the decode's frames, channels, rate, PCM encoding and byte count against the container's; the store the process saw; raw output equal to the WAV data chunk.
 fn check(
     name: &str,
     exp: &Expected,
@@ -250,6 +255,12 @@ fn check(
     {
         bad.push(format!(
             "store not declared with instance default: `{line}`"
+        ));
+    }
+    if num("ashmem")? != ASHMEM_PROBE_SIZE {
+        bad.push(format!(
+            "ashmem region size {} != created {ASHMEM_PROBE_SIZE}",
+            num("ashmem")?
         ));
     }
     if got.get("store").map(String::as_str) != Some("local") {

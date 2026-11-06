@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 6 Nov 2026 23:59:57 +0800
+Subject: [PATCH] libcutils: memfd without the ashmem-ioctl compat probe
+
+__has_memfd_support() accepts memfd only when ioctl(ASHMEM_GET_SIZE)
+works on a memfd, an Android-kernel compat feature. Desktop Linux
+kernels have neither /dev/ashmem nor that ioctl, so libcutils had no
+shared-memory backend at all: ashmem_create_region failed and Codec2
+FMQ / input buffers returned NO_MEMORY. Drop the probe; the memfd
+paths in this file already take the size from fstat, the protection
+from F_SEAL_FUTURE_WRITE and treat pin/unpin as no-ops.
+
+Upstream-Status: Inappropriate [desktop Linux kernel]
+Patch-Reason: the probe runs inside libcutils on a kernel ioctl; the launcher, loader and environment cannot add an ioctl to the host kernel, and an LD_PRELOAD ioctl shim would intercept every caller
+---
+SPDX-License-Identifier: Apache-2.0
+ libcutils/ashmem-dev.cpp | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/libcutils/ashmem-dev.cpp b/libcutils/ashmem-dev.cpp
+index 80c4f4c1ea552c967622662edd1e16978056d96c..a6f5d28e9198c3c8b63b76d33e32b0f8a32ca19b 100644
+--- a/libcutils/ashmem-dev.cpp
++++ b/libcutils/ashmem-dev.cpp
+@@ -135,15 +135,10 @@ static bool __has_memfd_support() {
+     }
+ 
+     /*
+-     * Ensure that the kernel supports ashmem ioctl commands on memfds. If not,
+-     * fall back to using ashmem.
++     * No ASHMEM_GET_SIZE-on-memfd probe: desktop Linux kernels have neither
++     * ashmem nor its ioctls on memfds. Every memfd path in this file already
++     * works without them (size from fstat, prot from seals, pin a no-op).
+      */
+-    int ashmem_size = TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_GET_SIZE, 0));
+-    if (ashmem_size != static_cast<int>(buf_size)) {
+-        ALOGE("ioctl(ASHMEM_GET_SIZE): %d != buf_size: %zd , no ashmem-memfd compat support",
+-              ashmem_size, buf_size);
+-        return false;
+-    }
+ 
+     if (debug_log) {
+         ALOGD("memfd: device has memfd support, using it");
