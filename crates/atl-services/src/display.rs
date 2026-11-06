@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering for display 0 from the display the Tasks own (tasks.rs `Tasks::display`: atld's `--display` at start, then the window's monitor via registry SET_DISPLAY); registered callbacks hear each change ([`DisplayCallbacks`]).
-//! getDisplayInfo is display 0's record (DisplayManagerService.getDisplayInfo: null for any other id) and getDisplayIds lists display 0. Every other method keeps the stub's default body,
-//! so each call is counted (counters.rs) and answered UNKNOWN_TRANSACTION. An activity launch made these calls before this service answered (measured by `xtask test app`):
-//! `getDisplayInfo` 7 times, `getPreferredWideGamutColorSpaceId` and `getOverlaySupport` once each.
+//! getDisplayInfo is display 0's record (DisplayManagerService.getDisplayInfo: null for any other id) and getDisplayIds lists display 0; getOverlaySupport is AOSP's no-HWC default.
+//! Every other method keeps the stub's default body, so each call is counted (counters.rs) and answered UNKNOWN_TRANSACTION.
 
 use atl_aidl::aidl::android::hardware::display::IDisplayManager::{
     BnDisplayManager, EnforcePermission, IDisplayManager,
 };
+use atl_parcelables::android::hardware::OverlayProperties;
 use atl_parcelables::android::view::DisplayInfo;
+use atl_parcelables::codecs::android::hardware::OverlayProperties::SupportedBufferCombinations;
 use atl_parcelables::parts::DisplayMode;
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status,
@@ -21,7 +22,7 @@ use atl_aidl::aidl::android::hardware::display::IDisplayManagerCallback::IDispla
 use binder::Strong;
 
 use crate::counters;
-use crate::display_model::DisplayModel;
+use crate::display_model::{self, DisplayModel};
 use crate::permission::Permissions;
 use crate::tasks::Tasks;
 
@@ -160,6 +161,14 @@ impl IDisplayManager for DisplayManager {
         Ok(COLOR_SPACE_SRGB)
     }
 
+    /// DisplayManagerService.getOverlaySupport:5471 -> mOverlayProperties, taken once at start from SurfaceControl.getOverlaySupport (:672) = SurfaceFlinger::getOverlaySupport:1713 =
+    /// the HWC's composer3 getOverlaySupport. Here no hardware overlay reaches Android: the platform layer hands each window's one buffer to the desktop compositor (GSK texture), which composes it.
+    /// So the answer is AOSP's own for a display without HWC overlay data, OverlayProperties.getDefault (nCreateDefault, android_hardware_OverlayProperties.cpp:93): RGBA_8888 in
+    /// BT709 / sRGB / full range, mixed colour spaces supported. Display.getOverlaySupport:1734 gives that same default to non-internal displays.
+    fn r#getOverlaySupport(&self) -> binder::Result<Option<OverlayProperties>> {
+        Ok(Some(overlay_support()))
+    }
+
     /// DisplayManagerService.getDisplayIds: display 0, whether or not disabled displays are asked for (the model has no other).
     fn r#getDisplayIds(&self, _include_disabled: bool) -> binder::Result<Option<Vec<i32>>> {
         Ok(Some(vec![DEFAULT_DISPLAY]))
@@ -253,6 +262,19 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
         hdr_sdr_ratio: f32::NAN,
         can_host_tasks: true,
         ..Default::default()
+    }
+}
+
+/// OverlayProperties.getDefault's values (see getOverlaySupport), which are the desktop's composition format.
+pub fn overlay_support() -> OverlayProperties {
+    OverlayProperties {
+        combinations: vec![SupportedBufferCombinations {
+            pixel_formats: vec![display_model::COMPOSITION_PIXEL_FORMAT],
+            standards: vec![display_model::DATASPACE_STANDARD_BT709],
+            transfers: vec![display_model::DATASPACE_TRANSFER_SRGB],
+            ranges: vec![display_model::DATASPACE_RANGE_FULL],
+        }],
+        support_mixed_color_spaces: true,
     }
 }
 

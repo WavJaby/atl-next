@@ -6,6 +6,7 @@
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
+use atl_aidl::aidl::android::gui::CompositionPreference::CompositionPreference;
 use atl_aidl::aidl::android::gui::CreateSurfaceResult::CreateSurfaceResult;
 use atl_aidl::aidl::android::gui::DisplayConnectionType::DisplayConnectionType;
 use atl_aidl::aidl::android::gui::DisplayMode::DisplayMode;
@@ -26,7 +27,7 @@ use atl_aidl::aidl::android::gui::Size::Size;
 use atl_aidl::aidl::android::gui::StaticDisplayInfo::StaticDisplayInfo;
 use atl_compositor::event::ConnectionId;
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_services::counters;
+use atl_services::{counters, display_model};
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
 
@@ -98,6 +99,18 @@ impl ISurfaceComposer for SurfaceComposer {
     /// SurfaceFlinger::getMaxAcquiredBufferCount: the pipeline depth.
     fn r#getMaxAcquiredBufferCount(&self) -> binder::Result<i32> {
         Ok(self.composer.max_acquired_buffer_count())
+    }
+
+    /// SurfaceComposerAIDL::getCompositionPreference:9246 -> SurfaceFlinger::getCompositionPreference:2032: the default and wide-gamut composition dataspace and format, from the
+    /// surface_flinger sysprops with defaults (SurfaceFlinger.cpp:458-467) V0_SRGB / RGBA_8888, and V0_SRGB for wide gamut when `has_wide_color_display` is false. The desktop composes
+    /// in sRGB 8-bit (display_model COMPOSITION_*), the defaults' values; hwui's DeviceInfo::updateDisplayInfo aborts without an answer (ADisplay_acquirePhysicalDisplays).
+    fn r#getCompositionPreference(&self) -> binder::Result<Option<CompositionPreference>> {
+        Ok(Some(CompositionPreference {
+            defaultDataspace: display_model::COMPOSITION_DATASPACE,
+            defaultPixelFormat: display_model::COMPOSITION_PIXEL_FORMAT,
+            wideColorGamutDataspace: display_model::COMPOSITION_DATASPACE,
+            wideColorGamutPixelFormat: display_model::COMPOSITION_PIXEL_FORMAT,
+        }))
     }
 
     fn r#getPhysicalDisplayIds(&self) -> binder::Result<Option<Vec<i64>>> {

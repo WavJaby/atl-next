@@ -33,6 +33,9 @@ pub mod android {
     pub mod graphics {
         pub mod Rect;
     }
+    pub mod hardware {
+        pub mod OverlayProperties;
+    }
     pub mod net {
         pub mod Uri;
     }

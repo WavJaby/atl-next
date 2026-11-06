@@ -34,6 +34,7 @@ import android.content.pm.SharedLibraryInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
 import android.graphics.Rect;
+import android.hardware.OverlayProperties;
 import android.view.Display;
 import android.view.DisplayInfo;
 import android.view.InputChannel;
@@ -243,6 +244,8 @@ public class ParcelTruth {
         check("InputDevice", inputDevice(-1, "Virtual", "atl:virtual-keyboard", InputDevice.SOURCE_KEYBOARD, InputDevice.KEYBOARD_TYPE_ALPHABETIC, keymap), InputDevice.CREATOR);
         check("InputDevice:pointer", inputDevice(1, "ATL pointer", "atl:pointer", InputDevice.SOURCE_MOUSE, 0, keymap), InputDevice.CREATOR);
         check("Rect", new Rect(1, 2, 3, 4), Rect.CREATOR);
+        // IDisplayManager.getOverlaySupport's reply (atl-services display.rs overlay_support): AOSP's no-HWC default, built by its own native nCreateDefault
+        check("OverlayProperties", OverlayProperties.getDefault(), OverlayProperties.CREATOR);
         // the mount service's volume as StorageService builds it (StorageVolume.Builder: internal path = path; owner = user 0)
         check("StorageVolume", new StorageVolume.Builder("emulated", new File("/storage/emulated/0"), "Internal shared storage", UserHandle.SYSTEM, "mounted").setPrimary(true).setEmulated(true).build(), StorageVolume.CREATOR);
         checkInputChannel("InputChannel");

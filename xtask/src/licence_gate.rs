@@ -187,6 +187,7 @@ pub fn check(
             &build,
             out,
             Reach::Members(&loaded),
+            &[],
             roots,
             licenses,
             &mut report,
@@ -212,6 +213,7 @@ pub fn check_build_outputs(
         build,
         out,
         Reach::Links(&artifacts),
+        &[],
         roots,
         licenses,
         &mut report,
@@ -225,22 +227,30 @@ enum Reach<'a> {
     Members(&'a [(&'a Path, &'a str, &'a Path)]),
     /// The build's own link outputs (build-relative). Over-counts: those links run without `--trace`, so an artifact reaches every object of its link edge and of each build-dir input's edge (static archives, other libraries of the build), transitively, loaded or not. Shared libraries among the inputs are their own artifacts or the converter's, system files the platform's.
     Links(&'a [&'a Path]),
+    /// Every object the build compiled (its depfile records), each its own artifact: for a build whose archives later links load (the runtimes), a superset, so a pass holds for any link.
+    All,
 }
 
-/// One external ninja build: what reaches shipped artifacts (`reach`) -> objects through the build's own edges -> each object's depfile (`ninja -t deps`) -> judged; files under `out` (the converter's out dir, which holds the build) count as generated.
+/// One external ninja build: what reaches shipped artifacts (`reach`) -> objects through the build's own edges -> each object's depfile (`ninja -t deps`) -> staged copies mapped to
+/// their sources (`staged`) -> judged; files under `out` (the dir holding the build) count as generated.
 fn check_external(
     build: &Path,
     out: &Path,
     reach: Reach,
+    staged: &[Staged],
     roots: &[Root],
     licenses: &Licenses,
     report: &mut Report,
 ) -> Result<()> {
-    let objects = match reach {
+    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
+    let objects: BTreeMap<PathBuf, &Path> = match reach {
         Reach::Members(loaded) => member_objects(build, loaded, report)?,
         Reach::Links(artifacts) => link_objects(build, artifacts)?,
+        Reach::All => {
+            report.artifacts += deps.len();
+            deps.keys().map(|o| (o.clone(), o.as_path())).collect()
+        }
     };
-    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
     let abs = |f: &Path| {
         let p = if f.is_absolute() {
             f.to_path_buf()
@@ -263,7 +273,33 @@ fn check_external(
             placed.entry(abs(f)).or_insert(artifact);
         }
     }
-    judge(placed, roots, out, licenses, report)
+    let (placed, configured) = unstage(placed, staged);
+    judge(placed, roots, out, licenses, report)?;
+    for (file, s, artifact) in configured {
+        let text = String::from_utf8_lossy(
+            &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+        )
+        .into_owned();
+        let rel = file.display().to_string();
+        let own = || {
+            Err(anyhow::anyhow!(
+                "{rel}: staged but no identical source, and no own notice"
+            ))
+        };
+        match notice::resolve(&rel, &text, licenses.upstream.get(&s.key), own) {
+            Ok(expr) => {
+                report.checked += 1;
+                if !licenses.allows(licenses::RUNTIME, &expr)? {
+                    let name = artifact
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    report.denied.entry(expr).or_default().insert(rel, name);
+                }
+            }
+            Err(e) => report.unresolved.push(format!("{e:#}")),
+        }
+    }
+    Ok(())
 }
 
 /// `Reach::Links`: build-relative object -> first artifact reaching it.
@@ -426,57 +462,23 @@ fn unstage<'a>(
     (kept, configured)
 }
 
-/// Every file an object of the CMake-generated ninja build in `build` (canonical) was compiled from, by its depfiles: what the runtimes build (`xtask runtimes`) can put into an archive.
-/// All objects of the build, not only the archive members a later link loads: a superset, so a pass here holds for any link of its archives.
+/// The licence gate over the CMake-generated ninja build in `build` (canonical; the runtimes, `xtask runtimes`): `Reach::All` of [`check_external`], counting each object as an artifact.
 pub fn check_build(
     build: &Path,
     staged: &[Staged],
     roots: &[Root],
     licenses: &Licenses,
 ) -> Result<Report> {
-    let deps = parse_deps(&ninja(build, &["-t", "deps"])?);
-    let mut report = Report {
-        artifacts: deps.len(),
-        ..Report::default()
-    };
-    let mut placed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
-    for (object, files) in &deps {
-        for f in files {
-            let abs = if f.is_absolute() {
-                f.clone()
-            } else {
-                build.join(f)
-            };
-            let real = std::fs::canonicalize(&abs).unwrap_or(abs);
-            placed.entry(real).or_insert(object.as_path());
-        }
-    }
-    let (placed, configured) = unstage(placed, staged);
-    judge(placed, roots, build, licenses, &mut report)?;
-    for (file, s, object) in configured {
-        let text = String::from_utf8_lossy(
-            &std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
-        )
-        .into_owned();
-        let rel = file.display().to_string();
-        let own = || {
-            Err(anyhow::anyhow!(
-                "{rel}: staged but no identical source, and no own notice"
-            ))
-        };
-        match notice::resolve(&rel, &text, licenses.upstream.get(&s.key), own) {
-            Ok(expr) => {
-                report.checked += 1;
-                if !licenses.allows(licenses::RUNTIME, &expr)? {
-                    let name = object
-                        .file_name()
-                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                    report.denied.entry(expr).or_default().insert(rel, name);
-                }
-            }
-            Err(e) => report.unresolved.push(format!("{e:#}")),
-        }
-    }
+    let mut report = Report::default();
+    check_external(
+        build,
+        build,
+        Reach::All,
+        staged,
+        roots,
+        licenses,
+        &mut report,
+    )?;
     Ok(report)
 }
 

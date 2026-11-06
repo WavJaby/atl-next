@@ -9,6 +9,16 @@ const INITIAL_BOUNDS_PERCENT: i32 = 75;
 /// `DisplayMetrics.DENSITY_DEFAULT`: the dpi of density 1 (mdpi), where 1 dp is 1 px.
 pub const DENSITY_DEFAULT: i32 = 160;
 
+/// How the desktop composes the display: 8-bit RGBA in sRGB, no wide gamut (the window's buffer becomes a GSK texture). HAL values from system/core/libsystem/include/system/graphics-base-v1.0.h:
+/// HAL_PIXEL_FORMAT_RGBA_8888, HAL_DATASPACE_STANDARD_BT709 (1 << 16), HAL_DATASPACE_TRANSFER_SRGB (2 << 22), HAL_DATASPACE_RANGE_FULL (1 << 27), and their sum HAL_DATASPACE_V0_SRGB.
+/// Readers: IDisplayManager.getOverlaySupport (display.rs) and ISurfaceComposer.getCompositionPreference (atl-composer).
+pub const COMPOSITION_PIXEL_FORMAT: i32 = 1;
+pub const DATASPACE_STANDARD_BT709: i32 = 1 << 16;
+pub const DATASPACE_TRANSFER_SRGB: i32 = 2 << 22;
+pub const DATASPACE_RANGE_FULL: i32 = 1 << 27;
+pub const COMPOSITION_DATASPACE: i32 =
+    DATASPACE_STANDARD_BT709 | DATASPACE_TRANSFER_SRGB | DATASPACE_RANGE_FULL;
+
 /// The default display: size in pixels, refresh rate in Hz, density in dots per inch (DisplayMetrics.densityDpi).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayModel {

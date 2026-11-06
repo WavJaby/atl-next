@@ -104,6 +104,10 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#registerCallback",
     "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#registerCallbackWithEventMask",
     "frameworks/base/core/java/android/view/DisplayInfo.java#writeToParcel",
+    "frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java#getOverlaySupportInternal",
+    "frameworks/base/core/jni/android_hardware_OverlayProperties.cpp#android_hardware_OverlayProperties_createDefault",
+    "frameworks/base/core/java/android/hardware/OverlayProperties.java#writeToParcel",
+    "frameworks/native/libs/gui/aidl/android/gui/OverlayProperties.aidl",
 ]
 
 [window]
