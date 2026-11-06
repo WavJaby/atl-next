@@ -19,6 +19,7 @@ struct Process {
     dlsym: usize,
     dlclose: usize,
     dlerror: usize,
+    dladdr: usize,
     update_path: usize,
     base_path: Vec<PathBuf>,
     lib_dirs: Vec<PathBuf>,
@@ -39,6 +40,7 @@ fn start(cfg: &Config) -> Result<Process, String> {
         dlopen: linker_fn(&guest, "__dl___loader_dlopen")?,
         dlclose: linker_fn(&guest, "__dl___loader_dlclose")?,
         dlerror: linker_fn(&guest, "__dl___loader_dlerror")?,
+        dladdr: linker_fn(&guest, "__dl___loader_dladdr")?,
         update_path: linker_fn(&guest, "__dl___loader_android_update_LD_LIBRARY_PATH")?,
         dlsym: linker_fn(&guest, "__dl___loader_dlsym")?,
         guest,
@@ -133,18 +135,30 @@ pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
     r.ok().filter(|&f| f != 0)
 }
 
-/// A host-callable trampoline into guest function `f` (one per function: ART may ask again for the same symbol).
-pub fn trampoline(f: usize) -> Result<usize, String> {
-    static STUBS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// A host-callable trampoline into guest function `f` taking a first argument of `kind` (one per function and kind: ART may ask again for the same symbol).
+pub fn trampoline(f: usize, kind: arch::Down) -> Result<usize, String> {
+    static STUBS: Mutex<Vec<(usize, arch::Down, usize)>> = Mutex::new(Vec::new());
     let mut stubs = STUBS
         .lock()
         .map_err(|_| "trampolines poisoned".to_owned())?;
-    if let Some(&(_, t)) = stubs.iter().find(|&&(g, _)| g == f) {
+    if let Some(&(_, _, t)) = stubs.iter().find(|&&(g, k, _)| g == f && k == kind) {
         return Ok(t);
     }
-    let t = arch::down(f)?;
-    stubs.push((f, t));
+    let t = arch::down(f, kind)?;
+    stubs.push((f, kind, t));
     Ok(t)
+}
+
+/// Whether `addr` lies in an object the guest linker loaded (guest `dladdr`); false without a guest.
+/// Not narrowed to executable segments: ART asks only about method pointers `RegisterNatives` got.
+pub fn is_guest_code(addr: usize) -> bool {
+    with(None, |p| {
+        // bionic Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr
+        let mut info = [0usize; 4];
+        // SAFETY: int __loader_dladdr(const void*, Dl_info*); `info` is a Dl_info-sized buffer.
+        Ok(unsafe { p.guest.call(p.dladdr, addr, info.as_mut_ptr() as usize, 0) } != 0)
+    })
+    .unwrap_or(false)
 }
 
 /// Guest `dlclose(handle)`: 0 or the linker's error.

@@ -11,6 +11,7 @@ pub mod arch;
 mod args;
 pub mod image;
 mod intercepts;
+pub mod jni;
 pub mod thread;
 pub mod vdso;
 

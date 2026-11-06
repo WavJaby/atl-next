@@ -118,7 +118,7 @@ std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c) -> f(a, b, c) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_cross_to_guest, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_jni_up, atl_nb_jni_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
@@ -154,17 +154,34 @@ std::arch::global_asm!(
         ".globl atl_nb_cross_to_host\n",
         ".type atl_nb_cross_to_host,@function\n",
         "atl_nb_cross_to_host:\n",
+        "    pop %r11\n",
+        "    lea atl_nb_host_thunks+5(%rip), %r10\n",
+        "    sub %r10, %r11\n",
+        "    lea atl_nb_host_targets(%rip), %r10\n",
+        "    mov (%r10,%r11), %r11\n",
+        "    jmp atl_nb_up\n",
+        ".size atl_nb_cross_to_host, .-atl_nb_cross_to_host\n",
+        // guest->host through a JNI table (jni.rs): entered from JNI stub i by `call`; %rdi = the guest JNIEnv/JavaVM object, whose word 1 is the host one (jni.rs GuestObj).
+        // Arg rewrite only: %rdi = host object, target = its own function table's slot i (ART swaps an env's table for CheckJNI, so read per call). Everything else reaches the host function untouched (variadic Call*Method: stack args, %al).
+        ".globl atl_nb_jni_up\n",
+        ".type atl_nb_jni_up,@function\n",
+        "atl_nb_jni_up:\n",
+        "    pop %r11\n",
+        "    lea atl_nb_jni_stubs+5(%rip), %r10\n",
+        "    sub %r10, %r11\n",
+        "    mov 8(%rdi), %rdi\n",
+        "    mov (%rdi), %r10\n",
+        "    mov (%r10,%r11), %r11\n",
+        "    jmp atl_nb_up\n",
+        ".size atl_nb_jni_up, .-atl_nb_jni_up\n",
+        // the up crossing proper: %r11 = host target, [rsp] = guest return
+        ".type atl_nb_up,@function\n",
+        "atl_nb_up:\n",
         "    mov %gs:0, %r10\n",
         "    cmp %gs:24, %r10\n",
         "    jae 9f\n",
-        "    pop 16(%r10)\n",
-        "    pop 0(%r10)\n",
-        "    lea atl_nb_host_thunks+5(%rip), %r11\n",
-        "    sub %r11, 16(%r10)\n",
-        "    lea atl_nb_host_targets(%rip), %r11\n",
-        "    add 16(%r10), %r11\n",
-        "    mov (%r11), %r11\n",
         "    mov %r11, 16(%r10)\n",
+        "    pop 0(%r10)\n",
         "    rdfsbase %r11\n",
         "    mov %r11, 8(%r10)\n",
         "    add $24, %r10\n",
@@ -180,16 +197,25 @@ std::arch::global_asm!(
         "    push 0(%r10)\n",
         "    ret\n",
         "9:  ud2\n",
-        ".size atl_nb_cross_to_host, .-atl_nb_cross_to_host\n",
+        ".size atl_nb_up, .-atl_nb_up\n",
         // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = host return, then the caller's stack args.
         // Same shadow-stack frame as the up direction (3 words): host return, guest target (while calling), the GS the caller had (0 outermost, the record when nested inside an up call).
         // Argument registers, %al and stack args reach the guest untouched; only %r10/%r11 (and %rcx after the call, not a return register) are scratch.
+        // Three entries, by what the first argument is (`Down`): none to rewrite, a host JNIEnv, a host JavaVM; the kind rides in the caller's-GS slot until attach has read it.
         ".globl atl_nb_cross_to_guest\n",
         ".type atl_nb_cross_to_guest,@function\n",
         "atl_nb_cross_to_guest:\n",
-        // the record always comes from host TLS (attach; FS is the host's here, nested or not): an incoming GS base is not trusted (a nonzero one that was no record trapped, app run 2026-11-06)
-        // slot for the caller's GS, then every argument register saved around the call; 9 pushes + 128 keep the call 16-aligned
         "    push $0\n",
+        "    jmp 2f\n",
+        ".globl atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm\n",
+        "atl_nb_cross_to_guest_env:\n",
+        "    push $1\n",
+        "    jmp 2f\n",
+        "atl_nb_cross_to_guest_vm:\n",
+        "    push $2\n",
+        "2:\n",
+        // the record always comes from host TLS (attach; FS is the host's here, nested or not): an incoming GS base is not trusted (a nonzero one that was no record trapped, app run 2026-11-06)
+        // every argument register saved around the attach call; with the kind slot, 9 pushes + 128 keep the call 16-aligned
         "    push %r10\n",
         "    push %rdi\n",
         "    push %rsi\n",
@@ -207,6 +233,9 @@ std::arch::global_asm!(
         "    movdqu %xmm5, 80(%rsp)\n",
         "    movdqu %xmm6, 96(%rsp)\n",
         "    movdqu %xmm7, 112(%rsp)\n",
+        // attach(&saved %rdi, kind): the record; rewrites the saved first argument to the guest object for kinds 1 and 2
+        "    lea 176(%rsp), %rdi\n",
+        "    mov 192(%rsp), %rsi\n",
         "    call *atl_nb_attach_fn(%rip)\n",
         "    mov %rax, %r11\n",
         "    movdqu 0(%rsp), %xmm0\n",
@@ -289,16 +318,35 @@ std::arch::global_asm!(
         "    call atl_nb_cross_to_host\n",
         "    .p2align 3\n",
         ".endr\n",
+        // JNI stub i = slot i of every guest JNI table (jni.rs); same 8-byte shape, so atl_nb_jni_up's index arithmetic yields slot * 8
+        ".p2align 3\n",
+        ".globl atl_nb_jni_stubs\n",
+        "atl_nb_jni_stubs:\n",
+        ".rept 256\n",
+        "    call atl_nb_jni_up\n",
+        "    .p2align 3\n",
+        ".endr\n",
     ),
     options(att_syntax)
 );
 
-// the `.rept` count above is THUNKS; the index arithmetic in atl_nb_cross_to_host is THUNK_BYTES
-const _: () = assert!(THUNKS == 128 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 24);
+// the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot
+const _: () =
+    assert!(THUNKS == 128 && JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 24);
+
+/// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today; jni.rs asserts the fit).
+pub const JNI_STUBS: usize = 256;
+
+/// The guest-callable address of JNI table slot `slot` (jni.rs): crosses to the host object's own slot with the object rewritten.
+pub fn jni_stub(slot: usize) -> usize {
+    assert!(slot < JNI_STUBS, "JNI slot {slot} past the stub array");
+    (&raw const atl_nb_jni_stubs) as usize + slot * THUNK_BYTES
+}
 
 unsafe extern "C" {
     fn atl_nb_call_guest(ht: *mut HostThread, f: usize, a: usize, b: usize, c: usize) -> usize;
     static atl_nb_host_thunks: u8;
+    static atl_nb_jni_stubs: u8;
     fn atl_nb_signal_entry(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void);
 }
 
@@ -338,28 +386,57 @@ pub fn bind(target: usize) -> Option<usize> {
     Some(base + i * THUNK_BYTES)
 }
 
-/// What `atl_nb_cross_to_guest` calls on a thread's first down call (GS = 0): its record, attached on demand (thread.rs `attach_current`).
-#[unsafe(no_mangle)]
-static atl_nb_attach_fn: extern "C" fn() -> *mut HostThread = attach_entry;
+/// What a down call's first argument is, so the crossing hands the guest its own object for it (jni.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Down {
+    /// passed through: plain C, `@CriticalNative`
+    Plain = 0,
+    /// a host `JNIEnv*` -> this thread's guest env (Regular / FastNative JNI methods)
+    Env = 1,
+    /// a host `JavaVM*` -> the guest vm (`JNI_OnLoad`)
+    Vm = 2,
+}
 
-extern "C" fn attach_entry() -> *mut HostThread {
-    super::thread::attach_current()
+/// What `atl_nb_cross_to_guest` calls on every down call: the thread's record, attached on demand (thread.rs `attach_current`), after rewriting the saved first argument for its kind.
+#[unsafe(no_mangle)]
+static atl_nb_attach_fn: extern "C" fn(*mut usize, usize) -> *mut HostThread = attach_entry;
+
+extern "C" fn attach_entry(first: *mut usize, kind: usize) -> *mut HostThread {
+    let ht = super::thread::attach_current();
+    if kind != Down::Plain as usize {
+        // SAFETY: `first` is the crossing's saved %rdi slot on its own stack frame.
+        unsafe {
+            *first = if kind == Down::Env as usize {
+                super::jni::guest_env(*first)
+            } else {
+                super::jni::guest_vm(*first)
+            };
+        }
+    }
+    ht
 }
 
 unsafe extern "C" {
     fn atl_nb_cross_to_guest();
+    fn atl_nb_cross_to_guest_env();
+    fn atl_nb_cross_to_guest_vm();
 }
 
-/// Down stub: `movabs $target, %r10; movabs $atl_nb_cross_to_guest, %r11; jmp *%r11` (10 + 10 + 3 bytes).
+/// Down stub: `movabs $target, %r10; movabs $<entry of its kind>, %r11; jmp *%r11` (10 + 10 + 3 bytes).
 const DOWN_STUB: usize = 24;
 
 /// Bytes of a down stub calling guest `target` from host code on any thread.
-fn down_stub(target: usize) -> [u8; DOWN_STUB] {
+fn down_stub(target: usize, kind: Down) -> [u8; DOWN_STUB] {
+    let entry = match kind {
+        Down::Plain => atl_nb_cross_to_guest as *const () as usize,
+        Down::Env => atl_nb_cross_to_guest_env as *const () as usize,
+        Down::Vm => atl_nb_cross_to_guest_vm as *const () as usize,
+    };
     let mut s = [0xcc; DOWN_STUB];
     s[0..2].copy_from_slice(&[0x49, 0xba]);
     s[2..10].copy_from_slice(&target.to_le_bytes());
     s[10..12].copy_from_slice(&[0x49, 0xbb]);
-    s[12..20].copy_from_slice(&(atl_nb_cross_to_guest as *const () as usize).to_le_bytes());
+    s[12..20].copy_from_slice(&entry.to_le_bytes());
     s[20..23].copy_from_slice(&[0x41, 0xff, 0xe3]);
     s
 }
@@ -403,7 +480,7 @@ fn new_chunk() -> Result<Pool, String> {
 }
 
 /// A host-callable address that runs guest function `target` on the calling thread's guest thread pointer (attaching the thread first if needed), every argument as the caller passed it.
-pub fn down(target: usize) -> Result<usize, String> {
+pub fn down(target: usize, kind: Down) -> Result<usize, String> {
     let mut pool = POOL.lock().map_err(|_| "down stubs: poisoned".to_owned())?;
     if pool.as_ref().is_none_or(|p| p.used + DOWN_STUB > CHUNK) {
         // the full chunk stays mapped: its stubs are in use
@@ -412,7 +489,7 @@ pub fn down(target: usize) -> Result<usize, String> {
     let Some(p) = pool.as_mut() else {
         return Err("down stubs: no pool".into());
     };
-    let bytes = down_stub(target);
+    let bytes = down_stub(target, kind);
     // SAFETY: `used + DOWN_STUB <= CHUNK` bytes into the RW view; the RX view shows the same page.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (p.rw + p.used) as *mut u8, DOWN_STUB) };
     let at = p.rx + p.used;

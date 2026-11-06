@@ -13,9 +13,10 @@ use std::sync::OnceLock;
 
 use crate::elf::{self, Verdict};
 use crate::engine::Config;
+use crate::engine::arch::Down;
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
-    kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,
+    kJNICallTypeCriticalNative, kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,
 };
 use crate::loader;
 use object::elf as obj_elf;
@@ -91,23 +92,21 @@ pub unsafe fn getTrampoline(
     unsafe { getTrampolineWithJNICallType(handle, name, shorty, len, kJNICallTypeRegular) }
 }
 
-/// Symbols ART calls with a JavaVM, not a JNIEnv: no trampoline until the guest JavaVM table exists (bridge1-step4-plan 4.4). ART treats a missing `JNI_OnLoad` as none.
-const NEEDS_GUEST_VM: &[&CStr] = &[c"JNI_OnLoad"];
-
-/// The trampoline of guest `name` in `handle`, or null.
-///
-/// # Safety
-/// `name` is null or a NUL-terminated string.
-unsafe fn trampoline(handle: *mut c_void, name: *const c_char) -> *mut c_void {
-    // SAFETY: caller contract.
-    let Some(name) = (unsafe { str_arg(name) }) else {
-        return std::ptr::null_mut();
-    };
-    if NEEDS_GUEST_VM.contains(&name) {
-        return std::ptr::null_mut();
+/// What a JNI function's first argument is: ART calls `JNI_OnLoad` with a JavaVM (java_vm_ext.cc `LoadNativeLibrary`, through `getTrampolineWithJNICallType` like any method); `@CriticalNative` methods get no env; every other method a JNIEnv.
+fn down_kind(name: Option<&CStr>, jni_call_type: u32) -> Down {
+    if name == Some(c"JNI_OnLoad") {
+        Down::Vm
+    } else if jni_call_type == kJNICallTypeCriticalNative {
+        Down::Plain
+    } else {
+        Down::Env
     }
-    loader::symbol(handle as usize, name)
-        .and_then(|f| loader::trampoline(f).map_err(fail).ok())
+}
+
+/// The trampoline of guest function `f`, or null with the reason for `getError`.
+fn trampoline(f: usize, kind: Down) -> *mut c_void {
+    loader::trampoline(f, kind)
+        .map_err(fail)
         .map_or(std::ptr::null_mut(), |t| t as *mut c_void)
 }
 
@@ -203,7 +202,7 @@ pub unsafe fn getExportedNamespace(_name: *const c_char) -> *mut native_bridge_n
 
 pub unsafe fn preZygoteFork() {}
 
-/// Every call type gets the same trampoline: the identity crossing passes the arguments through (the JNIEnv too, for now: the guest env table is 4.4).
+/// Guest `dlsym` -> a down trampoline whose crossing hands the guest its own env/vm (engine/jni.rs); arguments otherwise pass through (identity ABI), so the shorty is not read.
 ///
 /// # Safety
 /// `name` is null or a NUL-terminated string (native_bridge.h).
@@ -212,24 +211,34 @@ pub unsafe fn getTrampolineWithJNICallType(
     name: *const c_char,
     _shorty: *const c_char,
     _len: u32,
-    _jni_call_type: u32,
+    jni_call_type: u32,
 ) -> *mut c_void {
     // SAFETY: the header's contract.
-    unsafe { trampoline(handle, name) }
+    let Some(name) = (unsafe { str_arg(name) }) else {
+        return std::ptr::null_mut();
+    };
+    loader::symbol(handle as usize, name).map_or(std::ptr::null_mut(), |f| {
+        trampoline(f, down_kind(Some(name), jni_call_type))
+    })
 }
 
+/// `RegisterNatives` with a guest pointer (jni_internal.cc, after `isNativeBridgeFunctionPointer`): the same trampoline as a looked-up method.
 pub unsafe fn getTrampolineForFunctionPointer(
-    _method: *const c_void,
+    method: *const c_void,
     _shorty: *const c_char,
     _len: u32,
-    _jni_call_type: u32,
+    jni_call_type: u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    trampoline(method as usize, down_kind(None, jni_call_type))
 }
 
-/// Nothing is loaded, so no pointer is a bridged function.
-pub unsafe fn isNativeBridgeFunctionPointer(_method: *const c_void) -> bool {
-    false
+/// Whether `method` is guest code: inside an object the guest linker loaded.
+pub unsafe fn isNativeBridgeFunctionPointer(method: *const c_void) -> bool {
+    // deliberate break of gate 4.4: ART then registers the guest pointer as host code
+    if cfg!(atl_nb_nbfp_false) {
+        return false;
+    }
+    loader::is_guest_code(method as usize)
 }
 
 #[cfg(test)]
