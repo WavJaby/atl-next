@@ -140,7 +140,13 @@ fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) 
         matrix_text(&MATRIX)
     );
     let devices = [
-        ("iio:device0", DEVICE_NAME, DEVICE_DEV, display_db, brk == Some(Break::Hwdb)),
+        (
+            "iio:device0",
+            DEVICE_NAME,
+            DEVICE_DEV,
+            display_db,
+            brk == Some(Break::Hwdb),
+        ),
         (
             "iio:device1",
             BASE_NAME,
@@ -466,7 +472,10 @@ mod tests {
         }
         iio.push("done events=5".into());
         let stopped = format!("sensor: {DEVICE_NAME} (handle 1) stopped");
-        assert_eq!(check(Stage::Iio, &iio, &stopped, want), Vec::<String>::new());
+        assert_eq!(
+            check(Stage::Iio, &iio, &stopped, want),
+            Vec::<String>::new()
+        );
         // the canonical (unconverted) values
         iio[4] = ev(100, "-0.06,-8.71,3.74");
         assert!(!check(Stage::Iio, &iio, &stopped, want).is_empty());

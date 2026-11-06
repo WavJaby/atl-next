@@ -30,6 +30,8 @@ pub struct Output {
     pub refresh_mhz: i32,
     /// Physical per logical pixel; fractional scales go to clients as `wp_fractional_scale_v1`.
     pub scale: f64,
+    /// `wl_output.transform` (wayland.xml: 1 = 90° counter-clockwise .. 3 = 270°), sent as `set_transform`.
+    pub transform: i32,
 }
 
 /// The gates' output. It must hold the largest gate window plus its chrome, or GTK shrinks the window to the work area (a 1280 x 800 output cut the gtk stage's 1280 x 800 content to 1280 x 761, measured 2026-11-06); largest: the resize stage's 1600 x 1000 configure.
@@ -39,6 +41,7 @@ pub const GATE_OUTPUT: Output = Output {
     height: 1200,
     refresh_mhz: 60_000,
     scale: 1.0,
+    transform: 0,
 };
 
 /// How long labwc may take to listen and to answer a roundtrip; it takes ~30 ms unloaded (measured 2026-11-06), so this only bounds a hang.
@@ -237,13 +240,22 @@ impl NestedCompositor {
 
 impl Output {
     /// This output as Android's display: the mode this module sets (`set_custom_mode`: physical pixels), its rate and scale. The headless window stages (no Wayland window) take [`GATE_OUTPUT`]'s, so they judge the same display as the stages on a compositor, whatever the desktop's monitor runs at.
+    /// The transform: wayland.xml turns are counter-clockwise, Android's Surface.ROTATION_* clockwise (Display.getRotation docs), so n counter-clockwise quarter turns are (4 - n) mod 4 clockwise;
+    /// a quarter-turned output shows its mode with the sides swapped (wlroots' transformed output size, GDK's geometry).
     pub fn display(&self) -> DisplayModel {
         let physical = |px: i32| u32::try_from(px).unwrap_or(0);
+        let ccw = self.transform.rem_euclid(4);
+        let (w, h) = if ccw % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
         DisplayModel::from_monitor(
-            physical(self.width),
-            physical(self.height),
+            physical(w),
+            physical(h),
             Some(self.refresh_mhz as f32 / 1000.0),
             self.scale,
+            ((4 - ccw) % 4) as u8,
         )
     }
 }
@@ -268,6 +280,7 @@ mod op {
     pub const CONFIGURATION_SUCCEEDED: u16 = 0;
     pub const CONFIG_HEAD_SET_CUSTOM_MODE: u16 = 1;
     pub const CONFIG_HEAD_SET_POSITION: u16 = 2;
+    pub const CONFIG_HEAD_SET_TRANSFORM: u16 = 3;
     pub const CONFIG_HEAD_SET_SCALE: u16 = 4;
 }
 
@@ -407,6 +420,8 @@ struct Setup {
     om: u32,
     heads: Vec<u32>,
     outputs: Vec<Output>,
+    /// Which outputs the last configuration turned on.
+    on: Vec<bool>,
     /// The last `zwlr_output_manager_v1.done` serial: a configuration names it, or the compositor cancels it.
     serial: u32,
 }
@@ -446,6 +461,7 @@ impl Setup {
                 );
                 c.send(ch, op::CONFIG_HEAD_SET_POSITION, &[Arg::I(x), Arg::I(0)]);
                 c.send(ch, op::CONFIG_HEAD_SET_SCALE, &[Arg::F(o.scale)]);
+                c.send(ch, op::CONFIG_HEAD_SET_TRANSFORM, &[Arg::I(o.transform)]);
             } else {
                 c.send(config, op::CONFIGURATION_DISABLE_HEAD, &[Arg::U(*head)]);
             }
@@ -488,6 +504,20 @@ impl OutputControl {
             .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
         ensure!(index < s.heads.len(), "no output {index}");
         let on: Vec<bool> = (0..s.heads.len()).map(|i| i == index).collect();
+        s.configure(&on)?;
+        s.on = on;
+        Ok(())
+    }
+
+    /// Output `index` takes `transform` in place: the outputs on stay on, so windows stay where they are; the compositor sends the new `wl_output.geometry` + `done`.
+    pub fn set_transform(&self, index: usize, transform: i32) -> Result<()> {
+        let mut s = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
+        ensure!(index < s.heads.len(), "no output {index}");
+        s.outputs[index].transform = transform;
+        let on = s.on.clone();
         s.configure(&on)
     }
 }
@@ -568,6 +598,7 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
         om,
         heads: heads.into_iter().map(|(h, _)| h).collect(),
         outputs: outputs.to_vec(),
+        on: vec![true; outputs.len()],
         serial,
     };
     s.configure(&vec![true; outputs.len()])?;

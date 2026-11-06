@@ -12,7 +12,7 @@ use std::os::fd::{OwnedFd, RawFd};
 
 pub use atl_compositor::scene::Scene;
 /// The value types the host side shares (a window's monitor is the same type atld reads).
-pub use atl_platform_types::{Monitor, PhysSize, Scale};
+pub use atl_platform_types::{Monitor, PhysSize, Rotation, Scale};
 
 /// A position in physical pixels from the window content's top-left corner; fractional because pointers report sub-pixel positions.
 #[derive(Clone, Copy, Debug, PartialEq)]

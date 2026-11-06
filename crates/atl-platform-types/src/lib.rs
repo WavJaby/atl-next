@@ -42,7 +42,34 @@ impl Scale {
     }
 }
 
-/// A monitor as the desktop reports it: its mode in physical pixels, its refresh rate, its scale.
+/// How the desktop turns the drawn image on the panel, from the panel's natural orientation, clockwise: Android's `Surface.ROTATION_*` sense ("the rotation of the drawn graphics on the screen,
+/// the opposite direction of the physical rotation of the device", Display.getRotation docs). A mirroring transform reports its rotation part (Android has no mirrored display).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    /// The natural orientation.
+    #[default]
+    Deg0,
+    /// A quarter turn clockwise (Surface.ROTATION_90).
+    Deg90,
+    /// Upside down.
+    Deg180,
+    /// Three quarter turns clockwise (Surface.ROTATION_270).
+    Deg270,
+}
+
+impl Rotation {
+    /// Clockwise quarter turns, 0..=3: the value of `Surface.ROTATION_*`.
+    pub fn quarter_turns(self) -> u8 {
+        match self {
+            Rotation::Deg0 => 0,
+            Rotation::Deg90 => 1,
+            Rotation::Deg180 => 2,
+            Rotation::Deg270 => 3,
+        }
+    }
+}
+
+/// A monitor as the desktop reports it: its mode in physical pixels (as the desktop shows it, so a quarter-turned panel's sides are swapped), its refresh rate, its scale, its rotation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Monitor {
     /// The mode in physical pixels.
@@ -51,6 +78,8 @@ pub struct Monitor {
     pub refresh_hz: Option<f32>,
     /// Physical pixels per desktop logical pixel.
     pub scale: Scale,
+    /// [`Rotation::Deg0`] from [`Monitor::from_desktop`]: the implementation sets it where the desktop reports one.
+    pub rotation: Rotation,
 }
 
 impl Monitor {
@@ -70,6 +99,7 @@ impl Monitor {
             },
             refresh_hz: (millihz > 0).then(|| millihz as f32 / 1000.0),
             scale,
+            rotation: Rotation::Deg0,
         })
     }
 }

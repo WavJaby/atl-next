@@ -166,6 +166,7 @@ fn log(msg: std::fmt::Arguments<'_>) {
 }
 
 /// The display without `--display`: the desktop's first monitor (atl-platform-host) as [`DisplayModel::from_monitor`]. No desktop or no monitor: the default, and atld says why.
+/// A start value only: the window's own monitor (size, scale, rotation) replaces it at the window's first entry (registry SET_DISPLAY).
 fn host_display() -> DisplayModel {
     match atl_platform_host::first_monitor() {
         Ok(Some(m)) => {
@@ -174,6 +175,7 @@ fn host_display() -> DisplayModel {
                 m.size.height,
                 m.refresh_hz,
                 m.scale.get(),
+                m.rotation.quarter_turns(),
             );
             log(format_args!("display: monitor {m:?} -> {}", model.to_arg()));
             model

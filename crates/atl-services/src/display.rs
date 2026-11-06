@@ -38,8 +38,7 @@ const STATE_ON: i32 = 2;
 const REMOVE_MODE_MOVE_CONTENT_TO_PRIMARY: i32 = 0;
 /// Display.INVALID_MODE_ID (Display.java:2402): no user-preferred mode.
 const INVALID_MODE_ID: i32 = -1;
-/// Surface.ROTATION_0 and ColorMode.COLOR_MODE_DEFAULT: the panel's natural orientation and colour mode.
-const ROTATION_0: i32 = 0;
+/// ColorMode.COLOR_MODE_DEFAULT: the panel's colour mode.
 const COLOR_MODE_DEFAULT: i32 = 0;
 /// The one mode the display has (DisplayInfo.modeId; a mode id is positive, INVALID_MODE_ID is not).
 const MODE_ID: i32 = 1;
@@ -210,14 +209,15 @@ impl DisplayManager {
     }
 }
 
-/// The DisplayInfo of the model's display: its size as the app area and the logical size (no insets, rotation 0), its one mode (refresh rate as both peak and vsync rate), its density
+/// The DisplayInfo of the model's display: its shown size as the app area and the logical size (no insets), its rotation, its one mode (the panel's natural size; refresh rate as both peak and vsync rate), its density
 /// (logicalDensityDpi, and physical dpi equal to it: no physical size is known), the state ON, the panel's kind TYPE_INTERNAL. Values with no source in the model (unique id, brightness,
 /// vsync offset and presentation deadline, owner) are test values until the platform layer supplies them; nested parcelables the codec does not model stay null.
 pub fn display_info(m: &DisplayModel) -> DisplayInfo {
+    let (natural_width, natural_height) = m.natural_size();
     let mode = DisplayMode {
         mode_id: MODE_ID,
-        width: m.width,
-        height: m.height,
+        width: natural_width,
+        height: natural_height,
         peak_refresh_rate: m.refresh_hz,
         vsync_rate: m.refresh_hz,
         is_synthetic: false,
@@ -239,7 +239,7 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
         largest_nominal_app_height: long_side,
         logical_width: m.width,
         logical_height: m.height,
-        rotation: ROTATION_0,
+        rotation: m.rotation,
         mode_id: MODE_ID,
         render_frame_rate: m.refresh_hz,
         supported_refresh_rates: vec![m.refresh_hz],

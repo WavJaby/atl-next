@@ -121,14 +121,14 @@ impl ISurfaceComposer for SurfaceComposer {
         Ok((display_id == DISPLAY_ID as i64).then(|| self.composer.display_token()))
     }
 
-    /// The layer stack 0, unrotated, the display's size.
+    /// The layer stack 0, the display's rotation and shown size (SurfaceFlinger.cpp getDisplayState: `display->getOrientation()`, the layer stack space).
     fn r#getDisplayState(
         &self,
         _display: Option<&SpIBinder>,
     ) -> binder::Result<Option<DisplayState>> {
         Ok(Some(DisplayState {
             layerStack: 0,
-            orientation: Rotation::Rotation0,
+            orientation: Rotation(self.composer.display().rotation),
             layerStackSpaceRect: Some(size(&self.composer)),
         }))
     }
@@ -181,10 +181,12 @@ impl ISurfaceComposer for SurfaceComposer {
 fn dynamic_info(c: &Composer) -> DynamicDisplayInfo {
     let d = c.display();
     let hz = d.refresh_hz;
+    let (width, height) = d.natural_size();
     DynamicDisplayInfo {
+        // the mode is the panel's (SurfaceFlinger.cpp getDynamicDisplayInfoInternal: the HWC mode's size), not the rotated view's
         supportedDisplayModes: Some(vec![Some(DisplayMode {
             id: MODE_ID,
-            resolution: Some(size(c)),
+            resolution: Some(Size { width, height }),
             xDpi: d.dpi as f32,
             yDpi: d.dpi as f32,
             supportedHdrTypes: Some(Vec::new()),

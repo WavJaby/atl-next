@@ -204,6 +204,7 @@ fn open() {
                 m.size.height,
                 m.refresh_hz,
                 m.scale.get(),
+                m.rotation.quarter_turns(),
             );
             if frames.set_display(model) {
                 tracing::info!("atl-composer: ui: display {}", model.to_arg());

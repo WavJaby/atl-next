@@ -10,6 +10,7 @@ mod geometry;
 mod input;
 #[allow(unsafe_code)]
 pub(crate) mod mirror;
+mod outputs;
 mod pacing;
 mod scene;
 mod text_input;

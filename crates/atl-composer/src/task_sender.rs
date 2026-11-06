@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn reports_wait_for_the_task_and_put_the_display_first() {
         let mut p = Pending::default();
-        let first = DisplayModel::from_monitor(1920, 1080, None, 1.0);
-        let second = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6);
+        let first = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0);
+        let second = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
         p.size = Some(size(800, 600));
         p.display = Some(first);
         p.display = Some(second);

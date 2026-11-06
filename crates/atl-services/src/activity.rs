@@ -143,9 +143,18 @@ pub(crate) fn global_configuration(display: &DisplayModel) -> Configuration {
         } else {
             ORIENTATION_LANDSCAPE
         },
+        // DisplayContent.computeScreenConfiguration:2460/2475: the display's rotation as both
+        window_configuration: atl_parcelables::parts::WindowConfiguration {
+            rotation: display.rotation,
+            display_rotation: display.rotation,
+            ..Default::default()
+        },
         ..Configuration::default()
     }
 }
+
+/// WindowConfiguration.ROTATION_UNDEFINED (WindowConfiguration.java:100): an override that leaves the rotation to its parent (WindowConfiguration.updateFrom skips it).
+const ROTATION_UNDEFINED: i32 = -1;
 
 /// WindowConfiguration.WINDOWING_MODE_FREEFORM (WindowConfiguration.java:113): a Task the user sizes, one per toplevel window.
 const WINDOWING_MODE_FREEFORM: i32 = 5;
@@ -177,6 +186,8 @@ pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configura
             app_bounds: Some(rect(size.width, size.height)),
             max_bounds: rect(display.width, display.height),
             windowing_mode: WINDOWING_MODE_FREEFORM,
+            rotation: ROTATION_UNDEFINED,
+            display_rotation: ROTATION_UNDEFINED,
             ..Default::default()
         },
         ..Configuration::default()
@@ -191,7 +202,16 @@ pub(crate) fn task_configuration(display: &DisplayModel, size: TaskSize) -> Conf
     config.screen_height_dp = over.screen_height_dp;
     config.smallest_screen_width_dp = over.smallest_screen_width_dp;
     config.orientation = over.orientation;
+    let rotations = (
+        config.window_configuration.rotation,
+        config.window_configuration.display_rotation,
+    );
     config.window_configuration = over.window_configuration;
+    // the override leaves them undefined: the parent's stay
+    (
+        config.window_configuration.rotation,
+        config.window_configuration.display_rotation,
+    ) = rotations;
     config
 }
 

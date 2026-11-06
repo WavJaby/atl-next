@@ -18,6 +18,7 @@ use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::input;
 use crate::mirror;
+use crate::outputs;
 use crate::pacing;
 use crate::scene;
 use crate::text_input::GtkTextInput;
@@ -401,6 +402,17 @@ impl Window for GtkWindow {
             paint_pending: Cell::new(false),
             releases: RefCell::default(),
         });
+        // the output transform is not GDK's (outputs.rs): its change re-reports the window's monitor
+        let rotated = Rc::downgrade(&shared);
+        outputs::follow(move || {
+            let Some(shared) = rotated.upgrade() else {
+                return;
+            };
+            let monitor = shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
+            if let Some(m) = monitor {
+                report_monitor(&shared, &m);
+            }
+        });
         let window = gtk4::Window::new();
         let view = SceneView::new();
         Self::wire_frame_clock(&window, &shared);
@@ -624,23 +636,29 @@ fn follow_monitor(shared: &Rc<Shared>, m: &gdk::Monitor) {
     report_monitor(shared, m);
 }
 
-/// Logs `m` and hands it to the window's `on_monitor` (Monitor::from_desktop: GDK's logical geometry times the fractional scale, milli-Hz; the host side converts with the same function).
+/// Logs `m` and hands it to the window's `on_monitor` (Monitor::from_desktop: GDK's logical geometry times the fractional scale, milli-Hz; the host side converts with the same function), with the
+/// rotation of its output (outputs.rs, by connector name).
 fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
     let g = m.geometry();
+    let connector = m.connector();
+    let rotation = outputs::rotation(connector.as_deref());
     tracing::info!(
-        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}",
-        m.connector().map(|c| c.to_string()).unwrap_or_default(),
+        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}, rotation {:?}",
+        connector.as_deref().unwrap_or_default(),
         g.width(),
         g.height(),
         g.x(),
         g.y(),
         m.refresh_rate(),
-        m.scale()
+        m.scale(),
+        rotation
     );
-    let Some(monitor) = Monitor::from_desktop(g.width(), g.height(), m.refresh_rate(), m.scale())
+    let Some(mut monitor) =
+        Monitor::from_desktop(g.width(), g.height(), m.refresh_rate(), m.scale())
     else {
         return;
     };
+    monitor.rotation = rotation;
     shared.on_monitor.call(|f| f(monitor));
 }
 

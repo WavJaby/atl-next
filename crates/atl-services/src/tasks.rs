@@ -392,7 +392,7 @@ mod tests {
         let sized = t.new_task(7);
         let fresh = t.new_task(8);
         t.set_size(sized, size(1000, 700));
-        let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0);
+        let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0);
         assert_eq!(t.set_display(monitor), vec![sized, fresh]);
         assert_eq!(t.display(), monitor);
         assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));

@@ -6,6 +6,7 @@
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`.
 //!
+//! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
@@ -611,6 +612,15 @@ fn server_to_client(
         if woken {
             let mut counter = [0u8; 8];
             let _ = read(wake, &mut counter);
+        }
+        // only a connection with windows takes injections: an app may hold others (atl-platform-ui-linux's own wl_output connection, outputs.rs), and one of those taking the queue would drop it
+        if ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ids poisoned"))?
+            .id_of(WM_BASE)
+            .is_none()
+        {
+            continue;
         }
         // injections are written between whole forwarded messages: `pending` holds only a partial message here, which is not forwarded yet
         let items = std::mem::take(

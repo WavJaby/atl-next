@@ -39,6 +39,8 @@ spdx = "0.13"
 thiserror = "2"
 toml = "1"
 toml_edit = "0.25"
+# Wayland client on its pure-Rust backend (no libwayland, no `unsafe` in our crate): atl-platform-ui-linux's own connection for wl_output transforms, which GDK reads but does not expose (deny.toml bans)
+wayland-client = "0.31"
 # APK reading for the install's native-library extraction (atl-services native_libs, temporary until the installer process runs AOSP's NativeLibraryHelper); inflate via flate2 + zlib-rs only (feature `deflate` would add the zopfli compressor)
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # no `attributes` (the #[instrument] macro): it is the only user of syn 2, the rest of the graph is on syn 3

@@ -2,8 +2,12 @@
 //! Stage `move` of `xtask test window`: the window moves to an output of another density, and Android follows. The nested compositor has two outputs, [`GATE_OUTPUT`] and [`SCALED_OUTPUT`] to its right; only the first is on when the window opens (with both on, labwc opened it on the second). After its first draw the probe turns the second on and the first off in one configuration ([`OutputControl::only`]), so labwc moves the window to the second.
 //! The window reports its new monitor (Window::on_monitor), the composer submits it as the display (TaskSender::submit_display -> registry SET_DISPLAY), and the services make it every Task's display ([`checks`]).
 //! Lifecycle, from AOSP: the move changes densityDpi (CONFIG_DENSITY) and screen size; the fixture declares no configChanges, so ActivityRecord.shouldRelaunchLocked (changes & ~info.getRealConfigChanged() != 0) relaunches the activity.
+//! Then rotation: once the relaunched instance has run its frames, the second output takes transform [`ROTATED_TRANSFORM`] in place. GDK reports no change for a half turn (same geometry), so only the platform layer's own
+//! wl_output listener (atl-platform-ui-linux outputs.rs) can see it; the services must take a second display, the same one at Surface.ROTATION_180. Only windowConfiguration changes, which is not a public
+//! config diff (ActivityRecord.getConfigurationChanges: `diffPublicOnly`), so there is no second relaunch.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use atl_services::display_model::DisplayModel;
 
@@ -22,6 +26,10 @@ pub const SCALED_OUTPUT: Output = Output {
 };
 /// The outputs, left to right; the window opens on the first (the gates' display).
 pub const OUTPUTS: [Output; 2] = [GATE_OUTPUT, SCALED_OUTPUT];
+/// wl_output transform 180 (wayland.xml), given to the second output after the move: same size, so no GDK signal and no relaunch.
+pub const ROTATED_TRANSFORM: i32 = 2;
+/// How long the relaunched instance may take to run its frames after the move.
+const RELAUNCH_WAIT: Duration = Duration::from_secs(60);
 /// The fixture's density line (Main.java logDensity): `AtlWindow: density <created|changed> config=N metrics=N`.
 const DENSITY_LINE: &str = "AtlWindow: density ";
 /// The services' display line (registry_service.rs set_display): `services: display WxH@hz,dpi from uid U`.
@@ -40,6 +48,17 @@ pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liv
         .ok_or("the fixture never drew")?;
     std::thread::sleep(INPUT_SETTLE);
     outputs.only(1).map_err(|e| format!("{e:#}"))?;
+    // the relaunched (second) instance ran its frame callbacks: the move's configuration change is over
+    let start = Instant::now();
+    while std::fs::read_to_string(app_log).map_or(0, |log| log.matches(LAST_FRAME).count()) < 2 {
+        if start.elapsed() > RELAUNCH_WAIT {
+            return Err("the relaunched instance never ran its frames".to_owned());
+        }
+        std::thread::sleep(INPUT_SETTLE);
+    }
+    outputs
+        .set_transform(1, ROTATED_TRANSFORM)
+        .map_err(|e| format!("{e:#}"))?;
     Ok(Liveness {
         answered: false,
         silent: false,
@@ -64,7 +83,18 @@ pub fn checks(
                 .map(|_| "second output on, first off".to_owned())
                 .map_err(Clone::clone),
         ),
-        ("display", display_check(services, moved)),
+        (
+            "display",
+            display_check(
+                services,
+                moved,
+                Output {
+                    transform: ROTATED_TRANSFORM,
+                    ..SCALED_OUTPUT
+                }
+                .display(),
+            ),
+        ),
         ("density", density_check(app, opened.dpi, moved.dpi)),
         ("relaunch", relaunch_check(app, services)),
         ("frames", frames_check(app)),
@@ -80,19 +110,28 @@ fn displays(services: &str) -> Vec<DisplayModel> {
         .collect()
 }
 
-/// The last display the services took has `moved`'s density and rate. Its size is the window's monitor as GDK reports it (logical size x scale), which wl_fixed rounding of 1.6 moves off the mode by a few pixels, so the size is shown, not judged.
-fn display_check(services: &str, moved: DisplayModel) -> Result<String, String> {
+/// The displays the services took: `moved`'s density, rate and rotation, then the same at the rotated output's rotation (`rotated`, [`ROTATED_TRANSFORM`]: Output::display derives it from wayland.xml).
+/// The size is the window's monitor as GDK reports it (logical size x scale), which wl_fixed rounding of 1.6 moves off the mode by a few pixels, so the size is shown, not judged.
+fn display_check(
+    services: &str,
+    moved: DisplayModel,
+    rotated: DisplayModel,
+) -> Result<String, String> {
     let all = displays(services);
-    let last = all.last().ok_or("the services took no display change")?;
-    // one change: the window opened on the gates' display (no change), then moved once
-    if all.len() == 1 && last.dpi == moved.dpi && last.refresh_hz == moved.refresh_hz {
-        Ok(format!("{} ({} changes)", last.to_arg(), all.len()))
+    let same = |d: &DisplayModel, w: &DisplayModel| {
+        d.dpi == w.dpi && d.refresh_hz == w.refresh_hz && d.rotation == w.rotation
+    };
+    // the window opened on the gates' display (no change), moved once, then its output turned
+    if all.len() == 2 && same(&all[0], &moved) && same(&all[1], &rotated) {
+        Ok(format!("{} then {}", all[0].to_arg(), all[1].to_arg()))
     } else {
         Err(format!(
-            "displays {:?}, want one change, to dpi {} at {} Hz",
+            "displays {:?}, want two changes: dpi {} at {} Hz rotation {}, then rotation {}",
             all.iter().map(DisplayModel::to_arg).collect::<Vec<_>>(),
             moved.dpi,
-            moved.refresh_hz
+            moved.refresh_hz,
+            moved.rotation,
+            rotated.rotation
         ))
     }
 }
@@ -162,8 +201,25 @@ mod tests {
     #[test]
     fn scaled_output_is_density_256() {
         let o = SCALED_OUTPUT;
-        let d = DisplayModel::from_monitor(o.width as u32, o.height as u32, None, o.scale);
+        let d = DisplayModel::from_monitor(o.width as u32, o.height as u32, None, o.scale, 0);
         assert_eq!(d.dpi, 256);
+    }
+
+    /// wayland.xml counter-clockwise turns as Android's clockwise ROTATION_*: 180 stays 180, 90 is ROTATION_270 with the sides swapped, 270 is ROTATION_90.
+    #[test]
+    fn output_transform_is_the_display_rotation() {
+        let turned = |transform| {
+            let d = Output {
+                transform,
+                ..GATE_OUTPUT
+            }
+            .display();
+            (d.rotation, d.width, d.height)
+        };
+        assert_eq!(turned(0), (0, 1920, 1200));
+        assert_eq!(turned(ROTATED_TRANSFORM), (2, 1920, 1200));
+        assert_eq!(turned(1), (3, 1200, 1920));
+        assert_eq!(turned(3), (1, 1200, 1920));
     }
 
     #[test]
