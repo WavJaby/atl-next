@@ -221,7 +221,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 /// The app's first fault up to the watch's end (marker + WINDOW_MS), from the log's start: the app's other threads run before onCreate (hwui's RenderThread made its EGL context 50 ms before the marker when it aborted, round-4 run). None without a marker.
 fn fault(app_log: &str, atld_exited: bool) -> Option<String> {
     let marker_ms = window::verdict(app_log, MARKER, atld_exited, WINDOW_MS).marker_ms?;
-    window::fault_after(app_log, 0, marker_ms + WINDOW_MS, atld_exited)
+    window::fault_after(app_log, 0, marker_ms + WINDOW_MS, marker_ms, atld_exited)
 }
 
 #[cfg(test)]

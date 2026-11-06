@@ -150,16 +150,12 @@ pub const OUTPUTS: &[&str] = &[
     "src/gallium/targets/dri/libgallium_dri.so",
 ];
 
-/// AOSP Loader.cpp `VENDOR_LIB_EGL_DIR` for an LP64 process: where it looks for `lib{EGL,GLESv1_CM,GLESv2}_<ro.hardware.egl>.so`.
-const VENDOR_EGL_DIR: &str = if cfg!(target_pointer_width = "64") {
-    "/vendor/lib64/egl"
-} else {
-    "/vendor/lib/egl"
-};
+/// The Mesa driver's placement: (host file, Android path) pairs, and library dirs.
+pub type Driver = (Vec<(PathBuf, String)>, Vec<PathBuf>);
 
 /// The Mesa driver as the runtime root holds it: (host file, Android path) to place (the [`OUTPUTS`] fronts in the driver dir, a /vendor/build.prop with `ro.hardware.egl`), and the build dirs of what they link (`libglapi`, `libgallium_dri`) for the library path.
 /// Their RUNPATH names those dirs by `$ORIGIN`, which a link placed in /vendor does not keep.
-pub fn driver(out: &Path) -> Result<(Vec<(PathBuf, String)>, Vec<PathBuf>)> {
+pub fn driver(out: &Path) -> Result<Driver> {
     let build = out.join(OUT_SUBDIR).join("build");
     let suffix = OPTIONS
         .iter()
@@ -177,20 +173,20 @@ pub fn driver(out: &Path) -> Result<(Vec<(PathBuf, String)>, Vec<PathBuf>)> {
     for o in OUTPUTS {
         let path = build.join(o);
         ensure!(path.is_file(), "missing Mesa output {}", path.display());
-        let name = Path::new(o)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+            bail!("Mesa output {o} has no file name");
+        };
+        let name = name.to_string_lossy().into_owned();
+        let dir = dir.to_path_buf();
         if name.ends_with(&format!("{suffix}.so")) {
-            files.push((path, format!("{VENDOR_EGL_DIR}/{name}")));
+            files.push((path, format!("{}/{name}", atl_android_paths::VENDOR_EGL)));
         } else {
-            dirs.push(path.parent().unwrap().to_path_buf());
+            dirs.push(dir);
         }
     }
     let prop = out.join(OUT_SUBDIR).join("vendor-build.prop");
     std::fs::write(&prop, format!("ro.hardware.egl={hardware}\n"))?;
-    files.push((prop, "/vendor/build.prop".to_owned()));
+    files.push((prop, atl_android_paths::VENDOR_BUILD_PROP.to_owned()));
     Ok((files, dirs))
 }
 

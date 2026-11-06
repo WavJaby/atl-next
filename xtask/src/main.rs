@@ -25,6 +25,7 @@ mod deps;
 mod fetch;
 mod git;
 mod gl_dispatch;
+mod gl_probe;
 mod gles2_fixture;
 mod gralloc;
 mod host_art;
@@ -233,6 +234,10 @@ enum Test {
     ///
     /// Control every run: a libGLESv2 with its own atl-bionic copy (dlmopen) must fail. Needs libEGL + libGLESv2 in --out; no driver.
     GlDispatch(gl_dispatch::Args),
+    /// GLES on the real driver in an app process: a pbuffer cleared and read back, and an extension outside entries.in through eglGetProcAddress (patch 0010); then a deliberate break that both checks must catch.
+    ///
+    /// Needs the fronts, Mesa, gralloc and the services in --out (`xtask native`).
+    Gl(gl_probe::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -317,6 +322,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::GlDispatch(args),
         } => gl_dispatch::run(&root, &args),
+        Command::Test {
+            test: Test::Gl(args),
+        } => gl_probe::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -348,6 +356,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Gles2Fixture(_) => "gles2-fixture",
             Test::TaskBind(_) => "task-bind",
             Test::GlDispatch(_) => "gl-dispatch",
+            Test::Gl(_) => "gl",
         },
         _ => return None,
     })

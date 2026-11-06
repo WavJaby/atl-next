@@ -303,15 +303,17 @@ pub fn verdict(app_log: &str, marker: &str, atld_exited: bool, window_ms: u64) -
     };
     Verdict {
         marker_ms: Some(marker_ms),
-        fault: fault_after(app_log, marker_ms, window_ms, atld_exited),
+        fault: fault_after(app_log, marker_ms, window_ms, marker_ms, atld_exited),
     }
 }
 
-/// The first fault of an app log in [from_ms, from_ms + window_ms], the stamp `from_ms` taken as onResume's time (run-apk reads it from the services log). `atld_exited` is a fault at the window's end.
+/// The first fault of an app log in [from_ms, from_ms + window_ms], its time told relative to `resumed_ms`, onResume's stamp (run-apk reads it from the services log; the app gate watches from
+/// the log's start, so a fault may precede it). `atld_exited` is a fault at the window's end.
 pub(crate) fn fault_after(
     app_log: &str,
     from_ms: u64,
     window_ms: u64,
+    resumed_ms: u64,
     atld_exited: bool,
 ) -> Option<String> {
     let end = from_ms + window_ms;
@@ -331,7 +333,8 @@ pub(crate) fn fault_after(
             } else {
                 return None;
             };
-            Some((t, format!("{what} at +{} ms after onResume", t - from_ms)))
+            let offset = i128::from(t) - i128::from(resumed_ms);
+            Some((t, format!("{what} at {offset:+} ms from onResume")))
         })
         .collect();
     if atld_exited {

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test gl`: the GL gate's package. No activity: its class runs as a plain app process (atld's run-class option), with the GL driver placed as for an app. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlgl"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL GL test" />
+</manifest>

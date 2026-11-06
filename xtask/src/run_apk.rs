@@ -223,7 +223,7 @@ fn judge(
             last.class
         ));
     }
-    if let Some(fault) = window::fault_after(app, last.ms, watch_ms, atld_exited) {
+    if let Some(fault) = window::fault_after(app, last.ms, watch_ms, last.ms, atld_exited) {
         return Err(format!("{fault} (last resumed: {})", last.class));
     }
     if !complete {

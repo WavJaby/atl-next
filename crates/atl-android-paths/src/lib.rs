@@ -7,6 +7,20 @@
 pub const SYSTEM: &str = "/system";
 /// The vendor partition (`Environment.getVendorDirectory()`), bound read-only: the GL driver (libEGL's Loader.cpp `/vendor/lib64/egl`), /vendor/build.prop.
 pub const VENDOR: &str = "/vendor";
+/// The platform's native libraries for the process's pointer width (bionic linker's `/system/lib64` in LP64, `/system/lib` in ILP32): libEGL's Loader.cpp `SYSTEM_LIB_PATH`.
+pub const SYSTEM_LIB: &str = if cfg!(target_pointer_width = "64") {
+    "/system/lib64"
+} else {
+    "/system/lib"
+};
+/// libEGL's Loader.cpp `VENDOR_LIB_EGL_DIR` for the process's pointer width: where it looks for `lib{EGL,GLESv1_CM,GLESv2}_<ro.hardware.egl>.so`.
+pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
+    "/vendor/lib64/egl"
+} else {
+    "/vendor/lib/egl"
+};
+/// The vendor partition's properties (`ro.hardware.egl`), joined into the property area.
+pub const VENDOR_BUILD_PROP: &str = "/vendor/build.prop";
 /// Framework jars and their libraries (`Environment.getRootDirectory()/framework`).
 pub const SYSTEM_FRAMEWORK: &str = "/system/framework";
 /// The CA store Conscrypt's `TrustedCertificateStore` reads (`$ANDROID_ROOT/etc/security/cacerts`).

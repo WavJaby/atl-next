@@ -47,7 +47,9 @@ pub struct Runtime {
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
     /// The GL driver (mesa.rs `driver`), when [`Runtime::with_gl_driver`] asked for it: files placed by atld `--file`, library dirs joining the library path.
-    gl_driver: Option<(Vec<(PathBuf, String)>, Vec<PathBuf>)>,
+    gl_driver: Option<crate::mesa::Driver>,
+    /// A gate's own test files placed by atld `--file` ([`Runtime::with_fixture_file`]): never shipped, so outside `refuse_test_only`.
+    fixture_files: Vec<(PathBuf, String)>,
     /// The directory of the NativeBridge core (atl-native-bridge `LIBRARY`), which ART of every app process opens by name (`ro.dalvik.vm.native.bridge`).
     native_bridge: PathBuf,
     /// The device's ABIs, preferred first (`ro.product.cpu.abilist`'s role), for the install's native-library extraction: the host row's `android_abis` (arches.toml); translated ABIs join when the bridge runs guest code.
@@ -268,6 +270,7 @@ impl Runtime {
             keychars,
             gralloc: None,
             gl_driver: None,
+            fixture_files: Vec::new(),
             headless_pointer: None,
             display: None,
             ui: None,
@@ -295,11 +298,7 @@ impl Runtime {
     /// Also the fronts at Loader.cpp's `SYSTEM_LIB_PATH` (`/system/lib64` in LP64): it dlopens them there as the "wrapper" libraries (`load_wrapper`) and aborts without them; the links name the files already loaded, so glibc returns the loaded copy (same inode).
     pub fn with_gl_driver(mut self) -> Result<Self> {
         let (mut files, dirs) = crate::mesa::driver(&self.out)?;
-        let system_lib = if cfg!(target_pointer_width = "64") {
-            "/system/lib64"
-        } else {
-            "/system/lib"
-        };
+        let system_lib = atl_android_paths::SYSTEM_LIB;
         for m in GL_FRONTS {
             let lib = self.out.join("device").join(m).join(format!("{m}.so"));
             ensure!(lib.is_file(), "missing input {}", lib.display());
@@ -307,6 +306,12 @@ impl Runtime {
         }
         self.gl_driver = Some((files, dirs));
         Ok(self)
+    }
+
+    /// Places a gate's fixture file `host` at `at` (a /system or /vendor path) in every app sandbox.
+    pub fn with_fixture_file(mut self, host: PathBuf, at: &str) -> Self {
+        self.fixture_files.push((host, at.to_owned()));
+        self
     }
 
     /// Feeds atld a headless pointer script (format: atl-composer `input::parse_script`); the app injects it after its first frame. Only the input gate sets it.
@@ -529,7 +534,8 @@ impl Runtime {
             lib_path.push(dir);
         }
         let mut cmd = Command::new(&self.atld);
-        for (host, at) in self.gl_driver.iter().flat_map(|(files, _)| files) {
+        let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
+        for (host, at) in driver_files.chain(&self.fixture_files) {
             cmd.arg("--file").arg(format!("{}={at}", host.display()));
         }
         if let Some((allocator, _)) = &self.gralloc {
