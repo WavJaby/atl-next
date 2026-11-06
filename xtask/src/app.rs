@@ -56,7 +56,7 @@ const FONT_SIZE: u16 = 2048;
 const BRIDGE1: &str = "AtlTest: bridge1 loaded";
 /// Main.bridge1Calls' lines: `AtlTest: bridge1 call <name> = <value>`.
 const BRIDGE1_CALL: &str = "AtlTest: bridge1 call ";
-/// (call, expected value), from the fixture's sources (xtask/testdata/jni-test, AtlJniTest.java): `tlsCounter` is a `__thread` counter per thread (1, 2, untouched by threadSum's worker: 3, a fresh Java thread's own: 1); threadSum = 1 + .. + 100; errno ENOENT = 2; atl_jni_sibling.c's answer 42; RegisterNatives' `registeredAnswer` 7.
+/// (call, expected value), from the fixture's sources (xtask/testdata/jni-test, AtlJniTest.java): `tlsCounter` is a `__thread` counter per thread (1, 2, untouched by threadSum's worker: 3, a fresh Java thread's own: 1); threadSum = 1 + .. + 100; errno ENOENT = 2; atl_jni_sibling.c's answer 42; RegisterNatives' `registeredAnswer` 7; `sigsegvRecover` 1 (guest handler + siglongjmp ran); `nullFieldRead` "caught" (ART's null check still first, guest handler installed).
 const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("tlsCounter#1", "1"),
     ("tlsCounter#2", "2"),
@@ -69,6 +69,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("greet", "hello, bridge1"),
     ("callJavaAdd", "5"),
     ("registeredAnswer", "7"),
+    ("sigsegvRecover", "1"),
+    ("nullFieldRead", "caught"),
 ];
 /// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
 const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";

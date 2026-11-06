@@ -44,7 +44,10 @@ fn provider_fn(name: &str) -> Option<usize> {
 }
 
 fn host_fn(name: &str) -> Option<usize> {
-    if let Some(p) = provider_fn(name).or_else(|| super::intercepts::host_fn(name)) {
+    if let Some(p) = provider_fn(name)
+        .or_else(|| super::intercepts::host_fn(name))
+        .or_else(|| super::signal::host_fn(name))
+    {
         return Some(p);
     }
     Some(match name {

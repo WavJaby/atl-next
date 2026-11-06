@@ -57,6 +57,8 @@ pub unsafe fn initialize(
     _private_dir: *const c_char,
     _instruction_set: *const c_char,
 ) -> bool {
+    // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs
+    crate::engine::signal::rewrap_all();
     true
 }
 
@@ -69,6 +71,8 @@ pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
         return std::ptr::null_mut();
     };
     let path = Path::new(OsStr::from_bytes(path.to_bytes()));
+    // a rewrap point (engine/signal.rs): host handlers installed since the last one
+    crate::engine::signal::rewrap_all();
     match loader::load(path, &Config::installed) {
         Ok(h) => h as *mut c_void,
         Err(e) => {

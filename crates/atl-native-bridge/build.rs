@@ -35,6 +35,8 @@ const THREAD_HEADERS: &[&str] = &[
     "bionic/libc/bionic/pthread_internal.h",
     // pthread_attr_t: the intercepted pthread API hands it to glibc unconverted (engine/intercepts.rs size gate)
     "bionic/libc/include/bits/pthread_types.h",
+    // struct sigaction / sigset_t: guest sigaction's host side converts them (engine/signal.rs layout gate)
+    "bionic/libc/include/bits/signal_types.h",
     "bionic/libc/private/bionic_tls.h",
     "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
 ];

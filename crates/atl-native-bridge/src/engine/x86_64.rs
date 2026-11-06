@@ -18,14 +18,28 @@ pub struct HostThread {
     host_fs: usize,
     guest_fs: usize,
     shadow_end: *mut usize,
+    /// RECORD_MAGIC: GS holds ART's `Thread*` on every ART thread (art thread_x86_64.cc `arch_prctl(ARCH_SET_GS)`), so the signal entry trusts GS as a record only when this word matches.
+    magic: usize,
     shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
 }
+
+/// `HostThread::magic`, as hex digits: the asm compares it as an immediate.
+macro_rules! record_magic {
+    () => {
+        "41544c4e42524543"
+    };
+}
+const RECORD_MAGIC: usize = match usize::from_str_radix(record_magic!(), 16) {
+    Ok(v) => v,
+    Err(_) => panic!("record_magic! is not hex"),
+};
 
 const _: () = {
     assert!(std::mem::offset_of!(HostThread, shadow_sp) == 0);
     assert!(std::mem::offset_of!(HostThread, host_fs) == 8);
     assert!(std::mem::offset_of!(HostThread, guest_fs) == 16);
     assert!(std::mem::offset_of!(HostThread, shadow_end) == 24);
+    assert!(std::mem::offset_of!(HostThread, magic) == 32);
 };
 
 impl HostThread {
@@ -36,6 +50,7 @@ impl HostThread {
             host_fs: 0,
             guest_fs: 0,
             shadow_end: std::ptr::null_mut(),
+            magic: RECORD_MAGIC,
             shadow: [0; SHADOW_FRAMES * FRAME_WORDS],
         }));
         let range = t.shadow.as_mut_ptr_range();
@@ -297,6 +312,9 @@ std::arch::global_asm!(
         "    rdgsbase %r12\n",
         "    test %r12, %r12\n",
         "    jz 1f\n",
+        concat!("    movabs $0x", record_magic!(), ", %r11\n"),
+        "    cmp %r11, 32(%r12)\n",
+        "    jne 1f\n",
         "    mov 8(%r12), %r11\n",
         "    test %r11, %r11\n",
         "    jz 1f\n",

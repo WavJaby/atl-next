@@ -6,8 +6,11 @@
 #include <fcntl.h>
 #include <jni.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define JNI_CLS "atl/bridge1/testlib/AtlJniTest"
@@ -81,6 +84,35 @@ JNI_FN(jint, dlopenSibling)(JNIEnv *env, jclass cls)
     int v = answer != NULL ? answer() : -2;
     dlclose(h);
     return v;
+}
+
+static sigjmp_buf segv_env;
+static volatile sig_atomic_t segv_armed;
+
+// Only the fault sigsegvRecover raises may reach it: anything else means the host's claim on SIGSEGV (ART's implicit null checks) was lost to this handler.
+static void segv_handler(int sig, siginfo_t *info, void *uc)
+{
+    if (!segv_armed)
+        abort();
+    segv_armed = 0;
+    siglongjmp(segv_env, 1);
+}
+
+// 1 = a guest SIGSEGV handler ran and siglongjmp'd back. The handler stays installed, so the Java null check after this runs with a guest handler claimed.
+JNI_FN(jint, sigsegvRecover)(JNIEnv *env, jclass cls)
+{
+    struct sigaction sa = { 0 };
+    sa.sa_sigaction = segv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, NULL) != 0)
+        return -1;
+    if (sigsetjmp(segv_env, 1) == 0) {
+        segv_armed = 1;
+        *(volatile int *)(uintptr_t)16 = 1;
+        return -2;
+    }
+    return 1;
 }
 
 // Bound by RegisterNatives, so no exported Java_ symbol for this one.
