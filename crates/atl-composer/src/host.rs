@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
 use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData};
-use atl_compositor::model::{ClientCall, Compositor, CompositorConfig, FrameOutput, LayerSpec};
+use atl_compositor::model::{
+    ClientCall, ColorLayer, Compositor, CompositorConfig, FrameOutput, LayerSpec,
+};
 use atl_compositor::scene::{Quad, Scene};
 use atl_libgui_parcel::parcel::WireParcel;
 use atl_libgui_parcel::parcel::{BinderKey, StrongBinder};
@@ -499,6 +501,15 @@ impl Composer {
     /// Places layer `id` at (`x`, `y`) in its parent: the window service's frame origin for a window (ui_agent WINDOW_POSITION). BAD_VALUE for an unknown layer.
     pub fn set_layer_position(&self, id: i32, x: f32, y: f32) -> Result<(), StatusCode> {
         if !self.lock().compositor.set_position(id, x, y) {
+            return Err(StatusCode::BAD_VALUE);
+        }
+        self.notify();
+        Ok(())
+    }
+
+    /// Sets colour layer `id` (the window service's dim layer, ui_agent DIM_LAYER; Compositor::set_color_layer). BAD_VALUE for an unknown layer or anchor.
+    pub fn set_color_layer(&self, id: i32, c: ColorLayer) -> Result<(), StatusCode> {
+        if !self.lock().compositor.set_color_layer(id, c) {
             return Err(StatusCode::BAD_VALUE);
         }
         self.notify();

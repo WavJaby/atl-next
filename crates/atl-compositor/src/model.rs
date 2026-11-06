@@ -74,6 +74,20 @@ pub struct LayerSpec {
     pub fills_color: bool,
 }
 
+/// A colour layer's state as the window manager sets it ([`Compositor::set_color_layer`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorLayer {
+    /// The id of the layer this one is ordered relative to.
+    pub relative_to: i32,
+    /// Its z relative to that layer: negative = below it.
+    pub z: i32,
+    /// r, g, b in 0..=1.
+    pub color: [f32; 3],
+    pub alpha: f32,
+    /// The crop from the layer's origin: width, height.
+    pub size: (f32, f32),
+}
+
 /// Why the model refused a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
@@ -411,6 +425,35 @@ impl Compositor {
             (l.x, l.y) = (x, y);
             self.dirty = true;
         }
+        true
+    }
+
+    /// The window manager's colour layer `id` (Dimmer's dim layer, Dimmer.java makeDimLayer: a colour layer): filled with `c.color` at `c.alpha`, cropped to `c.size` from its origin,
+    /// ordered `c.z` relative to layer `c.relative_to` (DimmerAnimationHelper.java:257 setRelativeLayer(dim, window, -1): just below the dimming window). Applied at once, as set_position.
+    /// False: no layer has id `id` or `c.relative_to`.
+    pub fn set_color_layer(&mut self, id: i32, c: ColorLayer) -> bool {
+        let Some(anchor) = self
+            .layers
+            .iter()
+            .find(|(_, l)| l.id == c.relative_to)
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        let Some(l) = self.layers.values_mut().find(|l| l.id == id) else {
+            return false;
+        };
+        l.relative_to = Some(anchor);
+        l.z = c.z;
+        l.color = c.color;
+        l.alpha = c.alpha;
+        l.crop = Some(FloatRect {
+            left: 0.0,
+            top: 0.0,
+            right: c.size.0,
+            bottom: c.size.1,
+        });
+        self.dirty = true;
         true
     }
 

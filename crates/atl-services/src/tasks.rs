@@ -40,10 +40,24 @@ struct TaskRecord {
     config_seq: i32,
 }
 
-/// One window of a Task: the client handle (what `remove` finds the window by) and the Task it belongs to.
+/// What a window's frame and surface position are computed from (WindowState.mAttrs + mRequestedWidth/Height): set at addToDisplay, replaced by each relayout, read again by `resized`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    pub r#type: i32,
+    pub gravity: i32,
+    pub x: i32,
+    pub y: i32,
+    /// the size the client last asked for at relayout (its measured size); 0x0 before the first
+    pub requested: (i32, i32),
+    /// LayoutParams.surfaceInsets left/top: the surface extends past the frame by them (a dialog's shadow)
+    pub surface_inset: (i32, i32),
+}
+
+/// One window of a Task: the client handle (what `remove` finds the window by), the Task it belongs to, and its placement.
 struct WindowEntry<C> {
     task: TaskId,
     client: C,
+    placement: Placement,
 }
 
 struct State<C> {
@@ -216,10 +230,30 @@ impl<C: Clone + PartialEq> Tasks<C> {
     }
 
     /// Records a window of `task`; a client already recorded is not recorded twice.
-    pub fn add_window(&self, task: TaskId, client: C) {
+    pub fn add_window(&self, task: TaskId, client: C, placement: Placement) {
         let mut st = self.lock();
         if !st.windows.iter().any(|w| w.client == client) {
-            st.windows.push(WindowEntry { task, client });
+            st.windows.push(WindowEntry {
+                task,
+                client,
+                placement,
+            });
+        }
+    }
+
+    /// The placement of the window whose client is `client`, if recorded.
+    pub fn placement(&self, client: &C) -> Option<Placement> {
+        self.lock()
+            .windows
+            .iter()
+            .find(|w| w.client == *client)
+            .map(|w| w.placement)
+    }
+
+    /// Replaces the placement of the window whose client is `client` (relayout); nothing for an unknown client.
+    pub fn set_placement(&self, client: &C, placement: Placement) {
+        if let Some(w) = self.lock().windows.iter_mut().find(|w| w.client == *client) {
+            w.placement = placement;
         }
     }
 
@@ -228,13 +262,13 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().windows.retain(|w| w.client != *client);
     }
 
-    /// The clients of `task`'s windows, in the order they were added.
-    pub fn windows_of(&self, task: TaskId) -> Vec<C> {
+    /// The clients of `task`'s windows with their placements, in the order they were added.
+    pub fn windows_of(&self, task: TaskId) -> Vec<(C, Placement)> {
         self.lock()
             .windows
             .iter()
             .filter(|w| w.task == task)
-            .map(|w| w.client.clone())
+            .map(|w| (w.client.clone(), w.placement))
             .collect()
     }
 
@@ -386,14 +420,33 @@ mod tests {
     fn windows_belong_to_their_task() {
         let t = tasks();
         let (main, second) = (t.new_task(7), t.new_task(7));
-        t.add_window(main, 100);
-        t.add_window(second, 200);
-        t.add_window(main, 100);
-        assert_eq!(t.windows_of(main), vec![100]);
-        assert_eq!(t.windows_of(second), vec![200]);
+        let p = Placement::default();
+        t.add_window(main, 100, p);
+        t.add_window(second, 200, p);
+        t.add_window(main, 100, p);
+        assert_eq!(t.windows_of(main), vec![(100, p)]);
+        assert_eq!(t.windows_of(second), vec![(200, p)]);
         t.remove_window(&100);
         assert!(t.windows_of(main).is_empty());
-        assert_eq!(t.windows_of(second), vec![200]);
+        assert_eq!(t.windows_of(second), vec![(200, p)]);
+    }
+
+    /// A relayout's placement replaces the add's, and `resized` reads it back per window.
+    #[test]
+    fn placement_follows_relayout() {
+        let t = tasks();
+        let main = t.new_task(7);
+        t.add_window(main, 100, Placement::default());
+        let popup = Placement {
+            r#type: 1000,
+            requested: (196, 160),
+            ..Placement::default()
+        };
+        t.set_placement(&100, popup);
+        assert_eq!(t.placement(&100), Some(popup));
+        assert_eq!(t.windows_of(main), vec![(100, popup)]);
+        t.set_placement(&999, Placement::default());
+        assert_eq!(t.placement(&999), None);
     }
 
     /// Frame sequence numbers only go up.

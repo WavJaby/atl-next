@@ -6,7 +6,8 @@
 //! openSession: a session for the caller's callback (WindowManagerService.openSession:6004-6005); the session's window methods are below.
 //! Session, the window path: addToDisplayAsUser (WindowManagerService.addWindow: ADD_OKAY, the client end of the window's input channel (its server end goes to the app's UI agent), the insets, the frame, scale 1),
 //! relayout (WindowManagerService.relayoutWindow: the client frames, the merged configuration, the SurfaceControl the window's UI agent gives, the insets), remove (the window goes:
-//! its input channel's server end stays with the app: no close signal yet, a known gap). The frames are the Task's bounds (tasks.rs, freeform); the display frame is the display; no insets (the desktop shows no system bars).
+//! its input channel's server end stays with the app: no close signal yet, a known gap). The frames come from one place, [`client_frames`] (relayout and `resized` alike): display and parent frame are the Task's bounds
+//! (freeform: WindowLayout.computeFrames sets the display frame from the window bounds), no insets (the desktop shows no system bars).
 //! finishDrawing: the post-draw SurfaceControl.Transaction goes unchanged to the app's composer (Session::finishDrawing; what is not modelled is listed there).
 //! Every other method keeps the stub's default body: counted (counters.rs) and answered UNKNOWN_TRANSACTION.
 
@@ -33,7 +34,7 @@ use binder::{
 };
 
 use crate::permission::Permissions;
-use crate::tasks::{TaskId, Tasks};
+use crate::tasks::{Placement, TaskId, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters};
 
@@ -173,10 +174,8 @@ struct Window {
     laid_out: bool,
     /// The window's SurfaceControl once its agent gave one: kept, so the layer's handle lives as long as the window.
     surface: Option<SurfaceControl>,
-    /// Where the agent placed the window's layer in its Task (a new layer sits at the origin): its frame's origin at the last relayout the agent took.
+    /// Where the agent placed the window's layer in its Task (a new layer sits at the origin): its surface origin ([`surface_origin`]) at the last relayout the agent took.
     position: (i32, i32),
-    /// Its LayoutParams as the frame needs them: from addToDisplayAsUser, replaced by a relayout that carries LayoutParams.
-    layout: Layout,
     /// The token of the input channel the agent took; None for a window without one.
     input: Option<SpIBinder>,
 }
@@ -266,83 +265,93 @@ impl IWindowManager for WindowManager {
 }
 
 impl Session {
-    /// The display's frame: the insets' display frame and the global bounds. A window's frame is [`Session::task_rect`].
-    fn display_rect(&self) -> Rect {
-        let display = self.tasks.display();
-        Rect {
-            left: 0,
-            top: 0,
-            right: display.width,
-            bottom: display.height,
-        }
-    }
-
-    /// A window's frame: from the origin, the size of its Task (tasks.rs). Freeform, so it is the window's bounds, not the display's.
-    /// A toast is placed in it by its gravity (window_frame).
-    fn task_rect(&self, task: TaskId) -> Rect {
-        let size = self.tasks.size(task);
-        Rect {
-            left: 0,
-            top: 0,
-            right: size.width,
-            bottom: size.height,
-        }
-    }
-
-    /// The insets a window of the display sees: none (no system bars, no cutout), the display frame.
-    fn insets_state(&self) -> InsetsState {
-        InsetsState {
-            display_frame: self.display_rect(),
-            rounded_corner_frame: self.display_rect(),
-            seq: 0,
-            sources: Vec::new(),
-        }
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Window>> {
         // a poisoned list still holds the windows
         self.windows.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// The LayoutParams fields the frame depends on, kept per window from its add and its relayouts that carry LayoutParams (WindowState.mAttrs).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Layout {
-    r#type: i32,
-    gravity: i32,
-    x: i32,
-    y: i32,
-}
-
-impl Layout {
-    fn of(a: &WindowManager_LayoutParams) -> Self {
-        Layout {
-            r#type: a.r#type,
-            gravity: a.gravity,
-            x: a.x,
-            y: a.y,
-        }
-    }
-}
-
-/// The frame relayout reports: the Task's rect, except a TYPE_TOAST window or a sub-window (a popup, whose parent fills the Task), which is its requested (measured) size placed by its gravity
-/// and x/y in the Task (window_layout::gravity_frame).
-fn window_frame(a: Layout, requested_width: i32, requested_height: i32, parent: Rect) -> Rect {
-    if !(a.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&a.r#type)) {
-        return parent;
-    }
-    let (left, top, right, bottom) = crate::window_layout::gravity_frame(
-        a.gravity,
-        (requested_width, requested_height),
-        (a.x, a.y),
-        (parent.left, parent.top, parent.right, parent.bottom),
-    );
+fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
     Rect {
         left,
         top,
         right,
         bottom,
     }
+}
+
+/// The display's bounds: the insets' display frame (InsetsState is the display's, DisplayContent).
+fn display_rect(tasks: &Tasks<SpIBinder>) -> Rect {
+    let display = tasks.display();
+    rect(0, 0, display.width, display.height)
+}
+
+/// A Task's bounds from the origin (tasks.rs): freeform, so the windows' bounds, not the display's.
+fn task_rect(tasks: &Tasks<SpIBinder>, task: TaskId) -> Rect {
+    let size = tasks.size(task);
+    rect(0, 0, size.width, size.height)
+}
+
+/// The insets a window of the display sees: none (no system bars, no cutout), the display frame.
+fn display_insets(tasks: &Tasks<SpIBinder>) -> InsetsState {
+    InsetsState {
+        display_frame: display_rect(tasks),
+        rounded_corner_frame: display_rect(tasks),
+        seq: 0,
+        sources: Vec::new(),
+    }
+}
+
+impl Placement {
+    /// The add's placement: the LayoutParams fields the frame and the surface position depend on, nothing requested yet.
+    fn of(a: &WindowManager_LayoutParams) -> Self {
+        Placement {
+            r#type: a.r#type,
+            gravity: a.gravity,
+            x: a.x,
+            y: a.y,
+            requested: (0, 0),
+            surface_inset: (a.surface_insets.left, a.surface_insets.top),
+        }
+    }
+}
+
+/// The frames of a window in a Task whose bounds are `task` (WindowLayout.computeFrames, WindowLayout.java:66-275, for a freeform window with no insets and no cutout):
+/// display frame = window bounds (:86-87, the Task's bounds) = parent frame (:90). The frame is the parent frame for a MATCH_PARENT window; a TYPE_TOAST window or a sub-window
+/// (a popup, whose parent fills the Task) is its requested size placed by gravity and x/y (:259 Gravity.apply; window_layout::gravity_frame).
+/// The same function answers relayout and `resized`, so a window's frames never depend on which of the two reported last.
+fn client_frames(p: Placement, task: Rect, seq: i32) -> ClientWindowFrames {
+    let frame = if p.r#type == TYPE_TOAST || (FIRST_SUB_WINDOW..=LAST_SUB_WINDOW).contains(&p.r#type) {
+        let (left, top, right, bottom) = crate::window_layout::gravity_frame(
+            p.gravity,
+            p.requested,
+            (p.x, p.y),
+            (task.left, task.top, task.right, task.bottom),
+        );
+        rect(left, top, right, bottom)
+    } else {
+        task.clone()
+    };
+    ClientWindowFrames {
+        frame,
+        display_frame: task.clone(),
+        parent_frame: task,
+        attached_frame: None,
+        is_parent_frame_clipped_by_display_cutout: false,
+        compat_scale: COMPAT_SCALE_NONE,
+        seq,
+    }
+}
+
+/// Where a window's layer goes in its Task: the frame's origin less the surface insets (WindowState.transformFrameToSurfacePosition, WindowState.java:5190-5218: the surface
+/// extends past the frame by surfaceInsets, e.g. a dialog's shadow, so its top-left sits that far up and left of the frame).
+fn surface_origin(p: Placement, frame: &Rect) -> (i32, i32) {
+    (frame.left - p.surface_inset.0, frame.top - p.surface_inset.1)
+}
+
+/// A rect as `l,t wxh` for the diagnostic lines.
+fn show_rect(r: &Rect) -> String {
+    format!("{},{} {}x{}", r.left, r.top, r.right - r.left, r.bottom - r.top)
 }
 
 /// AOSP InputChannel.openInputChannelPair (InputTransport.cpp:355-378): a SOCK_SEQPACKET pair, both ends with the buffer sizes above. The first fd is the server end, the second
@@ -442,7 +451,8 @@ impl IWindowSession for Session {
         } else {
             (InputChannel::default(), None)
         };
-        self.tasks.add_window(task, window.as_binder());
+        self.tasks
+            .add_window(task, window.as_binder(), Placement::of(attrs));
         self.lock().push(Window {
             client: window.as_binder(),
             title: attrs.title.clone().unwrap_or_default(),
@@ -450,14 +460,28 @@ impl IWindowSession for Session {
             laid_out: false,
             surface: None,
             position: (0, 0),
-            layout: Layout::of(attrs),
             input,
         });
         *out_input_channel = Some(channel);
-        *insets_state = Some(self.insets_state());
+        *insets_state = Some(display_insets(&self.tasks));
         *active_controls = None;
         *attached_frame = Some(Rect::default());
         *size_compat_scale = Some(vec![COMPAT_SCALE_NONE]);
+        // one line per add: what the app asked for and the Task it lands in, the evidence a misplaced window is read from
+        activity::log(format_args!(
+            "window add {} type {} attrs {}x{} gravity {:#x} at {},{} flags {:#x} dim {} surface_insets {:?} task {}",
+            attrs.title.as_deref().unwrap_or(""),
+            attrs.r#type,
+            attrs.width,
+            attrs.height,
+            attrs.gravity,
+            attrs.x,
+            attrs.y,
+            attrs.flags,
+            attrs.dim_amount,
+            attrs.surface_insets,
+            show_rect(&task_rect(&self.tasks, task)),
+        ));
         // WMS dispatches the app's visibility to its windows (WindowState's app visibility): ViewRootImpl draws only while its app is visible, and it starts out not.
         if let Err(e) = window.r#dispatchAppVisibility(true) {
             counters::count(
@@ -487,7 +511,7 @@ impl IWindowSession for Session {
             return Err(StatusCode::BAD_VALUE.into());
         };
         let client = window.as_binder();
-        let (first, pending, task, layout) = {
+        let (first, pending, task, title) = {
             let mut windows = self.lock();
             let Some(record) = windows.iter_mut().find(|w| w.client == client) else {
                 counters::refused(WINDOW_SESSION, "relayout: window not added by this session");
@@ -495,17 +519,23 @@ impl IWindowSession for Session {
             };
             let first = !record.laid_out;
             record.laid_out = true;
-            // relayout carries the LayoutParams only when they changed (ViewRootImpl sends null otherwise); WMS keeps the window's own (WindowState.mAttrs)
-            if let Some(a) = attrs {
-                record.layout = Layout::of(a);
-            }
             (
                 first,
                 record.surface.is_none().then(|| record.title.clone()),
                 record.task,
-                record.layout,
+                record.title.clone(),
             )
         };
+        // relayout carries the LayoutParams only when they changed (ViewRootImpl sends null otherwise); WMS keeps the window's own (WindowState.mAttrs) and the requested size
+        // (mRequestedWidth/Height), which `resized` lays out with again
+        let placement = Placement {
+            requested: (requested_width, requested_height),
+            ..attrs.map_or_else(
+                || self.tasks.placement(&client).unwrap_or_default(),
+                Placement::of,
+            )
+        };
+        self.tasks.set_placement(&client, placement);
         // The agent is another process, asked without the windows lock. A window gets its surface once; a failed call is asked again at the next relayout.
         let created = pending.and_then(|title| self.agent.window_surface(&title));
         if let Some(surface) = &created
@@ -514,12 +544,7 @@ impl IWindowSession for Session {
             record.surface = Some(surface.clone());
         }
         // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
-        let frame = window_frame(
-            layout,
-            requested_width,
-            requested_height,
-            self.task_rect(task),
-        );
+        let frames = client_frames(placement, task_rect(&self.tasks, task), seq);
         let (surface, placed) = {
             let windows = self.lock();
             let record = windows.iter().find(|w| w.client == client);
@@ -528,8 +553,9 @@ impl IWindowSession for Session {
                 record.map(|w| w.position),
             )
         };
-        // the window's layer goes to its frame's origin (WindowState.updateSurfacePosition), asked without the windows lock; a refused call is asked again at the next relayout
-        let origin = (frame.left, frame.top);
+        // the window's layer goes to its surface origin (WindowState.updateSurfacePosition), asked without the windows lock; a refused call is asked again at the next relayout
+        let frame = &frames.frame;
+        let origin = surface_origin(placement, frame);
         if let Some(layer_id) = surface
             .as_ref()
             .and_then(|s| s.native.as_ref())
@@ -539,29 +565,33 @@ impl IWindowSession for Session {
             && let Some(record) = self.lock().iter_mut().find(|w| w.client == client)
         {
             record.position = origin;
-            // the line run-apk / a gate reads the placement from: the frame the layer now shows at, in its Task
+            // the line run-apk / a gate reads the placement from: the frame the window now shows, in its Task, and its layer's origin
             activity::log(format_args!(
-                "window {} placed at {},{} size {}x{}",
+                "window {} placed at {},{} size {}x{} surface at {},{}",
                 record.title,
                 frame.left,
                 frame.top,
                 frame.right - frame.left,
-                frame.bottom - frame.top
+                frame.bottom - frame.top,
+                origin.0,
+                origin.1
             ));
         }
         let display = self.tasks.display();
         let size = self.tasks.size(task);
         let surface_changed = created.is_some();
+        // one line per relayout: the frames the client lays out in
+        activity::log(format_args!(
+            "window relayout {} requested {}x{} frame {} display_frame {} parent_frame {}",
+            title,
+            requested_width,
+            requested_height,
+            show_rect(&frames.frame),
+            show_rect(&frames.display_frame),
+            show_rect(&frames.parent_frame),
+        ));
         *out_relayout_result = Some(WindowRelayoutResult {
-            frames: ClientWindowFrames {
-                frame,
-                display_frame: self.display_rect(),
-                parent_frame: self.task_rect(task),
-                attached_frame: None,
-                is_parent_frame_clipped_by_display_cutout: false,
-                compat_scale: COMPAT_SCALE_NONE,
-                seq,
-            },
+            frames,
             merged_configuration: MergedConfiguration {
                 global: activity::global_configuration(&display),
                 override_config: Configuration {
@@ -571,7 +601,7 @@ impl IWindowSession for Session {
                 merged: activity::task_configuration(&display, size),
             },
             surface_control: surface.unwrap_or_default(),
-            insets_state: self.insets_state(),
+            insets_state: display_insets(&self.tasks),
             // no controls: the null array (InsetsSourceControl.Array with mControls null, its sequence 0)
             active_controls: InsetsSourceControl_Array {
                 controls_count: -1,
@@ -674,12 +704,6 @@ pub fn new_binder(
 pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
     let size = tasks.size(task);
-    let rect = |right: i32, bottom: i32| Rect {
-        left: 0,
-        top: 0,
-        right,
-        bottom,
-    };
     let merged = MergedConfiguration {
         global: activity::global_configuration(&display),
         override_config: Configuration {
@@ -689,7 +713,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
         merged: activity::task_configuration(&display, size),
     };
     let clients = tasks.windows_of(task);
-    for client in &clients {
+    for (client, placement) in &clients {
         let window = match client
             .clone()
             .into_interface::<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>()
@@ -703,21 +727,9 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
                 continue;
             }
         };
-        let frames = ClientWindowFrames {
-            frame: rect(size.width, size.height),
-            display_frame: rect(display.width, display.height),
-            parent_frame: rect(size.width, size.height),
-            attached_frame: None,
-            is_parent_frame_clipped_by_display_cutout: false,
-            compat_scale: COMPAT_SCALE_NONE,
-            seq: tasks.next_seq(),
-        };
-        let insets = InsetsState {
-            display_frame: rect(display.width, display.height),
-            rounded_corner_frame: rect(display.width, display.height),
-            seq: 0,
-            sources: Vec::new(),
-        };
+        // a popup keeps its requested size and gravity, a MATCH_PARENT window takes the new bounds (client_frames, as relayout)
+        let frames = client_frames(*placement, task_rect(tasks, task), tasks.next_seq());
+        let insets = display_insets(tasks);
         if let Err(e) = window.r#resized(
             Some(&frames),
             false,
