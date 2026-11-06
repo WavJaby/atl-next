@@ -14,8 +14,8 @@ use atl_layout::Layout;
 
 use crate::sources::{Checkout, Pin};
 
-/// Set inside the namespace to the overlay set it was entered with ([`describe`]), so the re-executed xtask does not enter again.
-const ENV: &str = "ATL_XTASK_OVERLAYS";
+/// Set inside the namespace to the overlay set it was entered with ([`describe`]), so the re-executed xtask does not enter again. `fetch --migrate-git-dirs` looks for it in other processes.
+pub const ENV: &str = "ATL_XTASK_OVERLAYS";
 
 /// The shared AOSP tree, `src/aosp`: its root holds no checkout of its own, so only the tree-wide readers (the converter, the prune markers, manifest links) take it whole.
 pub fn shared_tree(layout: &Layout) -> PathBuf {
@@ -34,76 +34,21 @@ pub const KEYBOARD_FILES: [(&str, &str); 3] = [
     ("Generic.kl", "usr/keylayout"),
 ];
 
-/// One bind mount: the task copy `copy` shown at `target` (`src/aosp/<project>`).
+/// One bind mount: the task copy `copy` shown at `target` (`src/aosp/<project>`). Git needs no binds of its own: both `.git` gitfiles point into `src/.git-dirs/` (atl_layout::Layout::git_dir), which no bind covers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overlay {
     /// Project path in the manifest (`frameworks/native`).
     pub project: String,
     pub copy: PathBuf,
     pub target: PathBuf,
-    pub git: Option<GitShadow>,
-}
-
-/// A task copy is a git worktree of the shared checkout: its `.git` file points into `<target>/.git/worktrees/<n>`, which the bind hides. The namespace shows the shared checkout at
-/// `shadow` (`src-wt/<task>/.shadow/<project>`) and binds `gitfile` (the pointer rewritten into it) over the copy's `.git` at both paths, so git works inside.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GitShadow {
-    pub shadow: PathBuf,
-    pub gitfile: PathBuf,
-    /// The rewritten pointer, `gitdir: <shadow>/.git/worktrees/<n>`.
-    pub content: String,
-}
-
-/// The copy's `.git` pointer, when it leads under `target` (a worktree of the checkout the bind hides).
-fn git_shadow(copy: &Path, target: &Path, shadow_root: &Path, project: &str) -> Option<GitShadow> {
-    let text = std::fs::read_to_string(copy.join(".git")).ok()?;
-    let gitdir = Path::new(text.strip_prefix("gitdir:")?.trim());
-    let rest = gitdir.strip_prefix(target).ok()?;
-    let (shadow, gitfile) = shadow_paths(shadow_root, project);
-    Some(GitShadow {
-        content: format!("gitdir: {}\n", shadow.join(rest).display()),
-        gitfile,
-        shadow,
-    })
-}
-
-/// A project's shadow mount point and rewritten pointer under `shadow_root` (`src-wt/<task>/.shadow`).
-fn shadow_paths(shadow_root: &Path, project: &str) -> (PathBuf, PathBuf) {
-    (
-        shadow_root.join(project),
-        shadow_root.join(format!("{}.gitfile", project.replace('/', "_"))),
-    )
-}
-
-/// `xtask patch --done` removed the task copy of `project`: its shadow goes too (the mount point, empty outside the namespace, and the pointer), then the emptied directories up to `.shadow`.
-pub fn remove_shadow(layout: &Layout, project: &str) -> Result<()> {
-    let Some((_, task_dir)) = layout.task() else {
-        return Ok(());
-    };
-    let root = task_dir.join(".shadow");
-    let (shadow, gitfile) = shadow_paths(&root, project);
-    match std::fs::remove_file(&gitfile) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("removing {}", gitfile.display()));
-        }
-        _ => {}
-    }
-    // remove_dir only: an empty mount point never takes anything with it
-    for d in shadow.ancestors().take_while(|d| d.starts_with(&root)) {
-        if std::fs::remove_dir(d).is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 /// This repo checkout's AOSP task copies, in project order. A pinned project inside an edited one is refused: the mount would hide its checkout.
 pub fn overlays(layout: &Layout, checkouts: &[Checkout]) -> Result<Vec<Overlay>> {
     let shared = shared_tree(layout);
-    let Some((_, task_dir)) = layout.task() else {
+    if layout.task().is_none() {
         return Ok(Vec::new());
-    };
-    let shadow_root = task_dir.join(".shadow");
+    }
     let mut out: Vec<Overlay> = checkouts
         .iter()
         .filter_map(|c| match &c.pin {
@@ -112,7 +57,6 @@ pub fn overlays(layout: &Layout, checkouts: &[Checkout]) -> Result<Vec<Overlay>>
                 let target = shared.join(p);
                 l.task.is_some().then(|| Overlay {
                     project: p.clone(),
-                    git: git_shadow(&l.dir, &target, &shadow_root, p),
                     copy: l.dir,
                     target,
                 })
@@ -160,38 +104,9 @@ pub fn bwrap_args(overlays: &[Overlay]) -> Vec<String> {
         ]);
     };
     for o in overlays {
-        // the shared checkout first, while its path still shows it
-        if let Some(g) = &o.git {
-            bind("--bind", &o.target, &g.shadow);
-        }
         bind("--bind", &o.copy, &o.target);
-        if let Some(g) = &o.git {
-            bind("--ro-bind", &g.gitfile, &o.target.join(".git"));
-            bind("--ro-bind", &g.gitfile, &o.copy.join(".git"));
-        }
     }
     a
-}
-
-/// One overlay of `copy` over `target` outside a workspace layout (the task-bind gate's scratch trees), its git shadow under `shadow_root`.
-pub fn overlays_for_test(copy: &Path, target: &Path, shadow_root: &Path) -> Overlay {
-    Overlay {
-        project: "probe".into(),
-        git: git_shadow(copy, target, shadow_root, "probe"),
-        copy: copy.to_path_buf(),
-        target: target.to_path_buf(),
-    }
-}
-
-/// Write each overlay's shadow mount point and rewritten git pointer (read by [`bwrap_args`]'s binds).
-pub fn prepare(overlays: &[Overlay]) -> Result<()> {
-    for g in overlays.iter().filter_map(|o| o.git.as_ref()) {
-        std::fs::create_dir_all(&g.shadow)
-            .with_context(|| format!("creating {}", g.shadow.display()))?;
-        std::fs::write(&g.gitfile, &g.content)
-            .with_context(|| format!("writing {}", g.gitfile.display()))?;
-    }
-    Ok(())
 }
 
 /// Every overlay is in effect: its target is the task copy's directory (same device + inode). Fails outside the namespace, or with the wrong copy bound.
@@ -242,7 +157,6 @@ pub fn enter(overlays: &[Overlay], shell: bool) -> Result<Option<ExitCode>> {
             o.target.display()
         );
     }
-    prepare(overlays)?;
     let mut cmd = Command::new("bwrap");
     cmd.args(bwrap_args(overlays)).arg("--").env(ENV, &want);
     if shell {
@@ -282,13 +196,21 @@ mod tests {
     fn workspace(tag: &str) -> PathBuf {
         let ws = std::env::temp_dir().join(format!("xtask-tree-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
-        for d in ["src/aosp/a/b/.git", "src/aosp/a/c"] {
-            std::fs::create_dir_all(ws.join(d)).unwrap();
+        let layout = Layout::new(&ws, None);
+        for d in ["aosp/a/b", "aosp/a/c"] {
+            std::fs::create_dir_all(ws.join("src").join(d)).unwrap();
+            let store = layout.git_dir(Path::new(d));
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(
+                ws.join("src").join(d).join(".git"),
+                format!("gitdir: {}\n", store.display()),
+            )
+            .unwrap();
         }
         let copy = ws.join("src-wt/t/aosp/a/b");
         std::fs::create_dir_all(&copy).unwrap();
         // a worktree of the shared checkout, as `xtask patch --edit` makes it
-        let gitdir = ws.join("src/aosp/a/b/.git/worktrees/b");
+        let gitdir = layout.git_dir(Path::new("aosp/a/b")).join("worktrees/b");
         std::fs::write(copy.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         std::fs::write(copy.join("patched"), "").unwrap();
         ws
@@ -306,14 +228,6 @@ mod tests {
                 project: "a/b".into(),
                 copy: ws.join("src-wt/t/aosp/a/b"),
                 target: ws.join("src/aosp/a/b"),
-                git: Some(GitShadow {
-                    shadow: ws.join("src-wt/t/.shadow/a/b"),
-                    gitfile: ws.join("src-wt/t/.shadow/a_b.gitfile"),
-                    content: format!(
-                        "gitdir: {}\n",
-                        ws.join("src-wt/t/.shadow/a/b/.git/worktrees/b").display()
-                    ),
-                }),
             }]
         );
         assert_eq!(
@@ -334,11 +248,8 @@ mod tests {
         // outside the namespace the overlay is not in effect: verify must fire
         let e = format!("{:#}", verify(&o).unwrap_err());
         assert!(e.contains("outside the task-copy namespace"), "{e}");
-        // the shadow is written for the namespace and goes with the task copy
-        prepare(&o).unwrap();
-        assert!(ws.join("src-wt/t/.shadow/a_b.gitfile").is_file());
-        remove_shadow(&layout, "a/b").unwrap();
-        assert!(!ws.join("src-wt/t/.shadow").exists());
+        // one bind per task copy, nothing for git
+        assert_eq!(bwrap_args(&o).len(), 4 + 3);
         std::fs::remove_dir_all(&ws).unwrap();
     }
 }

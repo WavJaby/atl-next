@@ -25,6 +25,7 @@ mod cts_table;
 mod deps;
 mod fetch;
 mod git;
+mod git_dirs;
 mod gl_dispatch;
 mod gl_probe;
 mod gles2_fixture;

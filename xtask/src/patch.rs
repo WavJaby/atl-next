@@ -739,9 +739,6 @@ fn done(u: &Up, layout: &Layout, licenses: &Licenses) -> Result<String> {
         );
     }
     remove_copy(&shared, &copy, &u.branch)?;
-    if let Pin::Aosp(p) = &u.c.pin {
-        crate::tree::remove_shadow(layout, p)?;
-    }
     layout.remove_empty_parents(&copy);
     Ok(format!("task copy removed; src/{} in use again", u.name()))
 }
@@ -1348,12 +1345,13 @@ pub mod fixture {
         /// A checkout of `c` in `<root>/<ws>/src`, detached at the pin.
         pub fn fetched<'a>(&self, c: &'a Checkout, ws: &str) -> Up<'a> {
             let u = self.at(c, ws);
-            std::fs::create_dir_all(&u.checkout).unwrap();
-            git(Some(&u.checkout), &["init", "-q"]).unwrap();
-            fetch::fetch_pin(c, &u.checkout).unwrap();
-            git(
-                Some(&u.checkout),
-                &["checkout", "-q", "--detach", &c.commit],
+            fetch::create_checkout(
+                &u.checkout,
+                &self.layout(ws, None).git_dir(&c.dir),
+                c.url().unwrap(),
+                &c.rev,
+                &fetch::Sparse::Full,
+                Some(&c.commit),
             )
             .unwrap();
             u
@@ -1515,7 +1513,17 @@ mod tests {
         for file in ["new.c", "link.h", "build.o"] {
             std::fs::write(u.checkout.join(file), "").unwrap();
         }
-        std::fs::write(u.checkout.join(".git/info/exclude"), "*.o\n").unwrap();
+        let exclude = git(
+            Some(&u.checkout),
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+        )
+        .unwrap();
+        std::fs::write(exclude, "*.o\n").unwrap();
         u.untracked.insert("link.h".into());
         let e = check(&u).unwrap_err();
         assert!(

@@ -113,9 +113,25 @@ pub struct Args {
     /// Parallel git processes (default: the AOSP manifest's `sync-j`).
     #[arg(long)]
     jobs: Option<usize>,
+    /// Move every checkout's in-tree `.git` dir to `src/.git-dirs/<dir>.git` and repair its task copies (one-time, per workspace; dry run unless --execute). Refuses while a build token is held,
+    /// a process has its cwd under src/ or src-wt/ or is inside a task-copy namespace, or a git lock exists. Resumable: run it again after a crash.
+    #[arg(long, conflicts_with_all = ["bump", "add"])]
+    migrate_git_dirs: bool,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if args.migrate_git_dirs {
+        let layout = Layout::of(root)?;
+        let sources = sources::load(root)?;
+        let mut dirs: Vec<PathBuf> = sources.checkouts(None).into_iter().map(|c| c.dir).collect();
+        dirs.insert(0, sources.manifest_checkout().dir);
+        let scope = crate::git_dirs::Scope {
+            ws: layout.workspace(),
+            dirs: &dirs,
+        };
+        crate::git_dirs::migrate(&scope, args.execute)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     Ok(if fetch(root, args)? {
         ExitCode::SUCCESS
     } else {
@@ -131,6 +147,7 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
         write: false,
         add: paths.to_vec(),
         jobs: None,
+        migrate_git_dirs: false,
     };
     ensure!(fetch(root, &args)?, "fetch failed (rows above)");
     Ok(())
@@ -220,7 +237,7 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let dir = u.checkout();
     let action = decide(&inspect(dir)?, &c.commit, u.branch());
     if ctx.execute {
-        apply(&action, c, dir)?;
+        apply(&action, c, dir, &ctx.layout.git_dir(&c.dir))?;
     }
     let patches = match action {
         Action::LeaveBranch(_) | Action::Blocked(_) => None,
@@ -400,6 +417,11 @@ fn inspect(dir: &Path) -> Result<Local> {
         "{} exists but is not a git checkout",
         dir.display()
     );
+    ensure!(
+        !dir.join(".git").is_dir(),
+        "{}: its git dir is still inside the tree (a task copy's worktree admin dir would be hidden by the namespace bind): cargo xtask fetch --migrate-git-dirs",
+        dir.display()
+    );
     let Ok(head) = git(Some(dir), &["rev-parse", "-q", "--verify", "HEAD"]) else {
         let files = std::fs::read_dir(dir)?
             .filter_map(Result::ok)
@@ -419,22 +441,29 @@ fn inspect(dir: &Path) -> Result<Local> {
     })
 }
 
-fn apply(action: &Action, c: &Checkout, dir: &Path) -> Result<()> {
+/// `git_dir`: where a new checkout's git dir goes (`Layout::git_dir`); Clone and Reclone only happen to shared checkouts.
+fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()> {
     match action {
         Action::Clone => {
             verify_ref(c)?;
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            git(Some(dir), &["init", "-q"])?;
-            git(Some(dir), &["remote", "add", "origin", c.url()?])?;
-            if !c.sparse.is_empty() {
-                init_sparse(c, dir)?;
-            }
-            fetch_pin(c, dir)?;
-            checkout_pin(c, dir)
+            let sparse = if c.sparse.is_empty() {
+                Sparse::Full
+            } else {
+                Sparse::Cone(&c.sparse)
+            };
+            create_checkout(dir, git_dir, c.url()?, &c.rev, &sparse, Some(&c.commit))?;
+            Ok(())
         }
         Action::Reclone => {
-            std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
-            apply(&Action::Clone, c, dir)
+            for d in [dir, git_dir] {
+                match std::fs::remove_dir_all(d) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(e).with_context(|| format!("removing {}", d.display()));
+                    }
+                    _ => {}
+                }
+            }
+            apply(&Action::Clone, c, dir, git_dir)
         }
         Action::MoveToPin => {
             verify_ref(c)?;
@@ -481,16 +510,68 @@ pub fn fetch_pin(c: &Checkout, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Marks a fresh repository as a promisor partial clone limited to `c.sparse` (cone mode).
-fn init_sparse(c: &Checkout, dir: &Path) -> Result<()> {
+/// Which files a new checkout holds.
+pub enum Sparse<'a> {
+    Full,
+    /// Cone mode: these directories (sources.toml `sparse`).
+    Cone(&'a [String]),
+    /// Non-cone patterns (the AOSP blueprint index: `*.bp`).
+    Patterns(&'a [&'a str]),
+}
+
+/// The one way a checkout is created: a shallow checkout of `refname` from `url` at `dir`, detached, its git dir at `git_dir` (outside the tree, `dir/.git` a gitfile -- atl_layout::git_store).
+/// A sparse one is a blobless promisor partial clone, so blobs outside it are never fetched. `expect`: the pinned commit, checked before checkout. Re-running on an interrupted one reuses its git dir. Returns the commit.
+pub fn create_checkout(
+    dir: &Path,
+    git_dir: &Path,
+    url: &str,
+    refname: &str,
+    sparse: &Sparse,
+    expect: Option<&str>,
+) -> Result<String> {
+    for d in [Some(dir), git_dir.parent()].into_iter().flatten() {
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    }
     let g = |args: &[&str]| git(Some(dir), args);
-    // lazy blob fetch on checkout needs the remote marked as a partial-clone promisor
-    g(&["config", "remote.origin.promisor", "true"])?;
-    g(&["config", "remote.origin.partialclonefilter", "blob:none"])?;
-    let mut set = vec!["sparse-checkout", "set", "--cone"];
-    set.extend(c.sparse.iter().map(String::as_str));
-    g(&set)?;
-    Ok(())
+    g(&[
+        "init",
+        "-q",
+        "--separate-git-dir",
+        &git_dir.display().to_string(),
+    ])?;
+    crate::git_dirs::write_gitfile(dir, git_dir)?;
+    g(&["remote", "add", "origin", url]).or_else(|_| g(&["remote", "set-url", "origin", url]))?;
+    let mut fetch = vec!["fetch", "-q", "--depth", "1", "--no-tags"];
+    let (mode, set): (&str, Vec<&str>) = match sparse {
+        Sparse::Full => ("", Vec::new()),
+        Sparse::Cone(dirs) => ("--cone", dirs.iter().map(String::as_str).collect()),
+        Sparse::Patterns(p) => ("--no-cone", p.to_vec()),
+    };
+    if !mode.is_empty() {
+        // lazy blob fetch on checkout needs the remote marked as a partial-clone promisor
+        g(&["config", "remote.origin.promisor", "true"])?;
+        g(&["config", "remote.origin.partialclonefilter", "blob:none"])?;
+        let mut args = vec!["sparse-checkout", "set", mode];
+        args.extend(set);
+        g(&args)?;
+        fetch.push("--filter=blob:none");
+    }
+    let refspec = format!("+{refname}:{refname}");
+    fetch.extend(["origin", &refspec]);
+    g(&fetch)?;
+    let commit = g(&["rev-parse", &format!("{refname}^{{commit}}")])?;
+    if let Some(want) = expect {
+        ensure!(commit == want, "{refname} is {commit}, pin says {want}");
+    }
+    g(&[
+        "-c",
+        "advice.detachedHead=false",
+        "checkout",
+        "-q",
+        "--detach",
+        &commit,
+    ])?;
+    Ok(commit)
 }
 
 /// The remote's current commit for the ref must be the pin: a moved tag (or advanced branch) fails here.
@@ -756,15 +837,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
         let c = remote.checkout(&remote.first);
         let dir = src.join(&c.dir);
-        apply(&decide(&inspect(&dir).unwrap(), &c.commit), &c, &dir).unwrap();
+        let store = atl_layout::git_store(&src, &c.dir);
+        apply(
+            &decide(&inspect(&dir).unwrap(), &c.commit),
+            &c,
+            &dir,
+            &store,
+        )
+        .unwrap();
         assert_eq!(
             git(Some(&dir), &["rev-parse", "HEAD"]).unwrap(),
             remote.first
         );
+        // the git dir is in the store, the tree holds a relative gitfile
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git")).unwrap(),
+            "gitdir: ../.git-dirs/up.git\n"
+        );
+        assert!(store.join("HEAD").is_file());
         assert_eq!(
             decide(&inspect(&dir).unwrap(), &c.commit),
             Action::AtPin { dirty: false }
         );
+        // an in-tree git dir (not yet migrated) is refused, naming the migration
+        let old = src.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        git(Some(&old), &["init", "-q"]).unwrap();
+        let e = format!("{:#}", inspect(&old).unwrap_err());
+        assert!(e.contains("--migrate-git-dirs"), "{e}");
         std::fs::remove_dir_all(&src).unwrap();
     }
 
@@ -777,21 +877,36 @@ mod tests {
         let dir = src.join(&c.dir);
         // what a killed `git fetch --depth 1` leaves (measured on prebuilts/clang): a stale lock that
         // makes every later fetch fail, and a partial pack
-        std::fs::create_dir_all(&dir).unwrap();
-        git(Some(&dir), &["init", "-q"]).unwrap();
-        std::fs::write(dir.join(".git/shallow.lock"), "").unwrap();
-        std::fs::write(dir.join(".git/objects/pack/tmp_pack_x"), "partial").unwrap();
+        let store = atl_layout::git_store(&src, &c.dir);
+        let init = |dir: &Path, store: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+            git(
+                Some(dir),
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    &store.display().to_string(),
+                ],
+            )
+            .unwrap();
+        };
+        init(&dir, &store);
+        std::fs::write(store.join("shallow.lock"), "").unwrap();
+        std::fs::write(store.join("objects/pack/tmp_pack_x"), "partial").unwrap();
         let local = inspect(&dir).unwrap();
         assert_eq!(decide(&local, &c.commit), Action::Reclone);
-        apply(&Action::Reclone, &c, &dir).unwrap();
+        apply(&Action::Reclone, &c, &dir, &store).unwrap();
         assert_eq!(
             decide(&inspect(&dir).unwrap(), &c.commit),
             Action::AtPin { dirty: false }
         );
+        // the stale store went with the tree
+        assert!(!store.join("shallow.lock").exists());
         // a commit-less repository with someone's files in it is never deleted
         let other = src.join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        git(Some(&other), &["init", "-q"]).unwrap();
+        init(&other, &atl_layout::git_store(&src, Path::new("other")));
         std::fs::write(other.join("notes.txt"), "mine").unwrap();
         assert!(matches!(
             decide(&inspect(&other).unwrap(), &c.commit),

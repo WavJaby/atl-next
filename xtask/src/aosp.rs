@@ -536,8 +536,14 @@ fn sparse_checkouts(
 ) -> Result<()> {
     let results = par::map(projects, jobs, |(path, project)| {
         let url = sources.aosp_url(&project.name);
-        sparse_checkout(&base.join(path), &url, &sources.aosp.tag, patterns)
-            .with_context(|| path.to_string())
+        sparse_checkout(
+            base,
+            Path::new(path.as_str()),
+            &url,
+            &sources.aosp.tag,
+            patterns,
+        )
+        .with_context(|| path.to_string())
     });
     let failed: Vec<String> = results
         .into_iter()
@@ -921,48 +927,42 @@ fn enclosing<'a>(namespaces: &BTreeSet<&'a str>, dir: &str) -> Option<&'a str> {
 const BLUEPRINT_FILES: &str = "*.bp";
 const GO_FILES: &str = "*.go";
 
-/// A shallow, blobless checkout of `tag` holding only files matching `patterns`. An existing one is
+/// A shallow, blobless checkout `<base>/<path>` of `tag` holding only files matching `patterns`, its git dir in `<base>`'s store (atl_layout::git_store, as `src/`). An existing one is
 /// only widened, so a later narrower request never drops what another pass added.
-fn sparse_checkout(dir: &Path, url: &str, tag: &str, patterns: &[&str]) -> Result<()> {
-    let tag_ref = format!("refs/tags/{tag}");
-    let g = |args: &[&str]| git(Some(dir), args);
-    let sparse_file = dir.join(".git/info/sparse-checkout");
-    let text = |set: &BTreeSet<&str>| set.iter().map(|p| format!("{p}\n")).collect::<String>();
+fn sparse_checkout(
+    base: &Path,
+    path: &Path,
+    url: &str,
+    tag: &str,
+    patterns: &[&str],
+) -> Result<()> {
+    let dir = base.join(path);
+    let g = |args: &[&str]| git(Some(&dir), args);
     if dir.join(".git").exists() && g(&["rev-parse", "-q", "--verify", "HEAD"]).is_ok() {
+        let sparse_file = g(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/sparse-checkout",
+        ])?;
         let current = std::fs::read_to_string(&sparse_file).unwrap_or_default();
         let mut set: BTreeSet<&str> = current.lines().collect();
         if !patterns.iter().all(|p| set.contains(p)) {
             set.extend(patterns);
-            std::fs::write(&sparse_file, text(&set))?;
+            let text = set.iter().map(|p| format!("{p}\n")).collect::<String>();
+            std::fs::write(&sparse_file, text)?;
             g(&["sparse-checkout", "reapply"])?;
         }
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
-    g(&["init", "-q"])?;
-    g(&["remote", "add", "origin", url]).or_else(|_| g(&["remote", "set-url", "origin", url]))?;
-    // lazy blob fetch on checkout needs the remote marked as a partial-clone promisor
-    g(&["config", "remote.origin.promisor", "true"])?;
-    g(&["config", "remote.origin.partialclonefilter", "blob:none"])?;
-    g(&["config", "core.sparseCheckout", "true"])?;
-    std::fs::write(&sparse_file, text(&patterns.iter().copied().collect()))?;
-    g(&[
-        "fetch",
-        "-q",
-        "--depth",
-        "1",
-        "--filter=blob:none",
-        "origin",
-        &format!("+{tag_ref}:{tag_ref}"),
-    ])?;
-    g(&[
-        "-c",
-        "advice.detachedHead=false",
-        "checkout",
-        "-q",
-        "--detach",
-        &tag_ref,
-    ])?;
+    crate::fetch::create_checkout(
+        &dir,
+        &atl_layout::git_store(base, path),
+        url,
+        &format!("refs/tags/{tag}"),
+        &crate::fetch::Sparse::Patterns(patterns),
+        None,
+    )?;
     Ok(())
 }
 

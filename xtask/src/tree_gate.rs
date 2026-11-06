@@ -2,7 +2,7 @@
 //! `xtask test task-bind`: the task-copy namespace (tree.rs) gives javac and ninja the paths a plain build sees. Each check has a control that must fail:
 //! - javac: a source under a `--patch-module=java.base` directory compiles when the directory is a bind mount; the control, the same directory reached through a symlink (the removed link farm's shape), fails with "package exists in another module".
 //! - verify: run inside a namespace with the right copy bound passes; the wrong copy bound, and no namespace at all, both fail.
-//! - git: a worktree bound over its own shared checkout answers `git status` at both paths; without the shadow binds (tree::GitShadow) it fails.
+//! - git: a worktree bound over its own shared checkout answers `git status` at both paths when the git dir is in the store (`<root>/.git-dirs`, atl_layout::git_store); the control, the same with an in-tree git dir, fails (the bind hides the worktree's admin dir).
 //! - compiler cache: with a plain view's sccache server running, a compile in the namespace through the task view's socket yields the task copy's object; the control (the plain server) yields the unpatched one.
 //! - `--plain <out> --task <out>`: the two native out dirs' build.ninja differ only on lines naming a bound project (`src/aosp/<project>/`); one other differing line fails.
 
@@ -47,7 +47,6 @@ fn overlay(copy: &Path, target: &Path) -> Overlay {
         project: "probe".into(),
         copy: copy.to_path_buf(),
         target: target.to_path_buf(),
-        git: None,
     }
 }
 
@@ -156,9 +155,7 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
         "task-bind: PASS verify: right copy passes; wrong copy, empty namespace, no namespace refused"
     );
 
-    // a task copy is a git worktree whose admin dir the bind hides: git at both paths works only with the shadow binds
-    let (shared, wt) = (scratch.join("git/shared"), scratch.join("git/wt"));
-    std::fs::create_dir_all(&shared)?;
+    // a task copy is a git worktree of the checkout the bind hides: with the git dir in the store (src/.git-dirs) its admin dir stays visible, so git works at both paths with no extra binds
     let git = |dir: &Path, a: &[&str]| -> Result<()> {
         let o = Command::new("git").arg("-C").arg(dir).args(a).output()?;
         ensure!(
@@ -168,31 +165,41 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
         );
         Ok(())
     };
-    git(&shared, &["init", "-q"])?;
-    git(
-        &shared,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "p",
-        ],
-    )?;
-    git(
-        &shared,
-        &["worktree", "add", "-q", &wt.display().to_string()],
-    )?;
-    let with_git = tree::overlays_for_test(&wt, &shared, &scratch.join("git/.shadow"));
-    ensure!(
-        with_git.git.is_some(),
-        "the worktree's .git pointer was not recognised"
-    );
-    tree::prepare(std::slice::from_ref(&with_git))?;
+    // `<root>/shared` + its worktree `<root>/wt`; `store` = git dir in `<root>/.git-dirs` (the workspace layout), else in the tree (the control)
+    let checkout_with_worktree = |root: &Path, store: bool| -> Result<Overlay> {
+        let (shared, wt) = (root.join("shared"), root.join("wt"));
+        std::fs::create_dir_all(&shared)?;
+        if store {
+            let g = atl_layout::git_store(root, Path::new("shared"));
+            std::fs::create_dir_all(root.join(".git-dirs"))?;
+            git(
+                &shared,
+                &["init", "-q", "--separate-git-dir", &g.display().to_string()],
+            )?;
+        } else {
+            git(&shared, &["init", "-q"])?;
+        }
+        git(
+            &shared,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "p",
+            ],
+        )?;
+        git(
+            &shared,
+            &["worktree", "add", "-q", &wt.display().to_string()],
+        )?;
+        Ok(overlay(&wt, &shared))
+    };
+    let with_git = checkout_with_worktree(&scratch.join("git/store"), true)?;
     let git_in = |o: &Overlay| -> Result<bool> {
         let mut ok = true;
         for dir in [&o.target, &o.copy] {
@@ -209,18 +216,15 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
     };
     ensure!(
         git_in(&with_git)?,
-        "git fails in the namespace with the shadow binds"
+        "git fails in the namespace with the git dir in the store"
     );
-    let bare = Overlay {
-        git: None,
-        ..with_git
-    };
+    let in_tree = checkout_with_worktree(&scratch.join("git/in-tree"), false)?;
     ensure!(
-        !git_in(&bare)?,
-        "control: git worked with the worktree admin dir hidden"
+        !git_in(&in_tree)?,
+        "control: git worked with the git dir inside the bound checkout (the bind should hide it)"
     );
     println!(
-        "task-bind: PASS git: task-copy worktree works in the namespace; control without the shadow fails"
+        "task-bind: PASS git: task-copy worktree works in the namespace with the git dir in the store; control with an in-tree git dir fails"
     );
 
     compiler_cache(scratch, &target, &copy)?;

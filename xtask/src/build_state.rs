@@ -177,7 +177,6 @@ mod tests {
         let copy = repo("guard-copy");
         let bound = [crate::tree::Overlay {
             project: "p".into(),
-            git: None,
             copy: copy.clone(),
             target: d.join("p"),
         }];

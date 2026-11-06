@@ -53,6 +53,26 @@ pub fn acquire(
     }
 }
 
+/// Every one of `tokens` tokens without waiting (a quiet window: no ninja build runs while they are held): Ok(all), or Err(the holders line) when any is held -- the ones taken are released again.
+pub fn try_take_all(
+    dir: &Path,
+    tokens: u32,
+    who: &str,
+) -> Result<std::result::Result<Vec<Token>, String>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut held = Vec::new();
+    for index in 1..=tokens {
+        match try_take(dir, index, who)? {
+            Some(t) => held.push(t),
+            None => {
+                drop(held);
+                return Ok(Err(holders(dir, tokens)));
+            }
+        }
+    }
+    Ok(Ok(held))
+}
+
 fn path(dir: &Path, index: u32) -> PathBuf {
     dir.join(format!("token-{index}"))
 }

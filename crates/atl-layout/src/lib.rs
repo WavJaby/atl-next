@@ -2,6 +2,7 @@
 //! Where an upstream path lives for one repo checkout -- the one resolver, used by xtask (fetch, patch, native, check) and by every build script reading upstream sources (through `atl-bridgegen::buildscript`).
 //! `src/<up>` is shared by every repo checkout of the workspace and holds the pin + origin/main's patches; a task editing an upstream works in its own copy `src-wt/<task>/<up>` (`xtask patch --edit`; `<task>` = the repo checkout's branch), a git worktree of `src/<up>` on branch `atl-patches-<task>`.
 //! A path is resolved through its owner, the shared checkout holding it: the task copy when this repo checkout has one of the owner, else `src/`. So a file of a nested checkout belongs to the nested one, never to a task copy of its parent.
+//! Every checkout's git dir lives outside the source tree, in `src/.git-dirs/<dir>.git` ([`Layout::git_dir`]); `src/<dir>/.git` is a gitfile pointing there. So a task copy's worktree admin dir (`<store>/worktrees/<n>`) is never under a path the task-copy namespace binds over, and git works at both paths with no extra binds.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -100,13 +101,21 @@ impl Layout {
         }
     }
 
-    /// What a build script watches besides the located path so cargo reruns it when `locate(path)` would answer differently: the repo checkout's HEAD (a branch switch), and on a task branch the owner's git dir in `src/` (`xtask patch --edit` / `--done` add and remove its worktrees there).
+    /// The git dir of the shared checkout `src/<dir>`: `src/.git-dirs/<dir>.git` (the `.git` suffix keeps nested checkouts' dirs apart). The only place this path is built.
+    pub fn git_dir(&self, dir: &Path) -> PathBuf {
+        git_store(&self.src, dir)
+    }
+
+    /// What a build script watches besides the located path so cargo reruns it when `locate(path)` would answer differently: the repo checkout's HEAD (a branch switch), and on a task branch the owner's worktree list
+    /// `<git dir>/worktrees` (`xtask patch --edit` / `--done` add and remove entries there). Before the owner's first worktree that dir does not exist, and cargo reruns a script on every build for a missing input, so the git dir itself stands in: creating `worktrees` changes it.
     pub fn resolution_inputs(&self, path: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self.head.iter().cloned().collect();
         if self.task.is_some()
             && let Some(owner) = self.owner(path)
         {
-            out.push(self.src.join(owner).join(".git"));
+            let store = self.git_dir(owner);
+            let worktrees = store.join("worktrees");
+            out.push(if worktrees.is_dir() { worktrees } else { store });
         }
         out
     }
@@ -146,6 +155,13 @@ impl Layout {
     }
 }
 
+/// The git dir of checkout `<root>/<dir>` in the store under `root`: `<root>/.git-dirs/<dir>.git`. `src/` uses it through [`Layout::git_dir`]; xtask's own sparse caches (the AOSP blueprint index) take the same shape under their root.
+pub fn git_store(root: &Path, dir: &Path) -> PathBuf {
+    let mut name = dir.as_os_str().to_owned();
+    name.push(".git");
+    root.join(".git-dirs").join(name)
+}
+
 /// `git <args>` in `dir`, stdout trimmed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -172,9 +188,13 @@ mod tests {
         d
     }
 
-    /// A shared checkout `src/<dir>` (a `.git` directory is all the resolver looks at).
+    /// A shared checkout `src/<dir>`: its gitfile and its git dir in the store (all the resolver looks at).
     fn shared(ws: &Path, dir: &str) {
-        std::fs::create_dir_all(ws.join("src").join(dir).join(".git")).unwrap();
+        let d = ws.join("src").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        let store = Layout::new(ws, None).git_dir(Path::new(dir));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(d.join(".git"), format!("gitdir: {}\n", store.display())).unwrap();
     }
 
     /// A task copy `src-wt/<task>/<dir>` (a worktree's `.git` is a file).
@@ -227,9 +247,21 @@ mod tests {
         let ws = temp("inputs");
         shared(&ws, "aosp/a");
         let p = Path::new("aosp/a/inc");
+        let task = Layout::new(&ws, Some("t"));
+        // no worktree yet: the git dir, whose entry list changes when `worktrees` appears
         assert_eq!(
-            Layout::new(&ws, Some("t")).resolution_inputs(p),
-            vec![ws.join("src/aosp/a/.git")]
+            task.resolution_inputs(p),
+            vec![ws.join("src/.git-dirs/aosp/a.git")]
+        );
+        std::fs::create_dir_all(ws.join("src/.git-dirs/aosp/a.git/worktrees")).unwrap();
+        assert_eq!(
+            task.resolution_inputs(p),
+            vec![ws.join("src/.git-dirs/aosp/a.git/worktrees")]
+        );
+        // a nested checkout's dir does not collide with its parent's
+        assert_eq!(
+            task.git_dir(Path::new("aosp/a/b")),
+            ws.join("src/.git-dirs/aosp/a/b.git")
         );
         // on main a task copy never applies: nothing but HEAD (absent for `new`)
         assert!(Layout::new(&ws, None).resolution_inputs(p).is_empty());
