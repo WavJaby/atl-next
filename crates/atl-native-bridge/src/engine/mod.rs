@@ -117,13 +117,16 @@ impl Guest {
             .ok_or("linker64 has no __dl___linker_init")?;
         let block = args::build(cfg, &linker, &vdso)?;
         let thread = HostThread::leak();
+        arch::set_bootstrap(Some(&raw mut *thread));
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
         let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0) };
+        arch::set_bootstrap(None);
         // the linker ran on a temporary TCB in its own (now returned) frame; NBS leaves the main thread's static TLS to the host
         let tls = thread::static_tls()
             .ok_or("the guest linker reported no static TLS (__native_bridge_config_static_tls)")?;
         let tp = thread::alloc_static_tls(&tls)?;
-        arch::init_tcb(tp);
+        // SAFETY: `tp` is a fresh guest TCB inside static TLS (bionic's TCB words lie in it); the record is leaked.
+        unsafe { arch::init_tcb(tp, &raw mut *thread) };
         thread.set_guest_fs(tp);
         let start_thread: *mut HostThread = thread;
         thread::adopt(start_thread);

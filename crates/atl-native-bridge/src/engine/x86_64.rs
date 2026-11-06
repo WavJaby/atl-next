@@ -1,56 +1,68 @@
 // SPDX-License-Identifier: MIT
 //! x86_64 crossing. Thread pointer = FS base for glibc and bionic alike; FSGSBASE instructions (Linux 5.9+, `HWCAP2_FSGSBASE`) switch it without a syscall.
-//! GS base = this thread's `HostThread` while guest code runs: neither glibc nor bionic uses GS on x86_64, so a guest->host thunk finds the host FS without reading guest TLS.
-//! Not the guest TCB's `NATIVE_BRIDGE_GUEST_STATE` slot (bionic tls_defines.h, x86_64 slot 10): that TCB does not exist yet while `__linker_init` runs, and the guest libc's constructors already call the host from inside it (vdso `native_bridge_intercept_symbol`).
-//! Guest->host keeps the guest return address and guest FS on the `HostThread` shadow stack, not the machine stack: stack arguments and `%al` (variadic vector count) reach the host function untouched, so one body serves every signature (bridge1-step4-plan section 3).
+//! The engine never writes GS: ART owns it on every thread (`Thread*`, art thread_x86_64.cc `arch_prctl(ARCH_SET_GS)`), and host code -- JIT/nterp Java reached by an up call included -- reads `%gs:` for it.
+//! The thread's `HostThread` is found: host side (FS = host) from host TLS (thread.rs `attach_current`); guest->host and signal entries (FS = guest) from the guest TCB's `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` (bionic tls_defines.h, x86_64 slot 10: reserved by bionic for the native bridge, unused by guest bionic itself), written by `init_tcb`; across a crossing's own call, from callee-saved `%rbx` (caller's value kept in the shadow frame).
+//! berberis needs no guest-side lookup (its translated code holds the guest state in a register; host side: `GetCurrentGuestThread`, a host pthread key); our guest code runs natively, hence the TCB slot.
+//! Guest->host keeps the guest return address, guest FS and `%rbx` on the `HostThread` shadow stack, not the machine stack: stack arguments and `%al` (variadic vector count) reach the host function untouched, so one body serves every signature (bridge1-step4-plan section 3).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 /// Guest->host frames one thread can nest (JNI down -> up -> Java -> down chains); overflow traps (`ud2`) instead of writing past the record.
 const SHADOW_FRAMES: usize = 64;
-/// Words per guest->host frame: guest return address, guest FS, host target.
-const FRAME_WORDS: usize = 3;
+/// Words per frame, both directions: return address, guest FS (up) / guest target (down), host target (up) / unused (down), the caller's `%rbx`.
+const FRAME_WORDS: usize = 4;
 
-/// Per-thread crossing record, addressed through GS by the asm below; field offsets are fixed by it (asserted).
+/// Byte offset of `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` from the guest thread pointer (generated from bionic's tls_defines.h).
+const SLOT_OFFSET: usize = {
+    let slot = super::thread::layout::TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE;
+    assert!(
+        slot >= 0,
+        "x86_64 bionic slots lie above the thread pointer"
+    );
+    slot as usize * std::mem::size_of::<usize>()
+};
+
+/// Per-thread crossing record, addressed through a register by the asm below; field offsets are fixed by it (asserted).
 #[repr(C)]
 pub struct HostThread {
     shadow_sp: *mut usize,
     host_fs: usize,
     guest_fs: usize,
     shadow_end: *mut usize,
-    /// RECORD_MAGIC: GS holds ART's `Thread*` on every ART thread (art thread_x86_64.cc `arch_prctl(ARCH_SET_GS)`), so the signal entry trusts GS as a record only when this word matches.
-    magic: usize,
     shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
 }
-
-/// `HostThread::magic`, as hex digits: the asm compares it as an immediate.
-macro_rules! record_magic {
-    () => {
-        "41544c4e42524543"
-    };
-}
-const RECORD_MAGIC: usize = match usize::from_str_radix(record_magic!(), 16) {
-    Ok(v) => v,
-    Err(_) => panic!("record_magic! is not hex"),
-};
 
 const _: () = {
     assert!(std::mem::offset_of!(HostThread, shadow_sp) == 0);
     assert!(std::mem::offset_of!(HostThread, host_fs) == 8);
     assert!(std::mem::offset_of!(HostThread, guest_fs) == 16);
     assert!(std::mem::offset_of!(HostThread, shadow_end) == 24);
-    assert!(std::mem::offset_of!(HostThread, magic) == 32);
 };
 
+/// Bootstrap record: the starting thread's, while `Guest::start` runs `__linker_init`.
+/// Defends against: the NBS linker runs `__linker_init` and the guest libc constructors (which already call the host: vdso `native_bridge_intercept_symbol`) first on the host's FS, then on its own stack `temp_tcb` (bionic `__libc_init_main_thread_early`), whose slot the engine cannot write; the main thread's real TCB is the engine's (`Guest::start`, after `__native_bridge_config_static_tls`).
+/// Delete when the guest main thread's first TCB carries the slot (e.g. NBS asks the host for it at `__libc_init_main_thread_early`).
+#[unsafe(no_mangle)]
+static atl_nb_bootstrap: AtomicUsize = AtomicUsize::new(0);
+/// The bootstrap thread's tid: a signal on another thread during bootstrap must not get its host FS.
+#[unsafe(no_mangle)]
+static atl_nb_bootstrap_tid: AtomicI32 = AtomicI32::new(0);
+
+/// Makes `ht` the bootstrap record for the calling thread (Some) or ends bootstrap (None).
+pub fn set_bootstrap(ht: Option<*mut HostThread>) {
+    // SAFETY: gettid has no memory effects.
+    atl_nb_bootstrap_tid.store(unsafe { libc::gettid() }, Ordering::Release);
+    atl_nb_bootstrap.store(ht.map_or(0, |p| p as usize), Ordering::Release);
+}
+
 impl HostThread {
-    /// A record for the calling thread; leaked: guest TLS and the GS base keep pointing at it.
+    /// A record for the calling thread; leaked: its guest TCB keeps pointing at it.
     pub fn leak() -> &'static mut HostThread {
         let t = Box::leak(Box::new(HostThread {
             shadow_sp: std::ptr::null_mut(),
             host_fs: 0,
             guest_fs: 0,
             shadow_end: std::ptr::null_mut(),
-            magic: RECORD_MAGIC,
             shadow: [0; SHADOW_FRAMES * FRAME_WORDS],
         }));
         let range = t.shadow.as_mut_ptr_range();
@@ -75,10 +87,16 @@ impl HostThread {
     }
 }
 
-/// The x86-64 TCB word the ABI fixes: `%fs:0` holds the thread pointer itself (TLS variant II; bionic `TLS_SLOT_SELF` = 0, `__init_tcb`), so `mov %fs:0` yields the TCB address.
-pub fn init_tcb(tp: usize) {
-    // SAFETY: `tp` is the start of a guest TCB inside a live static-TLS block (thread::alloc_static_tls).
-    unsafe { (tp as *mut usize).write(tp) };
+/// The guest TCB words the engine owns: `%fs:0` = the thread pointer itself (TLS variant II; bionic `TLS_SLOT_SELF` = 0, `__init_tcb`), and the native-bridge slot = `ht`, which the guest->host and signal entries read.
+///
+/// # Safety
+/// `tp` must be a guest TCB of at least `SLOT_OFFSET + 8` bytes (bionic's TCB: `MAX_TLS_SLOT` + 1 words), live while `ht` is used on it.
+pub unsafe fn init_tcb(tp: usize, ht: *mut HostThread) {
+    // SAFETY: caller contract.
+    unsafe {
+        (tp as *mut usize).write(tp);
+        ((tp + SLOT_OFFSET) as *mut usize).write(ht as usize);
+    }
 }
 
 /// Whether the CPU and kernel let user code run `rdfsbase`/`wrfsbase` (else they fault with SIGILL).
@@ -129,21 +147,40 @@ pub const THUNKS: usize = 128;
 /// Bytes per thunk: `call rel32` (5) padded to 8 (`.p2align 3` below).
 const THUNK_BYTES: usize = 8;
 
+/// The up crossing's call of its host target (`%r11` = frame end, `%rbx` = record).
+#[cfg(not(atl_nb_foreign_gs))]
+macro_rules! up_call {
+    () => {
+        "    call *-16(%r11)\n"
+    };
+}
+// deliberate break of the JIT up-call gate: GS = the record (not ART's Thread*) while the host target runs, ART's GS kept in the frame's target word
+#[cfg(atl_nb_foreign_gs)]
+macro_rules! up_call {
+    () => {
+        concat!(
+            "    rdgsbase %r10\n",
+            "    xchg %r10, -16(%r11)\n",
+            "    wrgsbase %rbx\n",
+            "    call *%r10\n",
+            "    mov 0(%rbx), %r10\n",
+            "    mov -16(%r10), %r10\n",
+            "    wrgsbase %r10\n",
+        )
+    };
+}
+
 std::arch::global_asm!(
     concat!(
         // atl_nb_call_guest(ht, f, a, b, c) -> f(a, b, c) on the guest thread pointer
         // hidden: rip-relative references must not be preemptible in the cdylib
-        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_jni_up, atl_nb_jni_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers\n",
+        ".hidden atl_nb_host_targets, atl_nb_host_thunks, atl_nb_call_guest, atl_nb_cross_to_host, atl_nb_jni_up, atl_nb_jni_stubs, atl_nb_up, atl_nb_cross_to_guest, atl_nb_cross_to_guest_env, atl_nb_cross_to_guest_vm, atl_nb_attach_fn, atl_nb_signal_entry, atl_nb_signal_handlers, atl_nb_bootstrap, atl_nb_bootstrap_tid\n",
         ".text\n",
         ".globl atl_nb_call_guest\n",
         ".type atl_nb_call_guest,@function\n",
         "atl_nb_call_guest:\n",
         "    push %rbx\n",
-        "    push %r12\n",
-        "    sub $8, %rsp\n",
         "    mov %rdi, %rbx\n",
-        "    rdgsbase %r12\n",
-        "    wrgsbase %rbx\n",
         "    rdfsbase %rax\n",
         "    mov %rax, 8(%rbx)\n",
         "    mov 16(%rbx), %rax\n",
@@ -159,9 +196,6 @@ std::arch::global_asm!(
         "    rdfsbase %rcx\n",
         "    mov %rcx, 16(%rbx)\n",
         restore_host_fs!(),
-        "    wrgsbase %r12\n",
-        "    add $8, %rsp\n",
-        "    pop %r12\n",
         "    pop %rbx\n",
         "    ret\n",
         ".size atl_nb_call_guest, .-atl_nb_call_guest\n",
@@ -189,34 +223,47 @@ std::arch::global_asm!(
         "    mov (%r10,%r11), %r11\n",
         "    jmp atl_nb_up\n",
         ".size atl_nb_jni_up, .-atl_nb_jni_up\n",
-        // the up crossing proper: %r11 = host target, [rsp] = guest return
+        // the up crossing proper: %r11 = host target, [rsp] = guest return, FS = guest
+        // record: the bootstrap one while it is set (only the starting thread runs guest code then), else the guest TCB's slot
+        // frame: guest return, guest FS, host target, guest %rbx; %rbx = the record while the host target runs (callee-saved by it)
         ".type atl_nb_up,@function\n",
         "atl_nb_up:\n",
-        "    mov %gs:0, %r10\n",
-        "    cmp %gs:24, %r10\n",
+        "    mov atl_nb_bootstrap(%rip), %r10\n",
+        "    test %r10, %r10\n",
+        "    jnz 1f\n",
+        "    mov %fs:{slot}, %r10\n",
+        "    test %r10, %r10\n",
+        "    jz 9f\n",
+        "1:\n",
+        "    push %r11\n",
+        "    mov 0(%r10), %r11\n",
+        "    cmp 24(%r10), %r11\n",
         "    jae 9f\n",
-        "    mov %r11, 16(%r10)\n",
-        "    pop 0(%r10)\n",
-        "    rdfsbase %r11\n",
-        "    mov %r11, 8(%r10)\n",
-        "    add $24, %r10\n",
-        "    mov %r10, %gs:0\n",
-        "    mov %gs:8, %r11\n",
-        "    wrfsbase %r11\n",
-        "    call *-8(%r10)\n",
-        "    mov %gs:0, %r10\n",
-        "    sub $24, %r10\n",
-        "    mov %r10, %gs:0\n",
+        "    mov %rbx, 24(%r11)\n",
+        "    pop 16(%r11)\n",
+        "    pop 0(%r11)\n",
+        "    rdfsbase %rbx\n",
+        "    mov %rbx, 8(%r11)\n",
+        "    mov %r10, %rbx\n",
+        "    add $32, %r11\n",
+        "    mov %r11, 0(%rbx)\n",
+        "    mov 8(%rbx), %r10\n",
+        "    wrfsbase %r10\n",
+        up_call!(),
+        "    mov 0(%rbx), %r10\n",
+        "    sub $32, %r10\n",
+        "    mov %r10, 0(%rbx)\n",
         "    mov 8(%r10), %r11\n",
         "    wrfsbase %r11\n",
         "    push 0(%r10)\n",
+        "    mov 24(%r10), %rbx\n",
         "    ret\n",
         "9:  ud2\n",
         ".size atl_nb_up, .-atl_nb_up\n",
         // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = host return, then the caller's stack args.
-        // Same shadow-stack frame as the up direction (3 words): host return, guest target (while calling), the GS the caller had (0 outermost, the record when nested inside an up call).
+        // Frame (4 words, as up): host return, guest target, host FS, the caller's %rbx; %rbx = the record while the guest runs (callee-saved by it).
         // Argument registers, %al and stack args reach the guest untouched; only %r10/%r11 (and %rcx after the call, not a return register) are scratch.
-        // Three entries, by what the first argument is (`Down`): none to rewrite, a host JNIEnv, a host JavaVM; the kind rides in the caller's-GS slot until attach has read it.
+        // Three entries, by what the first argument is (`Down`): none to rewrite, a host JNIEnv, a host JavaVM; the kind rides in a pushed slot until attach has read it, which then carries the caller's %rbx.
         ".globl atl_nb_cross_to_guest\n",
         ".type atl_nb_cross_to_guest,@function\n",
         "atl_nb_cross_to_guest:\n",
@@ -261,8 +308,6 @@ std::arch::global_asm!(
         "    movdqu 80(%rsp), %xmm5\n",
         "    movdqu 96(%rsp), %xmm6\n",
         "    movdqu 112(%rsp), %xmm7\n",
-        "    rdgsbase %rax\n",
-        "    mov %rax, 192(%rsp)\n",
         "    add $128, %rsp\n",
         "    pop %rax\n",
         "    pop %r9\n",
@@ -272,36 +317,38 @@ std::arch::global_asm!(
         "    pop %rsi\n",
         "    pop %rdi\n",
         "    pop %r10\n",
-        // [rsp] = the caller's GS; GS = the record from here on
-        "    wrgsbase %r11\n",
-        "    mov %gs:0, %r11\n",
-        "    cmp %gs:24, %r11\n",
+        // [rsp] = the kind slot, now the caller's %rbx; %r11 = the record
+        "    mov %rbx, (%rsp)\n",
+        "    mov %r11, %rbx\n",
+        "    mov 0(%rbx), %r11\n",
+        "    cmp 24(%rbx), %r11\n",
         "    jae 9f\n",
-        "    pop 16(%r11)\n",
+        "    pop 24(%r11)\n",
         "    pop 0(%r11)\n",
         "    mov %r10, 8(%r11)\n",
         "    rdfsbase %r10\n",
-        "    mov %r10, %gs:8\n",
-        "    add $24, %r11\n",
-        "    mov %r11, %gs:0\n",
-        "    mov %gs:16, %r10\n",
+        "    mov %r10, 16(%r11)\n",
+        "    mov %r10, 8(%rbx)\n",
+        "    add $32, %r11\n",
+        "    mov %r11, 0(%rbx)\n",
+        "    mov 16(%rbx), %r10\n",
         "    wrfsbase %r10\n",
-        "    call *-16(%r11)\n",
+        "    call *-24(%r11)\n",
         "    rdfsbase %r10\n",
-        "    mov %r10, %gs:16\n",
-        "    mov %gs:0, %r11\n",
-        "    sub $24, %r11\n",
-        "    mov %r11, %gs:0\n",
-        "    mov %gs:8, %r10\n",
+        "    mov %r10, 16(%rbx)\n",
+        "    mov 0(%rbx), %r11\n",
+        "    sub $32, %r11\n",
+        "    mov %r11, 0(%rbx)\n",
+        "    mov 16(%r11), %r10\n",
         "    wrfsbase %r10\n",
         "    push 0(%r11)\n",
-        "    mov 16(%r11), %r10\n",
-        "    wrgsbase %r10\n",
+        "    mov 24(%r11), %rbx\n",
         "    ret\n",
         "9:  ud2\n",
         ".size atl_nb_cross_to_guest, .-atl_nb_cross_to_guest\n",
-        // signal entry: the kernel delivers on whatever FS the thread had (guest or host) and sigreturn does not restore FS base;
-        // GS != 0 = a crossing is active on this thread -> run the host handler on the record's host FS, put the interrupted FS back after
+        // signal entry: the kernel delivers on whatever FS the thread had (guest or host) and sigreturn does not restore FS base; the interrupted FS decides:
+        // a glibc TCB (tcbhead_t.self at %fs:16 == FS, sysdeps/x86_64/nptl/tls.h; bionic's slot 2 TLS_SLOT_APP never holds the thread pointer) = host, left alone;
+        // else a guest TCB whose slot names the record -> run the host handler on its host FS; else (bootstrap: the linker's own TCB, slot 0) the bootstrap record if this is its thread. Interrupted FS put back after.
         ".globl atl_nb_signal_entry\n",
         ".type atl_nb_signal_entry,@function\n",
         "atl_nb_signal_entry:\n",
@@ -309,12 +356,25 @@ std::arch::global_asm!(
         "    push %r12\n",
         "    sub $8, %rsp\n",
         "    rdfsbase %rbx\n",
-        "    rdgsbase %r12\n",
+        "    cmp %fs:16, %rbx\n",
+        "    je 1f\n",
+        "    mov %fs:{slot}, %r12\n",
+        "    test %r12, %r12\n",
+        "    jnz 3f\n",
+        "    mov atl_nb_bootstrap(%rip), %r12\n",
         "    test %r12, %r12\n",
         "    jz 1f\n",
-        concat!("    movabs $0x", record_magic!(), ", %r11\n"),
-        "    cmp %r11, 32(%r12)\n",
+        "    push %rdi\n",
+        "    push %rsi\n",
+        "    push %rdx\n",
+        "    mov ${gettid}, %eax\n",
+        "    syscall\n",
+        "    pop %rdx\n",
+        "    pop %rsi\n",
+        "    pop %rdi\n",
+        "    cmp atl_nb_bootstrap_tid(%rip), %eax\n",
         "    jne 1f\n",
+        "3:\n",
         "    mov 8(%r12), %r11\n",
         "    test %r11, %r11\n",
         "    jz 1f\n",
@@ -345,12 +405,14 @@ std::arch::global_asm!(
         "    .p2align 3\n",
         ".endr\n",
     ),
+    slot = const SLOT_OFFSET,
+    gettid = const libc::SYS_gettid,
     options(att_syntax)
 );
 
-// the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot
+// the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot; frames are 32 bytes in the asm
 const _: () =
-    assert!(THUNKS == 128 && JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 24);
+    assert!(THUNKS == 128 && JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 32);
 
 /// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today; jni.rs asserts the fit).
 pub const JNI_STUBS: usize = 256;

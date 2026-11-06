@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Spike gate g4 (bridge-1 route N): crossing cost. RUNS runs x CALLS calls each of
 //! - guest->host: a guest loop (`g4_guest_loop`, run on a stand-in guest TCB) calls an engine thunk (`arch::bind`) bound to an empty host function: shadow-stack push, FS switch both ways;
-//! - host->guest: a host loop calls `arch::call_guest` on an empty guest function: GS + FS switch both ways;
+//! - host->guest: a host loop calls `arch::call_guest` on an empty guest function: FS switch both ways;
 //! - baseline: the same guest loop calling the empty host function directly (loop + indirect call, no crossing), subtracted from guest->host.
 //!
 //! Reports median and min-max ns per call over the runs, and whether the CPU has FSGSBASE (without it the engine refuses to start).
@@ -102,6 +102,8 @@ fn run() -> Result<(), String> {
     let host = arch::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
+    // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
+    unsafe { arch::init_tcb(tcb, &raw mut *ht) };
     ht.set_guest_fs(tcb);
     let thunk = arch::bind(crossed_target as *const () as usize).ok_or("no free thunk")?;
     let target = host_target as *const () as usize;

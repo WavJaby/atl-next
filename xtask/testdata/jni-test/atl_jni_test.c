@@ -75,6 +75,18 @@ JNI_FN(jint, callJavaAdd)(JNIEnv *env, jclass cls, jint a, jint b)
     return (*env)->CallStaticIntMethod(env, cls, mid, a, b);
 }
 
+// Up-calls whose host target is JIT-compiled Java (AtlJniTest.jitUpCall warms it first): compiled code reads ART's Thread* through %gs.
+JNI_FN(jlong, jitUpCallNative)(JNIEnv *env, jclass cls, jint calls)
+{
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "jitWork", "(I)I");
+    if (mid == NULL)
+        return -1;
+    jlong s = 0;
+    for (jint i = 0; i < calls; i++)
+        s += (*env)->CallStaticIntMethod(env, cls, mid, i & 7);
+    return s;
+}
+
 JNI_FN(jint, dlopenSibling)(JNIEnv *env, jclass cls)
 {
     void *h = dlopen("libatl-jni-sibling.so", RTLD_NOW | RTLD_LOCAL);

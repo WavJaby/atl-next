@@ -38,6 +38,8 @@ const THREAD_HEADERS: &[&str] = &[
     // struct sigaction / sigset_t: guest sigaction's host side converts them (engine/signal.rs layout gate)
     "bionic/libc/include/bits/signal_types.h",
     "bionic/libc/private/bionic_tls.h",
+    // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE
+    "bionic/libc/platform/bionic/tls_defines.h",
     "frameworks/libs/native_bridge_support/android_api/linker/include/native_bridge_support/linker/static_tls_config.h",
 ];
 /// Their include directories: `bionic/…`, `private/…`, `platform/bionic/…` (bionic/libc), `async_safe/log.h`, `native_bridge_support/linker/…`.
@@ -72,7 +74,8 @@ fn bionic_thread(
         path: &unit,
         lang: Lang::Cxx,
         also: &also,
-        macros: &[],
+        // the guest TCB slot that holds the engine's per-thread record (x86_64 crossing: guest->host and signal entries find it there)
+        macros: &["TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE"],
     };
     let iface = atl_bridgegen::interface(
         "bionic_thread",
@@ -149,6 +152,8 @@ fn main() -> Result<()> {
     // gate 4.4's deliberate breaks: `atl_nb_jni_direct` (engine/jni.rs: a guest env slot = the host function, no crossing), `atl_nb_nbfp_false` (exports.rs: isNativeBridgeFunctionPointer answers false)
     println!("cargo::rustc-check-cfg=cfg(atl_nb_jni_direct)");
     println!("cargo::rustc-check-cfg=cfg(atl_nb_nbfp_false)");
+    // `atl_nb_foreign_gs`: deliberate break of the app gate's `jitUpCall` (engine::x86_64: GS = the record, not ART's Thread*, while an up call's host target runs)
+    println!("cargo::rustc-check-cfg=cfg(atl_nb_foreign_gs)");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;

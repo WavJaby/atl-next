@@ -59,6 +59,26 @@ public final class AtlJniTest {
         return b.v;
     }
 
+    /** Up-call target once JIT-compiled: its allocation goes through an entrypoint compiled code finds via %gs (ART's Thread* on x86_64). */
+    public static int jitWork(int k) {
+        return new int[k + 1].length + k;
+    }
+
+    /** Calls jitWork(i &amp; 7) `calls` times through JNI CallStaticIntMethod from guest code; returns the sum. */
+    private static native long jitUpCallNative(int calls);
+
+    /** Up-calls jitUpCall makes: UP_CALLS / 8 rounds of sum(2k + 1, k = 0..7) = 64 -> 8_000_000. */
+    private static final int UP_CALLS = 1_000_000;
+
+    /** JNI up-calls into JIT-compiled Java: jitWork warmed like readV, then reached from guest code. */
+    public static long jitUpCall() {
+        int s = 0;
+        for (int i = 0; i < WARM_CALLS; i++) {
+            s += jitWork(i & 7);
+        }
+        return s == 0 ? -1 : jitUpCallNative(UP_CALLS);
+    }
+
     /** A field read through null in JIT code: ART's implicit null check (a SIGSEGV its fault handler turns into an NPE) must still win over the guest handler sigsegvRecover left. */
     public static String nullFieldRead() {
         Box live = new Box();

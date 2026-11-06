@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Signals under one process-wide kernel action table shared by host and guest.
 //! Host handlers (ART's sigchain `SignalChain::Handler` above all) assume the host thread pointer, but a signal hitting guest code arrives on the guest's: x86_64 `rt_sigreturn` restores no FS base, and nothing between kernel and handler switches it. So every installed kernel handler is re-wrapped at kernel level (`rewrap_all`): raw `rt_sigaction` reads each action, a handler that is not the arch's signal entry moves into the entry's table and the entry takes its place; the entry switches to host FS, calls it, restores the interrupted FS. Rewrap points: NB `initialize` (after ART's `FaultManager::Init`), each guest library load, and the host side of guest `sigaction`. Gap: a host library calling `sigaction` after the last point leaves its handler unwrapped (plan D6 (a)).
-//! The entry finds the record through GS only when its magic matches: on ART threads GS is ART's `Thread*`.
+//! The entry decides from the interrupted FS alone (x86_64.rs `atl_nb_signal_entry`): host TCB -> as is; guest TCB -> its record's host FS. GS is ART's `Thread*`, never read or written.
 //! Guest `sigaction` / `sigaction64` (bionic's own is a raw syscall): NBS stubs (patch 0003) -- bionic's `sigaction.o` defines only these two, so the guest libc's archive link never pulls it and bionic needs no patch (measured: shipped libc's `sigaction` = `jmp sigaction_stub`). The guest handler is registered with sigchain's `sigaction`, so ART keeps its claimed signals first; the host side runs it on the guest thread pointer through `guest_handler`. Old actions naming `guest_handler` are answered with the guest handler they stand for (as Berberis `guest_signal_action.cc` does).
 
 use std::ffi::{c_int, c_void};
@@ -95,30 +95,36 @@ pub fn rewrap_all() -> usize {
     n
 }
 
-/// Host `sigaction` the guest's goes through: ART's sigchain one (`libsigchain.so`, loaded in every ART process), so a guest handler is chained behind ART's claims instead of replacing them.
-fn sigchain_sigaction()
--> Option<unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int> {
+/// Host `sigaction` the guest's goes through: the one that owns the process's handler table -- ART's sigchain (`libsigchain.so`, loaded in every ART process), so a guest handler is chained behind ART's claims instead of replacing them; libc's in a process without sigchain (the engine gates g1-g3), where nothing claims signals ahead of the guest.
+fn host_sigaction()
+-> unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int {
     static P: OnceLock<usize> = OnceLock::new();
     let p = *P.get_or_init(|| {
         // SAFETY: dlopen of an already loaded library (RTLD_NOLOAD), dlsym of a NUL-terminated name.
-        unsafe {
+        let chain = unsafe {
             let h = libc::dlopen(
                 c"libsigchain.so".as_ptr(),
                 libc::RTLD_NOW | libc::RTLD_NOLOAD,
             );
             if h.is_null() {
-                return 0;
+                0
+            } else {
+                libc::dlsym(h, c"sigaction".as_ptr()) as usize
             }
-            libc::dlsym(h, c"sigaction".as_ptr()) as usize
+        };
+        if chain != 0 {
+            chain
+        } else {
+            libc::sigaction as *const () as usize
         }
     });
-    // SAFETY: sigchain's `sigaction` has libc's signature (sigchain.cc `extern "C" int sigaction`).
-    (p != 0).then(|| unsafe {
+    // SAFETY: sigchain's `sigaction` has libc's signature (sigchain.cc `extern "C" int sigaction`); libc's is libc's.
+    unsafe {
         std::mem::transmute::<
             usize,
             unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int,
         >(p)
-    })
+    }
 }
 
 /// The host handler standing for every guest one: runs the guest's on this thread's guest thread pointer. A guest handler may `siglongjmp` out: it lands in guest code on the guest thread pointer, which is where it must be.
@@ -152,9 +158,7 @@ extern "C" fn sigaction(
     let Some(slot) = usize::try_from(sig).ok().filter(|&s| s > 0 && s <= NSIG) else {
         return -1;
     };
-    let Some(host_sigaction) = sigchain_sigaction() else {
-        super::unsupported("guest sigaction: libsigchain.so's sigaction not found");
-    };
+    let host_sigaction = host_sigaction();
     let prev_guest = GUEST[slot].load(Ordering::Acquire);
     // SAFETY: a zeroed glibc sigaction is an empty one; `new` / `old` are the guest's, null or valid (sigaction contract).
     unsafe {

@@ -71,10 +71,13 @@ pub fn attach_current() -> *mut HostThread {
         .ok_or_else(|| "attach: no guest static TLS (guest not started)".to_owned())
         .and_then(|t| alloc_static_tls(&t))
         .map(|tp| {
-            arch::init_tcb(tp);
-            let ht = HostThread::leak();
-            ht.set_guest_fs(tp);
-            ht as *mut HostThread
+            let ht: *mut HostThread = HostThread::leak();
+            // SAFETY: `tp` is a fresh guest TCB inside static TLS; `ht` is leaked until this thread's detach, after which no guest code runs on `tp`.
+            unsafe {
+                arch::init_tcb(tp, ht);
+                (*ht).set_guest_fs(tp);
+            }
+            ht
         })
         .unwrap_or_else(|e| super::unsupported(&e));
     adopt(ht);
