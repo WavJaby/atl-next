@@ -67,7 +67,7 @@ enum Step {
     GlProxies,
 }
 
-const ALL: [Step; 16] = [
+const ALL: [Step; 17] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
