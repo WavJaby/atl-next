@@ -55,6 +55,7 @@ pub mod android {
         pub mod inputmethod {
             pub mod EditorInfo;
             pub mod ImeTracker_Token;
+            pub mod InputBinding;
         }
         pub mod SurfaceControl;
         pub mod WindowManager_LayoutParams;
@@ -71,6 +72,9 @@ pub mod java {
     pub mod io {
         pub mod FileDescriptor;
     }
+    pub mod lang {
+        pub mod CharSequence;
+    }
     pub mod util {
         pub mod Map;
     }
@@ -81,6 +85,7 @@ pub mod com {
         pub mod internal {
             pub mod inputmethod {
                 pub mod InputBindResult;
+                pub mod InputConnectionCommandHeader;
                 pub mod InputMethodInfoSafeList;
             }
         }

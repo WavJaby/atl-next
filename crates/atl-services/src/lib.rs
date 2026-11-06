@@ -17,6 +17,7 @@ pub mod compositor_registry;
 pub mod config_diff;
 pub mod counters;
 pub mod display_model;
+pub mod ime_bind;
 pub mod input_devices;
 pub mod manifest_flags;
 pub mod native_libs;

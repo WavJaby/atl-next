@@ -45,11 +45,14 @@ import android.view.InsetsState;
 import android.view.PointerIcon;
 import android.os.UserHandle;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.view.autofill.AutofillId;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.ImeTracker;
+import android.view.inputmethod.InputBinding;
 import android.window.ImeOnBackInvokedDispatcher;
 import com.android.internal.inputmethod.InputBindResult;
+import com.android.internal.inputmethod.InputConnectionCommandHeader;
 import com.android.internal.inputmethod.InputMethodInfoSafeList;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
@@ -246,6 +249,12 @@ public class ParcelTruth {
         check("EditorInfo", editorInfo(), EditorInfo.CREATOR);
         check("EditorInfo:empty", new EditorInfo(), EditorInfo.CREATOR);
         check("InputBindResult:no-ime", InputBindResult.NO_IME, InputBindResult.CREATOR);
+        // the bind path (atl-services ime_bind.rs): the waiting result carries id + sequence; the session form differs only in the binder
+        check("InputBindResult:waiting", new InputBindResult(InputBindResult.ResultCode.SUCCESS_WAITING_IME_SESSION, null, null, null, "atl/.InAppInputMethod", 1, false), InputBindResult.CREATOR);
+        check("InputBinding", new InputBinding(null, null, 10123, 4567), InputBinding.CREATOR);
+        // every IRemoteInputConnection call the in-app IME makes (atl-ime)
+        check("InputConnectionCommandHeader", new InputConnectionCommandHeader(3), InputConnectionCommandHeader.CREATOR);
+        checkCharSequence("CharSequence", "仮名😀");
         checkImeDispatcher("ImeOnBackInvokedDispatcher");
         // show/hideSoftInput's token and getInputMethodList's empty answer (atl-services input_method.rs)
         checkImeToken("ImeTracker_Token");
@@ -1075,6 +1084,31 @@ public class ParcelTruth {
             return;
         }
         result(ok, name, ok ? java.length + " bytes, rust putAll == java putAll, byte-equal" : "java re-encodes rust's bytes differently");
+    }
+
+    /// java.lang.CharSequence as AIDL passes it (TextUtils.writeToParcel); Java reads Rust's bytes back with TextUtils.CHAR_SEQUENCE_CREATOR.
+    static void checkCharSequence(String name, String text) {
+        Parcel parcel = Parcel.obtain();
+        TextUtils.writeToParcel(text, parcel, 0);
+        byte[] java = parcel.marshall();
+        parcel.recycle();
+        byte[] rust = roundTrip("java.lang.CharSequence", java, MODE_PLAIN);
+        if (rust == null) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        if (!Arrays.equals(java, rust)) {
+            result(false, name, "rust bytes differ from java's at byte " + firstDiff(java, rust) + " (" + rust.length + " vs " + java.length + ")");
+            return;
+        }
+        Parcel in = Parcel.obtain();
+        in.unmarshall(rust, 0, rust.length);
+        in.setDataPosition(0);
+        CharSequence back = TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel(in);
+        boolean consumed = in.dataPosition() == rust.length;
+        in.recycle();
+        boolean ok = consumed && back != null && text.equals(back.toString());
+        result(ok, name, ok ? java.length + " bytes, java -> rust byte-equal, java reads rust's text back equal" : "java reads rust's bytes as " + back + " (consumed " + consumed + ")");
     }
 
     /// java.util.Map, the Java-only builtin, as Parcel.writeMap writes it; Java reads Rust's bytes back with readHashMap.

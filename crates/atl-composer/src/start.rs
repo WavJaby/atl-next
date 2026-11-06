@@ -13,7 +13,7 @@ use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCo
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use atl_compositor::model::CompositorConfig;
-use atl_platform_ui::{PhysSize, PlatformUi};
+use atl_platform_ui::{PhysSize, PlatformUi, Ui};
 
 use crate::host::{Composer, ComposerConfig, ThreadHost};
 use crate::input::{self, Message};
@@ -117,7 +117,10 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             ..Default::default()
         },
     });
+    // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
+    let mut input_method = None;
     let sender = if let Some(ui) = ui {
+        input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
         // the size the services give a new Task: the window opens at it, so its first bounds report changes nothing
         let (width, height) = display.opening_size();
         let size = PhysSize {
@@ -145,7 +148,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     };
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
-    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender);
+    let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender, input_method);
     register(&suffix, &surface_flinger, &surface_flinger_aidl, &ui_agent)?;
     // the registry holds the binders; the process holds the compositor (the clock or deliver thread does)
     Ok(composer)

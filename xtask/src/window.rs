@@ -28,6 +28,7 @@ use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
+mod ime;
 mod move_output;
 mod surface_view;
 mod widgets;
@@ -61,6 +62,9 @@ pub struct Args {
     /// Deliberate break (stage surface-view): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
     #[arg(long)]
     break_z_order: bool,
+    /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_ime_commit: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -75,6 +79,8 @@ enum Stage {
     Gtk,
     /// The widget fixture in UI mode: layout, the text in the readback, a tap on the button, focus, a list drag, presents and cadence (xtask/src/window/widgets.rs).
     Widgets,
+    /// The widget fixture in UI mode with a fake desktop input method: the EditText's focus binds the in-app input method, and the IME's preedit, commit and delete reach the EditText (xtask/src/window/ime.rs).
+    Ime,
     /// Resume in UI mode, then the probe configures the window larger, then smaller ([`drive_resize`]); the sub-gates follow each size ([`resize_checks`]).
     Resize,
     /// The resize stage on window-sized (a sw600dp resource, no configChanges): the shrink crosses 600 dp, so the activity relaunches; the grow crosses nothing and does not.
@@ -97,6 +103,7 @@ impl Stage {
             Stage::Input => "input",
             Stage::Gtk => "gtk",
             Stage::Widgets => "widgets",
+            Stage::Ime => "ime",
             Stage::Resize => "resize",
             Stage::Relaunch => "relaunch",
             Stage::Declared => "declared",
@@ -112,7 +119,7 @@ impl Stage {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk | Stage::SurfaceView => GTK_WINDOW_MS,
-            Stage::Widgets => WIDGETS_WINDOW_MS,
+            Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
             | Stage::Declared
@@ -227,6 +234,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Input
         | Stage::Gtk
         | Stage::Widgets
+        | Stage::Ime
         | Stage::Resize
         | Stage::Relaunch
         | Stage::Declared
@@ -1390,6 +1398,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
         | Stage::Widgets
+        | Stage::Ime
         | Stage::Resize
         | Stage::Relaunch
         | Stage::Declared
@@ -1401,7 +1410,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 rt.with_ui("gtk")
             } else {
                 let outputs: &[Output] = match args.stage {
-                    Stage::Widgets => &[widgets::OUTPUT],
+                    Stage::Widgets | Stage::Ime => &[widgets::OUTPUT],
                     Stage::SurfaceView => &[surface_view::OUTPUT],
                     Stage::Move => &move_output::OUTPUTS,
                     _ => &[GATE_OUTPUT],
@@ -1440,7 +1449,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .filter(|_| matches!(args.stage, Stage::Move))
         .map(|n| n.output_display(1));
     let fixture = match args.stage {
-        Stage::Widgets => widgets::FIXTURE,
+        Stage::Widgets | Stage::Ime => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
@@ -1475,18 +1484,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let start_ms = now_ms();
     let started = Instant::now();
+    // the ime stage's fake desktop input method holds the seat before the app's window exists
+    let mut fake_ime = match (args.stage, &nested) {
+        (Stage::Ime, Some(n)) => Some(crate::nested_wayland::Ime::bind(n)?),
+        _ => None,
+    };
+    let break_ime_commit = args.break_ime_commit;
     let mut atld_child = rt.start_atld(&run)?;
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
-        std::thread::spawn(move || match (stage, outputs) {
-            (Stage::Widgets, _) => widgets::drive(p, &log),
-            (Stage::SurfaceView, _) => surface_view::drive(p, &log),
-            (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _) => {
+        let fake_ime = fake_ime.take();
+        std::thread::spawn(move || match (stage, outputs, fake_ime) {
+            (Stage::Ime, _, Some(ime)) => ime::drive(p, &log, ime, break_ime_commit),
+            (Stage::Widgets, _, _) => widgets::drive(p, &log),
+            (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
+            (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 drive_resize(p, &log)
             }
-            (Stage::Move, Some(outputs)) => move_output::drive(p, &log, outputs),
+            (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
             _ => drive(p, &log),
         })
     });
@@ -1551,6 +1568,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
+        (Stage::Ime, Some(_)) => ime::checks(&app, &liveness),
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
             &after_marker(&app, marker),

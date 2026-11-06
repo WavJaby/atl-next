@@ -125,9 +125,28 @@ mirrors = [
 ]
 
 [input_method]
-src = ["crates/atl-services/src/input_method.rs"]
+src = [
+    "crates/atl-services/src/input_method.rs",
+    "crates/atl-services/src/ime_bind.rs",
+    "crates/atl-ime/src/method.rs",
+    "crates/atl-ime/src/field.rs",
+    "crates/atl-ime/src/content.rs",
+]
 mirrors = [
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#addClient",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#attachNewInputLocked",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#onSessionCreated",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#requestClientSessionLocked",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#startInputUncheckedLocked",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#prepareClientSwitchLocked",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodBindingController.java#bindCurrentInputMethodService",
+    "frameworks/base/services/core/java/com/android/server/inputmethod/ZeroJankProxy.java#startInputOrWindowGainedFocusAsync",
+    "frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java#createSession",
+    "frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java#startInput",
+    "frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java#invalidateInput",
+    "frameworks/base/core/java/android/inputmethodservice/RemoteInputConnection.java#setComposingText",
+    "frameworks/base/core/java/android/inputmethodservice/RemoteInputConnection.java#commitText",
+    "frameworks/base/core/java/android/inputmethodservice/RemoteInputConnection.java#deleteSurroundingTextInCodePoints",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#startInputOrWindowGainedFocus",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#showSoftInput",
     "frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java#hideSoftInput",

@@ -30,7 +30,7 @@ use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
-use atl_parcelables::android::view::inputmethod::{EditorInfo, ImeTracker_Token};
+use atl_parcelables::android::view::inputmethod::{EditorInfo, ImeTracker_Token, InputBinding};
 use atl_parcelables::android::view::{
     DisplayInfo, InputChannel, InputDevice, InsetsSourceControl_Array, InsetsState, PointerIcon,
     SurfaceControl, WindowManager_LayoutParams, WindowRelayoutResult,
@@ -39,9 +39,10 @@ use atl_parcelables::android::window::{
     ClientWindowFrames, ImeOnBackInvokedDispatcher, SizeConfigurationBuckets,
 };
 use atl_parcelables::com::android::internal::inputmethod::{
-    InputBindResult, InputMethodInfoSafeList,
+    InputBindResult, InputConnectionCommandHeader, InputMethodInfoSafeList,
 };
 use atl_parcelables::java::io::FileDescriptor;
+use atl_parcelables::java::lang::CharSequence;
 use atl_parcelables::java::util::Map;
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
@@ -281,6 +282,11 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "com.android.internal.inputmethod.InputBindResult" => {
             round_trip_as::<InputBindResult>(input, mode)
         }
+        "com.android.internal.inputmethod.InputConnectionCommandHeader" => {
+            round_trip_as::<InputConnectionCommandHeader>(input, mode)
+        }
+        "android.view.inputmethod.InputBinding" => round_trip_as::<InputBinding>(input, mode),
+        "java.lang.CharSequence" => round_trip_as::<CharSequence>(input, mode),
         "com.android.internal.inputmethod.InputMethodInfoSafeList" => {
             round_trip_as::<InputMethodInfoSafeList>(input, mode)
         }

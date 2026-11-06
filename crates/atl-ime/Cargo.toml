@@ -8,7 +8,22 @@ license.workspace = true
 publish.workspace = true
 
 # The app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method (atl-platform-ui TextInput) to the focused field's InputConnection.
-# So far only `units`: the one place text indices change units (Android UTF-16 / code points <-> the toolkit's UTF-8 bytes / chars). No unsafe.
+# `units` and `content` are plain Rust; the binder servers need feature `converter` (libbinder_rs, the codecs and the AIDL stubs come from the converter, not cargo). No unsafe.
+
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust"]
+
+[features]
+converter = ["atl-aidl/converter"]
+
+[dependencies]
+atl-aidl = { path = "../atl-aidl" }
+atl-platform-ui = { path = "../atl-platform-ui" }
+tracing.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
 
 [lints]
 workspace = true

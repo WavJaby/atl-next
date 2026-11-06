@@ -49,7 +49,7 @@ uses = ["generators", "bionic", "composer", "platform-ui"]
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths"]
+uses = ["aidl", "compositor", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]
@@ -92,11 +92,11 @@ crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]
 exports = ["atl-platform-ui"]
 uses = ["compositor", "gralloc", "scene-buffer", "platform-types"]
 
-# the app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method to the focused field's InputConnection; so far the one module of text-index unit conversions
+# the app process's in-app input method (IME plan route R1): the Rust IInputMethod / IInputMethodSession IMMS-lite binds, adapting the desktop's input method (platform-ui TextInput) to the focused field's InputConnection (aidl stubs); the text-index unit conversions
 [ime]
 crates = ["atl-ime"]
 exports = ["atl-ime"]
-uses = []
+uses = ["aidl", "platform-ui", "generators"]
 
 # the value types both platform halves speak (physical size, scale, monitor) and the one conversion from a desktop's report into them; no OS or toolkit dependency
 [platform-types]

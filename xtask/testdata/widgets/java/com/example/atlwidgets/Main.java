@@ -101,6 +101,20 @@ public class Main extends Activity {
         list = (ListView) findViewById(R.id.list);
         // setText from code: the EditText must render it
         input.setText("typed from code");
+        // every edit after that, with its composing span (the ime stage: the in-app input method's preedit and commit land here)
+        input.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(android.text.Editable s) {
+                Log.i(TAG, "text input=" + s + " composing=" + android.view.inputmethod.BaseInputConnection.getComposingSpanStart(s)
+                        + "," + android.view.inputmethod.BaseInputConnection.getComposingSpanEnd(s));
+            }
+        });
         String[] items = new String[50];
         for (int i = 0; i < items.length; i++) {
             items[i] = "Item " + i;

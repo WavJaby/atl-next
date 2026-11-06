@@ -170,6 +170,7 @@ dependencies = [
  "atl-android-paths",
  "atl-bridgegen",
  "atl-compositor",
+ "atl-ime",
  "atl-libinput",
  "atl-platform-ui",
  "atl-scene-buffer",
@@ -231,6 +232,13 @@ dependencies = [
 [[package]]
 name = "atl-ime"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-aidl",
+ "atl-bridgegen",
+ "atl-platform-ui",
+ "tracing",
+]
 
 [[package]]
 name = "atl-layout"

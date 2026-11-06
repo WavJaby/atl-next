@@ -26,10 +26,10 @@ pub const FIXTURE: &str = "xtask/testdata/widgets";
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
 /// The fixture's line after the cadence run: the picture the last readback must show.
 const FINAL_LINE: &str = "AtlWindow: final frame";
-const CAPTURE_LINE: &str = "atl-composer: ui: capture ";
+pub(super) const CAPTURE_LINE: &str = "atl-composer: ui: capture ";
 /// The fixture's lines around its second window (activity .Second, started by the EditText's focus; `closed` once Main is back and Second's window is gone).
 const SECOND_SHOWN: &str = "AtlWindow: window second shown";
-const SECOND_CLOSED: &str = "AtlWindow: window second closed";
+pub(super) const SECOND_CLOSED: &str = "AtlWindow: window second closed";
 /// A surface point in the header bar: below the shadow's 12 px, above the content's origin (as the gtk stage's chrome press).
 const HEADER_POINT: (f64, f64) = (100.0, 20.0);
 /// How long a fixture line may take after the injection that should cause it.
@@ -85,11 +85,11 @@ const KEY_HOLD: Duration = Duration::from_millis(1000);
 
 /// A widget's rectangle in the content, from its `AtlWindow: layout <name>` line.
 #[derive(Debug, Clone, Copy)]
-struct Rect {
-    left: i64,
-    top: i64,
-    width: i64,
-    height: i64,
+pub(super) struct Rect {
+    pub(super) left: i64,
+    pub(super) top: i64,
+    pub(super) width: i64,
+    pub(super) height: i64,
 }
 
 /// The `key=` value on the first app log line containing `prefix`.
@@ -111,7 +111,7 @@ fn number<T: std::str::FromStr>(value: Option<&str>, what: &str) -> Result<T, St
         .ok_or_else(|| format!("no {what} in the app log"))
 }
 
-fn widget(app: &str, name: &str) -> Result<Rect, String> {
+pub(super) fn widget(app: &str, name: &str) -> Result<Rect, String> {
     let rest = rest_of(app, &format!("AtlWindow: layout {name} "))
         .ok_or_else(|| format!("no layout line for {name}"))?;
     let num = |key: &str| number::<i64>(word(rest, key), &format!("{name} {key}"));
@@ -671,14 +671,14 @@ pub fn checks(
     ]
 }
 
-fn press(pressed: bool) -> PointerAction {
+pub(super) fn press(pressed: bool) -> PointerAction {
     PointerAction::Button {
         button: BTN_LEFT,
         pressed,
     }
 }
 
-fn inject(proxy: &Proxy, actions: Vec<PointerAction>) -> Result<(), String> {
+pub(super) fn inject(proxy: &Proxy, actions: Vec<PointerAction>) -> Result<(), String> {
     for action in actions {
         proxy.inject_pointer(action).map_err(|e| e.to_string())?;
     }
@@ -697,7 +697,7 @@ fn wait_until(app_log: &Path, within: Duration, want: impl Fn(&str) -> bool) -> 
     false
 }
 
-fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
+pub(super) fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
     wait_for_line(app_log, needle, LINE_WAIT)
         .then_some(())
         .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))

@@ -134,7 +134,7 @@ fn main() -> Result<()> {
     .context("addService window")?;
     binder::add_service(
         INPUT_METHOD,
-        atl_services::input_method::new_binder(Arc::clone(&permissions)),
+        atl_services::input_method::new_binder(Arc::clone(&permissions), Arc::clone(&agents)),
     )
     .context("addService input_method")?;
     binder::add_service(

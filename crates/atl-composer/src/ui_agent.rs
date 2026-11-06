@@ -25,6 +25,8 @@ struct UiAgent {
     composer: Arc<Composer>,
     input: Sender<Message>,
     sender: Option<Arc<TaskSender>>,
+    /// the in-app input method (atl-ime) IMMS-lite binds (INPUT_METHOD); None in headless mode
+    input_method: Option<SpIBinder>,
 }
 
 impl Interface for UiAgent {}
@@ -75,23 +77,29 @@ impl IUiAgent for UiAgent {
     }
 
     /// To the UI thread's window (ui_window); headless mode has none and ignores it.
+    fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode> {
+        Ok(self.input_method.clone())
+    }
+
     fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {
         crate::ui_window::set_pointer_icon(kind);
         Ok(())
     }
 }
 
-/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task.
+/// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod.
 pub fn new_binder(
     composer: Arc<Composer>,
     input: Sender<Message>,
     sender: Option<Arc<TaskSender>>,
+    input_method: Option<SpIBinder>,
 ) -> SpIBinder {
     BnUiAgent::new_binder(
         UiAgent {
             composer,
             input,
             sender,
+            input_method,
         },
         BinderFeatures::default(),
     )

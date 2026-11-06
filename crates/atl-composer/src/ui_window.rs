@@ -197,6 +197,8 @@ fn open() {
             monitors.submit_display(model);
         });
         window.request_frame();
+        // the in-app input method's desktop side: the window's TextInput
+        atl_ime::attach(Rc::clone(&window));
         session.window = Some(window);
     });
 }
