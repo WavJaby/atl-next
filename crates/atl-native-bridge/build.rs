@@ -88,7 +88,7 @@ fn bionic_thread(
 }
 
 /// The guest libc stubs whose host is the process's bionic provider (`libatl_bionic`: the bionic-only API glibc lacks, implemented with bionic's signature from these same headers, atl-bionic build.rs `APIS`), by header relative to the AOSP tree.
-/// The one list: engine/vdso.rs binds exactly these names to the provider, typed by the header's signatures (`provider.rs`).
+/// The one list: the binding table binds these names to the provider's own handle (`Host::Provider`), except the [`SHIMS`] among them; `provider.rs` types them by the header's signatures.
 const PROVIDER_APIS: &[(&str, &[&str])] = &[
     (
         "sys/system_properties.h",
@@ -154,11 +154,102 @@ fn provider(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path)
         .iter()
         .flat_map(|(_, f)| f.iter().copied())
         .collect();
-    let mut code = atl_bridgegen::rust::import_module(&iface, &host.arch, &functions, &[])?;
-    code.push_str(&format!(
-        "\n/// Every provider function, by C name.\npub const NAMES: &[&str] = &{functions:?};\n"
-    ));
-    Ok(code)
+    atl_bridgegen::rust::import_module(&iface, &host.arch, &functions, &[])
+}
+
+/// Guest libc stubs with a hand-written host side (the guest hands host code a guest function, or the host side owns a table): resolved by `bindings::shim`'s one match, its test proving every name here has an arm.
+const SHIMS: &[&str] = &[
+    // intercepts.rs: start routine / key destructor run on the guest thread pointer
+    "pthread_create",
+    "pthread_key_create",
+    "pthread_key_delete",
+    // provider.rs: the provider calls a host trampoline that crosses to the guest callback
+    "__system_property_foreach",
+    "__system_property_read_callback",
+    // signal.rs: the guest handler registered with sigchain behind ART's claims
+    "sigaction",
+    "sigaction64",
+];
+
+/// Guest libc stubs glibc's `libc.so.6` serves with the same ABI, by (stub name, glibc symbol). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
+/// The pthread rows rest on intercepts.rs's size gates (`pthread_t` long, `pthread_key_t` int, `pthread_attr_t` only ever filled and read by glibc since every `pthread_attr_*` is here); the rest are the C contract (memory, allocation, time), identical in bionic and glibc on LP64.
+const GLIBC: &[(&str, &str)] = &[
+    ("memcpy", "memcpy"),
+    ("memset", "memset"),
+    ("memcmp", "memcmp"),
+    ("native_bridge_malloc", "malloc"),
+    ("native_bridge_free", "free"),
+    ("native_bridge_calloc", "calloc"),
+    ("native_bridge_realloc", "realloc"),
+    ("native_bridge_memalign", "memalign"),
+    ("native_bridge_posix_memalign", "posix_memalign"),
+    ("native_bridge_aligned_alloc", "aligned_alloc"),
+    ("native_bridge_malloc_usable_size", "malloc_usable_size"),
+    ("clock_gettime", "clock_gettime"),
+    ("clock_getres", "clock_getres"),
+    ("gettimeofday", "gettimeofday"),
+    ("time", "time"),
+    ("pthread_attr_destroy", "pthread_attr_destroy"),
+    ("pthread_attr_getdetachstate", "pthread_attr_getdetachstate"),
+    ("pthread_attr_getguardsize", "pthread_attr_getguardsize"),
+    (
+        "pthread_attr_getinheritsched",
+        "pthread_attr_getinheritsched",
+    ),
+    ("pthread_attr_getschedparam", "pthread_attr_getschedparam"),
+    ("pthread_attr_getschedpolicy", "pthread_attr_getschedpolicy"),
+    ("pthread_attr_getscope", "pthread_attr_getscope"),
+    ("pthread_attr_getstack", "pthread_attr_getstack"),
+    ("pthread_attr_getstacksize", "pthread_attr_getstacksize"),
+    ("pthread_attr_init", "pthread_attr_init"),
+    ("pthread_attr_setdetachstate", "pthread_attr_setdetachstate"),
+    ("pthread_attr_setguardsize", "pthread_attr_setguardsize"),
+    (
+        "pthread_attr_setinheritsched",
+        "pthread_attr_setinheritsched",
+    ),
+    ("pthread_attr_setschedparam", "pthread_attr_setschedparam"),
+    ("pthread_attr_setschedpolicy", "pthread_attr_setschedpolicy"),
+    ("pthread_attr_setscope", "pthread_attr_setscope"),
+    ("pthread_attr_setstack", "pthread_attr_setstack"),
+    ("pthread_attr_setstacksize", "pthread_attr_setstacksize"),
+    ("pthread_detach", "pthread_detach"),
+    ("pthread_getattr_np", "pthread_getattr_np"),
+    ("pthread_getcpuclockid", "pthread_getcpuclockid"),
+    ("pthread_getname_np", "pthread_getname_np"),
+    ("pthread_getschedparam", "pthread_getschedparam"),
+    ("pthread_join", "pthread_join"),
+    ("pthread_kill", "pthread_kill"),
+    ("pthread_setname_np", "pthread_setname_np"),
+    ("pthread_setschedparam", "pthread_setschedparam"),
+    ("pthread_setschedprio", "pthread_setschedprio"),
+    ("pthread_sigqueue", "pthread_sigqueue"),
+    ("pthread_getspecific", "pthread_getspecific"),
+    ("pthread_setspecific", "pthread_setspecific"),
+];
+
+/// The provider's soname, as cargo-c names a cdylib (`lib<crate>.so.<v>`): `<v>` is the version's semver-compatible prefix -- the major from 1.0, `0.<minor>` below it, the whole `0.0.<patch>` below that (measured: `libatl_bionic.so.0.0.0`, readelf SONAME). Read from atl-bionic's own manifest so a version bump moves it.
+fn provider_soname(manifest_dir: &std::path::Path) -> Result<String> {
+    const CRATE: &str = "atl_bionic";
+    let path = manifest_dir.join("../atl-bionic/Cargo.toml");
+    println!("cargo::rerun-if-changed={}", path.display());
+    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    let version = text
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+        .with_context(|| format!("{}: no version line", path.display()))?;
+    let parts: Vec<&str> = version.split('.').collect();
+    ensure!(
+        parts.len() == 3,
+        "{}: version {version} is not x.y.z",
+        path.display()
+    );
+    let v = match (parts[0], parts[1]) {
+        ("0", "0") => version.to_owned(),
+        ("0", minor) => format!("0.{minor}"),
+        (major, _) => major.to_owned(),
+    };
+    Ok(format!("lib{CRATE}.so.{v}"))
 }
 
 /// The JNI function tables, relative to the AOSP tree: `JNINativeInterface` (behind `JNIEnv`) and `JNIInvokeInterface` (behind `JavaVM`).
@@ -226,7 +317,7 @@ const PROXY_LIBS: &[(&str, &str)] = &[
     ("libGLESv3.so", "libGLESv3"),
     ("libnativewindow.so", "libnativewindow"),
 ];
-/// The libc stub list whose count sizes the thunk pool (NBS, x86_64 entries).
+/// The guest libc's stub list (NBS, x86_64 entries; patch 0003 adds sigaction / sigaction64).
 const LIBC_STUBS: &str = "frameworks/libs/native_bridge_support/android_api/libc/stubs_x86_64.cpp";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
 const PROTOTYPE_HEADERS: &[&str] = &[
@@ -241,6 +332,8 @@ const PROTOTYPE_HEADERS: &[&str] = &[
     "GLES3/gl32.h",
 ];
 const PROTOTYPE_INCLUDES: &[&str] = &["frameworks/native/opengl/include"];
+/// Env var naming a header force-included into the guest prototype view only: the identity gate's deliberate break.
+const GUEST_INCLUDE_BREAK: &str = "ATL_NB_GL_GUEST_INCLUDE";
 /// Functions whose prototype alone does not say what the binding does: `glGetPointerv` answers a wrapped GL_DEBUG_CALLBACK_FUNCTION, `glGetVkProcAddrNV` is refused (GS2.2).
 const ANNOTATED: &[&str] = &["glGetPointerv", "glGetPointervKHR", "glGetVkProcAddrNV"];
 
@@ -266,34 +359,79 @@ fn is_fn_ptr(t: &Ty) -> bool {
     matches!(t.resolved(), Ty::Pointer { pointee, .. } if matches!(pointee.resolved(), Ty::Function(_)))
 }
 
-/// `proxy_table.rs` (module `proxy`): per guest proxy library, its NBS stub names in list order, each with the entry it binds.
-/// `Entry::Generic` binds the host front's symbol of that name through the generic crossing; `Entry::Trap(i)` binds `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
-/// The prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
-fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path) -> Result<String> {
-    let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
-    for &(soname, dir) in PROXY_LIBS {
-        let rel = format!("frameworks/libs/native_bridge_support/android_api/{dir}/stubs_arm64.cc");
-        let path = up.aosp(&rel);
-        let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
-        let names: Vec<String> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("DEFINE_INTERCEPTABLE_STUB_FUNCTION(")?.strip_suffix(");"))
-            .map(str::to_owned)
-            .collect();
-        ensure!(!names.is_empty(), "{soname}: no stubs in {}", path.display());
-        for p in up.rerun_paths(&format!("aosp/{rel}")) {
-            println!("cargo::rerun-if-changed={}", p.display());
-        }
-        lists.push((soname, names));
-    }
-    let libc_text = std::fs::read_to_string(up.aosp(LIBC_STUBS))?;
-    let libc_stubs = libc_text
+/// The stub names of one NBS stub list (`DEFINE_INTERCEPTABLE_STUB_FUNCTION(name);`), in list order.
+fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
+    let path = up.aosp(rel);
+    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    let names: Vec<String> = text
         .lines()
-        .filter(|l| l.starts_with("DEFINE_INTERCEPTABLE_STUB_FUNCTION("))
-        .count();
-    for p in up.rerun_paths(&format!("aosp/{LIBC_STUBS}")) {
+        .filter_map(|l| {
+            l.strip_prefix("DEFINE_INTERCEPTABLE_STUB_FUNCTION(")?
+                .strip_suffix(");")
+        })
+        .map(str::to_owned)
+        .collect();
+    ensure!(!names.is_empty(), "no stubs in {}", path.display());
+    for p in up.rerun_paths(&format!("aosp/{rel}")) {
         println!("cargo::rerun-if-changed={}", p.display());
     }
+    Ok(names)
+}
+
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`], [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
+fn libc_entries(
+    names: &[String],
+    trap: &mut dyn FnMut(&str, &'static str) -> String,
+) -> Result<Vec<String>> {
+    let provider: Vec<&str> = PROVIDER_APIS
+        .iter()
+        .flat_map(|(_, f)| f.iter().copied())
+        .collect();
+    for n in SHIMS
+        .iter()
+        .chain(GLIBC.iter().map(|(n, _)| n))
+        .chain(&provider)
+    {
+        ensure!(
+            names.iter().any(|s| s == n),
+            "libc.so: {n} is in a binding list but not an NBS libc stub"
+        );
+    }
+    Ok(names
+        .iter()
+        .map(|name| {
+            if SHIMS.contains(&name.as_str()) {
+                "Entry::Shim".to_owned()
+            } else if let Some((_, sym)) = GLIBC.iter().find(|(n, _)| n == name) {
+                format!("Entry::Generic(Host::Glibc, {sym:?})")
+            } else if provider.contains(&name.as_str()) {
+                format!("Entry::Generic(Host::Provider, {name:?})")
+            } else {
+                trap(name, "unbound: no host side")
+            }
+        })
+        .collect())
+}
+
+/// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
+/// `Entry::Generic(host, symbol)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing; `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
+/// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
+fn bindings_table(
+    up: &Upstreams,
+    host: &buildscript::HostArch,
+    out: &std::path::Path,
+    provider_soname: &str,
+) -> Result<String> {
+    let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
+    for &(soname, dir) in PROXY_LIBS {
+        let names = stub_names(
+            up,
+            &format!("frameworks/libs/native_bridge_support/android_api/{dir}/stubs_arm64.cc"),
+        )
+        .with_context(|| soname.to_owned())?;
+        lists.push((soname, names));
+    }
+    let libc_names = stub_names(up, LIBC_STUBS)?;
 
     let unit = out.join("proxy_prototypes.cc");
     let mut text = String::from("#define EGL_EGLEXT_PROTOTYPES\n#define GL_GLEXT_PROTOTYPES\n");
@@ -313,6 +451,12 @@ fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Pa
     );
     guest.arch = "guest".to_owned();
     guest.args.extend(includes.iter().cloned());
+    // deliberate break of the identity gate: a header force-included into the guest view only (e.g. one widening a GL typedef) must fail the build naming the function
+    println!("cargo::rerun-if-env-changed={GUEST_INCLUDE_BREAK}");
+    if let Ok(h) = std::env::var(GUEST_INCLUDE_BREAK) {
+        println!("cargo::rerun-if-changed={h}");
+        guest.args.extend(["-include".to_owned(), h]);
+    }
     let host_view = Target {
         arch: "host".to_owned(),
         triple: buildscript::clang_triple_from_cargo()?,
@@ -349,8 +493,14 @@ fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Pa
             if !guest_view.functions.contains_key(name) || !host_ir.functions.contains_key(name) {
                 continue;
             }
-            if let Some(d) = diffs.iter().find(|d| &d.name == name).filter(|d| !d.identical) {
-                broken.push(format!("{name}: {}", d.differences.join("; ")));
+            // only an equal-width TyDiff::PointerVsInteger passes (abi_identical); every other kind fails
+            if let Some(d) = diffs
+                .iter()
+                .find(|d| &d.name == name)
+                .filter(|d| !d.abi_identical())
+            {
+                let why: Vec<String> = d.differences.iter().map(ToString::to_string).collect();
+                broken.push(format!("{name}: {}", why.join("; ")));
             }
         }
     }
@@ -362,16 +512,10 @@ fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Pa
     );
 
     let mut traps: Vec<(String, String, &'static str)> = Vec::new();
-    let mut code = String::from(
-        "// generated by build.rs (atl-native-bridge) from the NBS stub lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Entry, Lib};\n\npub const LIBS: &[Lib] = &[\n",
-    );
-    let mut total = 0usize;
+    let mut rows: Vec<(&str, Vec<(String, String)>)> = Vec::new();
     for (soname, names) in &lists {
-        code.push_str(&format!(
-            "    Lib {{\n        soname: {soname:?},\n        stubs: &[\n"
-        ));
+        let mut entries = Vec::new();
         for name in names {
-            total += 1;
             let mut trap = |why: &'static str| {
                 traps.push(((*soname).to_owned(), name.clone(), why));
                 format!("Entry::Trap({})", traps.len() - 1)
@@ -381,28 +525,50 @@ fn proxy_table(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Pa
                     trap("pending: annotated, GS2.2")
                 }
                 (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => trap("pending: fn-return, GS2.2"),
-                (Some(sig), Some(_)) if sig.params.iter().any(|p| is_fn_ptr(p)) => {
+                (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
                     trap("pending: callback-param, GS2.2")
                 }
-                (Some(_), Some(_)) => "Entry::Generic".to_owned(),
+                (Some(_), Some(_)) => format!("Entry::Generic(Host::Front, {name:?})"),
                 _ if *soname == "libnativewindow.so" => {
                     trap("pending: nativewindow prototypes not in the EGL/GLES set")
                 }
                 _ => trap("unbound: no prototype in the EGL/GLES headers"),
             };
+            entries.push((name.clone(), entry));
+        }
+        rows.push((soname, entries));
+    }
+    let libc = libc_entries(&libc_names, &mut |name, why| {
+        traps.push(("libc.so".to_owned(), name.to_owned(), why));
+        format!("Entry::Trap({})", traps.len() - 1)
+    })?;
+    rows.push(("libc.so", libc_names.into_iter().zip(libc).collect()));
+
+    let mut code = String::from(
+        "// generated by build.rs (atl-native-bridge) from the NBS stub lists, the binding lists and the EGL/GLES prototypes of the guest and host views, do not edit\nuse super::{Entry, Host, Lib};\n\npub const LIBS: &[Lib] = &[\n",
+    );
+    let mut total = 0usize;
+    for (soname, entries) in &rows {
+        code.push_str(&format!(
+            "    Lib {{\n        soname: {soname:?},\n        stubs: &[\n"
+        ));
+        for (name, entry) in entries {
+            total += 1;
             code.push_str(&format!("            ({name:?}, {entry}),\n"));
         }
         code.push_str("        ],\n    },\n");
     }
     code.push_str("];\n\n");
     code.push_str(&format!(
-        "/// Stub names over all lists; the libc stubs (`LIBC_STUB_COUNT`) bind from the same pool.\npub const STUB_COUNT: usize = {total};\npub const LIBC_STUB_COUNT: usize = {libc_stubs};\n\n"
+        "/// Stub names over all libraries: each binds one thunk.\npub const STUB_COUNT: usize = {total};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
     ));
     code.push_str("/// Per `Entry::Trap(i)`: library, name, why trapped.\npub const TRAP_NAMES: &[(&str, &str, &str)] = &[\n");
     for (lib, name, why) in &traps {
         code.push_str(&format!("    ({lib:?}, {name:?}, {why:?}),\n"));
     }
-    code.push_str("];\n\n/// `trap::<i>` per `Entry::Trap(i)`.\npub const TRAPS: &[extern \"C\" fn()] = &[\n");
+    code.push_str(
+        "];\n\n/// `trap::<i>` per `Entry::Trap(i)`.\npub const TRAPS: &[extern \"C\" fn()] = &[\n",
+    );
     for i in 0..traps.len() {
         code.push_str(&format!("    super::trap::<{i}>,\n"));
     }
@@ -476,8 +642,8 @@ fn main() -> Result<()> {
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
     std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
     std::fs::write(
-        out.join("proxy_table.rs"),
-        proxy_table(&up, &host, &out)?,
+        out.join("bindings_table.rs"),
+        bindings_table(&up, &host, &out, &provider_soname(&manifest)?)?,
     )?;
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)

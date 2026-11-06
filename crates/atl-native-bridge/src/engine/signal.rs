@@ -149,9 +149,9 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     }
 }
 
-/// Host side of guest stubs `sigaction` / `sigaction64` (one LP64 layout).
+/// Host side of guest stubs `sigaction` / `sigaction64` (one LP64 layout; a `Shim` row of the binding table).
 /// Errors return -1 with the host errno only: the guest's errno is its own TLS, which this side does not reach (only an invalid signal number fails here).
-extern "C" fn sigaction(
+pub(super) extern "C" fn sigaction(
     sig: c_int,
     new: *const BionicSigaction,
     old: *mut BionicSigaction,
@@ -204,12 +204,4 @@ extern "C" fn sigaction(
     }
     rewrap_all();
     0
-}
-
-/// The host side of guest stub `name`, if this module serves it.
-pub fn host_fn(name: &str) -> Option<usize> {
-    match name {
-        "sigaction" | "sigaction64" => Some(sigaction as *const () as usize),
-        _ => None,
-    }
 }

@@ -142,8 +142,8 @@ macro_rules! restore_host_fs {
 static atl_nb_host_targets: [AtomicUsize; THUNKS] = [const { AtomicUsize::new(0) }; THUNKS];
 /// Next free thunk.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
-/// Thunks: one per binding, derived from the generated proxy table (proxy.rs `THUNKS`); the asm's `.rept` takes this count.
-pub const THUNKS: usize = super::proxy::THUNKS;
+/// Thunks: one per binding, derived from the generated binding table (bindings.rs `THUNKS`); the asm's `.rept` takes this count.
+pub const THUNKS: usize = super::bindings::THUNKS;
 /// Bytes per thunk: `call rel32` (5) padded to 8 (`.p2align 3` below).
 const THUNK_BYTES: usize = 8;
 
@@ -413,8 +413,7 @@ std::arch::global_asm!(
 );
 
 // the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot; frames are 32 bytes in the asm
-const _: () =
-    assert!(JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 32);
+const _: () = assert!(JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 32);
 
 /// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today; jni.rs asserts the fit).
 pub const JNI_STUBS: usize = 256;

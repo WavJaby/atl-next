@@ -9,11 +9,11 @@
 #[path = "x86_64.rs"]
 pub mod arch;
 mod args;
+pub mod bindings;
 pub mod image;
 mod intercepts;
 pub mod jni;
 mod provider;
-mod proxy;
 pub mod signal;
 pub mod thread;
 pub mod vdso;

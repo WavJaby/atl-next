@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Host side of NBS `libnative_bridge_vdso.so` (soname `linux-vdso.so.1`), the guest's door to the host: the guest linker takes it as the kernel vdso (auxv AT_SYSINFO_EHDR, bionic linker_main.cpp `add_vdso`), and the guest libc imports `native_bridge_intercept_symbol` from it.
 //! Its entries are 2-3-byte `ud2` bodies a translator traps on (berberis binds them per symbol, `MakeElfSymbolTrampolineCallable`); a native engine cannot patch code that small, so each entry's `st_value` in our mapped copy is rewritten to point at a host thunk (bias + value wraps to the thunk address). The file stays unpatched.
-//! `native_bridge_intercept_symbol` binds a guest libc stub (NBS `interceptable_functions.h` x86_64: `movabs $0, %r11; jmp *%r11`) by writing the thunk of its host function into the `movabs` immediate. Names without a host function stay unbound: the stub jumps to 0 if called (spike g1 binds what the linker's init path calls; full set = step 4.3).
+//! `native_bridge_intercept_symbol` binds a guest libc stub (NBS `interceptable_functions.h` x86_64: `movabs $0, %r11; jmp *%r11`) by writing the thunk of its binding (bindings.rs, keyed (library, name)) into the `movabs` immediate. A stub the table lacks, or whose host symbol is absent, stays unbound: it jumps to 0 if called.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
@@ -15,34 +15,6 @@ pub static BOUND: AtomicU32 = AtomicU32::new(0);
 pub static UNBOUND: AtomicU32 = AtomicU32::new(0);
 /// Names left unbound, for the startup report.
 pub static UNBOUND_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// The host function of guest stub `name`: the bionic provider's (provider.rs), our own (intercepts.rs, signal.rs), else glibc's own where the contract is the C one (memory, allocation, time). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
-fn host_fn(name: &str) -> Option<usize> {
-    if let Some(p) = super::provider::host_fn(name)
-        .or_else(|| super::intercepts::host_fn(name))
-        .or_else(|| super::signal::host_fn(name))
-    {
-        return Some(p);
-    }
-    Some(match name {
-        "memcpy" => libc::memcpy as *const () as usize,
-        "memset" => libc::memset as *const () as usize,
-        "memcmp" => libc::memcmp as *const () as usize,
-        "native_bridge_malloc" => libc::malloc as *const () as usize,
-        "native_bridge_free" => libc::free as *const () as usize,
-        "native_bridge_calloc" => libc::calloc as *const () as usize,
-        "native_bridge_realloc" => libc::realloc as *const () as usize,
-        "native_bridge_memalign" => libc::memalign as *const () as usize,
-        "native_bridge_posix_memalign" => libc::posix_memalign as *const () as usize,
-        "native_bridge_aligned_alloc" => libc::aligned_alloc as *const () as usize,
-        "native_bridge_malloc_usable_size" => libc::malloc_usable_size as *const () as usize,
-        "clock_gettime" => libc::clock_gettime as *const () as usize,
-        "clock_getres" => libc::clock_getres as *const () as usize,
-        "gettimeofday" => libc::gettimeofday as *const () as usize,
-        "time" => libc::time as *const () as usize,
-        _ => return None,
-    })
-}
 
 /// Rewrites the imm64 of the stub at `addr` to `target`; false if `addr` is not a stub.
 fn patch_stub(addr: usize, target: usize) -> bool {
@@ -87,11 +59,8 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
         // the exported entry (`jmp name_stub`) or a variable: reaches the host through the stub
         return;
     }
-    // a proxy library's stub resolves by (library, name) (proxy.rs), never by the global scope; libc's by name
-    let host = match super::proxy::target(&lib, &name) {
-        Some(t) => t.address(),
-        None => host_fn(&name),
-    };
+    // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope
+    let host = super::bindings::target(&lib, &name).and_then(|t| t.address());
     match host.and_then(arch::bind) {
         Some(thunk) if patch_stub(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);
