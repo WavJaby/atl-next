@@ -456,7 +456,11 @@ fn main() -> Result<()> {
                 let (_fd, scene) = frame_scene(width, height, f)?;
                 window2.present(&scene)?;
                 let saved = save(&out, &format!("frame-{f}.rgba"), &window2)?;
-                emit(format_args!("FRAME {f} time_ns={} {saved}", tick.time_ns));
+                emit(format_args!(
+                    "FRAME {f} time_ns={} scale={} {saved}",
+                    tick.time_ns,
+                    window2.scale().get()
+                ));
                 frame.set(f + 1);
                 if f + 1 < frames {
                     window2.request_frame();
