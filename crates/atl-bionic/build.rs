@@ -408,6 +408,12 @@ const FORWARDED_MACROS: &[&str] = &[
 /// tracing_perfetto_internal.cpp: `__system_property_find` / `__system_property_serial`).
 const SUBSTITUTES: &[&str] = &["sys/_system_properties.h", "sys/endian.h", "sys/limits.h"];
 
+/// bionic platform-private headers AOSP code includes, forwarded as they are (bionic's file by absolute path), per host arch (arches.toml row) where their meaning on glibc was checked.
+/// `bionic/tls.h`, x86_64: `__get_tls()` reads `%fs:0`, which glibc sets to its TCB self pointer as bionic does. AOSP's GL fronts keep the per-thread dispatch table in slot TLS_SLOT_OPENGL_API (4, tls_defines.h) = `%fs:32`, glibc x86_64 tcbhead_t `sysinfo`, a field glibc keeps for layout and writes only on i386 (NEED_DL_SYSINFO); tests/tls_slot.rs measures that.
+/// The GL trampolines (GLES2/gl2.cpp `CALL_GL_API_INTERNAL_CALL`) read that offset by inline asm, so the slot must sit at the thread pointer: a header returning a separate per-thread array would leave them reading a different word.
+/// Other hosts: glibc's thread-pointer layout differs (aarch64 `tp + 32` lies in the executable's TLS block), so no row until designed; their GL fronts fail to compile here.
+const PLATFORM_FORWARDS: &[(&str, &str)] = &[("x86_64", "bionic/tls.h")];
+
 /// Generated files: path relative to OUT_DIR -> text.
 type Outputs = Vec<(PathBuf, String)>;
 
@@ -755,6 +761,15 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
             .display()
             .to_string();
         wrappers.push((name.clone(), shape::print_forward(file, &source)?));
+    }
+    for (arch, name) in PLATFORM_FORWARDS {
+        if host.arch != *arch {
+            continue;
+        }
+        let source = format!("bionic/libc/platform/{name}");
+        let file = up.aosp(&source);
+        ensure!(file.is_file(), "{}: missing", file.display());
+        wrappers.push(((*name).to_owned(), shape::print_forward(&file, &source)?));
     }
     let host_inputs = host_probes
         .values()

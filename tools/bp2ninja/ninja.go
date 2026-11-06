@@ -492,7 +492,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 	}
 	libs = append(libs, "-Wl,--end-group")
 	var provided, providedRpath []string
-	// several provided modules may share an artifact (libEGL and libGLESv2: atl-opengl), linked once
+	// several provided modules may share an artifact (one crate providing two rows), linked once
 	seenLib := map[string]bool{}
 	for _, d := range sharedOrder {
 		if !d.provided {

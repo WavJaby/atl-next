@@ -63,7 +63,7 @@ cc_library { name: "libstat", srcs: ["s.cc"], static_libs: ["libcrypto"] }
 	}
 }
 
-// A row with several providers (libEGL = the host library + atl-opengl): every artifact first on the link line, in the row's order; one shared by two modules is linked once.
+// A row with several providers (a host library + a crate shared by two rows): every artifact first on the link line, in the row's order; one shared by two modules is linked once.
 func TestSeveralProviders(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `
 cc_library_shared { name: "libEGL", srcs: ["e.cc"] }
@@ -71,7 +71,7 @@ cc_library_shared { name: "libGLESv2", srcs: ["g.cc"] }
 cc_library_shared { name: "libbase", srcs: ["b.cc"] }
 cc_library_shared { name: "libgui", srcs: ["u.cc"], shared_libs: ["libbase", "libEGL", "libGLESv2"] }
 `})
-	ext := "/crates/lib/libatl_opengl.so"
+	ext := "/crates/lib/libshared_ext.so"
 	g.provided = map[string]Provided{
 		"libEGL":    {Libs: []string{"/usr/lib/libEGL.so", ext}},
 		"libGLESv2": {Libs: []string{"/usr/lib/libGLESv2.so", ext}},

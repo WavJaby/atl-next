@@ -128,12 +128,6 @@ crates = ["atl-binder-wire", "atl-binderd", "atl-binder-driver"]
 exports = ["atl-binderd"]
 uses = ["generators"]
 
-# AOSP libEGL / libGLES* surface on the host GL loaders, linked next to them (providers.toml): extension entry points as symbols, libEGL's private API
-[opengl]
-crates = ["atl-opengl"]
-exports = ["atl-opengl"]
-uses = ["generators"]
-
 # the NativeBridge core ART loads (`-XX:NativeBridge=`, plan S11 NB): which app libraries are bridged (`elf`) and the NativeBridgeCallbacks shells generated from native_bridge.h; bridge 1 routing so far, engines behind it later
 [native-bridge]
 crates = ["atl-native-bridge"]

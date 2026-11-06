@@ -58,21 +58,6 @@ min_reason = "BoringSSL CMakeLists.txt: cmake_minimum_required(VERSION 3.22)"
 scope = ["build"]
 used_by = ["upstream:boringssl"]
 
-# providers.toml system: rows (GL/Vulkan loaders): the dev package carries the .pc and the lib<name>.so link name
-[egl]
-debian = "libegl-dev"
-arch = "libglvnd"
-pkgconfig = "egl"
-scope = ["build", "runtime"]
-used_by = ["upstream:aosp"]
-
-# Mesa's EGL vendor library behind libglvnd: atl-opengl's tests need a real driver to resolve extensions through and to initialize a display on
-[egl-mesa]
-debian = "libegl-mesa0"
-arch = "mesa"
-scope = ["test"]
-used_by = ["crate:atl-opengl"]
-
 [flex]
 debian = "flex"
 arch = "flex"
@@ -93,19 +78,6 @@ arch = "git"
 scope = ["build", "test"]
 used_by = ["xtask:aosp", "xtask:check", "xtask:fetch", "xtask:patch"]
 
-[glesv1-cm]
-debian = "libgles-dev"
-arch = "libglvnd"
-pkgconfig = "glesv1_cm"
-scope = ["build", "runtime"]
-used_by = ["upstream:aosp"]
-
-[glesv2]
-debian = "libgles-dev"
-arch = "libglvnd"
-pkgconfig = "glesv2"
-scope = ["build", "runtime"]
-used_by = ["upstream:aosp"]
 
 # Go builds the converter (tools/bp2ninja), the one Go program allowed (CLAUDE.md)
 [go]

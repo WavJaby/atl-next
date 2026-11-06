@@ -75,27 +75,8 @@ reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsam
 provider = "module:libartpalette_fake"
 reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (owner 2026-11-02)"
 
-# GL and Vulkan loaders: the host's (libglvnd dispatching to Mesa, the Khronos Vulkan loader), owner decision 2026-10-31.
-# Headers stay AOSP's (gl_headers, vulkan_headers, through the tree modules' export_header_lib_headers): the Khronos registry headers the pinned AOSP code is written against (hwui uses EGL_TELEMETRY_HINT_ANDROID, absent from Debian 13's 2021 eglext.h); the Khronos ABI only grows, so they declare the host library correctly.
-# AOSP's libEGL_getProcAddress is a static helper of AOSP's libEGL alone: no row, nothing else links it.
-# Extension functions: AOSP's libEGL exports them as symbols, which AOSP code calls directly (eglCreateImageKHR, glEGLImageTargetTexture2DOES, ...); the host loaders (libglvnd) export only the core API and hand extensions out through eglGetProcAddress. atl-opengl exports them, each resolved through eglGetProcAddress (owner decision 2026-10-31), so every GL row links it after the host library.
-# libEGL's private API (private/EGL/cache.h, display.h; `android::egl_set_cache_filename`, `android::egl_get_init_count`), which hwui and libandroid_runtime call: atl-opengl exports both and installs their headers (owner decision 2026-11-01).
-# libGLESv1_CM's private API (`gl*PointerBounds`, declared by GLES_CM/gl.cpp and by each caller), which libandroid_runtime's GLES 1 bindings call: atl-opengl exports the seven, forwarding as gl.cpp does.
-["libEGL"]
-provider = ["system:egl", "crate:atl-opengl"]
-reason = "AOSP's GL loaders keep their dispatch tables in bionic's TLS_SLOT_OPENGL_API via __get_tls() (opengl/libs/hooks.h, bionic/tls.h), which on glibc is glibc's own thread block; it loads drivers only as Android EGL HALs. The host libEGL loads the desktop's driver"
-
-["libGLESv1_CM"]
-provider = ["system:glesv1-cm", "crate:atl-opengl"]
-reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES_CM/gl.cpp) into AOSP's libEGL; the host's GLESv1_CM dispatches into the host libEGL"
-
-["libGLESv2"]
-provider = ["system:glesv2", "crate:atl-opengl"]
-reason = "dispatches through bionic's TLS_SLOT_OPENGL_API (opengl/libs/GLES2/gl2.cpp) into AOSP's libEGL; the host's GLESv2 dispatches into the host libEGL"
-
-["libGLESv3"]
-provider = ["system:glesv2", "crate:atl-opengl"]
-reason = "AOSP's libGLESv3 is libGLESv2's sources under a second name (same TLS dispatch); on the desktop libGLESv2 carries the ES 3.x entry points (glesv2.pc: OpenGL ES v2/v3)"
+# GL: no row. AOSP's libEGL / libGLES* fronts are built from the tree and load Mesa built for the Android platform as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06).
+# Vulkan loader: the host's (the Khronos loader), owner decision 2026-10-31; AOSP's libvulkan replaces it at G4 (O2).
 
 ["libvulkan"]
 provider = "system:vulkan"

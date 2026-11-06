@@ -279,14 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atl-opengl"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "atl-bridgegen",
-]
-
-[[package]]
 name = "atl-parcel-truth"
 version = "0.0.0"
 dependencies = [
