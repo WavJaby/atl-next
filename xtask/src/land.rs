@@ -3,6 +3,7 @@
 //! Why this order: `src/<up>` is one checkout shared by every worktree and holds origin/main's pins and patches (`fetch::Main`), so a branch's unlanded patches exist only in its task copies (`src-wt/<branch>/<up>`), which only the branch's worktree resolves (`atl-layout`).
 //! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked in its own worktree before the push, and why its copies go only after main and `src/` reached the new commit.
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
+//! Cleanup runs in a child `cargo xtask land <branch> --cleanup --execute` in main: this process's binary predates the sync, so it cannot parse the tables the sync brought in.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -27,14 +28,19 @@ pub struct Args {
     /// Act: check, push, bring the main checkout and `src/` to the new commit, check again, clean up. Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
+    /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.
+    #[arg(long, hide = true, requires = "execute")]
+    cleanup: bool,
 }
 
-/// What `land` runs beside its git work: the check of a checkout and the fetch of the main checkout. Tests substitute both.
+/// What `land` runs beside its git work: the check of a checkout, the fetch of the main checkout and the cleanup child. Tests substitute all three.
 struct Runner<'a> {
     /// The checkout's verdict line, Ok only when that check passed (`check_verdict`).
     check: &'a dyn Fn(&Path) -> Result<String>,
     /// `xtask fetch --execute` in the main checkout.
     fetch: &'a dyn Fn(&Path) -> Result<()>,
+    /// The cleanup child for the main checkout and the branch; its note line (`cleanup_execute`).
+    cleanup: &'a dyn Fn(&Path, &str) -> Result<String>,
 }
 
 /// One step of a landing, in run order.
@@ -49,7 +55,7 @@ enum Stage {
     Sync,
     /// `cargo xtask check` in the main checkout.
     VerifyMain,
-    /// Task copies, the state note (kept in out/), the worktree and the branch.
+    /// Task copies, the state note (kept in out/), the worktree and the branch, in a child (`cleanup_execute`): this process's binary predates the sync.
     Cleanup,
 }
 
@@ -69,7 +75,6 @@ impl Stage {
 /// The preflight's facts: what the stages need, read without writing.
 struct Plan {
     repo: PathBuf,
-    ws: PathBuf,
     branch: String,
     wt: PathBuf,
     /// origin/main before the push.
@@ -84,6 +89,10 @@ struct Plan {
 
 /// `xtask land <branch>`: prints the steps unless `--execute`.
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if args.cleanup {
+        println!("{}", clean_up_child(root, &args.branch)?);
+        return Ok(ExitCode::SUCCESS);
+    }
     let plan = Plan::new(root, &args.branch, args.execute)?;
     let stages = plan.stages();
     if !args.execute {
@@ -99,6 +108,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let runner = Runner {
         check: &check_verdict,
         fetch: &fetch_execute,
+        cleanup: &cleanup_execute,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -205,7 +215,6 @@ impl Plan {
         }
         Ok(Plan {
             repo: repo.to_path_buf(),
-            ws: layout.workspace().to_path_buf(),
             branch: branch.to_owned(),
             wt,
             origin,
@@ -322,8 +331,7 @@ impl Plan {
                     self.repo.display()
                 )
             }),
-            Stage::Cleanup => self
-                .cleanup()
+            Stage::Cleanup => (runner.cleanup)(&self.repo, &self.branch)
                 .context("pushed and checked, but cleanup failed: finish it by hand"),
         }
     }
@@ -360,33 +368,6 @@ impl Plan {
         })?;
         Ok(format!("main and src/ at {}", short(&self.head)))
     }
-
-    /// The task copies, then the state note, the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
-    fn cleanup(&self) -> Result<String> {
-        let wt = self.wt.display().to_string();
-        let copies = copies_of(
-            &Layout::new(&self.ws, Some(self.branch.as_str())),
-            &sources::load(&self.wt)?,
-        );
-        if !copies.is_empty() {
-            let failed = patch::done_task(&self.repo, &self.branch, copies.clone())?;
-            ensure!(failed == 0, "{failed} task copies not removed (rows above)");
-        }
-        let note = self.wt.join(STATE_NOTE);
-        if note.is_file() {
-            let out = self.ws.join("out");
-            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-            let kept = out.join(format!("{}-state-note.md", self.branch));
-            std::fs::copy(&note, &kept).with_context(|| format!("keeping {}", note.display()))?;
-        }
-        git(Some(&self.repo), &["worktree", "remove", "--force", &wt])?;
-        git(Some(&self.repo), &["branch", "-d", &self.branch])?;
-        Ok(format!(
-            "{} task copies, worktree {wt}, branch {}",
-            copies.len(),
-            self.branch
-        ))
-    }
 }
 
 /// `cargo xtask check` in `dir`, run by that checkout's own xtask: its verdict line, or an error carrying it when the check did not pass.
@@ -413,6 +394,62 @@ fn fetch_execute(dir: &Path) -> Result<()> {
         "cargo xtask fetch --execute exited with {status}"
     );
     Ok(())
+}
+
+/// The cleanup child: `cargo xtask land <branch> --cleanup --execute` in the main checkout, run by that checkout's own xtask.
+/// `cargo run` rebuilds it from the source the sync moved to; the pre-sync binary cannot parse the tables the sync brought (`licenses.toml` `[test_only]`). Returns the note line it printed.
+fn cleanup_execute(repo: &Path, branch: &str) -> Result<String> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "land", branch, "--cleanup", "--execute"])
+        .current_dir(repo);
+    let (status, stdout, stderr) = check::run_teed(cmd)
+        .with_context(|| format!("running cargo xtask land --cleanup in {}", repo.display()))?;
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        stderr
+            .rfind("Error:")
+            .map_or(stderr.trim_end(), |at| stderr[at..].trim_end())
+    );
+    stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
+        .context("the cleanup child printed no note")
+}
+
+/// The cleanup child's body. The parent names only the branch, so the worktree is looked up again here.
+fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
+    let porcelain = git_raw(repo, &["worktree", "list", "--porcelain"])?;
+    let wt = find_worktree(&porcelain, branch)
+        .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
+    let ws = Layout::of(repo)?.workspace().to_path_buf();
+    clean_up(repo, &ws, &wt, branch)
+}
+
+/// The task copies, then the state note (kept in out/), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
+fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
+    let copies = copies_of(&Layout::new(ws, Some(branch)), &sources::load(wt)?);
+    if !copies.is_empty() {
+        let failed = patch::done_task(repo, branch, copies.clone())?;
+        ensure!(failed == 0, "{failed} task copies not removed (rows above)");
+    }
+    let note = wt.join(STATE_NOTE);
+    if note.is_file() {
+        let out = ws.join("out");
+        std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+        let kept = out.join(format!("{branch}-state-note.md"));
+        std::fs::copy(&note, &kept).with_context(|| format!("keeping {}", note.display()))?;
+    }
+    let wt_arg = wt.display().to_string();
+    git(Some(repo), &["worktree", "remove", "--force", &wt_arg])?;
+    git(Some(repo), &["branch", "-d", branch])?;
+    Ok(format!(
+        "{} task copies, worktree {wt_arg}, branch {branch}",
+        copies.len()
+    ))
 }
 
 /// A verdict line that passed: `check: ok`, optionally followed by its counts.
@@ -673,11 +710,15 @@ mod tests {
         let fetch_fn = |_: &Path| -> Result<()> {
             panic!("the main checkout was fetched after a failed check")
         };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> {
+            panic!("the cleanup child ran after a failed check")
+        };
         let line = plan.execute(
             &stages,
             &Runner {
                 check: &check_fn,
                 fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
             },
         );
         assert!(
@@ -697,25 +738,35 @@ mod tests {
         let plan = Plan::new(&env.repo, "land", true).unwrap();
         let check_fn = |_: &Path| -> Result<String> { Ok("check: ok (12 steps)".to_owned()) };
         let fetch_fn = |_: &Path| -> Result<()> { Ok(()) };
+        // the cleanup child, run in this process: the stage must reach it through the runner
+        let children = std::cell::RefCell::new(Vec::new());
+        let cleanup_fn = |repo: &Path, branch: &str| -> Result<String> {
+            children
+                .borrow_mut()
+                .push((repo.to_path_buf(), branch.to_owned()));
+            clean_up_child(repo, branch)
+        };
         let stages = plan.stages();
         let line = plan.execute(
             &stages,
             &Runner {
                 check: &check_fn,
                 fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
             },
         );
         assert_eq!(line, "land: ok (5 steps)");
+        assert_eq!(*children.borrow(), [(env.repo.clone(), "land".to_owned())]);
         assert_eq!(env.origin_main(), head);
         assert_eq!(git(Some(&env.repo), &["rev-parse", "HEAD"]).unwrap(), head);
-        assert!(!env.wt.exists(), "the worktree is kept");
+        assert!(!env.wt.exists(), "the worktree is not removed");
         assert!(
             git(
                 Some(&env.repo),
                 &["rev-parse", "--verify", "-q", "refs/heads/land"]
             )
             .is_err(),
-            "the branch is kept"
+            "the branch is not removed"
         );
     }
 

@@ -527,14 +527,10 @@ impl Host {
         .collect()
     }
 
-    /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.surfaceflinger.suffix` makes libgui look up this process's own compositor
-    /// (compositor_registry.rs); `ro.atl.display` is the display that compositor answers with, the model the services answer with too; `ro.atl.headless.pointer` is the input script, present only with `--headless-pointer`.
+    /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.display` is the display the process's compositor answers with
+    /// (compositor_registry.rs), the model the services answer with too; `ro.atl.headless.pointer` is the input script, present only with `--headless-pointer`.
     fn process_properties(&self, uid: u32, name: &str) -> Result<PathBuf> {
         let mut props = self.defaults.clone();
-        props.push((
-            compositor_registry::SUFFIX_PROPERTY.to_owned(),
-            compositor_registry::suffix(uid, name),
-        ));
         props.push((
             compositor_registry::DISPLAY_PROPERTY.to_owned(),
             self.display.to_arg(),

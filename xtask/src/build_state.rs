@@ -84,7 +84,7 @@ pub fn ensure_current(root: &Path, out: &Path) -> Result<()> {
     ensure_matches(&of_build(root)?, out)
 }
 
-fn ensure_matches(now: &str, out: &Path) -> Result<()> {
+pub(crate) fn ensure_matches(now: &str, out: &Path) -> Result<()> {
     let recorded = match std::fs::read_to_string(out.join(RECORD)) {
         Ok(s) => s.trim().to_owned(),
         Err(_) => bail!(

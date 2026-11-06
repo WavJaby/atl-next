@@ -68,6 +68,7 @@ mod sensors;
 mod service_mirrors;
 mod services;
 mod slot;
+mod soong;
 mod sources;
 mod spdx;
 mod system;
@@ -266,10 +267,18 @@ fn main() -> Result<ExitCode> {
         Command::Check(_) => Some(false),
         _ => None,
     };
-    if let Some(shell) = shell
-        && let Some(code) = tree::enter(&tree::overlays_of(&root)?, shell)?
-    {
-        return Ok(code);
+    if let Some(shell) = shell {
+        let overlays = tree::overlays_of(&root)?;
+        // `native --shell`: the shell gets the compiler-cache variables of its own source view, as each ninja run does
+        let env = match &cli.command {
+            Command::Native(a) if a.shell => {
+                native::shell_env(a, &root, &tree::describe(&overlays))?
+            }
+            _ => Vec::new(),
+        };
+        if let Some(code) = tree::enter(&overlays, shell, &env)? {
+            return Ok(code);
+        }
     }
     let result = match cli.command {
         Command::Check(args) => check::run(&root, &args),

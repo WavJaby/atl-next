@@ -10,12 +10,12 @@ publish.workspace = true
 # The in-app SurfaceFlinger (M3 slice 4, plan C3 "Amended 2026-11-04"): the binder front-ends of the atl-compositor core. They implement AOSP's own interfaces (android.ui.ISurfaceComposer raw,
 # android.gui.ISurfaceComposer / ISurfaceComposerClient / IDisplayEventConnection through the converter's stubs) and call back ITransactionCompletedListener, so only `xtask native` builds them (feature `converter`);
 # plain workspace builds take the modules without binder types (wire, objects, vsync, clock) and their tests. The launcher (atl-app-launcher) starts the compositor in an app process.
-# librustutils: the process's system properties (the suffix and display atld wrote into its property area).
+# librustutils: the process's system properties (the display atld wrote into its property area).
 [package.metadata.atl]
 converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
 
 [features]
-converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services/converter"]
+converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services/converter", "atl-service-view/converter"]
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
@@ -27,6 +27,7 @@ atl-libinput = { path = "../atl-libinput" }
 atl-platform-ui = { path = "../atl-platform-ui" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 atl-services = { path = "../atl-services" }
+atl-service-view = { path = "../atl-service-view" }
 rustix.workspace = true
 tracing.workspace = true
 

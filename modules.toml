@@ -44,13 +44,19 @@ uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "ser
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "bionic", "composer", "platform-ui"]
+uses = ["generators", "bionic", "composer", "platform-ui", "service-view"]
+
+# the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger; later Codec2, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
+[service-view]
+crates = ["atl-service-view"]
+exports = ["atl-service-view"]
+uses = ["aidl", "generators"]
 
 # the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules
 [composer]
 crates = ["atl-composer"]
 exports = ["atl-composer"]
-uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths"]
+uses = ["aidl", "compositor", "libgui-parcel", "ime", "libinput", "platform-ui", "scene-buffer", "services", "generators", "android-paths", "service-view"]
 
 # framework natives (libandroid_runtime) ATL implements itself instead of building their AOSP sources
 [android-runtime]

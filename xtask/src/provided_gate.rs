@@ -102,9 +102,28 @@ pub fn exported(lib: &Path) -> Result<Exported> {
     })
 }
 
-/// The converter's link outputs under `<out>/device/<module>/`: `<name>.so` and the executable `<name>`, name = Soong's stem + suffix (bp2ninja outName: libartpalette_fake/libartpalette-system.so, dalvikvm/dalvikvm64).
+/// The device outputs of the current converter graph (graph.json `artifacts."device/<module>".out`): the only files the gate scans.
+/// A module directory keeps the files of earlier builds (a renamed or dropped module's `libEGL*`), which are not what this build links.
+pub fn current_outputs(out: &Path) -> Result<BTreeSet<PathBuf>> {
+    let file = out.join("graph.json");
+    let graph: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?,
+    )
+    .with_context(|| file.display().to_string())?;
+    let artifacts = graph["artifacts"]
+        .as_object()
+        .context("graph.json has no artifacts")?;
+    Ok(artifacts
+        .iter()
+        .filter(|(module, _)| module.starts_with("device/"))
+        .filter_map(|(_, row)| row["out"].as_str())
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// The converter's link outputs under `<out>/device/<module>/` that `current` names: `<name>.so` and the executable `<name>`, name = Soong's stem + suffix (bp2ninja outName: libartpalette_fake/libartpalette-system.so, dalvikvm/dalvikvm64).
 /// Everything else there has an extension (archives, link traces) or is no ELF file (read_elf skips it).
-fn artifacts(device: &Path) -> Result<Vec<(PathBuf, bool)>> {
+fn artifacts(device: &Path, current: &BTreeSet<PathBuf>) -> Result<Vec<(PathBuf, bool)>> {
     let mut out = Vec::new();
     let Ok(dirs) = std::fs::read_dir(device) else {
         return Ok(out);
@@ -119,7 +138,7 @@ fn artifacts(device: &Path) -> Result<Vec<(PathBuf, bool)>> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !path.is_file() {
+            if !path.is_file() || !current.contains(&path) {
                 continue;
             }
             if name.ends_with(".so") {
@@ -133,13 +152,13 @@ fn artifacts(device: &Path) -> Result<Vec<(PathBuf, bool)>> {
     Ok(out)
 }
 
-/// Checks every artifact under `device` against the `provided` libraries.
-pub fn check(device: &Path, provided: &[Exported]) -> Result<Report> {
+/// Checks every artifact under `device` that `current` names (`current_outputs`) against the `provided` libraries.
+pub fn check(device: &Path, provided: &[Exported], current: &BTreeSet<PathBuf>) -> Result<Report> {
     if provided.is_empty() {
         bail!("no provided library to check against");
     }
     let mut report = Report::default();
-    for (path, executable) in artifacts(device)? {
+    for (path, executable) in artifacts(device, current)? {
         let Some(elf) = read_elf(&path, executable)? else {
             continue;
         };
@@ -267,5 +286,31 @@ mod tests {
         // not needing a provided library at all is fine: the process's first needed list brings it
         let leaf = elf(&["libc.so.6"], &[]);
         assert!(violations("leaf.so", &leaf, false, &p, &mut weak).is_empty());
+    }
+
+    #[test]
+    fn only_the_current_graphs_outputs_are_scanned() {
+        let root =
+            std::env::temp_dir().join(format!("xtask-provided-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let device = root.join("device");
+        std::fs::create_dir_all(device.join("libnew")).expect("test dir");
+        std::fs::create_dir_all(device.join("libold")).expect("test dir");
+        std::fs::write(device.join("libnew/libnew.so"), b"not elf").expect("test file");
+        // left by an earlier build: no longer in build.ninja's graph
+        std::fs::write(device.join("libold/libold.so"), b"not elf").expect("test file");
+        std::fs::write(
+            root.join("graph.json"),
+            format!(
+                r#"{{"artifacts": {{"device/libnew": {{"out": "{d}/libnew/libnew.so"}}, "host/x": {{"out": "{d}/host/x"}}}}}}"#,
+                d = device.display()
+            ),
+        )
+        .expect("test graph");
+        let current = current_outputs(&root).expect("graph read");
+        assert_eq!(current, BTreeSet::from([device.join("libnew/libnew.so")]));
+        let scanned = artifacts(&device, &current).expect("scan");
+        assert_eq!(scanned, [(device.join("libnew/libnew.so"), false)]);
+        std::fs::remove_dir_all(&root).expect("test dir cleanup");
     }
 }

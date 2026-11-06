@@ -69,3 +69,7 @@ print_stderr = "deny"
 # allowed in tests via clippy.toml `allow-unwrap-in-tests`; elsewhere `expect("reason")` or `?`
 unwrap_used = "deny"
 undocumented_unsafe_blocks = "deny"
+
+# Dev builds keep line tables only: backtraces still show file:line; variable and type debuginfo is dropped.
+[profile.dev]
+debug = "line-tables-only"

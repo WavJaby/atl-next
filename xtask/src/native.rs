@@ -689,14 +689,26 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// The environment `native --shell` gives the shell: the compiler cache's variables for source view `view` (`tree::describe`), the ones every ninja run in that view gets (`CompilerCache::env`).
+/// Without them a hand-run `ninja` reads no `SCCACHE_SERVER_UDS` and reaches another view's server, which compiles that view's sources (measured: the shared `server.sock`).
+pub(crate) fn shell_env(
+    args: &Args,
+    repo: &Path,
+    view: &str,
+) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
+    let workspace = Layout::of(repo)?.workspace().to_path_buf();
+    Ok(CompilerCache::of(args, &workspace, view).map_or_else(Vec::new, |c| c.env().to_vec()))
+}
+
 /// The compiler cache of the converter's C/C++ compiles: sccache, prefixed to the cc rule by the converter's `-launcher` (tools/bp2ninja ninja.go says why Rust and yasm steps go uncached).
 /// Preprocessor mode only (`SCCACHE_DIRECT=false`): it keys a compile on its preprocessed text and non-preprocessor flags, not on paths, so another out dir or a task build hits wherever the text is equal (measured with sccache 0.10).
 /// Direct mode, sccache's default, keys on the include paths, which name the out dir (`-I<out>/compat/device`, `-isystem <out>/gen/...`): measured 21% hits in a second out dir, every cross-out-dir lookup a miss. Do not drop the setting.
 /// It writes the depfile from its own preprocessor run, so `deps = gcc` sees this out dir's headers on a hit too. Compiles with debug info run uncached (bp2ninja `debugInfo`): a hit would carry the filling out dir's paths in DWARF.
 /// The one remaining difference from an uncached build: two sources with equal preprocessed text (empty `*_neon.cc` on x86, trivial generated AIDL/pbzero units) share an entry, so the local `STT_FILE` symbol may name the other source's basename; code, data and relocations are equal.
 /// Its server is this cache's own: a socket inside the cache dir, so a user's own sccache server (another dir, another size) is never the one answering.
-/// One server per source view: the server, not the client, runs the preprocessor and the compiler, so it reads sources in its own mount namespace. A server shared with a task build (tree.rs namespace) compiled the unpatched `src/aosp` -> wrong objects.
-/// The socket is keyed by the overlay set (`tree::describe`); a server started inside a namespace only ever serves clients of that same view. Do not share one socket across views.
+/// One server per build: the server, not the client, runs the preprocessor and the compiler, so it reads sources in the mount namespace it started in.
+/// A copy removed and re-created under its path (patch --done, --edit) leaves an older server on the deleted directory: compiles then fail with `no such file`. So the socket carries the view (`tree::describe`) and a token unique to each cache, and `Drop` stops it with the build.
+/// Do not share one socket across builds or views.
 /// The on-disk entries stay shared: sccache 0.10 c.rs `hash_key` keys on compiler digest + common/arch args (-D yes, -I/-isystem no) + 7 whitelisted env vars + the preprocessed text, so a differing patched file gives a differing key.
 #[derive(Debug, PartialEq)]
 pub(crate) struct CompilerCache {
@@ -717,21 +729,26 @@ impl CompilerCache {
         })
     }
 
-    /// The cache in `dir` as seen from source view `view` (task-bind gate: a scratch dir).
+    /// A new cache in `dir` as seen from source view `view` (task-bind gate: a scratch dir). Its server is shared with no other cache.
     pub(crate) fn for_view(launcher: &str, dir: PathBuf, view: &str) -> Self {
         Self {
             launcher: launcher.into(),
-            socket: dir.join(format!("server-{:016x}.sock", fnv1a(view.as_bytes()))),
+            socket: dir.join(format!(
+                "server-{:016x}-{:016x}.sock",
+                fnv1a(view.as_bytes()),
+                build_token()
+            )),
             dir,
         }
     }
 
-    /// Stops this view's server (task-bind gate cleanup; builds leave theirs running).
-    pub(crate) fn stop(&self) {
+    /// Stops this cache's server and removes its socket file (sccache leaves it behind). Runs on `Drop`: a build's server ends with the build.
+    fn stop(&self) {
         let _ = Command::new(&self.launcher)
             .arg("--stop-server")
             .envs(self.env())
             .output();
+        let _ = std::fs::remove_file(&self.socket);
     }
 
     fn converter_args(&self) -> [&str; 2] {
@@ -777,6 +794,26 @@ impl CompilerCache {
         );
         Ok(())
     }
+}
+
+impl Drop for CompilerCache {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Differs between processes and between calls (pid + clock): the socket name must never name an earlier build's server.
+fn build_token() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+    fnv1a(
+        &[
+            u64::from(std::process::id()).to_le_bytes(),
+            now.to_le_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 /// Prints the table check's problems; the first one, None when there are none.
@@ -1042,7 +1079,8 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     if exported.is_empty() {
         return Ok(None);
     }
-    let report = provided_gate::check(&out.join("device"), &exported)?;
+    let current = provided_gate::current_outputs(out)?;
+    let report = provided_gate::check(&out.join("device"), &exported, &current)?;
     println!(
         "native: provided gate: {} libraries, {} artifacts, {} weak fallbacks lose, {} violations",
         exported.len(),
@@ -1341,15 +1379,17 @@ nope
         let env: BTreeMap<_, _> = on.env().into_iter().collect();
         assert_eq!(env["SCCACHE_DIR"], "/ws/cache/sccache");
         assert_eq!(env["SCCACHE_DIRECT"], "false");
-        // FNV-1a 64 offset basis = hash of the empty view (the plain build)
-        assert_eq!(
-            env["SCCACHE_SERVER_UDS"],
-            "/ws/cache/sccache/server-cbf29ce484222325.sock"
-        );
+        // view hash = FNV-1a 64 offset basis for the empty view (the plain build); then this cache's token
+        let uds = env["SCCACHE_SERVER_UDS"].to_string_lossy().into_owned();
+        assert!(uds.starts_with("/ws/cache/sccache/server-cbf29ce484222325-"));
+        assert!(uds.ends_with(".sock"));
         // another source view -> another server, same on-disk cache
         let task = CompilerCache::of(&parse(&[]), ws, "bionic=/ws/src-wt/t/bionic").unwrap();
         assert_ne!(task.socket, on.socket);
         assert_eq!(task.dir, on.dir);
+        // the same view again -> still another server: no build inherits an earlier build's
+        let again = CompilerCache::of(&parse(&[]), ws, "").unwrap();
+        assert_ne!(again.socket, on.socket);
         let other =
             CompilerCache::of(&parse(&["--compiler-cache", "/opt/sccache"]), ws, "").unwrap();
         assert_eq!(other.converter_args(), ["-launcher", "/opt/sccache"]);
@@ -1357,6 +1397,21 @@ nope
             CompilerCache::of(&parse(&["--no-compiler-cache"]), ws, ""),
             None
         );
+    }
+
+    /// sccache leaves its socket file behind; a dropped cache's file must go with it.
+    #[test]
+    fn dropping_a_cache_removes_its_socket_file() {
+        let dir = std::env::temp_dir().join(format!("atl-cc-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // no such launcher: the stop fails quietly and the file must still go
+        let cache = CompilerCache::for_view("atl-no-such-compiler-launcher", dir.clone(), "");
+        let socket = cache.socket.clone();
+        std::fs::write(&socket, b"").expect("stand-in socket file");
+        drop(cache);
+        let gone = !socket.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "the socket file of a dropped cache is still there");
     }
 
     #[test]

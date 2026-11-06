@@ -41,3 +41,13 @@ pub unsafe extern "C" fn dlsym(_handle: *mut c_void, symbol: *const c_char) -> *
     atl_guest_dlsym_hits.fetch_add(1, Ordering::Relaxed);
     android_set_abort_message as *const () as *mut c_void
 }
+
+/// `cargo build --all-targets` links this crate's lib test harness even with `test = false` (Cargo.toml), and the host has no bionic to supply the symbol.
+/// This no-op stands in for it in that harness only (`cfg(test)`); the guest build links bionic's function.
+#[cfg(test)]
+mod host_harness {
+    use core::ffi::c_char;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn android_set_abort_message(_msg: *const c_char) {}
+}

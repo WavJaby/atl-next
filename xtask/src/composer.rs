@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test composer`: the in-app SurfaceFlinger (crate atl-composer) against AOSP's libgui in a real app process (M3 slice 4).
-//! atld starts the services and the composer fixture's class (xtask/testdata/composer: `Client`) as an app process (`--run-class`, uid 10123): its launcher starts the process's compositor, which is registered through the system process as
-//! `SurfaceFlinger-<uid>-<process>` / `SurfaceFlingerAIDL-<uid>-<process>`, and libgui's lookup finds it by the suffix in the process's property area. The client then does what a window does with the framework's public API:
+//! atld starts the services and the composer fixture's class (xtask/testdata/composer: `Client`) as an app process (`--run-class`, uid 10123): its launcher starts the process's compositor, served as
+//! `SurfaceFlinger` / `SurfaceFlingerAIDL` by the process's own service view (atl-service-view), where libgui's unpatched lookup finds it; its UI agent is registered through the system process. The client then does what a window does with the framework's public API:
 //! two layers (`createConnection`, `createSurface`), 30 transactions (`setTransactionState`), a transaction-committed callback (the compositor's call into libgui's TransactionCompletedListener) and Choreographer's vsync (`createDisplayEventConnection`, the BitTube).
 //! Pass (all checked from the logs, [`evaluate`]): both services registered; every client step logged; the compositor's own counters (its last `composer: counters` line) show every transaction applied, both layers created and gone, every vsync event sent and
 //! none dropped, the callback delivered; the vsync cadence is the display model's refresh interval (Choreographer's frame times) and close to it on the wall clock; no FATAL EXCEPTION and no wait on an unserved service.
@@ -38,6 +38,9 @@ pub struct Args {
     /// Instead of the run: the verdict on synthetic logs (what the gate must pass and must fail). Needs no device.
     #[arg(long)]
     self_test: bool,
+    /// Deliberate failure: the compositor is not served by the process's service view (atl-composer `BREAK_NO_SERVE`); the run must fail, libgui left waiting for `SurfaceFlinger`.
+    #[arg(long)]
+    break_view: bool,
     /// liblog tag filter of the app (ANDROID_LOG_TAGS).
     #[arg(long, default_value = "*:i")]
     log_tags: String,
@@ -217,12 +220,12 @@ fn pixel_checks(app: &str) -> Vec<Check> {
 /// Every check of a run, from its client log (the process's stdout and stderr: liblog records and the compositor's stderr lines) and the services' log.
 fn evaluate(app: &str, services: &str, display: &DisplayModel) -> Vec<Check> {
     let mut out = Vec::new();
-    let suffix = atl_services::compositor_registry::suffix(APP_UID, CLIENT_NAME);
-    let (name, name_aidl) = atl_services::compositor_registry::service_names(&suffix);
+    let served = served_line();
+    let agent = agent_line();
     out.push(check(
         "registered",
-        services.contains(&format!("services: registered {name}, {name_aidl}")),
-        format!("{name}, {name_aidl}"),
+        app.contains(&served) && services.contains(&agent),
+        format!("`{served}` in the app, `{agent}` in the services"),
     ));
     let steps = [
         ("layers", "layers created valid=true"),
@@ -385,7 +388,8 @@ fn log_showing(frames: &[u32]) -> String {
         }
     }
     format!(
-        "1 1 1 I liblog/AtlComposer: start\n\
+        "{}\n\
+         1 1 1 I liblog/AtlComposer: start\n\
          1 1 1 I liblog/AtlComposer: fds baseline=41\n\
          2 1 1 I liblog/AtlComposer: layers created valid=true\n\
          2 1 1 I liblog/AtlComposer: bbq created surface valid=true\n\
@@ -396,14 +400,24 @@ fn log_showing(frames: &[u32]) -> String {
          {quads}\
          composer: counters ticks=50 transactions=66 layers_created=4 layers_alive=0 transactions_applied=66 layer_states=95 unknown_layer=0 buffers_acquired=31 buffers_released=31 completions=1 scenes=36 vsync_sent=50 vsync_dropped=0 callbacks_sent=1 callbacks_failed=0 releases_on_channel=29 releases_peer_gone=2 fds_held=0 fds_taken=62 fds_closed=62 ignored=\n\
          5 1 1 I liblog/AtlComposer: fds after=41\n\
-         6 1 1 I liblog/AtlComposer: done\n"
+         6 1 1 I liblog/AtlComposer: done\n",
+        served_line()
     )
 }
 
 fn good_services() -> String {
-    let suffix = atl_services::compositor_registry::suffix(APP_UID, CLIENT_NAME);
-    let (a, b) = atl_services::compositor_registry::service_names(&suffix);
-    format!("services: registered {a}, {b}\n")
+    format!("{}\n", agent_line())
+}
+
+/// atl-composer start's line once both services are in the process's service view.
+fn served_line() -> String {
+    use atl_services::compositor_registry::{SURFACE_FLINGER, SURFACE_FLINGER_AIDL};
+    format!("composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process")
+}
+
+/// The registry's line once the client's UI agent is registered (registry_service.rs).
+fn agent_line() -> String {
+    format!("services: registered the UI agent of uid {APP_UID}")
 }
 
 /// One synthetic run and the checks that must fail on it (empty: the run must pass).
@@ -658,6 +672,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?;
     // the display this gate judges against: atld takes it as given and never asks the desktop
     let rt = rt.with_display(display.to_arg());
+    let rt = if args.break_view {
+        rt.with_ui_break("no-serve")
+    } else {
+        rt
+    };
     let work = rt.out.join("composer");
     let apk = rt
         .apk
