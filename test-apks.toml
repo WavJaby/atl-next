@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+# The test APKs `xtask run-apk <row>` runs: pinned official builds, never built here. A row's file is downloaded once into <workspace>/cache/test-apks/<sha256>.apk; every use re-verifies it, so a damaged or swapped file is refused by name, never run.
+#
+# Row key: the name `xtask run-apk` takes (lowercase letters, digits, `-`).
+# Fields, all required:
+#   package       application id. run-apk checks it against the APK's own manifest.
+#   version_name  the APK's own versionName: run-apk checks it against the manifest. A github-release url's tag need not equal it.
+#   version_code  integer. run-apk checks it against the manifest. fdroid: the url's file name must be `<package>_<version_code>.apk`.
+#   url           https. fdroid: https://f-droid.org/repo/<package>_<version_code>.apk. github-release: https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>.apk
+#   sha256        64 lowercase hex digits of the downloaded file. Checked at download and at every use of the cache.
+#   size          bytes of the downloaded file. Same.
+#   signer_sha256 64 lowercase hex digits of the signing certificate's SHA-256: the first certificate of the first signer of the v2 signing block (v3 when there is no v2), apksigner's `Signer #1 certificate SHA-256 digest`. Same.
+#   source        fdroid | github-release. Fixes the shape of the url.
+# `cargo xtask check` (step tables) checks the schema and the url and file-name invariants. The content fields are checked against the file itself: `xtask fetch --test-apks --execute` downloads and verifies every row, `xtask run-apk` verifies the row it runs. A mismatch refuses the row and names the field.
+# Rows are added when a gate first needs them.
+
+# fdroid rows: signed with Fossify's key (CN=Naveen Singh), the signer the measured builds carry
+[fossify-math]
+package = "org.fossify.math"
+version_name = "1.4.0"
+version_code = 10
+url = "https://f-droid.org/repo/org.fossify.math_10.apk"
+sha256 = "7c5443c22d6d62c67dfe80df33ea9161ff0fa440f92590bcb45d7008b57613ed"
+size = 7047681
+signer_sha256 = "affdb124d3f4720c2f98dbca9eacba0514fba4306e20a2786c861c3c0d6ff292"
+source = "fdroid"
+
+[fossify-notes]
+package = "org.fossify.notes"
+version_name = "1.7.0"
+version_code = 13
+url = "https://f-droid.org/repo/org.fossify.notes_13.apk"
+sha256 = "5a56e0e39cc488e1f3b947d3801006d3b7450ec73c67f03195c64c5fd3b6bced"
+size = 9528948
+signer_sha256 = "affdb124d3f4720c2f98dbca9eacba0514fba4306e20a2786c861c3c0d6ff292"
+source = "fdroid"
+
+# the upstream release asset of tag 1.14.0; its manifest declares versionName 1.0. Signed with the Android debug key (CN=Android Debug): the owner accepted that signature
+[material-catalog]
+package = "io.material.catalog"
+version_name = "1.0"
+version_code = 1
+url = "https://github.com/material-components/material-components-android/releases/download/1.14.0/catalog-debug.apk"
+sha256 = "fe8658062885413953798af76e2df85b4d65f9c756f233268dc5e607d7435e09"
+size = 35799987
+signer_sha256 = "597d7771ec20993d1c45310913d2d4e4e8de1638b4ba58c5fbfbc071812236f4"
+source = "github-release"

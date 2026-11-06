@@ -22,7 +22,7 @@
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
 #            upstream:<sources.toml name or aosp>, xtask:<subcommand>
 # Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle,
-# the Android SDK and apkeep (their only callers are test-APK scripts outside the repo, so no consumer to check).
+# the Android SDK and apkeep (no repo consumer: the test APKs are pinned in test-apks.toml and downloaded with curl).
 # Rows are added when a consumer first needs them.
 
 [bison]
@@ -86,6 +86,16 @@ min = "3.22"
 min_reason = "BoringSSL CMakeLists.txt: cmake_minimum_required(VERSION 3.22)"
 scope = ["build"]
 used_by = ["upstream:boringssl"]
+
+# downloads the test APKs of test-apks.toml (`xtask fetch --test-apks`, `xtask run-apk`): HTTPS, redirects followed, file size capped
+[curl]
+debian = "curl"
+arch = "curl"
+binary = "curl"
+min = "8.14.1"
+min_reason = "observed 2026-11-06; older is untested"
+scope = ["test"]
+used_by = ["xtask:fetch", "xtask:run-apk"]
 
 # the Java pipeline's d8: a bash script that runs r8.jar with `java` on PATH, so it runs with the `jdk` row's JDK first on PATH (atld_run.rs)
 [d8]
@@ -152,7 +162,7 @@ min_reason = "workspace Cargo.toml gtk4 feature v4_14: GDK_MEMORY_R8G8B8X8 and t
 scope = ["build", "runtime"]
 used_by = ["crate:atl-platform-ui-linux"]
 
-# the one JDK: AOSP's prebuilt JDK 21 (pinned). Used by the converter's host Java tools, the test pipeline's javac and jar, and the Gradle test-APK builds outside the repo (JAVA_HOME). The per-OS subdirectory comes from arches.toml `soong_prebuilt_os`.
+# the one JDK: AOSP's prebuilt JDK 21 (pinned). Used by the converter's host Java tools, the test pipeline's javac and jar, and d8 (run-apk). The per-OS subdirectory comes from arches.toml `soong_prebuilt_os`.
 [jdk]
 aosp = "prebuilts/jdk/jdk21"
 scope = ["build"]

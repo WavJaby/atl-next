@@ -12,7 +12,7 @@ use clap::ValueEnum;
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
-    providers, prune, service_mirrors, slot, sources, spdx, workspace,
+    providers, prune, service_mirrors, slot, sources, spdx, test_apks, workspace,
 };
 use atl_layout::Layout;
 
@@ -35,7 +35,7 @@ enum Step {
     Fmt,
     /// SPDX header on every tracked or new, non-ignored file
     Spdx,
-    /// repo tables (arches, sources, deps, providers, licenses, prune, cts) parse with their schema and invariants
+    /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks) parse with their schema and invariants
     Tables,
     /// modules.toml equals the real cross-module crate graph
     Modules,
@@ -188,6 +188,8 @@ impl Step {
                     layout.locate(&Path::new("aosp").join(tree_path)).dir
                 })?;
                 eprintln!("tables: {} ok ({} rows)", cts_table::FILE, cts.len());
+                let apk_rows = test_apks::check(root)?;
+                eprintln!("tables: {} ok ({apk_rows} rows)", test_apks::FILE);
                 let mirrors = service_mirrors::load(root)?;
                 let entries = service_mirrors::check(root, &mirrors, &sources.aosp, &|project| {
                     layout.locate(&Path::new("aosp").join(project)).dir

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask run-apk <APK>`: any APK, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
+//! `xtask run-apk <ROW>`: a test APK row of test-apks.toml, started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
 use crate::nested_wayland::NestedCompositor;
-use crate::{manifest, window};
+use crate::{manifest, test_apks, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
 const PRESENT_LINE: &str = "atl-composer: ui: present";
@@ -23,8 +23,8 @@ const STAGE: &str = "window-art";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// The APK to run, built as an app is: its manifest is the package file.
-    apk: PathBuf,
+    /// A row of test-apks.toml: its pinned APK is downloaded and verified into `<workspace>/cache/test-apks` on first use.
+    row: String,
     /// The host arch (an arches.toml row with `[host]`): the default --out.
     #[arg(long)]
     host: String,
@@ -53,6 +53,7 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let (row, apk_file) = test_apks::ensure(root, &args.row)?;
     let rt = Runtime::new(
         root,
         &args.host,
@@ -88,15 +89,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => rt.with_display(run_display().to_arg()),
     };
     let apk = work.join("base.apk");
-    std::fs::copy(&args.apk, &apk).with_context(|| format!("copying {}", args.apk.display()))?;
+    std::fs::copy(&apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
+    test_apks::check_identity(
+        &args.row,
+        &row,
+        &m.name,
+        m.version_code,
+        m.version_name.as_deref(),
+    )?;
     let activity = m
         .launch_activity()
         .map(|a| a.name.clone())
         .context("the APK has no launcher activity")?;
     println!(
         "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity})",
-        args.apk.display(),
+        apk_file.display(),
         m.name,
         m.version_code,
         m.min_sdk,

@@ -117,9 +117,16 @@ pub struct Args {
     /// a process has its cwd under src/ or src-wt/ or is inside a task-copy namespace, or a git lock exists. Resumable: run it again after a crash.
     #[arg(long, conflicts_with_all = ["bump", "add"])]
     migrate_git_dirs: bool,
+    /// Instead of the checkouts: every test APK of test-apks.toml into `<workspace>/cache/test-apks`, verified (size, sha256, signing certificate). Dry run unless --execute, which downloads what is missing or damaged.
+    #[arg(long, conflicts_with_all = ["bump", "add", "migrate_git_dirs"])]
+    test_apks: bool,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if args.test_apks {
+        crate::test_apks::fetch(root, args.execute)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if args.migrate_git_dirs {
         let layout = Layout::of(root)?;
         let sources = sources::load(root)?;
@@ -148,6 +155,7 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
         add: paths.to_vec(),
         jobs: None,
         migrate_git_dirs: false,
+        test_apks: false,
     };
     ensure!(fetch(root, &args)?, "fetch failed (rows above)");
     Ok(())

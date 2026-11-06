@@ -10,6 +10,7 @@
 
 mod android_paths;
 mod aosp;
+mod apk_sig;
 mod app;
 mod arches;
 mod atld_run;
@@ -75,6 +76,7 @@ mod soong;
 mod sources;
 mod spdx;
 mod system;
+mod test_apks;
 mod test_fonts;
 mod tree;
 mod tree_gate;
@@ -111,7 +113,7 @@ enum Command {
     /// Distro rows: package installed (dpkg-query / pacman), `min` met (pkg-config for libraries,
     /// package version otherwise). Cargo rows: exact version in `cargo install --list`. Read-only.
     Deps(deps::Args),
-    /// Upstream checkouts under <workspace>/src at the pins in sources.toml.
+    /// Upstream checkouts under <workspace>/src at the pins in sources.toml. `--test-apks` fetches the test APKs of test-apks.toml instead.
     ///
     /// Dry run by default (offline): shows what each checkout needs. The AOSP manifest (pinned in
     /// sources.toml) is fetched first: it maps tree paths to repositories and holds the tree's link/copy
@@ -172,10 +174,10 @@ enum Command {
     /// Per service, most churn first; per entry lines added + deleted, of the whole file or of the named declaration's body (overloads together), GONE when it vanished. Read-only.
     /// The src/aosp checkouts are shallow (pinned tag only): fetch the other tag there blobless, or pass `--repo <project>=<git dir>` holding both; a missing revision fails with the command it needs.
     UpgradeDiff(service_mirrors::Args),
-    /// Runs any APK under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
+    /// Runs a test APK row (test-apks.toml) under atld the way an app is: its launcher activity in a GTK window (UI mode), no probe, no injected input.
     ///
-    /// The package file is the APK's own manifest; the APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
-    /// Without `--hold` the window maps in the gate's headless weston (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Until GPU lands only apps with `android:hardwareAccelerated="false"` are supported (owner, 2026-11-05).
+    /// The row's file comes from `<workspace>/cache/test-apks`, downloaded and verified on first use; the package file is the APK's own manifest, which must match the row. The APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
+    /// Without `--hold` the window maps in the gate's headless compositor (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Hardware acceleration is the APK's own setting: the pinned official builds run with it on.
     RunApk(run_apk::Args),
     /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).
     Test {
