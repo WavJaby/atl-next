@@ -4,8 +4,11 @@
 //! The APK is built against the SDK's android.jar of the platform's API level (prebuilts/sdk/<ro.build.version.sdk>/public): aapt2 link (manifest only), javac + d8 (the Java pipeline's), classes.dex added uncompressed.
 //! Needs the converter's ART, servicemanager, atl-services and the boot jars' JNI libraries in --out (`xtask native ... servicemanager libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain atl-aidl-stubs-rust platform-bootclasspath-jni`).
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
@@ -37,6 +40,8 @@ pub struct Runtime {
     pub apk: ApkTools,
     servicemanager: PathBuf,
     services: PathBuf,
+    /// atl-am, atld's `--am`: the control command `start`
+    am: PathBuf,
     binderd: PathBuf,
     atld: PathBuf,
     framework_res: PathBuf,
@@ -70,6 +75,8 @@ pub struct Runtime {
     test_only: std::collections::BTreeSet<PathBuf>,
     /// Input method clients get a death link unless this is cleared (`--no-ime-death-link`, the ime gate's deliberate break).
     ime_death_link: bool,
+    /// A start may reuse a singleTop / singleTask instance unless this is cleared (`--no-new-intent`, the start-finish stage's deliberate break).
+    new_intent: bool,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -115,6 +122,67 @@ impl Run {
     pub fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
     }
+
+    /// One command on atld's control socket (atld main.rs serve_run_control: `stop`, `start <package>/<class>`); its reply line.
+    pub fn control(&self, command: &str) -> Result<String> {
+        control_at(&self.root, command)
+    }
+
+    /// Ends the run the way it ends (owner decision 2026-11-06): `stop` on the control socket, then waits for atld. SIGKILL only when atld does not answer or exit within [`STOP_WAIT`]
+    /// (its processes then stay: the caller's stop_apps ends the apps first).
+    pub fn stop(&self, atld: &mut Child) -> Result<ExitStatus> {
+        if let Some(s) = atld.try_wait()? {
+            return Ok(s);
+        }
+        let asked = self.control("stop");
+        let deadline = Instant::now() + STOP_WAIT;
+        while Instant::now() < deadline {
+            if let Some(s) = atld.try_wait()? {
+                return Ok(s);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("atld: no exit {STOP_WAIT:?} after stop ({asked:?}): killed");
+        let _ = atld.kill();
+        Ok(atld.wait()?)
+    }
+
+    /// Whether the first app process the services started has ended (atld's `started ... host pid <n>`, then `process <n> ended`): the run goes on without it, so a gate that ends with the
+    /// app reads it here.
+    pub fn app_ended(&self) -> bool {
+        first_app_ended(&std::fs::read_to_string(self.atld_log()).unwrap_or_default())
+    }
+}
+
+/// atld main.rs CONTROL_SOCKET, below the root.
+const CONTROL_SOCKET: &str = "control.sock";
+/// How long a control command may take: `start` waits for atl-am's startActivity round trip.
+const CONTROL_REPLY: Duration = Duration::from_secs(30);
+/// How long atld may take to exit after `stop`: it kills the sandboxes and waits for the services and servicemanager.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// [`Run::control`] for a run's `root`, for a thread that holds no Run (the ime probe).
+pub fn control_at(root: &Path, command: &str) -> Result<String> {
+    let path = root.join(CONTROL_SOCKET);
+    let mut conn =
+        UnixStream::connect(&path).with_context(|| format!("connecting {}", path.display()))?;
+    conn.set_read_timeout(Some(CONTROL_REPLY))?;
+    writeln!(conn, "{command}")?;
+    let mut reply = String::new();
+    BufReader::new(&conn).read_line(&mut reply)?;
+    Ok(reply.trim().to_owned())
+}
+
+/// [`Run::app_ended`] over atld's log text.
+fn first_app_ended(atld_log: &str) -> bool {
+    let first = atld_log
+        .lines()
+        .filter(|l| l.contains("started ") && l.contains("(package "))
+        .find_map(|l| l.rsplit("host pid ").next()?.trim().parse::<i32>().ok());
+    first.is_some_and(|pid| {
+        let ended = format!("process {pid} ended");
+        atld_log.lines().any(|l| l.contains(&ended))
+    })
 }
 
 /// The gates' display: the model's default size and density (fixed, so pictures and sizes are the same on every host, and small enough that WSLg keeps the display rate) at the monitor's refresh rate
@@ -212,6 +280,7 @@ impl Runtime {
             servicemanager.display()
         );
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
+        let am = packages::bin(root, &out, "atl-services", "atl-am")?;
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let atld = cargo_bin(root, &out, "atld")?;
         let apk = ApkTools::new(root, host, &out, &java_out)?;
@@ -264,6 +333,7 @@ impl Runtime {
             apk,
             servicemanager,
             services,
+            am,
             binderd,
             atld,
             framework_res,
@@ -280,6 +350,7 @@ impl Runtime {
             wayland: None,
             app_seccomp: true,
             ime_death_link: true,
+            new_intent: true,
         })
     }
 
@@ -356,6 +427,12 @@ impl Runtime {
     /// Input method clients get no death link (atld `--no-ime-death-link`): the ime gate's death sub-gate must then fail.
     pub fn without_ime_death_link(mut self) -> Self {
         self.ime_death_link = false;
+        self
+    }
+
+    /// The services refuse a start that would reuse an instance (atld `--no-new-intent`): the start-finish stage's new-intent sub-gate must then fail.
+    pub fn without_new_intent(mut self) -> Self {
+        self.new_intent = false;
         self
     }
 }
@@ -558,6 +635,8 @@ impl Runtime {
             .arg(&self.servicemanager)
             .arg("--services")
             .arg(&self.services)
+            .arg("--am")
+            .arg(&self.am)
             .arg("--launcher")
             .arg(&self.art.launcher)
             .arg("--lib-path")
@@ -612,6 +691,9 @@ impl Runtime {
         }
         if !self.ime_death_link {
             cmd.arg("--no-ime-death-link");
+        }
+        if !self.new_intent {
+            cmd.arg("--no-new-intent");
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
@@ -856,6 +938,20 @@ mod tests {
             ]
         );
         assert!(counter_lines("nothing\n").is_empty());
+    }
+
+    /// Only the first started app's end counts (atld main.rs start_app / reap lines); another pid's end, or none, is not it.
+    #[test]
+    fn first_app_ended_follows_the_first_started_pid() {
+        let started = "atld: services ready\natld: started org.x (package org.x): uid 10123, host pid 41\natld: started org.x (package org.x): uid 10123, host pid 57\n";
+        assert!(!first_app_ended(started));
+        assert!(!first_app_ended(&format!(
+            "{started}atld: process 57 ended: signal: 9\n"
+        )));
+        assert!(first_app_ended(&format!(
+            "{started}atld: process 41 ended: exit status: 0\n"
+        )));
+        assert!(!first_app_ended("atld: process 41 ended: exit status: 0\n"));
     }
 
     /// The last resume line gives the class and its stamp; a last line without a parsable stamp, a line of another kind, and no line at all give None.

@@ -18,13 +18,16 @@ use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::parts::{
-    DestroyActivityItem, PauseActivityItem, StartActivityItem, StopActivityItem,
+    DestroyActivityItem, NewIntentItem, PauseActivityItem, ReferrerIntent, StartActivityItem,
+    StopActivityItem,
 };
 use binder::{BinderFeatures, FromIBinder, Interface, SpIBinder, Status, Strong, ThreadState};
 
-use crate::activity::{global_configuration, launch_item, log, resume_item, security};
+use crate::activity::{
+    ActivityManager, global_configuration, launch_item, log, resume_item, security,
+};
 use crate::activity_stack::{Command, Machine, Step};
-use crate::activity_start::{self, Call, Refusal, Source, Target};
+use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
 use crate::counters;
 use crate::manifest_flags;
@@ -60,14 +63,15 @@ pub(crate) struct Launch {
     pub ident: i32,
 }
 
-type Lifecycle = Machine<SpIBinder, Owner, Launch>;
+/// The intent a reused record gets in onNewIntent (ActivityRecord.deliverNewIntentLocked: the start's intent, referrer = the calling package, no caller token here).
+type Lifecycle = Machine<SpIBinder, Owner, Launch, ReferrerIntent>;
 
 /// The parts of a startActivity call the lifecycle needs besides the caller's identity.
 pub(crate) struct StartArgs<'a> {
-    /// The intent's explicit component (package, class); None for an implicit intent.
-    pub component: Option<(&'a str, &'a str)>,
+    pub intent: Option<&'a Intent>,
+    /// false: a start that would reuse an instance is refused instead (`--no-new-intent`, the deliberate break of the start-finish stage's new-intent sub-gate)
+    pub reuse: bool,
     pub request_code: i32,
-    pub flags: i32,
     pub result_to: Option<&'a SpIBinder>,
 }
 
@@ -133,7 +137,11 @@ impl ActivityTasks {
     }
 
     /// The transaction item of one step of `token`'s record. None: a launch of a package that is no longer installed (counted, never reached).
-    fn item(&self, token: &SpIBinder, step: Step<Launch>) -> Option<ClientTransactionItem> {
+    fn item(
+        &self,
+        token: &SpIBinder,
+        step: Step<Launch, ReferrerIntent>,
+    ) -> Option<ClientTransactionItem> {
         let activity_token = Some(token.clone());
         Some(match step {
             Step::Launch(launch) => {
@@ -153,6 +161,13 @@ impl ActivityTasks {
             }
             Step::Start => {
                 ClientTransactionItem::StartActivity(StartActivityItem { activity_token })
+            }
+            Step::NewIntent { intents, resume } => {
+                ClientTransactionItem::NewIntent(NewIntentItem {
+                    activity_token,
+                    resume,
+                    intents: Some(intents.into_iter().map(Some).collect()),
+                })
             }
             Step::Resume => ClientTransactionItem::ResumeActivity(resume_item(token.clone())),
             Step::Pause {
@@ -176,8 +191,20 @@ impl ActivityTasks {
     }
 
     /// One transaction per command, in the order the machine decided. Called under the machine lock.
-    fn send(&self, commands: Vec<Command<SpIBinder, Owner, Launch>>) {
+    fn send(&self, commands: Vec<Command<SpIBinder, Owner, Launch, ReferrerIntent>>) {
         for command in commands {
+            if command
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::NewIntent { .. }))
+            {
+                // the line the onNewIntent gate counts
+                log(format_args!(
+                    "activity new intent to {} at={}",
+                    command.owner.component,
+                    counters::wall_stamp()
+                ));
+            }
             let items = command
                 .steps
                 .into_iter()
@@ -241,11 +268,16 @@ impl ActivityTasks {
         args: StartArgs<'_>,
     ) -> Result<i32, Status> {
         let StartArgs {
-            component,
+            intent,
+            reuse,
             request_code,
-            flags,
             result_to,
         } = args;
+        let component = intent
+            .and_then(|i| i.component.as_ref())
+            .map(|c| (c.package.as_str(), c.class.as_str()));
+        // ActivityStarter.mLaunchFlags start from intent.getFlags() (ActivityStarter.java computeLaunchingTaskFlags); the binder `flags` argument is startFlags (debug / profiling), unused here
+        let flags = intent.map_or(0, |i| i.flags);
         let mut m = self.machine();
         let source = result_to.and_then(|t| {
             m.owner(t)
@@ -269,29 +301,50 @@ impl ActivityTasks {
             component,
             source: source_view,
         };
-        let in_task = match (&source, component) {
-            (Some((t, _)), Some((_, class))) => m.task_of(t).is_some_and(|task| {
-                m.records(task)
-                    .any(|(k, o)| o.component == class && m.is_finishing(k) == Some(false))
-            }),
-            _ => false,
-        };
+        let source_task = source.as_ref().and_then(|(t, _)| m.task_of(t));
+        let class = component.map(|(_, class)| class);
+        let instance = source_task
+            .zip(class)
+            .and_then(|(task, class)| m.find_in_task(task, |o| o.component == class).cloned());
+        let top_is_class = source_task
+            .zip(class)
+            .is_some_and(|(task, class)| m.top(task).is_some_and(|(_, o)| o.component == class));
         let target = Target {
             process: package.map_or("", |p| p.process_name()),
             decl,
-            in_task,
+            in_task: instance.is_some(),
+            top_is_class,
         };
-        let decl = match activity_start::check(&call, target) {
-            Ok(decl) => decl,
+        let (decl, start) = match activity_start::check(&call, target) {
+            Ok(accepted) => accepted,
             Err(Refusal::Code { code, .. }) => return Ok(code),
             Err(Refusal::Security(msg)) => return Err(security(msg)),
         };
-        let Some((source_token, _)) = source else {
+        let (Some(task), Some(intent)) = (source_task, intent) else {
             return Ok(activity_start::START_CANCELED);
         };
-        let Some(task) = m.task_of(&source_token) else {
+        if let (Start::Reuse { .. }, false) = (start, reuse) {
+            counters::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
             return Ok(activity_start::START_CANCELED);
-        };
+        }
+        if let (Start::Reuse { clear_top }, Some(instance)) = (start, instance) {
+            // ActivityStarter.deliverNewIntent: START_DELIVERED_TO_TOP (3) for the top, START_TASK_TO_FRONT (2) after a clear-top; both are success codes the app does not throw for
+            let referrer = ReferrerIntent {
+                intent: intent.clone(),
+                referrer: Some(calling_package.to_owned()),
+                caller_token: None,
+            };
+            let commands = m
+                .new_intent(&instance, referrer, clear_top)
+                .unwrap_or_default();
+            self.note_settle(&m);
+            self.send(commands);
+            return Ok(if clear_top {
+                activity_start::START_TASK_TO_FRONT
+            } else {
+                activity_start::START_DELIVERED_TO_TOP
+            });
+        }
         let token = token::new();
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
@@ -385,10 +438,12 @@ impl ActivityTasks {
         Config::from(&global_configuration(&self.tasks.display()))
     }
 
-    /// The records of `task` with their owners, bottom -> top: what a configuration change of the Task is delivered to. A destroyed record is not on the stack, so not listed.
-    pub(crate) fn records(&self, task: TaskId) -> Vec<(SpIBinder, Owner)> {
-        self.machine()
-            .records(task)
+    /// The records of `task` with their owners, bottom -> top, that a configuration change of the Task is delivered to: not finishing (ActivityRecord.java:8441-8445 ensureActivityConfiguration
+    /// skips a finishing activity; relaunching one re-ran a splash's onCreate, which started its next activity again). A destroyed record is not on the stack, so not listed.
+    pub(crate) fn config_records(&self, task: TaskId) -> Vec<(SpIBinder, Owner)> {
+        let m = self.machine();
+        m.records(task)
+            .filter(|(k, _)| m.is_finishing(k) == Some(false))
             .map(|(k, o)| (k.clone(), o.clone()))
             .collect()
     }
@@ -414,16 +469,28 @@ impl ActivityTasks {
 /// IActivityTaskManager: startActivity and getActivityClientController. Every other method keeps the stub's unimplemented answer (counted).
 pub struct ActivityTaskService {
     atm: Arc<ActivityTasks>,
+    /// the processes: a start with no caller app starts one (ActivityManager::start_without_caller)
+    am: ActivityManager,
+    /// StartArgs::reuse
+    reuse: bool,
 }
 
 impl ActivityTaskService {
-    pub fn new(atm: Arc<ActivityTasks>) -> Self {
-        ActivityTaskService { atm }
+    pub fn new(am: ActivityManager, reuse: bool) -> Self {
+        ActivityTaskService {
+            atm: am.activity_tasks(),
+            am,
+            reuse,
+        }
     }
 
-    pub fn new_binder(atm: Arc<ActivityTasks>) -> SpIBinder {
-        BnActivityTaskManager::new_binder(ActivityTaskService::new(atm), BinderFeatures::default())
-            .as_binder()
+    /// `reuse` false: the test-only `--no-new-intent` (StartArgs::reuse).
+    pub fn new_binder(am: ActivityManager, reuse: bool) -> SpIBinder {
+        BnActivityTaskManager::new_binder(
+            ActivityTaskService::new(am, reuse),
+            BinderFeatures::default(),
+        )
+        .as_binder()
     }
 }
 
@@ -444,30 +511,31 @@ impl IActivityTaskManager for ActivityTaskService {
         result_to: Option<&SpIBinder>,
         _result_who: Option<&str>,
         request_code: i32,
-        flags: i32,
+        _start_flags: i32,
         _profiler_info: Option<&ProfilerInfo>,
         _options: Option<&Bundle>,
     ) -> binder::Result<i32> {
-        let (Some(caller), Some(calling_package)) = (caller, calling_package) else {
-            return Err(security(
-                "startActivity: no caller thread or calling package",
-            ));
+        let calling_uid = ThreadState::get_calling_uid();
+        let Some(calling_package) = calling_package else {
+            return Err(security("startActivity: no calling package"));
         };
-        let component = intent
-            .and_then(|i| i.component.as_ref())
-            .map(|c| (c.package.as_str(), c.class.as_str()));
+        let Some(caller) = caller else {
+            let component = intent
+                .and_then(|i| i.component.as_ref())
+                .map(|c| (c.package.as_str(), c.class.as_str()));
+            return self.am.start_without_caller(
+                calling_uid,
+                intent.map_or(0, |i| i.flags),
+                component,
+            );
+        };
         let args = StartArgs {
-            component,
+            intent,
+            reuse: self.reuse,
             request_code,
-            flags,
             result_to,
         };
-        self.atm.start(
-            caller,
-            ThreadState::get_calling_uid(),
-            calling_package,
-            args,
-        )
+        self.atm.start(caller, calling_uid, calling_package, args)
     }
 
     fn r#getActivityClientController(

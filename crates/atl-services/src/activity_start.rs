@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: MIT
 //! Whether the services start an activity for a startActivity call: the accepted subset of ActivityStarter, pure (no binder), so the tests build without the converter feature.
-//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, with no result, in the caller's task and process, standard launch mode,
-//! or singleTop / singleTask when no instance of the class is in that task (a new instance, as standard).
+//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, with no result, in the caller's task and process: standard (a new
+//! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new).
+//! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed), otherwise the START code AOSP returns for the case
 //! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `counters::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
-//! Refused, not modelled: implicit intents (intent filters), other packages, startActivityForResult, reusing a singleTop / singleTask instance, singleInstance, other processes, intent flags except NEW_TASK.
+//! Refused, not modelled: implicit intents (intent filters), other packages, startActivityForResult, singleInstance, other processes, intent flags except NEW_TASK, task affinity
+//! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
 use crate::counters;
 use crate::packages::ActivityDecl;
+use crate::permission::{SHELL_UID, SYSTEM_UID};
 
 /// ActivityManager.START_SUCCESS: the activity is started (the record is pushed and its launch sent).
 pub const START_SUCCESS: i32 = 0;
+/// ActivityManager.START_TASK_TO_FRONT / START_DELIVERED_TO_TOP: a reused instance got the intent (after a clear-top / as the top); success codes, Instrumentation does not throw.
+pub const START_TASK_TO_FRONT: i32 = 2;
+pub const START_DELIVERED_TO_TOP: i32 = 3;
 /// ActivityManager.START_CANCELED: Instrumentation.execStartActivity throws "Activity could not be started" (Instrumentation.java:2452).
 pub const START_CANCELED: i32 = -96;
 /// ActivityManager.START_CLASS_NOT_FOUND: the explicit component's class is not in the package.
@@ -59,8 +65,10 @@ pub struct Call<'a> {
 pub struct Target<'a> {
     pub process: &'a str,
     pub decl: Option<&'a ActivityDecl>,
-    /// An activity of the component's class, not finishing, is in the source's task: what a singleTop / singleTask start would reuse.
+    /// An activity of the component's class, not finishing, is in the source's task: what a singleTask start reuses.
     pub in_task: bool,
+    /// The source task's top non-finishing activity is of the component's class: what a singleTop start reuses.
+    pub top_is_class: bool,
 }
 
 fn refused(code: i32, reason: &'static str) -> Refusal {
@@ -69,7 +77,10 @@ fn refused(code: i32, reason: &'static str) -> Refusal {
 }
 
 /// Validates one start. Ok: the declaration of the activity to start; the caller starts it in the source's task.
-pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<&'a ActivityDecl, Refusal> {
+pub fn check<'a>(
+    call: &Call<'_>,
+    target: Target<'a>,
+) -> Result<(&'a ActivityDecl, Start), Refusal> {
     let Some(source) = call.source else {
         return Err(refused(START_CANCELED, "resultTo names no activity"));
     };
@@ -98,24 +109,22 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<&'a ActivityDecl
             "class not declared by the package",
         ));
     };
-    // singleTop / singleTask with no instance of the class in the source's task: ActivityStarter finds nothing to reuse (singleTop: no such top, singleTask: no such activity in the
-    // task of its affinity, checked below as for NEW_TASK, which singleTask implies) and starts a new instance on top, as standard. Reusing one (onNewIntent, clear-top) is not modelled.
-    match decl.launch_mode {
-        LAUNCH_MODE_STANDARD => {}
-        LAUNCH_SINGLE_TOP | LAUNCH_SINGLE_TASK if !target.in_task => {}
-        LAUNCH_SINGLE_TOP | LAUNCH_SINGLE_TASK => {
-            return Err(refused(
-                START_CANCELED,
-                "singleTop/singleTask instance already in the task (onNewIntent)",
-            ));
-        }
+    // reuse (ActivityStarter.startActivityInner): singleTop reuses the task's top when it is this class (deliverToCurrentTopIfNeeded, ActivityStarter.java:2441-2448); singleTask reuses
+    // the class's instance in the task of its affinity, finishing what is above it (complyActivityFlags -> performClearTop, :2510-2533; the affinity is checked below as for NEW_TASK,
+    // which singleTask implies). Either way the instance gets onNewIntent (deliverNewIntent). No instance: a new one on top, as standard.
+    let start = match decl.launch_mode {
+        LAUNCH_MODE_STANDARD => Start::New,
+        LAUNCH_SINGLE_TOP if target.top_is_class => Start::Reuse { clear_top: false },
+        LAUNCH_SINGLE_TOP => Start::New,
+        LAUNCH_SINGLE_TASK if target.in_task => Start::Reuse { clear_top: true },
+        LAUNCH_SINGLE_TASK => Start::New,
         _ => {
             return Err(refused(
                 START_CANCELED,
                 "launch mode singleInstance / singleInstancePerTask",
             ));
         }
-    }
+    };
     let flags = if decl.launch_mode == LAUNCH_SINGLE_TASK {
         call.flags | FLAG_ACTIVITY_NEW_TASK
     } else {
@@ -139,7 +148,56 @@ pub fn check<'a>(call: &Call<'_>, target: Target<'a>) -> Result<&'a ActivityDecl
             ));
         }
     }
-    Ok(decl)
+    Ok((decl, start))
+}
+
+/// What an accepted start does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// A new record on top of the source's task.
+    New,
+    /// The instance of the class already in the task gets onNewIntent; `clear_top`: what is above it finishes first.
+    Reuse { clear_top: bool },
+}
+
+/// A start with no caller app thread (ActivityTaskManagerService.startActivityAsUser with caller null: `am start`, a home screen). The uid must hold START_ANY_ACTIVITY, which only
+/// the system and shell uids are given here (ActivityTaskSupervisor.checkStartAnyActivityPermission; fail-closed: any other uid is a SecurityException). Accepted: the explicit
+/// launcher activity of an installed package whose process is not running, with NEW_TASK (ContextImpl.startActivity requires it outside an activity): its process is started and the
+/// activity launched on attach (ActivityTaskManagerService.startProcessAsync -> realStartActivityLocked), in a new task. Refused: a running process (bringing its task to front is not
+/// modelled), another class, flags other than NEW_TASK.
+pub fn check_shell(
+    calling_uid: u32,
+    flags: i32,
+    component: Option<(&str, &str)>,
+    launcher: Option<&str>,
+    running: bool,
+) -> Result<(), Refusal> {
+    if calling_uid != SYSTEM_UID && calling_uid != SHELL_UID {
+        counters::refused(INTERFACE, "startActivity (no caller app, uid without START_ANY_ACTIVITY)");
+        return Err(Refusal::Security("startActivity: no caller app thread"));
+    }
+    let Some((_, class)) = component else {
+        return Err(refused(
+            START_INTENT_NOT_RESOLVED,
+            "implicit intent (intent filters are not modelled)",
+        ));
+    };
+    let Some(launcher) = launcher else {
+        return Err(refused(START_CLASS_NOT_FOUND, "package not installed or without launcher"));
+    };
+    if class != launcher {
+        return Err(refused(START_CANCELED, "shell start of a class other than the launcher"));
+    }
+    if flags != FLAG_ACTIVITY_NEW_TASK {
+        return Err(refused(START_CANCELED, "shell start without NEW_TASK alone"));
+    }
+    if running {
+        return Err(refused(
+            START_CANCELED,
+            "shell start of a running process (task to front not modelled)",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -187,21 +245,56 @@ mod tests {
             process: PACKAGE,
             decl: Some(main),
             in_task: false,
+            top_is_class: false,
         }
     }
 
-    fn code_of(r: Result<&ActivityDecl, Refusal>) -> Refusal {
+    fn code_of(r: Result<(&ActivityDecl, Start), Refusal>) -> Refusal {
         match r {
             Err(refusal) => refusal,
-            Ok(d) => panic!("accepted {}, refusal expected", d.name),
+            Ok((d, _)) => panic!("accepted {}, refusal expected", d.name),
         }
     }
 
     #[test]
     fn accepts_an_explicit_start_in_the_callers_task() {
         let main = decl(MAIN);
-        let accepted = check(&call(), target(&main)).expect("accepted");
+        let (accepted, start) = check(&call(), target(&main)).expect("accepted");
         assert_eq!(accepted.name, MAIN);
+        assert_eq!(start, Start::New);
+    }
+
+    /// The shell start: system / shell uid only, the launcher only, NEW_TASK alone, a process not running.
+    #[test]
+    fn shell_starts_only_a_dead_packages_launcher() {
+        let ok = |uid, flags, class, running| {
+            check_shell(uid, flags, Some((PACKAGE, class)), Some(MAIN), running)
+        };
+        assert_eq!(ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false), Ok(()));
+        assert_eq!(
+            ok(SYSTEM_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false),
+            Ok(())
+        );
+        assert!(matches!(
+            ok(UID, FLAG_ACTIVITY_NEW_TASK, MAIN, false),
+            Err(Refusal::Security(_))
+        ));
+        assert!(matches!(
+            ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, MAIN, true),
+            Err(Refusal::Code { code: START_CANCELED, .. })
+        ));
+        assert!(matches!(
+            ok(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, SPLASH, false),
+            Err(Refusal::Code { code: START_CANCELED, .. })
+        ));
+        assert!(matches!(
+            ok(SHELL_UID, 0, MAIN, false),
+            Err(Refusal::Code { code: START_CANCELED, .. })
+        ));
+        assert!(matches!(
+            check_shell(SHELL_UID, FLAG_ACTIVITY_NEW_TASK, Some((PACKAGE, MAIN)), None, false),
+            Err(Refusal::Code { code: START_CLASS_NOT_FOUND, .. })
+        ));
     }
 
     #[test]
@@ -346,6 +439,7 @@ mod tests {
             process: PACKAGE,
             decl: None,
             in_task: false,
+            top_is_class: false,
         };
         assert_eq!(
             code_of(check(&c, none)),
@@ -356,25 +450,42 @@ mod tests {
         );
     }
 
+    fn start_of(r: Result<(&ActivityDecl, Start), Refusal>) -> Start {
+        r.expect("accepted").1
+    }
+
+    /// singleTop reuses only the top (ActivityStarter.java:2441-2448), singleTask any instance in the task, clearing above (:2510-2533); none to reuse: a new instance.
     #[test]
-    fn single_top_and_task_start_new_unless_an_instance_is_in_the_task() {
+    fn single_top_and_task_reuse_their_instance_else_start_new() {
         let mut main = decl(MAIN);
-        for mode in [1, 2] {
-            // singleTop, singleTask (ActivityInfo LAUNCH_SINGLE_TOP / LAUNCH_SINGLE_TASK)
-            main.launch_mode = mode;
-            assert!(check(&call(), target(&main)).is_ok(), "mode {mode}");
-            let reuse = Target {
+        fn in_task(m: &ActivityDecl) -> Target<'_> {
+            Target {
                 in_task: true,
-                ..target(&main)
-            };
-            assert_eq!(
-                code_of(check(&call(), reuse)),
-                Refusal::Code {
-                    code: START_CANCELED,
-                    reason: "singleTop/singleTask instance already in the task (onNewIntent)"
-                }
-            );
+                ..target(m)
+            }
         }
+        fn on_top(m: &ActivityDecl) -> Target<'_> {
+            Target {
+                in_task: true,
+                top_is_class: true,
+                ..target(m)
+            }
+        }
+        main.launch_mode = LAUNCH_SINGLE_TOP;
+        assert_eq!(start_of(check(&call(), target(&main))), Start::New);
+        assert_eq!(start_of(check(&call(), in_task(&main))), Start::New);
+        assert_eq!(
+            start_of(check(&call(), on_top(&main))),
+            Start::Reuse { clear_top: false }
+        );
+        main.launch_mode = LAUNCH_SINGLE_TASK;
+        assert_eq!(start_of(check(&call(), target(&main))), Start::New);
+        assert_eq!(
+            start_of(check(&call(), in_task(&main))),
+            Start::Reuse { clear_top: true }
+        );
+        main.launch_mode = LAUNCH_MODE_STANDARD;
+        assert_eq!(start_of(check(&call(), on_top(&main))), Start::New);
         main.launch_mode = 3; // singleInstance
         assert_eq!(
             code_of(check(&call(), target(&main))),

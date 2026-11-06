@@ -140,6 +140,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ended = Some(s);
             break;
         }
+        // the app's end is the run's end here, as when atld ended with it
+        if run.app_ended() {
+            ended = Some(run.stop(&mut atld)?);
+            break;
+        }
         if started.elapsed() > window::LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
             break;
         }
@@ -147,8 +152,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if ended.is_none() {
         window::stop_apps(atld.id());
-        let _ = atld.kill();
-        atld.wait()?;
+        run.stop(&mut atld)?;
     }
     let app = read(&app_log);
     let services = read(&services_log);

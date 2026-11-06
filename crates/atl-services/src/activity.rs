@@ -47,6 +47,7 @@ use binder::{
     ThreadState,
 };
 
+use crate::activity_start::{self, Refusal};
 use crate::activity_task::ActivityTasks;
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
@@ -553,6 +554,41 @@ impl ActivityManager {
             .map_err(|e| format!("starting {package}: {e}"))
     }
 
+    /// startActivity with no caller app thread (`am start`, a home screen): checked by activity_start::check_shell; accepted -> the package's process is started through the
+    /// control and its launcher launched on attach (ActivityTaskManagerService.startProcessAsync, then realStartActivityLocked from attachApplication). Ok: the START code.
+    pub(crate) fn start_without_caller(
+        &self,
+        calling_uid: u32,
+        flags: i32,
+        component: Option<(&str, &str)>,
+    ) -> Result<i32, Status> {
+        let p = component.and_then(|(package, _)| self.inner.packages.by_name(package));
+        let launcher = p.and_then(|p| p.launch_activity()).map(|d| d.name.as_str());
+        let mut st = self.inner.state();
+        let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name));
+        match activity_start::check_shell(calling_uid, flags, component, launcher, running) {
+            Ok(()) => {}
+            Err(Refusal::Code { code, .. }) => return Ok(code),
+            Err(Refusal::Security(msg)) => return Err(security(msg)),
+        }
+        let Some(p) = p else {
+            return Ok(activity_start::START_CLASS_NOT_FOUND);
+        };
+        self.inner
+            .start_process_locked(&mut st, p, p.process_name(), true, None)
+            .map_err(|e| {
+                Status::new_exception_str(
+                    ExceptionCode::ILLEGAL_STATE,
+                    Some(format!("starting {}: {e}", p.name)),
+                )
+            })?;
+        log(format_args!(
+            "activity start of {} from uid {calling_uid} (no caller app): process started",
+            p.name
+        ));
+        Ok(activity_start::START_SUCCESS)
+    }
+
     /// The lifecycle the activity_task service (IActivityTaskManager) is built on.
     pub fn activity_tasks(&self) -> Arc<ActivityTasks> {
         Arc::clone(&self.inner.atm)
@@ -627,7 +663,7 @@ impl Inner {
         };
         let mut sends = Vec::new();
         {
-            for (token, entry) in self.atm.records(task) {
+            for (token, entry) in self.atm.config_records(task) {
                 let mut relaunching = entry.relaunching;
                 let buckets = self.buckets.get(&token);
                 let items = match config_diff::delivery(

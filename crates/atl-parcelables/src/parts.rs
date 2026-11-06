@@ -848,6 +848,51 @@ impl Part for StartActivityItem {
     }
 }
 
+/// com.android.internal.content.ReferrerIntent (ReferrerIntent.java:46-56): the Intent's own body (super.writeToParcel), then mReferrer (writeString = String16) and mCallerToken.
+#[derive(Debug, Clone, Default)]
+pub struct ReferrerIntent {
+    pub intent: Intent,
+    pub referrer: Option<String>,
+    pub caller_token: Option<SpIBinder>,
+}
+impl Part for ReferrerIntent {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        self.intent.write(p)?;
+        w_str16(p, &self.referrer)?;
+        w_binder(p, &self.caller_token)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(ReferrerIntent {
+            intent: Intent::read(p)?,
+            referrer: r_str16(p)?,
+            caller_token: r_binder(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.NewIntentItem (NewIntentItem.java:77-89): the token (ActivityTransactionItem.java:105-112), mResume, then mIntents as writeTypedList / createTypedArrayList.
+/// The body after ClientTransaction's class name.
+#[derive(Debug, Clone, Default)]
+pub struct NewIntentItem {
+    pub activity_token: Option<SpIBinder>,
+    pub resume: bool,
+    pub intents: Option<Vec<Option<ReferrerIntent>>>,
+}
+impl Part for NewIntentItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_bool(p, self.resume)?;
+        w_typed_list(p, &self.intents)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(NewIntentItem {
+            activity_token: r_binder(p)?,
+            resume: r_bool(p)?,
+            intents: r_typed_list(p)?,
+        })
+    }
+}
+
 /// android.view.Display.Mode (Display.java:2695 writeToParcel / Mode(Parcel)): a nested class of DisplayInfo, not an AIDL parcelable, so a Part here and no codec file.
 /// Its arrays are the Java ones (`createFloatArray` / `createIntArray`): null is -1, which Mode's constructor never produces.
 #[derive(Debug, Clone, Default, PartialEq)]

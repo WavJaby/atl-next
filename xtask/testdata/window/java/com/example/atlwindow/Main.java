@@ -45,6 +45,13 @@ public class Main extends Activity {
         setContentView(new Quadrants(this));
     }
 
+    /** A start that reused this instance (singleTop in window-start): the start-finish stage's new-intent sub-gate reads this line. */
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        Log.i(TAG, "onNewIntent reached again=" + intent.getBooleanExtra("again", false));
+    }
+
     @Override
     protected void onResume() {
         super.onResume();

@@ -110,6 +110,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(s) = atld_child.try_wait()? {
             break (read(&app_log).lines().any(|l| l.contains(MARKER)), Some(s));
         }
+        // the app's end is the run's end here, as when atld ended with it
+        if run.app_ended() {
+            let s = run.stop(&mut atld_child)?;
+            break (read(&app_log).lines().any(|l| l.contains(MARKER)), Some(s));
+        }
         if start.elapsed() > LIMIT {
             break (false, None);
         }
@@ -126,8 +131,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     }
     if ended.is_none() {
-        let _ = atld_child.kill();
-        atld_child.wait()?;
+        run.stop(&mut atld_child)?;
     }
     let app = read(&app_log);
     let fault = fault(&app, ended.is_some());

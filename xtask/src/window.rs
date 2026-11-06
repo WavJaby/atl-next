@@ -74,6 +74,12 @@ pub struct Args {
     /// Stage ime only: the services give input method clients no death link, so the death sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_death: bool,
+    /// Stage ime only: the run ends by SIGKILL, not the control socket's `stop`, so the run sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_atld_stop: bool,
+    /// Stage start-finish only: the services refuse a start that would reuse an instance (atld `--no-new-intent`), so the new-intent sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_new_intent: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -648,6 +654,53 @@ pub(crate) fn stop_apps(atld: u32) {
         && Instant::now() < deadline
     {
         std::thread::sleep(POLL);
+    }
+}
+
+/// Ime stage: atld outlived the killed app (owner decision 2026-11-06: an app's death is an event, not the run's end) and ended on the control socket's `stop` with status 0. In atld's
+/// log (main.rs): the first app's `process <pid> ended`, then the relaunch's `control: start ...: ok`, then `control: stop`; `stopped` is atld's exit after the gate stopped it.
+fn run_survives_check(atld_log: &str, stopped: Option<std::process::ExitStatus>) -> Result<String, String> {
+    let pid = atld_log
+        .lines()
+        .filter(|l| l.contains("started ") && l.contains("(package "))
+        .find_map(|l| l.rsplit("host pid ").next()?.trim().parse::<i32>().ok());
+    let at = |needle: &str| atld_log.find(needle);
+    let died = pid.and_then(|pid| at(&format!("process {pid} ended")));
+    let order = (died, at("control: start "), at("control: stop"));
+    let in_order = matches!(order, (Some(d), Some(s), Some(e)) if d < s && s < e)
+        && atld_log.contains(": ok am: start ");
+    match (in_order, stopped) {
+        (true, Some(s)) if s.success() => Ok(format!(
+            "atld outlived app pid {} (relaunched it), ended on `stop`: {s}",
+            pid.unwrap_or(0)
+        )),
+        _ => Err(format!(
+            "want the first app's end, then an ok `control: start`, then `control: stop` and a successful exit; offsets {order:?}, exit {stopped:?}"
+        )),
+    }
+}
+
+/// The fixture's onNewIntent line (window Main.java) for Start's second start, the services' delivery line (activity_task.rs send) and their refusal count (counters.rs).
+const NEW_INTENT_APP: &str = "AtlWindow: onNewIntent reached again=true";
+const NEW_INTENT_SERVICES: &str = "services: activity new intent to com.example.atlwindow.Main ";
+const START_REFUSED: &str = "refused IActivityTaskManager.startActivity";
+
+/// Start-finish: Start starts singleTop Main twice; the second reuses the top (ActivityStarter.deliverToCurrentTopIfNeeded): one onNewIntent with the second intent, one delivery line,
+/// no refused start, one onCreate (no second instance).
+fn new_intent_check(app: &str, services: &str) -> Result<String, String> {
+    let count = |text: &str, needle: &str| text.lines().filter(|l| l.contains(needle)).count();
+    let got = (
+        count(app, NEW_INTENT_APP),
+        count(services, NEW_INTENT_SERVICES),
+        count(services, START_REFUSED),
+        count(app, "AtlWindow: onCreate reached"),
+    );
+    if got == (1, 1, 0, 1) {
+        Ok("the second start reused Main: one onNewIntent, one delivery, no refusal, one onCreate".to_owned())
+    } else {
+        Err(format!(
+            "want 1 `{NEW_INTENT_APP}`, 1 delivery, 0 refused starts, 1 onCreate; got {got:?} (onNewIntent, deliveries, refusals, onCreate)"
+        ))
     }
 }
 
@@ -1511,6 +1564,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.break_new_intent {
+        rt.without_new_intent()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -1570,10 +1628,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let log = run.log(&m.name);
         let services_log = run.log("services");
         let fake_ime = fake_ime.take();
+        let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Ime, _, Some(ime)) => {
-                ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log)
-            }
+            (Stage::Ime, _, Some(ime)) => ime::drive(
+                p,
+                &log,
+                ime,
+                ime_breaks,
+                atld_pid,
+                &services_log,
+                relaunch,
+            ),
             (Stage::Widgets, _, _) => widgets::drive(p, &log),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
@@ -1598,15 +1663,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ended = Some(s);
             break;
         }
+        // the app's end is the run's end for a gate, as when atld ended with it; not in the ime stage, whose probe kills the app and relaunches it (its death sub-gate)
+        if !matches!(args.stage, Stage::Ime) && run.app_ended() {
+            ended = Some(run.stop(&mut atld_child)?);
+            break;
+        }
         if started.elapsed() > LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
             break;
         }
         std::thread::sleep(POLL);
     }
+    let mut stopped = None;
     if ended.is_none() {
         stop_apps(atld_child.id());
-        let _ = atld_child.kill();
-        atld_child.wait()?;
+        stopped = Some(if args.break_atld_stop {
+            let _ = atld_child.kill();
+            atld_child.wait()?
+        } else {
+            run.stop(&mut atld_child)?
+        });
     }
     if let Some(secs) = args.hold {
         return Ok(hold_report(&app_log, marker, secs, ended.is_some()));
@@ -1644,7 +1719,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
-        (Stage::Ime, Some(_)) => ime::checks(&app, &services, &liveness),
+        (Stage::Ime, Some(_)) => {
+            let mut sub = ime::checks(&app, &services, &liveness);
+            sub.push((
+                "run",
+                run_survives_check(&read(&run.atld_log()), stopped),
+            ));
+            sub
+        }
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
             &after_marker(&app, marker),
@@ -1672,6 +1754,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ));
             sub.push(("burst", burst_check(&app, &services, &steps)));
             sub.push(("lifecycle", lifecycle_check(&app, &services, &steps, want)));
+            if matches!(args.stage, Stage::StartFinish) {
+                sub.push(("new-intent", new_intent_check(&app, &services)));
+            }
             sub
         }
         (Stage::Gtk, Some(_)) => vec![

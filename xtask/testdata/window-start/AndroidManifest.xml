@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: MIT -->
 <!-- `xtask test window`, stage start-finish: the launcher (.Start) starts .Main and finishes; Main is window-declared's activity (the resize bits declared), not the launcher, so each resize
-     reaches it only if an activity started by startActivity gets configuration changes. -->
+     reaches it only if an activity started by startActivity gets configuration changes. Main is singleTop and .Start starts it twice: the second start is onNewIntent to the top. -->
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.atlwindow"
@@ -19,6 +19,7 @@
             </intent-filter>
         </activity>
         <activity android:name=".Main" android:exported="false" android:hardwareAccelerated="false"
+            android:launchMode="singleTop"
             android:configChanges="screenSize|smallestScreenSize|orientation|screenLayout"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
     </application>

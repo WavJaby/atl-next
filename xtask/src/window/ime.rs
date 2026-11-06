@@ -8,9 +8,10 @@
 //! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail. `--break-ime-delete` sends the delete's byte count as after_length (after the cursor, where nothing is): the delete
 //! sub-gate must fail.
 //! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
-//! the link (`--no-ime-death-link`): the death sub-gate must fail.
+//! the link (`--no-ime-death-link`): the death sub-gate must fail. Then relaunch: the probe starts the fixture again through atld's control `start` (startActivity with no caller app,
+//! a process started anew); the relaunch sub-gate wants a fresh addClient and bind after the death.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,9 +33,12 @@ const TEXT_LINE: &str = "AtlWindow: text input=";
 const IME_WAIT: Duration = Duration::from_secs(10);
 
 /// The services' client-death counter (counters::count's line: `services: unimplemented <interface>.<name> <n> at=...`) and removal line (input_method.rs State::client_died).
-const DEATH_COUNTER: &str = "unimplemented input_method.client died";
+const DEATH_COUNTER: &str = "unimplemented IInputMethodManager.client died";
 const DEATH_LINE: &str = "services: input_method client uid=";
 const NONE_LEFT: &str = "entry removed, 0 clients left";
+/// The relaunched process's client: the second addClient, then the second onBindMethod (the counters' running counts, counters.rs line format).
+const READDED_LINE: &str = "unimplemented IInputMethodManager.addClient 2 ";
+const REBOUND_LINE: &str = "sent IInputMethodManager.IInputMethodClient.onBindMethod 2 ";
 
 /// The surrounding text (text, cursor byte, anchor byte) the fake IME held after the commit: the probe thread's, for `checks` (Liveness is shared by every stage).
 static SURROUNDING: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
@@ -108,6 +112,7 @@ pub fn drive(
     breaks: Breaks,
     atld: u32,
     services_log: &Path,
+    relaunch: (PathBuf, String),
 ) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -185,6 +190,14 @@ pub fn drive(
             .status();
     }
     wait_for_line(services_log, DEATH_LINE, IME_WAIT);
+    // then the relaunch, as a launcher tap: startActivity with no caller app (atld `start` -> atl-am), whose process is started anew; its window's focus binds again (fresh addClient)
+    let (root, component) = relaunch;
+    let reply = crate::atld_run::control_at(&root, &format!("start {component}"))
+        .map_err(|e| format!("relaunch: {e:#}"))?;
+    if !reply.starts_with("ok") {
+        return Err(format!("relaunch refused: {reply}"));
+    }
+    wait_for_line(services_log, REBOUND_LINE, IME_WAIT);
     Ok(Liveness {
         answered: true,
         silent: true,
@@ -233,16 +246,34 @@ pub fn checks(app: &str, services: &str, probe: &Result<Liveness, String>) -> Ve
             edit(after_delete(), &|c| c == "-1,-1", "no composing span"),
         ),
         ("death", death_check(services)),
+        ("relaunch", relaunch_check(services)),
     ]
 }
 
-/// After the kill: the services counted exactly one client death, and its line names the app's uid with its entry removed and no client left (the fixture is the only app).
+/// After the death line: the relaunched process added a fresh client (addClient 2) and was bound again (onBindMethod 2), in that order.
+fn relaunch_check(services: &str) -> Result<String, String> {
+    let at = |needle: &str| services.find(needle);
+    match (at(DEATH_LINE), at(READDED_LINE), at(REBOUND_LINE)) {
+        (Some(d), Some(a), Some(b)) if d < a && a < b => {
+            Ok("after the death: a fresh addClient, then a fresh bind (onBindMethod 2)".to_owned())
+        }
+        (d, a, b) => Err(format!(
+            "want the death line, then `{READDED_LINE}`, then `{REBOUND_LINE}`; offsets {d:?}, {a:?}, {b:?}"
+        )),
+    }
+}
+
+/// After the kill, before the relaunch's client is added: the services counted exactly one client death, and its line names the app's uid with its entry removed and no client left
+/// (the fixture is the only app). Lines after the relaunch are not this death: the run's stop kills the relaunched app too.
 fn death_check(services: &str) -> Result<String, String> {
-    let counted: Vec<&str> = services
+    let before = services
+        .find(READDED_LINE)
+        .map_or(services, |at| &services[..at]);
+    let counted: Vec<&str> = before
         .lines()
         .filter(|l| l.contains(DEATH_COUNTER))
         .collect();
-    let removed: Vec<&str> = services
+    let removed: Vec<&str> = before
         .lines()
         .filter(|l| l.contains(DEATH_LINE))
         .collect();

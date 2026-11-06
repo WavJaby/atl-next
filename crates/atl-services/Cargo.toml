@@ -30,6 +30,12 @@ name = "atl-services-client"
 path = "src/bin/client.rs"
 required-features = ["converter"]
 
+# `am start` as the shell uid: startActivity with no caller app; atld spawns it for its control command `start`.
+[[bin]]
+name = "atl-am"
+path = "src/bin/am.rs"
+required-features = ["converter"]
+
 [dependencies]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }

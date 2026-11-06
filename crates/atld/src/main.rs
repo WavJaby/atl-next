@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until its main process ends.
+//! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
 //!    `data/` (`app/<package>/base.apk`, `user/0/<package>/`, `dalvik-cache/`), `packages.json` (the installed packages), `log/<process>.log` (each process's stdout + stderr; a System.out line is a liblog record there).
 //! 2. the install: each `--package` (an APK and the manifest xtask read from it) gets the next app uid, its data directories and `/data/app/<package>/base.apk`; the records go to `packages.json`.
@@ -7,19 +7,20 @@
 //! 4. AOSP servicemanager as uid 1000 (AID_SYSTEM), the one process that may become context manager.
 //! 5. atl-system-services as uid 1000 with the packages and, as its stdin, the process-control connection (atl_broker::control): it starts app processes (ActivityManager's ProcessList) and kills them, here, through
 //!    the broker's sandbox. atld waits for its `services: ready`.
-//! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example. Without it the main process is the first one the services start.
+//! 6. `--run-class`: a command as uid `--run-uid` (the shell), `am instrument` for example; its exit ends the run.
+//! 7. the control socket `<root>/control.sock` (serve_run_control): `stop` ends the run, `start <package>/<class>` is `am start`. An app process ending does not end the run: the services see its death.
 //!
-//! Exit status: the main process's (bwrap passes it on). Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
+//! Exit status: the command's (bwrap passes it on); 0 after `stop`; failure when the services exited. Plan: binderd, servicemanager and the services move into this process later; here each is a process, as `xtask test binder` runs them.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,9 @@ struct Args {
     /// The UI mode of every app process: `gtk` gives each one a GTK window on its main thread (delivered as `ro.atl.ui`, compositor_registry::UI_PROPERTY). Omitted: headless.
     #[arg(long, value_parser = ["gtk"])]
     ui: Option<String>,
+    /// atl-am: run as the shell uid for the control command `start` (a startActivity with no caller app). Omitted: `start` is refused.
+    #[arg(long)]
+    am: Option<PathBuf>,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -127,11 +131,19 @@ struct Args {
     /// Test only: passed to the services (`--no-ime-death-link`), the deliberate break of the ime gate's death sub-gate.
     #[arg(long)]
     no_ime_death_link: bool,
+    /// Test only: passed to the services (`--no-new-intent`), the deliberate break of the start-finish stage's new-intent sub-gate.
+    #[arg(long)]
+    no_new_intent: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
 const AID_SYSTEM: u32 = 1000;
+const AID_SHELL: u32 = 2000;
 const AID_APP_START: u32 = 10_000;
+/// The run's control socket, below the root (serve_run_control).
+const CONTROL_SOCKET: &str = "control.sock";
+/// How often the run checks that the services still run while it waits for its end: a dead services process is noticed within this.
+const SERVICES_POLL: Duration = Duration::from_millis(200);
 /// How long the services may take to register: servicemanager's start, then two addService round trips (well under a second measured by `xtask test binder`; libbinder waits 1 s
 /// per retry while the context manager is missing); 20 s for a loaded machine.
 const READY: Duration = Duration::from_secs(20);
@@ -445,12 +457,20 @@ struct Host {
     ui: Option<String>,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
-    /// set by the first process that claims to be the main one
-    main_claimed: AtomicBool,
-    /// the main process's end
-    done: Sender<ExitStatus>,
-    /// whether the first process the services start is the main one (no `--run-class`)
-    services_start_main: bool,
+    /// why the run ends: the `--run-class` command's exit or an explicit stop
+    done: Sender<End>,
+    /// atl-am (`--am`): what the control command `start` runs
+    am: Option<PathBuf>,
+}
+
+/// Why a run ends. An app process ending is not one: the services observe it (its binder death) and the run goes on, as system_server outlives its apps.
+enum End {
+    /// the `--run-class` command exited
+    Command(ExitStatus),
+    /// the control command `stop`
+    Stop,
+    /// the services exited: nothing can run any more
+    Services(ExitStatus),
 }
 
 impl Host {
@@ -580,7 +600,7 @@ impl Host {
         });
     }
 
-    /// Starts `spawn`; a thread reaps it. When it is the main process its end is atld's (`done`).
+    /// Starts `spawn`; a thread reaps it. `main`: the `--run-class` command, whose end is the run's (`done`).
     fn start(self: &Arc<Self>, spawn: Spawn, main: bool, controlled: bool) -> Result<i32> {
         let Process {
             mut child,
@@ -605,7 +625,7 @@ impl Host {
                     Ok(status) => {
                         log(format_args!("process {host_pid} ended: {status}"));
                         if main {
-                            let _ = host.done.send(status);
+                            let _ = host.done.send(End::Command(status));
                         }
                     }
                     Err(e) => log(format_args!("waiting for process {host_pid}: {e}")),
@@ -626,9 +646,7 @@ impl Host {
             &req.args,
         )?;
         self.external_storage(&mut spawn, &req.package);
-        // the first process the services start is the main one when no command is
-        let main = self.services_start_main && !self.main_claimed.swap(true, Ordering::SeqCst);
-        let pid = self.start(spawn, main, true)?;
+        let pid = self.start(spawn, false, true)?;
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
             req.process_name, req.package, req.uid
@@ -653,6 +671,73 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&pid);
         Ok(())
+    }
+}
+
+impl Host {
+    /// The control command `start <package>/<class>`: atl-am as the shell uid (AID_SHELL), a startActivity with no caller app; waits for it. Its reply line, `ok <am line>` or `error <why>`.
+    fn am_start(&self, component: &str) -> String {
+        let Some(am) = &self.am else {
+            return "error atld has no --am".to_owned();
+        };
+        let log = self.root.log("am");
+        let spawn = || -> Result<Spawn> {
+            Ok(Spawn {
+                uid: AID_SHELL,
+                context_manager: false,
+                mounts: vec![],
+                links: vec![],
+                devices: vec![],
+                property_area: Some(self.root.properties()),
+                program: am.clone(),
+                args: vec!["start".into(), component.into()],
+                env: vec![self.lib.clone()],
+                stdin: None,
+                log: OpenOptions::new().create(true).append(true).open(&log)?,
+            })
+        };
+        let outcome = spawn()
+            .and_then(|s| Ok(self.broker.spawn(s)?))
+            .and_then(|mut p| Ok(p.child.wait()?));
+        let last = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("am: "))
+            .unwrap_or("")
+            .to_owned();
+        match outcome {
+            Ok(s) if s.success() => format!("ok {last}"),
+            Ok(s) => format!("error atl-am {s}: {last}"),
+            Err(e) => format!("error {e:#}"),
+        }
+    }
+}
+
+/// The run's control socket, `<root>/control.sock` (owner decision 2026-11-06: the run ends on an explicit stop, not with an app): one command line per connection, one reply line.
+/// `stop` ends the run (reply `ok`); `start <package>/<class>` starts an activity as `am start` does ([`Host::am_start`]). Anything else: `error unknown command`.
+fn serve_run_control(host: Arc<Host>, listener: UnixListener) {
+    for conn in listener.incoming() {
+        let Ok(mut conn) = conn else { continue };
+        let mut line = String::new();
+        if BufReader::new(&conn).read_line(&mut line).is_err() {
+            continue;
+        }
+        let line = line.trim();
+        let reply = match line.split_once(' ').unwrap_or((line, "")) {
+            ("stop", "") => {
+                log(format_args!("control: stop"));
+                let _ = host.done.send(End::Stop);
+                "ok".to_owned()
+            }
+            ("start", component) if !component.is_empty() => {
+                let reply = host.am_start(component);
+                log(format_args!("control: start {component}: {reply}"));
+                reply
+            }
+            _ => "error unknown command".to_owned(),
+        };
+        let _ = writeln!(conn, "{reply}");
     }
 }
 
@@ -774,7 +859,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         SocketFlags::CLOEXEC,
         None,
     )?;
-    let (done_tx, done_rx): (Sender<ExitStatus>, Receiver<ExitStatus>) = channel();
+    let (done_tx, done_rx): (Sender<End>, Receiver<End>) = channel();
     // the services and every app process answer with this one display
     let display = a.display.unwrap_or_else(host_display);
     let host = Arc::new(Host {
@@ -789,9 +874,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
         controlled: Mutex::new(BTreeSet::new()),
-        main_claimed: AtomicBool::new(false),
         done: done_tx,
-        services_start_main: a.run_class.is_none(),
+        am: a.am.clone(),
         root: Root {
             root: r.root.clone(),
         },
@@ -816,6 +900,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     services_args.extend(["--display".into(), display.to_arg().into()]);
     if a.no_ime_death_link {
         services_args.push("--no-ime-death-link".into());
+    }
+    if a.no_new_intent {
+        services_args.push("--no-new-intent".into());
     }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([
@@ -860,15 +947,42 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
         let spawn = host.app_spawn(uid, name, PLATFORM_SDK, &boot, class, &a.run_args)?;
-        let pid = host.start(
-            spawn,
-            !host.main_claimed.swap(true, Ordering::SeqCst),
-            false,
-        )?;
+        let pid = host.start(spawn, true, false)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }
-    let status = done_rx.recv().context("no main process ended")?;
-    log(format_args!("main process ended: {status}"));
+    // the control socket is up once everything above is: a `start` reaches running services
+    let control_path = r.root.join(CONTROL_SOCKET);
+    let listener = UnixListener::bind(&control_path)
+        .with_context(|| format!("binding {}", control_path.display()))?;
+    {
+        let host = Arc::clone(&host);
+        std::thread::Builder::new()
+            .name("run-control".into())
+            .spawn(move || serve_run_control(host, listener))?;
+    }
+    log(format_args!("control: {}", control_path.display()));
+    let end = loop {
+        match done_rx.recv_timeout(SERVICES_POLL) {
+            Ok(end) => break end,
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(s) = services.child.try_wait()? {
+                    break End::Services(s);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => bail!("the run's end channel closed"),
+        }
+    };
+    let code = match &end {
+        End::Command(status) => {
+            log(format_args!("command ended: {status}"));
+            status.code()
+        }
+        End::Stop => Some(0),
+        End::Services(status) => {
+            log(format_args!("services ended: {status}"));
+            None
+        }
+    };
     // what the services started dies with the run; then the services and servicemanager (their sandboxes' first processes, so everything in them). Every thread holding the host ends with its process,
     // and the broker's admin connection then closes; binderd is killed anyway, as nothing needs it any more.
     let left: Vec<i32> = host
@@ -892,7 +1006,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     drop(host);
     let _ = binderd.kill();
     let _ = binderd.wait();
-    Ok(match status.code() {
+    Ok(match code {
         Some(0) => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     })

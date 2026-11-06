@@ -35,7 +35,7 @@ struct Args {
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
-    /// A package whose launcher activity starts once the services are up (the stand-in for a home screen tap; startActivity is not implemented).
+    /// A package whose launcher activity starts once the services are up (the stand-in for a home screen tap at boot; later starts come as startActivity with no caller app, `atl-am`).
     #[arg(long)]
     launch: Option<String>,
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
@@ -47,6 +47,9 @@ struct Args {
     /// Test only: input method clients get no death link, the deliberate break of the ime gate's death sub-gate (a dead app's client then stays in the table).
     #[arg(long)]
     no_ime_death_link: bool,
+    /// Test only: a start that would reuse a singleTop / singleTask instance (onNewIntent) is refused, the deliberate break of the start-finish stage's new-intent sub-gate.
+    #[arg(long)]
+    no_new_intent: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -109,7 +112,10 @@ fn main() -> Result<()> {
     binder::add_service(ACTIVITY, am.as_binder()).context("addService activity")?;
     binder::add_service(
         ACTIVITY_TASK,
-        atl_services::activity_task::ActivityTaskService::new_binder(activity.activity_tasks()),
+        atl_services::activity_task::ActivityTaskService::new_binder(
+            activity.clone(),
+            !a.no_new_intent,
+        ),
     )
     .context("addService activity_task")?;
     let pm = BnPackageManager::new_binder(
