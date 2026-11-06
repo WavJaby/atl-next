@@ -8,13 +8,18 @@
 //! - dim: every pixel below the dialog times (1 - dimAmount): a black colour layer at alpha dimAmount over the Task, just below the dialog (Dimmer.java:169-173, DimmerAnimationHelper.java:257, :286-293).
 //!
 //! Sub-gates ([`checks`]): shown (the dialog drew), readback (the last settled readback is that picture), pong, controls (no dim / surface origin without the insets / popup below the anchor each give
-//! another picture, so each would fail the readback).
+//! another picture, so each would fail the readback), touch (real wl_pointer drags on the off-origin dialog, before and after a resize with it open, reach it in its own coordinates: InputDispatcher's
+//! per-window transform, raw coordinates staying the Task's; `--break-input-frames` must fail it). The readback is the picture at the resized size.
 
 use std::path::Path;
 
-use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, capture_line, wait_for_line};
+use super::widgets::{inject, press};
+use super::{
+    ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event, capture_line, content_origin,
+    wait_for_line,
+};
 use crate::composer::{fnv1a64, word};
-use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
+use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask/testdata/dialog";
@@ -33,6 +38,16 @@ const POPUP_SIZE: (u32, u32) = (160, 80);
 /// Main.java DIM = 0.5: each channel under the dim is halved. Main.java keeps every dimmed channel even and at most 0x80, so the halving is exact whether the compositor's alpha is 0.5
 /// or the 8-bit 128/255 (0x80 * (1 - 128/255) = 63.75 rounds to 64).
 const DIM_DIVISOR: u8 = 2;
+/// The fixture's line per touch on the dialog.
+const TOUCH: &str = "AtlWindow: dialog touch ";
+/// A drag starts at the dialog's centre and ends this far from it: inside the dialog, so a window-relative event stays on it.
+const DRAG: (u32, u32) = (30, 20);
+/// The configure with the dialog open: xdg_toplevel size and an injected serial far from the compositor's. Smaller than the gates' opening size, so the dialog moves and the window stays under the display.
+const RESIZED: (i32, i32, u32) = (1000, 700, 0xd1a1);
+/// MotionEvent ACTION_DOWN / ACTION_UP / ACTION_MOVE.
+const ACTION_DOWN: u32 = 0;
+const ACTION_UP: u32 = 1;
+const ACTION_MOVE: u32 = 2;
 
 /// `l,t,r,b` in window pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,11 +81,16 @@ struct Layout {
     anchor: Rect,
 }
 
+/// The window's last layout.
 fn layout(app: &str) -> Result<Layout, String> {
-    let line = app
-        .lines()
-        .find(|l| l.contains(SHOWN))
-        .ok_or("the dialog never drew")?;
+    parse_layout(
+        app.lines()
+            .rfind(|l| l.contains(SHOWN))
+            .ok_or("the dialog never drew")?,
+    )
+}
+
+fn parse_layout(line: &str) -> Result<Layout, String> {
     let anchor: Vec<u32> = word(line, "anchor")
         .map(|s| s.split(',').filter_map(|p| p.parse().ok()).collect())
         .unwrap_or_default();
@@ -210,6 +230,81 @@ fn controls(app: &str) -> Result<String, String> {
     }
 }
 
+/// The dialog's frame origin in a window of `l` (Gravity.apply centre, as [`picture`]).
+fn dialog_origin(l: &Layout) -> (u32, u32) {
+    (
+        (l.width - DIALOG_SIZE.0) / 2,
+        (l.height - DIALOG_SIZE.1) / 2,
+    )
+}
+
+/// One logged touch: action, the dialog's x and y, raw x and y.
+fn touches(app: &str) -> Vec<(u32, [f32; 4])> {
+    app.lines()
+        .filter(|l| l.contains(TOUCH))
+        .filter_map(|l| {
+            let f = |k| word(l, k)?.parse::<f32>().ok();
+            Some((
+                word(l, "action")?.parse().ok()?,
+                [f("x")?, f("y")?, f("rawx")?, f("rawy")?],
+            ))
+        })
+        .collect()
+}
+
+/// Two drags, down at the dialog's centre, up DRAG from it, each in the dialog's coordinates and raw = its frame origin plus them; the first at the first layout, the second at the last.
+fn touch_check(app: &str) -> Result<String, String> {
+    let first = parse_layout(
+        app.lines()
+            .find(|l| l.contains(SHOWN))
+            .ok_or("the dialog never drew")?,
+    )?;
+    let last = layout(app)?;
+    if (first.width, first.height) == (last.width, last.height) {
+        return Err(format!(
+            "the window never resized from {}x{}",
+            last.width, last.height
+        ));
+    }
+    let all = touches(app);
+    let mut gestures = all.split_inclusive(|(action, _)| *action == ACTION_UP);
+    for (name, l) in [("first", &first), ("resized", &last)] {
+        let g = gestures
+            .next()
+            .ok_or_else(|| format!("no {name} drag reached the dialog"))?;
+        let (ox, oy) = dialog_origin(l);
+        let (cx, cy) = (DIALOG_SIZE.0 / 2, DIALOG_SIZE.1 / 2);
+        let want = |action, x: u32, y: u32| {
+            (
+                action,
+                [x as f32, y as f32, (ox + x) as f32, (oy + y) as f32],
+            )
+        };
+        let (down, up) = (g[0], g[g.len() - 1]);
+        if down != want(ACTION_DOWN, cx, cy) {
+            return Err(format!(
+                "{name} down {down:?}, want {:?}",
+                want(ACTION_DOWN, cx, cy)
+            ));
+        }
+        if up != want(ACTION_UP, cx + DRAG.0, cy + DRAG.1) {
+            return Err(format!(
+                "{name} up {up:?}, want {:?}",
+                want(ACTION_UP, cx + DRAG.0, cy + DRAG.1)
+            ));
+        }
+        if g[1..g.len() - 1].iter().any(|(a, _)| *a != ACTION_MOVE) || g.len() < 3 {
+            return Err(format!(
+                "{name} drag has no moves between down and up: {g:?}"
+            ));
+        }
+    }
+    Ok(format!(
+        "{} touches: both drags in the dialog's coordinates, raw in the Task's",
+        all.len()
+    ))
+}
+
 /// The sub-gates.
 pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
     vec![
@@ -226,11 +321,38 @@ pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
                 Err(e) => Err(e.clone()),
             },
         ),
+        ("touch", touch_check(app)),
         ("controls", controls(app)),
     ]
 }
 
-/// The probe: the window's configure is acked, the dialog drew, then one ping.
+/// A drag on the dialog of the log's last layout: pointer in at its centre, press, move DRAG in two steps, release.
+fn drag(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let (ox, oy) = content_origin(&text)?;
+    let (fx, fy) = dialog_origin(&layout(&text)?);
+    let x = f64::from(ox) + f64::from(fx + DIALOG_SIZE.0 / 2);
+    let y = f64::from(oy) + f64::from(fy + DIALOG_SIZE.1 / 2);
+    let (dx, dy) = (f64::from(DRAG.0), f64::from(DRAG.1));
+    inject(
+        proxy,
+        vec![
+            PointerAction::Enter { x, y },
+            press(true),
+            PointerAction::Motion {
+                x: x + dx / 2.0,
+                y: y + dy / 2.0,
+            },
+            PointerAction::Motion {
+                x: x + dx,
+                y: y + dy,
+            },
+            press(false),
+        ],
+    )
+}
+
+/// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -244,6 +366,19 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         *e == ProxyEvent::Pong { serial: 1 }
     })
     .is_some();
+    drag(&proxy, app_log)?;
+    std::thread::sleep(RESIZE_SETTLE);
+    let (width, height, serial) = RESIZED;
+    proxy
+        .inject_configure(width, height, serial)
+        .map_err(|e| e.to_string())?;
+    await_event(&proxy.events, PONG_WAIT, |e| {
+        *e == ProxyEvent::Acked { serial }
+    })
+    .ok_or("the resize was never acked")?;
+    std::thread::sleep(RESIZE_SETTLE);
+    drag(&proxy, app_log)?;
+    std::thread::sleep(RESIZE_SETTLE);
     Ok(Liveness {
         answered,
         ..Liveness::default()

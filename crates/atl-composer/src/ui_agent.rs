@@ -84,6 +84,26 @@ impl IUiAgent for UiAgent {
             .map_err(|_| StatusCode::DEAD_OBJECT)
     }
 
+    fn input_frame(
+        &self,
+        token: SpIBinder,
+        [left, top, right, bottom]: [i32; 4],
+    ) -> Result<(), StatusCode> {
+        if std::env::var(crate::start::BREAK_ENV).as_deref() == Ok(crate::start::BREAK_INPUT_FRAMES)
+        {
+            return Ok(());
+        }
+        let frame = crate::input::Frame {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        self.input
+            .send(Message::WindowFrame { token, frame })
+            .map_err(|_| StatusCode::DEAD_OBJECT)
+    }
+
     /// To the UI thread's window (ui_window); headless mode has none and ignores it.
     fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode> {
         Ok(self.input_method.clone())

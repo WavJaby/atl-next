@@ -64,6 +64,7 @@ fn key_and_motion_reach_the_consumer_and_finish() {
             button_state: 0,
             classification: CLASSIFICATION_NONE,
             transform: IDENTITY,
+            raw_transform: IDENTITY,
             x_precision: 1.0,
             y_precision: 1.0,
             x_cursor: 0.0,

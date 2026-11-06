@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has nine transactions. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has ten transactions. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
 //! just below that layer (WMS Dimmer), amount <= 0 drops it. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
@@ -40,6 +40,8 @@ pub const INPUT_METHOD: TransactionCode = 7;
 pub const POST_DRAW_TRANSACTION: TransactionCode = 8;
 /// A dimming window's layer id, the dim amount (f32) and the dim bounds' width and height (i32, from the Task's origin) in; nothing out. Amount <= 0 drops the window's dim layer.
 pub const DIM_LAYER: TransactionCode = 9;
+/// A window's input channel token and its frame in its Task (left, top, right, bottom: i32) in; nothing out. The agent's dispatcher hit-tests and translates that window's pointer events with it.
+pub const INPUT_FRAME: TransactionCode = 10;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -50,6 +52,8 @@ pub trait IUiAgent: Interface {
     fn input_server(&self, token: SpIBinder, fd: OwnedFd, flags: i32) -> Result<(), StatusCode>;
     /// The window of input channel `token` is removed: the agent drops the channel, and input goes to the windows left.
     fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode>;
+    /// The frame (left, top, right, bottom, in its Task) of the window of input channel `token` (WindowInfo.frame and transform).
+    fn input_frame(&self, token: SpIBinder, frame: [i32; 4]) -> Result<(), StatusCode>;
     /// The Task the app's window belongs to, by its number (tasks.rs TaskId::raw): the app's bounds go to it.
     fn task(&self, task: i32) -> Result<(), StatusCode>;
     /// The pointer icon the app's view hierarchy resolved (PointerIconType value): the app's window shows it as its cursor.
@@ -98,6 +102,11 @@ fn on_transact(
         REMOVE_INPUT => {
             let token: SpIBinder = data.read()?;
             service.remove_input(token)
+        }
+        INPUT_FRAME => {
+            let token: SpIBinder = data.read()?;
+            let frame = [data.read()?, data.read()?, data.read()?, data.read()?];
+            service.input_frame(token, frame)
         }
         TASK => {
             let task: i32 = data.read()?;
@@ -159,6 +168,17 @@ impl IUiAgent for BpUiAgent {
         let mut data = binder.prepare_transact()?;
         data.write(&token)?;
         binder.submit_transact(REMOVE_INPUT, data, 0)?;
+        Ok(())
+    }
+
+    fn input_frame(&self, token: SpIBinder, frame: [i32; 4]) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(&token)?;
+        for side in frame {
+            data.write(&side)?;
+        }
+        binder.submit_transact(INPUT_FRAME, data, 0)?;
         Ok(())
     }
 
@@ -284,6 +304,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn remove_input(&self, token: SpIBinder) -> Result<(), StatusCode> {
         self.0.remove_input(token)
+    }
+
+    fn input_frame(&self, token: SpIBinder, frame: [i32; 4]) -> Result<(), StatusCode> {
+        self.0.input_frame(token, frame)
     }
 
     fn task(&self, task: i32) -> Result<(), StatusCode> {

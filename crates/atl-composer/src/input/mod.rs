@@ -31,6 +31,11 @@ pub enum Message {
     },
     /// The window of this channel token was removed (WMS removeWindow): its channel is dropped.
     WindowRemoved(SpIBinder),
+    /// The frame of this channel token's window, in its Task (WindowInfo.frame + transform).
+    WindowFrame {
+        token: SpIBinder,
+        frame: Frame,
+    },
     FirstFrame,
     /// A pointer event of the UI-mode window (its `on_events`), published like a scripted one.
     Event(InputEvent),
@@ -39,15 +44,32 @@ pub enum Message {
 /// WindowManager.LayoutParams flags InputDispatcher acts on (WMS hands them over as WindowInfo inputConfig NOT_FOCUSABLE / NOT_TOUCHABLE).
 pub const FLAG_NOT_FOCUSABLE: i32 = 0x8;
 pub const FLAG_NOT_TOUCHABLE: i32 = 0x10;
+pub const FLAG_NOT_TOUCH_MODAL: i32 = 0x20;
 
-/// The app's input windows, bottom to top, each by its channel key `K` with its channel `C` and its LayoutParams flags, and the open pointer gesture's window: the part of AOSP's InputDispatcher
-/// that picks a window. Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top). Every touchable window is taken as touch-modal and
-/// covering the pointer (activity windows fill the Task, dialogs are touch-modal: InputDispatcher `windowAcceptsTouchAt` takes a window without FLAG_NOT_TOUCH_MODAL wherever the touch is), so the
-/// topmost window without FLAG_NOT_TOUCHABLE is the touched one (`findTouchedWindowAtLocked` skips NOT_TOUCHABLE: a toast) and the topmost without FLAG_NOT_FOCUSABLE the focused one.
-/// Re-check when windows carry frames here (popups are FLAG_NOT_TOUCH_MODAL).
+/// A window's frame in its Task, `[left, right)` x `[top, bottom)` (WindowInfo.frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Frame {
+    /// InputDispatcher windowAcceptsTouchAt: floor the point, right and bottom edges outside.
+    fn contains(&self, (x, y): (f32, f32)) -> bool {
+        let (x, y) = (x.floor() as i32, y.floor() as i32);
+        (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
+    }
+}
+
+/// The app's input windows, bottom to top, each by its channel key `K` with its channel `C`, its LayoutParams flags and its frame (None until the first relayout), and the open pointer gesture's window:
+/// the part of AOSP's InputDispatcher that picks a window. Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top).
+/// Touched window = topmost without FLAG_NOT_TOUCHABLE that is touch-modal or holds the point: a modal window's touchable region is the Task, any other's its frame (WindowState.getEffectiveTouchableRegion,
+/// InputDispatcher windowAcceptsTouchAt). A window with no frame yet counts as covering. The topmost without FLAG_NOT_FOCUSABLE is the focused one.
 /// Focus (InputDispatcher's focused window, delivered as InputChannel focus events -> ViewRootImpl windowFocusChanged): the top window while the desktop toplevel is active, none otherwise.
 pub struct Windows<K, C> {
-    list: Vec<(K, C, i32)>,
+    list: Vec<(K, C, i32, Option<Frame>)>,
     gesture: Option<K>,
     /// The desktop toplevel is active (InputEvent::Focus); false until told.
     active: bool,
@@ -70,13 +92,20 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
     /// `key`'s channel goes on top (a key added again replaces its old channel); `flags` = its window's LayoutParams flags.
     pub fn add(&mut self, key: K, channel: C, flags: i32) {
         self.remove(&key);
-        self.list.push((key, channel, flags));
+        self.list.push((key, channel, flags, None));
+    }
+
+    /// `key`'s window frame, from its relayout.
+    pub fn set_frame(&mut self, key: &K, frame: Frame) {
+        if let Some(window) = self.list.iter_mut().find(|(k, ..)| k == key) {
+            window.3 = Some(frame);
+        }
     }
 
     /// Drops `key`'s channel; true when it was held. A gesture on it stays open with no window: its remaining events are dropped (InputDispatcher drops a stream whose touched window is gone).
     pub fn remove(&mut self, key: &K) -> bool {
         let before = self.list.len();
-        self.list.retain(|(k, _, _)| k != key);
+        self.list.retain(|(k, ..)| k != key);
         before != self.list.len()
     }
 
@@ -92,8 +121,8 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
             self.list
                 .iter()
                 .rev()
-                .find(|(_, _, f)| f & FLAG_NOT_FOCUSABLE == 0)
-                .map(|(k, _, _)| k.clone())
+                .find(|(_, _, f, _)| f & FLAG_NOT_FOCUSABLE == 0)
+                .map(|(k, ..)| k.clone())
         } else {
             None
         };
@@ -121,26 +150,33 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
     pub fn channel(&mut self, key: &K) -> Option<&mut C> {
         self.list
             .iter_mut()
-            .find(|(k, _, _)| k == key)
-            .map(|(_, c, _)| c)
+            .find(|(k, ..)| k == key)
+            .map(|(_, c, ..)| c)
     }
 
     /// The window of a pointer event, given whether a gesture (button held, swipe going) was open before it: without one the event starts a gesture (or is a hover or wheel) and goes to the top window,
-    /// which the gesture keeps until it ends (InputDispatcher's TouchState: later windows do not take a stream already going).
-    pub fn pointer_target(&mut self, in_gesture: bool) -> Option<(&K, &mut C)> {
+    /// which the gesture keeps until it ends (InputDispatcher's TouchState: later windows do not take a stream already going). `at` = the event's point in the Task. Also returns the window's origin, what its events are translated by.
+    pub fn pointer_target(
+        &mut self,
+        in_gesture: bool,
+        at: (f32, f32),
+    ) -> Option<(&K, &mut C, (i32, i32))> {
         if !in_gesture {
             self.gesture = self
                 .list
                 .iter()
                 .rev()
-                .find(|(_, _, f)| f & FLAG_NOT_TOUCHABLE == 0)
-                .map(|(k, _, _)| k.clone());
+                .find(|(_, _, f, frame)| {
+                    f & FLAG_NOT_TOUCHABLE == 0
+                        && (f & FLAG_NOT_TOUCH_MODAL == 0 || frame.is_none_or(|r| r.contains(at)))
+                })
+                .map(|(k, ..)| k.clone());
         }
         let key = self.gesture.as_ref()?;
         self.list
             .iter_mut()
-            .find(|(k, _, _)| k == key)
-            .map(|(k, c, _)| (&*k, c))
+            .find(|(k, ..)| k == key)
+            .map(|(k, c, _, frame)| (&*k, c, frame.map_or((0, 0), |r| (r.left, r.top))))
     }
 }
 
@@ -266,8 +302,8 @@ mod publish {
         }
     }
 
-    /// `m` as the MotionEvent numbered `seq` with the keyboard's `meta_state`, identity transform.
-    fn motion(m: &Motion, seq: u32, meta_state: i32) -> MotionEvent {
+    /// `m` as the MotionEvent numbered `seq` with the keyboard's `meta_state`. Coordinates stay the Task's; the transform takes them to the window at `origin` (WindowInfo.transform), getRawX keeps the Task's.
+    fn motion(m: &Motion, seq: u32, meta_state: i32, origin: (i32, i32)) -> MotionEvent {
         MotionEvent {
             seq,
             event_id: i32::try_from(seq).unwrap_or(i32::MAX),
@@ -281,7 +317,8 @@ mod publish {
             meta_state,
             button_state: m.button_state,
             classification: m.classification,
-            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            transform: [1.0, 0.0, 0.0, 1.0, -(origin.0 as f32), -(origin.1 as f32)],
+            raw_transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             x_precision: 1.0,
             y_precision: 1.0,
             // a mouse hit-tests at the cursor (MotionEvent.getXDispatchLocation); its NaN check is `!=`, always true, so NaN hits no child
@@ -387,14 +424,18 @@ mod publish {
             return;
         }
         let mut windows = state.windows.borrow_mut();
-        let Some((token, publisher)) = windows.pointer_target(in_gesture) else {
+        let at = motions[0]
+            .pointers
+            .first()
+            .map_or((0.0, 0.0), |p| (p.at.x as f32, p.at.y as f32));
+        let Some((token, publisher, origin)) = windows.pointer_target(in_gesture, at) else {
             tracing::warn!("input: no window takes {} event(s), dropped", motions.len());
             return;
         };
         for m in &motions {
             let seq = next_seq(state.seq.get());
             state.seq.set(seq);
-            if let Err(err) = publisher.publish_motion(&motion(m, seq, meta_state)) {
+            if let Err(err) = publisher.publish_motion(&motion(m, seq, meta_state, origin)) {
                 tracing::warn!("input: publishing event {seq}: {err:?}");
                 if matches!(
                     err,
@@ -469,6 +510,9 @@ mod publish {
                 Message::WindowRemoved(token) => {
                     state.windows.borrow_mut().remove(&token);
                     publish_focus(&state);
+                }
+                Message::WindowFrame { token, frame } => {
+                    state.windows.borrow_mut().set_frame(&token, frame);
                 }
                 Message::Event(event) => source.inject(event),
                 // once: the script's events come back as Message::Event from its own thread, so a wait never holds up the channels a later window brings
@@ -552,7 +596,7 @@ mod publish {
                 time_ms: 7,
             };
             // AMETA_SHIFT_ON | AMETA_SHIFT_LEFT_ON (android/input.h): the keyboard's meta state rides on the motion
-            let m = motion(&m, 3, 0x41);
+            let m = motion(&m, 3, 0x41, (600, 390));
             assert_eq!(m.meta_state, 0x41);
             assert_eq!(
                 (
@@ -576,7 +620,9 @@ mod publish {
                     axes: vec![(2, 0.0)]
                 }]
             );
-            assert_eq!(m.transform, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+            // a window at (600, 390): getX is the point less the origin, getRawX the point
+            assert_eq!(m.transform, [1.0, 0.0, 0.0, 1.0, -600.0, -390.0]);
+            assert_eq!(m.raw_transform, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
             assert_eq!((m.down_time, m.event_time), (5_000_000, 7_000_000));
         }
     }
@@ -590,6 +636,31 @@ mod tests {
     use atl_platform_ui::PointerEvent;
 
     use super::*;
+
+    /// A non-modal popup takes only points in its frame, right and bottom edges out (windowAcceptsTouchAt); a modal window takes any point; origins come with the target.
+    #[test]
+    fn touch_hit_test_follows_frames() {
+        let frame = |left, top, right, bottom| Frame {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let mut w: Windows<u32, ()> = Windows::default();
+        w.add(1, (), 0);
+        w.set_frame(&1, frame(0, 0, 400, 300));
+        w.add(2, (), FLAG_NOT_TOUCH_MODAL);
+        w.set_frame(&2, frame(100, 50, 200, 150));
+        let hit =
+            |w: &mut Windows<u32, ()>, at| w.pointer_target(false, at).map(|(k, _, o)| (*k, o));
+        assert_eq!(hit(&mut w, (100.0, 50.0)), Some((2, (100, 50))));
+        assert_eq!(hit(&mut w, (199.9, 149.9)), Some((2, (100, 50))));
+        assert_eq!(hit(&mut w, (200.0, 100.0)), Some((1, (0, 0))));
+        assert_eq!(hit(&mut w, (150.0, 150.0)), Some((1, (0, 0))));
+        w.add(3, (), 0);
+        w.set_frame(&3, frame(100, 50, 200, 150));
+        assert_eq!(hit(&mut w, (10.0, 10.0)), Some((3, (100, 50))));
+    }
 
     /// The script's items in order: kinds, positions and phases as written; a bad item refuses the whole script; an empty script has no steps.
     #[test]
@@ -628,21 +699,36 @@ mod tests {
     #[test]
     fn windows_route_to_the_top_and_keep_a_gesture() {
         let mut w = Windows::<u32, &str>::default();
-        assert!(w.pointer_target(false).is_none());
+        assert!(w.pointer_target(false, (0.0, 0.0)).is_none());
         w.add(1, "main", 0);
         w.add(2, "history", 0);
-        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(2));
+        assert_eq!(
+            w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(2)
+        );
         assert!(w.remove(&2));
         assert!(!w.remove(&2));
-        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
+        assert_eq!(
+            w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(1)
+        );
         // press on 1 (no gesture before), 3 comes up, the move with the button held stays on 1
-        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
+        assert_eq!(
+            w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(1)
+        );
         w.add(3, "dialog", 0);
-        assert_eq!(w.pointer_target(true).map(|(k, _)| *k), Some(1));
+        assert_eq!(
+            w.pointer_target(true, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(1)
+        );
         // the gesture's window goes: the rest of the gesture has no window; the next gesture starts on the top
         w.remove(&1);
-        assert!(w.pointer_target(true).is_none());
-        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(3));
+        assert!(w.pointer_target(true, (0.0, 0.0)).is_none());
+        assert_eq!(
+            w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(3)
+        );
     }
 
     /// Focus goes to the top window only while the desktop window is active: replayed to a window added later, moved when the top changes, taken (false) on deactivation.
@@ -676,10 +762,13 @@ mod tests {
         assert_eq!(w.focus_changes(), [(1, true)]);
         w.add(2, "toast", FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE);
         assert!(w.focus_changes().is_empty());
-        assert_eq!(w.pointer_target(false).map(|(k, _)| *k), Some(1));
+        assert_eq!(
+            w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),
+            Some(1)
+        );
         w.remove(&1);
         assert_eq!(w.focus_changes(), [(1, false)]);
-        assert!(w.pointer_target(false).is_none());
+        assert!(w.pointer_target(false, (0.0, 0.0)).is_none());
     }
 
     /// The headless source runs the callback set by `on_events` once per injected event; with none set an event is dropped.

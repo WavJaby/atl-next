@@ -27,7 +27,9 @@ use crate::{service, surface_flinger, ui_agent, ui_window};
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
 /// A deliberate-failure run's broken rule (set by xtask's window gate only): with [`BREAK_Z_ORDER`] siblings ignore their z (CompositorConfig::z_order).
-const BREAK_ENV: &str = "ATL_UI_BREAK";
+pub(crate) const BREAK_ENV: &str = "ATL_UI_BREAK";
+/// With it the windows' frames never reach the input thread (ui_agent input_frame): pointer events stay in Task coordinates.
+pub(crate) const BREAK_INPUT_FRAMES: &str = "input-frames";
 const BREAK_Z_ORDER: &str = "z-order";
 /// With it the window service's forwarded post-draw Transactions are dropped (ComposerConfig::post_draw).
 const BREAK_POST_DRAW: &str = "post-draw";

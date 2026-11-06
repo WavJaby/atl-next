@@ -54,7 +54,7 @@ pub(crate) mod ffi {
             down_time: i64,
             event_time: i64,
         ) -> i32;
-        /// InputPublisher::publishMotionEvent. `transform` is (a, b, c, d, tx, ty), used for both the transform and the raw transform; `pointer_ids` and `tool_types` hold one entry per pointer; axis entry k sets axis `axis_ids[k]` of pointer `axis_pointers[k]` to `axis_values[k]`.
+        /// InputPublisher::publishMotionEvent. `transform` and `raw_transform` are (a, b, c, d, tx, ty); `pointer_ids` and `tool_types` hold one entry per pointer; axis entry k sets axis `axis_ids[k]` of pointer `axis_pointers[k]` to `axis_values[k]`.
         pub fn publish_motion(
             publisher: Pin<&mut Publisher>,
             seq: u32,
@@ -70,6 +70,7 @@ pub(crate) mod ffi {
             button_state: i32,
             classification: u8,
             transform: &[f32],
+            raw_transform: &[f32],
             x_precision: f32,
             y_precision: f32,
             x_cursor: f32,

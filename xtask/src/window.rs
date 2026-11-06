@@ -72,6 +72,9 @@ pub struct Args {
     /// Deliberate break (stage hwui): the expected quadrants have red and blue swapped, so the readback check must fail (it compares channel order exactly).
     #[arg(long)]
     break_swap_rb: bool,
+    /// Deliberate break (stage dialog): the composer ignores window frames, so the dialog's touches arrive in Task coordinates and the touch check must fail.
+    #[arg(long)]
+    break_input_frames: bool,
     /// Deliberate break (any UI stage that replaces buffers): the composer sends a tick's releases before the window painted, so the release check must fail.
     #[arg(long)]
     break_release_before_paint: bool,
@@ -1641,6 +1644,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     rt.with_ui_break("queue")
                 } else if args.break_release_before_paint {
                     rt.with_ui_break("release-before-paint")
+                } else if args.break_input_frames {
+                    rt.with_ui_break("input-frames")
                 } else {
                     rt
                 };

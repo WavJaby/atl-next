@@ -51,10 +51,13 @@ int32_t publish_key(Publisher& publisher, uint32_t seq, int32_t event_id, int32_
     return publisher.publisher.publishKeyEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, flags, key_code, scan_code, meta_state, repeat_count, down_time, event_time);
 }
 
-int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const int32_t> tool_types, rust::Slice<const uint32_t> axis_pointers, rust::Slice<const int32_t> axis_ids, rust::Slice<const float> axis_values) {
+int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int32_t device_id, int32_t source, int32_t display_id, int32_t action, int32_t action_button, int32_t flags, int32_t edge_flags, int32_t meta_state, int32_t button_state, uint8_t classification, rust::Slice<const float> transform, rust::Slice<const float> raw_transform, float x_precision, float y_precision, float x_cursor, float y_cursor, int64_t down_time, int64_t event_time, rust::Slice<const int32_t> pointer_ids, rust::Slice<const int32_t> tool_types, rust::Slice<const uint32_t> axis_pointers, rust::Slice<const int32_t> axis_ids, rust::Slice<const float> axis_values) {
     android::ui::Transform affine;
     affine.set(transform[0], transform[1], transform[2], transform[3]);
     affine.set(transform[4], transform[5]);
+    android::ui::Transform raw_affine;
+    raw_affine.set(raw_transform[0], raw_transform[1], raw_transform[2], raw_transform[3]);
+    raw_affine.set(raw_transform[4], raw_transform[5]);
     const size_t count = pointer_ids.size();
     std::vector<android::PointerProperties> properties(count);
     std::vector<android::PointerCoords> pointer_coords(count);
@@ -67,7 +70,7 @@ int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int
     for (size_t k = 0; k < axis_ids.size(); k++) {
         pointer_coords[axis_pointers[k]].setAxisValue(axis_ids[k], axis_values[k]);
     }
-    return publisher.publisher.publishMotionEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, action_button, flags, edge_flags, meta_state, button_state, static_cast<android::MotionClassification>(classification), affine, x_precision, y_precision, x_cursor, y_cursor, affine, down_time, event_time, static_cast<uint32_t>(count), properties.data(), pointer_coords.data());
+    return publisher.publisher.publishMotionEvent(seq, event_id, device_id, source, android::ui::LogicalDisplayId(display_id), {}, action, action_button, flags, edge_flags, meta_state, button_state, static_cast<android::MotionClassification>(classification), affine, x_precision, y_precision, x_cursor, y_cursor, raw_affine, down_time, event_time, static_cast<uint32_t>(count), properties.data(), pointer_coords.data());
 }
 
 int32_t publish_focus(Publisher& publisher, uint32_t seq, int32_t event_id, bool has_focus) {

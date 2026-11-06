@@ -74,7 +74,7 @@ pub struct Pointer {
     pub axes: Vec<(i32, f32)>,
 }
 
-/// A motion event to publish (InputPublisher::publishMotionEvent). `transform` is the affine (a, b, c, d, tx, ty) applied to the event's coordinates; the raw transform is the same.
+/// A motion event to publish (InputPublisher::publishMotionEvent). `transform` is the affine (a, b, c, d, tx, ty) taking the event's coordinates to the window (getX); `raw_transform` the one taking them to the screen (getRawX).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotionEvent {
     pub seq: u32,
@@ -91,6 +91,7 @@ pub struct MotionEvent {
     /// AOSP's MotionClassification (`enum class`, uint8_t).
     pub classification: u8,
     pub transform: [f32; 6],
+    pub raw_transform: [f32; 6],
     pub x_precision: f32,
     pub y_precision: f32,
     pub x_cursor: f32,
@@ -169,6 +170,7 @@ impl Publisher {
             e.button_state,
             e.classification,
             &e.transform,
+            &e.raw_transform,
             e.x_precision,
             e.y_precision,
             e.x_cursor,

@@ -18,7 +18,7 @@ import android.widget.PopupWindow;
  * a PopupWindow of POPUP drops down from the anchor (no room below, so it must open above it, inside the window); then a dialog window of DIALOG, DIALOG_W x DIALOG_H,
  * centred (gravity 0), FLAG_DIM_BEHIND at DIM, with manual surfaceInsets INSET on each side (a shadow's room; set by reflection, the field is hidden API).
  * Sizes are pixels; colours stay at or under 0x80 per channel, so the dimmed value is exact whether the compositor's alpha is 0.5 or 128/255.
- * After the dialog's first draw the fixture logs the window size and the anchor's rectangle.
+ * After the dialog's first draw, and at each window layout after it, the fixture logs the window size and the anchor's rectangle; the dialog logs each touch in its own and in raw coordinates.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -81,6 +81,13 @@ public class Main extends Activity {
         popup.showAsDropDown(anchor);
     }
 
+    private void logShown() {
+        int[] at = new int[2];
+        anchor.getLocationInWindow(at);
+        Log.i(TAG, "dialog shown window=" + root.getWidth() + "x" + root.getHeight() + " anchor=" + at[0] + "," + at[1] + ","
+                + (at[0] + anchor.getWidth()) + "," + (at[1] + anchor.getHeight()));
+    }
+
     private void showDialog() {
         final View content = new View(this);
         content.setBackgroundColor(DIALOG);
@@ -104,10 +111,20 @@ public class Main extends Activity {
                     return;
                 }
                 logged = true;
-                int[] at = new int[2];
-                anchor.getLocationInWindow(at);
-                Log.i(TAG, "dialog shown window=" + root.getWidth() + "x" + root.getHeight() + " anchor=" + at[0] + "," + at[1] + ","
-                        + (at[0] + anchor.getWidth()) + "," + (at[1] + anchor.getHeight()));
+                logShown();
+                root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                    @Override
+                    public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
+                        logShown();
+                    }
+                });
+            }
+        });
+        content.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, android.view.MotionEvent e) {
+                Log.i(TAG, "dialog touch action=" + e.getActionMasked() + " x=" + e.getX() + " y=" + e.getY() + " rawx=" + e.getRawX() + " rawy=" + e.getRawY());
+                return true;
             }
         });
         getWindowManager().addView(content, lp);

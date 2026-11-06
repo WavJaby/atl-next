@@ -183,6 +183,23 @@ impl RegisteredAgent {
             );
         }
     }
+
+    /// Tells the agent the frame of the window of input channel `token`; false, counted, when no agent takes it.
+    fn input_frame(&self, token: SpIBinder, frame: &Rect) -> bool {
+        let Some(agent) = self.agent("relayout") else {
+            return false;
+        };
+        match agent.input_frame(token, [frame.left, frame.top, frame.right, frame.bottom]) {
+            Ok(()) => true,
+            Err(e) => {
+                counters::answered(
+                    WINDOW_SESSION,
+                    &format!("relayout: UI agent refused the input frame: {e:?}"),
+                );
+                false
+            }
+        }
+    }
 }
 
 /// One window the session added: its client binder (what `remove` and `relayout` find it by), its title (the layer name) and its Task (the activity its `attrs.token` names). Its input channel's server end went to the app's UI agent.
@@ -556,14 +573,19 @@ impl IWindowSession for Session {
         }
         // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
         let frames = client_frames(placement, task_rect(&self.tasks, task), seq);
-        let (surface, placed) = {
+        let (surface, placed, input) = {
             let windows = self.lock();
             let record = windows.iter().find(|w| w.client == client);
             (
                 record.and_then(|w| w.surface.clone()),
                 record.map(|w| w.position),
+                record.and_then(|w| w.input.clone()),
             )
         };
+        // every relayout: a Task resize reaches the frame only through the client's relayout after `resized`
+        if let Some(input) = input {
+            self.agent.input_frame(input, &frames.frame);
+        }
         // the window's layer goes to its surface origin (WindowState.updateSurfacePosition), asked without the windows lock; a refused call is asked again at the next relayout
         let frame = &frames.frame;
         let origin = crate::window_layout::surface_origin(&placement, (frame.left, frame.top));
