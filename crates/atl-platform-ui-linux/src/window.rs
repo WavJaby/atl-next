@@ -420,6 +420,21 @@ impl Window for GtkWindow {
         self.window.is_mapped() && self.window.surface().is_some_and(|s| s.is_mapped())
     }
 
+    /// GdkToplevelState as GDK's Wayland backend sets it from the last acked xdg_toplevel.configure's states (any tiled edge counts).
+    fn is_size_fixed(&self) -> bool {
+        let fixed = gdk::ToplevelState::MAXIMIZED
+            | gdk::ToplevelState::FULLSCREEN
+            | gdk::ToplevelState::TILED
+            | gdk::ToplevelState::TOP_TILED
+            | gdk::ToplevelState::RIGHT_TILED
+            | gdk::ToplevelState::BOTTOM_TILED
+            | gdk::ToplevelState::LEFT_TILED;
+        self.window
+            .surface()
+            .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
+            .is_some_and(|t| t.state().intersects(fixed))
+    }
+
     fn present(&self, scene: &Scene) -> Result<Presented, PresentError> {
         self.view.show_node(scene::build(scene)?);
         self.shared.presented.set(true);

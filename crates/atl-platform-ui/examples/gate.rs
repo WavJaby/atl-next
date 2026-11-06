@@ -4,7 +4,8 @@
 //!
 //! Phases, in order:
 //! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
-//! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`.
+//! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`. Then the resize probe: `set_size` larger then smaller, each size the content gets as `RESIZED`; on a
+//!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
 //! 3. refusals: an unsignalled acquire fence and a bad-stride buffer are refused, the signalled fence is accepted.
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
 //! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
@@ -77,6 +78,8 @@ const PASS: Duration = Duration::from_millis(20);
 /// Phase 1b: ticks asked for one at a time with nothing presented (the idle timer paces each after the first), and how long each may take: a 60 Hz grid tick is due within 17 ms, so 1 s only fails a tick that never comes.
 const IDLE_TICKS: u32 = 3;
 const IDLE_WAIT: Duration = Duration::from_secs(1);
+/// Phase 2b on a size-fixed window: ticks after each size request before the size is read. GTK applies set_default_size at the next layout (one tick); a second covers the commit the compositor would answer with a configure.
+const FIXED_TICKS: u32 = 2;
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
 const COMPOSITE_FRAMES: [u32; 5] = [100, 101, 102, 103, 104];
 /// The composite scene's colour layers (layer 5 opaque, layer 6 at alpha 0.5): components that are whole multiples of 1/255 (51, 102, 153; 255, 0, 0), so the harness expects exact bytes.
@@ -503,15 +506,37 @@ fn main() -> Result<()> {
         window.on_resize(move |size| sizes.borrow_mut().push(size));
     }
     let step = args.resize_step;
+    // a maximized / tiled / fullscreen window keeps the configured size (xdg-shell: that configure's size is binding), so no request can be waited for: each is followed by
+    // FIXED_TICKS frame-clock ticks (each a commit + frame callback round trip), then the content size is reported, which must still be the granted one
+    let fixed = window.is_size_fixed();
+    if fixed {
+        let granted = window.size();
+        emit(format_args!(
+            "SIZE-FIXED {}x{}",
+            granted.width, granted.height
+        ));
+    }
     for (width, height) in [
         (args.width + step, args.height + step),
         (args.width - step, args.height - step),
     ] {
         let want = PhysSize { width, height };
         window.set_size(want);
-        spin(&looper, deadline, "the resized content", || {
-            sizes.borrow().last() == Some(&want)
-        })?;
+        if fixed {
+            let start = idle.get();
+            for n in 1..=FIXED_TICKS {
+                window.request_frame();
+                spin(&looper, deadline, "a tick after the size request", || {
+                    idle.get() >= start + n
+                })?;
+            }
+            let now = window.size();
+            emit(format_args!("FIXED-AFTER {}x{}", now.width, now.height));
+        } else {
+            spin(&looper, deadline, "the resized content", || {
+                sizes.borrow().last() == Some(&want)
+            })?;
+        }
     }
     for size in sizes.borrow().iter() {
         emit(format_args!("RESIZED {}x{}", size.width, size.height));

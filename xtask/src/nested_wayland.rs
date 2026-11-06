@@ -48,6 +48,9 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 /// labwc's rc.xml: client-side decorations, as WSLg's weston and GNOME have them. labwc's default (server side, offered through `org_kde_kwin_server_decoration_manager`) makes GTK drop its header bar, and the gtk stage's chrome click (surface y 20) then lands in the content (measured 2026-11-06).
 const RC_XML: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n</labwc_config>\n";
+/// [`RC_XML`] plus a window rule maximizing every window at its first map (labwc-config(5) windowRules, action Maximize): the window gets a configure whose size is binding (state maximized) right
+/// after it maps, as a tiling compositor (Hyprland) tiles a new window before the client is done starting.
+const RC_XML_MAXIMIZE: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n  <windowRules>\n    <windowRule identifier=\"*\">\n      <action name=\"Maximize\"/>\n    </windowRule>\n  </windowRules>\n</labwc_config>\n";
 /// wlroots' first free name in a fresh runtime dir.
 const SOCKET: &str = "wayland-0";
 
@@ -125,16 +128,25 @@ pub struct NestedCompositor {
 impl NestedCompositor {
     /// Starts labwc headless with [`GATE_OUTPUT`], config and log under `work`.
     pub fn start(work: &Path) -> Result<Self> {
-        Self::start_with(work, &[GATE_OUTPUT])
+        Self::start_rc(work, &[GATE_OUTPUT], RC_XML)
+    }
+
+    /// As [`start`](Self::start), but every window is maximized when it first maps ([`RC_XML_MAXIMIZE`]).
+    pub fn start_maximizing(work: &Path) -> Result<Self> {
+        Self::start_rc(work, &[GATE_OUTPUT], RC_XML_MAXIMIZE)
     }
 
     /// Starts labwc headless with `outputs` (left to right), config and log under `work`; returns once the outputs are configured and the seat has its pointer.
     pub fn start_with(work: &Path, outputs: &[Output]) -> Result<Self> {
+        Self::start_rc(work, outputs, RC_XML)
+    }
+
+    fn start_rc(work: &Path, outputs: &[Output], rc_xml: &str) -> Result<Self> {
         ensure!(!outputs.is_empty(), "a nested compositor needs an output");
         // this run's config dir, not the user's ~/.config/labwc
         let config = work.join("labwc");
         std::fs::create_dir_all(&config)?;
-        std::fs::write(config.join("rc.xml"), RC_XML)?;
+        std::fs::write(config.join("rc.xml"), rc_xml)?;
         // a private runtime dir, emptied first: a killed run's socket left there would move wlroots to the next name (sun_path holds 108 bytes; the slot work dirs stay well under)
         let runtime = work.join("rt");
         if runtime.exists() {

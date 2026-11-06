@@ -39,8 +39,11 @@ pub struct Args {
     #[arg(long, default_value_t = 5000)]
     ping_timeout_ms: u64,
     /// Keep the client blocked this many extra seconds after the probe, so a person can watch the compositor's own "not responding" reaction (the Arch-laptop check).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "maximized")]
     hold_blocked: Option<u64>,
+    /// The gate's labwc maximizes the window when it maps (a binding configure size before READY, as a tiling compositor gives): the content must follow the granted size, set_size must not be waited for.
+    #[arg(long)]
+    maximized: bool,
     /// Keep the captures in this directory instead of a temporary one.
     #[arg(long)]
     keep: Option<PathBuf>,
@@ -456,6 +459,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // --hold-blocked is watched on the desktop's compositor; every other run maps in the gate's own (outlives the client: declared before it)
     let nested = match args.hold_blocked {
         Some(_) => None,
+        None if args.maximized => {
+            Some(NestedCompositor::start_maximizing(&out_dir.join("nested"))?)
+        }
         None => Some(NestedCompositor::start(&out_dir.join("nested"))?),
     };
     let upstream = match &nested {
@@ -574,20 +580,61 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             Some((w.parse().ok()?, h.parse().ok()?))
         })
         .collect();
-    let larger = (WIDTH + RESIZE_STEP, HEIGHT + RESIZE_STEP);
-    let smaller = (WIDTH - RESIZE_STEP, HEIGHT - RESIZE_STEP);
-    let in_order = match (
-        sizes.iter().position(|s| *s == larger),
-        sizes.iter().position(|s| *s == smaller),
-    ) {
-        (Some(a), Some(b)) => a < b,
-        _ => false,
+    let size_of = |l: &str, key: &str| {
+        let (w, h) = l.strip_prefix(key)?.split_once('x')?;
+        Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
     };
-    report.check(
-        in_order && sizes.last() == Some(&smaller),
-        "content follows the window: larger, then smaller probe size, the smaller last",
-        &format!("sizes {sizes:?}"),
-    );
+    let fixed = client
+        .lines_with("SIZE-FIXED ")
+        .first()
+        .and_then(|l| size_of(l, "SIZE-FIXED "));
+    // each capture's size, from its FRAME / COMPOSITE line (`<file> WxH`, last word)
+    let captured = |prefix: &str| -> Vec<Option<(u32, u32)>> {
+        client
+            .lines_with(prefix)
+            .into_iter()
+            .map(|l| size_of(l.rsplit(' ').next()?, ""))
+            .collect()
+    };
+    let frame_sizes = captured("FRAME ");
+    let composite_size = captured("COMPOSITE ").first().copied().flatten();
+    if args.maximized {
+        report.check(
+            frame_sizes.last().copied().flatten() == fixed && composite_size == fixed,
+            "maximized: the content follows the configure (last frame and composite at the fixed size)",
+            &format!("frames {frame_sizes:?}, composite {composite_size:?}"),
+        );
+        let after: Vec<_> = client
+            .lines_with("FIXED-AFTER ")
+            .into_iter()
+            .filter_map(|l| size_of(l, "FIXED-AFTER "))
+            .collect();
+        report.check(
+            fixed.is_some_and(|g| g != (WIDTH, HEIGHT) && g.0 >= WIDTH && g.1 >= HEIGHT),
+            "maximized: the window reports a fixed size, the configured one, larger than requested",
+            &format!("fixed {fixed:?}"),
+        );
+        report.check(
+            after.len() == 2 && after.iter().all(|s| Some(*s) == fixed),
+            "maximized: size requests leave the content at the configured size",
+            &format!("after requests {after:?}, resized {sizes:?}"),
+        );
+    } else {
+        let larger = (WIDTH + RESIZE_STEP, HEIGHT + RESIZE_STEP);
+        let smaller = (WIDTH - RESIZE_STEP, HEIGHT - RESIZE_STEP);
+        let in_order = match (
+            sizes.iter().position(|s| *s == larger),
+            sizes.iter().position(|s| *s == smaller),
+        ) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        };
+        report.check(
+            fixed.is_none() && in_order && sizes.last() == Some(&smaller),
+            "content follows the window: larger, then smaller probe size, the smaller last",
+            &format!("fixed {fixed:?}, sizes {sizes:?}"),
+        );
+    }
     // a tick asked for outside a mirror pass comes (mirror::resync): the client asks for IDLE_TICKS (gate.rs), one at a time
     let idle = client
         .lines_with("IDLE_TICKS ")
@@ -599,18 +646,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &format!("ticks {idle:?} of {IDLE_TICKS}"),
     );
 
-    // gate 2: readback
+    // gate 2: readback. The scene is WIDTH x HEIGHT; on a maximized window the capture is the granted size and the scene its top-left corner
+    let scene_of = |got: Vec<u8>, size: Option<(u32, u32)>| -> Option<Vec<u8>> {
+        let (w, h) = if args.maximized {
+            size?
+        } else {
+            (WIDTH, HEIGHT)
+        };
+        (w >= WIDTH && h >= HEIGHT && got.len() == (w * h * 4) as usize).then(|| {
+            got.chunks((w * 4) as usize)
+                .take(HEIGHT as usize)
+                .flat_map(|row| row[..(WIDTH * 4) as usize].iter().copied())
+                .collect()
+        })
+    };
     for f in 0..args.frames {
         let path = out_dir.join(format!("frame-{f}.rgba"));
         let got = std::fs::read(&path).with_context(|| path.display().to_string())?;
-        if got.len() != (WIDTH * HEIGHT * 4) as usize {
+        let len = got.len();
+        let size = frame_sizes.get(f as usize).copied().flatten();
+        let Some(got) = scene_of(got, size) else {
             report.check(
                 false,
                 &format!("frame {f} readback size"),
-                &format!("{} bytes, want {}x{}x4", got.len(), WIDTH, HEIGHT),
+                &format!("{len} bytes ({size:?}), want {WIDTH}x{HEIGHT}x4"),
             );
             continue;
-        }
+        };
         let want = expected_frame(f);
         let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
         report.check(
@@ -621,7 +683,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let path = out_dir.join("composite.rgba");
     let got = std::fs::read(&path).with_context(|| path.display().to_string())?;
-    if got.len() == (WIDTH * HEIGHT * 4) as usize {
+    let len = got.len();
+    if let Some(got) = scene_of(got, composite_size) {
         let (bad, first) = compare(&got, composite_pixel);
         report.check(
             bad == 0,
@@ -632,7 +695,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         report.check(
             false,
             "composite readback size",
-            &format!("{} bytes", got.len()),
+            &format!("{len} bytes ({composite_size:?})"),
         );
     }
 
@@ -668,7 +731,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
     // gate 4: ping / pong
     let ping_timeout = Duration::from_millis(args.ping_timeout_ms);
-    let block = ping_timeout + BLOCK_MARGIN;
+    // the client stays blocked through the hold too: a block that ended during the harness's sleep left nothing for the compositor's ANR check to see (11-04 defect 1)
+    let hold = Duration::from_secs(args.hold_blocked.unwrap_or(0));
+    let block = ping_timeout + hold + BLOCK_MARGIN;
     let mut serial = PROBE_SERIAL_BASE;
     let mut next_serial = || {
         serial += 1;
@@ -695,15 +760,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "blocked UI thread: no pong within the ping timeout",
         &format!("waited {ping_timeout:?} after the ping"),
     );
-    if let Some(hold) = args.hold_blocked {
-        println!("holding: the UI thread is blocked, watch the compositor for {hold} more seconds");
-        thread::sleep(Duration::from_secs(hold));
+    if !hold.is_zero() {
+        println!("holding: the UI thread is blocked, watch the compositor for {hold:?} more");
+        thread::sleep(hold);
     }
     client.expect_line("UNBLOCKED", block + RESPONSIVE_LIMIT * 5)?;
     let late = probe.pong(s2, Instant::now() + RESPONSIVE_LIMIT);
     report.check(
-        late.is_some_and(|at| at - sent >= ping_timeout),
-        "the ping sent while blocked is answered once the UI thread runs again, after the timeout",
+        late.is_some_and(|at| at - sent >= ping_timeout + hold),
+        "the ping sent while blocked is answered once the UI thread runs again, after the timeout and the hold",
         &late.map_or("no pong".to_owned(), |at| {
             format!("pong after {:?} (block {block:?})", at - sent)
         }),

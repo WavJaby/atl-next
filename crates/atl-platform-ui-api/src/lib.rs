@@ -209,6 +209,10 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// The window is on screen: the compositor has configured it and a frame can be shown.
     fn is_mapped(&self) -> bool;
 
+    /// The shell fixes the content size now (xdg_toplevel state maximized, fullscreen or tiled: the configure's size is binding, xdg-shell.xml): [`set_size`](Window::set_size) is not honoured until that state
+    /// ends, and the content keeps the configured size. Otherwise (a floating window) the request is the window's own size to set.
+    fn is_size_fixed(&self) -> bool;
+
     /// Shows `scene` (quad coordinates are physical pixels of the content area), replacing the previous one; takes effect at the next frame. Returns the release points present produced; step 1 reads the buffers before returning and reports none, so the caller may reuse them immediately.
     fn present(&self, scene: &Scene) -> Result<Presented, PresentError>;
 
