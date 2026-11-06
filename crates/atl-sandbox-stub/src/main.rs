@@ -77,6 +77,7 @@ fn restrict(grants: &[(Grant, PathBuf)], net: bool) -> Result<(ABI, RulesetStatu
         | AccessFs::MakeReg
         | AccessFs::MakeDir
         | AccessFs::MakeSym
+        | AccessFs::MakeSock
         | AccessFs::RemoveFile
         | AccessFs::RemoveDir
         | AccessFs::Refer;

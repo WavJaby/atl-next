@@ -64,7 +64,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     fs::create_dir_all(&work)?;
     let (broker, _binderd) = binder::start_binderd(root, &out, &work.join("binderd.log"))?;
     let status = crate::cargo_command()
-        .args(["build", "--release", "-p", "atl-sandbox-probe", "--target-dir"])
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "atl-sandbox-probe",
+            "--target-dir",
+        ])
         .arg(out.join("cargo"))
         .current_dir(root)
         .status()?;
@@ -74,12 +80,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let pid = std::process::id();
     let secret = home.join(format!(".atl-sandbox-probe-{pid}"));
     let created = home.join(format!(".atl-sandbox-probe-new-{pid}"));
-    fs::write(&secret, b"the real $HOME: the app sandbox must not show this")?;
+    fs::write(
+        &secret,
+        b"the real $HOME: the app sandbox must not show this",
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let runs = [
-        ("no INTERNET", probe_once(&broker, &probe, &work, &secret, &created, port, false)),
-        ("INTERNET", probe_once(&broker, &probe, &work, &secret, &created, port, true)),
+        (
+            "no INTERNET",
+            probe_once(&broker, &probe, &work, &secret, &created, port, false),
+        ),
+        (
+            "INTERNET",
+            probe_once(&broker, &probe, &work, &secret, &created, port, true),
+        ),
     ];
     // the gate's own names in $HOME and its listener, whatever the probes did
     let _ = fs::remove_file(&secret);
@@ -91,7 +106,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let p = run?;
         match p.abi {
             Some(a) if a >= NET_ABI => {}
-            Some(a) => println!("sandbox: [{tag}] net not judged: landlock abi {a} < {NET_ABI}, TCP is not restricted here"),
+            Some(a) => println!(
+                "sandbox: [{tag}] net not judged: landlock abi {a} < {NET_ABI}, TCP is not restricted here"
+            ),
             None => fails.push(format!("[{tag}] no landlock line in the probe's log")),
         }
         fails.extend(p.fails.iter().map(|f| format!("[{tag}] {f}")));
@@ -122,7 +139,11 @@ fn probe_once(
     let host_own = work.join("own");
     fs::create_dir_all(&host_own)?;
     let mut cmd = Command::new(probe);
-    cmd.arg(secret).arg(created).arg(OUTSIDE).arg(&own).arg(port.to_string());
+    cmd.arg(secret)
+        .arg(created)
+        .arg(OUTSIDE)
+        .arg(&own)
+        .arg(port.to_string());
     let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
     spawn.mounts.push(Mount {
         host: host_own,
@@ -135,7 +156,11 @@ fn probe_once(
     } else {
         rights_of::<&str>(&[])
     };
-    let log = work.join(if internet { "probe-internet.log" } else { "probe.log" });
+    let log = work.join(if internet {
+        "probe-internet.log"
+    } else {
+        "probe.log"
+    });
     (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
     let mut p = broker.spawn(spawn).context("starting the probe")?;
     let status = binder::wait_limited(&mut p.child, LIMIT)?;
@@ -179,9 +204,21 @@ fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
         (g != "ok").then(|| format!("{key}={g}: {what}"))
     };
     let mut fails: Vec<String> = [
-        refused("home-read", HOME_REFUSED, "the real $HOME file is readable from the app sandbox"),
-        refused("home-create", HOME_REFUSED, "a new file in the real $HOME is creatable from the app sandbox"),
-        refused("outside-write", WRITE_REFUSED, "a write to /usr is not refused"),
+        refused(
+            "home-read",
+            HOME_REFUSED,
+            "the real $HOME file is readable from the app sandbox",
+        ),
+        refused(
+            "home-create",
+            HOME_REFUSED,
+            "a new file in the real $HOME is creatable from the app sandbox",
+        ),
+        refused(
+            "outside-write",
+            WRITE_REFUSED,
+            "a write to /usr is not refused",
+        ),
         succeeded("own-write", "the app's own data dir is not writable"),
         succeeded("own-read", "the app's own data dir is not readable"),
     ]
@@ -192,7 +229,11 @@ fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
         fails.extend(if internet {
             succeeded("net-connect", "TCP connect refused with INTERNET")
         } else {
-            refused("net-connect", &[EACCES], "TCP connect not refused without INTERNET")
+            refused(
+                "net-connect",
+                &[EACCES],
+                "TCP connect not refused without INTERNET",
+            )
         });
     }
     fails

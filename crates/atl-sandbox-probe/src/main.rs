@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::ExitCode;
@@ -42,7 +42,10 @@ fn net(port: &str) -> String {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [home_file, home_new, outside, own, port] = args.as_slice() else {
-        eprintln!("probe: usage: HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT");
+        let _ = writeln!(
+            io::stderr(),
+            "probe: usage: HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT"
+        );
         return ExitCode::from(2);
     };
     let checks = [
@@ -54,6 +57,6 @@ fn main() -> ExitCode {
         ("net-connect", net(port)),
     ];
     let line: Vec<String> = checks.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    println!("probe: {}", line.join(" "));
+    let _ = writeln!(io::stdout(), "probe: {}", line.join(" "));
     ExitCode::SUCCESS
 }

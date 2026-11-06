@@ -178,7 +178,7 @@ pub enum RootEntry {
 pub const APP_ROOT_DIRS: &[&str] = &["usr", "etc"];
 
 /// Host sysfs subtrees every sandbox shows read-only, the narrowest that work: libdrm finds a DRM device's PCI info through `/sys/dev/char` (links into `/sys/devices`). Without them Mesa falls back to a render node, whose dumb buffers EACCES.
-pub const SYSFS_DIRS: &[&str] = &["/sys/dev", "/sys/devices"];
+pub const SYSFS_DIRS: &[&str] = &["/sys/dev", "/sys/devices", "/sys/class/drm"];
 
 /// bwrap's argv limit: bubblewrap.c's "Exceeded maximum number of arguments", counted over bwrap's own arguments and the program's.
 pub const BWRAP_MAX_ARGS: usize = 9000;
@@ -244,7 +244,10 @@ pub fn bwrap_args(
     let covered = |name: &str| {
         name == "dev"
             || name == "proc"
-            || spawn.mounts.iter().any(|m| m.at == Path::new("/").join(name))
+            || spawn
+                .mounts
+                .iter()
+                .any(|m| m.at == Path::new("/").join(name))
     };
     for e in root {
         match e {
@@ -414,8 +417,8 @@ fn elf_runpath(path: &Path) -> io::Result<Vec<String>> {
         for d in dynamic {
             let tag = d.tag(endian);
             if tag == object::elf::DT_RUNPATH || tag == object::elf::DT_RPATH {
-                let text = String::from_utf8_lossy(d.string(endian, strings).map_err(bad)?)
-                    .into_owned();
+                let text =
+                    String::from_utf8_lossy(d.string(endian, strings).map_err(bad)?).into_owned();
                 let list = if tag == object::elf::DT_RUNPATH {
                     &mut runpath
                 } else {
@@ -444,7 +447,11 @@ pub fn runpath_mounts_of(roots: &[PathBuf]) -> io::Result<Vec<Mount>> {
         if !seen.insert(obj.clone()) {
             continue;
         }
-        let origin = obj.parent().unwrap_or(Path::new("/")).to_string_lossy().into_owned();
+        let origin = obj
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_string_lossy()
+            .into_owned();
         // not a 64-bit ELF: not loadable by this sandbox's loader path, so nothing to follow
         let Ok((_, needed)) = elf_deps(&obj) else {
             continue;
@@ -457,7 +464,12 @@ pub fn runpath_mounts_of(roots: &[PathBuf]) -> io::Result<Vec<Mount>> {
             if dirs.insert(dir.clone()) {
                 mounts.extend(tree_mounts(&dir)?);
             }
-            queue.extend(needed.iter().map(|n| dir.join(n)).filter(|lib| lib.is_file()));
+            queue.extend(
+                needed
+                    .iter()
+                    .map(|n| dir.join(n))
+                    .filter(|lib| lib.is_file()),
+            );
         }
     }
     Ok(mounts)
@@ -564,7 +576,8 @@ impl Broker {
             }
         }
         let bwrap_args = binderd_args(&files, info_w.as_raw_fd(), seccomp.as_raw_fd());
-        let grants: Vec<(Access, PathBuf)> = allow.iter().map(|f| (Access::Ro, f.clone())).collect();
+        let grants: Vec<(Access, PathBuf)> =
+            allow.iter().map(|f| (Access::Ro, f.clone())).collect();
         let args = stub_args(&grants, false, program);
         let process = launch(
             Launch {
@@ -606,11 +619,19 @@ impl Broker {
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         // the libraries its loader finds through RUNPATH are part of the program's view (runpath_mounts)
         spawn.mounts.extend(runpath_mounts(&spawn.program)?);
+        // the trees of the LD_LIBRARY_PATH the process starts with: a library the loader finds there loads its own RUNPATH dirs too (library_path_mounts)
+        for (k, v) in &spawn.env {
+            if k == "LD_LIBRARY_PATH" {
+                spawn.mounts.extend(library_path_mounts(v)?);
+            }
+        }
         // a path the root already shows read-only at the same place is not mounted again, and none is mounted twice
         let mut seen = std::collections::BTreeSet::new();
         spawn.mounts.retain(|m| {
             let in_root = m.host == m.at
-                && APP_ROOT_DIRS.iter().any(|d| m.at.starts_with(Path::new("/").join(d)));
+                && APP_ROOT_DIRS
+                    .iter()
+                    .any(|d| m.at.starts_with(Path::new("/").join(d)));
             !in_root && seen.insert((m.host.clone(), m.at.clone(), m.writable))
         });
         let (ours, theirs) = socketpair(
@@ -771,7 +792,7 @@ mod tests {
         // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev (with init's /dev/socket) and /proc, a private /tmp; then the seccomp program when given;
         // the root's dirs read-only and its symlinks recreated; the sysfs subtrees read-only; the mounts, the device nodes, the area at bionic's path; the stub and the program read-only; cwd `/`; the end of options.
         let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc --tmpfs /tmp";
-        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
+        let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /sys/dev /sys/dev --ro-bind /sys/devices /sys/devices --ro-bind /sys/class/drm /sys/class/drm --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
         let stub = Path::new("/b/stub");
         assert_eq!(
             s(&bwrap_args(&spawn(), &root, stub, 9, None).0).join(" "),
@@ -791,15 +812,21 @@ mod tests {
             (Access::Ro, "/usr"),
             (Access::Ro, "/sys/dev"),
             (Access::Ro, "/sys/devices"),
-            (Access::Ro, "/system"),
-            (Access::Rw, "/data"),
+            (Access::Ro, "/sys/class/drm"),
+            (Access::Ro, SYSTEM),
+            (Access::Rw, DATA),
             (Access::Dev, "/dev/dri"),
-            (Access::Ro, "/dev/__properties__"),
+            (Access::Ro, PROPERTY_AREA),
             (Access::Ro, "/.atl-sandbox-stub"),
             (Access::Ro, "/bin/true"),
         ];
         let got: Vec<(Access, &Path)> = grants.iter().map(|(a, p)| (*a, p.as_path())).collect();
-        assert_eq!(got, want.iter().map(|(a, p)| (*a, Path::new(p))).collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            want.iter()
+                .map(|(a, p)| (*a, Path::new(p)))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A mount below a root dir is bound over it, after it: the root dir stays bound (the covered check is exact-path only).
@@ -811,10 +838,20 @@ mod tests {
             at: "/usr/share/fonts".into(),
             writable: false,
         });
-        let (argv, _) = bwrap_args(&sp, &[RootEntry::Dir("usr".into())], Path::new("/b/stub"), 9, None);
+        let (argv, _) = bwrap_args(
+            &sp,
+            &[RootEntry::Dir("usr".into())],
+            Path::new("/b/stub"),
+            9,
+            None,
+        );
         let joined = s(&argv).join(" ");
-        let usr = joined.find("--ro-bind /usr /usr ").expect("the root dir is bound");
-        let fonts = joined.find("--ro-bind /r/fonts /usr/share/fonts").expect("the nested mount is bound");
+        let usr = joined
+            .find("--ro-bind /usr /usr ")
+            .expect("the root dir is bound");
+        let fonts = joined
+            .find("--ro-bind /r/fonts /usr/share/fonts")
+            .expect("the nested mount is bound");
         assert!(usr < fonts, "{joined}");
     }
 
@@ -834,19 +871,22 @@ mod tests {
     fn stub_argv() {
         let grants: Vec<(Access, PathBuf)> = vec![
             (Access::Ro, "/b/atl-binderd".into()),
-            (Access::Rw, "/data/x".into()),
+            (Access::Rw, "/rw/x".into()),
             (Access::Dev, "/dev/dri".into()),
         ];
         assert_eq!(
             s(&stub_args(&grants, false, Path::new("/b/atl-binderd"))).join(" "),
-            "--ro /b/atl-binderd --rw /data/x --device /dev/dri -- /b/atl-binderd"
+            "--ro /b/atl-binderd --rw /rw/x --device /dev/dri -- /b/atl-binderd"
         );
         assert_eq!(
             s(&stub_args(&grants, true, Path::new("/b/atl-binderd"))).join(" "),
-            "--net --ro /b/atl-binderd --rw /data/x --device /dev/dri -- /b/atl-binderd"
+            "--net --ro /b/atl-binderd --rw /rw/x --device /dev/dri -- /b/atl-binderd"
         );
         // INTERNET is one table row; no permission gives no right
-        assert_eq!(rights_of(&["android.permission.INTERNET"]), vec![Right::Net]);
+        assert_eq!(
+            rights_of(&["android.permission.INTERNET"]),
+            vec![Right::Net]
+        );
         assert!(rights_of::<&str>(&[]).is_empty());
     }
 

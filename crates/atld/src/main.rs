@@ -910,7 +910,11 @@ fn run(a: &Args) -> Result<ExitCode> {
         .chain(std::iter::once(system_dir.as_path()))
         .chain(a.boot_jars.iter().map(PathBuf::as_path))
         .chain(a.run_boot_jars.iter().map(PathBuf::as_path))
-        .chain(a.shared_libraries.iter().map(|(_, lib)| Path::new(&lib.file)))
+        .chain(
+            a.shared_libraries
+                .iter()
+                .map(|(_, lib)| Path::new(&lib.file)),
+        )
         .chain(a.files.iter().map(|(host, _)| host.as_path()))
         .collect();
     shared_ro.extend(linked.into_iter().map(ro_at_own_path));

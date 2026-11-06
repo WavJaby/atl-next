@@ -29,6 +29,11 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "links_follow_the_mounts",
         "golden argv tail",
     ),
+    (
+        "crates/atl-broker/src/lib.rs",
+        "nested_mount_keeps_the_root_dir",
+        "golden argv: a mount below a root dir",
+    ),
     ("xtask/src/tree.rs", "namespace_argv", "golden argv"),
     (
         "xtask/src/android_paths.rs",

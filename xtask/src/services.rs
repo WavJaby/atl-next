@@ -210,7 +210,9 @@ pub fn stage(
         .envs(env.iter().cloned());
     let mut services_spawn = binder::spawn_of(&cmd, AID_SYSTEM)?;
     // what the services read by path, read-only at their own paths: the packages record and the keyboard maps (--keychars)
-    services_spawn.mounts.extend(atl_broker::tree_mounts(Path::new(&keychars))?);
+    services_spawn
+        .mounts
+        .extend(atl_broker::tree_mounts(Path::new(&keychars))?);
     services_spawn.mounts.push(atl_broker::Mount {
         host: packages_file.clone(),
         at: packages_file.clone(),
