@@ -1042,7 +1042,8 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     if exported.is_empty() {
         return Ok(None);
     }
-    let report = provided_gate::check(&out.join("device"), &exported)?;
+    let current = provided_gate::current_outputs(out)?;
+    let report = provided_gate::check(&out.join("device"), &exported, &current)?;
     println!(
         "native: provided gate: {} libraries, {} artifacts, {} weak fallbacks lose, {} violations",
         exported.len(),
