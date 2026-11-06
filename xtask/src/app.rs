@@ -2,6 +2,7 @@
 //! `xtask test app`: the M2 gate. The test APK (xtask/testdata/app: a manifest and one Activity whose onCreate logs [`MARKER`]) is started the Android way by atld: atl-binderd,
 //! AOSP servicemanager, the M2 services (atl-system-services), then the services start the app through atld's process control (the broker's sandbox); ActivityThread attaches, is bound, launches the activity.
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
+//! Every run has the graphics allocator HAL (it must register with servicemanager, the VINTF-declared way) and the GL driver (`Runtime::with_gl_driver`).
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::path::{Path, PathBuf};
@@ -32,9 +33,6 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
-    /// Also start the graphics allocator HAL under atld (needs a DRM device that allocates, WSL: vgem; and `xtask native` with the gralloc crates built): the run must register it with servicemanager, the VINTF-declared way, and the app must still reach onCreate with `mapper.atl.so` on its library path.
-    #[arg(long)]
-    gralloc: bool,
 }
 
 /// The fixture's dir.
@@ -67,12 +65,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.java_out.as_deref(),
         "app-art",
         args.verbose,
-    )?;
-    let rt = if args.gralloc {
-        rt.with_gralloc(root)?.with_gl_driver()?
-    } else {
-        rt
-    };
+    )?
+    // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
+    .with_gralloc(root)?
+    .with_gl_driver()?;
     let work = rt.out.join("app");
     // the bridge-1 JNI fixture rides along in lib/<abi>/, unloaded until bridge 1 loads it (jni_fixture.rs)
     let native = jni_fixture::apk_libs(root, &args.host, &work.join("jni-fixture"))?;
@@ -144,7 +140,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     // atld waits for the allocator's ready line before it starts the app, so a started app means a registered allocator; the line is checked anyway, with the allocator's own log as the explanation
     let gralloc_log = read(&run.log("gralloc"));
-    let gralloc_ok = !args.gralloc || gralloc_log.contains("gralloc: ready");
+    let gralloc_ok = gralloc_log.contains("gralloc: ready");
     let cacerts = app
         .lines()
         .find_map(|l| l.split_once(CACERTS).map(|(_, r)| r.to_owned()))
@@ -182,9 +178,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && gralloc_ok {
         println!("app: cacerts {cacerts}");
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
-        if args.gralloc {
-            println!("app: gralloc registered: {}", gralloc_log.trim());
-        }
+        println!("app: gralloc registered: {}", gralloc_log.trim());
         return Ok(ExitCode::SUCCESS);
     }
     if passed {
