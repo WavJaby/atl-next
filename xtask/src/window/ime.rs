@@ -7,6 +7,8 @@
 //! count into chars against that surrounding).
 //! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail. `--break-ime-delete` sends the delete's byte count as after_length (after the cursor, where nothing is): the delete
 //! sub-gate must fail.
+//! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
+//! the link (`--no-ime-death-link`): the death sub-gate must fail.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -28,6 +30,11 @@ const COMMIT: &str = "仮名";
 const TEXT_LINE: &str = "AtlWindow: text input=";
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
+
+/// The services' client-death counter (counters::count's line: `services: unimplemented <interface>.<name> <n> at=...`) and removal line (input_method.rs State::client_died).
+const DEATH_COUNTER: &str = "unimplemented input_method.client died";
+const DEATH_LINE: &str = "services: input_method client uid=";
+const NONE_LEFT: &str = "entry removed, 0 clients left";
 
 /// The surrounding text (text, cursor byte, anchor byte) the fake IME held after the commit: the probe thread's, for `checks` (Liveness is shared by every stage).
 static SURROUNDING: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
@@ -99,6 +106,8 @@ pub fn drive(
     app_log: &Path,
     mut ime: Ime,
     breaks: Breaks,
+    atld: u32,
+    services_log: &Path,
 ) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -165,6 +174,17 @@ pub fn drive(
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_delete());
+    // mid-session, input bound: SIGKILL the app (no Java-side teardown, so only the binder death can tell the services), then give the death notification time to arrive
+    let apps = super::app_pids(atld);
+    if apps.is_empty() {
+        return Err("no app process to kill".to_owned());
+    }
+    for pid in &apps {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    wait_for_line(services_log, DEATH_LINE, IME_WAIT);
     Ok(Liveness {
         answered: true,
         silent: true,
@@ -174,7 +194,7 @@ pub fn drive(
 }
 
 /// The stage's sub-gates over the fixture log; `activate` is the probe's (it fails when the desktop input method never activated).
-pub fn checks(app: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
+pub fn checks(app: &str, services: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
     let activate = probe
         .as_ref()
         .map(|_| "the desktop input method was activated for the focused EditText".to_owned())
@@ -212,7 +232,36 @@ pub fn checks(app: &str, probe: &Result<Liveness, String>) -> Vec<Sub> {
             "delete",
             edit(after_delete(), &|c| c == "-1,-1", "no composing span"),
         ),
+        ("death", death_check(services)),
     ]
+}
+
+/// After the kill: the services counted exactly one client death, and its line names the app's uid with its entry removed and no client left (the fixture is the only app).
+fn death_check(services: &str) -> Result<String, String> {
+    let counted: Vec<&str> = services
+        .lines()
+        .filter(|l| l.contains(DEATH_COUNTER))
+        .collect();
+    let removed: Vec<&str> = services
+        .lines()
+        .filter(|l| l.contains(DEATH_LINE))
+        .collect();
+    let want = format!("{DEATH_LINE}{} ", super::APP_UID);
+    match (counted.as_slice(), removed.as_slice()) {
+        ([c], [r])
+            if c.contains(&format!("{DEATH_COUNTER} 1 "))
+                && r.contains(&want)
+                && r.ends_with(NONE_LEFT) =>
+        {
+            Ok(format!(
+                "one client death counted; uid {} entry removed, 0 clients left",
+                super::APP_UID
+            ))
+        }
+        _ => Err(format!(
+            "want one `{DEATH_COUNTER} 1` and one `{want}... {NONE_LEFT}`; counter lines {counted:?}, removal lines {removed:?}"
+        )),
+    }
 }
 
 /// After the commit the IME holds the editor's whole text, cursor and anchor at its end: byte offset = the UTF-8 length (INITIAL 15 ASCII bytes + 仮名 2 x 3 bytes = 21).

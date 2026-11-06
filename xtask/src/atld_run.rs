@@ -68,6 +68,8 @@ pub struct Runtime {
     app_seccomp: bool,
     /// The build's `[test_only]` artifacts (licenses.toml): never bound into the runtime root.
     test_only: std::collections::BTreeSet<PathBuf>,
+    /// Input method clients get a death link unless this is cleared (`--no-ime-death-link`, the ime gate's deliberate break).
+    ime_death_link: bool,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -277,6 +279,7 @@ impl Runtime {
             ui_break: None,
             wayland: None,
             app_seccomp: true,
+            ime_death_link: true,
         })
     }
 
@@ -347,6 +350,12 @@ impl Runtime {
     /// Apps start without the app seccomp filter (atld `--no-app-seccomp`): the deliberate-failure check of the thread-priority rule (seccomp.rs).
     pub fn without_app_seccomp(mut self) -> Self {
         self.app_seccomp = false;
+        self
+    }
+
+    /// Input method clients get no death link (atld `--no-ime-death-link`): the ime gate's death sub-gate must then fail.
+    pub fn without_ime_death_link(mut self) -> Self {
+        self.ime_death_link = false;
         self
     }
 }
@@ -600,6 +609,9 @@ impl Runtime {
         }
         if !self.app_seccomp {
             cmd.arg("--no-app-seccomp");
+        }
+        if !self.ime_death_link {
+            cmd.arg("--no-ime-death-link");
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);

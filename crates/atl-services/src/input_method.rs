@@ -9,6 +9,7 @@
 //! Every other method stays counted and answered UNKNOWN_TRANSACTION.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Mutex, MutexGuard};
 
 use atl_aidl::aidl::com::android::internal::inputmethod::IInputMethod::IInputMethod;
@@ -63,14 +64,34 @@ struct Client {
     pid: i32,
     method: Option<Strong<dyn IInputMethod>>,
     bind: ClientBind<Session, Start>,
-    /// The death link on `client`; held only so the link lives as long as the entry.
-    _death: DeathRecipient,
+    /// The death link on `client`; held only so the link lives as long as the entry. None only under `--no-ime-death-link`.
+    _death: Option<DeathRecipient>,
 }
 
 /// The service's state, shared with the session callbacks it hands out.
 struct State {
     agents: Arc<UiAgents>,
     clients: Mutex<HashMap<u32, Client>>,
+    /// Clients get a death link (false only for the ime gate's deliberate break, services `--no-ime-death-link`).
+    death_link: bool,
+}
+
+impl State {
+    /// The client of `uid` in process `pid` died: its entry goes, unless a newer process of the uid replaced it. Counted and logged with what is left, for the ime gate's death sub-gate.
+    fn client_died(&self, uid: u32, pid: i32) {
+        let mut clients = self.clients();
+        if !clients.get(&uid).is_some_and(|c| c.pid == pid) {
+            return;
+        }
+        clients.remove(&uid);
+        let left = clients.len();
+        drop(clients);
+        counters::count(INTERFACE, "client died");
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: input_method client uid={uid} pid={pid} died; entry removed, {left} clients left"
+        );
+    }
 }
 
 impl State {
@@ -316,23 +337,23 @@ impl IInputMethodManager for InputMethodManager {
         };
         let uid = ThreadState::get_calling_uid();
         let pid = ThreadState::get_calling_pid();
-        let weak = Arc::downgrade(&self.state);
-        let mut death = DeathRecipient::new(move || {
-            let Some(state) = weak.upgrade() else {
-                return;
-            };
-            let mut clients = state.clients();
-            if clients.get(&uid).is_some_and(|c| c.pid == pid) {
-                clients.remove(&uid);
-                counters::count(INTERFACE, "client died");
-            }
-        });
-        client.as_binder().link_to_death(&mut death).map_err(|e| {
-            Status::new_exception_str(
-                ExceptionCode::ILLEGAL_STATE,
-                Some(format!("linkToDeath: {e:?}")),
-            )
-        })?;
+        let death = if self.state.death_link {
+            let weak = Arc::downgrade(&self.state);
+            let mut death = DeathRecipient::new(move || {
+                if let Some(state) = weak.upgrade() {
+                    state.client_died(uid, pid);
+                }
+            });
+            client.as_binder().link_to_death(&mut death).map_err(|e| {
+                Status::new_exception_str(
+                    ExceptionCode::ILLEGAL_STATE,
+                    Some(format!("linkToDeath: {e:?}")),
+                )
+            })?;
+            Some(death)
+        } else {
+            None
+        };
         let entry = Client {
             client,
             uid,
@@ -462,11 +483,16 @@ impl IInputMethodManager for InputMethodManager {
     }
 }
 
-/// A new input method service binder, finding each app's input method through its UI agent in `agents`.
-pub fn new_binder(permissions: Arc<Permissions>, agents: Arc<UiAgents>) -> SpIBinder {
+/// A new input method service binder, finding each app's input method through its UI agent in `agents`. `death_link` false leaves clients without a death link (test only: the gate's break).
+pub fn new_binder(
+    permissions: Arc<Permissions>,
+    agents: Arc<UiAgents>,
+    death_link: bool,
+) -> SpIBinder {
     let state = Arc::new(State {
         agents,
         clients: Mutex::new(HashMap::new()),
+        death_link,
     });
     BnInputMethodManager::new_binder(
         InputMethodManager { permissions, state },

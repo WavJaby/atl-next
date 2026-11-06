@@ -44,6 +44,9 @@ struct Args {
     /// AOSP's keychars directory (/system/usr/keychars): Virtual.kcm (the virtual keyboard's map, also carried by the pointer devices) and Generic.kcm (the physical keyboard's), loaded through libinput at start.
     #[arg(long)]
     keychars: PathBuf,
+    /// Test only: input method clients get no death link, the deliberate break of the ime gate's death sub-gate (a dead app's client then stays in the table).
+    #[arg(long)]
+    no_ime_death_link: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -134,7 +137,11 @@ fn main() -> Result<()> {
     .context("addService window")?;
     binder::add_service(
         INPUT_METHOD,
-        atl_services::input_method::new_binder(Arc::clone(&permissions), Arc::clone(&agents)),
+        atl_services::input_method::new_binder(
+            Arc::clone(&permissions),
+            Arc::clone(&agents),
+            !a.no_ime_death_link,
+        ),
     )
     .context("addService input_method")?;
     binder::add_service(

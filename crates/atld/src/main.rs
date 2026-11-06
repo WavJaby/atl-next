@@ -124,6 +124,9 @@ struct Args {
     /// Test only: apps start without the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of its thread-priority rule: without the filter queued-work-looper dies with SecurityException.
     #[arg(long)]
     no_app_seccomp: bool,
+    /// Test only: passed to the services (`--no-ime-death-link`), the deliberate break of the ime gate's death sub-gate.
+    #[arg(long)]
+    no_ime_death_link: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -811,6 +814,9 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
+    if a.no_ime_death_link {
+        services_args.push("--no-ime-death-link".into());
+    }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([
         "--keychars".into(),

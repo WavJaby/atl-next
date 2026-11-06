@@ -71,6 +71,9 @@ pub struct Args {
     /// Stage ime only: the fake input method sends its delete as after_length (after the cursor, where nothing is), so the delete sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_delete: bool,
+    /// Stage ime only: the services give input method clients no death link, so the death sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_ime_death: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -632,19 +635,7 @@ fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String>
 
 /// Stops the app processes atld started, before atld is killed: an app whose atld dies under it aborts on its binder calls (DEAD_OBJECT, ~5 s after onResume). SIGTERM, then up to STOP_WAIT for them to exit.
 pub(crate) fn stop_apps(atld: u32) {
-    let apps: Vec<u32> = std::fs::read_dir("/proc")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
-                c.windows(APP_LAUNCHER.len())
-                    .any(|w| w == APP_LAUNCHER.as_bytes())
-            })
-        })
-        .filter(|&pid| descends_from(pid, atld))
-        .collect();
+    let apps = app_pids(atld);
     for pid in &apps {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
@@ -658,6 +649,23 @@ pub(crate) fn stop_apps(atld: u32) {
     {
         std::thread::sleep(POLL);
     }
+}
+
+/// The app processes atld started (the launcher's processes under it).
+pub(crate) fn app_pids(atld: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                c.windows(APP_LAUNCHER.len())
+                    .any(|w| w == APP_LAUNCHER.as_bytes())
+            })
+        })
+        .filter(|&pid| descends_from(pid, atld))
+        .collect()
 }
 
 /// Whether `pid` is a descendant of `ancestor`, by the parent links in /proc.
@@ -1498,6 +1506,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
     let rt = rt.with_display(display.to_arg());
+    let rt = if args.break_ime_death {
+        rt.without_ime_death_link()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -1550,13 +1563,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         delete: args.break_ime_delete,
     };
     let mut atld_child = rt.start_atld(&run)?;
+    let atld_pid = atld_child.id();
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
+        let services_log = run.log("services");
         let fake_ime = fake_ime.take();
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Ime, _, Some(ime)) => ime::drive(p, &log, ime, ime_breaks),
+            (Stage::Ime, _, Some(ime)) => {
+                ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log)
+            }
             (Stage::Widgets, _, _) => widgets::drive(p, &log),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
@@ -1627,7 +1644,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
-        (Stage::Ime, Some(_)) => ime::checks(&app, &liveness),
+        (Stage::Ime, Some(_)) => ime::checks(&app, &services, &liveness),
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
             &after_marker(&app, marker),
