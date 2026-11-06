@@ -742,12 +742,13 @@ impl CompilerCache {
         }
     }
 
-    /// Stops this cache's server. Runs on `Drop`: a build's server ends with the build.
+    /// Stops this cache's server and removes its socket file (sccache leaves it behind). Runs on `Drop`: a build's server ends with the build.
     fn stop(&self) {
         let _ = Command::new(&self.launcher)
             .arg("--stop-server")
             .envs(self.env())
             .output();
+        let _ = std::fs::remove_file(&self.socket);
     }
 
     fn converter_args(&self) -> [&str; 2] {
@@ -1396,6 +1397,21 @@ nope
             CompilerCache::of(&parse(&["--no-compiler-cache"]), ws, ""),
             None
         );
+    }
+
+    /// sccache leaves its socket file behind; a dropped cache's file must go with it.
+    #[test]
+    fn dropping_a_cache_removes_its_socket_file() {
+        let dir = std::env::temp_dir().join(format!("atl-cc-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // no such launcher: the stop fails quietly and the file must still go
+        let cache = CompilerCache::for_view("atl-no-such-compiler-launcher", dir.clone(), "");
+        let socket = cache.socket.clone();
+        std::fs::write(&socket, b"").expect("stand-in socket file");
+        drop(cache);
+        let gone = !socket.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "the socket file of a dropped cache is still there");
     }
 
     #[test]
