@@ -24,6 +24,16 @@ use crate::{manifest, packages, slot, tree};
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
 const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"];
+
+/// The native goals (= module names) of the GL fronts: what `with_gl_driver` places and the `gl-proxies` check reads.
+pub fn gl_front_goals() -> &'static [&'static str] {
+    &GL_FRONTS
+}
+
+/// Where `xtask native` puts GL front `module` under `out`.
+pub fn gl_front(out: &Path, module: &str) -> PathBuf {
+    out.join("device").join(module).join(format!("{module}.so"))
+}
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
@@ -43,7 +53,10 @@ const NB_LIBS: [(&str, &str); 16] = [
     ("libnative_bridge_guest_libGLESv1_CM", "libGLESv1_CM.so"),
     ("libnative_bridge_guest_libGLESv2", "libGLESv2.so"),
     ("libnative_bridge_guest_libGLESv3", "libGLESv3.so"),
-    ("libnative_bridge_guest_libnativewindow", "libnativewindow.so"),
+    (
+        "libnative_bridge_guest_libnativewindow",
+        "libnativewindow.so",
+    ),
     (
         "libnative_bridge_vdso",
         atl_native_bridge::engine::VDSO_FILE,
@@ -438,9 +451,14 @@ impl Runtime {
     pub fn with_gl_driver(mut self) -> Result<Self> {
         let (mut files, dirs) = crate::mesa::driver(&self.out)?;
         let system_lib = atl_android_paths::SYSTEM_LIB;
-        for m in GL_FRONTS {
-            let lib = self.out.join("device").join(m).join(format!("{m}.so"));
-            ensure!(lib.is_file(), "missing input {}", lib.display());
+        for m in gl_front_goals() {
+            let lib = gl_front(&self.out, m);
+            ensure!(
+                lib.is_file(),
+                "missing input {}: build native goal `{m}` (with_gl_driver needs all of {:?})",
+                lib.display(),
+                gl_front_goals()
+            );
             files.push((lib, format!("{system_lib}/{m}.so")));
         }
         self.gl_driver = Some((files, dirs));
