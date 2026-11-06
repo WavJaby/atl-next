@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MIT
+//! bubblewrap's command line, spelled once: every bwrap flag any of our code passes is a method here (F1.1). Users: the broker's profiles and xtask's build-tree namespace (`tree::namespace_args`), a different concept that shares only the flag spelling.
+//! Flag meanings: bubblewrap's bwrap.c `usage()` / bwrap(1). Order matters to bwrap (mounts apply in argv order), so the builder keeps call order.
+
+use std::ffi::OsString;
+use std::path::Path;
+
+/// The sandbox program.
+pub const PROGRAM: &str = "bwrap";
+
+/// bwrap's options, in call order; [`Args::end`] closes them with `--`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Args(Vec<OsString>);
+
+impl Args {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn word(&mut self, w: impl Into<OsString>) -> &mut Self {
+        self.0.push(w.into());
+        self
+    }
+
+    fn pair(&mut self, flag: &str, a: impl Into<OsString>, b: impl Into<OsString>) -> &mut Self {
+        self.word(flag).word(a).word(b)
+    }
+
+    /// `--unshare-user`: a new user namespace.
+    pub fn unshare_user(&mut self) -> &mut Self {
+        self.word("--unshare-user")
+    }
+
+    /// `--unshare-pid`: a new pid namespace; the program's sandbox ends when its pid 1 does.
+    pub fn unshare_pid(&mut self) -> &mut Self {
+        self.word("--unshare-pid")
+    }
+
+    /// `--unshare-all`: user (try), ipc, pid, net, uts, cgroup (try) namespaces.
+    pub fn unshare_all(&mut self) -> &mut Self {
+        self.word("--unshare-all")
+    }
+
+    /// `--uid U --gid U`: the uid and gid inside the user namespace (mapped to the caller's).
+    pub fn ids(&mut self, id: u32) -> &mut Self {
+        self.word("--uid")
+            .word(id.to_string())
+            .word("--gid")
+            .word(id.to_string())
+    }
+
+    /// `--die-with-parent`: the sandbox is killed when bwrap's parent dies.
+    pub fn die_with_parent(&mut self) -> &mut Self {
+        self.word("--die-with-parent")
+    }
+
+    /// `--new-session`: setsid, so the program cannot reach the caller's terminal (TIOCSTI).
+    pub fn new_session(&mut self) -> &mut Self {
+        self.word("--new-session")
+    }
+
+    /// `--cap-drop ALL`: no capabilities inside the namespace either.
+    pub fn cap_drop_all(&mut self) -> &mut Self {
+        self.word("--cap-drop").word("ALL")
+    }
+
+    /// `--info-fd FD`: bwrap writes `{"child-pid": N, ...}` there once the sandbox's first process exists.
+    pub fn info_fd(&mut self, fd: i32) -> &mut Self {
+        self.word("--info-fd").word(fd.to_string())
+    }
+
+    /// `--seccomp FD`: a `struct sock_filter` array installed before the program runs.
+    pub fn seccomp(&mut self, fd: i32) -> &mut Self {
+        self.word("--seccomp").word(fd.to_string())
+    }
+
+    /// `--tmpfs AT`.
+    pub fn tmpfs(&mut self, at: impl AsRef<Path>) -> &mut Self {
+        self.word("--tmpfs").word(at.as_ref())
+    }
+
+    /// `--dev AT`: a fresh minimal /dev (null, zero, full, random, urandom, tty, pts, shm).
+    pub fn dev(&mut self, at: impl AsRef<Path>) -> &mut Self {
+        self.word("--dev").word(at.as_ref())
+    }
+
+    /// `--proc AT`: procfs of the sandbox's pid namespace.
+    pub fn proc(&mut self, at: impl AsRef<Path>) -> &mut Self {
+        self.word("--proc").word(at.as_ref())
+    }
+
+    /// `--bind HOST AT` (writable).
+    pub fn bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.pair("--bind", host.as_ref(), at.as_ref())
+    }
+
+    /// `--ro-bind HOST AT`.
+    pub fn ro_bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.pair("--ro-bind", host.as_ref(), at.as_ref())
+    }
+
+    /// `--bind` or `--ro-bind` by `writable`.
+    pub fn mount(
+        &mut self,
+        host: impl AsRef<Path>,
+        at: impl AsRef<Path>,
+        writable: bool,
+    ) -> &mut Self {
+        if writable {
+            self.bind(host, at)
+        } else {
+            self.ro_bind(host, at)
+        }
+    }
+
+    /// `--dev-bind HOST AT`: a bind that keeps device nodes usable.
+    pub fn dev_bind(&mut self, host: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.pair("--dev-bind", host.as_ref(), at.as_ref())
+    }
+
+    /// `--symlink TARGET AT`: `at` links to `target`.
+    pub fn symlink(&mut self, target: impl AsRef<Path>, at: impl AsRef<Path>) -> &mut Self {
+        self.pair("--symlink", target.as_ref(), at.as_ref())
+    }
+
+    /// `--chdir DIR`: the program's working directory.
+    pub fn chdir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+        self.word("--chdir").word(dir.as_ref())
+    }
+
+    /// The options and the closing `--`; the program and its arguments follow.
+    pub fn end(mut self) -> Vec<OsString> {
+        self.0.push("--".into());
+        self.0
+    }
+}

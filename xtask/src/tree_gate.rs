@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_broker::bwrap;
 use atl_layout::Layout;
 
 use crate::native::CompilerCache;
@@ -83,16 +84,13 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
     std::fs::create_dir_all(&farm_root)?;
     std::os::unix::fs::symlink(&copy, farm_root.join("lib"))?;
     let javac_in = |cwd: &Path, ns: Option<&Path>| -> Result<(bool, String)> {
-        let mut cmd = Command::new("bwrap");
-        if let Some(bound) = ns {
-            cmd.args(tree::bwrap_args(&[overlay(bound, &target)]));
-        } else {
-            cmd.args(tree::bwrap_args(&[]));
-        }
-        let o = cmd
-            .arg("--chdir")
-            .arg(cwd)
-            .arg("--")
+        let mut a = match ns {
+            Some(bound) => tree::namespace_args(&[overlay(bound, &target)]),
+            None => tree::namespace_args(&[]),
+        };
+        a.chdir(cwd);
+        let o = Command::new(bwrap::PROGRAM)
+            .args(a.end())
             .arg(&javac)
             .arg("--patch-module=java.base=.")
             .arg("-d")
@@ -121,13 +119,12 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
 
     let exe = std::env::current_exe()?;
     let verify_in = |bound: Option<&Path>| -> Result<bool> {
-        let mut cmd = Command::new("bwrap");
-        match bound {
-            Some(b) => cmd.args(tree::bwrap_args(&[overlay(b, &target)])),
-            None => cmd.args(tree::bwrap_args(&[])),
+        let a = match bound {
+            Some(b) => tree::namespace_args(&[overlay(b, &target)]),
+            None => tree::namespace_args(&[]),
         };
-        let o = cmd
-            .arg("--")
+        let o = Command::new(bwrap::PROGRAM)
+            .args(a.end())
             .arg(&exe)
             .args(["test", "task-bind", "--verify-only"])
             .args([&copy, &target])
@@ -203,9 +200,9 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
     let git_in = |o: &Overlay| -> Result<bool> {
         let mut ok = true;
         for dir in [&o.target, &o.copy] {
-            ok &= Command::new("bwrap")
-                .args(tree::bwrap_args(std::slice::from_ref(o)))
-                .args(["--", "git", "-C"])
+            ok &= Command::new(bwrap::PROGRAM)
+                .args(tree::namespace_args(std::slice::from_ref(o)).end())
+                .args(["git", "-C"])
                 .arg(dir)
                 .args(["status", "--porcelain"])
                 .output()?
@@ -280,11 +277,10 @@ fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
         // the plain build's server, started outside the namespace
         plain.start()?;
         let compile = |cache: &CompilerCache, ns: bool, obj: &str| -> Result<String> {
-            let mut cmd = Command::new("bwrap");
-            cmd.args(tree::bwrap_args(if ns { &task_ov } else { &[] }));
+            let mut cmd = Command::new(bwrap::PROGRAM);
+            cmd.args(tree::namespace_args(if ns { &task_ov } else { &[] }).end());
             let out = scratch.join(obj);
             let o = cmd
-                .arg("--")
                 .args(["sccache", "cc", "-c"])
                 .arg(target.join(SRC))
                 .arg("-o")

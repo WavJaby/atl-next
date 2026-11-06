@@ -8,6 +8,7 @@
 //! [`control`] is how the system services ask atld (which owns the broker) to start and kill processes.
 #![forbid(unsafe_code)]
 
+pub mod bwrap;
 pub mod control;
 mod seccomp;
 
@@ -29,8 +30,7 @@ use rustix::process::{Pid, Signal, kill_process};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
-/// The sandbox program.
-const BWRAP: &str = "bwrap";
+use bwrap::PROGRAM as BWRAP;
 
 /// One bind mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,29 +122,17 @@ pub fn bwrap_args(
     info_fd: i32,
     seccomp_fd: Option<i32>,
 ) -> Vec<OsString> {
-    let uid = spawn.uid.to_string();
-    let mut a: Vec<OsString> = [
-        "--unshare-user",
-        "--uid",
-        &uid,
-        "--gid",
-        &uid,
-        "--unshare-pid",
-        "--die-with-parent",
-        "--info-fd",
-        &info_fd.to_string(),
-        "--tmpfs",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-    ]
-    .iter()
-    .map(OsString::from)
-    .collect();
+    let mut a = bwrap::Args::new();
+    a.unshare_user()
+        .ids(spawn.uid)
+        .unshare_pid()
+        .die_with_parent()
+        .info_fd(info_fd)
+        .tmpfs("/")
+        .dev("/dev")
+        .proc("/proc");
     if let Some(fd) = seccomp_fd {
-        a.extend(["--seccomp".into(), fd.to_string().into()]);
+        a.seccomp(fd);
     }
     let covered = |name: &str| {
         name == "dev"
@@ -159,49 +147,27 @@ pub fn bwrap_args(
         match e {
             RootEntry::Dir(n) if !covered(n) => {
                 let p = format!("/{n}");
-                a.extend(["--bind".into(), p.clone().into(), p.into()]);
+                a.bind(&p, &p);
             }
             RootEntry::Symlink { name, target } if !covered(name) => {
-                a.extend([
-                    "--symlink".into(),
-                    target.clone().into_os_string(),
-                    format!("/{name}").into(),
-                ]);
+                a.symlink(target, format!("/{name}"));
             }
             _ => {}
         }
     }
     for m in &spawn.mounts {
-        let kind = if m.writable { "--bind" } else { "--ro-bind" };
-        a.extend([
-            kind.into(),
-            m.host.clone().into_os_string(),
-            m.at.clone().into_os_string(),
-        ]);
+        a.mount(&m.host, &m.at, m.writable);
     }
     for l in &spawn.links {
-        a.extend([
-            "--symlink".into(),
-            l.target.clone().into_os_string(),
-            l.at.clone().into_os_string(),
-        ]);
+        a.symlink(&l.target, &l.at);
     }
     for d in &spawn.devices {
-        a.extend([
-            "--dev-bind".into(),
-            d.clone().into_os_string(),
-            d.clone().into_os_string(),
-        ]);
+        a.dev_bind(d, d);
     }
     if let Some(area) = &spawn.property_area {
-        a.extend([
-            "--ro-bind".into(),
-            area.clone().into_os_string(),
-            PROPERTY_AREA.into(),
-        ]);
+        a.ro_bind(area, PROPERTY_AREA);
     }
-    a.push("--".into());
-    a
+    a.end()
 }
 
 /// `child-pid` of bwrap's `--info-fd` JSON (`{"child-pid": N, ...}`, bwrap.c).
@@ -402,26 +368,18 @@ mod tests {
             RootEntry::Dir("proc".into()),
             RootEntry::Dir("system".into()),
         ];
-        let a = s(&bwrap_args(&spawn(), &root, 9, None));
-        let joined = a.join(" ");
-        assert!(!joined.contains("--seccomp"));
-        let with_filter = s(&bwrap_args(&spawn(), &root, 9, Some(8)));
-        assert!(with_filter.windows(2).any(|w| w == ["--seccomp", "8"]));
-        // the uid map and the namespaces Q4(a) names
-        assert!(joined.starts_with(
-            "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 "
-        ));
-        // the host's dirs bound, its symlinks recreated; what the sandbox replaces is not bound
-        assert!(joined.contains("--bind /home /home"));
-        assert!(joined.contains("--symlink usr/lib /lib"));
-        for replaced in ["/data /data", "/dev /dev", "/proc /proc", "/system /system"] {
-            assert!(
-                !joined.contains(&format!("--bind {replaced}")),
-                "{replaced}"
-            );
-        }
-        // the mounts after the root, then the device nodes, then the area at bionic's path, then the end of options
-        assert!(joined.ends_with("--ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --"));
+        // Golden argv, written from the profile (Q4(a)): uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev and /proc; then the seccomp program when given;
+        // the host's dirs bound and symlinks recreated, except what the sandbox replaces (dev, proc) or a mount covers (data, system); the mounts, the device nodes, the area at bionic's path; the end of options.
+        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --proc /proc";
+        let tail = "--bind /home /home --symlink usr/lib /lib --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --";
+        assert_eq!(
+            s(&bwrap_args(&spawn(), &root, 9, None)).join(" "),
+            format!("{head} {tail}")
+        );
+        assert_eq!(
+            s(&bwrap_args(&spawn(), &root, 9, Some(8))).join(" "),
+            format!("{head} --seccomp 8 {tail}")
+        );
     }
 
     #[test]

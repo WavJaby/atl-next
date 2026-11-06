@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_broker::bwrap;
 use atl_layout::Layout;
 
 use crate::sources::{Checkout, Pin};
@@ -88,23 +89,12 @@ pub fn describe(overlays: &[Overlay]) -> String {
         .join(" ")
 }
 
-/// bubblewrap arguments for the namespace: the host's `/` as is, each task copy bound over its target.
-pub fn bwrap_args(overlays: &[Overlay]) -> Vec<String> {
-    let mut a: Vec<String> = vec![
-        "--dev-bind".into(),
-        "/".into(),
-        "/".into(),
-        "--die-with-parent".into(),
-    ];
-    let mut bind = |kind: &str, from: &Path, to: &Path| {
-        a.extend([
-            kind.into(),
-            from.display().to_string(),
-            to.display().to_string(),
-        ]);
-    };
+/// bubblewrap options for the build namespace: the host's `/` as is (devices too), each task copy bound over its target. Not a sandbox: it isolates nothing, it only changes which tree a path shows; it shares the broker's flag spelling, not its profiles.
+pub fn namespace_args(overlays: &[Overlay]) -> bwrap::Args {
+    let mut a = bwrap::Args::new();
+    a.dev_bind("/", "/").die_with_parent();
     for o in overlays {
-        bind("--bind", &o.copy, &o.target);
+        a.bind(&o.copy, &o.target);
     }
     a
 }
@@ -157,8 +147,8 @@ pub fn enter(overlays: &[Overlay], shell: bool) -> Result<Option<ExitCode>> {
             o.target.display()
         );
     }
-    let mut cmd = Command::new("bwrap");
-    cmd.args(bwrap_args(overlays)).arg("--").env(ENV, &want);
+    let mut cmd = Command::new(bwrap::PROGRAM);
+    cmd.args(namespace_args(overlays).end()).env(ENV, &want);
     if shell {
         cmd.arg(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()));
     } else {
@@ -216,6 +206,28 @@ mod tests {
         ws
     }
 
+    /// Golden argv, written from the namespace's spec: the host's / as is with devices (`--dev-bind / /`: builds open /dev/null, sccache its socket), gone with xtask (`--die-with-parent`);
+    /// per overlay one bind of the task copy over its target, nothing for git (the git dir lives in the store, outside the bound tree).
+    #[test]
+    fn namespace_argv() {
+        assert_eq!(
+            namespace_args(&[]).end(),
+            ["--dev-bind", "/", "/", "--die-with-parent", "--"]
+        );
+        let o = Overlay {
+            project: "a/b".into(),
+            copy: "/c".into(),
+            target: "/t".into(),
+        };
+        let want = "--dev-bind / / --die-with-parent --bind /c /t --";
+        let got: Vec<String> = namespace_args(&[o])
+            .end()
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got.join(" "), want);
+    }
+
     #[test]
     fn overlays_follow_task_copies() {
         let ws = workspace("set");
@@ -248,8 +260,6 @@ mod tests {
         // outside the namespace the overlay is not in effect: verify must fire
         let e = format!("{:#}", verify(&o).unwrap_err());
         assert!(e.contains("outside the task-copy namespace"), "{e}");
-        // one bind per task copy, nothing for git
-        assert_eq!(bwrap_args(&o).len(), 4 + 3);
         std::fs::remove_dir_all(&ws).unwrap();
     }
 }
