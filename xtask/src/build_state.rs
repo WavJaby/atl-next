@@ -13,8 +13,9 @@ use anyhow::{Context, Result, bail, ensure};
 /// The record, in the out dir.
 const RECORD: &str = "built-from";
 /// Top-level entries native's artifacts do not come from: `xtask/` is the gate side (gate code and the fixtures each gate builds itself), so editing a gate needs no native run.
+/// `test-apks.toml` feeds only `run-apk`, `fetch --test-apks` and the `tables` check: a row or pin change needs no native run.
 /// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the slot only through a native run anyway.
-const GATE_SIDE: &[&str] = &["xtask"];
+const GATE_SIDE: &[&str] = &["xtask", "test-apks.toml"];
 
 /// The checkout's source state: the hash of its top-level tree entries, [`GATE_SIDE`] left out.
 pub fn of_checkout(root: &Path) -> Result<String> {
@@ -155,12 +156,13 @@ mod tests {
         std::fs::create_dir_all(d.join("xtask")).unwrap();
         std::fs::write(d.join("crates/a.rs"), "a").unwrap();
         std::fs::write(d.join("xtask/g.rs"), "g").unwrap();
+        std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\n").unwrap();
         git(&d, &["init", "-q"], None).unwrap();
         d
     }
 
     /// The guard fires with no record and after a source edit (untracked, uncommitted: the rebase case is the same tree change), stays quiet on the recorded state,
-    /// and ignores the gate side; the scratch index leaves the real one untouched.
+    /// and ignores the gate side (`xtask/`, `test-apks.toml`); the scratch index leaves the real one untouched.
     #[test]
     fn guard_fires_on_another_tree() {
         let d = repo("guard");
@@ -185,6 +187,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&copy);
         std::fs::write(d.join("xtask/g.rs"), "gate edit").unwrap();
         ensure_current(&d, &out).expect("gate side is not native input");
+        std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\nsize = 1\n").unwrap();
+        ensure_current(&d, &out).expect("test APK table is not native input");
         std::fs::write(d.join("crates/a.rs"), "edited").unwrap();
         let e = ensure_current(&d, &out).expect_err("source edited");
         assert!(
