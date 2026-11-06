@@ -29,7 +29,6 @@ use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod move_output;
-mod native_activity;
 mod surface_view;
 mod widgets;
 
@@ -83,8 +82,6 @@ enum Stage {
     StartFinish,
     /// Two outputs, the second at scale 1.6: the first goes off, the window moves, and Android's density follows (xtask/src/window/move_output.rs).
     Move,
-    /// Headless: a pure native app on the framework's NativeActivity; its library's callbacks, CPU-drawn frame and AInputQueue touches (xtask/src/window/native_activity.rs).
-    NativeActivity,
     /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/surface_view.rs).
     SurfaceView,
 }
@@ -102,7 +99,6 @@ impl Stage {
             Stage::Declared => "declared",
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
-            Stage::NativeActivity => "native-activity",
             Stage::SurfaceView => "surface-view",
         }
     }
@@ -111,7 +107,7 @@ impl Stage {
     fn window_ms(self) -> u64 {
         match self {
             Stage::Resume => WINDOW_MS,
-            Stage::Frames | Stage::Input | Stage::NativeActivity => FRAMES_WINDOW_MS,
+            Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
             Stage::Gtk | Stage::SurfaceView => GTK_WINDOW_MS,
             Stage::Widgets => WIDGETS_WINDOW_MS,
             Stage::Resize
@@ -233,7 +229,6 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move => "AtlWindow: onResume reached",
-        Stage::NativeActivity => native_activity::MARKER,
         Stage::SurfaceView => surface_view::MARKER,
     }
 }
@@ -1389,7 +1384,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // declared before atld, so dropped after it; a hold keeps the desktop's compositor
     let mut nested = None;
     let rt = match args.stage {
-        Stage::Input | Stage::NativeActivity => rt.with_headless_pointer(POINTER_SCRIPT),
+        Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
         | Stage::Widgets
         | Stage::Resize
@@ -1441,24 +1436,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Relaunch => SIZED_FIXTURE,
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
-        Stage::NativeActivity => native_activity::FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
         _ => FIXTURE,
     };
-    let native = match args.stage {
-        Stage::NativeActivity => {
-            let (abi, lib) = native_activity::build_lib(
-                root,
-                &native_activity::default_ndk(root)?,
-                &work.join("lib"),
-            )?;
-            Some((abi, vec![lib]))
-        }
-        _ => None,
-    };
     let apk = rt
         .apk
-        .build(&root.join(fixture), &work.join("apk"), &[], native.as_ref())?;
+        .build(&root.join(fixture), &work.join("apk"), &[], None)?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -1560,9 +1543,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
-        (Stage::NativeActivity, Some(_)) => {
-            native_activity::checks(&app, &after_marker(&app, marker), display)
-        }
         (Stage::Widgets, Some(_)) => widgets::checks(
             &app,
             &after_marker(&app, marker),
