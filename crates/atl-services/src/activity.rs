@@ -1015,7 +1015,11 @@ impl Inner {
                     package_name: Some(p.name.clone()),
                     ..Default::default()
                 },
-                application_info: package::application_info(p, &self.packages),
+                application_info: package::application_info(
+                    p,
+                    &self.packages,
+                    package::STOCK_PM_FLAGS,
+                ),
                 process_name: Some(process_name.clone()),
                 enabled: true,
                 exported: decl.exported,
