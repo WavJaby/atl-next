@@ -215,7 +215,7 @@ enum Test {
     Instrument(instrument::Args),
     /// The CTS progress metric: every cts.toml row's test APK is built, installed and run with `am instrument`; the number of passing tests per module is the result.
     ///
-    /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the services' counters (unimplemented, answered, refused, sent) summed over the run, most hit first. `<out>/cts/report.json` holds every test's outcome.
+    /// Per module: state (RAN / INCOMPLETE / CRASH / START_FAIL / BUILD_FAIL) and pass / fail / error / ignored / total, then the unimplemented and refused counters summed over the run, most hit first; answered and sent counts as totals. `<out>/cts/report.json` holds every test's outcome.
     /// Exit status is nonzero only for harness errors and, with `--baseline <report.json>`, for modules or tests that got worse than that saved report; failing tests are the metric, not errors.
     Cts(cts::Args),
     /// The in-app SurfaceFlinger against AOSP's libgui in a real app process (M3 slice 4): atld starts the services and a client class (xtask/testdata/composer) as an app process; its compositor is registered through the system process and found by libgui by name.
