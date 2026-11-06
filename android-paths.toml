@@ -17,3 +17,18 @@ reason = "test input of the basename parser: any absolute path serves; no layout
 file = "crates/atl-native-bridge/src/exports.rs"
 literal = "/data/app/lib/x86_64/libatl-jni-test.so"
 reason = "test input of the native bridge's path classifier: a library path as libnativeloader passes one, never opened"
+
+[[allow]]
+file = "xtask/src/host_disk.rs"
+literal = "/mnt/{}"
+reason = "WSL's host-drive mount (/mnt/<letter>), a Linux host path, not an Android one"
+
+[[allow]]
+file = "xtask/src/host_disk.rs"
+literal = "/mnt/c"
+reason = "WSL host-drive mount as the test's expected value and input"
+
+[[allow]]
+file = "xtask/src/host_disk.rs"
+literal = "/mnt/d"
+reason = "WSL host-drive mount as the test's expected value"
