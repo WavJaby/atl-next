@@ -179,7 +179,7 @@ impl Plan {
 
         let layout = Layout::of(repo)?;
         let wt_layout = Layout::of(&wt)?;
-        let sources = sources::load(&wt)?;
+        let sources = branch_sources(repo, &wt, branch)?;
         let main = fetch::Main::load(repo)?;
         let manifest = sources.manifest_checkout();
         let manifest_stored = patch::stored(&wt.join("patches").join(&manifest.dir))?;
@@ -470,6 +470,22 @@ fn first(lines: &[&str]) -> String {
     lines.iter().take(3).copied().collect::<Vec<_>>().join(", ")
 }
 
+/// The branch's sources.toml, read by this (main's) xtask. A file main's own sources.toml reads fine but the branch's does not is a schema change: this xtask cannot judge
+/// the branch, and the bare parse error (`TOML parse error at line 1, column 1`) does not say so. `root` resolves from xtask's manifest dir, so the branch's xtask cannot land
+/// into main either: the land goes by hand.
+fn branch_sources(repo: &Path, wt: &Path, branch: &str) -> Result<sources::Sources> {
+    sources::load(wt).or_else(|e| {
+        if sources::load(repo).is_err() {
+            return Err(e);
+        }
+        bail!(
+            "branch {branch} changes the sources.toml schema: main's xtask cannot read {} ({e:#}). Land by hand: `cargo xtask check` in that worktree (the branch's xtask), then in {} `git merge --ff-only {branch}`, `git push`, `cargo xtask fetch --execute` (now the branch's xtask)",
+            wt.display(),
+            repo.display()
+        )
+    })
+}
+
 /// A commit as the messages show it.
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
@@ -480,6 +496,40 @@ mod tests {
     use super::*;
 
     const SOURCES: &str = "[aosp]\nremote = \"https://android.googlesource.com/\"\ntag = \"android-16.0.0_r1\"\nmanifest = \"0123456789abcdef0123456789abcdef01234567\"\nprojects = {}\n";
+
+    /// A branch whose sources.toml main's schema cannot read (a renamed table) is named as a schema change; when main's own file fails too, the plain error stays.
+    #[test]
+    fn schema_change_is_named() {
+        let root = std::env::temp_dir().join(format!("xtask-land-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, wt) = (root.join("repo"), root.join("wt"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        write(&repo, "sources.toml", SOURCES);
+        write(
+            &wt,
+            "sources.toml",
+            &SOURCES.replace("[aosp]", "[platform]"),
+        );
+        let e = format!(
+            "{:#}",
+            branch_sources(&repo, &wt, "b").expect_err("new schema")
+        );
+        assert!(
+            e.contains("branch b changes the sources.toml schema"),
+            "{e}"
+        );
+        write(&wt, "sources.toml", SOURCES);
+        assert!(branch_sources(&repo, &wt, "b").is_ok());
+        write(&repo, "sources.toml", "not toml [");
+        write(&wt, "sources.toml", "not toml [");
+        let e = format!(
+            "{:#}",
+            branch_sources(&repo, &wt, "b").expect_err("both broken")
+        );
+        assert!(!e.contains("schema"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Temp tree: `origin.git` (bare, the remote), `ws/repo` (the main checkout on main, pushed) and `ws/wt/land` (a worktree on `land`, one commit ahead). No upstreams, so `check` has nothing to fetch.
     struct Env {
