@@ -107,6 +107,20 @@ const OVERFLOW_ROUNDS: u32 = 3;
 /// The recursing method, as ART's PrettyMethod prints it in the `JIT added` line: compiled, its stack check faults (interpreted, ART may check explicitly and never fault).
 const OVERFLOW_JIT: &str = "void NativeLoad.recurse()";
 
+/// Native goals (gate_goals.rs): the converter's ART with its boot jars and their JNI libraries, and libandroid_runtime.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::host(&[
+        "platform-bootclasspath",
+        "libart",
+        "libnativehelper",
+        "libjavacore",
+        "libopenjdk",
+        "libicu_jni",
+        "libandroid_runtime",
+        "libsigchain",
+    ])
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let env = Env::new(root, args)?;
     let fixture = env.build_fixture(root)?;
@@ -316,7 +330,8 @@ const NO_AREA: &str = "no system property area";
 impl Env {
     fn new(root: &Path, args: &Args) -> Result<Self> {
         let layout = Layout::of(root)?;
-        let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+        let out =
+            crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "native-load")?;
         let host = HostArt::new(
             root,
             &args.host,

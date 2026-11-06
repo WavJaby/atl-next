@@ -175,8 +175,19 @@ fn spawn_probe(
     b.spawn(s).context("spawning the probe")
 }
 
+/// Native goals (gate_goals.rs): servicemanager, `service`, libnativewindow, and the allocator HAL's AIDL crate.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::host(&[
+        "servicemanager",
+        "service",
+        "libnativewindow",
+        "libui",
+        "android.hardware.graphics.allocator-V2-rust",
+    ])
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "gralloc")?;
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
     let service = device.join("service/service");

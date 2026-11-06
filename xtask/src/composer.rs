@@ -654,6 +654,11 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Native goals (gate_goals.rs): the runtime with gralloc.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -663,6 +668,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let display = run_display();
     let rt = Runtime::new(
         root,
+        "composer",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

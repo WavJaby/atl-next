@@ -184,6 +184,11 @@ fn am_args(row: &Row, component: &str) -> Vec<String> {
     args
 }
 
+/// Native goals (gate_goals.rs): what `am instrument` needs (instrument.rs).
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::instrument::goals()
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let table = cts_table::load(root)?;
     for m in &args.modules {
@@ -218,6 +223,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let rt = Runtime::new(
         root,
+        "cts",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

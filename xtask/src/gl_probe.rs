@@ -56,10 +56,16 @@ const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
 const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 
+/// Native goals (gate_goals.rs): the runtime with gralloc and the GL driver.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
     let rt = Runtime::new(
         root,
+        "gl",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

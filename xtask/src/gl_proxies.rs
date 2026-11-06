@@ -80,6 +80,17 @@ fn guest_proxy(out: &Path, arch: &str, lib: &str) -> PathBuf {
         .join(format!("{lib}.so"))
 }
 
+/// Native goals (gate_goals.rs): the GL fronts and their guest proxies.
+pub fn goals() -> crate::gate_goals::Goals {
+    let fronts = crate::atld_run::gl_front_goals();
+    let proxies: Vec<String> = fronts
+        .iter()
+        .map(|f| format!("libnative_bridge_guest_{f}"))
+        .collect();
+    let proxies: Vec<&str> = proxies.iter().map(String::as_str).collect();
+    crate::gate_goals::Goals::host(fronts).with(crate::gate_goals::Goals::nb(&proxies))
+}
+
 /// Runs the step on slot `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the slot lacks the inputs.
 pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
     let fronts = crate::atld_run::gl_front_goals();

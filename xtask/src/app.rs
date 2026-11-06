@@ -169,6 +169,14 @@ fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
     Ok(whys)
 }
 
+/// Native goals (gate_goals.rs): the runtime with gralloc, the GL driver and the native-bridge guest, as [`run`] stages it.
+pub fn goals() -> crate::gate_goals::Goals {
+    use crate::atld_run;
+    atld_run::goals()
+        .with(atld_run::gralloc_goals())
+        .with(atld_run::nb_guest_goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
     anyhow::ensure!(
@@ -179,6 +187,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     let rt = Runtime::new(
         root,
+        "app",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

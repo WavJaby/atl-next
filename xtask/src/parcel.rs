@@ -216,8 +216,17 @@ fn refusal_logged(stderr: &str) -> Option<String> {
     }
 }
 
+/// Native goals (gate_goals.rs): host ART (native_load.rs) for the Java side, the converter crates the probe and atl-parcel-truth link.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::native_load::goals().with(crate::gate_goals::Goals::host(&[
+        "libbinder_rs",
+        "libatl_parcelables",
+        "atl-aidl-stubs-rust",
+    ]))
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "parcel")?;
     let probe = packages::bin(root, &out, PACKAGE, PROBE)?;
     let stage = crate::binder::lib_env(&out)?;
     let mut fails = verdict(

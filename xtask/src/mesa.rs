@@ -27,6 +27,14 @@ pub const PC_MODULES: &[(&str, &str)] = &[
     ("ui", "device/libui"),
 ];
 
+/// The native goals (module names) behind [`PC_MODULES`]: what a build needs for Mesa to be built at all.
+pub fn pc_goals() -> Vec<&'static str> {
+    PC_MODULES
+        .iter()
+        .map(|(_, dir)| dir.strip_prefix("device/").unwrap_or(dir))
+        .collect()
+}
+
 /// Host (distro) libraries Mesa may find by pkg-config; their `.pc` files are copied next to [`PC_MODULES`]' and native.ini restricts pkg-config to that dir (`pkg_config_libdir`).
 /// Mesa looks up libudev, SPIRV-Tools and libelf as `required: false` with no option to turn them off (owner 2026-11-06: not linked; SPIRV-Tools is a libstdc++ static archive, which breaks the libc++ link of libgallium_dri). Whatever the build host has installed, only these are found.
 pub const HOST_PC: &[&str] = &[

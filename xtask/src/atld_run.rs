@@ -2,7 +2,7 @@
 //! What the runtime gates that start atld share (`xtask test app`, `xtask test instrument`): the converter's ART staged as an install lays it out (host_art.rs), servicemanager, atl-system-services, atl-binderd and atld,
 //! the Java pipeline's boot jars, aapt2, d8 and the SDK's android.jar, the test fonts, an APK built the way an app is built, and atld's command line for it.
 //! The APK is built against the SDK's android.jar of the platform's API level (prebuilts/sdk/<ro.build.version.sdk>/public): aapt2 link (manifest only), javac + d8 (the Java pipeline's), classes.dex added uncompressed.
-//! Needs the converter's ART, servicemanager, atl-services and the boot jars' JNI libraries in --out (`xtask native ... servicemanager libart libnativehelper libjavacore libopenjdk libicu_jni libandroid_runtime libandroid libsigchain atl-aidl-stubs-rust platform-bootclasspath-jni`).
+//! Native inputs: [`goals`], plus [`gralloc_goals`] for [`Runtime::with_gralloc`] / `with_gl_driver` and [`nb_guest_goals`] for [`Runtime::with_native_bridge_guest`]; each gate composes its own (gate_goals.rs).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -17,6 +17,7 @@ use atl_services::native_libs::SupportedAbi;
 use atl_services::packages::{Library, Manifest};
 use serde::{Deserialize, Serialize};
 
+use crate::gate_goals::Goals;
 use crate::host_art::{self, HostArt};
 use crate::{manifest, packages, slot, tree};
 
@@ -28,6 +29,47 @@ const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"
 /// The native goals (= module names) of the GL fronts: what `with_gl_driver` places and the `gl-proxies` check reads.
 pub fn gl_front_goals() -> &'static [&'static str] {
     &GL_FRONTS
+}
+
+/// What every [`Runtime`] reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, and the converter crates the service packages link (packages.rs).
+pub fn goals() -> Goals {
+    Goals::host(&[
+        "servicemanager",
+        "framework-res",
+        "platform-bootclasspath",
+        "libart",
+        "libnativehelper",
+        "libjavacore",
+        "libopenjdk",
+        "libicu_jni",
+        "libandroid_runtime",
+        "libandroid",
+        "libsigchain",
+        "libbinder",
+        "libutils",
+        "libinput",
+        "libbinder_rs",
+        "libatl_parcelables",
+        "atl-aidl-stubs-rust",
+        "libgui_aidl_types_rs",
+        "librustutils",
+    ])
+}
+
+/// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the libraries Mesa's Android platform links (mesa.rs PC_MODULES).
+pub fn gralloc_goals() -> Goals {
+    Goals::host(&GL_FRONTS)
+        .with(Goals::host(&[
+            "android.hardware.graphics.allocator-V2-rust",
+        ]))
+        .with(Goals::host(&crate::mesa::pc_goals()))
+}
+
+/// [`Runtime::with_native_bridge_guest`]: the guest linker, app_process and [`NB_LIBS`], plus the host side that loads them.
+pub fn nb_guest_goals() -> Goals {
+    let mut nb = vec![NB_LINKER, NB_EXE];
+    nb.extend(NB_LIBS.iter().map(|(m, _)| *m));
+    Goals::nb(&nb).with(Goals::host(&["libnativeloader", "libnativebridge"]))
 }
 
 /// Where `xtask native` puts GL front `module` under `out`.
@@ -336,9 +378,11 @@ impl ApkTools {
 }
 
 impl Runtime {
-    /// Stages ART into `<out>/<stage>`, builds the cargo binaries, checks every input exists; the test fonts are written to `<out>/fonts`.
+    /// Stages ART into `<out>/<stage>`, builds the cargo binaries, checks every input exists; the test fonts are written to `<out>/fonts`. `gate` names the caller in gate_goals.rs GATES:
+    /// the slot is refused up front unless built with its goals.
     pub fn new(
         root: &Path,
+        gate: &str,
         host: &str,
         out: Option<&Path>,
         java_out: Option<&Path>,
@@ -346,7 +390,7 @@ impl Runtime {
         verbose: bool,
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
-        let out = crate::build_state::gate_out(root, out, host)?;
+        let out = crate::build_state::gate_out(root, out, host, gate)?;
         let java_out = slot::out_dir(root, java_out, "--java-out", |workspace| {
             workspace.join("out/java/build")
         })?;

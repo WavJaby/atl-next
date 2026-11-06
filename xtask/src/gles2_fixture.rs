@@ -216,6 +216,11 @@ fn control_failures(needed: &[String], imports: &BTreeSet<String>, m: &ApkManife
     f
 }
 
+/// Native goals (gate_goals.rs): none beyond a current slot (it reads the Java pipeline's tools and build.prop there).
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::default()
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ndk = match &args.ndk {
         Some(n) => n.clone(),
@@ -225,7 +230,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(w) => w.clone(),
         None => Layout::of(root)?.workspace().join("out/gles2-fixture"),
     };
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "gles2-fixture")?;
     let java_out = slot::out_dir(root, args.java_out.as_deref(), "--java-out", |w| {
         w.join("out/java/build")
     })?;

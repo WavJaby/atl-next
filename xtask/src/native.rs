@@ -22,11 +22,14 @@ use crate::{
     triage, upstream, workspace,
 };
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 pub struct Args {
     /// Android.bp module names to build (with their dependency closure); `nb:<module>` = its native bridge variant (needs --native-bridge).
-    #[arg(required_unless_present = "shell")]
+    #[arg(required_unless_present_any = ["shell", "for_gates"])]
     goals: Vec<String>,
+    /// Also build the goals these gates declare (gate_goals.rs GATES; `all-gates` = every gate), comma-separated. Gates needing the native-bridge guest set --native-bridge to --host.
+    #[arg(long = "for", value_delimiter = ',')]
+    for_gates: Vec<String>,
     /// The host arch (an arches.toml row with `[host]`); also Soong's arch name.
     #[arg(long)]
     host: String,
@@ -72,6 +75,46 @@ pub struct Args {
     host_free_compact_gib: u64,
 }
 
+impl Args {
+    /// The explicit goals plus those of the `--for` gates; their nb goals set --native-bridge to the host (the identity engine's guest, atld_run.rs).
+    fn resolved(&self) -> Result<Args> {
+        let mut a = self.clone();
+        let wanted = crate::gate_goals::union(&self.for_gates)?;
+        if !wanted.nb.is_empty() {
+            match &a.native_bridge {
+                None => a.native_bridge = Some(a.host.clone()),
+                Some(arch) if *arch != a.host => bail!(
+                    "--for {}: the gates need the native-bridge guest for --host {}, not --native-bridge {arch}",
+                    self.for_gates.join(","),
+                    a.host
+                ),
+                Some(_) => {}
+            }
+        }
+        let extra = wanted
+            .host
+            .into_iter()
+            .chain(wanted.nb.iter().map(|m| format!("{NB_GOAL}{m}")));
+        for g in extra {
+            if !a.goals.contains(&g) {
+                a.goals.push(g);
+            }
+        }
+        Ok(a)
+    }
+
+    /// The build record's names of this run's goals (build_state.rs): `nb:<m>` -> `nb:<arch>:<m>`.
+    fn recorded_goals(&self) -> BTreeSet<String> {
+        self.goals
+            .iter()
+            .map(|g| match (g.strip_prefix(NB_GOAL), &self.native_bridge) {
+                (Some(m), Some(arch)) => crate::gate_goals::nb_key(arch, m),
+                _ => g.clone(),
+            })
+            .collect()
+    }
+}
+
 /// A tool flag's value, else the binary of its deps.toml row.
 fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> {
     match flag {
@@ -81,6 +124,7 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    let args = &args.resolved()?;
     crate::host_disk::check(crate::host_disk::Limits {
         stop_gib: args.host_free_stop_gib,
         compact_gib: args.host_free_compact_gib,
@@ -118,7 +162,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the state the crates will be built from, taken first; the record goes until they are
     let state = build_state::of_build(root)?;
     std::fs::create_dir_all(&out)?;
-    build_state::forget(&out)?;
+    let mut built_goals = build_state::forget(&out, &state)?;
+    built_goals.extend(args.recorded_goals());
     let tool_dir = out.join("bp2ninja");
     std::fs::create_dir_all(&out)?;
     let go_work = converter::go_work(root, &layout, &tool_dir)?;
@@ -442,7 +487,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
         // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
-        build_state::record(&out, &state)?;
+        build_state::record(&out, &state, &built_goals)?;
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
         }

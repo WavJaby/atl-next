@@ -54,10 +54,16 @@ pub struct Args {
     pointer: Option<String>,
 }
 
+/// Native goals (gate_goals.rs): as `test app` stages the runtime.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::app::goals()
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (pin, apk_file) = source(root, &args.target)?;
     let rt = Runtime::new(
         root,
+        "run-apk",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

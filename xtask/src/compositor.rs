@@ -60,8 +60,14 @@ const CASES: [&str; 9] = [
     "summary",
 ];
 
+/// Native goals (gate_goals.rs): servicemanager, `service`, host ART with its boot jars, libgui.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::host(&["servicemanager", "service", "libgui"])
+        .with(crate::native_load::goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "compositor")?;
     let art = HostArt::new(
         root,
         &args.host,

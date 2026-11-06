@@ -116,6 +116,36 @@ pub fn build(
     Ok(provided)
 }
 
+/// Deletes `build`'s CMakeCache.txt + CMakeFiles when the cache names another source dir (`CMAKE_HOME_DIRECTORY`), e.g. a removed task copy: cmake refuses such a cache.
+/// Returns the old source dir when it deleted.
+fn drop_foreign_cache(src: &Path, build: &Path) -> Result<Option<String>> {
+    let cache = build.join("CMakeCache.txt");
+    let Ok(text) = std::fs::read_to_string(&cache) else {
+        return Ok(None);
+    };
+    let Some(old) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
+    else {
+        return Ok(None);
+    };
+    let same = match (std::fs::canonicalize(old), std::fs::canonicalize(src)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => Path::new(old) == src,
+    };
+    if same {
+        return Ok(None);
+    }
+    std::fs::remove_file(&cache).context("removing a foreign CMakeCache.txt")?;
+    match std::fs::remove_dir_all(build.join("CMakeFiles")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).context("removing a foreign CMakeFiles");
+        }
+        _ => {}
+    }
+    Ok(Some(old.to_owned()))
+}
+
 /// Configures (Ninja generator, `cache` as `-D` entries), builds and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
 pub fn cmake(
     src: &Path,
@@ -125,6 +155,13 @@ pub fn cmake(
     install: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(build)?;
+    if let Some(old) = drop_foreign_cache(src, build)? {
+        println!(
+            "cmake: {}: cache was generated from {old}, not {}: deleted, reconfiguring",
+            build.display(),
+            src.display()
+        );
+    }
     let mut configure = Command::new("cmake");
     configure
         .args(["-G", "Ninja", "-S"])
@@ -151,4 +188,36 @@ pub fn cmake(
         ensure!(status.success(), "cmake failed, log {}", log.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_from_another_source_dir_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("xtask-cmake-cache-{}", std::process::id()));
+        let (src, gone, build) = (
+            dir.join("src"),
+            dir.join("removed-task-copy"),
+            dir.join("build"),
+        );
+        std::fs::create_dir_all(build.join("CMakeFiles")).expect("test dir");
+        std::fs::create_dir_all(&src).expect("test dir");
+        let cache = |home: &Path| {
+            std::fs::write(
+                build.join("CMakeCache.txt"),
+                format!("CMAKE_HOME_DIRECTORY:INTERNAL={}\n", home.display()),
+            )
+            .expect("test cache")
+        };
+        cache(&src);
+        assert_eq!(drop_foreign_cache(&src, &build).expect("same"), None);
+        assert!(build.join("CMakeCache.txt").is_file());
+        cache(&gone);
+        let old = drop_foreign_cache(&src, &build).expect("foreign");
+        assert_eq!(old.as_deref(), Some(gone.to_str().expect("utf-8")));
+        assert!(!build.join("CMakeCache.txt").exists() && !build.join("CMakeFiles").exists());
+        std::fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
 }

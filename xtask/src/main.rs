@@ -31,6 +31,7 @@ mod cts_report;
 mod cts_table;
 mod deps;
 mod fetch;
+mod gate_goals;
 mod gdk_dmabuf;
 mod git;
 mod git_dirs;

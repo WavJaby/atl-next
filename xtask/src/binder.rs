@@ -290,8 +290,19 @@ pub(crate) fn fresh_layout_with(root: &Path, vendor_hals: &str) -> Result<()> {
     layout(root, vendor_hals)
 }
 
+/// Native goals (gate_goals.rs): servicemanager and `service`, plus the crates stage `services` runs (services.rs).
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::host(&[
+        "servicemanager",
+        "service",
+        "atl-aidl-stubs-rust",
+        "libbinder_rs",
+        "libatl_parcelables",
+    ])
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "binder")?;
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
     let service = device.join("service/service");

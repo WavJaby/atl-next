@@ -34,7 +34,7 @@ pub struct Args {
     #[arg(long)]
     out: Option<PathBuf>,
     /// Java pipeline build directory: boot jars, aapt2, d8, `am` and the android.test.* libraries (default: this checkout's slot, see `xtask slot`; else <workspace>/out/java/build); build them with
-    /// `xtask native --out <dir> platform-bootclasspath am android.test.runner.impl android.test.base.impl android.test.mock.impl`.
+    /// `xtask native --for instrument`.
     #[arg(long)]
     java_out: Option<PathBuf>,
     /// Which test APKs to run: the hand-built fixture (two runs), the converter-built `libcore-sdk-current-test` (build it with the Java pipeline too; its `androidx.test` runner broadcasts a Bundle holding a binder and registers a receiver), or both.
@@ -459,9 +459,20 @@ pub fn am_shell(rt: &Runtime, args: Vec<String>) -> Shell {
     }
 }
 
+/// Native goals (gate_goals.rs): the runtime, `am` and the android.test.* libraries.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals().with(crate::gate_goals::Goals::host(&[
+        "am",
+        "android.test.runner.impl",
+        "android.test.base.impl",
+        "android.test.mock.impl",
+    ]))
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = Runtime::new(
         root,
+        "instrument",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

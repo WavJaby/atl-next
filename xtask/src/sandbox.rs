@@ -66,8 +66,13 @@ struct Probed {
     fails: Vec<String>,
 }
 
+/// Native goals (gate_goals.rs): none beyond a current slot.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::default()
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host)?;
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "sandbox")?;
     let work = out.join("sandbox");
     fs::create_dir_all(&work)?;
     let (broker, _binderd) = binder::start_binderd(root, &out, &work.join("binderd.log"))?;

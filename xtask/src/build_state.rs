@@ -4,7 +4,10 @@
 //! The state is the checkout's working tree as git sees it (tracked + untracked, ignored excluded), hashed through a scratch index: `git add -A` into a copy of the index,
 //! `git write-tree`. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
 //! packages succeeded (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
+//! The record also lists the goals built from that state (line 1 state, then one goal per line, nb goals as `nb:<arch>:<module>`): a run from the same state adds its goals to the
+//! previous record's, a run from another state starts over, since the older goals' outputs are stale. A gate refuses a slot lacking its goals (gate_goals.rs).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -43,27 +46,60 @@ pub fn of_checkout(root: &Path) -> Result<String> {
     result
 }
 
-/// `native` starts: the out dir no longer holds a known build.
-pub fn forget(out: &Path) -> Result<()> {
+/// A parsed record: the state, and the goals built from it.
+struct Record {
+    state: String,
+    goals: BTreeSet<String>,
+}
+
+fn read(out: &Path) -> Option<Record> {
+    let text = std::fs::read_to_string(out.join(RECORD)).ok()?;
+    let mut lines = text.lines();
+    Some(Record {
+        state: lines.next()?.trim().to_owned(),
+        goals: lines
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    })
+}
+
+/// `native` starts from `state`: the out dir no longer holds a known build. Returns the goals a previous run built from this same state, which stay current.
+pub fn forget(out: &Path, state: &str) -> Result<BTreeSet<String>> {
+    let kept = read(out)
+        .filter(|r| r.state == state)
+        .map(|r| r.goals)
+        .unwrap_or_default();
     match std::fs::remove_file(out.join(RECORD)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             Err(e).context("removing the build record")
         }
-        _ => Ok(()),
+        _ => Ok(kept),
     }
 }
 
-/// `native` built the crates from `state`.
-pub fn record(out: &Path, state: &str) -> Result<()> {
-    std::fs::write(out.join(RECORD), format!("{state}\n")).context("writing the build record")
+/// `native` built `goals` from `state`.
+pub fn record(out: &Path, state: &str, goals: &BTreeSet<String>) -> Result<()> {
+    let mut text = format!("{state}\n");
+    for g in goals {
+        text.push_str(&format!("{g}\n"));
+    }
+    std::fs::write(out.join(RECORD), text).context("writing the build record")
 }
 
-/// A runtime gate's native out dir (`--out`, else the slot): refused unless built from the checkout at `root` as it is now.
-pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str) -> Result<PathBuf> {
+/// Gate `gate`'s native out dir (`--out`, else the slot): refused unless built from the checkout at `root` as it is now, with every goal the gate declares (gate_goals.rs).
+pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) -> Result<PathBuf> {
     let out = crate::slot::out_dir(root, explicit, "--out", |workspace| {
         workspace.join("out/native").join(host)
     })?;
-    ensure_current(root, &out)?;
+    ensure_current(root, &out).with_context(|| {
+        format!(
+            "gate `{gate}`: the slot is stale: run `cargo xtask native --host {host} --for {gate}`"
+        )
+    })?;
+    let built = read(&out).map(|r| r.goals).unwrap_or_default();
+    crate::gate_goals::ensure_built(gate, host, &built)?;
     Ok(out)
 }
 
@@ -86,9 +122,9 @@ pub fn ensure_current(root: &Path, out: &Path) -> Result<()> {
 }
 
 pub(crate) fn ensure_matches(now: &str, out: &Path) -> Result<()> {
-    let recorded = match std::fs::read_to_string(out.join(RECORD)) {
-        Ok(s) => s.trim().to_owned(),
-        Err(_) => bail!(
+    let recorded = match read(out) {
+        Some(r) => r.state,
+        None => bail!(
             "{} holds no record of the tree it was built from (a native run never finished there): run `cargo xtask native`",
             out.display()
         ),
@@ -172,9 +208,16 @@ mod tests {
         let ensure_current = |d: &Path, out: &Path| ensure_matches(&with_overlays(d, &[])?, out);
         let e = ensure_current(&d, &out).expect_err("no record");
         assert!(format!("{e}").contains("run `cargo xtask native`"), "{e}");
-        forget(&out).unwrap();
-        record(&out, &of_checkout(&d).unwrap()).unwrap();
+        let state = of_checkout(&d).unwrap();
+        assert!(forget(&out, &state).unwrap().is_empty());
+        let goals: BTreeSet<String> = ["a".to_owned()].into();
+        record(&out, &state, &goals).unwrap();
         ensure_current(&d, &out).expect("built from this state");
+        // a run from the same state keeps the earlier goals; from another, starts over
+        assert_eq!(forget(&out, &state).unwrap(), goals);
+        record(&out, &state, &goals).unwrap();
+        assert!(forget(&out, "other").unwrap().is_empty());
+        record(&out, &state, &goals).unwrap();
         // the same checkout with a task copy bound: another build
         let copy = repo("guard-copy");
         let bound = [crate::tree::Overlay {
@@ -200,7 +243,7 @@ mod tests {
             status.lines().all(|l| l.starts_with("??")),
             "the real index stays empty: {status}"
         );
-        forget(&out).unwrap();
+        forget(&out, "").unwrap();
         assert!(
             ensure_current(&d, &out).is_err(),
             "a started native run forgets"

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
 use crate::host_art::exec;
-use crate::{slot, tree};
+use crate::tree;
 
 const PROBE: &str = "xtask/testdata/gl-dispatch";
 /// The fronts' sources, tree-relative: gl_hooks_t is `GL_ENTRY` x entries.in + `MAX_NUMBER_OF_GL_EXTENSIONS` pointers (hooks.h).
@@ -25,10 +25,14 @@ pub struct Args {
     out: Option<PathBuf>,
 }
 
+/// Native goals (gate_goals.rs): the fronts it dispatches through.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::gate_goals::Goals::host(&["libEGL", "libGLESv2"])
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = slot::out_dir(root, args.out.as_deref(), "--out", |w| {
-        w.join("out/native/x86_64")
-    })?;
+    // no --host: the gate has only ever run on x86_64
+    let out = crate::build_state::gate_out(root, args.out.as_deref(), "x86_64", "gl-dispatch")?;
     let tree = tree::shared_tree(&Layout::of(root)?);
     let size = table_pointers(
         &std::fs::read_to_string(tree.join(ENTRIES_IN))?,

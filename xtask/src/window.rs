@@ -1565,6 +1565,11 @@ fn hold_report(app_log: &Path, marker: &str, secs: u64, atld_exited: bool) -> Ex
     }
 }
 
+/// Native goals (gate_goals.rs): the runtime with gralloc.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -1575,6 +1580,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
+        "window",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

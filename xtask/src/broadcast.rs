@@ -65,10 +65,16 @@ fn count(text: &str, marker: &str) -> usize {
     text.lines().filter(|l| l.contains(marker)).count()
 }
 
+/// Native goals (gate_goals.rs): the plain runtime.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals()
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = Layout::of(root)?;
     let rt = Runtime::new(
         root,
+        "broadcast",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),

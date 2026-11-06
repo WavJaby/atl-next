@@ -283,6 +283,11 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
     whys
 }
 
+/// Native goals (gate_goals.rs): the runtime with gralloc.
+pub fn goals() -> crate::gate_goals::Goals {
+    crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let name = match args.stage {
         Stage::Empty => "sensors-empty",
@@ -290,6 +295,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let mut rt = Runtime::new(
         root,
+        "sensors",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
