@@ -4,6 +4,7 @@
     clippy::unwrap_used,
     reason = "test helpers outside #[test] functions; a failure is the test failing"
 )]
+#![expect(clippy::disallowed_types, reason = "a test: it runs rustc on the host")]
 
 use std::path::PathBuf;
 use std::process::Command;

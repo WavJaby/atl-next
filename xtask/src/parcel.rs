@@ -248,8 +248,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         runtime.display()
     );
     // writing a binder, even null, reaches libbinder's IPCThreadState and so opens the driver: the run is a binder process of binderd, as an app's is
-    let (mut binderd, harness) =
-        binder::start_binderd(root, &out, &out.join("parcel/binderd.log"))?;
+    let (broker, mut binderd) = binder::start_binderd(root, &out, &out.join("parcel/binderd.log"))?;
     // the virtual keyboard's KeyCharacterMap in Parcel form, loaded by the same atl-libinput code the input service runs
     let keymap = out.join("parcel/Virtual.kcm.parcel");
     let to_parcel = packages::bin(root, &out, "atl-libinput", "atl-kcm-parcel")?;
@@ -277,21 +276,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
     );
     let what = format!("{cmd:?}");
-    let run = harness
-        .spawn(cmd, AID_APP_START, false)
-        .and_then(|child| art.finish(&what, child));
+    let run =
+        binder::spawn_piped(&broker, &cmd, AID_APP_START).and_then(|p| art.finish(&what, p.child));
     // the permission hook (atl-aidl-probe --enforce), a binder process too
     let mut enforce_cmd = Command::new(&probe);
-    enforce_cmd
-        .arg(ENFORCE)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let enforce = harness
-        .spawn(enforce_cmd, AID_APP_START, false)
-        .and_then(|child| Ok(child.wait_with_output()?));
-    drop(harness);
-    binderd.wait()?;
+    enforce_cmd.arg(ENFORCE);
+    let enforce = binder::spawn_piped(&broker, &enforce_cmd, AID_APP_START)
+        .and_then(|p| Ok(p.child.wait_with_output()?));
+    drop(broker);
+    binderd.child.wait()?;
     let run = run?;
     let enforce = enforce?;
     if enforce.status.success() {

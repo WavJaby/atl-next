@@ -18,14 +18,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::{self, Request, Response};
+use atl_broker::{Broker, Process};
 use atl_layout::Layout;
 use atl_services::native_libs::LIB_DIR_NAME;
 use atl_services::packages::{ActivityDecl, InstrumentationDecl, Manifest, PackageRecord};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::atld_run::without_stamp;
-use crate::binder::Harness;
-use crate::{packages, tree};
+use crate::{binder, packages, tree};
 
 const PACKAGE: &str = "atl-services";
 /// The test package: an app uid (AID_APP_START 10000 + 123, any app id), its paths, launcher activity and start.
@@ -74,13 +74,9 @@ fn wait(child: &mut Child, limit: Duration) -> Result<Option<std::process::ExitS
 }
 
 /// `cmd` as a binder process of `uid`, output to `log`; killed after `limit`.
-fn run(h: &Harness, mut cmd: Command, uid: u32, log: &Path, limit: Duration) -> Result<Run> {
-    let file = std::fs::File::create(log)?;
-    cmd.stdin(Stdio::null())
-        .stdout(file.try_clone()?)
-        .stderr(file);
-    let mut child = h.spawn(cmd, uid, false)?;
-    let status = wait(&mut child, limit)?;
+fn run(b: &Broker, cmd: Command, uid: u32, log: &Path, limit: Duration) -> Result<Run> {
+    let mut p = binder::spawn_logged(b, &cmd, uid, log)?;
+    let status = wait(&mut p.child, limit)?;
     let text = std::fs::read_to_string(log)?;
     Ok(match status {
         Some(s) => (s.success(), text),
@@ -131,7 +127,7 @@ pub fn stage(
     root: &Path,
     out: &Path,
     host_arch: &str,
-    h: &Harness,
+    b: &Broker,
     env: &[(String, String)],
     service: &Path,
     test_root: &Path,
@@ -211,14 +207,16 @@ pub fn stage(
         .arg("--keychars")
         .arg(&keychars)
         .args(["--launch", APP])
-        .envs(env.iter().cloned())
-        .stdin(Stdio::from(control_theirs))
-        .stderr(std::fs::File::create(&services_log)?);
-    // the process the services start: the client, as the package's uid; the handler sends its Child here
-    let (started_tx, started_rx) = channel::<Child>();
+        .envs(env.iter().cloned());
+    let mut services_spawn = binder::spawn_of(&cmd, AID_SYSTEM)?;
+    services_spawn.stdin = Some(control_theirs);
+    services_spawn.stdout = Stdio::inherit();
+    services_spawn.stderr = std::fs::File::create(&services_log)?.into();
+    // the process the services start: the client, as the package's uid; the handler sends its Process here
+    let (started_tx, started_rx) = channel::<Process>();
     let client_log = test_root.join("client-app.log");
     // the harness is atld for this stage: what the services start, it spawns; it kills nothing (the client ends by itself)
-    let serve = |tx: Sender<Child>| {
+    let serve = |tx: Sender<Process>| {
         let result = control::serve(&control_ours, |request| match request {
             Request::Start(start) => {
                 let Some(seq) = start
@@ -243,20 +241,13 @@ pub fn stage(
                     "--start-seq",
                     &seq,
                 ]);
-                let spawned = std::fs::File::create(&client_log)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|file| {
-                        app.stdin(Stdio::null())
-                            .stdout(file.try_clone()?)
-                            .stderr(file);
-                        h.spawn(app, start.uid, false)
-                    });
-                match spawned.and_then(|child| {
-                    let pid = i32::try_from(child.id())?;
-                    tx.send(child).ok();
-                    Ok(pid)
-                }) {
-                    Ok(pid) => Response::Started { pid },
+                match binder::spawn_logged(b, &app, start.uid, &client_log) {
+                    Ok(p) => {
+                        // the tag binderd reports, as atld answers
+                        let pid = p.host_pid;
+                        tx.send(p).ok();
+                        Response::Started { pid }
+                    }
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
@@ -271,8 +262,11 @@ pub fn stage(
     };
     std::thread::scope(|scope| -> Result<Vec<String>> {
         scope.spawn(|| serve(started_tx));
-        let mut services = h
-            .spawn(cmd, AID_SYSTEM, false)
+        let Process {
+            child: mut services,
+            ..
+        } = b
+            .spawn(services_spawn)
             .context("starting atl-system-services")?;
         let start = Instant::now();
         while !std::fs::read_to_string(&services_log)?.contains("services: ready") {
@@ -299,8 +293,8 @@ pub fn stage(
         let codes = String::from_utf8_lossy(&codes.stdout).into_owned();
         // the services' `--launch` made them ask for the app process: the client the handler spawned
         let app: Run = match started_rx.recv_timeout(READY) {
-            Ok(mut child) => {
-                let status = wait(&mut child, CLIENT_LIMIT)?;
+            Ok(mut p) => {
+                let status = wait(&mut p.child, CLIENT_LIMIT)?;
                 let text = std::fs::read_to_string(&client_log)?;
                 match status {
                     Some(s) => (s.success(), text),
@@ -315,7 +309,7 @@ pub fn stage(
         let mut system = Command::new(&client);
         system.envs(env.iter().cloned()).arg("system");
         let system = run(
-            h,
+            b,
             system,
             AID_SYSTEM,
             &test_root.join("client-system.log"),
@@ -333,7 +327,7 @@ pub fn stage(
                 // `--`: service parses options with getopt, which would take the argument -1 for one
                 .args(["--", "call", "package", &c])
                 .args(args);
-            run(h, cmd, AID_SHELL, &test_root.join(log), CLIENT_LIMIT)
+            run(b, cmd, AID_SHELL, &test_root.join(log), CLIENT_LIMIT)
         };
         // hasSystemFeature(String name = null, int version = 0); getApplicationInfo(String packageName = null, long flags = 0, int userId = 0)
         let feature = call(

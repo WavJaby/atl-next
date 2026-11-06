@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! The app sandbox's seccomp filter. bwrap installs it (`--seccomp FD`) before the sandboxed program runs, so every thread of the app inherits it.
-//! This is the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
-//! Rule: `setpriority` with a negative priority returns 0 and changes nothing; a non-negative priority reaches the kernel unchanged.
+//! The sandboxes' seccomp filters, one per [`Profile`]. bwrap installs it (`--seccomp FD`) before the sandboxed program runs, so every thread inherits it.
+//! BinderDaemon: a measured allow-list, everything else kills ([`binderd_program`]; derivation in arch.rs).
+//! App: the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
+//! App rule: `setpriority` with a negative priority returns 0 and changes nothing; a non-negative priority reaches the kernel unchanged.
 //! Condition defended: an unprivileged user cannot lower nice (RLIMIT_NICE hard limit 0 here; real Android's init sets 40/40, init.rc:42-43). ART starts HandlerThreads at THREAD_PRIORITY_FOREGROUND (-2),
 //! so Process.setThreadPriority throws SecurityException (android_util_Process.cpp:115) and the app's queued-work looper dies with the app.
 //! Delete the rule when thread priority goes through the desktop (rtkit or the realtime portal): the ideal, not now.
@@ -11,6 +12,8 @@ mod arch;
 
 use std::collections::BTreeMap;
 use std::io;
+
+use crate::Profile;
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -22,8 +25,47 @@ const PRIORITY_ARG: u8 = 2;
 /// Bit 31 set: the 32-bit int is negative. A Dword comparison reads the argument's low 32 bits, the int the kernel reads, whatever the upper half holds.
 const NEGATIVE: u64 = 0x8000_0000;
 
-/// The filter as seccompiler's program: setpriority with a negative priority returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
-pub fn program() -> io::Result<BpfProgram> {
+/// `profile`'s program.
+pub fn program(profile: Profile) -> io::Result<BpfProgram> {
+    match profile {
+        Profile::App => app_program(),
+        Profile::BinderDaemon => binderd_program(),
+    }
+}
+
+/// socketpair(domain, type, protocol, sv): the domain is the first argument.
+const DOMAIN_ARG: u8 = 0;
+
+/// binderd's filter: an allow-list ([`arch::BINDERD_SYSCALLS`], measured), socketpair only for AF_UNIX, anything else kills the process (SECCOMP_RET_KILL_PROCESS: the run then fails on "binderd ended", never on a half-working daemon).
+/// Covers bwrap's pid 1 in the sandbox too (it waits for binderd), since bwrap installs the filter before it forks it.
+fn binderd_program() -> io::Result<BpfProgram> {
+    let unix = SeccompCondition::new(
+        DOMAIN_ARG,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        u64::from(libc::AF_UNIX.unsigned_abs()),
+    )
+    .map_err(io::Error::other)?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = arch::BINDERD_SYSCALLS
+        .iter()
+        .map(|&n| (n, vec![]))
+        .collect();
+    rules.insert(
+        libc::SYS_socketpair,
+        vec![SeccompRule::new(vec![unix]).map_err(io::Error::other)?],
+    );
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        arch::HOST,
+    )
+    .map_err(io::Error::other)?;
+    filter.try_into().map_err(io::Error::other)
+}
+
+/// The app filter as seccompiler's program: setpriority with a negative priority returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
+fn app_program() -> io::Result<BpfProgram> {
     let negative = SeccompCondition::new(
         PRIORITY_ARG,
         SeccompCmpArgLen::Dword,
@@ -43,9 +85,9 @@ pub fn program() -> io::Result<BpfProgram> {
     filter.try_into().map_err(io::Error::other)
 }
 
-/// The filter as the bytes bwrap reads from `--seccomp`'s fd: a `struct sock_filter` array in host byte order (code u16, jt u8, jf u8, k u32).
-pub fn app_filter() -> io::Result<Vec<u8>> {
-    Ok(program()?
+/// `profile`'s filter as the bytes bwrap reads from `--seccomp`'s fd: a `struct sock_filter` array in host byte order (code u16, jt u8, jf u8, k u32).
+pub fn filter(profile: Profile) -> io::Result<Vec<u8>> {
+    Ok(program(profile)?
         .iter()
         .flat_map(|i| {
             let mut bytes = Vec::with_capacity(8);
@@ -59,6 +101,10 @@ pub fn app_filter() -> io::Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test: the probe re-runs this test binary unfiltered"
+)]
 mod tests {
     use super::*;
     use rustix::process::{Resource, getpriority_process, getrlimit, setpriority_process};
@@ -84,7 +130,8 @@ mod tests {
             return;
         };
         if mode.to_str() == Some("filtered") {
-            seccompiler::apply_filter(&program().expect("program")).expect("apply_filter");
+            seccompiler::apply_filter(&program(Profile::App).expect("program"))
+                .expect("apply_filter");
         }
         let outcome = |r: rustix::io::Result<()>| match r {
             Ok(()) => "ok".to_owned(),
@@ -153,8 +200,8 @@ mod tests {
     /// bwrap reads whole `sock_filter` instructions: the bytes are the program's instruction count times the struct's size.
     #[test]
     fn filter_bytes_are_whole_instructions() {
-        let program = program().expect("program");
-        let bytes = app_filter().expect("bytes");
+        let program = program(Profile::App).expect("program");
+        let bytes = filter(Profile::App).expect("bytes");
         assert!(!program.is_empty());
         assert_eq!(
             bytes.len(),

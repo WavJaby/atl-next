@@ -3,6 +3,10 @@
 //! `clang++ -Xclang -fdump-record-layouts-complete` run on the same header, never from bridgegen.
 //! One LP64 and one ILP32 target, so the pointer width really varies.
 //! Deliberate break: `RUSTFLAGS=--cfg=atl_bridgegen_break` sizes a reference by its referent -> fails.
+#![expect(
+    clippy::disallowed_types,
+    reason = "a test: it runs clang++ on the host"
+)]
 
 use std::collections::BTreeMap;
 use std::path::Path;

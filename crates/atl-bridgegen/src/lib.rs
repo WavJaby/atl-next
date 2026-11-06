@@ -5,6 +5,10 @@
 //! Also include wrappers giving one libc's headers another's header shape (`shape`), and build scripts' access to the Blueprint converter's output (`converter`: linking its artifacts, its AIDL Rust stubs).
 //! Output is deterministic for the same sources and targets.
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::disallowed_types,
+    reason = "a build tool: it runs clang and the converter on the host, never a runtime process"
+)]
 
 pub mod buildscript;
 pub mod c;

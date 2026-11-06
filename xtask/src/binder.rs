@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test binder`: AOSP's servicemanager and `service` command, built by the converter on libbinder's driver seam (patches/aosp/frameworks/native 0003), talking through binderd.
 //!
-//! The harness stands in for the broker: it starts `atl-binderd` (admin connection on its stdin), and per process makes a SEQPACKET socketpair, passes one end as `ATL_BINDER_FD`, registers the other with binderd tagged {uid, host pid}.
-//! servicemanager: uid 1000 (AID_SYSTEM), the one process allowed to become context manager; run under bubblewrap with the test layout's /system, /vendor, /odm (empty VINTF manifests) over the host's root.
+//! Every process goes through atl-broker as atld's do: `Broker::start` runs `atl-binderd` in its BinderDaemon sandbox, `Broker::spawn` each binder process in the app sandbox, registered with binderd tagged {uid, host pid}; so this gate runs on the argv the broker emits.
+//! servicemanager: uid 1000 (AID_SYSTEM), the one process allowed to become context manager, with the test layout's /system, /vendor, /odm (empty VINTF manifests) mounted.
 //! `service`: uid 2000 (AID_SHELL). Gate: `service list` lists `manager` (servicemanager registers itself, main.cpp), `service check manager` finds it, `service check <absent>` does not; binderd's counters show the driver paths that must fire on this workload: the context manager's TXN_SECURITY_CTX flag (ignored) and libbinder's oneway-spam ioctl (unsupported).
 //! Then stage `services` (services.rs): the M2 Rust services registered with that servicemanager and called through binderd. Needs `xtask native` to have built crate atl-services.
 
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use atl_broker::{Broker, Mount, Process, Spawn, to_log};
 use atl_layout::Layout;
-use rustix::io::{FdFlags, fcntl_setfd};
-use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -29,8 +28,6 @@ pub struct Args {
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_SHELL.
 const AID_SYSTEM: u32 = 1000;
 const AID_SHELL: u32 = 2000;
-/// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
-const CONTROL_ENV: &str = "ATL_BINDER_FD";
 /// The name servicemanager registers itself under (cmds/servicemanager/main.cpp `addService("manager", ...)`).
 const MANAGER: &str = "manager";
 /// A name nothing registers, shaped as an AIDL HAL instance (`<package>.<Interface>/<instance>`) so servicemanager's miss path consults the VINTF manifests (ServiceManager.cpp `isVintfDeclared` via `NativeName::fill` / AIDL instance names): without them it logs `NULL VINTF MANIFEST`.
@@ -66,51 +63,62 @@ fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
     Ok(())
 }
 
-/// bubblewrap arguments: a tmpfs root holding every entry of the host's `/` (dirs bound, symlinks recreated), plus `root`'s system, vendor, odm.
-fn sandbox_args(root: &Path) -> Result<Vec<String>> {
-    let mut a: Vec<String> = vec!["--tmpfs".into(), "/".into()];
-    let ours = ["system", "vendor", "odm"];
-    for e in std::fs::read_dir("/")? {
-        let e = e?;
-        let name = e.file_name().to_string_lossy().into_owned();
-        if ours.contains(&name.as_str()) {
-            continue;
-        }
-        let path = format!("/{name}");
-        let ft = e.file_type()?;
-        if ft.is_symlink() {
-            let target = std::fs::read_link(&path)?;
-            a.extend(["--symlink".into(), target.display().to_string(), path]);
-        } else if ft.is_dir() {
-            let kind = match name.as_str() {
-                "dev" => "--dev-bind",
-                "proc" => "--proc",
-                _ => "--bind",
-            };
-            if kind == "--proc" {
-                a.extend([kind.into(), path]);
-            } else {
-                a.extend([kind.into(), path.clone(), path]);
-            }
-        }
-    }
-    for d in ours {
-        a.extend([
-            "--ro-bind".into(),
-            root.join(d).display().to_string(),
-            format!("/{d}"),
-        ]);
-    }
-    Ok(a)
+/// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests.
+fn layout_mounts(root: &Path) -> Vec<Mount> {
+    ["system", "vendor", "odm"]
+        .into_iter()
+        .map(|d| Mount {
+            host: root.join(d),
+            at: PathBuf::from("/").join(d),
+            writable: false,
+        })
+        .collect()
 }
 
-/// The broker's side of binderd: its admin connection. Dropping it closes the connection, which ends binderd.
-pub(crate) struct Harness {
-    admin: OwnedFd,
+/// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid`: no mounts, devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
+/// Variables `cmd` removes are not expressible (the sandbox inherits the broker's environment): an error.
+pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
+    let mut env = Vec::new();
+    for (k, v) in cmd.get_envs() {
+        let v = v.with_context(|| format!("{k:?}: a removed variable has no Spawn form"))?;
+        env.push((k.to_owned(), v.to_owned()));
+    }
+    Ok(Spawn {
+        uid,
+        context_manager: false,
+        mounts: vec![],
+        links: vec![],
+        devices: vec![],
+        property_area: None,
+        program: cmd.get_program().into(),
+        args: cmd.get_args().map(OsStr::to_owned).collect(),
+        env,
+        cwd: cmd.get_current_dir().map(Path::to_path_buf),
+        stdin: None,
+        stdout: Stdio::null(),
+        stderr: Stdio::null(),
+    })
 }
 
-/// atl-binderd, built into `out`'s cargo target dir as `xtask native` builds crates, started with its admin connection on stdin and its stderr (counters) in `log`.
-pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Child, Harness)> {
+/// [`spawn_of`] with stdout + stderr to the file `log`, started.
+pub(crate) fn spawn_logged(b: &Broker, cmd: &Command, uid: u32, log: &Path) -> Result<Process> {
+    let mut s = spawn_of(cmd, uid)?;
+    (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
+    b.spawn(s)
+        .with_context(|| format!("spawning {}", cmd.get_program().display()))
+}
+
+/// [`spawn_of`] with stdout and stderr piped (read through `Process::child`, e.g. `wait_with_output`), started.
+pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process> {
+    let mut s = spawn_of(cmd, uid)?;
+    s.stdout = Stdio::piped();
+    s.stderr = Stdio::piped();
+    b.spawn(s)
+        .with_context(|| format!("spawning {}", cmd.get_program().display()))
+}
+
+/// atl-binderd, built into `out`'s cargo target dir as `xtask native` builds crates, started by the broker (its BinderDaemon sandbox) with its stderr (counters) in `log`.
+pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Broker, Process)> {
     let status = crate::cargo_command()
         .args([
             "build",
@@ -125,63 +133,30 @@ pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Chil
         .current_dir(root)
         .status()?;
     ensure!(status.success(), "building atl-binderd failed");
-    let (admin, theirs) = socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    let binderd = Command::new(out.join("cargo/release/atl-binderd"))
-        .stdin(Stdio::from(theirs))
-        .stderr(std::fs::File::create(log)?)
-        .spawn()
-        .context("starting atl-binderd")?;
-    Ok((binderd, Harness { admin }))
+    Broker::start(
+        &out.join("cargo/release/atl-binderd"),
+        std::fs::File::create(log)?,
+    )
+    .context("starting atl-binderd")
 }
 
-impl Harness {
-    /// Spawns `cmd` as a binder process tagged `uid` (context manager if `cm`), its control connection inherited.
-    pub(crate) fn spawn(&self, mut cmd: Command, uid: u32, cm: bool) -> Result<Child> {
-        let (ours, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::SEQPACKET,
-            SocketFlags::CLOEXEC,
-            None,
-        )?;
-        // inherited by this child only: cleared just before the spawn, closed right after it
-        fcntl_setfd(&theirs, FdFlags::empty())?;
-        cmd.env(CONTROL_ENV, theirs.as_raw_fd().to_string());
-        let child = cmd.spawn().context("spawning a binder process")?;
-        drop(theirs);
-        let pid = i32::try_from(child.id())?;
-        atl_binderd::server::register(self.admin.as_fd(), ours.as_fd(), uid, pid, cm)
-            .context("registering with binderd")?;
-        Ok(child)
-    }
-
-    /// `service <args>` as the shell uid: (success, stdout + stderr), output through `log` (a file: a pipe would hang on any grandchild holding it). Killed after `RUN_LIMIT`.
-    fn service(
-        &self,
-        service: &Path,
-        env: &[(String, String)],
-        args: &[&str],
-        log: &Path,
-    ) -> Result<(bool, String)> {
-        let file = std::fs::File::create(log)?;
-        let mut cmd = Command::new(service);
-        cmd.args(args)
-            .envs(env.iter().cloned())
-            .stdin(Stdio::null())
-            .stdout(file.try_clone()?)
-            .stderr(file);
-        let mut child = self.spawn(cmd, AID_SHELL, false)?;
-        let status = wait_limited(&mut child, RUN_LIMIT)?;
-        let text = std::fs::read_to_string(log)?;
-        Ok(match status {
-            Some(s) => (s.success(), text),
-            None => (false, format!("{text}(killed after {RUN_LIMIT:?})")),
-        })
-    }
+/// `service <args>` as the shell uid: (success, stdout + stderr), output through `log` (a file: a pipe would hang on any grandchild holding it). Killed after `RUN_LIMIT`.
+fn service(
+    b: &Broker,
+    service: &Path,
+    env: &[(String, String)],
+    args: &[&str],
+    log: &Path,
+) -> Result<(bool, String)> {
+    let mut cmd = Command::new(service);
+    cmd.args(args).envs(env.iter().cloned());
+    let mut p = spawn_logged(b, &cmd, AID_SHELL, log)?;
+    let status = wait_limited(&mut p.child, RUN_LIMIT)?;
+    let text = std::fs::read_to_string(log)?;
+    Ok(match status {
+        Some(s) => (s.success(), text),
+        None => (false, format!("{text}(killed after {RUN_LIMIT:?})")),
+    })
 }
 
 /// How long one `service` run may take: a lookup is one binder round trip (well under 100 ms); a hang means a lost reply.
@@ -259,35 +234,29 @@ pub(crate) fn lib_env(out: &Path) -> Result<Vec<(String, String)>> {
 
 /// servicemanager as the context manager (uid 1000) in the test layout under `test_root` (which `layout` filled), and the result of its first `service check manager`, polled until it answers, exits or `STARTUP` passes.
 pub(crate) fn start_servicemanager(
-    h: &Harness,
+    b: &Broker,
     test_root: &Path,
     servicemanager: &Path,
     service: &Path,
     env: &[(String, String)],
-) -> Result<(Child, (bool, String))> {
-    // bwrap stays the sandbox's pid 1 (--unshare-pid) and takes servicemanager with it when killed (--die-with-parent)
-    let sm_log_path = test_root.join("servicemanager.log");
-    let sm_log_file = std::fs::File::create(&sm_log_path)?;
-    let mut sm = Command::new("bwrap");
-    sm.args(["--unshare-pid", "--die-with-parent"])
-        .args(sandbox_args(test_root)?)
-        .arg("--")
-        .arg(servicemanager)
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(sm_log_file.try_clone()?)
-        .stderr(sm_log_file);
-    let mut sm = h.spawn(sm, AID_SYSTEM, true)?;
+) -> Result<(Process, (bool, String))> {
+    let mut cmd = Command::new(servicemanager);
+    cmd.envs(env.iter().cloned());
+    let mut s = spawn_of(&cmd, AID_SYSTEM)?;
+    s.context_manager = true;
+    s.mounts = layout_mounts(test_root);
+    (s.stdout, s.stderr) = to_log(std::fs::File::create(test_root.join("servicemanager.log"))?)?;
+    let mut sm = b.spawn(s).context("spawning servicemanager")?;
 
     // servicemanager answers once its Looper runs
     let start = Instant::now();
     let log = |n: &str| test_root.join(format!("service-{n}.log"));
     let found = loop {
-        let r = h.service(service, env, &["check", MANAGER], &log("check"))?;
+        let r = self::service(b, service, env, &["check", MANAGER], &log("check"))?;
         if r.0 && r.1.contains("found") && !r.1.contains("not found") || start.elapsed() > STARTUP {
             break r;
         }
-        if let Some(status) = sm.try_wait()? {
+        if let Some(status) = sm.child.try_wait()? {
             break (false, format!("servicemanager exited: {status}"));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -329,20 +298,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     layout(&test_root, "")?;
     let env = lib_env(&out)?;
 
-    let (mut binderd, h) = start_binderd(root, &out, &test_root.join("binderd.log"))?;
+    let (b, mut binderd) = start_binderd(root, &out, &test_root.join("binderd.log"))?;
 
     let sm_log_path = test_root.join("servicemanager.log");
     let log = |n: &str| test_root.join(format!("service-{n}.log"));
-    let (mut sm, found) = start_servicemanager(&h, &test_root, &servicemanager, &service, &env)?;
-    let list = h.service(&service, &env, &["list"], &log("list"))?;
-    let absent = h.service(&service, &env, &["check", ABSENT], &log("absent"))?;
+    let (mut sm, found) = start_servicemanager(&b, &test_root, &servicemanager, &service, &env)?;
+    let list = self::service(&b, &service, &env, &["list"], &log("list"))?;
+    let absent = self::service(&b, &service, &env, &["check", ABSENT], &log("absent"))?;
     let services_fails =
-        crate::services::stage(root, &out, &args.host, &h, &env, &service, &test_root)?;
+        crate::services::stage(root, &out, &args.host, &b, &env, &service, &test_root)?;
 
-    let _ = sm.kill();
-    sm.wait()?;
-    drop(h);
-    let bstatus = wait_limited(&mut binderd, RUN_LIMIT)?;
+    let _ = sm.child.kill();
+    sm.child.wait()?;
+    drop(b);
+    let bstatus = wait_limited(&mut binderd.child, RUN_LIMIT)?;
     let counters = std::fs::read_to_string(test_root.join("binderd.log"))?;
     let sm_log = std::fs::read_to_string(&sm_log_path)?;
     print!("{counters}");

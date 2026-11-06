@@ -106,9 +106,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sm_root = out.join("compositor-sm");
     binder::fresh_layout(&sm_root)?;
     let env = binder::lib_env(&out)?;
-    let (mut binderd, harness) = binder::start_binderd(root, &out, &sm_root.join("binderd.log"))?;
+    let (broker, mut binderd) = binder::start_binderd(root, &out, &sm_root.join("binderd.log"))?;
     let (mut sm, found) =
-        binder::start_servicemanager(&harness, &sm_root, &servicemanager, &service, &env)?;
+        binder::start_servicemanager(&broker, &sm_root, &servicemanager, &service, &env)?;
     ensure!(
         found.0,
         "servicemanager did not come up: {}",
@@ -116,13 +116,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     let cmd = art.command(&fixture, &fixture.area.1, &[], DRIVER, &extra);
     let what = format!("{cmd:?}");
-    let run = harness
-        .spawn(cmd, AID_SYSTEM, false)
-        .and_then(|child| art.finish(&what, child));
-    sm.kill().ok();
-    sm.wait().ok();
-    drop(harness);
-    binderd.wait()?;
+    let run =
+        binder::spawn_piped(&broker, &cmd, AID_SYSTEM).and_then(|p| art.finish(&what, p.child));
+    sm.child.kill().ok();
+    sm.child.wait().ok();
+    drop(broker);
+    binderd.child.wait()?;
     let run = run.context("running the compositor truth driver")?;
     let (passes, fails) = truth_verdict("ct ", &CASES, DRIVER, run.ok, &run.stdout, &run.failure());
     for p in &passes {

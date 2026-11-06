@@ -1,2 +1,9 @@
 # SPDX-License-Identifier: MIT
 allow-unwrap-in-tests = true
+# Every runtime process starts through atl-broker (plan Q5, F1.2): its launcher holds the one `#[expect]`; build tools and tests carry a crate- or module-level `#[expect]` with their reason, which fails once unused.
+disallowed-types = [
+    { path = "std::process::Command", reason = "runtime processes start through atl_broker::Broker (the sandbox launcher)" },
+]
+disallowed-methods = [
+    { path = "std::os::unix::process::CommandExt::exec", reason = "replacing the process bypasses the broker's sandbox" },
+]

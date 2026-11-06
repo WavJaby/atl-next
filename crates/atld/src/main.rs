@@ -19,7 +19,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, ExitCode, ExitStatus};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::{DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FRAMEWORK, VENDOR};
 use atl_broker::control::{self, Request, Response, StartRequest};
-use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox};
+use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox, to_log};
 use atl_gralloc::vintf;
 use atl_property_service::Property;
 use atl_services::compositor_registry;
@@ -421,28 +421,6 @@ fn property_area(a: &Args, r: &Root) -> Result<Vec<Property>> {
     Ok(props)
 }
 
-/// atl-binderd with its admin connection on stdin, its stderr (counters) in its log; the broker over the other end.
-fn start_binderd(a: &Args, r: &Root) -> Result<(Child, Broker)> {
-    let (admin, theirs) = socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    let binderd = Command::new(&a.binderd)
-        .stdin(Stdio::from(theirs))
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(r.log("binderd"))?)
-        .spawn()
-        .with_context(|| format!("starting {}", a.binderd.display()))?;
-    let broker = if a.no_app_seccomp {
-        Broker::new(admin).without_app_seccomp()
-    } else {
-        Broker::new(admin)
-    };
-    Ok((binderd, broker))
-}
-
 /// What spawning a process takes beyond the process itself: everything the apps share, and the table of the processes the services started.
 struct Host {
     broker: Broker,
@@ -550,6 +528,12 @@ impl Host {
         .chain(args.iter().cloned())
         .map(OsString::from)
         .collect();
+        let (stdout, stderr) = to_log(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.log(name))?,
+        )?;
         Ok(Spawn {
             uid,
             context_manager: false,
@@ -578,11 +562,10 @@ impl Host {
             program: self.launcher.clone(),
             args: launcher_args,
             env: self.art_env(),
+            cwd: None,
             stdin: None,
-            log: OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.root.log(name))?,
+            stdout,
+            stderr,
         })
     }
 
@@ -688,6 +671,8 @@ impl Host {
         };
         let log = self.root.log("am");
         let spawn = || -> Result<Spawn> {
+            let (stdout, stderr) =
+                to_log(OpenOptions::new().create(true).append(true).open(&log)?)?;
             Ok(Spawn {
                 uid: AID_SHELL,
                 context_manager: false,
@@ -698,8 +683,10 @@ impl Host {
                 program: am.clone(),
                 args: vec!["start".into(), component.into()],
                 env: vec![self.lib.clone()],
+                cwd: None,
                 stdin: None,
-                log: OpenOptions::new().create(true).append(true).open(&log)?,
+                stdout,
+                stderr,
             })
         };
         let outcome = spawn()
@@ -815,7 +802,13 @@ fn run(a: &Args) -> Result<ExitCode> {
     {
         bail!("--launch {p}: not an installed package");
     }
-    let (mut binderd, broker) = start_binderd(a, &r)?;
+    let (broker, mut binderd) =
+        Broker::start(&a.binderd, std::fs::File::create(r.log("binderd"))?)?;
+    let broker = if a.no_app_seccomp {
+        broker.without_app_seccomp()
+    } else {
+        broker
+    };
     let lib = (OsString::from("LD_LIBRARY_PATH"), a.lib_path.clone());
     let system_spawn = |name: &str,
                         program: &Path,
@@ -823,6 +816,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                         cm: bool,
                         stdin: Option<std::os::fd::OwnedFd>|
      -> Result<Spawn> {
+        let (stdout, stderr) = to_log(std::fs::File::create(r.log(name))?)?;
         Ok(Spawn {
             uid: AID_SYSTEM,
             context_manager: cm,
@@ -845,8 +839,10 @@ fn run(a: &Args) -> Result<ExitCode> {
             program: program.to_owned(),
             args,
             env: vec![lib.clone()],
+            cwd: None,
             stdin,
-            log: std::fs::File::create(r.log(name))?,
+            stdout,
+            stderr,
         })
     };
     let mut sm = broker
@@ -1013,8 +1009,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         let _ = p.child.wait();
     }
     drop(host);
-    let _ = binderd.kill();
-    let _ = binderd.wait();
+    let _ = kill_sandbox(binderd.host_pid);
+    let _ = binderd.child.wait();
     Ok(match code {
         Some(0) => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,

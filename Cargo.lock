@@ -156,6 +156,7 @@ dependencies = [
  "atl-android-paths",
  "atl-binderd",
  "libc",
+ "object",
  "rustix",
  "seccompiler",
  "serde",

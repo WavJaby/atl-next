@@ -7,17 +7,17 @@
 //!
 //! Needs `xtask native` to have built servicemanager, service, libnativewindow and the crates atl-gralloc-service, atl-gralloc-truth (its converter modules are in the build's graph), and a DRM device that allocates: without one the allocator exits with its explanation, which this prints.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_broker::{Broker, Process, to_log};
 use atl_gralloc::vintf;
-use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
-use crate::binder::{self, Harness};
+use crate::binder;
 use crate::packages;
 
 #[derive(clap::Args)]
@@ -150,28 +150,29 @@ fn wait_limited(child: &mut Child, limit: Duration) -> Result<Option<std::proces
     }
 }
 
-/// A probe role as a binder process of uid `AID_APP` whose fd `sock` is inherited.
+/// The DRM device directory the allocator opens (atl_gralloc_service::backend::DRM_DIR), bound into its sandbox as atld binds it.
+const DRM_DIR: &str = "/dev/dri";
+
+/// The probe's `--sock` fd: its stdin, the one fd the broker passes besides the binder connection.
+const PROBE_SOCK_FD: &str = "0";
+
+/// A probe role as a binder process of uid `AID_APP` with `sock` as its stdin (`--sock 0`).
 fn spawn_probe(
-    h: &Harness,
+    b: &Broker,
     probe: &Path,
     role: &str,
-    sock: &OwnedFd,
+    sock: OwnedFd,
     env: &[(String, String)],
     log: &Path,
-) -> Result<Child> {
-    // inherited by this child only: cleared for the spawn, set again right after
-    fcntl_setfd(sock, FdFlags::empty())?;
-    let file = std::fs::File::create(log)?;
+) -> Result<Process> {
     let mut cmd = Command::new(probe);
     cmd.arg(role)
-        .args(["--sock", &sock.as_raw_fd().to_string()])
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(file.try_clone()?)
-        .stderr(file);
-    let child = h.spawn(cmd, AID_APP, false);
-    fcntl_setfd(sock, FdFlags::CLOEXEC)?;
-    child
+        .args(["--sock", PROBE_SOCK_FD])
+        .envs(env.iter().cloned());
+    let mut s = binder::spawn_of(&cmd, AID_APP)?;
+    s.stdin = Some(sock);
+    (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
+    b.spawn(s).context("spawning the probe")
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -197,9 +198,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut env = binder::lib_env(&out)?;
     append_lib_path(&mut env, &mapper_dir);
 
-    let (mut binderd, h) = binder::start_binderd(root, &out, &test_root.join("binderd.log"))?;
+    let (broker, mut binderd) = binder::start_binderd(root, &out, &test_root.join("binderd.log"))?;
     let (mut sm, found) =
-        binder::start_servicemanager(&h, &test_root, &servicemanager, &service, &env)?;
+        binder::start_servicemanager(&broker, &test_root, &servicemanager, &service, &env)?;
     let result = (|| -> Result<Vec<String>> {
         ensure!(
             found.0,
@@ -212,14 +213,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(node) = &args.drm_node {
             cmd.arg("--drm-node").arg(node);
         }
-        let file = std::fs::File::create(&alloc_log)?;
-        cmd.envs(env.iter().cloned())
-            .stdin(Stdio::null())
-            .stdout(file.try_clone()?)
-            .stderr(file);
-        let mut alloc = h
-            .spawn(cmd, AID_SYSTEM, false)
-            .context("starting the allocator")?;
+        cmd.envs(env.iter().cloned());
+        let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
+        (s.stdout, s.stderr) = to_log(std::fs::File::create(&alloc_log)?)?;
+        // the DRM nodes it allocates on (the sandbox's /dev is otherwise minimal), and a --drm-node elsewhere
+        s.devices = std::iter::once(PathBuf::from(DRM_DIR))
+            .chain(
+                args.drm_node
+                    .iter()
+                    .filter(|n| !n.starts_with(DRM_DIR))
+                    .cloned(),
+            )
+            .collect();
+        let Process {
+            child: mut alloc, ..
+        } = broker.spawn(s).context("starting the allocator")?;
         let start = Instant::now();
         loop {
             let log = std::fs::read_to_string(&alloc_log).unwrap_or_default();
@@ -251,11 +259,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         )?;
         let writer_log = test_root.join("writer.log");
         let reader_log = test_root.join("reader.log");
-        let mut writer = spawn_probe(&h, &probe, "writer", &a, &env, &writer_log)?;
-        let mut reader = spawn_probe(&h, &probe, "reader", &b, &env, &reader_log)?;
-        drop((a, b));
-        let reader_status = wait_limited(&mut reader, PROBE_LIMIT)?;
-        let writer_status = wait_limited(&mut writer, PROBE_LIMIT)?;
+        let mut writer = spawn_probe(&broker, &probe, "writer", a, &env, &writer_log)?;
+        let mut reader = spawn_probe(&broker, &probe, "reader", b, &env, &reader_log)?;
+        let reader_status = wait_limited(&mut reader.child, PROBE_LIMIT)?;
+        let writer_status = wait_limited(&mut writer.child, PROBE_LIMIT)?;
         let _ = alloc.kill();
         let _ = alloc.wait();
 
@@ -293,10 +300,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         Ok(fails)
     })();
-    let _ = sm.kill();
-    sm.wait().ok();
-    drop(h);
-    binderd.wait()?;
+    let _ = sm.child.kill();
+    sm.child.wait().ok();
+    drop(broker);
+    binderd.child.wait()?;
     let fails = result?;
     for f in &fails {
         println!("gralloc: FAIL {f}");

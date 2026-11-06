@@ -4,6 +4,10 @@
 //! A path is resolved through its owner, the shared checkout holding it: the task copy when this repo checkout has one of the owner, else `src/`. So a file of a nested checkout belongs to the nested one, never to a task copy of its parent.
 //! Every checkout's git dir lives outside the source tree, in `src/.git-dirs/<dir>.git` ([`Layout::git_dir`]); `src/<dir>/.git` is a gitfile pointing there. So a task copy's worktree admin dir (`<store>/worktrees/<n>`) is never under a path the task-copy namespace binds over, and git works at both paths with no extra binds.
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::disallowed_types,
+    reason = "a build-time resolver: it runs git on the host for xtask and build scripts"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

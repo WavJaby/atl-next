@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 // Terminal output is this tool's product, not logging.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+#![expect(
+    clippy::disallowed_types,
+    reason = "a build tool: it runs compilers, git and test drivers on the host; the runtime processes of its gates start through atl_broker"
+)]
 
 mod android_paths;
 mod aosp;

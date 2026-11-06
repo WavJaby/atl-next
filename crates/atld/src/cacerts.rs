@@ -136,6 +136,10 @@ pub fn write_store(bundle: &Path, dir: &Path) -> Result<usize> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test: openssl is its independent oracle"
+)]
 mod tests {
     use super::*;
     use std::process::Command;
