@@ -3,6 +3,7 @@
 //! - javac: a source under a `--patch-module=java.base` directory compiles when the directory is a bind mount; the control, the same directory reached through a symlink (the removed link farm's shape), fails with "package exists in another module".
 //! - verify: run inside a namespace with the right copy bound passes; the wrong copy bound, and no namespace at all, both fail.
 //! - git: a worktree bound over its own shared checkout answers `git status` at both paths; without the shadow binds (tree::GitShadow) it fails.
+//! - compiler cache: with a plain view's sccache server running, a compile in the namespace through the task view's socket yields the task copy's object; the control (the plain server) yields the unpatched one.
 //! - `--plain <out> --task <out>`: the two native out dirs' build.ninja differ only on lines naming a bound project (`src/aosp/<project>/`); one other differing line fails.
 
 use std::collections::BTreeSet;
@@ -12,6 +13,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
+use crate::native::CompilerCache;
 use crate::tree::{self, Overlay};
 
 #[derive(clap::Args)]
@@ -221,6 +223,8 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
         "task-bind: PASS git: task-copy worktree works in the namespace; control without the shadow fails"
     );
 
+    compiler_cache(scratch, &target, &copy)?;
+
     if let (Some(plain), Some(task)) = (&args.plain, &args.task) {
         let read = |out: &Path| -> Result<String> {
             let p = out.join("build.ninja");
@@ -247,6 +251,71 @@ fn checks(root: &Path, scratch: &Path, args: &Args) -> Result<()> {
         }
         println!("task-bind: PASS build.ninja: {n} differing lines, all on bound projects' inputs");
     }
+    Ok(())
+}
+
+/// The sccache server runs the compiler, so it must see the build's view. With a plain build's server running on the same cache dir, a compile inside the namespace through the task view's
+/// socket must yield the task copy's object (its tag string); the control sends the same compile to the plain server (the shared server before per-view sockets) and must get the unpatched one.
+fn compiler_cache(scratch: &Path, target: &Path, copy: &Path) -> Result<()> {
+    const SRC: &str = "probe.c";
+    let tag = |name: &str| format!("ATL_TASK_BIND_{name}_{}", std::process::id());
+    // target = the unpatched tree's file, copy = the task copy's: same name, different content
+    std::fs::write(
+        target.join(SRC),
+        format!("const char t[] = \"{}\";\n", tag("PLAIN")),
+    )?;
+    std::fs::write(
+        copy.join(SRC),
+        format!("const char t[] = \"{}\";\n", tag("PATCHED")),
+    )?;
+    let task_ov = [overlay(copy, target)];
+    let dir = scratch.join("sccache");
+    let plain = CompilerCache::for_view("sccache", dir.clone(), &tree::describe(&[]));
+    let task = CompilerCache::for_view("sccache", dir, &tree::describe(&task_ov));
+    let result = (|| -> Result<()> {
+        // the plain build's server, started outside the namespace
+        plain.start()?;
+        let compile = |cache: &CompilerCache, ns: bool, obj: &str| -> Result<String> {
+            let mut cmd = Command::new("bwrap");
+            cmd.args(tree::bwrap_args(if ns { &task_ov } else { &[] }));
+            let out = scratch.join(obj);
+            let o = cmd
+                .arg("--")
+                .args(["sccache", "cc", "-c"])
+                .arg(target.join(SRC))
+                .arg("-o")
+                .arg(&out)
+                .envs(cache.env())
+                .output()
+                .context("running sccache cc under bwrap")?;
+            ensure!(
+                o.status.success(),
+                "sccache cc: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            Ok(String::from_utf8_lossy(&std::fs::read(&out)?).into_owned())
+        };
+        let has = |obj: &str, name: &str| obj.contains(&tag(name));
+        let o = compile(&plain, false, "plain.o")?;
+        ensure!(has(&o, "PLAIN"), "plain compile lacks the plain tag");
+        let o = compile(&plain, true, "shared.o")?;
+        ensure!(
+            has(&o, "PLAIN") && !has(&o, "PATCHED"),
+            "control: the plain server compiled the task copy (the probe does not tell views apart)"
+        );
+        let o = compile(&task, true, "task.o")?;
+        ensure!(
+            has(&o, "PATCHED"),
+            "task build's compile through the compiler cache yielded the unpatched object (server outside the build's view)"
+        );
+        Ok(())
+    })();
+    plain.stop();
+    task.stop();
+    result?;
+    println!(
+        "task-bind: PASS compiler cache: task view's server compiles the task copy; control via the plain server gets the unpatched one"
+    );
     Ok(())
 }
 
