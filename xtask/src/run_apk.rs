@@ -5,6 +5,7 @@
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
+//! `--drive <script>`: once that wait is over, the script runs against the window (drive.rs for its grammar); a failed step fails the run, and the verdict covers the run up to the script's end.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,12 +15,12 @@ use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
 use crate::nested_wayland::NestedCompositor;
-use crate::{manifest, test_apks, window};
+use crate::{drive, manifest, test_apks, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
 const PRESENT_LINE: &str = "atl-composer: ui: present";
 /// The staged runtime's name, shared with the window gate: one ART install for both.
-const STAGE: &str = "window-art";
+pub(crate) const STAGE: &str = "window-art";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -50,8 +51,41 @@ pub struct Args {
     no_app_seccomp: bool,
     /// A pointer script the app injects into its window from its first present (atl-composer `input::parse_script`): `down:X,Y up:X,Y` in the content's physical pixels, `wait:MS` between steps,
     /// e.g. `wait:6000 down:792,28 up:792,28` taps (792, 28) 6 s after the first frame. The verdict is still about the last resumed activity, so wait for each tap's answer to settle.
-    #[arg(long, value_name = "SCRIPT")]
+    #[arg(long, value_name = "SCRIPT", conflicts_with = "drive")]
     pointer: Option<String>,
+    /// A script file run against the window on the headless compositor, one step a line, coordinates in window content pixels: `wait <ms>`, `wait-frames <n>`, `tap <x> <y>`, `swipe <x1> <y1> <x2> <y2> <ms>`, `key <name>` (a letter, a digit, or escape, backspace, tab, enter, space, home, end, up, down, left, right, pageup, pagedown, back), `resize <w> <h>`, `shot <file.png>` (the window's content; a one-colour capture fails the run).
+    /// The app is stopped after the last step; a failed step exits non-zero.
+    #[arg(long, value_name = "FILE", conflicts_with = "hold")]
+    drive: Option<PathBuf>,
+    /// Deliberate-failure check of --drive: every shot is blanked, so the first one must fail the run.
+    #[arg(long, requires = "drive")]
+    break_blank_capture: bool,
+}
+
+impl Args {
+    /// A `--drive` run of the APK file `apk`, for `xtask test drive`.
+    pub(crate) fn driven(
+        apk: &Path,
+        host: &str,
+        out: Option<PathBuf>,
+        java_out: Option<PathBuf>,
+        script: PathBuf,
+        break_blank_capture: bool,
+    ) -> Self {
+        Self {
+            target: apk.display().to_string(),
+            host: host.to_owned(),
+            out,
+            java_out,
+            hold: None,
+            log_tags: "*:i".to_owned(),
+            verbose: false,
+            no_app_seccomp: false,
+            pointer: None,
+            drive: Some(script),
+            break_blank_capture,
+        }
+    }
 }
 
 /// Native goals (gate_goals.rs): as `test app` stages the runtime.
@@ -61,6 +95,15 @@ pub fn goals() -> crate::gate_goals::Goals {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (pin, apk_file) = source(root, &args.target)?;
+    // a bad script fails before anything starts
+    let steps = match &args.drive {
+        Some(file) => {
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            Some(drive::parse(&text).with_context(|| file.display().to_string())?)
+        }
+        None => None,
+    };
     let rt = Runtime::new(
         root,
         "run-apk",
@@ -85,16 +128,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
-    let nested = match args.hold {
-        Some(_) => None,
-        None => Some(NestedCompositor::start(&work.join("nested"))?),
+    let nested = match (args.hold, &steps) {
+        (Some(_), _) => None,
+        (None, Some(_)) => Some(NestedCompositor::start_placed(&work.join("nested"))?),
+        (None, None) => Some(NestedCompositor::start(&work.join("nested"))?),
+    };
+    // a script's input goes through the proxy
+    let proxy = match (&nested, &steps) {
+        (Some(n), Some(_)) => Some(window::start_proxy(&n.socket)?),
+        _ => None,
     };
     // the display at the rate of the compositor the window maps on
-    let rt = match &nested {
-        Some(n) => rt
+    let rt = match (&nested, &proxy) {
+        (Some(n), Some(p)) => rt
+            .with_wayland(&p.listen)
+            .with_display(n.display().to_arg()),
+        (Some(n), None) => rt
             .with_wayland(&n.socket)
             .with_display(n.display().to_arg()),
-        None => rt.with_display(run_display().to_arg()),
+        (None, _) => rt.with_display(run_display().to_arg()),
     };
     let apk = work.join("base.apk");
     std::fs::copy(&apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
@@ -148,6 +200,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut atld = rt.start_atld(&run)?;
     let mut ended = None;
     let mut complete = false;
+    let mut driven = None;
     loop {
         let services = read(&services_log);
         let scripted = started.elapsed() >= Duration::from_millis(script_ms + watch_ms);
@@ -159,6 +212,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             });
         if done {
             complete = true;
+            if let (Some(steps), Some(proxy), Some(nested)) = (&steps, &proxy, &nested) {
+                let target = drive::Target {
+                    proxy,
+                    nested,
+                    app_log: &app_log,
+                    present_line: PRESENT_LINE,
+                    alive: &|| !run.app_ended(),
+                    break_blank: args.break_blank_capture,
+                };
+                driven = Some(drive::run(steps, target));
+            }
             break;
         }
         if let Some(s) = atld.try_wait()? {
@@ -184,11 +248,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    let fault_ms = match (args.pointer.is_some(), last_resumed(&services)) {
+    let scripted = args.pointer.is_some() || args.drive.is_some();
+    let fault_ms = match (scripted, last_resumed(&services)) {
         (true, Some(r)) => watch_ms.max(window::now_ms().saturating_sub(r.ms)),
         _ => watch_ms,
     };
     let outcome = judge(&services, &app, complete, ended.is_some(), fault_ms);
+    // the drive's failure first: it says what the script could not do, the verdict only what the app did
+    let outcome = match (driven, args.drive.is_some()) {
+        (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
+        (None, true) => outcome.and(Err("the script never ran".to_owned())),
+        _ => outcome,
+    };
     match &outcome {
         Ok(s) => println!("run-apk: ok {s}"),
         Err(s) => {

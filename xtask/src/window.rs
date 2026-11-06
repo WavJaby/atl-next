@@ -164,7 +164,9 @@ impl Stage {
 pub(crate) type Sub = (&'static str, Result<String, String>);
 
 /// The fixture's dir.
-const FIXTURE: &str = "xtask/testdata/window";
+pub(crate) const FIXTURE: &str = "xtask/testdata/window";
+/// The widget fixture's dir (`xtask test drive` taps its Button).
+pub(crate) const WIDGETS_FIXTURE: &str = widgets::FIXTURE;
 /// The same app with a sw600dp resource (their java/ links to FIXTURE's): no configChanges; the resize bits declared.
 const SIZED_FIXTURE: &str = "xtask/testdata/window-sized";
 const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
@@ -565,7 +567,7 @@ pub(crate) fn tail(text: &str, n: usize) -> String {
 /// The quadrants the fixture paints (Main.java `Quadrants.onDraw`): top-left red, top-right green, bottom-left blue, bottom-right white, as RGBA_8888 bytes
 /// (Color.RED and the others). Each boundary is half the view's size with integer division (`getWidth() / 2`). The picture is the buffer's rows without stride padding,
 /// the bytes the compositor's sink digests.
-fn quadrant_pixels(width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn quadrant_pixels(width: u32, height: u32) -> Vec<u8> {
     const RED: [u8; 4] = [255, 0, 0, 255];
     const GREEN: [u8; 4] = [0, 255, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -788,7 +790,7 @@ fn ppid(pid: u32) -> Option<u32> {
 }
 
 /// The gtk stage's proxy in front of `upstream` (the nested compositor): the app's Wayland connection goes through it, so the probe sees the pongs and injects the pointer.
-fn start_proxy(upstream: &Path) -> Result<Proxy> {
+pub(crate) fn start_proxy(upstream: &Path) -> Result<Proxy> {
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?);
     Proxy::start(
@@ -1497,7 +1499,7 @@ fn release_check(app: &str) -> Result<String, String> {
 const CONTENT_ORIGIN_LINE: &str = "atl-platform-ui: content origin ";
 
 /// The content's origin in the surface, as the platform logs it once the window is mapped: an injected surface point lands in the content at `point - origin`.
-fn content_origin(app: &str) -> Result<(f32, f32), String> {
+pub(crate) fn content_origin(app: &str) -> Result<(f32, f32), String> {
     let line = app
         .lines()
         .find(|l| l.contains(CONTENT_ORIGIN_LINE))

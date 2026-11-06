@@ -37,6 +37,8 @@ gtk4 = { version = "0.11", features = ["v4_14"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 # PipeWire client (plan A0): the PCM output of atl-platform-ui-linux, over the safe pipewire crate and its pipewire-sys / libspa bindings (libpipewire-0.3: deps.toml [pipewire]); deny.toml keeps it out of every crate but -linux
 pipewire = "0.10.1"
+# xtask only: `run-apk --drive` screenshots
+png = "0.18"
 roxmltree = "0.21"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }

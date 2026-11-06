@@ -20,6 +20,7 @@ atl-platform-host = { path = "../crates/atl-platform-host" }
 atl-services = { path = "../crates/atl-services" }
 clap.workspace = true
 object.workspace = true
+png.workspace = true
 roxmltree.workspace = true
 rustix.workspace = true
 serde.workspace = true

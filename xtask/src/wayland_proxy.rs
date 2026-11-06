@@ -48,6 +48,7 @@ const XDG_WM_BASE_GET_XDG_SURFACE: u16 = 2;
 const XDG_SURFACE: &str = "xdg_surface";
 const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
 const XDG_SURFACE_GET_TOPLEVEL: u16 = 1;
+const XDG_SURFACE_SET_WINDOW_GEOMETRY: u16 = 3;
 const XDG_TOPLEVEL: &str = "xdg_toplevel";
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
 const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
@@ -120,6 +121,13 @@ pub enum Event {
     ShmPool,
     /// The client acknowledged a configure (`xdg_surface.ack_configure`): the window is set up.
     Acked { serial: u32 },
+    /// `xdg_surface.set_window_geometry` of the window: the part of its surface that is the window, shadow excluded.
+    Geometry {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
     PointerInjected,
     /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
@@ -239,6 +247,14 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         (Some(XDG_SURFACE), XDG_SURFACE_ACK_CONFIGURE) => Some(Event::Acked {
             serial: word(body, 0)?,
         }),
+        (Some(XDG_SURFACE), XDG_SURFACE_SET_WINDOW_GEOMETRY) if ids.xdg_surface == Some(object) => {
+            Some(Event::Geometry {
+                x: word(body, 0)? as i32,
+                y: word(body, 4)? as i32,
+                width: word(body, 8)? as i32,
+                height: word(body, 12)? as i32,
+            })
+        }
         _ => None,
     }
 }
@@ -275,7 +291,7 @@ fn receive(from: BorrowedFd<'_>) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
 }
 
 /// Sends `bytes`, the first `sendmsg` carrying up to `MAX_FDS_PER_SEND` of `fds` (removed from the queue).
-fn forward(to: BorrowedFd<'_>, bytes: &[u8], fds: &mut Vec<OwnedFd>) -> Result<()> {
+pub(crate) fn forward(to: BorrowedFd<'_>, bytes: &[u8], fds: &mut Vec<OwnedFd>) -> Result<()> {
     let mut sent = 0;
     while sent < bytes.len() || !fds.is_empty() {
         let take = fds.len().min(MAX_FDS_PER_SEND);

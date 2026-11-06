@@ -10,7 +10,8 @@
 //! Needs `labwc` (>= 0.8) on PATH; in WSL a wrapper supplies what wlroots needs there (environment setup, not this module).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,8 @@ const RC_XML: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decorati
 /// [`RC_XML`] plus a window rule maximizing every window at its first map (labwc-config(5) windowRules, action Maximize): the window gets a configure whose size is binding (state maximized) right
 /// after it maps, as a tiling compositor (Hyprland) tiles a new window before the client is done starting.
 const RC_XML_MAXIMIZE: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n  <windowRules>\n    <windowRule identifier=\"*\">\n      <action name=\"Maximize\"/>\n    </windowRule>\n  </windowRules>\n</labwc_config>\n";
+/// [`RC_XML`] plus a window rule moving every window to the output's top-left corner at its first map: its window geometry's origin is then output (0, 0), so a capture finds the window without asking the compositor.
+const RC_XML_PLACED: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n  <windowRules>\n    <windowRule identifier=\"*\">\n      <action name=\"MoveTo\" x=\"0\" y=\"0\"/>\n    </windowRule>\n  </windowRules>\n</labwc_config>\n";
 /// wlroots' first free name in a fresh runtime dir.
 const SOCKET: &str = "wayland-0";
 
@@ -115,6 +118,9 @@ impl Drop for ChildGuard {
     }
 }
 
+/// `wl_registry.bind`, for clients of [`NestedCompositor::connect`] outside this module.
+pub(crate) const REGISTRY_BIND: u16 = op::REGISTRY_BIND;
+
 /// A registry's globals: interface -> (global name, version).
 pub type Globals = HashMap<String, (u32, u32)>;
 
@@ -132,6 +138,34 @@ impl NestedCompositor {
     /// Starts labwc headless with [`GATE_OUTPUT`], config and log under `work`.
     pub fn start(work: &Path) -> Result<Self> {
         Self::start_rc(work, &[GATE_OUTPUT], RC_XML)
+    }
+
+    /// As [`start`](Self::start), but every window opens at the output's top-left corner ([`RC_XML_PLACED`]), and the cursor waits in the opposite corner: wlroots draws it in software into the output, so a capture holds it whatever `overlay_cursor` says (measured 2026-11-07: an arrow over the fixture's quadrants).
+    pub fn start_placed(work: &Path) -> Result<Self> {
+        let nested = Self::start_rc(work, &[GATE_OUTPUT], RC_XML_PLACED)?;
+        {
+            let mut s = nested
+                .setup
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("output setup poisoned"))?;
+            let (pointer, w, h) = (
+                s.pointer,
+                GATE_OUTPUT.width as u32,
+                GATE_OUTPUT.height as u32,
+            );
+            let args = [
+                Arg::U(0),
+                Arg::U(w - 1),
+                Arg::U(h - 1),
+                Arg::U(w),
+                Arg::U(h),
+            ];
+            s.client.send(pointer, op::VPOINTER_MOTION_ABSOLUTE, &args);
+            s.client.send(pointer, op::VPOINTER_FRAME, &[]);
+            s.client.roundtrip()?;
+        }
+        Ok(nested)
     }
 
     /// As [`start_with`](Self::start_with) on one output, but every window is maximized when it first maps ([`RC_XML_MAXIMIZE`]).
@@ -269,6 +303,8 @@ mod op {
     pub const REGISTRY_GLOBAL: u16 = 0;
     pub const CALLBACK_DONE: u16 = 0;
     pub const VPOINTER_MANAGER_CREATE: u16 = 0;
+    pub const VPOINTER_MOTION_ABSOLUTE: u16 = 1;
+    pub const VPOINTER_FRAME: u16 = 4;
     pub const VKEYBOARD_MANAGER_CREATE: u16 = 0;
     pub const OUTPUT_MANAGER_CREATE_CONFIGURATION: u16 = 0;
     pub const OUTPUT_MANAGER_HEAD: u16 = 0;
@@ -417,6 +453,8 @@ const OUTPUT_MANAGER_VERSION: u32 = 2;
 /// The setup connection: it keeps the virtual pointer alive and holds the output manager and its heads (ordered as the outputs), so the outputs can be changed later.
 struct Setup {
     client: Client,
+    /// The virtual pointer.
+    pointer: u32,
     om: u32,
     heads: Vec<u32>,
     outputs: Vec<Output>,
@@ -595,6 +633,7 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
     );
     let mut s = Setup {
         client: c,
+        pointer,
         om,
         heads: heads.into_iter().map(|(h, _)| h).collect(),
         outputs: outputs.to_vec(),
@@ -639,11 +678,12 @@ fn word_after_string(body: &[u8], at: usize) -> Result<u32> {
     word(body, at + 4 + len.div_ceil(4) * 4)
 }
 
-/// A minimal Wayland client: requests out, events back by roundtrip. No fds: nothing it binds sends any.
+/// A minimal Wayland client: requests out (fds through [`Client::attach`]), events back by roundtrip. No fds in: nothing it binds sends any.
 pub struct Client {
     stream: UnixStream,
     next: u32,
     pending: Vec<u8>,
+    pending_fds: Vec<OwnedFd>,
     /// Bytes read past the last roundtrip's `done`: events the compositor sent on its own (an input method's `done`), kept for the next roundtrip. Dropping them lost IME serials (measured 2026-11-06: 4 of 5 ime gate runs).
     inbox: Vec<u8>,
 }
@@ -656,8 +696,14 @@ impl Client {
             stream,
             next: 2,
             pending: Vec::new(),
+            pending_fds: Vec::new(),
             inbox: Vec::new(),
         })
+    }
+
+    /// `fd` for the next request taking one: fds travel beside the bytes, in order (the wire has no slot for them).
+    pub(crate) fn attach(&mut self, fd: OwnedFd) {
+        self.pending_fds.push(fd);
     }
 
     pub(crate) fn new_id(&mut self) -> u32 {
@@ -692,7 +738,11 @@ impl Client {
     pub(crate) fn roundtrip(&mut self) -> Result<Vec<(u32, u16, Vec<u8>)>> {
         let done = self.new_id();
         self.send(1, op::DISPLAY_SYNC, &[Arg::U(done)]);
-        self.stream.write_all(&std::mem::take(&mut self.pending))?;
+        crate::wayland_proxy::forward(
+            self.stream.as_fd(),
+            &std::mem::take(&mut self.pending),
+            &mut self.pending_fds,
+        )?;
         let mut events = Vec::new();
         let mut buf = std::mem::take(&mut self.inbox);
         loop {
