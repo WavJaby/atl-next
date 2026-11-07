@@ -50,6 +50,9 @@ struct Args {
     /// Test only: a start that would reuse a singleTop / singleTask instance (onNewIntent) is refused, the deliberate break of the start-finish stage's new-intent sub-gate.
     #[arg(long)]
     no_new_intent: bool,
+    /// Test only: a start owes its caller no result, so no onActivityResult arrives (none is delivered or cancelled), the deliberate break of the app gate's result sub-gate.
+    #[arg(long)]
+    no_activity_result: bool,
     /// Test only: onBackPressed sends no requestFinish, the deliberate break of the dialog gate's back-close sub-gate (no activity finishes on Back).
     #[arg(long)]
     no_root_back: bool,
@@ -139,6 +142,7 @@ fn main() -> Result<()> {
         atl_services::activity_task::ActivityTaskService::new_binder(
             activity.clone(),
             !a.no_new_intent,
+            !a.no_activity_result,
         ),
     )
     .context("addService activity_task")?;

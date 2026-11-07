@@ -75,6 +75,8 @@ pub(crate) struct StartArgs<'a> {
     pub intent: Option<&'a Intent>,
     /// false: a start that would reuse an instance is refused instead (`--no-new-intent`, the deliberate break of the start-finish stage's new-intent sub-gate)
     pub reuse: bool,
+    /// false: the start owes no result, so none is delivered or cancelled (`--no-activity-result`, the deliberate break of the app gate's result sub-gate); the start is decided as with one
+    pub results: bool,
     pub request_code: i32,
     pub result_to: Option<&'a SpIBinder>,
     /// resultWho: the name the caller gave the result (startActivity's resultWho)
@@ -296,6 +298,7 @@ impl ActivityTasks {
         let StartArgs {
             intent,
             reuse,
+            results,
             request_code,
             result_to,
             result_who,
@@ -329,9 +332,9 @@ impl ActivityTasks {
             component,
             source: source_view,
         };
-        // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested)
+        // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested); none with `results` off
         let mut owed = match (call.result_requested(), &source) {
-            (true, Some((to, _))) => Some(ResultTo {
+            (true, Some((to, _))) if results => Some(ResultTo {
                 token: to.clone(),
                 who: result_who.map(str::to_owned),
                 request_code,
@@ -558,21 +561,24 @@ pub struct ActivityTaskService {
     am: ActivityManager,
     /// StartArgs::reuse
     reuse: bool,
+    /// StartArgs::results
+    results: bool,
 }
 
 impl ActivityTaskService {
-    pub fn new(am: ActivityManager, reuse: bool) -> Self {
+    pub fn new(am: ActivityManager, reuse: bool, results: bool) -> Self {
         ActivityTaskService {
             atm: am.activity_tasks(),
             am,
             reuse,
+            results,
         }
     }
 
-    /// `reuse` false: the test-only `--no-new-intent` (StartArgs::reuse).
-    pub fn new_binder(am: ActivityManager, reuse: bool) -> SpIBinder {
+    /// `reuse` false: the test-only `--no-new-intent` (StartArgs::reuse); `results` false: the test-only `--no-activity-result` (StartArgs::results).
+    pub fn new_binder(am: ActivityManager, reuse: bool, results: bool) -> SpIBinder {
         BnActivityTaskManager::new_binder(
-            ActivityTaskService::new(am, reuse),
+            ActivityTaskService::new(am, reuse, results),
             BinderFeatures::default(),
         )
         .as_binder()
@@ -617,6 +623,7 @@ impl IActivityTaskManager for ActivityTaskService {
         let args = StartArgs {
             intent,
             reuse: self.reuse,
+            results: self.results,
             request_code,
             result_to,
             result_who,
