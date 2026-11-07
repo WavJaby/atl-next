@@ -2,6 +2,7 @@
 package com.example.atltest;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.Paint;
@@ -27,10 +28,14 @@ import javax.net.ssl.X509TrustManager;
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
  * Service lines (app.rs SERVICE_LINES): connectivity = the offline answers of the `connectivity` service; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
  * media.player line (app.rs MEDIA_PLAYER_SERVICE): setDataSource(fd) reaches the served service and returns.
+ * result lines (app.rs RESULT): after the marker, Main starts ResultChild for request 7; its result comes back in onActivityResult, and the singleTop self-start from it cancels request 9 before its new intent.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
     private static final String ROOT = "CN=ISRG Root X1";
+    /** The result round trip's request codes (app.rs RESULT): the child's, and the singleTop self-start's, which is cancelled. */
+    private static final int REQUEST_CHILD = 7;
+    private static final int REQUEST_SELF = 9;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +60,35 @@ public class Main extends Activity {
         }
         bridge1Legacy();
         Log.i("AtlTest", "onCreate reached");
+        startActivityForResult(new Intent(this, ResultChild.class), REQUEST_CHILD);
+    }
+
+    /** The order check's marker: a result line must come before Main's next resume (app.rs RESULT). */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        Log.i("AtlTest", "main resumed");
+    }
+
+    /** The intent of the singleTop self-start, after its cancelled result (app.rs RESULT). */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        Log.i("AtlTest", "main new intent");
+    }
+
+    /**
+     * "result request=<r> code=<c> extra=<e>" for each result (app.rs RESULT); a missing extra is "none". The child's result (request 7) starts Main singleTop for request 9:
+     * the services cancel that before the new intent (ActivityStarter.java:2469).
+     */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        String extra = data == null ? null : data.getStringExtra(ResultChild.EXTRA);
+        Log.i("AtlTest", "result request=" + requestCode + " code=" + resultCode + " extra=" + (extra == null ? "none" : extra));
+        if (requestCode == REQUEST_CHILD) {
+            startActivityForResult(new Intent(this, Main.class), REQUEST_SELF);
+        }
     }
 
     /** "active=<NetworkInfo> metered=<bool>" from ConnectivityManager; "absent" when getSystemService returns null (Cut the Rope's NPE); else what it threw. */

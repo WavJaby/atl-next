@@ -4,7 +4,7 @@
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
 //! Every run has the graphics allocator HAL (it must register with servicemanager, the VINTF-declared way) and the GL driver (`Runtime::with_gl_driver`).
 //! Fonts sub-gate ([`FONTS`]): the app's text advances equal the pinned test fonts' hmtx sums, i.e. atld's font list (atl-fonts via fontconfig) reached Typeface; `--font-break` must fail it.
-//! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
+//! Pass: [`MARKER`] in the app's log within [`LIMIT`], then the startActivityForResult round trip after it ([`result_failures`]; `--result-break` must fail it). Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,9 @@ pub struct Args {
     /// The media player break: the app starts with `--no-media-player-service` (atld, then the launcher), so the view answers no media.player; the probe's lookup is never answered and its line reads "no answer", so the gate must go red.
     #[arg(long)]
     media_player_break: bool,
+    /// The result break: the services owe no start its result (atld `--no-activity-result`), so Main's startActivityForResult answers never arrive and the result lines must go red.
+    #[arg(long)]
+    result_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -105,6 +108,17 @@ const MEDIA_PLAYER_SERVICE: &str = "AtlTest: media.player: ";
 const MEDIA_PLAYER_ANSWERED: &str = "returned";
 /// The served service's own line, logged inside its setDataSource: it asks the real servicemanager for media.extractor, which this host does not serve (MediaPlayerService.cpp:892-894). Its presence shows the served object ran the call; it goes once media.extractor is served.
 const MEDIA_PLAYER_RAN: &str = "MediaPlayerService: extractor service not available";
+/// The startActivityForResult round trip (Main.java, ResultChild.java): after the marker Main starts ResultChild for request 7; its RESULT_OK (-1) and extra come back in
+/// onActivityResult, then Main's singleTop self-start cancels request 9 (RESULT_CANCELED, 0) before its new intent. Lines are `AtlTest: result request=<r> code=<c> extra=<e>`.
+const RESULT: &str = "AtlTest: result ";
+const RESULT_CHILD: &str = "request=7 code=-1 extra=atl-result-7";
+const RESULT_CANCELED: &str = "request=9 code=0 extra=none";
+const CHILD_FINISHING: &str = "AtlTest: result child finishing";
+const MAIN_RESUMED: &str = "AtlTest: main resumed";
+const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
+/// How long the watch after the marker waits for the round trip's last line ([`MAIN_NEW_INTENT`]) once WINDOW_MS has passed. The gate reads the log without it after this, so a slow host
+/// gets this long and a broken round trip fails after it.
+const RESULT_WAIT: Duration = Duration::from_secs(30);
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -330,6 +344,61 @@ fn player_failures(app: &str) -> Vec<String> {
         .collect()
 }
 
+/// The round trip's lines against what Main.java and ResultChild.java log, one reason per missing or wrong line. The child's result carries its code and extra. Main's first
+/// result or resume after the child finished is that result: a pending result goes out before the resume (ActivityResultItem, TaskFragment.java:1665-1693). The self-start's
+/// cancel comes before its new intent (ActivityStarter.java:2469).
+fn result_failures(app: &str) -> Vec<String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let results: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| l.split_once(RESULT).map(|(_, r)| (i, r.trim_end())))
+        .collect();
+    let line_of = |prefix: &str| results.iter().copied().find(|(_, r)| r.starts_with(prefix));
+    let mut whys = Vec::new();
+    let child = line_of("request=7 ");
+    if child.map(|(_, r)| r) != Some(RESULT_CHILD) {
+        whys.push(format!(
+            "result 7: want {RESULT_CHILD:?}, got {:?}",
+            child.map(|(_, r)| r)
+        ));
+    }
+    if let (Some((at, _)), Some(done)) = (
+        child,
+        lines.iter().position(|l| l.contains(CHILD_FINISHING)),
+    ) {
+        let first = lines
+            .iter()
+            .enumerate()
+            .skip(done + 1)
+            .find(|(_, l)| l.contains(RESULT) || l.contains(MAIN_RESUMED))
+            .map(|(i, _)| i);
+        if first != Some(at) {
+            whys.push(format!(
+                "result 7 (line {at}) is not Main's first result or resume after the child finished (line {first:?})"
+            ));
+        }
+    }
+    let cancel = line_of("request=9 ");
+    if cancel.map(|(_, r)| r) != Some(RESULT_CANCELED) {
+        whys.push(format!(
+            "result 9: want {RESULT_CANCELED:?}, got {:?}",
+            cancel.map(|(_, r)| r)
+        ));
+    }
+    match (
+        cancel,
+        lines.iter().position(|l| l.contains(MAIN_NEW_INTENT)),
+    ) {
+        (Some((c, _)), Some(i)) if c > i => whys.push(format!(
+            "result 9 (line {c}) comes after the new intent (line {i})"
+        )),
+        (_, None) => whys.push(format!("main new intent: no {MAIN_NEW_INTENT:?} line")),
+        _ => {}
+    }
+    whys
+}
+
 /// Native goals (gate_goals.rs): the runtime with gralloc, the GL driver and the native-bridge guest, as [`run`] stages it.
 pub fn goals() -> crate::gate_goals::Goals {
     use crate::atld_run;
@@ -380,6 +449,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .fold(rt, |rt, s| rt.without_service(s));
     let rt = if args.media_player_break {
         rt.without_media_player_service()
+    } else {
+        rt
+    };
+    let rt = if args.result_break {
+        rt.without_activity_result()
     } else {
         rt
     };
@@ -463,11 +537,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Some(children_outside_broker(atld_child.id())?),
         Some(_) => None,
     };
-    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the app's death ends the watch, atld outlives it
+    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS), and the round trip runs in it too, until its last line or RESULT_WAIT;
+    // the app's death ends the watch, atld outlives it
     let mut ended = ended;
     if passed && ended.is_none() {
         let watch = Instant::now();
-        while ended.is_none() && watch.elapsed() < Duration::from_millis(WINDOW_MS) {
+        while ended.is_none()
+            && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
+                || (watch.elapsed() < RESULT_WAIT && !read(&app_log).contains(MAIN_NEW_INTENT)))
+        {
             ended = atld_child.try_wait()?;
             if ended.is_none() && run.app_ended() {
                 ended = Some(run.stop(&mut atld_child)?);
@@ -583,6 +661,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "media.player: the served service did not run setDataSource (no {MEDIA_PLAYER_RAN:?} line)"
         ));
     }
+    // startActivityForResult round trip (Main.java, ResultChild.java): the result, its order against Main's resume, and the singleTop self-start's cancel
+    if passed {
+        whys.extend(result_failures(&app));
+    }
     if passed && !bridge1_ok {
         whys.push(format!(
             "bridge1: want {BRIDGE1:?}, got {:?}",
@@ -635,6 +717,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass media.player {} (answered through the view; the served service ran setDataSource)",
             probe.unwrap_or_default()
         );
+        println!("app: pass result {RESULT_CHILD}; {RESULT_CANCELED} before main new intent");
         if let Some(n) = es1_compared {
             println!(
                 "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"
@@ -810,6 +893,80 @@ mod tests {
         assert_eq!(
             es1_pixels(&format!("{log}{first}\n"), &scene),
             Err("row 0 logged twice".to_owned())
+        );
+    }
+
+    /// The round trip as Main.java and ResultChild.java log it when AOSP's order holds: the child's result, Main's resume, the self-start's cancel, its new intent.
+    const ROUND_TRIP: &str = concat!(
+        "AtlTest: onCreate reached\n",
+        "AtlTest: main resumed\n",
+        "AtlTest: result child finishing\n",
+        "AtlTest: result request=7 code=-1 extra=atl-result-7\n",
+        "AtlTest: main resumed\n",
+        "AtlTest: result request=9 code=0 extra=none\n",
+        "AtlTest: main new intent\n",
+    );
+
+    #[test]
+    fn round_trip_as_logged_passes() {
+        assert_eq!(result_failures(ROUND_TRIP), Vec::<String>::new());
+    }
+
+    #[test]
+    fn round_trip_judged_line_by_line() {
+        // no child result (the break): the child's line and the cancel's line are both missing, and so is the new intent
+        let broken =
+            ROUND_TRIP.replace("AtlTest: result request=7 code=-1 extra=atl-result-7\n", "");
+        let why = result_failures(&broken);
+        assert!(
+            why.iter().any(|w| w.starts_with("result 7: want")),
+            "{why:?}"
+        );
+        // a wrong extra is a wrong value, not a missing line
+        let wrong = ROUND_TRIP.replace("extra=atl-result-7", "extra=other");
+        assert!(
+            result_failures(&wrong)
+                .iter()
+                .any(|w| w.starts_with("result 7: want"))
+        );
+        // a cancel with a code other than RESULT_CANCELED is wrong too
+        let code = ROUND_TRIP.replace("request=9 code=0", "request=9 code=-1");
+        assert!(
+            result_failures(&code)
+                .iter()
+                .any(|w| w.starts_with("result 9: want"))
+        );
+        // nothing logged after the marker: all three required lines are reported
+        assert_eq!(result_failures("AtlTest: onCreate reached\n").len(), 3);
+    }
+
+    #[test]
+    fn result_must_precede_main_resume() {
+        // the child's result logged after Main resumed is the wrong order (AOSP delivers it before the resume)
+        let late = concat!(
+            "AtlTest: result child finishing\n",
+            "AtlTest: main resumed\n",
+            "AtlTest: result request=7 code=-1 extra=atl-result-7\n",
+        );
+        let why = result_failures(late);
+        assert!(
+            why.iter()
+                .any(|w| w.contains("is not Main's first result or resume")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_must_precede_new_intent() {
+        // the self-start's new intent logged before its cancel is the wrong order (ActivityStarter.java:2469)
+        let swapped = ROUND_TRIP.replace(
+            "AtlTest: result request=9 code=0 extra=none\nAtlTest: main new intent\n",
+            "AtlTest: main new intent\nAtlTest: result request=9 code=0 extra=none\n",
+        );
+        assert!(
+            result_failures(&swapped)
+                .iter()
+                .any(|w| w.contains("comes after the new intent"))
         );
     }
 }

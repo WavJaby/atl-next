@@ -218,6 +218,8 @@ pub struct Runtime {
     ime_death_link: bool,
     /// A start may reuse a singleTop / singleTask instance unless this is cleared (`--no-new-intent`, the start-finish stage's deliberate break).
     new_intent: bool,
+    /// Starts owe their callers a result unless this is cleared (`--no-activity-result`, the app gate's deliberate break).
+    activity_result: bool,
     /// Back finishes an activity unless this is cleared (`--no-root-back`, the dialog gate's back-close sub-gate's deliberate break).
     root_back: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
@@ -553,6 +555,7 @@ impl Runtime {
             app_seccomp: true,
             ime_death_link: true,
             new_intent: true,
+            activity_result: true,
             root_back: true,
             sensor_service: true,
             omitted_services: Vec::new(),
@@ -737,6 +740,12 @@ impl Runtime {
     /// The services refuse a start that would reuse an instance (atld `--no-new-intent`): the start-finish stage's new-intent sub-gate must then fail.
     pub fn without_new_intent(mut self) -> Self {
         self.new_intent = false;
+        self
+    }
+
+    /// Starts owe their callers no result (atld `--no-activity-result`): the app gate's result sub-gate must then fail.
+    pub fn without_activity_result(mut self) -> Self {
+        self.activity_result = false;
         self
     }
 
@@ -1142,6 +1151,9 @@ impl Runtime {
         }
         if !self.new_intent {
             cmd.arg("--no-new-intent");
+        }
+        if !self.activity_result {
+            cmd.arg("--no-activity-result");
         }
         if !self.root_back {
             cmd.arg("--no-root-back");
