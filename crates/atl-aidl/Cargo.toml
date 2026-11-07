@@ -47,6 +47,8 @@ include_dirs = [
     "packages/modules/Bluetooth/framework/aidl-export",
     "packages/modules/Connectivity/framework/aidl-export",
     "packages/modules/Connectivity/framework/src",
+    # IPermissionManager imports the structured AttributionSourceState
+    "frameworks/native/libs/permission/aidl",
     "system/hardware/interfaces/media/aidl",
     "system/vold/binder",
 ]
