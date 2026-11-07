@@ -83,7 +83,7 @@ bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t cha
     if (mix.exists(name)) {
         return false;
     }
-    if (mix.create(name, channel_mask, AUDIO_FORMAT_PCM_16_BIT, session) != android::OK) {
+    if (mix.create(name, static_cast<audio_channel_mask_t>(channel_mask), AUDIO_FORMAT_PCM_16_BIT, session) != android::OK) {
         return false;
     }
     mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MIXER_FORMAT,

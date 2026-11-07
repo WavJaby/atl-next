@@ -31,13 +31,10 @@ fn main() -> Result<()> {
         .no_default_flags(true)
         .include(&manifest)
         .file("wrap/mix.cpp");
-    // the flags of every module, each once: the adapters include headers from all three
-    let mut seen = std::collections::BTreeSet::new();
+    // every module's flags in order, as atl-media-player passes its two: the adapters include headers from all three. Each token is kept: de-duplicating single tokens drops the second `-include` of a pair, and clang then reads its header as a source file
     for module in MODULES {
         for flag in &out.artifact(module)?.cxx {
-            if seen.insert(flag.clone()) {
-                build.flag(flag);
-            }
+            build.flag(flag);
         }
     }
     build.compile("atl_audio_bridge");

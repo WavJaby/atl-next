@@ -379,9 +379,7 @@ impl UserData {
             requested.min(capacity)
         };
         if frames > 0 {
-            self.shared
-                .quantum
-                .store(frames as u32, Ordering::Relaxed);
+            self.shared.quantum.store(frames as u32, Ordering::Relaxed);
         }
         let mut done = 0;
         while done < frames {

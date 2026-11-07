@@ -161,7 +161,10 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     let mut ok = verdict(
         "pcm tones",
         runs.len() == 2,
-        &format!("{} run(s) of tone, want 2 (static, then streaming)", runs.len()),
+        &format!(
+            "{} run(s) of tone, want 2 (static, then streaming)",
+            runs.len()
+        ),
     );
     for (i, (name, hz)) in [("static", STATIC_TONE_HZ), ("stream", STREAM_TONE_HZ)]
         .into_iter()
@@ -178,7 +181,11 @@ fn pcm_verdicts(rec: &Recording) -> bool {
             &format!("{span} frames at {rate} Hz, want {want} ±{QUANTUM_FRAMES} (one quantum)"),
         );
         if span <= 2 * QUANTUM_FRAMES {
-            ok &= verdict(&format!("pcm {name} frequency"), false, "run shorter than two quanta");
+            ok &= verdict(
+                &format!("pcm {name} frequency"),
+                false,
+                "run shorter than two quanta",
+            );
             continue;
         }
         // the central part: one quantum off each edge, so edge timing does not reach the estimates

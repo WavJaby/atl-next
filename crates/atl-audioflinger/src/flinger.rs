@@ -202,8 +202,14 @@ impl IAudioFlingerService for AudioFlinger {
                         return Err(status.into());
                     }
                 };
-                match track::server_shared(&region, shared, channels, frames, frame_bytes, track_rate)
-                {
+                match track::server_shared(
+                    &region,
+                    shared,
+                    channels,
+                    frames,
+                    frame_bytes,
+                    track_rate,
+                ) {
                     Ok(server) => (frames, region, server),
                     Err(status) => {
                         counters::refused(INTERFACE, "createTrack.region");

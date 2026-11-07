@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The server side of AOSP's track shared memory and mixer, for atl-audioflinger (game audio A2). A track's control block and buffer are mapped here; AOSP's server proxy reads them (ServerProxy, AudioTrackServerProxy, StaticAudioTrackServerProxy); AudioMixerBase mixes every enabled track into one quantum of float output (wrap/mix.cpp).
-//! [`Mapping`] is the only place pointers into shared memory are made. [`Track`] and [`Mix`] own the C++ objects and the mappings they read. [`Mix`] is `Send`: its C++ state has no thread affinity, and the owner serializes every call (atl-audioflinger holds it under one mutex, which the output callback also takes).
+//! [`Mapping`] is the only place pointers into shared memory are made. [`Track`] and [`Mix`] own the C++ objects and the mappings they read. [`Mix`] is `Send`: its C++ state has no thread affinity. [`MixCell`] gives the mixer to one holder at a time (the output's realtime fill or one control call), so no lock is shared with the fill.
 //! With feature `converter` (`xtask native` turns it on) it is compiled; without, it is empty.
 #![cfg(feature = "converter")]
 
@@ -8,8 +8,10 @@ mod bridge;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::AsFd;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use cxx::UniquePtr;
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
@@ -48,8 +50,17 @@ impl Mapping {
             ProtFlags::READ
         };
         // SAFETY: no address hint, so the kernel picks the range; `fd` is open for this call, and a shared mapping stays valid after the fd closes; `map_len` and `aligned` are the values checked above.
-        let base = unsafe { mmap(ptr::null_mut(), map_len, prot, MapFlags::SHARED, fd, aligned) }
-            .map_err(|e| format!("mmap of {map_len} bytes at {aligned}: {e}"))?;
+        let base = unsafe {
+            mmap(
+                ptr::null_mut(),
+                map_len,
+                prot,
+                MapFlags::SHARED,
+                fd,
+                aligned,
+            )
+        }
+        .map_err(|e| format!("mmap of {map_len} bytes at {aligned}: {e}"))?;
         Ok(Self {
             base,
             map_len,
@@ -148,7 +159,14 @@ impl Track {
         }
         // SAFETY: both mappings are checked above and owned by the track; the C++ side only reads the buffer.
         let proxy = unsafe {
-            bridge::ffi::new_track(cblk.as_ptr(), buffer.as_ptr(), frames, frame_bytes, true, rate)
+            bridge::ffi::new_track(
+                cblk.as_ptr(),
+                buffer.as_ptr(),
+                frames,
+                frame_bytes,
+                true,
+                rate,
+            )
         };
         Ok(Self {
             proxy,
@@ -166,7 +184,7 @@ pub struct Mix {
     next_name: i32,
 }
 
-// SAFETY: the C++ mixer and its tracks have no thread affinity. The owner serializes every call: atl-audioflinger holds the mixer under one mutex, which the output's realtime callback takes too.
+// SAFETY: the C++ mixer and its tracks have no thread affinity. Calls never overlap: [`MixCell`] hands the mixer to one holder at a time.
 unsafe impl Send for Mix {}
 
 impl Mix {
@@ -218,5 +236,92 @@ impl Mix {
     /// Fills `out` (interleaved stereo) with the next frames of the mix: one AudioMixerBase quantum at a time, any request size.
     pub fn render(&mut self, out: &mut [f32]) {
         bridge::ffi::mix_render(self.inner.pin_mut(), out);
+    }
+}
+
+/// The output's mixer, given from holder to holder: the realtime fill, or one control call. Whoever holds the [`Mix`] has it alone; each handoff is one atomic swap, so the fill never waits for a lock.
+/// The fill takes it, renders and stores it back. While a control call holds it, the fill finds the cell empty and plays silence for that cycle; a control call that finds the fill mixing waits (yielding) for the store, one quantum at most.
+#[derive(Default)]
+pub struct MixCell {
+    /// The mixer (`Box::into_raw`) while in the cell; null while held.
+    slot: AtomicPtr<Mix>,
+    /// Set once by [`MixCell::install`]: before it, [`MixCell::hold`] refuses and the fill plays silence.
+    installed: AtomicBool,
+}
+
+impl MixCell {
+    /// Puts `mix` in the cell. False, and `mix` is dropped, when one is installed already.
+    pub fn install(&self, mix: Mix) -> bool {
+        if self.installed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.slot
+            .store(Box::into_raw(Box::new(mix)), Ordering::Release);
+        true
+    }
+
+    /// Realtime fill: renders `out` from the mixer and stores it back. False, with `out` untouched, when no mixer is in the cell (not installed, or a control call holds it).
+    /// Lock-free and allocation-free: one swap to take the mixer, one store to return it.
+    pub fn fill(&self, out: &mut [f32]) -> bool {
+        let p = self.slot.swap(ptr::null_mut(), Ordering::AcqRel);
+        if p.is_null() {
+            return false;
+        }
+        // SAFETY: the swap moved the pointer out of the cell, so this call holds the only reference to the mixer until the store below puts it back
+        unsafe { (*p).render(out) };
+        self.slot.store(p, Ordering::Release);
+        true
+    }
+
+    /// Control call: takes the mixer for the guard's life. None before [`MixCell::install`]; otherwise waits, yielding, while the fill holds it.
+    pub fn hold(&self) -> Option<MixGuard<'_>> {
+        if !self.installed.load(Ordering::Acquire) {
+            return None;
+        }
+        loop {
+            let p = self.slot.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !p.is_null() {
+                return Some(MixGuard { cell: self, mix: p });
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for MixCell {
+    fn drop(&mut self) {
+        let p = *self.slot.get_mut();
+        if !p.is_null() {
+            // SAFETY: the pointer came from `Box::into_raw` in install and is in no guard (`&mut self`: no fill or guard is alive)
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+
+/// A control call's hold on the mixer: gives it back to its [`MixCell`] on drop.
+pub struct MixGuard<'a> {
+    cell: &'a MixCell,
+    mix: *mut Mix,
+}
+
+impl Deref for MixGuard<'_> {
+    type Target = Mix;
+
+    fn deref(&self) -> &Mix {
+        // SAFETY: the guard's pointer was taken out of the cell, so this guard alone refers to the mixer
+        unsafe { &*self.mix }
+    }
+}
+
+impl DerefMut for MixGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Mix {
+        // SAFETY: as in `deref`; `&mut self` makes this the only reference
+        unsafe { &mut *self.mix }
+    }
+}
+
+impl Drop for MixGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.slot.store(self.mix, Ordering::Release);
     }
 }

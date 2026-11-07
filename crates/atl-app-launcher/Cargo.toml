@@ -9,9 +9,9 @@ publish.workspace = true
 
 # The executable links the converter's libsigchain, which only `xtask native` has built: it builds this package after the converter with feature `converter` (build.rs, atl-bridgegen converter.rs).
 # Plain workspace builds and tests skip the executable and take the library. With it, in app mode, the process's SurfaceFlinger (atl-composer) runs in the launcher: its converter modules are linked here too
-# (a package's link arguments reach only its own links).
+# (a package's link arguments reach only its own links). The audio bridge (atl-audio-bridge, game audio A2) runs in the launcher too, so its archive (AudioMixerBase's libaudioprocessing_base) and libaudioclient / libaudioutils link here.
 [package.metadata.atl]
-converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libstagefright", "device/libresourcemanagerservice", "device/libmediaplayerservice"]
+converter = ["device/libsigchain", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/libcodec2_aidl_noisurface", "device/libcodec2_vndk", "device/libstagefright", "device/libresourcemanagerservice", "device/libmediaplayerservice", "device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils"]
 
 [[bin]]
 name = "atl-app-launcher"

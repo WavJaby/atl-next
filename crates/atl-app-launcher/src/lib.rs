@@ -204,7 +204,15 @@ fn run() -> Result<i32> {
     }
     install_service_view()?;
     // held to the end of the launch: the served PCM output stops when this binding drops
+    #[cfg(feature = "converter")]
     let _audio_output = serve_media_services(
+        launch.no_audio_service,
+        launch.break_cblk,
+        launch.no_media_player_service,
+        launch.break_mix,
+    )?;
+    #[cfg(not(feature = "converter"))]
+    serve_media_services(
         launch.no_audio_service,
         launch.break_cblk,
         launch.no_media_player_service,
