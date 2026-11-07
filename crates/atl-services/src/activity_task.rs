@@ -106,6 +106,27 @@ fn cancel_owed(m: &mut Lifecycle, owed: Option<&ResultTo<SpIBinder>>) -> Vec<Cmd
     })
 }
 
+/// Step names of one command for the log: `Pause(finished=true,user_leaving=false),Stop`.
+fn step_names<L, I, R>(steps: &[Step<L, I, R>]) -> String {
+    steps
+        .iter()
+        .map(|s| match s {
+            Step::Launch(_) => "Launch".to_owned(),
+            Step::NewIntent { resume, .. } => format!("NewIntent(resume={resume})"),
+            Step::Result(_) => "Result".to_owned(),
+            Step::Start => "Start".to_owned(),
+            Step::Resume => "Resume".to_owned(),
+            Step::Pause {
+                finished,
+                user_leaving,
+            } => format!("Pause(finished={finished},user_leaving={user_leaving})"),
+            Step::Stop => "Stop".to_owned(),
+            Step::Destroy { finished } => format!("Destroy(finished={finished})"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub struct ActivityTasks {
     packages: Arc<Packages>,
     tasks: Arc<Tasks<SpIBinder>>,
@@ -221,6 +242,12 @@ impl ActivityTasks {
     /// One transaction per command, in the order the machine decided. Called under the machine lock.
     fn send(&self, commands: Vec<Cmd>) {
         for command in commands {
+            log(format_args!(
+                "activity send {} {} at={}",
+                step_names(&command.steps),
+                command.owner.component,
+                counters::wall_stamp()
+            ));
             if command
                 .steps
                 .iter()
@@ -455,6 +482,11 @@ impl ActivityTasks {
         if m.phase(token).is_none() {
             return false;
         }
+        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        log(format_args!(
+            "activity paused {component} at={}",
+            counters::wall_stamp()
+        ));
         let commands = m.paused(token);
         self.note_settle(&m);
         self.send(commands);
@@ -467,6 +499,11 @@ impl ActivityTasks {
         if m.phase(token).is_none() {
             return false;
         }
+        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        log(format_args!(
+            "activity stopped {component} at={}",
+            counters::wall_stamp()
+        ));
         let commands = m.stopped(token);
         self.note_settle(&m);
         self.send(commands);
@@ -499,6 +536,11 @@ impl ActivityTasks {
             data,
             caller_token: None,
         };
+        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        log(format_args!(
+            "activity finish {component} code={code} at={}",
+            counters::wall_stamp()
+        ));
         match m.finish(token, result) {
             Some(commands) => {
                 self.note_settle(&m);
