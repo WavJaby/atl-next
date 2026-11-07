@@ -477,24 +477,18 @@ pub unsafe fn fault_report(
         })
     };
     let mut comm = [0u8; 32];
-    // SAFETY: a NUL-terminated path; the fd is closed below; reads into a live buffer.
-    let comm_len = unsafe {
-        let fd = libc::open(c"/proc/thread-self/comm".as_ptr(), libc::O_RDONLY);
-        let n = if fd < 0 {
-            0
-        } else {
-            libc::read(fd, comm.as_mut_ptr().cast(), comm.len()).max(0) as usize
-        };
-        if fd >= 0 {
-            libc::close(fd);
-        }
+    let fd = raw_open(c"/proc/thread-self/comm");
+    let comm_len = if fd < 0 {
+        0
+    } else {
+        let n = raw_read(fd, &mut comm).max(0) as usize;
+        raw_close(fd);
         n
     };
     let name = comm[..comm_len]
         .strip_suffix(b"\n")
         .unwrap_or(&comm[..comm_len]);
-    // SAFETY: a raw syscall without arguments.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let tid = raw_syscall3(libc::SYS_gettid, 0, 0, 0);
     let mut line = [0u8; 256];
     let mut w = &mut line[..];
     let _ = write!(
@@ -504,8 +498,7 @@ pub unsafe fn fault_report(
     let _ = w.write_all(name);
     let _ = writeln!(w, "\"");
     let left = w.len();
-    // SAFETY: a live buffer; a failed write loses only the line.
-    unsafe { libc::write(2, line.as_ptr().cast(), line.len() - left) };
+    raw_write_stderr(&line[..line.len() - left]);
     emit_mappings(&[pc, addr]);
     // stack words: the caller chain of frame-pointerless code; skipped when the fault is on the stack itself (overflow), where reading it would fault again inside the handler
     let span = STACK_WORDS * 8;
@@ -522,9 +515,53 @@ pub unsafe fn fault_report(
         }
         let _ = writeln!(w);
         let left = w.len();
-        // SAFETY: a live buffer; a failed write loses only the line.
-        unsafe { libc::write(2, line.as_ptr().cast(), line.len() - left) };
+        raw_write_stderr(&line[..line.len() - left]);
     }
+}
+
+/// Raw 3-argument syscall. The diagnostics below run on a thread pointer that may not be glibc's (guest TCB, FS 0): glibc's open/read/write/close are cancellation points that read
+/// THREAD_SELF (%fs:0x10) and its `syscall` sets errno through TLS, so either faults there (g5 caught it). Returns the kernel's value (negative errno on failure).
+fn raw_syscall3(nr: libc::c_long, a: usize, b: usize, c: usize) -> isize {
+    let ret: isize;
+    // SAFETY: the callers pass only open/read/write/close/gettid with pointers to live buffers / NUL-terminated paths; the kernel clobbers rcx and r11 only.
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a,
+            in("rsi") b,
+            in("rdx") c,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// `open(path, O_RDONLY)` without glibc (see [`raw_syscall3`]); negative on failure.
+fn raw_open(path: &std::ffi::CStr) -> i32 {
+    raw_syscall3(
+        libc::SYS_openat,
+        libc::AT_FDCWD as usize,
+        path.as_ptr() as usize,
+        libc::O_RDONLY as usize,
+    ) as i32
+}
+
+/// `read` into `buf` without glibc; negative on failure.
+fn raw_read(fd: i32, buf: &mut [u8]) -> isize {
+    raw_syscall3(libc::SYS_read, fd as usize, buf.as_mut_ptr() as usize, buf.len())
+}
+
+/// `write(2, buf)` without glibc; a failed write loses only these bytes.
+fn raw_write_stderr(buf: &[u8]) {
+    raw_syscall3(libc::SYS_write, 2, buf.as_ptr() as usize, buf.len());
+}
+
+/// `close` without glibc.
+fn raw_close(fd: i32) {
+    raw_syscall3(libc::SYS_close, fd as usize, 0, 0);
 }
 
 /// Guard below sp that `fault_report` treats as the stack (one x86_64 page: the smallest guard a fault past sp lands in).
@@ -553,16 +590,14 @@ fn maps_line_covers(line: &[u8], addr: usize) -> bool {
 
 /// Writes to stderr the `/proc/self/maps` lines covering `addrs`; streamed through a stack buffer (see `up_failed`).
 fn emit_mappings(addrs: &[usize]) {
-    // SAFETY: a NUL-terminated path; the fd is closed below.
-    let fd = unsafe { libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY) };
+    let fd = raw_open(c"/proc/self/maps");
     if fd < 0 {
         return;
     }
     let mut buf = [0u8; 8192];
     let mut have = 0;
     loop {
-        // SAFETY: the unfilled tail of `buf`.
-        let n = unsafe { libc::read(fd, buf[have..].as_mut_ptr().cast(), buf.len() - have) };
+        let n = raw_read(fd, &mut buf[have..]);
         if n <= 0 {
             break;
         }
@@ -571,16 +606,14 @@ fn emit_mappings(addrs: &[usize]) {
         while let Some(nl) = buf[done..have].iter().position(|c| *c == b'\n') {
             let line = &buf[done..=done + nl];
             if addrs.iter().any(|a| maps_line_covers(line, *a)) {
-                // SAFETY: a live buffer; a failed write loses only the line.
-                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+                raw_write_stderr(line);
             }
             done += nl + 1;
         }
         buf.copy_within(done..have, 0);
         have -= done;
     }
-    // SAFETY: the fd opened above.
-    unsafe { libc::close(fd) };
+    raw_close(fd);
 }
 
 /// `atl_nb_up` found no way up: names why on stderr. Runs on the guest FS: no TLS, no heap, so only stack buffers and raw write.
@@ -595,10 +628,7 @@ extern "C" fn up_failed(
 ) {
     use std::io::Write;
     let mut line = [0u8; 160];
-    let emit = |line: &[u8]| {
-        // SAFETY: a live buffer; a failed write leaves only the trap.
-        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    };
+    let emit = raw_write_stderr;
     let mut w = &mut line[..];
     let why = if ht.is_null() {
         "no crossing record"

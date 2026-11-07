@@ -33,6 +33,11 @@ harness = false
 name = "g4"
 harness = false
 
+# g5: the signal entry's last-chance report fires when no host thread pointer is found (fake TCB on FS), host handler still runs
+[[test]]
+name = "g5"
+harness = false
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 libc.workspace = true
