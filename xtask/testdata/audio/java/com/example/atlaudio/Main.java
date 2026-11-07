@@ -43,7 +43,14 @@ public class Main extends Activity {
             AudioTrack track = new AudioTrack(attributes, format, min, AudioTrack.MODE_STREAM, a);
             // getBufferSizeInFrames throws on an uninitialised track: read it only then
             boolean initialized = track.getState() == AudioTrack.STATE_INITIALIZED;
-            Log.i(TAG, "track: state=" + track.getState() + " piid=" + track.getPlayerIId()
+            // PlayerBase.getPlayerIId is hidden API (the fixture compiles against the public SDK): read it reflectively
+            Object piid = null;
+            try {
+                piid = AudioTrack.class.getMethod("getPlayerIId").invoke(track);
+            } catch (Throwable t) {
+                Log.i(TAG, "track: piid unreadable: " + t);
+            }
+            Log.i(TAG, "track: state=" + track.getState() + " piid=" + piid
                     + " frames=" + (initialized ? track.getBufferSizeInFrames() : 0));
             track.release();
         } catch (Throwable e) {

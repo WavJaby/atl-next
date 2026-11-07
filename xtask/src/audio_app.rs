@@ -58,12 +58,11 @@ const REQ_RATE_HZ: u64 = 44_100;
 const REQ_CHANNELS: u64 = 2;
 const REQ_BYTES_PER_SAMPLE: u64 = 2;
 
-/// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output and routing.
-const IN_PROCESS: [&str; 5] = [
+/// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output. getOutputForAttr is served but no client on the game path calls it (AudioTrack asks getOutput(stream)), so it is not required here.
+const IN_PROCESS: [&str; 4] = [
     "answered IAudioFlingerService.newAudioUniqueId",
     "answered IAudioFlingerService.sampleRate",
     "answered IAudioPolicyService.getOutput",
-    "answered IAudioPolicyService.getOutputForAttr",
     "answered IAudioFlingerService.createTrack",
 ];
 /// The counter line of a FAST request the server refused (flinger.rs createTrack).
