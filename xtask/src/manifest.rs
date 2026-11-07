@@ -87,7 +87,8 @@ fn parse_tree(text: &str) -> Result<Element> {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let indent = line.len() - line.trim_start().len();
         let body = line.trim_start();
-        if body.starts_with("N: ") {
+        // `T:` = a text node: stray text in a manifest; PackageParser skips it too
+        if body.starts_with("N: ") || body.starts_with("T: ") {
             continue;
         }
         if let Some(rest) = body.strip_prefix("E: ") {
@@ -535,6 +536,13 @@ mod tests {
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="t" (Raw: "t")
             A: http://schemas.android.com/apk/res/android:value(0x01010024)="text" (Raw: "text")
 "#;
+
+    #[test]
+    fn text_nodes_are_skipped() {
+        let tree = parse_tree("E: manifest (line=1)\n  T: ' > '\n  E: application (line=2)\n")
+            .expect("parse");
+        assert_eq!(tree.name, "manifest");
+    }
 
     #[test]
     fn application_meta_data_types() {
