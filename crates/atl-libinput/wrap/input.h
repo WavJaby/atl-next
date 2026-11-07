@@ -86,6 +86,8 @@ int32_t publish_motion(Publisher& publisher, uint32_t seq, int32_t event_id, int
 // InputPublisher::publishFocusEvent: the window gained or lost input focus.
 int32_t publish_focus(Publisher& publisher, uint32_t seq, int32_t event_id, bool has_focus);
 int32_t receive_finished(Publisher& publisher, Message& out);
+// The channel's fd (InputPublisher::getChannel().getFd()): the InputChannel owns it while the publisher lives.
+int32_t publisher_fd(const Publisher& publisher);
 
 std::unique_ptr<Consumer> new_consumer(int32_t fd, rust::Str name);
 int32_t consume(Consumer& consumer, Message& out);

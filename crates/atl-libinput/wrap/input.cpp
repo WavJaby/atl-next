@@ -92,6 +92,10 @@ int32_t receive_finished(Publisher& publisher, Message& out) {
     return 0;
 }
 
+int32_t publisher_fd(const Publisher& publisher) {
+    return publisher.publisher.getChannel().getFd();
+}
+
 std::unique_ptr<Consumer> new_consumer(int32_t fd, rust::Str name) {
     auto channel = open_channel(fd, name);
     if (!channel) {

@@ -7,10 +7,12 @@
 use std::cell::RefCell;
 #[cfg(feature = "converter")]
 use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 
 use atl_platform_ui::{InputEvent, InputSource, PhysPoint, PointerButton, PointerPhase};
 #[cfg(feature = "converter")]
 use binder::SpIBinder;
+use rustix::event::PollFlags;
 
 /// One scripted step: the phase and the position it happens at.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,6 +182,37 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
     }
 }
 
+impl<K, C: AsFd> Windows<K, C> {
+    /// Each held channel's key and fd, in add order: the input loop polls them ([`wake::InputReceiver::wait`]).
+    pub fn channel_fds(&self) -> impl Iterator<Item = (&K, BorrowedFd<'_>)> {
+        self.list.iter().map(|(k, c, ..)| (k, c.as_fd()))
+    }
+}
+
+/// The channels of one poll round: a readable one is drained by `finished` (false: the channel is broken), and one that hung up, failed or broke is removed.
+/// A key the windows no longer hold is skipped. True when a window was removed, so the focus may have moved.
+pub fn settle<K: PartialEq + Clone, C>(
+    windows: &mut Windows<K, C>,
+    channels: &[(K, PollFlags)],
+    mut finished: impl FnMut(&mut C) -> bool,
+) -> bool {
+    let mut removed = false;
+    for (key, revents) in channels {
+        let drained = if revents.contains(PollFlags::IN) {
+            match windows.channel(key) {
+                Some(channel) => finished(channel),
+                None => continue,
+            }
+        } else {
+            true
+        };
+        if !drained || revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+            removed |= windows.remove(key);
+        }
+    }
+    removed
+}
+
 /// The script's steps, in order. A bad item (kind, shape, non-finite position) refuses the whole script; an empty script has no steps.
 pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
     script
@@ -251,6 +284,9 @@ impl InputSource for HeadlessInput {
 pub mod key;
 pub mod pointer;
 pub mod touch;
+pub mod wake;
+
+pub use wake::InputSender;
 
 #[cfg(feature = "converter")]
 pub use publish::spawn;
@@ -260,7 +296,6 @@ pub use publish::spawn;
 mod publish {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
-    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::thread;
     use std::time::Instant;
 
@@ -271,7 +306,8 @@ mod publish {
     use super::key::{self, Key};
     use super::pointer::{self, Motion};
     use super::touch;
-    use super::{HeadlessInput, Message, Step, Windows};
+    use super::wake::{self, InputReceiver, InputSender};
+    use super::{HeadlessInput, Message, Step, Windows, settle};
 
     /// The default display.
     const DISPLAY_ID: i32 = 0;
@@ -382,7 +418,7 @@ mod publish {
         }
     }
 
-    /// Publishes the events of one platform event: keys to the focused window, MotionEvents to the pointer's window ([`Windows::pointer_target`]), then drains the finished signals the channel holds (no ANR path: no system dispatcher waits on them).
+    /// Publishes the events of one platform event: keys to the focused window, MotionEvents to the pointer's window ([`Windows::pointer_target`]).
     /// A channel whose window end is closed is dropped (InputDispatcher::handleReceiveCallback: "unrecoverably broken" -> removeInputChannelLocked).
     fn publish(state: &State, event: InputEvent) {
         if let InputEvent::Focus(active) = event {
@@ -433,7 +469,7 @@ mod publish {
         publish_keys(state, &ups);
     }
 
-    /// Publishes `motions` to the pointer's window, then drains the finished signals the channel holds.
+    /// Publishes `motions` to the pointer's window. Finished signals are read by the loop, when the channel is readable.
     fn publish_motions(state: &State, motions: &[Motion], in_gesture: bool, meta_state: i32) {
         if motions.is_empty() {
             return;
@@ -465,6 +501,11 @@ mod publish {
                 return;
             }
         }
+    }
+
+    /// Reads the finished signals a channel holds (receiveConsumerResponse until none). False when a read fails: the loop then removes the channel, since a channel left readable with every read failing spins the loop.
+    /// `Ok(None)` also covers a non-finished message; the next poll reports whatever is left.
+    fn drain_finished(publisher: &mut Publisher) -> bool {
         loop {
             match publisher.receive_finished() {
                 Ok(Some(finished)) => tracing::debug!(
@@ -472,10 +513,10 @@ mod publish {
                     finished.seq,
                     finished.handled
                 ),
-                Ok(None) => break,
+                Ok(None) => return true,
                 Err(err) => {
                     tracing::warn!("input: finished signal: {err:?}");
-                    break;
+                    return false;
                 }
             }
         }
@@ -499,7 +540,8 @@ mod publish {
     }
 
     /// The input thread: takes each window's channel, and at the first frame injects the script through the headless source. The publisher stays on this thread (it is not Send).
-    fn dispatch(rx: Receiver<Message>, tx: Sender<Message>, mut script: Vec<Step>) {
+    /// A turn waits on the wake end and every window's channel, with no timeout. It settles the channels first: the round polled them as they were, and a Window message handled before them could replace a hung-up channel under its key.
+    fn dispatch(rx: InputReceiver<Message>, tx: InputSender<Message>, mut script: Vec<Step>) {
         let layout = KeyLayoutMap::load(KEY_LAYOUT)
             .inspect_err(|err| {
                 tracing::warn!("input: key layout {KEY_LAYOUT}: {err:?}; keys dropped")
@@ -513,61 +555,90 @@ mod publish {
         let publish_state = Rc::clone(&state);
         source.on_events(move |event| publish(&publish_state, event));
         let started = Instant::now();
-        for message in rx {
-            match message {
-                Message::Window { token, fd, flags } => match Publisher::new(fd, CHANNEL) {
-                    Ok(publisher) => {
-                        state.windows.borrow_mut().add(token, publisher, flags);
+        loop {
+            let round = {
+                let windows = state.windows.borrow();
+                let channels: Vec<_> = windows
+                    .channel_fds()
+                    .map(|(key, fd)| (key.clone(), fd))
+                    .collect();
+                rx.wait(&channels, None)
+            };
+            let round = match round {
+                Ok(round) => round,
+                Err(err) => {
+                    tracing::error!("input: wait: {err}; the input thread ends");
+                    return;
+                }
+            };
+            if settle(
+                &mut state.windows.borrow_mut(),
+                &round.channels,
+                drain_finished,
+            ) {
+                publish_focus(&state);
+            }
+            if !round.wake {
+                continue;
+            }
+            rx.ack();
+            for message in rx.try_iter() {
+                match message {
+                    Message::Window { token, fd, flags } => match Publisher::new(fd, CHANNEL) {
+                        Ok(publisher) => {
+                            state.windows.borrow_mut().add(token, publisher, flags);
+                            publish_focus(&state);
+                        }
+                        Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
+                    },
+                    Message::WindowRemoved(token) => {
+                        state.windows.borrow_mut().remove(&token);
                         publish_focus(&state);
                     }
-                    Err(err) => tracing::warn!("input: input channel refused: {err:?}"),
-                },
-                Message::WindowRemoved(token) => {
-                    state.windows.borrow_mut().remove(&token);
-                    publish_focus(&state);
-                }
-                Message::WindowFrame { token, frame } => {
-                    state.windows.borrow_mut().set_frame(&token, frame);
-                }
-                Message::Event(event) => source.inject(event),
-                // once: the script's events come back as Message::Event from its own thread, so a wait never holds up the channels a later window brings
-                Message::FirstFrame if !script.is_empty() => {
-                    let steps = std::mem::take(&mut script);
-                    let tx = tx.clone();
-                    let run = move || {
-                        for step in steps {
-                            match step {
-                                Step::Wait(d) => thread::sleep(d),
-                                Step::Pointer(phase, position) => {
-                                    let time_ms = u32::try_from(started.elapsed().as_millis())
-                                        .unwrap_or(u32::MAX);
-                                    let event = InputEvent::Pointer(PointerEvent {
-                                        phase,
-                                        position,
-                                        time_ms,
-                                    });
-                                    if tx.send(Message::Event(event)).is_err() {
-                                        return;
+                    Message::WindowFrame { token, frame } => {
+                        state.windows.borrow_mut().set_frame(&token, frame);
+                    }
+                    Message::Event(event) => source.inject(event),
+                    // once: the script's events come back as Message::Event from its own thread, so a wait never holds up the channels a later window brings
+                    Message::FirstFrame if !script.is_empty() => {
+                        let steps = std::mem::take(&mut script);
+                        let tx = tx.clone();
+                        let run = move || {
+                            for step in steps {
+                                match step {
+                                    Step::Wait(d) => thread::sleep(d),
+                                    Step::Pointer(phase, position) => {
+                                        let time_ms = u32::try_from(started.elapsed().as_millis())
+                                            .unwrap_or(u32::MAX);
+                                        let event = InputEvent::Pointer(PointerEvent {
+                                            phase,
+                                            position,
+                                            time_ms,
+                                        });
+                                        if tx.send(Message::Event(event)).is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                             }
+                        };
+                        if let Err(err) = thread::Builder::new()
+                            .name("atl-input-script".to_owned())
+                            .spawn(run)
+                        {
+                            tracing::warn!("input: script thread: {err}");
                         }
-                    };
-                    if let Err(err) = thread::Builder::new()
-                        .name("atl-input-script".to_owned())
-                        .spawn(run)
-                    {
-                        tracing::warn!("input: script thread: {err}");
                     }
+                    Message::FirstFrame => {}
                 }
-                Message::FirstFrame => {}
             }
         }
     }
 
     /// Starts the input thread with `script` (empty: nothing injected, channels still taken). The sender takes each window's channel and the first frame.
-    pub fn spawn(script: Vec<Step>) -> Result<Sender<Message>, String> {
-        let (tx, rx) = channel();
+    /// `wake_enabled` false is the deliberate-failure break (start.rs BREAK_INPUT_NO_WAKE): sends queue but never wake the loop.
+    pub fn spawn(script: Vec<Step>, wake_enabled: bool) -> Result<InputSender<Message>, String> {
+        let (tx, rx) = wake::channel(wake_enabled).map_err(|e| format!("input wake pair: {e}"))?;
         // the thread's own sender (for the script's events) keeps its loop open for the process's life; it ends with the process, as before
         let own = tx.clone();
         thread::Builder::new()
@@ -646,9 +717,14 @@ mod publish {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::os::fd::OwnedFd;
     use std::rc::Rc;
+    use std::thread;
+    use std::time::Duration;
 
     use atl_platform_ui::PointerEvent;
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+    use rustix::time::Timespec;
 
     use super::*;
 
@@ -802,5 +878,49 @@ mod tests {
         source.inject(event);
         source.inject(event);
         assert_eq!(seen.get(), 2);
+    }
+
+    /// A channel hangs up while the loop waits: the round reports only that channel, settle removes its window and keeps the other, and a message sent afterwards still wakes the loop.
+    #[test]
+    fn a_hung_up_channel_is_removed_mid_wait() {
+        let pair = || {
+            socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+                None,
+            )
+            .expect("socket pair")
+        };
+        let (kept, _kept_peer) = pair();
+        let (gone, gone_peer) = pair();
+        let mut windows = Windows::<u32, OwnedFd>::default();
+        windows.add(1, kept, 0);
+        windows.add(2, gone, 0);
+        let (tx, rx) = wake::channel::<u32>(true).expect("wake pair");
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(gone_peer);
+        });
+        let channels: Vec<_> = windows.channel_fds().map(|(key, fd)| (*key, fd)).collect();
+        let round = rx.wait(&channels, None).expect("wait");
+        drop(channels);
+        assert!(!round.wake);
+        assert_eq!(round.channels.len(), 1);
+        assert_eq!(round.channels[0].0, 2);
+        assert!(round.channels[0].1.contains(PollFlags::HUP));
+        assert!(settle(&mut windows, &round.channels, |_| true));
+        assert!(windows.channel(&1).is_some());
+        assert!(windows.channel(&2).is_none());
+        tx.send(7).expect("queue");
+        let bound = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let round = rx.wait::<u32>(&[], Some(&bound)).expect("wait");
+        assert!(round.wake);
+        rx.ack();
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [7]);
+        closer.join().expect("closer");
     }
 }

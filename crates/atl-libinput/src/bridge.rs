@@ -92,6 +92,8 @@ pub(crate) mod ffi {
         ) -> i32;
         /// InputPublisher::receiveConsumerResponse into `out`; the status is WOULD_BLOCK when none is pending.
         pub fn receive_finished(publisher: Pin<&mut Publisher>, out: Pin<&mut Message>) -> i32;
+        /// The channel's fd (InputPublisher::getChannel().getFd()); valid while the publisher lives.
+        pub fn publisher_fd(publisher: &Publisher) -> i32;
 
         /// Takes `fd` into an InputChannel for an InputConsumer; null when AOSP refuses it.
         pub fn new_consumer(fd: i32, name: &str) -> UniquePtr<Consumer>;

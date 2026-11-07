@@ -39,6 +39,8 @@ const BREAK_QUEUE: &str = "queue";
 const BREAK_RELEASE_BEFORE_PAINT: &str = "release-before-paint";
 /// With it the compositor is not served by the service view (xtask composer `--break-view`): libgui's lookup must then fail the gate.
 const BREAK_NO_SERVE: &str = "no-serve";
+/// With it the input loop is never woken by a send (input::spawn): messages queue, and the loop sleeps through them.
+const BREAK_INPUT_NO_WAKE: &str = "input-no-wake";
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 
@@ -113,7 +115,8 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         Some(script) => input::parse_script(&script)?,
         None => Vec::new(),
     };
-    let input_tx = input::spawn(script)?;
+    let wake_enabled = std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_INPUT_NO_WAKE);
+    let input_tx = input::spawn(script, wake_enabled)?;
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {

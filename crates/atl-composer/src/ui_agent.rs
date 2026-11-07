@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, mpsc::Sender};
+use std::sync::{Arc, Mutex};
 
 use atl_compositor::model::ColorLayer;
 use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
@@ -14,7 +14,7 @@ use atl_services::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
 use crate::host::Composer;
-use crate::input::Message;
+use crate::input::{InputSender, Message};
 use crate::service;
 use crate::task_sender::TaskSender;
 
@@ -25,7 +25,7 @@ const RGBA_8888: u32 = 1;
 /// mode, which has no toplevel to size.
 struct UiAgent {
     composer: Arc<Composer>,
-    input: Sender<Message>,
+    input: InputSender<Message>,
     sender: Option<Arc<TaskSender>>,
     /// the in-app input method (atl-ime) IMMS-lite binds (INPUT_METHOD); None in headless mode
     input_method: Option<SpIBinder>,
@@ -157,7 +157,7 @@ impl IUiAgent for UiAgent {
 /// A new UI agent binder of `composer`; `input` takes the windows' input channels, `sender` the window's Task, `input_method` is the app's IInputMethod.
 pub fn new_binder(
     composer: Arc<Composer>,
-    input: Sender<Message>,
+    input: InputSender<Message>,
     sender: Option<Arc<TaskSender>>,
     input_method: Option<SpIBinder>,
 ) -> SpIBinder {

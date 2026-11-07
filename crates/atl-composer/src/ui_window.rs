@@ -5,7 +5,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock};
 
 use atl_platform_ui::{
@@ -16,7 +15,7 @@ use atl_platform_ui::{
 use atl_services::display_model::DisplayModel;
 
 use crate::host::UiFrames;
-use crate::input::Message;
+use crate::input::{InputSender, Message};
 use crate::sink::fnv1a64;
 use crate::task_sender::TaskSender;
 
@@ -29,7 +28,7 @@ const SETTLED_TICKS: u32 = 20;
 struct Session {
     ui: PlatformUi,
     frames: Arc<UiFrames>,
-    input: Sender<Message>,
+    input: InputSender<Message>,
     size: PhysSize,
     /// the window's size and monitor changes go here (the Task's bounds and the display in the services)
     sender: Arc<TaskSender>,
@@ -62,7 +61,7 @@ pub fn set_pointer_icon(kind: i32) {
 pub fn install(
     ui: PlatformUi,
     frames: UiFrames,
-    input: Sender<Message>,
+    input: InputSender<Message>,
     size: PhysSize,
     sender: Arc<TaskSender>,
 ) {

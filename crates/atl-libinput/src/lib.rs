@@ -8,7 +8,7 @@
 #[allow(clippy::too_many_arguments)]
 mod bridge;
 
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 
 use bridge::ffi;
 
@@ -206,6 +206,15 @@ impl Publisher {
             seq: message.seq(),
             handled: message.handled(),
         }))
+    }
+}
+
+impl AsFd for Publisher {
+    /// The channel's fd, for the composer's poll. Borrowed from the publisher, which owns the InputChannel holding it.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        let fd = ffi::publisher_fd(&self.0);
+        // SAFETY: the InputChannel keeps fd open until the publisher drops, and the borrow cannot outlive `self`.
+        unsafe { BorrowedFd::borrow_raw(fd) }
     }
 }
 
