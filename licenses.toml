@@ -31,7 +31,7 @@ reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge,
 # Apache-2.0 WITH LLVM-exception: owner decision 2026-11-06 (llvm-project runtimes libc++/libc++abi/libunwind/compiler-rt builtins for the bionic targets, and 2026-11-07 the host LLVM of llvm_host.rs: llvm-project's LICENSE.TXT); the exception only removes Apache-2.0 attribution duties for compiled-in runtime code, so it stays GPL-3-compatible as Apache-2.0 is.
 # BSL-1.0, HPND-sell-variant: accepted 2026-11-06 (Mesa: c11 threads emulation, loader_dri_helper); both permissive and on the FSF list of GPL-compatible licences.
 # TU-Berlin-2.0: accepted 2026-11-07 (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
-# CC0-1.0, NCSA: added 2026-11-07 for the host LLVM build (llvm_host.rs, plan llvmpipe S1), pending owner confirmation: BLAKE3 (llvm/lib/Support/BLAKE3, `SPDX-License-Identifier: CC0-1.0`, a public-domain dedication, the class of LicenseRef-Public-Domain but a named instrument) and LLVM's legacy University-of-Illinois header (llvm/lib/TargetParser/CSKYTargetParser.cpp). Both permissive and on the FSF list of GPL-compatible licences.
+# CC0-1.0, NCSA: owner decision 2026-11-07, for the host LLVM build (llvm_host.rs, plan llvmpipe S1): BLAKE3 (llvm/lib/Support/BLAKE3, `SPDX-License-Identifier: CC0-1.0`, a public-domain dedication, the class of LicenseRef-Public-Domain but a named instrument) and LLVM's legacy University-of-Illinois header (llvm/lib/TargetParser/CSKYTargetParser.cpp). Both permissive and on the FSF list of GPL-compatible licences.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
