@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.graphics.Bitmap;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.media.AudioManager;
+import android.media.SoundPool;
 import android.os.Bundle;
 import android.util.Log;
 
@@ -19,6 +21,7 @@ import javax.net.ssl.X509TrustManager;
  * CA line (app.rs CACERTS): the default TrustManagerFactory trusts a distro root.
  * Fonts line (app.rs FONTS): the default and monospace typefaces' advance of one text, which the gate compares with the pinned fonts' hmtx tables.
  * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser) through the NativeBridge core into its guest; a failed load logs ART's UnsatisfiedLinkError, which carries the core's reason.
+ * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -29,6 +32,7 @@ public class Main extends Activity {
         super.onCreate(savedInstanceState);
         Log.i("AtlTest", "cacerts: " + caCerts());
         Log.i("AtlTest", "fonts: default=" + advance(Typeface.DEFAULT) + " monospace=" + advance(Typeface.MONOSPACE));
+        Log.i("AtlTest", "soundpool: " + soundPool());
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -162,6 +166,28 @@ public class Main extends Activity {
             return "FAIL no X509TrustManager";
         } catch (Exception e) {
             return "FAIL " + e;
+        }
+    }
+
+    /**
+     * "constructed" when `new SoundPool` returns (libsoundpool.so loaded, its constructor ran); else "threw <throwable>" with its frames
+     * (innermost first, " <- " between, one log line) so the line says where it came from. Released at once: the gate plays nothing.
+     */
+    private static String soundPool() {
+        try {
+            SoundPool pool = new SoundPool(4, AudioManager.STREAM_MUSIC, 0);
+            pool.release();
+            return "constructed";
+        } catch (Throwable t) {
+            StringBuilder s = new StringBuilder("threw " + t);
+            StackTraceElement[] frames = t.getStackTrace();
+            for (int i = 0; i < frames.length && i < 12; i++) {
+                s.append(" <- ").append(frames[i]);
+            }
+            for (Throwable c = t.getCause(); c != null; c = c.getCause()) {
+                s.append(" caused by ").append(c);
+            }
+            return s.toString();
         }
     }
 }

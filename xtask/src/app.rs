@@ -44,6 +44,9 @@ pub struct Args {
     /// The C12 break: leaves this native-bridge guest library (an NB_LIBS file, e.g. libstdc++.so or libz.so) out of the guest, so the legacy fixture's load fails naming it; the gate must then go red.
     #[arg(long)]
     drop_nb_lib: Option<String>,
+    /// The SoundPool break: unlinks libsoundpool.so from the ART lib dir, so `new SoundPool` must fail naming it and the soundpool line must go red.
+    #[arg(long)]
+    soundpool_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -58,6 +61,8 @@ const CACERTS: &str = "AtlTest: cacerts: ";
 /// Main.onCreate's fonts line: `default=<adv> monospace=<adv>`, Typeface.DEFAULT's and MONOSPACE's advance of [`FONT_TEXT`] at text size 2048 (Main.FONT_SIZE), kerning/ligatures off.
 /// Pass: each equals the pinned font's hmtx sum (test_fonts.rs `advance`, read-fonts): Roboto for the default (atld's fonts.toml sans-serif row through fontconfig), Droid Sans Mono for monospace.
 const FONTS: &str = "AtlTest: fonts: ";
+/// Main.onCreate's SoundPool line: `soundpool: constructed` when `new SoundPool` loaded libsoundpool.so and returned (the load gate, plan A-early); otherwise what it threw.
+const SOUNDPOOL: &str = "AtlTest: soundpool: ";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -243,6 +248,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(file) => rt.without_nb_lib(file)?,
         None => rt,
     };
+    let rt = if args.soundpool_break {
+        rt.without_art_lib("libsoundpool.so")?
+    } else {
+        rt
+    };
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -387,6 +397,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 .map(|w| format!("fonts: {w}")),
         );
     }
+    let soundpool = app
+        .lines()
+        .find_map(|l| l.split_once(SOUNDPOOL).map(|(_, r)| r.to_owned()));
+    if passed && soundpool.as_deref() != Some("constructed") {
+        whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
+    }
     if passed && !bridge1_ok {
         whys.push(format!(
             "bridge1: want {BRIDGE1:?}, got {:?}",
@@ -412,6 +428,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass fonts {} = pinned hmtx",
             fonts_line.unwrap_or_default()
         );
+        println!("app: pass soundpool {}", soundpool.unwrap_or_default());
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         println!("app: gralloc registered: {}", gralloc_log.trim());
         return Ok(ExitCode::SUCCESS);

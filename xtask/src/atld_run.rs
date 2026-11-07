@@ -58,10 +58,13 @@ pub fn goals() -> Goals {
         "librustutils",
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
+    .with(Goals::host(&FRAMEWORK_JNI))
 }
 
 /// The extractor plugins [`platform_rows`] places: every [`Runtime`] reads them, so [`goals`] builds them.
 const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
+/// Framework JNI libraries an app loads by name (`System.loadLibrary`): libsoundpool (SoundPool.java:119), built as AOSP's source as-is. Its closure builds with it; stage_art links every built `device/<module>/*.so` into the ART lib dir, which atld's LD_LIBRARY_PATH names, so no placement row is needed.
+const FRAMEWORK_JNI: [&str; 1] = ["libsoundpool"];
 
 /// The NDK libraries whose host side the NativeBridge core loads from SYSTEM_LIB (C3, bindings.rs `Host::System`): their guest proxies forward to them.
 const NDK_HOST_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
@@ -622,6 +625,14 @@ impl Runtime {
             self.native_bridge_guest.len() < before,
             "--drop-nb-lib {file}: no placed native-bridge file of that name"
         );
+        Ok(self)
+    }
+
+    /// The SoundPool break (`test app --soundpool-break`): unlinks `file` from the staged ART lib dir, so every app process's dlopen of it fails. stage_art restages that dir on every run, so the break lasts one run.
+    pub fn without_art_lib(self, file: &str) -> Result<Self> {
+        let at = self.art.lib_path.join(file);
+        std::fs::remove_file(&at)
+            .with_context(|| format!("--soundpool-break: unlinking {}", at.display()))?;
         Ok(self)
     }
 
