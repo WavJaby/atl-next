@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-audio-bridge"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Boundary crate (game audio A2): AOSP's server side of a track (AudioTrackServerProxy / StaticAudioTrackServerProxy over the control block and buffer Rust maps) and its mixer (AudioMixerBase), reached through cxx. Mapping the memory and the raw pointers stay here; atl-audioflinger (a core crate) sees safe types only.
+# Everything needs libaudioclient and libaudioprocessing_base, so without feature `converter` the crate is empty.
+# C++ is cxx glue (src/bridge.rs) plus wrap/mix.{h,cpp}: adapters that convert types and forward to AOSP's public API, no logic (AGENTS.md, C++ exception).
+[package.metadata.atl]
+converter = ["device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils"]
+
+[features]
+converter = []
+
+[dependencies]
+cxx.workspace = true
+rustix.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true

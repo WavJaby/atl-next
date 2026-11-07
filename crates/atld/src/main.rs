@@ -181,6 +181,9 @@ struct Args {
     /// Test only: apps start with `--no-media-player-service` (their launcher serves no media.player), the deliberate break of the media player gate.
     #[arg(long)]
     no_media_player_service: bool,
+    /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.
+    #[arg(long)]
+    break_mix: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -531,6 +534,8 @@ struct Host {
     break_cblk: bool,
     /// test only: each app's launcher gets `--no-media-player-service` (the media player gate's break)
     no_media_player_service: bool,
+    /// test only: each app's launcher gets `--break-mix` (the audio gate's third break)
+    break_mix: bool,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// why the run ends: the `--run-class` command's exit or an explicit stop
@@ -637,6 +642,7 @@ impl Host {
                     self.no_media_player_service
                         .then(|| "--no-media-player-service".to_owned()),
                 )
+                .chain(self.break_mix.then(|| "--break-mix".to_owned()))
                 .chain([
                     format!("-Xbootclasspath:{boot}"),
                     format!("-Xbootclasspath-locations:{boot}"),
@@ -1091,6 +1097,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         no_audio_service: a.no_audio_service,
         break_cblk: a.break_cblk,
         no_media_player_service: a.no_media_player_service,
+        break_mix: a.break_mix,
         controlled: Mutex::new(BTreeSet::new()),
         done: done_tx,
         am: a.am.clone(),

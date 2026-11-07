@@ -333,14 +333,14 @@ fn run_client(client: &Path, args: &Args, env: &[(&str, &Path)]) -> Result<Clien
 }
 
 /// The environment the normal run changes: a null sink and the default sink naming it. Dropping it restores the default and removes the sink, on every exit path.
-struct Routing {
+pub(crate) struct Routing {
     name: String,
     sink: Option<String>,
     previous: Option<String>,
 }
 
 impl Routing {
-    fn setup(name: &str) -> Result<Self> {
+    pub(crate) fn setup(name: &str) -> Result<Self> {
         let mut routing = Routing {
             name: name.to_owned(),
             sink: None,
@@ -386,12 +386,12 @@ impl Drop for Routing {
 }
 
 /// `pw-record` of the null sink's monitor, stopped with SIGINT so the WAV header is finalised.
-struct Recorder {
+pub(crate) struct Recorder {
     child: Child,
 }
 
 impl Recorder {
-    fn start(sink: &str, wav: &Path, rate: u32) -> Result<Self> {
+    pub(crate) fn start(sink: &str, wav: &Path, rate: u32) -> Result<Self> {
         let log = wav.with_extension("log");
         let out = fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
         let err = out.try_clone().context("duplicating the pw-record log")?;
@@ -432,7 +432,7 @@ impl Recorder {
     }
 
     /// Ends the recording. pw-record exits with status 1 on SIGINT (its normal exit for that signal), so the exit status is not checked: a truncated file fails the duration gate instead.
-    fn stop(mut self) -> Result<()> {
+    pub(crate) fn stop(mut self) -> Result<()> {
         let status = Command::new("kill")
             .arg("-INT")
             .arg(self.child.id().to_string())
@@ -586,14 +586,14 @@ fn delete_default_sink() -> Result<()> {
 }
 
 /// A recording: interleaved samples and their format.
-struct Recording {
-    rate: u32,
-    channels: u16,
-    samples: Vec<f32>,
+pub(crate) struct Recording {
+    pub(crate) rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) samples: Vec<f32>,
 }
 
 impl Recording {
-    fn channel(&self, channel: usize) -> Vec<f32> {
+    pub(crate) fn channel(&self, channel: usize) -> Vec<f32> {
         self.samples
             .iter()
             .skip(channel)
@@ -604,7 +604,7 @@ impl Recording {
 }
 
 /// Reads a RIFF/WAVE file of 32-bit IEEE float samples, as `pw-record --format f32` writes it.
-fn read_wav(bytes: &[u8]) -> Result<Recording> {
+pub(crate) fn read_wav(bytes: &[u8]) -> Result<Recording> {
     ensure!(
         bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
         "the recording is not a RIFF/WAVE file"
@@ -651,14 +651,14 @@ fn read_wav(bytes: &[u8]) -> Result<Recording> {
 }
 
 /// First and last index whose magnitude reaches `threshold`; None for silence.
-fn active_span(x: &[f32], threshold: f32) -> Option<(usize, usize)> {
+pub(crate) fn active_span(x: &[f32], threshold: f32) -> Option<(usize, usize)> {
     let first = x.iter().position(|v| v.abs() >= threshold)?;
     let last = x.iter().rposition(|v| v.abs() >= threshold)?;
     Some((first, last))
 }
 
 /// Frequency from rising zero crossings with linear interpolation: (crossings - 1) periods over their span, in Hz.
-fn frequency_hz(x: &[f32], rate: f64) -> Option<f64> {
+pub(crate) fn frequency_hz(x: &[f32], rate: f64) -> Option<f64> {
     let mut first = None;
     let mut last = 0.0;
     let mut count = 0usize;
@@ -675,7 +675,7 @@ fn frequency_hz(x: &[f32], rate: f64) -> Option<f64> {
     (count >= 2).then(|| (count - 1) as f64 * rate / (last - first))
 }
 
-fn rms(x: &[f32]) -> f64 {
+pub(crate) fn rms(x: &[f32]) -> f64 {
     let sum: f64 = x.iter().map(|v| f64::from(*v).powi(2)).sum();
     (sum / x.len() as f64).sqrt()
 }

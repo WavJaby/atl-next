@@ -119,11 +119,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "atl-audioflinger"
+name = "atl-audio-bridge"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
+ "cxx",
+ "cxx-build",
+ "rustix",
+ "tracing",
+]
+
+[[package]]
+name = "atl-audioflinger"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-audio-bridge",
+ "atl-bridgegen",
+ "atl-platform-ui",
  "atl-service-view",
  "atl-services",
  "rustix",

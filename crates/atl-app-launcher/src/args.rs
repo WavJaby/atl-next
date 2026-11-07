@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--no-audio-service] [--break-cblk] [--no-media-player-service] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--no-audio-service] [--break-cblk] [--no-media-player-service] [--break-mix] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -19,6 +19,8 @@ pub struct Launch {
     pub break_cblk: bool,
     /// Test only: the process serves no media.player (lib.rs serve_media_services), the media player gate's deliberate break.
     pub no_media_player_service: bool,
+    /// Test only: AudioFlinger's mixer plays silence (`atl_audioflinger::Options`), the audio gate's deliberate break.
+    pub break_mix: bool,
     pub vm_options: Vec<CString>,
     /// None: none given; dalvikvm reports that after creating the VM (so `-help` and the like run).
     pub class: Option<String>,
@@ -30,6 +32,7 @@ const APP: &str = "--app";
 const NO_AUDIO_SERVICE: &str = "--no-audio-service";
 const BREAK_CBLK: &str = "--break-cblk";
 const NO_MEDIA_PLAYER_SERVICE: &str = "--no-media-player-service";
+const BREAK_MIX: &str = "--break-mix";
 
 pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
     let mut it = argv
@@ -42,6 +45,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         no_audio_service: false,
         break_cblk: false,
         no_media_player_service: false,
+        break_mix: false,
         vm_options: Vec::new(),
         class: None,
         args: Vec::new(),
@@ -66,6 +70,11 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         }
         if text == NO_MEDIA_PLAYER_SERVICE {
             launch.no_media_player_service = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if text == BREAK_MIX {
+            launch.break_mix = true;
             pending = it.next().transpose()?;
             continue;
         }
@@ -135,6 +144,13 @@ mod tests {
         assert!(l.no_media_player_service);
         assert_eq!(l.class.as_deref(), Some("Main"));
         assert!(!p(&["Main"]).unwrap().no_media_player_service);
+    }
+
+    #[test]
+    fn break_mix_is_a_launcher_option() {
+        let l = p(&["--break-mix", "Main"]).unwrap();
+        assert!(l.break_mix && !l.break_cblk);
+        assert!(!p(&["Main"]).unwrap().break_mix);
     }
 
     #[test]

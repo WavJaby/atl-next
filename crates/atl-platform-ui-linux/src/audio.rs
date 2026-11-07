@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use atl_platform_ui_api::audio::{AudioError, AudioHost, PcmOutput, PcmSpec};
 use pipewire::context::ContextRc;
@@ -206,6 +207,18 @@ impl AudioHost for PipeWireHost {
                 |s| format!("still {:?}", s.phase),
             )
             .map_err(AudioError::Stream)?;
+        // The quantum is the server's request size, which only a running cycle shows: one short start measures it, so it is known before the caller asks. The link wait in set_active makes an output with no sink fail here.
+        output.set_active(true)?;
+        let started = Instant::now();
+        while output.shared.quantum.load(Ordering::Relaxed) == 0 {
+            if started.elapsed() > START_LIMIT {
+                return Err(AudioError::Stream(format!(
+                    "no server cycle within {START_LIMIT:?}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        output.set_active(false)?;
         Ok(output)
     }
 }
@@ -239,6 +252,10 @@ impl PipeWireOutput {
 impl PcmOutput for PipeWireOutput {
     fn spec(&self) -> PcmSpec {
         self.shared.lock().spec
+    }
+
+    fn quantum(&self) -> u32 {
+        self.shared.quantum.load(Ordering::Relaxed)
     }
 
     fn set_active(&self, on: bool) -> Result<(), AudioError> {
@@ -361,6 +378,11 @@ impl UserData {
         } else {
             requested.min(capacity)
         };
+        if frames > 0 {
+            self.shared
+                .quantum
+                .store(frames as u32, Ordering::Relaxed);
+        }
         let mut done = 0;
         while done < frames {
             let n = (frames - done).min(SCRATCH_FRAMES);
@@ -386,6 +408,8 @@ struct Shared {
     changed: Condvar,
     rt_fallbacks: AtomicU64,
     underruns: AtomicU64,
+    /// Frames in the latest server cycle (0 until one ran).
+    quantum: AtomicU32,
 }
 
 struct Status {
@@ -420,6 +444,7 @@ impl Shared {
             changed: Condvar::new(),
             rt_fallbacks: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            quantum: AtomicU32::new(0),
         }
     }
 

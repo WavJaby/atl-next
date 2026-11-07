@@ -76,11 +76,17 @@ crates = ["atl-media-player"]
 exports = ["atl-media-player"]
 uses = ["service-view", "generators"]
 
-# AudioFlinger and AudioPolicyService the app process serves through the view (audio A1a): AOSP's audio AIDL stubs (atl-audioflinger-stubs-rust) answering the ids, rate, frame count, latency and output calls AudioSystem makes; the rest is counted UNKNOWN_TRANSACTION
+# AudioFlinger and AudioPolicyService the app process serves through the view (audio A1a, A1b, A2): AOSP's audio AIDL stubs (atl-audioflinger-stubs-rust) answering the ids, the served output profile, createTrack and the mixer; the rest is counted UNKNOWN_TRANSACTION. The PCM output comes from platform-ui
 [audioflinger]
 crates = ["atl-audioflinger"]
 exports = ["atl-audioflinger"]
-uses = ["service-view", "services", "generators"]
+uses = ["service-view", "services", "generators", "audio-bridge", "platform-ui"]
+
+# AOSP's server side of a track (ServerProxy over the mapped control block and buffer) and its mixer (AudioMixerBase), through cxx (wrap/mix.cpp): the boundary crate for atl-audioflinger's data plane (audio A2); libaudioclient and libaudioprocessing_base from the converter
+[audio-bridge]
+crates = ["atl-audio-bridge"]
+exports = ["atl-audio-bridge"]
+uses = ["generators"]
 
 # the app process's SurfaceFlinger (M3 slice 4): AOSP's compositor interfaces served in-process over the compositor core, through the converter's AIDL stubs; the display model and the registry protocol are the services' plain modules
 [composer]

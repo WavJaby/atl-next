@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test audio-app`: the audio gate of A1a (AudioFlinger and AudioPolicyService served) and A1b (createTrack and IAudioTrack). The test APK (xtask/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids and the minimum buffer, builds a track and a low-latency track, and logs their state, piid and frame count.
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
-//! The served output is atl-audioflinger's OUTPUT_* constants; [`SPEC_RATE_HZ`] and the others copy them, so a change there must change these too (a mismatch is a red gate).
+//! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
+//! PCM (A2): the fixture plays a static track, then a streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold two runs of tone with the frequency, length and level the fixture's input gives. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
-//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of).
+//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::audio_pcm::{Recorder, Recording, Routing, frequency_hz, read_wav, rms};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -37,6 +40,9 @@ pub struct Args {
     /// The second deliberate break: the app starts with `--break-cblk`, so each streaming track's control block region is one buffer short; createTrack refuses it and both streaming tracks must fail to initialise.
     #[arg(long)]
     break_cblk: bool,
+    /// The third deliberate break: the app starts with `--break-mix`, so the mixer plays silence; the recording holds no tone and the PCM checks must go red.
+    #[arg(long)]
+    break_mix: bool,
 }
 
 /// The fixture's dir.
@@ -49,7 +55,7 @@ const APP_UID: u32 = 10_123;
 /// The run's time limit: the APK's start, the two binder lookups' waits (5 s each when a service is missing) and the two tracks.
 const LIMIT: Duration = Duration::from_secs(180);
 
-/// The served output (atl-audioflinger lib.rs OUTPUT_RATE_HZ, OUTPUT_FRAMES, OUTPUT_LATENCY_MS), copied: the expectation is worked from these, not read back from the service.
+/// The served profile: the PCM output's granted rate and quantum, which on this host are PipeWire's defaults (`default.clock.rate`, `default.clock.quantum`). The expectation is worked from these, not read back from the service.
 const SPEC_RATE_HZ: u64 = 48_000;
 const SPEC_FRAMES: u64 = 1024;
 const SPEC_LATENCY_MS: u64 = 42;
@@ -60,7 +66,7 @@ const REQ_BYTES_PER_SAMPLE: u64 = 2;
 /// The static track's buffer in Main.java (`STATIC_BYTES`): 4096 bytes, one frame per 4 bytes of the request. Not rounded: a shared-buffer track keeps its frame count (Tracks.cpp:162 rounds only a streaming track).
 const STATIC_BYTES: u64 = 4096;
 
-/// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output. getOutputForAttr is served but no client on the game path calls it (AudioTrack asks getOutput(stream)), so it is not required here.
+/// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output. getOutputForAttr is not served (policy.rs): no client on the game path calls it (AudioTrack asks getOutput(stream)), so it is not required here.
 const IN_PROCESS: [&str; 4] = [
     "answered IAudioFlingerService.newAudioUniqueId",
     "answered IAudioFlingerService.sampleRate",
@@ -75,6 +81,21 @@ const STATE_INITIALIZED: i64 = 1;
 const STATE_NO_STATIC_DATA: i64 = 2;
 /// AudioPlaybackConfiguration.PLAYER_PIID_INVALID: a player that has no piid.
 const PIID_INVALID: i64 = -1;
+
+/// The PCM tones (game audio A2). Main.java plays them in this order: a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ, each TONE_FRAMES frames at TONE_RATE_HZ and TONE_DBFS peak, with a gap of about 0.5 s between. The fixture's samples come from the same values.
+const TONE_RATE_HZ: u64 = 44_100;
+const TONE_FRAMES: u64 = 22_050;
+const STATIC_TONE_HZ: f64 = 1_000.0;
+const STREAM_TONE_HZ: f64 = 500.0;
+const TONE_DBFS: f64 = -12.0;
+/// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
+const GAP_SECONDS: f64 = 0.2;
+/// As audio_pcm.rs: a sample at or above -60 dB of the peak counts as tone.
+const PRESENCE_DB: f64 = -60.0;
+const FREQ_TOLERANCE_HZ: f64 = 1.0;
+const LEVEL_TOLERANCE_DB: f64 = 1.0;
+/// One quantum of PipeWire's default graph (1024 frames, `default.clock.quantum`): the length tolerance, and the trim at each edge of a run before frequency and level are measured.
+const QUANTUM_FRAMES: usize = 1_024;
 
 /// AudioSystem::calculateMinFrameCount at speed 1.0, in frames: `minBufCount` quanta (at least 2) of `sourceFramesNeeded + 2` source frames each, the stretch's `+1 +1` (AudioResamplerPublic.h:109).
 /// The source frames are `dst * src / dstRate + 1 + 1` (uint64 math), since the rates differ.
@@ -113,6 +134,74 @@ fn verdict(name: &str, pass: bool, detail: &str) -> bool {
     pass
 }
 
+/// Runs of samples whose magnitude reaches `threshold`; two runs are one when at most `gap` samples lie between them.
+fn segments(x: &[f32], threshold: f32, gap: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, v) in x.iter().enumerate() {
+        if v.abs() < threshold {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run) if i - run.1 <= gap => run.1 = i,
+            _ => runs.push((i, i)),
+        }
+    }
+    runs
+}
+
+/// The PCM checks (game audio A2): the recording holds the static tone, then the streaming tone, each a run of samples above the presence level. Length, frequency and level come from the fixture's input (TONE_*), never from the server.
+fn pcm_verdicts(rec: &Recording) -> bool {
+    let rate = u64::from(rec.rate);
+    let amplitude = 10f64.powf(TONE_DBFS / 20.0);
+    let expected_rms = amplitude / std::f64::consts::SQRT_2;
+    let threshold = (amplitude * 10f64.powf(PRESENCE_DB / 20.0)) as f32;
+    let gap = (GAP_SECONDS * f64::from(rec.rate)) as usize;
+    let want = TONE_FRAMES * rate / TONE_RATE_HZ;
+    let runs = segments(&rec.channel(0), threshold, gap);
+    let mut ok = verdict(
+        "pcm tones",
+        runs.len() == 2,
+        &format!("{} run(s) of tone, want 2 (static, then streaming)", runs.len()),
+    );
+    for (i, (name, hz)) in [("static", STATIC_TONE_HZ), ("stream", STREAM_TONE_HZ)]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(&(first, last)) = runs.get(i) else {
+            ok &= verdict(&format!("pcm {name} tone"), false, "not in the recording");
+            continue;
+        };
+        let span = last - first + 1;
+        ok &= verdict(
+            &format!("pcm {name} length"),
+            (span as u64).abs_diff(want) <= QUANTUM_FRAMES as u64,
+            &format!("{span} frames at {rate} Hz, want {want} ±{QUANTUM_FRAMES} (one quantum)"),
+        );
+        if span <= 2 * QUANTUM_FRAMES {
+            ok &= verdict(&format!("pcm {name} frequency"), false, "run shorter than two quanta");
+            continue;
+        }
+        // the central part: one quantum off each edge, so edge timing does not reach the estimates
+        for ch in 0..usize::from(rec.channels) {
+            let x = rec.channel(ch);
+            let central = &x[first + QUANTUM_FRAMES..=last - QUANTUM_FRAMES];
+            let got = frequency_hz(central, rate as f64);
+            ok &= verdict(
+                &format!("pcm {name} frequency"),
+                got.is_some_and(|f| (f - hz).abs() <= FREQ_TOLERANCE_HZ),
+                &format!("ch{ch} {got:?} Hz, want {hz} ±{FREQ_TOLERANCE_HZ}"),
+            );
+            let level_db = 20.0 * (rms(central) / expected_rms).log10();
+            ok &= verdict(
+                &format!("pcm {name} level"),
+                level_db.abs() <= LEVEL_TOLERANCE_DB,
+                &format!("ch{ch} {level_db:+.2} dB re A/√2, want ±{LEVEL_TOLERANCE_DB}"),
+            );
+        }
+    }
+    ok
+}
+
 /// The native goals the gate reads: the app gate's (same runtime and APK tooling, native-bridge guest included).
 pub fn goals() -> crate::gate_goals::Goals {
     crate::app::goals()
@@ -141,6 +230,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.break_mix {
+        rt.with_broken_mix()
+    } else {
+        rt
+    };
     let work = rt.out.join("audio");
     let apk = rt
         .apk
@@ -157,6 +251,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         shell: None,
         log_tags: args.log_tags.clone(),
     };
+    // the output plays into a null sink the gate makes the default for the run; its monitor is recorded (audio_pcm.rs)
+    let sink = format!("atl-audio-app-{}", std::process::id());
+    let wav = work.join("recording.wav");
+    let routing = Routing::setup(&sink)?;
+    let recorder = Recorder::start(&sink, &wav, u32::try_from(SPEC_RATE_HZ)?)?;
     let mut atld_child = rt.start_atld(&run)?;
     let app_log = run.log(&m.name);
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -170,6 +269,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    recorder.stop()?;
+    drop(routing);
     if atld_child.try_wait()?.is_none() {
         run.stop(&mut atld_child)?;
     }
@@ -263,6 +364,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         in_process,
         "AudioFlinger and AudioPolicyService answered in the app process",
     );
+    let pcm = fs::read(&wav)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| read_wav(&bytes));
+    ok &= match pcm {
+        Ok(recording) => pcm_verdicts(&recording),
+        Err(e) => verdict("pcm recording", false, &format!("{e:#}")),
+    };
     if !ok {
         println!("---- app log tail");
         for l in app

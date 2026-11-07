@@ -402,9 +402,14 @@ fn result_failures(app: &str) -> Vec<String> {
 /// Native goals (gate_goals.rs): the runtime with gralloc, the GL driver and the native-bridge guest, as [`run`] stages it.
 pub fn goals() -> crate::gate_goals::Goals {
     use crate::atld_run;
+    // atl-audio-bridge (the server's mixer, game audio A2) links AudioMixerBase's library and the utilities its gain conversion uses; the launcher builds it in every app run
     atld_run::goals()
         .with(atld_run::gralloc_goals())
         .with(atld_run::nb_guest_goals())
+        .with(crate::gate_goals::Goals::host(&[
+            "libaudioprocessing_base",
+            "libaudioutils",
+        ]))
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {

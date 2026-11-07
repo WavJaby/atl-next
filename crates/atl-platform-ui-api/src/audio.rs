@@ -47,6 +47,9 @@ pub trait PcmOutput {
     /// The format `fill` is called for: what the server granted.
     fn spec(&self) -> PcmSpec;
 
+    /// Frames per server cycle: the frame count of the server's requests, measured by [`AudioHost::open_output`] before it returns. 0 only if the server never ran a cycle.
+    fn quantum(&self) -> u32;
+
     /// Starts (`true`) or stops (`false`) the stream.
     /// `true` returns once the server runs the stream; a stream that fails or does not start in time is an error.
     fn set_active(&self, on: bool) -> Result<(), AudioError>;

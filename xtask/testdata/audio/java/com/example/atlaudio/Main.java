@@ -16,6 +16,7 @@ import android.util.Log;
  * `track: state=<n> piid=<n> frames=<n>`: a track's constructor (createTrack, IAudioTrack, then PlayerBase's trackPlayer): its state, its player id, its frame count.
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
  * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
+ * `pcm: ...`: the PCM tones (audio_app.rs TONE_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ, one after the other; the gate checks the recording of the sink.
  * `done`: the end of the run.
  */
 public class Main extends Activity {
@@ -24,6 +25,25 @@ public class Main extends Activity {
     private static final int RATE_HZ = 44100;
     /** The static track's buffer: 4096 bytes, 1024 stereo 16-bit frames (audio_app.rs STATIC_BYTES). */
     private static final int STATIC_BYTES = 4096;
+    /** The PCM tones (audio_app.rs TONE_*): rate, frames, frequencies, peak level, and the gap between the two. */
+    private static final int TONE_RATE_HZ = 44100;
+    private static final int TONE_FRAMES = 22050;
+    private static final int STATIC_TONE_HZ = 1000;
+    private static final int STREAM_TONE_HZ = 500;
+    private static final double TONE_DBFS = -12.0;
+    private static final int TONE_GAP_MS = 500;
+
+    /** Stereo 16-bit samples of a sine of `hz`: TONE_FRAMES frames at TONE_DBFS peak. */
+    private static short[] tone(int hz) {
+        short[] s = new short[TONE_FRAMES * 2];
+        double amp = Math.pow(10.0, TONE_DBFS / 20.0) * 32767.0;
+        for (int i = 0; i < TONE_FRAMES; i++) {
+            short v = (short) Math.round(amp * Math.sin(2.0 * Math.PI * hz * i / TONE_RATE_HZ));
+            s[2 * i] = v;
+            s[2 * i + 1] = v;
+        }
+        return s;
+    }
 
     @Override
     protected void onCreate(Bundle state) {
@@ -81,6 +101,36 @@ public class Main extends Activity {
             st.release();
         } catch (Throwable e) {
             Log.i(TAG, "static: " + e);
+        }
+        AudioFormat toneFormat = new AudioFormat.Builder()
+                .setSampleRate(TONE_RATE_HZ)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .build();
+        int toneMs = TONE_FRAMES * 1000 / TONE_RATE_HZ;
+        try {
+            // a static track (SoundPool's shape): the samples are written before play, then the track plays them once
+            short[] samples = tone(STATIC_TONE_HZ);
+            AudioTrack st = new AudioTrack(attributes, toneFormat, samples.length * 2,
+                    AudioTrack.MODE_STATIC, 0);
+            int wrote = st.write(samples, 0, samples.length);
+            st.play();
+            Log.i(TAG, "pcm: static wrote=" + wrote + " state=" + st.getState());
+            Thread.sleep(toneMs + TONE_GAP_MS);
+            st.release();
+        } catch (Throwable e) {
+            Log.i(TAG, "pcm: static " + e);
+        }
+        try {
+            // a streaming track: play, then write; the blocking write returns once the buffer has taken every sample
+            AudioTrack ts = new AudioTrack(attributes, toneFormat, min, AudioTrack.MODE_STREAM, 0);
+            ts.play();
+            int wrote = ts.write(tone(STREAM_TONE_HZ), 0, TONE_FRAMES * 2);
+            Log.i(TAG, "pcm: stream wrote=" + wrote);
+            Thread.sleep(TONE_GAP_MS);
+            ts.release();
+        } catch (Throwable e) {
+            Log.i(TAG, "pcm: stream " + e);
         }
         Log.i(TAG, "done");
     }
