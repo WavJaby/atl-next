@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! android.app.servertransaction.ClientTransaction: app/servertransaction/ClientTransaction.java writeToParcel (writeParcelableList of mTransactionItems) / ClientTransaction(Parcel).
-//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, PauseActivityItem, StopActivityItem, DestroyActivityItem, StartActivityItem, NewIntentItem, ConfigurationChangeItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
+//! Each item is Parcel.writeParcelable: its class name (String16, null for a null item), then its writeToParcel. Modelled: LaunchActivityItem, ResumeActivityItem, PauseActivityItem, StopActivityItem, DestroyActivityItem, StartActivityItem, NewIntentItem, ActivityResultItem, ConfigurationChangeItem, ActivityConfigurationChangeItem, ActivityRelaunchItem; any other item class is refused.
 
 use crate::parcel::*;
 use crate::parts::*;
@@ -17,6 +17,7 @@ const STOP_ACTIVITY_ITEM: &str = "android.app.servertransaction.StopActivityItem
 const DESTROY_ACTIVITY_ITEM: &str = "android.app.servertransaction.DestroyActivityItem";
 const START_ACTIVITY_ITEM: &str = "android.app.servertransaction.StartActivityItem";
 const NEW_INTENT_ITEM: &str = "android.app.servertransaction.NewIntentItem";
+const ACTIVITY_RESULT_ITEM: &str = "android.app.servertransaction.ActivityResultItem";
 
 #[derive(Debug, Clone)]
 pub enum ClientTransactionItem {
@@ -28,6 +29,8 @@ pub enum ClientTransactionItem {
     DestroyActivity(DestroyActivityItem),
     StartActivity(StartActivityItem),
     NewIntent(NewIntentItem),
+    /// The results of activities that finished for this one (ActivityResultItem): a token and a list, so not boxed.
+    ActivityResult(ActivityResultItem),
     /// Boxed like LaunchActivity: the Configuration and ActivityWindowInfo make it large.
     ActivityConfigurationChange(Box<ActivityConfigurationChangeItem>),
     /// Boxed: a Configuration.
@@ -76,6 +79,10 @@ impl Part for ClientTransaction {
                     w_str16(p, &Some(NEW_INTENT_ITEM.to_owned()))?;
                     i.write(p)?;
                 }
+                Some(ClientTransactionItem::ActivityResult(i)) => {
+                    w_str16(p, &Some(ACTIVITY_RESULT_ITEM.to_owned()))?;
+                    i.write(p)?;
+                }
                 Some(ClientTransactionItem::ActivityConfigurationChange(i)) => {
                     w_str16(p, &Some(ACTIVITY_CONFIGURATION_CHANGE_ITEM.to_owned()))?;
                     i.write(p)?;
@@ -121,6 +128,9 @@ impl Part for ClientTransaction {
                 Some(NEW_INTENT_ITEM) => {
                     Some(ClientTransactionItem::NewIntent(NewIntentItem::read(p)?))
                 }
+                Some(ACTIVITY_RESULT_ITEM) => Some(ClientTransactionItem::ActivityResult(
+                    ActivityResultItem::read(p)?,
+                )),
                 Some(ACTIVITY_CONFIGURATION_CHANGE_ITEM) => {
                     Some(ClientTransactionItem::ActivityConfigurationChange(
                         Box::new(ActivityConfigurationChangeItem::read(p)?),

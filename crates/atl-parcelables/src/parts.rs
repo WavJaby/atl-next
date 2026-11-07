@@ -675,7 +675,7 @@ impl Part for ResumeActivityItem {
     }
 }
 
-/// android.app.servertransaction.ActivityRelaunchItem (ActivityRelaunchItem.java writeToParcel): the token, the pending results and new intents (typed lists; only null modelled: the services hold neither), the
+/// android.app.servertransaction.ActivityRelaunchItem (ActivityRelaunchItem.java writeToParcel): the token, the pending results and new intents (typed lists; only null modelled: AOSP sends them only when resumed, and a resumed record holds neither, see activity_stack), the
 /// MergedConfiguration and ActivityWindowInfo as typed objects, the config changes, preserveWindow. The body after ClientTransaction's class name.
 #[derive(Debug, Clone, Default)]
 pub struct ActivityRelaunchItem {
@@ -889,6 +889,55 @@ impl Part for NewIntentItem {
             activity_token: r_binder(p)?,
             resume: r_bool(p)?,
             intents: r_typed_list(p)?,
+        })
+    }
+}
+
+/// android.app.ResultInfo (ResultInfo.java:66-77 writeToParcel): mResultWho (writeString), mRequestCode, mResultCode, mData (a presence int, then the Intent's body), mCallerToken (a strong binder).
+/// Embedded in ActivityResultItem's list, not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct ResultInfo {
+    pub result_who: Option<String>,
+    pub request_code: i32,
+    pub result_code: i32,
+    pub data: Option<Intent>,
+    pub caller_token: Option<SpIBinder>,
+}
+impl Part for ResultInfo {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_str16(p, &self.result_who)?;
+        w_i32(p, self.request_code)?;
+        w_i32(p, self.result_code)?;
+        w_typed(p, &self.data)?;
+        w_binder(p, &self.caller_token)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(ResultInfo {
+            result_who: r_str16(p)?,
+            request_code: r_i32(p)?,
+            result_code: r_i32(p)?,
+            data: r_typed(p)?,
+            caller_token: r_binder(p)?,
+        })
+    }
+}
+
+/// android.app.servertransaction.ActivityResultItem (ActivityResultItem.java:86-89 writeToParcel): the ActivityTransactionItem's token, then mResultInfoList (writeTypedList).
+/// The body after ClientTransaction's class name; the item is not a codec of its own.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityResultItem {
+    pub activity_token: Option<SpIBinder>,
+    pub result_infos: Option<Vec<Option<ResultInfo>>>,
+}
+impl Part for ActivityResultItem {
+    fn write(&self, p: &mut In<'_>) -> Result<()> {
+        w_binder(p, &self.activity_token)?;
+        w_typed_list(p, &self.result_infos)
+    }
+    fn read(p: &In<'_>) -> Result<Self> {
+        Ok(ActivityResultItem {
+            activity_token: r_binder(p)?,
+            result_infos: r_typed_list(p)?,
         })
     }
 }
