@@ -366,6 +366,8 @@ std::arch::global_asm!(
         "    push %r12\n",
         "    sub $8, %rsp\n",
         "    rdfsbase %rbx\n",
+        "    test %rbx, %rbx\n",
+        "    jz 4f\n",
         "    cmp %fs:16, %rbx\n",
         "    je 1f\n",
         "    mov %fs:{slot}, %r12\n",
@@ -373,7 +375,7 @@ std::arch::global_asm!(
         "    jnz 3f\n",
         "    mov atl_nb_bootstrap(%rip), %r12\n",
         "    test %r12, %r12\n",
-        "    jz 1f\n",
+        "    jz 4f\n",
         "    push %rdi\n",
         "    push %rsi\n",
         "    push %rdx\n",
@@ -383,12 +385,25 @@ std::arch::global_asm!(
         "    pop %rsi\n",
         "    pop %rdi\n",
         "    cmp atl_nb_bootstrap_tid(%rip), %eax\n",
-        "    jne 1f\n",
+        "    jne 4f\n",
         "3:\n",
         "    mov 8(%r12), %r11\n",
         "    test %r11, %r11\n",
-        "    jz 1f\n",
+        "    jz 4f\n",
         "    wrfsbase %r11\n",
+        "    jmp 1f\n",
+        // no host FS found (FS 0, or a guest TCB without a record off the bootstrap thread): the host handler would run on a foreign thread pointer; report first (TLS-free), then run it as before
+        "4:\n",
+        "    push %rdi\n",
+        "    push %rsi\n",
+        "    push %rdx\n",
+        "    sub $8, %rsp\n",
+        "    mov %rbx, %rcx\n",
+        "    call {no_host_fs}\n",
+        "    add $8, %rsp\n",
+        "    pop %rdx\n",
+        "    pop %rsi\n",
+        "    pop %rdi\n",
         "1:\n",
         "    movslq %edi, %rax\n",
         "    lea atl_nb_signal_handlers(%rip), %r11\n",
@@ -419,8 +434,101 @@ std::arch::global_asm!(
     thunks = const THUNKS,
     gettid = const libc::SYS_gettid,
     up_failed = sym up_failed,
+    no_host_fs = sym no_host_fs,
     options(att_syntax)
 );
+
+/// `atl_nb_signal_entry` found no host thread pointer for the interrupted FS `fs`: reports, then the host handler runs on `fs` anyway (it may well fault: a nested fault on a blocked signal kills the process with no further output, so this line is the last one).
+extern "C" fn no_host_fs(
+    sig: i32,
+    info: *const libc::siginfo_t,
+    uc: *const libc::c_void,
+    fs: usize,
+) {
+    // SAFETY: the kernel's arguments to this delivery's handler, passed through by the entry.
+    unsafe { fault_report("no host thread pointer for the handler", sig, info, uc, fs) };
+}
+
+/// Last-chance fault report on stderr: signal, code, fault address, pc + sp, thread name, the mappings of pc and fault address. TLS-free and heap-free (stack buffers, raw syscalls): callable on any thread pointer from a signal handler. `fs`: the interrupted FS base, 0 when the caller does not know it.
+///
+/// # Safety
+/// `info` / `uc`: null or the kernel's siginfo / ucontext of the signal being handled.
+pub unsafe fn fault_report(
+    why: &str,
+    sig: i32,
+    info: *const libc::siginfo_t,
+    uc: *const libc::c_void,
+    fs: usize,
+) {
+    use std::io::Write;
+    // SAFETY: the kernel's siginfo / ucontext for this delivery, or null.
+    let (code, addr) = unsafe {
+        info.as_ref()
+            .map_or((0, 0), |i| (i.si_code, i.si_addr() as usize))
+    };
+    // SAFETY: as above; x86_64 glibc `ucontext_t` is the kernel frame's layout.
+    let (pc, sp) = unsafe {
+        uc.cast::<libc::ucontext_t>().as_ref().map_or((0, 0), |u| {
+            let g = &u.uc_mcontext.gregs;
+            (
+                g[libc::REG_RIP as usize] as usize,
+                g[libc::REG_RSP as usize] as usize,
+            )
+        })
+    };
+    let mut comm = [0u8; 32];
+    // SAFETY: a NUL-terminated path; the fd is closed below; reads into a live buffer.
+    let comm_len = unsafe {
+        let fd = libc::open(c"/proc/thread-self/comm".as_ptr(), libc::O_RDONLY);
+        let n = if fd < 0 {
+            0
+        } else {
+            libc::read(fd, comm.as_mut_ptr().cast(), comm.len()).max(0) as usize
+        };
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        n
+    };
+    let name = comm[..comm_len]
+        .strip_suffix(b"\n")
+        .unwrap_or(&comm[..comm_len]);
+    // SAFETY: a raw syscall without arguments.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let mut line = [0u8; 256];
+    let mut w = &mut line[..];
+    let _ = write!(
+        w,
+        "atl-native-bridge: fatal-signal report: {why}: sig {sig} code {code} addr {addr:#x} pc {pc:#x} sp {sp:#x} fs {fs:#x} tid {tid} thread \""
+    );
+    let _ = w.write_all(name);
+    let _ = writeln!(w, "\"");
+    let left = w.len();
+    // SAFETY: a live buffer; a failed write loses only the line.
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len() - left) };
+    emit_mappings(&[pc, addr]);
+    // stack words: the caller chain of frame-pointerless code; skipped when the fault is on the stack itself (overflow), where reading it would fault again inside the handler
+    let span = STACK_WORDS * 8;
+    if sp == 0 || (sp.saturating_sub(PAGE)..sp + span).contains(&addr) {
+        return;
+    }
+    for row in 0..STACK_WORDS / 4 {
+        let mut w = &mut line[..];
+        let _ = write!(w, "atl-native-bridge: stack +{:#x}", row * 32);
+        for i in 0..4 {
+            // SAFETY: the interrupted thread's live stack, read upward from its sp; STACK_WORDS stays inside the frames above it.
+            let word = unsafe { ((sp + (row * 4 + i) * 8) as *const usize).read() };
+            let _ = write!(w, " {word:#x}");
+        }
+        let _ = writeln!(w);
+        let left = w.len();
+        // SAFETY: a live buffer; a failed write loses only the line.
+        unsafe { libc::write(2, line.as_ptr().cast(), line.len() - left) };
+    }
+}
+
+/// Guard below sp that `fault_report` treats as the stack (one x86_64 page: the smallest guard a fault past sp lands in).
+const PAGE: usize = 4096;
 
 /// Guest stack words `up_failed` reports: enough for a few frames of caller chain.
 const STACK_WORDS: usize = 96;

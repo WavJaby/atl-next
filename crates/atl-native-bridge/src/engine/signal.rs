@@ -136,6 +136,11 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     if f == 0 {
         return;
     }
+    // a fault reaching a guest handler is one ART's sigchain claims declined: the app's own crash handler takes it, which often re-raises with SIG_DFL and leaves no ART dump -> report first
+    if [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE].contains(&sig) {
+        // SAFETY: the kernel's siginfo / ucontext of this delivery.
+        unsafe { arch::fault_report("fault handed to the guest's handler", sig, info, uc, 0) };
+    }
     // SAFETY: the guest's handler (SA_SIGINFO signature; a plain one ignores the extra arguments under the SysV ABI); `siginfo_t` is the kernel's for both libcs and `uc` the kernel frame.
     unsafe {
         arch::call_guest(
