@@ -368,6 +368,11 @@ impl ActivityTasks {
         Ok(activity_start::START_SUCCESS)
     }
 
+    /// ActivityClientController.onBackPressed (isInRootTaskLocked): true when a record has the token. A lookup only; nothing is sent or changed.
+    pub(crate) fn has_record(&self, token: &SpIBinder) -> bool {
+        self.machine().phase(token).is_some()
+    }
+
     /// ActivityClientController.activityResumed: the resume ack, logged as `activity resumed <class> at=<stamp>` before the settled change it may cause. False when no record has the token (nothing logged).
     pub(crate) fn resumed(&self, token: &SpIBinder) -> bool {
         let mut m = self.machine();

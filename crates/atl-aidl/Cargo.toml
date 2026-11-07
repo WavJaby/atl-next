@@ -69,6 +69,7 @@ types = [
     "android.content.IContentService",
     "android.media.IAudioService",
     "android.app.IActivityClientController",
+    "android.app.IRequestFinishCallback",
     "com.android.internal.view.IInputMethodManager",
     "com.android.internal.inputmethod.IInputMethod",
     "com.android.internal.inputmethod.IInputMethodSession",

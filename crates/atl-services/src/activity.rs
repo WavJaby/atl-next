@@ -19,6 +19,7 @@ use atl_aidl::aidl::android::app::IActivityClientController::{
 use atl_aidl::aidl::android::app::IActivityManager::{EnforcePermission, IActivityManager};
 use atl_aidl::aidl::android::app::IApplicationThread::IApplicationThread;
 use atl_aidl::aidl::android::app::IInstrumentationWatcher::IInstrumentationWatcher;
+use atl_aidl::aidl::android::app::IRequestFinishCallback::IRequestFinishCallback;
 use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnection;
 use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
 use atl_broker::control::StartRequest;
@@ -518,13 +519,28 @@ fn illegal_argument(msg: &str) -> Status {
     Status::new_exception_str(ExceptionCode::ILLEGAL_ARGUMENT, Some(msg))
 }
 
+/// onBackPressed's effect: a known record's callback gets requestFinish. Unknown token or no callback: nothing sent, counted (AOSP returns the same way).
+/// A failed send is logged, not returned: the call is oneway, so no caller hears of it. Returns whether requestFinish was sent.
+fn back_pressed(known: bool, callback: Option<&dyn IRequestFinishCallback>) -> bool {
+    let (true, Some(callback)) = (known, callback) else {
+        counters::answered(ACC, "onBackPressed: no such activity");
+        return false;
+    };
+    if let Err(e) = callback.requestFinish() {
+        log(format_args!("onBackPressed: requestFinish: {e:?}"));
+    }
+    true
+}
+
 impl ActivityManager {
     /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there.
+    /// `root_back` false is the test-only break (`--no-root-back`): see [`ActivityClientController::root_back`].
     pub fn new(
         packages: Arc<Packages>,
         permissions: Arc<Permissions>,
         control: Arc<dyn ProcessControl>,
         tasks: Arc<Tasks<SpIBinder>>,
+        root_back: bool,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -533,6 +549,7 @@ impl ActivityManager {
                     ActivityClientController {
                         buckets: Arc::clone(&buckets),
                         inner: inner.clone(),
+                        root_back,
                     },
                     BinderFeatures::default(),
                 )
@@ -2026,6 +2043,8 @@ impl ReportedBuckets {
 struct ActivityClientController {
     buckets: Arc<ReportedBuckets>,
     inner: Weak<Inner>,
+    /// false: onBackPressed sends nothing (`--no-root-back`, the dialog gate's deliberate break); the Back then never finishes an activity.
+    root_back: bool,
 }
 
 impl Interface for ActivityClientController {}
@@ -2109,6 +2128,25 @@ impl IActivityClientController for ActivityClientController {
         Ok(inner.atm.finish(token))
     }
 
+    /// ActivityClientController.onBackPressed (oneway, AIDL): a record with the token gets requestFinish, and the app finishes it. The root closes with the window; never moveTaskToBack
+    /// (owner, 2026-11-07: the branch at ActivityClientController.java:1736-1739 is not modelled) and no task organizer (:1728-1735).
+    fn r#onBackPressed(
+        &self,
+        token: Option<&SpIBinder>,
+        callback: Option<&Strong<dyn IRequestFinishCallback>>,
+    ) -> binder::Result<()> {
+        if !self.root_back {
+            counters::refused(ACC, "onBackPressed (--no-root-back)");
+            return Ok(());
+        }
+        let known = match (token, self.inner.upgrade()) {
+            (Some(token), Some(inner)) => inner.atm.has_record(token),
+            _ => false,
+        };
+        back_pressed(known, callback.map(|c| &**c));
+        Ok(())
+    }
+
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
     fn r#getDisplayId(&self, _token: Option<&SpIBinder>) -> binder::Result<i32> {
         Ok(DEFAULT_DISPLAY)
@@ -2149,5 +2187,76 @@ impl IActivityClientController for ActivityClientController {
     ) -> binder::Result<()> {
         counters::answered(ACC, "setTaskDescription (not kept: no recents)");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use binder::StatusCode;
+
+    use super::*;
+
+    /// Counts requestFinish calls; `fail` answers each with DEAD_OBJECT (the app died before the oneway call landed).
+    struct Callback {
+        calls: AtomicU32,
+        fail: bool,
+    }
+
+    impl Callback {
+        fn new(fail: bool) -> Self {
+            Callback {
+                calls: AtomicU32::new(0),
+                fail,
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Interface for Callback {}
+
+    impl IRequestFinishCallback for Callback {
+        fn r#unimplemented(&self, _method: &'static str) -> Status {
+            StatusCode::UNKNOWN_TRANSACTION.into()
+        }
+
+        fn r#requestFinish(&self) -> binder::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(StatusCode::DEAD_OBJECT.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_token_sends_nothing() {
+        let cb = Callback::new(false);
+        assert!(!back_pressed(false, Some(&cb)));
+        assert_eq!(cb.calls(), 0);
+    }
+
+    #[test]
+    fn known_token_sends_one_request_finish() {
+        let cb = Callback::new(false);
+        assert!(back_pressed(true, Some(&cb)));
+        assert_eq!(cb.calls(), 1);
+    }
+
+    #[test]
+    fn failed_send_is_logged_not_a_panic() {
+        let cb = Callback::new(true);
+        assert!(back_pressed(true, Some(&cb)));
+        assert_eq!(cb.calls(), 1);
+    }
+
+    #[test]
+    fn no_callback_sends_nothing() {
+        assert!(!back_pressed(true, None));
     }
 }

@@ -16,5 +16,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".Sub" android:exported="false" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
     </application>
 </manifest>

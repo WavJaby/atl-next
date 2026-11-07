@@ -83,7 +83,7 @@ const KEY_LEFTSHIFT: u32 = 42;
 /// How long A is held: past labwc's default repeat delay (600 ms, wlroots keyboard default) plus a few repeats at its 25 Hz.
 const KEY_HOLD: Duration = Duration::from_millis(1000);
 /// linux/input-event-codes.h BTN_SIDE and BTN_EXTRA: a mouse's back and forward side buttons (GDK 8 and 9, X11 numbering).
-const BTN_SIDE: u32 = 0x113;
+pub(super) const BTN_SIDE: u32 = 0x113;
 const BTN_EXTRA: u32 = 0x114;
 /// keycodes.h AKEYCODE_BACK and AKEYCODE_FORWARD: the KeyEvents the side buttons send.
 const KEYCODE_BACK: i64 = 4;
@@ -735,7 +735,7 @@ pub(super) fn inject(proxy: &Proxy, actions: Vec<PointerAction>) -> Result<(), S
 }
 
 /// Whether the app log satisfies `want` within `within` (polled: the app process writes the log).
-fn wait_until(app_log: &Path, within: Duration, want: impl Fn(&str) -> bool) -> bool {
+pub(super) fn wait_until(app_log: &Path, within: Duration, want: impl Fn(&str) -> bool) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if std::fs::read_to_string(app_log).is_ok_and(|text| want(&text)) {

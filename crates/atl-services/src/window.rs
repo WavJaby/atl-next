@@ -670,16 +670,21 @@ impl IWindowSession for Session {
             counters::refused(WINDOW_SESSION, "remove: no client token");
             return Err(StatusCode::BAD_VALUE.into());
         };
-        let (removed, layers): (Vec<SpIBinder>, Vec<i32>) = {
+        let (removed, layers, titles): (Vec<SpIBinder>, Vec<i32>, Vec<String>) = {
             let mut windows = self.lock();
             let mine = || windows.iter().filter(|w| w.client == *token);
             let inputs = mine().filter_map(|w| w.input.clone()).collect();
             let layers = mine()
                 .filter_map(|w| w.surface.as_ref()?.native.as_ref().map(|n| n.layer_id))
                 .collect();
+            let titles = mine().map(|w| w.title.clone()).collect();
             windows.retain(|w| w.client != *token);
-            (inputs, layers)
+            (inputs, layers, titles)
         };
+        // one line per window that left its Task: the back-close gate reads it (the window goes away when its activity finishes)
+        for title in titles {
+            activity::log(format_args!("window {title} removed"));
+        }
         // the dim goes with the window (Dimmer drops the dim layer of a window that no longer dims)
         if self.tasks.placement(token).is_some_and(|p| p.dim() > 0.0) {
             for layer_id in layers {

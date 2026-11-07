@@ -10,10 +10,12 @@
 //! Sub-gates ([`checks`]): shown (the dialog drew), readback (the last settled readback is that picture), pong, controls (no dim / surface origin without the insets / popup below the anchor each give
 //! another picture, so each would fail the readback), touch (real wl_pointer drags on the off-origin dialog, before and after a resize with it open, reach it in its own coordinates: InputDispatcher's
 //! per-window transform, raw coordinates staying the Task's; `--break-input-frames` must fail it). The readback is the picture at the resized size.
+//! back-close (Main starts Sub after the first draw; Sub's Back pops to Main, which stays; after the resize, Main's Back finishes Main and the services remove its window; `--break-root-back` must fail it).
 
 use std::path::Path;
+use std::time::Duration;
 
-use super::widgets::{inject, press};
+use super::widgets::{BTN_SIDE, inject, press, wait_until};
 use super::{
     ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event, capture_line, content_origin,
     wait_for_line,
@@ -40,6 +42,12 @@ const POPUP_SIZE: (u32, u32) = (160, 80);
 const DIM_DIVISOR: u8 = 2;
 /// The fixture's line per touch on the dialog.
 const TOUCH: &str = "AtlWindow: dialog touch ";
+/// The back-close case's lines: Sub.java's onResume / onDestroy, Main.java's onDestroy (MARKER is Main's onResume).
+const SUB_RESUMED: &str = "AtlWindow: sub onResume reached";
+const SUB_DESTROYED: &str = "AtlWindow: sub onDestroy reached";
+const DESTROYED: &str = "AtlWindow: onDestroy reached";
+/// Each back-close wait polls this long for its line; a break leaves it unmet and the verdict names the line.
+const BACK_WAIT: Duration = Duration::from_secs(5);
 /// A drag starts at the dialog's centre and ends this far from it: inside the dialog, so a window-relative event stays on it.
 const DRAG: (u32, u32) = (30, 20);
 /// The configure with the dialog open: xdg_toplevel size and an injected serial far from the compositor's. Smaller than the gates' opening size, so the dialog moves and the window stays under the display.
@@ -176,11 +184,12 @@ fn picture(l: &Layout, rules: Rules) -> Vec<u8> {
     out
 }
 
-/// The last readback's size and digest against [`picture`].
+/// The last readback before Main's onDestroy, its size and digest against [`picture`]. The back-close case closes Main last, and the teardown captured after its onDestroy is not the dialog.
 fn readback_check(app: &str) -> Result<String, String> {
     let l = layout(app)?;
-    capture_line(app)?;
-    let line = app
+    let judged = app.find(DESTROYED).map_or(app, |i| &app[..i]);
+    capture_line(judged)?;
+    let line = judged
         .lines()
         .rfind(|line| line.contains(super::widgets::CAPTURE_LINE))
         .ok_or("no readback")?;
@@ -305,9 +314,11 @@ fn touch_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The sub-gates.
-pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
+/// The sub-gates. `services` is the services log: the back-close case reads the window removals there.
+pub fn checks(app: &str, services: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
     vec![
+        // first: the probe's first step, and a break of it leaves Sub on top for everything after
+        ("back-close", back_close_check(app, services)),
         (
             "shown",
             layout(app).map(|l| format!("window {}x{}, anchor {:?}", l.width, l.height, l.anchor)),
@@ -324,6 +335,36 @@ pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
         ("touch", touch_check(app)),
         ("controls", controls(app)),
     ]
+}
+
+/// The back-close verdict: Sub's Back popped Sub (Main resumed before Sub's onDestroy, as AOSP resumes the activity below first), then Main's Back finished Main.
+/// The services removed both windows: Sub's (its Back) and Main's (the root close). A services break (`--no-root-back`: no requestFinish) misses the first line that needs it.
+fn back_close_check(app: &str, services: &str) -> Result<String, String> {
+    let started = app
+        .find(SUB_RESUMED)
+        .ok_or("Main never started Sub (no sub onResume)")?;
+    let sub = app[started..]
+        .find(SUB_DESTROYED)
+        .map(|i| started + i)
+        .ok_or("Sub's Back never finished Sub (no sub onDestroy)")?;
+    if !app[started..sub].contains(MARKER) {
+        return Err("Main did not resume when Sub's Back popped it".to_owned());
+    }
+    app[sub..]
+        .find(DESTROYED)
+        .ok_or("Main's Back never finished Main (no onDestroy)")?;
+    let removed = |title: &str| {
+        services
+            .lines()
+            .any(|l| l.contains("window ") && l.ends_with(&format!("{title} removed")))
+    };
+    if !removed(".Sub") {
+        return Err("the services removed no Sub window".to_owned());
+    }
+    if !removed(".Main") {
+        return Err("the services removed no Main window".to_owned());
+    }
+    Ok("Sub's Back popped Sub, Main resumed, Main's Back finished Main; the services removed both windows".to_owned())
 }
 
 /// A drag on the dialog of the log's last layout: pointer in at its centre, press, move DRAG in two steps, release.
@@ -352,7 +393,50 @@ fn drag(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     )
 }
 
+/// The anchor's centre in surface pixels, from the last layout line.
+fn anchor_centre(app_log: &Path) -> Result<(f64, f64), String> {
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let (ox, oy) = content_origin(&text)?;
+    let a = layout(&text)?.anchor;
+    Ok((
+        f64::from(ox) + f64::from((a.left + a.right) / 2),
+        f64::from(oy) + f64::from((a.top + a.bottom) / 2),
+    ))
+}
+
+/// BTN_SIDE down and up over (x, y): KEYCODE_BACK from the mouse (widgets' buttons check).
+fn back(proxy: &Proxy, x: f64, y: f64) -> Result<(), String> {
+    let button = |pressed| PointerAction::Button {
+        button: BTN_SIDE,
+        pressed,
+    };
+    inject(
+        proxy,
+        vec![PointerAction::Enter { x, y }, button(true), button(false)],
+    )
+}
+
+/// The back-close case, first half: Main started Sub after the dialog's first draw; Sub's Back pops to Main, which resumes and stays.
+/// The dialog is touch-modal, so no touch reaches the anchor (a click there lands in the dialog); the Back is a mouse button, which goes to the focused window.
+/// Waits only; [`back_close_check`] judges the lines, so a break fails there, not here.
+fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+    wait_until(app_log, BACK_WAIT, |t| t.contains(SUB_RESUMED));
+    let (x, y) = anchor_centre(app_log)?;
+    back(proxy, x, y)?;
+    wait_until(app_log, BACK_WAIT, |t| t.contains(SUB_DESTROYED));
+    Ok(())
+}
+
+/// The back-close case, second half: Main's own Back. Its onDestroy and the window's removal are judged by [`back_close_check`].
+fn root_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+    let (x, y) = anchor_centre(app_log)?;
+    back(proxy, x, y)?;
+    wait_until(app_log, BACK_WAIT, |t| t.contains(DESTROYED));
+    Ok(())
+}
+
 /// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
+/// The back-close case's Sub Back comes first, before any other input (Sub covers the dialog until it pops); Main's Back comes last, since the window goes away with it.
 pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
@@ -361,6 +445,8 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     wait_for_line(app_log, SHOWN, ACK_WAIT)
         .then_some(())
         .ok_or("the dialog never drew")?;
+    sub_back(&proxy, app_log)?;
+    std::thread::sleep(RESIZE_SETTLE);
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
     let answered = await_event(&proxy.events, PONG_WAIT, |e| {
         *e == ProxyEvent::Pong { serial: 1 }
@@ -378,6 +464,8 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     .ok_or("the resize was never acked")?;
     std::thread::sleep(RESIZE_SETTLE);
     drag(&proxy, app_log)?;
+    std::thread::sleep(RESIZE_SETTLE);
+    root_back(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     Ok(Liveness {
         answered,
@@ -412,5 +500,57 @@ mod tests {
         assert_eq!(at(&p, 200, 251), [0x10, 0x20, 0x30, 0xff]);
         assert_eq!(at(&p, 40, 252), [0x30, 0x30, 0x10, 0xff]);
         assert!(controls(LINE).is_ok());
+    }
+
+    /// The fixture's lines in the back-close case: Main resumes when Sub's Back pops it, before Sub's onDestroy (AOSP resumes the activity below first); Main's onDestroy comes last.
+    const BACK_CLOSE: &str = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: onResume reached\n1.3 I AtlWindow: sub onDestroy reached\n1.4 I AtlWindow: onDestroy reached\n";
+    /// The services' window lines: Sub's window (its Back), then Main's (the root close).
+    const REMOVED_LINE: &str = "services: window com.example.atldialog/com.example.atldialog.Sub removed\nservices: window com.example.atldialog/com.example.atldialog.Main removed\n";
+
+    #[test]
+    fn back_close_wants_sub_popped_then_main_finished() {
+        assert!(back_close_check(BACK_CLOSE, REMOVED_LINE).is_ok());
+    }
+
+    #[test]
+    fn back_close_needs_main_finished_by_its_own_back() {
+        // --no-root-back: no requestFinish on either Back, so Sub never destroys and Main never does
+        let no_back = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n";
+        assert!(
+            back_close_check(no_back, REMOVED_LINE)
+                .unwrap_err()
+                .contains("no sub onDestroy")
+        );
+        // Sub popped but Main's Back never finished it
+        let no_root = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: onResume reached\n1.3 I AtlWindow: sub onDestroy reached\n";
+        assert!(
+            back_close_check(no_root, REMOVED_LINE)
+                .unwrap_err()
+                .contains("no onDestroy")
+        );
+        let sub_only = "services: window com.example.atldialog/com.example.atldialog.Sub removed\n";
+        assert!(
+            back_close_check(BACK_CLOSE, sub_only)
+                .unwrap_err()
+                .contains("no Main window")
+        );
+        let main_only =
+            "services: window com.example.atldialog/com.example.atldialog.Main removed\n";
+        assert!(
+            back_close_check(BACK_CLOSE, main_only)
+                .unwrap_err()
+                .contains("no Sub window")
+        );
+    }
+
+    #[test]
+    fn back_close_needs_main_to_resume_when_sub_pops() {
+        // Sub's Back took Main down with it: no Main resume between Sub's onResume and onDestroy
+        let no_resume = "1.0 I AtlWindow: onResume reached\n1.1 I AtlWindow: sub onResume reached\n1.2 I AtlWindow: sub onDestroy reached\n1.3 I AtlWindow: onDestroy reached\n";
+        assert!(
+            back_close_check(no_resume, REMOVED_LINE)
+                .unwrap_err()
+                .contains("did not resume")
+        );
     }
 }

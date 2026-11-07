@@ -210,6 +210,8 @@ pub struct Runtime {
     ime_death_link: bool,
     /// A start may reuse a singleTop / singleTask instance unless this is cleared (`--no-new-intent`, the start-finish stage's deliberate break).
     new_intent: bool,
+    /// Back finishes an activity unless this is cleared (`--no-root-back`, the dialog gate's back-close sub-gate's deliberate break).
+    root_back: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
     /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
@@ -530,6 +532,7 @@ impl Runtime {
             app_seccomp: true,
             ime_death_link: true,
             new_intent: true,
+            root_back: true,
             sensor_service: true,
             fake_devices: None,
         })
@@ -694,6 +697,12 @@ impl Runtime {
     /// The services refuse a start that would reuse an instance (atld `--no-new-intent`): the start-finish stage's new-intent sub-gate must then fail.
     pub fn without_new_intent(mut self) -> Self {
         self.new_intent = false;
+        self
+    }
+
+    /// Back finishes nothing (atld `--no-root-back`): the dialog gate's back-close sub-gate must then fail.
+    pub fn without_root_back(mut self) -> Self {
+        self.root_back = false;
         self
     }
 
@@ -1008,6 +1017,9 @@ impl Runtime {
         }
         if !self.new_intent {
             cmd.arg("--no-new-intent");
+        }
+        if !self.root_back {
+            cmd.arg("--no-root-back");
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);

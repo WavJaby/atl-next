@@ -102,6 +102,9 @@ pub struct Args {
     /// Stage widgets only: the back press is BTN_LEFT, so no back key comes and the mouse-buttons sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_back: bool,
+    /// Stage dialog only: the services send no requestFinish on Back (atld `--no-root-back`), so the back-close sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_root_back: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -164,9 +167,8 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Dialog | Stage::Gles2 => {
-                GTK_WINDOW_MS
-            }
+            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Gles2 => GTK_WINDOW_MS,
+            Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -206,6 +208,8 @@ pub(crate) const WINDOW_MS: u64 = 2_000;
 const FRAMES_WINDOW_MS: u64 = 5_000;
 /// The gtk stage's watch after the marker: the first draw, the pointer script, the probe's block and the pong after it.
 const GTK_WINDOW_MS: u64 = 10_000;
+/// The dialog stage's watch after the marker: the probe's drags, the resize, and the back-close case (two Backs, each with its settle and waits), so longer than the gtk watch.
+const DIALOG_WINDOW_MS: u64 = 30_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
 /// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
@@ -1701,6 +1705,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.break_root_back {
+        rt.without_root_back()
+    } else {
+        rt
+    };
     let outputs = nested.as_ref().map(NestedCompositor::control);
     // the move stage's second output, as Android's display
     let moved = nested
@@ -1865,7 +1874,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
-        (Stage::Dialog, Some(_)) => dialog::checks(&app, &liveness),
+        (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness),
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);

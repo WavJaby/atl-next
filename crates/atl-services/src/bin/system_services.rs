@@ -50,6 +50,9 @@ struct Args {
     /// Test only: a start that would reuse a singleTop / singleTask instance (onNewIntent) is refused, the deliberate break of the start-finish stage's new-intent sub-gate.
     #[arg(long)]
     no_new_intent: bool,
+    /// Test only: onBackPressed sends no requestFinish, the deliberate break of the dialog gate's back-close sub-gate (no activity finishes on Back).
+    #[arg(long)]
+    no_root_back: bool,
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
@@ -109,6 +112,7 @@ fn main() -> Result<()> {
         Arc::clone(&permissions),
         control,
         Arc::clone(&tasks),
+        !a.no_root_back,
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()

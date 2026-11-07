@@ -2,6 +2,7 @@
 package com.example.atldialog;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.os.Bundle;
@@ -19,6 +20,7 @@ import android.widget.PopupWindow;
  * centred (gravity 0), FLAG_DIM_BEHIND at DIM, with manual surfaceInsets INSET on each side (a shadow's room; set by reflection, the field is hidden API).
  * Sizes are pixels; colours stay at or under 0x80 per channel, so the dimmed value is exact whether the compositor's alpha is 0.5 or 128/255.
  * After the dialog's first draw, and at each window layout after it, the fixture logs the window size and the anchor's rectangle; the dialog logs each touch in its own and in raw coordinates.
+ * After the dialog's first draw Main starts Sub (Sub.java): the back-close sub-gate's first Back pops it, then Main's own Back finishes Main and logs its onDestroy.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -71,6 +73,12 @@ public class Main extends Activity {
         Log.i(TAG, "onResume reached");
     }
 
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        Log.i(TAG, "onDestroy reached");
+    }
+
     private void showPopup() {
         View content = new View(this);
         content.setBackgroundColor(POPUP);
@@ -91,8 +99,9 @@ public class Main extends Activity {
     private void showDialog() {
         final View content = new View(this);
         content.setBackgroundColor(DIALOG);
+        // NOT_FOCUSABLE: keys stay with the activity, so its Back (the back-close case) reaches Main, not this window
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(DIALOG_W, DIALOG_H, WindowManager.LayoutParams.TYPE_APPLICATION,
-                WindowManager.LayoutParams.FLAG_DIM_BEHIND, PixelFormat.TRANSLUCENT);
+                WindowManager.LayoutParams.FLAG_DIM_BEHIND | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
         lp.gravity = 0;
         lp.dimAmount = DIM;
         try {
@@ -112,6 +121,13 @@ public class Main extends Activity {
                 }
                 logged = true;
                 logShown();
+                // Sub goes up at once: the modal dialog takes every touch outside it, so the anchor cannot start it
+                root.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        startActivity(new Intent(Main.this, Sub.class));
+                    }
+                });
                 root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
                     @Override
                     public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
