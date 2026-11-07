@@ -6,18 +6,18 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::gate_goals::Goals;
 use crate::licence_gate;
 use crate::verdict::{Failure, Verdict};
-use crate::{arches, build_state, runtimes, upstream};
+use crate::{arches, build_state, provided_gate, runtimes, upstream};
 
 /// The native goal and `--for` gate name of this build (gate_goals.rs). Not an Android.bp module: `native` keeps it out of the converter's goals.
 pub const GOAL: &str = "llvm";
 
 /// What `llvm-config --version` prints at the pin: MAJOR.MINOR.PATCH 20.0.0 plus the release branch's suffix `git` (observed 2026-11-07; the branch is a snapshot, not the 20.0.0 tag).
-const VERSION: &str = "20.0.0git";
+pub const VERSION: &str = "20.0.0git";
 
 /// Built after `all`, which leaves tools out under `LLVM_BUILD_TOOLS=OFF`: `llvm-config` (Mesa's meson, S2) and `lli` (the JIT gate).
 const TOOLS: &[&str] = &["llvm-config", "lli"];
@@ -54,6 +54,10 @@ const OPTIONS: &[(&str, &str)] = &[
     ("LLVM_ENABLE_LIBEDIT", "OFF"),
     ("LLVM_ENABLE_CURL", "OFF"),
     ("LLVM_ENABLE_HTTPLIB", "OFF"),
+    // config-ix.cmake probes `__unw_add_dynamic_fde` with the default link (libgcc_s: absent), so the JIT registers each section libgcc's way (one pointer to the whole .eh_frame, a CIE first).
+    // The process's unwinder is libunwind.so.1 (libc++abi NEEDs it), which `__register_frame` binds to and which takes one FDE: "bad fde: FDE is really a CIE" per registered section.
+    // Forced on: per-FDE registration, which libunwind takes and libgcc takes too (measured: lli, S2).
+    ("HAVE_UNW_ADD_DYNAMIC_FDE", "1"),
 ];
 
 /// This build as a native goal: `native --for llvm` builds it and records it; the gate `llvm` reads the record.
@@ -64,6 +68,11 @@ pub fn goals() -> Goals {
 /// `<out>/upstream/llvm/<host>/`: holds `build/`, the CMake build dir.
 pub fn dir(out: &Path, host: &str) -> PathBuf {
     out.join("upstream").join("llvm").join(host)
+}
+
+/// The host's `llvm-config` in the build dir: the one Mesa's meson is configured with (mesa.rs `native_file`).
+pub fn config(out: &Path, host: &str) -> PathBuf {
+    tool(&dir(out, host).join("build"), "llvm-config")
 }
 
 /// The `llvm_target` of the `[<host>.host]` row: the LLVM target this host builds and JITs for.
@@ -140,7 +149,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let target = llvm_target(root, &args.host)?;
     let config = tool(&build, "llvm-config");
     let mut failed = Vec::new();
-    let version = stdout_of(Command::new(&config).arg("--version"))?;
+    let version = version_of(&config)?;
     println!("llvm: llvm-config --version {version}");
     if version != VERSION {
         failed.push(Failure::step(
@@ -184,8 +193,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ));
     }
     for name in ["llvm-config", "lli"] {
-        let dynamic = stdout_of(Command::new("readelf").arg("-d").arg(tool(&build, name)))?;
-        if needs_libstdcxx(&dynamic) {
+        let needed = provided_gate::needed(&tool(&build, name))?;
+        if needed.iter().any(|n| n.starts_with("libstdc++")) {
             failed.push(Failure::step(
                 "libstdc++",
                 format!("{name} NEEDs libstdc++"),
@@ -216,11 +225,29 @@ fn ir(code: i32) -> String {
     format!("define i32 @main() {{\n  ret i32 {code}\n}}\n")
 }
 
-/// Whether a `readelf -d` dump names libstdc++ as NEEDED.
-fn needs_libstdcxx(dynamic: &str) -> bool {
-    dynamic
-        .lines()
-        .any(|l| l.contains("(NEEDED)") && l.contains("libstdc++"))
+/// `llvm-config --version` of `config`.
+pub fn version_of(config: &Path) -> Result<String> {
+    stdout_of(Command::new(config).arg("--version"))
+}
+
+/// Refuses a `llvm-config` that is not the pinned LLVM: Mesa is configured only against the host LLVM this module builds (mesa.rs `configure`).
+pub fn check_config(config: &Path) -> Result<()> {
+    let version = version_of(config)?;
+    ensure!(
+        version == VERSION,
+        "{} reports LLVM {version}, expected {VERSION}",
+        config.display()
+    );
+    Ok(())
+}
+
+/// Whether `config`'s LLVM has RTTI (`llvm-config --has-rtti`, YES/NO). Mesa's meson checks its `cpp_rtti` against it (mesa.rs `native_file`).
+pub fn has_rtti(config: &Path) -> Result<bool> {
+    match stdout_of(Command::new(config).arg("--has-rtti"))?.as_str() {
+        "YES" => Ok(true),
+        "NO" => Ok(false),
+        other => bail!("{} --has-rtti printed {other:?}", config.display()),
+    }
 }
 
 /// Trimmed stdout of a command that must succeed; otherwise its exit status and stderr.
@@ -242,13 +269,5 @@ mod tests {
     #[test]
     fn ir_returns_its_code() {
         assert_eq!(ir(42), "define i32 @main() {\n  ret i32 42\n}\n");
-    }
-
-    #[test]
-    fn libstdcxx_is_needed_only_by_name() {
-        let libstdcxx = "0x1 (NEEDED)  Shared library: [libstdc++.so.6]\n";
-        let libcxx = "0x1 (NEEDED)  Shared library: [libc++.so.1]\n";
-        assert!(needs_libstdcxx(libstdcxx));
-        assert!(!needs_libstdcxx(libcxx));
     }
 }

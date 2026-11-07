@@ -133,6 +133,27 @@ reason = "README: \"a verbatim copy from https://github.com/BLAKE3-team/BLAKE3, 
 licence = "MIT"
 reason = "Mesa's addition to its BLAKE3 copy (README Changes: \"Add mesa_blake3_visibility.h\"), no notice: Mesa docs/license.rst \"The core Mesa library is licensed according to the terms of the MIT license\""
 
+# Mesa llvmpipe (S2): five files with no notice at all (no copyright line, no grant); Android.bp names 11 kinds for the directory, so each file needs its row. Reason: Mesa docs/license.rst (MIT).
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_linear_priv.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no notice in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_linear_sampler_tmp.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no notice in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_public.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no notice in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_rast_debug.c"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no notice in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/llvmpipe/lp_state_setup.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no notice in the file"
+
 # Mesa files with no licence grant (none, a copyright line only, or "No copyright claimed"); no notice or SPDX tag in their directories names a licence other than MIT. Reason: Mesa docs/license.rst "The core Mesa library is licensed according to the terms of the MIT license".
 [upstream.aosp.paths."external/mesa3d/include/pci_ids/crocus_pci_ids.h"]
 licence = "MIT"

@@ -9,14 +9,14 @@
 //! 2. pixels: every pixel of the [`SIZE`] pbuffer equals [`CLEAR`]: GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) of c / 255 gives c back, so the bytes are the expectation.
 //! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in a Mesa object, not libEGL.
 //! 4. driver: a DRM node the probe holds after eglInitialize, each with a known kernel driver (`judge_driver`).
-//! 5. renderer: `GL_RENDERER` starts with [`RENDERER`]. Break: [`LLVMPIPE_RENDERER`] must not match it.
+//! 5. renderer: `GL_RENDERER` starts with [`RENDERER`]. Break: [`SOFTPIPE_RENDERER`] must not match it.
 //! 6. scene: the last frame of a timed scene ([`TIMED_SIZE`] pixels; [`FRAMES`] frames after one untimed warm-up, each clear + draw + glFinish) reads back [`TEXEL`] on every pixel.
 //! 7. frames: one wall-clock time per timed frame. The gate prints their median and p95 (nearest rank) with the 1/5/15-minute load average before and after (`uptime`'s figures).
 //!    A baseline only while the 1-minute load before the run is below [`QUIET_LOAD`]; the gate never fails on it.
 //!
 //! Then a deliberate break, every run: the probe skips glClear and the timed draws, and calls a no-op in place of the extension; the pixel, scene and extension checks must fail.
 //! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
-//! 1. GL_VERSION `OpenGL ES-CM 1.`, renderer softpipe; 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
+//! 1. GL_VERSION `OpenGL ES-CM 1.`, renderer llvmpipe; 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
 //!
 //! Break: the steps marked `break` are dropped (skip glPopMatrix and the GL_COLOR_ARRAY enable); checks 4 and 5 must then mismatch, with a readback present.
 
@@ -76,10 +76,10 @@ const TEXEL: [u8; 4] = [204, 153, 51, 255];
 const FRAMES: u32 = 60;
 /// Nearest-rank p95 of n samples is the maximum while n < 20 (rank ceil(0.95 n) = n); from 20 on it is not.
 const P95_MIN_FRAMES: u32 = 20;
-/// The renderer name the gate requires: Mesa's softpipe (`softpipe_get_name`, src/gallium/drivers/softpipe/sp_screen.c). A build whose llvmpipe tier runs reports `llvmpipe (LLVM ...)` and changes this.
-const RENDERER: &str = "softpipe";
-/// The llvmpipe tier's name prefix. A deliberate break every run: on the renderer above it must not match.
-const LLVMPIPE_RENDERER: &str = "llvmpipe (LLVM ";
+/// The renderer name the gate requires: Mesa's llvmpipe on the host LLVM (`llvmpipe (LLVM <version>, <bits> bits)`, lp_screen.c). The prefix's version is checked against llvm_host::VERSION (unit test).
+const RENDERER: &str = "llvmpipe (LLVM 20.";
+/// The software tier llvmpipe replaced (softpipe, sp_screen.c). A deliberate break every run: on the renderer above it must not match.
+const SOFTPIPE_RENDERER: &str = "softpipe";
 /// Median and p95 are a baseline only while the 1-minute load is below this: an unconfirmed first guess (a quarter of this host's 16 threads). Reported as `quiet`, never a failure.
 const QUIET_LOAD: f64 = 4.0;
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -149,6 +149,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         } else {
             found.join("; ")
         }
+    );
+    let links = mesa::driver_links(&build.join(mesa::DRIVER))?;
+    ok &= links.failures.is_empty();
+    println!(
+        "gl: {} driver links: NEEDED {}{}",
+        verdict(links.failures.is_empty()),
+        links.needed.join(" "),
+        links
+            .failures
+            .iter()
+            .map(|f| format!("; {f}"))
+            .collect::<String>()
     );
     let lib = build_lib(root, &work.join("cargo"), &[])?;
     // deliberate break: the probe library built with an undefined glClear
@@ -240,8 +252,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 r.as_ref().unwrap_or_else(|e| e)
             );
         }
-        // deliberate break: the llvmpipe tier's name must not match this renderer
-        let wrong = judge_renderer(&lines, LLVMPIPE_RENDERER);
+        // deliberate break: the software tier's name must not match this renderer
+        let wrong = judge_renderer(&lines, SOFTPIPE_RENDERER);
         let fired = wrong.is_err();
         ok &= fired;
         println!(
@@ -384,7 +396,7 @@ fn es1(
             ),
             (
                 "1 renderer",
-                renderer.to_ascii_lowercase().contains(RENDERER),
+                renderer.starts_with(RENDERER),
                 renderer.to_owned(),
             ),
             (
@@ -788,12 +800,20 @@ mod tests {
     #[test]
     fn renderer_prefix_selects_the_tier() {
         let soft = lines(&["renderer softpipe", "version OpenGL ES 3.2 Mesa"]);
-        let llvm = lines(&["renderer llvmpipe (LLVM 20.0.0, 256 bits)"]);
-        assert!(judge_renderer(&soft, RENDERER).is_ok());
-        assert!(judge_renderer(&soft, LLVMPIPE_RENDERER).is_err());
-        assert!(judge_renderer(&llvm, LLVMPIPE_RENDERER).is_ok());
-        assert!(judge_renderer(&llvm, RENDERER).is_err());
+        let llvm = lines(&["renderer llvmpipe (LLVM 20.0.0git, 256 bits)"]);
+        assert!(judge_renderer(&soft, SOFTPIPE_RENDERER).is_ok());
+        assert!(judge_renderer(&soft, RENDERER).is_err());
+        assert!(judge_renderer(&llvm, RENDERER).is_ok());
+        assert!(judge_renderer(&llvm, SOFTPIPE_RENDERER).is_err());
         assert!(judge_renderer(&lines(&["drm none"]), RENDERER).is_err());
+    }
+
+    #[test]
+    fn renderer_prefix_names_the_pinned_llvm() {
+        let major_minor = RENDERER
+            .strip_prefix("llvmpipe (LLVM ")
+            .expect("llvmpipe name");
+        assert!(crate::llvm_host::VERSION.starts_with(major_minor));
     }
 
     #[test]

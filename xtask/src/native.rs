@@ -52,6 +52,9 @@ pub struct Args {
     /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
     #[arg(long)]
     no_compiler_cache: bool,
+    /// Deliberate break of Mesa's configure (mesa.rs `Break`): `llvm-config-19` must fail the native's Mesa step, `no-llvmpipe` must turn the gl gate red.
+    #[arg(long = "break", value_enum)]
+    deliberate_break: Option<crate::mesa::Break>,
     /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the slot; outside it ninja reads the unpatched src/aosp.
     #[arg(long)]
     pub shell: bool,
@@ -468,7 +471,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         built_goals.remove(crate::llvm_host::GOAL);
     }
     // Mesa's own meson build against what ninja built (mesa.rs), still under the token: it compiles as much as a converter module
-    let mesa_step = crate::mesa::build_after_ninja(&out, &tree.join(crate::mesa::MESA_TREE))?;
+    let mesa_step = crate::mesa::build_after_ninja(
+        &out,
+        &tree.join(crate::mesa::MESA_TREE),
+        &args.host,
+        args.deliberate_break,
+    )?;
     drop(token);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
