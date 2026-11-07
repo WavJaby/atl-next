@@ -3,8 +3,9 @@
 //! Every decision comes back as [`Command`]s in decision order. The caller sends them under its lock: each is a oneway `scheduleTransaction`, so the app runs them in the order decided.
 //! Nothing waits on an ack. `resumed` / `paused` / `stopped` move one record to its next phase and advance its task again, so the order of acks between records does not change what is sent.
 //! Generic over the token `K` (the services use SpIBinder), the owner `O` (the app's thread and identity, cloned into each command) and the launch payload `L` (taken by the one Launch step).
+//! A Task is shown or hidden ([`Machine::set_visible`]): hidden, every record of it stays stopped; shown again, its top restarts. A Task starts shown.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tasks::TaskId;
 
@@ -77,12 +78,15 @@ type FoundMut<'a, R> = Option<(TaskId, &'a mut R)>;
 /// The stack of every Task: records bottom -> top, Tasks in id order. A Task with no records is dropped.
 pub struct Machine<K, O, L, I> {
     tasks: BTreeMap<TaskId, Vec<Record<K, O, L, I>>>,
+    /// Tasks whose window is hidden (minimized or occluded: one path, `suspended`). Kept while the Task has no records: the window outlives them.
+    hidden: BTreeSet<TaskId>,
 }
 
 impl<K, O, L, I> Default for Machine<K, O, L, I> {
     fn default() -> Self {
         Machine {
             tasks: BTreeMap::new(),
+            hidden: BTreeSet::new(),
         }
     }
 }
@@ -268,6 +272,21 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         })
     }
 
+    /// The window of `task` is shown or hidden. Hidden: its records pause and stop, the top included, and none is resumed until shown (each step waits for its ack).
+    /// Shown: the top restarts from Stopped or Paused, as any record does. The commands come back in decision order; a Task with no records only changes its flag.
+    pub fn set_visible(&mut self, task: TaskId, visible: bool) -> Vec<Command<K, O, L, I>> {
+        if visible {
+            self.hidden.remove(&task);
+        } else {
+            self.hidden.insert(task);
+        }
+        self.advance(task)
+    }
+
+    pub fn is_visible(&self, task: TaskId) -> bool {
+        !self.hidden.contains(&task)
+    }
+
     fn find(&self, token: &K) -> Found<'_, Record<K, O, L, I>> {
         self.tasks.iter().find_map(|(task, records)| {
             records
@@ -286,16 +305,17 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         })
     }
 
-    /// The rules, applied to one task in order. D = the top record that is not finishing: the one to resume.
+    /// The rules, applied to one task in order. D = the top record that is not finishing: the one to resume, unless the Task is hidden.
     fn advance(&mut self, task: TaskId) -> Vec<Command<K, O, L, I>> {
         let mut out = Vec::new();
+        let hidden = !self.is_visible(task);
         let Some(records) = self.tasks.get_mut(&task) else {
             return out;
         };
         let top = records.iter().rposition(|r| !r.finishing);
-        // (1) every record other than D that is Resumed or Resuming is paused first
+        // (1) every record other than D that is Resumed or Resuming is paused first; a hidden Task pauses D too
         for (i, r) in records.iter_mut().enumerate() {
-            if Some(i) != top && matches!(r.phase, Phase::Resumed | Phase::Resuming) {
+            if (Some(i) != top || hidden) && matches!(r.phase, Phase::Resumed | Phase::Resuming) {
                 r.phase = Phase::Pausing;
                 let steps = vec![Step::Pause {
                     finished: r.finishing,
@@ -304,8 +324,18 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
                 out.push(r.command(steps));
             }
         }
-        // (2) D comes back: launched, restarted from Stopped, or resumed from Paused. Pausing/Resuming/Stopping wait for their ack.
-        if let Some(i) = top {
+        // (2) a hidden Task's created D is launched stopped: Launch, then Stop, so it never resumes unseen (its stop ack comes back as any other).
+        if let Some(i) = top.filter(|&i| hidden && records[i].phase == Phase::Created) {
+            let r = &mut records[i];
+            let launch = r
+                .launch
+                .take()
+                .expect("a Created record holds its launch payload");
+            r.phase = Phase::Stopping;
+            out.push(r.command(vec![Step::Launch(launch), Step::Stop]));
+        }
+        // (2') D comes back when its Task is shown: launched, restarted from Stopped, or resumed from Paused. Pausing/Resuming/Stopping wait for their ack.
+        if let Some(i) = top.filter(|_| !hidden) {
             let r = &mut records[i];
             let steps = match r.phase {
                 Phase::Created => Some(vec![
@@ -337,14 +367,15 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
                 out.push(r.command(steps));
             }
         }
-        // (3) paused records other than D are stopped once D is Resumed, or once no D is left
-        let ready = match top {
-            None => true,
-            Some(i) => records[i].phase == Phase::Resumed,
-        };
+        // (3) paused records other than D are stopped once D is Resumed, or once no D is left; a hidden Task stops every paused record, D included
+        let ready = hidden
+            || match top {
+                None => true,
+                Some(i) => records[i].phase == Phase::Resumed,
+            };
         if ready {
             for (i, r) in records.iter_mut().enumerate() {
-                if Some(i) != top && r.phase == Phase::Paused {
+                if (Some(i) != top || hidden) && r.phase == Phase::Paused {
                     r.phase = Phase::Stopping;
                     out.push(r.command(vec![Step::Stop]));
                 }
@@ -706,5 +737,138 @@ mod tests {
         assert!(m.finish(&UNKNOWN).is_none());
         assert_eq!(m.phase(&UNKNOWN), None);
         assert_eq!(m.is_finishing(&SPLASH), Some(false));
+    }
+
+    /// A Task starts shown; hiding one leaves another Task's resumed top resumed.
+    #[test]
+    fn hiding_one_task_leaves_the_others_resumed() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push(task(2), OTHER, APP, "other");
+        m.resumed(&OTHER);
+        assert!(m.is_visible(task(1)));
+        let cmds = m.set_visible(task(1), false);
+        assert_eq!(sent(&cmds), vec![(MAIN, vec![pause(false, true)])]);
+        assert_eq!(m.phase(&OTHER), Some(Phase::Resumed));
+        assert!(m.is_visible(task(2)));
+    }
+
+    /// Hiding a resumed top: it pauses first, as a cover (`user_leaving`, not finished), and stops only after the pause ack; the stop ack ends it Stopped with nothing sent.
+    #[test]
+    fn hiding_pauses_the_resumed_top_then_stops_it() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        let cmds = m.set_visible(t, false);
+        assert_eq!(sent(&cmds), vec![(MAIN, vec![pause(false, true)])]);
+        assert_eq!(m.phase(&MAIN), Some(Phase::Pausing));
+        assert_eq!(sent(&m.paused(&MAIN)), vec![(MAIN, vec![Step::Stop])]);
+        assert!(m.stopped(&MAIN).is_empty());
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopped));
+        assert!(!m.is_visible(t));
+    }
+
+    /// The resume of a launch is still unacknowledged when the Task is hidden: the pause goes after it, its ack keeps the pause (as `resume_ack_while_pausing_keeps_the_pause`), then the stop.
+    #[test]
+    fn hiding_a_resuming_top_pauses_it_after_its_resume_ack() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        assert_eq!(m.phase(&MAIN), Some(Phase::Resuming));
+        let cmds = m.set_visible(t, false);
+        assert_eq!(sent(&cmds), vec![(MAIN, vec![pause(false, true)])]);
+        assert!(m.resumed(&MAIN).is_empty());
+        assert_eq!(m.phase(&MAIN), Some(Phase::Pausing));
+        assert_eq!(sent(&m.paused(&MAIN)), vec![(MAIN, vec![Step::Stop])]);
+    }
+
+    /// Hiding a Task with two records: the resumed top pauses, and the paused record below it is stopped by the pause ack's advance. Both end Stopped.
+    #[test]
+    fn hiding_stops_every_record_of_the_task() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push(t, OTHER, APP, "other");
+        m.paused(&MAIN);
+        m.resumed(&OTHER);
+        m.stopped(&MAIN);
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopped));
+        assert_eq!(m.phase(&OTHER), Some(Phase::Resumed));
+        let cmds = m.set_visible(t, false);
+        assert_eq!(sent(&cmds), vec![(OTHER, vec![pause(false, true)])]);
+        assert_eq!(sent(&m.paused(&OTHER)), vec![(OTHER, vec![Step::Stop])]);
+        assert!(m.stopped(&OTHER).is_empty());
+        assert_eq!(m.phase(&OTHER), Some(Phase::Stopped));
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopped));
+    }
+
+    /// A launch into a hidden Task: created and stopped in one transaction (Launch, Stop), never resumed; the stop ack ends it Stopped.
+    #[test]
+    fn a_launch_into_a_hidden_task_stays_stopped() {
+        let mut m = Machine::new();
+        let t = task(1);
+        assert!(m.set_visible(t, false).is_empty());
+        let cmds = m.push(t, MAIN, APP, "main");
+        assert_eq!(
+            sent(&cmds),
+            vec![(MAIN, vec![Step::Launch("main"), Step::Stop])]
+        );
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopping));
+        assert!(m.stopped(&MAIN).is_empty());
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopped));
+    }
+
+    /// Restore: a shown Task's stopped top gets Start then Resume, the rule of any stop; the resume ack makes it Resumed.
+    #[test]
+    fn showing_a_hidden_task_restarts_its_top_with_start_then_resume() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.set_visible(t, false);
+        m.push(t, MAIN, APP, "main");
+        m.stopped(&MAIN);
+        let cmds = m.set_visible(t, true);
+        assert_eq!(sent(&cmds), vec![(MAIN, vec![Step::Start, Step::Resume])]);
+        assert_eq!(m.phase(&MAIN), Some(Phase::Resuming));
+        assert!(m.is_visible(t));
+        m.resumed(&MAIN);
+        assert_eq!(m.phase(&MAIN), Some(Phase::Resumed));
+    }
+
+    /// Shown while the hide's stop is unacknowledged: nothing is sent; the stop ack then restarts the top.
+    #[test]
+    fn showing_while_stopping_waits_for_the_stop_ack() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.set_visible(t, false);
+        m.paused(&MAIN);
+        assert_eq!(m.phase(&MAIN), Some(Phase::Stopping));
+        assert!(m.set_visible(t, true).is_empty());
+        assert_eq!(
+            sent(&m.stopped(&MAIN)),
+            vec![(MAIN, vec![Step::Start, Step::Resume])]
+        );
+    }
+
+    /// An intent to a hidden Task's stopped top waits (pending) and goes between Start and Resume when the Task is shown, as ActivityRecord.newIntents.
+    #[test]
+    fn an_intent_to_a_hidden_stopped_top_waits_for_the_show() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.set_visible(t, false);
+        m.paused(&MAIN);
+        m.stopped(&MAIN);
+        let cmds = m.new_intent(&MAIN, "again", false).expect("known token");
+        assert!(cmds.is_empty());
+        assert_eq!(
+            sent(&m.set_visible(t, true)),
+            vec![(MAIN, vec![Step::Start, new_intent(false), Step::Resume])]
+        );
     }
 }

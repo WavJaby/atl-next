@@ -413,6 +413,21 @@ impl ActivityTasks {
         true
     }
 
+    /// The window of `task` is shown or hidden (Machine::set_visible). Logged as `activity task <id> visible=<bool>` before the commands it causes.
+    /// No caller yet: the composer's visibility report reaches it in window lifecycle S2.
+    #[expect(dead_code, reason = "S2 sends the composer's visibility report here")]
+    pub(crate) fn visibility(&self, task: TaskId, visible: bool) {
+        let mut m = self.machine();
+        log(format_args!(
+            "activity task {} visible={visible} at={}",
+            task.raw(),
+            counters::wall_stamp()
+        ));
+        let commands = m.set_visible(task, visible);
+        self.note_settle(&m);
+        self.send(commands);
+    }
+
     /// finishActivity: the record is finishing; false when the token names no record.
     pub(crate) fn finish(&self, token: &SpIBinder) -> bool {
         let mut m = self.machine();
