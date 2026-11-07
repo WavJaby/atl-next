@@ -482,7 +482,10 @@ impl ActivityTasks {
         if m.phase(token).is_none() {
             return false;
         }
-        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        let component = m
+            .owner(token)
+            .map(|o| o.component.clone())
+            .unwrap_or_default();
         log(format_args!(
             "activity paused {component} at={}",
             counters::wall_stamp()
@@ -499,7 +502,10 @@ impl ActivityTasks {
         if m.phase(token).is_none() {
             return false;
         }
-        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        let component = m
+            .owner(token)
+            .map(|o| o.component.clone())
+            .unwrap_or_default();
         log(format_args!(
             "activity stopped {component} at={}",
             counters::wall_stamp()
@@ -536,7 +542,10 @@ impl ActivityTasks {
             data,
             caller_token: None,
         };
-        let component = m.owner(token).map(|o| o.component.clone()).unwrap_or_default();
+        let component = m
+            .owner(token)
+            .map(|o| o.component.clone())
+            .unwrap_or_default();
         log(format_args!(
             "activity finish {component} code={code} at={}",
             counters::wall_stamp()
