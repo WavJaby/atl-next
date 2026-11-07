@@ -5,14 +5,18 @@
 //! Resolution per flag: explicit flag > the checkout's slot > the old default. The old default prints a note naming `cargo xtask slot assign`, so it is never taken silently.
 //! A record that cannot be read as a slot in the pool is an error, never a silent fallback.
 //! A slot held by a live other checkout is refused unless `--force`; a record whose checkout directory is gone is stale and may be reassigned.
+//! A process that resolves a slot holds its slot lock (`build_pool::hold_slot`) until it exits; `slot prune` skips a slot whose lock it cannot take.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
+use crate::build_pool::{self, SlotLock};
 use crate::git::git;
+use crate::slot_prune;
 
 /// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (9-15 GB measured 2026-11-07), so one per worktree is too much; 3 keeps the vhdx's host drive from filling between owner compactions (2026-11-08: 52.8 GB free, vhdx 146 GB vs 113 GB used; owner cut 5 -> 3).
 /// Concurrent builds are a separate limit (CPU/RAM), [`crate::build_pool::TOKENS`]: a slot holder mostly edits and tests, and queues only for ninja.
@@ -71,6 +75,23 @@ pub enum Slot {
         #[arg(long)]
         force: bool,
     },
+    /// Deletes the cargo units of each slot's target trees that were not rebuilt for `--older-than` days (dry run unless --execute).
+    ///
+    /// Name a slot, or `--all` for the whole pool. A slot a build holds is skipped with a line saying so. Stale units are those whose `invoked.timestamp` (last rebuild) is older than the cutoff; units without one are kept.
+    Prune {
+        /// Slot number, 1..=SLOTS.
+        #[arg(conflicts_with = "all")]
+        slot: Option<u32>,
+        /// Every slot of the pool.
+        #[arg(long)]
+        all: bool,
+        /// Stale after this many days since the last rebuild.
+        #[arg(long, value_name = "DAYS", default_value_t = slot_prune::PRUNE_AFTER_DAYS)]
+        older_than: u64,
+        /// Delete (default: print the plan only).
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 /// The out dir of slot `n` under workspace `ws`.
@@ -125,7 +146,26 @@ pub fn out_dir(
             target.dir.display()
         );
     }
+    hold_if_slot(&workspace, &target.dir)?;
     Ok(target.dir)
+}
+
+/// Slot locks this process holds, one per slot number; released at exit.
+static HELD: Mutex<Vec<(u32, SlotLock)>> = Mutex::new(Vec::new());
+
+/// Holds the lock of `dir` when it is a pool slot, so `slot prune` skips the slot while this process runs. Other dirs take no lock.
+fn hold_if_slot(ws: &Path, dir: &Path) -> Result<()> {
+    let Some(n) = slot_prune::pool_slot(ws, dir) else {
+        return Ok(());
+    };
+    let mut held = HELD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("slot lock table poisoned"))?;
+    if held.iter().all(|(m, _)| *m != n) {
+        let lock = build_pool::hold_slot(ws, n, || eprintln!("slot {n}: being pruned, waiting"))?;
+        held.push((n, lock));
+    }
+    Ok(())
 }
 
 /// The record file of the checkout at `checkout`, in its own git dir.
@@ -270,6 +310,12 @@ pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?);
     match cmd {
+        Slot::Prune {
+            slot,
+            all,
+            older_than,
+            execute,
+        } => return slot_prune::run(ws, &holders(&common)?, *slot, *all, *older_than, *execute),
         Slot::Show => match read_record(&record)? {
             Some(n) => {
                 let dir = slot_dir(ws, n);

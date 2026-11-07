@@ -116,6 +116,56 @@ pub fn this_holder(root: &Path) -> String {
     format!("{} pid {}", root.display(), std::process::id())
 }
 
+/// Per-slot lock `<workspace>/cache/build-pool/slot-<n>.lock`. Every process that resolves slot `n` (`slot::out_dir`) holds it shared until it exits; `slot prune` takes it exclusive without waiting, so a slot is pruned only while no build runs in it. Freed by the kernel on exit or SIGKILL, like the tokens.
+/// Covers only xtask processes: cargo runs that xtask does not wrap, and binaries built before this lock, are invisible to it.
+pub fn slot_lock_path(ws: &Path, slot: u32) -> PathBuf {
+    dir(ws).join(format!("slot-{slot}.lock"))
+}
+
+/// A held slot lock; dropping it (or the process dying) releases it.
+#[derive(Debug)]
+pub struct SlotLock {
+    _file: File,
+}
+
+fn open_slot_lock(ws: &Path, slot: u32) -> Result<(PathBuf, File)> {
+    let p = slot_lock_path(ws, slot);
+    std::fs::create_dir_all(dir(ws)).with_context(|| format!("creating {}", dir(ws).display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&p)
+        .with_context(|| format!("opening {}", p.display()))?;
+    Ok((p, file))
+}
+
+/// Shared hold on `slot`: any number of builds at once; refused only while prune holds it. When prune does, `on_wait` runs once and the call waits for prune to finish.
+pub fn hold_slot(ws: &Path, slot: u32, on_wait: impl FnOnce()) -> Result<SlotLock> {
+    let (p, file) = open_slot_lock(ws, slot)?;
+    match flock(&file, FlockOperation::NonBlockingLockShared) {
+        Ok(()) => {}
+        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => {
+            on_wait();
+            flock(&file, FlockOperation::LockShared)
+                .with_context(|| format!("flock {}", p.display()))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("flock {}", p.display())),
+    }
+    Ok(SlotLock { _file: file })
+}
+
+/// Exclusive hold on `slot`, without waiting: `None` when a build holds it or another prune runs.
+pub fn try_prune_slot(ws: &Path, slot: u32) -> Result<Option<SlotLock>> {
+    let (p, file) = open_slot_lock(ws, slot)?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(SlotLock { _file: file })),
+        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("flock {}", p.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +180,73 @@ mod tests {
         let d = std::env::temp_dir().join(format!("xtask-pool-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// Tries before a lock released a moment ago reads as free. The flock stays held by a child another test thread forked before the close and has not exec'd yet (git_dirs.rs hits the same race): FREE_TRIES x FREE_POLL covers that window.
+    const FREE_TRIES: u32 = 100;
+    const FREE_POLL: Duration = Duration::from_millis(10);
+
+    fn retry_until_free<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..FREE_TRIES {
+            if let Some(got) = attempt() {
+                return Some(got);
+            }
+            std::thread::sleep(FREE_POLL);
+        }
+        None
+    }
+
+    /// Every build's shared hold keeps prune out of its slot and no other: prune gets slot 1 only after the last hold is gone; slot 2 was never held.
+    #[test]
+    fn prune_waits_for_every_build_hold() {
+        let dir = scratch("slot-lock");
+        let first = hold_slot(&dir, 1, || panic!("uncontended hold waited")).unwrap();
+        let second = hold_slot(&dir, 1, || panic!("a second build waited")).unwrap();
+        assert!(
+            try_prune_slot(&dir, 1).unwrap().is_none(),
+            "builds hold slot 1, prune got it"
+        );
+        drop(first);
+        assert!(
+            try_prune_slot(&dir, 1).unwrap().is_none(),
+            "one build still holds slot 1"
+        );
+        drop(second);
+        assert!(
+            retry_until_free(|| try_prune_slot(&dir, 1).expect("lock file")).is_some(),
+            "no build left, prune must get slot 1"
+        );
+        assert!(
+            try_prune_slot(&dir, 2).unwrap().is_some(),
+            "slot 2 has no holder"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build that starts while prune holds its slot reports the wait once, then runs after prune.
+    #[test]
+    fn build_waits_for_a_running_prune() {
+        let dir = scratch("slot-prune-first");
+        let prune = try_prune_slot(&dir, 1).unwrap().expect("free slot");
+        let (wtx, wrx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let d = dir.clone();
+        let build = std::thread::spawn(move || {
+            let hold = hold_slot(&d, 1, || wtx.send(()).unwrap()).unwrap();
+            tx.send(()).unwrap();
+            drop(hold);
+        });
+        wrx.recv_timeout(STILL_WAITING)
+            .expect("build did not report the wait");
+        assert!(
+            rx.recv_timeout(STILL_WAITING).is_err(),
+            "build ran while prune held the slot"
+        );
+        drop(prune);
+        rx.recv_timeout(STILL_WAITING * 4)
+            .expect("build did not get the slot after prune");
+        build.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// flock is per open file, so two tokens taken in one process exclude each other as two processes would.

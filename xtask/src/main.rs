@@ -82,6 +82,7 @@ mod sensors;
 mod service_mirrors;
 mod services;
 mod slot;
+mod slot_prune;
 mod soong;
 mod sources;
 mod spdx;
