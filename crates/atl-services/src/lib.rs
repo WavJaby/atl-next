@@ -58,8 +58,6 @@ pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;
 #[cfg(feature = "converter")]
-pub mod permission_manager;
-#[cfg(feature = "converter")]
 pub mod process_info;
 #[cfg(feature = "converter")]
 pub mod registry_service;
