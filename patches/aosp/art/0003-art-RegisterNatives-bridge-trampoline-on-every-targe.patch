@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 7 Nov 2026 15:40:40 +0800
+Subject: [PATCH] art: RegisterNatives bridge trampoline on every target build
+
+GenerateNativeBridgeTrampoline only ran under ART_TARGET_ANDROID.
+An ART_TARGET_LINUX runtime with a native bridge then registers the
+raw guest pointer and enters guest code on the host thread pointer.
+
+Upstream-Status: Pending
+Patch-Reason: a compile-time guard inside libart; launcher, loader and
+ env cannot change it. The NativeBridge seam already has the callback
+ (getTrampolineForFunctionPointer), the guard only keeps ART from
+ calling it. Wrapping RegisterNatives in the bridge's guest JNIEnv
+ instead is a second route that cannot see @CriticalNative (ArtMethod
+ only) nor a host caller registering a guest pointer (b/393035780).
+---
+SPDX-License-Identifier: Apache-2.0
+ runtime/jni/jni_internal.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/jni/jni_internal.cc b/runtime/jni/jni_internal.cc
+index 1dde2de74169940a9d6e6867e8bd2cb816fe5518..74142e8825e2ebc3f0cc6299d81aea055eb08ed4 100644
+--- a/runtime/jni/jni_internal.cc
++++ b/runtime/jni/jni_internal.cc
+@@ -2946,7 +2946,7 @@ class JNI {
+ 
+   static const void* GenerateNativeBridgeTrampoline(const void* fn_ptr, ArtMethod* method)
+       REQUIRES_SHARED(Locks::mutator_lock_) {
+-#if defined(ART_TARGET_ANDROID)
++#if defined(ART_TARGET)
+     uint32_t shorty_length;
+     const char* shorty = method->GetShorty(&shorty_length);
+     android::JNICallType jni_call_type = method->IsCriticalNative() ?

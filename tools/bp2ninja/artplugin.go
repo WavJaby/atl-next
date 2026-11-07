@@ -492,7 +492,7 @@ func lists(kv ...any) *Obj {
 // artTargetLinux: the environment variable ART_TARGET_LINUX this build gives Soong, read by addImplicitFlags (art.go IsEnvTrue).
 // true: ART's target build for Linux without Android's platform (AOSP-maintained, globals.h kIsTargetLinux), which this runtime is: no Android kernel or init, so no reserved-address android_dlopen_ext for oat files (plain dlopen, ElfOatFile for reservations),
 // no logd (libbase StderrLogger as InitLogging's default, LogLineLowStack to stderr), no userfaultfd GC chosen from properties or the 5.16 kernel probe (concurrent copying unless -Xgc:CMC), no statsd/perfetto/apex-info consumers, no linker namespaces in dalvikvm, oat loading or libnativebridge.
-// false would be ART_TARGET_ANDROID, which needs all of those from the platform. The NativeBridge trampoline path (jni_internal.cc) is off either way under LINUX; plan Q7's patch enables it.
+// false would be ART_TARGET_ANDROID, which needs all of those from the platform. The NativeBridge trampoline of RegisterNatives (jni_internal.cc GenerateNativeBridgeTrampoline) is ART_TARGET_ANDROID-only upstream; patches/aosp/art widens it to ART_TARGET.
 const artTargetLinux = true
 
 // implicitFlags: addImplicitFlags for artTargetLinux.

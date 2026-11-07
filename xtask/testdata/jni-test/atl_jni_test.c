@@ -182,10 +182,13 @@ JNI_FN(jint, sigsegvRecover)(JNIEnv *env, jclass cls)
     return 1;
 }
 
+static pthread_key_t registered_key;
+
 // Bound by RegisterNatives, so no exported Java_ symbol for this one.
+// Crosses up: entered without ART's trampoline it runs on the host thread pointer, where a same-ISA guest's pure `return` still works and only a crossing finds no record.
 static jint registeredAnswer(JNIEnv *env, jclass cls)
 {
-    return 7;
+    return pthread_getspecific(registered_key) == NULL ? 7 : -1;
 }
 
 static const JNINativeMethod k_methods[] = {
@@ -199,6 +202,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
         return JNI_ERR;
     jclass cls = (*env)->FindClass(env, JNI_CLS);
     if (cls == NULL)
+        return JNI_ERR;
+    if (pthread_key_create(&registered_key, NULL) != 0)
         return JNI_ERR;
     if ((*env)->RegisterNatives(env, cls, k_methods, 1) != JNI_OK)
         return JNI_ERR;
