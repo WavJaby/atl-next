@@ -235,6 +235,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-cpu-pressure"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "atl-fonts"
 version = "0.0.0"
 dependencies = [
@@ -351,6 +358,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-bridgegen",
+ "atl-cpu-pressure",
  "libc",
  "object",
 ]
@@ -2459,6 +2467,7 @@ dependencies = [
  "atl-android-paths",
  "atl-binderd",
  "atl-broker",
+ "atl-cpu-pressure",
  "atl-fonts",
  "atl-gralloc",
  "atl-layout",

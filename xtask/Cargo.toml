@@ -12,6 +12,7 @@ anyhow.workspace = true
 atl-binderd = { path = "../crates/atl-binderd" }
 atl-android-paths = { path = "../crates/atl-android-paths" }
 atl-broker = { path = "../crates/atl-broker" }
+atl-cpu-pressure = { path = "../crates/atl-cpu-pressure" }
 atl-gralloc = { path = "../crates/atl-gralloc" }
 atl-fonts = { path = "../crates/atl-fonts" }
 atl-layout = { path = "../crates/atl-layout" }

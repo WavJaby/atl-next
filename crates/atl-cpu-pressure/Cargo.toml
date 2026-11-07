@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-cpu-pressure"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Host CPU starvation (PSI `some` share) over a window, and the judgement made over it: the one measure xtask's cadence window and the g4 gate share. Core crate: no unsafe.
+[dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true

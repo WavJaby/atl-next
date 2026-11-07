@@ -42,5 +42,9 @@ object.workspace = true
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }
 
+[dev-dependencies]
+# g4's starvation share over its run: the measure xtask's cadence window is judged with (atl-cpu-pressure)
+atl-cpu-pressure = { path = "../atl-cpu-pressure" }
+
 [lints]
 workspace = true

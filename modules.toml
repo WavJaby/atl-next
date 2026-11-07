@@ -172,7 +172,8 @@ uses = ["generators"]
 [native-bridge]
 crates = ["atl-native-bridge", "atl-guest-dlsym"]
 exports = ["atl-native-bridge"]
-uses = ["generators", "android-paths"]
+# cpu-pressure: g4's starvation share over its run (test-only dev-dependency)
+uses = ["generators", "android-paths", "cpu-pressure"]
 
 [generators]
 crates = ["atl-bridgegen"]
@@ -185,7 +186,12 @@ uses = ["layout"]
 crates = ["atl-layout"]
 exports = ["atl-layout"]
 
+# host CPU starvation over a window (PSI `some` stall share) and the one judgement made over it (`judge_window`): the cadence window and g4 share it; a host measurement, no product code
+[cpu-pressure]
+crates = ["atl-cpu-pressure"]
+exports = ["atl-cpu-pressure"]
+
 [xtask]
 crates = ["xtask"]
-# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts: the tables step checks fonts.toml, the font gate reads the pinned fonts' tables
-uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts"]
+# binder: `xtask test binder` registers processes with atl-binderd as the broker will; broker: its control protocol, served by the same test; services: the package manifest records xtask writes for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes and the roots its android-paths check step scans for; fonts: the tables step checks fonts.toml, the font gate reads the pinned fonts' tables; cpu-pressure: the cadence window's starvation share (judge_window)
+uses = ["layout", "binder", "broker", "services", "gralloc", "platform-host", "native-bridge", "android-paths", "fonts", "cpu-pressure"]

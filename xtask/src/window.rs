@@ -25,11 +25,11 @@ use crate::atld_run::{
     Counter, Event, MS_PER_S, Run, Runtime, events, parse_stamp, run_display, totals,
 };
 use crate::composer::{fnv1a64, word};
-use crate::cpu_pressure::{Sampler, Samples};
 use crate::gles2_fixture;
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
+use atl_cpu_pressure::{Sampler, Samples, judge_window};
 
 mod dialog;
 mod gles2;
@@ -271,9 +271,6 @@ const WINDOW_TITLE: &str = "AtlWindowFixture";
 const CADENCE_TOLERANCE: f64 = 0.10;
 /// No single interval may exceed this many periods: a missed vsync shows as two.
 const CADENCE_MAX_PERIODS: f64 = 1.5;
-/// Host CPU stall share (PSI `some`, cpu_pressure) over a cadence window above which a failed cadence is undecidable rather than FAIL. 10%: over every share a quiet host showed
-/// (16 CPUs, load 7-15: 0-7% in 8 passing frames runs), under the 87-97% of a host oversubscribed twice (32 busy loops), where the app's first frames miss vsyncs.
-pub(crate) const STARVED_STALL_SHARE: f64 = 0.10;
 /// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
 const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
 /// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the opening size (DisplayModel::opening_size, 960x600 on the gates' 1280x800 display) and shrink under it in both dimensions.
@@ -1335,7 +1332,7 @@ fn frame_time(line: &str) -> Option<u64> {
 /// Sub-gate (b): the first FRAME_CALLBACKS callbacks after the marker come once per display period. The mean interval is within CADENCE_TOLERANCE of the period, and no
 /// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's (the display clock's grid point each callback was scheduled for, not a wall-clock stamp of the app's own),
 /// so the mean does not depend on when the app ran its callbacks; a missed interval is a vsync the client did not ask for in time. A failed judgement while the host was starved
-/// ([`STARVED_STALL_SHARE`] over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
+/// (`atl_cpu_pressure::judge_window`, share over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
 pub(crate) fn cadence_check(
     after: &[&str],
     refresh_hz: f32,
@@ -1350,20 +1347,7 @@ pub(crate) fn cadence_check(
         (Some(&a), Some(&b)) => pressure.stall_share(a as i64, b as i64),
         _ => None,
     };
-    let stall = share.map_or_else(
-        || "cpu stall unknown".to_owned(),
-        |s| format!("cpu stall {:.0}%", s * 100.0),
-    );
-    match cadence_judge(&times, refresh_hz) {
-        Ok(msg) => Ok(format!("{msg}; {stall}")),
-        Err(e) => match share {
-            Some(s) if s > STARVED_STALL_SHARE => Err(format!(
-                "undecidable: {e}, but the host was starved ({stall} over the window, threshold {:.0}%); rerun on a quieter host",
-                STARVED_STALL_SHARE * 100.0
-            )),
-            _ => Err(format!("{e}; {stall}")),
-        },
-    }
+    judge_window(cadence_judge(&times, refresh_hz), share, "the window")
 }
 
 fn cadence_judge(times: &[u64], refresh_hz: f32) -> Result<String, String> {
@@ -2401,7 +2385,7 @@ mod tests {
     /// PASS on both (a pass under load is a pass). Pressure samples bracket the window at the threshold's half and double.
     #[test]
     fn cadence_undecidable_only_when_starved() {
-        use crate::cpu_pressure::Sample;
+        use atl_cpu_pressure::{STARVED_STALL_SHARE, Sample};
         const STEP: u64 = 16_666_667;
         const T0: u64 = 5_000_000_000;
         let pressure = |share: f64| {

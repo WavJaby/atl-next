@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! Host CPU starvation over a time window, from the kernel's pressure stall information (`/proc/pressure/cpu`, PSI).
+//! Host CPU starvation over a time window, from the kernel's pressure stall information (`/proc/pressure/cpu`, PSI). The one measure the timing judgements of this repo share: xtask's cadence window and g4 over its run.
 //!
-//! The `some` line's `total` is the cumulative time (us) in which at least one runnable task waited for a CPU. A sampler thread reads it with a CLOCK_MONOTONIC stamp every [`SAMPLE_PERIOD`];
-//! [`Samples::stall_share`] is the stall time over wall time between the samples bracketing a window. CLOCK_MONOTONIC is the clock Choreographer frame times are on, so a cadence window maps
-//! onto the samples directly. A timing gate whose judgement fails while the share is over its threshold reports `undecidable` (the host, not the code, may have missed the deadline); an
-//! undecidable verdict is still a failed gate, so `land` needs a rerun that decides.
+//! The `some` line's `total` is the cumulative time (us) in which at least one runnable task waited for a CPU. A sampler thread reads it with a CLOCK_MONOTONIC stamp every [`SAMPLE_PERIOD`]; [`Samples::stall_share`] is the stall time over wall time between the samples bracketing a window, [`Samples::span_share`] over the whole sampled span. CLOCK_MONOTONIC is the clock Choreographer frame times are on, so a cadence window maps onto the samples directly.
+//! [`judge_window`] is the rule for a judgement made over such a window: a failure while the share is over [`STARVED_STALL_SHARE`] reports `undecidable` (the host, not the code, may have missed the deadline), and an undecidable verdict is still a failed gate, so `land` needs a rerun that decides. A pass is not changed: starvation only adds time, so a pass under load is a pass.
+
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,8 @@ use rustix::time::{ClockId, clock_gettime};
 const PSI_CPU: &str = "/proc/pressure/cpu";
 /// How often the sampler reads [`PSI_CPU`]: a tenth of the shortest judged window (31 callbacks at 60 Hz = 500 ms) keeps the bracketing samples within 20% of the window's span.
 const SAMPLE_PERIOD: Duration = Duration::from_millis(50);
+/// Stall share over a judged window above which a failed judgement is `undecidable` rather than FAIL. 10%: over every share a quiet host showed (16 CPUs, load 7-15: 0-7% in 8 passing frames runs), under the 87-97% of a host oversubscribed twice (32 busy loops), where the app's first frames miss vsyncs.
+pub const STARVED_STALL_SHARE: f64 = 0.10;
 
 /// One sample: CLOCK_MONOTONIC ns, cumulative `some` stall us.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,6 +57,12 @@ impl Samples {
         }
         Some(b.stall_us.saturating_sub(a.stall_us) as f64 / wall_us)
     }
+
+    /// [`Self::stall_share`] over the whole sampled span, i.e. the sampler's lifetime (one run). `None` with fewer than two samples.
+    pub fn span_share(&self) -> Option<f64> {
+        let (first, last) = (self.0.first()?, self.0.last()?);
+        self.stall_share(first.at_ns, last.at_ns)
+    }
 }
 
 /// The running sampler; [`Sampler::stop`] ends it and returns what it read.
@@ -65,6 +73,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// Starts the sampler thread: it reads [`PSI_CPU`] now and every [`SAMPLE_PERIOD`] until stopped.
     pub fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(Vec::new()));
@@ -107,6 +116,26 @@ impl Sampler {
     }
 }
 
+/// The judgement over a window: `Ok` keeps its message and appends the share; `Err` becomes `undecidable` when the share is over [`STARVED_STALL_SHARE`], and stays a failure either way. `over` names the window in that text (`the window`, `the run`).
+pub fn judge_window(
+    judgement: Result<String, String>,
+    share: Option<f64>,
+    over: &str,
+) -> Result<String, String> {
+    let stall = share.map_or_else(
+        || "cpu stall unknown".to_owned(),
+        |s| format!("cpu stall {:.0}%", s * 100.0),
+    );
+    match judgement {
+        Ok(msg) => Ok(format!("{msg}; {stall}")),
+        Err(e) if share.is_some_and(|s| s > STARVED_STALL_SHARE) => Err(format!(
+            "undecidable: {e}, but the host was starved ({stall} over {over}, threshold {:.0}%); rerun on a quieter host",
+            STARVED_STALL_SHARE * 100.0
+        )),
+        Err(e) => Err(format!("{e}; {stall}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +148,7 @@ mod tests {
         assert_eq!(some_total("full total=3\n"), None);
     }
 
-    /// Samples at 0, 1 s, 2 s with 0, 0.1 s, 0.6 s stalled: a window inside the second second uses samples 1 and 2 -> 50%; one past the last sample is unknown.
+    /// Samples at 0, 1 s, 2 s with 0, 0.1 s, 0.6 s stalled: a window inside the second second uses samples 1 and 2 -> 50%; one past the last sample is unknown. Whole span: 0.6 s over 2 s.
     #[test]
     fn share_from_bracketing_samples() {
         let s = Samples(vec![
@@ -141,7 +170,16 @@ mod tests {
             .expect("bracketed");
         assert!((share - 0.5).abs() < 1e-9, "{share}");
         assert!((s.stall_share(0, 2_000_000_000).expect("whole") - 0.3).abs() < 1e-9);
+        assert!((s.span_share().expect("span") - 0.3).abs() < 1e-9);
         assert_eq!(s.stall_share(500, 3_000_000_000), None);
+        assert_eq!(
+            Samples(vec![Sample {
+                at_ns: 0,
+                stall_us: 0
+            }])
+            .span_share(),
+            None
+        );
     }
 
     /// The sampler reads the live file (the dev host has CONFIG_PSI): at least the final sample, stamps rising.
@@ -155,5 +193,26 @@ mod tests {
         let got = s.stop();
         assert!(got.0.len() >= 2, "{got:?}");
         assert!(got.0.windows(2).all(|w| w[0].at_ns < w[1].at_ns));
+    }
+
+    /// The verdict rule: a pass keeps its message; only a failure strictly over the threshold becomes undecidable (the threshold itself is not starved); no share is `unknown`, still a plain failure.
+    #[test]
+    fn judge_window_undecidable_only_over_threshold() {
+        assert_eq!(
+            judge_window(Ok("ok".into()), Some(0.5), "the run"),
+            Ok("ok; cpu stall 50%".into())
+        );
+        assert_eq!(
+            judge_window(Err("e".into()), Some(0.10), "the run"),
+            Err("e; cpu stall 10%".into())
+        );
+        assert_eq!(
+            judge_window(Err("e".into()), None, "the run"),
+            Err("e; cpu stall unknown".into())
+        );
+        assert_eq!(
+            judge_window(Err("e".into()), Some(0.20), "the run"),
+            Err("undecidable: e, but the host was starved (cpu stall 20% over the run, threshold 10%); rerun on a quieter host".into())
+        );
     }
 }

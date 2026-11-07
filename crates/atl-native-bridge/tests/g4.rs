@@ -6,6 +6,7 @@
 //!
 //! Reports median and min-max ns per call over the runs, and whether the CPU has FSGSBASE (without it the engine refuses to start).
 //! Gate: median per crossing (minus baseline) < BAND_NS for both directions, and the host target ran exactly RUNS x CALLS times.
+//! Starvation: the host's CPU stall share over the whole run (atl-cpu-pressure, the measure the cadence window is judged with); a band failure while it is over the threshold is `undecidable`, still a failure. A pass stands.
 //! Deliberate break: `ATL_NB_BREAK=g4_break` adds SYSCALLS_IN_BREAK `getppid` syscalls to the crossed path only -> guest->host must leave the band.
 //! Timing is wall clock on an uncontrolled host (WSL2 here): a band, not a measurement of record; run in release (`--release`) for numbers worth reporting.
 #![allow(
@@ -20,6 +21,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use atl_cpu_pressure::{Sampler, judge_window};
 use atl_native_bridge::engine::{HostThread, arch};
 
 /// Plan bridge1-plan step 3 g4: target < 50 ns per crossing.
@@ -95,7 +97,7 @@ fn band(mut v: Vec<f64>) -> (f64, f64, f64) {
     (m, v[0], v[RUNS - 1])
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<String, String> {
     if !arch::supported() {
         return Err("FSGSBASE: no (the engine cannot cross)".into());
     }
@@ -109,6 +111,7 @@ fn run() -> Result<(), String> {
     let target = host_target as *const () as usize;
     let lp = g4_guest_loop as *const () as usize;
     let empty = g4_guest_empty as *const () as usize;
+    let sampler = Sampler::start();
     let base = band(runs(|| {
         // SAFETY: the guest loop touches no TLS; host_target, called on the guest FS, only does an atomic add.
         unsafe { arch::call_guest(ht, lp, CALLS, target, 0, 0) };
@@ -124,6 +127,7 @@ fn run() -> Result<(), String> {
             unsafe { arch::call_guest(ht, empty, 0, 0, 0, 0) };
         }
     }));
+    let pressure = sampler.stop();
     if arch::fs_base() != host {
         // SAFETY: this thread's own thread pointer, read above.
         unsafe { arch::set_fs_base(host) };
@@ -141,15 +145,20 @@ fn run() -> Result<(), String> {
         "g4: FSGSBASE yes; {RUNS} runs x {CALLS}: baseline loop+call {:.2} ns ({:.2}-{:.2}); guest->host {:.2} ns ({:.2}-{:.2}), net {g2h_net:.2}; host->guest {:.2} ns ({:.2}-{:.2})",
         base.0, base.1, base.2, g2h.0, g2h.1, g2h.2, h2g.0, h2g.1, h2g.2
     );
-    if g2h_net >= BAND_NS || h2g.0 >= BAND_NS {
-        return Err(format!(
+    let band_judgement = if g2h_net >= BAND_NS || h2g.0 >= BAND_NS {
+        Err(format!(
             "outside the band: guest->host net {g2h_net:.2} ns, host->guest {:.2} ns, band < {BAND_NS} ns",
             h2g.0
-        ));
-    }
-    Ok(())
+        ))
+    } else {
+        Ok(format!(
+            "net {g2h_net:.2} ns, host->guest {:.2} ns, band < {BAND_NS} ns",
+            h2g.0
+        ))
+    };
+    judge_window(band_judgement, pressure.span_share(), "the run")
 }
 
 fn main() -> ExitCode {
-    common::verdict("g4", [Some(run())])
+    common::verdict("g4", [Some(run().map(|m| println!("g4: {m}")))])
 }

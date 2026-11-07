@@ -16,9 +16,9 @@ use super::{
     content_origin, wait_for_line,
 };
 use crate::composer::word;
-use crate::cpu_pressure::Samples;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
+use atl_cpu_pressure::Samples;
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask/testdata/widgets";
