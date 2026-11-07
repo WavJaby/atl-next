@@ -46,6 +46,7 @@ pub fn goals() -> Goals {
         "libicu_jni",
         "libandroid_runtime",
         "libandroid",
+        "libjnigraphics",
         "libsigchain",
         "libbinder",
         "libutils",
@@ -61,6 +62,9 @@ pub fn goals() -> Goals {
 
 /// The extractor plugins [`platform_rows`] places: every [`Runtime`] reads them, so [`goals`] builds them.
 const EXTRACTOR_PLUGINS: [&str; 2] = ["liboggextractor", "libwavextractor"];
+
+/// The NDK libraries whose host side the NativeBridge core loads from SYSTEM_LIB (C3, bindings.rs `Host::System`): their guest proxies forward to them.
+const NDK_HOST_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
 
 /// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the libraries Mesa's Android platform links (mesa.rs PC_MODULES).
 pub fn gralloc_goals() -> Goals {
@@ -85,8 +89,8 @@ pub fn gl_front(out: &Path, module: &str) -> PathBuf {
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
-/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), and AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
-const NB_LIBS: [(&str, &str); 18] = [
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process), and the NDK proxies libandroid, libandroid_runtime and libjnigraphics (C3: DT_NEEDED of the fixtures' asset and bitmap calls). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
+const NB_LIBS: [(&str, &str); 21] = [
     ("libnative_bridge_guest_libc", "libc.so"),
     ("libm", "libm.so"),
     ("libdl", "libdl.so"),
@@ -107,6 +111,12 @@ const NB_LIBS: [(&str, &str); 18] = [
         "libnative_bridge_guest_libnativewindow",
         "libnativewindow.so",
     ),
+    ("libnative_bridge_guest_libandroid", "libandroid.so"),
+    (
+        "libnative_bridge_guest_libandroid_runtime",
+        "libandroid_runtime.so",
+    ),
+    ("libnative_bridge_guest_libjnigraphics", "libjnigraphics.so"),
     (
         "libnative_bridge_vdso",
         atl_native_bridge::engine::VDSO_FILE,
@@ -587,6 +597,17 @@ impl Runtime {
                 f.display()
             );
         }
+        // the NDK proxies' host sides, where the NativeBridge core loads them (bindings.rs `Host::System`), as the GL fronts are placed
+        for m in NDK_HOST_LIBS {
+            let host = self.out.join("device").join(m).join(format!("{m}.so"));
+            ensure!(
+                host.is_file(),
+                "missing input {} (build native goal `{m}`)",
+                host.display()
+            );
+            self.platform_files
+                .push((host, format!("{}/{m}.so", atl_android_paths::SYSTEM_LIB)));
+        }
         self.native_bridge_guest = files;
         Ok(self)
     }
@@ -686,13 +707,14 @@ pub struct NativeLibs {
 }
 
 impl ApkTools {
-    /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar; `native` see [`NativeLibs`].
+    /// Builds the APK of `fixture` (AndroidManifest.xml and java/**.java) into `work`; `class_jars` are on javac's and d8's class path besides android.jar; `native` see [`NativeLibs`]; `assets`: a directory whose files become the APK's assets (aapt2 `-A`), `.bin` stored and the rest deflated (`-0 bin`).
     pub fn build(
         &self,
         fixture: &Path,
         work: &Path,
         class_jars: &[PathBuf],
         native: Option<&NativeLibs>,
+        assets: Option<&Path>,
     ) -> Result<PathBuf> {
         if work.exists() {
             std::fs::remove_dir_all(work)?;
@@ -714,6 +736,9 @@ impl ApkTools {
             .arg(&apk);
         if let Some(n) = native {
             link.arg("--min-sdk-version").arg(n.min_sdk.to_string());
+        }
+        if let Some(dir) = assets {
+            link.arg("-A").arg(dir).args(["-0", "bin"]);
         }
         // real resources (res/): compiled, linked, and R.java generated for javac
         if fixture.join("res").is_dir() {

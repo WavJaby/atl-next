@@ -2,6 +2,7 @@
 package com.example.atltest;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.os.Bundle;
@@ -75,7 +76,7 @@ public class Main extends Activity {
     }
 
     /** Order matters: tlsCounter is per thread, so threadSum's worker and a fresh Java thread must leave the main thread's count alone. */
-    private static void bridge1Calls(Class<?> jni) {
+    private void bridge1Calls(Class<?> jni) {
         bridge1Call(jni, "tlsCounter#1", "tlsCounter");
         bridge1Call(jni, "tlsCounter#2", "tlsCounter");
         bridge1Call(jni, "threadSum", "threadSum", 100);
@@ -106,6 +107,24 @@ public class Main extends Activity {
         bridge1Call(jni, "propCallbacks", "propCallbacks");
         bridge1Call(jni, "glesPbuffer", "glesPbuffer");
         bridge1Call(jni, "mesaMapped", "mesaMapped");
+        bridge1Call(jni, "assetProbe", "assetProbe", getAssets());
+        bridge1Call(jni, "bitmapArgb8888", "bitmapProbe", bitmap3x2(Bitmap.Config.ARGB_8888, ARGB_PIXELS));
+        bridge1Call(jni, "bitmapRgb565", "bitmapProbe", bitmap3x2(Bitmap.Config.RGB_565, RGB565_PIXELS));
+    }
+
+    /** The C3 bitmap rows' pixels, row-major, opaque, exact in both configs (app.rs BRIDGE1_CALLS): red, green, blue / white, black, gray 0x80 (ARGB_8888); yellow for the last one in RGB_565, whose 565 values are exact for primaries and 0 / 255 channels. */
+    private static final int[] ARGB_PIXELS = {
+        0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF, 0xFF000000, 0xFF808080,
+    };
+    private static final int[] RGB565_PIXELS = {
+        0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF, 0xFF000000, 0xFFFFFF00,
+    };
+
+    /** A 3x2 bitmap of `config` holding `pixels`. */
+    private static Bitmap bitmap3x2(Bitmap.Config config, int[] pixels) {
+        Bitmap b = Bitmap.createBitmap(3, 2, config);
+        b.setPixels(pixels, 0, 3, 0, 0, 3, 2);
+        return b;
     }
 
     /** C12 legacy rows (AtlLegacyTest.java), loaded apart from the bridge-1 fixture. A failed load logs every row as threw, with ART's reason (the library's name). */

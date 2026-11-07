@@ -94,11 +94,40 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("legacyNew", "40 42"),
     // compress + uncompress of "123456789", then crc32 of the result: the CRC-32 check value 0xCBF43926 (3421780262)
     ("zRoundTrip", "3421780262"),
+    // C3 asset probe (atl_jni_test.c assetProbe): the 70000-byte assets, stored and deflated, streamed to the same SHA-256 F; the tail after seek 1000: remaining 69000 and SHA-256 T; AAsset_getBuffer of the stored one: F; a missing name: NULL. F and T: sha256sum over the bytes of an awk generator (`asset_row_matches_the_generated_bytes` derives them again from write_assets' bytes)
+    (
+        "assetProbe",
+        "stream b56c58471e5e93f1329a5878b818e0cd23ab1a59925a7dc2b1576063a9109955 deflated b56c58471e5e93f1329a5878b818e0cd23ab1a59925a7dc2b1576063a9109955 seek 69000 df8a2c0f36b885db9597fe5aa4d4776d7068707f53d44b45efb587c405b15f86 buffer b56c58471e5e93f1329a5878b818e0cd23ab1a59925a7dc2b1576063a9109955 missing null",
+    ),
+    // C3 bitmap probe (AtlJniTest.bitmapProbe, 3x2 ARGB_8888: RGBA bytes, stride 12, format 1, flags 0 = ANDROID_BITMAP_FLAGS_ALPHA_PREMUL in bitmap.h): red, green, blue / white, black, gray 0x80
+    (
+        "bitmapArgb8888",
+        "info 3 2 12 1 0 bytes ff0000ff00ff00ff0000ffffffffffff000000ff808080ff",
+    ),
+    // C3 bitmap probe, 3x2 RGB_565 (stride 6, format 4, flags 1 = ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE in bitmap.h: no alpha): red, green, blue / white, black, yellow, as little-endian 565 words
+    (
+        "bitmapRgb565",
+        "info 3 2 6 4 1 bytes 00f8e0071f00ffff0000e0ff",
+    ),
 ];
 /// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
 /// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
 const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";
+/// The C3 assets (game-support §2): `stored.bin` (aapt2 stores `.bin`: `-0 bin`) and `deflated.txt`, `ASSET_LEN` bytes each, byte i = (i*31+7) mod 251. The probe seeks to 1000 (atl_jni_test.c `ASSET_SEEK`).
+const ASSET_LEN: usize = 70_000;
+/// The bytes both assets hold.
+fn asset_bytes() -> Vec<u8> {
+    (0..ASSET_LEN).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+}
+/// Writes the two assets into `dir`, which `Apk::build` packs as the APK's assets.
+fn write_assets(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let bytes = asset_bytes();
+    std::fs::write(dir.join("stored.bin"), &bytes)?;
+    std::fs::write(dir.join("deflated.txt"), &bytes)?;
+    Ok(())
+}
 
 /// Every bridge-1 call whose line is missing or wrong, then the thread balance.
 fn bridge1_call_failures(app: &str) -> Vec<String> {
@@ -228,9 +257,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &work.join("jni-fixture"),
         args.legacy_no_libc,
     )?;
-    let apk = rt
-        .apk
-        .build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
+    let assets = work.join("assets");
+    write_assets(&assets)?;
+    let apk = rt.apk.build(
+        &root.join(FIXTURE),
+        &work.join("apk"),
+        &[],
+        Some(&native),
+        Some(&assets),
+    )?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()
@@ -322,6 +357,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
     let bridge1_ok = bridge1.is_some();
     let mut whys = jni_fixture::legacy_failures(&native.libs)?;
+    whys.extend(jni_fixture::ndk_failures(&native.libs)?);
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
         println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
@@ -452,5 +488,23 @@ mod tests {
         assert!(fault(&line(T, "I", MARKER), true).is_some());
         let crash = line(T, "I", MARKER) + &line(T + 100, "E", "FATAL EXCEPTION: main");
         assert!(fault(&crash, false).is_some());
+    }
+
+    #[test]
+    fn asset_row_matches_the_generated_bytes() {
+        // the row's digests, recomputed over the bytes write_assets writes (sha2, not the guest's C SHA-256); seek: atl_jni_test.c's ASSET_SEEK
+        let seek = 1_000;
+        let bytes = asset_bytes();
+        let whole = crate::test_apks::sha256_hex(&bytes);
+        let tail = crate::test_apks::sha256_hex(&bytes[seek..]);
+        let want = format!(
+            "stream {whole} deflated {whole} seek {} {tail} buffer {whole} missing null",
+            ASSET_LEN - seek
+        );
+        let row = BRIDGE1_CALLS
+            .iter()
+            .find(|(n, _)| *n == "assetProbe")
+            .map(|(_, v)| *v);
+        assert_eq!(row, Some(want.as_str()));
     }
 }

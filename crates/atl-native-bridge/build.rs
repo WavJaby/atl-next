@@ -170,6 +170,13 @@ const SHIMS: &[&str] = &[
     "sigaction",
     "sigaction64",
 ];
+/// NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs): the generic crossing would hand the host library the guest's env, so each binds `Entry::Shim` in its library. Any NDK proxy library may list them; each must be in one (`bindings_table`).
+const NDK_SHIMS: &[&str] = &[
+    "AAssetManager_fromJava",
+    "AndroidBitmap_getInfo",
+    "AndroidBitmap_lockPixels",
+    "AndroidBitmap_unlockPixels",
+];
 
 /// Guest libc stubs glibc's `libc.so.6` serves with the same ABI, by (stub name, glibc symbol). NBS names the allocator entries `native_bridge_<fn>` (one heap: the guest libc's malloc calls them).
 /// The pthread rows rest on intercepts.rs's size gates (`pthread_t` long, `pthread_key_t` int, `pthread_attr_t` only ever filled and read by glibc since every `pthread_attr_*` is here); the rest are the C contract (memory, allocation, time), identical in bionic and glibc on LP64.
@@ -310,12 +317,16 @@ fn jni_tables(up: &Upstreams, target: &Target) -> Result<String> {
 }
 
 /// The guest proxy libraries (NBS `libnative_bridge_guest_*`): soname, and the NBS directory whose `stubs_arm64.cc` (arch-neutral, LP64) is the library's symbol set.
+/// The last three are the NDK libraries of C3: a stub gets a binding only when its prototype is in [`PROTOTYPE_HEADERS`]; the rest trap (`missing_prototype`).
 const PROXY_LIBS: &[(&str, &str)] = &[
     ("libEGL.so", "libEGL"),
     ("libGLESv1_CM.so", "libGLESv1_CM"),
     ("libGLESv2.so", "libGLESv2"),
     ("libGLESv3.so", "libGLESv3"),
     ("libnativewindow.so", "libnativewindow"),
+    ("libandroid.so", "libandroid"),
+    ("libandroid_runtime.so", "libandroid_runtime"),
+    ("libjnigraphics.so", "libjnigraphics"),
 ];
 /// The guest libc's stub list (NBS, x86_64 entries; patch 0003 adds sigaction / sigaction64).
 const LIBC_STUBS: &str = "frameworks/libs/native_bridge_support/android_api/libc/stubs_x86_64.cpp";
@@ -330,8 +341,18 @@ const PROTOTYPE_HEADERS: &[&str] = &[
     "GLES3/gl3.h",
     "GLES3/gl31.h",
     "GLES3/gl32.h",
+    // C3: the NDK headers of libandroid / libjnigraphics; their declarations count through `also` (bindings_table)
+    "android/asset_manager.h",
+    "android/asset_manager_jni.h",
+    "android/bitmap.h",
 ];
-const PROTOTYPE_INCLUDES: &[&str] = &["frameworks/native/opengl/include"];
+/// The NDK headers' declarations count from `frameworks/native/include/android` (bindings_table `also`).
+const NDK_HEADERS: &[&str] = &["asset_manager.h", "asset_manager_jni.h", "bitmap.h"];
+const PROTOTYPE_INCLUDES: &[&str] = &[
+    "frameworks/native/opengl/include",
+    "frameworks/native/include",
+    "libnativehelper/include_jni",
+];
 /// Env var naming a header force-included into the guest prototype view only: the identity gate's deliberate break.
 const GUEST_INCLUDE_BREAK: &str = "ATL_NB_GL_GUEST_INCLUDE";
 /// Functions whose prototype alone does not say what the binding does: `glGetPointerv` answers a wrapped GL_DEBUG_CALLBACK_FUNCTION, `glGetVkProcAddrNV` is refused (GS2.2).
@@ -413,7 +434,17 @@ fn libc_entries(
         .collect())
 }
 
-/// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
+/// Why a stub with no prototype in the set traps. libandroid and libjnigraphics: the NDK prototypes outside [`PROTOTYPE_HEADERS`] are pending; libandroid_runtime is C++ internals no app calls.
+fn missing_prototype(soname: &str) -> &'static str {
+    match soname {
+        "libnativewindow.so" => "pending: nativewindow prototypes not in the EGL/GLES set",
+        "libandroid.so" | "libjnigraphics.so" => "pending: NDK prototypes not in the set",
+        "libandroid_runtime.so" => "unbound: C++ internals",
+        _ => "unbound: no prototype in the EGL/GLES headers",
+    }
+}
+
+/// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
 /// `Entry::Generic(host, symbol)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing; `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
 fn bindings_table(
@@ -432,6 +463,14 @@ fn bindings_table(
         lists.push((soname, names));
     }
     let libc_names = stub_names(up, LIBC_STUBS)?;
+    for n in NDK_SHIMS {
+        ensure!(
+            lists
+                .iter()
+                .any(|(_, names)| names.iter().any(|s| s.as_str() == *n)),
+            "{n}: an NDK shim that no NDK proxy library lists"
+        );
+    }
 
     let unit = out.join("proxy_prototypes.cc");
     let mut text = String::from("#define EGL_EGLEXT_PROTOTYPES\n#define GL_GLEXT_PROTOTYPES\n");
@@ -469,6 +508,9 @@ fn bindings_table(
         headers_under(&root.join(dir), &mut also)?;
     }
     println!("cargo::rerun-if-changed={}", root.display());
+    let ndk = up.aosp("frameworks/native/include/android");
+    also.extend(NDK_HEADERS.iter().map(|h| ndk.join(h)));
+    println!("cargo::rerun-if-changed={}", ndk.display());
     let src = Source {
         path: &unit,
         lang: Lang::Cxx,
@@ -521,6 +563,9 @@ fn bindings_table(
                 format!("Entry::Trap({})", traps.len() - 1)
             };
             let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                (Some(_), Some(_)) if NDK_SHIMS.contains(&name.as_str()) => {
+                    "Entry::Shim".to_owned()
+                }
                 (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
                     trap("pending: annotated, GS2.2")
                 }
@@ -528,12 +573,13 @@ fn bindings_table(
                 (Some(sig), Some(_)) if sig.params.iter().any(is_fn_ptr) => {
                     trap("pending: callback-param, GS2.2")
                 }
-                (Some(_), Some(_)) => format!("Entry::Generic(Host::Front, {name:?})"),
-                _ if *soname == "libnativewindow.so" => {
-                    trap("pending: nativewindow prototypes not in the EGL/GLES set")
-                }
-                _ => trap("unbound: no prototype in the EGL/GLES headers"),
+                (Some(_), Some(_)) => format!("Entry::Generic(Host::System, {name:?})"),
+                _ => trap(missing_prototype(soname)),
             };
+            ensure!(
+                !NDK_SHIMS.contains(&name.as_str()) || entry == "Entry::Shim",
+                "{name}: an NDK shim without a prototype in the set ({PROTOTYPE_HEADERS:?})"
+            );
             entries.push((name.clone(), entry));
         }
         rows.push((soname, entries));
@@ -587,6 +633,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("foreign_gs", "atl_nb_foreign_gs"),
     // gate 4.4 (engine/jni.rs): a guest env slot = the host function, no crossing
     ("jni_direct", "atl_nb_jni_direct"),
+    // C3 (engine/ndk.rs, jni.rs `host_env`): the NDK shims hand the host library the guest env unmapped
+    ("ndk_env", "atl_nb_ndk_env"),
     // gate 4.4 (exports.rs): isNativeBridgeFunctionPointer answers false
     ("nbfp_false", "atl_nb_nbfp_false"),
     // spike gates g1/g2 (engine::x86_64): the host->guest crossing without its FS restore

@@ -123,7 +123,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = rt.with_fixture_file(lib, &lib_at);
     let apk = rt
         .apk
-        .build(&root.join(FIXTURE), &work.join("apk"), &[], None)?;
+        .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
     for broken in [false, true] {
         let tag = if broken { "break" } else { "run" };
         let mut shell_args: Vec<String> =

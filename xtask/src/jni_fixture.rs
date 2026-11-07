@@ -65,6 +65,33 @@ const LEGACY_IMPORTS: [&str; 9] = [
     "uncompress",
 ];
 
+/// The C3 break, selected by `ATL_JNI_BREAK` on the run that builds the fixture: `seek` moves the asset probe's seek one byte off (atl_jni_test.c `ASSET_SEEK_TO`), so the tail's hash and remaining length go red.
+const BREAK_ENV: &str = "ATL_JNI_BREAK";
+/// Whether the `seek` break is selected; an unknown break name fails, naming the known ones.
+fn seek_break() -> Result<bool> {
+    match std::env::var(BREAK_ENV) {
+        Err(_) => Ok(false),
+        Ok(v) if v == "seek" => Ok(true),
+        Ok(v) => bail!("{BREAK_ENV}={v}: no such break (known: seek)"),
+    }
+}
+
+/// The C3 probes' libraries (atl_jni_test.c `assetProbe` / `bitmapProbe`): DT_NEEDED names the NDK libraries, and each import is one the probes call.
+const NDK_NEEDED: [&str; 2] = ["libandroid.so", "libjnigraphics.so"];
+const NDK_IMPORTS: [&str; 11] = [
+    "AAssetManager_fromJava",
+    "AAssetManager_open",
+    "AAsset_read",
+    "AAsset_seek",
+    "AAsset_getRemainingLength",
+    "AAsset_getBuffer",
+    "AAsset_getLength",
+    "AAsset_close",
+    "AndroidBitmap_getInfo",
+    "AndroidBitmap_lockPixels",
+    "AndroidBitmap_unlockPixels",
+];
+
 /// One built variant: its API level and the libraries an APK carries for it.
 pub struct Built {
     pub api: u32,
@@ -173,7 +200,11 @@ pub fn build(
     )?;
     let c_obj = dir.join("atl_jni_test.o");
     let cxx_obj = dir.join("atl_jni_cxx.o");
-    compile("clang", &c_obj, "atl_jni_test.c", &["-std=c11"])?;
+    let mut c_flags = vec!["-std=c11"];
+    if seek_break()? {
+        c_flags.push("-DATL_JNI_SEEK_BREAK=1");
+    }
+    compile("clang", &c_obj, "atl_jni_test.c", &c_flags)?;
     compile("clang++", &cxx_obj, "atl_jni_cxx.cpp", &["-std=c++17"])?;
     let lib = dir.join(LIB);
     host_art::exec(
@@ -185,6 +216,8 @@ pub fn build(
             .arg("-llog")
             .arg("-lEGL")
             .arg("-lGLESv2")
+            .arg("-landroid")
+            .arg("-ljnigraphics")
             .arg("-o")
             .arg(&lib),
         "NDK clang++ link",
@@ -491,7 +524,23 @@ pub fn apk_libs(
     })
 }
 
-/// The C12 legacy fixture's ELF expectations: DT_NEEDED names the guest libraries that answer its calls, and each import is one its source calls at run time.
+/// A fixture's ELF expectations: DT_NEEDED names the libraries that answer its calls, and each import is one its source calls at run time (a folded call drops its import).
+fn calls_failures(file: &str, s: &Shape, needed: &[&str], imports: &[&str]) -> Vec<String> {
+    let mut f = Vec::new();
+    for &n in needed {
+        if !s.needed.iter().any(|x| x == n) {
+            f.push(format!("{file}: DT_NEEDED lacks {n} (has {:?})", s.needed));
+        }
+    }
+    for &i in imports {
+        if !s.imports.contains(i) {
+            f.push(format!("{file}: no import {i}"));
+        }
+    }
+    f
+}
+
+/// The C12 legacy fixture's ELF expectations (`calls_failures`), plus no GNU verneed on libc.so: the old-NDK stub is unversioned. Legacy-only; calls_failures stays generic.
 fn legacy_shape_failures(s: &Shape) -> Vec<String> {
     let mut f = Vec::new();
     // libstdc++.so's own stub stays versioned: only libc's is the old-NDK shape
@@ -501,29 +550,26 @@ fn legacy_shape_failures(s: &Shape) -> Vec<String> {
             s.verneed
         ));
     }
-    for n in LEGACY_NEEDED {
-        if !s.needed.iter().any(|x| x == n) {
-            f.push(format!(
-                "{LEGACY}: DT_NEEDED lacks {n} (has {:?})",
-                s.needed
-            ));
-        }
-    }
-    for i in LEGACY_IMPORTS {
-        if !s.imports.contains(i) {
-            f.push(format!("{LEGACY}: no import {i}"));
-        }
-    }
+    f.extend(calls_failures(LEGACY, s, &LEGACY_NEEDED, &LEGACY_IMPORTS));
     f
+}
+
+/// The fixture library `name` among the APK's `libs` (apk_libs).
+fn lib_named<'a>(libs: &'a [PathBuf], name: &str) -> Result<&'a PathBuf> {
+    libs.iter()
+        .find(|l| l.file_name().is_some_and(|n| n == name))
+        .with_context(|| format!("no {name} among the fixture libraries"))
 }
 
 /// The legacy fixture among the APK's `libs` (apk_libs), checked by `legacy_shape_failures`.
 pub fn legacy_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
-    let lib = libs
-        .iter()
-        .find(|l| l.file_name().is_some_and(|n| n == LEGACY))
-        .with_context(|| format!("no {LEGACY} among the fixture libraries"))?;
-    Ok(legacy_shape_failures(&shape(lib)?))
+    Ok(legacy_shape_failures(&shape(lib_named(libs, LEGACY)?)?))
+}
+
+/// The C3 probes' fixture among the APK's `libs`, checked by `calls_failures` against `NDK_NEEDED` / `NDK_IMPORTS`.
+pub fn ndk_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
+    let s = shape(lib_named(libs, LIB)?)?;
+    Ok(calls_failures(LIB, &s, &NDK_NEEDED, &NDK_IMPORTS))
 }
 
 #[cfg(test)]

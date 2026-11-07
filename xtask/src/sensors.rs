@@ -314,7 +314,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let apk = rt
         .apk
-        .build(&root.join(FIXTURE), &work.join("apk"), &[], None)?;
+        .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let run = Run {
         root: work.join("root"),

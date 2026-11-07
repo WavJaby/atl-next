@@ -63,11 +63,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &work.join("apk-window"),
         &[],
         None,
+        None,
     )?;
     let widgets = rt.apk.build(
         &root.join(window::WIDGETS_FIXTURE),
         &work.join("apk-widgets"),
         &[],
+        None,
         None,
     )?;
     let drive = |apk: &Path, name: &str, script: String| -> Result<ExitCode> {

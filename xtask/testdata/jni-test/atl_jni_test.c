@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // bridge-1 fixture, C side. Uses the bionic-only surface on purpose (errno through __errno, bionic pthread/dlopen, __thread) so a glibc host cannot satisfy it.
 // Java side: xtask/testdata/app/java/atl/bridge1/testlib/AtlJniTest.java. C++ side: atl_jni_cxx.cpp. Built by xtask/src/jni_fixture.rs.
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+#include <android/bitmap.h>
 #include <android/log.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -297,4 +300,210 @@ JNI_FN(jint, mesaMapped)(JNIEnv *env, jclass cls)
         found = strstr(line, "mesa") != NULL;
     fclose(f);
     return found;
+}
+
+/* C3: libandroid's asset API and libjnigraphics' AndroidBitmap, through the guest. app.rs writes the assets (stored.bin, stored by `aapt2 -0 bin`; deflated.txt) and checks the SHA-256 values it computes over the same bytes. */
+#define ASSET_STORED "stored.bin"
+#define ASSET_DEFLATED "deflated.txt"
+#define ASSET_SEEK 1000
+#ifdef ATL_JNI_SEEK_BREAK
+/* deliberate break (xtask `ATL_JNI_BREAK=seek`): one byte off, so the tail's hash and remaining length go red */
+#define ASSET_SEEK_TO (ASSET_SEEK + 1)
+#else
+#define ASSET_SEEK_TO ASSET_SEEK
+#endif
+
+typedef struct {
+    uint32_t h[8];
+    uint64_t bits;
+    unsigned char block[64];
+    size_t fill;
+} sha256_ctx;
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+static uint32_t sha256_rotr(uint32_t x, unsigned n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static void sha256_init(sha256_ctx *c)
+{
+    static const uint32_t h0[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    memcpy(c->h, h0, sizeof c->h);
+    c->bits = 0;
+    c->fill = 0;
+}
+
+static void sha256_block(sha256_ctx *c, const unsigned char *p)
+{
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) | ((uint32_t)p[4 * i + 2] << 8) | p[4 * i + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = c->h[0], b = c->h[1], cc = c->h[2], d = c->h[3];
+    uint32_t e = c->h[4], f = c->h[5], g = c->h[6], hh = c->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = hh + s1 + ch + sha256_k[i] + w[i];
+        uint32_t s0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint32_t t2 = s0 + maj;
+        hh = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = cc;
+        cc = b;
+        b = a;
+        a = t1 + t2;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+    c->h[5] += f;
+    c->h[6] += g;
+    c->h[7] += hh;
+}
+
+static void sha256_update(sha256_ctx *c, const unsigned char *p, size_t n)
+{
+    c->bits += (uint64_t)n * 8;
+    while (n > 0) {
+        size_t take = 64 - c->fill;
+        if (take > n)
+            take = n;
+        memcpy(c->block + c->fill, p, take);
+        c->fill += take;
+        p += take;
+        n -= take;
+        if (c->fill == 64) {
+            sha256_block(c, c->block);
+            c->fill = 0;
+        }
+    }
+}
+
+/* out: 64 hex digits and NUL */
+static void sha256_final_hex(sha256_ctx *c, char out[65])
+{
+    static const unsigned char pad[64] = { 0x80 };
+    uint64_t bits = c->bits;
+    unsigned char len[8];
+    for (int i = 0; i < 8; i++)
+        len[i] = (unsigned char)(bits >> (56 - 8 * i));
+    sha256_update(c, pad, c->fill < 56 ? 56 - c->fill : 120 - c->fill);
+    sha256_update(c, len, 8);
+    for (int i = 0; i < 8; i++)
+        snprintf(out + 8 * i, 9, "%08x", c->h[i]);
+}
+
+static void sha256_hex_of(const unsigned char *p, size_t n, char out[65])
+{
+    sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, p, n);
+    sha256_final_hex(&c, out);
+}
+
+/* Streams an asset to its end in 4096-byte AAsset_read calls: its SHA-256 into out, the bytes read (-1 on a read error). */
+static long long asset_hash(AAsset *a, char out[65])
+{
+    sha256_ctx c;
+    unsigned char buf[4096];
+    long long total = 0;
+    sha256_init(&c);
+    for (;;) {
+        int n = AAsset_read(a, buf, sizeof buf);
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;
+        sha256_update(&c, buf, (size_t)n);
+        total += n;
+    }
+    sha256_final_hex(&c, out);
+    return total;
+}
+
+// AtlJniTest.assetProbe: the stored and deflated assets streamed (their SHA-256), the tail after a seek to ASSET_SEEK (remaining length, SHA-256), AAsset_getBuffer of the stored one (SHA-256), and AAssetManager_open of a missing name (NULL).
+JNI_FN(jstring, assetProbe)(JNIEnv *env, jclass cls, jobject assetManager)
+{
+    AAssetManager *mgr = AAssetManager_fromJava(env, assetManager);
+    if (mgr == NULL)
+        return (*env)->NewStringUTF(env, "no AAssetManager");
+    char stored[65] = "null", deflated[65] = "null", tail[65] = "null", buffer[65] = "null";
+    char missing[16] = "null";
+    long long remaining = -1;
+    AAsset *a = AAssetManager_open(mgr, ASSET_STORED, AASSET_MODE_STREAMING);
+    if (a != NULL) {
+        asset_hash(a, stored);
+        AAsset_close(a);
+    }
+    a = AAssetManager_open(mgr, ASSET_DEFLATED, AASSET_MODE_STREAMING);
+    if (a != NULL) {
+        asset_hash(a, deflated);
+        AAsset_close(a);
+    }
+    a = AAssetManager_open(mgr, ASSET_STORED, AASSET_MODE_STREAMING);
+    if (a != NULL) {
+        AAsset_seek(a, ASSET_SEEK_TO, SEEK_SET);
+        remaining = AAsset_getRemainingLength(a);
+        asset_hash(a, tail);
+        AAsset_close(a);
+    }
+    a = AAssetManager_open(mgr, ASSET_STORED, AASSET_MODE_BUFFER);
+    if (a != NULL) {
+        const unsigned char *p = AAsset_getBuffer(a);
+        if (p != NULL)
+            sha256_hex_of(p, (size_t)AAsset_getLength(a), buffer);
+        AAsset_close(a);
+    }
+    a = AAssetManager_open(mgr, "missing.bin", AASSET_MODE_BUFFER);
+    snprintf(missing, sizeof missing, "%s", a == NULL ? "null" : "found");
+    if (a != NULL)
+        AAsset_close(a);
+    char line[512];
+    snprintf(line, sizeof line, "stream %s deflated %s seek %lld %s buffer %s missing %s", stored, deflated, remaining, tail, buffer, missing);
+    return (*env)->NewStringUTF(env, line);
+}
+
+// AtlJniTest.bitmapProbe: AndroidBitmap_getInfo and the locked pixel bytes of a bitmap, as "info <width> <height> <stride> <format> <flags> bytes <hex>".
+JNI_FN(jstring, bitmapProbe)(JNIEnv *env, jclass cls, jobject bitmap)
+{
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
+        return (*env)->NewStringUTF(env, "getInfo failed");
+    size_t n = (size_t)info.stride * info.height;
+    if (n > 64)
+        return (*env)->NewStringUTF(env, "too big");
+    void *px = NULL;
+    if (AndroidBitmap_lockPixels(env, bitmap, &px) != ANDROID_BITMAP_RESULT_SUCCESS)
+        return (*env)->NewStringUTF(env, "lockPixels failed");
+    char hex[2 * 64 + 1] = "";
+    const unsigned char *p = px;
+    for (size_t i = 0; i < n; i++)
+        snprintf(hex + 2 * i, 3, "%02x", p[i]);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    char line[256];
+    snprintf(line, sizeof line, "info %u %u %u %d %u bytes %s", info.width, info.height, info.stride, info.format, info.flags, hex);
+    return (*env)->NewStringUTF(env, line);
 }

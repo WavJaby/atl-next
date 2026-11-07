@@ -1723,9 +1723,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         )?),
         _ => None,
     };
-    let apk = rt
-        .apk
-        .build(&root.join(fixture), &work.join("apk"), &[], native.as_ref())?;
+    let apk = rt.apk.build(
+        &root.join(fixture),
+        &work.join("apk"),
+        &[],
+        native.as_ref(),
+        None,
+    )?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     let activity = m
         .launch_activity()

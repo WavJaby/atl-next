@@ -147,6 +147,27 @@ unsafe fn host_of(obj: *const GuestObj) -> usize {
     unsafe { (*obj).host }
 }
 
+/// The host env behind guest env `guest` (0 = 0), for the NDK shims (ndk.rs): an NDK function takes a `JNIEnv*` and calls the host library through it.
+/// Deliberate break `ATL_NB_BREAK=ndk_env`: the guest env itself, whose function table is the guest's.
+///
+/// # Safety
+/// `guest` is 0 or a guest env made by `guest_env`.
+#[cfg(not(atl_nb_ndk_env))]
+pub(super) unsafe fn host_env(guest: usize) -> usize {
+    if guest == 0 {
+        return 0;
+    }
+    // SAFETY: caller contract.
+    unsafe { host_of(guest as *const GuestObj) }
+}
+
+/// # Safety
+/// As the non-break `host_env`; ignores its argument.
+#[cfg(atl_nb_ndk_env)]
+pub(super) unsafe fn host_env(guest: usize) -> usize {
+    guest
+}
+
 /// `jint GetJavaVM(JNIEnv*, JavaVM**)`, on the host thread pointer (a bound thunk).
 extern "C" fn get_java_vm(env: *const GuestObj, out: *mut usize) -> i32 {
     // SAFETY: the guest's own env and out-parameter, as jni.h's GetJavaVM takes them.

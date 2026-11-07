@@ -13,6 +13,7 @@ pub mod bindings;
 pub mod image;
 mod intercepts;
 pub mod jni;
+mod ndk;
 mod provider;
 pub mod signal;
 pub mod thread;

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 7 Nov 2026 08:38:12 +0800
+Subject: [PATCH] Build libandroid, libandroid_runtime and libjnigraphics for
+ x86_64 guests
+
+The identity engine runs x86_64 guests on an x86_64 host, so the
+NativeBridge guest needs x86_64 builds of the NDK libraries the test
+apps link: libandroid and libjnigraphics, and the libandroid_runtime
+they depend on. Their stub lists are LP64 and arch-neutral
+(stubs_arm64.cc equals stubs_riscv64.cc), so the x86_64 build takes
+the arm64 list, as 0004 does for the GL proxies.
+
+Upstream-Status: Pending
+Patch-Reason: the x86_64 arch blocks live inside these Android.bp modules, which no launcher, loader or environment setting can add; the stub list is shared by every LP64 arch here
+---
+SPDX-License-Identifier: Apache-2.0
+ android_api/libandroid/Android.bp         | 3 +++
+ android_api/libandroid_runtime/Android.bp | 3 +++
+ android_api/libjnigraphics/Android.bp     | 3 +++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/android_api/libandroid/Android.bp b/android_api/libandroid/Android.bp
+index 600161c99f39991039ffb09e97cc1c3ac38d0a50..31745f672bae1b85fe5330a680cf2d2e880312d1 100644
+--- a/android_api/libandroid/Android.bp
++++ b/android_api/libandroid/Android.bp
+@@ -30,6 +30,9 @@ cc_library {
+         arm64: {
+             srcs: ["stubs_arm64.cc"],
+         },
++        x86_64: {
++            srcs: ["stubs_arm64.cc"],
++        },
+         riscv64: {
+             srcs: ["stubs_riscv64.cc"],
+         },
+diff --git a/android_api/libandroid_runtime/Android.bp b/android_api/libandroid_runtime/Android.bp
+index c87a397c803a1c305159c13b7a1788726c4d46b7..6890fbfa938e7c1dbd2884d67ce1c2bafed46514 100644
+--- a/android_api/libandroid_runtime/Android.bp
++++ b/android_api/libandroid_runtime/Android.bp
+@@ -30,6 +30,9 @@ cc_library {
+         arm64: {
+             srcs: ["stubs_arm64.cc"],
+         },
++        x86_64: {
++            srcs: ["stubs_arm64.cc"],
++        },
+         riscv64: {
+             srcs: ["stubs_riscv64.cc"],
+         },
+diff --git a/android_api/libjnigraphics/Android.bp b/android_api/libjnigraphics/Android.bp
+index 5e21123077becc02c0be64cfaa4f1115bc30d029..6dc050a7eb6b86b0e8fb18e43c489a80a7b4fa81 100644
+--- a/android_api/libjnigraphics/Android.bp
++++ b/android_api/libjnigraphics/Android.bp
+@@ -30,6 +30,9 @@ cc_library {
+         arm64: {
+             srcs: ["stubs_arm64.cc"],
+         },
++        x86_64: {
++            srcs: ["stubs_arm64.cc"],
++        },
+         riscv64: {
+             srcs: ["stubs_riscv64.cc"],
+         },

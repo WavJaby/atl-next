@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step gl-proxies: the guest GL proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`) against what an NDK app may call and what the host fronts serve. Static tier, on the slot's built files:
+//! `xtask check` step gl-proxies: the guest proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`: the GL fronts and the NDK libraries of C3) against what an NDK app may call and what the host libraries serve. Static tier, on the slot's built files:
 //! 1. every NDK name of an AOSP `<lib>.map.txt` (any `introduced` level; `# llndk` names are vendor-only, not NDK) is a defined dynamic symbol of the guest proxy, or an [`ABSENT`] entry;
-//! 2. every stub of the binding table (atl-native-bridge engine `bindings::rows`) for a GL front is a defined dynamic symbol of that front, unless the table traps it as unbound (no prototype in the EGL/GLES headers);
+//! 2. every stub of the binding table (atl-native-bridge engine `bindings::rows`) of a checked library is a defined dynamic symbol of its host library, unless the table traps it as unbound (no prototype in the EGL/GLES headers, or C++ internals);
 //! 3. every [`ABSENT`] entry still holds: its map line names it, and neither the front nor the guest proxy exports it -- else the entry is stale (red).
 //!
 //! Skipped, naming why, when the slot has no guest proxies or fronts (`xtask native` without the nb guest set).
@@ -47,7 +47,7 @@ fn exports(path: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// The NDK names of a `map.txt`: the `global:` entries, minus `# llndk` ones. A tag besides `introduced*` / `llndk` fails: a new annotation must be classified, not guessed.
+/// The NDK names of a `map.txt`: the `global:` entries, minus `# llndk` (vendor-only) and `# systemapi` (system-only) ones, which AOSP's stub generator omits from the NDK surface (build/soong/cc/symbolfile `_should_omit_tags`). A tag besides `introduced*` / `llndk` / `systemapi` fails: a new annotation must be classified, not guessed.
 fn ndk_names(map: &str) -> Result<Vec<(usize, String)>> {
     let mut out = Vec::new();
     for (i, line) in map.lines().enumerate() {
@@ -63,11 +63,11 @@ fn ndk_names(map: &str) -> Result<Vec<(usize, String)>> {
         let tags: Vec<&str> = tags.split_whitespace().collect();
         if let Some(t) = tags
             .iter()
-            .find(|t| !t.starts_with("introduced") && **t != "llndk")
+            .find(|t| !t.starts_with("introduced") && !matches!(**t, "llndk" | "systemapi"))
         {
             bail!("map line {}: unclassified tag {t} on {name}", i + 1);
         }
-        if !tags.contains(&"llndk") {
+        if !tags.iter().any(|t| matches!(*t, "llndk" | "systemapi")) {
             out.push((i + 1, name.to_owned()));
         }
     }
@@ -80,21 +80,42 @@ fn guest_proxy(out: &Path, arch: &str, lib: &str) -> PathBuf {
         .join(format!("{lib}.so"))
 }
 
-/// Native goals (gate_goals.rs): the GL fronts and their guest proxies.
+/// The NDK libraries whose guest proxies this step checks beside the GL fronts (C3): their NDK maps are AOSP's `frameworks/base/native`.
+const NDK_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
+
+/// The libraries checked: each has a guest proxy and a host library at `gl_front` (the GL fronts, then the NDK libraries).
+fn checked_libs() -> Vec<&'static str> {
+    crate::atld_run::gl_front_goals()
+        .iter()
+        .copied()
+        .chain(NDK_LIBS)
+        .collect()
+}
+
+/// The AOSP directory of `lib`'s NDK symbol map: the GL fronts' (`MAPS`) or the NDK libraries' own.
+fn map_dir(lib: &str) -> &'static str {
+    match lib {
+        "libandroid" => "aosp/frameworks/base/native/android",
+        "libjnigraphics" => "aosp/frameworks/base/native/graphics/jni",
+        _ => MAPS,
+    }
+}
+
+/// Native goals (gate_goals.rs): the checked libraries and their guest proxies.
 pub fn goals() -> crate::gate_goals::Goals {
-    let fronts = crate::atld_run::gl_front_goals();
-    let proxies: Vec<String> = fronts
+    let libs = checked_libs();
+    let proxies: Vec<String> = libs
         .iter()
         .map(|f| format!("libnative_bridge_guest_{f}"))
         .collect();
     let proxies: Vec<&str> = proxies.iter().map(String::as_str).collect();
-    crate::gate_goals::Goals::host(fronts).with(crate::gate_goals::Goals::nb(&proxies))
+    crate::gate_goals::Goals::host(&libs).with(crate::gate_goals::Goals::nb(&proxies))
 }
 
 /// Runs the step on slot `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the slot lacks the inputs.
 pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
-    let fronts = crate::atld_run::gl_front_goals();
-    let missing: Vec<String> = fronts
+    let libs = checked_libs();
+    let missing: Vec<String> = libs
         .iter()
         .flat_map(|l| [guest_proxy(out, arch, l), crate::atld_run::gl_front(out, l)])
         .filter(|p| !p.is_file())
@@ -102,16 +123,17 @@ pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
         .collect();
     if !missing.is_empty() {
         return Ok(Some(format!(
-            "no {}: build the GL fronts {fronts:?} and nb:libnative_bridge_guest_<front> first",
+            "no {}: build the checked libraries {libs:?} and nb:libnative_bridge_guest_<lib> first",
             missing.join(", ")
         )));
     }
-    let maps = Layout::of(root)?.locate(Path::new(MAPS)).dir;
+    let layout = Layout::of(root)?;
     let mut problems = Vec::new();
     let mut counted = 0usize;
-    for &lib in fronts {
+    for &lib in &libs {
         let guest = exports(&guest_proxy(out, arch, lib))?;
         let front = exports(&crate::atld_run::gl_front(out, lib))?;
+        let maps = layout.locate(Path::new(map_dir(lib))).dir;
         let map_path = maps.join(format!("{lib}.map.txt"));
         let map =
             std::fs::read_to_string(&map_path).with_context(|| map_path.display().to_string())?;
@@ -163,10 +185,27 @@ pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
     if !problems.is_empty() {
         bail!("{} problem(s): {}", problems.len(), problems.join(" | "));
     }
+    // the NDK proxies' binding classes: a pending stub has no prototype in the set yet (build.rs `missing_prototype`)
+    let split: Vec<String> = NDK_LIBS
+        .iter()
+        .map(|lib| {
+            let soname = format!("{lib}.so");
+            let (mut bound, mut pending, mut unbound) = (0usize, 0usize, 0usize);
+            for (_, _, b) in bindings::rows().filter(|(l, ..)| *l == soname) {
+                match b {
+                    Binding::Generic { .. } | Binding::Shim => bound += 1,
+                    Binding::Trap(why) if why.starts_with("pending") => pending += 1,
+                    Binding::Trap(_) => unbound += 1,
+                }
+            }
+            format!("{lib} {bound} bound, {pending} pending, {unbound} unbound")
+        })
+        .collect();
     eprintln!(
-        "gl-proxies: ok ({} fronts: NDK maps in the guest proxies, {counted} table stubs in the fronts, {} ABSENT entries hold)",
-        fronts.len(),
-        ABSENT.len()
+        "gl-proxies: ok ({} libraries: NDK maps in the guest proxies, {counted} table stubs in the fronts, {} ABSENT entries hold; NDK stubs: {})",
+        libs.len(),
+        ABSENT.len(),
+        split.join(", ")
     );
     Ok(None)
 }
@@ -176,14 +215,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn map_names_skip_llndk_and_refuse_unknown_tags() {
-        let map = "LIBEGL {\n  global:\n    eglA;\n    eglB; # introduced=29\n    eglC; # llndk\n  local:\n    *;\n};\n";
+    fn map_names_skip_llndk_and_systemapi_and_refuse_unknown_tags() {
+        let map = "LIBEGL {\n  global:\n    eglA;\n    eglB; # introduced=29\n    eglC; # llndk\n    eglD; # systemapi introduced=31\n  local:\n    *;\n};\n";
         let names: Vec<String> = ndk_names(map)
             .unwrap()
             .into_iter()
             .map(|(_, n)| n)
             .collect();
         assert_eq!(names, ["eglA", "eglB"]);
-        assert!(ndk_names("    eglD; # systemapi\n").is_err());
+        assert!(ndk_names("    eglE; # bogus\n").is_err());
     }
 }

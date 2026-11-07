@@ -301,7 +301,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?));
 
     let tools = ApkTools::new(root, &args.host, &out, &java_out)?;
-    let apk = tools.build(&root.join(FIXTURE), &work.join("apk"), &[], Some(&native))?;
+    let apk = tools.build(
+        &root.join(FIXTURE),
+        &work.join("apk"),
+        &[],
+        Some(&native),
+        None,
+    )?;
     let m = manifest::read(&tools.aapt2, &apk)?;
     let am = ApkManifest {
         gl_es: manifest::gl_es_version(&tools.aapt2, &apk)?,

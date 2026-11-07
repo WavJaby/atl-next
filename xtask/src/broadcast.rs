@@ -86,7 +86,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for (fixture, dir) in [(SENDER, "sender"), (RECEIVER, "receiver")] {
         let apk = rt
             .apk
-            .build(&root.join(fixture), &work.join(dir), &[], None)?;
+            .build(&root.join(fixture), &work.join(dir), &[], None, None)?;
         let m = manifest::read(&rt.apk.aapt2, &apk)?;
         println!(
             "broadcast: built {} ({}, {} receivers)",

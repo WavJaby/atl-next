@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 package atl.bridge1.testlib;
 
+import android.content.res.AssetManager;
+import android.graphics.Bitmap;
+
 /**
  * Java side of the bridge-1 fixture. Native code: libatl-jni-test.so (xtask/testdata/jni-test, built by xtask/src/jni_fixture.rs), packaged into the M2 test APK's lib/x86_64/; the M2 app does not load it until bridge 1 can.
  * A failed load must surface as UnsatisfiedLinkError naming the library; a crash is a failed gate.
@@ -50,6 +53,12 @@ public final class AtlJniTest {
 
     /** After glesPbuffer: 1 when /proc/self/maps names the host driver ("mesa"), 0 when not, -1 when unreadable (atl_jni_test.c). */
     public static native int mesaMapped();
+
+    /** C3 asset probe over libandroid's AAsset API: one line of streamed SHA-256s, a seek's tail, getBuffer and a missing name (atl_jni_test.c assetProbe, app.rs BRIDGE1_CALLS). */
+    public static native String assetProbe(AssetManager assets);
+
+    /** C3 bitmap probe over libjnigraphics' AndroidBitmap: info and the locked pixel bytes, one line (atl_jni_test.c bitmapProbe). */
+    public static native String bitmapProbe(Bitmap bitmap);
 
     /** Bound by RegisterNatives in JNI_OnLoad. */
     public static native int registeredAnswer();
