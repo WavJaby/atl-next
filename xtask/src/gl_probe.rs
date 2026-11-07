@@ -8,8 +8,13 @@
 //!    eglGetProcAddress's extension-slot path, where 0010 returns the driver's address instead of the asm forwarder. [`EXTENSION`] must be one; the count is printed.
 //! 2. pixels: every pixel of the [`SIZE`] pbuffer equals [`CLEAR`]: GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) of c / 255 gives c back, so the bytes are the expectation.
 //! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in a Mesa object, not libEGL.
+//! 4. driver: a DRM node the probe holds after eglInitialize, each with a known kernel driver (`judge_driver`).
+//! 5. renderer: `GL_RENDERER` starts with [`RENDERER`]. Break: [`LLVMPIPE_RENDERER`] must not match it.
+//! 6. scene: the last frame of a timed scene ([`TIMED_SIZE`] pixels; [`FRAMES`] frames after one untimed warm-up, each clear + draw + glFinish) reads back [`TEXEL`] on every pixel.
+//! 7. frames: one wall-clock time per timed frame. The gate prints their median and p95 (nearest rank) with the 1/5/15-minute load average before and after (`uptime`'s figures).
+//!    A baseline only while the 1-minute load before the run is below [`QUIET_LOAD`]; the gate never fails on it.
 //!
-//! Then a deliberate break, every run: the probe skips glClear and calls a no-op in place of the extension (what a forwarder that does nothing gives); both checks must fail.
+//! Then a deliberate break, every run: the probe skips glClear and the timed draws, and calls a no-op in place of the extension; the pixel, scene and extension checks must fail.
 //! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
 //! 1. GL_VERSION `OpenGL ES-CM 1.`, renderer softpipe; 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
 //!
@@ -20,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, Shell};
@@ -38,6 +43,9 @@ pub struct Args {
     /// Java pipeline build directory: boot jars, aapt2, d8 (default: this checkout's slot; else <workspace>/out/java/build).
     #[arg(long)]
     java_out: Option<PathBuf>,
+    /// Timed frames of the scene, after one untimed warm-up; the median and p95 are over these. At least 20: below that the p95 is the slowest frame.
+    #[arg(long, default_value_t = FRAMES)]
+    frames: u32,
     /// Print each probe log.
     #[arg(long, short)]
     verbose: bool,
@@ -60,6 +68,21 @@ const ES1_MODE: &str = "es1";
 const SCENE: &str = "es1-scene.toml";
 /// The message AOSP's libEGL logs when a hook falls to the unimplemented stub (egl.cpp:177): check 3 fails on it.
 const UNIMPLEMENTED: &str = "called unimplemented OpenGL ES API";
+/// The timed scene's surface. A multiple of the grid size (Probe.java `GRID`), so the cell edges fall on pixel boundaries and no pixel centre sits on one.
+const TIMED_SIZE: (u32, u32) = (256, 256);
+/// The scene's texel: every scene pixel must read it back. Its fragment loop sums 64 terms of texel / 64, exact up to float rounding, which the unorm8 conversion absorbs.
+const TEXEL: [u8; 4] = [204, 153, 51, 255];
+/// Timed frames after one untimed warm-up. Each frame's time is one sample; a longer run only lengthens LIMIT's share.
+const FRAMES: u32 = 60;
+/// Nearest-rank p95 of n samples is the maximum while n < 20 (rank ceil(0.95 n) = n); from 20 on it is not.
+const P95_MIN_FRAMES: u32 = 20;
+/// The renderer name the gate requires: Mesa's softpipe (`softpipe_get_name`, src/gallium/drivers/softpipe/sp_screen.c). A build whose llvmpipe tier runs reports `llvmpipe (LLVM ...)` and changes this.
+const RENDERER: &str = "softpipe";
+/// The llvmpipe tier's name prefix. A deliberate break every run: on the renderer above it must not match.
+const LLVMPIPE_RENDERER: &str = "llvmpipe (LLVM ";
+/// Median and p95 are a baseline only while the 1-minute load is below this: an unconfirmed first guess (a quarter of this host's 16 threads). Reported as `quiet`, never a failure.
+const QUIET_LOAD: f64 = 4.0;
+const NS_PER_MS: f64 = 1_000_000.0;
 /// In Mesa's ES dispatch, not in entries.in; observable through a query whose answer an entries.in call also gives.
 const EXTENSION: &str = "glGetInteger64vEXT";
 /// Mesa's generated dispatch table (build-relative) and its API XML (tree-relative); AOSP's entries.in.
@@ -80,6 +103,11 @@ pub fn goals() -> crate::gate_goals::Goals {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    ensure!(
+        args.frames >= P95_MIN_FRAMES,
+        "--frames {} is below {P95_MIN_FRAMES}: the p95 would be the slowest frame",
+        args.frames
+    );
     let layout = Layout::of(root)?;
     let rt = Runtime::new(
         root,
@@ -143,6 +171,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
     let scene = load_scene(root)?;
+    // the normal run's frame times, its renderer, and the load average around it
+    let mut timed = None;
     for broken in [false, true] {
         let tag = if broken { "break" } else { "run" };
         let mut shell_args: Vec<String> = vec![
@@ -152,16 +182,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             SIZE.1.to_string(),
         ];
         shell_args.extend(CLEAR.iter().map(u8::to_string));
+        shell_args.extend(
+            [TIMED_SIZE.0, TIMED_SIZE.1, args.frames]
+                .iter()
+                .map(u32::to_string),
+        );
+        shell_args.extend(TEXEL.iter().map(u8::to_string));
         if broken {
             shell_args.push("break".to_owned());
         }
+        let load_before = loadavg()?;
         let log = run_probe(&rt, &apk, &work.join(tag), shell_args, args.verbose, tag)?;
+        let load_after = loadavg()?;
         let lines = probe_lines(&log);
-        let pixels = judge_pixels(&lines);
+        let pixels = judge_pixels(&lines, "pixels", CLEAR, SIZE.0 * SIZE.1);
         let ext = judge_extension(&lines);
+        let scene_pixels = judge_scene(&lines);
         if broken {
-            // the break passes when both checks fire
-            for (what, r) in [("pixels", &pixels), ("extension", &ext)] {
+            // the break passes when every check fires
+            for (what, r) in [
+                ("pixels", &pixels),
+                ("extension", &ext),
+                ("scene", &scene_pixels),
+            ] {
                 let fired = r.is_err();
                 ok &= fired;
                 println!(
@@ -173,24 +216,54 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     )
                 );
             }
-        } else {
-            let driver = judge_driver(&lines);
-            for (what, r) in [
-                ("pixels", &pixels),
-                ("extension", &ext),
-                ("driver", &driver),
-            ] {
-                ok &= r.is_ok();
-                println!(
-                    "gl: {} {what}: {}",
-                    verdict(r.is_ok()),
-                    r.as_ref().unwrap_or_else(|e| e)
-                );
-            }
-            if let Some(r) = lines.iter().find(|l| l.starts_with("renderer ")) {
-                println!("gl: {r}");
-            }
+            continue;
         }
+        let driver = judge_driver(&lines);
+        let renderer = judge_renderer(&lines, RENDERER);
+        let timing = judge_frames(&lines, args.frames);
+        let timing_check = timing
+            .as_ref()
+            .map(|ns| format!("{} frame times, all positive", ns.len()))
+            .map_err(String::clone);
+        for (what, r) in [
+            ("pixels", &pixels),
+            ("extension", &ext),
+            ("driver", &driver),
+            ("renderer", &renderer),
+            ("scene", &scene_pixels),
+            ("frames", &timing_check),
+        ] {
+            ok &= r.is_ok();
+            println!(
+                "gl: {} {what}: {}",
+                verdict(r.is_ok()),
+                r.as_ref().unwrap_or_else(|e| e)
+            );
+        }
+        // deliberate break: the llvmpipe tier's name must not match this renderer
+        let wrong = judge_renderer(&lines, LLVMPIPE_RENDERER);
+        let fired = wrong.is_err();
+        ok &= fired;
+        println!(
+            "gl: {} break renderer: {}",
+            verdict(fired),
+            wrong.as_ref().map_or_else(
+                |e| format!("fails as it must: {e}"),
+                |d| format!("PASSED on {d}")
+            )
+        );
+        let name = renderer.as_deref().unwrap_or("unknown").to_owned();
+        timed = timing.ok().map(|ns| (name, ns, load_before, load_after));
+    }
+    if let Some((name, ns, before, after)) = timed {
+        let (median, p95) = perf_ms(&ns);
+        println!(
+            "gl: perf {name}, {} frames: median {median:.3} ms, p95 {p95:.3} ms (nearest rank); load avg 1/5/15 min before {}, after {}; quiet: {}",
+            ns.len(),
+            fmt_load(before),
+            fmt_load(after),
+            if before[0] < QUIET_LOAD { "yes" } else { "no" }
+        );
     }
     ok &= es1(&rt, &apk, &work, &lib_at, &scene, args.verbose)?;
     println!(
@@ -311,7 +384,7 @@ fn es1(
             ),
             (
                 "1 renderer",
-                renderer.to_ascii_lowercase().contains("softpipe"),
+                renderer.to_ascii_lowercase().contains(RENDERER),
                 renderer.to_owned(),
             ),
             (
@@ -456,25 +529,106 @@ fn probe_lines(log: &str) -> Vec<String> {
         .collect()
 }
 
-/// `pixels <r,g,b,a>x<count> ...`: exactly one value, [`CLEAR`], on every pixel.
-fn judge_pixels(lines: &[String]) -> Result<String, String> {
+/// `<what> <r,g,b,a>x<count> ...`: exactly one value, `want`, on all `count` pixels.
+fn judge_pixels(lines: &[String], what: &str, want: [u8; 4], count: u32) -> Result<String, String> {
     let line = lines
         .iter()
-        .find_map(|l| l.strip_prefix("pixels "))
-        .ok_or_else(|| no_line("pixels", lines))?;
-    let want = format!(
-        "{},{},{},{}x{}",
-        CLEAR[0],
-        CLEAR[1],
-        CLEAR[2],
-        CLEAR[3],
-        SIZE.0 * SIZE.1
-    );
-    if line == want {
-        Ok(format!("all {} pixels {:?}", SIZE.0 * SIZE.1, CLEAR))
+        .find_map(|l| l.strip_prefix(what).and_then(|r| r.strip_prefix(' ')))
+        .ok_or_else(|| no_line(what, lines))?;
+    let expect = format!("{},{},{},{}x{count}", want[0], want[1], want[2], want[3]);
+    if line == expect {
+        Ok(format!("all {count} pixels {want:?}"))
     } else {
-        Err(format!("read back {line}, want {want}"))
+        Err(format!("read back {line}, want {expect}"))
     }
+}
+
+/// The timed scene's last frame: every pixel [`TEXEL`], and no GL or shader error from the probe. A failed draw reads back the clear colour.
+fn judge_scene(lines: &[String]) -> Result<String, String> {
+    let errors: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("scene-error"))
+        .map(String::as_str)
+        .collect();
+    if !errors.is_empty() {
+        return Err(errors.join(" | "));
+    }
+    judge_pixels(lines, "scene", TEXEL, TIMED_SIZE.0 * TIMED_SIZE.1)
+}
+
+/// The text of the probe's `renderer <GL_RENDERER>` line.
+fn renderer_name(lines: &[String]) -> Result<&str, String> {
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("renderer "))
+        .ok_or_else(|| no_line("renderer", lines))
+}
+
+/// The renderer is the tier the gate wants when its name starts with `want`; Ok carries the name.
+fn judge_renderer(lines: &[String], want: &str) -> Result<String, String> {
+    let name = renderer_name(lines)?;
+    if name.starts_with(want) {
+        Ok(name.to_owned())
+    } else {
+        Err(format!("{name} does not start with `{want}`"))
+    }
+}
+
+/// `frame_ns <n>,<n>,...`: exactly `frames` times, each positive (ns).
+fn judge_frames(lines: &[String], frames: u32) -> Result<Vec<u64>, String> {
+    let line = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("frame_ns "))
+        .ok_or_else(|| no_line("frame_ns", lines))?;
+    let ns = line
+        .split(',')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("unreadable frame_ns `{line}`: {e}"))?;
+    if ns.len() == frames as usize && ns.iter().all(|&n| n > 0) {
+        Ok(ns)
+    } else {
+        Err(format!(
+            "{} frame times, want {frames}, all positive",
+            ns.len()
+        ))
+    }
+}
+
+/// Median and p95 of the frame times, ms, by nearest rank.
+fn perf_ms(ns: &[u64]) -> (f64, f64) {
+    let mut sorted = ns.to_vec();
+    sorted.sort_unstable();
+    (
+        nearest_rank(&sorted, 50) as f64 / NS_PER_MS,
+        nearest_rank(&sorted, 95) as f64 / NS_PER_MS,
+    )
+}
+
+/// The nearest-rank `percent` value of a non-empty sorted slice: 1-based rank ceil(percent x n / 100), no interpolation.
+fn nearest_rank(sorted: &[u64], percent: usize) -> u64 {
+    let rank = (percent * sorted.len()).div_ceil(100);
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// The 1, 5 and 15 minute load averages: `/proc/loadavg`, the figures `uptime` prints.
+fn loadavg() -> Result<[f64; 3]> {
+    let text = std::fs::read_to_string("/proc/loadavg").context("reading /proc/loadavg")?;
+    parse_loadavg(&text)
+}
+
+fn parse_loadavg(text: &str) -> Result<[f64; 3]> {
+    let words = text
+        .split_whitespace()
+        .take(3)
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing loadavg `{text}`"))?;
+    <[f64; 3]>::try_from(words).map_err(|w| anyhow!("loadavg has {} fields, want 3", w.len()))
+}
+
+fn fmt_load(load: [f64; 3]) -> String {
+    format!("{:.2} {:.2} {:.2}", load[0], load[1], load[2])
 }
 
 /// The DRM driver in use: `drm <node>=<modalias> ...`, the /dev/dri nodes the probe holds after eglInitialize. Mesa's Android platform opens one for every driver it loads, and with software rendering
@@ -611,16 +765,66 @@ mod tests {
     #[test]
     fn pixels_need_one_value_everywhere() {
         let n = SIZE.0 * SIZE.1;
-        assert!(judge_pixels(&lines(&[&format!("pixels 51,102,204,255x{n}")])).is_ok());
-        assert!(judge_pixels(&lines(&[&format!("pixels 0,0,0,0x{n}")])).is_err());
-        assert!(
-            judge_pixels(&lines(&[&format!(
-                "pixels 0,0,0,0x1 51,102,204,255x{}",
-                n - 1
-            )]))
-            .is_err()
+        let check = |text: String| judge_pixels(&lines(&[text.as_str()]), "pixels", CLEAR, n);
+        assert!(check(format!("pixels 51,102,204,255x{n}")).is_ok());
+        assert!(check(format!("pixels 0,0,0,0x{n}")).is_err());
+        assert!(check(format!("pixels 0,0,0,0x1 51,102,204,255x{}", n - 1)).is_err());
+        assert!(judge_pixels(&lines(&["renderer x"]), "pixels", CLEAR, n).is_err());
+    }
+
+    #[test]
+    fn scene_needs_texel_everywhere_and_no_error() {
+        let n = TIMED_SIZE.0 * TIMED_SIZE.1;
+        assert!(judge_scene(&lines(&[&format!("scene 204,153,51,255x{n}")])).is_ok());
+        // a frame that never drew reads back the clear colour
+        assert!(judge_scene(&lines(&[&format!("scene 51,102,204,255x{n}")])).is_err());
+        let shader = judge_scene(&lines(&[
+            &format!("scene 204,153,51,255x{n}"),
+            "scene-error shader: 0:1: syntax error",
+        ]));
+        assert!(shader.is_err_and(|e| e.contains("syntax error")));
+    }
+
+    #[test]
+    fn renderer_prefix_selects_the_tier() {
+        let soft = lines(&["renderer softpipe", "version OpenGL ES 3.2 Mesa"]);
+        let llvm = lines(&["renderer llvmpipe (LLVM 20.0.0, 256 bits)"]);
+        assert!(judge_renderer(&soft, RENDERER).is_ok());
+        assert!(judge_renderer(&soft, LLVMPIPE_RENDERER).is_err());
+        assert!(judge_renderer(&llvm, LLVMPIPE_RENDERER).is_ok());
+        assert!(judge_renderer(&llvm, RENDERER).is_err());
+        assert!(judge_renderer(&lines(&["drm none"]), RENDERER).is_err());
+    }
+
+    #[test]
+    fn frames_must_all_be_timed() {
+        assert_eq!(
+            judge_frames(&lines(&["frame_ns 1,2,3"]), 3),
+            Ok(vec![1, 2, 3])
         );
-        assert!(judge_pixels(&lines(&["renderer x"])).is_err());
+        assert!(judge_frames(&lines(&["frame_ns 1,2,3"]), 4).is_err());
+        assert!(judge_frames(&lines(&["frame_ns 1,0,3"]), 3).is_err());
+        assert!(judge_frames(&lines(&["frame_ns 1,x,3"]), 3).is_err());
+    }
+
+    #[test]
+    fn nearest_rank_is_the_ceiling_rank() {
+        let one_to = |n: u64| (1..=n).collect::<Vec<u64>>();
+        assert_eq!(nearest_rank(&one_to(5), 50), 3);
+        assert_eq!(nearest_rank(&one_to(20), 50), 10);
+        assert_eq!(nearest_rank(&one_to(20), 95), 19);
+        // below 20 samples the p95 is the maximum
+        assert_eq!(nearest_rank(&one_to(19), 95), 19);
+        assert_eq!(nearest_rank(&[7], 95), 7);
+    }
+
+    #[test]
+    fn loadavg_takes_three_fields() {
+        assert_eq!(
+            parse_loadavg("0.64 1.70 0.99 2/256 11879\n").unwrap(),
+            [0.64, 1.70, 0.99]
+        );
+        assert!(parse_loadavg("1.00 2.00").is_err());
     }
 
     #[test]
