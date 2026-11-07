@@ -12,6 +12,7 @@
 //! - set at start, as AOSP's `dumpsys sensorservice hal_bypass_replay_data_injection <package>` sets it (changeOperatingMode :2430): global, one allow-listed package matched by `contains` (isAllowListedPackage :2538)
 //! - refused while the platform lists a real accelerometer (probed at start, logged + counted): an injecting client would otherwise replace real readings for every app (in bypass mode poll() reads only the injected queue)
 //! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`]) for injected events to land on; it has no source thread
+//! - not AOSP: an event is accepted only from the process owning the focused window ([`FocusedProcess`]), checked per event; the name check alone lets any process that claims the allow-listed name (the op package is the caller's own string) steer every app's accelerometer
 
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
@@ -23,6 +24,7 @@ use atl_platform_host::{Accelerometer, Sensors};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 
 use crate::counters;
+use crate::focus::FocusedProcess;
 
 /// `ASensorEvent` as clang lays it out from the pinned android/sensor.h (build.rs).
 #[allow(clippy::all)]
@@ -311,12 +313,18 @@ pub struct SensorHub {
     next_connection: AtomicU64,
     /// The allow-listed package while in HAL bypass injection mode (SensorService mAllowListedPackage); None: NORMAL.
     injection: Option<String>,
+    /// The focus owner an injected event must come from; None: no focus check (test only, the tilt gate's `focus` break).
+    focus: Option<Arc<FocusedProcess>>,
 }
 
 impl SensorHub {
     /// The sensors `source` lists now, handles from 1 (SensorService `registerSensor` at start; no hot-plug).
-    /// `injection`: start in HAL bypass injection mode with this allow-listed package, unless the source lists a real accelerometer (then NORMAL, logged and counted).
-    pub fn new(source: Arc<dyn Sensors>, injection: Option<&str>) -> Arc<SensorHub> {
+    /// `injection`: start in HAL bypass injection mode with this allow-listed package, unless the source lists a real accelerometer (then NORMAL, logged and counted). `focus`: see [`SensorHub::inject`].
+    pub fn new(
+        source: Arc<dyn Sensors>,
+        injection: Option<&str>,
+        focus: Option<Arc<FocusedProcess>>,
+    ) -> Arc<SensorHub> {
         let mut sensors: Vec<SensorInfo> = source
             .accelerometers()
             .iter()
@@ -350,6 +358,7 @@ impl SensorHub {
             }),
             next_connection: AtomicU64::new(1),
             injection,
+            focus,
         })
     }
 
@@ -366,10 +375,14 @@ impl SensorHub {
     }
 
     /// One record an injecting client wrote (SensorEventConnection::handleEvent -> SensorDevice::injectSensorData, HAL bypass: queued, then fanned out as a HAL event).
-    /// Dropped (counted) outside the mode, for a package not allow-listed, or for an unknown handle (AOSP: getSensorInterfaceFromHandle null).
-    pub fn inject(&self, package: &str, record: &[u8; EVENT_SIZE]) {
+    /// Dropped (counted) outside the mode, for a package not allow-listed, from a `pid` (the connection's creator) not owning the focused window, or for an unknown handle (AOSP: getSensorInterfaceFromHandle null).
+    pub fn inject(&self, package: &str, pid: i32, record: &[u8; EVENT_SIZE]) {
         if !self.is_allow_listed(package) {
             counters::refused(INTERFACE, "injected event: not allowed");
+            return;
+        }
+        if self.focus.as_ref().is_some_and(|f| !f.is(pid)) {
+            counters::refused(INTERFACE, "injected event: caller has no focused window");
             return;
         }
         let word = |off: u64| {
@@ -631,19 +644,22 @@ mod tests {
 
     #[test]
     fn empty_source_lists_nothing_and_refuses_enable() {
-        let hub = SensorHub::new(Arc::new(Nothing), None);
+        let hub = SensorHub::new(Arc::new(Nothing), None, None);
         assert!(hub.sensor_list().is_empty());
         let ch = Arc::new(Channel::open().unwrap());
         assert_eq!(hub.enable(1, &ch, 1, 20_000_000), BAD_VALUE);
     }
 
-    /// A real accelerometer refuses the mode; without one the injected sensor is listed and an allow-listed client's records reach the subscribers with the type set, others' are dropped.
+    /// A real accelerometer refuses the mode; without one the injected sensor is listed and an allow-listed client's records reach the subscribers with the type set, others' are dropped;
+    /// so are the allow-listed name's from a process without the focused window (pid 5 focused, 6 not).
     #[test]
-    fn injection_needs_no_real_sensor_and_an_allow_listed_package() {
-        let real = SensorHub::new(Arc::new(Fixed), Some("atl.tilt"));
+    fn injection_needs_no_real_sensor_an_allow_listed_package_and_focus() {
+        let real = SensorHub::new(Arc::new(Fixed), Some("atl.tilt"), None);
         assert!(!real.hal_bypass_injection());
         assert_eq!(real.sensor_list().len(), 1);
-        let hub = SensorHub::new(Arc::new(Nothing), Some("atl.tilt"));
+        let focus = Arc::new(FocusedProcess::default());
+        focus.gained(5);
+        let hub = SensorHub::new(Arc::new(Nothing), Some("atl.tilt"), Some(focus));
         assert!(hub.hal_bypass_injection());
         let s = &hub.sensor_list()[0];
         assert_eq!((s.handle, s.name.as_str()), (1, INJECTED_NAME));
@@ -652,18 +668,19 @@ mod tests {
         assert_eq!(hub.enable(3, &ch, 1, 20_000_000), OK);
         // type 0 on the wire: the service sets the sensor's
         let record = encode_event(1, 0, 42, &[0.5, 0.0, 9.0]);
-        hub.inject("com.example:atl.tilt", &record);
+        hub.inject("com.example:atl.tilt", 5, &record);
         let e = recv_event(&ch, &rx);
         assert_eq!(&e[8..12], &1i32.to_ne_bytes());
         assert_eq!(&e[16..24], &42i64.to_ne_bytes());
-        hub.inject("other", &record);
+        hub.inject("other", 5, &record);
+        hub.inject("com.example:atl.tilt", 6, &record);
         let mut buf = [0u8; EVENT_SIZE];
         assert!(rustix::net::recv(&rx, &mut buf, rustix::net::RecvFlags::DONTWAIT).is_err());
     }
 
     #[test]
     fn flatten_matches_sensor_cpp_field_widths() {
-        let hub = SensorHub::new(Arc::new(Fixed), None);
+        let hub = SensorHub::new(Arc::new(Fixed), None, None);
         let s = &hub.sensor_list()[0];
         assert_eq!(s.handle, 1);
         // fixed (Sensor::getFlattenedSize): 4 version + 4 handle + 4 type + 4x4 floats + 4 minDelay + 2x4 fifo + 1 bool + 4 appOp + 4 maxDelay + 4 flags + 16 uuid + 4 id = 73;
@@ -676,7 +693,7 @@ mod tests {
 
     #[test]
     fn events_reach_the_channel_with_aosp_layout_and_stop_on_last_disable() {
-        let hub = SensorHub::new(Arc::new(Fixed), None);
+        let hub = SensorHub::new(Arc::new(Fixed), None, None);
         let ch = Arc::new(Channel::open().unwrap());
         let rx = ch.take_receive().unwrap();
         assert!(ch.take_receive().is_none(), "the client end is given once");
@@ -710,7 +727,7 @@ mod tests {
 
     #[test]
     fn clamp_raises_to_min_delay() {
-        let hub = SensorHub::new(Arc::new(Fixed), None);
+        let hub = SensorHub::new(Arc::new(Fixed), None, None);
         let s = &hub.sensor_list()[0];
         assert_eq!(SensorHub::clamp(s, 1), 5_000_000);
         assert_eq!(SensorHub::clamp(s, 20_000_000), 20_000_000);

@@ -33,6 +33,8 @@ pub struct TiltConfig {
     pub ramp_ms: u32,
     /// The injected events' period, ms.
     pub period_ms: u32,
+    /// Test only (atld `--tilt-probe-unfocused`): while no window of the process has focus, inject the 90 deg probe reading anyway, the misbehaving injector the services' focus check must refuse.
+    pub probe_unfocused: bool,
 }
 
 impl Default for TiltConfig {
@@ -42,27 +44,40 @@ impl Default for TiltConfig {
             max_deg: 30.0,
             ramp_ms: 250,
             period_ms: 20,
+            probe_unfocused: false,
         }
     }
 }
 
 impl TiltConfig {
-    /// `max_deg,ramp_ms,period_ms`.
+    /// `max_deg,ramp_ms,period_ms`, then `,probe` when [`TiltConfig::probe_unfocused`].
     pub fn to_arg(&self) -> String {
-        format!("{},{},{}", self.max_deg, self.ramp_ms, self.period_ms)
+        let probe = if self.probe_unfocused { ",probe" } else { "" };
+        format!(
+            "{},{},{}{probe}",
+            self.max_deg, self.ramp_ms, self.period_ms
+        )
     }
 
     /// [`TiltConfig::to_arg`]'s form; the angle in (0, 90], the period > 0.
     pub fn parse_arg(s: &str) -> Result<TiltConfig, String> {
-        let bad = || format!("{s}: not max_deg,ramp_ms,period_ms (angle in (0, 90], period > 0)");
+        let bad =
+            || format!("{s}: not max_deg,ramp_ms,period_ms[,probe] (angle in (0, 90], period > 0)");
         let mut it = s.split(',');
-        let (Some(a), Some(r), Some(p), None) = (it.next(), it.next(), it.next(), it.next()) else {
+        let (Some(a), Some(r), Some(p), probe, None) =
+            (it.next(), it.next(), it.next(), it.next(), it.next())
+        else {
             return Err(bad());
         };
         let c = TiltConfig {
             max_deg: a.parse().map_err(|_| bad())?,
             ramp_ms: r.parse().map_err(|_| bad())?,
             period_ms: p.parse().map_err(|_| bad())?,
+            probe_unfocused: match probe {
+                None => false,
+                Some("probe") => true,
+                Some(_) => return Err(bad()),
+            },
         };
         if !(c.max_deg > 0.0 && c.max_deg <= 90.0) || c.period_ms == 0 {
             return Err(bad());

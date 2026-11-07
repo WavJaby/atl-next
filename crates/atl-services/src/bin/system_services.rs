@@ -62,6 +62,9 @@ struct Args {
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); refused while the machine has a real accelerometer. atld `--tilt-keys` sets it.
     #[arg(long)]
     sensor_injection: Option<String>,
+    /// Test only: injected events are accepted from any process, not only the focused window's, the deliberate break of the sensors gate's tilt `focus` sub-gate.
+    #[arg(long)]
+    no_sensor_focus_check: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -144,6 +147,7 @@ fn main() -> Result<()> {
         BinderFeatures::default(),
     );
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
+    let focus = Arc::new(atl_services::focus::FocusedProcess::default());
     binder::add_service(
         DISPLAY,
         atl_services::display::new_binder(
@@ -168,6 +172,7 @@ fn main() -> Result<()> {
             Arc::clone(&permissions),
             Arc::clone(&agents),
             !a.no_ime_death_link,
+            Arc::clone(&focus),
         ),
     )
     .context("addService input_method")?;
@@ -224,7 +229,11 @@ fn main() -> Result<()> {
         // the machine's sensors through the platform layer, listed once at start
         let source: Arc<dyn atl_platform_host::Sensors> =
             Arc::new(atl_platform_host::PlatformSensors::default());
-        let hub = atl_services::sensor::SensorHub::new(source, a.sensor_injection.as_deref());
+        let hub = atl_services::sensor::SensorHub::new(
+            source,
+            a.sensor_injection.as_deref(),
+            (!a.no_sensor_focus_check).then(|| Arc::clone(&focus)),
+        );
         writeln!(
             std::io::stderr(),
             "sensor: {} sensors listed",

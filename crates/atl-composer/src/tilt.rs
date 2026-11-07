@@ -36,9 +36,14 @@ pub struct Tilt {
     held: Vec<i32>,
     theta_deg: f32,
     focused: bool,
+    /// A window of this process had focus once: ends the probe ([`TiltConfig::probe_unfocused`]).
+    was_focused: bool,
     /// A level event is owed after losing focus (the last one this process sends).
     owe_level: bool,
 }
+
+/// The probe's reading: the left edge straight down (90 deg), beyond any configured angle, so an app that receives it shows the focus check failed.
+const PROBE: [f32; 3] = [GRAVITY, 0.0, 0.0];
 
 impl Tilt {
     pub fn new(config: TiltConfig) -> Tilt {
@@ -47,6 +52,7 @@ impl Tilt {
             held: Vec::new(),
             theta_deg: 0.0,
             focused: false,
+            was_focused: false,
             owe_level: false,
         }
     }
@@ -72,6 +78,7 @@ impl Tilt {
         self.theta_deg = 0.0;
         self.owe_level = self.focused && !focused;
         self.focused = focused;
+        self.was_focused |= focused;
     }
 
     /// The angle the held keys aim at: one direction's keys -> +-max, none or both -> level.
@@ -80,8 +87,11 @@ impl Tilt {
         sum.signum() * if sum == 0.0 { 0.0 } else { self.config.max_deg }
     }
 
-    /// Advances the angle by `dt`; the values to inject, None when this process injects nothing now.
+    /// Advances the angle by `dt`; the values to inject, None when this process injects nothing now. Before the first focus with the probe on: [`PROBE`], every step.
     pub fn step(&mut self, dt: Duration, rotation: i32) -> Option<[f32; 3]> {
+        if self.config.probe_unfocused && !self.was_focused {
+            return Some(PROBE);
+        }
         if !self.focused {
             return std::mem::take(&mut self.owe_level).then(|| self.values(rotation));
         }
@@ -161,7 +171,26 @@ mod tests {
             max_deg: 30.0,
             ramp_ms: 300,
             period_ms: 20,
+            probe_unfocused: false,
         }
+    }
+
+    #[test]
+    fn probe_injects_only_before_the_first_focus() {
+        let mut t = Tilt::new(TiltConfig {
+            probe_unfocused: true,
+            ..cfg()
+        });
+        assert_eq!(t.step(MS(20), 0), Some(PROBE));
+        t.focus(true);
+        assert!(close(t.step(MS(20), 0).unwrap(), [0.0, 0.0, GRAVITY]));
+        t.focus(false);
+        assert!(close(t.step(MS(20), 0).unwrap(), [0.0, 0.0, GRAVITY]));
+        assert_eq!(
+            t.step(MS(20), 0),
+            None,
+            "after a focus: as without the probe"
+        );
     }
 
     fn close(a: [f32; 3], b: [f32; 3]) -> bool {

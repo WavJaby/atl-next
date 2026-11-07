@@ -233,11 +233,12 @@ impl IHandWritten for SensorServer {
                 };
                 let channel = Arc::new(Channel::open().map_err(|_| StatusCode::NO_MEMORY)?);
                 if injecting {
-                    // updateLooperRegistration(mLooper): the service reads what the client writes on its end
+                    // updateLooperRegistration(mLooper): the service reads what the client writes on its end; the creator's pid is the one its events are checked against (SensorHub::inject)
+                    let pid = binder::ThreadState::get_calling_pid();
                     let (hub, ch) = (Arc::clone(&self.hub), Arc::clone(&channel));
                     std::thread::Builder::new()
                         .name("sensor-inject".to_owned())
-                        .spawn(move || ch.read_injected(|r| hub.inject(&package, r)))
+                        .spawn(move || ch.read_injected(|r| hub.inject(&package, pid, r)))
                         .map_err(|_| StatusCode::NO_MEMORY)?;
                 }
                 let connection = EventConnection {

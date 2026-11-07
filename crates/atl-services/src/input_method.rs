@@ -38,6 +38,7 @@ use binder::{
 };
 
 use crate::counters;
+use crate::focus::FocusedProcess;
 use crate::ime_bind::{self, Bind, ClientBind, Peer};
 use crate::permission::Permissions;
 use crate::ui_agent::{IUiAgent, UiAgents};
@@ -74,6 +75,8 @@ struct State {
     clients: Mutex<HashMap<u32, Client>>,
     /// Clients get a death link (false only for the ime gate's deliberate break, services `--no-ime-death-link`).
     death_link: bool,
+    /// Every startInputOrWindowGainedFocus names its caller the focus owner (focus.rs).
+    focus: Arc<FocusedProcess>,
 }
 
 impl State {
@@ -389,6 +392,8 @@ impl IInputMethodManager for InputMethodManager {
         start_input_seq: i32,
         _use_async_show_hide_method: bool,
     ) -> binder::Result<()> {
+        // a window of the caller has focus, editor or not, client or not
+        self.state.focus.gained(ThreadState::get_calling_pid());
         let Some(client) = client else {
             counters::answered(
                 INTERFACE,
@@ -488,11 +493,13 @@ pub fn new_binder(
     permissions: Arc<Permissions>,
     agents: Arc<UiAgents>,
     death_link: bool,
+    focus: Arc<FocusedProcess>,
 ) -> SpIBinder {
     let state = Arc::new(State {
         agents,
         clients: Mutex::new(HashMap::new()),
         death_link,
+        focus,
     });
     BnInputMethodManager::new_binder(
         InputMethodManager { permissions, state },

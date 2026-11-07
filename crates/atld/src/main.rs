@@ -163,6 +163,12 @@ struct Args {
     /// With `--tilt-keys`: the injected events' period, ms.
     #[arg(long, requires = "tilt_keys")]
     tilt_period_ms: Option<u32>,
+    /// Test only, with `--tilt-keys`: each app's tilt injects a 90 deg probe reading until its first focus (atl-services `TiltConfig::probe_unfocused`), the misbehaving injector of the sensors gate's focus sub-gate.
+    #[arg(long, requires = "tilt_keys")]
+    tilt_probe_unfocused: bool,
+    /// Test only: passed to the services (`--no-sensor-focus-check`), the deliberate break of the sensors gate's focus sub-gate.
+    #[arg(long)]
+    no_sensor_focus_check: bool,
     /// Test only: apps start with `--no-audio-service` (their launcher serves neither AudioFlinger nor AudioPolicyService), the deliberate break of the audio gate.
     #[arg(long)]
     no_audio_service: bool,
@@ -1076,6 +1082,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 max_deg: a.tilt_max_deg.unwrap_or(d.max_deg),
                 ramp_ms: a.tilt_ramp_ms.unwrap_or(d.ramp_ms),
                 period_ms: a.tilt_period_ms.unwrap_or(d.period_ms),
+                probe_unfocused: a.tilt_probe_unfocused,
             }
         }),
         no_audio_service: a.no_audio_service,
@@ -1133,6 +1140,9 @@ fn run(a: &Args) -> Result<ExitCode> {
             "--sensor-injection".into(),
             atl_services::sensor::TILT_INJECTOR_PACKAGE.into(),
         ]);
+    }
+    if a.no_sensor_focus_check {
+        services_args.push("--no-sensor-focus-check".into());
     }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([

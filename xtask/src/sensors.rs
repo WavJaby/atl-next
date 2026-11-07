@@ -4,8 +4,9 @@
 //! Stage `iio`: two fake accelerometers, the owner's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
 //! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
 //! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
-//! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`], the headless script [`TILT_SCRIPT`] (focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
-//! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one). Each must fail.
+//! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`] (incl. the unfocused probe: 90 deg readings until the first focus), the headless script [`TILT_SCRIPT`] (unfocused, focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
+//! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line and their count of the refused probe. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one),
+//! `focus` (services `--no-sensor-focus-check`: the probe reaches the app). Each must fail.
 //! Expected values, computed here independently: axis = raw x scale (offset 0, kernel sysfs-bus-iio), m/s²; canonical r = mount-matrix row r . sensor vector (iio-sensor-proxy `apply_mount_matrix`); Android = (-x, -y, z) of canonical (iio.rs `to_android` derives it).
 
 use std::path::{Path, PathBuf};
@@ -41,6 +42,8 @@ pub enum Break {
     Off,
     /// stage tilt: a real accelerometer present (the iio stage's devices)
     Real,
+    /// stage tilt: the services accept injection from a process without the focused window
+    Focus,
 }
 
 #[derive(clap::Args)]
@@ -102,16 +105,20 @@ const BASE_DEV: &str = "250:1";
 const INJECTED_NAME: &str = "ATL injected accelerometer";
 /// The tilt the gate sets: 30 deg (x = g/2), a 300 ms ramp (a fifth of a hold), 20 ms period (SENSOR_DELAY_GAME).
 const TILT_MAX_DEG: f64 = 30.0;
-const TILT_ARGS: [&str; 6] = [
+const TILT_ARGS: [&str; 7] = [
     "--tilt-max-deg",
     "30",
     "--tilt-ramp-ms",
     "300",
     "--tilt-period-ms",
     "20",
+    "--tilt-probe-unfocused",
 ];
-/// Linux KEY_LEFT / KEY_RIGHT (input-event-codes.h). Holds of 1.5 s: five ramps, so each plateau gets ~60 events; the last hold ends in a focus loss, which must level the device.
-const TILT_SCRIPT: &str = "focus:in wait:1500 key-down:105 wait:1500 key-up:105 wait:1000 key-down:106 wait:1500 key-up:106 wait:1000 key-down:105 wait:1500 focus:out wait:1000";
+/// The services' count of an injected event refused for want of focus (atl-services sensor.rs `SensorHub::inject`).
+const FOCUS_REFUSED: &str = "injected event: caller has no focused window";
+/// Linux KEY_LEFT / KEY_RIGHT (input-event-codes.h). First 500 ms unfocused: the probe's window (`--tilt-probe-unfocused`, ~25 events at 20 ms), after the fixture registered in onCreate.
+/// Holds of 1.5 s: five ramps, so each plateau gets ~60 events; the last hold ends in a focus loss, which must level the device.
+const TILT_SCRIPT: &str = "wait:500 focus:in wait:1500 key-down:105 wait:1500 key-up:105 wait:1000 key-down:106 wait:1500 key-up:106 wait:1000 key-down:105 wait:1500 focus:out wait:1000";
 /// SensorManager.GRAVITY_EARTH.
 const GRAVITY: f64 = 9.806_65;
 /// float32 trig and the Java log's decimal form.
@@ -359,6 +366,12 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
             if !services.lines().any(|l| l.contains("sensor: injection on")) {
                 whys.push("no `sensor: injection on` line from the services".to_owned());
             }
+            // the probe before focus: refused (counted) by the services, so no 90 deg reading reaches the app (check_tilt's "beyond max")
+            if !services.lines().any(|l| l.contains(FOCUS_REFUSED)) {
+                whys.push(format!(
+                    "no `{FOCUS_REFUSED}` count: the unfocused probe was not refused"
+                ));
+            }
             let values: Vec<Vec<f64>> = msgs
                 .iter()
                 .filter(|m| m.starts_with("event "))
@@ -415,7 +428,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.stage == Stage::Tilt {
         rt = rt.with_headless_pointer(TILT_SCRIPT);
         if args.break_ != Some(Break::Off) {
-            rt = rt.with_tilt_keys(&TILT_ARGS.map(String::from));
+            let mut extra: Vec<String> = TILT_ARGS.map(String::from).to_vec();
+            if args.break_ == Some(Break::Focus) {
+                extra.push("--no-sensor-focus-check".to_owned());
+            }
+            rt = rt.with_tilt_keys(&extra);
         }
     }
     let apk = rt
