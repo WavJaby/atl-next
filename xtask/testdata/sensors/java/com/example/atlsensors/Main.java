@@ -17,6 +17,7 @@ import android.util.Log;
  * onCreate: "start" (the gate times the lookup from it), "lookup ms=" how long getSystemService + getDefaultSensor(TYPE_ACCELEROMETER) took, then "list n=" the sensor count.
  * No accelerometer: "default null register=<registerListener result>", then "done".
  * One: "default name=... type=... stringType=... minDelay=...", registerListener(GAME), one "event ts=<timestamp> now=<elapsedRealtimeNanos> v=<x>,<y>,<z>" line per event up to EVENTS, then unregisterListener and "done events=<n>".
+ * The key tilt's injected accelerometer (INJECTED): every event for TILT_WAIT_MS, so the gate sees the keys its script holds.
  */
 public class Main extends Activity implements SensorEventListener {
     private static final String TAG = "AtlSensors";
@@ -24,10 +25,15 @@ public class Main extends Activity implements SensorEventListener {
     private static final int EVENTS = 5;
     /** How long to wait for them (the gate's limit is longer). */
     private static final long WAIT_MS = 3000;
+    /** atl-services sensor.rs INJECTED_NAME. */
+    private static final String INJECTED = "ATL injected accelerometer";
+    /** Longer than the gate's tilt script (sensors.rs TILT_SCRIPT) from the first frame. */
+    private static final long TILT_WAIT_MS = 16000;
 
     private SensorManager manager;
     private int events;
     private boolean finished;
+    private boolean tilt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -44,6 +50,7 @@ public class Main extends Activity implements SensorEventListener {
             return;
         }
         Log.i(TAG, "default name=" + accel.getName() + " type=" + accel.getType() + " stringType=" + accel.getStringType() + " minDelay=" + accel.getMinDelay());
+        tilt = INJECTED.equals(accel.getName());
         Log.i(TAG, "register=" + manager.registerListener(this, accel, SensorManager.SENSOR_DELAY_GAME));
         // no lambda: the boot classpath has no LambdaMetafactory for javac
         new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
@@ -51,7 +58,7 @@ public class Main extends Activity implements SensorEventListener {
             public void run() {
                 finish_();
             }
-        }, WAIT_MS);
+        }, tilt ? TILT_WAIT_MS : WAIT_MS);
     }
 
     @Override
@@ -60,7 +67,7 @@ public class Main extends Activity implements SensorEventListener {
             return;
         }
         Log.i(TAG, "event ts=" + e.timestamp + " now=" + SystemClock.elapsedRealtimeNanos() + " v=" + e.values[0] + "," + e.values[1] + "," + e.values[2]);
-        if (++events >= EVENTS) {
+        if (++events >= EVENTS && !tilt) {
             finish_();
         }
     }

@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 7 Nov 2026 22:34:38 +0800
+Subject: [PATCH] libbinder_ndk, libbinder_rs: bare fd read
+
+A Rust client of a hand-written C++ binder interface (ISensorEventConnection
+GET_SENSOR_CHANNEL) gets a BitTube end as a bare file descriptor object.
+The NDK reads fds only as ParcelFileDescriptor (two leading ints).
+AParcel_readDupFileDescriptor reads the bare object, as
+BitTube(const Parcel&) does, the reader twin of patch 0006s writer.
+
+Upstream-Status: Pending
+Patch-Reason: AParcel wraps android::Parcel privately and the platform API offers no bare fd read; reaching android::Parcel from our unsafe-free crates is possible only through libbinder_rs (same reason as the bare fd write)
+---
+SPDX-License-Identifier: Apache-2.0
+ .../android/binder_parcel_platform.h                 |  7 +++++++
+ libs/binder/ndk/libbinder_ndk.map.txt                |  1 +
+ libs/binder/ndk/parcel.cpp                           |  8 ++++++++
+ libs/binder/rust/src/parcel.rs                       | 12 ++++++++++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+index 25ef7a98b0b65f0d8288cd56f8eea9b4fada5e24..666e52d012546e178ffb7fac4f3243e338e9824b 100644
+--- a/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
++++ b/libs/binder/ndk/include_platform/android/binder_parcel_platform.h
+@@ -50,6 +50,13 @@ const uint8_t* AParcel_getDataWithObjects(const AParcel*, size_t* dataSize, size
+  */
+ binder_status_t AParcel_writeDupFileDescriptor(AParcel*, int fd);
+ 
++/**
++ * Reads a bare file descriptor object (the form AParcel_writeDupFileDescriptor
++ * writes) and sets *fd to a duplicate the caller owns
++ * (android::Parcel::readUniqueFileDescriptor; BitTube(const Parcel&) reads it).
++ */
++binder_status_t AParcel_readDupFileDescriptor(const AParcel*, int* fd);
++
+ #endif
+ 
+ /**
+diff --git a/libs/binder/ndk/libbinder_ndk.map.txt b/libs/binder/ndk/libbinder_ndk.map.txt
+index 8c10777148fe225eb3a8b7b082a6c325a3b08434..e4173f3ed4810ea05ebd12fb60150e9f7081ed90 100644
+--- a/libs/binder/ndk/libbinder_ndk.map.txt
++++ b/libs/binder/ndk/libbinder_ndk.map.txt
+@@ -228,6 +228,7 @@ LIBBINDER_NDK_PLATFORM {
+     AParcel_hasFileDescriptors;
+     AParcel_getDataWithObjects;
+     AParcel_writeDupFileDescriptor;
++    AParcel_readDupFileDescriptor;
+     extern "C++" {
+         AIBinder_fromPlatformBinder*;
+         AIBinder_toPlatformBinder*;
+diff --git a/libs/binder/ndk/parcel.cpp b/libs/binder/ndk/parcel.cpp
+index ef2d52ff4b6baf37f05e8d1a2d3efe809d97a1c6..9e3955280b0dfc5728d037b842b596b6ebcfd139 100644
+--- a/libs/binder/ndk/parcel.cpp
++++ b/libs/binder/ndk/parcel.cpp
+@@ -694,6 +694,14 @@ binder_status_t AParcel_writeDupFileDescriptor(AParcel* parcel, int fd) {
+     return PruneStatusT(parcel->get()->writeDupFileDescriptor(fd));
+ }
+ 
++binder_status_t AParcel_readDupFileDescriptor(const AParcel* parcel, int* fd) {
++    unique_fd out;
++    status_t status = parcel->get()->readUniqueFileDescriptor(&out);
++    if (status != STATUS_OK) return PruneStatusT(status);
++    *fd = out.release();
++    return STATUS_OK;
++}
++
+ binder_status_t AParcel_reset(AParcel* parcel) {
+     parcel->get()->freeData();
+     return STATUS_OK;
+diff --git a/libs/binder/rust/src/parcel.rs b/libs/binder/rust/src/parcel.rs
+index dfc48dfada294288f187b8da4afee7c748b41eb6..981bae38d181c6a7e2ca8b911e0beb453465af6c 100644
+--- a/libs/binder/rust/src/parcel.rs
++++ b/libs/binder/rust/src/parcel.rs
+@@ -328,6 +328,18 @@ impl BorrowedParcel<'_> {
+         status_result(unsafe { sys::AParcel_writeDupFileDescriptor(self.as_native_mut(), raw) })
+     }
+ 
++    /// Reads a bare file descriptor object (the form [`Self::write_dup_file_descriptor`] writes) as a duplicate the caller owns (`Parcel::readUniqueFileDescriptor`).
++    pub fn read_dup_file_descriptor(&self) -> Result<std::os::fd::OwnedFd> {
++        let mut raw = -1;
++        // Safety: `BorrowedParcel` always contains a valid pointer to an `AParcel`; the call only reads it and sets `raw`.
++        status_result(unsafe { sys::AParcel_readDupFileDescriptor(self.as_native(), &mut raw) })?;
++        if raw < 0 {
++            return Err(StatusCode::BAD_VALUE);
++        }
++        // Safety: on success `raw` is a new fd the call dup'ed, owned by nobody else.
++        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
++    }
++
+     /// Moves the position to `pos`, which must lie within the data (0 up to the data size); any other `pos` is BAD_VALUE.
+     /// The bound that `set_data_position` leaves to its caller is checked here.
+     pub fn set_data_position_checked(&self, pos: i32) -> Result<()> {

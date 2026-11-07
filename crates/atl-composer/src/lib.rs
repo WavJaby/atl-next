@@ -26,6 +26,7 @@ pub mod cursor;
 pub mod input;
 pub mod objects;
 pub mod sink;
+pub mod tilt;
 pub mod vsync;
 
 #[cfg(feature = "converter")]

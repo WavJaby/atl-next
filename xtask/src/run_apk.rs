@@ -60,6 +60,9 @@ pub struct Args {
     /// Deliberate-failure check of --drive: every shot is blanked, so the first one must fail the run.
     #[arg(long, requires = "drive")]
     break_blank_capture: bool,
+    /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
+    #[arg(long)]
+    tilt_keys: bool,
 }
 
 impl Args {
@@ -84,6 +87,7 @@ impl Args {
             pointer: None,
             drive: Some(script),
             break_blank_capture,
+            tilt_keys: false,
         }
     }
 }
@@ -125,6 +129,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = match &args.pointer {
         Some(script) => rt.with_headless_pointer(script),
         None => rt,
+    };
+    let rt = if args.tilt_keys {
+        rt.with_tilt_keys(&[])
+    } else {
+        rt
     };
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;

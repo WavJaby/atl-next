@@ -21,6 +21,55 @@ pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
 /// The system property selecting an app process's UI mode (atld `--ui`): `gtk` presents the compositor's scenes into a GTK window of the process, on its main thread (atl-app-launcher lib.rs `start_ui`, atl-composer). Unset: headless.
 pub const UI_PROPERTY: &str = "ro.atl.ui";
+/// The system property holding the key tilt settings (atld `--tilt-keys`, [`TiltConfig::to_arg`]), read by atl-composer's tilt. Unset: no tilt.
+pub const TILT_PROPERTY: &str = "ro.atl.tilt";
+
+/// The key tilt: the arrow / A-D keys tilt the device for accelerometer games (sensor data injection, atl-composer `tilt`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TiltConfig {
+    /// The angle a held key reaches, degrees.
+    pub max_deg: f32,
+    /// How long a held key takes from level to `max_deg`, and a released one back, ms.
+    pub ramp_ms: u32,
+    /// The injected events' period, ms.
+    pub period_ms: u32,
+}
+
+impl Default for TiltConfig {
+    /// 30 deg: x = g sin 30 = g/2, a firm tilt below a game's own clamp; 250 ms: a wrist's quick tilt; 20 ms: SENSOR_DELAY_GAME (SensorManager.getDelay), what games register with.
+    fn default() -> Self {
+        TiltConfig {
+            max_deg: 30.0,
+            ramp_ms: 250,
+            period_ms: 20,
+        }
+    }
+}
+
+impl TiltConfig {
+    /// `max_deg,ramp_ms,period_ms`.
+    pub fn to_arg(&self) -> String {
+        format!("{},{},{}", self.max_deg, self.ramp_ms, self.period_ms)
+    }
+
+    /// [`TiltConfig::to_arg`]'s form; the angle in (0, 90], the period > 0.
+    pub fn parse_arg(s: &str) -> Result<TiltConfig, String> {
+        let bad = || format!("{s}: not max_deg,ramp_ms,period_ms (angle in (0, 90], period > 0)");
+        let mut it = s.split(',');
+        let (Some(a), Some(r), Some(p), None) = (it.next(), it.next(), it.next(), it.next()) else {
+            return Err(bad());
+        };
+        let c = TiltConfig {
+            max_deg: a.parse().map_err(|_| bad())?,
+            ramp_ms: r.parse().map_err(|_| bad())?,
+            period_ms: p.parse().map_err(|_| bad())?,
+        };
+        if !(c.max_deg > 0.0 && c.max_deg <= 90.0) || c.period_ms == 0 {
+            return Err(bad());
+        }
+        Ok(c)
+    }
+}
 /// AOSP's service names, libgui's lookups (SurfaceComposerClient.cpp ComposerService / ComposerServiceAIDL), served in-process.
 pub const SURFACE_FLINGER: &str = "SurfaceFlinger";
 pub const SURFACE_FLINGER_AIDL: &str = "SurfaceFlingerAIDL";

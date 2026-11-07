@@ -2,7 +2,7 @@
 //! `xtask run-apk --drive <script>`: an agent's hands and eyes on a real APK, headless. A script runs against the app's window once run-apk's own wait is over (resumed, settled, a frame presented, the watch done).
 //! Input goes through the window proxy (wayland_proxy.rs), shots through the compositor (screencopy.rs). The compositor holds the window at output (0, 0) ([`NestedCompositor::start_placed`]), so content pixels map to the output by the window geometry the client declared.
 //! Script, one step a line; blank lines and `#` comments are skipped. Coordinates are window content pixels (the output has scale 1).
-//!   wait <ms> | wait-frames <n> | tap <x> <y> | swipe <x1> <y1> <x2> <y2> <ms> | key <name> | resize <w> <h> | shot <file.png>
+//!   wait <ms> | wait-frames <n> | tap <x> <y> | swipe <x1> <y1> <x2> <y2> <ms> | key <name> | key-down <name> | key-up <name> | resize <w> <h> | shot <file.png>
 //! `wait-frames` counts the app's presents from that step on and fails if they do not come: an idle app presents nothing, so use it only after something that redraws. A present is logged before the compositor shows it: a shot straight after may be one frame old.
 //! `shot` paths are relative to the current directory; the image is the window's content (a dialog reaching past it is cut), and a one-colour image is an error, never a pass.
 
@@ -56,6 +56,8 @@ pub enum Step {
         ms: u64,
     },
     Key(u32),
+    /// `key-down` / `key-up`: one half of a key, so a key can be held across waits and shots.
+    KeyHalf(u32, bool),
     Resize(i32, i32),
     Shot(PathBuf),
 }
@@ -109,6 +111,10 @@ fn parse_step(line: &str) -> Result<Step> {
         ["key", name] => {
             Step::Key(key_code(name).with_context(|| format!("no key named {name:?}"))?)
         }
+        [half @ ("key-down" | "key-up"), name] => Step::KeyHalf(
+            key_code(name).with_context(|| format!("no key named {name:?}"))?,
+            *half == "key-down",
+        ),
         ["resize", w, h] => {
             let (w, h) = (num(w)?, num(h)?);
             ensure!(w > 0 && h > 0, "resize needs a positive size");
@@ -263,6 +269,7 @@ impl Driver<'_> {
                 self.t.proxy.inject_key(*code, true)?;
                 self.t.proxy.inject_key(*code, false)?;
             }
+            Step::KeyHalf(code, down) => self.t.proxy.inject_key(*code, *down)?,
             Step::Resize(w, h) => self.resize(*w, *h)?,
             Step::Shot(file) => self.shot(file)?,
         }

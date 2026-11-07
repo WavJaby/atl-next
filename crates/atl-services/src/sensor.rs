@@ -7,6 +7,11 @@
 //! - one source read per sensor, at the shortest period any connection asked for, every event to every connection with the sensor enabled (SensorService::threadLoop fans one HAL stream out)
 //! - events are `ASensorEvent` records sent whole on the connection's SOCK_SEQPACKET channel without blocking; a full channel drops the event (AOSP caches it in mEventCache: not done, counted)
 //! - timestamps on CLOCK_BOOTTIME, the base of SystemClock.elapsedRealtimeNanos (SensorEvent.timestamp docs)
+//!
+//! Data injection: only HAL_BYPASS_REPLAY_DATA_INJECTION (SensorService.h Mode 4), the one mode that needs no HAL: injected events go to every app with the sensor enabled (SensorDevice::injectSensorData queues them, poll() plays them back, SensorDevice.cpp :370, :799).
+//! - set at start, as AOSP's `dumpsys sensorservice hal_bypass_replay_data_injection <package>` sets it (changeOperatingMode :2430): global, one allow-listed package matched by `contains` (isAllowListedPackage :2538)
+//! - refused while the platform lists a real accelerometer (probed at start, logged + counted): an injecting client would otherwise replace real readings for every app (in bypass mode poll() reads only the injected queue)
+//! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`]) for injected events to land on; it has no source thread
 
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
@@ -46,6 +51,30 @@ const SOCKET_BUFFER_SIZE: usize = 4 * 1024;
 /// BitTube.cpp DEFAULT_SOCKET_BUFFER_SIZE: the unused return direction (acks of wake-up sensors only).
 const RETURN_BUFFER_SIZE: usize = 4 * 1024;
 
+/// android/sensor.h ASENSOR_TYPE_ACCELEROMETER.
+pub const TYPE_ACCELEROMETER: i32 = layout::ASENSOR_TYPE_ACCELEROMETER_ID;
+/// SensorService.h Mode HAL_BYPASS_REPLAY_DATA_INJECTION (SensorManager.java HAL_BYPASS_REPLAY_DATA_INJECTION).
+pub const MODE_HAL_BYPASS_REPLAY_DATA_INJECTION: i32 = 4;
+/// The package the composer's key tilt injects as and atld allow-lists (`--tilt-keys`): not an app package, so no app's own name matches it.
+pub const TILT_INJECTOR_PACKAGE: &str = "atl.tilt-keys";
+/// The accelerometer the injection mode lists.
+pub const INJECTED_NAME: &str = "ATL injected accelerometer";
+/// Its range: +-2 g, a phone accelerometer's smallest common range; injected values are +-1 g.
+const INJECTED_MAX_RANGE: f32 = 2.0 * 9.806_65;
+/// float32 resolution: the values are computed, not quantised.
+const INJECTED_RESOLUTION: f32 = 1.0e-6;
+/// SENSOR_DELAY_FASTEST's floor on most phones, 200 Hz: the injector's rate is its own business.
+const INJECTED_MIN_PERIOD: Duration = Duration::from_millis(5);
+
+/// Where a sensor's events come from.
+#[derive(Debug, Clone, PartialEq)]
+enum Source {
+    /// A platform device (its id), polled.
+    Platform(String),
+    /// Injected by a client (HAL bypass mode); no thread.
+    Injected,
+}
+
 /// One sensor as the list reports it (libsensor `Sensor` fields).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorInfo {
@@ -61,7 +90,7 @@ pub struct SensorInfo {
     pub min_delay_us: i32,
     /// µs, 0: no limit.
     pub max_delay_us: i32,
-    source: String,
+    source: Source,
 }
 
 impl SensorInfo {
@@ -76,8 +105,27 @@ impl SensorInfo {
             power: 0.0,
             min_delay_us: i32::try_from(a.min_period.as_micros().max(1)).unwrap_or(i32::MAX),
             max_delay_us: 0,
-            source: a.id.clone(),
+            source: Source::Platform(a.id.clone()),
         }
+    }
+
+    fn injected(handle: i32) -> SensorInfo {
+        SensorInfo::accelerometer(
+            handle,
+            &Accelerometer {
+                id: String::new(),
+                name: INJECTED_NAME.to_owned(),
+                max_range: INJECTED_MAX_RANGE,
+                resolution: INJECTED_RESOLUTION,
+                min_period: INJECTED_MIN_PERIOD,
+            },
+        )
+        .with_source(Source::Injected)
+    }
+
+    fn with_source(mut self, source: Source) -> SensorInfo {
+        self.source = source;
+        self
     }
 
     fn min_delay_ns(&self) -> i64 {
@@ -202,6 +250,32 @@ impl Channel {
             .take()
     }
 
+    /// The events an injecting client writes on its end (SensorEventConnection::handleEvent :846-878, ALOOPER_EVENT_INPUT): each whole record to `on_event`, until the client end closes. Blocks: run on its own thread.
+    /// A packet of another size (AOSP: a 4-byte wake-lock ack) is skipped.
+    pub fn read_injected(&self, mut on_event: impl FnMut(&[u8; EVENT_SIZE])) {
+        use rustix::event::{PollFd, PollFlags};
+        let mut buf = [0u8; EVENT_SIZE];
+        loop {
+            let mut fds = [PollFd::new(&self.send, PollFlags::IN)];
+            match rustix::event::poll(&mut fds, None) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(_) => return,
+            }
+            let revents = fds[0].revents();
+            if revents.contains(PollFlags::IN) {
+                match rustix::net::recv(&self.send, &mut buf, rustix::net::RecvFlags::DONTWAIT) {
+                    Ok((n, _)) if n == EVENT_SIZE => on_event(&buf),
+                    // the client closed its end
+                    Ok((0, _)) => return,
+                    Ok(_) | Err(rustix::io::Errno::AGAIN) => {}
+                    Err(_) => return,
+                }
+            } else if revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+                return;
+            }
+        }
+    }
+
     /// BitTube::sendObjects: one packet, never blocking. false once the client end is gone.
     fn send(&self, event: &[u8]) -> bool {
         match rustix::net::send(&self.send, event, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
@@ -235,17 +309,39 @@ pub struct SensorHub {
     source: Arc<dyn Sensors>,
     state: Mutex<State>,
     next_connection: AtomicU64,
+    /// The allow-listed package while in HAL bypass injection mode (SensorService mAllowListedPackage); None: NORMAL.
+    injection: Option<String>,
 }
 
 impl SensorHub {
     /// The sensors `source` lists now, handles from 1 (SensorService `registerSensor` at start; no hot-plug).
-    pub fn new(source: Arc<dyn Sensors>) -> Arc<SensorHub> {
-        let sensors = source
+    /// `injection`: start in HAL bypass injection mode with this allow-listed package, unless the source lists a real accelerometer (then NORMAL, logged and counted).
+    pub fn new(source: Arc<dyn Sensors>, injection: Option<&str>) -> Arc<SensorHub> {
+        let mut sensors: Vec<SensorInfo> = source
             .accelerometers()
             .iter()
             .zip(1..)
             .map(|(a, h)| SensorInfo::accelerometer(h, a))
             .collect();
+        let injection = match injection {
+            Some(_) if !sensors.is_empty() => {
+                log(&format!(
+                    "injection off: {} real accelerometer(s)",
+                    sensors.len()
+                ));
+                counters::refused(INTERFACE, "data injection: real accelerometer present");
+                None
+            }
+            Some(package) => {
+                sensors.push(SensorInfo::injected(1));
+                log(&format!(
+                    "injection on: hal_bypass_replay_data_injection for {package:?}"
+                ));
+                counters::answered(INTERFACE, "data injection: hal bypass mode");
+                Some(package.to_owned())
+            }
+            None => None,
+        };
         Arc::new(SensorHub {
             sensors,
             source,
@@ -253,7 +349,57 @@ impl SensorHub {
                 active: BTreeMap::new(),
             }),
             next_connection: AtomicU64::new(1),
+            injection,
         })
+    }
+
+    /// SensorService::isHalBypassReplayDataInjectionEnabled (:1642).
+    pub fn hal_bypass_injection(&self) -> bool {
+        self.injection.is_some()
+    }
+
+    /// SensorService::isAllowListedPackage (:2538): the allow-listed name is a substring of `package`.
+    pub fn is_allow_listed(&self, package: &str) -> bool {
+        self.injection
+            .as_deref()
+            .is_some_and(|allowed| package.contains(allowed))
+    }
+
+    /// One record an injecting client wrote (SensorEventConnection::handleEvent -> SensorDevice::injectSensorData, HAL bypass: queued, then fanned out as a HAL event).
+    /// Dropped (counted) outside the mode, for a package not allow-listed, or for an unknown handle (AOSP: getSensorInterfaceFromHandle null).
+    pub fn inject(&self, package: &str, record: &[u8; EVENT_SIZE]) {
+        if !self.is_allow_listed(package) {
+            counters::refused(INTERFACE, "injected event: not allowed");
+            return;
+        }
+        let word = |off: u64| {
+            let off = off as usize;
+            i32::from_ne_bytes(record[off..off + 4].try_into().unwrap_or_default())
+        };
+        let handle = word(layout::ASENSOR_EVENT_SENSOR);
+        let Some(s) = self.sensor(handle) else {
+            counters::refused(INTERFACE, "injected event: unknown handle");
+            return;
+        };
+        let mut event = *record;
+        // handleEvent: `sensor_event.type = si->getSensor().getType()`
+        let off = layout::ASENSOR_EVENT_TYPE as usize;
+        event[off..off + 4].copy_from_slice(&s.sensor_type.to_ne_bytes());
+        let channels: Vec<(u64, Arc<Channel>)> = {
+            let st = self.lock();
+            let Some(a) = st.active.get(&handle) else {
+                return;
+            };
+            a.subscribers
+                .iter()
+                .filter_map(|(c, (_, w))| w.upgrade().map(|ch| (*c, ch)))
+                .collect()
+        };
+        for (c, ch) in &channels {
+            if ch.dead.load(Ordering::Relaxed) || !ch.send(&event) {
+                self.disable(*c, handle);
+            }
+        }
     }
 
     /// A poisoned lock still holds consistent maps (every update is one insert or remove).
@@ -307,11 +453,13 @@ impl SensorHub {
         a.subscribers
             .insert(connection, (period, Arc::downgrade(channel)));
         if start {
-            let stop = Arc::clone(&a.stop);
-            let hub = Arc::clone(self);
-            let s = s.clone();
             log(&format!("{} (handle {handle}) started", s.name));
-            std::thread::spawn(move || hub.poll(s, stop));
+            if let Source::Platform(id) = &s.source {
+                let stop = Arc::clone(&a.stop);
+                let hub = Arc::clone(self);
+                let (s, id) = (s.clone(), id.clone());
+                std::thread::spawn(move || hub.poll(s, id, stop));
+            }
         }
         OK
     }
@@ -351,6 +499,12 @@ impl SensorHub {
         if a.subscribers.is_empty() {
             a.stop.store(true, Ordering::Relaxed);
             st.active.remove(&handle);
+            if self
+                .sensor(handle)
+                .is_some_and(|s| s.source == Source::Injected)
+            {
+                log(&format!("{INJECTED_NAME} (handle {handle}) stopped"));
+            }
         }
         OK
     }
@@ -381,7 +535,7 @@ impl SensorHub {
     }
 
     /// The poll loop of one enabled sensor: read, stamp, send to each subscriber, sleep the shortest asked period.
-    fn poll(&self, s: SensorInfo, stop: Arc<AtomicBool>) {
+    fn poll(&self, s: SensorInfo, id: String, stop: Arc<AtomicBool>) {
         while !stop.load(Ordering::Relaxed) {
             let (period, channels): (i64, Vec<(u64, Arc<Channel>)>) = {
                 let st = self.lock();
@@ -401,7 +555,7 @@ impl SensorHub {
                     .collect();
                 (period, ch)
             };
-            match self.source.read_accel(&s.source) {
+            match self.source.read_accel(&id) {
                 Ok(v) => {
                     let event = encode_event(s.handle, s.sensor_type, boottime_ns(), &v);
                     for (c, ch) in &channels {
@@ -477,15 +631,39 @@ mod tests {
 
     #[test]
     fn empty_source_lists_nothing_and_refuses_enable() {
-        let hub = SensorHub::new(Arc::new(Nothing));
+        let hub = SensorHub::new(Arc::new(Nothing), None);
         assert!(hub.sensor_list().is_empty());
         let ch = Arc::new(Channel::open().unwrap());
         assert_eq!(hub.enable(1, &ch, 1, 20_000_000), BAD_VALUE);
     }
 
+    /// A real accelerometer refuses the mode; without one the injected sensor is listed and an allow-listed client's records reach the subscribers with the type set, others' are dropped.
+    #[test]
+    fn injection_needs_no_real_sensor_and_an_allow_listed_package() {
+        let real = SensorHub::new(Arc::new(Fixed), Some("atl.tilt"));
+        assert!(!real.hal_bypass_injection());
+        assert_eq!(real.sensor_list().len(), 1);
+        let hub = SensorHub::new(Arc::new(Nothing), Some("atl.tilt"));
+        assert!(hub.hal_bypass_injection());
+        let s = &hub.sensor_list()[0];
+        assert_eq!((s.handle, s.name.as_str()), (1, INJECTED_NAME));
+        let ch = Arc::new(Channel::open().unwrap());
+        let rx = ch.take_receive().unwrap();
+        assert_eq!(hub.enable(3, &ch, 1, 20_000_000), OK);
+        // type 0 on the wire: the service sets the sensor's
+        let record = encode_event(1, 0, 42, &[0.5, 0.0, 9.0]);
+        hub.inject("com.example:atl.tilt", &record);
+        let e = recv_event(&ch, &rx);
+        assert_eq!(&e[8..12], &1i32.to_ne_bytes());
+        assert_eq!(&e[16..24], &42i64.to_ne_bytes());
+        hub.inject("other", &record);
+        let mut buf = [0u8; EVENT_SIZE];
+        assert!(rustix::net::recv(&rx, &mut buf, rustix::net::RecvFlags::DONTWAIT).is_err());
+    }
+
     #[test]
     fn flatten_matches_sensor_cpp_field_widths() {
-        let hub = SensorHub::new(Arc::new(Fixed));
+        let hub = SensorHub::new(Arc::new(Fixed), None);
         let s = &hub.sensor_list()[0];
         assert_eq!(s.handle, 1);
         // fixed (Sensor::getFlattenedSize): 4 version + 4 handle + 4 type + 4x4 floats + 4 minDelay + 2x4 fifo + 1 bool + 4 appOp + 4 maxDelay + 4 flags + 16 uuid + 4 id = 73;
@@ -498,7 +676,7 @@ mod tests {
 
     #[test]
     fn events_reach_the_channel_with_aosp_layout_and_stop_on_last_disable() {
-        let hub = SensorHub::new(Arc::new(Fixed));
+        let hub = SensorHub::new(Arc::new(Fixed), None);
         let ch = Arc::new(Channel::open().unwrap());
         let rx = ch.take_receive().unwrap();
         assert!(ch.take_receive().is_none(), "the client end is given once");
@@ -532,7 +710,7 @@ mod tests {
 
     #[test]
     fn clamp_raises_to_min_delay() {
-        let hub = SensorHub::new(Arc::new(Fixed));
+        let hub = SensorHub::new(Arc::new(Fixed), None);
         let s = &hub.sensor_list()[0];
         assert_eq!(SensorHub::clamp(s, 1), 5_000_000);
         assert_eq!(SensorHub::clamp(s, 20_000_000), 20_000_000);

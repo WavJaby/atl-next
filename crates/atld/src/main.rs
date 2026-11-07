@@ -151,6 +151,18 @@ struct Args {
     /// Test only: passed to the services (`--omit-service <name>`, repeat), the deliberate break of the app gate's line for that service.
     #[arg(long)]
     omit_service: Vec<String>,
+    /// Desktop tilt for accelerometer games: while an app window has focus, held Left / Right (or A / D) tilt the device, injected as accelerometer data (sensorservice HAL bypass injection); the keys still reach the app. Off: no emulation. No effect on a machine with a real accelerometer (the services probe it).
+    #[arg(long)]
+    tilt_keys: bool,
+    /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
+    #[arg(long, requires = "tilt_keys")]
+    tilt_max_deg: Option<f32>,
+    /// With `--tilt-keys`: ms from level to the full angle and back.
+    #[arg(long, requires = "tilt_keys")]
+    tilt_ramp_ms: Option<u32>,
+    /// With `--tilt-keys`: the injected events' period, ms.
+    #[arg(long, requires = "tilt_keys")]
+    tilt_period_ms: Option<u32>,
     /// Test only: apps start with `--no-audio-service` (their launcher serves neither AudioFlinger nor AudioPolicyService), the deliberate break of the audio gate.
     #[arg(long)]
     no_audio_service: bool,
@@ -502,6 +514,8 @@ struct Host {
     headless_pointer: Option<String>,
     /// the UI mode; pushed to each app process as `ro.atl.ui`
     ui: Option<String>,
+    /// the key tilt (`--tilt-keys`); pushed to each app process as `ro.atl.tilt`
+    tilt: Option<compositor_registry::TiltConfig>,
     /// test only: each app's launcher gets `--no-audio-service` (the audio gate's break)
     no_audio_service: bool,
     /// test only: each app's launcher gets `--break-cblk` (the audio gate's second break)
@@ -580,6 +594,9 @@ impl Host {
         }
         if let Some(mode) = &self.ui {
             props.push((compositor_registry::UI_PROPERTY.to_owned(), mode.clone()));
+        }
+        if let Some(tilt) = &self.tilt {
+            props.push((compositor_registry::TILT_PROPERTY.to_owned(), tilt.to_arg()));
         }
         let path = self.root.process_properties(uid, name);
         std::fs::write(&path, atl_property_service::area(&props)?)
@@ -1053,6 +1070,14 @@ fn run(a: &Args) -> Result<ExitCode> {
         display,
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
+        tilt: a.tilt_keys.then(|| {
+            let d = compositor_registry::TiltConfig::default();
+            compositor_registry::TiltConfig {
+                max_deg: a.tilt_max_deg.unwrap_or(d.max_deg),
+                ramp_ms: a.tilt_ramp_ms.unwrap_or(d.ramp_ms),
+                period_ms: a.tilt_period_ms.unwrap_or(d.period_ms),
+            }
+        }),
         no_audio_service: a.no_audio_service,
         break_cblk: a.break_cblk,
         no_media_player_service: a.no_media_player_service,
@@ -1102,6 +1127,12 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     for s in &a.omit_service {
         services_args.extend(["--omit-service".into(), s.into()]);
+    }
+    if a.tilt_keys {
+        services_args.extend([
+            "--sensor-injection".into(),
+            atl_services::sensor::TILT_INJECTOR_PACKAGE.into(),
+        ]);
     }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([

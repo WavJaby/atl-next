@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atl_services::compositor_registry::{
     DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
-    SURFACE_FLINGER_AIDL,
+    SURFACE_FLINGER_AIDL, TILT_PROPERTY, TiltConfig,
 };
 use atl_services::counters;
 use atl_services::display_model::DisplayModel;
@@ -116,7 +116,17 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
         None => Vec::new(),
     };
     let wake_enabled = std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_INPUT_NO_WAKE);
-    let input_tx = input::spawn(script, wake_enabled)?;
+    let tilt = match optional_property(TILT_PROPERTY)? {
+        Some(arg) => {
+            let t = Arc::new(std::sync::Mutex::new(crate::tilt::Tilt::new(
+                TiltConfig::parse_arg(&arg)?,
+            )));
+            crate::tilt::spawn(Arc::clone(&t), display.rotation)?;
+            Some(t)
+        }
+        None => None,
+    };
+    let input_tx = input::spawn(script, wake_enabled, tilt)?;
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {

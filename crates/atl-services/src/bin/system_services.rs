@@ -59,6 +59,9 @@ struct Args {
     /// Test only: this service (`connectivity`, `permissionmgr`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
+    /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); refused while the machine has a real accelerometer. atld `--tilt-keys` sets it.
+    #[arg(long)]
+    sensor_injection: Option<String>,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -221,7 +224,7 @@ fn main() -> Result<()> {
         // the machine's sensors through the platform layer, listed once at start
         let source: Arc<dyn atl_platform_host::Sensors> =
             Arc::new(atl_platform_host::PlatformSensors::default());
-        let hub = atl_services::sensor::SensorHub::new(source);
+        let hub = atl_services::sensor::SensorHub::new(source, a.sensor_injection.as_deref());
         writeln!(
             std::io::stderr(),
             "sensor: {} sensors listed",

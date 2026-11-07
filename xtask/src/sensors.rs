@@ -4,6 +4,8 @@
 //! Stage `iio`: two fake accelerometers, the owner's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
 //! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
 //! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
+//! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`], the headless script [`TILT_SCRIPT`] (focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
+//! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one). Each must fail.
 //! Expected values, computed here independently: axis = raw x scale (offset 0, kernel sysfs-bus-iio), m/s²; canonical r = mount-matrix row r . sensor vector (iio-sensor-proxy `apply_mount_matrix`); Android = (-x, -y, z) of canonical (iio.rs `to_android` derives it).
 
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ use crate::{manifest, verdict};
 pub enum Stage {
     Empty,
     Iio,
+    Tilt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -34,6 +37,10 @@ pub enum Break {
     Frame,
     /// stage iio: doubled scale written, real values expected
     Scale,
+    /// stage tilt: atld runs without `--tilt-keys`
+    Off,
+    /// stage tilt: a real accelerometer present (the iio stage's devices)
+    Real,
 }
 
 #[derive(clap::Args)]
@@ -91,6 +98,68 @@ const BASE_NAME: &str = "atl-fake-base-accel";
 const DEVICE_DEV: &str = "250:0";
 const BASE_DEV: &str = "250:1";
 
+/// atl-services sensor.rs INJECTED_NAME.
+const INJECTED_NAME: &str = "ATL injected accelerometer";
+/// The tilt the gate sets: 30 deg (x = g/2), a 300 ms ramp (a fifth of a hold), 20 ms period (SENSOR_DELAY_GAME).
+const TILT_MAX_DEG: f64 = 30.0;
+const TILT_ARGS: [&str; 6] = [
+    "--tilt-max-deg",
+    "30",
+    "--tilt-ramp-ms",
+    "300",
+    "--tilt-period-ms",
+    "20",
+];
+/// Linux KEY_LEFT / KEY_RIGHT (input-event-codes.h). Holds of 1.5 s: five ramps, so each plateau gets ~60 events; the last hold ends in a focus loss, which must level the device.
+const TILT_SCRIPT: &str = "focus:in wait:1500 key-down:105 wait:1500 key-up:105 wait:1000 key-down:106 wait:1500 key-up:106 wait:1000 key-down:105 wait:1500 focus:out wait:1000";
+/// SensorManager.GRAVITY_EARTH.
+const GRAVITY: f64 = 9.806_65;
+/// float32 trig and the Java log's decimal form.
+const TILT_TOLERANCE: f64 = 1e-3;
+
+/// The stage tilt's checks over the event values in order; empty = pass.
+fn check_tilt(values: &[Vec<f64>]) -> Vec<String> {
+    let mut whys = Vec::new();
+    let plateau = GRAVITY * TILT_MAX_DEG.to_radians().sin();
+    let near = |a: f64, b: f64| (a - b).abs() <= TILT_TOLERANCE;
+    let level = |v: &Vec<f64>| near(v[0], 0.0) && near(v[2], GRAVITY);
+    if values.iter().any(|v| v.len() != 3) {
+        whys.push("an event without 3 values".to_owned());
+        return whys;
+    }
+    for v in values {
+        let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if !near(m, GRAVITY) || !near(v[1], 0.0) || v[0].abs() > plateau + TILT_TOLERANCE {
+            whys.push(format!(
+                "event {v:?}: want |v| = g, y = 0, |x| <= g sin {TILT_MAX_DEG}"
+            ));
+            break;
+        }
+    }
+    match (values.first(), values.last()) {
+        (Some(f), Some(l)) => {
+            if !level(f) {
+                whys.push(format!("first event {f:?} not level"));
+            }
+            if !level(l) {
+                whys.push(format!(
+                    "last event {l:?} not level: the focus loss did not reset the tilt"
+                ));
+            }
+        }
+        _ => whys.push("no events".to_owned()),
+    }
+    let left = values.iter().position(|v| near(v[0], plateau));
+    let right = values.iter().position(|v| near(v[0], -plateau));
+    match (left, right) {
+        (Some(l), Some(r)) if l < r => {}
+        _ => whys.push(format!(
+            "want x = +{plateau:.4} (Left held) before x = -{plateau:.4} (Right held): first at {left:?}, {right:?}"
+        )),
+    }
+    whys
+}
+
 fn matrix_text(m: &[[f64; 3]; 3]) -> String {
     m.iter()
         .map(|r| {
@@ -127,7 +196,7 @@ fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) 
         }
         std::fs::create_dir_all(dir)?;
     }
-    if stage == Stage::Empty {
+    if stage == Stage::Empty || (stage == Stage::Tilt && brk != Some(Break::Real)) {
         return Ok(());
     }
     let scale = if brk == Some(Break::Scale) {
@@ -276,6 +345,36 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
                 whys.push("the services' poll did not stop after unregisterListener".to_owned());
             }
         }
+        Stage::Tilt => {
+            if n != Some(1) {
+                whys.push(format!("sensor count {n:?}, want 1"));
+            }
+            let d = find("default ");
+            let default = format!(
+                "default name={INJECTED_NAME} type=1 stringType=android.sensor.accelerometer"
+            );
+            if !d.is_some_and(|d| d.starts_with(&default)) {
+                whys.push(format!("want `{default} ...`, got {d:?}"));
+            }
+            if !services.lines().any(|l| l.contains("sensor: injection on")) {
+                whys.push("no `sensor: injection on` line from the services".to_owned());
+            }
+            let values: Vec<Vec<f64>> = msgs
+                .iter()
+                .filter(|m| m.starts_with("event "))
+                .filter_map(|e| field(e, "v"))
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .collect();
+            whys.extend(check_tilt(&values));
+            if !services
+                .lines()
+                .any(|l| l.contains(&format!("sensor: {INJECTED_NAME}")) && l.ends_with("stopped"))
+            {
+                whys.push(
+                    "the injected sensor was not stopped after unregisterListener".to_owned(),
+                );
+            }
+        }
     }
     if find("done").is_none() {
         whys.push("no done line".to_owned());
@@ -292,6 +391,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let name = match args.stage {
         Stage::Empty => "sensors-empty",
         Stage::Iio => "sensors-iio",
+        Stage::Tilt => "sensors-tilt",
     };
     let mut rt = Runtime::new(
         root,
@@ -311,6 +411,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     rt = rt.with_fake_devices(sys_bus.clone(), udev);
     if args.break_ == Some(Break::Unregistered) {
         rt = rt.without_sensor_service();
+    }
+    if args.stage == Stage::Tilt {
+        rt = rt.with_headless_pointer(TILT_SCRIPT);
+        if args.break_ != Some(Break::Off) {
+            rt = rt.with_tilt_keys(&TILT_ARGS.map(String::from));
+        }
     }
     let apk = rt
         .apk
@@ -372,7 +478,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the poll's stop line follows unregisterListener
     let services_path = run.log("services");
     let stop_deadline = Instant::now() + STOP_WAIT;
-    while args.stage == Stage::Iio
+    while args.stage != Stage::Empty
         && Instant::now() < stop_deadline
         && !read(&services_path).lines().any(|l| l.ends_with("stopped"))
     {
@@ -485,5 +591,28 @@ mod tests {
         // the canonical (unconverted) values
         iio[4] = ev(100, "-0.06,-8.71,3.74");
         assert!(!check(Stage::Iio, &iio, &stopped, want).is_empty());
+    }
+
+    #[test]
+    fn tilt_wants_level_left_then_right_then_level() {
+        // by hand: g sin 30 = 4.903325, g cos 30 = 8.492829
+        let lvl = vec![0.0, 0.0, GRAVITY];
+        let l = vec![4.903_325, 0.0, 8.492_829];
+        let r = vec![-4.903_325, 0.0, 8.492_829];
+        assert!(
+            check_tilt(&[lvl.clone(), l.clone(), lvl.clone(), r.clone(), lvl.clone()]).is_empty()
+        );
+        assert!(
+            !check_tilt(&[lvl.clone(), r.clone(), l.clone(), lvl.clone()]).is_empty(),
+            "order"
+        );
+        assert!(
+            !check_tilt(&[lvl.clone(), l.clone(), r.clone(), l.clone()]).is_empty(),
+            "last not level"
+        );
+        assert!(
+            !check_tilt(&[lvl.clone(), vec![6.0, 0.0, 7.6], r, lvl]).is_empty(),
+            "beyond max"
+        );
     }
 }

@@ -20,6 +20,10 @@ pub enum Step {
     Pointer(PointerPhase, PhysPoint),
     /// `wait:MS`: the steps after it go in this much later (run-apk interactions: a tap, then the next once the UI answered).
     Wait(std::time::Duration),
+    /// `focus:in` / `focus:out`: the desktop toplevel becomes active or not (headless has no toplevel, so no window has focus and keys are dropped until this).
+    Focus(bool),
+    /// `key-down:CODE` / `key-up:CODE`: a physical key, Linux input event code (KEY_LEFT = 105).
+    Key(bool, u32),
 }
 
 /// What the input thread takes: a window's input channel (token + server end, from the UI agent) or its removal, an event, or the first frame reaching the compositor.
@@ -142,6 +146,11 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         out
     }
 
+    /// A window has focus.
+    pub fn has_focus(&self) -> bool {
+        self.focused.is_some()
+    }
+
     /// The focused window's channel (keys go there), if one is focused and still held.
     pub fn focused_channel(&mut self) -> Option<&mut C> {
         let key = self.focused.clone()?;
@@ -227,6 +236,19 @@ pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
                     .map_err(|_| format!("script item {item:?}: want wait:MS"))?;
                 return Ok(Step::Wait(std::time::Duration::from_millis(ms)));
             }
+            if kind == "focus" {
+                return match at {
+                    "in" => Ok(Step::Focus(true)),
+                    "out" => Ok(Step::Focus(false)),
+                    _ => Err(format!("script item {item:?}: want focus:in or focus:out")),
+                };
+            }
+            if kind == "key-down" || kind == "key-up" {
+                let code = at
+                    .parse::<u32>()
+                    .map_err(|_| format!("script item {item:?}: want {kind}:CODE"))?;
+                return Ok(Step::Key(kind == "key-down", code));
+            }
             let (x, y) = at
                 .split_once(',')
                 .ok_or_else(|| format!("script item {item:?}: want kind:x,y"))?;
@@ -236,7 +258,7 @@ pub fn parse_script(script: &str) -> Result<Vec<Step>, String> {
                 "up" => PointerPhase::Up(PointerButton::Primary),
                 _ => {
                     return Err(format!(
-                        "script item {item:?}: kind is down, move, up or wait"
+                        "script item {item:?}: kind is down, move, up, wait, focus, key-down or key-up"
                     ));
                 }
             };
@@ -296,9 +318,11 @@ pub use publish::spawn;
 mod publish {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
 
+    use crate::tilt::Tilt;
     use atl_libinput::{KeyEvent, KeyLayoutMap, MotionEvent, Pointer, Publisher};
     use atl_platform_ui::{InputEvent, InputSource, PointerEvent};
     use binder::SpIBinder;
@@ -393,6 +417,15 @@ mod publish {
         keys: RefCell<key::Keys>,
         layout: Option<KeyLayoutMap>,
         seq: Cell<u32>,
+        /// The key tilt (`ro.atl.tilt`), shared with its injector thread; None: off.
+        tilt: Option<Arc<Mutex<Tilt>>>,
+    }
+
+    /// Runs `f` on the tilt, when on.
+    fn with_tilt(state: &State, f: impl FnOnce(&mut Tilt)) {
+        if let Some(t) = &state.tilt {
+            f(&mut t.lock().unwrap_or_else(|e| e.into_inner()));
+        }
     }
 
     /// Publishes `keys` to the focused window (InputDispatcher sends keys to the focused window, none while the desktop window is inactive).
@@ -447,6 +480,14 @@ mod publish {
                 .keys
                 .borrow_mut()
                 .translate(e, map, atl_libinput::update_meta_state);
+            // keys go both ways: the app gets them, and the tilt follows those its focused window got
+            if state.windows.borrow().has_focus() {
+                with_tilt(state, |t| {
+                    for k in &k {
+                        t.key(k.key_code, k.action == key::ACTION_DOWN);
+                    }
+                });
+            }
             publish_keys(state, k.as_slice());
             return;
         }
@@ -525,7 +566,12 @@ mod publish {
     /// Publishes the focus events owed ([`Windows::focus_changes`]) to the windows still held.
     fn publish_focus(state: &State) {
         let mut windows = state.windows.borrow_mut();
-        for (token, has_focus) in windows.focus_changes() {
+        let changes = windows.focus_changes();
+        if !changes.is_empty() {
+            let focused = windows.has_focus();
+            with_tilt(state, |t| t.focus(focused));
+        }
+        for (token, has_focus) in changes {
             let Some(publisher) = windows.channel(&token) else {
                 continue;
             };
@@ -541,7 +587,12 @@ mod publish {
 
     /// The input thread: takes each window's channel, and at the first frame injects the script through the headless source. The publisher stays on this thread (it is not Send).
     /// A turn waits on the wake end and every window's channel, with no timeout. It settles the channels first: the round polled them as they were, and a Window message handled before them could replace a hung-up channel under its key.
-    fn dispatch(rx: InputReceiver<Message>, tx: InputSender<Message>, mut script: Vec<Step>) {
+    fn dispatch(
+        rx: InputReceiver<Message>,
+        tx: InputSender<Message>,
+        mut script: Vec<Step>,
+        tilt: Option<Arc<Mutex<Tilt>>>,
+    ) {
         let layout = KeyLayoutMap::load(KEY_LAYOUT)
             .inspect_err(|err| {
                 tracing::warn!("input: key layout {KEY_LAYOUT}: {err:?}; keys dropped")
@@ -549,6 +600,7 @@ mod publish {
             .ok();
         let state = Rc::new(State {
             layout,
+            tilt,
             ..State::default()
         });
         let source = HeadlessInput::default();
@@ -605,20 +657,32 @@ mod publish {
                         let tx = tx.clone();
                         let run = move || {
                             for step in steps {
-                                match step {
-                                    Step::Wait(d) => thread::sleep(d),
+                                let time_ms = u32::try_from(started.elapsed().as_millis())
+                                    .unwrap_or(u32::MAX);
+                                let event = match step {
+                                    Step::Wait(d) => {
+                                        thread::sleep(d);
+                                        continue;
+                                    }
                                     Step::Pointer(phase, position) => {
-                                        let time_ms = u32::try_from(started.elapsed().as_millis())
-                                            .unwrap_or(u32::MAX);
-                                        let event = InputEvent::Pointer(PointerEvent {
+                                        InputEvent::Pointer(PointerEvent {
                                             phase,
                                             position,
                                             time_ms,
-                                        });
-                                        if tx.send(Message::Event(event)).is_err() {
-                                            return;
-                                        }
+                                        })
                                     }
+                                    Step::Focus(active) => InputEvent::Focus(active),
+                                    Step::Key(down, scan_code) => {
+                                        InputEvent::Key(atl_platform_ui::KeyEvent {
+                                            down,
+                                            scan_code,
+                                            locks: Default::default(),
+                                            time_ms,
+                                        })
+                                    }
+                                };
+                                if tx.send(Message::Event(event)).is_err() {
+                                    return;
                                 }
                             }
                         };
@@ -637,13 +701,18 @@ mod publish {
 
     /// Starts the input thread with `script` (empty: nothing injected, channels still taken). The sender takes each window's channel and the first frame.
     /// `wake_enabled` false is the deliberate-failure break (start.rs BREAK_INPUT_NO_WAKE): sends queue but never wake the loop.
-    pub fn spawn(script: Vec<Step>, wake_enabled: bool) -> Result<InputSender<Message>, String> {
+    /// `tilt`: the key tilt the keys and focus drive (its injector runs on its own thread).
+    pub fn spawn(
+        script: Vec<Step>,
+        wake_enabled: bool,
+        tilt: Option<Arc<Mutex<Tilt>>>,
+    ) -> Result<InputSender<Message>, String> {
         let (tx, rx) = wake::channel(wake_enabled).map_err(|e| format!("input wake pair: {e}"))?;
         // the thread's own sender (for the script's events) keeps its loop open for the process's life; it ends with the process, as before
         let own = tx.clone();
         thread::Builder::new()
             .name("atl-input".to_owned())
-            .spawn(move || dispatch(rx, own, script))
+            .spawn(move || dispatch(rx, own, script, tilt))
             .map_err(|e| format!("input thread: {e}"))?;
         Ok(tx)
     }

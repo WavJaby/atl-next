@@ -224,6 +224,8 @@ pub struct Runtime {
     sensor_service: bool,
     /// Services left unregistered (`--omit-service`, the app gate's per-service breaks).
     omitted_services: Vec<String>,
+    /// atld `--tilt-keys` plus these extra atld args (`--tilt-max-deg` ...), when set.
+    tilt_keys: Option<Vec<String>>,
     /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
     fake_devices: Option<(PathBuf, PathBuf)>,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
@@ -554,6 +556,7 @@ impl Runtime {
             root_back: true,
             sensor_service: true,
             omitted_services: Vec::new(),
+            tilt_keys: None,
             fake_devices: None,
         })
     }
@@ -752,6 +755,12 @@ impl Runtime {
     /// The services do not register `name` (atld `--omit-service`): its manager must then be null in the app.
     pub fn without_service(mut self, name: &str) -> Self {
         self.omitted_services.push(name.to_owned());
+        self
+    }
+
+    /// atld `--tilt-keys` (the desktop key tilt) with `extra` atld args, e.g. `--tilt-max-deg 30`.
+    pub fn with_tilt_keys(mut self, extra: &[String]) -> Self {
+        self.tilt_keys = Some(extra.to_vec());
         self
     }
 
@@ -1031,6 +1040,9 @@ impl Runtime {
                 c
             }
         };
+        if let Some(extra) = &self.tilt_keys {
+            cmd.arg("--tilt-keys").args(extra);
+        }
         if !self.sensor_service {
             cmd.arg("--no-sensor-service");
         }
