@@ -56,7 +56,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`connectivity`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`connectivity`, `permissionmgr`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
 }
@@ -92,6 +92,9 @@ const NOTIFICATION: &str = "notification";
 const SENSOR: &str = "sensorservice";
 /// Context.CONNECTIVITY_SERVICE (ConnectivityFrameworkInitializer.registerServiceWrappers looks it up by this name).
 const CONNECTIVITY: &str = "connectivity";
+/// The name PermissionManager's constructor looks IPermissionManager up by (PermissionManager.java getServiceOrThrow("permissionmgr")).
+const PERMISSION_MANAGER: &str = "permissionmgr";
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let display = a.display.unwrap_or_default();
@@ -194,6 +197,16 @@ fn main() -> Result<()> {
             atl_services::connectivity::new_binder(Arc::clone(&permissions)),
         )
         .context("addService connectivity")?;
+    }
+    if !a.omit_service.iter().any(|s| s == PERMISSION_MANAGER) {
+        binder::add_service(
+            PERMISSION_MANAGER,
+            atl_services::permission_manager::new_binder(
+                Arc::clone(&packages),
+                Arc::clone(&permissions),
+            ),
+        )
+        .context("addService permissionmgr")?;
     }
     binder::add_service(
         NOTIFICATION,

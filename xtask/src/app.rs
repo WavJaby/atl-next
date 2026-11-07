@@ -83,11 +83,19 @@ const MEDIAPLAYER: &str = "AtlTest: mediaplayer: ";
 const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// Main.onCreate's lines for services an app reaches through a manager that is null without them: (servicemanager name, line prefix, expected value). A missing service logs `absent`.
 /// connectivity: a device with no network agent (ConnectivityService.getActiveNetworkInfo -> null, isActiveNetworkMetered -> true).
-const SERVICE_LINES: [(&str, &str, &str); 1] = [(
-    "connectivity",
-    "AtlTest: connectivity: ",
-    "active=null metered=true",
-)];
+/// permissionmgr: PackageManager.checkPermission for the fixture itself: ACCESS_NETWORK_STATE is requested + NORMAL -> granted (0, permission.rs rule A); CAMERA is not requested -> denied (-1).
+const SERVICE_LINES: [(&str, &str, &str); 2] = [
+    (
+        "connectivity",
+        "AtlTest: connectivity: ",
+        "active=null metered=true",
+    ),
+    (
+        "permissionmgr",
+        "AtlTest: permission: ",
+        "network_state=0 camera=-1",
+    ),
+];
 /// The native bridge's report of a fault handed to a guest handler (x86_64.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";

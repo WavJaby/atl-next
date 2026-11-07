@@ -123,6 +123,58 @@ func TestAidlCratesImportOtherInterfaces(t *testing.T) {
 	}
 }
 
+// A code file's own unstructured declaration (IPermissionManager.aidl: `parcelable PermissionManager.PermissionState;` after its interface) is one of the crate's parcelables like a separate
+// file's: the preprocessed file names it with its rust_type, the parcelables crate gives it an opaque type, and the compiled copy drops the declaration (aidl's Rust backend refuses a document
+// defining one). A comment naming a parcelable is no declaration; a declaration with its own rust_type is refused; a type the code file does not own is not a crate type.
+func TestAidlCratesInFileParcelable(t *testing.T) {
+	files := map[string]string{
+		"inc/a/IMix.aidl": "package a;\nimport a.Mix.Part;\n/* parcelable Commented; is not one */\ninterface IMix { Part get(in Part p); }\n\n/** doc */\nparcelable Mix.Part;\n",
+	}
+	g := graphFor(t, files)
+	dir := t.TempDir()
+	for _, f := range []string{"src/lib.rs", "src/codecs/mod.rs"} {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(f)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parcelables := &AidlParcelables{Module: "libm", Crate: "m", Dir: dir, Edition: "2024", Rustlibs: []string{"libbinder_rs"}, Lints: []string{"-D", "warnings"}}
+	if err := g.addAidlCrates(map[string]AidlCrate{"mix": {IncludeDirs: []string{"inc"}, Types: []string{"a.IMix"}, Parcelables: parcelables}}); err != nil {
+		t.Fatal(err)
+	}
+	m := g.synth("mix-rust", Device)
+	if m == nil || m.aidl == nil {
+		t.Fatalf("mix-rust: %+v, problems %v", m, g.problems)
+	}
+	gen := filepath.Join(g.out, "aidl", "device", "mix", "src")
+	if len(m.aidl.srcs) != 1 || m.aidl.srcs[0].path != filepath.Join(gen, "a/IMix.aidl") || m.aidl.srcs[0].root != gen {
+		t.Fatalf("srcs %+v, want the copy a/IMix.aidl under %s", m.aidl.srcs, gen)
+	}
+	src := g.genFiles[m.aidl.srcs[0].path]
+	if strings.Contains(src, "parcelable Mix.Part") || !strings.Contains(src, "/* parcelable Commented; is not one */") || !strings.Contains(src, "interface IMix { Part get(in Part p); }") {
+		t.Errorf("compiled copy keeps the declaration or loses the rest:\n%s", src)
+	}
+	if len(src) != len(files["inc/a/IMix.aidl"]) {
+		t.Errorf("compiled copy is %d bytes, the original %d: offsets moved", len(src), len(files["inc/a/IMix.aidl"]))
+	}
+	if pre := g.genFiles[m.aidl.preprocessed[0]]; !strings.Contains(pre, "parcelable a.Mix.Part rust_type \"m::a::Mix_Part\";") {
+		t.Errorf("preprocessed lacks the in-file parcelable:\n%s", pre)
+	}
+	if rs := g.mods[Device]["libm-types"][0].genText; !strings.Contains(rs, `crate::opaque!(Mix_Part, "a.Mix.Part");`) {
+		t.Errorf("parcelables.rs lacks the opaque in-file parcelable:\n%s", rs)
+	}
+	if err := g.addAidlCrates(map[string]AidlCrate{"typed": {IncludeDirs: []string{"inc"}, Types: []string{"a.Mix.Part"}}}); err == nil || !strings.Contains(err.Error(), "type a.Mix.Part") {
+		t.Errorf("a parcelable named as a crate type: %v", err)
+	}
+
+	own := graphFor(t, map[string]string{"inc/a/IOwn.aidl": "package a; interface IOwn {}\nparcelable Own rust_type \"x::Own\";"})
+	if err := own.addAidlCrates(map[string]AidlCrate{"own": {IncludeDirs: []string{"inc"}, Types: []string{"a.IOwn"}}}); err == nil || !strings.Contains(err.Error(), "with its own rust_type") {
+		t.Errorf("in-file parcelable with its own rust_type: %v, want a refusal", err)
+	}
+}
+
 // An aidl crate compiles the closure of its types over its include dirs; every unstructured parcelable without its own rust_type gets one from the parcelables crate, whose generated
 // parcelables.rs takes a hand-written codec where src/codecs/<path>.rs exists and an opaque type elsewhere; bad inputs are refused.
 func TestAidlCrates(t *testing.T) {

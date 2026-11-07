@@ -47,6 +47,8 @@ include_dirs = [
     "packages/modules/Bluetooth/framework/aidl-export",
     "packages/modules/Connectivity/framework/aidl-export",
     "packages/modules/Connectivity/framework/src",
+    # IPermissionManager imports the structured AttributionSourceState
+    "frameworks/native/libs/permission/aidl",
     "system/hardware/interfaces/media/aidl",
     "system/vold/binder",
 ]
@@ -66,6 +68,8 @@ types = [
     "android.content.IClipboard",
     # the connectivity service (connectivity.rs)
     "android.net.IConnectivityManager",
+    # the permissionmgr service (permission_manager.rs)
+    "android.permission.IPermissionManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.app.IActivityTaskManager",

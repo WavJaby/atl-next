@@ -86,6 +86,11 @@ type aidlScanned struct {
 	unstructured    []aidlDecl
 }
 
+// qualified: the name of the file's own type (`pkg.<stem>`), the key indexAidl and closure look a compiled type up by.
+func (f *aidlScanned) qualified() string {
+	return f.pkg + "." + strings.TrimSuffix(filepath.Base(f.path), ".aidl")
+}
+
 // aidlDecl is one unstructured parcelable declaration.
 type aidlDecl struct {
 	name     string // qualified
@@ -133,19 +138,65 @@ func scanAidl(text string) (pkg string, code bool, imports, names []string, decl
 	for _, m := range aidlImportRe.FindAllStringSubmatch(text, -1) {
 		imports = append(imports, m[1])
 	}
-	code = aidlCodeRe.MatchString(text)
-	if !code {
-		for _, m := range aidlUnstructRe.FindAllStringSubmatch(text, -1) {
-			d := aidlDecl{name: pkg + "." + m[1], pkg: pkg, params: strings.Join(strings.Fields(m[2]), ""), rustType: strings.Contains(m[3], "rust_type")}
-			if c := aidlRustTypeRe.FindStringSubmatch(m[3]); c != nil {
-				d.rustCrate = c[1]
-			}
-			decls = append(decls, d)
+	// also in a code file: `parcelable PermissionManager.PermissionState;` beside its interface (IPermissionManager.aidl) is an unstructured declaration like any other
+	for _, m := range aidlUnstructRe.FindAllStringSubmatch(text, -1) {
+		d := aidlDecl{name: pkg + "." + m[1], pkg: pkg, params: strings.Join(strings.Fields(m[2]), ""), rustType: strings.Contains(m[3], "rust_type")}
+		if c := aidlRustTypeRe.FindStringSubmatch(m[3]); c != nil {
+			d.rustCrate = c[1]
 		}
-		return
+		decls = append(decls, d)
 	}
-	names = aidlNameRe.FindAllString(text, -1)
+	code = aidlCodeRe.MatchString(text)
+	if code {
+		names = aidlNameRe.FindAllString(text, -1)
+	}
 	return
+}
+
+// withoutUnstructuredText: text with every unstructured declaration blanked, byte for byte the same length (offsets and line structure kept). aidl's Rust backend refuses a document that
+// defines an unstructured parcelable (aidl.cpp "Refusing to generate code with unstructured parcelables"); the type is only referenced, through the preprocessed file (-p) addParcelables writes,
+// which is how a separate-file parcelable already reaches a compile.
+func withoutUnstructuredText(text string) string {
+	masked := aidlCommentRe.ReplaceAllStringFunc(text, blankBytes)
+	out := []byte(text)
+	for _, loc := range aidlUnstructRe.FindAllStringIndex(masked, -1) {
+		for i := loc[0]; i < loc[1]; i++ {
+			if out[i] != '\n' {
+				out[i] = ' '
+			}
+		}
+	}
+	return string(out)
+}
+
+// blankBytes: s with every byte but newlines replaced by a space (the byte length is kept).
+func blankBytes(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c != '\n' {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
+// compiledCopy: the file aidl compiles for f, a copy without its unstructured declarations (withoutUnstructuredText) under the crate's generated root, keeping f's package path: aidl checks a
+// file's name against its package, and the rust backend names its output by it. A declaration with its own rust_type cannot take the preprocessed route (the -p line would need its crate, and a
+// separate file is imported instead), so it is refused until it moves to its own file.
+func (g *Graph) compiledCopy(crate string, f *aidlScanned) (path, root string, err error) {
+	for _, d := range f.unstructured {
+		if d.rustType {
+			return "", "", fmt.Errorf("%s declares %s with its own rust_type beside its interface: move it to its own file", f.path, d.name)
+		}
+	}
+	b, err := os.ReadFile(g.abs(f.path))
+	if err != nil {
+		return "", "", err
+	}
+	root = filepath.Join(g.out, "aidl", "device", crate, "src")
+	path = filepath.Join(root, strings.TrimPrefix(f.path, f.root+"/"))
+	g.genFile(path, withoutUnstructuredText(string(b)))
+	return path, root, nil
 }
 
 // aidlIndex: every .aidl under the include dirs, first dir wins for a qualified name (aidl's -I order).
@@ -189,12 +240,11 @@ func (g *Graph) indexAidl(dirs []string) (*aidlIndex, error) {
 			f := &aidlScanned{path: p, root: d}
 			f.pkg, f.code, f.imports, f.names, f.unstructured = scanAidl(string(b))
 			if f.code {
-				q := f.pkg + "." + strings.TrimSuffix(filepath.Base(p), ".aidl")
-				if _, dup := x.files[q]; !dup {
+				if q := f.qualified(); x.files[q] == nil {
 					x.files[q] = f
 				}
-				continue
 			}
+			// a code file's own unstructured declarations index as a separate file's do: they resolve to the code file, whose compiled copy drops them (compiledCopy)
 			for _, dcl := range f.unstructured {
 				if _, dup := x.files[dcl.name]; !dup {
 					x.files[dcl.name] = f
@@ -271,7 +321,7 @@ func (g *Graph) closure(x *aidlIndex, types []string) (compile []*aidlScanned, s
 	seen := map[*aidlScanned]bool{}
 	for _, t := range types {
 		f := x.files[t]
-		if f == nil || !f.code {
+		if f == nil || !f.code || f.qualified() != t {
 			return nil, nil, nil, nil, fmt.Errorf("type %s: no interface, structured parcelable, enum or union of that name under the include dirs", t)
 		}
 		if o := g.aidlOwner(f.path); o != nil && !slices.Contains(standIn, o) {
@@ -358,7 +408,15 @@ func (g *Graph) addAidlCrates(crates map[string]AidlCrate) error {
 		}
 		spec := &aidlCrateSpec{includes: c.IncludeDirs}
 		for _, f := range files {
-			spec.srcs = append(spec.srcs, srcFile{path: f.path, root: f.root})
+			if len(f.unstructured) == 0 {
+				spec.srcs = append(spec.srcs, srcFile{path: f.path, root: f.root})
+				continue
+			}
+			p, root, err := g.compiledCopy(name, f)
+			if err != nil {
+				return fmt.Errorf("aidl crate %s: %w", name, err)
+			}
+			spec.srcs = append(spec.srcs, srcFile{path: p, root: root})
 		}
 		if p := c.Parcelables; p != nil {
 			if err := g.addParcelables(name, p, x, spec); err != nil {

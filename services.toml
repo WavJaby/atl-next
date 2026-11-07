@@ -247,6 +247,14 @@ mirrors = [
     "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#isActiveNetworkMetered",
     "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#enforceAccessPermission",
 ]
+
+[permissionmgr]
+src = ["crates/atl-services/src/permission_manager.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerServiceImpl.java#checkPermission",
+    "frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerServiceImpl.java#checkPermissionInternal",
+]
+
 [input]
 src = ["crates/atl-services/src/input.rs"]
 mirrors = [
