@@ -14,9 +14,9 @@ use atl_layout::Layout;
 
 use crate::git::git;
 
-/// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (9-15 GB measured 2026-11-07), so one per worktree is too much; 5 fits the dev machine's free disk (48 GB on the vhdx's host drive, compacted below 30 GB; owner 2026-11-07).
+/// Slots in the pool = checkouts that hold an out dir at once, i.e. agents working in parallel. Disk is the limit: each slot is a whole out dir (9-15 GB measured 2026-11-07), so one per worktree is too much; 3 keeps the vhdx's host drive from filling between owner compactions (2026-11-08: 52.8 GB free, vhdx 146 GB vs 113 GB used; owner cut 5 -> 3).
 /// Concurrent builds are a separate limit (CPU/RAM), [`crate::build_pool::TOKENS`]: a slot holder mostly edits and tests, and queues only for ninja.
-pub const SLOTS: u32 = 5;
+pub const SLOTS: u32 = 3;
 
 /// File in a checkout's git dir holding its slot number.
 const RECORD: &str = "atl-out-slot";
