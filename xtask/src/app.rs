@@ -53,9 +53,9 @@ pub struct Args {
     /// The MediaPlayer break: unlinks libmedia_jni.so from the ART lib dir, so `new MediaPlayer` must fail and the mediaplayer lines must go red.
     #[arg(long)]
     mediaplayer_break: bool,
-    /// The connectivity break: the services do not register `connectivity`, so getSystemService returns null and the connectivity line must go red.
+    /// The per-service break: the services do not register this [`SERVICE_LINES`] service (repeat), so its manager is null and its line must go red.
     #[arg(long)]
-    connectivity_break: bool,
+    omit_service: Vec<String>,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -78,13 +78,24 @@ const SOUNDPOOL_CALLS: [&str; 2] = ["trackPlayer", "releasePlayer"];
 const MEDIAPLAYER: &str = "AtlTest: mediaplayer: ";
 /// AOSP's ALOGE in MediaPlayer::start for a player in Idle (mediaplayer.cpp:364, tag MediaPlayerNative, state 1 = MEDIA_PLAYER_IDLE): start() reached the native player and was refused there. Java's _start throws nothing for that (android_media_MediaPlayer.cpp), so this line is the only evidence the native path ran.
 const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
-/// Main.onCreate's connectivity line: ConnectivityManager's answers on a device with no network agent (ConnectivityService.getActiveNetworkInfo -> null, isActiveNetworkMetered -> true).
-const CONNECTIVITY: &str = "AtlTest: connectivity: ";
+/// Main.onCreate's lines for services an app reaches through a manager that is null without them: (servicemanager name, line prefix, expected value). A missing service logs `absent`.
+/// connectivity: a device with no network agent (ConnectivityService.getActiveNetworkInfo -> null, isActiveNetworkMetered -> true).
+/// permissionmgr: PackageManager.checkPermission for the fixture itself: ACCESS_NETWORK_STATE is requested + NORMAL -> granted (0, permission.rs rule A); CAMERA is not requested -> denied (-1).
+const SERVICE_LINES: [(&str, &str, &str); 2] = [
+    (
+        "connectivity",
+        "AtlTest: connectivity: ",
+        "active=null metered=true",
+    ),
+    (
+        "permissionmgr",
+        "AtlTest: permission: ",
+        "network_state=0 camera=-1",
+    ),
+];
 /// The native bridge's report of a fault handed to a guest handler (x86_64.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
-/// The line's expected value; `absent` = getSystemService returned null (no `connectivity` binder).
-const CONNECTIVITY_OFFLINE: &str = "active=null metered=true";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -341,11 +352,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
-    let rt = if args.connectivity_break {
-        rt.without_connectivity_service()
-    } else {
-        rt
-    };
+    let rt = args
+        .omit_service
+        .iter()
+        .fold(rt, |rt, s| rt.without_service(s));
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -497,13 +507,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && soundpool.as_deref() != Some("constructed") {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
     }
-    let connectivity = app
-        .lines()
-        .find_map(|l| l.split_once(CONNECTIVITY).map(|(_, r)| r.to_owned()));
-    if passed && connectivity.as_deref() != Some(CONNECTIVITY_OFFLINE) {
-        whys.push(format!(
-            "connectivity: want {CONNECTIVITY_OFFLINE:?}, got {connectivity:?}"
-        ));
+    for (service, prefix, want) in SERVICE_LINES {
+        let got = app
+            .lines()
+            .find_map(|l| l.split_once(prefix).map(|(_, r)| r.to_owned()));
+        if passed && got.as_deref() != Some(want) {
+            whys.push(format!("{service}: want {want:?}, got {got:?}"));
+        }
     }
     // the row's release: releasePlayer is oneway, so the app sees no error; the audio service's own count shows that the track and the release reached it and were served
     if passed {
@@ -575,7 +585,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass mediaplayer {} (no media.player lookup)",
             mediaplayer_steps(&app)
         );
-        println!("app: pass connectivity {CONNECTIVITY_OFFLINE}");
+        for (service, _, want) in SERVICE_LINES {
+            println!("app: pass {service} {want}");
+        }
         if let Some(n) = es1_compared {
             println!(
                 "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"

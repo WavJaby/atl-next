@@ -220,8 +220,8 @@ pub struct Runtime {
     root_back: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
-    /// The services register `connectivity` unless this is cleared (`--no-connectivity-service`, the app gate's connectivity break).
-    connectivity_service: bool,
+    /// Services left unregistered (`--omit-service`, the app gate's per-service breaks).
+    omitted_services: Vec<String>,
     /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
     fake_devices: Option<(PathBuf, PathBuf)>,
 }
@@ -544,7 +544,7 @@ impl Runtime {
             new_intent: true,
             root_back: true,
             sensor_service: true,
-            connectivity_service: true,
+            omitted_services: Vec::new(),
             fake_devices: None,
         })
     }
@@ -734,9 +734,9 @@ impl Runtime {
         self
     }
 
-    /// The services do not register `connectivity` (atld `--no-connectivity-service`): getSystemService(CONNECTIVITY_SERVICE) must then return null.
-    pub fn without_connectivity_service(mut self) -> Self {
-        self.connectivity_service = false;
+    /// The services do not register `name` (atld `--omit-service`): its manager must then be null in the app.
+    pub fn without_service(mut self, name: &str) -> Self {
+        self.omitted_services.push(name.to_owned());
         self
     }
 
@@ -961,8 +961,8 @@ impl Runtime {
         if !self.sensor_service {
             cmd.arg("--no-sensor-service");
         }
-        if !self.connectivity_service {
-            cmd.arg("--no-connectivity-service");
+        for s in &self.omitted_services {
+            cmd.args(["--omit-service", s]);
         }
         let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
         let placed = driver_files

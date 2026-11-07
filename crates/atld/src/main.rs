@@ -148,9 +148,9 @@ struct Args {
     /// Test only: passed to the services (`--no-sensor-service`), the deliberate break of the sensors gate's empty stage.
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: passed to the services (`--no-connectivity-service`), the deliberate break of the app gate's connectivity line.
+    /// Test only: passed to the services (`--omit-service <name>`, repeat), the deliberate break of the app gate's line for that service.
     #[arg(long)]
-    no_connectivity_service: bool,
+    omit_service: Vec<String>,
     /// Test only: apps start with `--no-audio-service` (their launcher serves neither AudioFlinger nor AudioPolicyService), the deliberate break of the audio gate.
     #[arg(long)]
     no_audio_service: bool,
@@ -1090,8 +1090,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     if a.no_sensor_service {
         services_args.push("--no-sensor-service".into());
     }
-    if a.no_connectivity_service {
-        services_args.push("--no-connectivity-service".into());
+    for s in &a.omit_service {
+        services_args.extend(["--omit-service".into(), s.into()]);
     }
     // the key maps are /system files (`--file`, usr/keychars); the services read them where they lie in the root
     services_args.extend([

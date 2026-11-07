@@ -24,7 +24,7 @@ import javax.net.ssl.X509TrustManager;
  * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser) through the NativeBridge core into its guest; a failed load logs ART's UnsatisfiedLinkError, which carries the core's reason.
  * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
- * Connectivity line (app.rs CONNECTIVITY): getSystemService(CONNECTIVITY_SERVICE) and the offline answers of the `connectivity` service, or `absent` / what it threw.
+ * Service lines (app.rs SERVICE_LINES): connectivity = the offline answers of the `connectivity` service; permission = PackageManager.checkPermission through `permissionmgr`; else `absent` / what it threw.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -38,6 +38,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "soundpool: " + soundPool());
         mediaPlayer();
         Log.i("AtlTest", "connectivity: " + connectivity());
+        Log.i("AtlTest", "permission: " + permission());
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -62,6 +63,17 @@ public class Main extends Activity {
                 return "absent";
             }
             return "active=" + cm.getActiveNetworkInfo() + " metered=" + cm.isActiveNetworkMetered();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** "network_state=<int> camera=<int>": PackageManager.checkPermission for this package (Cut the Rope's getNetworkType path); else what it threw. */
+    private String permission() {
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            return "network_state=" + pm.checkPermission("android.permission.ACCESS_NETWORK_STATE", getPackageName())
+                    + " camera=" + pm.checkPermission("android.permission.CAMERA", getPackageName());
         } catch (Throwable t) {
             return "threw " + t;
         }

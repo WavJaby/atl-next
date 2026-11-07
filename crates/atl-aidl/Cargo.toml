@@ -66,6 +66,8 @@ types = [
     "android.content.IClipboard",
     # the connectivity service (connectivity.rs)
     "android.net.IConnectivityManager",
+    # the permissionmgr service (permission_manager.rs)
+    "android.permission.IPermissionManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.app.IActivityTaskManager",
