@@ -10,7 +10,12 @@
 //! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in a Mesa object, not libEGL.
 //!
 //! Then a deliberate break, every run: the probe skips glClear and calls a no-op in place of the extension (what a forwarder that does nothing gives); both checks must fail.
+//! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
+//! 1. GL_VERSION `OpenGL ES-CM 1.`, renderer softpipe; 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
+//!
+//! Break: the steps marked `break` are dropped (skip glPopMatrix and the GL_COLOR_ARRAY enable); checks 4 and 5 must then mismatch, with a readback present.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
@@ -19,6 +24,7 @@ use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, Shell};
+use crate::gl_scene::{self, Judged};
 use crate::{manifest, mesa, tree};
 
 #[derive(clap::Args)]
@@ -47,6 +53,13 @@ const LIB: &str = "libatl_gl_probe.so";
 /// The pbuffer's size and clear colour (bytes): odd sizes so no row or tile alignment hides a stray pixel; each channel a k / 255 value away from 0 and 255.
 const SIZE: (u32, u32) = (67, 33);
 const CLEAR: [u8; 4] = [51, 102, 204, 255];
+/// The probe's first shell argument after the library: the clear test or the ES1 scene (Probe.java dispatches on it).
+const CLEAR_MODE: &str = "clear";
+const ES1_MODE: &str = "es1";
+/// The ES1 scene (mode es1), read by gl_scene.rs; its program is the probe's arguments.
+const SCENE: &str = "es1-scene.toml";
+/// The message AOSP's libEGL logs when a hook falls to the unimplemented stub (egl.cpp:177): check 3 fails on it.
+const UNIMPLEMENTED: &str = "called unimplemented OpenGL ES API";
 /// In Mesa's ES dispatch, not in entries.in; observable through a query whose answer an entries.in call also gives.
 const EXTENSION: &str = "glGetInteger64vEXT";
 /// Mesa's generated dispatch table (build-relative) and its API XML (tree-relative); AOSP's entries.in.
@@ -124,44 +137,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
+    let scene = gl_scene::Scene::load(&root.join(FIXTURE).join(SCENE))?;
     for broken in [false, true] {
         let tag = if broken { "break" } else { "run" };
-        let mut shell_args: Vec<String> =
-            vec![lib_at.clone(), SIZE.0.to_string(), SIZE.1.to_string()];
+        let mut shell_args: Vec<String> = vec![
+            lib_at.clone(),
+            CLEAR_MODE.to_owned(),
+            SIZE.0.to_string(),
+            SIZE.1.to_string(),
+        ];
         shell_args.extend(CLEAR.iter().map(u8::to_string));
         if broken {
             shell_args.push("break".to_owned());
         }
-        let run = Run {
-            root: work.join(tag).join("root"),
-            scratch: work.join(tag).join("scratch"),
-            launch: None,
-            packages: vec![(apk.clone(), manifest::read(&rt.apk.aapt2, &apk)?)],
-            first_uid: APP_UID,
-            libraries: vec![],
-            shell: Some(Shell {
-                class: PROBE_CLASS.to_owned(),
-                uid: APP_UID,
-                name: PROBE_NAME.to_owned(),
-                args: shell_args,
-                boot_jars: vec![apk.clone()],
-            }),
-            log_tags: "*:i".to_owned(),
-        };
-        let mut child = rt.start_atld(&run)?;
-        let started = Instant::now();
-        while child.try_wait()?.is_none() {
-            if started.elapsed() > LIMIT {
-                let _ = child.kill();
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-        child.wait()?;
-        let log = std::fs::read_to_string(run.log(PROBE_NAME)).unwrap_or_default();
-        if args.verbose {
-            println!("---- {tag} log\n{log}");
-        }
+        let log = run_probe(&rt, &apk, &work.join(tag), shell_args, args.verbose, tag)?;
         let lines = probe_lines(&log);
         let pixels = judge_pixels(&lines);
         let ext = judge_extension(&lines);
@@ -198,6 +187,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
     }
+    ok &= es1(&rt, &apk, &work, &lib_at, &scene, args.verbose)?;
     println!(
         "{}",
         crate::verdict::gate(
@@ -214,6 +204,185 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// One probe process: the probe class with `args` as its shell arguments, its files under `dir`; returns the log.
+fn run_probe(
+    rt: &Runtime,
+    apk: &Path,
+    dir: &Path,
+    args: Vec<String>,
+    verbose: bool,
+    tag: &str,
+) -> Result<String> {
+    let run = Run {
+        root: dir.join("root"),
+        scratch: dir.join("scratch"),
+        launch: None,
+        packages: vec![(apk.to_path_buf(), manifest::read(&rt.apk.aapt2, apk)?)],
+        first_uid: APP_UID,
+        libraries: vec![],
+        shell: Some(Shell {
+            class: PROBE_CLASS.to_owned(),
+            uid: APP_UID,
+            name: PROBE_NAME.to_owned(),
+            args,
+            boot_jars: vec![apk.to_path_buf()],
+        }),
+        log_tags: "*:i".to_owned(),
+    };
+    let mut child = rt.start_atld(&run)?;
+    let started = Instant::now();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() > LIMIT {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
+    child.wait()?;
+    let log = std::fs::read_to_string(run.log(PROBE_NAME)).unwrap_or_default();
+    if verbose {
+        println!("---- {tag} log\n{log}");
+    }
+    Ok(log)
+}
+
+/// Mode es1: the scene through Java GL10 and through libGLESv1_CM.so, read back and judged (checks 1-6). Then the deliberate break: checks 4 and 5 must fail.
+fn es1(
+    rt: &Runtime,
+    apk: &Path,
+    work: &Path,
+    lib_at: &str,
+    scene: &gl_scene::Scene,
+    verbose: bool,
+) -> Result<bool> {
+    let mut ok = true;
+    for broken in [false, true] {
+        let tag = if broken { "es1-break" } else { "es1-run" };
+        let (w, h) = scene.size();
+        let mut args = vec![
+            lib_at.to_owned(),
+            ES1_MODE.to_owned(),
+            w.to_string(),
+            h.to_string(),
+        ];
+        args.extend(scene.program(broken));
+        let log = run_probe(rt, apk, &work.join(tag), args, verbose, tag)?;
+        let lines = probe_lines(&log);
+        let java = scene.judge(&rows(&lines, "java row"))?;
+        let native = scene.judge(&rows(&lines, "native row"))?;
+        for line in lines.iter().filter(|l| l.contains(" error ")) {
+            ok = false;
+            println!("gl: FAIL es1 probe said: {line}");
+        }
+        if broken {
+            for (who, j) in [("java", &java), ("native", &native)] {
+                let fired = matches!(j, Judged::Mismatch(_));
+                ok &= fired;
+                match j {
+                    Judged::Mismatch(m) => {
+                        println!("gl: pass es1 break {who} pixels: fails as it must: {m}")
+                    }
+                    other => println!("gl: FAIL es1 break {who} pixels: {}", describe(other)),
+                }
+            }
+            continue;
+        }
+        let version = first_line(&lines, "version ").unwrap_or("none");
+        let renderer = first_line(&lines, "renderer ").unwrap_or("none");
+        let maps = first_line(&lines, "maps ").unwrap_or("none");
+        let unimplemented = log.contains(UNIMPLEMENTED);
+        let dl = dladdr(&lines);
+        let dl_ok = scene.names().iter().all(|n| {
+            dl.iter()
+                .any(|(name, file)| name == n && file.ends_with("libGLESv1_CM.so"))
+        });
+        let checks: [(&str, bool, String); 6] = [
+            (
+                "1 version",
+                version.starts_with("OpenGL ES-CM 1."),
+                version.to_owned(),
+            ),
+            (
+                "1 renderer",
+                renderer.to_ascii_lowercase().contains("softpipe"),
+                renderer.to_owned(),
+            ),
+            (
+                "2 maps",
+                maps.contains("libGLESv1_CM_mesa.so"),
+                maps.to_owned(),
+            ),
+            (
+                "3 unimplemented",
+                !unimplemented,
+                if unimplemented {
+                    UNIMPLEMENTED.to_owned()
+                } else {
+                    "none".to_owned()
+                },
+            ),
+            (
+                "4 java pixels",
+                matches!(java, Judged::Match(_)),
+                describe(&java),
+            ),
+            (
+                "5 native pixels",
+                matches!(native, Judged::Match(_)),
+                describe(&native),
+            ),
+        ];
+        for (what, pass, detail) in checks {
+            ok &= pass;
+            println!("gl: {} es1 {what}: {detail}", verdict(pass));
+        }
+        ok &= dl_ok;
+        println!(
+            "gl: {} es1 6 dladdr: {} of {} names resolve into libGLESv1_CM.so",
+            verdict(dl_ok),
+            dl.iter()
+                .filter(|(_, f)| f.ends_with("libGLESv1_CM.so"))
+                .count(),
+            scene.names().len()
+        );
+    }
+    Ok(ok)
+}
+
+/// The `<prefix> <y> <hex>` lines of a probe, as row y -> hex.
+fn rows(lines: &[String], prefix: &str) -> BTreeMap<usize, String> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (y, hex) = l.strip_prefix(prefix)?.strip_prefix(' ')?.split_once(' ')?;
+            Some((y.parse().ok()?, hex.to_owned()))
+        })
+        .collect()
+}
+
+/// The `native dladdr <name> <file>` lines: name and the object its address lies in.
+fn dladdr(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (name, file) = l.strip_prefix("native dladdr ")?.split_once(' ')?;
+            Some((name.to_owned(), file.to_owned()))
+        })
+        .collect()
+}
+
+fn first_line<'a>(lines: &'a [String], prefix: &str) -> Option<&'a str> {
+    lines.iter().find_map(|l| l.strip_prefix(prefix))
+}
+
+fn describe(j: &Judged) -> String {
+    match j {
+        Judged::Match(n) => format!("all {n} non-edge pixels match"),
+        Judged::Mismatch(m) => m.clone(),
+        Judged::Missing(m) => format!("no readback: {m}"),
+    }
 }
 
 fn verdict(ok: bool) -> &'static str {

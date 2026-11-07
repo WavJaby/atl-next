@@ -7,19 +7,25 @@ import android.opengl.EGLContext;
 import android.opengl.EGLDisplay;
 import android.opengl.EGLExt;
 import android.opengl.EGLSurface;
+import android.opengl.GLES10;
 import android.opengl.GLES20;
 import android.util.Log;
 
+import javax.microedition.khronos.egl.EGL10;
+
 import java.nio.ByteBuffer;
 
-/// `xtask test gl`'s driver: a GLES3 pbuffer through the framework's EGL14 / GLES20 (AOSP libEGL + libGLESv2 -> the driver), cleared to the colour given as four bytes and read back;
-/// then glGetInteger64vEXT, a name outside AOSP's entries.in, through eglGetProcAddress (native lib). Prints one `gl-probe:` line per result; the gate judges them.
-/// Args: path of the native lib, w, h, r, g, b, a [, "break"]. Break: no glClear, and the extension call goes to a no-op instead (what a dead forwarder does).
+/// `xtask test gl`'s driver, two modes. clear: a GLES3 pbuffer through the framework's EGL14 / GLES20 (AOSP libEGL + libGLESv2 -> the driver), cleared to the colour given as four bytes and read back;
+/// then glGetInteger64vEXT, a name outside AOSP's entries.in, through eglGetProcAddress (native lib). es1: the ES1 scene (es1-scene.toml) through EGL10 + GL10 (Es1Scene) and through libGLESv1_CM.so (native lib).
+/// Prints one `gl-probe:` line per result; the gate judges them. Args: path of the native lib, mode, then clear: w, h, r, g, b, a [, "break"]; es1: w, h, the program lines.
+/// Break (clear): no glClear, and the extension call goes to a no-op instead (what a dead forwarder does).
 public class Probe {
     private static final String TAG = "gl-probe";
 
     static native long ext64(boolean broken);
     static native String owner();
+    /// Runs the program through libGLESv1_CM.so on the current context; the result is `native`-prefixed lines (rows, dladdr, errors).
+    static native String es1Scene(String program);
 
     static void say(String text) {
         Log.i(TAG, text);
@@ -58,12 +64,66 @@ public class Probe {
         }
     }
 
+    static final int EGL_CONTEXT_CLIENT_VERSION = 0x3098;
+
+    static void die(EGL10 egl, String what) {
+        say("FAIL " + what + ": egl error 0x" + Integer.toHexString(egl.eglGetError()));
+        System.exit(1);
+    }
+
+    /// The path of the mapped libGLESv1_CM_mesa.so (the Loader picked Mesa's ES1 driver), or "none".
+    static String mesaMaps() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/maps"))) {
+            for (String l; (l = r.readLine()) != null;) {
+                if (l.contains("libGLESv1_CM_mesa.so")) return l.substring(l.indexOf('/'));
+            }
+        } catch (java.io.IOException e) {
+            return "unreadable " + e;
+        }
+        return "none";
+    }
+
+    /// Mode es1 (EGL10 as GLSurfaceView does it, a 16-bit depth buffer): the program through GL10 on the first pbuffer, then through libGLESv1_CM.so on a second one of the same context.
+    static void es1(int w, int h, String[] ops) {
+        EGL10 egl = (EGL10) javax.microedition.khronos.egl.EGLContext.getEGL();
+        javax.microedition.khronos.egl.EGLDisplay d = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY);
+        if (!egl.eglInitialize(d, new int[2])) die(egl, "eglInitialize");
+        int[] attrs = {EGL10.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES_BIT, EGL10.EGL_SURFACE_TYPE, EGL10.EGL_PBUFFER_BIT,
+            EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8, EGL10.EGL_ALPHA_SIZE, 8,
+            EGL10.EGL_DEPTH_SIZE, 16, EGL10.EGL_NONE};
+        javax.microedition.khronos.egl.EGLConfig[] config = new javax.microedition.khronos.egl.EGLConfig[1];
+        int[] n = new int[1];
+        if (!egl.eglChooseConfig(d, attrs, config, 1, n) || n[0] != 1) die(egl, "eglChooseConfig");
+        javax.microedition.khronos.egl.EGLContext c = egl.eglCreateContext(d, config[0], EGL10.EGL_NO_CONTEXT,
+            new int[] {EGL_CONTEXT_CLIENT_VERSION, 1, EGL10.EGL_NONE});
+        if (c == EGL10.EGL_NO_CONTEXT) die(egl, "eglCreateContext");
+        int[] size = {EGL10.EGL_WIDTH, w, EGL10.EGL_HEIGHT, h, EGL10.EGL_NONE};
+        javax.microedition.khronos.egl.EGLSurface s1 = egl.eglCreatePbufferSurface(d, config[0], size);
+        if (s1 == EGL10.EGL_NO_SURFACE || !egl.eglMakeCurrent(d, s1, s1, c)) die(egl, "eglMakeCurrent");
+        say("version " + GLES10.glGetString(GLES10.GL_VERSION));
+        say("renderer " + GLES10.glGetString(GLES10.GL_RENDERER));
+        say("maps " + mesaMaps());
+        try {
+            Es1Scene.run((javax.microedition.khronos.opengles.GL10) c.getGL(), ops);
+        } catch (RuntimeException e) {
+            say("java error " + e);
+        }
+        javax.microedition.khronos.egl.EGLSurface s2 = egl.eglCreatePbufferSurface(d, config[0], size);
+        if (s2 == EGL10.EGL_NO_SURFACE || !egl.eglMakeCurrent(d, s2, s2, c)) die(egl, "eglMakeCurrent (second pbuffer)");
+        for (String line : es1Scene(String.join("\n", ops)).split("\n")) say("native " + line);
+        egl.eglMakeCurrent(d, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT);
+        egl.eglTerminate(d);
+        say("done");
+        System.exit(0);
+    }
+
     public static void main(String[] args) {
         System.load(args[0]);
-        int w = Integer.parseInt(args[1]), h = Integer.parseInt(args[2]);
+        if (args[1].equals("es1")) es1(Integer.parseInt(args[2]), Integer.parseInt(args[3]), java.util.Arrays.copyOfRange(args, 4, args.length));
+        int w = Integer.parseInt(args[2]), h = Integer.parseInt(args[3]);
         int[] rgba = new int[4];
-        for (int i = 0; i < 4; i++) rgba[i] = Integer.parseInt(args[3 + i]);
-        boolean broken = args.length > 7 && args[7].equals("break");
+        for (int i = 0; i < 4; i++) rgba[i] = Integer.parseInt(args[4 + i]);
+        boolean broken = args.length > 8 && args[8].equals("break");
 
         EGLDisplay d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
         int[] version = new int[2];

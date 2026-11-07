@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! JNI natives of com.example.atlgl.Probe: `ext64` calls glGetInteger64vEXT(GL_MAX_TEXTURE_SIZE) through the address AOSP libEGL's eglGetProcAddress returns (patch 0010: the driver's, not a
 //! forwarder); `owner` names the object that address lies in (dladdr). Test fixture: glibc's dl* directly, no crates.
+//! `es1Scene` (es1.rs) runs the ES1 scene's program through libGLESv1_CM.so, resolved by dlsym, so this library imports no gl* symbol.
+
+mod es1;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
