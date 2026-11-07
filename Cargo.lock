@@ -104,6 +104,7 @@ name = "atl-app-launcher"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-audioflinger",
  "atl-bionic",
  "atl-bridgegen",
  "atl-codec-store",
@@ -114,6 +115,16 @@ dependencies = [
  "atl-service-view",
  "rustix",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "atl-audioflinger"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-service-view",
+ "atl-services",
 ]
 
 [[package]]

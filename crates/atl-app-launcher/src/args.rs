@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--no-audio-service] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -13,6 +13,8 @@ pub struct Launch {
     pub target_sdk: i32,
     /// An app process (lib.rs app mode): the class runs as zygote's child runs it, not as dalvikvm's main.
     pub app: bool,
+    /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services), the audio gate's deliberate break.
+    pub no_audio_service: bool,
     pub vm_options: Vec<CString>,
     /// None: none given; dalvikvm reports that after creating the VM (so `-help` and the like run).
     pub class: Option<String>,
@@ -21,6 +23,7 @@ pub struct Launch {
 
 const TARGET_SDK: &str = "--target-sdk=";
 const APP: &str = "--app";
+const NO_AUDIO_SERVICE: &str = "--no-audio-service";
 
 pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
     let mut it = argv
@@ -30,6 +33,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
     let mut launch = Launch {
         target_sdk: 0,
         app: false,
+        no_audio_service: false,
         vm_options: Vec::new(),
         class: None,
         args: Vec::new(),
@@ -39,6 +43,11 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         let text = arg.to_string_lossy();
         if text == APP {
             launch.app = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if text == NO_AUDIO_SERVICE {
+            launch.no_audio_service = true;
             pending = it.next().transpose()?;
             continue;
         }
@@ -84,6 +93,14 @@ mod tests {
 
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
+    }
+
+    #[test]
+    fn no_audio_service_is_a_launcher_option() {
+        let l = p(&["--no-audio-service", "Main"]).unwrap();
+        assert!(l.no_audio_service);
+        assert_eq!(l.class.as_deref(), Some("Main"));
+        assert!(!p(&["Main"]).unwrap().no_audio_service);
     }
 
     #[test]

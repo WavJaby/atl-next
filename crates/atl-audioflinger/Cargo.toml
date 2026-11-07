@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-audioflinger"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# AudioFlinger and AudioPolicyService in the app process (game audio A1a, plan section 3): AOSP's own audio AIDL, served through the view as media.audio_flinger and media.audio_policy.
+# [package.metadata.atl.aidl] makes device/atl-audioflinger-stubs-rust (crate atl_audioflinger_stubs): the five types of the C0 probe (Run C), their import closure, no parcelables.
+# The stubs keep types of other AIDL crates crate-private, so this crate names AudioUniqueIdUse and AudioStreamType from their own converter crates (listed below, extern crate in lib.rs).
+[package.metadata.atl]
+converter = ["device/libbinder_rs", "device/atl-audioflinger-stubs-rust", "device/audioclient-types-aidl-rust", "device/android.media.audio.common.types-V4-rust"]
+
+[package.metadata.atl.aidl]
+include_dirs = [
+    "frameworks/av/media/libaudioclient/aidl",
+    "frameworks/av/media/libshmem/aidl",
+    "frameworks/native/libs/permission/aidl",
+    "frameworks/native/libs/binder/aidl",
+    "frameworks/base/core/java",
+    "frameworks/base/drm/java",
+    "frameworks/base/graphics/java",
+    "frameworks/base/identity/java",
+    "frameworks/base/keystore/java",
+    "frameworks/base/media/java",
+    "frameworks/base/media/mca/effect/java",
+    "frameworks/base/media/mca/filterfw/java",
+    "frameworks/base/media/mca/filterpacks/java",
+    "frameworks/base/mms/java",
+    "frameworks/base/opengl/java",
+    "frameworks/base/rs/java",
+    "frameworks/base/sax/java",
+    "frameworks/base/telecomm/java",
+    "frameworks/base/telephony/java",
+    "frameworks/native/aidl/binder",
+    "frameworks/native/aidl/gui",
+    "frameworks/native/libs/gui/aidl",
+    "frameworks/native/libs/gui",
+    "hardware/interfaces/graphics/common/aidl",
+    "frameworks/av/aidl",
+    "packages/modules/Bluetooth/framework/aidl-export",
+    "system/hardware/interfaces/media/aidl",
+    "system/vold/binder",
+]
+types = [
+    "android.media.IAudioFlingerService",
+    "android.media.IAudioFlingerClient",
+    "android.media.IAudioPolicyService",
+    "android.media.IAudioPolicyServiceClient",
+    "android.media.AudioPolicyForcedConfig",
+]
+
+[features]
+converter = ["atl-service-view/converter"]
+
+[dependencies]
+atl-service-view = { path = "../atl-service-view" }
+atl-services = { path = "../atl-services" }
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

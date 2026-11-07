@@ -14,6 +14,7 @@ mod apk_sig;
 mod app;
 mod arches;
 mod atld_run;
+mod audio_app;
 mod audio_pcm;
 mod binder;
 mod broadcast;
@@ -222,6 +223,8 @@ enum Test {
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
     /// NativeBridge breaks: `ATL_NB_BREAK=<name>[,<name>]` in this run's environment; the run stages the core with it (names: atl-native-bridge build.rs `BREAKS`).
     App(app::Args),
+    /// The A1a audio gate (xtask/testdata/audio): AudioSystem's session ids, AudioTrack's minimum buffer and a track's player id, served by atl-audioflinger in the app process (audio_app.rs).
+    AudioApp(audio_app::Args),
     /// Broadcast delivery P1: two fixture apps (xtask/testdata/broadcast) under atld; a runtime receiver, a sticky returned and replayed, an explicit manifest receiver cold-started headless, a denied sticky send, an unexported receiver skipped.
     ///
     /// Each check prints pass / FAIL; the services' counters are printed either way, the logs' tails on failure.
@@ -350,6 +353,9 @@ fn main() -> Result<ExitCode> {
             test: Test::App(args),
         } => app::run(&root, &args),
         Command::Test {
+            test: Test::AudioApp(args),
+        } => audio_app::run(&root, &args),
+        Command::Test {
             test: Test::Broadcast(args),
         } => broadcast::run(&root, &args),
         Command::Test {
@@ -419,6 +425,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Binder(_) => "binder",
             Test::Sandbox(_) => "sandbox",
             Test::App(_) => "app",
+            Test::AudioApp(_) => "audio-app",
             Test::Broadcast(_) => "broadcast",
             Test::Instrument(_) => "instrument",
             Test::Cts(_) => "cts",

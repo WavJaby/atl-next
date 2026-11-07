@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test audio-app`: the audio A1a gate's app. One launcher activity; versionCode, SDK levels and the activity are read back from the built APK, never restated. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlaudio"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- minSdkVersion is the app gate's default fixture API level, so the same native build serves both gates -->
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL audio test">
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

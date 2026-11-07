@@ -148,6 +148,9 @@ struct Args {
     /// Test only: passed to the services (`--no-sensor-service`), the deliberate break of the sensors gate's empty stage.
     #[arg(long)]
     no_sensor_service: bool,
+    /// Test only: apps start with `--no-audio-service` (their launcher serves neither AudioFlinger nor AudioPolicyService), the deliberate break of the audio gate.
+    #[arg(long)]
+    no_audio_service: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -490,6 +493,8 @@ struct Host {
     headless_pointer: Option<String>,
     /// the UI mode; pushed to each app process as `ro.atl.ui`
     ui: Option<String>,
+    /// test only: each app's launcher gets `--no-audio-service` (the audio gate's break)
+    no_audio_service: bool,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// why the run ends: the `--run-class` command's exit or an explicit stop
@@ -581,18 +586,22 @@ impl Host {
         args: &[String],
     ) -> Result<Spawn> {
         let boot = boot.join(":");
-        let launcher_args: Vec<OsString> = [
-            format!("--target-sdk={target_sdk}"),
-            "--app".to_owned(),
-            format!("-Xbootclasspath:{boot}"),
-            format!("-Xbootclasspath-locations:{boot}"),
-            "-Xnoimage-dex2oat".to_owned(),
-            class.to_owned(),
-        ]
-        .into_iter()
-        .chain(args.iter().cloned())
-        .map(OsString::from)
-        .collect();
+        let launcher_args: Vec<OsString> =
+            [format!("--target-sdk={target_sdk}"), "--app".to_owned()]
+                .into_iter()
+                .chain(
+                    self.no_audio_service
+                        .then(|| "--no-audio-service".to_owned()),
+                )
+                .chain([
+                    format!("-Xbootclasspath:{boot}"),
+                    format!("-Xbootclasspath-locations:{boot}"),
+                    "-Xnoimage-dex2oat".to_owned(),
+                    class.to_owned(),
+                ])
+                .chain(args.iter().cloned())
+                .map(OsString::from)
+                .collect();
         let (stdout, stderr) = to_log(
             OpenOptions::new()
                 .create(true)
@@ -1026,6 +1035,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         display,
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
+        no_audio_service: a.no_audio_service,
         controlled: Mutex::new(BTreeSet::new()),
         done: done_tx,
         am: a.am.clone(),

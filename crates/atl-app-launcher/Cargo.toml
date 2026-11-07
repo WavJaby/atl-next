@@ -18,7 +18,7 @@ name = "atl-app-launcher"
 required-features = ["converter"]
 
 [features]
-converter = ["atl-codec-store/converter", "atl-composer/converter", "atl-media-extractors/converter", "atl-resource-manager/converter", "atl-service-view/converter"]
+converter = ["atl-audioflinger/converter", "atl-codec-store/converter", "atl-composer/converter","atl-media-extractors/converter", "atl-resource-manager/converter", "atl-service-view/converter"]
 
 [dependencies]
 anyhow.workspace = true
@@ -26,6 +26,8 @@ atl-bionic = { path = "../atl-bionic" }
 atl-composer = { path = "../atl-composer" }
 # the process's view of servicemanager, installed before the VM (lib.rs step 1b)
 atl-service-view = { path = "../atl-service-view" }
+# AudioFlinger and AudioPolicyService the process serves through the view (lib.rs step 1c)
+atl-audioflinger = { path = "../atl-audioflinger" }
 # the Codec2 store the process serves through the view (lib.rs step 1c)
 atl-codec-store = { path = "../atl-codec-store" }
 # the media resource manager the process serves through the view (lib.rs step 1c)

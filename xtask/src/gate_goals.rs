@@ -68,6 +68,7 @@ type GoalsOf = fn() -> Goals;
 /// Every gate that reads a native out dir: `xtask test <name>`, `xtask run-apk`, and the `xtask check` steps that read built files.
 pub const GATES: &[(&str, GoalsOf)] = &[
     ("app", crate::app::goals),
+    ("audio-app", crate::audio_app::goals),
     ("binder", crate::binder::goals),
     ("broadcast", crate::broadcast::goals),
     ("provider", crate::provider::goals),
