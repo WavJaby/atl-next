@@ -155,19 +155,20 @@ pub(crate) fn spawn_piped_with(
 
 /// atl-binderd and atl-sandbox-stub, built into `out`'s cargo target dir as `xtask native` builds crates; binderd started by the broker (its BinderDaemon sandbox, Landlock through the stub) with its stderr (counters) in `log`.
 pub(crate) fn start_binderd(root: &Path, out: &Path, log: &Path) -> Result<(Broker, Process)> {
-    let status = crate::cargo_command()
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "atl-binderd",
-            "-p",
-            "atl-sandbox-stub",
-            "--target-dir",
-        ])
-        .arg(out.join("cargo"))
-        .current_dir(root)
-        .status()?;
+    let status = crate::unit_use::status(
+        crate::cargo_command()
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "atl-binderd",
+                "-p",
+                "atl-sandbox-stub",
+                "--target-dir",
+            ])
+            .arg(out.join("cargo"))
+            .current_dir(root),
+    )?;
     ensure!(status.success(), "building atl-binderd failed");
     let bin = out.join("cargo/release");
     Broker::start(

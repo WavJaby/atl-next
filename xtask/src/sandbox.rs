@@ -76,17 +76,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = out.join("sandbox");
     fs::create_dir_all(&work)?;
     let (broker, _binderd) = binder::start_binderd(root, &out, &work.join("binderd.log"))?;
-    let status = crate::cargo_command()
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "atl-sandbox-probe",
-            "--target-dir",
-        ])
-        .arg(out.join("cargo"))
-        .current_dir(root)
-        .status()?;
+    let status = crate::unit_use::status(
+        crate::cargo_command()
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "atl-sandbox-probe",
+                "--target-dir",
+            ])
+            .arg(out.join("cargo"))
+            .current_dir(root),
+    )?;
     ensure!(status.success(), "building atl-sandbox-probe failed");
     let probe = out.join("cargo/release/atl-sandbox-probe");
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);

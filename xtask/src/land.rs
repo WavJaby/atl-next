@@ -15,6 +15,8 @@ use crate::check;
 use crate::fetch;
 use crate::git::{Ident, git, git_raw};
 use crate::patch;
+use crate::slot::{self, SLOTS};
+use crate::slot_prune;
 use crate::sources::{self, Sources};
 use crate::verdict::{self, Failure, Verdict};
 
@@ -426,7 +428,25 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
     let wt = find_worktree(&porcelain, branch)
         .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     let ws = Layout::of(repo)?.workspace().to_path_buf();
-    clean_up(repo, &ws, &wt, branch)
+    let note = clean_up(repo, &ws, &wt, branch)?;
+    prune_slots_after_land(repo, &ws);
+    Ok(note)
+}
+
+/// After a land: `slot prune --all --execute`. A busy slot is skipped; a failure is logged, never fatal, since the land is already pushed.
+fn prune_slots_after_land(repo: &Path, ws: &Path) {
+    let slots: Vec<u32> = (1..=SLOTS).collect();
+    let swept = slot::holders_of(repo).and_then(|holders| {
+        slot_prune::sweep(ws, &holders, &slots, slot_prune::PRUNE_AFTER_DAYS, true)
+    });
+    match swept {
+        Ok(sweep) if sweep.failed == 0 => {}
+        Ok(sweep) => eprintln!(
+            "slot prune after land: {} slot(s) failed (rows above)",
+            sweep.failed
+        ),
+        Err(e) => eprintln!("slot prune after land failed: {e:#}"),
+    }
 }
 
 /// The task copies, then the state note (kept in out/), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.

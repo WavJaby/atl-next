@@ -7,11 +7,12 @@ use anyhow::{Context, Result, ensure};
 
 /// Builds cdylib `package` (release, into `<out>/cargo`) and installs it as `<out>/<dir>/<name>`; returns `<out>/<dir>`, for LD_LIBRARY_PATH.
 pub fn stage(root: &Path, out: &Path, package: &str, dir: &str, name: &str) -> Result<PathBuf> {
-    let status = crate::cargo_command()
-        .args(["build", "--release", "-p", package, "--target-dir"])
-        .arg(out.join("cargo"))
-        .current_dir(root)
-        .status()?;
+    let status = crate::unit_use::status(
+        crate::cargo_command()
+            .args(["build", "--release", "-p", package, "--target-dir"])
+            .arg(out.join("cargo"))
+            .current_dir(root),
+    )?;
     ensure!(status.success(), "building {package} failed");
     let dir = out.join(dir);
     std::fs::create_dir_all(&dir)?;

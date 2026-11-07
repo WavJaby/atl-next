@@ -474,7 +474,7 @@ pub fn output(cmd: &mut Command, what: &str) -> Result<String> {
 
 /// [`PROPERTY_SERVICE`], release, in the cargo target dir `target` (cargo's own staleness check: a no-op when current); its path.
 fn build_property_service(root: &Path, target: &Path) -> Result<PathBuf> {
-    exec(
+    crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)
             .args(["build", "--release", "--locked", "-p", PROPERTY_SERVICE])

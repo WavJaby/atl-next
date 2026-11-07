@@ -10,7 +10,6 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 
-use crate::host_art::exec;
 use crate::tree;
 
 const PROBE: &str = "xtask/testdata/gl-dispatch";
@@ -89,7 +88,7 @@ fn table_pointers(entries: &str, hooks: &str) -> Result<usize> {
 }
 
 fn build_probe(root: &Path, target: &Path) -> Result<PathBuf> {
-    exec(
+    crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)
             .args(["build", "--release", "--locked", "--manifest-path"])

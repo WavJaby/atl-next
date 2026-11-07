@@ -1116,28 +1116,29 @@ fn build_crates<'a>(
         let include = out.join("gen").join(krate).join("include");
         let dest = out.join("cinstall").join(krate);
         remove_path(&dest)?;
-        let status = Command::new("cargo")
-            .args([
-                "cinstall",
-                "--release",
-                "--library-type",
-                "cdylib",
-                "-p",
-                krate,
-            ])
-            .arg("--target-dir")
-            .arg(out.join("cargo"))
-            .arg("--destdir")
-            .arg(&dest)
-            .arg("--prefix")
-            .arg(&prefix)
-            .arg("--libdir")
-            .arg(prefix.join("lib"))
-            .arg("--includedir")
-            .arg(&include)
-            .current_dir(root)
-            .status()
-            .context("running cargo cinstall (deps.toml row cargo-c)")?;
+        let status = crate::unit_use::status(
+            Command::new("cargo")
+                .args([
+                    "cinstall",
+                    "--release",
+                    "--library-type",
+                    "cdylib",
+                    "-p",
+                    krate,
+                ])
+                .arg("--target-dir")
+                .arg(out.join("cargo"))
+                .arg("--destdir")
+                .arg(&dest)
+                .arg("--prefix")
+                .arg(&prefix)
+                .arg("--libdir")
+                .arg(prefix.join("lib"))
+                .arg("--includedir")
+                .arg(&include)
+                .current_dir(root),
+        )
+        .context("running cargo cinstall (deps.toml row cargo-c)")?;
         ensure!(status.success(), "building crate {krate} failed");
         let staged_lib = staged(&dest, &prefix.join("lib"))?;
         if staged_lib.is_dir() {

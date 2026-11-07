@@ -92,6 +92,7 @@ mod test_fonts;
 mod tree;
 mod tree_gate;
 mod triage;
+mod unit_use;
 mod upstream;
 mod verdict;
 mod wayland_proxy;

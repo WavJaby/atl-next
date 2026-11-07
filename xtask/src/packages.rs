@@ -515,11 +515,11 @@ impl<'a> Selection<'a> {
 
     /// The code behind feature `converter` is linted where it is built (`xtask check` step clippy runs without the feature).
     fn lint(&self) -> Result<()> {
-        let status = self
-            .cargo("clippy")?
-            .args(["--lib", "--bins", "--", "-D", "warnings"])
-            .status()
-            .context("running cargo clippy (converter packages)")?;
+        let status = crate::unit_use::status(
+            self.cargo("clippy")?
+                .args(["--lib", "--bins", "--", "-D", "warnings"]),
+        )
+        .context("running cargo clippy (converter packages)")?;
         ensure!(status.success(), "clippy on {} failed", self.names());
         Ok(())
     }
@@ -530,13 +530,13 @@ impl<'a> Selection<'a> {
     /// `build` and the clippy steps stay on stable, so an unstable feature in our code still fails there.
     /// Test binaries run in the stage's library environment (binder::lib_env), as every runtime process: converter device libraries carry no runpath (runpath_gate), so their own needs are found only there.
     fn test(&self) -> Result<()> {
-        let status = self
-            .cargo("test")?
-            .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
-            .env("RUSTC_BOOTSTRAP", "1")
-            .envs(crate::binder::lib_env(self.out)?)
-            .status()
-            .context("running cargo test (converter packages)")?;
+        let status = crate::unit_use::status(
+            self.cargo("test")?
+                .args(["-Z", "panic-abort-tests", "--lib", "--bins"])
+                .env("RUSTC_BOOTSTRAP", "1")
+                .envs(crate::binder::lib_env(self.out)?),
+        )
+        .context("running cargo test (converter packages)")?;
         ensure!(status.success(), "tests of {} failed", self.names());
         Ok(())
     }
@@ -555,9 +555,7 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
     if sel.selected.is_empty() {
         return Ok(Vec::new());
     }
-    let status = sel
-        .cargo("build")?
-        .status()
+    let status = crate::unit_use::status(&mut sel.cargo("build")?)
         .context("running cargo build (converter packages)")?;
     ensure!(status.success(), "building {} failed", sel.names());
     sel.lint()?;

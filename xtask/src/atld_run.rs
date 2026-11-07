@@ -409,7 +409,7 @@ pub fn run_display() -> DisplayModel {
 
 /// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir; its path.
 fn cargo_bin(root: &Path, out: &Path, package: &str) -> Result<PathBuf> {
-    host_art::exec(
+    crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)
             .args(["build", "--release", "--locked", "-p", package])

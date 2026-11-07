@@ -628,7 +628,7 @@ impl Env {
 
 /// The fixture's JNI shim (its own cargo package, `<FIXTURE>/shim`), release, in the cargo target dir `target`; its path.
 fn build_shim(root: &Path, target: &Path) -> Result<PathBuf> {
-    exec(
+    crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)
             .args(["build", "--release", "--locked", "--manifest-path"])

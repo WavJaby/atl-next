@@ -75,9 +75,9 @@ pub enum Slot {
         #[arg(long)]
         force: bool,
     },
-    /// Deletes the cargo units of each slot's target trees that were not rebuilt for `--older-than` days (dry run unless --execute).
+    /// Deletes the cargo units of each slot's target trees that no cargo build used for `--older-than` days (dry run unless --execute).
     ///
-    /// Name a slot, or `--all` for the whole pool. A slot a build holds is skipped with a line saying so. Stale units are those whose `invoked.timestamp` (last rebuild) is older than the cutoff; units without one are kept.
+    /// Name a slot, or `--all` for the whole pool. A slot a build holds is skipped with a line saying so. Use is what each build recorded (`<tree>/.atl-unit-use.json`, `unit_use`); a unit with no entry is stale once the record is `--older-than` days old.
     Prune {
         /// Slot number, 1..=SLOTS.
         #[arg(conflicts_with = "all")]
@@ -85,7 +85,7 @@ pub enum Slot {
         /// Every slot of the pool.
         #[arg(long)]
         all: bool,
-        /// Stale after this many days since the last rebuild.
+        /// Stale after this many days since the last build that used the unit.
         #[arg(long, value_name = "DAYS", default_value_t = slot_prune::PRUNE_AFTER_DAYS)]
         older_than: u64,
         /// Delete (default: print the plan only).
@@ -229,6 +229,15 @@ pub fn holders(common: &Path) -> Result<Vec<Holder>> {
     }
     found.sort_by_key(|h| h.slot);
     Ok(found)
+}
+
+/// Every slot record of the repository that `root` belongs to (see [`holders`]).
+pub fn holders_of(root: &Path) -> Result<Vec<Holder>> {
+    let common = PathBuf::from(git(
+        Some(root),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    holders(&common)
 }
 
 fn holder(slot: u32, checkout: PathBuf, record: PathBuf) -> Holder {

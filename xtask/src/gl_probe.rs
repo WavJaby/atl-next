@@ -551,14 +551,15 @@ fn verdict(ok: bool) -> &'static str {
 
 /// Builds the JNI library into `target`; returns the .so.
 fn build_lib(root: &Path, target: &Path, features: &[&str]) -> Result<PathBuf> {
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--release", "--quiet", "--manifest-path"])
-        .arg(root.join(FIXTURE).join("jni/Cargo.toml"))
-        .arg(format!("--features={}", features.join(",")))
-        .arg("--target-dir")
-        .arg(target)
-        .status()
-        .context("running cargo for the gl-probe library")?;
+    let status = crate::unit_use::status(
+        Command::new(env!("CARGO"))
+            .args(["build", "--release", "--quiet", "--manifest-path"])
+            .arg(root.join(FIXTURE).join("jni/Cargo.toml"))
+            .arg(format!("--features={}", features.join(",")))
+            .arg("--target-dir")
+            .arg(target),
+    )
+    .context("running cargo for the gl-probe library")?;
     ensure!(status.success(), "building the gl-probe library failed");
     Ok(target.join("release").join(LIB))
 }
