@@ -488,7 +488,47 @@ fn dump(aapt2: &Path, apk: &Path) -> Result<String> {
 
 /// `apk`'s manifest, through `aapt2`.
 pub fn read(aapt2: &Path, apk: &Path) -> Result<Manifest> {
-    parse(&dump(aapt2, apk)?).with_context(|| format!("the manifest of {}", apk.display()))
+    let mut text = dump(aapt2, apk)?;
+    if text.lines().any(|l| value_reference(l).is_some()) {
+        let resources = host_art::output(
+            Command::new(aapt2).args(["dump", "resources"]).arg(apk),
+            "aapt2 dump resources",
+        )?;
+        text = resolve_value_references(&text, &resources);
+    }
+    parse(&text).with_context(|| format!("the manifest of {}", apk.display()))
+}
+
+/// The `@0x...` of an `android:value` attribute line of the xmltree dump, with the attribute's text up to `=`.
+fn value_reference(line: &str) -> Option<(&str, &str)> {
+    let (attribute, id) = line.split_once("=@0x")?;
+    attribute
+        .contains(":value(")
+        .then_some((attribute, id.trim()))
+}
+
+/// `<meta-data android:value="@string/x">`: obtainAttributes resolves a reference, so parseMetaData sees the value's own type (ParsingPackageUtils.parseMetaData). Rewrites each such line to the default-configuration value `aapt2 dump resources` prints
+/// (`resource 0x7f110001 string/x`, then `() "text"`), as if written literally; a reference with no default value stays and meta_value drops it.
+fn resolve_value_references(xmltree: &str, resources: &str) -> String {
+    let mut values = BTreeMap::new();
+    let mut current = None;
+    for line in resources.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("resource 0x") {
+            current = rest.split_whitespace().next();
+        } else if let (Some(id), Some(value)) = (current, line.strip_prefix("() ")) {
+            values.insert(id, value);
+        }
+    }
+    let resolved = xmltree.lines().map(|line| {
+        match value_reference(line).and_then(|(a, id)| Some((a, *values.get(id)?))) {
+            Some((attribute, value)) if value.starts_with('"') => {
+                format!("{attribute}={value} (Raw: {value})")
+            }
+            Some((attribute, value)) => format!("{attribute}={value}"),
+            None => line.to_owned(),
+        }
+    });
+    resolved.collect::<Vec<_>>().join("\n") + "\n"
 }
 
 /// The highest `<uses-feature android:glEsVersion>` (ConfigurationInfo.reqGlEsVersion: major << 16 | minor); None when no feature names one.
@@ -738,6 +778,44 @@ mod tests {
         assert_eq!(m.activities[0].theme, 0x0103_012a);
         assert_eq!(m.activities[1].theme, 0);
         assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
+    }
+
+    /// A string and a bool reference resolve to their default-configuration values and type; one with no default value stays a reference, which meta_value drops. Values as CTR's `aapt2 dump resources` prints them.
+    #[test]
+    fn value_references_resolve() {
+        let value = "http://schemas.android.com/apk/res/android:value(0x01010024)";
+        let text = format!(
+            r#"N: android=http://schemas.android.com/apk/res/android (line=3)
+  E: manifest (line=3)
+    A: package="com.example.p" (Raw: "com.example.p")
+      E: application (line=7)
+          E: meta-data (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="s" (Raw: "s")
+            A: {value}=@0x7f110001
+          E: meta-data (line=9)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="b" (Raw: "b")
+            A: {value}=@0x7f050000
+          E: meta-data (line=10)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="none" (Raw: "none")
+            A: {value}=@0x7f110002
+"#
+        );
+        let resources = r#"    resource 0x7f050000 bool/flag
+      () true
+    resource 0x7f110001 string/id
+      (fr) "autre"
+      () "ca-app~1"
+    resource 0x7f110002 string/only_fr
+      (fr) "x"
+"#;
+        let m = parse(&resolve_value_references(&text, resources)).expect("parse");
+        assert_eq!(
+            m.application_meta_data,
+            vec![
+                ("s".to_owned(), MetaValue::String("ca-app~1".to_owned())),
+                ("b".to_owned(), MetaValue::Bool(true)),
+            ]
+        );
     }
 
     /// `<provider>`: no targetSdk written = 0 here, so `exported` unwritten is true (< 17, parseProvider); permission falls back own -> `android:permission` -> application; initOrder as `aapt2` prints it (decimal, CTR's manifest).

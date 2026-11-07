@@ -157,7 +157,7 @@ pub struct PermissionDecl {
 }
 
 /// A `<meta-data>` value as ParsingPackageUtils.parseMetaData types it: `android:resource` -> its id as an Int; `android:value` by TypedValue type: string, boolean, any int type (decimal, hex, color) -> Int, float.
-/// Other value types (a reference in `android:value`) are dropped there with a warning, so they have no variant.
+/// A reference in `android:value` is resolved before parseMetaData sees it; other value types are dropped there with a warning, so they have no variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetaValue {
     String(String),
