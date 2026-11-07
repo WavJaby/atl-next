@@ -119,6 +119,14 @@ reason = "\"Distributed under the Boost Software License, Version 1.0.\" with th
 licence = "HPND-sell-variant"
 reason = "\"Permission to use, copy, modify, distribute, and sell this software ... without fee\" + no-advertising clause + \"THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES\": the SPDX HPND-sell-variant text"
 
+[upstream.aosp.paths."external/mesa3d/src/intel/compiler/brw_disasm.c"]
+licence = "HPND-sell-variant"
+reason = "same notice as loader_dri_helper.c (Keith Packard 2008 / Intel 2014): the SPDX HPND-sell-variant text"
+
+[upstream.aosp.paths."external/mesa3d/src/intel/compiler/elk/elk_disasm.c"]
+licence = "HPND-sell-variant"
+reason = "same notice as brw_disasm.c, which it was copied from: the SPDX HPND-sell-variant text"
+
 [upstream.aosp.paths."external/mesa3d/src/loader/loader_dri_helper.h"]
 licence = "HPND-sell-variant"
 reason = "\"Permission to use, copy, modify, distribute, and sell this software ... without fee\" + no-advertising clause + \"THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES\": the SPDX HPND-sell-variant text"
