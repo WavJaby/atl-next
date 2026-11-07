@@ -187,6 +187,21 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/notification/NotificationManagerService.java#areNotificationsEnabled",
 ]
 
+[alarm]
+src = [
+    "crates/atl-services/src/alarm.rs",
+    "crates/atl-services/src/alarm_table.rs",
+]
+mirrors = [
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#set",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#setImplLocked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#remove",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#removeLocked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#removeAll",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java#getNextAlarmClock",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/Alarm.java#matches",
+]
+
 [content]
 src = [
     "crates/atl-services/src/content.rs",

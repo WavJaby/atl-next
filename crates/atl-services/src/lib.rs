@@ -13,6 +13,7 @@ extern crate binder;
 
 pub mod activity_stack;
 pub mod activity_start;
+pub mod alarm_table;
 pub mod broadcast;
 pub mod compositor_registry;
 pub mod config_diff;
@@ -38,6 +39,8 @@ pub mod window_layout;
 pub mod activity;
 #[cfg(feature = "converter")]
 pub mod activity_task;
+#[cfg(feature = "converter")]
+pub mod alarm;
 #[cfg(feature = "converter")]
 pub mod audio;
 #[cfg(feature = "converter")]

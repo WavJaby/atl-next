@@ -97,6 +97,8 @@ const MOUNT: &str = "mount";
 const CLIPBOARD: &str = "clipboard";
 /// Context.NOTIFICATION_SERVICE (Toast.getService looks INotificationManager up by it).
 const NOTIFICATION: &str = "notification";
+/// Context.ALARM_SERVICE (Context.java:4750).
+const ALARM: &str = "alarm";
 /// The name libsensor's SensorManager waits for (SensorManager.cpp `waitForSensorService`).
 const SENSOR: &str = "sensorservice";
 /// Context.CONNECTIVITY_SERVICE (ConnectivityFrameworkInitializer.registerServiceWrappers looks it up by this name).
@@ -229,6 +231,11 @@ fn main() -> Result<()> {
         ),
     )
     .context("addService notification")?;
+    binder::add_service(
+        ALARM,
+        atl_services::alarm::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
+    )
+    .context("addService alarm")?;
     if !a.no_sensor_service {
         // the machine's sensors through the platform layer, listed once at start
         let source: Arc<dyn atl_platform_host::Sensors> =
