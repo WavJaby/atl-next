@@ -106,6 +106,8 @@ pub enum Break {
     DropLibunwind,
     /// Drops atld from the bundle: the prerequisite check names it as not delivered (`push --apply`), and a run without it stops at the executable check.
     DropAtld,
+    /// Test only (`remote test`; `push` refuses it): gl's tier table maps `xe` to llvmpipe, so the target's iris renderer must fail the gl gate's renderer check.
+    TierXeLlvmpipe,
 }
 
 pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
@@ -116,6 +118,10 @@ pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
 }
 
 fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
+    ensure!(
+        a.brk != Some(Break::TierXeLlvmpipe),
+        "--break tier-xe-llvmpipe is test-only: `remote test` runs it, push refuses it"
+    );
     let host = Host::parse(&a.host)?;
     let out = out_of(root, a.out.as_deref())?;
     let slot = slot_name(&out)?;
@@ -221,7 +227,7 @@ fn runtime_half(
     );
     let arches = arches::load(root)?;
     let (arch, _) = arches::build_machine(root, &arches)?;
-    let dir = out.join(REMOTE_DIR);
+    let dir = out.join(REMOTE_DIR).join(host.log_dir());
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
@@ -232,7 +238,7 @@ fn runtime_half(
         limit: gl_probe::LIMIT,
         log: log.clone(),
     });
-    let code = gl_probe::run_on(root, arch, out, site)?;
+    let code = gl_probe::run_on(root, arch, out, site, a.brk)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
 }
@@ -605,6 +611,14 @@ impl Host {
         }
     }
 
+    /// The host's transcript directory under `out/remote/`: its alias, or `local` for a `local:` directory.
+    fn log_dir(&self) -> String {
+        match self {
+            Host::Ssh(alias) => alias.clone(),
+            Host::Local(_) => "local".to_owned(),
+        }
+    }
+
     /// Where the bundle sits on the target: `~/atl-next-run/<slot>` (relative to the home dir), or the local dir.
     fn base(&self, slot: &str) -> String {
         match self {
@@ -706,11 +720,12 @@ fn ssh(alias: &str) -> Command {
     c
 }
 
-/// An ssh alias: a `Host` name, never `user@address` or `host:path`.
+/// An ssh alias: a `Host` name, never `user@address` or `host:path`. It names a transcript directory under out/remote/, so dot-only names (`.`, `..`) are refused.
 fn valid_alias(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 64
         && !text.starts_with('-')
+        && !text.chars().all(|c| c == '.')
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -1276,6 +1291,26 @@ mod tests {
         assert!(Host::parse("host:path").is_err());
         assert!(Host::parse("-oProxyCommand=x").is_err());
         assert!(Host::parse("").is_err());
+    }
+
+    #[test]
+    fn alias_names_one_transcript_dir() {
+        // `.` and `..` would name out/remote/ itself or its parent
+        assert!(Host::parse(".").is_err());
+        assert!(Host::parse("..").is_err());
+        assert!(Host::parse("...").is_err());
+        assert!(matches!(Host::parse("a.b"), Ok(Host::Ssh(a)) if a == "a.b"));
+        assert_eq!(
+            Host::parse("node-a").map(|h| h.log_dir()).ok().as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            Host::parse("local:/tmp/t")
+                .map(|h| h.log_dir())
+                .ok()
+                .as_deref(),
+            Some("local")
+        );
     }
 
     #[test]

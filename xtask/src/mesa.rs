@@ -57,6 +57,16 @@ pub enum Opt {
 /// The gallium drivers built.
 pub const GALLIUM_DRIVERS: &[&str] = &["llvmpipe", "iris"];
 
+/// Kernel DRM driver -> the gallium driver Mesa takes for a node of it. Intel: iris takes `i915` and `xe` (`iris_predicate`, loader.c L127-131, on the name `loader_get_kernel_driver_name` reads, L108-118).
+/// `vgem` and `virtio_gpu` take kms_swrast on llvmpipe (platform_android.c L1035-1043). Chips in `i915_pci_ids.h` / `crocus_pci_ids.h` (`pci_id_driver_map.h` L57-58) take the classic i915 / crocus drivers, not built here, so no row covers them (unverified on hardware; owner decision).
+/// Read by `gl_probe::expected_tier` from each DRM node the probe holds; a driver with no row fails the gate, naming it.
+pub const KERNEL_DRIVER_TIERS: &[(&str, &str)] = &[
+    ("i915", "iris"),
+    ("xe", "iris"),
+    ("vgem", "llvmpipe"),
+    ("virtio_gpu", "llvmpipe"),
+];
+
 /// Each of [`GALLIUM_DRIVERS`] -> its screen constructor (lp_screen.c, iris_screen.c), which [`driver_links`] requires in [`DRIVER`]'s symtab.
 const DRIVER_SCREENS: &[(&str, &str)] = &[
     ("llvmpipe", "llvmpipe_create_screen"),
@@ -914,6 +924,31 @@ mod tests {
     fn every_driver_has_a_screen_symbol() {
         let named: Vec<&str> = DRIVER_SCREENS.iter().map(|(d, _)| *d).collect();
         assert_eq!(named, GALLIUM_DRIVERS);
+    }
+
+    #[test]
+    fn kernel_driver_tiers_name_built_drivers() {
+        assert!(!KERNEL_DRIVER_TIERS.is_empty());
+        assert!(
+            KERNEL_DRIVER_TIERS
+                .iter()
+                .all(|(_, gallium)| GALLIUM_DRIVERS.contains(gallium))
+        );
+    }
+
+    #[test]
+    fn kernel_driver_rows_are_mesas() {
+        // Mesa's rows, written out from its source (loader.c iris_predicate; platform_android.c L1035-1043)
+        let mut want = vec![
+            ("i915", "iris"),
+            ("xe", "iris"),
+            ("vgem", "llvmpipe"),
+            ("virtio_gpu", "llvmpipe"),
+        ];
+        let mut have = KERNEL_DRIVER_TIERS.to_vec();
+        want.sort();
+        have.sort();
+        assert_eq!(have, want);
     }
 
     #[test]

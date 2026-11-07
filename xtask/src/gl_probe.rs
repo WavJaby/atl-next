@@ -8,15 +8,15 @@
 //!    eglGetProcAddress's extension-slot path, where 0010 returns the driver's address instead of the asm forwarder. [`EXTENSION`] must be one; the count is printed.
 //! 2. pixels: every pixel of the [`SIZE`] pbuffer equals [`CLEAR`]: GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) of c / 255 gives c back, so the bytes are the expectation.
 //! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in a Mesa object, not libEGL.
-//! 4. driver: a DRM node the probe holds after eglInitialize, each with a known kernel driver (`judge_driver`).
-//! 5. renderer: `GL_RENDERER` starts with [`RENDERER`]. Break: [`SOFTPIPE_RENDERER`] must not match it.
+//! 4. tier: the DRM nodes the probe holds after eglInitialize (its `drm` line, each with the kernel driver its DRM name gives) give the gallium driver the target's GPU calls for (`expected_tier`, through mesa::KERNEL_DRIVER_TIERS). None held and no render node (`render` line) is the software tier (llvmpipe); a render node with none held fails as a silent fallback.
+//! 5. renderer: `GL_RENDERER` starts with the prefix of the tier check 4 gives ([`RENDERERS`]). Break, every run: no other tier's prefix may match it.
 //! 6. scene: the last frame of a timed scene ([`TIMED_SIZE`] pixels; [`FRAMES`] frames after one untimed warm-up, each clear + draw + glFinish) reads back [`TEXEL`] on every pixel.
 //! 7. frames: one wall-clock time per timed frame. The gate prints their median and p95 (nearest rank) with the 1/5/15-minute load average before and after (`uptime`'s figures).
 //!    A baseline only while the 1-minute load before the run is below [`QUIET_LOAD`]; the gate never fails on it.
 //!
 //! Then a deliberate break, every run: the probe skips glClear and the timed draws, and calls a no-op in place of the extension; the pixel, scene and extension checks must fail.
 //! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
-//! 1. GL_VERSION `OpenGL ES-CM 1.`, renderer llvmpipe; 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
+//! 1. GL_VERSION `OpenGL ES-CM 1.`, the tier and renderer of checks 4 and 5 (no other tier's prefix may match); 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
 //!
 //! Break: the steps marked `break` are dropped (skip glPopMatrix and the GL_COLOR_ARRAY enable); checks 4 and 5 must then mismatch, with a readback present.
 
@@ -76,10 +76,20 @@ const TEXEL: [u8; 4] = [204, 153, 51, 255];
 const FRAMES: u32 = 60;
 /// Nearest-rank p95 of n samples is the maximum while n < 20 (rank ceil(0.95 n) = n); from 20 on it is not.
 const P95_MIN_FRAMES: u32 = 20;
-/// The renderer name the gate requires: Mesa's llvmpipe on the host LLVM (`llvmpipe (LLVM <version>, <bits> bits)`, lp_screen.c). The prefix's version is checked against llvm_host::VERSION (unit test).
-const RENDERER: &str = "llvmpipe (LLVM 20.";
-/// The software tier llvmpipe replaced (softpipe, sp_screen.c). A deliberate break every run: on the renderer above it must not match.
-const SOFTPIPE_RENDERER: &str = "softpipe";
+/// The software tier: no DRM node held and no render node bound, so Mesa's software path on the host LLVM (llvm_host.rs).
+const SOFTWARE_TIER: &str = "llvmpipe";
+/// Each built gallium driver's GL_RENDERER prefix. llvmpipe: `llvmpipe (LLVM <version>, <bits> bits)` (lp_screen.c L1101); the version is checked against llvm_host::VERSION (unit test). iris: "Mesa " + the device name (iris_screen.c L139, iris_get_name), e.g. `Mesa Intel(R) Graphics (LNL)`.
+const RENDERERS: &[(&str, &str)] = &[
+    ("llvmpipe", "llvmpipe (LLVM 20."),
+    ("iris", "Mesa Intel(R)"),
+];
+/// Test-only break (`remote test --break tier-xe-llvmpipe`): mesa::KERNEL_DRIVER_TIERS with xe -> llvmpipe, so the target's iris renderer must fail the renderer check.
+fn forced_tiers() -> Vec<(&'static str, &'static str)> {
+    mesa::KERNEL_DRIVER_TIERS
+        .iter()
+        .map(|&(driver, gallium)| (driver, if driver == "xe" { "llvmpipe" } else { gallium }))
+        .collect()
+}
 /// Median and p95 are a baseline only while the 1-minute load is below this: an unconfirmed first guess (a quarter of this host's 16 threads). Reported as `quiet`, never a failure.
 const QUIET_LOAD: f64 = 4.0;
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -105,11 +115,17 @@ pub fn goals() -> crate::gate_goals::Goals {
 
 /// `test gl`: the gate on this host.
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    judge(root, args, remote::Site::Host)
+    judge(root, args, remote::Site::Host, mesa::KERNEL_DRIVER_TIERS)
 }
 
-/// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the slot the bundle was pushed from.
-pub fn run_on(root: &Path, host: &str, out: &Path, site: remote::Site) -> Result<ExitCode> {
+/// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the slot the bundle was pushed from; `brk` is the test-only tier break, if any.
+pub fn run_on(
+    root: &Path,
+    host: &str,
+    out: &Path,
+    site: remote::Site,
+    brk: Option<remote::Break>,
+) -> Result<ExitCode> {
     let args = Args {
         host: host.to_owned(),
         out: Some(out.to_path_buf()),
@@ -117,10 +133,17 @@ pub fn run_on(root: &Path, host: &str, out: &Path, site: remote::Site) -> Result
         frames: FRAMES,
         verbose: false,
     };
-    judge(root, &args, site)
+    let forced = forced_tiers();
+    let tiers = match brk {
+        Some(remote::Break::TierXeLlvmpipe) => forced.as_slice(),
+        Some(remote::Break::DropLibunwind | remote::Break::DropAtld) | None => {
+            mesa::KERNEL_DRIVER_TIERS
+        }
+    };
+    judge(root, &args, site, tiers)
 }
 
-fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
+fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -> Result<ExitCode> {
     ensure!(
         args.frames >= P95_MIN_FRAMES,
         "--frames {} is below {P95_MIN_FRAMES}: the p95 would be the slowest frame",
@@ -249,8 +272,15 @@ fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
             }
             continue;
         }
-        let driver = judge_driver(&lines);
-        let renderer = judge_renderer(&lines, RENDERER);
+        let tier = expected_tier(&lines, tiers);
+        let tier_check = tier
+            .as_ref()
+            .map(|t| format!("{} ({})", t.gallium, t.facts))
+            .map_err(String::clone);
+        let renderer = match &tier {
+            Ok(t) => judge_renderer(&lines, t.prefix),
+            Err(e) => Err(format!("no tier to check against: {e}")),
+        };
         let timing = judge_frames(&lines, args.frames);
         let timing_check = timing
             .as_ref()
@@ -259,7 +289,7 @@ fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
         for (what, r) in [
             ("pixels", &pixels),
             ("extension", &ext),
-            ("driver", &driver),
+            ("tier", &tier_check),
             ("renderer", &renderer),
             ("scene", &scene_pixels),
             ("frames", &timing_check),
@@ -271,17 +301,17 @@ fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
                 r.as_ref().unwrap_or_else(|e| e)
             );
         }
-        // deliberate break: the software tier's name must not match this renderer
-        let wrong = judge_renderer(&lines, SOFTPIPE_RENDERER);
-        let fired = wrong.is_err();
+        // deliberate break, every run: no other tier's prefix may match this renderer
+        let wrong = tier
+            .as_ref()
+            .ok()
+            .and_then(|t| other_tier_match(&lines, &t.gallium));
+        let fired = tier.is_ok() && wrong.is_none();
         ok &= fired;
         println!(
             "gl: {} break renderer: {}",
             verdict(fired),
-            wrong.as_ref().map_or_else(
-                |e| format!("fails as it must: {e}"),
-                |d| format!("PASSED on {d}")
-            )
+            break_detail(&tier, wrong, &lines)
         );
         let name = renderer.as_deref().unwrap_or("unknown").to_owned();
         timed = timing.ok().map(|ns| (name, ns, load_before, load_after));
@@ -296,7 +326,7 @@ fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
             if before[0] < QUIET_LOAD { "yes" } else { "no" }
         );
     }
-    ok &= es1(&rt, &apk, &work, &lib_at, &scene, args.verbose)?;
+    ok &= es1(&rt, &apk, &work, &lib_at, &scene, args.verbose, tiers)?;
     println!(
         "{}",
         crate::verdict::gate(
@@ -366,6 +396,7 @@ fn es1(
     lib_at: &str,
     scene: &gl_scene::Scene,
     verbose: bool,
+    tiers: &[(&str, &str)],
 ) -> Result<bool> {
     let mut ok = true;
     for broken in [false, true] {
@@ -400,7 +431,15 @@ fn es1(
             continue;
         }
         let version = first_line(&lines, "version ").unwrap_or("none");
-        let renderer = first_line(&lines, "renderer ").unwrap_or("none");
+        let tier = expected_tier(&lines, tiers);
+        let renderer = match &tier {
+            Ok(t) => judge_renderer(&lines, t.prefix),
+            Err(e) => Err(format!("no tier to check against: {e}")),
+        };
+        let wrong = tier
+            .as_ref()
+            .ok()
+            .and_then(|t| other_tier_match(&lines, &t.gallium));
         let maps = first_line(&lines, "maps ").unwrap_or("none");
         let unimplemented = log.contains(UNIMPLEMENTED);
         let dl = dladdr(&lines);
@@ -408,16 +447,27 @@ fn es1(
             dl.iter()
                 .any(|(name, file)| name == n && file.ends_with("libGLESv1_CM.so"))
         });
-        let checks: [(&str, bool, String); 6] = [
+        let checks: [(&str, bool, String); 8] = [
             (
                 "1 version",
                 version.starts_with("OpenGL ES-CM 1."),
                 version.to_owned(),
             ),
             (
+                "1 tier",
+                tier.is_ok(),
+                tier.as_ref()
+                    .map_or_else(|e| e.clone(), |t| format!("{} ({})", t.gallium, t.facts)),
+            ),
+            (
                 "1 renderer",
-                renderer.starts_with(RENDERER),
-                renderer.to_owned(),
+                renderer.is_ok(),
+                renderer.unwrap_or_else(|e| e),
+            ),
+            (
+                "1 break renderer",
+                tier.is_ok() && wrong.is_none(),
+                break_detail(&tier, wrong, &lines),
             ),
             (
                 "2 maps",
@@ -606,6 +656,96 @@ fn judge_renderer(lines: &[String], want: &str) -> Result<String, String> {
     }
 }
 
+/// The tier the target's GPU calls for, from the probe's `drm` and `render` lines.
+struct Tier {
+    /// The gallium driver (mesa::GALLIUM_DRIVERS).
+    gallium: String,
+    /// Its GL_RENDERER prefix ([`RENDERERS`]).
+    prefix: &'static str,
+    /// The two probe lines as printed.
+    facts: String,
+}
+
+/// Mesa's tier is the gallium driver of the node it holds (platform_android.c droid_open_device): each held node's kernel driver maps through `tiers`, and the held nodes must agree.
+/// Nothing held and no render node is the software tier. A render node with nothing held is a silent fallback to software, so it fails. Render nodes Mesa does not hold are ignored.
+fn expected_tier(lines: &[String], tiers: &[(&str, &str)]) -> Result<Tier, String> {
+    let drm = first_line(lines, "drm ").ok_or_else(|| no_line("drm", lines))?;
+    let render = first_line(lines, "render ").ok_or_else(|| no_line("render", lines))?;
+    let mut held: Option<(&str, &str)> = None;
+    for entry in drm.split_whitespace().filter(|e| *e != "none") {
+        let (node, driver) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("unreadable drm entry `{entry}`"))?;
+        let gallium = match driver {
+            "unreadable" => {
+                return Err(format!(
+                    "{node}: kernel driver unreadable (DRM_IOCTL_VERSION failed, or the name is too long)"
+                ));
+            }
+            _ => tiers
+                .iter()
+                .find(|(d, _)| *d == driver)
+                .map(|(_, g)| *g)
+                .ok_or_else(|| {
+                    format!(
+                        "{node}: kernel driver `{driver}` has no row in mesa::KERNEL_DRIVER_TIERS"
+                    )
+                })?,
+        };
+        if let Some((first, first_gallium)) = held {
+            if first_gallium != gallium {
+                return Err(format!(
+                    "held DRM nodes disagree: {first} -> {first_gallium}, {node} -> {gallium}"
+                ));
+            }
+        } else {
+            held = Some((node, gallium));
+        }
+    }
+    let gallium = match held {
+        Some((_, gallium)) => gallium.to_owned(),
+        None => {
+            let present: Vec<&str> = render.split_whitespace().filter(|e| *e != "none").collect();
+            if !present.is_empty() {
+                return Err(format!(
+                    "render node {} present but no DRM node held after eglInitialize: Mesa fell back to software",
+                    present.join(" ")
+                ));
+            }
+            SOFTWARE_TIER.to_owned()
+        }
+    };
+    let prefix = RENDERERS
+        .iter()
+        .find(|(g, _)| *g == gallium.as_str())
+        .map(|(_, p)| *p)
+        .ok_or_else(|| format!("no renderer name for `{gallium}`"))?;
+    Ok(Tier {
+        gallium,
+        prefix,
+        facts: format!("drm {drm}; render {render}"),
+    })
+}
+
+/// The every-run break's check: the gallium of a tier other than `gallium` whose prefix the renderer starts with, if any. None is wanted: a renderer of another tier then fails the renderer check.
+fn other_tier_match(lines: &[String], gallium: &str) -> Option<&'static str> {
+    let name = renderer_name(lines).ok()?;
+    RENDERERS
+        .iter()
+        .find(|(g, p)| *g != gallium && name.starts_with(*p))
+        .map(|(g, _)| *g)
+}
+
+/// The every-run break's line: the renderer's name, and the other tier whose prefix it matches, if any.
+fn break_detail(tier: &Result<Tier, String>, wrong: Option<&str>, lines: &[String]) -> String {
+    let name = renderer_name(lines).unwrap_or("none");
+    match (tier, wrong) {
+        (Err(e), _) => format!("no tier to break: {e}"),
+        (Ok(_), Some(g)) => format!("{name} starts with the {g} prefix"),
+        (Ok(_), None) => format!("fails as it must: {name} matches no other tier's prefix"),
+    }
+}
+
 /// `frame_ns <n>,<n>,...`: exactly `frames` times, each positive (ns).
 fn judge_frames(lines: &[String], frames: u32) -> Result<Vec<u64>, String> {
     let line = lines
@@ -661,24 +801,6 @@ fn parse_loadavg(text: &str) -> Result<[f64; 3]> {
 
 fn fmt_load(load: [f64; 3]) -> String {
     format!("{:.2} {:.2} {:.2}", load[0], load[1], load[2])
-}
-
-/// The DRM driver in use: `drm <node>=<modalias> ...`, the /dev/dri nodes the probe holds after eglInitialize. Mesa's Android platform opens one for every driver it loads, and with software rendering
-/// forced it takes only vgem / virtio_gpu and loads kms_swrast on it (`platform_android.c` droid_probe_device); a pure software rasteriser holds none. So: at least one node, each with a known kernel driver.
-fn judge_driver(lines: &[String]) -> Result<String, String> {
-    let line = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("drm "))
-        .ok_or_else(|| no_line("drm", lines))?;
-    let nodes: Vec<&str> = line.split_whitespace().filter(|n| *n != "none").collect();
-    let unknown = nodes
-        .iter()
-        .any(|n| n.ends_with("=unknown") || n.ends_with("=unreadable"));
-    match (nodes.is_empty(), unknown) {
-        (true, _) => Err("no DRM node open after eglInitialize: not a DRI driver".to_owned()),
-        (false, true) => Err(format!("kernel driver unknown: {line}")),
-        (false, false) => Ok(format!("DRI driver on {line}")),
-    }
 }
 
 /// `ext <EXTENSION> <v> glGetIntegerv <w> from <file>`: v == w > 0, and the address in a Mesa object.
@@ -772,14 +894,6 @@ mod tests {
     }
 
     #[test]
-    fn driver_needs_a_known_drm_node() {
-        assert!(judge_driver(&lines(&["drm /dev/dri/card0=platform:vgem"])).is_ok());
-        assert!(judge_driver(&lines(&["drm none"])).is_err());
-        assert!(judge_driver(&lines(&["drm /dev/dri/card0=unreadable"])).is_err());
-        assert!(judge_driver(&lines(&["renderer x"])).is_err());
-    }
-
-    #[test]
     fn candidates_are_es_names_outside_entries_in() {
         let tmp = "x\nstatic const char public_string_pool[] =\n   \"Accum\\0\"\n   \"GetError\\0\"\n   \"GetInteger64vEXT\\0\";\n";
         let es = lines(&["glGetError", "glGetInteger64vEXT"]);
@@ -817,20 +931,156 @@ mod tests {
         assert!(shader.is_err_and(|e| e.contains("syntax error")));
     }
 
-    #[test]
-    fn renderer_prefix_selects_the_tier() {
-        let soft = lines(&["renderer softpipe", "version OpenGL ES 3.2 Mesa"]);
-        let llvm = lines(&["renderer llvmpipe (LLVM 20.0.0git, 256 bits)"]);
-        assert!(judge_renderer(&soft, SOFTPIPE_RENDERER).is_ok());
-        assert!(judge_renderer(&soft, RENDERER).is_err());
-        assert!(judge_renderer(&llvm, RENDERER).is_ok());
-        assert!(judge_renderer(&llvm, SOFTPIPE_RENDERER).is_err());
-        assert!(judge_renderer(&lines(&["drm none"]), RENDERER).is_err());
+    /// `expected_tier` on one `drm` line and one `render` line: the gallium driver, or the error.
+    fn tier(drm: &str, render: &str, tiers: &[(&str, &str)]) -> Result<String, String> {
+        let drm = format!("drm {drm}");
+        let render = format!("render {render}");
+        expected_tier(&lines(&[drm.as_str(), render.as_str()]), tiers).map(|t| t.gallium)
     }
 
     #[test]
-    fn renderer_prefix_names_the_pinned_llvm() {
-        let major_minor = RENDERER
+    fn held_node_gives_the_tier_of_its_kernel_driver() {
+        // expected values from Mesa (loader.c iris_predicate; platform_android.c L1035-1043), not from the table under test
+        let table = mesa::KERNEL_DRIVER_TIERS;
+        let node = "/dev/dri/renderD128";
+        assert_eq!(
+            tier(&format!("{node}=xe"), node, table),
+            Ok("iris".to_owned())
+        );
+        assert_eq!(
+            tier(&format!("{node}=i915"), node, table),
+            Ok("iris".to_owned())
+        );
+        assert_eq!(
+            tier("/dev/dri/card0=vgem /dev/dri/renderD128=vgem", node, table),
+            Ok("llvmpipe".to_owned())
+        );
+        assert_eq!(
+            tier(&format!("{node}=virtio_gpu"), node, table),
+            Ok("llvmpipe".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_node_held_and_no_render_node_is_the_software_tier() {
+        assert_eq!(
+            tier("none", "none", mesa::KERNEL_DRIVER_TIERS),
+            Ok("llvmpipe".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_node_with_none_held_fails_as_a_silent_fallback() {
+        let err = tier("none", "/dev/dri/renderD128", mesa::KERNEL_DRIVER_TIERS)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("renderD128") && err.contains("software"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn held_nodes_must_agree() {
+        let split = tier(
+            "/dev/dri/card0=vgem /dev/dri/renderD128=xe",
+            "/dev/dri/renderD128",
+            mesa::KERNEL_DRIVER_TIERS,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            split.contains("card0") && split.contains("renderD128"),
+            "{split}"
+        );
+        assert_eq!(
+            tier(
+                "/dev/dri/card0=xe /dev/dri/renderD128=xe",
+                "/dev/dri/renderD128",
+                mesa::KERNEL_DRIVER_TIERS
+            ),
+            Ok("iris".to_owned())
+        );
+    }
+
+    #[test]
+    fn unknown_or_unreadable_driver_fails_naming_its_node() {
+        for driver in ["amdgpu", "unreadable"] {
+            let held = format!("/dev/dri/renderD128={driver}");
+            let err = tier(&held, "/dev/dri/renderD128", mesa::KERNEL_DRIVER_TIERS)
+                .err()
+                .unwrap_or_default();
+            assert!(err.contains("renderD128") && err.contains(driver), "{err}");
+        }
+    }
+
+    #[test]
+    fn render_nodes_mesa_does_not_hold_are_ignored() {
+        // Mesa holds renderD128 (xe); renderD129 (another GPU's node) is bound but not held
+        assert_eq!(
+            tier(
+                "/dev/dri/renderD128=xe",
+                "/dev/dri/renderD128 /dev/dri/renderD129",
+                mesa::KERNEL_DRIVER_TIERS
+            ),
+            Ok("iris".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_probe_line_fails() {
+        assert!(expected_tier(&lines(&["render none"]), mesa::KERNEL_DRIVER_TIERS).is_err());
+        assert!(expected_tier(&lines(&["drm none"]), mesa::KERNEL_DRIVER_TIERS).is_err());
+    }
+
+    #[test]
+    fn forced_break_maps_only_xe_to_llvmpipe() {
+        let forced = forced_tiers();
+        let node = "/dev/dri/renderD128";
+        assert_eq!(
+            tier(&format!("{node}=xe"), node, &forced),
+            Ok("llvmpipe".to_owned())
+        );
+        assert_eq!(
+            tier(&format!("{node}=i915"), node, &forced),
+            Ok("iris".to_owned())
+        );
+    }
+
+    #[test]
+    fn renderer_must_start_with_its_tiers_prefix() {
+        let soft = lines(&["renderer llvmpipe (LLVM 20.1.0, 256 bits)"]);
+        let iris = lines(&["renderer Mesa Intel(R) Graphics (LNL)"]);
+        assert!(judge_renderer(&soft, "llvmpipe (LLVM 20.").is_ok());
+        assert!(judge_renderer(&soft, "Mesa Intel(R)").is_err());
+        assert!(judge_renderer(&iris, "Mesa Intel(R)").is_ok());
+        assert!(judge_renderer(&iris, "llvmpipe (LLVM 20.").is_err());
+        assert!(judge_renderer(&lines(&["drm none"]), "llvmpipe (LLVM 20.").is_err());
+    }
+
+    #[test]
+    fn other_tier_must_not_match_the_renderer() {
+        let soft = lines(&["renderer llvmpipe (LLVM 20.1.0, 256 bits)"]);
+        let iris = lines(&["renderer Mesa Intel(R) Graphics (LNL)"]);
+        assert_eq!(other_tier_match(&soft, "llvmpipe"), None);
+        assert_eq!(other_tier_match(&soft, "iris"), Some("llvmpipe"));
+        assert_eq!(other_tier_match(&iris, "iris"), None);
+        assert_eq!(other_tier_match(&iris, "llvmpipe"), Some("iris"));
+    }
+
+    #[test]
+    fn every_built_driver_has_a_renderer_name() {
+        let named: Vec<&str> = RENDERERS.iter().map(|(g, _)| *g).collect();
+        assert_eq!(named, mesa::GALLIUM_DRIVERS);
+    }
+
+    #[test]
+    fn llvmpipe_prefix_names_the_pinned_llvm() {
+        let (_, prefix) = RENDERERS
+            .iter()
+            .find(|(g, _)| *g == "llvmpipe")
+            .expect("llvmpipe row");
+        let major_minor = prefix
             .strip_prefix("llvmpipe (LLVM ")
             .expect("llvmpipe name");
         assert!(crate::llvm_host::VERSION.starts_with(major_minor));

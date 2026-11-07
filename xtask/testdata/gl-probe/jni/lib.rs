@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! JNI natives of com.example.atlgl.Probe: `ext64` calls glGetInteger64vEXT(GL_MAX_TEXTURE_SIZE) through the address AOSP libEGL's eglGetProcAddress returns (patch 0010: the driver's, not a
-//! forwarder); `owner` names the object that address lies in (dladdr). Test fixture: glibc's dl* directly, no crates.
+//! forwarder); `owner` names the object that address lies in (dladdr); `drmDriver` names the kernel driver of a DRM fd (DRM_IOCTL_VERSION, the name Mesa's loader reads). Test fixture: glibc's dl* and ioctl directly, no crates.
 //! `es1Scene` (es1.rs) runs the ES1 scene's program through libGLESv1_CM.so, resolved by dlsym, so this library imports no gl* symbol.
 
 mod es1;
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
 
 #[repr(C)]
 struct DlInfo {
@@ -19,6 +19,7 @@ unsafe extern "C" {
     fn dlopen(file: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
 /// <dlfcn.h>: RTLD_NOW | RTLD_NOLOAD -- the libEGL the framework already loaded, never a second copy.
@@ -121,5 +122,61 @@ pub extern "C" fn Java_com_example_atlgl_Probe_owner(
             *const c_char,
         ) -> *mut c_void = std::mem::transmute(*(*env).add(NEW_STRING_UTF));
         new_string(env, name)
+    }
+}
+
+/// <drm.h> `struct drm_version` (Mesa's include/drm-uapi/drm.h L133-143): the kernel copies at most `name_len` bytes of the driver name into `name`, without a NUL, and sets `name_len` to the full length.
+#[allow(dead_code)] // the kernel also fills the version and date/desc fields, which are never read
+#[repr(C)]
+struct DrmVersion {
+    version_major: c_int,
+    version_minor: c_int,
+    version_patchlevel: c_int,
+    name_len: usize,
+    name: *mut c_char,
+    date_len: usize,
+    date: *mut c_char,
+    desc_len: usize,
+    desc: *mut c_char,
+}
+
+/// Room for a driver name (`i915`, `xe`, `vgem`, `virtio_gpu`, ...); a longer one reads as unreadable.
+const NAME_CAP: usize = 64;
+
+/// asm-generic/ioctl.h `_IOWR(type, nr, size)`: the encoding of x86, arm, arm64 and riscv.
+const fn iowr(ty: u8, nr: u8, size: usize) -> u32 {
+    (3 << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | nr as u32
+}
+
+/// drm.h `DRM_IOCTL_VERSION` (L1037) = `DRM_IOWR(0x00, struct drm_version)`; the size is the struct's for this pointer width.
+const DRM_IOCTL_VERSION: u32 = iowr(b'd', 0x00, std::mem::size_of::<DrmVersion>());
+
+/// The kernel driver of an open DRM fd, the name `drmGetVersion(fd)->name` gives (loader.c L108-118); null when the ioctl fails or the name does not fit NAME_CAP.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_example_atlgl_Probe_drmDriver(
+    env: *mut *const *const c_void,
+    _class: *mut c_void,
+    fd: c_int,
+) -> *mut c_void {
+    let mut name = [0u8; NAME_CAP];
+    let mut v = DrmVersion {
+        version_major: 0,
+        version_minor: 0,
+        version_patchlevel: 0,
+        name_len: NAME_CAP,
+        name: name.as_mut_ptr().cast(),
+        date_len: 0,
+        date: std::ptr::null_mut(),
+        desc_len: 0,
+        desc: std::ptr::null_mut(),
+    };
+    // SAFETY: a fd that is not a DRM node fails with an errno; v is a drm_version whose name buffer (NAME_CAP bytes) outlives the call, and its date and desc lengths are 0, so the kernel writes nothing else.
+    let rc = unsafe { ioctl(fd, DRM_IOCTL_VERSION as c_ulong, &mut v as *mut DrmVersion) };
+    if rc != 0 || v.name_len > NAME_CAP {
+        return std::ptr::null_mut();
+    }
+    match std::str::from_utf8(&name[..v.name_len]) {
+        Ok(text) => es1::new_string(env, text),
+        Err(_) => std::ptr::null_mut(),
     }
 }

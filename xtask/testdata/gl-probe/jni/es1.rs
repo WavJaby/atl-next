@@ -349,7 +349,7 @@ fn jni_string(env: *mut *const *const c_void, s: *mut c_void) -> String {
     }
 }
 
-fn new_string(env: *mut *const *const c_void, text: &str) -> *mut c_void {
+pub(crate) fn new_string(env: *mut *const *const c_void, text: &str) -> *mut c_void {
     type New = unsafe extern "C" fn(*mut *const *const c_void, *const c_char) -> *mut c_void;
     let c = CString::new(text).unwrap_or_default();
     // SAFETY: env is the JNIEnv* of this call; c is NUL-terminated and outlives the call.

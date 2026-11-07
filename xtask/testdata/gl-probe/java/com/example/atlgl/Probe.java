@@ -34,12 +34,14 @@ public class Probe {
     static native String owner();
     /// Runs the program through libGLESv1_CM.so on the current context; the result is `native`-prefixed lines (rows, dladdr, errors).
     static native String es1Scene(String program);
+    /// The kernel driver name of an open DRM fd (lib.rs drmDriver: DRM_IOCTL_VERSION); null when the ioctl fails.
+    static native String drmDriver(int fd);
 
     static void say(String text) {
         Log.i(TAG, text);
     }
 
-    /// The DRM nodes this process holds open, each with its kernel driver (sysfs `device/uevent` MODALIAS): Mesa's DRI drivers open one (WSL: kms_swrast on vgem, platform_android.c), a pure software rasteriser none. "none" when there is none.
+    /// The /dev/dri nodes this process holds open (its fds under /proc/self/fd), each with the kernel driver its DRM name gives (drmDriver). Mesa's DRI drivers hold the node they render on; a pure software rasteriser holds none. "none" when there is none.
     static String drmNodes() {
         StringBuilder out = new StringBuilder();
         java.io.File[] fds = new java.io.File("/proc/self/fd").listFiles();
@@ -51,18 +53,21 @@ public class Probe {
                 continue;
             }
             if (!target.startsWith("/dev/dri/")) continue;
-            String node = target.substring("/dev/dri/".length());
-            String driver = "unknown";
-            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/sys/class/drm/" + node + "/device/uevent"))) {
-                for (String l; (l = r.readLine()) != null;) {
-                    if (l.startsWith("MODALIAS=")) driver = l.substring("MODALIAS=".length());
-                }
-            } catch (java.io.IOException e) {
-                driver = "unreadable";
-            }
-            out.append(out.length() == 0 ? "" : " ").append(target).append('=').append(driver);
+            String driver = drmDriver(Integer.parseInt(fd.getName()));
+            out.append(out.length() == 0 ? "" : " ").append(target).append('=').append(driver == null ? "unreadable" : driver);
         }
         return out.length() == 0 ? "none" : out.toString();
+    }
+
+    /// The render nodes the sandbox binds (/dev/dri is bound whole), by path, sorted. "none" when there is none. Presence only: a driver is read for the node Mesa holds (drmNodes), not here.
+    static String renderNodes() {
+        java.io.File[] entries = new java.io.File("/dev/dri").listFiles();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (java.io.File e : entries == null ? new java.io.File[0] : entries) {
+            if (e.getName().startsWith("renderD")) names.add("/dev/dri/" + e.getName());
+        }
+        java.util.Collections.sort(names);
+        return names.isEmpty() ? "none" : String.join(" ", names);
     }
 
     static void check(boolean ok, String what) {
@@ -96,6 +101,7 @@ public class Probe {
         EGL10 egl = (EGL10) javax.microedition.khronos.egl.EGLContext.getEGL();
         javax.microedition.khronos.egl.EGLDisplay d = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY);
         if (!egl.eglInitialize(d, new int[2])) die(egl, "eglInitialize");
+        say("drm " + drmNodes());
         int[] attrs = {EGL10.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES_BIT, EGL10.EGL_SURFACE_TYPE, EGL10.EGL_PBUFFER_BIT,
             EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8, EGL10.EGL_ALPHA_SIZE, 8,
             EGL10.EGL_DEPTH_SIZE, 16, EGL10.EGL_NONE};
@@ -229,6 +235,7 @@ public class Probe {
 
     public static void main(String[] args) {
         System.load(args[0]);
+        say("render " + renderNodes());
         if (args[1].equals("es1")) es1(Integer.parseInt(args[2]), Integer.parseInt(args[3]), java.util.Arrays.copyOfRange(args, 4, args.length));
         int w = Integer.parseInt(args[2]), h = Integer.parseInt(args[3]);
         int[] rgba = new int[4];
