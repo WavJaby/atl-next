@@ -154,6 +154,10 @@ cc_library_shared { name: "libuser", srcs: ["u.cc"], static_libs: ["libaudioproc
 	if len(ap.Needs) != 0 {
 		t.Errorf("static needs %q", ap.Needs)
 	}
+	// its own C++ argv, as a shared artifact's: the module's directory is an include path of its compiles (Soong's cc rule)
+	if !slices.ContainsFunc(ap.Cxx, func(f string) bool { return strings.HasPrefix(f, "-I") && strings.HasSuffix(f, "/p") }) {
+		t.Errorf("static cxx %q lacks the module's own directory", ap.Cxx)
+	}
 	if want := []string{"device/libboth", "device/libcrypto", "device/libsub"}; !slices.Equal(f.Deps["device/libaudioprocessing_base"], want) {
 		t.Errorf("deps %q, want %q", f.Deps["device/libaudioprocessing_base"], want)
 	}

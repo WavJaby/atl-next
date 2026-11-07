@@ -43,7 +43,7 @@ type artifact struct {
 	Search []string `json:"search,omitempty"`
 	Link   []string `json:"link,omitempty"`
 	Native []string `json:"native,omitempty"`
-	// shared only: the C++ argv of the module's own C++ compiles (compileFlags cxx: libc++, device defines, include paths), what a Rust package compiling a C++ wrapper against the module takes
+	// shared and static: the C++ argv of the module's own C++ compiles (compileFlags cxx: libc++, device defines, include paths), what a Rust package compiling a C++ wrapper against the module takes; a static archive's wrapper needs it as much as a shared library's
 	Cxx []string `json:"cxx,omitempty"`
 	// shared only: the provided shared libraries its link names, by module directory (providedNeeds); they lie outside the stage, so an outside link finds them through their own artifacts
 	Needs []string `json:"needs,omitempty"`
@@ -63,7 +63,7 @@ func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
 		return artifact{Kind: "object", Out: g.objectOut(n)}, true
 	case n.kind == Static:
 		link, _ := g.linkLibs(n)
-		return artifact{Kind: n.kind.String(), Out: n.out, Link: link}, n.out != ""
+		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx, Link: link}, n.out != ""
 	}
 	return artifact{}, false
 }

@@ -47,7 +47,7 @@ pub struct Artifact {
     /// rlib: those libraries' dirs, where rustc finds its crates' `#[link(name = ...)]` (rustc `-L native=`)
     #[serde(default)]
     pub native: Vec<PathBuf>,
-    /// shared: the C++ argv of the module's own C++ compiles (libc++, device defines, include paths); a package compiling a C++ wrapper against the module takes it
+    /// shared, static: the C++ argv of the module's own C++ compiles (libc++, device defines, include paths); a package compiling a C++ wrapper against the module takes it
     #[serde(default)]
     pub cxx: Vec<String>,
     /// shared: the provided shared libraries its link names, by module (`device/libcrypto`); outside `out`, so the stage holds no copy and `link_lines` searches their dirs
