@@ -473,6 +473,44 @@ pub fn check_build(
     Ok(report)
 }
 
+/// One upstream CMake build the gate judges: its canonical dir and the copies it stages.
+pub struct Build {
+    pub name: String,
+    pub dir: PathBuf,
+    pub staged: Vec<Staged>,
+}
+
+/// The licence gate over each build (`check_build`): a line per build with its denied and unresolved files, then `<label>: verdict`. True when every build passes.
+/// The one route for an upstream CMake build (runtimes, host LLVM), so both judge by the same rules.
+pub fn gate_builds(root: &Path, label: &str, builds: &[Build]) -> Result<bool> {
+    let layout = atl_layout::Layout::of(root)?;
+    let sources = crate::sources::load(root)?;
+    let checkouts = sources.checkouts(None);
+    let licenses = licenses::load(root, &sources.upstream_names())?;
+    let roots = roots(&layout, &checkouts);
+    let mut ok = true;
+    for b in builds {
+        let r = check_build(&b.dir, &b.staged, &roots, &licenses)?;
+        println!(
+            "{label}: licence {:<20} {} objects, {} files checked, {} generated, {} system",
+            b.name, r.artifacts, r.checked, r.generated, r.system
+        );
+        for (expr, files) in &r.denied {
+            println!(
+                "{label}: licence DENIED {expr}: {} files, e.g. {}",
+                files.len(),
+                files.keys().next().map_or("", |k| k)
+            );
+        }
+        for u in r.unresolved.iter().take(5) {
+            println!("{label}: licence UNRESOLVED {u}");
+        }
+        ok &= r.ok();
+    }
+    println!("{label}: verdict {}", if ok { "PASS" } else { "FAIL" });
+    Ok(ok)
+}
+
 /// Resolves and checks the licence of each placed file (canonical path -> the first artifact reaching it); files under `out` count as generated.
 fn judge(
     placed: BTreeMap<PathBuf, &Path>,

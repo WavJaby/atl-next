@@ -31,6 +31,7 @@ pub struct Host {
     pub debian: String,
     pub archlinux: Option<String>,
     pub soong_prebuilt_os: Option<String>,
+    pub llvm_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +157,39 @@ pub fn java_tools(tree: &Path, os: &str, jdk: &str) -> (PathBuf, PathBuf) {
         tree.join(jdk).join(os),
         tree.join(BUILD_TOOLS).join(os).join("bin"),
     )
+}
+
+/// Every `llvm_target` is `llvm/lib/Target/<it>` at the llvm-project pin. Read from the pin's git tree (`cat-file`), so it needs no sparse checkout: the trees sit in the checkout's object store.
+pub fn check_llvm_target(root: &Path, arches: &Arches) -> Result<()> {
+    let sources = crate::sources::load(root)?;
+    let layout = atl_layout::Layout::of(root)?;
+    let c = sources
+        .checkouts(None)
+        .into_iter()
+        .find(|c| matches!(&c.pin, crate::sources::Pin::Git(n) if n == "llvm-project"))
+        .context("no sources.toml row llvm-project")?;
+    let dir = layout.locate(&c.dir).dir;
+    for (name, host) in arches
+        .iter()
+        .filter_map(|(n, a)| Some((n, a.host.as_ref()?)))
+    {
+        let Some(target) = &host.llvm_target else {
+            continue;
+        };
+        let object = format!("{}:llvm/lib/Target/{target}", c.commit);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["cat-file", "-t", &object])
+            .output()
+            .context("running git cat-file")?;
+        ensure!(
+            out.status.success() && out.stdout == b"tree\n",
+            "{FILE}: {name}: llvm_target {target} is not llvm/lib/Target/{target} at the llvm-project pin {}",
+            c.commit
+        );
+    }
+    Ok(())
 }
 
 /// Every `soong_prebuilt_os` is a value Soong's PrebuiltOS returns on Linux, and `prebuilts/build-tools/<it>/bin` exists in the checkout `layout`

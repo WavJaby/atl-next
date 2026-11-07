@@ -165,7 +165,7 @@ fn check_patch_dir_file(root: &Path, rel: &str, text: &str) -> Option<String> {
 /// Lines searched in upstream files, whose tag often follows a copyright block (QEMU, Linux style).
 pub const UPSTREAM_TAG_LINES: usize = 30;
 
-/// The licence expression of the first SPDX tag within `max_lines`, comment closers stripped.
+/// The licence expression of the first SPDX tag within `max_lines`, comment closers stripped: `-->`, `*/`, and LLVM's `*|` (its `|* ... *|` banner lines).
 pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
     text.lines().take(max_lines).find_map(|line| {
         let (_, rest) = line.split_once(TAG)?;
@@ -173,6 +173,7 @@ pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
         let rest = rest
             .strip_suffix("-->")
             .or_else(|| rest.strip_suffix("*/"))
+            .or_else(|| rest.strip_suffix("*|"))
             .unwrap_or(rest);
         Some(rest.trim())
     })
@@ -181,6 +182,17 @@ pub fn tag_value(text: &str, max_lines: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{attributed, check_patch_dir_file, header_license};
+
+    /// LLVM's C headers close each banner line with `*|`; the tag's value ends before it.
+    #[test]
+    fn tag_value_stops_before_llvm_banner_closer() {
+        let banner =
+            "|* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception                    *|\n";
+        assert_eq!(
+            super::tag_value(banner, 3),
+            Some("Apache-2.0 WITH LLVM-exception")
+        );
+    }
 
     /// An Apache-2.0 file passes only with the attribution line, with a path, right after the tag.
     #[test]

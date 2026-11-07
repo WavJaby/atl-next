@@ -88,7 +88,8 @@ pub fn build(
         .map(|(k, v)| (*k, v.as_str()))
         .chain(recipe.cache.iter().chain(recipe.shared_defines).copied())
         .collect();
-    cmake(src, &build, &cache, &log, true).with_context(|| format!("upstream {}", recipe.name))?;
+    cmake(src, &build, &cache, &log, &[], true)
+        .with_context(|| format!("upstream {}", recipe.name))?;
     let defines: Vec<String> = recipe
         .shared_defines
         .iter()
@@ -146,12 +147,13 @@ fn drop_foreign_cache(src: &Path, build: &Path) -> Result<Option<String>> {
     Ok(Some(old.to_owned()))
 }
 
-/// Configures (Ninja generator, `cache` as `-D` entries), builds and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
+/// Configures (Ninja generator, `cache` as `-D` entries), builds `all`, then `targets` (what `all` leaves out, e.g. tools under `LLVM_BUILD_TOOLS=OFF`) and, with `install`, installs one CMake project; all output to `log`. Incremental: a rerun reuses `build`.
 pub fn cmake(
     src: &Path,
     build: &Path,
     cache: &[(&str, &str)],
     log: &Path,
+    targets: &[&str],
     install: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(build)?;
@@ -173,6 +175,11 @@ pub fn cmake(
     }
     let mut steps = vec![configure, Command::new("cmake")];
     steps[1].arg("--build").arg(build);
+    if !targets.is_empty() {
+        let mut t = Command::new("cmake");
+        t.arg("--build").arg(build).arg("--target").args(targets);
+        steps.push(t);
+    }
     if install {
         let mut i = Command::new("cmake");
         i.arg("--install").arg(build);

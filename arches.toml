@@ -14,6 +14,7 @@
 #   archlinux         Arch Linux architecture; absent where Arch has no official port
 #   soong_prebuilt_os Soong's PrebuiltOS on a build machine of this arch (build/soong/android/config.go): `prebuilts/build-tools/<it>/bin` holds the
 #                     prebuilt build-only tools a native build on this host runs (aconfig); absent = Soong ships none. Checked: a linux value PrebuiltOS returns, and the directory exists in the fetched tree.
+#   llvm_target       LLVM target built for this host (`LLVM_TARGETS_TO_BUILD`, llvm_host.rs): the backend the in-process JIT (gallivm) compiles for. Checked: `llvm/lib/Target/<it>` is a tree at the llvm-project pin.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -85,6 +86,7 @@ meson_cpu_family = "x86_64"
 debian = "amd64"
 archlinux = "x86_64"
 soong_prebuilt_os = "linux-x86"
+llvm_target = "X86"
 
 [x86_64.guest]
 android_abis = ["x86_64"]

@@ -81,6 +81,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("gles2-fixture", crate::gles2_fixture::goals),
     ("gralloc", crate::gralloc::goals),
     ("instrument", crate::instrument::goals),
+    ("llvm", crate::llvm_host::goals),
     ("native-load", crate::native_load::goals),
     ("parcel", crate::parcel::goals),
     ("run-apk", crate::run_apk::goals),

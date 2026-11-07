@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-use crate::{arches, licence_gate, licenses, sources, upstream};
+use crate::{arches, licence_gate, sources, upstream};
 
 /// Upstream name in sources.toml.
 const UPSTREAM: &str = "llvm-project";
@@ -356,15 +356,21 @@ pub fn build_guest(
     Ok(built)
 }
 
-/// The pinned llvm-project checkout.
-fn llvm_src(root: &Path) -> Result<PathBuf> {
+/// The pinned llvm-project checkout: its sources.toml row, and the directory builds read (its task copy where there is one).
+pub(crate) fn llvm_checkout(root: &Path) -> Result<(sources::Checkout, PathBuf)> {
     let sources = sources::load(root)?;
     let c = sources
         .checkouts(None)
         .into_iter()
         .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
         .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
-    Ok(Layout::of(root)?.locate(&c.dir).dir)
+    let dir = Layout::of(root)?.locate(&c.dir).dir;
+    Ok((c, dir))
+}
+
+/// The pinned llvm-project checkout's directory (see [`llvm_checkout`]).
+fn llvm_src(root: &Path) -> Result<PathBuf> {
+    Ok(llvm_checkout(root)?.1)
 }
 
 /// The C/C++ include flags of every guest runtimes compile: bionic's (`bionic`, the converter's `libc_headers` exports) instead of the host's.
@@ -381,48 +387,29 @@ fn includes(bionic: &[String]) -> Result<String> {
 
 /// Licence gate over every source and header the `variants` builds under `base` compiled; prints a line per variant and the verdict.
 fn gate(root: &Path, base: &Path, variants: &[&Variant]) -> Result<bool> {
-    let layout = Layout::of(root)?;
-    let sources = sources::load(root)?;
-    let checkouts = sources.checkouts(None);
-    let c = checkouts
+    let (c, src) = llvm_checkout(root)?;
+    let canon_src = std::fs::canonicalize(&src)?;
+    let builds = variants
         .iter()
-        .find(|c| matches!(&c.pin, sources::Pin::Git(n) if n == UPSTREAM))
-        .with_context(|| format!("no sources.toml row {UPSTREAM}"))?;
-    let src = layout.locate(&c.dir).dir;
-    let licenses = licenses::load(root, &sources.upstream_names())?;
-    let roots = licence_gate::roots(&layout, &checkouts);
-    let mut ok = true;
-    for v in variants {
-        let build = std::fs::canonicalize(base.join(v.name).join("build"))?;
-        let canon_src = std::fs::canonicalize(&src)?;
-        let staged: Vec<licence_gate::Staged> = v
-            .staged
-            .iter()
-            .map(|(dir, from)| licence_gate::Staged {
-                dir: build.join(dir),
-                from: from.iter().map(|f| canon_src.join(f)).collect(),
-                key: c.licence_key.clone(),
+        .map(|v| {
+            let dir = std::fs::canonicalize(base.join(v.name).join("build"))?;
+            let staged = v
+                .staged
+                .iter()
+                .map(|(d, from)| licence_gate::Staged {
+                    dir: dir.join(d),
+                    from: from.iter().map(|f| canon_src.join(f)).collect(),
+                    key: c.licence_key.clone(),
+                })
+                .collect();
+            Ok(licence_gate::Build {
+                name: v.name.to_owned(),
+                dir,
+                staged,
             })
-            .collect();
-        let r = licence_gate::check_build(&build, &staged, &roots, &licenses)?;
-        println!(
-            "runtimes: licence {:<20} {} objects, {} files checked, {} generated, {} system",
-            v.name, r.artifacts, r.checked, r.generated, r.system
-        );
-        for (expr, files) in &r.denied {
-            println!(
-                "runtimes: licence DENIED {expr}: {} files, e.g. {}",
-                files.len(),
-                files.keys().next().map_or("", |k| k)
-            );
-        }
-        for u in r.unresolved.iter().take(5) {
-            println!("runtimes: licence UNRESOLVED {u}");
-        }
-        ok &= r.ok();
-    }
-    println!("runtimes: verdict {}", if ok { "PASS" } else { "FAIL" });
-    Ok(ok)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    licence_gate::gate_builds(root, "runtimes", &builds)
 }
 
 /// One variant's CMake build; `link` = cache entries of a build that links against the guest libc (pass 2), empty otherwise.
@@ -460,7 +447,7 @@ fn build(
     cache.extend(NO_TESTS);
     cache.extend(v.cache);
     cache.extend(link);
-    upstream::cmake(src, &build, &cache, &dir.join("build.log"), false)
+    upstream::cmake(src, &build, &cache, &dir.join("build.log"), &[], false)
         .with_context(|| format!("runtimes {}", v.name))?;
     v.modules
         .iter()

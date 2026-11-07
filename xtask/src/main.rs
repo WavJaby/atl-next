@@ -52,6 +52,7 @@ mod land;
 mod libcxx_gate;
 mod licence_gate;
 mod licenses;
+mod llvm_host;
 mod manifest;
 mod mesa;
 mod modules;
@@ -195,6 +196,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Test {
+    /// The host LLVM the in-process JIT links (llvm_host.rs, `native --for llvm`): llvm-config reports LLVM 20.0.0 with the host target, no libstdc++ NEEDED, and `lli -jit-kind=mcjit` on `ret i32 42` exits 42. `--break` returns 43 and must fail.
+    Llvm(llvm_host::Args),
     /// The converter-built libandroid_runtime on host ART: load (every symbol bound), JNI registration (startReg + gRegJNI count), native calls checked against Android semantics, one copy per library.
     ///
     /// Stages print pass / FAIL / measured / WARN with counts; the exit code fails on any FAIL.
@@ -323,6 +326,9 @@ fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Test {
+            test: Test::Llvm(args),
+        } => llvm_host::run(&root, &args),
+        Command::Test {
             test: Test::NativeLoad(args),
         } => native_load::run(&root, &args),
         Command::Test {
@@ -404,6 +410,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Land(_) => "land",
         Command::RunApk(_) => "run-apk",
         Command::Test { test } => match test {
+            Test::Llvm(_) => "llvm",
             Test::NativeLoad(_) => "native-load",
             Test::Parcel(_) => "parcel",
             Test::Provider(_) => "provider",

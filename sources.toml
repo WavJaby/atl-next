@@ -296,7 +296,20 @@ commit = "d3bf4795ad5b79d646cddf2fec687da5b9b502db"
 git = "https://android.googlesource.com/toolchain/llvm-project"
 branch = "llvm-r547379-release"
 commit = "b718bcaf8c198c82f3021447d943401e3ab5bd54"
-sparse = ["cmake", "compiler-rt", "libc", "libcxx", "libcxxabi", "libunwind", "llvm/cmake", "llvm/utils/llvm-lit", "runtimes", "third-party"]
+# Host LLVM (llvm_host.rs, `native --for llvm`) builds the llvm/ project. CMake adds every non-Target llvm/lib dir unconditionally (llvm/lib/CMakeLists.txt), so all 46 are kept;
+# of llvm/lib/Target: X86 (built) and ARM, AArch64, RISCV, whose .td files llvm/include/llvm/TargetParser/CMakeLists.txt tablegens for every target (not built: no source is compiled).
+# llvm/projects is an empty stub CMake adds unconditionally.
+sparse = [
+    "cmake", "compiler-rt", "libc", "libcxx", "libcxxabi", "libunwind", "llvm/cmake", "llvm/utils/llvm-lit", "runtimes", "third-party",
+    "llvm/include", "llvm/projects", "llvm/utils/TableGen", "llvm/tools/llvm-config", "llvm/tools/lli", "llvm/lib/Target/X86",
+    "llvm/lib/Target/ARM", "llvm/lib/Target/AArch64", "llvm/lib/Target/RISCV",
+    "llvm/lib/Analysis", "llvm/lib/AsmParser", "llvm/lib/BinaryFormat", "llvm/lib/Bitcode", "llvm/lib/Bitstream", "llvm/lib/CGData", "llvm/lib/CodeGen", "llvm/lib/CodeGenTypes",
+    "llvm/lib/DWARFLinker", "llvm/lib/DWP", "llvm/lib/DebugInfo", "llvm/lib/Debuginfod", "llvm/lib/Demangle", "llvm/lib/ExecutionEngine", "llvm/lib/Extensions", "llvm/lib/FileCheck",
+    "llvm/lib/Frontend", "llvm/lib/FuzzMutate", "llvm/lib/Fuzzer", "llvm/lib/IR", "llvm/lib/IRPrinter", "llvm/lib/IRReader", "llvm/lib/InterfaceStub", "llvm/lib/LTO",
+    "llvm/lib/LineEditor", "llvm/lib/Linker", "llvm/lib/MC", "llvm/lib/MCA", "llvm/lib/ObjCopy", "llvm/lib/Object", "llvm/lib/ObjectYAML", "llvm/lib/Option",
+    "llvm/lib/Passes", "llvm/lib/ProfileData", "llvm/lib/Remarks", "llvm/lib/SandboxIR", "llvm/lib/Support", "llvm/lib/TableGen", "llvm/lib/TargetParser", "llvm/lib/Testing",
+    "llvm/lib/TextAPI", "llvm/lib/ToolDrivers", "llvm/lib/Transforms", "llvm/lib/WindowsDriver", "llvm/lib/WindowsManifest", "llvm/lib/XRay",
+]
 
 [qemu]
 git = "https://gitlab.com/qemu-project/qemu.git"

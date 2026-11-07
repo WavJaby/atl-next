@@ -156,6 +156,7 @@ impl Step {
                 let layout = Layout::of(root)?;
                 arches::check_kernel_arch(&layout, &arches)?;
                 arches::check_prebuilt_os(&layout, &arches)?;
+                arches::check_llvm_target(root, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

@@ -77,7 +77,7 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "xtask:check"]
 
-# CMake only for upstream BoringSSL (CLAUDE.md); its CMakeLists.txt needs 3.22
+# CMake is the build system of upstream BoringSSL, the LLVM runtimes (runtimes.rs) and the host LLVM (llvm_host.rs): their only supported build (CLAUDE.md). BoringSSL's CMakeLists.txt needs 3.22
 [cmake]
 debian = "cmake"
 arch = "cmake"
