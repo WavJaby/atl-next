@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
-//! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, hasSystemFeature, getPackagesForUid, notifyDexLoad, getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures.
+//! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getPackagesForUid, notifyDexLoad, getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures.
 //! Every other method is counted unimplemented (counters).
-//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted except GET_META_DATA (application and activity meta-data): the records carry no signatures and of the components only activities, and `sharedLibraryFiles` is always filled.
+//! One user (0): a userId other than 0 is a user that does not exist. Flags (MATCH_*, GET_*) are not interpreted except GET_META_DATA (application, activity and provider meta-data) and MATCH_DISABLED_COMPONENTS for providers: the records carry no signatures and of the components only activities and providers, and `sharedLibraryFiles` is always filled.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use atl_aidl::aidl::android::content::pm::IPackageManager::{EnforcePermission, I
 use atl_parcelables::android::content::ComponentName;
 use atl_parcelables::android::content::pm::{
     ActivityInfo, ApplicationInfo, InstrumentationInfo, PackageInfo, ParceledListSlice,
+    ProviderInfo,
 };
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::os::Bundle::Value;
@@ -20,6 +21,7 @@ use binder::{ExceptionCode, Interface, Status, ThreadState};
 
 use crate::packages::{
     ActivityDecl, InstrumentationDecl, LibraryNode, MetaValue, PackageRecord, Packages,
+    ProviderDecl,
 };
 use crate::permission::{self, Permissions};
 use crate::{counters, manifest_flags};
@@ -36,6 +38,8 @@ const SIGNATURE_MATCH: i32 = 0;
 const SIGNATURE_UNKNOWN_PACKAGE: i32 = -4;
 /// PackageManager.GET_META_DATA (PackageManager.java).
 const GET_META_DATA: i64 = 0x80;
+/// PackageManager.MATCH_DISABLED_COMPONENTS (PackageManager.java).
+const MATCH_DISABLED_COMPONENTS: i64 = 0x200;
 /// ActivityManagerService.STOCK_PM_FLAGS: GET_SHARED_LIBRARY_FILES, the flags AMS reads an app's ApplicationInfo with (bindApplication's, the launch's).
 pub const STOCK_PM_FLAGS: i64 = 0x400;
 
@@ -176,7 +180,74 @@ pub fn activity_info(
     }
 }
 
-/// getActivityInfo after the visibility check: `class` of `p` with its ApplicationInfo built for the same `flags`; None for a class `p` does not declare.
+/// PackageInfoUtils.generateProviderInfo, reduced to what the declaration holds; GET_META_DATA adds the `<provider>`'s own meta-data, null when it has none.
+fn provider_info(
+    p: &PackageRecord,
+    d: &ProviderDecl,
+    packages: &Packages,
+    flags: i64,
+) -> ProviderInfo {
+    ProviderInfo {
+        component: ComponentInfo {
+            item: PackageItemInfo {
+                name: Some(d.name.clone()),
+                package_name: Some(p.name.clone()),
+                meta_data: (flags & GET_META_DATA != 0 && !d.meta_data.is_empty())
+                    .then(|| meta_bundle(&d.meta_data)),
+                ..Default::default()
+            },
+            application_info: application_info(p, packages, flags),
+            process_name: Some(provider_process(p, d).to_owned()),
+            enabled: d.enabled,
+            exported: d.exported,
+            direct_boot_aware: d.direct_boot_aware,
+            ..Default::default()
+        },
+        authority: d.authority.clone(),
+        read_permission: d.read_permission.clone(),
+        write_permission: d.write_permission.clone(),
+        grant_uri_permissions: d.grant_uri_permissions,
+        force_uri_permissions: d.force_uri_permissions,
+        multiprocess: d.multiprocess,
+        init_order: d.init_order,
+        is_syncable: d.syncable,
+        ..Default::default()
+    }
+}
+
+/// ParsedMainComponent.getProcessName: the component's process, else the package's.
+fn provider_process<'a>(p: &'a PackageRecord, d: &'a ProviderDecl) -> &'a str {
+    d.process.as_deref().unwrap_or_else(|| p.process_name())
+}
+
+/// PackageStateUtils.isEnabledAndMatches, reduced to the component's own state.
+fn provider_matches(d: &ProviderDecl, flags: i64) -> bool {
+    d.enabled || flags & MATCH_DISABLED_COMPONENTS != 0
+}
+
+/// ComputerEngine.queryContentProviders for one package (ContentProviderHelper.generateApplicationProvidersLocked's call): its enabled providers with an authority in `process`, higher initOrder first
+/// (sProviderInitOrderSorter). Equal orders stay in manifest order; AOSP leaves them in its map's order, which no app can rely on.
+pub fn process_providers(
+    p: &PackageRecord,
+    packages: &Packages,
+    process: &str,
+    flags: i64,
+) -> Vec<ProviderInfo> {
+    let mut list: Vec<&ProviderDecl> = p
+        .manifest
+        .providers
+        .iter()
+        .filter(|d| {
+            d.authority.is_some() && provider_process(p, d) == process && provider_matches(d, flags)
+        })
+        .collect();
+    list.sort_by_key(|d| std::cmp::Reverse(d.init_order));
+    list.into_iter()
+        .map(|d| provider_info(p, d, packages, flags))
+        .collect()
+}
+
+/// getActivityInfo after the visibility check:`class` of `p` with its ApplicationInfo built for the same `flags`; None for a class `p` does not declare.
 fn find_activity_info(
     p: &PackageRecord,
     packages: &Packages,
@@ -266,6 +337,47 @@ impl IPackageManager for PackageManager {
         Ok(self
             .visible(Some(&c.package), user)
             .and_then(|p| find_activity_info(p, &self.packages, &c.class, flags)))
+    }
+
+    /// ComputerEngine.getProviderInfo:4119: null for an unknown user, package or class, and for a disabled provider without MATCH_DISABLED_COMPONENTS.
+    fn r#getProviderInfo(
+        &self,
+        component: Option<&ComponentName>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ProviderInfo>> {
+        let Some(c) = component else {
+            return Ok(None);
+        };
+        Ok(self.visible(Some(&c.package), user).and_then(|p| {
+            p.manifest
+                .providers
+                .iter()
+                .find(|d| d.name == c.class && provider_matches(d, flags))
+                .map(|d| provider_info(p, d, &self.packages, flags))
+        }))
+    }
+
+    /// ComputerEngine.resolveContentProvider:4787: the visible provider one of whose `;`-separated authorities is `name`. Not modelled: the `user@authority` form (one user).
+    fn r#resolveContentProvider(
+        &self,
+        name: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> binder::Result<Option<ProviderInfo>> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        Ok(self.packages.all().iter().find_map(|record| {
+            let p = self.visible(Some(&record.name), user)?;
+            let d = p.manifest.providers.iter().find(|d| {
+                provider_matches(d, flags)
+                    && d.authority
+                        .as_deref()
+                        .is_some_and(|a| a.split(';').any(|one| one == name))
+            })?;
+            Some(provider_info(p, d, &self.packages, flags))
+        }))
     }
 
     /// ComputerEngine.getPackageInfo:1581: null as getApplicationInfo; the PackageInfo carries the ApplicationInfo, the version and the requested permissions.
@@ -449,6 +561,7 @@ mod tests {
                 libraries: vec![],
                 instrumentation: vec![],
                 receivers: vec![],
+                providers: vec![],
             },
             uid: 10_001,
             source_dir: String::new(),

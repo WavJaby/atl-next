@@ -70,6 +70,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("app", crate::app::goals),
     ("binder", crate::binder::goals),
     ("broadcast", crate::broadcast::goals),
+    ("provider", crate::provider::goals),
     ("composer", crate::composer::goals),
     ("compositor", crate::compositor::goals),
     ("drive", crate::drive_gate::goals),

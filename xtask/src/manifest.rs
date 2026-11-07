@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use atl_services::packages::{
     ActivityDecl, InstrumentationDecl, IntentFilterDecl, Manifest, MetaValue, PermissionDecl,
-    ReceiverDecl, UsesLibrary,
+    ProviderDecl, ReceiverDecl, UsesLibrary,
 };
 
 use crate::host_art;
@@ -292,6 +292,50 @@ fn receivers(application: Option<&Element>, package: &str) -> Vec<ReceiverDecl> 
         .collect()
 }
 
+/// Every `<provider>` of `application`, in manifest order (ParsedProviderUtils.parseProvider): `exported` unwritten = targetSdk < JELLY_BEAN_MR1; a read or write permission falls back to `android:permission`, then the application's.
+fn providers(
+    application: Option<&Element>,
+    package: &str,
+    target_sdk: i32,
+) -> Result<Vec<ProviderDecl>> {
+    /// Build.VERSION_CODES.JELLY_BEAN_MR1.
+    const JELLY_BEAN_MR1: i32 = 17;
+    let Some(application) = application else {
+        return Ok(vec![]);
+    };
+    application
+        .children("provider")
+        .filter(|p| p.attr("name").is_some())
+        .map(|p| {
+            let permission = |own: &str| {
+                p.attr(own)
+                    .or_else(|| p.attr("permission"))
+                    .or_else(|| application.attr("permission"))
+                    .map(str::to_owned)
+            };
+            let init_order = p.attr("initOrder").unwrap_or("0");
+            Ok(ProviderDecl {
+                name: resolve_class(package, p.attr("name").unwrap_or_default()),
+                authority: p.attr("authorities").map(str::to_owned),
+                exported: p.bool_attr("exported", target_sdk < JELLY_BEAN_MR1),
+                enabled: p.bool_attr("enabled", true),
+                process: process_attr(p, package),
+                read_permission: permission("readPermission"),
+                write_permission: permission("writePermission"),
+                grant_uri_permissions: p.bool_attr("grantUriPermissions", false),
+                force_uri_permissions: p.bool_attr("forceUriPermissions", false),
+                multiprocess: p.bool_attr("multiprocess", false),
+                init_order: init_order
+                    .parse()
+                    .with_context(|| format!("initOrder {init_order:?} is not an integer"))?,
+                syncable: p.bool_attr("syncable", false),
+                direct_boot_aware: p.bool_attr("directBootAware", false),
+                meta_data: meta_data(p)?,
+            })
+        })
+        .collect()
+}
+
 pub fn parse(text: &str) -> Result<Manifest> {
     let root = parse_tree(text)?;
     if root.name != "manifest" {
@@ -389,6 +433,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
         activities,
         permissions: permissions(&root)?,
         receivers: receivers(application, package),
+        providers: providers(application, package, target_sdk)?,
         requested_permissions: root
             .children("uses-permission")
             .filter_map(|e| e.attr("name").map(str::to_owned))
@@ -693,6 +738,37 @@ mod tests {
         assert_eq!(m.activities[0].theme, 0x0103_012a);
         assert_eq!(m.activities[1].theme, 0);
         assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
+    }
+
+    /// `<provider>`: no targetSdk written = 0 here, so `exported` unwritten is true (< 17, parseProvider); permission falls back own -> `android:permission` -> application; initOrder as `aapt2` prints it (decimal, CTR's manifest).
+    #[test]
+    fn providers_follow_parse_provider() {
+        let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
+  E: manifest (line=3)
+    A: package="com.example.p" (Raw: "com.example.p")
+      E: application (line=7)
+        A: http://schemas.android.com/apk/res/android:permission(0x01010006)="p.App" (Raw: "p.App")
+          E: provider (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="a;b" (Raw: "a;b")
+            A: http://schemas.android.com/apk/res/android:initOrder(0x0101001a)=100
+            A: http://schemas.android.com/apk/res/android:readPermission(0x01010007)="p.R" (Raw: "p.R")
+              E: meta-data (line=9)
+                A: http://schemas.android.com/apk/res/android:name(0x01010003)="k" (Raw: "k")
+                A: http://schemas.android.com/apk/res/android:value(0x01010024)="v" (Raw: "v")
+"#;
+        let m = parse(text).expect("parse");
+        let p = &m.providers[0];
+        assert_eq!(p.name, "com.example.p.A");
+        assert_eq!(p.authority.as_deref(), Some("a;b"));
+        assert_eq!(p.init_order, 100);
+        assert!(p.exported && p.enabled);
+        assert_eq!(p.read_permission.as_deref(), Some("p.R"));
+        assert_eq!(p.write_permission.as_deref(), Some("p.App"));
+        assert_eq!(
+            p.meta_data,
+            vec![("k".to_owned(), MetaValue::String("v".to_owned()))]
+        );
     }
 
     /// `<receiver>`: exported unwritten = has a filter (ParsedActivityUtils:495-507), written wins; permission, process, filter parts as written, unwritten kinds None.

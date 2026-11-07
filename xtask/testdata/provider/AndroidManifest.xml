@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test provider`: providers of the app's process start before Application.onCreate, higher initOrder first; a disabled one and one of another process do not. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlprovider"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL provider" android:name=".App">
+        <provider android:name=".Low" android:authorities="com.example.atlprovider.low" android:exported="false" android:initOrder="1">
+            <meta-data android:name="com.example.atlprovider.KEY" android:value="startup" />
+        </provider>
+        <provider android:name=".High" android:authorities="com.example.atlprovider.high;com.example.atlprovider.alias" android:exported="false" android:initOrder="9" />
+        <provider android:name=".Off" android:authorities="com.example.atlprovider.off" android:exported="false" android:enabled="false" />
+        <provider android:name=".Elsewhere" android:authorities="com.example.atlprovider.elsewhere" android:exported="false" android:process=":other" />
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

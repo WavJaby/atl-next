@@ -383,6 +383,7 @@ mod tests {
             application_booleans: std::collections::BTreeMap::new(),
             activities: Vec::new(),
             receivers: Vec::new(),
+            providers: Vec::new(),
             requested_permissions: Vec::new(),
             permissions: Vec::new(),
             libraries: Vec::new(),

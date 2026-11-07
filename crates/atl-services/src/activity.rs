@@ -1310,7 +1310,7 @@ impl IActivityManager for ActivityManager {
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
         let core_settings = Bundle::default();
         // what attachApplicationLocked passes for a plain app start (no profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
-        // an empty provider list (no providers of its own yet), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
+        // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
         // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); no settings are mirrored into it yet.
         // An instrumentation passes its class, arguments, watcher and UiAutomation connection (:4723-4737).
         let (test_name, test_arguments, test_watcher, test_ui) = match instr {
@@ -1322,13 +1322,24 @@ impl IActivityManager for ActivityManager {
             ),
             None => (None, None, None, None),
         };
+        let providers = ProviderInfoList {
+            list: package::process_providers(
+                p,
+                &inner.packages,
+                &process_name,
+                package::STOCK_PM_FLAGS,
+            )
+            .into_iter()
+            .map(Some)
+            .collect(),
+        };
         thread.r#bindApplication(
             Some(&process_name),
             Some(&info),
             None,
             None,
             false,
-            Some(&ProviderInfoList::default()),
+            Some(&providers),
             test_name,
             None,
             test_arguments,
@@ -1432,6 +1443,29 @@ impl IActivityManager for ActivityManager {
             }
         }
         Ok((name == Some(SETTINGS_AUTHORITY)).then(|| self.inner.settings_holder()))
+    }
+
+    /// ContentProviderHelper.publishContentProviders:731: an unknown caller is a SecurityException (:742). ActivityThread.installContentProviders calls it before Application.onCreate; a failure there rethrows and kills the app.
+    /// Not kept: nothing here serves another process's provider yet (getContentProvider knows settings only); a process finds its own in ActivityThread's mProviderMap without asking.
+    fn r#publishContentProviders(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        _providers: Option<&[Option<ContentProviderHolder>]>,
+    ) -> binder::Result<()> {
+        let known = caller.is_some_and(|t| {
+            let st = self.inner.state();
+            Inner::record_for_thread(&st, t).is_some()
+        });
+        if !known {
+            return Err(security(
+                "Unable to find app for caller when publishing content providers",
+            ));
+        }
+        counters::answered(
+            AM,
+            "publishContentProviders (not kept: no cross-process lookup)",
+        );
+        Ok(())
     }
 
     /// ActivityManagerService.startInstrumentation (:14452-14644), user 0 only. The PackageManager lookups (:14472-14500) read the same package table the PackageManager service answers from.

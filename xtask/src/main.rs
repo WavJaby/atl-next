@@ -67,6 +67,7 @@ mod parcel;
 mod patch;
 mod platform_ui;
 mod provided_gate;
+mod provider;
 mod providers;
 mod prune;
 mod run_apk;
@@ -222,6 +223,8 @@ enum Test {
     ///
     /// Each check prints pass / FAIL; the services' counters are printed either way, the logs' tails on failure.
     Broadcast(broadcast::Args),
+    /// An app's ContentProviders (xtask/testdata/provider) under atld: initOrder before Application.onCreate, disabled and other-process ones skipped, PackageManager lookups, a call to its own provider.
+    Provider(provider::Args),
     /// The CTS instrumentation path: AOSP's `am instrument` runs a JUnit3 test APK (xtask/testdata/instrument) through the services; its INSTRUMENTATION_* text is parsed and checked.
     ///
     /// Run 1: a passing, a failing and an erroring test: status codes 1/0, 1/-2, 1/-1, the final code -1, and the instrumented process killed once the run finished.
@@ -344,6 +347,9 @@ fn main() -> Result<ExitCode> {
             test: Test::Broadcast(args),
         } => broadcast::run(&root, &args),
         Command::Test {
+            test: Test::Provider(args),
+        } => provider::run(&root, &args),
+        Command::Test {
             test: Test::Instrument(args),
         } => instrument::run(&root, &args),
         Command::Test {
@@ -400,6 +406,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Test { test } => match test {
             Test::NativeLoad(_) => "native-load",
             Test::Parcel(_) => "parcel",
+            Test::Provider(_) => "provider",
             Test::Compositor(_) => "compositor",
             Test::Gralloc(_) => "gralloc",
             Test::Binder(_) => "binder",

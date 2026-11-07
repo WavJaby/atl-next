@@ -259,6 +259,7 @@ mod tests {
                 .collect(),
             activities: vec![],
             receivers: vec![],
+            providers: vec![],
             requested_permissions: vec![],
             permissions: Vec::new(),
             libraries: vec![],

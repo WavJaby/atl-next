@@ -81,6 +81,34 @@ pub struct ReceiverDecl {
     pub filters: Vec<IntentFilterDecl>,
 }
 
+/// `<provider>` (ParsedProviderUtils.parseProvider, reduced to what ProviderInfo carries; no uri-permission patterns or path permissions).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderDecl {
+    /// `android:name`, resolved against the package name: the ContentProvider class.
+    pub name: String,
+    /// `android:authorities`, `;`-separated as ProviderInfo.authority; None = queryProviders skips it.
+    pub authority: Option<String>,
+    /// `android:exported`; unwritten = targetSdk < 17 (parseProvider).
+    pub exported: bool,
+    /// `android:enabled` (default true).
+    pub enabled: bool,
+    /// `android:process` resolved as the application's; None = the package's process.
+    pub process: Option<String>,
+    /// `android:readPermission`, else `android:permission`, else `<application android:permission>`.
+    pub read_permission: Option<String>,
+    /// `android:writePermission`, same fallbacks.
+    pub write_permission: Option<String>,
+    pub grant_uri_permissions: bool,
+    pub force_uri_permissions: bool,
+    pub multiprocess: bool,
+    /// `android:initOrder` (default 0): higher starts first.
+    pub init_order: i32,
+    pub syncable: bool,
+    pub direct_boot_aware: bool,
+    /// `<provider>`'s `<meta-data>` in manifest order, typed as `<application>`'s (androidx.startup lists its initializers here).
+    pub meta_data: Vec<(String, MetaValue)>,
+}
+
 /// What an APK's AndroidManifest.xml declares that the services use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -109,6 +137,9 @@ pub struct Manifest {
     /// Every `<receiver>`, in manifest order.
     #[serde(default)]
     pub receivers: Vec<ReceiverDecl>,
+    /// Every `<provider>`, in manifest order.
+    #[serde(default)]
+    pub providers: Vec<ProviderDecl>,
     /// `<uses-permission android:name>`, in order.
     pub requested_permissions: Vec<String>,
     /// `<permission>` elements: the permissions the package defines (the platform's are framework-res's), the install-time grant rule's input (permission::install_grants).
@@ -333,6 +364,7 @@ mod tests {
                 application_booleans: BTreeMap::new(),
                 activities: vec![],
                 receivers: vec![],
+                providers: vec![],
                 requested_permissions: vec![],
                 permissions: vec![],
                 libraries: vec![],
