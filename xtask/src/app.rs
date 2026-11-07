@@ -16,6 +16,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines, counters};
 use crate::gl_scene::{Judged, Scene};
+use crate::native_load::PLAYER_STEPS;
 use crate::test_fonts;
 use crate::window::{self, WINDOW_MS};
 use crate::{gl_probe, jni_fixture, manifest};
@@ -49,6 +50,9 @@ pub struct Args {
     /// The SoundPool break: unlinks libsoundpool.so from the ART lib dir, so `new SoundPool` must fail naming it and the soundpool line must go red.
     #[arg(long)]
     soundpool_break: bool,
+    /// The MediaPlayer break: unlinks libmedia_jni.so from the ART lib dir, so `new MediaPlayer` must fail and the mediaplayer lines must go red.
+    #[arg(long)]
+    mediaplayer_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -67,6 +71,10 @@ const FONTS: &str = "AtlTest: fonts: ";
 const SOUNDPOOL: &str = "AtlTest: soundpool: ";
 /// The audio service's calls the SoundPool row makes (IAudioService, services.toml `audio`): the track at construction, the release. Each must be answered in the services' log.
 const SOUNDPOOL_CALLS: [&str; 2] = ["trackPlayer", "releasePlayer"];
+/// Main.onCreate's MediaPlayer lines: `AtlTest: mediaplayer: <step> ok`, or `<step> <throwable>`, one per step of native_load.rs PLAYER_STEPS (Happy Jump's GameShared.loadMusic sequence).
+const MEDIAPLAYER: &str = "AtlTest: mediaplayer: ";
+/// AOSP's ALOGE in MediaPlayer::start for a player in Idle (mediaplayer.cpp:364, tag MediaPlayerNative, state 1 = MEDIA_PLAYER_IDLE): start() reached the native player and was refused there. Java's _start throws nothing for that (android_media_MediaPlayer.cpp), so this line is the only evidence the native path ran.
+const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -253,6 +261,32 @@ fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
     Ok(whys)
 }
 
+/// Main.onCreate's MediaPlayer lines in order, joined: `new ok; setLooping ok; ...`.
+fn mediaplayer_steps(app: &str) -> String {
+    app.lines()
+        .filter_map(|l| l.split_once(MEDIAPLAYER).map(|(_, r)| r.trim_end()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The MediaPlayer lines against PLAYER_STEPS: one reason per step whose line is missing or does not start with what the sequence must print.
+fn player_failures(app: &str) -> Vec<String> {
+    PLAYER_STEPS
+        .iter()
+        .filter_map(|&(step, want)| {
+            let got = app.lines().find_map(|l| {
+                let (_, r) = l.split_once(MEDIAPLAYER)?;
+                let r = r.strip_prefix(step)?.strip_prefix(' ')?;
+                Some(r.trim_end().to_owned())
+            });
+            match got {
+                Some(r) if r.starts_with(want) => None,
+                other => Some(format!("mediaplayer {step}: want {want}, got {other:?}")),
+            }
+        })
+        .collect()
+}
+
 /// Native goals (gate_goals.rs): the runtime with gralloc, the GL driver and the native-bridge guest, as [`run`] stages it.
 pub fn goals() -> crate::gate_goals::Goals {
     use crate::atld_run;
@@ -289,6 +323,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let rt = if args.soundpool_break {
         rt.without_art_lib("libsoundpool.so")?
+    } else {
+        rt
+    };
+    let rt = if args.mediaplayer_break {
+        rt.without_art_lib("libmedia_jni.so")?
     } else {
         rt
     };
@@ -458,6 +497,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
     }
+    // Happy Jump's MediaPlayer sequence (native_load.rs PLAYER_STEPS): construction and these steps need no service, so a media.player lookup (the wait J1 forbids) fails the row
+    if passed {
+        whys.extend(player_failures(&app));
+        if app.contains("media.player") {
+            whys.push("mediaplayer: the app looked up media.player".to_owned());
+        }
+        if !app.contains(MEDIAPLAYER_START) {
+            whys.push("mediaplayer: start() did not reach the native player".to_owned());
+        }
+    }
     if passed && !bridge1_ok {
         whys.push(format!(
             "bridge1: want {BRIDGE1:?}, got {:?}",
@@ -492,6 +541,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass soundpool {} (the audio service answered {})",
             soundpool.unwrap_or_default(),
             SOUNDPOOL_CALLS.join(", ")
+        );
+        println!(
+            "app: pass mediaplayer {} (no media.player lookup)",
+            mediaplayer_steps(&app)
         );
         if let Some(n) = es1_compared {
             println!(
@@ -592,6 +645,29 @@ mod tests {
             .find(|(n, _)| *n == "assetProbe")
             .map(|(_, v)| *v);
         assert_eq!(row, Some(want.as_str()));
+    }
+
+    /// Main.onCreate's MediaPlayer lines when every call behaves as AOSP's does: start() in Idle throws nothing (android_media_MediaPlayer.cpp _start).
+    const SEQUENCE: &str = concat!(
+        "AtlTest: mediaplayer: new ok\n",
+        "AtlTest: mediaplayer: setLooping ok\n",
+        "AtlTest: mediaplayer: setVolume ok\n",
+        "AtlTest: mediaplayer: start ok\n",
+        "AtlTest: mediaplayer: release ok\n",
+    );
+
+    #[test]
+    fn mediaplayer_sequence_judged_against_the_steps() {
+        assert_eq!(player_failures(SEQUENCE), Vec::<String>::new());
+        // start() throwing in Idle is wrong: AOSP's _start throws nothing for INVALID_OPERATION
+        let threw = SEQUENCE.replace("start ok", "start java.lang.IllegalStateException: null");
+        let why = player_failures(&threw);
+        assert!(why.iter().any(|w| w.starts_with("mediaplayer start:")));
+        // the libmedia_jni break: `new` throws and no later step is logged, so every step fails
+        let broken = "AtlTest: mediaplayer: new java.lang.UnsatisfiedLinkError: dlopen failed\n";
+        let why = player_failures(broken);
+        assert!(why.iter().any(|w| w.starts_with("mediaplayer new:")));
+        assert_eq!(why.len(), PLAYER_STEPS.len());
     }
 
     /// The app-log lines atl_jni_es1.c writes for `px`: one `row` line each, in liblog's form.

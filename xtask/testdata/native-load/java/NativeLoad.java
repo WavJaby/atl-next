@@ -112,7 +112,7 @@ public class NativeLoad {
     }
 
     // Happy Jump's GameShared.loadMusic sequence on android.media.MediaPlayer (libmedia_jni through its static init), each step one line: `ok`, or the throwable's class and message.
-    // start() in Idle: AOSP's MediaPlayer.cpp start() returns INVALID_OPERATION there, which android_media_MediaPlayer.cpp turns into IllegalStateException.
+    // start() in Idle: MediaPlayer.cpp start() returns INVALID_OPERATION, which _start reports as MEDIA_ERROR to the listener (none set): no exception, so `ok`.
     static void player() {
         try {
             Class.forName("android.media.MediaPlayer");

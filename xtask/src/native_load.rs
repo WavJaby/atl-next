@@ -340,12 +340,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     Ok(report.finish())
 }
 
-/// Stage 10's steps and what each must print: Happy Jump's sequence, `start()` in Idle as AOSP answers it (MediaPlayer.cpp INVALID_OPERATION -> IllegalStateException).
-const PLAYER_STEPS: [(&str, &str); 5] = [
+/// Stage 10's steps and what each must print (the app gate checks the same table, app.rs player_failures): Happy Jump's sequence, `start()` in Idle as AOSP answers it (MediaPlayer.cpp returns INVALID_OPERATION; _start's process_media_player_call throws nothing for it: exception NULL reports MEDIA_ERROR to the listener, android_media_MediaPlayer.cpp:193-199, 425-434).
+pub(crate) const PLAYER_STEPS: [(&str, &str); 5] = [
     ("new", "ok"),
     ("setLooping", "ok"),
     ("setVolume", "ok"),
-    ("start", "java.lang.IllegalStateException"),
+    ("start", "ok"),
     ("release", "ok"),
 ];
 

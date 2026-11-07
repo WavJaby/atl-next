@@ -6,6 +6,7 @@ import android.graphics.Bitmap;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.media.AudioManager;
+import android.media.MediaPlayer;
 import android.media.SoundPool;
 import android.os.Bundle;
 import android.util.Log;
@@ -22,6 +23,7 @@ import javax.net.ssl.X509TrustManager;
  * Fonts line (app.rs FONTS): the default and monospace typefaces' advance of one text, which the gate compares with the pinned fonts' hmtx tables.
  * Bridge-1 line (app.rs BRIDGE1): the fixture is loaded (AtlJniTest's static initialiser) through the NativeBridge core into its guest; a failed load logs ART's UnsatisfiedLinkError, which carries the core's reason.
  * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
+ * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -33,6 +35,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "cacerts: " + caCerts());
         Log.i("AtlTest", "fonts: default=" + advance(Typeface.DEFAULT) + " monospace=" + advance(Typeface.MONOSPACE));
         Log.i("AtlTest", "soundpool: " + soundPool());
+        mediaPlayer();
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -195,5 +198,53 @@ public class Main extends Activity {
             }
             return s.toString();
         }
+    }
+
+    /**
+     * Happy Jump's GameShared.loadMusic sequence (app.rs MEDIAPLAYER, native_load.rs PLAYER_STEPS): one line per step, "<step> ok" or "<step> <throwable>".
+     * start() in Idle: no exception; AOSP reports INVALID_OPERATION to the (absent) listener (android_media_MediaPlayer.cpp _start). Released at once; the gate plays nothing.
+     */
+    private static void mediaPlayer() {
+        MediaPlayer mp;
+        try {
+            mp = new MediaPlayer();
+            mediaPlayerLog("new ok");
+        } catch (Throwable t) {
+            mediaPlayerLog("new " + thrown(t));
+            return;
+        }
+        try {
+            mp.setLooping(true);
+            mediaPlayerLog("setLooping ok");
+        } catch (Throwable t) {
+            mediaPlayerLog("setLooping " + thrown(t));
+        }
+        try {
+            mp.setVolume(0.5f, 0.5f);
+            mediaPlayerLog("setVolume ok");
+        } catch (Throwable t) {
+            mediaPlayerLog("setVolume " + thrown(t));
+        }
+        try {
+            mp.start();
+            mediaPlayerLog("start ok");
+        } catch (Throwable t) {
+            mediaPlayerLog("start " + thrown(t));
+        }
+        try {
+            mp.release();
+            mediaPlayerLog("release ok");
+        } catch (Throwable t) {
+            mediaPlayerLog("release " + thrown(t));
+        }
+    }
+
+    private static void mediaPlayerLog(String text) {
+        Log.i("AtlTest", "mediaplayer: " + text);
+    }
+
+    /** A throwable's class and message on one line. */
+    private static String thrown(Throwable t) {
+        return t.getClass().getName() + ": " + String.valueOf(t.getMessage()).replace('\n', ' ');
     }
 }
