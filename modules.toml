@@ -44,9 +44,9 @@ uses = ["binder", "broker", "gralloc", "platform-host", "property-service", "ser
 # the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time; bionic only for its API's names; the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "bionic", "composer", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-extractors"]
+uses = ["generators", "bionic", "composer", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors"]
 
-# the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger; later Codec2, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
+# the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]
 crates = ["atl-service-view"]
 exports = ["atl-service-view"]
@@ -68,6 +68,12 @@ uses = ["service-view", "generators"]
 [resource-manager]
 crates = ["atl-resource-manager"]
 exports = ["atl-resource-manager"]
+uses = ["service-view", "generators"]
+
+# the media player service the app process serves through the view (audio P1a): AOSP's MediaPlayerService constructed as instantiate() does minus addService, as media.player (MediaPlayer's native calls wait for it); cxx adapter in wrap/player.cpp
+[media-player]
+crates = ["atl-media-player"]
+exports = ["atl-media-player"]
 uses = ["service-view", "generators"]
 
 # AudioFlinger and AudioPolicyService the app process serves through the view (audio A1a): AOSP's audio AIDL stubs (atl-audioflinger-stubs-rust) answering the ids, rate, frame count, latency and output calls AudioSystem makes; the rest is counted UNKNOWN_TRANSACTION

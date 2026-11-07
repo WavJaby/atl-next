@@ -2,6 +2,7 @@
 package com.example.atltest;
 
 import android.app.Activity;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.Paint;
 import android.graphics.Typeface;
@@ -25,6 +26,7 @@ import javax.net.ssl.X509TrustManager;
  * SoundPool line (app.rs SOUNDPOOL): `new SoundPool` (the legacy 3-arg path HJ takes) loads libsoundpool.so and constructs, or logs what it threw.
  * MediaPlayer lines (app.rs MEDIAPLAYER): Happy Jump's GameShared.loadMusic sequence, one line per step.
  * Service lines (app.rs SERVICE_LINES): connectivity = the offline answers of the `connectivity` service; else `absent` / what it threw.
+ * media.player line (app.rs MEDIA_PLAYER_SERVICE): setDataSource(fd) reaches the served service and returns.
  */
 public class Main extends Activity {
     /** A root every supported distro bundle carries (Let's Encrypt's). */
@@ -38,6 +40,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "soundpool: " + soundPool());
         mediaPlayer();
         Log.i("AtlTest", "connectivity: " + connectivity());
+        mediaPlayerService();
         Class<?> jni;
         try {
             jni = Class.forName("atl.bridge1.testlib.AtlJniTest");
@@ -262,5 +265,40 @@ public class Main extends Activity {
     /** A throwable's class and message on one line. */
     private static String thrown(Throwable t) {
         return t.getClass().getName() + ": " + String.valueOf(t.getMessage()).replace('\n', ' ');
+    }
+
+    /** How long the media.player probe waits for the view's answer before its line says so (app.rs MEDIA_PLAYER_SERVICE). */
+    private static final long PROBE_MS = 20000L;
+
+    /**
+     * media.player through the process's view (audio P1a): setDataSource(fd) on a stored asset of bytes no demuxer knows. The native call looks the service up
+     * (IMediaDeathNotifier::getMediaPlayerService, waitForService); the service answers and setDataSource returns, so the line reads "returned" (MediaPlayer.java drops a native error). A lookup nobody
+     * answers blocks the call, so the probe runs on its own thread and the line then says "no answer".
+     */
+    private void mediaPlayerService() {
+        Thread probe = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String r;
+                try {
+                    AssetFileDescriptor afd = getAssets().openFd("stored.bin");
+                    MediaPlayer mp = new MediaPlayer();
+                    mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+                    r = "returned";
+                } catch (Throwable t) {
+                    r = thrown(t);
+                }
+                Log.i("AtlTest", "media.player: " + r);
+            }
+        });
+        probe.start();
+        try {
+            probe.join(PROBE_MS);
+        } catch (InterruptedException e) {
+            Log.i("AtlTest", "media.player: interrupted " + e);
+        }
+        if (probe.isAlive()) {
+            Log.i("AtlTest", "media.player: no answer within " + PROBE_MS + " ms");
+        }
     }
 }

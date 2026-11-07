@@ -121,19 +121,31 @@ fn install_service_view() -> Result<()> {
     Ok(())
 }
 
-/// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for).
+/// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for), and the media player service (atl-media-player, `media.player`, which MediaPlayer's native calls wait for; skipped under `--no-media-player-service`, the media player gate's break).
 #[cfg(feature = "converter")]
-fn serve_media_services(no_audio_service: bool, break_cblk: bool) -> Result<()> {
+fn serve_media_services(
+    no_audio_service: bool,
+    break_cblk: bool,
+    no_media_player_service: bool,
+) -> Result<()> {
     if !no_audio_service {
         atl_audioflinger::serve(atl_audioflinger::Options { break_cblk })
             .map_err(|e| anyhow!(e))?;
     }
     atl_codec_store::serve().map_err(|e| anyhow!(e))?;
-    atl_resource_manager::serve().map_err(|e| anyhow!(e))
+    atl_resource_manager::serve().map_err(|e| anyhow!(e))?;
+    if !no_media_player_service {
+        atl_media_player::serve().map_err(|e| anyhow!(e))?;
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "converter"))]
-fn serve_media_services(_no_audio_service: bool, _break_cblk: bool) -> Result<()> {
+fn serve_media_services(
+    _no_audio_service: bool,
+    _break_cblk: bool,
+    _no_media_player_service: bool,
+) -> Result<()> {
     Ok(())
 }
 
@@ -181,7 +193,11 @@ fn run() -> Result<i32> {
         );
     }
     install_service_view()?;
-    serve_media_services(launch.no_audio_service, launch.break_cblk)?;
+    serve_media_services(
+        launch.no_audio_service,
+        launch.break_cblk,
+        launch.no_media_player_service,
+    )?;
     load_media_extractors();
     let mut vm_options = launch.vm_options.clone();
     if launch.app {

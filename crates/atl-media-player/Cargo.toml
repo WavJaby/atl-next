@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+# The media player service an app process serves in-process (audio P1a): AOSP's MediaPlayerService (frameworks/av/media/libmediaplayerservice, built as-is by the converter), constructed as instantiate() does minus addService, as `media.player`.
+# C++ is cxx glue (src/bridge.rs) plus wrap/player.{h,cpp}: the construction and the AIBinder conversion, nothing else. No logic (project CLAUDE.md, C++ exception).
+[package]
+name = "atl-media-player"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.atl]
+converter = ["device/libmediaplayerservice", "device/libbinder_ndk", "device/libbinder", "device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+
+[features]
+converter = ["atl-service-view/converter"]
+
+[dependencies]
+atl-service-view = { path = "../atl-service-view" }
+cxx.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
+
+[lints]
+workspace = true

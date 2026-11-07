@@ -56,6 +56,9 @@ pub struct Args {
     /// The per-service break: the services do not register this [`SERVICE_LINES`] service (repeat), so its manager is null and its line must go red.
     #[arg(long)]
     omit_service: Vec<String>,
+    /// The media player break: the app starts with `--no-media-player-service` (atld, then the launcher), so the view answers no media.player; the probe's lookup is never answered and its line reads "no answer", so the gate must go red.
+    #[arg(long)]
+    media_player_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -88,6 +91,12 @@ const SERVICE_LINES: [(&str, &str, &str); 1] = [(
 /// The native bridge's report of a fault handed to a guest handler (x86_64.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
+/// Main.mediaPlayerService's line: "returned" when the view answered the lookup and setDataSource(fd) returned, "no answer" when nothing did. A return means an answer (getMediaPlayerService waits for media.player, IMediaDeathNotifier.cpp:41); a native setDataSource error is logged and dropped by MediaPlayer.java:1305, so MEDIA_PLAYER_RAN carries the served service's own evidence.
+const MEDIA_PLAYER_SERVICE: &str = "AtlTest: media.player: ";
+/// The probe's line when its lookup was answered and setDataSource(fd) returned (MEDIA_PLAYER_SERVICE).
+const MEDIA_PLAYER_ANSWERED: &str = "returned";
+/// The served service's own line, logged inside its setDataSource: it asks the real servicemanager for media.extractor, which this host does not serve (MediaPlayerService.cpp:892-894). Its presence shows the served object ran the call; it goes once media.extractor is served.
+const MEDIA_PLAYER_RAN: &str = "MediaPlayerService: extractor service not available";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -274,6 +283,19 @@ fn font_check(layout: &Layout, line: Option<&str>) -> Result<Vec<String>> {
     Ok(whys)
 }
 
+/// Whether a media.player lookup was logged between Happy Jump's first and last MediaPlayer line: its steps run in that window, and the media.player probe starts after it.
+fn mediaplayer_looked_up(app: &str) -> bool {
+    let lines: Vec<&str> = app.lines().collect();
+    let first = lines.iter().position(|l| l.contains(MEDIAPLAYER));
+    let last = lines.iter().rposition(|l| l.contains(MEDIAPLAYER));
+    match (first, last) {
+        (Some(first), Some(last)) => lines[first..=last]
+            .iter()
+            .any(|l| l.contains("media.player")),
+        _ => false,
+    }
+}
+
 /// Main.onCreate's MediaPlayer lines in order, joined: `new ok; setLooping ok; ...`.
 fn mediaplayer_steps(app: &str) -> String {
     app.lines()
@@ -348,6 +370,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .omit_service
         .iter()
         .fold(rt, |rt, s| rt.without_service(s));
+    let rt = if args.media_player_break {
+        rt.without_media_player_service()
+    } else {
+        rt
+    };
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -525,12 +552,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // Happy Jump's MediaPlayer sequence (native_load.rs PLAYER_STEPS): construction and these steps need no service, so a media.player lookup (the wait J1 forbids) fails the row
     if passed {
         whys.extend(player_failures(&app));
-        if app.contains("media.player") {
+        // J1's steps run between its first and last line; the probe starts after them, so its own lookups fall outside
+        if mediaplayer_looked_up(&app) {
             whys.push("mediaplayer: the app looked up media.player".to_owned());
         }
         if !app.contains(MEDIAPLAYER_START) {
             whys.push("mediaplayer: start() did not reach the native player".to_owned());
         }
+    }
+    // media.player through the view (audio P1a): the probe's setDataSource was answered by the served service and returned
+    let probe = app.lines().find_map(|l| {
+        l.split_once(MEDIA_PLAYER_SERVICE)
+            .map(|(_, r)| r.trim_end().to_owned())
+    });
+    if passed && probe.as_deref() != Some(MEDIA_PLAYER_ANSWERED) {
+        whys.push(format!(
+            "media.player: want {MEDIA_PLAYER_ANSWERED:?}, got {probe:?}"
+        ));
+    }
+    if passed && !app.contains(MEDIA_PLAYER_RAN) {
+        whys.push(format!(
+            "media.player: the served service did not run setDataSource (no {MEDIA_PLAYER_RAN:?} line)"
+        ));
     }
     if passed && !bridge1_ok {
         whys.push(format!(
@@ -580,6 +623,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         for (service, _, want) in SERVICE_LINES {
             println!("app: pass {service} {want}");
         }
+        println!(
+            "app: pass media.player {} (answered through the view; the served service ran setDataSource)",
+            probe.unwrap_or_default()
+        );
         if let Some(n) = es1_compared {
             println!(
                 "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"
@@ -702,6 +749,18 @@ mod tests {
         let why = player_failures(broken);
         assert!(why.iter().any(|w| w.starts_with("mediaplayer new:")));
         assert_eq!(why.len(), PLAYER_STEPS.len());
+    }
+
+    #[test]
+    fn mediaplayer_lookup_counts_only_inside_the_steps() {
+        let steps = "AtlTest: mediaplayer: new ok\nAtlTest: mediaplayer: release ok\n";
+        assert!(!mediaplayer_looked_up(steps));
+        let inside = "AtlTest: mediaplayer: new ok\nW ServiceManagerCppClient: Waited one second for media.player\nAtlTest: mediaplayer: release ok\n";
+        assert!(mediaplayer_looked_up(inside));
+        // after the steps: the probe's own wait, not J1's lookup
+        let after =
+            format!("{steps}W ServiceManagerCppClient: Waited one second for media.player\n");
+        assert!(!mediaplayer_looked_up(&after));
     }
 
     /// The app-log lines atl_jni_es1.c writes for `px`: one `row` line each, in liblog's form.

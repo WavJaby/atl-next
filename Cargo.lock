@@ -110,6 +110,7 @@ dependencies = [
  "atl-codec-store",
  "atl-composer",
  "atl-media-extractors",
+ "atl-media-player",
  "atl-platform-ui",
  "atl-resource-manager",
  "atl-service-view",
@@ -347,6 +348,17 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "atl-bridgegen",
+ "cxx",
+ "cxx-build",
+]
+
+[[package]]
+name = "atl-media-player"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-service-view",
  "cxx",
  "cxx-build",
 ]

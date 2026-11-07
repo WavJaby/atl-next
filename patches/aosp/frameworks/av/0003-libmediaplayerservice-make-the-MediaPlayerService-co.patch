@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 7 Nov 2026 22:38:26 +0800
+Subject: [PATCH] libmediaplayerservice: make the MediaPlayerService()
+ constructor public
+
+instantiate() is the only AOSP caller of the constructor, and it
+registers the new object with the real servicemanager (addService).
+The app process serves media.player through its own service view
+instead, so atl-media-player builds the service itself, as
+instantiate() does minus addService (wrap/player.cpp in that crate).
+
+Upstream-Status: Pending
+Patch-Reason: a private constructor cannot be called from outside the class, and no launcher flag, loader setting or environment variable changes that. The only other route, instantiate(), would addService the object on the real servicemanager, which the app process must not write to.
+---
+SPDX-License-Identifier: Apache-2.0
+ media/libmediaplayerservice/MediaPlayerService.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/media/libmediaplayerservice/MediaPlayerService.h b/media/libmediaplayerservice/MediaPlayerService.h
+index 497ef798f2f6d07ff0a49710af2095410f3e106f..8764eabaf323e0250dd669d47ec611763a2ea651 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.h
++++ b/media/libmediaplayerservice/MediaPlayerService.h
+@@ -502,7 +502,9 @@ private:
+ 
+ // ----------------------------------------------------------------------------
+ 
++public:
+                             MediaPlayerService();
++private:
+     virtual                 ~MediaPlayerService();
+ 
+     mutable     Mutex                       mLock;

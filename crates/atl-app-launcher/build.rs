@@ -319,6 +319,21 @@ fn main() -> Result<()> {
             "cargo::rustc-link-arg-bins=-Wl,--version-script={}",
             map.display()
         );
+        // libmediaplayerservice and libstagefright_httplive NEED libcrypto.so (BoringSSL, providers.toml `libcrypto`), a provided library no converter link line carries (graph.json has no artifact for it): the executable links it from its install prefix (xtask upstream.rs), `-lcrypto` kept against --as-needed; RUNPATH for the modules' NEEDED at run time
+        let prefix = PathBuf::from(
+            std::env::var_os(atl_bridgegen::converter::NATIVE_OUT).context("ATL_NATIVE_OUT")?,
+        )
+        .join("upstream/boringssl/prefix/lib");
+        println!(
+            "cargo::rerun-if-changed={}",
+            prefix.join("libcrypto.so").display()
+        );
+        println!("cargo::rustc-link-search=native={}", prefix.display());
+        println!("cargo::rustc-link-arg-bins=-Wl,--no-as-needed,-lcrypto,--as-needed");
+        println!(
+            "cargo::rustc-link-arg-bins=-Wl,--enable-new-dtags,-rpath,{}",
+            prefix.display()
+        );
     }
     Ok(())
 }
