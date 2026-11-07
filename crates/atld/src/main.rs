@@ -151,6 +151,9 @@ struct Args {
     /// Test only: apps start with `--no-audio-service` (their launcher serves neither AudioFlinger nor AudioPolicyService), the deliberate break of the audio gate.
     #[arg(long)]
     no_audio_service: bool,
+    /// Test only: apps start with `--break-cblk` (their AudioFlinger's tracks get a control block one buffer short), the audio gate's second break.
+    #[arg(long)]
+    break_cblk: bool,
 }
 
 /// Android uids (system/core/libcutils/include/private/android_filesystem_config.h): AID_SYSTEM, AID_APP_START.
@@ -495,6 +498,8 @@ struct Host {
     ui: Option<String>,
     /// test only: each app's launcher gets `--no-audio-service` (the audio gate's break)
     no_audio_service: bool,
+    /// test only: each app's launcher gets `--break-cblk` (the audio gate's second break)
+    break_cblk: bool,
     /// the processes the services started and may kill: the host pids binderd tags them with
     controlled: Mutex<BTreeSet<i32>>,
     /// why the run ends: the `--run-class` command's exit or an explicit stop
@@ -593,6 +598,7 @@ impl Host {
                     self.no_audio_service
                         .then(|| "--no-audio-service".to_owned()),
                 )
+                .chain(self.break_cblk.then(|| "--break-cblk".to_owned()))
                 .chain([
                     format!("-Xbootclasspath:{boot}"),
                     format!("-Xbootclasspath-locations:{boot}"),
@@ -1036,6 +1042,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
         no_audio_service: a.no_audio_service,
+        break_cblk: a.break_cblk,
         controlled: Mutex::new(BTreeSet::new()),
         done: done_tx,
         am: a.am.clone(),

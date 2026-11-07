@@ -202,6 +202,8 @@ pub struct Runtime {
     ui_break: Option<&'static str>,
     /// Apps serve AudioFlinger and AudioPolicyService unless this is cleared (`--no-audio-service`, the audio gate's break).
     audio_service: bool,
+    /// Apps' AudioFlinger gives tracks a control block one buffer short when this is set (`--break-cblk`, the audio gate's second break).
+    audio_break_cblk: bool,
     /// Window pixels each capture reads back (`ATL_UI_CAPTURE_PIXELS`, atl-composer ui_window.rs), when [`Runtime::with_ui_pixels`] set them.
     ui_pixels: Vec<(u32, u32)>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
@@ -532,6 +534,7 @@ impl Runtime {
             ui: None,
             ui_break: None,
             audio_service: true,
+            audio_break_cblk: false,
             ui_pixels: Vec::new(),
             wayland: None,
             app_seccomp: true,
@@ -677,6 +680,12 @@ impl Runtime {
     /// Apps start with `--no-audio-service`: they serve neither AudioFlinger nor AudioPolicyService (audio_app.rs `--break-serve`, test only).
     pub fn without_audio_service(mut self) -> Self {
         self.audio_service = false;
+        self
+    }
+
+    /// Apps start with `--break-cblk`: their AudioFlinger allocates each track's region one buffer short, so createTrack refuses it (audio_app.rs `--break-cblk`, test only).
+    pub fn with_broken_cblk(mut self) -> Self {
+        self.audio_break_cblk = true;
         self
     }
 
@@ -1018,6 +1027,9 @@ impl Runtime {
         }
         if !self.audio_service {
             cmd.arg("--no-audio-service");
+        }
+        if self.audio_break_cblk {
+            cmd.arg("--break-cblk");
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);

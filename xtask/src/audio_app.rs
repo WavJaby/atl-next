@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test audio-app`: the A1a gate. The test APK (xtask/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids, the minimum buffer and a track's player id, which AudioSystem, AudioTrack and PlayerBase need.
-//! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0.
+//! `xtask test audio-app`: the audio gate of A1a (AudioFlinger and AudioPolicyService served) and A1b (createTrack and IAudioTrack). The test APK (xtask/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids and the minimum buffer, builds a track and a low-latency track, and logs their state, piid and frame count.
+//! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served output is atl-audioflinger's OUTPUT_* constants; [`SPEC_RATE_HZ`] and the others copy them, so a change there must change these too (a mismatch is a red gate).
-//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); the track's player id is deferred to A1b (trackPlayer runs only after native_setup succeeds, AudioTrack.java:912); AudioFlinger's and AudioPolicyService's calls were answered in-process (their counter lines).
-//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red.
+//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
+//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each track's region is one buffer short, createTrack refuses it, and both tracks fail to initialise.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,6 +34,9 @@ pub struct Args {
     /// The deliberate break: the app starts with `--no-audio-service`, so it serves neither AudioFlinger nor AudioPolicyService, and the session line must go red.
     #[arg(long)]
     break_serve: bool,
+    /// The second deliberate break: the app starts with `--break-cblk`, so each track's control block region is one buffer short; createTrack refuses it and both tracks must fail to initialise.
+    #[arg(long)]
+    break_cblk: bool,
 }
 
 /// The fixture's dir.
@@ -43,7 +46,7 @@ const TAG: &str = "AtlAudio: ";
 const DONE: &str = "AtlAudio: done";
 /// The app's uid under atld (as the app gate's).
 const APP_UID: u32 = 10_123;
-/// The run's time limit: the APK's start, the two binder lookups' waits (5 s each when a service is missing) and the track.
+/// The run's time limit: the APK's start, the two binder lookups' waits (5 s each when a service is missing) and the two tracks.
 const LIMIT: Duration = Duration::from_secs(180);
 
 /// The served output (atl-audioflinger lib.rs OUTPUT_RATE_HZ, OUTPUT_FRAMES, OUTPUT_LATENCY_MS), copied: the expectation is worked from these, not read back from the service.
@@ -55,12 +58,20 @@ const REQ_RATE_HZ: u64 = 44_100;
 const REQ_CHANNELS: u64 = 2;
 const REQ_BYTES_PER_SAMPLE: u64 = 2;
 
-/// The counter lines the in-process check needs: AudioFlinger's ids and rate, AudioPolicyService's output.
-const IN_PROCESS: [&str; 3] = [
+/// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output and routing.
+const IN_PROCESS: [&str; 5] = [
     "answered IAudioFlingerService.newAudioUniqueId",
     "answered IAudioFlingerService.sampleRate",
     "answered IAudioPolicyService.getOutput",
+    "answered IAudioPolicyService.getOutputForAttr",
+    "answered IAudioFlingerService.createTrack",
 ];
+/// The counter line of a FAST request the server refused (flinger.rs createTrack).
+const FAST_REFUSED: &str = "refused IAudioFlingerService.createTrack.FAST";
+/// AudioTrack.STATE_INITIALIZED; STATE_UNINITIALIZED is 0.
+const STATE_INITIALIZED: i64 = 1;
+/// AudioPlaybackConfiguration.PLAYER_PIID_INVALID: a player that has no piid.
+const PIID_INVALID: i64 = -1;
 
 /// AudioSystem::calculateMinFrameCount at speed 1.0, in frames: `minBufCount` quanta (at least 2) of `sourceFramesNeeded + 2` source frames each, the stretch's `+1 +1` (AudioResamplerPublic.h:109).
 /// The source frames are `dst * src / dstRate + 1 + 1` (uint64 math), since the rates differ.
@@ -71,12 +82,24 @@ fn expected_min_frames() -> u64 {
     min_buf * (needed + 2)
 }
 
+/// The frame count of a track requested at the minimum buffer: AudioFlinger rounds a streaming track's frame count up to a power of two (Tracks.cpp:162, `roundup`).
+fn expected_track_frames() -> u64 {
+    expected_min_frames().next_power_of_two()
+}
+
 /// The value of the app's `AtlAudio: <key><value>` line, the last one if the app logged it twice.
 fn line_value<'a>(app: &'a str, key: &str) -> Option<&'a str> {
     app.lines()
         .filter_map(|l| l.find(TAG).map(|i| &l[i + TAG.len()..]))
         .filter_map(|m| m.strip_prefix(key))
         .next_back()
+}
+
+/// The integer of `key=<n>` among a log line's fields (`state=1 piid=7 frames=2048`).
+fn field(text: Option<&str>, key: &str) -> Option<i64> {
+    text?
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
 }
 
 fn verdict(name: &str, pass: bool, detail: &str) -> bool {
@@ -107,6 +130,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_native_bridge_guest(&args.host)?;
     let rt = if args.break_serve {
         rt.without_audio_service()
+    } else {
+        rt
+    };
+    let rt = if args.break_cblk {
+        rt.with_broken_cblk()
     } else {
         rt
     };
@@ -175,13 +203,41 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
     );
 
-    // Deferred, not judged: trackPlayer runs only after native_setup succeeds (AudioTrack.java:912), and createTrack is A1b.
-    let track = line_value(&app, "track: ").unwrap_or("no line");
-    let track_served = counter_lines(&services)
-        .iter()
-        .any(|l| l.starts_with("answered IAudioService.trackPlayer"));
-    println!(
-        "audio-app: track player id: DEFERRED to A1b (trackPlayer answered: {track_served}; track: {track})"
+    let track = line_value(&app, "track: ");
+    let state = field(track, "state");
+    let piid = field(track, "piid");
+    let frames = field(track, "frames");
+    let want_frames = i64::try_from(expected_track_frames())?;
+    ok &= verdict(
+        "track init",
+        state == Some(STATE_INITIALIZED),
+        &format!(
+            "state {state:?} (STATE_INITIALIZED), line: {}",
+            track.unwrap_or("no line")
+        ),
+    );
+    ok &= verdict(
+        "track piid",
+        piid.is_some_and(|p| p != 0 && p != PIID_INVALID),
+        &format!("piid {piid:?} (nonzero)"),
+    );
+    ok &= verdict(
+        "track frames",
+        frames == Some(want_frames),
+        &format!(
+            "got {frames:?}, expected {want_frames} (the min buffer rounded up to a power of two)"
+        ),
+    );
+
+    let fast = line_value(&app, "fast: ");
+    let fast_state = field(fast, "state");
+    let fast_refused = app.contains(FAST_REFUSED) || services.contains(FAST_REFUSED);
+    ok &= verdict(
+        "fast track",
+        fast_state == Some(STATE_INITIALIZED) && fast_refused,
+        &format!(
+            "state {fast_state:?} (STATE_INITIALIZED); server refused FAST (counted): {fast_refused}"
+        ),
     );
 
     let in_process = IN_PROCESS

@@ -123,16 +123,17 @@ fn install_service_view() -> Result<()> {
 
 /// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for).
 #[cfg(feature = "converter")]
-fn serve_media_services(no_audio_service: bool) -> Result<()> {
+fn serve_media_services(no_audio_service: bool, break_cblk: bool) -> Result<()> {
     if !no_audio_service {
-        atl_audioflinger::serve().map_err(|e| anyhow!(e))?;
+        atl_audioflinger::serve(atl_audioflinger::Options { break_cblk })
+            .map_err(|e| anyhow!(e))?;
     }
     atl_codec_store::serve().map_err(|e| anyhow!(e))?;
     atl_resource_manager::serve().map_err(|e| anyhow!(e))
 }
 
 #[cfg(not(feature = "converter"))]
-fn serve_media_services(_no_audio_service: bool) -> Result<()> {
+fn serve_media_services(_no_audio_service: bool, _break_cblk: bool) -> Result<()> {
     Ok(())
 }
 
@@ -180,7 +181,7 @@ fn run() -> Result<i32> {
         );
     }
     install_service_view()?;
-    serve_media_services(launch.no_audio_service)?;
+    serve_media_services(launch.no_audio_service, launch.break_cblk)?;
     load_media_extractors();
     let mut vm_options = launch.vm_options.clone();
     if launch.app {

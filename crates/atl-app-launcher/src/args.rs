@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--no-audio-service] <VM option>... <class> [<arg>...]`.
+//! The command line: `atl-app-launcher [--target-sdk=<n>] [--app] [--no-audio-service] [--break-cblk] <VM option>... <class> [<arg>...]`.
 //! VM options are dalvikvm's (art/dalvikvm/dalvikvm.cc): every argument up to the first not starting with `-` goes to `JNI_CreateJavaVM`, `-cp` / `-classpath` taking the next one with it; the class follows, then main's arguments.
 //! Launcher options start with `--` and come first; ART takes no option of that form.
 
@@ -15,6 +15,8 @@ pub struct Launch {
     pub app: bool,
     /// Test only: the process serves neither AudioFlinger nor AudioPolicyService (lib.rs serve_media_services), the audio gate's deliberate break.
     pub no_audio_service: bool,
+    /// Test only: AudioFlinger's tracks get a control block one buffer short (`atl_audioflinger::Options`), the audio gate's deliberate break.
+    pub break_cblk: bool,
     pub vm_options: Vec<CString>,
     /// None: none given; dalvikvm reports that after creating the VM (so `-help` and the like run).
     pub class: Option<String>,
@@ -24,6 +26,7 @@ pub struct Launch {
 const TARGET_SDK: &str = "--target-sdk=";
 const APP: &str = "--app";
 const NO_AUDIO_SERVICE: &str = "--no-audio-service";
+const BREAK_CBLK: &str = "--break-cblk";
 
 pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
     let mut it = argv
@@ -34,6 +37,7 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         target_sdk: 0,
         app: false,
         no_audio_service: false,
+        break_cblk: false,
         vm_options: Vec::new(),
         class: None,
         args: Vec::new(),
@@ -48,6 +52,11 @@ pub fn parse(argv: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
         }
         if text == NO_AUDIO_SERVICE {
             launch.no_audio_service = true;
+            pending = it.next().transpose()?;
+            continue;
+        }
+        if text == BREAK_CBLK {
+            launch.break_cblk = true;
             pending = it.next().transpose()?;
             continue;
         }
@@ -101,6 +110,14 @@ mod tests {
         assert!(l.no_audio_service);
         assert_eq!(l.class.as_deref(), Some("Main"));
         assert!(!p(&["Main"]).unwrap().no_audio_service);
+    }
+
+    #[test]
+    fn break_cblk_is_a_launcher_option() {
+        let l = p(&["--break-cblk", "--no-audio-service", "Main"]).unwrap();
+        assert!(l.break_cblk && l.no_audio_service);
+        assert_eq!(l.class.as_deref(), Some("Main"));
+        assert!(!p(&["Main"]).unwrap().break_cblk);
     }
 
     #[test]

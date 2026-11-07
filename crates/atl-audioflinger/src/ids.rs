@@ -6,8 +6,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// `AUDIO_UNIQUE_ID_USE_MAX` (system/media/audio/include/system/audio.h:201): a power of two; the step between ids of one use.
 const USE_MAX: u32 = 8;
+/// `AUDIO_UNIQUE_ID_USE_SESSION` (audio.h:190): audio_session_t, the ids AudioManager.generateAudioSessionId and a track's session 0 get.
+pub const USE_SESSION: u32 = 1;
 /// `AUDIO_UNIQUE_ID_USE_OUTPUT` (audio.h AUDIO_UNIQUE_ID_USE_OUTPUT = 5).
 pub const USE_OUTPUT: u32 = 5;
+/// `AUDIO_UNIQUE_ID_USE_CLIENT` (audio.h:197): client-side players and recorders; a track's port id comes from this use.
+pub const USE_CLIENT: u32 = 7;
 
 static NEXT: [AtomicU32; USE_MAX as usize] = [const { AtomicU32::new(USE_MAX) }; USE_MAX as usize];
 
