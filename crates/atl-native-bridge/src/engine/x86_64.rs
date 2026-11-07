@@ -239,7 +239,7 @@ std::arch::global_asm!(
         "    push %r11\n",
         "    mov 0(%r10), %r11\n",
         "    cmp 24(%r10), %r11\n",
-        "    jae 9f\n",
+        "    jae 8f\n",
         "    mov %rbx, 24(%r11)\n",
         "    pop 16(%r11)\n",
         "    pop 0(%r11)\n",
@@ -259,7 +259,16 @@ std::arch::global_asm!(
         "    push 0(%r10)\n",
         "    mov 24(%r10), %rbx\n",
         "    ret\n",
-        "9:  ud2\n",
+        // no way up: report (r10 = the record, 0 when the slot held none), then trap
+        "8:  pop %r11\n",
+        "9:  mov %r10, %rdi\n",
+        "    mov %r11, %rsi\n",
+        "    mov (%rsp), %rdx\n",
+        "    mov %rsp, %rcx\n",
+        "    rdfsbase %r8\n",
+        "    and $-16, %rsp\n",
+        "    call {up_failed}\n",
+        "    ud2\n",
         ".size atl_nb_up, .-atl_nb_up\n",
         // host->guest (down call): entered by `jmp` from a down stub with %r10 = guest target; [rsp] = host return, then the caller's stack args.
         // Frame (4 words, as up): host return, guest target, host FS, the caller's %rbx; %rbx = the record while the guest runs (callee-saved by it).
@@ -409,8 +418,118 @@ std::arch::global_asm!(
     slot = const SLOT_OFFSET,
     thunks = const THUNKS,
     gettid = const libc::SYS_gettid,
+    up_failed = sym up_failed,
     options(att_syntax)
 );
+
+/// Guest stack words `up_failed` reports: enough for a few frames of caller chain.
+const STACK_WORDS: usize = 96;
+
+/// Whether maps line `line` (`start-end perms ...`, hex) covers `addr`.
+fn maps_line_covers(line: &[u8], addr: usize) -> bool {
+    let hex = |s: &[u8]| {
+        s.iter().try_fold(0usize, |v, c| {
+            Some(v.checked_mul(16)? + (*c as char).to_digit(16)? as usize)
+        })
+    };
+    let mut range = line
+        .split(|c| *c == b' ')
+        .next()
+        .unwrap_or(&[])
+        .split(|c| *c == b'-');
+    match (range.next().and_then(hex), range.next().and_then(hex)) {
+        (Some(start), Some(end)) => (start..end).contains(&addr),
+        _ => false,
+    }
+}
+
+/// Writes to stderr the `/proc/self/maps` lines covering `addrs`; streamed through a stack buffer (see `up_failed`).
+fn emit_mappings(addrs: &[usize]) {
+    // SAFETY: a NUL-terminated path; the fd is closed below.
+    let fd = unsafe { libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 8192];
+    let mut have = 0;
+    loop {
+        // SAFETY: the unfilled tail of `buf`.
+        let n = unsafe { libc::read(fd, buf[have..].as_mut_ptr().cast(), buf.len() - have) };
+        if n <= 0 {
+            break;
+        }
+        have += n as usize;
+        let mut done = 0;
+        while let Some(nl) = buf[done..have].iter().position(|c| *c == b'\n') {
+            let line = &buf[done..=done + nl];
+            if addrs.iter().any(|a| maps_line_covers(line, *a)) {
+                // SAFETY: a live buffer; a failed write loses only the line.
+                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            }
+            done += nl + 1;
+        }
+        buf.copy_within(done..have, 0);
+        have -= done;
+    }
+    // SAFETY: the fd opened above.
+    unsafe { libc::close(fd) };
+}
+
+/// `atl_nb_up` found no way up: names why on stderr. Runs on the guest FS: no TLS, no heap, so only stack buffers and raw write.
+/// `ht` null: the guest TCB slot held no record. Else the shadow stack is full; its frames name what never returned (up: return, guest FS, host target, rbx; down: host return, guest target, host FS, rbx).
+/// `sp`: the guest stack at the crossing; its words go out with the mappings of those that are code, the caller chain a frame-pointerless guest leaves. `fs`: the FS base found.
+extern "C" fn up_failed(
+    ht: *const HostThread,
+    target: usize,
+    guest_return: usize,
+    sp: *const usize,
+    fs: usize,
+) {
+    use std::io::Write;
+    let mut line = [0u8; 160];
+    let emit = |line: &[u8]| {
+        // SAFETY: a live buffer; a failed write leaves only the trap.
+        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    };
+    let mut w = &mut line[..];
+    let why = if ht.is_null() {
+        "no crossing record"
+    } else {
+        "shadow stack full"
+    };
+    let _ = writeln!(
+        w,
+        "atl-native-bridge: guest->host: {why}: target {target:#x} guest return {guest_return:#x} fs {fs:#x}"
+    );
+    let left = w.len();
+    emit(&line[..line.len() - left]);
+    let mut words = [target; STACK_WORDS];
+    words[1] = guest_return;
+    for (i, word) in words.iter_mut().enumerate().skip(2) {
+        // SAFETY: the live stack of this thread, read upward from its top of stack; STACK_WORDS stays inside any frame chain that reached a crossing.
+        *word = unsafe { sp.add(i).read() };
+        let mut w = &mut line[..];
+        let _ = writeln!(w, "atl-native-bridge: stack +{:#x} {word:#x}", i * 8);
+        let left = w.len();
+        emit(&line[..line.len() - left]);
+    }
+    emit_mappings(&words);
+    if ht.is_null() {
+        return;
+    }
+    // SAFETY: non-null `ht` is the live record of this thread, which is stopped here.
+    let frames = unsafe { &(*ht).shadow };
+    for f in frames.as_chunks::<FRAME_WORDS>().0 {
+        let mut w = &mut line[..];
+        let _ = writeln!(
+            w,
+            "atl-native-bridge: frame {:#x} {:#x} {:#x}",
+            f[0], f[1], f[2]
+        );
+        let left = w.len();
+        emit(&line[..line.len() - left]);
+    }
+}
 
 // the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot; frames are 32 bytes in the asm
 const _: () = assert!(JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 32);
@@ -594,3 +713,18 @@ pub fn down(target: usize, kind: Down) -> Result<usize, String> {
 
 /// x86_64 `movabs $imm64, %r11` opcode bytes (REX.W+B, B8+r): the NBS x86_64 interceptable stub starts with it, then `jmp *%r11`.
 pub const STUB_PREFIX: [u8; 2] = [0x49, 0xbb];
+
+#[cfg(test)]
+mod tests {
+    use super::maps_line_covers;
+
+    /// proc(5): the range is `start-end`, end exclusive; a line without one covers nothing.
+    #[test]
+    fn maps_range_is_half_open() {
+        let line = b"7f00-7f10 r-xp 00000000 08:30 1 /lib/x.so\n";
+        assert!(maps_line_covers(line, 0x7f00));
+        assert!(maps_line_covers(line, 0x7f0f));
+        assert!(!maps_line_covers(line, 0x7f10));
+        assert!(!maps_line_covers(b"not a mapping\n", 0x7f00));
+    }
+}
