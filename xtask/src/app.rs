@@ -41,6 +41,9 @@ pub struct Args {
     /// The bridge-1 JNI fixture variant packaged, by API level = the APK's minSdk: 21 = emulated TLS, 29 = ELF TLS (jni_fixture.rs).
     #[arg(long, default_value_t = jni_fixture::EMULATED_TLS_API)]
     fixture_api: u32,
+    /// The C12 break: leaves this native-bridge guest library (an NB_LIBS file, e.g. libstdc++.so or libz.so) out of the guest, so the legacy fixture's load fails naming it; the gate must then go red.
+    #[arg(long)]
+    drop_nb_lib: Option<String>,
 }
 
 /// The fixture's dir.
@@ -82,6 +85,12 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("glesPbuffer", "4096"),
     // after glesPbuffer, the process maps the host driver (a /proc/self/maps line naming "mesa"): the proxies reached Mesa, not a stand-in
     ("mesaMapped", "1"),
+    // C12 legacy fixture (AtlLegacyTest.java, atl_jni_legacy.cpp): seven values in order: 17 (fprintf "legacy-stdout 42\n"), 1 (_CTYPE_U of 'A'), 6 (strlen "abcdef"), 3 (strchr 'd' offset), 2 (strlen after strncpy "xy"), 2 (fpclassify(NAN) = FP_NAN 0x02), 2 (errno ENOENT after a failing open)
+    ("legacyStdio", "17 1 6 3 2 2 2"),
+    // new int(40) through operator new/delete, then the guarded static g_seed + 2
+    ("legacyNew", "40 42"),
+    // compress + uncompress of "123456789", then crc32 of the result: the CRC-32 check value 0xCBF43926 (3421780262)
+    ("zRoundTrip", "3421780262"),
 ];
 /// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
@@ -198,6 +207,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?
     .with_gl_driver()?
     .with_native_bridge_guest(&args.host)?;
+    let rt = match &args.drop_nb_lib {
+        Some(file) => rt.without_nb_lib(file)?,
+        None => rt,
+    };
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -304,7 +317,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .unwrap_or_else(|| "FAIL no cacerts line".to_owned());
     let bridge1 = app.lines().find(|l| l.contains(BRIDGE1));
     let bridge1_ok = bridge1.is_some();
-    let mut whys = Vec::new();
+    let mut whys = jni_fixture::legacy_failures(&native.libs)?;
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
         println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));

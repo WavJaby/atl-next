@@ -85,8 +85,8 @@ pub fn gl_front(out: &Path, module: &str) -> PathBuf {
 /// The native-bridge guest's linker and main executable (NBS modules; `app_process64` = argv[1] of the guest linker, atl-native-bridge engine/mod.rs).
 const NB_LINKER: &str = "native_bridge_guest_linker";
 const NB_EXE: &str = "native_bridge_guest_app_process";
-/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), and the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
-const NB_LIBS: [(&str, &str); 16] = [
+/// The guest libraries `app_process64`'s closure needs (its and their `DT_NEEDED`), by (module, file): NBS's guest libc and linker helpers, AOSP's guest libcutils / libutils / liblog (NBS `NATIVE_BRIDGE_ORIG_GUEST_LIBS`), the GL / window proxies (`libnative_bridge_guest_*`, installed under their stems) that route GL calls to the host fronts (GS2), and AOSP's guest zlib and libstdc++ (C12: DT_NEEDED of the legacy fixture, not of app_process). libc++.so comes from the runtimes build (runtimes.rs `shared_libcxx`).
+const NB_LIBS: [(&str, &str); 18] = [
     ("libnative_bridge_guest_libc", "libc.so"),
     ("libm", "libm.so"),
     ("libdl", "libdl.so"),
@@ -97,6 +97,8 @@ const NB_LIBS: [(&str, &str); 16] = [
     ("libdl_android", "libdl_android.so"),
     ("libcutils", "libcutils.so"),
     ("libutils", "libutils.so"),
+    ("libz", "libz.so"),
+    ("libstdc++", "libstdc++.so"),
     ("libnative_bridge_guest_libEGL", "libEGL.so"),
     ("libnative_bridge_guest_libGLESv1_CM", "libGLESv1_CM.so"),
     ("libnative_bridge_guest_libGLESv2", "libGLESv2.so"),
@@ -586,6 +588,19 @@ impl Runtime {
             );
         }
         self.native_bridge_guest = files;
+        Ok(self)
+    }
+
+    /// The C12 break (`test app --drop-nb-lib`): leaves the NB_LIBS file `file` out of the guest's lib dir, so a guest load that needs it fails naming it. Errors when no placed file has that name.
+    pub fn without_nb_lib(mut self, file: &str) -> Result<Self> {
+        let at = format!("/{file}");
+        let before = self.native_bridge_guest.len();
+        self.native_bridge_guest
+            .retain(|(_, dst)| !dst.ends_with(at.as_str()));
+        ensure!(
+            self.native_bridge_guest.len() < before,
+            "--drop-nb-lib {file}: no placed native-bridge file of that name"
+        );
         Ok(self)
     }
 

@@ -39,6 +39,7 @@ public class Main extends Activity {
         if (jni != null) {
             bridge1Calls(jni);
         }
+        bridge1Legacy();
         Log.i("AtlTest", "onCreate reached");
     }
 
@@ -105,6 +106,22 @@ public class Main extends Activity {
         bridge1Call(jni, "propCallbacks", "propCallbacks");
         bridge1Call(jni, "glesPbuffer", "glesPbuffer");
         bridge1Call(jni, "mesaMapped", "mesaMapped");
+    }
+
+    /** C12 legacy rows (AtlLegacyTest.java), loaded apart from the bridge-1 fixture. A failed load logs every row as threw, with ART's reason (the library's name). */
+    private static void bridge1Legacy() {
+        Class<?> legacy;
+        try {
+            legacy = Class.forName("atl.bridge1.testlib.AtlLegacyTest");
+        } catch (Throwable t) {
+            for (String row : new String[] {"legacyStdio", "legacyNew", "zRoundTrip"}) {
+                Log.i("AtlTest", "bridge1 call " + row + " = threw " + t);
+            }
+            return;
+        }
+        bridge1Call(legacy, "legacyStdio", "legacyStdio");
+        bridge1Call(legacy, "legacyNew", "legacyNew");
+        bridge1Call(legacy, "zRoundTrip", "zRoundTrip");
     }
 
     /** The default TrustManagerFactory's issuers (Conscrypt: AndroidCAStore -> TrustedCertificateStore): "trusted <ROOT> of <n>", or why not. */

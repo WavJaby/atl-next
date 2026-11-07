@@ -47,6 +47,22 @@ const LIB: &str = "libatl-jni-test.so";
 const SIBLING: &str = "libatl-jni-sibling.so";
 /// libc++ the fixture links (`-stdlib=libc++`, NDK clang++'s shared default); packaged next to the fixture as an app packages it.
 const CXX_SHARED: &str = "libc++_shared.so";
+/// The C12 legacy fixture (atl_jni_legacy.cpp): C and C++ calls old NDK binaries make, linked to the guest's libstdc++.so and libz.so instead of libc++.
+const LEGACY: &str = "libatl-jni-legacy.so";
+/// DT_NEEDED the legacy fixture names: the guest libraries that answer its calls (atld_run.rs NB_LIBS rows).
+const LEGACY_NEEDED: [&str; 2] = ["libstdc++.so", "libz.so"];
+/// Imports the legacy fixture carries, each one a call its source makes at run time: a folded call drops its import, and the check fails.
+const LEGACY_IMPORTS: [&str; 9] = [
+    "__sF",
+    "_ctype_",
+    "__strlen_chk",
+    "_Znwm",
+    "_ZdlPv",
+    "__cxa_guard_acquire",
+    "crc32",
+    "compress",
+    "uncompress",
+];
 
 /// One built variant: its API level and the libraries an APK carries for it.
 pub struct Built {
@@ -166,13 +182,37 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
     )?;
     std::fs::remove_file(&c_obj)?;
     std::fs::remove_file(&cxx_obj)?;
+    let legacy = dir.join(LEGACY);
+    let legacy_obj = dir.join("atl_jni_legacy.o");
+    // Old NDK default: C++11 without sized operator delete. The guest's libstdc++ has no `_ZdlPvm` (bionic/libstdc++/include/new: TODO), so clang's C++14 default would make a modern-ABI import this fixture must not carry.
+    compile(
+        "clang++",
+        &legacy_obj,
+        "atl_jni_legacy.cpp",
+        &[
+            "-std=c++11",
+            "-fno-sized-deallocation",
+            "-D_FORTIFY_SOURCE=2",
+        ],
+    )?;
+    host_art::exec(
+        t.cmd("clang++")
+            .args(["-shared", "-nostdlib++"])
+            .arg(&legacy_obj)
+            .arg(format!("-Wl,-soname,{LEGACY}"))
+            .args(["-lstdc++", "-lz"])
+            .arg("-o")
+            .arg(&legacy),
+        "NDK clang++ legacy link",
+    )?;
+    std::fs::remove_file(&legacy_obj)?;
     let cxx = t.sysroot_lib.join(CXX_SHARED);
     let cxx_copy = dir.join(CXX_SHARED);
     std::fs::copy(&cxx, &cxx_copy).with_context(|| format!("copying {}", cxx.display()))?;
     Ok(Built {
         api,
         dir,
-        libs: vec![lib, sibling, cxx_copy],
+        libs: vec![lib, sibling, cxx_copy, legacy],
     })
 }
 
@@ -418,9 +458,61 @@ pub fn apk_libs(root: &Path, arch: &str, api: u32, out: &Path) -> Result<NativeL
     })
 }
 
+/// The C12 legacy fixture's ELF expectations: DT_NEEDED names the guest libraries that answer its calls, and each import is one its source calls at run time.
+fn legacy_shape_failures(s: &Shape) -> Vec<String> {
+    let mut f = Vec::new();
+    for n in LEGACY_NEEDED {
+        if !s.needed.iter().any(|x| x == n) {
+            f.push(format!(
+                "{LEGACY}: DT_NEEDED lacks {n} (has {:?})",
+                s.needed
+            ));
+        }
+    }
+    for i in LEGACY_IMPORTS {
+        if !s.imports.contains(i) {
+            f.push(format!("{LEGACY}: no import {i}"));
+        }
+    }
+    f
+}
+
+/// The legacy fixture among the APK's `libs` (apk_libs), checked by `legacy_shape_failures`.
+pub fn legacy_failures(libs: &[PathBuf]) -> Result<Vec<String>> {
+    let lib = libs
+        .iter()
+        .find(|l| l.file_name().is_some_and(|n| n == LEGACY))
+        .with_context(|| format!("no {LEGACY} among the fixture libraries"))?;
+    Ok(legacy_shape_failures(&shape(lib)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_shape_wants_its_guest_libs_and_calls() {
+        let shape_of = |needed: &[&str], drop: Option<&str>| Shape {
+            needed: needed.iter().map(|&n| n.to_owned()).collect(),
+            verneed: BTreeSet::new(),
+            imports: LEGACY_IMPORTS
+                .iter()
+                .filter(|&&i| Some(i) != drop)
+                .map(|&i| i.to_owned())
+                .collect(),
+            pt_tls: false,
+        };
+        let all = ["libc.so", "libstdc++.so", "libz.so"];
+        assert!(legacy_shape_failures(&shape_of(&all, None)).is_empty());
+        assert_eq!(
+            legacy_shape_failures(&shape_of(&["libc.so", "libstdc++.so"], None)).len(),
+            1
+        );
+        assert_eq!(
+            legacy_shape_failures(&shape_of(&all, Some("_Znwm"))).len(),
+            1
+        );
+    }
 
     fn s(imports: &[&str], pt_tls: bool) -> Shape {
         Shape {
