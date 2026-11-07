@@ -123,6 +123,40 @@ fn parse_label(text: &str) -> Option<Location> {
 }
 
 impl IioSensors {
+    /// What [`Sensors`] reads, as host paths a sandbox shows read-only at their own place: the device list dir (listed, so it is shown whole: a sandbox that shows only its entries cannot list it),
+    /// every device's udev database entry, and each listed accelerometer's real dir (a kernel entry is a relative link into `/sys/devices`, which then resolves). Unlisted devices' links dangle there and are skipped as non-accelerometers.
+    /// A device plugged in later is not covered: the sandbox's view is fixed at its start. Empty when there is no list dir.
+    pub fn read_paths(&self) -> Vec<PathBuf> {
+        if !self.root.is_dir() {
+            return Vec::new();
+        }
+        let mut v = vec![self.root.clone()];
+        // every device's udev entry: its location decides whether it is listed, so a sandbox without a base device's entry would list it
+        let mut ids: Vec<String> = std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        ids.sort();
+        for id in &ids {
+            if let Some(dev) = read_text(&self.device(id).join("dev")) {
+                let db = self.udev.join(format!("c{dev}"));
+                if db.is_file() {
+                    v.push(db);
+                }
+            }
+        }
+        for a in self.accelerometers() {
+            let dir = self.device(&a.id);
+            if let Ok(real) = std::fs::canonicalize(&dir)
+                && !real.starts_with(&self.root)
+            {
+                v.push(real);
+            }
+        }
+        v
+    }
+
     fn device(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
@@ -295,6 +329,27 @@ mod tests {
 
     fn close(a: [f32; 3], b: [f32; 3]) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    #[test]
+    fn read_paths_show_the_list_and_every_udev_entry() {
+        // device0: display; device1: base, whose entry must be shown too (without it the sandbox lists it as display)
+        let f = Fake::new(
+            "paths",
+            &[
+                (&RAW, Some("E:ACCEL_LOCATION=display\n")),
+                (&RAW, Some("E:ACCEL_LOCATION=base\n")),
+            ],
+        );
+        // plain dirs (no kernel links): the list dir covers them
+        assert_eq!(
+            f.sensors().read_paths(),
+            vec![
+                f.0.join("sys"),
+                f.0.join("udev/c250:0"),
+                f.0.join("udev/c250:1")
+            ]
+        );
     }
 
     #[test]

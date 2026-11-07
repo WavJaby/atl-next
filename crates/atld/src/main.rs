@@ -1139,15 +1139,22 @@ fn run(a: &Args) -> Result<ExitCode> {
         "--keychars".into(),
         r.system().join("usr/keychars").into_os_string(),
     ]);
+    let mut services_spawn = system_spawn(
+        "services",
+        &a.services,
+        services_args,
+        false,
+        Some(control_theirs),
+    )?;
+    // sensorservice's source reads the machine's accelerometers (PlatformSensors), which the minimal root does not show
+    let sensor_paths = atl_platform_host::PlatformSensors::default().read_paths();
+    log(format_args!("services: sensor paths {sensor_paths:?}"));
+    services_spawn
+        .mounts
+        .extend(sensor_paths.iter().map(|p| ro_at_own_path(p)));
     let mut services = host
         .broker
-        .spawn(system_spawn(
-            "services",
-            &a.services,
-            services_args,
-            false,
-            Some(control_theirs),
-        )?)
+        .spawn(services_spawn)
         .context("starting atl-system-services")?;
     wait_ready(
         &mut services.child,
