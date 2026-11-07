@@ -35,6 +35,9 @@ pub struct Args {
     /// Print every ART run's command, stdout and stderr.
     #[arg(long, short)]
     verbose: bool,
+    /// The PlayerIdCard break: the driver checks that case with one byte of the codec's encoding flipped (ParcelTruth MODE_CORRUPT), so `PlayerBase.PlayerIdCard` must fail.
+    #[arg(long)]
+    break_player_card: bool,
 }
 
 const PACKAGE: &str = "atl-aidl";
@@ -47,6 +50,8 @@ const SIZE_FAILURE: &str = "Parcel's encoding gives";
 const WRONG_BYTES: &str = "52";
 /// The probe's permission-hook mode (atl-aidl src/bin/probe.rs).
 const ENFORCE: &str = "--enforce";
+/// The driver's argument for the PlayerIdCard break (ParcelTruth.java BREAK_PLAYER_CARD).
+const BREAK_PLAYER_CARD: &str = "--break-player-card";
 
 /// The Java driver's dir and class (xtask/testdata/parcel).
 const FIXTURE: &str = "xtask/testdata/parcel/java";
@@ -58,7 +63,7 @@ const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_APP_START (system/core/libcutils/include/private/android_filesystem_config.h), the first app uid, as an app process has.
 const AID_APP_START: u32 = 10000;
 /// Every line ParcelTruth.java prints, by case, in its order: a missing one fails the stage (a driver that stops early passes nothing). `summary` is its last line.
-const CASES: [&str; 72] = [
+const CASES: [&str; 75] = [
     "ApplicationInfo",
     "ApplicationInfo:meta-data",
     "ActivityInfo",
@@ -125,6 +130,9 @@ const CASES: [&str; 72] = [
     "ImeOnBackInvokedDispatcher",
     "ImeTracker_Token",
     "InputMethodInfoSafeList:empty",
+    "PlayerBase.PlayerIdCard",
+    "PlayerBase.PlayerIdCard:binder",
+    "AudioAttributes:flattened",
     "self-test:corrupt",
     "self-test:wrong-codec",
     "self-test:refusal",
@@ -276,34 +284,36 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         to_parcel.display(),
         kcm.display()
     );
-    let cmd = art.command(
-        &fixture,
-        &fixture.area.1,
-        &[],
-        DRIVER,
-        &[
-            lib.display().to_string(),
-            runtime.display().to_string(),
-            keymap.display().to_string(),
-        ],
-    );
+    let mut driver_args = vec![
+        lib.display().to_string(),
+        runtime.display().to_string(),
+        keymap.display().to_string(),
+    ];
+    if args.break_player_card {
+        driver_args.push(BREAK_PLAYER_CARD.to_owned());
+    }
+    let cmd = art.command(&fixture, &fixture.area.1, &[], DRIVER, &driver_args);
     let what = format!("{cmd:?}");
-    // the run reads its inputs by host path: the fixture's library dir, runtime and keymap, read-only at their own paths
+    // the sandbox shows only what is mounted: the slot read-only at its own path (boot jars, ART root, launcher, fixture dex, runtime, keymap, property area: the launcher
+    // refuses to start without the area its variable names), ANDROID_DATA writable inside it, as native_load runs its launcher
     let run = (|| -> Result<_> {
         let mut s = binder::spawn_of(&cmd, AID_APP_START)?;
         s.stdout = std::process::Stdio::piped();
         s.stderr = std::process::Stdio::piped();
-        for p in [&lib, &runtime, &keymap] {
-            if p.is_dir() {
-                s.mounts.extend(atl_broker::tree_mounts(p)?);
-            } else {
-                s.mounts.push(atl_broker::Mount {
-                    host: p.clone(),
-                    at: p.clone(),
-                    writable: false,
-                });
-            }
-        }
+        s.mounts.push(atl_broker::Mount {
+            host: out.clone(),
+            at: out.clone(),
+            writable: false,
+        });
+        // the staged ART root's links name files outside the slot (ICU data in src/aosp): their targets are mounted too
+        s.mounts.extend(atl_broker::tree_mounts(&art.art)?);
+        let data = fixture.work.join("data");
+        std::fs::create_dir_all(&data)?;
+        s.mounts.push(atl_broker::Mount {
+            host: data.clone(),
+            at: data,
+            writable: true,
+        });
         let p = broker.spawn(s).context("spawning the parcel run")?;
         art.finish(&what, p.child)
     })();

@@ -75,7 +75,14 @@ import android.os.UserHandle;
 import android.os.storage.StorageVolume;
 import android.window.ActivityWindowInfo;
 import android.window.SizeConfigurationBuckets;
+import android.media.AudioAttributes;
+import android.media.AudioPlaybackConfiguration;
+import android.media.IPlayer;
+import android.media.PlayerBase;
+import android.media.VolumeShaperConfiguration;
+import android.media.VolumeShaperOperation;
 import java.io.File;
+import java.lang.reflect.Constructor;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -103,6 +110,8 @@ public class ParcelTruth {
     static final int MODE_FD_SELF = 3;
     /// Bundle only: the input is two marshalled Bundles, A then B; the result is A with putAll(B).
     static final int MODE_PUT_ALL = 4;
+    /// The driver's argument (args[3], parcel.rs BREAK_PLAYER_CARD): the PlayerIdCard case runs with MODE_CORRUPT, so it must fail.
+    static final String BREAK_PLAYER_CARD = "--break-player-card";
     static int failures = 0;
 
     public static void main(String[] args) {
@@ -274,6 +283,11 @@ public class ParcelTruth {
         // show/hideSoftInput's token and getInputMethodList's empty answer (atl-services input_method.rs)
         checkImeToken("ImeTracker_Token");
         check("InputMethodInfoSafeList:empty", InputMethodInfoSafeList.empty(), InputMethodInfoSafeList.CREATOR);
+        // the player path (AudioService.trackPlayer, atl-services audio.rs): the card SoundPool sends, its AudioAttributes (both tag forms), and the card's IPlayer binder
+        boolean breakCard = args.length > 3 && BREAK_PLAYER_CARD.equals(args[3]);
+        check("PlayerBase.PlayerIdCard", playerIdCard(null), PlayerBase.PlayerIdCard.CREATOR, breakCard ? MODE_CORRUPT : MODE_PLAIN);
+        checkPlayerIdCardBinder("PlayerBase.PlayerIdCard:binder");
+        checkFlattenedAttributes("AudioAttributes:flattened");
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
@@ -1049,10 +1063,15 @@ public class ParcelTruth {
     }
 
     static void check(String name, Parcelable p, Parcelable.Creator<?> creator) {
+        check(name, p, creator, MODE_PLAIN);
+    }
+
+    /// `mode` MODE_CORRUPT: the codec's bytes come back with one byte flipped (the PlayerIdCard break), so the comparison below must fail.
+    static void check(String name, Parcelable p, Parcelable.Creator<?> creator, int mode) {
         String cls = p.getClass().getName();
         if (p.getClass().isAnonymousClass()) cls = p.getClass().getSuperclass().getName(); // CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO is an anonymous subclass; a nested class keeps its `$` name
         byte[] java = marshal(p);
-        byte[] rust = roundTrip(cls, java, MODE_PLAIN);
+        byte[] rust = roundTrip(cls, java, mode);
         if (rust == null) {
             result(false, name, "rust: " + lastError());
             dumpHex(name, java);
@@ -1071,6 +1090,93 @@ public class ParcelTruth {
         }
         boolean ok = Arrays.equals(java, again);
         result(ok, name, ok ? java.length + " bytes, java -> rust -> java byte-equal" : "java re-encodes rust's bytes differently at byte " + firstDiff(java, again));
+    }
+
+    /// AudioAttributes with every field off its default: usage, content type, flags, two tags, a bundle (writeToParcel's array form and bundle marker).
+    static AudioAttributes taggedAttributes() {
+        Bundle extra = new Bundle();
+        extra.putString("atl.key", "value");
+        return new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
+                .addTag("atl:first")
+                .addTag("atl:second")
+                .addBundle(extra)
+                .build();
+    }
+
+    /// PlayerBase.PlayerIdCard as baseRegisterPlayer builds it (PlayerBase.java:126). The constructor is package-private, so reflection reaches it; the class and its CREATOR are public.
+    static PlayerBase.PlayerIdCard playerIdCard(IPlayer player) {
+        try {
+            Constructor<PlayerBase.PlayerIdCard> c = PlayerBase.PlayerIdCard.class.getDeclaredConstructor(
+                    int.class, AudioAttributes.class, IPlayer.class, int.class);
+            c.setAccessible(true);
+            return c.newInstance(AudioPlaybackConfiguration.PLAYER_TYPE_JAM_SOUNDPOOL, taggedAttributes(), player, 7);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /// A local IPlayer (PlayerBase's IPlayerWrapper is private). Every call is a no-op: the case only needs the object's identity.
+    static class PlayerStub extends IPlayer.Stub {
+        public void start() {}
+        public void pause() {}
+        public void stop() {}
+        public void setVolume(float vol) {}
+        public void setPan(float pan) {}
+        public void setStartDelayMs(int delayMs) {}
+        public void applyVolumeShaper(VolumeShaperConfiguration configuration, VolumeShaperOperation operation) {}
+    }
+
+    /// The IPlayer binder goes Java Parcel -> codec -> Java Parcel with the body (as Bundle:binder does): Java reads the same IPlayer back, and the card equals the one sent.
+    static void checkPlayerIdCardBinder(String name) {
+        PlayerStub player = new PlayerStub();
+        PlayerBase.PlayerIdCard sent = playerIdCard(player);
+        Parcel in = written(sent);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.media.PlayerBase$PlayerIdCard", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        PlayerBase.PlayerIdCard back = PlayerBase.PlayerIdCard.CREATOR.createFromParcel(out);
+        boolean ok = consumed && back.mIPlayer == player && back.equals(sent);
+        result(ok, name, ok ? "IPlayer survived java -> rust -> java: same object, card equal" : "IPlayer " + back.mIPlayer + ", sizes " + in.dataSize() + "/" + out.dataSize());
+        in.recycle();
+        out.recycle();
+    }
+
+    /// AudioAttributes written with FLATTEN_TAGS (the native marshalling's form): one flattened string, no bundle. Java's bytes must come back from the codec, and Java must write the same bytes from what it reads.
+    static void checkFlattenedAttributes(String name) {
+        AudioAttributes sent = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).addTag("atl:flat").build();
+        Parcel p = Parcel.obtain();
+        sent.writeToParcel(p, AudioAttributes.FLATTEN_TAGS);
+        byte[] java = p.marshall();
+        p.recycle();
+        byte[] rust = roundTrip("android.media.AudioAttributes", java, MODE_PLAIN);
+        if (rust == null) {
+            result(false, name, "rust: " + lastError());
+            dumpHex(name, java);
+            return;
+        }
+        if (!Arrays.equals(java, rust)) {
+            result(false, name, "rust bytes differ from java's at byte " + firstDiff(java, rust) + " (" + rust.length + " vs " + java.length + ")");
+            return;
+        }
+        Parcel in = Parcel.obtain();
+        in.unmarshall(rust, 0, rust.length);
+        in.setDataPosition(0);
+        AudioAttributes back = AudioAttributes.CREATOR.createFromParcel(in);
+        boolean consumed = in.dataPosition() == rust.length;
+        in.recycle();
+        Parcel again = Parcel.obtain();
+        back.writeToParcel(again, AudioAttributes.FLATTEN_TAGS);
+        byte[] bytes = again.marshall();
+        again.recycle();
+        boolean ok = consumed && Arrays.equals(java, bytes) && back.equals(sent);
+        result(ok, name, ok ? java.length + " bytes, flattened tags: java -> rust -> java byte-equal" : "consumed " + consumed + ", java re-encodes rust's bytes differently at byte " + firstDiff(java, bytes));
     }
 
     /// Bundle.putAll: the codec merges A and B (both marshalled into one input); the bytes must equal Java's merged Bundle's, and Java must read them back as the merged map.

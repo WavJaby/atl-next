@@ -36,6 +36,10 @@ pub mod android {
     pub mod hardware {
         pub mod OverlayProperties;
     }
+    pub mod media {
+        pub mod AudioAttributes;
+        pub mod PlayerBase_PlayerIdCard;
+    }
     pub mod net {
         pub mod Uri;
     }

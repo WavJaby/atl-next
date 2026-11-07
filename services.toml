@@ -200,10 +200,19 @@ mirrors = [
 ]
 
 [audio]
-src = ["crates/atl-services/src/audio.rs"]
+src = ["crates/atl-services/src/audio.rs", "crates/atl-services/src/players.rs"]
 mirrors = [
     "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#areNavigationRepeatSoundEffectsEnabled",
     "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playSoundEffect",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#trackPlayer",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playerAttributes",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playerEvent",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#playerSessionId",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#releasePlayer",
+    "frameworks/base/services/core/java/com/android/server/audio/PlaybackActivityMonitor.java#trackPlayer",
+    "frameworks/base/services/core/java/com/android/server/audio/PlaybackActivityMonitor.java#releasePlayer",
+    "frameworks/base/media/java/android/media/PlayerBase.java#PlayerIdCard",
+    "frameworks/base/media/java/android/media/AudioAttributes.java#writeToParcel",
 ]
 
 [processinfo]

@@ -25,6 +25,7 @@ pub mod native_libs;
 pub mod observer_rules;
 pub mod packages;
 pub mod permission;
+pub mod players;
 pub mod process_control;
 pub mod sensor;
 pub mod shared_memory;

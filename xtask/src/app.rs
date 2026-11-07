@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use atl_layout::Layout;
 
-use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines};
+use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines, counters};
 use crate::test_fonts;
 use crate::window::{self, WINDOW_MS};
 use crate::{jni_fixture, manifest};
@@ -61,8 +61,10 @@ const CACERTS: &str = "AtlTest: cacerts: ";
 /// Main.onCreate's fonts line: `default=<adv> monospace=<adv>`, Typeface.DEFAULT's and MONOSPACE's advance of [`FONT_TEXT`] at text size 2048 (Main.FONT_SIZE), kerning/ligatures off.
 /// Pass: each equals the pinned font's hmtx sum (test_fonts.rs `advance`, read-fonts): Roboto for the default (atld's fonts.toml sans-serif row through fontconfig), Droid Sans Mono for monospace.
 const FONTS: &str = "AtlTest: fonts: ";
-/// Main.onCreate's SoundPool line: `soundpool: constructed` when `new SoundPool` loaded libsoundpool.so and returned (the load gate, plan A-early); otherwise what it threw.
+/// Main.onCreate's SoundPool line: `soundpool: constructed` when `new SoundPool` loaded libsoundpool.so and returned (the load gate, plan A-early), after its release; otherwise what it threw.
 const SOUNDPOOL: &str = "AtlTest: soundpool: ";
+/// The audio service's calls the SoundPool row makes (IAudioService, services.toml `audio`): the track at construction, the release. Each must be answered in the services' log.
+const SOUNDPOOL_CALLS: [&str; 2] = ["trackPlayer", "releasePlayer"];
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -403,6 +405,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && soundpool.as_deref() != Some("constructed") {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
     }
+    // the row's release: releasePlayer is oneway, so the app sees no error; the audio service's own count shows that the track and the release reached it and were served
+    if passed {
+        let served = counters(&services_log);
+        for method in SOUNDPOOL_CALLS {
+            let want = format!("IAudioService.{method}");
+            if !served
+                .iter()
+                .any(|c| c.kind == "answered" && c.name == want && c.count > 0)
+            {
+                whys.push(format!(
+                    "soundpool: the audio service did not answer {method}"
+                ));
+            }
+        }
+    }
     if passed && !bridge1_ok {
         whys.push(format!(
             "bridge1: want {BRIDGE1:?}, got {:?}",
@@ -428,7 +445,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass fonts {} = pinned hmtx",
             fonts_line.unwrap_or_default()
         );
-        println!("app: pass soundpool {}", soundpool.unwrap_or_default());
+        println!(
+            "app: pass soundpool {} (the audio service answered {})",
+            soundpool.unwrap_or_default(),
+            SOUNDPOOL_CALLS.join(", ")
+        );
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         println!("app: gralloc registered: {}", gralloc_log.trim());
         return Ok(ExitCode::SUCCESS);
