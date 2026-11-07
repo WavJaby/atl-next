@@ -22,7 +22,8 @@ type graphFile struct {
 	// For the caller's none gate: a compile failing to find a header these hold, in a module that dropped the module, shows the row hides a user still built.
 	NoneExports map[string][]string `json:"none_exports"`
 	// module directory -> what a build outside the converter takes of it: cargo packages `xtask native` builds after ninja (Cargo.toml `[package.metadata.atl] converter`, atl-bridgegen converter.rs).
-	// Rust libraries, shared libraries and binaries the emitted graph builds (broken crates and provided modules aside); the shared node of a module with both.
+	// Rust libraries, shared libraries, static archives and binaries the emitted graph builds (broken crates aside), and the provided modules by their real path.
+	// A module with a shared and a static node: the shared one (putArtifact).
 	Artifacts map[string]artifact `json:"artifacts"`
 	// the cc link driver every link here runs (Tools.CXX): an rlib's Link arguments are its arguments (its stl's -nostdlib++ / -lc++), so an outside build links with it too
 	LinkDriver string `json:"link_driver"`
@@ -34,31 +35,72 @@ type graphFile struct {
 
 // artifact: one linkable output, as the converter's own links take it.
 type artifact struct {
-	Kind string `json:"kind"` // rlib | shared | binary (Kind.String) | object (a cc_object's object file: crtbegin_so, which xtask's guest libc++ link takes)
+	Kind string `json:"kind"` // rlib | shared | static | binary (Kind.String) | object (a cc_object's object file: crtbegin_so, which xtask's guest libc++ link takes); a provided module: shared or static
 	Out  string `json:"out"`
-	// rlib only: its crate name, the -L dependency= dirs of its crate closure (crateDirs), the cc link driver arguments a final link of it needs (rustCcLibs; none without cc libraries) and their dirs (rustLinkDirs: -L native=)
+	// rlib: its crate name, the -L dependency= dirs of its crate closure (crateDirs), its cc link arguments (rustCcLibs; none without cc libraries) and their dirs (rustLinkDirs: -L native=)
+	// static: its link arguments beyond the archive (linkLibs: static closure, shared and system libraries), what a final link of it takes; Out is the archive itself
 	Crate  string   `json:"crate,omitempty"`
 	Search []string `json:"search,omitempty"`
 	Link   []string `json:"link,omitempty"`
 	Native []string `json:"native,omitempty"`
 	// shared only: the C++ argv of the module's own C++ compiles (compileFlags cxx: libc++, device defines, include paths), what a Rust package compiling a C++ wrapper against the module takes
 	Cxx []string `json:"cxx,omitempty"`
+	// shared only: the provided shared libraries its link names, by module directory (providedNeeds); they lie outside the stage, so an outside link finds them through their own artifacts
+	Needs []string `json:"needs,omitempty"`
 }
 
-// artifactOf: n's graph.json artifact; ok=false for kinds no outside build links (archives, headers, generators, proc macros) and for crates that cannot compile.
+// artifactOf: n's graph.json artifact; ok=false for kinds no outside build links (headers, generators, proc macros) and for crates that cannot compile.
 func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
 	switch {
 	case n.kind == Rlib && n.rust.broken == "":
 		link, _ := g.rustCcLibs(n)
 		return artifact{Kind: n.kind.String(), Out: n.out, Crate: n.rust.crateName, Search: crateDirs([]*Node{n}), Link: link, Native: rustLinkDirs(link)}, true
 	case n.kind == Shared:
-		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx}, n.out != ""
+		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx, Needs: providedNeeds(n)}, n.out != ""
 	case n.kind == Binary:
 		return artifact{Kind: n.kind.String(), Out: n.out}, n.out != ""
 	case n.kind == Static && n.mod != nil && g.baseType(n.mod.Type) == "cc_object":
 		return artifact{Kind: "object", Out: g.objectOut(n)}, true
+	case n.kind == Static:
+		link, _ := g.linkLibs(n)
+		return artifact{Kind: n.kind.String(), Out: n.out, Link: link}, n.out != ""
 	}
 	return artifact{}, false
+}
+
+// providedNeeds: the provided shared libraries n's link names (linkedShared), by module directory, sorted.
+// Only n's own names: a tree shared library they need names them itself, and lib_env (xtask) takes every artifact's needs for the stage's search path.
+func providedNeeds(n *Node) []string {
+	var out []string
+	for _, d := range linkedShared(n, linkClosure(n)) {
+		if d.provided && d.kind == Shared {
+			out = appendNew(out, d.dir())
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// putArtifact: a module's static and shared nodes share its directory. The shared output stands (an outside build links the shared library); an archive fills an empty slot only.
+func putArtifact(m map[string]artifact, dir string, a artifact) {
+	if old, ok := m[dir]; ok && a.Kind == Static.String() && old.Kind != Static.String() {
+		return
+	}
+	m[dir] = a
+}
+
+// providedNodes: the provided modules this graph reaches, sorted by directory and kind (provided.go providedNode).
+func (g *Graph) providedNodes() []*Node {
+	var out []*Node
+	for _, n := range g.nodes {
+		if n.provided {
+			out = append(out, n)
+		}
+	}
+	slices.SortFunc(out, func(a, b *Node) int {
+		return strings.Compare(a.dir()+a.kind.String(), b.dir()+b.kind.String())
+	})
+	return out
 }
 
 func (n *Node) dir() string { return n.side.String() + "/" + n.name }
@@ -187,8 +229,11 @@ func (g *Graph) graphJSON(goals []*Node, linkDriver, cc string) ([]byte, error) 
 		}
 		f.Deps[n.dir()] = sortedKeys(set)
 		if a, ok := g.artifactOf(n); ok {
-			f.Artifacts[n.dir()] = a
+			putArtifact(f.Artifacts, n.dir(), a)
 		}
+	}
+	for _, n := range g.providedNodes() {
+		putArtifact(f.Artifacts, n.dir(), artifact{Kind: n.kind.String(), Out: n.out})
 	}
 	return json.MarshalIndent(f, "", " ")
 }

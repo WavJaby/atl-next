@@ -477,12 +477,7 @@ func (g *Graph) linkFlags(n *Node) []string {
 // Bionic sides link as Soong does (cc.go depsToPaths: orderStaticModuleDeps(directStaticDeps, directSharedDeps)): only the module's own static and shared dependencies, whose static_libs and shared_libs it lists itself
 // (bionic's linker names libbase's liblog_for_runtime_apex; libbase's libc++_static would clash with the linker's libc++_static_noexcept). Rust crates still bring their cc libraries (Soong bundles them into the rlib).
 func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
-	var closure []*Node
-	if n.side.glibc() {
-		staticClosure(n, map[*Node]bool{}, &closure)
-	} else {
-		directStatic(n, &closure)
-	}
+	closure := linkClosure(n)
 	// a whole dependency's own whole_static_libs are objects of its archive in Soong (library.go), so they are whole-linked with it, recursively
 	whole := map[*Node]bool{}
 	var wholeOrder []*Node
@@ -497,17 +492,7 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		}
 	}
 	addWhole(n.deps.whole)
-	shared := map[*Node]bool{}
-	var sharedOrder []*Node
-	addShared := func(list []*Node) {
-		for _, d := range list {
-			if !shared[d] {
-				shared[d] = true
-				sharedOrder = append(sharedOrder, d)
-			}
-		}
-	}
-	addShared(n.deps.shared)
+	sharedOrder := linkedShared(n, closure)
 	// rlibs link through the generated staticlib (rust.go rustStaticlib)
 	var wholeLibs []string
 	for _, d := range wholeOrder {
@@ -530,9 +515,6 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		inputs = append(inputs, n.rustlib)
 	}
 	for _, d := range closure {
-		if n.side.glibc() {
-			addShared(d.deps.shared)
-		}
 		if !whole[d] && d.kind == Static {
 			libs = append(libs, d.out)
 			inputs = append(inputs, d.out)
@@ -589,6 +571,38 @@ func (g *Graph) linkLibs(n *Node) (libs, inputs []string) {
 		libs = append(libs, systemLinkFlags...)
 	}
 	return libs, inputs
+}
+
+// linkClosure: the static archives n's final link takes (linkLibs): staticClosure on glibc sides, directStatic on bionic ones.
+func linkClosure(n *Node) []*Node {
+	var closure []*Node
+	if n.side.glibc() {
+		staticClosure(n, map[*Node]bool{}, &closure)
+	} else {
+		directStatic(n, &closure)
+	}
+	return closure
+}
+
+// linkedShared: the shared libraries n's link names, in linkLibs' DT_NEEDED order: its own shared dependencies, then on glibc sides those of its static closure; each once.
+func linkedShared(n *Node, closure []*Node) []*Node {
+	var out []*Node
+	seen := map[*Node]bool{}
+	add := func(list []*Node) {
+		for _, d := range list {
+			if !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	add(n.deps.shared)
+	if n.side.glibc() {
+		for _, d := range closure {
+			add(d.deps.shared)
+		}
+	}
+	return out
 }
 
 // systemLinkFlags: the glibc libraries every glibc-side link ends with (linkLibs, devicePlatform).

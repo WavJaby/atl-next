@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Build scripts of packages `xtask native` builds after the Blueprint converter: a workspace package naming converter modules in its Cargo.toml (`[package.metadata.atl] converter = ["device/libbinder_rs"]`, graph.json module directories `<side>/<name>`) gets them linked when its feature `converter` is on.
-//! What is linked comes from `$ATL_NATIVE_OUT/graph.json` `artifacts` (tools/bp2ninja graph.go), so it is what the converter's own links take: an rlib as a crate (`extern crate <name>;` finds it on the `crate=` search path, its crate closure on `dependency=`) plus its cc libraries as link-driver arguments; a shared library as `-l` + RUNPATH.
+//! What is linked comes from `$ATL_NATIVE_OUT/graph.json` `artifacts` (tools/bp2ninja graph.go), so it is what the converter's own links take: an rlib as a crate (`extern crate <name>;` finds it on the `crate=` search path, its crate closure on `dependency=`) plus its cc libraries as link-driver arguments; a static library as its archive plus the arguments a final link of it takes beyond it; a shared library as `-l` + RUNPATH, after the provided shared libraries it names (`needs`) are searched.
 //! `rustc-link-lib` lands before std's `-lc`, so a shared module leads DT_NEEDED in the order named (libsigchain must precede libc); rlib link arguments are `rustc-link-arg`, which reach only this package's own links (a dependent package names the modules itself).
 //! The build around it is `xtask native`'s: cargo's linker is the converter's link driver (graph.json `link_driver`; rlib arguments are clang driver arguments such as `-stdlib=libc++`) and the profile's `panic` is `abort`, as the converter's device crates are compiled (a panic strategy mismatch fails the link).
 //! `[package.metadata.atl.aidl]` adds the package's AIDL crate `device/<package>-stubs-rust` (crate `<package>_stubs`), which the converter generates from those types' import closure (xtask packages.rs, bp2ninja aidlcrates.go).
@@ -22,6 +22,8 @@ pub const FEATURE: &str = "converter";
 pub enum Kind {
     Rlib,
     Shared,
+    /// a cc_library_static's archive: `link` is what a final link takes beyond it
+    Static,
     Binary,
     /// a cc_object's object file (xtask native's runtimes pass 2 links crtbegin_so)
     Object,
@@ -39,7 +41,7 @@ pub struct Artifact {
     /// rlib: the dirs of its crate closure (rustc `-L dependency=`)
     #[serde(default)]
     pub search: Vec<PathBuf>,
-    /// rlib: link-driver arguments for its cc libraries
+    /// rlib, static: link-driver arguments (static: what a final link takes beyond its archive)
     #[serde(default)]
     pub link: Vec<String>,
     /// rlib: those libraries' dirs, where rustc finds its crates' `#[link(name = ...)]` (rustc `-L native=`)
@@ -48,6 +50,9 @@ pub struct Artifact {
     /// shared: the C++ argv of the module's own C++ compiles (libc++, device defines, include paths); a package compiling a C++ wrapper against the module takes it
     #[serde(default)]
     pub cxx: Vec<String>,
+    /// shared: the provided shared libraries its link names, by module (`device/libcrypto`); outside `out`, so the stage holds no copy and `link_lines` searches their dirs
+    #[serde(default)]
+    pub needs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +101,7 @@ impl Converter {
     pub fn artifact(&self, module: &str) -> Result<&Artifact> {
         self.artifacts.get(module).with_context(|| {
             format!(
-                "{module}: no such artifact in {} (a module the build's goals do not reach, or not a Rust library, shared library or binary)",
+                "{module}: no such artifact in {} (a module the build's goals do not reach, or not a Rust library, static or shared library, or binary)",
                 self.graph.display()
             )
         })
@@ -128,13 +133,7 @@ impl Converter {
                             ));
                         }
                     }
-                    for arg in &a.link {
-                        // a static archive's members are copied in: relink when it changes (shared objects are looked up at run time)
-                        if arg.ends_with(".a") && Path::new(arg).is_absolute() {
-                            lines.push(format!("cargo::rerun-if-changed={arg}"));
-                        }
-                        lines.push(format!("cargo::rustc-link-arg={arg}"));
-                    }
+                    push_link_args(&mut lines, &a.link);
                     for d in &a.native {
                         if native.insert(d.clone()) {
                             lines.push(format!("cargo::rustc-link-search=native={}", d.display()));
@@ -145,12 +144,33 @@ impl Converter {
                     let name =
                         shared_name(&a.out).with_context(|| format!("{m}: {}", a.out.display()))?;
                     lines.push(format!("cargo::rustc-link-search=native={}", dir.display()));
+                    for need in &a.needs {
+                        let p = self
+                            .artifact(need)
+                            .with_context(|| format!("{m}: needs {need}"))?;
+                        ensure!(
+                            p.kind == Kind::Shared,
+                            "{m}: needs {need}, which is not a shared library"
+                        );
+                        let d = p
+                            .out
+                            .parent()
+                            .with_context(|| format!("{need}: output without a directory"))?;
+                        lines.push(format!("cargo::rerun-if-changed={}", p.out.display()));
+                        if native.insert(d.to_path_buf()) {
+                            lines.push(format!("cargo::rustc-link-search=native={}", d.display()));
+                        }
+                    }
                     lines.push(format!("cargo::rustc-link-lib=dylib={name}"));
                     // RUNPATH, not RPATH: LD_LIBRARY_PATH still overrides it. Unlike converter device links, which carry none (xtask runpath_gate).
                     lines.push(format!(
                         "cargo::rustc-link-arg=-Wl,--enable-new-dtags,-rpath,{}",
                         dir.display()
                     ));
+                }
+                Kind::Static => {
+                    lines.push(format!("cargo::rustc-link-arg={}", a.out.display()));
+                    push_link_args(&mut lines, &a.link);
                 }
                 Kind::Binary => {
                     bail!("{m}: a binary links into nothing")
@@ -161,6 +181,16 @@ impl Converter {
             }
         }
         Ok(lines)
+    }
+}
+
+/// A link's cc arguments: an archive relinks when it changes (its members are copied in); shared objects are looked up at run time.
+fn push_link_args(lines: &mut Vec<String>, link: &[String]) {
+    for arg in link {
+        if arg.ends_with(".a") && Path::new(arg).is_absolute() {
+            lines.push(format!("cargo::rerun-if-changed={arg}"));
+        }
+        lines.push(format!("cargo::rustc-link-arg={arg}"));
     }
 }
 
@@ -233,9 +263,9 @@ pub fn link_package(manifest_dir: &Path) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// A graph.json as bp2ninja writes one (graph_test.go TestGraphJSONArtifacts shape): an rlib with a cc closure, a shared library, a binary, an archive-only module absent.
-    fn fixture(dir: &Path) -> Converter {
-        let json = serde_json::json!({
+    /// A graph.json as bp2ninja writes one (graph_test.go TestGraphJSONArtifacts, TestGraphJSONStaticAndProvided shapes): an rlib with a cc closure, a shared library, a binary, a static archive, a provided shared library, and a shared library naming it in `needs`.
+    fn fixture_json() -> serde_json::Value {
+        serde_json::json!({
             "goals": ["device/libgoal"],
             "deps": {},
             "dropped": {},
@@ -254,11 +284,24 @@ mod tests {
                 },
                 "device/libsigchain": { "kind": "shared", "out": "/o/device/libsigchain/libsigchain.so" },
                 "device/odd": { "kind": "shared", "out": "/o/device/odd/odd.so" },
-                "host/aidl": { "kind": "binary", "out": "/o/host/aidl/aidl" }
+                "host/aidl": { "kind": "binary", "out": "/o/host/aidl/aidl" },
+                "device/libaudioprocessing_base": {
+                    "kind": "static", "out": "/o/device/libaudioprocessing_base/libaudioprocessing_base.a",
+                    "link": ["-Wl,--start-group", "/o/device/libsub/libsub.a", "/upstream/boringssl/prefix/lib/libcrypto.so", "-Wl,--end-group"]
+                },
+                "device/libcrypto": { "kind": "shared", "out": "/upstream/boringssl/prefix/lib/libcrypto.so" },
+                "device/libmid": { "kind": "shared", "out": "/o/device/libmid/libmid.so", "needs": ["device/libcrypto"] }
             }
-        });
+        })
+    }
+
+    fn load_json(dir: &Path, json: &serde_json::Value) -> Converter {
         std::fs::write(dir.join("graph.json"), json.to_string()).unwrap();
         Converter::load(dir).unwrap()
+    }
+
+    fn fixture(dir: &Path) -> Converter {
+        load_json(dir, &fixture_json())
     }
 
     fn tmp(name: &str) -> PathBuf {
@@ -323,6 +366,69 @@ mod tests {
             format!("{:#}", Converter::load(&dir.join("nowhere")).unwrap_err())
                 .contains("cargo xtask native")
         );
+    }
+
+    /// A static artifact is its archive, then what its final link takes (archives relink on change); a shared artifact searches the provided libraries it needs before its own `-l`, then its RUNPATH.
+    #[test]
+    fn link_lines_static_and_needs() {
+        let dir = tmp("static");
+        let conv = fixture(&dir);
+        let lines = conv
+            .link_lines(&[
+                "device/libaudioprocessing_base".into(),
+                "device/libmid".into(),
+            ])
+            .unwrap();
+        let graph = dir.join("graph.json");
+        let archive = "/o/device/libaudioprocessing_base/libaudioprocessing_base.a";
+        let crypto = "/upstream/boringssl/prefix/lib/libcrypto.so";
+        let want = [
+            format!("cargo::rerun-if-changed={}", graph.display()),
+            format!("cargo::rerun-if-changed={archive}"),
+            format!("cargo::rustc-link-arg={archive}"),
+            "cargo::rustc-link-arg=-Wl,--start-group".into(),
+            "cargo::rerun-if-changed=/o/device/libsub/libsub.a".into(),
+            "cargo::rustc-link-arg=/o/device/libsub/libsub.a".into(),
+            format!("cargo::rustc-link-arg={crypto}"),
+            "cargo::rustc-link-arg=-Wl,--end-group".into(),
+            "cargo::rerun-if-changed=/o/device/libmid/libmid.so".into(),
+            "cargo::rustc-link-search=native=/o/device/libmid".into(),
+            format!("cargo::rerun-if-changed={crypto}"),
+            "cargo::rustc-link-search=native=/upstream/boringssl/prefix/lib".into(),
+            "cargo::rustc-link-lib=dylib=mid".into(),
+            "cargo::rustc-link-arg=-Wl,--enable-new-dtags,-rpath,/o/device/libmid".into(),
+        ];
+        assert_eq!(lines, want);
+    }
+
+    /// A provided library a shared module needs must be a shared artifact of the graph: a missing one, or an archive, fails the link, named after the module that needs it.
+    #[test]
+    fn needs_refusals() {
+        // the switchable break: the provided artifact dropped from graph.json
+        let mut json = fixture_json();
+        json["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("device/libcrypto");
+        let conv = load_json(&tmp("needs-missing"), &json);
+        let err = format!(
+            "{:#}",
+            conv.link_lines(&["device/libmid".into()]).unwrap_err()
+        );
+        assert!(
+            err.contains("device/libmid: needs device/libcrypto")
+                && err.contains("device/libcrypto: no such artifact"),
+            "{err}"
+        );
+        let mut json = fixture_json();
+        json["artifacts"]["device/libmid"]["needs"] =
+            serde_json::json!(["device/libaudioprocessing_base"]);
+        let conv = load_json(&tmp("needs-static"), &json);
+        let err = format!(
+            "{:#}",
+            conv.link_lines(&["device/libmid".into()]).unwrap_err()
+        );
+        assert!(err.contains("which is not a shared library"), "{err}");
     }
 
     /// The metadata list: read as written; refused when absent, empty, not strings, or not `<device|host>/<name>`.

@@ -61,7 +61,7 @@ cc_library { name: "libgoal", srcs: ["g.cc"], static_libs: ["libs"], shared_libs
 }
 
 // artifacts: what a cargo package links of the graph, as the converter's own links take it: an rlib with its crate name, crate dirs and its cc libraries' link arguments (rust_test.go rustGraph:
-// libffi carries libcc whole, libdep only a proc macro, so no link arguments); shared libraries and binaries by output; never archives, proc macros or generators.
+// libffi carries libcc whole, libdep only a proc macro, so no link arguments); shared libraries, static archives and binaries by output; never headers, proc macros or generators.
 func TestGraphJSONArtifacts(t *testing.T) {
 	g, _ := rustGraph(t)
 	goal := g.node("libuser", Device, Shared, "goal")
@@ -105,10 +105,67 @@ func TestGraphJSONArtifacts(t *testing.T) {
 	if tool := f.Artifacts["host/tool"]; tool.Kind != "binary" || tool.Out != out("host/tool/tool") {
 		t.Errorf("tool %+v", tool)
 	}
-	for _, none := range []string{"device/libcc", "host/libmac", "device/bridge_h"} {
+	// a static archive is an artifact at its own path: libcc, the cc library libffi carries whole
+	if cc := f.Artifacts["device/libcc"]; cc.Kind != "static" || cc.Out != out("device/libcc/libcc.a") {
+		t.Errorf("libcc %+v", cc)
+	}
+	for _, none := range []string{"host/libmac", "device/bridge_h"} {
 		if a, ok := f.Artifacts[none]; ok {
 			t.Errorf("%s: artifact %+v", none, a)
 		}
+	}
+}
+
+// static archives and provided modules: a static artifact is its archive with the link arguments a final link of it takes beyond it (linkLibs: here the provided library the module names); a provided module is an artifact at its real path.
+// A shared artifact names the provided shared libraries its own link takes (needs); a module with a shared and a static node is the shared artifact.
+func TestGraphJSONStaticAndProvided(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library_static { name: "libsub", srcs: ["s.cc"] }
+cc_library { name: "libboth", srcs: ["b.cc"] }
+cc_library_static { name: "libaudioprocessing_base", srcs: ["a.cc"], static_libs: ["libsub", "libboth"], shared_libs: ["libcrypto"] }
+cc_library_shared { name: "libuser", srcs: ["u.cc"], static_libs: ["libaudioprocessing_base"], shared_libs: ["libcrypto", "libboth"] }
+`})
+	crypto := "/upstream/boringssl/prefix/lib/libcrypto.so"
+	g.provided = map[string]Provided{"libcrypto": {Lib: crypto}}
+	goal := g.node("libuser", Device, Shared, "goal")
+	if goal == nil {
+		t.Fatal(g.problems)
+	}
+	g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar"}) // sets node outs (main.go: emit, then graphJSON)
+	b, err := g.graphJSON([]*Node{goal}, "c++", "cc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f graphFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatal(err)
+	}
+	out := func(p string) string { return filepath.Join(g.out, p) }
+	ap := f.Artifacts["device/libaudioprocessing_base"]
+	if ap.Kind != "static" || ap.Out != out("device/libaudioprocessing_base/libaudioprocessing_base.a") {
+		t.Errorf("static artifact %+v", ap)
+	}
+	// its link: the static closure's archives and the shared library it names, as a final link of it takes them
+	for _, want := range []string{out("device/libsub/libsub.a"), out("device/libboth/libboth.a"), crypto} {
+		if !slices.Contains(ap.Link, want) {
+			t.Errorf("link %q lacks %s", ap.Link, want)
+		}
+	}
+	if len(ap.Needs) != 0 {
+		t.Errorf("static needs %q", ap.Needs)
+	}
+	if want := []string{"device/libboth", "device/libcrypto", "device/libsub"}; !slices.Equal(f.Deps["device/libaudioprocessing_base"], want) {
+		t.Errorf("deps %q, want %q", f.Deps["device/libaudioprocessing_base"], want)
+	}
+	if c := f.Artifacts["device/libcrypto"]; c.Kind != "shared" || c.Out != crypto || len(c.Needs) != 0 {
+		t.Errorf("provided artifact %+v", c)
+	}
+	// libboth has a shared and a static node: the shared artifact stands
+	if lib := f.Artifacts["device/libboth"]; lib.Kind != "shared" || lib.Out != out("device/libboth/libboth.so") {
+		t.Errorf("libboth %+v", lib)
+	}
+	if u := f.Artifacts["device/libuser"]; !slices.Equal(u.Needs, []string{"device/libcrypto"}) {
+		t.Errorf("libuser needs %q", u.Needs)
 	}
 }
 
