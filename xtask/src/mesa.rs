@@ -54,8 +54,14 @@ pub enum Opt {
     Arr(&'static [&'static str]),
 }
 
-/// The gallium drivers built: [`DRIVER`] must export `__driDriverGetExtensions_<name>` for each ([`driver_links`]).
+/// The gallium drivers built.
 pub const GALLIUM_DRIVERS: &[&str] = &["llvmpipe", "iris"];
+
+/// Each of [`GALLIUM_DRIVERS`] -> its screen constructor (lp_screen.c, iris_screen.c), which [`driver_links`] requires in [`DRIVER`]'s symtab.
+const DRIVER_SCREENS: &[(&str, &str)] = &[
+    ("llvmpipe", "llvmpipe_create_screen"),
+    ("iris", "iris_screen_create"),
+];
 
 /// Option set (G1, owner 2026-11-06; llvmpipe plan S2): llvmpipe on the host LLVM (llvm_host.rs), Android EGL platform only.
 pub const OPTIONS: &[(&str, Opt)] = &[
@@ -303,14 +309,24 @@ pub fn driver_links(lib: &Path) -> Result<Links> {
     if exported > 0 {
         failures.push(format!("{exported} exported LLVM symbols"));
     }
-    // a driver missing from the build (Break::NoIris / NoLlvmpipe) or dropped by a Mesa pin bump
-    for d in GALLIUM_DRIVERS {
-        let entry = format!("__driDriverGetExtensions_{d}");
-        if !text
+    // a driver missing from the build (Break::NoIris / NoLlvmpipe) or dropped by a Mesa pin bump. Mesa 25 exports no per-driver entry (one megadriver table), so the full symtab is read: each driver's screen constructor is local but present
+    let all = Command::new("nm")
+        .arg("--defined-only")
+        .arg(lib)
+        .output()
+        .context("running nm")?;
+    ensure!(
+        all.status.success(),
+        "nm {}: no symbol table",
+        lib.display()
+    );
+    let all = String::from_utf8_lossy(&all.stdout);
+    for (d, screen) in DRIVER_SCREENS {
+        if !all
             .lines()
-            .any(|l| l.split_whitespace().last() == Some(entry.as_str()))
+            .any(|l| l.split_whitespace().last() == Some(*screen))
         {
-            failures.push(format!("{} exports no {entry}", lib.display()));
+            failures.push(format!("{} holds no {d} ({screen})", lib.display()));
         }
     }
     Ok(Links { needed, failures })
@@ -892,6 +908,12 @@ mod tests {
         let no_iris = broken(Break::NoIris);
         assert!(no_iris.contains("gallium-drivers = ['llvmpipe']\n"));
         assert!(!no_iris.contains("'iris'"));
+    }
+
+    #[test]
+    fn every_driver_has_a_screen_symbol() {
+        let named: Vec<&str> = DRIVER_SCREENS.iter().map(|(d, _)| *d).collect();
+        assert_eq!(named, GALLIUM_DRIVERS);
     }
 
     #[test]

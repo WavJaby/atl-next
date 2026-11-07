@@ -32,6 +32,7 @@ reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge,
 # BSL-1.0, HPND-sell-variant: accepted 2026-11-06 (Mesa: c11 threads emulation, loader_dri_helper); both permissive and on the FSF list of GPL-compatible licences.
 # TU-Berlin-2.0: accepted 2026-11-07 (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
 # CC0-1.0, NCSA: owner decision 2026-11-07, for the host LLVM build (llvm_host.rs, plan llvmpipe S1): BLAKE3 (llvm/lib/Support/BLAKE3, `SPDX-License-Identifier: CC0-1.0`, a public-domain dedication, the class of LicenseRef-Public-Domain but a named instrument) and LLVM's legacy University-of-Illinois header (llvm/lib/TargetParser/CSKYTargetParser.cpp). Both permissive and on the FSF list of GPL-compatible licences.
+# GPL-1.0-or-later WITH Linux-syscall-note: added 2026-11-08 by precedent of the 2026-10-31 syscall-note decision, pending owner confirmation (Mesa's copy of the kernel uapi sync_file.h, pulled in by iris); "or later" makes it GPL-3-compatible, and the note frees uapi-header users as above.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -41,6 +42,7 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "FTL",
+    "GPL-1.0-or-later WITH Linux-syscall-note",
     "GPL-2.0-only WITH Classpath-exception-2.0",
     "GPL-2.0-only WITH Linux-syscall-note",
     "HPND-sell-variant",
@@ -156,6 +158,26 @@ reason = "Mesa default (docs/license.rst), no notice in the file"
 
 # Mesa files with no licence grant (none, a copyright line only, or "No copyright claimed"); no notice or SPDX tag in their directories names a licence other than MIT. Reason: Mesa docs/license.rst "The core Mesa library is licensed according to the terms of the MIT license".
 [upstream.aosp.paths."external/mesa3d/include/pci_ids/crocus_pci_ids.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no grant in the file"
+
+[upstream.aosp.paths."external/mesa3d/include/pci_ids/iris_pci_ids.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no grant in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/iris/driinfo_iris.h"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no grant in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/gallium/drivers/iris/iris_fine_fence.c"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no grant in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/intel/common/intel_debug_identifier.c"]
+licence = "MIT"
+reason = "Mesa default (docs/license.rst), no grant in the file"
+
+[upstream.aosp.paths."external/mesa3d/src/intel/common/intel_debug_identifier.h"]
 licence = "MIT"
 reason = "Mesa default (docs/license.rst), no grant in the file"
 
