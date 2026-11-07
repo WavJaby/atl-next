@@ -15,7 +15,10 @@
         <provider android:name=".High" android:authorities="com.example.atlprovider.high;com.example.atlprovider.alias" android:exported="false" android:initOrder="9" />
         <provider android:name=".Off" android:authorities="com.example.atlprovider.off" android:exported="false" android:enabled="false" />
         <provider android:name=".Elsewhere" android:authorities="com.example.atlprovider.elsewhere" android:exported="false" android:process=":other" />
-        <activity android:name=".Main" android:exported="true">
+        <!-- no window, no hardware rendering: handleLaunchActivity would preload HWUI, and this gate stages no EGL driver -->
+        <activity android:name=".Main" android:exported="true"
+            android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

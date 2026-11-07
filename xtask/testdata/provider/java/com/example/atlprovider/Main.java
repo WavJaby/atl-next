@@ -25,5 +25,6 @@ public class Main extends Activity {
             Log.i(Base.TAG, "lookup failed " + e);
         }
         Log.i(Base.TAG, "done");
+        finish(); // Theme.NoDisplay requires it before onResume
     }
 }
