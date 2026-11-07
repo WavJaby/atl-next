@@ -326,6 +326,23 @@ impl HostArt {
     }
 }
 
+impl HostArt {
+    /// What the runtime reads from the staged ART: its tree and library dir (whole, remote.rs `Inputs`), the launcher, the property service's input and the boot jars.
+    pub fn runtime_inputs(&self) -> crate::remote::Inputs {
+        crate::remote::Inputs {
+            files: [
+                self.launcher.clone(),
+                self.property_service.clone(),
+                self.build_prop.clone(),
+            ]
+            .into_iter()
+            .chain(self.boot.iter().cloned())
+            .collect(),
+            dirs: vec![self.art.clone(), self.lib_path.clone()],
+        }
+    }
+}
+
 /// The lib dirs of the providers `xtask native` built outside the tree: `<out>/crates/<crate>/lib`, `<out>/upstream/<name>/prefix/lib`.
 fn provided_lib_dirs(out: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();

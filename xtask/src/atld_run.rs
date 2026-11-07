@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gate_goals::Goals;
 use crate::host_art::{self, HostArt};
-use crate::{manifest, packages, slot, tree};
+use crate::{manifest, packages, remote, slot, tree};
 
 /// framework-res.apk in the Java pipeline's out: built as Soong builds it (manifest_fixer, link, merge, align; bp2ninja app.go), unsigned.
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
@@ -224,6 +224,10 @@ pub struct Runtime {
     omitted_services: Vec<String>,
     /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
     fake_devices: Option<(PathBuf, PathBuf)>,
+    /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
+    gate: String,
+    /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
+    tree: PathBuf,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -510,6 +514,8 @@ impl Runtime {
         let licenses = crate::licenses::load(root, &crate::sources::load(root)?.upstream_names())?;
         let test_only = crate::licenses::test_only_outputs(&licenses, &out)?;
         Ok(Runtime {
+            gate: gate.to_owned(),
+            tree: tree::shared_tree(&layout),
             test_only,
             native_bridge,
             abis,
@@ -905,8 +911,66 @@ impl ApkTools {
 }
 
 impl Runtime {
+    /// Every host path the runtime reads: the staged daemons and their libraries, ART, fonts, keyboards, the media stack's files, the GL driver, the gralloc HAL and the native bridge.
+    fn runtime_inputs(&self) -> Result<remote::Inputs> {
+        let mut inputs = self.art.runtime_inputs();
+        inputs.files.extend([
+            self.servicemanager.clone(),
+            self.services.clone(),
+            self.am.clone(),
+            self.binderd.clone(),
+            self.sandbox_stub.clone(),
+            self.atld.clone(),
+            self.framework_res.clone(),
+            self.fonts.conf.clone(),
+            self.fonts.font_data.clone(),
+        ]);
+        inputs.files.extend(self.fonts.files.iter().cloned());
+        inputs.files.extend(
+            tree::KEYBOARD_FILES
+                .iter()
+                .map(|(f, _)| self.keychars.join(f)),
+        );
+        if let Some((allocator, mapper_dir)) = &self.gralloc {
+            inputs.files.push(allocator.clone());
+            inputs.files.extend(remote::lib_files(mapper_dir)?);
+        }
+        if let Some((driver_files, dirs)) = &self.gl_driver {
+            inputs
+                .files
+                .extend(driver_files.iter().map(|(f, _)| f.clone()));
+            for dir in dirs {
+                inputs.files.extend(remote::lib_files(dir)?);
+            }
+        }
+        inputs
+            .files
+            .extend(self.fixture_files.iter().map(|(f, _)| f.clone()));
+        inputs
+            .files
+            .extend(self.native_bridge_guest.iter().map(|(f, _)| f.clone()));
+        inputs
+            .files
+            .extend(self.platform_files.iter().map(|(f, _)| f.clone()));
+        inputs.files.extend(remote::lib_files(&self.native_bridge)?);
+        Ok(inputs)
+    }
+
+    /// Records what `run` reads for `xtask remote push` (remote.rs `write_record`): the runtime's inputs, the run's packages and boot jars. Written before atld starts, so a run that fails still leaves its record.
+    fn record_inputs(&self, run: &Run) -> Result<()> {
+        let mut inputs = self.runtime_inputs()?;
+        inputs
+            .files
+            .extend(run.packages.iter().map(|(apk, _)| apk.clone()));
+        if let Some(shell) = &run.shell {
+            inputs.files.extend(shell.boot_jars.iter().cloned());
+        }
+        remote::write_record(&self.out, &self.gate, &self.java_out, &self.tree, &inputs)
+    }
+
     /// Starts atld for `run`, its stdout and stderr in `run.atld_log()`. The caller waits for it and ends it.
     pub fn start_atld(&self, run: &Run) -> Result<Child> {
+        self.record_inputs(run)?;
         std::fs::create_dir_all(&run.scratch)?;
         // atld makes the root again itself, but only once it runs: a poll must not see the previous run's logs
         if run.root.exists() {

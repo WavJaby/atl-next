@@ -71,6 +71,7 @@ mod provided_gate;
 mod provider;
 mod providers;
 mod prune;
+mod remote;
 mod run_apk;
 mod runpath_gate;
 mod runtimes;
@@ -187,6 +188,13 @@ enum Command {
     /// A row's file comes from `<workspace>/cache/test-apks`, downloaded and verified on first use; the package file is the APK's own manifest, which must match the row. A path runs unpinned: no row checks its bytes, signer or identity. The APK is copied to `<out>/run-apk`. Pass: the app reports its resume (onResume), no fault in its log for the watch after it, and a presented frame.
     /// Without `--hold` the window maps in the gate's headless compositor (nested_wayland.rs); `--hold SECS` maps it on the desktop and keeps the app up that long after its resume, the window open for drags. Staging is `xtask test window`'s. Hardware acceleration is the APK's own setting: the pinned official builds run with it on.
     RunApk(run_apk::Args),
+    /// Runs WSL-built outputs on a Linux desktop over ssh (the owner's laptop, plan L1): `push` bundles a gate's record and `lib/`, `test` runs the prerequisite check on the target.
+    ///
+    /// Read-only or dry-run by default; `--apply` is the only mode that copies or runs anything remotely. The host is an ssh alias from WSL `~/.ssh/config` or `local:<dir>`.
+    Remote {
+        #[command(subcommand)]
+        remote: remote::Remote,
+    },
     /// Runtime tests over build outputs (not `cargo test`: they need built AOSP artifacts and ART).
     Test {
         #[command(subcommand)]
@@ -318,6 +326,7 @@ fn main() -> Result<ExitCode> {
         Command::Land(args) => land::run(&root, &args),
         Command::Licence(args) => notice::run(&root, &args),
         Command::RunApk(args) => run_apk::run(&root, &args),
+        Command::Remote { remote } => remote::run(&root, &remote),
         Command::UpgradeDiff(args) => {
             let layout = atl_layout::Layout::of(&root)?;
             service_mirrors::upgrade_diff(&root, &args, &|project| {
@@ -414,6 +423,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::Check(_) => "check",
         Command::Land(_) => "land",
         Command::RunApk(_) => "run-apk",
+        Command::Remote { .. } => "remote",
         Command::Test { test } => match test {
             Test::Llvm(_) => "llvm",
             Test::NativeLoad(_) => "native-load",
