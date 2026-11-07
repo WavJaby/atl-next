@@ -55,6 +55,9 @@ const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
 const XDG_SURFACE_CONFIGURE: u16 = 0;
 /// xdg-shell's `activated` window state: the injected configure says the window has focus, as the compositor's do for the focused window.
 const XDG_STATE_ACTIVATED: u32 = 4;
+/// xdg-shell `xdg_toplevel.state` values for [`Proxy::inject_configure`]'s `states` (xdg-shell.xml, stable: maximized = 1, suspended = 9 since version 6).
+pub const XDG_STATE_MAXIMIZED: u32 = 1;
+pub const XDG_STATE_SUSPENDED: u32 = 9;
 const WL_SEAT: &str = "wl_seat";
 const WL_SEAT_GET_POINTER: u16 = 0;
 const WL_SEAT_GET_KEYBOARD: u16 = 1;
@@ -336,7 +339,7 @@ pub enum TouchAction {
 }
 
 /// What the proxy writes to the client between two forwarded messages.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Injection {
     Ping(u32),
     Touch {
@@ -356,6 +359,7 @@ enum Injection {
         width: i32,
         height: i32,
         serial: u32,
+        states: Vec<u32>,
     },
 }
 
@@ -427,13 +431,21 @@ impl Proxy {
         })
     }
 
-    /// Queues an xdg-shell configure of the window: `xdg_toplevel.configure(width, height, activated)`, then `xdg_surface.configure(serial)`, the order a compositor sends them.
+    /// Queues an xdg-shell configure of the window: `xdg_toplevel.configure(width, height, states)`, then `xdg_surface.configure(serial)`, the order a compositor sends them.
+    /// `states` join `activated` in the array; a configure is the window's whole state, so one without `states` clears the others (`[]` = focused, no other state). Values: [`XDG_STATE_MAXIMIZED`], [`XDG_STATE_SUSPENDED`].
     /// The client's `ack_configure(serial)` comes back as [`Event::Acked`] but is not forwarded: the compositor never sent that serial, and it would drop the client for it (`client_to_server`). Inject after the first [`Event::Acked`], as [`Proxy::inject_pointer`]: nothing is written before the window exists.
-    pub fn inject_configure(&self, width: i32, height: i32, serial: u32) -> Result<()> {
+    pub fn inject_configure(
+        &self,
+        width: i32,
+        height: i32,
+        serial: u32,
+        states: &[u32],
+    ) -> Result<()> {
         self.queue(Injection::Configure {
             width,
             height,
             serial,
+            states: states.to_vec(),
         })
     }
 
@@ -740,6 +752,7 @@ fn server_to_client(
                     width,
                     height,
                     serial,
+                    states,
                 } => match (toplevel, xdg_surface) {
                     (Some(toplevel), Some(xdg_surface)) => {
                         // recorded before the bytes go out: the client's ack cannot come before this
@@ -748,7 +761,7 @@ fn server_to_client(
                             .injected
                             .push(serial);
                         let _ = events.send((Instant::now(), Event::ConfigureInjected { serial }));
-                        configure_bytes(toplevel, xdg_surface, width, height, serial)
+                        configure_bytes(toplevel, xdg_surface, width, height, serial, &states)
                     }
                     _ => {
                         eprintln!(
@@ -778,22 +791,28 @@ fn ping_bytes(wm_base: u32, serial: u32) -> Vec<u8> {
     event(wm_base, XDG_WM_BASE_PING, &serial.to_ne_bytes())
 }
 
-/// `xdg_toplevel.configure(width, height, states)` then `xdg_surface.configure(serial)` as a client receives them. The states array is the one `activated` entry: a u32 byte length, then the entry.
+/// `xdg_toplevel.configure(width, height, states)` then `xdg_surface.configure(serial)` as a client receives them. The states array is `activated`, then `states`: a u32 byte length, then one u32 per entry.
 fn configure_bytes(
     toplevel: u32,
     xdg_surface: u32,
     width: i32,
     height: i32,
     serial: u32,
+    states: &[u32],
 ) -> Vec<u8> {
-    let states_bytes = 4u32;
-    let body = [
+    let entries: Vec<u32> = std::iter::once(XDG_STATE_ACTIVATED)
+        .chain(states.iter().copied())
+        .collect();
+    let states_bytes = (entries.len() * 4) as u32;
+    let mut body = [
         width.to_ne_bytes(),
         height.to_ne_bytes(),
         states_bytes.to_ne_bytes(),
-        XDG_STATE_ACTIVATED.to_ne_bytes(),
     ]
     .concat();
+    for entry in entries {
+        body.extend(entry.to_ne_bytes());
+    }
     let mut out = event(toplevel, XDG_TOPLEVEL_CONFIGURE, &body);
     out.extend(event(
         xdg_surface,
@@ -1059,7 +1078,7 @@ mod tests {
     /// The toplevel's message is 24 bytes (header, 1600, 1000, a 4-byte array holding `activated` = 4); the surface's is 12 bytes (header, serial 5).
     #[test]
     fn configure_is_the_toplevel_then_the_surface() {
-        let bytes = configure_bytes(7, 8, 1600, 1000, 5);
+        let bytes = configure_bytes(7, 8, 1600, 1000, 5, &[]);
         let parts: [&[u8]; 5] = [
             &[7, 0, 0, 0, 0x00, 0x00, 0x18, 0x00],
             &[0x40, 0x06, 0, 0, 0xE8, 0x03, 0, 0],
@@ -1070,5 +1089,23 @@ mod tests {
         assert_eq!(bytes, parts.concat());
         assert_eq!(message(&bytes), Some((7, 0, 24)));
         assert_eq!(message(&bytes[24..]), Some((8, 0, 12)));
+    }
+
+    /// The states array is `activated` (4), then maximized (1) and suspended (9): 12 bytes, so the toplevel's message is 32 bytes (header, 1600, 1000, the length, three entries).
+    #[test]
+    fn configure_carries_the_states_beside_activated() {
+        let states = [XDG_STATE_MAXIMIZED, XDG_STATE_SUSPENDED];
+        let bytes = configure_bytes(7, 8, 1600, 1000, 5, &states);
+        let parts: [&[u8]; 6] = [
+            &[7, 0, 0, 0, 0x00, 0x00, 0x20, 0x00],
+            &[0x40, 0x06, 0, 0, 0xE8, 0x03, 0, 0],
+            &[12, 0, 0, 0],
+            &[4, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0],
+            &[8, 0, 0, 0, 0x00, 0x00, 0x0C, 0x00],
+            &[5, 0, 0, 0],
+        ];
+        assert_eq!(bytes, parts.concat());
+        assert_eq!(message(&bytes), Some((7, 0, 32)));
+        assert_eq!(message(&bytes[32..]), Some((8, 0, 12)));
     }
 }

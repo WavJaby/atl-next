@@ -10,6 +10,7 @@
 //! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
 //! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
 //! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
+//! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,6 +36,7 @@ mod gles2;
 mod ime;
 mod move_output;
 mod surface_view;
+mod suspended;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -105,6 +107,9 @@ pub struct Args {
     /// Stage dialog only: the services send no requestFinish on Back (atld `--no-root-back`), so the back-close sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_root_back: bool,
+    /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_suspended: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -139,6 +144,8 @@ enum Stage {
     Dialog,
     /// The GLES2 fixture in UI mode, its `.so` a guest library through the native bridge: the app's readback and the composer's readback at its probes are the expectation (xtask/src/window/gles2.rs; GS2.5).
     Gles2,
+    /// UI mode: the probe sends the maximized control, then the suspended state through the proxy; the platform layer must log each as the toplevel's state (xtask/src/window/suspended.rs; window lifecycle S0).
+    Suspended,
 }
 
 impl Stage {
@@ -159,6 +166,7 @@ impl Stage {
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
             Stage::Gles2 => "gles2",
+            Stage::Suspended => "suspended",
         }
     }
 
@@ -174,7 +182,8 @@ impl Stage {
             | Stage::Relaunch
             | Stage::Declared
             | Stage::StartFinish
-            | Stage::Move => RESIZE_WINDOW_MS,
+            | Stage::Move
+            | Stage::Suspended => RESIZE_WINDOW_MS,
         }
     }
 }
@@ -298,7 +307,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Relaunch
         | Stage::Declared
         | Stage::StartFinish
-        | Stage::Move => "AtlWindow: onResume reached",
+        | Stage::Move
+        | Stage::Suspended => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::Dialog => dialog::MARKER,
         Stage::Gles2 => gles2::MARKER,
@@ -901,7 +911,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     let (mut configured, [grow, shrink]) = (Vec::new(), RESIZE_STEPS);
     let step = |(width, height, serial): (i32, i32, u32)| -> Result<bool, String> {
         proxy
-            .inject_configure(width, height, serial)
+            .inject_configure(width, height, serial, &[])
             .map_err(|e| e.to_string())?;
         let acked = await_event(&proxy.events, PONG_WAIT, |e| {
             *e == ProxyEvent::Acked { serial }
@@ -913,7 +923,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     configured.push(step(grow)?);
     for (width, height, serial) in BURST_STEPS {
         proxy
-            .inject_configure(width, height, serial)
+            .inject_configure(width, height, serial, &[])
             .map_err(|e| e.to_string())?;
         std::thread::sleep(BURST_GAP);
     }
@@ -1642,7 +1652,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Move
         | Stage::SurfaceView
         | Stage::Dialog
-        | Stage::Gles2 => {
+        | Stage::Gles2
+        | Stage::Suspended => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
@@ -1783,6 +1794,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the probe drives the client through its proxy from here on
     let stage = args.stage;
     let break_mouse_back = args.break_mouse_back;
+    let break_suspended = args.break_suspended;
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -1799,6 +1811,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 drive_resize(p, &log)
             }
+            (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
             _ => drive(p, &log),
         })
@@ -1876,6 +1889,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness),
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness),
+        (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);
             sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));

@@ -295,7 +295,7 @@ impl Driver<'_> {
         let want = (w + geometry.width - cw, h + geometry.height - ch);
         let serial = self.serial;
         self.serial += 1;
-        self.t.proxy.inject_configure(want.0, want.1, serial)?;
+        self.t.proxy.inject_configure(want.0, want.1, serial, &[])?;
         let mut acked = false;
         self.wait_until("configure ack", |d| {
             acked |= d.pump(Some(serial));

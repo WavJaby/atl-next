@@ -436,6 +436,17 @@ impl Window for GtkWindow {
                         view.rescale();
                     }
                 });
+                // the xdg-shell states GDK reports: `suspended` is the hidden signal the window lifecycle consumes (S2); logged per change
+                if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
+                    toplevel.connect_state_notify(|t| {
+                        let state = t.state();
+                        tracing::info!(
+                            "atl-platform-ui: state maximized={} suspended={}",
+                            state.contains(gdk::ToplevelState::MAXIMIZED),
+                            state.contains(gdk::ToplevelState::SUSPENDED),
+                        );
+                    });
+                }
             }
         });
         // keyboard focus = the active toplevel (xdg_toplevel state `activated`); GTK notifies each change

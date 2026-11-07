@@ -456,7 +456,7 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     std::thread::sleep(RESIZE_SETTLE);
     let (width, height, serial) = RESIZED;
     proxy
-        .inject_configure(width, height, serial)
+        .inject_configure(width, height, serial, &[])
         .map_err(|e| e.to_string())?;
     await_event(&proxy.events, PONG_WAIT, |e| {
         *e == ProxyEvent::Acked { serial }
