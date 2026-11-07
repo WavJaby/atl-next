@@ -8,6 +8,7 @@ pub mod android {
         pub mod ActivityManager_TaskDescription;
         pub mod ApplicationErrorReport_ParcelableCrashInfo;
         pub mod ContentProviderHolder;
+        pub mod PendingIntent;
         pub mod servertransaction {
             pub mod ClientTransaction;
         }

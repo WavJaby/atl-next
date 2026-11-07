@@ -8,7 +8,9 @@
 import android.app.ActivityManager;
 import android.app.ApplicationErrorReport;
 import android.app.ContentProviderHolder;
+import android.app.PendingIntent;
 import android.app.ResultInfo;
+import android.content.IIntentSender;
 import android.app.servertransaction.ActivityConfigurationChangeItem;
 import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ActivityRelaunchItem;
@@ -245,6 +247,8 @@ public class ParcelTruth {
         checkBinder("Bundle:binder", echo);
         checkDescriptors("Bundle:fd", echo);
         checkIntentBinder("Intent:binder-extras", echo);
+        // the alarm path (atl-services alarm.rs): the operation a set alarm is matched by, its IIntentSender's binder
+        checkPendingIntent("PendingIntent", echo);
 
         // the window path (M3 slice 5): the LayoutParams IWindowSession receives, and the replies it sends (addToDisplayAsUser, relayout), each field off its default
         check("WindowManager.LayoutParams", layoutParams(), WindowManager.LayoutParams.CREATOR);
@@ -437,6 +441,24 @@ public class ParcelTruth {
         IBinder got = back.getBinder("binder");
         boolean ok = consumed && got == echo && "value".equals(back.getString("key")) && usable(got);
         result(ok, name, ok ? "binder survived java -> rust -> java: same object, answers a transaction" : "binder " + got + ", key " + back.getString("key") + ", sizes " + in.dataSize() + "/" + out.dataSize());
+        in.recycle();
+        out.recycle();
+    }
+
+    /// A PendingIntent is its IIntentSender's binder, and Parcel.marshall refuses a parcel holding one: Java Parcel -> codec -> Java Parcel, the same binder object back (PendingIntent.equals compares it), and it answers.
+    static void checkPendingIntent(String name, Binder echo) {
+        PendingIntent sent = new PendingIntent(IIntentSender.Stub.asInterface(echo));
+        Parcel in = written(sent);
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("android.app.PendingIntent", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean consumed = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        PendingIntent back = PendingIntent.CREATOR.createFromParcel(out);
+        boolean ok = consumed && back != null && back.equals(sent) && usable(back.getTarget().asBinder());
+        result(ok, name, ok ? "binder survived java -> rust -> java: equal to the sent PendingIntent, answers a transaction" : "consumed " + consumed + ", back " + back);
         in.recycle();
         out.recycle();
     }
