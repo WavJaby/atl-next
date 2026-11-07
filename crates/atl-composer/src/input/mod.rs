@@ -483,7 +483,7 @@ mod publish {
             // keys go both ways: the app gets them, and the tilt follows those its focused window got
             if state.windows.borrow().has_focus() {
                 with_tilt(state, |t| {
-                    for k in &k {
+                    if let Some(k) = &k {
                         t.key(k.key_code, k.action == key::ACTION_DOWN);
                     }
                 });

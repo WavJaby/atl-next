@@ -423,7 +423,7 @@ impl Injector {
             d.write(package)
         })?;
         let Some((handle, sensor_type)) =
-            first_accelerometer(&list.borrowed_ref()).map_err(err("getSensorList"))?
+            first_accelerometer(list.borrowed_ref()).map_err(err("getSensorList"))?
         else {
             return Ok(None);
         };
