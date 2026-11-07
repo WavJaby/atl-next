@@ -234,6 +234,8 @@ pub struct Runtime {
     gate: String,
     /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
     tree: PathBuf,
+    /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
+    site: remote::Site,
 }
 
 /// A command the shell runs once the system is up (`am instrument ...`).
@@ -561,7 +563,14 @@ impl Runtime {
             omitted_services: Vec::new(),
             tilt_keys: None,
             fake_devices: None,
+            site: remote::Site::Host,
         })
+    }
+
+    /// Runs atld on `site` (remote.rs): a target's copy of this runtime's bundle, instead of this host.
+    pub fn with_site(mut self, site: remote::Site) -> Self {
+        self.site = site;
+        self
     }
 
     /// Also starts the graphics allocator HAL under atld (`--gralloc`): the allocator `xtask native` built, and `mapper.atl.so` installed in `<out>/gralloc/lib`, which joins every process's library path.
@@ -950,8 +959,9 @@ impl Runtime {
             self.atld.clone(),
             self.framework_res.clone(),
             self.fonts.conf.clone(),
-            self.fonts.font_data.clone(),
         ]);
+        // a directory (atld's `--font-data`): the record takes its tree whole
+        inputs.dirs.push(self.fonts.font_data.clone());
         inputs.files.extend(self.fonts.files.iter().cloned());
         inputs.files.extend(
             tree::KEYBOARD_FILES
@@ -996,6 +1006,7 @@ impl Runtime {
     }
 
     /// Starts atld for `run`, its stdout and stderr in `run.atld_log()`. The caller waits for it and ends it.
+    /// On a remote [`remote::Site`] the same command runs on the target (remote.rs `RemoteRun::spawn`): the child is the transfer, and it ends with the run.
     pub fn start_atld(&self, run: &Run) -> Result<Child> {
         self.record_inputs(run)?;
         std::fs::create_dir_all(&run.scratch)?;
@@ -1004,6 +1015,48 @@ impl Runtime {
             std::fs::remove_dir_all(&run.root)
                 .with_context(|| format!("removing {}", run.root.display()))?;
         }
+        let (mut cmd, mut written) = self.atld_command(run)?;
+        if let remote::Site::Remote(target) = &self.site {
+            ensure!(
+                self.fake_devices.is_none()
+                    && self.wayland.is_none()
+                    && self.ui.is_none()
+                    && self.display.is_none()
+                    && self.headless_pointer.is_none()
+                    && run.launch.is_none()
+                    && run.libraries.is_empty(),
+                "remote run {}: not remotable yet (live UI, display, sensor injection, launch and shared libraries need a target runner)",
+                run.root.display()
+            );
+            // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates
+            let conf = run.scratch.join("fonts.conf");
+            std::fs::copy(&self.fonts.conf, &conf)
+                .with_context(|| format!("copying {}", self.fonts.conf.display()))?;
+            cmd.env("FONTCONFIG_FILE", &conf);
+            written.push(conf);
+            let roots = remote::Roots::of(&self.out, &self.java_out, &self.tree);
+            return target.spawn(&roots, &cmd, &run.root, &run.scratch, &written);
+        }
+        let log_file = std::fs::File::create(run.atld_log())?;
+        cmd.stdin(Stdio::null())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file);
+        cmd.spawn().context("starting atld")
+    }
+
+    /// How a run's child ended: an error naming the transcript's last line when a remote transfer failed by itself (an exit code). A transfer the caller stopped at its limit has no code: its logs are the judge's to read, as on this host.
+    pub fn check_end(&self, end: ExitStatus, run: &Run) -> Result<()> {
+        match &self.site {
+            remote::Site::Remote(target) if end.code().is_some_and(|c| c != 0) => {
+                Err(target.failed(&run.root, end))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// atld's command for `run`, and the files it wrote under `run.scratch` (the package and permission files it reads).
+    fn atld_command(&self, run: &Run) -> Result<(Command, Vec<PathBuf>)> {
+        let mut written = Vec::new();
         let keychars: Vec<PathBuf> = tree::KEYBOARD_FILES
             .iter()
             .map(|(file, _)| self.keychars.join(file))
@@ -1030,6 +1083,11 @@ impl Runtime {
         for dir in self.gl_driver.iter().flat_map(|(_, dirs)| dirs) {
             lib_path.push(":");
             lib_path.push(dir);
+        }
+        // a remote target has no libc++ of its own: the bundle's `lib/` (remote.rs `LLVM_LIB_DIR`) joins the runtime's library path there
+        if matches!(self.site, remote::Site::Remote(_)) {
+            lib_path.push(":");
+            lib_path.push(remote::LLVM_LIB_DIR);
         }
         // unshare and sh both exec (no --fork): the child's pid stays atld's, so stop() still reaches it
         let mut cmd = match &self.fake_devices {
@@ -1171,6 +1229,7 @@ impl Runtime {
                     abis: &self.abis,
                 })?,
             )?;
+            written.push(file.clone());
             cmd.arg("--package").arg(file);
         }
         // the platform's permission definitions, read from framework-res's manifest as an app's are (aapt2): atld's install grants from them
@@ -1182,6 +1241,7 @@ impl Runtime {
                 &self.framework_res,
             )?)?,
         )?;
+        written.push(platform.clone());
         cmd.arg("--platform-permissions").arg(platform);
         for (name, lib) in &run.libraries {
             cmd.arg("--shared-library").arg(lib.to_arg(name, &lib.file));
@@ -1200,11 +1260,7 @@ impl Runtime {
                 cmd.arg("--run-boot-jar").arg(j);
             }
         }
-        let log_file = std::fs::File::create(run.atld_log())?;
-        cmd.stdin(Stdio::null())
-            .stdout(log_file.try_clone()?)
-            .stderr(log_file);
-        cmd.spawn().context("starting atld")
+        Ok((cmd, written))
     }
 }
 

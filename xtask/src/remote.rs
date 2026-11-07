@@ -5,22 +5,24 @@
 //! `push` bundles that record, mapped to `out/`, `java/` and `src/aosp/` names, plus `lib/`: Debian's LLVM 19 runtimes (a labelled patch until our pinned runtimes ship in an install tree, plan L1 / D1).
 //! A directory is replicated with its symlinks kept as links and never followed (the ART tree's `com.android.art -> .` would loop); files are hard links, copies across filesystems.
 //! Dry run by default. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` (with a manifest of sha256 + size, or the link target) and runs `rsync -a --delete` to `~/atl-next-run/<slot>/` on the host.
-//! `test` runs the prerequisite check on the target first: `ldd` over every ELF of the bundle, with the bundle's directories on `LD_LIBRARY_PATH`. Each `not found` soname is named with the file that needs it, a file the push did not deliver is named, and any of them is red. The gate's runtime half on the target is not implemented ([`runtime_half`]), so `test` is red after a green prerequisite.
+//! `test` runs the prerequisite check on the target first: `ldd` over every ELF of the bundle, with the bundle's directories on `LD_LIBRARY_PATH`. Each `not found` soname is named with the file that needs it, a file the push did not deliver is named, and any of them is red. Then the runtime half ([`runtime_half`]): `gl` runs here, each of its atld runs runs on the target from the bundle ([`RemoteRun::spawn`]), and its judge reads the logs the target returns.
 //! Host: an ssh alias from the operator's WSL `~/.ssh/config`. The alias is the only handle: no address, user or key goes into the repo or a flag. `local:<absolute dir>` is a directory standing in for the target (the local gate).
 //! Limit: `ldd` here also searches this host's own libraries, so on WSL a missing bundle copy still resolves. The `drop-libunwind` break is red only on a host without its own `libunwind.so.1`.
+//! `local:` runs the same script on this host, so it cannot show a bundle file naming a WSL path the target lacks: only a real target does.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Output, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::{gate_goals, provided_gate, slot, verdict};
+use crate::{arches, gate_goals, gl_probe, provided_gate, slot, verdict};
 
 /// The bundle's `lib/`: Debian's LLVM 19 runtimes. Arch ships libc++ 23 but no LLVM `libunwind.so.1` (plan L1 section 3). A labelled patch: the ideal is our pinned runtimes (runtimes.rs) in a packaged install tree (plan D1).
-const LLVM_LIB_DIR: &str = "/usr/lib/llvm-19/lib";
+pub const LLVM_LIB_DIR: &str = "/usr/lib/llvm-19/lib";
 /// (soname, file in [`LLVM_LIB_DIR`]). Each file's SONAME must equal its soname before it is bundled.
 const LLVM_RUNTIMES: [(&str, &str); 3] = [
     ("libc++.so.1", "libc++.so.1.0"),
@@ -31,6 +33,8 @@ const LLVM_RUNTIMES: [(&str, &str); 3] = [
 const LIB_PREFIX: &str = "lib/";
 /// The break's entry: its name in the bundle.
 const LIBUNWIND: &str = "lib/libunwind.so.1";
+/// atld's entry: `cargo_bin` (atld_run.rs) under the slot.
+const ATLD: &str = "out/cargo/release/atld";
 /// Bundle names of a record's roots: the slot, the java out and the AOSP tree.
 const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree", "src/aosp")];
 /// The target's directory for a slot's bundle, relative to the host's home: `~/atl-next-run/<slot>/`.
@@ -50,7 +54,7 @@ pub enum Remote {
     /// Dry run by default: prints the bundle summary (`--list`: every entry) and the rsync it would run. `--apply` stages the bundle under `<out>/remote/bundle/<gate>` with a manifest, then runs `rsync -a --delete` to `~/atl-next-run/<slot>/` on the host.
     /// The record is written by a gate's run in the slot (`xtask test <gate>`); without it this names that command.
     Push(PushArgs),
-    /// The prerequisite check on the target: `ldd` over the bundle, every `not found` named with the file that needs it. The gate's runtime half then runs there: not implemented, so red.
+    /// The prerequisite check on the target: `ldd` over the bundle, every `not found` named with the file that needs it. Then the gate's runtime half: its atld runs execute on the target (`gl` only).
     ///
     /// Dry run by default: prints the check it would run. `--apply` runs it over ssh (or locally for `local:`). Run `push --apply` first: a file the push did not deliver is named as missing.
     Test(TestArgs),
@@ -100,6 +104,8 @@ pub struct TestArgs {
 pub enum Break {
     /// Drops `lib/libunwind.so.1`: the prerequisite check must name it on a host with no copy of its own.
     DropLibunwind,
+    /// Drops atld from the bundle: the prerequisite check names it as not delivered (`push --apply`), and a run without it stops at the executable check.
+    DropAtld,
 }
 
 pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
@@ -156,7 +162,10 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
             elf.len(),
             dirs.len()
         );
-        println!("dry run: the gate's runtime half would follow: not implemented (red)");
+        println!(
+            "dry run: the gate's runtime half would follow: `{}` runs its atld runs on the target (--apply)",
+            a.gate
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let text = host.run_script(&script)?;
@@ -174,8 +183,15 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
             println!("remote prereq {}: {f}", a.gate);
         }
     }
-    if let Err(e) = runtime_half(&a.gate) {
-        fails.push(format!("{e:#}"));
+    if fails.is_empty() {
+        match runtime_half(root, a, &host, &slot, &out, dirs) {
+            Ok(true) => {}
+            Ok(false) => fails.push(format!(
+                "gate `{}`: a check failed, see its lines above",
+                a.gate
+            )),
+            Err(e) => fails.push(format!("{e:#}")),
+        }
     }
     println!(
         "{}",
@@ -188,14 +204,375 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
     })
 }
 
-/// The gate's runtime half on the target: not implemented. The gate's run builds inside itself (cargo for the probe library, the APK with aapt2, javac and d8, its manifest read with aapt2) and starts atld from host paths. Running it on the target needs a serialized runtime and a target runner: a plan L1 open decision.
-fn runtime_half(gate: &str) -> Result<()> {
-    bail!(
-        "gate `{gate}`: its runtime half is not remotable yet (no target runner; the gate builds its inputs inside its run, plan L1 open decision)"
-    )
+/// The gate's runtime half on the target. The gate runs here; each atld run it starts runs on the target from the bundle, so its judge reads the logs the target returned and prints what the local gate prints.
+/// Only `gl`: its runs are one-shot probes. The other runtime gates drive a live atld (control socket, windows, sensors), which one transfer per run cannot serve. Returns whether the gate passed.
+fn runtime_half(
+    root: &Path,
+    a: &TestArgs,
+    host: &Host,
+    slot: &str,
+    out: &Path,
+    lib_dirs: Vec<String>,
+) -> Result<bool> {
+    ensure!(
+        a.gate == "gl",
+        "gate `{}`: its runtime half is not remotable yet (only `gl`: its runs are one-shot; the others drive a live runtime)",
+        a.gate
+    );
+    let arches = arches::load(root)?;
+    let (arch, _) = arches::build_machine(root, &arches)?;
+    let dir = out.join(REMOTE_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let log = dir.join(format!("{}.log", a.gate));
+    std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
+    let site = Site::Remote(RemoteRun {
+        host: host.clone(),
+        base: host.base(slot),
+        lib_dirs,
+        limit: gl_probe::LIMIT,
+        log: log.clone(),
+    });
+    let code = gl_probe::run_on(root, arch, out, site)?;
+    println!("remote test {}: transcript {}", a.gate, log.display());
+    Ok(code == ExitCode::SUCCESS)
+}
+
+/// Where a runtime's atld runs: this host, or a target that runs it from the bundle. The gate's judge reads the same log lines either way.
+#[derive(Default)]
+pub enum Site {
+    #[default]
+    Host,
+    Remote(RemoteRun),
+}
+
+/// A remote site: the target, the bundle's directory there, the library search path `test` checked, atld's time limit, and the transcript the transfers append to.
+pub struct RemoteRun {
+    host: Host,
+    /// Relative to the target's home dir over ssh, absolute for `local:`.
+    base: String,
+    /// Bundle names of the directories holding ELF files: the search path the prerequisite check ran with, and the run's `LD_LIBRARY_PATH`.
+    lib_dirs: Vec<String>,
+    /// atld's limit on the target (`timeout`); the caller's own limit is the same value.
+    limit: Duration,
+    /// Each run's header, then the stderr of its transfer.
+    log: PathBuf,
+}
+
+/// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree. Their bundle names are [`ROOT_NAMES`].
+pub struct Roots {
+    out: PathBuf,
+    java: PathBuf,
+    tree: PathBuf,
+}
+
+impl Roots {
+    pub fn of(out: &Path, java: &Path, tree: &Path) -> Roots {
+        Roots {
+            out: out.to_path_buf(),
+            java: java.to_path_buf(),
+            tree: tree.to_path_buf(),
+        }
+    }
+
+    /// Each root with its bundle name. The fourth is the bundle's `lib/`: the runtimes it ships stand for [`LLVM_LIB_DIR`] on this host.
+    fn named(&self) -> [(&Path, &'static str); 4] {
+        let [out, java, tree] = ROOT_NAMES.map(|(key, name)| (self.path(key), name));
+        [out, java, tree, (Path::new(LLVM_LIB_DIR), "lib")]
+    }
+
+    fn path(&self, key: &str) -> &Path {
+        match key {
+            "out" => &self.out,
+            "java" => &self.java,
+            "tree" => &self.tree,
+            other => unreachable!("record root `{other}`"),
+        }
+    }
+}
+
+/// Stands for the bundle's directory on the target: the run script expands it to `$BASE`.
+const BASE_MARK: &str = "@BASE@";
+/// `timeout -k`: KILL this many seconds after the limit's TERM.
+const KILL_GRACE: u64 = 10;
+/// The run script's name in the run's scratch dir.
+const REMOTE_SCRIPT: &str = "remote-run.sh";
+
+/// `text` with each host root that is a whole path token replaced by `@BASE@/<bundle name>`: the root is not preceded or followed by a path character (`[A-Za-z0-9._+/-]`, so `=`, `:`, quotes, `>` and spaces all bound it). The target then opens the bundle's copy, never this host's file.
+pub fn relocate(text: &str, roots: &Roots) -> String {
+    roots
+        .named()
+        .into_iter()
+        .fold(text.to_owned(), |text, (root, name)| {
+            replace_tokens(
+                &text,
+                &root.display().to_string(),
+                &format!("{BASE_MARK}/{name}"),
+            )
+        })
+}
+
+/// `text` with each occurrence of `from` that is a whole token (see [`relocate`]) replaced by `to`.
+fn replace_tokens(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for (at, _) in text.match_indices(from) {
+        let end = at + from.len();
+        let before = text[..at].chars().next_back();
+        let after = text[end..].chars().next();
+        if at >= last && starts_token(before) && ends_token(after) {
+            out.push_str(&text[last..at]);
+            out.push_str(to);
+            last = end;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// A character a path can continue with: the root's last name must end before it.
+fn path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/')
+}
+
+fn starts_token(before: Option<char>) -> bool {
+    before.is_none_or(|c| !path_char(c))
+}
+
+/// A `/` after the root is the path going on below it, so it bounds nothing but is kept: only a name character continues the root's last component.
+fn ends_token(after: Option<char>) -> bool {
+    after.is_none_or(|c| c == '/' || !path_char(c))
+}
+
+/// `text` as one double-quoted shell word, `@BASE@` as `$BASE`.
+fn word(text: &str) -> String {
+    let parts: Vec<String> = text.split(BASE_MARK).map(dq).collect();
+    format!("\"{}\"", parts.join("$BASE"))
+}
+
+/// `s` escaped for a double-quoted shell word.
+fn dq(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
+/// One atld run as the target runs it: the command, its environment, and the files this host wrote for it, all with bundle paths (`@BASE@`). `root` and `scratch` are relative to the slot's out dir, where the logs return.
+struct Plan {
+    /// The run's name, its dir under the slot, e.g. `gl/run`.
+    tag: String,
+    root: String,
+    scratch: String,
+    env: Vec<(String, String)>,
+    program: String,
+    args: Vec<String>,
+    /// (bundle path, content): the package and permission files, the fontconfig copy.
+    files: Vec<(String, String)>,
+    lib_dirs: Vec<String>,
+    limit: u64,
+}
+
+fn out_path(rel: &str) -> String {
+    format!("{BASE_MARK}/out/{rel}")
+}
+
+impl Plan {
+    /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, then its logs as a tar on stdout. The script's exit is the tar's.
+    fn script(&self, base: &str) -> String {
+        let mut s = format!(
+            "# xtask remote run {}: written by remote.rs, do not edit\ncd {} || exit 2\nset -u\nBASE=$(pwd)\n",
+            self.tag,
+            sh_quote(base)
+        );
+        s.push_str(&format!("rm -rf {}\n", word(&out_path(&self.root))));
+        s.push_str(&format!("mkdir -p {}\n", word(&out_path(&self.scratch))));
+        for (path, text) in &self.files {
+            s.push_str(&format!(
+                "sed \"s|{BASE_MARK}|$BASE|g\" > {} <<'ATL_EOF'\n{text}",
+                word(path)
+            ));
+            if !text.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("ATL_EOF\n");
+        }
+        let shown = self.program.replace(&format!("{BASE_MARK}/"), "");
+        s.push_str(&format!(
+            "[ -x {} ] || {{ echo \"remote run {}: {} is not an executable\" >&2; exit 4; }}\n",
+            word(&self.program),
+            self.tag,
+            dq(&shown)
+        ));
+        let lib_path: Vec<String> = self
+            .lib_dirs
+            .iter()
+            .map(|d| format!("{BASE_MARK}/{d}"))
+            .collect();
+        s.push_str(&format!(
+            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={}",
+            word(&lib_path.join(":"))
+        ));
+        for (key, value) in &self.env {
+            s.push_str(&format!(" {key}={}", word(value)));
+        }
+        let args: Vec<String> = self.args.iter().map(|a| word(a)).collect();
+        s.push_str(&format!(
+            " timeout -k {KILL_GRACE} {} {} {} < /dev/null > {} 2>&1\n",
+            self.limit,
+            word(&self.program),
+            args.join(" "),
+            word(&out_path(&format!("{}/atld.log", self.scratch)))
+        ));
+        s.push_str("rc=$?\n");
+        s.push_str(&format!(
+            "echo \"atld rc=$rc, remote run {}\" >&2\n",
+            self.tag
+        ));
+        s.push_str(&format!(
+            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {}\n",
+            sh_quote(&format!("{}/log", self.root)),
+            sh_quote(&format!("{}/atld.log", self.scratch))
+        ));
+        s
+    }
+}
+
+impl RemoteRun {
+    /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the slot's out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
+    pub fn spawn(
+        &self,
+        roots: &Roots,
+        cmd: &Command,
+        root: &Path,
+        scratch: &Path,
+        written: &[PathBuf],
+    ) -> Result<Child> {
+        ensure!(
+            cmd.get_current_dir().is_none(),
+            "remote run: a working directory is not relocated"
+        );
+        let root_rel = rel_out(&roots.out, root)?;
+        let tag = root_rel
+            .strip_suffix("/root")
+            .unwrap_or(&root_rel)
+            .to_owned();
+        let env = cmd
+            .get_envs()
+            .map(|(key, value)| -> Result<(String, String)> {
+                let value = value.with_context(|| format!("{key:?} is unset, not set"))?;
+                Ok((utf8(key)?, relocate(&utf8(value)?, roots)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let args = cmd
+            .get_args()
+            .map(|a| Ok(relocate(&utf8(a)?, roots)))
+            .collect::<Result<Vec<_>>>()?;
+        let files = written
+            .iter()
+            .map(|path| -> Result<(String, String)> {
+                let body = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Ok((
+                    relocate(&utf8(path.as_os_str())?, roots),
+                    relocate(&body, roots),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let plan = Plan {
+            tag: tag.clone(),
+            root: root_rel,
+            scratch: rel_out(&roots.out, scratch)?,
+            env,
+            program: relocate(&utf8(cmd.get_program())?, roots),
+            args,
+            files,
+            lib_dirs: self.lib_dirs.clone(),
+            limit: self.limit.as_secs(),
+        };
+        let script = scratch.join(REMOTE_SCRIPT);
+        std::fs::write(&script, plan.script(&self.base))
+            .with_context(|| format!("writing {}", script.display()))?;
+        let transport = match &self.host {
+            Host::Ssh(alias) => format!("ssh {} {} sh -s", SSH_OPTS.join(" "), sh_quote(alias)),
+            Host::Local(_) => "sh -s".to_owned(),
+        };
+        let transfer = format!(
+            "{transport} < {} | tar -x -C {}",
+            sh_quote(&script.display().to_string()),
+            sh_quote(&roots.out.display().to_string())
+        );
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .with_context(|| format!("opening {}", self.log.display()))?;
+        writeln!(log, "== run {tag} on {}", self.host.label())?;
+        Command::new("sh")
+            .args(["-c", &transfer])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log.try_clone()?)
+            .spawn()
+            .context("starting the transfer to the target")
+    }
+
+    /// The error for a run whose transfer ended `end`. The cause is the transcript's lines after the run's header (the script's own message comes first, then the transfer's), up to three.
+    pub fn failed(&self, root: &Path, end: ExitStatus) -> anyhow::Error {
+        // a leading newline: the first run's header starts the file
+        let text = format!(
+            "\n{}",
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        );
+        let after_header = text
+            .rsplit_once("\n== run ")
+            .map(|(_, run)| run.lines().skip(1).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let cause: Vec<&str> = after_header
+            .into_iter()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(3)
+            .collect();
+        anyhow!(
+            "remote run {} ended {end}: {} (transcript {})",
+            root.display(),
+            if cause.is_empty() {
+                "no output".to_owned()
+            } else {
+                cause.join(" | ")
+            },
+            self.log.display()
+        )
+    }
+}
+
+/// `path` relative to the slot's out dir: the target keeps that layout. A path outside the slot is refused.
+fn rel_out(out: &Path, path: &Path) -> Result<String> {
+    let rel = path.strip_prefix(out).with_context(|| {
+        format!(
+            "{} is not under the slot {}: a remote run keeps its files there",
+            path.display(),
+            out.display()
+        )
+    })?;
+    let text = rel
+        .to_str()
+        .with_context(|| format!("{} is not UTF-8", rel.display()))?;
+    ensure!(
+        safe_name(text),
+        "{text}: the target path takes only [A-Za-z0-9._+/-]"
+    );
+    Ok(text.to_owned())
+}
+
+fn utf8(s: &std::ffi::OsStr) -> Result<String> {
+    s.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{s:?} is not UTF-8"))
 }
 
 /// The host a bundle goes to.
+#[derive(Clone)]
 enum Host {
     /// An ssh alias (WSL `~/.ssh/config`).
     Ssh(String),
@@ -668,6 +1045,12 @@ impl Bundle {
                 "break drop-libunwind: no {LIBUNWIND} in the bundle"
             );
         }
+        if brk == Some(Break::DropAtld) {
+            ensure!(
+                map.remove(ATLD).is_some(),
+                "break drop-atld: no {ATLD} in the bundle"
+            );
+        }
         Ok(Bundle {
             gate: gate.to_owned(),
             entries: map.into_values().collect(),
@@ -842,7 +1225,7 @@ impl Prereq {
     }
 }
 
-/// [`prereq_script`]'s output: `== file` opens a file's `ldd` lines, `!missing file` a file the target lacks. Lines with `=> not found` are unresolved sonames. `ldd:` lines are failures, except `not a dynamic executable` (a static file has nothing to resolve).
+/// [`prereq_script`]'s output: `== file` opens a file's `ldd` lines, `!missing file` a file the target lacks. Lines with `=> not found` are unresolved sonames. `ldd:` lines are failures, except `not a dynamic executable` (a static file has nothing to resolve) and the execute-permission warning: glibc's `ldd` (2.44 on the laptop) prints it for a bundled 0644 library and still lists its NEEDED.
 pub fn parse_prereq(text: &str) -> Prereq {
     let mut p = Prereq::default();
     let mut current = String::new();
@@ -856,7 +1239,10 @@ pub fn parse_prereq(text: &str) -> Prereq {
             current = f.to_owned();
         } else if let Some(soname) = line.strip_suffix("=> not found").map(str::trim_end) {
             p.unresolved.push((current.clone(), soname.to_owned()));
-        } else if line.starts_with("ldd:") && !line.contains("not a dynamic executable") {
+        } else if line.starts_with("ldd:")
+            && !line.contains("not a dynamic executable")
+            && !line.contains("you do not have execution permission")
+        {
             p.failures.push(format!("{current}: {line}"));
         }
     }
@@ -970,6 +1356,18 @@ mod tests {
     }
 
     #[test]
+    fn ldd_permission_warning_is_not_a_failure() {
+        let p = parse_prereq(
+            "== lib/x.so\nldd: warning: you do not have execution permission for `lib/x.so'\n\tlibfoo.so.1 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n",
+        );
+        assert!(p.failures.is_empty(), "{:?}", p.failures);
+        assert_eq!(
+            p.unresolved,
+            vec![("lib/x.so".to_owned(), "libfoo.so.1".to_owned())]
+        );
+    }
+
+    #[test]
     fn green_output_has_no_problems() {
         let p = parse_prereq("== a.so\n\tlibc.so.6 => /lib/x (0x1)\n\tlinux-vdso.so.1 (0x2)\n");
         assert_eq!(p.checked, 1);
@@ -992,6 +1390,139 @@ mod tests {
         assert_eq!(rec.roots["out"], out);
         assert_eq!(rec.roots["tree"], tree);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The script's own message is the cause; the transfer's complaint follows it.
+    #[test]
+    fn failed_run_names_the_script_message_first() {
+        let dir = temp("failed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("gl.log");
+        std::fs::write(
+            &log,
+            "== run gl/run on local:/b\nremote run gl/run: out/x is not an executable\ntar: does not look like a tar archive\n",
+        )
+        .unwrap();
+        let run = RemoteRun {
+            host: Host::Local(PathBuf::from("/b")),
+            base: "/b".to_owned(),
+            lib_dirs: Vec::new(),
+            limit: Duration::from_secs(1),
+            log: log.clone(),
+        };
+        // a wait status: exit code 2 is `2 << 8`
+        let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
+        let msg = format!("{:#}", run.failed(Path::new("/w/out/gl/run/root"), end));
+        assert!(
+            msg.contains("ended exit status: 2: remote run gl/run: out/x is not an executable | tar: does not look like a tar archive"),
+            "{msg}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn host_roots() -> Roots {
+        Roots::of(
+            Path::new("/w/out/slot-9"),
+            Path::new("/w/out/java/build"),
+            Path::new("/w/src/aosp"),
+        )
+    }
+
+    #[test]
+    fn relocate_maps_each_root_at_a_token_start_only() {
+        let r = host_roots();
+        assert_eq!(
+            relocate("--root=/w/out/slot-9/gl/run/root", &r),
+            "--root=@BASE@/out/gl/run/root"
+        );
+        assert_eq!(
+            relocate("/w/out/java/build/boot.jar", &r),
+            "@BASE@/java/boot.jar"
+        );
+        assert_eq!(relocate("/w/src/aosp/k.kcm", &r), "@BASE@/src/aosp/k.kcm");
+        // `--file host=at`: the host side moves, the Android path stays
+        assert_eq!(
+            relocate("--file=/w/out/slot-9/a.so=/system/lib64/a.so", &r),
+            "--file=@BASE@/out/a.so=/system/lib64/a.so"
+        );
+        // a library path joins roots with `:`
+        assert_eq!(
+            relocate("/w/out/slot-9/a:/w/out/slot-9/b", &r),
+            "@BASE@/out/a:@BASE@/out/b"
+        );
+        // a JSON string value
+        assert_eq!(
+            relocate(r#"{"apk": "/w/out/slot-9/x.apk"}"#, &r),
+            r#"{"apk": "@BASE@/out/x.apk"}"#
+        );
+        // element text: `>` and `<` bound a path too (fontconfig's `<dir>`)
+        assert_eq!(
+            relocate("<dir>/w/out/slot-9/fonts/files</dir>", &r),
+            "<dir>@BASE@/out/fonts/files</dir>"
+        );
+        // a root followed by a name character is another path
+        assert_eq!(relocate("/w/out/slot-9.bak", &r), "/w/out/slot-9.bak");
+        // the bundle's `lib/` stands for the host's LLVM runtimes
+        assert_eq!(
+            relocate("--lib-path=/w/out/slot-9/a:/usr/lib/llvm-19/lib", &r),
+            "--lib-path=@BASE@/out/a:@BASE@/lib"
+        );
+        // a directory that only starts with the root's name is not under it
+        assert_eq!(relocate("/w/out/slot-90/x", &r), "/w/out/slot-90/x");
+    }
+
+    #[test]
+    fn word_quotes_for_the_shell_and_expands_the_base() {
+        assert_eq!(word("@BASE@/out/a b$c\"d"), "\"$BASE/out/a b\\$c\\\"d\"");
+    }
+
+    #[test]
+    fn remote_runs_keep_their_files_under_the_slot() {
+        let out = Path::new("/w/out/slot-9");
+        assert_eq!(
+            rel_out(out, Path::new("/w/out/slot-9/gl/run/root")).unwrap(),
+            "gl/run/root"
+        );
+        assert!(rel_out(out, Path::new("/w/elsewhere/x")).is_err());
+    }
+
+    /// One run's script, written out: directories fresh, the embedded file with `$BASE` expanded on the target, atld under `env -i` with stdin closed, then its logs as a tar.
+    #[test]
+    fn run_script_is_the_plan_in_order() {
+        let plan = Plan {
+            tag: "gl/run".to_owned(),
+            root: "gl/run/root".to_owned(),
+            scratch: "gl/run/scratch".to_owned(),
+            env: vec![(
+                "FONTCONFIG_FILE".to_owned(),
+                "@BASE@/out/gl/run/scratch/fonts.conf".to_owned(),
+            )],
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: vec!["--root".to_owned(), "@BASE@/out/gl/run/root".to_owned()],
+            files: vec![(
+                "@BASE@/out/gl/run/scratch/package-0.json".to_owned(),
+                "{\"apk\": \"@BASE@/out/gl/apk/x.apk\"}\n".to_owned(),
+            )],
+            lib_dirs: vec!["lib".to_owned()],
+            limit: 120,
+        };
+        let want = concat!(
+            "# xtask remote run gl/run: written by remote.rs, do not edit\n",
+            "cd 'atl-next-run/slot-9' || exit 2\n",
+            "set -u\n",
+            "BASE=$(pwd)\n",
+            "rm -rf \"$BASE/out/gl/run/root\"\n",
+            "mkdir -p \"$BASE/out/gl/run/scratch\"\n",
+            "sed \"s|@BASE@|$BASE|g\" > \"$BASE/out/gl/run/scratch/package-0.json\" <<'ATL_EOF'\n",
+            "{\"apk\": \"@BASE@/out/gl/apk/x.apk\"}\n",
+            "ATL_EOF\n",
+            "[ -x \"$BASE/out/cargo/release/atld\" ] || { echo \"remote run gl/run: out/cargo/release/atld is not an executable\" >&2; exit 4; }\n",
+            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" FONTCONFIG_FILE=\"$BASE/out/gl/run/scratch/fonts.conf\" timeout -k 10 120 \"$BASE/out/cargo/release/atld\" \"--root\" \"$BASE/out/gl/run/root\" < /dev/null > \"$BASE/out/gl/run/scratch/atld.log\" 2>&1\n",
+            "rc=$?\n",
+            "echo \"atld rc=$rc, remote run gl/run\" >&2\n",
+            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log'\n",
+        );
+        assert_eq!(plan.script("atl-next-run/slot-9"), want);
     }
 
     /// A record of one slot file, one slot tree holding a link to itself (`com.android.art -> .`, the ART staging's alias) and one AOSP file: the names, `lib/` from the LLVM runtimes, the link kept as a link in the stage, and the break removing exactly `lib/libunwind.so.1`.

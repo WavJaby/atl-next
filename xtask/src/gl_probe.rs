@@ -30,7 +30,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, Shell};
 use crate::gl_scene::{self, Judged};
-use crate::{manifest, mesa, tree};
+use crate::{manifest, mesa, remote, tree};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -89,7 +89,8 @@ const EXTENSION: &str = "glGetInteger64vEXT";
 const MAPI_TMP: &str = "build/src/mapi/shared-glapi/glapi_mapi_tmp.h";
 const MESA_XML: &str = "src/mapi/glapi/gen";
 const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
-const LIMIT: Duration = Duration::from_secs(120);
+/// Each probe run's time limit: the child is killed past it. A remote run gets the same limit as `timeout` on the target (remote.rs).
+pub const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 
 /// The ES1 scene, read by the host probe, the guest fixture's generator (jni_fixture.rs) and the app gate (app.rs): one description.
@@ -102,7 +103,24 @@ pub fn goals() -> crate::gate_goals::Goals {
     crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
 }
 
+/// `test gl`: the gate on this host.
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    judge(root, args, remote::Site::Host)
+}
+
+/// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the slot the bundle was pushed from.
+pub fn run_on(root: &Path, host: &str, out: &Path, site: remote::Site) -> Result<ExitCode> {
+    let args = Args {
+        host: host.to_owned(),
+        out: Some(out.to_path_buf()),
+        java_out: None,
+        frames: FRAMES,
+        verbose: false,
+    };
+    judge(root, &args, site)
+}
+
+fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
     ensure!(
         args.frames >= P95_MIN_FRAMES,
         "--frames {} is below {P95_MIN_FRAMES}: the p95 would be the slowest frame",
@@ -119,7 +137,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?;
+    .with_gl_driver()?
+    .with_site(site);
     let tree = tree::shared_tree(&layout);
     let cands = candidates(
         &std::fs::read_to_string(rt.out.join(mesa::OUT_SUBDIR).join(MAPI_TMP))?,
@@ -330,7 +349,8 @@ fn run_probe(
         }
         std::thread::sleep(POLL);
     }
-    child.wait()?;
+    let end = child.wait()?;
+    rt.check_end(end, &run)?;
     let log = std::fs::read_to_string(run.log(PROBE_NAME)).unwrap_or_default();
     if verbose {
         println!("---- {tag} log\n{log}");
