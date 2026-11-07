@@ -8,9 +8,11 @@
 import android.app.ActivityManager;
 import android.app.ApplicationErrorReport;
 import android.app.ContentProviderHolder;
+import android.app.ResultInfo;
 import android.app.servertransaction.ActivityConfigurationChangeItem;
 import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ActivityRelaunchItem;
+import android.app.servertransaction.ActivityResultItem;
 import android.app.servertransaction.ClientTransaction;
 import android.app.servertransaction.ClientTransactionItem;
 import android.app.servertransaction.DestroyActivityItem;
@@ -201,6 +203,10 @@ public class ParcelTruth {
         checkTransactionItem("ClientTransaction:stop", new StopActivityItem(itemToken), itemToken);
         checkTransactionItem("ClientTransaction:destroy", new DestroyActivityItem(itemToken, true), itemToken);
         checkTransactionItem("ClientTransaction:start", new StartActivityItem(itemToken, null), itemToken);
+        // ActivityResultItem (ActivityRecord.sendResult, a cancelled start): the token and the list, one ResultInfo with every field set (a binder caller), one with the nulls
+        IBinder resultCaller = new Echo();
+        checkTransactionItem("ClientTransaction:activity-result",
+                new ActivityResultItem(itemToken, Arrays.asList(new ResultInfo("who", 7, -1, intent(), resultCaller), new ResultInfo(null, -1, 0, null, null))), itemToken);
         // ActivityThread.reportSizeConfigurations: an app with no size-qualified resource sends the flags alone; a full one every array and the long bit
         check("SizeConfigurationBuckets:none", new SizeConfigurationBuckets(new Configuration[0]), SizeConfigurationBuckets.CREATOR);
         Configuration sized = new Configuration();
