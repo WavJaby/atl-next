@@ -52,7 +52,7 @@ pub struct Args {
     /// Compile without the compiler cache, e.g. to rule it out while debugging a build.
     #[arg(long)]
     no_compiler_cache: bool,
-    /// Deliberate break of Mesa's configure (mesa.rs `Break`): `llvm-config-19` must fail the native's Mesa step, `no-llvmpipe` must turn the gl gate red.
+    /// Deliberate break of Mesa's configure (mesa.rs `Break`): `llvm-config-19` must fail the native's Mesa step, `no-llvmpipe` / `no-iris` must fail its driver-export check.
     #[arg(long = "break", value_enum)]
     deliberate_break: Option<crate::mesa::Break>,
     /// Build nothing: open $SHELL inside the task-copy namespace (task copies bound over src/aosp), e.g. to run `ninja` by hand on the slot; outside it ninja reads the unpatched src/aosp.
@@ -475,6 +475,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &out,
         &tree.join(crate::mesa::MESA_TREE),
         &args.host,
+        &crate::deps::binary(root, "llvm-dev")?,
         args.deliberate_break,
     )?;
     drop(token);

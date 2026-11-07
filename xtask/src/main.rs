@@ -47,6 +47,7 @@ mod gralloc;
 mod host_art;
 mod host_disk;
 mod instrument;
+mod intel_clc;
 mod jni_fixture;
 mod land;
 mod libcxx_gate;

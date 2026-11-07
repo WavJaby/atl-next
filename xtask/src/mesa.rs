@@ -54,6 +54,9 @@ pub enum Opt {
     Arr(&'static [&'static str]),
 }
 
+/// The gallium drivers built: [`DRIVER`] must export `__driDriverGetExtensions_<name>` for each ([`driver_links`]).
+pub const GALLIUM_DRIVERS: &[&str] = &["llvmpipe", "iris"];
+
 /// Option set (G1, owner 2026-11-06; llvmpipe plan S2): llvmpipe on the host LLVM (llvm_host.rs), Android EGL platform only.
 pub const OPTIONS: &[(&str, Opt)] = &[
     // Android is the only platform meson accepts with `android` (R-B not buildable)
@@ -65,8 +68,10 @@ pub const OPTIONS: &[(&str, Opt)] = &[
     ("android-strict", Opt::Bool(true)),
     // real AOSP libs, not Mesa's stub libraries
     ("android-stub", Opt::Bool(false)),
-    // the software tier: llvmpipe JITs through the host LLVM (llvm_host.rs)
-    ("gallium-drivers", Opt::Arr(&["llvmpipe"])),
+    // software tier llvmpipe JITs through the host LLVM (llvm_host.rs); hardware tier iris (Intel Gen8+). Mesa's loader picks the tier from the DRM node's kernel driver (loader_get_driver_for_fd), so one libgallium_dri holds both
+    ("gallium-drivers", Opt::Arr(GALLIUM_DRIVERS)),
+    // iris' internal shaders are compiled at build time by the host intel_clc (intel_clc.rs); `enabled` would build it with the device toolchain against LLVM+Clang+libclc
+    ("intel-clc", Opt::Str("system")),
     ("llvm", Opt::Str("enabled")),
     // meson's default `auto` may pick a shared libLLVM; only the static archives are built and allowed (owner D2)
     ("shared-llvm", Opt::Str("disabled")),
@@ -96,9 +101,12 @@ pub enum Break {
     /// Mesa configured against distro LLVM 19 ([`DISTRO_LLVM_CONFIG`]): `configure` refuses its version, the last native.ini stays.
     #[value(name = "llvm-config-19")]
     LlvmConfig19,
-    /// gallium-drivers without llvmpipe (softpipe only): the gl gate's renderer check is red.
+    /// gallium-drivers with softpipe in place of llvmpipe: the Mesa step's driver-export check is red.
     #[value(name = "no-llvmpipe")]
     NoLlvmpipe,
+    /// gallium-drivers without iris: the Mesa step's driver-export check is red (on Intel hardware also the gl gate's renderer).
+    #[value(name = "no-iris")]
+    NoIris,
 }
 
 /// The distro's llvm-config (Debian llvm-19) that [`Break::LlvmConfig19`] points Mesa at.
@@ -118,6 +126,9 @@ pub struct Args {
     /// The host LLVM's `llvm-config` (llvm_host.rs `config`): Mesa's meson finds LLVM through it.
     #[arg(long)]
     llvm_config: PathBuf,
+    /// The host `intel_clc` (intel_clc.rs) Mesa runs at build time for iris' shaders.
+    #[arg(long)]
+    intel_clc: PathBuf,
 }
 
 /// graph.json, the fields read here (bp2ninja graph.go).
@@ -168,6 +179,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &mesa,
         &args.dest,
         &args.llvm_config,
+        &args.intel_clc,
         None,
     )?;
     Ok(ExitCode::SUCCESS)
@@ -238,12 +250,21 @@ pub fn read_graph(out: &Path) -> Result<Graph> {
 
 /// `xtask native`'s step after ninja (run under the build token): Mesa's meson build against the converter out dir `out`, in `<out>/mesa/build` (set up once; meson reconfigures itself when native.ini changes).
 /// Skipped with a printed reason when the goals did not build all of [`PC_MODULES`]' libraries; a missing host LLVM (`host`'s, llvm_host.rs) fails it instead. A failure carries the first error line (whole log: `<out>/mesa/ninja.log`).
-pub fn build_after_ninja(out: &Path, mesa: &Path, host: &str, brk: Option<Break>) -> Result<Step> {
-    Ok(match build_or_skip(out, mesa, host, brk)? {
-        None => Step::Skipped,
-        Some(Ok(build)) => Step::Built(build),
-        Some(Err(first)) => Step::Failed(first),
-    })
+/// `clc_llvm_config`: the distro llvm-config the host intel_clc builds against (deps.toml `llvm-dev`).
+pub fn build_after_ninja(
+    out: &Path,
+    mesa: &Path,
+    host: &str,
+    clc_llvm_config: &str,
+    brk: Option<Break>,
+) -> Result<Step> {
+    Ok(
+        match build_or_skip(out, mesa, host, clc_llvm_config, brk)? {
+            None => Step::Skipped,
+            Some(Ok(build)) => Step::Built(build),
+            Some(Err(first)) => Step::Failed(first),
+        },
+    )
 }
 
 /// libgallium_dri's link facts (plan llvmpipe S2): its DT_NEEDED list, and the failures: an LLVM or libstdc++ NEEDED, an exported LLVM symbol.
@@ -258,7 +279,8 @@ pub fn driver_links(lib: &Path) -> Result<Links> {
     let needed = provided_gate::needed(lib)?;
     let mut failures: Vec<String> = needed
         .iter()
-        .filter(|n| n.starts_with("libLLVM") || n.starts_with("libstdc++"))
+        // host-only LLVM/Clang NEEDED: app_links, run on every output
+        .filter(|n| n.starts_with("libstdc++"))
         .map(|n| format!("NEEDED {n}"))
         .collect();
     let symbols = Command::new("nm")
@@ -273,14 +295,44 @@ pub fn driver_links(lib: &Path) -> Result<Links> {
         String::from_utf8_lossy(&symbols.stderr).trim()
     );
     // C++ mangles namespace llvm as `4llvm`; the LLVM C API is `LLVM*`
-    let exported = String::from_utf8_lossy(&symbols.stdout)
+    let text = String::from_utf8_lossy(&symbols.stdout);
+    let exported = text
         .lines()
         .filter(|l| l.contains("4llvm") || l.contains("LLVM"))
         .count();
     if exported > 0 {
         failures.push(format!("{exported} exported LLVM symbols"));
     }
+    // a driver missing from the build (Break::NoIris / NoLlvmpipe) or dropped by a Mesa pin bump
+    for d in GALLIUM_DRIVERS {
+        let entry = format!("__driDriverGetExtensions_{d}");
+        if !text
+            .lines()
+            .any(|l| l.split_whitespace().last() == Some(entry.as_str()))
+        {
+            failures.push(format!("{} exports no {entry}", lib.display()));
+        }
+    }
     Ok(Links { needed, failures })
+}
+
+/// Distro LLVM/Clang libraries that may run only in host tools (intel_clc.rs), never in an app process (owner D1).
+const HOST_ONLY_LIBS: &[&str] = &["libLLVM", "libclang", "libLLVMSPIRVLib"];
+
+/// The NEEDED entries of app-side output `lib` that name a [`HOST_ONLY_LIBS`] library.
+pub fn app_links(lib: &Path) -> Result<Vec<String>> {
+    Ok(host_only(&provided_gate::needed(lib)?)
+        .into_iter()
+        .map(|n| format!("{} NEEDS {n}", lib.display()))
+        .collect())
+}
+
+fn host_only(needed: &[String]) -> Vec<String> {
+    needed
+        .iter()
+        .filter(|n| HOST_ONLY_LIBS.iter().any(|p| n.starts_with(p)))
+        .cloned()
+        .collect()
 }
 
 /// What [`build_after_ninja`] did.
@@ -295,6 +347,7 @@ fn build_or_skip(
     out: &Path,
     mesa: &Path,
     host: &str,
+    clc_llvm_config: &str,
     brk: Option<Break>,
 ) -> Result<Option<Result<PathBuf, String>>> {
     let graph = read_graph(out)?;
@@ -315,7 +368,11 @@ fn build_or_skip(
         ))));
     }
     let dest = out.join(OUT_SUBDIR);
-    if let Err(e) = configure(&graph, mesa, &dest, &llvm, brk) {
+    let intel_clc = match crate::intel_clc::build(&dest, mesa, clc_llvm_config)? {
+        Ok(p) => p,
+        Err(first) => return Ok(Some(Err(first))),
+    };
+    if let Err(e) = configure(&graph, mesa, &dest, &llvm, &intel_clc, brk) {
         return Ok(Some(Err(format!("{e:#}"))));
     }
     let build = dest.join("build");
@@ -372,9 +429,12 @@ fn build_or_skip(
             "Mesa's build produced none of {absent:?}"
         ))));
     }
-    let links = driver_links(&build.join(DRIVER))?;
-    if !links.failures.is_empty() {
-        return Ok(Some(Err(links.failures.join("; "))));
+    let mut failures = driver_links(&build.join(DRIVER))?.failures;
+    for o in OUTPUTS {
+        failures.extend(app_links(&build.join(o))?);
+    }
+    if !failures.is_empty() {
+        return Ok(Some(Err(failures.join("; "))));
     }
     println!(
         "native: mesa: {} libraries in {}",
@@ -390,12 +450,18 @@ pub fn configure(
     mesa: &Path,
     dest: &Path,
     llvm_config: &Path,
+    intel_clc: &Path,
     brk: Option<Break>,
 ) -> Result<()> {
     let options_file = mesa.join("meson_options.txt");
     let options = std::fs::read_to_string(&options_file)
         .with_context(|| format!("read {}", options_file.display()))?;
     check_options(&options)?;
+    let clc_missing = missing_options(&options, crate::intel_clc::OPTIONS.iter().map(|(n, _)| *n));
+    ensure!(
+        clc_missing.is_empty(),
+        "Mesa meson_options.txt lacks intel_clc option(s) {clc_missing:?}"
+    );
     // before any file is written: a refused LLVM leaves the last native.ini in place
     let llvm = match brk {
         Some(Break::LlvmConfig19) => Path::new(DISTRO_LLVM_CONFIG),
@@ -428,7 +494,7 @@ pub fn configure(
     write_changed(&forced, &forced_header(&graph.device))?;
     write_changed(
         &dest.join("native.ini"),
-        &native_file(&pc_dir, &forced, graph, llvm, rtti, brk)?,
+        &native_file(&pc_dir, &forced, graph, llvm, intel_clc, rtti, brk)?,
     )?;
     println!(
         "mesa-config: {} .pc files + {FORCED_HEADER} + native.ini in {}",
@@ -447,17 +513,22 @@ fn write_changed(path: &Path, text: &str) -> Result<()> {
 
 /// Fails on an option name the pinned Mesa does not declare.
 pub fn check_options(meson_options: &str) -> Result<()> {
-    let missing: Vec<&str> = OPTIONS
-        .iter()
-        .map(|(n, _)| *n)
-        .chain([SDK_OPTION])
-        .filter(|n| !meson_options.contains(&format!("'{n}'")))
-        .collect();
+    let missing = missing_options(
+        meson_options,
+        OPTIONS.iter().map(|(n, _)| *n).chain([SDK_OPTION]),
+    );
     ensure!(
         missing.is_empty(),
         "Mesa meson_options.txt lacks option(s) {missing:?}"
     );
     Ok(())
+}
+
+/// The `names` meson_options.txt does not declare.
+fn missing_options<'a>(meson_options: &str, names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    names
+        .filter(|n| !meson_options.contains(&format!("'{n}'")))
+        .collect()
 }
 
 /// The `.pc` text for pkg-config `name`, from converter module `module`'s artifact.
@@ -550,6 +621,7 @@ pub fn native_file(
     forced: &Path,
     graph: &Graph,
     llvm_config: &Path,
+    intel_clc: &Path,
     rtti: bool,
     brk: Option<Break>,
 ) -> Result<String> {
@@ -560,10 +632,11 @@ pub fn native_file(
     let mut s = String::from("# generated by xtask mesa-config\n[binaries]\n");
     let _ = writeln!(
         s,
-        "c = '{}'\ncpp = '{}'\nc_ld = 'lld'\ncpp_ld = 'lld'\nllvm-config = '{}'\n\n[built-in options]",
+        "c = '{}'\ncpp = '{}'\nc_ld = 'lld'\ncpp_ld = 'lld'\nllvm-config = '{}'\nintel_clc = '{}'\n\n[built-in options]",
         d.cc,
         graph.link_driver,
-        llvm_config.display()
+        llvm_config.display(),
+        intel_clc.display()
     );
     let _ = writeln!(
         s,
@@ -592,7 +665,8 @@ pub fn native_file(
     );
     for (n, o) in OPTIONS {
         let o = match (brk, *n) {
-            (Some(Break::NoLlvmpipe), "gallium-drivers") => Opt::Arr(&["softpipe"]),
+            (Some(Break::NoLlvmpipe), "gallium-drivers") => Opt::Arr(&["softpipe", "iris"]),
+            (Some(Break::NoIris), "gallium-drivers") => Opt::Arr(&["llvmpipe"]),
             _ => *o,
         };
         let _ = writeln!(s, "{n} = {}", value(o));
@@ -667,11 +741,15 @@ mod tests {
             Path::new("/d/f.h"),
             g,
             Path::new(LLVM),
+            Path::new(CLC),
             false,
             None,
         )
         .unwrap()
     }
+
+    /// The intel_clc the test native files point at.
+    const CLC: &str = "/c/intel_clc";
 
     #[test]
     fn forced_includes_skip_assembly() {
@@ -759,7 +837,16 @@ mod tests {
         let mut g = graph();
         g.product_variables
             .insert("platform_sdk_version".into(), 1.into());
-        let text = native_file(pc, Path::new("/d/f.h"), &g, Path::new(LLVM), false, None).unwrap();
+        let text = native_file(
+            pc,
+            Path::new("/d/f.h"),
+            &g,
+            Path::new(LLVM),
+            Path::new(CLC),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(text.contains(&format!(
             "[properties]\npkg_config_libdir = ['{}']\n",
             pc.display()
@@ -782,20 +869,50 @@ mod tests {
             .insert("platform_sdk_version".into(), 1.into());
         let text = native_text(&g);
         assert!(text.contains(&format!("llvm-config = '{LLVM}'\n")));
-        assert!(text.contains("gallium-drivers = ['llvmpipe']\n"));
+        assert!(text.contains(&format!("intel_clc = '{CLC}'\n")));
+        assert!(text.contains("gallium-drivers = ['llvmpipe', 'iris']\n"));
+        assert!(text.contains("intel-clc = 'system'\n"));
         assert!(text.contains("shared-llvm = 'disabled'\n"));
         assert!(text.contains("cpp_rtti = false\n"));
-        let broken = native_file(
-            Path::new("/d"),
-            Path::new("/d/f.h"),
-            &g,
-            Path::new(LLVM),
-            false,
-            Some(Break::NoLlvmpipe),
-        )
-        .unwrap();
-        assert!(broken.contains("gallium-drivers = ['softpipe']\n"));
-        assert!(!broken.contains("'llvmpipe'"));
+        let broken = |b| {
+            native_file(
+                Path::new("/d"),
+                Path::new("/d/f.h"),
+                &g,
+                Path::new(LLVM),
+                Path::new(CLC),
+                false,
+                Some(b),
+            )
+            .unwrap()
+        };
+        let no_lp = broken(Break::NoLlvmpipe);
+        assert!(no_lp.contains("gallium-drivers = ['softpipe', 'iris']\n"));
+        assert!(!no_lp.contains("'llvmpipe'"));
+        let no_iris = broken(Break::NoIris);
+        assert!(no_iris.contains("gallium-drivers = ['llvmpipe']\n"));
+        assert!(!no_iris.contains("'iris'"));
+    }
+
+    #[test]
+    fn host_only_libs_are_named() {
+        let needed: Vec<String> = [
+            "libc.so",
+            "libLLVM.so.19.1",
+            "libclang-cpp.so.19.1",
+            "libLLVMSPIRVLib.so.19.1",
+            "libdrm.so.2",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            host_only(&needed),
+            [
+                "libLLVM.so.19.1",
+                "libclang-cpp.so.19.1",
+                "libLLVMSPIRVLib.so.19.1"
+            ]
+        );
     }
 
     #[test]
