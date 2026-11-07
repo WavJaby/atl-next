@@ -31,7 +31,7 @@ pub fn gl_front_goals() -> &'static [&'static str] {
     &GL_FRONTS
 }
 
-/// What every [`Runtime`] reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, and the converter crates the service packages link (packages.rs).
+/// What every [`Runtime`] reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
 pub fn goals() -> Goals {
     Goals::host(&[
         "servicemanager",
@@ -59,6 +59,7 @@ pub fn goals() -> Goals {
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))
+    .with(Goals::codec_store())
 }
 
 /// The extractor plugins [`platform_rows`] places: every [`Runtime`] reads them, so [`goals`] builds them.

@@ -22,6 +22,7 @@ mod build_state;
 mod bwrap_flags;
 mod cdylib;
 mod check;
+mod codec2_store;
 mod composer;
 mod compositor;
 mod converter;

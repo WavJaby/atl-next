@@ -70,6 +70,9 @@ pub struct Args {
     /// The property area names the DMABUF-heap tier whatever the probe found (atl-property-service `--linear-tier dmabuf-heap`): on a host without /dev/dma_heap/system stage 9 must fail (NO_MEMORY), which shows the probe's gralloc-BLOB tier is what keeps it working.
     #[arg(long)]
     break_linear_tier: bool,
+    /// The Codec2 store break: leaves this store library (a codec2_store.rs name, e.g. libcodec2_soft_amrnbdec) off the library path of stages 8 + 9, so the store's constructor fails on its dlopen naming it, and stage 9 must go red.
+    #[arg(long)]
+    break_codec: Option<String>,
     /// Stage 9's game APKs (assets/audio/cheer.ogg, assets/sound/game_music.ogg, assets/sounds/tap.wav). Default: <workspace>/apk.
     #[arg(long)]
     apks: Option<PathBuf>,
@@ -119,7 +122,7 @@ const OVERFLOW_ROUNDS: u32 = 3;
 /// The recursing method, as ART's PrettyMethod prints it in the `JIT added` line: compiled, its stack check faults (interpreted, ART may check explicitly and never fault).
 const OVERFLOW_JIT: &str = "void NativeLoad.recurse()";
 
-/// Native goals (gate_goals.rs): the converter's ART with its boot jars and their JNI libraries, and libandroid_runtime.
+/// Native goals (gate_goals.rs): the converter's ART with its boot jars and their JNI libraries, and libandroid_runtime; then what stages 8 + 9 load beyond the runtime's closure: the binder harness's servicemanager + service, the in-process Codec2 store's server library and resource manager, the extractor plugins, and the store's libraries (codec2_store.rs).
 pub fn goals() -> crate::gate_goals::Goals {
     crate::gate_goals::Goals::host(&[
         "platform-bootclasspath",
@@ -130,11 +133,29 @@ pub fn goals() -> crate::gate_goals::Goals {
         "libicu_jni",
         "libandroid_runtime",
         "libsigchain",
+        "servicemanager",
+        "service",
+        "libcodec2_aidl_noisurface",
+        "libresourcemanagerservice",
+        "liboggextractor",
+        "libwavextractor",
     ])
+    .with(crate::gate_goals::Goals::codec_store())
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let env = Env::new(root, args)?;
+    // stage_art restaged the ART lib dir (every device/<m>/<m>.so as a link) for this run only, so the unlink lasts one run
+    if let Some(module) = &args.break_codec {
+        let libs = crate::codec2_store::libraries(root)?;
+        ensure!(
+            libs.contains(module),
+            "--break-codec {module}: not a Codec2 store library (codec2_store.rs)"
+        );
+        let at = env.host.lib_path.join(format!("{module}.so"));
+        std::fs::remove_file(&at)
+            .with_context(|| format!("--break-codec: unlinking {}", at.display()))?;
+    }
     let fixture = env.build_fixture(root)?;
     if args.self_test {
         return self_test(root, &env, &fixture);
@@ -306,48 +327,6 @@ const AID_APP_START: u32 = 10_000;
 /// Stage 8's run limit: ART start (~1 s here) plus codec lookups; a hang (a wait for an absent service) ends as SIGTERM in the detail instead of a stuck gate.
 const MEDIA_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `xtask native` goals stages 8 + 9 need beyond the runtime's closure, besides the store's codecs ([`store_codecs`]): the binder harness's servicemanager + service, the in-process Codec2 store's server library and resource manager, the extractor plugins.
-const GOALS: [&str; 6] = [
-    "servicemanager",
-    "service",
-    "libcodec2_aidl_noisurface",
-    "libresourcemanagerservice",
-    "liboggextractor",
-    "libwavextractor",
-];
-
-/// The Codec2 store's soft-codec list (`emplace("lib….so")` in the store's constructor): the store aborts on a listed library it cannot load, so each is a goal.
-const C2_STORE_CPP: &str = "frameworks/av/media/codec2/vndk/C2Store.cpp";
-
-/// Module names the store source `src` emplaces, commented-out lines skipped.
-fn store_codecs(src: &str) -> Vec<String> {
-    src.lines()
-        .filter_map(|l| l.trim().strip_prefix("emplace(\""))
-        .filter_map(|rest| rest.split_once(".so\""))
-        .map(|(m, _)| m.to_owned())
-        .collect()
-}
-
-/// Every goal stages 8 + 9 load, checked built in `out` (`device/<m>/<m>[.so]`); the error names what is missing and the build command.
-fn check_goals(out: &Path, host: &str, codecs: &[String]) -> Result<()> {
-    let missing: Vec<&str> = GOALS
-        .iter()
-        .copied()
-        .chain(codecs.iter().map(String::as_str))
-        .filter(|m| {
-            let dir = out.join("device").join(m);
-            !dir.join(m).is_file() && !dir.join(format!("{m}.so")).is_file()
-        })
-        .collect();
-    ensure!(
-        missing.is_empty(),
-        "native-load goals not built: {} (cargo xtask native --host {host} {})",
-        missing.join(" "),
-        missing.join(" ")
-    );
-    Ok(())
-}
-
 /// Stage 9's clip dir below the work dir: the clips extracted from the APKs and the decoder's .pcm output beside each.
 const CLIP_DIR: &str = "media";
 
@@ -421,17 +400,6 @@ impl Env {
         let cpp = tree::shared_tree(&layout).join(ANDROID_RUNTIME_CPP);
         let src =
             std::fs::read_to_string(&cpp).with_context(|| format!("reading {}", cpp.display()))?;
-        // the task copy's list when frameworks/av is edited (patches/aosp/frameworks/av 0002 drops the FDK-AAC and libaom codecs)
-        let store = tree::build_file(root, C2_STORE_CPP)?;
-        let store_src = std::fs::read_to_string(&store)
-            .with_context(|| format!("reading {}", store.display()))?;
-        let codecs = store_codecs(&store_src);
-        ensure!(
-            !codecs.is_empty(),
-            "{}: no emplace(\"lib….so\") line",
-            store.display()
-        );
-        check_goals(&out, &args.host, &codecs)?;
         Ok(Env {
             host,
             runtime,
@@ -463,7 +431,7 @@ impl Env {
     fn binder_art(&self, fixture: &Fixture, mode: &str, args: &[String]) -> Result<ArtRun> {
         let device = self.out.join("device");
         let servicemanager = device.join("servicemanager/servicemanager");
-        // both checked built by `check_goals`
+        // both in this gate's goals (gate_goals.rs), which gate_out checked built
         let service = device.join("service/service");
         let allocator = crate::gralloc::allocator(&self.root, &self.out)?;
         let mapper_dir = crate::gralloc::stage_mapper(&self.root, &self.out)?;
@@ -1390,13 +1358,6 @@ mod tests {
             ["libbase", "libc++", "libicuuc"]
         );
         assert!(duplicates(&maps[6..]).is_empty());
-    }
-
-    #[test]
-    fn store_codecs_skips_commented_lines() {
-        let src = "    emplace(\"libcodec2_soft_a.so\");\n    //emplace(\"libcodec2_soft_b.so\"); // gone\n  emplace(\"libcodec2_soft_c.so\");\n";
-        // a and c are emplaced; b's line is a comment
-        assert_eq!(store_codecs(src), ["libcodec2_soft_a", "libcodec2_soft_c"]);
     }
 
     #[test]

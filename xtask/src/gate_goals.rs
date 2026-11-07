@@ -10,31 +10,42 @@ use anyhow::{Result, bail};
 /// `--for` value meaning every gate in [`GATES`].
 pub const ALL: &str = "all-gates";
 
-/// Native goals: host modules, and native-bridge (`nb:`) modules built for the host's own arch (the identity engine's guest, atld_run.rs `with_native_bridge_guest`).
+/// Native goals: host modules, native-bridge (`nb:`) modules built for the host's own arch (the identity engine's guest, atld_run.rs `with_native_bridge_guest`), and the Codec2 store's libraries (`store`, a symbolic group: [`of`] and [`union`] expand it to names from the store source, codec2_store.rs).
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct Goals {
     pub host: BTreeSet<String>,
     pub nb: BTreeSet<String>,
+    /// Unexpanded until [`resolve`] adds [`crate::codec2_store::libraries`] to `host` and clears it.
+    pub store: bool,
 }
 
 impl Goals {
     pub fn host(names: &[&str]) -> Goals {
         Goals {
             host: names.iter().map(|s| s.to_string()).collect(),
-            nb: BTreeSet::new(),
+            ..Goals::default()
         }
     }
 
     pub fn nb(names: &[&str]) -> Goals {
         Goals {
-            host: BTreeSet::new(),
             nb: names.iter().map(|s| s.to_string()).collect(),
+            ..Goals::default()
+        }
+    }
+
+    /// The Codec2 store's libraries: the list its constructor dlopens (codec2_store.rs), so every process that can decode builds them.
+    pub fn codec_store() -> Goals {
+        Goals {
+            store: true,
+            ..Goals::default()
         }
     }
 
     pub fn with(mut self, other: Goals) -> Goals {
         self.host.extend(other.host);
         self.nb.extend(other.nb);
+        self.store |= other.store;
         self
     }
 
@@ -77,8 +88,13 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("window", crate::window::goals),
 ];
 
-/// The goals of gate `name`.
+/// The goals of gate `name`, expanded ([`resolve`]).
 pub fn of(name: &str) -> Result<Goals> {
+    resolve(declared(name)?)
+}
+
+/// The goals gate `name` declares, not yet expanded.
+fn declared(name: &str) -> Result<Goals> {
     match GATES.iter().find(|(n, _)| *n == name) {
         Some((_, f)) => Ok(f()),
         None => bail!(
@@ -97,8 +113,16 @@ pub fn union(names: &[String]) -> Result<Goals> {
                 g = g.with(f());
             }
         } else {
-            g = g.with(of(name)?);
+            g = g.with(declared(name)?);
         }
+    }
+    resolve(g)
+}
+
+/// `g` with its symbolic groups expanded: the store's libraries, from the store source of this checkout (tree::build_file).
+fn resolve(mut g: Goals) -> Result<Goals> {
+    if std::mem::take(&mut g.store) {
+        g.host.extend(crate::codec2_store::libraries(&crate::repo_root()?)?);
     }
     Ok(g)
 }
@@ -158,5 +182,18 @@ mod tests {
             .to_string();
         assert!(e.contains(&nb_key("x86_64", nb)), "{e}");
         assert!(ensure_built("app", "x86_64", &app.recorded("x86_64")).is_ok());
+    }
+
+    #[test]
+    fn store_libraries_reach_every_runtime_gate() {
+        // the store's own list (C2Store.cpp) is the expectation; no literal names
+        let root = crate::repo_root().expect("repo root");
+        let libs = crate::codec2_store::libraries(&root).expect("store list");
+        assert!(!libs.is_empty());
+        for gate in ["app", "native-load", "run-apk"] {
+            let g = of(gate).expect(gate);
+            assert!(!g.store, "{gate}: store not expanded");
+            assert!(libs.iter().all(|m| g.host.contains(m)), "{gate}");
+        }
     }
 }
