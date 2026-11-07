@@ -122,7 +122,8 @@ pub fn union(names: &[String]) -> Result<Goals> {
 /// `g` with its symbolic groups expanded: the store's libraries, from the store source of this checkout (tree::build_file).
 fn resolve(mut g: Goals) -> Result<Goals> {
     if std::mem::take(&mut g.store) {
-        g.host.extend(crate::codec2_store::libraries(&crate::repo_root()?)?);
+        g.host
+            .extend(crate::codec2_store::libraries(&crate::repo_root()?)?);
     }
     Ok(g)
 }
