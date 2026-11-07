@@ -6,6 +6,7 @@
 //! Fonts sub-gate ([`FONTS`]): the app's text advances equal the pinned test fonts' hmtx sums, i.e. atld's font list (atl-fonts via fontconfig) reached Typeface; `--font-break` must fail it.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`]. Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -14,9 +15,10 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, children_outside_broker, counter_lines, counters};
+use crate::gl_scene::{Judged, Scene};
 use crate::test_fonts;
 use crate::window::{self, WINDOW_MS};
-use crate::{jni_fixture, manifest};
+use crate::{gl_probe, jni_fixture, manifest};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -95,6 +97,12 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("glesPbuffer", "4096"),
     // after glesPbuffer, the process maps the host driver (a /proc/self/maps line naming "mesa"): the proxies reached Mesa, not a stand-in
     ("mesaMapped", "1"),
+    // S3 guest ES1 (plan gs3 S3): es1Begin makes an EGL10 pbuffer and ES1 context on this thread, as Happy Jump's GLSurfaceView does; es1Pixels is 1 when the scene ran with no GL error, and its rows are judged by es1_pixels
+    ("es1Begin", "true"),
+    ("es1Version", "1"),
+    ("es1Driver", "1"),
+    ("es1Pixels", "1"),
+    ("es1End", "true"),
     // C12 legacy fixture (AtlLegacyTest.java, atl_jni_legacy.cpp): seven values in order: 17 (fprintf "legacy-stdout 42\n"), 1 (_CTYPE_U of 'A'), 6 (strlen "abcdef"), 3 (strchr 'd' offset), 2 (strlen after strncpy "xy"), 2 (fpclassify(NAN) = FP_NAN 0x02), 2 (errno ENOENT after a failing open)
     ("legacyStdio", "17 1 6 3 2 2 2"),
     // new int(40) through operator new/delete, then the guarded static g_seed + 2
@@ -121,6 +129,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
 /// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
 const BRIDGE1_DETACH: &str = "atl-native-bridge: thread detached (attached ";
+/// The log prefix of atl_jni_es1.c's lines, `row <y> <hex>` (RGBA bytes, row 0 first) and `version ...`: liblog writes ` W liblog/<tag>: <text>`, the tag `AtlEs1`.
+const ES1_LOG: &str = "liblog/AtlEs1: ";
 /// The C3 assets (game-support §2): `stored.bin` (aapt2 stores `.bin`: `-0 bin`) and `deflated.txt`, `ASSET_LEN` bytes each, byte i = (i*31+7) mod 251. The probe seeks to 1000 (atl_jni_test.c `ASSET_SEEK`).
 const ASSET_LEN: usize = 70_000;
 /// The bytes both assets hold.
@@ -174,6 +184,32 @@ fn bridge1_call_failures(app: &str) -> Vec<String> {
     }
     whys
 }
+/// The ES1 scene's pixels: the `row <y> <hex>` lines of the app log, judged by the scene's model (gl_scene.rs `judge`). Ok: the pixels compared.
+fn es1_pixels(app: &str, scene: &Scene) -> Result<usize, String> {
+    let mut rows = BTreeMap::new();
+    for text in app
+        .lines()
+        .filter_map(|l| l.split_once(ES1_LOG).map(|(_, t)| t))
+    {
+        let Some(row) = text.strip_prefix("row ") else {
+            continue;
+        };
+        let (y, hex) = row
+            .split_once(' ')
+            .ok_or_else(|| format!("row line without pixels: {text}"))?;
+        let y: usize = y.parse().map_err(|e| format!("row number {y:?}: {e}"))?;
+        if rows.insert(y, hex.trim_end().to_owned()).is_some() {
+            return Err(format!("row {y} logged twice"));
+        }
+    }
+    match scene.judge(&rows) {
+        Ok(Judged::Match(n)) => Ok(n),
+        Ok(Judged::Mismatch(why)) => Err(why),
+        Ok(Judged::Missing(why)) => Err(format!("no readback: {why}")),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 /// The test app's uid: AID_APP_START + 123, any app id.
 const APP_UID: u32 = 10_123;
 /// How long a cold start may take: ART without a boot image interprets framework.jar's class initialisation (the parcel stage's runs take seconds); 180 s for a loaded machine.
@@ -227,6 +263,7 @@ pub fn goals() -> crate::gate_goals::Goals {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
+    let scene = gl_probe::load_scene(root)?;
     anyhow::ensure!(
         [jni_fixture::EMULATED_TLS_API, jni_fixture::ELF_TLS_API].contains(&args.fixture_api),
         "--fixture-api: {} or {}",
@@ -370,6 +407,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let bridge1_ok = bridge1.is_some();
     let mut whys = jni_fixture::legacy_failures(&native.libs)?;
     whys.extend(jni_fixture::ndk_failures(&native.libs)?);
+    whys.extend(jni_fixture::es1_failures(&native.libs)?);
     if let Some(f) = &fault {
         whys.push(format!("the app faulted: {f}"));
         println!("---- app log (last {TAIL} lines)\n{}", tail(&app, TAIL));
@@ -426,8 +464,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             bridge1.or_else(|| app.lines().find(|l| l.contains("AtlTest: bridge1")))
         ));
     }
+    let mut es1_compared = None;
     if passed && bridge1_ok {
         whys.extend(bridge1_call_failures(&app));
+        match es1_pixels(&app, &scene) {
+            Ok(n) => es1_compared = Some(n),
+            Err(why) => whys.push(format!("es1 pixels: {why}")),
+        }
     }
     if !whys.is_empty() {
         for why in &whys {
@@ -450,6 +493,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             soundpool.unwrap_or_default(),
             SOUNDPOOL_CALLS.join(", ")
         );
+        if let Some(n) = es1_compared {
+            println!(
+                "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"
+            );
+        }
         println!("app: pass ({activity} Activity.onCreate logged after {elapsed:.1?})");
         println!("app: gralloc registered: {}", gralloc_log.trim());
         return Ok(ExitCode::SUCCESS);
@@ -544,5 +592,47 @@ mod tests {
             .find(|(n, _)| *n == "assetProbe")
             .map(|(_, v)| *v);
         assert_eq!(row, Some(want.as_str()));
+    }
+
+    /// The app-log lines atl_jni_es1.c writes for `px`: one `row` line each, in liblog's form.
+    fn es1_log(px: &[crate::gl_scene::Pixel], w: usize, h: usize) -> String {
+        (0..h)
+            .map(|y| {
+                let hex: String = (0..w)
+                    .flat_map(|x| px[y * w + x].rgba)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                format!(" W liblog/AtlEs1: row {y} {hex}\n")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn es1_rows_judge_against_the_scene_model() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/gl-probe/es1-scene.toml");
+        let scene = Scene::load(&path).expect("the ES1 scene parses");
+        let (w, h) = scene.size();
+        let px = scene.expect().expect("the model runs");
+        let compared = px.iter().filter(|p| !p.edge).count();
+        let log = es1_log(&px, w, h);
+        assert_eq!(es1_pixels(&log, &scene), Ok(compared));
+        // one flipped pixel inside the flat quad [8,24)^2 is judged and named
+        let mut bad = px.clone();
+        bad[16 * w + 16].rgba[1] ^= 0x10;
+        let why = es1_pixels(&es1_log(&bad, w, h), &scene).expect_err("a flipped pixel fails");
+        assert!(why.contains("(16,16)"), "{why}");
+        // a row missing from the log has no readback
+        let missing: String = log
+            .lines()
+            .filter(|l| !l.contains("row 63 "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(es1_pixels(&missing, &scene).is_err_and(|e| e.contains("no readback")));
+        // a row logged twice is refused
+        let first = log.lines().next().expect("a row").to_owned();
+        assert_eq!(
+            es1_pixels(&format!("{log}{first}\n"), &scene),
+            Err("row 0 logged twice".to_owned())
+        );
     }
 }

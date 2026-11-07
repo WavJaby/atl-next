@@ -69,6 +69,11 @@ const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
 const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 
+/// The ES1 scene, read by the host probe, the guest fixture's generator (jni_fixture.rs) and the app gate (app.rs): one description.
+pub fn load_scene(root: &Path) -> Result<gl_scene::Scene> {
+    gl_scene::Scene::load(&root.join(FIXTURE).join(SCENE))
+}
+
 /// Native goals (gate_goals.rs): the runtime with gralloc and the GL driver.
 pub fn goals() -> crate::gate_goals::Goals {
     crate::atld_run::goals().with(crate::atld_run::gralloc_goals())
@@ -137,7 +142,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
-    let scene = gl_scene::Scene::load(&root.join(FIXTURE).join(SCENE))?;
+    let scene = load_scene(root)?;
     for broken in [false, true] {
         let tag = if broken { "break" } else { "run" };
         let mut shell_args: Vec<String> = vec![

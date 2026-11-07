@@ -3,6 +3,11 @@ package atl.bridge1.testlib;
 
 import android.content.res.AssetManager;
 import android.graphics.Bitmap;
+import javax.microedition.khronos.egl.EGL10;
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.egl.EGLContext;
+import javax.microedition.khronos.egl.EGLDisplay;
+import javax.microedition.khronos.egl.EGLSurface;
 
 /**
  * Java side of the bridge-1 fixture. Native code: libatl-jni-test.so (xtask/testdata/jni-test, built by xtask/src/jni_fixture.rs), packaged into the M2 test APK's lib/x86_64/; the M2 app does not load it until bridge 1 can.
@@ -53,6 +58,62 @@ public final class AtlJniTest {
 
     /** After glesPbuffer: 1 when /proc/self/maps names the host driver ("mesa"), 0 when not, -1 when unreadable (atl_jni_test.c). */
     public static native int mesaMapped();
+
+    /** The ES1 context the es1 natives draw on: an EGL10 pbuffer and context made by es1Begin on the calling thread, as GLSurfaceView makes them for Happy Jump (plan gs3 S3). */
+    private static EGL10 egl;
+    private static EGLDisplay dpy;
+    private static EGLSurface surf;
+    private static EGLContext ctx;
+
+    /** The scene's surface (es1-scene.toml [surface]); es1_scene.inc carries the same size. */
+    private static final int ES1_SIZE = 64;
+
+    /** Makes an ES1 context current on this thread; false when EGL refuses. */
+    public static boolean es1Begin() {
+        egl = (EGL10) EGLContext.getEGL();
+        dpy = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY);
+        if (dpy == EGL10.EGL_NO_DISPLAY || !egl.eglInitialize(dpy, new int[2])) {
+            return false;
+        }
+        // EGL_RENDERABLE_TYPE 0x0001 is EGL_OPENGL_ES_BIT (ES1); no EGL_CONTEXT_CLIENT_VERSION attribute, so the context is ES1
+        int[] cfgAttr = {
+            EGL10.EGL_SURFACE_TYPE, EGL10.EGL_PBUFFER_BIT,
+            EGL10.EGL_RENDERABLE_TYPE, 0x0001,
+            EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8, EGL10.EGL_ALPHA_SIZE, 8,
+            EGL10.EGL_NONE,
+        };
+        EGLConfig[] cfg = new EGLConfig[1];
+        int[] n = new int[1];
+        if (!egl.eglChooseConfig(dpy, cfgAttr, cfg, 1, n) || n[0] < 1) {
+            return false;
+        }
+        surf = egl.eglCreatePbufferSurface(dpy, cfg[0], new int[] {
+            EGL10.EGL_WIDTH, ES1_SIZE, EGL10.EGL_HEIGHT, ES1_SIZE, EGL10.EGL_NONE,
+        });
+        ctx = egl.eglCreateContext(dpy, cfg[0], EGL10.EGL_NO_CONTEXT, new int[] { EGL10.EGL_NONE });
+        return surf != EGL10.EGL_NO_SURFACE && ctx != EGL10.EGL_NO_CONTEXT
+                && egl.eglMakeCurrent(dpy, surf, surf, ctx);
+    }
+
+    /** Releases es1Begin's context and pbuffer; true when EGL released both. */
+    public static boolean es1End() {
+        if (egl == null) {
+            return false;
+        }
+        boolean ok = egl.eglMakeCurrent(dpy, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT);
+        ok &= egl.eglDestroyContext(dpy, ctx);
+        ok &= egl.eglDestroySurface(dpy, surf);
+        return ok;
+    }
+
+    /** GL_VERSION of the current context starts "OpenGL ES-CM 1.": 1 when so, 0 when not, 0 with no current context (atl_jni_es1.c). */
+    public static native int es1Version();
+
+    /** After es1Begin: 1 when /proc/self/maps names libGLESv1_CM_mesa.so, 0 when not, -1 when unreadable (atl_jni_es1.c). */
+    public static native int es1Driver();
+
+    /** The scene (es1-scene.toml, through es1_scene.inc) on the current context: 1 when no GL error came back. Its rows are logged as `row <y> <hex>`, and app.rs judges them (atl_jni_es1.c). */
+    public static native int es1Pixels();
 
     /** C3 asset probe over libandroid's AAsset API: one line of streamed SHA-256s, a seek's tail, getBuffer and a missing name (atl_jni_test.c assetProbe, app.rs BRIDGE1_CALLS). */
     public static native String assetProbe(AssetManager assets);
