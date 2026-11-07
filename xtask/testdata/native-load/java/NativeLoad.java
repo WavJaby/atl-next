@@ -7,6 +7,7 @@
 // crash <shim>: the shim raises SIGABRT in native code; the process must die of it (prints the number first).
 // media <lib> <shim> <mime>...: NDK AMediaCodec_createDecoderByType per mime (libmediandk, NEEDED by lib), prints 1 = codec created, 0 = null, -100 = libmediandk not loaded; a Codec2 abort ends the process, the lines before it are the measurement.
 // decode <lib> <shim> <clip> <pcm out>: one clip through the NDK extractor and decoder (stage 9): `nlt decode` is the step that failed (`error=`), else frames, bytes, channels, rate, and the store the process sees (`store=`, `declared=`, `instances=`).
+// player <lib> <shim>: startReg, then player(): `nlt player <step> ok|<throwable>` per MediaPlayer step (stage 10).
 // overflow <rounds>: unbounded recursion in recurse, `rounds` times on the main thread (warms the JIT: compiled code checks the stack implicitly, a SIGSEGV on the guard page), then `rounds` times on a new thread; each catches StackOverflowError, prints its depth, and the process exits normally.
 
 import java.io.BufferedReader;
@@ -84,6 +85,12 @@ public class NativeLoad {
             out("decode", decodeFile(a[3], a[4]));
             return;
         }
+        if (mode.equals("player")) {
+            out("startreg", startReg());
+            player();
+            // a thread the failed construction leaves running keeps the VM alive until the stage's kill (measured: exit 137 after MEDIA_LIMIT)
+            System.exit(0);
+        }
         if (mode.equals("startreg")) {
             out("startreg", startReg());
             return;
@@ -102,6 +109,54 @@ public class NativeLoad {
         if (mode.equals("call")) {
             calls();
         }
+    }
+
+    // Happy Jump's GameShared.loadMusic sequence on android.media.MediaPlayer (libmedia_jni through its static init), each step one line: `ok`, or the throwable's class and message.
+    // start() in Idle: AOSP's MediaPlayer.cpp start() returns INVALID_OPERATION there, which android_media_MediaPlayer.cpp turns into IllegalStateException.
+    static void player() {
+        try {
+            Class.forName("android.media.MediaPlayer");
+            out("player", "init ok");
+        } catch (Throwable t) {
+            out("player", "init " + thrown(t));
+            return;
+        }
+        android.media.MediaPlayer mp;
+        try {
+            mp = new android.media.MediaPlayer();
+            out("player", "new ok");
+        } catch (Throwable t) {
+            out("player", "new " + thrown(t));
+            return;
+        }
+        try {
+            mp.setLooping(true);
+            out("player", "setLooping ok");
+        } catch (Throwable t) {
+            out("player", "setLooping " + thrown(t));
+        }
+        try {
+            mp.setVolume(0.5f, 0.5f);
+            out("player", "setVolume ok");
+        } catch (Throwable t) {
+            out("player", "setVolume " + thrown(t));
+        }
+        try {
+            mp.start();
+            out("player", "start ok");
+        } catch (Throwable t) {
+            out("player", "start " + thrown(t));
+        }
+        try {
+            mp.release();
+            out("player", "release ok");
+        } catch (Throwable t) {
+            out("player", "release " + thrown(t));
+        }
+    }
+
+    static String thrown(Throwable t) {
+        return t.getClass().getName() + ": " + String.valueOf(t.getMessage()).replace('\n', ' ');
     }
 
     static int read(Box b) {

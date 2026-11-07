@@ -418,7 +418,9 @@ const HOMES: &[(&str, &str)] = &[("bits/ioctl.h", "sys/ioctl.h")];
 /// `TEMP_FAILURE_RETRY` (`unistd.h`; glibc defines it under `__USE_GNU` only, so the C view lacks it; libcore
 /// ojluni FileDescriptor_md.c): the same retry-on-EINTR statement expression in both libcs.
 /// `__printflike` (`sys/cdefs.h`, printf format attribute; libdebuggerd_client debuggerd_client.cpp `log_error`).
+/// `IN_LOOPBACK` (`netinet/in.h` via uapi `linux/in.h`; libstagefright_rtsp MyHandler.h): glibc has only `IN_LOOPBACKNET`; a 127/8 test on a host-order address, the same on any libc.
 const FORWARDED_MACROS: &[&str] = &[
+    "IN_LOOPBACK",
     "__unused",
     "__printflike",
     "TEMP_FAILURE_RETRY",
@@ -439,6 +441,19 @@ const FORWARDED_MACROS: &[&str] = &[
 /// is now only `#include <sys/system_properties.h>`, the generated declarations (frameworks/native
 /// tracing_perfetto_internal.cpp: `__system_property_find` / `__system_property_serial`).
 const SUBSTITUTES: &[&str] = &["sys/_system_properties.h", "sys/endian.h", "sys/limits.h"];
+
+/// Host macros a substitute redefines as bionic writes them (`shape::Override`). `sys/endian.h`'s byte-order
+/// family: glibc's are calls of `static __inline` functions (`__uint32_identity`, `__bswap_32`), bionic's
+/// constant expressions (identity, `__builtin_bswap*`); libmtp MtpDescriptors.cpp brace-initialises
+/// `__le32` fields with `htole32(1)`, a narrowing error unless constant. Same values on both libcs.
+const OVERRIDES: &[shape::Override] = &[shape::Override {
+    substitute: "sys/endian.h",
+    host: "endian.h",
+    macros: &[
+        "htobe16", "htobe32", "htobe64", "htole16", "htole32", "htole64", "be16toh", "be32toh",
+        "be64toh", "le16toh", "le32toh", "le64toh",
+    ],
+}];
 
 /// bionic's private `bionic/tls.h`, replaced: bionic's reads the thread pointer by inline asm, which on glibc is glibc's TCB. Ours declares `__get_tls()` out of line -> `crate::tls`, one per-thread slot array in this library, so every DSO sees the same one (a header-inline `thread_local` would give each DSO its own).
 /// `__set_tls` is not declared: only bionic's own startup sets the thread pointer.
@@ -524,6 +539,7 @@ fn main() -> Result<()> {
     );
 
     println!("cargo::rerun-if-changed={}", arches.display());
+    println!("cargo::rerun-if-env-changed=ATL_BIONIC_BREAK");
     for path in &first.host_inputs {
         println!("cargo::rerun-if-changed={}", path.display());
     }
@@ -754,6 +770,12 @@ fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) ->
         homes: HOMES,
         macros: FORWARDED_MACROS,
         substitutes: SUBSTITUTES,
+        // deliberate break for the gate: ATL_BIONIC_BREAK=overrides drops them -> libmtp fails to compile
+        overrides: if std::env::var("ATL_BIONIC_BREAK").as_deref() == Ok("overrides") {
+            &[]
+        } else {
+            OVERRIDES
+        },
         declared: &declared,
         scan: &scan,
         kernel: &kernel,

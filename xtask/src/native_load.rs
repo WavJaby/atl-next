@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in nine stages.
+//! `xtask test native-load`: the converter-built libandroid_runtime on the converter's ART (`stage_art`), started as an app process starts: atl-app-launcher over the default property area atl-property-service writes (the broker's place), in ten stages.
 //!
 //! 1. load: `System.load` with `LD_BIND_NOW=1`, so every undefined symbol of every object it pulls in must resolve at load time (lazy binding would fail only at the first call).
 //! 2. register: `AndroidRuntime::startReg` must return 0, then gRegJNI walked entry by entry (startReg's own loop, register_jni_procs) must register every entry.
@@ -21,6 +21,8 @@
 //!    the detail is the first fatal line, else the last Codec2 line. Measured 2026-11-06: without `media.c2.hal.selection=aidl` (atl-property-service CONSTANTS) Codec2Client::CacheServiceNames takes the HIDL path and aborts
 //!    (`Check failed: serviceManager Hardware service manager is not running.`); with it the process exits 0, both codecs null (`No Codec2 services declared in the manifest.`), after MediaCodecList's 5 s wait for `media.player`.
 //! 9. decode: the clips of `audio.rs` (Ogg Vorbis, WAV PCM, from the game APKs) decoded one by one through the NDK extractor and codec, as stage 8 runs them. Frames, channels, rate and PCM bytes equal each container's; raw output equals the WAV data chunk; the process's Codec2 store is in-process (`store=local`, declared, instance `default`).
+//! 10. player: after startReg, as stage 8 runs: MediaPlayer's class init must succeed (loads libmedia_jni, whose JNI_OnLoad registers every media class, then native_init). Then Happy Jump's sequence (GameShared.loadMusic): `new MediaPlayer`, `setLooping`, `setVolume`, `release`, no exception and no `media.player` lookup; `start()` in Idle throws IllegalStateException, as AOSP's MediaPlayer.cpp answers it.
+//!     The sequence is a warning here: construction resolves an AttributionSource, which needs ActivityThread or the package service (see `player_result`).
 //!
 //! Fixture (xtask/testdata/native-load): NativeLoad.java (driver), compiled against the boot class jars (framework's included) with the Java pipeline's JDK and d8; never shipped.
 //! shim/, a JNI cdylib (a cargo package of its own, for the `libc` crate's per-arch `struct sigaction`), calls the C++ entry points (hidden register_* by .symtab vaddr) and installs stage 5's handler; built into <out>/cargo.
@@ -73,6 +75,9 @@ pub struct Args {
     /// The Codec2 store break: leaves this store library (a codec2_store.rs name, e.g. libcodec2_soft_amrnbdec) off the library path of stages 8 + 9, so the store's constructor fails on its dlopen naming it, and stage 9 must go red.
     #[arg(long)]
     break_codec: Option<String>,
+    /// Leaves libmedia_jni.so off the library path: MediaPlayer's static init throws UnsatisfiedLinkError, and stage 10 must go red.
+    #[arg(long)]
+    break_media_jni: bool,
     /// Stage 9's game APKs (assets/audio/cheer.ogg, assets/sound/game_music.ogg, assets/sounds/tap.wav). Default: <workspace>/apk.
     #[arg(long)]
     apks: Option<PathBuf>,
@@ -139,6 +144,7 @@ pub fn goals() -> crate::gate_goals::Goals {
         "libresourcemanagerservice",
         "liboggextractor",
         "libwavextractor",
+        "libmedia_jni",
     ])
     .with(crate::gate_goals::Goals::codec_store())
 }
@@ -155,6 +161,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let at = env.host.lib_path.join(format!("{module}.so"));
         std::fs::remove_file(&at)
             .with_context(|| format!("--break-codec: unlinking {}", at.display()))?;
+    }
+    if args.break_media_jni {
+        let at = env.host.lib_path.join("libmedia_jni.so");
+        std::fs::remove_file(&at)
+            .with_context(|| format!("--break-media-jni: unlinking {}", at.display()))?;
     }
     let fixture = env.build_fixture(root)?;
     if args.self_test {
@@ -318,7 +329,88 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Ok(s) => report.pass("decode", s),
         Err(e) => report.fail("decode", e),
     }
+
+    // 10
+    let player = env.binder_art(&fixture, "player", &base)?;
+    match player_result(&player) {
+        Ok(s) => report.pass("player", s),
+        Err(PlayerErr::Init(e)) => report.fail("player", e),
+        Err(PlayerErr::Sequence(e)) => report.warn("player", e),
+    }
     Ok(report.finish())
+}
+
+/// Stage 10's steps and what each must print: Happy Jump's sequence, `start()` in Idle as AOSP answers it (MediaPlayer.cpp INVALID_OPERATION -> IllegalStateException).
+const PLAYER_STEPS: [(&str, &str); 5] = [
+    ("new", "ok"),
+    ("setLooping", "ok"),
+    ("setVolume", "ok"),
+    ("start", "java.lang.IllegalStateException"),
+    ("release", "ok"),
+];
+
+/// Stage 10's outcome short of a pass: class init failed (libmedia_jni, JNI_OnLoad, native_init: a failure), or the sequence (a warning).
+enum PlayerErr {
+    Init(String),
+    Sequence(String),
+}
+
+/// Stage 10: class init must succeed; then every step as expected, the process exits 0, and nothing asked servicemanager for `media.player` (construction needs no service; a lookup there is the 5 s wait).
+/// The sequence is a warning: `new MediaPlayer()` resolves an AttributionSource (AttributionSource.myAttributionSource: ActivityThread's, else PackageManager.getPackagesForUid), which this bare-ART harness has neither of; an app process has both.
+fn player_result(run: &ArtRun) -> Result<String, PlayerErr> {
+    let lines: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("nlt player "))
+        .collect();
+    if !lines.contains(&"init ok") {
+        return Err(PlayerErr::Init(format!(
+            "MediaPlayer class init: [{}], {}",
+            lines.join("; "),
+            run.status
+        )));
+    }
+    player_sequence(run, &lines).map_err(PlayerErr::Sequence)
+}
+
+fn player_sequence(run: &ArtRun, lines: &[&str]) -> Result<String, String> {
+    let bad: Vec<String> = PLAYER_STEPS
+        .iter()
+        .filter(|(step, want)| {
+            !lines.iter().any(|l| {
+                l.strip_prefix(step)
+                    .and_then(|r| r.strip_prefix(' '))
+                    .is_some_and(|r| r.starts_with(want))
+            })
+        })
+        .map(|(step, want)| format!("{step}: want {want}"))
+        .collect();
+    let lookup = run.stderr.contains("media.player");
+    if run.ok && bad.is_empty() && !lookup {
+        return Ok(lines.join("; "));
+    }
+    let why = run
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("nlt load-error"))
+        .or_else(|| {
+            run.stderr
+                .lines()
+                .find(|l| l.contains("UnsatisfiedLinkError") || l.contains(" F "))
+        })
+        .unwrap_or("");
+    Err(format!(
+        "[{}] {}{}, {}: {}",
+        lines.join("; "),
+        bad.join("; "),
+        if lookup {
+            "; media.player looked up"
+        } else {
+            ""
+        },
+        run.status,
+        why.trim()
+    ))
 }
 
 /// Stage 8's binder uid: AID_APP_START (libcutils android_filesystem_config.h), the first app uid, as an app process has.

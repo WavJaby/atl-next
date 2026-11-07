@@ -127,6 +127,8 @@ pub struct Inputs<'a> {
     pub macros: &'a [&'a str],
     /// bionic-only public headers generated whole. Each must be a usable bionic header the host lacks.
     pub substitutes: &'a [&'a str],
+    /// Host macros a substitute redefines (`Override`). Each macro must be bionic's and the host's.
+    pub overrides: &'a [Override<'a>],
     /// bionic public headers whose declarations atl-bionic generates (`buildscript::Api::header`), by
     /// include name: what a substitute may include besides host headers and substitutes.
     pub declared: &'a [&'a str],
@@ -160,6 +162,18 @@ pub struct Wrapper {
     /// The host header declares functions with C++ linkage, which bionic's gives C linkage: included
     /// inside `extern "C"` in C++.
     pub c_linkage: bool,
+    /// Host macros redefined as bionic writes them, after the host header defining them (`Inputs::overrides`).
+    pub overrides: Vec<(Guard, String)>,
+}
+
+/// Host macros a substitute redefines as bionic writes them, because AOSP code relies on bionic's form
+/// where the host's differs (glibc's `htole32` is an inline-function call, bionic's a constant expression:
+/// MtpDescriptors.cpp brace-initialises with it). The substitute includes `host` (which defines them), then
+/// `#undef`s and redefines each, so either include order ends with bionic's. Listed, not derived, as for substitutes.
+pub struct Override<'a> {
+    pub substitute: &'a str,
+    pub host: &'a str,
+    pub macros: &'a [&'a str],
 }
 
 /// One view's wrapper.
@@ -167,6 +181,7 @@ pub struct Wrapper {
 struct Plain {
     substitute: bool,
     defines: Vec<String>,
+    overrides: Vec<String>,
     includes: Vec<String>,
 }
 
@@ -363,6 +378,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
                 defines: merge(&dw.defines, &gw.defines),
                 includes: merge(&dw.includes, &gw.includes),
                 c_linkage: false,
+                overrides: merge(&dw.overrides, &gw.overrides),
             },
         );
     }
@@ -561,11 +577,24 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
         // a substitute's own names are walked as a private file's: the host declares them elsewhere
         let own = host.is_none().then(|| (name.clone(), root.clone()));
         let files: Vec<(String, PathBuf)> = own.into_iter().chain(walk.private).collect();
-        let defines = if host.is_none() {
+        let (defines, overrides) = if host.is_none() {
             substitute_macros(inputs, name, bionic, &files, &host_all, host_text)?
         } else {
-            Vec::new()
+            Default::default()
         };
+        if let Some(o) = inputs
+            .overrides
+            .iter()
+            .find(|o| o.substitute == name.as_str())
+        {
+            ensure!(host.is_none(), "override row <{name}>: not a substitute");
+            ensure!(
+                shaped.contains_key(o.host),
+                "override row <{name}>: the host has no <{}>",
+                o.host
+            );
+            extras.insert(o.host.to_owned());
+        }
         for (label, file) in files {
             let needed: BTreeSet<&String> = bionic.files[&file]
                 .names
@@ -608,6 +637,7 @@ fn derive_view(inputs: &Inputs, p: &Probes, host_text: &HostText) -> Result<View
                     substitute: true,
                     includes,
                     defines,
+                    overrides,
                 },
             );
         } else if !includes.is_empty() {
@@ -726,7 +756,7 @@ fn substitute_macros(
     files: &[(String, PathBuf)],
     host_all: &BTreeSet<&String>,
     host: &HostText,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut defined: BTreeMap<&str, &str> = BTreeMap::new();
     let own = probe
         .files
@@ -754,6 +784,35 @@ fn substitute_macros(
             }
         }
     }
+    let listed: &[&str] = inputs
+        .overrides
+        .iter()
+        .find(|o| o.substitute == name)
+        .map_or(&[], |o| o.macros);
+    let mut overrides = Vec::new();
+    for &m in listed {
+        let def = *defined
+            .get(m)
+            .with_context(|| format!("override {m} in <{name}>: bionic does not define it"))?;
+        ensure!(
+            host_all.contains(&m.to_owned()),
+            "override {m} in <{name}>: the host lacks it (a substitute defines it already: drop the row)"
+        );
+        // a body naming another host macro bionic redefines would mix the two libcs' forms
+        let mixed: Vec<&str> = identifiers(def)
+            .filter(|i| {
+                defined.contains_key(i)
+                    && host_all.contains(&(*i).to_owned())
+                    && !listed.contains(i)
+            })
+            .collect();
+        ensure!(
+            mixed.is_empty(),
+            "override {m} in <{name}>: its body names host macros {mixed:?} not overridden"
+        );
+        overrides.push(def.to_owned());
+        todo.extend(identifiers(def).filter(|i| defined.contains_key(i)));
+    }
     let mut defs: BTreeMap<&str, &str> = BTreeMap::new();
     while let Some(m) = todo.pop() {
         if defs.contains_key(m) || host_all.contains(&m.to_owned()) {
@@ -776,7 +835,7 @@ fn substitute_macros(
         clashes.is_empty(),
         "substitute <{name}>: host headers use its macros {clashes:?} as identifiers"
     );
-    Ok(defs.into_values().map(str::to_owned).collect())
+    Ok((defs.into_values().map(str::to_owned).collect(), overrides))
 }
 
 /// Host headers declaring every one of `needed`, fewest files reached first.
@@ -847,8 +906,21 @@ fn macro_homes(
         }
         let root = probe.file.as_ref().context("usable probe without a file")?;
         let walk = walk(inputs, probe, host_has)?;
-        let def = std::iter::once(root)
+        let own: Vec<&PathBuf> = std::iter::once(root)
             .chain(walk.private.iter().map(|(_, f)| f))
+            .collect();
+        // also the kernel uapi headers bionic's files include directly (netinet/in.h -> linux/in.h: IN_LOOPBACK); never included
+        // by a wrapper (bionic's uapi copies clash with glibc's definitions), so a macro defined there is forwarded alone
+        let uapi = own
+            .iter()
+            .filter_map(|f| probe.files.get(*f))
+            .flat_map(|r| r.includes.iter())
+            .filter(|inc| under(&inc.file, inputs.uapi))
+            .map(|inc| &inc.file);
+        let def = own
+            .iter()
+            .copied()
+            .chain(uapi)
             .find_map(|f| probe.files.get(f).and_then(|r: &Reached| r.macros.get(m)));
         if let Some(def) = def {
             found.push((name.clone(), def.clone()));
@@ -933,6 +1005,11 @@ pub fn print(name: &str, w: &Wrapper, source: &str) -> Result<String> {
         writeln!(out, "#ifndef {guard}\n#define {guard}")?;
         print_includes(&mut out, &w.includes)?;
         print_defines(&mut out, &w.defines)?;
+        print_guarded(&mut out, &w.overrides, |out, def| {
+            let m = macro_name(def).context("empty macro definition")?;
+            writeln!(out, "#undef {m}\n#define {def}")?;
+            Ok(())
+        })?;
         writeln!(out, "#endif")?;
         return Ok(out);
     }
@@ -1322,6 +1399,7 @@ mod tests {
             homes,
             macros,
             substitutes,
+            overrides: &[],
             declared,
             scan: &scan,
             kernel: &kernel,
