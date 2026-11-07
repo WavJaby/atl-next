@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! Which libraries the NB core takes: `isSupported` answers from the file alone, as libnativeloader asks it after glibc's `dlopen` refused the path.
-//! Ours = an ELF of the host's machine (route N: identity engine, bridge-1 plan section 0) that links against bionic: DT_NEEDED `libc.so` (bionic's soname; glibc's is `libc.so.6`) and a GNU verneed asking `libc.so` for `LIBC`, the version node every NDK build references (bionic `libc.map.txt`).
+//! Ours = an ELF of the host's machine (route N: identity engine, bridge-1 plan section 0) that links against bionic: DT_NEEDED `libc.so` (bionic's soname; glibc's is `libc.so.6`).
+//! No symbol-version marker: NDK stubs without version nodes produced binaries with no verneed at all, and those are the old games; a `LIBC` verneed exists only in newer NDK output.
 //! A foreign machine is the QEMU engine's (bridge 2) and is refused until that engine exists.
 //! The host machine is read from `/proc/self/exe`, so no arch name or constant is stored here (arches.toml stays the only arch list).
-
-use std::collections::BTreeSet;
 
 use object::read::elf::{Dyn, FileHeader};
 use object::{Endianness, FileKind, elf};
 
-/// bionic's soname and the version node NDK-built code asks it for.
+/// bionic's soname.
 const BIONIC_LIBC: &[u8] = b"libc.so";
-const BIONIC_LIBC_VERSION: &[u8] = b"LIBC";
 
 /// What `classify` makes of a file.
 #[derive(Debug, PartialEq, Eq)]
@@ -47,10 +45,7 @@ pub fn classify(lib: &[u8], host: elf::Machine) -> Verdict {
             host,
         };
     }
-    let bionic = m.needed.iter().any(|n| n == BIONIC_LIBC)
-        && m.verneed
-            .contains(&(BIONIC_LIBC.to_vec(), BIONIC_LIBC_VERSION.to_vec()));
-    if bionic {
+    if m.needed.iter().any(|n| n == BIONIC_LIBC) {
         Verdict::Bridged
     } else {
         Verdict::NotBionic
@@ -81,11 +76,9 @@ fn head<F: FileHeader<Endian = Endianness>>(data: &[u8]) -> object::Result<elf::
 struct Markers {
     machine: elf::Machine,
     needed: Vec<Vec<u8>>,
-    /// (file, version) pairs of the GNU verneed.
-    verneed: BTreeSet<(Vec<u8>, Vec<u8>)>,
 }
 
-/// Read through the section table (`.dynamic`, `.gnu.version_r`): NDK output keeps it; a library without one has no marker and is refused.
+/// Read through the section table (`.dynamic`): NDK output keeps it; a library without one has no marker and is refused.
 fn markers<F: FileHeader<Endian = Endianness>>(data: &[u8]) -> object::Result<Markers> {
     let h = F::parse(data)?;
     let endian = h.endian()?;
@@ -101,24 +94,9 @@ fn markers<F: FileHeader<Endian = Endianness>>(data: &[u8]) -> object::Result<Ma
             }
         }
     }
-    let mut verneed = BTreeSet::new();
-    if let Some((mut it, link)) = sections.gnu_verneed(endian, data)? {
-        let strings = sections.strings(endian, data, link)?;
-        while let Some((need, mut aux)) = it.next()? {
-            let Ok(file) = strings.get(need.vn_file.get(endian)) else {
-                continue;
-            };
-            while let Some(a) = aux.next()? {
-                if let Ok(v) = strings.get(a.vna_name.get(endian)) {
-                    verneed.insert((file.to_vec(), v.to_vec()));
-                }
-            }
-        }
-    }
     Ok(Markers {
         machine: h.e_machine(endian),
         needed,
-        verneed,
     })
 }
 

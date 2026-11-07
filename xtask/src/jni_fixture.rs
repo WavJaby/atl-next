@@ -48,6 +48,7 @@ const SIBLING: &str = "libatl-jni-sibling.so";
 /// libc++ the fixture links (`-stdlib=libc++`, NDK clang++'s shared default); packaged next to the fixture as an app packages it.
 const CXX_SHARED: &str = "libc++_shared.so";
 /// The C12 legacy fixture (atl_jni_legacy.cpp): C and C++ calls old NDK binaries make, linked to the guest's libstdc++.so and libz.so instead of libc++.
+/// Its libc is an empty unversioned stub, as old NDK platforms shipped: no GNU verneed, imports left undefined for the loader (Happy Jump's libndksetup.so has this shape).
 const LEGACY: &str = "libatl-jni-legacy.so";
 /// DT_NEEDED the legacy fixture names: the guest libraries that answer its calls (atld_run.rs NB_LIBS rows).
 const LEGACY_NEEDED: [&str; 2] = ["libstdc++.so", "libz.so"];
@@ -131,7 +132,15 @@ impl NdkTarget {
 }
 
 /// Builds the fixture for `arch` at `api` into `out/android-<api>`.
-pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Result<Built> {
+/// `legacy_no_libc`: the legacy library loses DT_NEEDED `libc.so`, the marker the NativeBridge core routes on (`xtask test app --legacy-no-libc`).
+pub fn build(
+    root: &Path,
+    ndk: &Path,
+    arch: &str,
+    api: u32,
+    out: &Path,
+    legacy_no_libc: bool,
+) -> Result<Built> {
     let t = NdkTarget::new(root, ndk, arch, api)?;
     let dir = out.join(format!("android-{api}"));
     if dir.exists() {
@@ -195,9 +204,25 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
             "-D_FORTIFY_SOURCE=2",
         ],
     )?;
+    let stubs = dir.join("legacy-stubs");
+    std::fs::create_dir_all(&stubs)?;
+    host_art::exec(
+        t.cmd("clang")
+            .args(["-shared", "-nostdlib", "-Wl,-soname,libc.so"])
+            .args(["-x", "c", "/dev/null", "-o"])
+            .arg(stubs.join("libc.so")),
+        "NDK clang legacy libc stub",
+    )?;
+    // the stub defines nothing, so --as-needed drops it from DT_NEEDED
+    let libc_needed = if legacy_no_libc {
+        "-Wl,--as-needed"
+    } else {
+        "-Wl,--no-as-needed"
+    };
     host_art::exec(
         t.cmd("clang++")
-            .args(["-shared", "-nostdlib++"])
+            .args(["-shared", "-nostdlib++", libc_needed])
+            .arg(format!("-L{}", stubs.display()))
             .arg(&legacy_obj)
             .arg(format!("-Wl,-soname,{LEGACY}"))
             .args(["-lstdc++", "-lz"])
@@ -206,6 +231,7 @@ pub fn build(root: &Path, ndk: &Path, arch: &str, api: u32, out: &Path) -> Resul
         "NDK clang++ legacy link",
     )?;
     std::fs::remove_file(&legacy_obj)?;
+    std::fs::remove_dir_all(&stubs)?;
     let cxx = t.sysroot_lib.join(CXX_SHARED);
     let cxx_copy = dir.join(CXX_SHARED);
     std::fs::copy(&cxx, &cxx_copy).with_context(|| format!("copying {}", cxx.display()))?;
@@ -407,7 +433,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let mut shapes = Vec::new();
     for api in [EMULATED_TLS_API, ELF_TLS_API] {
-        let built = build(root, &ndk, &args.arch, api, &out)?;
+        let built = build(root, &ndk, &args.arch, api, &out, false)?;
         let s = shape(&built.dir.join(LIB))?;
         let f = elf_failures(&s, api);
         if f.is_empty() {
@@ -420,6 +446,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fails.extend(f);
         fails.extend(probe_failures(&built)?);
         fails.extend(nb_failures(&built.dir.join(LIB), api)?);
+        fails.extend(nb_failures(&built.dir.join(LEGACY), api)?);
         shapes.push((api, s));
     }
     // control: each variant fails the other's TLS expectation
@@ -444,10 +471,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// The libraries the M2 test APK carries in `lib/<abi>/`: the `api` variant, built into `out`; `api` is also the APK's minSdk.
-pub fn apk_libs(root: &Path, arch: &str, api: u32, out: &Path) -> Result<NativeLibs> {
+pub fn apk_libs(
+    root: &Path,
+    arch: &str,
+    api: u32,
+    out: &Path,
+    legacy_no_libc: bool,
+) -> Result<NativeLibs> {
     let ndk = default_ndk(root)?;
     let abi = NdkTarget::new(root, &ndk, arch, api)?.abi;
-    let built = build(root, &ndk, arch, api, out)?;
+    let built = build(root, &ndk, arch, api, out, legacy_no_libc)?;
     if built.libs.is_empty() {
         bail!("no fixture libraries built");
     }
@@ -461,6 +494,13 @@ pub fn apk_libs(root: &Path, arch: &str, api: u32, out: &Path) -> Result<NativeL
 /// The C12 legacy fixture's ELF expectations: DT_NEEDED names the guest libraries that answer its calls, and each import is one its source calls at run time.
 fn legacy_shape_failures(s: &Shape) -> Vec<String> {
     let mut f = Vec::new();
+    // libstdc++.so's own stub stays versioned: only libc's is the old-NDK shape
+    if s.verneed.iter().any(|(file, _)| file == "libc.so") {
+        f.push(format!(
+            "{LEGACY}: want no verneed on libc.so, got {:?}",
+            s.verneed
+        ));
+    }
     for n in LEGACY_NEEDED {
         if !s.needed.iter().any(|x| x == n) {
             f.push(format!(
@@ -504,6 +544,9 @@ mod tests {
         };
         let all = ["libc.so", "libstdc++.so", "libz.so"];
         assert!(legacy_shape_failures(&shape_of(&all, None)).is_empty());
+        let mut versioned = shape_of(&all, None);
+        versioned.verneed.insert(("libc.so".into(), "LIBC".into()));
+        assert_eq!(legacy_shape_failures(&versioned).len(), 1);
         assert_eq!(
             legacy_shape_failures(&shape_of(&["libc.so", "libstdc++.so"], None)).len(),
             1

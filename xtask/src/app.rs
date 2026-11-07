@@ -44,6 +44,9 @@ pub struct Args {
     /// The C12 break: leaves this native-bridge guest library (an NB_LIBS file, e.g. libstdc++.so or libz.so) out of the guest, so the legacy fixture's load fails naming it; the gate must then go red.
     #[arg(long)]
     drop_nb_lib: Option<String>,
+    /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
+    #[arg(long)]
+    legacy_no_libc: bool,
 }
 
 /// The fixture's dir.
@@ -223,6 +226,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.fixture_api,
         &work.join("jni-fixture"),
+        args.legacy_no_libc,
     )?;
     let apk = rt
         .apk
