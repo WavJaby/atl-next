@@ -9,6 +9,7 @@
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
 
     <application android:label="ATL provider" android:name=".App">
+        <meta-data android:name="com.example.atlprovider.REF" android:value="@string/meta_ref" />
         <provider android:name=".Low" android:authorities="com.example.atlprovider.low" android:exported="false" android:initOrder="1">
             <meta-data android:name="com.example.atlprovider.KEY" android:value="startup" />
         </provider>

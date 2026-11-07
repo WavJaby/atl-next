@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use atl_layout::Layout;
+use atl_services::packages::MetaValue;
 
 use crate::atld_run::{Run, Runtime};
 use crate::manifest;
@@ -30,6 +31,9 @@ pub struct Args {
     /// Hand the services the package with no providers (deliberate break): the order and lookup checks must fail.
     #[arg(long)]
     break_provider_list: bool,
+    /// Read the manifest without resolving `android:value` references (deliberate break): the `@string` meta-data check must fail.
+    #[arg(long)]
+    break_meta_ref: bool,
     /// Print the app's whole log.
     #[arg(long, short)]
     verbose: bool,
@@ -77,7 +81,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("app"), &[], None, None)?;
-    let mut m = manifest::read(&rt.apk.aapt2, &apk)?;
+    let read = if args.break_meta_ref {
+        manifest::read_unresolved
+    } else {
+        manifest::read
+    };
+    let mut m = read(&rt.apk.aapt2, &apk)?;
+    // the fixture's res/values/strings.xml `meta_ref`, through aapt2's real dump
+    let wanted = (
+        "com.example.atlprovider.REF".to_owned(),
+        MetaValue::String("from-resource".to_owned()),
+    );
+    ensure!(
+        m.application_meta_data.contains(&wanted),
+        "provider: FAIL @string meta-data not resolved: {:?}",
+        m.application_meta_data
+    );
     println!(
         "provider: built {} ({} providers)",
         apk.display(),

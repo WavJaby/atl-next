@@ -488,8 +488,17 @@ fn dump(aapt2: &Path, apk: &Path) -> Result<String> {
 
 /// `apk`'s manifest, through `aapt2`.
 pub fn read(aapt2: &Path, apk: &Path) -> Result<Manifest> {
+    read_with(aapt2, apk, true)
+}
+
+/// [`read`] without resolving `android:value` references: `xtask test provider --break-meta-ref`, whose meta-data check must then fail.
+pub fn read_unresolved(aapt2: &Path, apk: &Path) -> Result<Manifest> {
+    read_with(aapt2, apk, false)
+}
+
+fn read_with(aapt2: &Path, apk: &Path, resolve: bool) -> Result<Manifest> {
     let mut text = dump(aapt2, apk)?;
-    if text.lines().any(|l| value_reference(l).is_some()) {
+    if resolve && text.lines().any(|l| value_reference(l).is_some()) {
         let resources = host_art::output(
             Command::new(aapt2).args(["dump", "resources"]).arg(apk),
             "aapt2 dump resources",
