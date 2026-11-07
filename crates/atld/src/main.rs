@@ -707,7 +707,14 @@ impl Host {
                     .remove(&host_pid);
                 match status {
                     Ok(status) => {
-                        log(format_args!("process {host_pid} ended: {status}"));
+                        // bwrap, the sandbox's pid 1, reports a child killed by signal N as exit 128 + N
+                        match status.code().filter(|c| *c > 128) {
+                            Some(c) => log(format_args!(
+                                "process {host_pid} ended: {status} (signal {})",
+                                c - 128
+                            )),
+                            None => log(format_args!("process {host_pid} ended: {status}")),
+                        }
                         if main {
                             let _ = host.done.send(End::Command(status));
                         }

@@ -272,6 +272,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             );
         }
     }
+    // the app's end as its parent saw it: a signal leaves no line of its own in the app's or the services' log
+    for line in read(&run.atld_log())
+        .lines()
+        .filter(|l| l.contains(" ended: "))
+    {
+        println!("run-apk: {line}");
+    }
     println!("run-apk: logs {}", run.root.join("log").display());
     Ok(if outcome.is_ok() {
         ExitCode::SUCCESS
