@@ -220,6 +220,8 @@ pub struct Runtime {
     root_back: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
+    /// The services register `connectivity` unless this is cleared (`--no-connectivity-service`, the app gate's connectivity break).
+    connectivity_service: bool,
     /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
     fake_devices: Option<(PathBuf, PathBuf)>,
 }
@@ -542,6 +544,7 @@ impl Runtime {
             new_intent: true,
             root_back: true,
             sensor_service: true,
+            connectivity_service: true,
             fake_devices: None,
         })
     }
@@ -728,6 +731,12 @@ impl Runtime {
     /// The services do not register `sensorservice` (atld `--no-sensor-service`): SensorManager's wait must then be detected.
     pub fn without_sensor_service(mut self) -> Self {
         self.sensor_service = false;
+        self
+    }
+
+    /// The services do not register `connectivity` (atld `--no-connectivity-service`): getSystemService(CONNECTIVITY_SERVICE) must then return null.
+    pub fn without_connectivity_service(mut self) -> Self {
+        self.connectivity_service = false;
         self
     }
 
@@ -951,6 +960,9 @@ impl Runtime {
         };
         if !self.sensor_service {
             cmd.arg("--no-sensor-service");
+        }
+        if !self.connectivity_service {
+            cmd.arg("--no-connectivity-service");
         }
         let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
         let placed = driver_files

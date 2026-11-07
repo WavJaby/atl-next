@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use atl_native_bridge::engine::arch;
 
 /// What `no_host_fs` passes as `why` (x86_64.rs).
-const WHY: &str = "atl-native-bridge: fatal-signal report: no host thread pointer for the handler: sig 10 ";
+const WHY: &str =
+    "atl-native-bridge: fatal-signal report: no host thread pointer for the handler: sig 10 ";
 /// The fake TCB: one page, zeroed -> `%fs:16` (tcbhead_t.self) != FS and every bionic slot 0.
 const FAKE_LEN: usize = 4096;
 
@@ -84,13 +85,14 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--child") {
         return child();
     }
-    let out = match std::env::current_exe().and_then(|exe| Command::new(exe).arg("--child").output()) {
-        Ok(o) => o,
-        Err(e) => {
-            println!("g5: FAIL spawning the child: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let out =
+        match std::env::current_exe().and_then(|exe| Command::new(exe).arg("--child").output()) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("g5: FAIL spawning the child: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let fake = stdout
@@ -102,7 +104,10 @@ fn main() -> ExitCode {
         whys.push(format!("child {}: {}", out.status, stderr.trim()));
     }
     match stderr.lines().find(|l| l.starts_with(WHY)) {
-        None => whys.push(format!("no report line {WHY:?} on stderr: {:?}", stderr.trim())),
+        None => whys.push(format!(
+            "no report line {WHY:?} on stderr: {:?}",
+            stderr.trim()
+        )),
         Some(l) if !l.contains(&format!(" fs {fake} ")) => {
             whys.push(format!("report does not name the fake fs {fake}: {l}"))
         }

@@ -8,6 +8,8 @@
 
     <!-- minSdkVersion: the JNI fixture's API level (xtask test app, option fixture-api), injected at link (atld_run.rs NativeLibs) -->
     <uses-sdk android:targetSdkVersion="36" />
+    <!-- the connectivity line (app.rs CONNECTIVITY): ConnectivityService.enforceAccessPermission -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application android:label="ATL test">
         <activity android:name=".Main" android:exported="true">

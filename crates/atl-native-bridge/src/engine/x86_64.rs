@@ -551,7 +551,12 @@ fn raw_open(path: &std::ffi::CStr) -> i32 {
 
 /// `read` into `buf` without glibc; negative on failure.
 fn raw_read(fd: i32, buf: &mut [u8]) -> isize {
-    raw_syscall3(libc::SYS_read, fd as usize, buf.as_mut_ptr() as usize, buf.len())
+    raw_syscall3(
+        libc::SYS_read,
+        fd as usize,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+    )
 }
 
 /// `write(2, buf)` without glibc; a failed write loses only these bytes.

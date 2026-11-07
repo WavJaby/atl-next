@@ -53,6 +53,9 @@ pub struct Args {
     /// The MediaPlayer break: unlinks libmedia_jni.so from the ART lib dir, so `new MediaPlayer` must fail and the mediaplayer lines must go red.
     #[arg(long)]
     mediaplayer_break: bool,
+    /// The connectivity break: the services do not register `connectivity`, so getSystemService returns null and the connectivity line must go red.
+    #[arg(long)]
+    connectivity_break: bool,
     /// The routing break: the legacy fixture is linked without DT_NEEDED `libc.so`, so the NativeBridge core refuses it, glibc's dlerror surfaces and the legacy rows must go red.
     #[arg(long)]
     legacy_no_libc: bool,
@@ -75,6 +78,13 @@ const SOUNDPOOL_CALLS: [&str; 2] = ["trackPlayer", "releasePlayer"];
 const MEDIAPLAYER: &str = "AtlTest: mediaplayer: ";
 /// AOSP's ALOGE in MediaPlayer::start for a player in Idle (mediaplayer.cpp:364, tag MediaPlayerNative, state 1 = MEDIA_PLAYER_IDLE): start() reached the native player and was refused there. Java's _start throws nothing for that (android_media_MediaPlayer.cpp), so this line is the only evidence the native path ran.
 const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
+/// Main.onCreate's connectivity line: ConnectivityManager's answers on a device with no network agent (ConnectivityService.getActiveNetworkInfo -> null, isActiveNetworkMetered -> true).
+const CONNECTIVITY: &str = "AtlTest: connectivity: ";
+/// The native bridge's report of a fault handed to a guest handler (x86_64.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
+const GUEST_FAULT_REPORT: &str =
+    "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
+/// The line's expected value; `absent` = getSystemService returned null (no `connectivity` binder).
+const CONNECTIVITY_OFFLINE: &str = "active=null metered=true";
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -331,6 +341,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         rt
     };
+    let rt = if args.connectivity_break {
+        rt.without_connectivity_service()
+    } else {
+        rt
+    };
     let rt = if args.font_break {
         rt.with_sans_serif(&layout, test_fonts::MONO.2)?
     } else {
@@ -482,6 +497,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if passed && soundpool.as_deref() != Some("constructed") {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
     }
+    let connectivity = app
+        .lines()
+        .find_map(|l| l.split_once(CONNECTIVITY).map(|(_, r)| r.to_owned()));
+    if passed && connectivity.as_deref() != Some(CONNECTIVITY_OFFLINE) {
+        whys.push(format!(
+            "connectivity: want {CONNECTIVITY_OFFLINE:?}, got {connectivity:?}"
+        ));
+    }
     // the row's release: releasePlayer is oneway, so the app sees no error; the audio service's own count shows that the track and the release reached it and were served
     if passed {
         let served = counters(&services_log);
@@ -516,6 +539,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut es1_compared = None;
     if passed && bridge1_ok {
         whys.extend(bridge1_call_failures(&app));
+        // sigsegvRecover's fault reaches the fixture's own handler through the bridge (signal.rs guest_handler), which reports it first: the report's only gate in a real app process
+        if !app.lines().any(|l| l.contains(GUEST_FAULT_REPORT)) {
+            whys.push(format!(
+                "bridge1: sigsegvRecover left no {GUEST_FAULT_REPORT:?} line"
+            ));
+        }
         match es1_pixels(&app, &scene) {
             Ok(n) => es1_compared = Some(n),
             Err(why) => whys.push(format!("es1 pixels: {why}")),
@@ -546,6 +575,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app: pass mediaplayer {} (no media.player lookup)",
             mediaplayer_steps(&app)
         );
+        println!("app: pass connectivity {CONNECTIVITY_OFFLINE}");
         if let Some(n) = es1_compared {
             println!(
                 "app: pass es1 {n} pixels match the scene model (libGLESv1_CM.so through the proxies)"

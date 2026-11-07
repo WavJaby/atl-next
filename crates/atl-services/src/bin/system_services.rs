@@ -56,6 +56,9 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
+    /// Test only: `connectivity` is not registered, the deliberate break of the app gate's connectivity line (getSystemService then returns null).
+    #[arg(long)]
+    no_connectivity_service: bool,
 }
 
 /// The names the framework looks the services up by (Context.ACTIVITY_SERVICE, Context.PACKAGE_SERVICE / ActivityThread.getPackageManager).
@@ -87,6 +90,8 @@ const CLIPBOARD: &str = "clipboard";
 const NOTIFICATION: &str = "notification";
 /// The name libsensor's SensorManager waits for (SensorManager.cpp `waitForSensorService`).
 const SENSOR: &str = "sensorservice";
+/// Context.CONNECTIVITY_SERVICE (ConnectivityFrameworkInitializer.registerServiceWrappers looks it up by this name).
+const CONNECTIVITY: &str = "connectivity";
 
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -184,6 +189,13 @@ fn main() -> Result<()> {
         atl_services::clipboard::new_binder(Arc::clone(&permissions)),
     )
     .context("addService clipboard")?;
+    if !a.no_connectivity_service {
+        binder::add_service(
+            CONNECTIVITY,
+            atl_services::connectivity::new_binder(Arc::clone(&permissions)),
+        )
+        .context("addService connectivity")?;
+    }
     binder::add_service(
         NOTIFICATION,
         atl_services::notification::new_binder(

@@ -45,6 +45,8 @@ include_dirs = [
     "hardware/interfaces/graphics/common/aidl",
     "frameworks/av/aidl",
     "packages/modules/Bluetooth/framework/aidl-export",
+    "packages/modules/Connectivity/framework/aidl-export",
+    "packages/modules/Connectivity/framework/src",
     "system/hardware/interfaces/media/aidl",
     "system/vold/binder",
 ]
@@ -62,6 +64,8 @@ types = [
     "android.os.IProcessInfoService",
     "android.os.storage.IStorageManager",
     "android.content.IClipboard",
+    # the connectivity service (connectivity.rs)
+    "android.net.IConnectivityManager",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.app.IActivityTaskManager",

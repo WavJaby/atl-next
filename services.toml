@@ -238,6 +238,16 @@ src = ["crates/atl-services/src/clipboard.rs"]
 mirrors = []
 reason = "registered only so ClipboardManager's constructor finds the service; every method keeps the stub's UNKNOWN_TRANSACTION default (clipboard.rs), so no ClipboardService behaviour is reproduced yet"
 
+[connectivity]
+src = ["crates/atl-services/src/connectivity.rs"]
+mirrors = [
+    "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#getActiveNetworkInfo",
+    "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#getActiveNetwork",
+    "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#getAllNetworks",
+    "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#isActiveNetworkMetered",
+    "packages/modules/Connectivity/service/src/com/android/server/ConnectivityService.java#enforceAccessPermission",
+]
+
 [input]
 src = ["crates/atl-services/src/input.rs"]
 mirrors = [

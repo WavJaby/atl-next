@@ -44,6 +44,8 @@ mod broadcast_queue;
 #[cfg(feature = "converter")]
 pub mod clipboard;
 #[cfg(feature = "converter")]
+pub mod connectivity;
+#[cfg(feature = "converter")]
 pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;
