@@ -30,21 +30,16 @@ pub(crate) fn round_frames(requested: i64) -> Option<usize> {
     (frames <= MAX_FRAMES).then_some(frames)
 }
 
-/// The track's region: a memfd of `len` bytes, the control block and `frames * frame_bytes` of buffer.
+/// The track's region: a memfd of `len` bytes, the control block and the track's own buffer (none for a shared-buffer track).
 pub(crate) struct Region {
     fd: OwnedFd,
     len: usize,
 }
 
-/// The region for a track of `frames` frames of `frame_bytes`. `break_cblk` allocates the control block alone (the audio gate's break); the size check then refuses it: a region shorter than the layout is never handed out.
-pub(crate) fn allocate(
-    frames: usize,
-    frame_bytes: usize,
-    break_cblk: bool,
-) -> Result<Region, StatusCode> {
-    let need = frames
-        .checked_mul(frame_bytes)
-        .and_then(|buffer| buffer.checked_add(CBLK_BYTES))
+/// The region for a track whose buffer is `buffer_bytes`: 0 for a shared-buffer (static) track, whose buffer is the client's (Tracks.cpp:893). `break_cblk` allocates the control block alone, one buffer short of a streaming track (the audio gate's break); the size check then refuses it: a region shorter than the layout is never handed out.
+pub(crate) fn allocate(buffer_bytes: usize, break_cblk: bool) -> Result<Region, StatusCode> {
+    let need = buffer_bytes
+        .checked_add(CBLK_BYTES)
         .ok_or(StatusCode::BAD_VALUE)?;
     let len = if break_cblk { CBLK_BYTES } else { need };
     if len < need {

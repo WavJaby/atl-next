@@ -35,7 +35,7 @@ pub const OUTPUT_CHANNEL_MASK: i32 = 0x3;
 /// Test switches of [`serve`]. The default serves normally.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
-    /// The audio gate's break (`--break-cblk`): each track's region is one buffer short of its layout, so createTrack's size check refuses it and the track fails to initialise.
+    /// The audio gate's break (`--break-cblk`): each streaming track's region is one buffer short of its layout, so createTrack's size check refuses it and the track fails to initialise.
     pub break_cblk: bool,
 }
 

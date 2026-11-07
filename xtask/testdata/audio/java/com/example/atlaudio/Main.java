@@ -15,12 +15,15 @@ import android.util.Log;
  * `minbuf: <bytes>`: AudioTrack.getMinBufferSize for 44100 Hz, stereo, 16-bit (AudioFlinger's sample rate, frame count and latency through AudioPolicyService's output).
  * `track: state=<n> piid=<n> frames=<n>`: a track's constructor (createTrack, IAudioTrack, then PlayerBase's trackPlayer): its state, its player id, its frame count.
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
+ * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
  * `done`: the end of the run.
  */
 public class Main extends Activity {
     private static final String TAG = "AtlAudio";
     /** The rate the gate asks for; audio_app.rs works the expected minimum buffer for it. */
     private static final int RATE_HZ = 44100;
+    /** The static track's buffer: 4096 bytes, 1024 stereo 16-bit frames (audio_app.rs STATIC_BYTES). */
+    private static final int STATIC_BYTES = 4096;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -67,6 +70,17 @@ public class Main extends Activity {
             fast.release();
         } catch (Throwable e) {
             Log.i(TAG, "fast: " + e);
+        }
+        try {
+            // a static track: its buffer is the client's (MODE_STATIC, the shared-buffer path SoundPool uses)
+            AudioTrack st = new AudioTrack(attributes, format, STATIC_BYTES, AudioTrack.MODE_STATIC, a);
+            // built = native setup succeeded (STATE_NO_STATIC_DATA until data is written)
+            boolean built = st.getState() != AudioTrack.STATE_UNINITIALIZED;
+            Log.i(TAG, "static: state=" + st.getState() + " frames="
+                    + (built ? st.getBufferSizeInFrames() : 0));
+            st.release();
+        } catch (Throwable e) {
+            Log.i(TAG, "static: " + e);
         }
         Log.i(TAG, "done");
     }

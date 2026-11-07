@@ -150,8 +150,8 @@ impl IAudioFlingerService for AudioFlinger {
         Ok(())
     }
 
-    /// AudioFlinger::createTrack (Tracks.cpp): a PCM 16-bit mono or stereo streaming track with its region and IAudioTrack.
-    /// FAST is refused and cleared from the response flags, so the client keeps the track on the normal path (AudioTrack.cpp createTrack_l takes the flags the server returns). Shared-buffer (static) tracks are refused until they are served.
+    /// AudioFlinger::createTrack (Tracks.cpp): a PCM 16-bit mono or stereo track with its region and IAudioTrack. A streaming track gets its own buffer after the control block; a shared-buffer (static) track takes the client's (SoundPool's streams).
+    /// FAST is refused and cleared from the response flags, so the client keeps the track on the normal path (AudioTrack.cpp createTrack_l takes the flags the server returns).
     fn r#createTrack(
         &self,
         request: Option<&CreateTrackRequest>,
@@ -170,29 +170,44 @@ impl IAudioFlingerService for AudioFlinger {
             tracing::warn!("createTrack: format or layout not served");
             return refused();
         };
-        if request.sharedBuffer.is_some() {
-            tracing::warn!("createTrack: static (shared-buffer) track not served yet");
-            return refused();
-        }
         let session = match request.sessionId {
             0 => ids::next(ids::USE_SESSION).expect("USE_SESSION is below AUDIO_UNIQUE_ID_USE_MAX"),
             s if s > 0 => s,
             _ => return refused(),
         };
-        let Some(frames) = track::round_frames(request.frameCount) else {
-            return refused();
+        let frame_bytes = channels * BYTES_PER_SAMPLE;
+        let (frames, buffer_bytes) = match request.sharedBuffer.as_ref() {
+            // static: the client's buffer is the track's buffer, and the frames are the buffer's (Threads.cpp:2569: a PCM shared buffer ignores the request's frame count). No roundup (TrackBase:162). The fd is not kept: the data plane (A2) must keep it.
+            Some(shared) => {
+                let frames = i64::try_from(frame_bytes)
+                    .ok()
+                    .and_then(|bytes| usize::try_from(shared.size / bytes).ok())
+                    .unwrap_or(0);
+                if frames == 0 {
+                    return refused();
+                }
+                (frames, 0)
+            }
+            None => {
+                let Some(frames) = track::round_frames(request.frameCount) else {
+                    return refused();
+                };
+                let Some(bytes) = frames.checked_mul(frame_bytes) else {
+                    return refused();
+                };
+                (frames, bytes)
+            }
         };
         if request.flags & AUDIO_OUTPUT_FLAG_FAST != 0 {
             counters::refused(INTERFACE, "createTrack.FAST");
         }
-        let region =
-            match track::allocate(frames, channels * BYTES_PER_SAMPLE, self.opts.break_cblk) {
-                Ok(region) => region,
-                Err(status) => {
-                    counters::refused(INTERFACE, "createTrack.region");
-                    return Err(status.into());
-                }
-            };
+        let region = match track::allocate(buffer_bytes, self.opts.break_cblk) {
+            Ok(region) => region,
+            Err(status) => {
+                counters::refused(INTERFACE, "createTrack.region");
+                return Err(status.into());
+            }
+        };
         counters::answered(INTERFACE, "createTrack");
         Ok(Some(CreateTrackResponse {
             r#flags: request.flags & !AUDIO_OUTPUT_FLAG_FAST,

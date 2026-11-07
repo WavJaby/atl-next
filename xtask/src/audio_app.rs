@@ -3,7 +3,7 @@
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served output is atl-audioflinger's OUTPUT_* constants; [`SPEC_RATE_HZ`] and the others copy them, so a change there must change these too (a mismatch is a red gate).
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
-//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each track's region is one buffer short, createTrack refuses it, and both tracks fail to initialise.
+//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,7 +34,7 @@ pub struct Args {
     /// The deliberate break: the app starts with `--no-audio-service`, so it serves neither AudioFlinger nor AudioPolicyService, and the session line must go red.
     #[arg(long)]
     break_serve: bool,
-    /// The second deliberate break: the app starts with `--break-cblk`, so each track's control block region is one buffer short; createTrack refuses it and both tracks must fail to initialise.
+    /// The second deliberate break: the app starts with `--break-cblk`, so each streaming track's control block region is one buffer short; createTrack refuses it and both streaming tracks must fail to initialise.
     #[arg(long)]
     break_cblk: bool,
 }
@@ -57,6 +57,8 @@ const SPEC_LATENCY_MS: u64 = 42;
 const REQ_RATE_HZ: u64 = 44_100;
 const REQ_CHANNELS: u64 = 2;
 const REQ_BYTES_PER_SAMPLE: u64 = 2;
+/// The static track's buffer in Main.java (`STATIC_BYTES`): 4096 bytes, one frame per 4 bytes of the request. Not rounded: a shared-buffer track keeps its frame count (Tracks.cpp:162 rounds only a streaming track).
+const STATIC_BYTES: u64 = 4096;
 
 /// The counter lines the in-process check needs: AudioFlinger's ids, rate and track, AudioPolicyService's output. getOutputForAttr is served but no client on the game path calls it (AudioTrack asks getOutput(stream)), so it is not required here.
 const IN_PROCESS: [&str; 4] = [
@@ -69,6 +71,8 @@ const IN_PROCESS: [&str; 4] = [
 const FAST_REFUSED: &str = "refused IAudioFlingerService.createTrack.FAST";
 /// AudioTrack.STATE_INITIALIZED; STATE_UNINITIALIZED is 0.
 const STATE_INITIALIZED: i64 = 1;
+/// AudioTrack.STATE_NO_STATIC_DATA (AudioTrack.java:170): a static track whose native setup succeeded and that has no data yet (set at :907).
+const STATE_NO_STATIC_DATA: i64 = 2;
 /// AudioPlaybackConfiguration.PLAYER_PIID_INVALID: a player that has no piid.
 const PIID_INVALID: i64 = -1;
 
@@ -236,6 +240,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fast_state == Some(STATE_INITIALIZED) && fast_refused,
         &format!(
             "state {fast_state:?} (STATE_INITIALIZED); server refused FAST (counted): {fast_refused}"
+        ),
+    );
+
+    let stat = line_value(&app, "static: ");
+    let stat_state = field(stat, "state");
+    let stat_frames = field(stat, "frames");
+    let want_static = i64::try_from(STATIC_BYTES / (REQ_CHANNELS * REQ_BYTES_PER_SAMPLE))?;
+    ok &= verdict(
+        "static track",
+        stat_state == Some(STATE_NO_STATIC_DATA) && stat_frames == Some(want_static),
+        &format!(
+            "state {stat_state:?} (STATE_NO_STATIC_DATA), frames {stat_frames:?}, expected {want_static} (the shared buffer's frames, not rounded)"
         ),
     );
 
