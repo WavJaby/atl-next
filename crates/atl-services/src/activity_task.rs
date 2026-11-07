@@ -18,15 +18,15 @@ use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::parts::{
-    DestroyActivityItem, NewIntentItem, PauseActivityItem, ReferrerIntent, StartActivityItem,
-    StopActivityItem,
+    ActivityResultItem, DestroyActivityItem, NewIntentItem, PauseActivityItem, ReferrerIntent,
+    ResultInfo, StartActivityItem, StopActivityItem,
 };
 use binder::{BinderFeatures, FromIBinder, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::activity::{
     ActivityManager, global_configuration, launch_item, log, resume_item, security,
 };
-use crate::activity_stack::{Command, Machine, Step};
+use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
 use crate::config_diff::Config;
 use crate::counters;
@@ -64,7 +64,11 @@ pub(crate) struct Launch {
 }
 
 /// The intent a reused record gets in onNewIntent (ActivityRecord.deliverNewIntentLocked: the start's intent, referrer = the calling package, no caller token here).
-type Lifecycle = Machine<SpIBinder, Owner, Launch, ReferrerIntent>;
+type Lifecycle = Machine<SpIBinder, Owner, Launch, ReferrerIntent, ResultInfo>;
+/// One command of the machine, sent as one transaction.
+type Cmd = Command<SpIBinder, Owner, Launch, ReferrerIntent, ResultInfo>;
+/// Activity.RESULT_CANCELED: the result of a start that does not happen.
+const RESULT_CANCELED: i32 = 0;
 
 /// The parts of a startActivity call the lifecycle needs besides the caller's identity.
 pub(crate) struct StartArgs<'a> {
@@ -73,6 +77,8 @@ pub(crate) struct StartArgs<'a> {
     pub reuse: bool,
     pub request_code: i32,
     pub result_to: Option<&'a SpIBinder>,
+    /// resultWho: the name the caller gave the result (startActivity's resultWho)
+    pub result_who: Option<&'a str>,
 }
 
 /// ActivityRecord's task affinity: the manifest's taskAffinity, else the package name.
@@ -80,6 +86,22 @@ pub(crate) fn affinity_of(decl: &ActivityDecl, package: &str) -> String {
     decl.task_affinity
         .clone()
         .unwrap_or_else(|| package.to_owned())
+}
+
+/// Answers the result `owed` as cancelled (RESULT_CANCELED, no data), as every cancelled start does (ActivityStarter.java:1222, 2470, 2846); nothing when none is owed.
+fn cancel_owed(m: &mut Lifecycle, owed: Option<&ResultTo<SpIBinder>>) -> Vec<Cmd> {
+    owed.map_or_else(Vec::new, |to| {
+        m.deliver(
+            to,
+            ResultInfo {
+                result_who: to.who.clone(),
+                request_code: to.request_code,
+                result_code: RESULT_CANCELED,
+                data: None,
+                caller_token: None,
+            },
+        )
+    })
 }
 
 pub struct ActivityTasks {
@@ -140,7 +162,7 @@ impl ActivityTasks {
     fn item(
         &self,
         token: &SpIBinder,
-        step: Step<Launch, ReferrerIntent>,
+        step: Step<Launch, ReferrerIntent, ResultInfo>,
     ) -> Option<ClientTransactionItem> {
         let activity_token = Some(token.clone());
         Some(match step {
@@ -159,6 +181,10 @@ impl ActivityTasks {
                     launch.ident,
                 )))
             }
+            Step::Result(results) => ClientTransactionItem::ActivityResult(ActivityResultItem {
+                activity_token,
+                result_infos: Some(results.into_iter().map(Some).collect()),
+            }),
             Step::Start => {
                 ClientTransactionItem::StartActivity(StartActivityItem { activity_token })
             }
@@ -191,7 +217,7 @@ impl ActivityTasks {
     }
 
     /// One transaction per command, in the order the machine decided. Called under the machine lock.
-    fn send(&self, commands: Vec<Command<SpIBinder, Owner, Launch, ReferrerIntent>>) {
+    fn send(&self, commands: Vec<Cmd>) {
         for command in commands {
             if command
                 .steps
@@ -272,6 +298,7 @@ impl ActivityTasks {
             reuse,
             request_code,
             result_to,
+            result_who,
         } = args;
         let component = intent
             .and_then(|i| i.component.as_ref())
@@ -284,10 +311,11 @@ impl ActivityTasks {
                 .filter(|o| o.thread.as_binder() == caller.as_binder())
                 .map(|o| (t.clone(), o.clone()))
         });
-        let source_view = source.as_ref().map(|(_, o)| Source {
+        let source_view = source.as_ref().map(|(t, o)| Source {
             uid: o.uid,
             package: &o.package,
             affinity: &o.affinity,
+            finishing: m.is_finishing(t) == Some(true),
         });
         let package = component.and_then(|(p, _)| self.packages.by_name(p));
         let decl = component.and_then(|(_, class)| {
@@ -300,6 +328,15 @@ impl ActivityTasks {
             flags,
             component,
             source: source_view,
+        };
+        // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested)
+        let mut owed = match (call.result_requested(), &source) {
+            (true, Some((to, _))) => Some(ResultTo {
+                token: to.clone(),
+                who: result_who.map(str::to_owned),
+                request_code,
+            }),
+            _ => None,
         };
         let source_task = source.as_ref().and_then(|(t, _)| m.task_of(t));
         let class = component.map(|(_, class)| class);
@@ -317,26 +354,46 @@ impl ActivityTasks {
         };
         let (decl, start) = match activity_start::check(&call, target) {
             Ok(accepted) => accepted,
-            Err(Refusal::Code { code, .. }) => return Ok(code),
+            Err(Refusal::Code { code, .. }) => {
+                // a refused start answers the result it owes as cancelled (ActivityStarter.java:1220-1222)
+                let cancelled = cancel_owed(&mut m, owed.as_ref());
+                self.note_settle(&m);
+                self.send(cancelled);
+                return Ok(code);
+            }
             Err(Refusal::Security(msg)) => return Err(security(msg)),
         };
+        let mut commands: Vec<Cmd> = Vec::new();
+        // an explicit NEW_TASK cancels the owed result before the start is decided (sendNewTaskResultRequestIfNeeded, ActivityStarter.java:2718, 2846-2849)
+        if call.new_task_cancels_result() {
+            commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+        }
         let (Some(task), Some(intent)) = (source_task, intent) else {
+            commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+            self.note_settle(&m);
+            self.send(commands);
             return Ok(activity_start::START_CANCELED);
         };
         if let (Start::Reuse { .. }, false) = (start, reuse) {
             counters::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
+            commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+            self.note_settle(&m);
+            self.send(commands);
             return Ok(activity_start::START_CANCELED);
         }
         if let (Start::Reuse { clear_top }, Some(instance)) = (start, instance) {
-            // ActivityStarter.deliverNewIntent: START_DELIVERED_TO_TOP (3) for the top, START_TASK_TO_FRONT (2) after a clear-top; both are success codes the app does not throw for
+            // ActivityStarter.deliverToCurrentTopIfNeeded: the owed result is cancelled first (:2469), then the intent goes to the instance (deliverNewIntent);
+            // START_DELIVERED_TO_TOP (3) for the top, START_TASK_TO_FRONT (2) after a clear-top; both are success codes the app does not throw for
             let referrer = ReferrerIntent {
                 intent: intent.clone(),
                 referrer: Some(calling_package.to_owned()),
                 caller_token: None,
             };
-            let commands = m
-                .new_intent(&instance, referrer, clear_top)
-                .unwrap_or_default();
+            commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+            commands.extend(
+                m.new_intent(&instance, referrer, clear_top)
+                    .unwrap_or_default(),
+            );
             self.note_settle(&m);
             self.send(commands);
             return Ok(if clear_top {
@@ -362,7 +419,7 @@ impl ActivityTasks {
             decl: decl.clone(),
             ident: self.next_ident(),
         };
-        let commands = m.push(task, token, owner, launch);
+        commands.extend(m.push_owed(task, token, owner, launch, owed));
         self.note_settle(&m);
         self.send(commands);
         Ok(activity_start::START_SUCCESS)
@@ -428,10 +485,18 @@ impl ActivityTasks {
         self.send(commands);
     }
 
-    /// finishActivity: the record is finishing; false when the token names no record.
-    pub(crate) fn finish(&self, token: &SpIBinder) -> bool {
+    /// finishActivity: the record is finishing and its result (`code`, `data`) goes to its caller (ActivityRecord.finishActivityResults); false when the token names no record.
+    /// The result's callerToken stays null: AOSP's per-result caller Binder (content-URI identity) is not modelled.
+    pub(crate) fn finish(&self, token: &SpIBinder, code: i32, data: Option<Intent>) -> bool {
         let mut m = self.machine();
-        match m.finish(token) {
+        let result = |to: &ResultTo<SpIBinder>| ResultInfo {
+            result_who: to.who.clone(),
+            request_code: to.request_code,
+            result_code: code,
+            data,
+            caller_token: None,
+        };
+        match m.finish(token, result) {
             Some(commands) => {
                 self.note_settle(&m);
                 self.send(commands);
@@ -529,7 +594,7 @@ impl IActivityTaskManager for ActivityTaskService {
         intent: Option<&Intent>,
         _resolved_type: Option<&str>,
         result_to: Option<&SpIBinder>,
-        _result_who: Option<&str>,
+        result_who: Option<&str>,
         request_code: i32,
         _start_flags: i32,
         _profiler_info: Option<&ProfilerInfo>,
@@ -554,6 +619,7 @@ impl IActivityTaskManager for ActivityTaskService {
             reuse: self.reuse,
             request_code,
             result_to,
+            result_who,
         };
         self.atm.start(caller, calling_uid, calling_package, args)
     }

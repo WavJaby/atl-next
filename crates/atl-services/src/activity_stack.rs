@@ -4,6 +4,7 @@
 //! Nothing waits on an ack. `resumed` / `paused` / `stopped` move one record to its next phase and advance its task again, so the order of acks between records does not change what is sent.
 //! Generic over the token `K` (the services use SpIBinder), the owner `O` (the app's thread and identity, cloned into each command) and the launch payload `L` (taken by the one Launch step).
 //! A Task is shown or hidden ([`Machine::set_visible`]): hidden, every record of it stays stopped; shown again, its top restarts. A Task starts shown.
+//! A result goes to its caller at once while the caller is resumed, else waits in the caller's results for its next resume ([`Machine::finish`], [`Machine::deliver`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,11 +25,13 @@ pub enum Phase {
 
 /// One lifecycle item the app must run, in order. Each maps to one servertransaction item (the caller builds it).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Step<L, I> {
+pub enum Step<L, I, R> {
     /// LaunchActivityItem: the record's launch payload, taken once.
     Launch(L),
     /// NewIntentItem: `intents` delivered to onNewIntent. `resume`: the item itself ends resumed (ActivityRecord.java:4997 `mState == RESUMED`); false when a Resume step follows or the record stays paused.
     NewIntent { intents: Vec<I>, resume: bool },
+    /// ActivityResultItem: the results of activities that finished for this one, in order. Sent before the NewIntent and Resume of the same resume (TaskFragment.java:1665-1668).
+    Result(Vec<R>),
     /// StartActivityItem: a stopped activity comes back to the top.
     Start,
     /// ResumeActivityItem.
@@ -43,13 +46,25 @@ pub enum Step<L, I> {
 
 /// The steps for one record, sent to its owner as one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Command<K, O, L, I> {
+pub struct Command<K, O, L, I, R> {
     pub token: K,
     pub owner: O,
-    pub steps: Vec<Step<L, I>>,
+    pub steps: Vec<Step<L, I, R>>,
 }
 
-struct Record<K, O, L, I> {
+/// A decision's commands, in decision order; the records of one Task, bottom -> top.
+type Commands<K, O, L, I, R> = Vec<Command<K, O, L, I, R>>;
+type Records<K, O, L, I, R> = Vec<Record<K, O, L, I, R>>;
+
+/// The result a record owes its caller: ActivityRecord.resultTo, resultWho and requestCode. Held from the start until the record finishes (`finish`), or answered as cancelled when the start does not happen (`deliver`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultTo<K> {
+    pub token: K,
+    pub who: Option<String>,
+    pub request_code: i32,
+}
+
+struct Record<K, O, L, I, R> {
     token: K,
     owner: O,
     phase: Phase,
@@ -57,12 +72,16 @@ struct Record<K, O, L, I> {
     finishing: bool,
     /// Taken by the Launch step.
     launch: Option<L>,
+    /// The result owed to the caller, taken by `finish`.
+    owed: Option<ResultTo<K>>,
     /// ActivityRecord.newIntents: intents not sent at once (record not resumed or paused), delivered before its next Resume (TaskFragment.java:1691-1693).
     pending: Vec<I>,
+    /// ActivityRecord.results: results of records that finished while this one was not resumed, delivered before its next Resume (TaskFragment.java:1665-1668).
+    results: Vec<R>,
 }
 
-impl<K: Clone, O: Clone, L, I> Record<K, O, L, I> {
-    fn command(&self, steps: Vec<Step<L, I>>) -> Command<K, O, L, I> {
+impl<K: Clone, O: Clone, L, I, R> Record<K, O, L, I, R> {
+    fn command(&self, steps: Vec<Step<L, I, R>>) -> Command<K, O, L, I, R> {
         Command {
             token: self.token.clone(),
             owner: self.owner.clone(),
@@ -76,13 +95,13 @@ type Found<'a, R> = Option<(TaskId, &'a R)>;
 type FoundMut<'a, R> = Option<(TaskId, &'a mut R)>;
 
 /// The stack of every Task: records bottom -> top, Tasks in id order. A Task with no records is dropped.
-pub struct Machine<K, O, L, I> {
-    tasks: BTreeMap<TaskId, Vec<Record<K, O, L, I>>>,
+pub struct Machine<K, O, L, I, R> {
+    tasks: BTreeMap<TaskId, Records<K, O, L, I, R>>,
     /// Tasks whose window is hidden (minimized or occluded: one path, `suspended`). Kept while the Task has no records: the window outlives them.
     hidden: BTreeSet<TaskId>,
 }
 
-impl<K, O, L, I> Default for Machine<K, O, L, I> {
+impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
     fn default() -> Self {
         Machine {
             tasks: BTreeMap::new(),
@@ -91,7 +110,7 @@ impl<K, O, L, I> Default for Machine<K, O, L, I> {
     }
 }
 
-impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
+impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -103,16 +122,45 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         token: K,
         owner: O,
         launch: L,
-    ) -> Vec<Command<K, O, L, I>> {
+    ) -> Vec<Command<K, O, L, I, R>> {
+        self.push_owed(task, token, owner, launch, None)
+    }
+
+    /// A launch whose start owes `owed` to the record below it (ActivityStarter's resultTo): the result goes out when the new record finishes.
+    pub fn push_owed(
+        &mut self,
+        task: TaskId,
+        token: K,
+        owner: O,
+        launch: L,
+        owed: Option<ResultTo<K>>,
+    ) -> Vec<Command<K, O, L, I, R>> {
         self.tasks.entry(task).or_default().push(Record {
             token,
             owner,
             phase: Phase::Created,
             finishing: false,
             launch: Some(launch),
+            owed,
             pending: Vec::new(),
+            results: Vec::new(),
         });
         self.advance(task)
+    }
+
+    /// Sends `item` to the record `to` (ActivityRecord.sendResult): at once when it is resumed (Resuming counts, as in new_intent), else kept in its results for its next resume
+    /// (addResultLocked, ActivityRecord.java:4920). A record that is gone gets nothing.
+    pub fn deliver(&mut self, to: &ResultTo<K>, item: R) -> Vec<Command<K, O, L, I, R>> {
+        match self.find_mut(&to.token) {
+            Some((_, r)) if matches!(r.phase, Phase::Resumed | Phase::Resuming) => {
+                vec![r.command(vec![Step::Result(vec![item])])]
+            }
+            Some((_, r)) => {
+                r.results.push(item);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// The top record of `task` that is not finishing (ActivityStarter.java:2442 topRunningNonDelayedActivityLocked): what a singleTop start reuses.
@@ -144,7 +192,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         token: &K,
         intent: I,
         clear_top: bool,
-    ) -> Option<Vec<Command<K, O, L, I>>> {
+    ) -> Option<Commands<K, O, L, I, R>> {
         let task = self.task_of(token)?;
         let records = self.tasks.get_mut(&task)?;
         let at = records.iter().position(|r| &r.token == token)?;
@@ -171,7 +219,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
     }
 
     /// The app acknowledged a resume. In `Pausing` the phase stays: the resume ran before the pause, so its ack comes first and the pause ack is still to come.
-    pub fn resumed(&mut self, token: &K) -> Vec<Command<K, O, L, I>> {
+    pub fn resumed(&mut self, token: &K) -> Vec<Command<K, O, L, I, R>> {
         let Some((task, record)) = self.find_mut(token) else {
             return Vec::new();
         };
@@ -182,7 +230,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
     }
 
     /// The app acknowledged a pause (`activityPaused`).
-    pub fn paused(&mut self, token: &K) -> Vec<Command<K, O, L, I>> {
+    pub fn paused(&mut self, token: &K) -> Vec<Command<K, O, L, I, R>> {
         let Some((task, record)) = self.find_mut(token) else {
             return Vec::new();
         };
@@ -193,7 +241,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
     }
 
     /// The app acknowledged a stop (`activityStopped`).
-    pub fn stopped(&mut self, token: &K) -> Vec<Command<K, O, L, I>> {
+    pub fn stopped(&mut self, token: &K) -> Vec<Command<K, O, L, I, R>> {
         let Some((task, record)) = self.find_mut(token) else {
             return Vec::new();
         };
@@ -203,11 +251,26 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         self.advance(task)
     }
 
-    /// `finishActivity`: the record is finishing. None when the token names no record.
-    pub fn finish(&mut self, token: &K) -> Option<Vec<Command<K, O, L, I>>> {
+    /// `finishActivity`: the record is finishing and its result goes out first (ActivityRecord.finishActivityResults, before the record pauses). `result` builds it from the
+    /// owed request. None when the token names no record.
+    pub fn finish(
+        &mut self,
+        token: &K,
+        result: impl FnOnce(&ResultTo<K>) -> R,
+    ) -> Option<Commands<K, O, L, I, R>> {
         let (task, record) = self.find_mut(token)?;
         record.finishing = true;
-        Some(self.advance(task))
+        record.results.clear();
+        let owed = record.owed.take();
+        let mut out = match owed {
+            Some(owed) => {
+                let item = result(&owed);
+                self.deliver(&owed, item)
+            }
+            None => Vec::new(),
+        };
+        out.extend(self.advance(task));
+        Some(out)
     }
 
     pub fn phase(&self, token: &K) -> Option<Phase> {
@@ -249,7 +312,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
 
     /// The steps a relaunch of `token` ends with (the relaunch item runs the lifecycle again). A resumed record resumes: Resume, phase Resuming, its ack awaited as any resume.
     /// Any other record keeps its phase, so no Resume: a paused or stopped activity is not resumed by a relaunch.
-    pub fn relaunch(&mut self, token: &K) -> Vec<Step<L, I>> {
+    pub fn relaunch(&mut self, token: &K) -> Vec<Step<L, I, R>> {
         let Some((_, record)) = self.find_mut(token) else {
             return Vec::new();
         };
@@ -274,7 +337,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
 
     /// The window of `task` is shown or hidden. Hidden: its records pause and stop, the top included, and none is resumed until shown (each step waits for its ack).
     /// Shown: the top restarts from Stopped or Paused, as any record does. The commands come back in decision order; a Task with no records only changes its flag.
-    pub fn set_visible(&mut self, task: TaskId, visible: bool) -> Vec<Command<K, O, L, I>> {
+    pub fn set_visible(&mut self, task: TaskId, visible: bool) -> Vec<Command<K, O, L, I, R>> {
         if visible {
             self.hidden.remove(&task);
         } else {
@@ -287,7 +350,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         !self.hidden.contains(&task)
     }
 
-    fn find(&self, token: &K) -> Found<'_, Record<K, O, L, I>> {
+    fn find(&self, token: &K) -> Found<'_, Record<K, O, L, I, R>> {
         self.tasks.iter().find_map(|(task, records)| {
             records
                 .iter()
@@ -296,7 +359,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
         })
     }
 
-    fn find_mut(&mut self, token: &K) -> FoundMut<'_, Record<K, O, L, I>> {
+    fn find_mut(&mut self, token: &K) -> FoundMut<'_, Record<K, O, L, I, R>> {
         self.tasks.iter_mut().find_map(|(task, records)| {
             records
                 .iter_mut()
@@ -306,7 +369,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
     }
 
     /// The rules, applied to one task in order. D = the top record that is not finishing: the one to resume, unless the Task is hidden.
-    fn advance(&mut self, task: TaskId) -> Vec<Command<K, O, L, I>> {
+    fn advance(&mut self, task: TaskId) -> Vec<Command<K, O, L, I, R>> {
         let mut out = Vec::new();
         let hidden = !self.is_visible(task);
         let Some(records) = self.tasks.get_mut(&task) else {
@@ -351,10 +414,10 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
                 _ => None,
             };
             if let Some(mut steps) = steps {
-                // pending intents go first, before the Resume that follows (TaskFragment.java:1691-1693 sends them in the resume, ahead of its ResumeActivityItem)
+                // results, then intents, go before the Resume that ends the steps (TaskFragment.java:1665-1693: results first, then new intents, ahead of its ResumeActivityItem)
+                let at = steps.len() - 1;
                 if !r.pending.is_empty() {
                     let intents = std::mem::take(&mut r.pending);
-                    let at = steps.len() - 1;
                     steps.insert(
                         at,
                         Step::NewIntent {
@@ -362,6 +425,10 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
                             resume: false,
                         },
                     );
+                }
+                if !r.results.is_empty() {
+                    let results = std::mem::take(&mut r.results);
+                    steps.insert(at, Step::Result(results));
                 }
                 r.phase = Phase::Resuming;
                 out.push(r.command(steps));
@@ -402,9 +469,9 @@ impl<K: Clone + PartialEq, O: Clone, L, I> Machine<K, O, L, I> {
 mod tests {
     use super::*;
 
-    type Machine = super::Machine<u32, &'static str, &'static str, &'static str>;
-    type Command = super::Command<u32, &'static str, &'static str, &'static str>;
-    type Step = super::Step<&'static str, &'static str>;
+    type Machine = super::Machine<u32, &'static str, &'static str, &'static str, &'static str>;
+    type Command = super::Command<u32, &'static str, &'static str, &'static str, &'static str>;
+    type Step = super::Step<&'static str, &'static str, &'static str>;
 
     const SPLASH: u32 = 1;
     const MAIN: u32 = 2;
@@ -526,7 +593,7 @@ mod tests {
             ]
         );
         // onCreate: finish() -> nothing to send, Main is still resuming
-        assert!(sent(&m.finish(&SPLASH).expect("known token")).is_empty());
+        assert!(sent(&m.finish(&SPLASH, |_| "ok").expect("known token")).is_empty());
         assert!(m.resumed(&SPLASH).is_empty());
         assert_eq!(m.phase(&SPLASH), Some(Phase::Pausing));
         assert!(m.paused(&SPLASH).is_empty());
@@ -583,7 +650,7 @@ mod tests {
         m.stopped(&SPLASH);
         assert_eq!(m.phase(&SPLASH), Some(Phase::Stopped));
 
-        let cmds = m.finish(&MAIN).expect("known token");
+        let cmds = m.finish(&MAIN, |_| "ok").expect("known token");
         assert_eq!(
             sent(&cmds),
             vec![
@@ -622,7 +689,7 @@ mod tests {
         m.push(t, MAIN, APP, "main");
         m.resumed(&MAIN);
         assert_eq!(
-            sent(&m.finish(&MAIN).expect("known token")),
+            sent(&m.finish(&MAIN, |_| "ok").expect("known token")),
             vec![(MAIN, vec![pause(true, false)])]
         );
         assert_eq!(sent(&m.paused(&MAIN)), vec![(MAIN, vec![Step::Stop])]);
@@ -734,7 +801,7 @@ mod tests {
         assert!(m.resumed(&UNKNOWN).is_empty());
         assert!(m.paused(&UNKNOWN).is_empty());
         assert!(m.stopped(&UNKNOWN).is_empty());
-        assert!(m.finish(&UNKNOWN).is_none());
+        assert!(m.finish(&UNKNOWN, |_| "ok").is_none());
         assert_eq!(m.phase(&UNKNOWN), None);
         assert_eq!(m.is_finishing(&SPLASH), Some(false));
     }
@@ -869,6 +936,155 @@ mod tests {
         assert_eq!(
             sent(&m.set_visible(t, true)),
             vec![(MAIN, vec![Step::Start, new_intent(false), Step::Resume])]
+        );
+    }
+
+    fn owed(to: u32, request_code: i32) -> super::ResultTo<u32> {
+        super::ResultTo {
+            token: to,
+            who: None,
+            request_code,
+        }
+    }
+
+    /// The child finishes while its caller is resumed in another Task: the result is sent at once (ActivityRecord.java:4873-4887), before the child pauses.
+    #[test]
+    fn a_result_to_a_resumed_caller_is_sent_at_once() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push_owed(task(2), OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.resumed(&OTHER);
+        let cmds = m
+            .finish(&OTHER, |to| {
+                assert_eq!((to.token, to.request_code), (MAIN, 7));
+                "ok"
+            })
+            .expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (MAIN, vec![Step::Result(vec!["ok"])]),
+                (OTHER, vec![pause(true, false)]),
+            ]
+        );
+        assert_eq!(m.phase(&MAIN), Some(Phase::Resumed));
+    }
+
+    /// The caller is stopped when its child finishes: the result waits in the caller's results and goes between its Start and its Resume (TaskFragment.java:1665-1693).
+    #[test]
+    fn a_result_to_a_stopped_caller_rides_its_restart() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, SPLASH, APP, "splash");
+        m.resumed(&SPLASH);
+        m.push_owed(t, MAIN, APP, "main", Some(owed(SPLASH, 7)));
+        m.paused(&SPLASH);
+        m.resumed(&MAIN);
+        m.stopped(&SPLASH);
+        assert_eq!(m.phase(&SPLASH), Some(Phase::Stopped));
+        let cmds = m.finish(&MAIN, |_| "ok").expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (MAIN, vec![pause(true, false)]),
+                (
+                    SPLASH,
+                    vec![Step::Start, Step::Result(vec!["ok"]), Step::Resume]
+                ),
+            ]
+        );
+        assert_eq!(m.phase(&SPLASH), Some(Phase::Resuming));
+    }
+
+    /// Results go before the intents that wait for the same resume (TaskFragment.java:1665-1693).
+    #[test]
+    fn a_result_goes_before_the_intents_of_the_same_resume() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push_owed(t, OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.paused(&MAIN);
+        m.resumed(&OTHER);
+        m.stopped(&MAIN);
+        assert!(
+            m.new_intent(&MAIN, "again", false)
+                .expect("known token")
+                .is_empty()
+        );
+        let cmds = m.finish(&OTHER, |_| "ok").expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (OTHER, vec![pause(true, false)]),
+                (
+                    MAIN,
+                    vec![
+                        Step::Start,
+                        Step::Result(vec!["ok"]),
+                        new_intent(false),
+                        Step::Resume,
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// A caller whose process died is gone: nothing is sent for the result, and the child's own finish still pauses the child.
+    #[test]
+    fn a_result_to_a_gone_caller_is_dropped() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push_owed(task(2), OTHER, "other", "other", Some(owed(MAIN, 7)));
+        m.resumed(&OTHER);
+        m.drop_owned(|o| *o == APP);
+        assert_eq!(m.phase(&MAIN), None);
+        let cmds = m.finish(&OTHER, |_| "ok").expect("known token");
+        assert_eq!(sent(&cmds), vec![(OTHER, vec![pause(true, false)])]);
+    }
+
+    /// singleTop reuse with a result owed to the top: the cancelled result goes out before the new intent (ActivityStarter.java:2469-2476).
+    #[test]
+    fn a_reuse_with_a_result_sends_the_cancel_before_the_intent() {
+        let mut m = Machine::new();
+        m.push(task(1), MAIN, APP, "main");
+        m.resumed(&MAIN);
+        let mut cmds = m.deliver(&owed(MAIN, 7), "cancel");
+        cmds.extend(m.new_intent(&MAIN, "again", false).expect("known token"));
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (MAIN, vec![Step::Result(vec!["cancel"])]),
+                (MAIN, vec![new_intent(true)]),
+            ]
+        );
+        assert_eq!(m.phase(&MAIN), Some(Phase::Resumed));
+    }
+
+    /// A cancelled start to a paused caller waits in its results and goes with the caller's next resume, not before it.
+    #[test]
+    fn a_cancel_to_a_paused_caller_waits_for_its_resume() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, SPLASH, APP, "splash");
+        m.resumed(&SPLASH);
+        m.push(t, MAIN, APP, "main");
+        m.paused(&SPLASH);
+        assert!(m.deliver(&owed(SPLASH, 7), "cancel").is_empty());
+        assert_eq!(sent(&m.resumed(&MAIN)), vec![(SPLASH, vec![Step::Stop])]);
+        m.stopped(&SPLASH);
+        let cmds = m.finish(&MAIN, |_| "unused").expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (MAIN, vec![pause(true, false)]),
+                (
+                    SPLASH,
+                    vec![Step::Start, Step::Result(vec!["cancel"]), Step::Resume]
+                ),
+            ]
         );
     }
 }

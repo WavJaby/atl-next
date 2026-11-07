@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! Whether the services start an activity for a startActivity call: the accepted subset of ActivityStarter, pure (no binder), so the tests build without the converter feature.
-//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, with no result, in the caller's task and process: standard (a new
-//! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new).
+//! Accepted: an explicit component of the caller's own package, started from one of the caller's activities, in the caller's task and process: standard (a new
+//! instance), singleTop (onNewIntent to the top when it is that class, else new), singleTask (onNewIntent to its instance in the task after clearing what is above, else new; a new instance while a result is owed).
+//! A start for a result (startActivityForResult) is accepted too: the result it owes its caller is answered by the services (see [`Call::result_requested`]).
 //! And a start with no caller app (shell / home) of a package's launcher whose process is not running ([`check_shell`]).
 //! Every other call is refused: a SecurityException when the caller does not own the activity it names (fail-closed), otherwise the START code AOSP returns for the case
 //! (ActivityManager.java:162 FIRST_START_FATAL = -100), counted by `counters::refused` under its reason. Refusals are never silent: the app sees the code, the log sees the count.
-//! Refused, not modelled: implicit intents (intent filters), other packages, startActivityForResult, singleInstance, other processes, intent flags except NEW_TASK, task affinity
+//! Refused, not modelled: implicit intents (intent filters), other packages, singleInstance, other processes, intent flags except NEW_TASK, task affinity
 //! across tasks (NEW_TASK into another affinity), more than one task per package, bringing a running app's task to front.
 
 use crate::counters;
@@ -45,6 +46,8 @@ pub struct Source<'a> {
     pub uid: u32,
     pub package: &'a str,
     pub affinity: &'a str,
+    /// ActivityRecord.finishing: no result is owed to a finishing caller (ActivityStarter.java:1112).
+    pub finishing: bool,
 }
 
 /// One startActivity call, as the binder interface delivers it.
@@ -58,6 +61,23 @@ pub struct Call<'a> {
     pub component: Option<(&'a str, &'a str)>,
     /// resultTo's activity, when the caller's thread runs it. None: resultTo names no activity.
     pub source: Option<Source<'a>>,
+}
+
+impl Call<'_> {
+    /// A result is owed to the source: requestCode >= 0 and the source not finishing (ActivityStarter.executeRequest, ActivityStarter.java:1106-1119: resultRecord).
+    pub fn result_requested(&self) -> bool {
+        self.request_code >= 0 && self.source.is_some_and(|s| !s.finishing)
+    }
+
+    /// An explicit NEW_TASK in the intent cancels the owed result before the start is decided (sendNewTaskResultRequestIfNeeded, ActivityStarter.java:2718, 2846-2849).
+    pub fn new_task_cancels_result(&self) -> bool {
+        self.result_requested() && self.flags & FLAG_ACTIVITY_NEW_TASK != 0
+    }
+
+    /// The result still owed when the start is decided: what a singleTask reuse depends on (ActivityStarter.java:2978).
+    pub fn result_at_reuse(&self) -> bool {
+        self.result_requested() && !self.new_task_cancels_result()
+    }
 }
 
 /// The package the component's class is looked up in: its process (`<application android:process>`, else the package name) and the class declaration, if the package has one.
@@ -91,9 +111,6 @@ pub fn check<'a>(
         );
         return Err(Refusal::Security("resultTo is not the caller's activity"));
     }
-    if call.request_code >= 0 {
-        return Err(refused(START_CANCELED, "startActivityForResult"));
-    }
     let Some((package, class)) = call.component else {
         return Err(refused(
             START_INTENT_NOT_RESOLVED,
@@ -109,14 +126,17 @@ pub fn check<'a>(
             "class not declared by the package",
         ));
     };
-    // reuse (ActivityStarter.startActivityInner): singleTop reuses the task's top when it is this class (deliverToCurrentTopIfNeeded, ActivityStarter.java:2441-2448); singleTask reuses
-    // the class's instance in the task of its affinity, finishing what is above it (complyActivityFlags -> performClearTop, :2510-2533; the affinity is checked below as for NEW_TASK,
-    // which singleTask implies). Either way the instance gets onNewIntent (deliverNewIntent). No instance: a new one on top, as standard.
+    // reuse (ActivityStarter.startActivityInner): singleTop reuses the task's top when it is this class (deliverToCurrentTopIfNeeded, ActivityStarter.java:2441-2448), with a result owed or not
+    // (its cancel goes first, :2469). singleTask reuses the class's instance in the task of its affinity, finishing what is above it (complyActivityFlags -> performClearTop, :2510-2533;
+    // the affinity is checked below as for NEW_TASK, which singleTask implies), only with no result owed: getReusableIntentActivity looks for an instance only while resultTo is null
+    // (:2978), so a result gives a new instance on the source's task (computeTargetTask, :2175). Either reuse gives the instance onNewIntent (deliverNewIntent). No instance: a new one on top.
     let start = match decl.launch_mode {
         LAUNCH_MODE_STANDARD => Start::New,
         LAUNCH_SINGLE_TOP if target.top_is_class => Start::Reuse { clear_top: false },
         LAUNCH_SINGLE_TOP => Start::New,
-        LAUNCH_SINGLE_TASK if target.in_task => Start::Reuse { clear_top: true },
+        LAUNCH_SINGLE_TASK if target.in_task && !call.result_at_reuse() => {
+            Start::Reuse { clear_top: true }
+        }
         LAUNCH_SINGLE_TASK => Start::New,
         _ => {
             return Err(refused(
@@ -248,6 +268,7 @@ mod tests {
                 uid: UID,
                 package: PACKAGE,
                 affinity: PACKAGE,
+                finishing: false,
             }),
         }
     }
@@ -344,6 +365,7 @@ mod tests {
                 uid: UID,
                 package: PACKAGE,
                 affinity: "org.example.tasks",
+                finishing: false,
             }),
             ..call()
         };
@@ -374,6 +396,7 @@ mod tests {
                 uid: UID + 1,
                 package: PACKAGE,
                 affinity: PACKAGE,
+                finishing: false,
             }),
             ..call()
         };
@@ -391,6 +414,7 @@ mod tests {
                 uid: UID,
                 package: OTHER_PACKAGE,
                 affinity: OTHER_PACKAGE,
+                finishing: false,
             }),
             ..call()
         };
@@ -400,18 +424,112 @@ mod tests {
         ));
     }
 
+    /// A start for a result is accepted: the result is owed to the caller (Call::result_requested) and answered by the services.
     #[test]
-    fn refuses_start_for_result() {
+    fn accepts_a_start_for_result_and_owes_the_result() {
         let main = decl(MAIN);
         let c = Call {
             request_code: 7,
             ..call()
         };
+        assert!(c.result_requested());
+        assert_eq!(start_of(check(&c, target(&main))), Start::New);
+    }
+
+    /// No result is owed to a plain start (request code -1), nor to a source that is finishing (ActivityStarter.java:1112-1119).
+    #[test]
+    fn owes_no_result_without_a_request_code_or_to_a_finishing_source() {
+        let main = decl(MAIN);
+        assert!(!call().result_requested());
+        let finishing = Call {
+            request_code: 7,
+            source: call().source.map(|s| Source {
+                finishing: true,
+                ..s
+            }),
+            ..call()
+        };
+        assert!(!finishing.result_requested());
+        assert_eq!(start_of(check(&finishing, target(&main))), Start::New);
+    }
+
+    /// singleTop reuses for a result too; the services send the cancel before the intent (ActivityStarter.java:2469-2474).
+    #[test]
+    fn single_top_reuses_for_a_result_too() {
+        let mut main = decl(MAIN);
+        main.launch_mode = LAUNCH_SINGLE_TOP;
+        let c = Call {
+            request_code: 7,
+            ..call()
+        };
+        let on_top = Target {
+            in_task: true,
+            top_is_class: true,
+            ..target(&main)
+        };
+        assert_eq!(
+            start_of(check(&c, on_top)),
+            Start::Reuse { clear_top: false }
+        );
+    }
+
+    /// singleTask is not reused while a result is owed: the new instance goes on the source's task (ActivityStarter.java:2978, 2175).
+    #[test]
+    fn single_task_with_a_result_starts_a_new_instance() {
+        let mut main = decl(MAIN);
+        main.launch_mode = LAUNCH_SINGLE_TASK;
+        let in_task = Target {
+            in_task: true,
+            ..target(&main)
+        };
+        assert_eq!(
+            start_of(check(&call(), in_task)),
+            Start::Reuse { clear_top: true }
+        );
+        let c = Call {
+            request_code: 7,
+            ..call()
+        };
+        assert_eq!(start_of(check(&c, in_task)), Start::New);
+    }
+
+    /// An explicit NEW_TASK cancels the result before the reuse decision (ActivityStarter.java:2718): singleTask reuses as it does with no result.
+    #[test]
+    fn an_explicit_new_task_cancels_the_result_before_the_reuse() {
+        let mut main = decl(MAIN);
+        main.launch_mode = LAUNCH_SINGLE_TASK;
+        let in_task = Target {
+            in_task: true,
+            ..target(&main)
+        };
+        let c = Call {
+            request_code: 7,
+            flags: FLAG_ACTIVITY_NEW_TASK,
+            ..call()
+        };
+        assert!(c.new_task_cancels_result());
+        assert!(!c.result_at_reuse());
+        assert_eq!(
+            start_of(check(&c, in_task)),
+            Start::Reuse { clear_top: true }
+        );
+    }
+
+    /// A refused start keeps its result owed: the caller answers it as cancelled (ActivityStarter.java:1220-1222).
+    #[test]
+    fn a_refused_start_for_result_keeps_the_result_owed() {
+        let main = decl(MAIN);
+        let c = Call {
+            request_code: 7,
+            component: Some((OTHER_PACKAGE, MAIN)),
+            ..call()
+        };
+        assert!(c.result_requested());
         assert_eq!(
             code_of(check(&c, target(&main))),
             Refusal::Code {
                 code: START_CANCELED,
-                reason: "startActivityForResult"
+                reason: "another package's activity"
             }
         );
     }

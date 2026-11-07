@@ -2109,12 +2109,12 @@ impl IActivityClientController for ActivityClientController {
         Ok(())
     }
 
-    /// ActivityClientController.finishActivity (synchronous): the record is finishing, true when the token names one. finishTask (finishAndRemoveTask) is not modelled: refused, counted.
+    /// ActivityClientController.finishActivity (synchronous): the record is finishing with its result (code, data), true when the token names one. finishTask (finishAndRemoveTask) is not modelled: refused, counted.
     fn r#finishActivity(
         &self,
         token: Option<&SpIBinder>,
-        _code: i32,
-        _data: Option<&Intent>,
+        code: i32,
+        data: Option<&Intent>,
         finish_task: i32,
     ) -> binder::Result<bool> {
         let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
@@ -2125,7 +2125,7 @@ impl IActivityClientController for ActivityClientController {
             counters::answered(ACC, "finishActivity (finishTask not modelled: refused)");
             return Ok(false);
         }
-        Ok(inner.atm.finish(token))
+        Ok(inner.atm.finish(token, code, data.cloned()))
     }
 
     /// ActivityClientController.onBackPressed (oneway, AIDL): a record with the token gets requestFinish, and the app finishes it. The root closes with the window; never moveTaskToBack
