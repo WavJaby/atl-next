@@ -67,6 +67,10 @@ pub struct Client {
     pub mapped: bool,
     pub hidden: bool,
     pub floating: bool,
+    /// Hyprland's `fullscreen` mode: 0 = none, else maximized or fullscreen, set by the compositor.
+    pub fullscreen: i32,
+    /// Hyprland's `fullscreenClient`: the mode the client asked for. 0 with `fullscreen` set = the compositor chose it.
+    pub fullscreen_client: i32,
     pub at: [i32; 2],
     pub size: [i32; 2],
     pub workspace: String,
@@ -82,6 +86,10 @@ struct RawClient {
     hidden: bool,
     #[serde(default)]
     floating: bool,
+    #[serde(default)]
+    fullscreen: i32,
+    #[serde(default, rename = "fullscreenClient")]
+    fullscreen_client: i32,
     #[serde(default)]
     at: [i32; 2],
     #[serde(default)]
@@ -108,6 +116,8 @@ pub fn atl_clients(json: &str) -> Result<Vec<Client>> {
             mapped: c.mapped,
             hidden: c.hidden,
             floating: c.floating,
+            fullscreen: c.fullscreen,
+            fullscreen_client: c.fullscreen_client,
             at: c.at,
             size: c.size,
             workspace: c.workspace.name,
@@ -512,8 +522,17 @@ where
 /// The verdict line: the window's last state, and how many ticks matched it.
 pub fn verdict(c: &Client, hits: u32, ticks: u32) -> String {
     format!(
-        "observe: {} floating={} mapped={} at={},{} size={}x{} workspace={} (matched {hits}/{ticks} ticks)",
-        c.class, c.floating, c.mapped, c.at[0], c.at[1], c.size[0], c.size[1], c.workspace
+        "observe: {} floating={} mapped={} fullscreen={} fullscreen_client={} at={},{} size={}x{} workspace={} (matched {hits}/{ticks} ticks)",
+        c.class,
+        c.floating,
+        c.mapped,
+        c.fullscreen,
+        c.fullscreen_client,
+        c.at[0],
+        c.at[1],
+        c.size[0],
+        c.size[1],
+        c.workspace
     )
 }
 
@@ -545,6 +564,8 @@ clients-end
             mapped,
             hidden,
             floating: true,
+            fullscreen: 0,
+            fullscreen_client: 0,
             at,
             size,
             workspace: "2".to_owned(),
@@ -724,7 +745,7 @@ clients-end
     fn the_verdict_names_the_window_state() {
         assert_eq!(
             verdict(&window([1000, 200]), 58, 60),
-            "observe: atl.com.noodlecake.happyjump floating=true mapped=true at=1000,200 size=720x960 workspace=2 (matched 58/60 ticks)"
+            "observe: atl.com.noodlecake.happyjump floating=true mapped=true fullscreen=0 fullscreen_client=0 at=1000,200 size=720x960 workspace=2 (matched 58/60 ticks)"
         );
     }
 
