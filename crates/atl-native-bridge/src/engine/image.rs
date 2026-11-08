@@ -172,6 +172,11 @@ impl Image {
         })
     }
 
+    /// (page start, length, `PROT_*` of the segment) per `PT_LOAD`, page-rounded: the ranges a guest maps (`arch::qemu` registers them with QEMU).
+    pub fn segments(&self) -> &[(usize, usize, i32)] {
+        &self.segments
+    }
+
     /// Applies each segment's own protection.
     pub fn seal(&self) -> Result<(), String> {
         for &(start, len, prot) in &self.segments {

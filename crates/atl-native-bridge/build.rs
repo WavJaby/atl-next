@@ -655,6 +655,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("g4_break", "atl_g4_break"),
     // Q4-2 (engine/arch/qemu.rs `is_stub`): the placeholder check decides on its first two bytes only (unit test stub_shape_is_the_whole_placeholder)
     ("qe_prefix", "atl_nb_qe_prefix"),
+    // Q4-3 (engine/arch/qemu.rs `ENTRY_BODY_BYTES`): a vdso entry's placeholder is searched at the symbol only, so native_bridge_call_guest (placeholder at +8) fails closed
+    ("qe_site", "atl_nb_qe_site"),
+    // Q4-3 (engine/arch/qemu.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
+    ("qe_nomap", "atl_nb_qe_nomap"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
@@ -690,6 +694,10 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-env-changed={BREAK_ENV}");
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
+    }
+    // Q4-3 gate (tests/qemu_linker.rs): QEMU's library calls P1's hook by name, and the executable must export it; without this, QEMU's weak default answers "not ours" and BOOT falls to the syscall path
+    if std::env::var_os("CARGO_FEATURE_QEMU_GUEST").is_some() {
+        println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;

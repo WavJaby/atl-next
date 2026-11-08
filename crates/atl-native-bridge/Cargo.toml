@@ -43,6 +43,12 @@ harness = false
 name = "g5"
 harness = false
 
+# Q4-3 gate: the six NB entries placed in place on the real arm64 linker64 and vdso, the pages registered with QEMU, a guest calls each site (QEMU bridge plan Q4-3); needs feature qemu-guest and the spike library
+[[test]]
+name = "qemu_linker"
+harness = false
+required-features = ["qemu-guest"]
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 atl-qemu-engine = { path = "../atl-qemu-engine" }
