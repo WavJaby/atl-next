@@ -21,6 +21,7 @@ extern crate gui_aidl_types_rs;
 #[cfg(feature = "converter")]
 extern crate rustutils;
 
+pub mod capture;
 pub mod clock;
 pub mod cursor;
 pub mod input;
@@ -32,6 +33,8 @@ pub mod vsync;
 
 #[cfg(feature = "converter")]
 pub mod bridge;
+#[cfg(feature = "converter")]
+pub mod capture_reply;
 #[cfg(feature = "converter")]
 pub mod host;
 #[cfg(feature = "converter")]

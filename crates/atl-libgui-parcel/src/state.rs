@@ -198,7 +198,8 @@ pub struct GraphicBuffer {
 }
 
 impl GraphicBuffer {
-    fn write(&self, p: &mut WireParcel) -> R<()> {
+    /// The flattened words: the GB01 header, then the handle's ints. The fds are `self.fds`; the caller carries them beside the words (a Parcel Flattenable, or a Flattened of ScreenCaptureResults).
+    pub fn flatten_words(&self) -> R<Vec<u8>> {
         let mut w = WireParcel::new();
         w.write_i32(GRAPHIC_BUFFER_MAGIC);
         w.write_i32(self.width);
@@ -216,7 +217,11 @@ impl GraphicBuffer {
         for &i in &self.ints {
             w.write_i32(i);
         }
-        p.write_flattenable(w.data(), &self.fds)
+        Ok(w.data().to_vec())
+    }
+
+    fn write(&self, p: &mut WireParcel) -> R<()> {
+        p.write_flattenable(&self.flatten_words()?, &self.fds)
     }
 
     fn read(r: &mut Reader<'_>) -> R<Self> {

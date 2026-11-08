@@ -6,8 +6,10 @@
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
+use atl_aidl::aidl::android::gui::CaptureArgs::CaptureArgs;
 use atl_aidl::aidl::android::gui::CompositionPreference::CompositionPreference;
 use atl_aidl::aidl::android::gui::CreateSurfaceResult::CreateSurfaceResult;
+use atl_aidl::aidl::android::gui::DisplayCaptureArgs::DisplayCaptureArgs;
 use atl_aidl::aidl::android::gui::DisplayConnectionType::DisplayConnectionType;
 use atl_aidl::aidl::android::gui::DisplayMode::DisplayMode;
 use atl_aidl::aidl::android::gui::DisplayStatInfo::DisplayStatInfo;
@@ -18,6 +20,7 @@ use atl_aidl::aidl::android::gui::HdrCapabilities::HdrCapabilities;
 use atl_aidl::aidl::android::gui::IDisplayEventConnection::{
     BnDisplayEventConnection, IDisplayEventConnection,
 };
+use atl_aidl::aidl::android::gui::IScreenCaptureListener::IScreenCaptureListener;
 use atl_aidl::aidl::android::gui::ISurfaceComposer::{BnSurfaceComposer, ISurfaceComposer};
 use atl_aidl::aidl::android::gui::ISurfaceComposerClient::{
     BnSurfaceComposerClient, ISurfaceComposerClient, eFXSurfaceEffect, eFXSurfaceMask, eNoColorFill,
@@ -31,6 +34,8 @@ use atl_services::{counters, display_model};
 use binder::{BinderFeatures, SpIBinder, Status, StatusCode, Strong};
 use gui_aidl_types_rs::{BitTube, LayerMetadata, VsyncEventData};
 
+use crate::capture::Args;
+use crate::capture_reply;
 use crate::clock;
 use crate::host::{Composer, DISPLAY_ID};
 
@@ -57,6 +62,28 @@ fn size(c: &Composer) -> Size {
     Size {
         width: d.width,
         height: d.height,
+    }
+}
+
+fn display_size(c: &Composer) -> (i32, i32) {
+    let d = c.display();
+    (d.width, d.height)
+}
+
+/// The arguments the composer checks (capture.rs); `size` is DisplayCaptureArgs' width x height, (0, 0) for captureDisplayById.
+fn capture_args(args: &CaptureArgs, size: (i32, i32)) -> Args {
+    Args {
+        pixel_format: args.pixelFormat,
+        frame_scale: (args.frameScaleX, args.frameScaleY),
+        cropped: args
+            .sourceCrop
+            .as_ref()
+            .is_some_and(|r| r.left < r.right && r.top < r.bottom),
+        secure_layers: args.captureSecureLayers,
+        dataspace: args.dataspace,
+        grayscale: args.grayscale,
+        excludes_layers: args.excludeHandles.as_ref().is_some_and(|h| !h.is_empty()),
+        size,
     }
 }
 
@@ -94,6 +121,45 @@ impl ISurfaceComposer for SurfaceComposer {
             },
             BinderFeatures::default(),
         )))
+    }
+
+    /// SurfaceFlinger::captureDisplay: the display's picture, answered on the listener (capture.rs). A token that is not this display is refused there.
+    fn r#captureDisplay(
+        &self,
+        args: Option<&DisplayCaptureArgs>,
+        listener: Option<&Strong<dyn IScreenCaptureListener>>,
+    ) -> binder::Result<()> {
+        let (Some(args), Some(listener)) = (args, listener) else {
+            return Ok(());
+        };
+        let request = match &args.captureArgs {
+            Some(c) if args.displayToken.as_ref() == Some(&self.composer.display_token()) => {
+                Ok(capture_args(c, (args.width, args.height)))
+            }
+            Some(_) => Err("displayToken is not this display"),
+            None => Err("no captureArgs"),
+        };
+        capture_reply::serve(listener, request, display_size(&self.composer));
+        Ok(())
+    }
+
+    /// SurfaceFlinger::captureDisplayById: as captureDisplay, for the one display this process has.
+    fn r#captureDisplayById(
+        &self,
+        display_id: i64,
+        args: Option<&CaptureArgs>,
+        listener: Option<&Strong<dyn IScreenCaptureListener>>,
+    ) -> binder::Result<()> {
+        let (Some(args), Some(listener)) = (args, listener) else {
+            return Ok(());
+        };
+        let request = if display_id == DISPLAY_ID as i64 {
+            Ok(capture_args(args, (0, 0)))
+        } else {
+            Err("no such display")
+        };
+        capture_reply::serve(listener, request, display_size(&self.composer));
+        Ok(())
     }
 
     /// SurfaceFlinger::getMaxAcquiredBufferCount: the pipeline depth.
