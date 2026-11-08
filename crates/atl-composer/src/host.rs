@@ -276,7 +276,7 @@ impl State {
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -297,6 +297,8 @@ impl State {
             s.releases_fenced,
             s.releases_fenced_unmatched,
             c.releases_carried,
+            c.releases_held,
+            c.completions_held,
             c.fence_waits,
             self.fds.len(),
             s.fds_taken,
