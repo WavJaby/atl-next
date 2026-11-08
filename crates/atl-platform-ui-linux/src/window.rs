@@ -11,7 +11,6 @@ use atl_platform_ui_api::{
     PhysSize, PointerPhase, PresentError, PresentTiming, QuadRelease, Scale, Scene, TouchPhase,
     UiError, Window, WindowAttributes,
 };
-use gdk4_wayland::WaylandToplevel;
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
@@ -161,20 +160,6 @@ pub struct GtkWindow {
 impl GtkWindow {
     fn logical(&self, physical: u32) -> i32 {
         self.view.scale().to_logical(f64::from(physical)).ceil() as i32
-    }
-
-    /// The toplevel's application id, set after `present`: GTK's own default is in place by then and the toplevel exists, so the request goes out before the first buffer commit (the frame loop's).
-    fn set_app_id(&self, app_id: &str) {
-        match self
-            .window
-            .surface()
-            .and_then(|s| s.downcast::<WaylandToplevel>().ok())
-        {
-            Some(toplevel) => toplevel.set_application_id(app_id),
-            None => tracing::warn!(
-                "atl-platform-ui-linux: app_id {app_id} not set: the window has no Wayland toplevel"
-            ),
-        }
     }
 
     /// The content's origin in the surface, where pointer input is injected: the native's surface transform (the client-side shadow) plus the view's place in the window (the header bar).
@@ -385,6 +370,10 @@ impl Window for GtkWindow {
 
     fn create(ui: &GtkUi, attributes: &WindowAttributes) -> Result<Self, UiError> {
         ui.check_thread()?;
+        // GTK takes the xdg app_id from the program name when it realises the toplevel; the first commit carries it and the compositor's window rules read it then, so it is set before `present`
+        if let Some(app_id) = &attributes.app_id {
+            glib::set_prgname(Some(app_id.as_str()));
+        }
         let shared = Rc::new(Shared {
             on_tick: Slot::new(),
             frame_requested: Cell::new(false),
@@ -470,9 +459,6 @@ impl Window for GtkWindow {
         this.set_title(&attributes.title);
         this.set_size(attributes.size);
         this.window.present();
-        if let Some(app_id) = &attributes.app_id {
-            this.set_app_id(app_id);
-        }
         mirror::resync();
         Ok(this)
     }

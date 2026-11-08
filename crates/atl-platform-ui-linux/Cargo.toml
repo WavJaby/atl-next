@@ -20,7 +20,6 @@ atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-platform-ui-api = { path = "../atl-platform-ui-api" }
 atl-scene-buffer = { path = "../atl-scene-buffer" }
 glib-unix.workspace = true
-gdk4-wayland.workspace = true
 gtk4.workspace = true
 libc.workspace = true
 pipewire = { workspace = true, features = ["v0_3_49"] }
