@@ -3,7 +3,7 @@
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's opening size (DisplayModel::opening_size) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's size (registry TASK_BOUNDS, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -27,7 +27,7 @@ const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
 /// Ticks without a new scene after which the picture counts as settled: 1/3 s at 60 Hz, longer than the gaps between the frames of one app redraw.
 const SETTLED_TICKS: u32 = 20;
 
-/// The UI thread's session: the toolkit, the compositor and its mailbox, the input thread, the window's opening size and the window once it exists.
+/// The UI thread's session: the toolkit, the compositor and its mailbox, the input thread, the window's size at install and the window once it exists.
 struct Session {
     ui: PlatformUi,
     composer: Arc<Composer>,

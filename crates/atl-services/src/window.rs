@@ -34,7 +34,7 @@ use binder::{
 };
 
 use crate::permission::Permissions;
-use crate::tasks::{Placement, TaskId, Tasks};
+use crate::tasks::{Placement, TaskId, TaskSize, Tasks};
 use crate::ui_agent::{IUiAgent, UiAgents};
 use crate::{activity, counters};
 
@@ -322,9 +322,16 @@ fn display_rect(tasks: &Tasks<SpIBinder>) -> Rect {
     rect(0, 0, display.width, display.height)
 }
 
+/// A window's Task size. A window is only ever on a Task that exists: its token names one (task_of_token), and Tasks are never removed.
+fn size_of(tasks: &Tasks<SpIBinder>, task: TaskId) -> TaskSize {
+    tasks
+        .size(task)
+        .expect("a window's Task has a size: Tasks are never removed")
+}
+
 /// A Task's bounds from the origin (tasks.rs): freeform, so the windows' bounds, not the display's.
 fn task_rect(tasks: &Tasks<SpIBinder>, task: TaskId) -> Rect {
-    let size = tasks.size(task);
+    let size = size_of(tasks, task);
     rect(0, 0, size.width, size.height)
 }
 
@@ -621,7 +628,7 @@ impl IWindowSession for Session {
                 .dim(layer_id, placement.dim(), &frames.parent_frame);
         }
         let display = self.tasks.display();
-        let size = self.tasks.size(task);
+        let size = size_of(&self.tasks, task);
         let surface_changed = created.is_some();
         // one line per relayout: the frames the client lays out in
         activity::log(format_args!(
@@ -785,7 +792,7 @@ pub fn new_binder(
 /// forceLayout is set so the app relayouts with the new frames; reportDraw is false: no BLAST sync or draw state is modelled (Session::finishDrawing).
 pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
-    let size = tasks.size(task);
+    let size = size_of(tasks, task);
     let merged = MergedConfiguration {
         global: activity::global_configuration(&display),
         override_config: Configuration {

@@ -3,9 +3,6 @@
 //! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::from_monitor`] of the desktop's monitor. That is the start value: the services keep the live one (tasks.rs `Tasks::display`, changed by registry SET_DISPLAY when the window's monitor changes), the app's compositor its SurfaceFlinger copy of the same monitor (atl-composer `Composer::set_display`).
 //! The default (1280x800, 60 Hz, 160 dpi) is a test value: the fallback when no desktop answers, and the base of the gates' fixed display.
 
-/// `persist.wm.debug.desktop_mode_initial_bounds_scale`'s default, in percent (DesktopModeUtils.kt:43-44: `SystemProperties.getInt(..., 75) / 100f`). The debug property is not read: no product sets it.
-const INITIAL_BOUNDS_PERCENT: i32 = 75;
-
 /// `DisplayMetrics.DENSITY_DEFAULT`: the dpi of density 1 (mdpi), where 1 dp is 1 px.
 pub const DENSITY_DEFAULT: i32 = 160;
 
@@ -74,17 +71,6 @@ impl DisplayModel {
         } else {
             (self.width, self.height)
         }
-    }
-
-    /// A new window's size in pixels: AOSP desktop mode's default bounds, `calculateDefaultDesktopTaskBounds` (Shell DesktopModeUtils.kt:49-56): each display side times
-    /// DESKTOP_MODE_INITIAL_BOUNDS_SCALE, truncated (`.toInt()`). The one rule for both ends: the services' new Task (tasks.rs) and the composer's new toplevel (atl-composer start.rs),
-    /// so the window's first size is its Task's and no resize round trip follows. Placement (centred) is the compositor's. Aspect-ratio / orientation rules of `calculateInitialBounds`
-    /// apply to non-resizable apps (size compat, plan density item 3b), not built.
-    pub fn opening_size(&self) -> (i32, i32) {
-        let scale = |side: i32| {
-            ((f64::from(side) * f64::from(INITIAL_BOUNDS_PERCENT) / 100.0) as i32).max(1)
-        };
-        (scale(self.width), scale(self.height))
     }
 
     /// `WxH@hz,dpi,rotation`, e.g. `1920x1080@59.94,240,1`. Sizes, rate and dpi must be positive, the rotation a Surface.ROTATION_* value (0..=3).

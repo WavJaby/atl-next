@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::desktop_bounds::{ActivityInput, Rect, initial_bounds};
 use crate::display_model::DisplayModel;
 
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
@@ -32,10 +33,10 @@ pub struct TaskSize {
     pub height: i32,
 }
 
-/// What the services keep per Task: the uid of the app it belongs to (checked by the registry), and its size once one was set (only the sizes that were set are kept: a Task without one has the display's size).
+/// What the services keep per Task: the uid of the app it belongs to (checked by the registry), and its size: the initial bounds at creation, then each SET_BOUNDS.
 struct TaskRecord {
     owner: u32,
-    size: Option<TaskSize>,
+    size: TaskSize,
     /// The seq of the override this size makes (config_seq).
     config_seq: i32,
 }
@@ -111,10 +112,19 @@ pub struct Tasks<C> {
     state: Mutex<State<C>>,
 }
 
-/// A new Task's size on `display` ([`DisplayModel::opening_size`]).
-fn opening(display: &DisplayModel) -> TaskSize {
-    let (width, height) = display.opening_size();
-    TaskSize { width, height }
+/// A new Task's size on `display`: AOSP's initial bounds of `activity` (desktop_bounds.rs), centred on the display. The origin is dropped: the compositor places the window.
+pub fn initial_size(display: &DisplayModel, activity: &ActivityInput) -> TaskSize {
+    let area = Rect {
+        left: 0,
+        top: 0,
+        right: display.width,
+        bottom: display.height,
+    };
+    let bounds = initial_bounds(area, area, activity);
+    TaskSize {
+        width: bounds.width(),
+        height: bounds.height(),
+    }
 }
 
 /// The config_seq after `seq`: positive, as a numbered override must be (0 = never changed).
@@ -123,7 +133,7 @@ fn next_config_seq(seq: i32) -> i32 {
 }
 
 impl<C: Clone + PartialEq> Tasks<C> {
-    /// `display` is the monitor at start. A Task with no size yet has the display's opening size: its window opens at it.
+    /// `display` is the monitor at start.
     pub fn new(display: DisplayModel) -> Self {
         Tasks {
             state: Mutex::new(State::new(display)),
@@ -140,8 +150,8 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A new Task of the app `owner` (its uid). The launch that starts a Task calls it once.
-    pub fn new_task(&self, owner: u32) -> TaskId {
+    /// A new Task of the app `owner` (its uid), at `size`. The process start that makes the Task calls it once.
+    pub fn new_task(&self, owner: u32, size: TaskSize) -> TaskId {
         let mut st = self.lock();
         st.last_id = st.last_id.checked_add(1).expect("TaskId space exhausted");
         let id = TaskId(st.last_id);
@@ -149,7 +159,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
             id,
             TaskRecord {
                 owner,
-                size: None,
+                size,
                 config_seq: 0,
             },
         );
@@ -166,43 +176,36 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.values().any(|t| t.owner == owner)
     }
 
-    /// The size of `task`: the one it was set to, else the initial size (a Task that does not exist has it too).
-    pub fn size(&self, task: TaskId) -> TaskSize {
-        let st = self.lock();
-        st.tasks
-            .get(&task)
-            .and_then(|t| t.size)
-            .unwrap_or_else(|| opening(&st.display))
+    /// The size of `task`; None for no Task.
+    pub fn size(&self, task: TaskId) -> Option<TaskSize> {
+        self.lock().tasks.get(&task).map(|t| t.size)
     }
 
     /// Sets `task`'s size; true when it changed, so its windows need `resized`. False for the size it already has and for no Task (the registry checks the owner first).
     pub fn set_size(&self, task: TaskId, size: TaskSize) -> bool {
         let mut st = self.lock();
-        let initial = opening(&st.display);
         let Some(record) = st.tasks.get_mut(&task) else {
             return false;
         };
-        if record.size.unwrap_or(initial) == size {
+        if record.size == size {
             return false;
         }
-        record.size = Some(size);
+        record.size = size;
         record.config_seq = next_config_seq(record.config_seq);
         true
     }
 
     /// The window's monitor changed (size, density or refresh rate: DisplayModel::from_monitor): it becomes the display. Every Task's configuration follows it, so each gets a new config_seq; returns those Tasks, empty when nothing changed.
-    /// A Task with no size set keeps its opening size from the old display: its window is already open at that size, and only a SET_BOUNDS changes it.
+    /// No Task's size changes: a window is resized only by SET_BOUNDS, never by the monitor it is on.
     pub fn set_display(&self, display: DisplayModel) -> Vec<TaskId> {
         let mut st = self.lock();
         if st.display == display {
             return Vec::new();
         }
-        let old = opening(&st.display);
         st.display = display;
         st.tasks
             .iter_mut()
             .map(|(id, record)| {
-                record.size.get_or_insert(old);
                 record.config_seq = next_config_seq(record.config_seq);
                 *id
             })
@@ -312,24 +315,32 @@ mod tests {
         Tasks::new(DisplayModel::default())
     }
 
-    /// What a Task without a size has: 3/4 of each side of the 1280x800 display (AOSP desktop default bounds, DesktopModeUtils.kt:49-56).
-    fn initial_size() -> TaskSize {
+    /// 3/4 of each side of the 1280x800 display: a new Task's size there, for a landscape app (AOSP desktop default bounds, DesktopModeUtils.kt:49-56).
+    fn three_quarters() -> TaskSize {
         TaskSize {
             width: 960,
             height: 600,
         }
     }
 
-    /// AOSP truncates each scaled side (`.toInt()`): 1366 x 0.75 = 1024.5 -> 1024, 2560x1600 -> 1920x1200.
+    /// AOSP truncates each scaled side (`.toInt()`): 1366 x 0.75 = 1024.5 -> 1024, 2560x1600 -> 1920x1200. The app: no declared orientation or aspect, resizeable.
     #[test]
     fn initial_size_is_three_quarters_truncated() {
+        let app = ActivityInput {
+            orientation: crate::desktop_bounds::ActivityOrientation::Unspecified,
+            resizeable: true,
+            min_aspect: None,
+            max_aspect: None,
+        };
         let at = |width, height| {
-            Tasks::<Handle>::new(DisplayModel {
-                width,
-                height,
-                ..DisplayModel::default()
-            })
-            .size(TaskId(1))
+            initial_size(
+                &DisplayModel {
+                    width,
+                    height,
+                    ..DisplayModel::default()
+                },
+                &app,
+            )
         };
         assert_eq!(at(1366, 768), size(1024, 576));
         assert_eq!(at(2560, 1600), size(1920, 1200));
@@ -343,16 +354,19 @@ mod tests {
     #[test]
     fn tasks_of_one_uid_hold_their_own_bounds() {
         let t = tasks();
-        let (main, second) = (t.new_task(10_123), t.new_task(10_123));
+        let (main, second) = (
+            t.new_task(10_123, three_quarters()),
+            t.new_task(10_123, three_quarters()),
+        );
         assert_ne!(main, second);
         assert_eq!(t.owner(main), Some(10_123));
         assert_eq!(t.owner(second), Some(10_123));
-        assert_eq!(t.size(main), initial_size());
-        assert_eq!(t.size(second), initial_size());
+        assert_eq!(t.size(main), Some(three_quarters()));
+        assert_eq!(t.size(second), Some(three_quarters()));
         assert!(t.set_size(main, size(352, 272)));
         assert!(t.set_size(second, size(288, 208)));
-        assert_eq!(t.size(main), size(352, 272));
-        assert_eq!(t.size(second), size(288, 208));
+        assert_eq!(t.size(main), Some(size(352, 272)));
+        assert_eq!(t.size(second), Some(size(288, 208)));
         assert_eq!(t.display(), DisplayModel::default());
     }
 
@@ -360,22 +374,22 @@ mod tests {
     #[test]
     fn set_size_reports_changes_and_keeps_the_last() {
         let t = tasks();
-        let task = t.new_task(7);
+        let task = t.new_task(7, three_quarters());
         assert!(t.set_size(task, size(1000, 700)));
         assert!(t.set_size(task, size(900, 650)));
         assert!(t.set_size(task, size(800, 600)));
         assert!(!t.set_size(task, size(800, 600)));
-        assert_eq!(t.size(task), size(800, 600));
-        assert!(t.set_size(task, initial_size()));
-        assert_eq!(t.size(task), initial_size());
-        assert!(!t.set_size(task, initial_size()));
+        assert_eq!(t.size(task), Some(size(800, 600)));
+        assert!(t.set_size(task, three_quarters()));
+        assert_eq!(t.size(task), Some(three_quarters()));
+        assert!(!t.set_size(task, three_quarters()));
     }
 
     /// One number per size: 0 before the first change, up by one at each change, not at a size it already has; none for no Task.
     #[test]
     fn config_seq_follows_the_size_changes() {
         let t = tasks();
-        let task = t.new_task(7);
+        let task = t.new_task(7, three_quarters());
         assert_eq!(t.config_seq(task), 0);
         t.set_size(task, size(1000, 700));
         assert_eq!(t.config_seq(task), 1);
@@ -385,38 +399,38 @@ mod tests {
         assert_eq!(t.config_seq(task), 2);
     }
 
-    /// A new monitor becomes the display and renumbers every Task's override; the same monitor again changes nothing. A Task never sized keeps the opening size it opened at (960x600: 3/4 of the default 1280x800), not the new display's.
+    /// A new monitor becomes the display and renumbers every Task's override; the same monitor again changes nothing. No Task's size follows the monitor: a window is resized only by SET_BOUNDS.
     #[test]
-    fn set_display_renumbers_every_task_and_keeps_open_sizes() {
+    fn set_display_renumbers_every_task_and_keeps_sizes() {
         let t = tasks();
-        let sized = t.new_task(7);
-        let fresh = t.new_task(8);
+        let sized = t.new_task(7, three_quarters());
+        let fresh = t.new_task(8, three_quarters());
         t.set_size(sized, size(1000, 700));
         let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0);
         assert_eq!(t.set_display(monitor), vec![sized, fresh]);
         assert_eq!(t.display(), monitor);
         assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
-        assert_eq!(t.size(sized), size(1000, 700));
-        assert_eq!(t.size(fresh), size(960, 600));
+        assert_eq!(t.size(sized), Some(size(1000, 700)));
+        assert_eq!(t.size(fresh), Some(three_quarters()));
         assert_eq!(t.set_display(monitor), Vec::new());
         assert_eq!(t.config_seq(sized), 2);
     }
 
-    /// A Task that does not exist has no owner, takes no size, and has the display's size.
+    /// A Task that does not exist has no owner, no size, and takes no size.
     #[test]
     fn unknown_task_is_refused() {
         let t = tasks();
         let ghost = TaskId::from_raw(99).expect("positive");
         assert_eq!(t.owner(ghost), None);
         assert!(!t.set_size(ghost, size(352, 272)));
-        assert_eq!(t.size(ghost), initial_size());
+        assert_eq!(t.size(ghost), None);
     }
 
     /// The wire form: zero and negative numbers name no Task; a Task's number round-trips.
     #[test]
     fn task_numbers_round_trip_and_refuse_non_positive() {
         let t = tasks();
-        let task = t.new_task(7);
+        let task = t.new_task(7, three_quarters());
         assert_eq!(TaskId::from_raw(0), None);
         assert_eq!(TaskId::from_raw(-1), None);
         assert_eq!(TaskId::from_raw(task.raw()), Some(task));
@@ -426,7 +440,10 @@ mod tests {
     #[test]
     fn activity_tokens_name_their_task() {
         let t = tasks();
-        let (first, second) = (t.new_task(7), t.new_task(7));
+        let (first, second) = (
+            t.new_task(7, three_quarters()),
+            t.new_task(7, three_quarters()),
+        );
         t.bind_token(1, first);
         assert_eq!(t.task_of_token(Some(&1)), Some(first));
         assert_eq!(t.task_of_token(None), None);
@@ -439,7 +456,10 @@ mod tests {
     #[test]
     fn windows_belong_to_their_task() {
         let t = tasks();
-        let (main, second) = (t.new_task(7), t.new_task(7));
+        let (main, second) = (
+            t.new_task(7, three_quarters()),
+            t.new_task(7, three_quarters()),
+        );
         let p = Placement::default();
         t.add_window(main, 100, p);
         t.add_window(second, 200, p);
@@ -455,7 +475,7 @@ mod tests {
     #[test]
     fn placement_follows_relayout() {
         let t = tasks();
-        let main = t.new_task(7);
+        let main = t.new_task(7, three_quarters());
         t.add_window(main, 100, Placement::default());
         let popup = Placement {
             r#type: 1000,

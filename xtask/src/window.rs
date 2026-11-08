@@ -279,7 +279,7 @@ const CADENCE_TOLERANCE: f64 = 0.10;
 const CADENCE_MAX_PERIODS: f64 = 1.5;
 /// The input stage's pointer script (atld `--headless-pointer`): a down at (200, 300), then a move and an up at (260, 340), one pointer, identity transform.
 const POINTER_SCRIPT: &str = "down:200,300 move:260,340 up:260,340";
-/// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the opening size (DisplayModel::opening_size, 960x600 on the gates' 1280x800 display) and shrink under it in both dimensions.
+/// The resize stage's configures, grow then shrink: xdg_toplevel size (logical px) and the serial of the injected configure, far from the compositor's sequential serials (the proxy absorbs the client's acks of these). The content is the configured size less the client-side decorations (a header bar, far under 200 px), so grow is over the opening size (opening_size below, 960x600 on the gates' 1280x800 display) and shrink under it in both dimensions.
 const RESIZE_STEPS: [(i32, i32, u32); 2] = [(1600, 1000, 0xA7C0_0101), (800, 500, 0xA7C0_0102)];
 /// The fixture's layout line prefix (Main.java Quadrants.onSizeChanged): `AtlWindow: size=WxH screenWidthDp=N window=WxH display=WxH`.
 const LAYOUT_LINE: &str = "AtlWindow: size=";

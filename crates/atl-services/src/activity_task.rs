@@ -277,16 +277,16 @@ impl ActivityTasks {
         }
     }
 
-    /// finishAttachApplication's launcher: a new Task (no launch yet names a caller's Task), its record pushed, its launch sent. Returns the record's token.
+    /// finishAttachApplication's launcher: the process's Task (made at its start, `task`), its record pushed, its launch sent. Returns the record's token.
     pub(crate) fn launch_launcher(
         &self,
         thread: Strong<dyn IApplicationThread>,
         uid: u32,
         package: &str,
         decl: &ActivityDecl,
+        task: TaskId,
     ) -> SpIBinder {
         let token = token::new();
-        let task = self.tasks.new_task(uid);
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
             thread,

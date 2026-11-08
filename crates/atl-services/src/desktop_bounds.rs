@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! Initial bounds of a freeform task on the desktop display: AOSP's DesktopModeBoundsCalculator.calculateInitialBounds (`:133-225`) and its centerInScreen (`:324-334`), for our display. Pure: no binder, no I/O. Not yet called from Task creation (launch-bounds slice 3).
+//! Initial bounds of a freeform task on the desktop display: AOSP's DesktopModeBoundsCalculator.calculateInitialBounds (`:133-225`) and its centerInScreen (`:324-334`), for our display. Pure: no binder, no I/O.
 //! Owner decision 2026-11-08 (aspect option A): the display is modelled as AOSP's "ignores orientation requests" mode (DisplayContent.getIgnoreOrientationRequest, DisplayContent.java:6647-6654). The desired aspect is then the display's own (DesktopAppCompatAspectRatioPolicy.getDesiredAspectRatio branch (c)), not the freeform default 1.01 (branch (a), off in that mode). Unresizeable apps are maximised within the ideal size, keeping their aspect.
 //! Not modelled: caption height (`:85-87`; maximise runs with 0), user min-aspect and compat-change overrides (DesktopAppCompatAspectRatioPolicy.getMinAspectRatio), fullscreen and windowLayout overrides, ActivityOptions launch bounds, and per-app universal resizability (ActivityRecord.isUniversalResizeable, ActivityRecord.java:3113-3126).
 //! Position: the centred rect of AOSP's rule. xdg-shell gives a client no toplevel position, so the compositor places the window and this origin only records the Task's bounds.
 
 use crate::packages::{
-    SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
+    ActivityDecl, SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
     SCREEN_ORIENTATION_REVERSE_LANDSCAPE, SCREEN_ORIENTATION_REVERSE_PORTRAIT,
     SCREEN_ORIENTATION_SENSOR_LANDSCAPE, SCREEN_ORIENTATION_SENSOR_PORTRAIT,
     SCREEN_ORIENTATION_USER_LANDSCAPE, SCREEN_ORIENTATION_USER_PORTRAIT,
@@ -77,6 +77,28 @@ pub struct ActivityInput {
     pub min_aspect: Option<f32>,
     /// `android:maxAspectRatio`.
     pub max_aspect: Option<f32>,
+}
+
+impl ActivityInput {
+    /// The activity a manifest declares: its screen orientation, resize mode and aspect limits.
+    pub fn from_decl(decl: &ActivityDecl) -> Self {
+        Self {
+            orientation: ActivityOrientation::from_screen_orientation(decl.screen_orientation),
+            resizeable: decl.resizeable,
+            min_aspect: decl.min_aspect_ratio,
+            max_aspect: decl.max_aspect_ratio,
+        }
+    }
+
+    /// A process with no launch activity: AOSP's default activity (unspecified orientation, resizeable, no aspect limits).
+    pub fn no_activity() -> Self {
+        Self {
+            orientation: ActivityOrientation::Unspecified,
+            resizeable: true,
+            min_aspect: None,
+            max_aspect: None,
+        }
+    }
 }
 
 /// Ideal size as a share of the display: DESKTOP_MODE_INITIAL_BOUNDS_SCALE = 75 / 100f (DesktopModeBoundsCalculator.java:50-51), AOSP's default for persist.wm.debug.desktop_mode_initial_bounds_scale.

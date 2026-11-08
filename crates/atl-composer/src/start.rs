@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atl_services::compositor_registry::{
     DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
-    SURFACE_FLINGER_AIDL, TILT_PROPERTY, TiltConfig,
+    SURFACE_FLINGER_AIDL, TASK_BOUNDS, TILT_PROPERTY, TiltConfig,
 };
 use atl_services::counters;
 use atl_services::display_model::DisplayModel;
@@ -95,6 +95,27 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
+/// The TASK_BOUNDS transaction: the size this process's window opens at, from the services (compositor_registry.rs). Both sides must be positive.
+fn task_bounds() -> Result<PhysSize, String> {
+    let proxy = registry()?;
+    let binder = proxy.as_binder();
+    let data = binder.prepare_transact().map_err(|e| e.to_string())?;
+    let reply = binder
+        .submit_transact(TASK_BOUNDS, data, 0)
+        .map_err(|e| format!("task bounds: {e}"))?;
+    let width: i32 = reply
+        .read()
+        .map_err(|e| format!("task bounds width: {e}"))?;
+    let height: i32 = reply
+        .read()
+        .map_err(|e| format!("task bounds height: {e}"))?;
+    let side = |v: i32| u32::try_from(v).ok().filter(|v| *v > 0);
+    match (side(width), side(height)) {
+        (Some(width), Some(height)) => Ok(PhysSize { width, height }),
+        _ => Err(format!("task bounds {width}x{height}: not a size")),
+    }
+}
+
 /// The REGISTER transaction: the UI agent.
 fn register(ui_agent: &SpIBinder) -> Result<(), String> {
     let proxy = registry()?;
@@ -142,12 +163,8 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let mut input_method = None;
     let sender = if let Some(ui) = ui {
         input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
-        // the size the services give a new Task: the window opens at it, so its first bounds report changes nothing
-        let (width, height) = display.opening_size();
-        let size = PhysSize {
-            width: u32::try_from(width).unwrap_or(1),
-            height: u32::try_from(height).unwrap_or(1),
-        };
+        // the size the services give this process's Task: the window opens at it, so its first bounds report changes nothing
+        let size = task_bounds()?;
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))

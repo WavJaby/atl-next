@@ -11,11 +11,12 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY};
+use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_BOUNDS};
 use crate::counters;
+use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
 use crate::display_model::DisplayModel;
-use crate::tasks::{TaskId, TaskSize, Tasks};
+use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agent::UiAgents;
 
 /// The interface name counters use.
@@ -36,6 +37,9 @@ pub trait ICompositorRegistry: Interface {
 
     /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
+
+    /// TASK_BOUNDS once the caller's pid is read: the size the process's window opens at (compositor_registry.rs TASK_BOUNDS).
+    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode>;
 }
 
 declare_binder_interface! {
@@ -50,7 +54,7 @@ fn on_transact(
     service: &dyn ICompositorRegistry,
     code: TransactionCode,
     data: &BorrowedParcel<'_>,
-    _reply: &mut BorrowedParcel<'_>,
+    reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
     if code == SET_BOUNDS {
         let task: i32 = data.read()?;
@@ -61,6 +65,11 @@ fn on_transact(
     if code == SET_DISPLAY {
         let display: String = data.read()?;
         return service.set_display(ThreadState::get_calling_uid(), &display);
+    }
+    if code == TASK_BOUNDS {
+        let size = service.task_bounds(ThreadState::get_calling_pid())?;
+        reply.write(&size.width)?;
+        return reply.write(&size.height);
     }
     if code != REGISTER {
         counters::count_unimplemented(INTERFACE, &format!("code {code}"));
@@ -76,6 +85,10 @@ impl ICompositorRegistry for BpCompositorRegistry {
     }
 
     fn set_display(&self, _: u32, _: &str) -> Result<(), StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
+    fn task_bounds(&self, _: i32) -> Result<TaskSize, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -97,6 +110,10 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
         self.0.set_display(caller_uid, display)
+    }
+
+    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode> {
+        self.0.task_bounds(caller_pid)
     }
 
     fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
@@ -137,6 +154,13 @@ impl Registry {
 }
 
 impl ICompositorRegistry for Registry {
+    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode> {
+        Ok(match self.activities.task_of_process(caller_pid) {
+            Some(task) => self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
+            None => initial_size(&self.tasks.display(), &ActivityInput::no_activity()),
+        })
+    }
+
     fn set_bounds(
         &self,
         caller_uid: u32,

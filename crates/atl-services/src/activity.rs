@@ -55,6 +55,7 @@ use crate::activity_task::ActivityTasks;
 use crate::broadcast::{self, BroadcastFilter, Broadcasts, IntentKey, StickyRefusal};
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
+use crate::desktop_bounds::ActivityInput;
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
 use crate::pending_intent::{self, PendingIntents};
@@ -63,7 +64,7 @@ use crate::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::size_buckets::SizeBuckets;
-use crate::tasks::{TaskId, TaskSize, Tasks};
+use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::{counters, package, settings};
 
 const AM: &str = "IActivityManager";
@@ -349,6 +350,8 @@ struct ProcessRecord {
     attached: Option<Attached>,
     /// the activity ActivityTaskManager launches once the process has attached (ActivityTaskSupervisor.realStartActivityLocked)
     launch_activity: bool,
+    /// the Task of the launch, made at the process start (start_process_locked); None for a process with no launch
+    task: Option<TaskId>,
     /// ProcessRecord.getActiveInstrumentation
     instr: Option<ActiveInstrumentation>,
     /// finishAttachApplication handed its waiting broadcasts to the sender (BroadcastQueueImpl.onApplicationAttachedLocked); until then deliveries queue
@@ -679,13 +682,25 @@ impl ActivityManager {
     pub(crate) fn task_relaunching(&self, task: TaskId) -> bool {
         self.inner.task_relaunching(task)
     }
+
+    /// The Task of the process `pid` (its launch's, made at the process start); None for a process with no launch.
+    pub(crate) fn task_of_process(&self, pid: i32) -> Option<TaskId> {
+        self.inner
+            .state()
+            .processes
+            .iter()
+            .find(|r| r.pid == pid)
+            .and_then(|r| r.task)
+    }
 }
 
 impl Inner {
     /// ActivityRecord.ensureActivityConfiguration for each activity of `task`, at the Task's size now. Reported is recorded before the send, as AOSP's mLastReportedConfiguration.
     /// Each activity is a record of the lifecycle machine (activity_task Owner): one started by startActivity gets the change as the launcher one does; the steps after a relaunch come from its phase.
     fn task_resized(&self, task: TaskId) {
-        let size = self.tasks.size(task);
+        let Some(size) = self.tasks.size(task) else {
+            return;
+        };
         let display = self.tasks.display();
         let over = Configuration {
             seq: self.tasks.config_seq(task),
@@ -826,6 +841,11 @@ impl Inner {
             entry_point: ACTIVITY_THREAD.to_owned(),
             args: vec![format!("{PROC_START_SEQ_IDENT}{start_seq}")],
         })?;
+        // the launch's Task exists before the process attaches: the composer asks for its bounds at its window's install (registry TASK_BOUNDS)
+        let task = p.launch_activity().filter(|_| launch_activity).map(|decl| {
+            let size = initial_size(&self.tasks.display(), &ActivityInput::from_decl(decl));
+            self.tasks.new_task(p.uid, size)
+        });
         st.processes.push(ProcessRecord {
             package: p.name.clone(),
             process_name: process_name.to_owned(),
@@ -834,6 +854,7 @@ impl Inner {
             pid,
             attached: None,
             launch_activity,
+            task,
             instr,
             broadcasts_attached: false,
         });
@@ -1412,19 +1433,20 @@ impl IActivityManager for ActivityManager {
             inner.kill(&[pid]);
             return Ok(());
         };
-        let (package, launch) = (rec.package.clone(), rec.launch_activity);
+        let (package, launch, task) = (rec.package.clone(), rec.launch_activity, rec.task);
         let Some(thread) = rec.attached.as_ref().map(|a| a.thread.clone()) else {
             return Ok(());
         };
         drop(st);
         if launch
+            && let Some(task) = task
             && let Some(p) = inner.packages.by_name(&package)
             && let Some(activity) = p.launch_activity()
         {
-            // the launch is the lifecycle's: a new Task, the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
+            // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
             inner
                 .atm
-                .launch_launcher(thread.clone(), uid, &package, activity);
+                .launch_launcher(thread.clone(), uid, &package, activity, task);
         }
         // :4933 mBroadcastQueue.onApplicationAttachedLocked, after the activity attach: the deliveries that waited for this process, in order
         let mut st = inner.state();
