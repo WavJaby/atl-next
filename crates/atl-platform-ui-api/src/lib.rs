@@ -242,6 +242,15 @@ pub struct FrameTick {
     pub time_ns: u64,
 }
 
+/// One frame the display showed, as the compositor's presentation feedback reports it: the sample the compositor's vsync grid is put on (UI mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentTiming {
+    /// When the frame reached the display, on the monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds.
+    pub time_ns: i64,
+    /// The display's refresh period at that frame, in nanoseconds.
+    pub refresh_ns: i64,
+}
+
 /// [`FrameClock::request_frame`] from another thread.
 pub trait FrameRequester: Send + Sync + 'static {
     /// Asks the window's clock for one tick.
@@ -262,6 +271,9 @@ pub trait FrameClock {
     /// Sets the callback run on each tick, replacing the previous one. A tick means "you may present now": the caller presents the latest scene it has, if any; the compositor's own clock (vsync, latch,
     /// releases) never waits for a tick.
     fn on_tick<F: FnMut(FrameTick) + 'static>(&self, on_tick: F);
+
+    /// Sets the callback run for each frame this window presented that the display has shown, in order, replacing the previous one. A frame whose feedback never comes is not reported.
+    fn on_presented<F: FnMut(PresentTiming) + 'static>(&self, on_presented: F);
 }
 
 /// A pointer button.

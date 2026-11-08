@@ -4,13 +4,12 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsFd;
 use std::rc::Rc;
-use std::time::Duration;
 
 use atl_gralloc_dmabuf::{SYNC_WRITE, export_sync_file};
 use atl_platform_ui_api::{
     Capture, CursorShape, FrameClock, FrameTick, InputEvent, InputSource, Locks, Monitor, Painted,
-    PhysSize, PointerPhase, PresentError, QuadRelease, Scale, Scene, TouchPhase, UiError, Window,
-    WindowAttributes,
+    PhysSize, PointerPhase, PresentError, PresentTiming, QuadRelease, Scale, Scene, TouchPhase,
+    UiError, Window, WindowAttributes,
 };
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
@@ -19,16 +18,13 @@ use gtk4::{gdk, glib, graphene, gsk};
 use crate::input;
 use crate::mirror;
 use crate::outputs;
-use crate::pacing;
 use crate::scene;
 use crate::text_input::GtkTextInput;
 use crate::ui::GtkUi;
 use crate::view::SceneView;
 
-/// GDK frame times are microseconds (`g_get_monotonic_time`), ticks are nanoseconds.
-const NS_PER_US: u64 = 1000;
-/// GDK's frame clock default when no refresh rate is known (60 Hz, in GDK's milli-Hz).
-const DEFAULT_REFRESH_MILLIHZ: i32 = 60_000;
+/// GDK frame times are microseconds (`g_get_monotonic_time`); ticks and presentation samples are nanoseconds.
+const NS_PER_US: i64 = 1000;
 
 /// A callback slot that tolerates the callback replacing itself while it runs: it is taken out for the call and put back unless a new one was set.
 pub(crate) struct Slot<T: ?Sized>(RefCell<Option<Box<T>>>);
@@ -63,13 +59,6 @@ struct Shared {
     on_monitor: Slot<dyn FnMut(Monitor)>,
     /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
-    /// The current tick presented a scene: the next is paced by the compositor's frame callback, else by the idle timer (pacing.rs).
-    presented: Cell<bool>,
-    /// The last tick's time, µs CLOCK_MONOTONIC: the idle grid's origin.
-    last_tick_us: Cell<Option<i64>>,
-    /// The pending idle tick.
-    idle_timer: RefCell<Option<glib::SourceId>>,
-    stats: RefCell<pacing::TickStats>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
     pointer_at: Cell<(f64, f64)>,
     /// A touchpad swipe is open: its end (GTK `scroll-end`) is reported; a wheel's is not.
@@ -77,22 +66,15 @@ struct Shared {
     /// Contact ids of the touch sequences down.
     touch_ids: RefCell<input::TouchIds>,
     on_painted: Slot<dyn FnMut(Painted)>,
+    on_presented: Slot<dyn FnMut(PresentTiming)>,
+    /// The frame counter of the last frame reported to `on_presented`; None before the first report.
+    presented_upto: Cell<Option<i64>>,
     /// The buffers the presented scene samples.
     shown: RefCell<Vec<scene::Shown>>,
     /// Buffers a present replaced: GSK may still draw them until the next paint; released at its after-paint.
     retired: RefCell<Vec<scene::Shown>>,
     /// A present waits for its paint: the next after-paint reports.
     paint_pending: Cell<bool>,
-    releases: RefCell<ReleaseStats>,
-}
-
-/// What the after-paint release did, for the gate: buffers released, of those with an exported read fence, and exports that failed (released with no fence).
-#[derive(Default)]
-struct ReleaseStats {
-    painted: u64,
-    released: u64,
-    fenced: u64,
-    unfenced: u64,
 }
 
 impl Shared {
@@ -103,19 +85,12 @@ impl Shared {
             return;
         }
         let retired = std::mem::take(&mut *self.retired.borrow_mut());
-        let mut stats = self.releases.borrow_mut();
-        stats.painted += 1;
         let releases = retired
             .into_iter()
             .map(|s| {
-                stats.released += 1;
                 let release_fence = match export_sync_file(s.dmabuf.as_fd(), SYNC_WRITE) {
-                    Ok(fence) => {
-                        stats.fenced += 1;
-                        Some(fence)
-                    }
+                    Ok(fence) => Some(fence),
                     Err(e) => {
-                        stats.unfenced += 1;
                         tracing::warn!(
                             "atl-platform-ui: layer {} buffer {:#x}: no read fence: {e}",
                             s.layer_id,
@@ -131,31 +106,39 @@ impl Shared {
                 }
             })
             .collect();
-        drop(stats);
         self.on_painted.call(|f| f(Painted { releases }));
     }
-}
 
-impl Shared {
-    /// One requested tick at `time_us`: the request is spent, a pending timer tick is dropped (this one replaces it), the tick is counted, and the callback runs. No request, no tick: the clock is on demand.
-    fn tick(&self, time_us: i64, idle: bool) {
+    /// Reports the frames GDK completed since the last report, in frame order, as presentation samples. A frame whose feedback has not come is skipped, not waited for: a frame that
+    /// committed nothing never gets feedback, so waiting would stall every later report. Samples with no presentation time or no period are not reported.
+    fn report_presented(&self, clock: &gdk::FrameClock) {
+        let first = self
+            .presented_upto
+            .get()
+            .map_or(clock.history_start(), |last| {
+                (last + 1).max(clock.history_start())
+            });
+        for frame in first..=clock.frame_counter() {
+            let Some(timings) = clock.timings(frame) else {
+                continue;
+            };
+            let (presented, period) = (timings.presentation_time(), timings.refresh_interval());
+            if !timings.is_complete() || presented <= 0 || period <= 0 {
+                continue;
+            }
+            self.presented_upto.set(Some(frame));
+            let sample = PresentTiming {
+                time_ns: presented * NS_PER_US,
+                refresh_ns: period * NS_PER_US,
+            };
+            self.on_presented.call(|f| f(sample));
+        }
+    }
+
+    /// One requested tick at `time_us`: the request is spent and the callback runs. No request, no tick: the clock is on demand.
+    fn tick(&self, time_us: i64) {
         self.frame_requested.set(false);
-        if let Some(id) = self.idle_timer.borrow_mut().take() {
-            id.remove();
-        }
-        self.last_tick_us.set(Some(time_us));
-        let report = self.stats.borrow_mut().count(idle, time_us);
-        if let Some((paced, idle_ticks, elapsed_us)) = report {
-            let r = self.releases.borrow();
-            tracing::info!(
-                "atl-platform-ui: frame clock paced={paced} idle={idle_ticks} over_us={elapsed_us} painted={} released={} fenced={} unfenced={}",
-                r.painted,
-                r.released,
-                r.fenced,
-                r.unfenced
-            );
-        }
-        let time_ns = u64::try_from(time_us).unwrap_or(0) * NS_PER_US;
+        let time_ns = u64::try_from(time_us * NS_PER_US).unwrap_or(0);
         self.on_tick.call(|f| f(FrameTick { time_ns }));
     }
 }
@@ -199,11 +182,14 @@ impl GtkWindow {
             let on_update = Rc::clone(&shared);
             clock.connect_update(move |clock| {
                 if on_update.frame_requested.get() {
-                    on_update.tick(clock.frame_time(), false);
+                    on_update.tick(clock.frame_time());
                 }
             });
             let on_after_paint = Rc::clone(&shared);
-            clock.connect_after_paint(move |_| on_after_paint.painted());
+            clock.connect_after_paint(move |clock| {
+                on_after_paint.painted();
+                on_after_paint.report_presented(clock);
+            });
             // a frame asked for before the window had a clock
             if shared.frame_requested.get() {
                 clock.request_phase(gdk::FrameClockPhase::UPDATE);
@@ -394,15 +380,12 @@ impl Window for GtkWindow {
             touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
             monitor: RefCell::new(None),
-            presented: Cell::new(false),
-            last_tick_us: Cell::new(None),
-            idle_timer: RefCell::new(None),
-            stats: RefCell::new(pacing::TickStats::default()),
             on_painted: Slot::new(),
+            on_presented: Slot::new(),
+            presented_upto: Cell::new(None),
             shown: RefCell::default(),
             retired: RefCell::default(),
             paint_pending: Cell::new(false),
-            releases: RefCell::default(),
         });
         // the output transform is not GDK's (outputs.rs): its change re-reports the window's monitor
         let rotated = Rc::downgrade(&shared);
@@ -422,7 +405,7 @@ impl Window for GtkWindow {
         Self::wire_scroll(&view, &shared);
         Self::wire_touch(&view, &shared);
         Self::wire_keys(&window, &shared);
-        // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor); the idle pacing reads its rate (monitor_interval_us)
+        // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor)
         // and its scale (wp_fractional_scale_v1 preferred_scale arrives after realisation): the content's logical size is re-derived from the physical one
         let entered = Rc::clone(&shared);
         let scaled = view.downgrade();
@@ -560,7 +543,6 @@ impl Window for GtkWindow {
         retired.extend(gone);
         drop(retired);
         self.shared.paint_pending.set(true);
-        self.shared.presented.set(true);
         let origin = (!self.origin_logged.get() && self.is_mapped())
             .then(|| self.content_origin())
             .flatten();
@@ -676,50 +658,18 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
     shared.on_monitor.call(|f| f(monitor));
 }
 
-/// One requested tick of `window`. After a tick that presented (or before the first tick) GDK paces the next: the compositor's frame callback. Otherwise the timer ticks on the monitor's grid (pacing.rs: GDK's own fallback runs at 60 Hz).
+/// One requested tick of `window`: GDK runs the frame clock's update phase, which the compositor's frame callback paces once a frame was committed. The composer's clock does not wait for it:
+/// a tick is requested only when a published scene asks for one (`FrameRequester`).
 fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
     if shared.frame_requested.replace(true) {
         // one tick is already on its way: a second request is the same tick (Choreographer.scheduleVsyncLocked asks once per frame)
         return;
     }
-    let last = shared.last_tick_us.get();
-    let Some(last) = last.filter(|_| !shared.presented.replace(false)) else {
-        if let Some(clock) = window.frame_clock() {
-            clock.request_phase(gdk::FrameClockPhase::UPDATE);
-        }
-        // the frame clock's own source, same as the timer below
-        mirror::resync();
-        return;
-    };
-    let interval = monitor_interval_us(window);
-    let now = glib::monotonic_time();
-    let at = pacing::next_grid_us(last, interval, now);
-    // whole ms, rounded up: the timer fires at or after the grid point, never before it (a point fired early would be computed again)
-    let delay_ms = u64::try_from((at - now + 999) / 1000).unwrap_or(0);
-    let fired = Rc::clone(shared);
-    let id = glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
-        // fired: the id is spent and must not be removed again
-        fired.idle_timer.borrow_mut().take();
-        if fired.frame_requested.get() {
-            fired.tick(at, true);
-        }
-    });
-    if let Some(old) = shared.idle_timer.replace(Some(id)) {
-        old.remove();
+    if let Some(clock) = window.frame_clock() {
+        clock.request_phase(gdk::FrameClockPhase::UPDATE);
     }
-    // a request from outside a mirror pass (the app's vsync request, Java on the Looper): the new timeout reaches the Looper only through a sync (mirror::resync)
+    // a request from outside a mirror pass (the app's vsync request, Java on the Looper): the frame clock's source reaches the Looper only through a sync (mirror::resync)
     mirror::resync();
-}
-
-/// The refresh interval of the monitor `window` is on; GDK's own default (60 Hz) where the monitor reports none.
-fn monitor_interval_us(window: &gtk4::Window) -> i64 {
-    let millihz = window
-        .surface()
-        .and_then(|s| WidgetExt::display(window).monitor_at_surface(&s))
-        .map_or(0, |m| m.refresh_rate());
-    pacing::interval_us(millihz)
-        .or_else(|| pacing::interval_us(DEFAULT_REFRESH_MILLIHZ))
-        .unwrap_or(1)
 }
 
 /// A window a [`GtkFrameRequester`] names: its id, then the window and its state, weakly.
@@ -780,6 +730,10 @@ impl FrameClock for GtkWindow {
 
     fn on_tick<F: FnMut(FrameTick) + 'static>(&self, on_tick: F) {
         self.shared.on_tick.set(Box::new(on_tick));
+    }
+
+    fn on_presented<F: FnMut(PresentTiming) + 'static>(&self, on_presented: F) {
+        self.shared.on_presented.set(Box::new(on_presented));
     }
 }
 

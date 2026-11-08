@@ -236,6 +236,9 @@ fn open() {
             );
             composer.presenter_reported();
         });
+        // the presented frames' timings (the display's feedback) are the clock's vsync grid: the clock moves onto each one
+        let presented = Arc::clone(&session.composer);
+        window.on_presented(move |sample| presented.on_presented(sample));
         let sizes = Arc::clone(&session.sender);
         window.on_resize(move |size| sizes.submit_size(size));
         // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)

@@ -5,6 +5,7 @@
 //! Phases, in order:
 //! Buffers are real dma-bufs from gralloc's GBM backend (WSL: vgem), linear, with handle ints as the allocator writes them: the window imports them as dmabuf textures.
 //! 1. `--frames` frames: each tick presents one full-window quad whose buffer holds [`pattern`] for frame `f` (rows padded with at least `STRIDE_PAD_PIXELS` extra pixels of 0xEE, so a wrong stride shows), then captures the window to `frame-<f>.rgba`.
+//!    Every presented frame's presentation sample is printed (`PRESENT`, the composer's grid follows them), with the monitor's rate (`MONITOR`) before them.
 //! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`. Then the resize probe: `set_size` larger then smaller, each size the content gets as `RESIZED`; on a
 //!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
 //! 3. refusals + release: a handle whose pitch is shorter than a row and one with a fourcc the table does not have are refused (never a CPU fallback); a scene that replaces the frame buffer releases it at the next paint, with a read fence (`RELEASES`).
@@ -31,8 +32,8 @@ use atl_gralloc_service::backend::Backend;
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
     ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, PhysRect, PhysSize, PlatformUi,
-    PlatformWindow, PresentError, Surrounding, TextInput, TextInputEvent, Ui, UiError, Window,
-    WindowAttributes,
+    PlatformWindow, PresentError, PresentTiming, Surrounding, TextInput, TextInputEvent, Ui,
+    UiError, Window, WindowAttributes,
 };
 
 /// What `ime-focus` declares the field to be; the harness checks the input method sees it (as text-input v3 `content_type`).
@@ -49,7 +50,7 @@ use clap::Parser;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::io::{read, write};
-use rustix::time::Timespec;
+use rustix::time::{ClockId, Timespec, clock_gettime};
 
 #[derive(Parser)]
 struct Args {
@@ -79,9 +80,6 @@ const STRIDE_PAD_PIXELS: u32 = 16;
 const PAD_BYTE: u8 = 0xEE;
 /// One `poll` waits at most this long when nothing is ready.
 const PASS: Duration = Duration::from_millis(20);
-/// Phase 1b: ticks asked for one at a time with nothing presented (the idle timer paces each after the first), and how long each may take: a 60 Hz grid tick is due within 17 ms, so 1 s only fails a tick that never comes.
-const IDLE_TICKS: u32 = 3;
-const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// Phase 2b on a size-fixed window: ticks after each size request before the size is read. GTK applies set_default_size at the next layout (one tick); a second covers the commit the compositor would answer with a configure.
 const FIXED_TICKS: u32 = 2;
 /// Pattern frame numbers of the composite scene's five buffers (distinct from the frame series).
@@ -111,6 +109,12 @@ fn emit(line: std::fmt::Arguments<'_>) {
     // a closed stdout means the harness is gone; nothing to report to
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// CLOCK_MONOTONIC now, in nanoseconds: the clock the presentation samples' times are on.
+fn monotonic_ns() -> i64 {
+    let t = clock_gettime(ClockId::Monotonic);
+    t.tv_sec * 1_000_000_000 + t.tv_nsec
 }
 
 /// The GBM backend of gralloc's allocator, started once on the first DRM node that allocates.
@@ -477,6 +481,18 @@ fn main() -> Result<()> {
         },
     )?);
 
+    // the monitor's rate, and every frame the display showed (its presentation time and period), in order: printed before DONE
+    let monitor_hz: Rc<Cell<Option<f32>>> = Rc::default();
+    {
+        let monitor_hz = Rc::clone(&monitor_hz);
+        window.on_monitor(move |m| monitor_hz.set(m.refresh_hz));
+    }
+    let presents: Rc<RefCell<Vec<(PresentTiming, i64)>>> = Rc::default();
+    {
+        let presents = Rc::clone(&presents);
+        window.on_presented(move |p| presents.borrow_mut().push((p, monotonic_ns())));
+    }
+
     // phase 1: the frame series, one frame per tick
     let frame = Rc::new(Cell::new(0u32));
     let failure: Rc<RefCell<Option<String>>> = Rc::default();
@@ -521,20 +537,12 @@ fn main() -> Result<()> {
         bail!("{e}");
     }
 
-    // phase 1b: ticks requested from outside a mirror pass, as the app's vsync request comes from Java on the Looper. After a tick that presented nothing the idle timer paces the next, and its timeout reaches the Looper only through the mirror's resync: without it no tick comes.
-    let idle = Rc::new(Cell::new(0u32));
+    // the ticks from here on are counted: phase 2b waits for them
+    let ticks = Rc::new(Cell::new(0u32));
     {
-        let idle = Rc::clone(&idle);
-        window.on_tick(move |_| idle.set(idle.get() + 1));
+        let ticks = Rc::clone(&ticks);
+        window.on_tick(move |_| ticks.set(ticks.get() + 1));
     }
-    for want in 1..=IDLE_TICKS {
-        window.request_frame();
-        let wait = Instant::now() + IDLE_WAIT;
-        while idle.get() < want && Instant::now() < wait {
-            looper.poll(PASS)?;
-        }
-    }
-    emit(format_args!("IDLE_TICKS {}", idle.get()));
 
     // phase 2: the composite scene
     let (_fds, scene) = composite_scene(args.width, args.height)?;
@@ -568,11 +576,11 @@ fn main() -> Result<()> {
         let want = PhysSize { width, height };
         window.set_size(want);
         if fixed {
-            let start = idle.get();
+            let start = ticks.get();
             for n in 1..=FIXED_TICKS {
                 window.request_frame();
                 spin(&looper, deadline, "a tick after the size request", || {
-                    idle.get() >= start + n
+                    ticks.get() >= start + n
                 })?;
             }
             let now = window.size();
@@ -738,6 +746,17 @@ fn main() -> Result<()> {
     emit(format_args!("READY"));
     while !quit.get() {
         looper.poll(PASS)?;
+    }
+    // `xtask test platform-ui` checks these: the monitor's rate (0 = none reported), then every presentation sample in order, with the monotonic time its report arrived
+    emit(format_args!(
+        "MONITOR refresh_hz={}",
+        monitor_hz.get().unwrap_or(0.0)
+    ));
+    for (p, seen_ns) in presents.borrow().iter() {
+        emit(format_args!(
+            "PRESENT time_ns={} refresh_ns={} seen_ns={seen_ns}",
+            p.time_ns, p.refresh_ns
+        ));
     }
     emit(format_args!("DONE"));
     Ok(())

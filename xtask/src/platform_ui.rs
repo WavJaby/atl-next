@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test platform-ui` (M3 slice 6): the GTK platform layer on a real Wayland compositor (the gate's headless labwc, nested_wayland.rs; with --hold-blocked the desktop's $WAYLAND_DISPLAY), through the `atl-platform-ui` facade.
 //! The client is `crates/atl-platform-ui/examples/gate.rs`; this side builds and starts it, reads its stdout and captures, and checks them against its own implementation of the spec below. Gates 1-4 run in any compositor, gate 5 only in the gate's labwc. Gates:
-//! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time.
+//! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time. The presentation samples (`PRESENT`: the compositor's feedback for each presented frame, which the composer's clock grid is put on) are monotonic, on CLOCK_MONOTONIC, and have the monitor's period +-2%; no sample at all fails these.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
@@ -177,8 +177,10 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 /// The resize probe's size step, physical pixels per axis: the larger and the smaller size are WIDTH/HEIGHT +- this. The smaller content stays above the title bar's minimum width (WSLg: ~280 px).
 const RESIZE_STEP: u32 = 32;
-/// Idle ticks the gate client asks for outside a mirror pass (gate.rs , the same number).
-const IDLE_TICKS: u32 = 3;
+/// The presentation samples' period against the monitor's rate: the sample comes from the compositor's wp_presentation refresh (ns), the rate from GDK's milli-Hz.
+const REFRESH_TOLERANCE: f64 = 0.02;
+/// How long after its frame a presentation sample may be reported: the report waits for the window's next paint, so a quiet window delays it. 10 s is far above that and far below a unit or clock-base mismatch.
+const PRESENT_LAG_LIMIT_NS: i64 = 10_000_000_000;
 /// How long the client may take to reach READY (build excluded): mapping, the frames, the fd test.
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 /// How long an idle UI thread may take to answer a ping. The client answers within one main-loop pass (20 ms); real compositors wait seconds, so 1 s is a generous bound for a loaded machine.
@@ -646,17 +648,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &format!("fixed {fixed:?}, sizes {sizes:?}"),
         );
     }
-    // a tick asked for outside a mirror pass comes (mirror::resync): the client asks for IDLE_TICKS (gate.rs), one at a time
-    let idle = client
-        .lines_with("IDLE_TICKS ")
-        .last()
-        .and_then(|l| l.strip_prefix("IDLE_TICKS ")?.parse::<u32>().ok());
-    report.check(
-        idle == Some(IDLE_TICKS),
-        "ticks asked for outside a mirror pass come (idle timer synced to the Looper)",
-        &format!("ticks {idle:?} of {IDLE_TICKS}"),
-    );
-
     // gate 2: readback. The scene is WIDTH x HEIGHT; on a maximized window the capture is the granted size and the scene its top-left corner
     let scene_of = |got: Vec<u8>, size: Option<(u32, u32)>| -> Option<Vec<u8>> {
         let (w, h) = if args.maximized {
@@ -845,6 +836,63 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // shutdown
     client.command("quit")?;
     client.expect_line("DONE", EXIT_LIMIT)?;
+    // presentation samples, one per presented frame the display showed (gate.rs), printed before DONE: in order, each period the monitor's rate. The composer's clock grid is put on them.
+    // Zero samples fails every check here, the period one included: an empty set must not pass.
+    let monitor_hz = client
+        .lines_with("MONITOR ")
+        .last()
+        .and_then(|l| field(l, "refresh_hz")?.parse::<f32>().ok())
+        .filter(|hz| *hz > 0.0);
+    // (presentation time, period, monotonic time its report arrived), all ns
+    let samples: Vec<(i64, i64, i64)> = client
+        .lines_with("PRESENT ")
+        .into_iter()
+        .filter_map(|l| {
+            let time = field(l, "time_ns")?.parse().ok()?;
+            let period = field(l, "refresh_ns")?.parse().ok()?;
+            let seen = field(l, "seen_ns")?.parse().ok()?;
+            Some((time, period, seen))
+        })
+        .collect();
+    report.check(
+        !samples.is_empty(),
+        "presentation samples come: the display reports each presented frame (wp_presentation feedback)",
+        &format!(
+            "{} samples{}",
+            samples.len(),
+            if samples.is_empty() { ": no samples" } else { "" }
+        ),
+    );
+    report.check(
+        samples.len() >= 2 && samples.windows(2).all(|w| w[0].0 < w[1].0),
+        "presentation samples are monotonic",
+        &format!("{} samples", samples.len()),
+    );
+    // the times are on the monotonic clock the composer's grid uses: each report arrives after its frame was shown, and within the bound (a unit or clock mismatch is far outside it)
+    report.check(
+        !samples.is_empty()
+            && samples
+                .iter()
+                .all(|(time, _, seen)| (0..=PRESENT_LAG_LIMIT_NS).contains(&(seen - time))),
+        "presentation times are on CLOCK_MONOTONIC: each report arrives at most 10 s after its frame was shown",
+        &format!("{} samples", samples.len()),
+    );
+    let want_ns = monitor_hz.map(|hz| 1e9 / f64::from(hz));
+    let periods = samples.iter().map(|s| s.1);
+    report.check(
+        !samples.is_empty()
+            && want_ns.is_some_and(|want| {
+                samples
+                    .iter()
+                    .all(|(_, period, _)| (*period as f64 - want).abs() <= want * REFRESH_TOLERANCE)
+            }),
+        "presentation sample periods equal the monitor rate (+-2%)",
+        &format!(
+            "monitor {monitor_hz:?} Hz, sample periods {:?}..{:?} ns",
+            periods.clone().min(),
+            periods.max()
+        ),
+    );
     let deadline = Instant::now() + EXIT_LIMIT;
     let status = loop {
         if let Some(s) = client.child.try_wait()? {

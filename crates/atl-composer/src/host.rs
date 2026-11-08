@@ -25,6 +25,7 @@ use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
 use atl_parcelables::codecs::android::view::SurfaceControl_Transaction::TransactionObject;
+use atl_platform_ui::PresentTiming;
 use atl_services::counters;
 use atl_services::display_model::DisplayModel;
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
@@ -251,6 +252,8 @@ pub struct Composer {
     wake: clock::Wake,
     /// UI mode: asks the window for a frame after a publish ([`Composer::set_frame_requester`]).
     frame_request: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// UI mode: the window's last presented frame, which the clock's grid sits on ([`Composer::on_presented`]). A leaf lock: taken alone, never with the core's.
+    presented: Mutex<Option<PresentTiming>>,
     stop: AtomicBool,
     /// the monitor the window is on (UI mode follows it: []); headless keeps the one it starts with
     display: Mutex<DisplayModel>,
@@ -338,6 +341,7 @@ impl Composer {
             }),
             wake: clock::Wake::default(),
             frame_request: OnceLock::new(),
+            presented: Mutex::new(None),
             stop: AtomicBool::new(false),
             display: Mutex::new(config.display),
             post_draw: config.post_draw,
@@ -361,6 +365,25 @@ impl Composer {
         if self.frame_request.set(request).is_err() {
             tracing::warn!("atl-composer: ui: a second frame requester refused");
         }
+    }
+
+    /// UI mode: the window showed a frame at `sample.time_ns` on a `sample.refresh_ns` period (its presentation feedback). The clock's grid moves onto it from the next tick. Takes no core lock.
+    pub fn on_presented(&self, sample: PresentTiming) {
+        let mut presented = self.presented.lock().unwrap_or_else(|e| e.into_inner());
+        if presented.is_none() {
+            tracing::info!(
+                "atl-composer: ui: clock grid on presented frames: time_ns={} refresh_ns={}",
+                sample.time_ns,
+                sample.refresh_ns
+            );
+        }
+        *presented = Some(sample);
+    }
+
+    /// The grid the next tick sits on: the window's last presented frame (UI mode), else the start time on the display's rate.
+    fn grid(&self, start_ns: i64) -> (i64, i64) {
+        let presented = *self.presented.lock().unwrap_or_else(|e| e.into_inner());
+        clock::tick_grid(presented, start_ns, self.display().refresh_hz)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -702,9 +725,9 @@ impl Composer {
     }
 
     /// The clock: parks while nothing wants a frame and no release report waits; a report alone is answered at once (its releases are what a blocked producer waits for), work waits for the next grid point.
-    /// The interval follows the display (UI mode: the window's monitor) from tick to tick.
+    /// The grid follows the window's presented frames (UI mode) from tick to tick: [`Composer::grid`].
     fn run(&self, frames: SyncSender<Frame>) {
-        let origin = monotonic_ns();
+        let start = monotonic_ns();
         loop {
             let seen = self.wake.generation();
             if self.stop.load(Ordering::Acquire) {
@@ -724,8 +747,8 @@ impl Composer {
                 }
                 continue;
             }
-            let interval = clock::interval_ns(self.display().refresh_hz);
             let now = monotonic_ns();
+            let (origin, interval) = self.grid(start);
             let at = clock::next_tick(origin, interval, now);
             std::thread::sleep(Duration::from_nanos(u64::try_from(at - now).unwrap_or(0)));
             let (frame, published) = self.tick(at, interval);
