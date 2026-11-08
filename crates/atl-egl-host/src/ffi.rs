@@ -59,6 +59,7 @@ pub const GL_NO_ERROR: GLenum = 0;
 pub const GL_VENDOR: GLenum = 0x1F00;
 pub const GL_RENDERER: GLenum = 0x1F01;
 pub const GL_VERSION: GLenum = 0x1F02;
+pub const GL_EXTENSIONS: GLenum = 0x1F03;
 pub const GL_TEXTURE_2D: GLenum = 0x0DE1;
 pub const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;

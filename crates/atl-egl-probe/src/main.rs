@@ -19,7 +19,7 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
-use atl_egl_host::ffi::{GL_RENDERER, GL_VERSION};
+use atl_egl_host::ffi::{GL_EXTENSIONS, GL_RENDERER, GL_VERSION};
 use atl_egl_host::{Device, DmabufPlane, Host};
 use atl_gralloc::descriptor::Descriptor;
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
@@ -269,7 +269,7 @@ fn pair(alloc: &Path, render: &str, native: bool) -> Result<String> {
         }
     }
     let summary = format!(
-        "alloc={} render={render} egl={}.{} vendor={:?} gl={version:?} renderer={renderer:?} pitch={} modifier={:#x} linear={linear} mods={} target={} readback={readback} fence={fence} swap_damage={} image_native_buffer={} partial_update={}",
+        "alloc={} render={render} egl={}.{} vendor={:?} gl={version:?} renderer={renderer:?} pitch={} modifier={:#x} linear={linear} mods={} target={} readback={readback} fence={fence} swap_damage={} image_native_buffer={} partial_update={} gl_flip_y={}",
         alloc.display(),
         display.version.0,
         display.version.1,
@@ -285,6 +285,10 @@ fn pair(alloc: &Path, render: &str, native: bool) -> Result<String> {
         display.has_extension("EGL_KHR_swap_buffers_with_damage"),
         display.has_extension("EGL_ANDROID_image_native_buffer"),
         display.has_extension("EGL_KHR_partial_update"),
+        // an FBO into an EGLImage stores GL row 0 first, a window surface stores it last: the adapter must flip somewhere
+        gl.string(GL_EXTENSIONS)
+            .split_ascii_whitespace()
+            .any(|e| e == "GL_MESA_framebuffer_flip_y"),
     );
     if let Some((x, y, got, want)) = first {
         return Err(anyhow!(
