@@ -663,6 +663,34 @@ impl IWindowSession for Session {
         Ok(result)
     }
 
+    /// Session.relayoutAsync (Session.java:289-295; IWindowSession.aidl:110 `oneway`): the relayout above with outRelayoutResult null. One path with it: the reply is dropped, and no error reaches the client (oneway).
+    fn r#relayoutAsync(
+        &self,
+        window: Option<&Strong<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>>,
+        attrs: Option<&WindowManager_LayoutParams>,
+        requested_width: i32,
+        requested_height: i32,
+        view_visibility: i32,
+        flags: i32,
+        seq: i32,
+        last_sync_seq_id: i32,
+    ) -> binder::Result<()> {
+        // one counter line per call: the resize and dialog gates count the served calls (`relayout_async_check`)
+        counters::answered(WINDOW_SESSION, "relayoutAsync");
+        self.r#relayout(
+            window,
+            attrs,
+            requested_width,
+            requested_height,
+            view_visibility,
+            flags,
+            seq,
+            last_sync_seq_id,
+            &mut None,
+        )
+        .map(|_| ())
+    }
+
     /// WindowManagerService.removeWindow: the window leaves the session, and its input channel leaves the app's dispatcher (WindowState.removeImmediately -> disposeInputChannel -> InputDispatcher::removeInputChannel), asked
     /// without the windows lock. A window the session does not hold is nothing to remove (AOSP does nothing for an unknown window either).
     fn r#remove(&self, client_token: Option<&SpIBinder>) -> binder::Result<()> {

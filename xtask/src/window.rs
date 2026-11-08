@@ -1198,6 +1198,26 @@ fn display_check(app: &str, display: DisplayModel) -> Result<String, String> {
     ))
 }
 
+/// Session.relayoutAsync (oneway, IWindowSession.aidl:110) is served: an unserved call leaves the client's frame at its old size, so no `unimplemented IWindowSession.relayoutAsync` counter may appear. The frames themselves are `relayout_check`'s and `frame_check`'s.
+fn relayout_async_check(services: &str) -> Result<String, String> {
+    let unserved = services
+        .lines()
+        .filter(|line| line.contains("unimplemented IWindowSession.relayoutAsync"))
+        .count();
+    if unserved > 0 {
+        return Err(format!(
+            "{unserved} relayoutAsync call(s) unimplemented: the client keeps its old frame"
+        ));
+    }
+    let served = services
+        .lines()
+        .filter(|line| line.contains("answered IWindowSession.relayoutAsync"))
+        .count();
+    Ok(format!(
+        "relayoutAsync served: {served} call(s), none unimplemented"
+    ))
+}
+
 /// The resize stages' sub-gates up to `display`; the stage adds click, burst, lifecycle.
 fn resize_checks(
     app: &str,
@@ -1210,6 +1230,7 @@ fn resize_checks(
         ("configure", configure_check(liveness)),
         ("bounds", bounds_check(services, &steps)),
         ("relayout", relayout_check(app, &steps)),
+        ("relayoutAsync", relayout_async_check(services)),
         ("frame", frame_check(app, &steps)),
         ("display", display_check(app, display)),
     ]
@@ -2026,6 +2047,16 @@ mod tests {
         let log = "boot line\n1000.001 x marker\n1000.500 x marker\n";
         assert_eq!(marker_stamp(log, "marker"), Some(1_000_001));
         assert_eq!(marker_stamp("no marker here\n", "marker"), None);
+    }
+
+    /// An unserved relayoutAsync fails its sub-gate: the resize's frames never reach the client. Served (no counter line) passes.
+    #[test]
+    fn relayout_async_fails_on_an_unserved_call() {
+        assert!(relayout_async_check(RESIZE_SERVICES).is_ok());
+        let unserved = format!(
+            "{RESIZE_SERVICES}services: unimplemented IWindowSession.relayoutAsync 1 at=1794093338.966\n"
+        );
+        assert!(relayout_async_check(&unserved).is_err());
     }
 
     /// The counters before the marker are totals; the calls from it on keep their offsets.

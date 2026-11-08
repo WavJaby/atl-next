@@ -333,6 +333,7 @@ pub fn checks(app: &str, services: &str, liveness: &Result<Liveness, String>) ->
             },
         ),
         ("touch", touch_check(app)),
+        ("relayoutAsync", super::relayout_async_check(services)),
         ("controls", controls(app)),
     ]
 }
