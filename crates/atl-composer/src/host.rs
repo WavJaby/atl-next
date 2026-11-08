@@ -66,19 +66,33 @@ struct Frame {
 }
 
 impl Frame {
-    /// The descriptors the present thread will use: every quad's buffer and every release channel.
+    /// The descriptors the present thread will use: every quad's buffer, and the calls' release channels and release fences.
     fn fds(&self) -> Vec<i32> {
-        let buffers = self.scene.iter().flat_map(|s| &s.quads);
-        let channels = self.calls.iter().filter_map(|c| match c {
-            ClientCall::ReleaseOnChannel { channel, .. } => Some(channel.fd),
-            _ => None,
-        });
-        buffers
-            .filter_map(Quad::buffer)
-            .flat_map(|b| b.buffer.fds.iter().map(|f| f.raw()))
-            .chain(channels)
-            .collect()
+        fds_of(self.scene.as_ref(), &self.calls)
     }
+}
+
+/// The descriptors a tick's output names that must stay open until it is delivered: the scene's buffers, and each call's release channel and release fence (an acquire fence the core released a buffer with).
+fn fds_of(scene: Option<&Scene>, calls: &[ClientCall]) -> Vec<i32> {
+    let mut fds: Vec<i32> = scene
+        .iter()
+        .flat_map(|s| &s.quads)
+        .filter_map(Quad::buffer)
+        .flat_map(|b| b.buffer.fds.iter().map(|f| f.raw()))
+        .collect();
+    for call in calls {
+        match call {
+            ClientCall::ReleaseOnChannel { channel, release } => {
+                fds.push(channel.fd);
+                fds.extend(release.release_fence.0.map(|f| f.fd));
+            }
+            ClientCall::ReleaseBuffer { release, .. } => {
+                fds.extend(release.release_fence.0.map(|f| f.fd));
+            }
+            ClientCall::TransactionCompleted { .. } => {}
+        }
+    }
+    fds
 }
 
 /// UI mode's frame path (no clock thread: the window's frame clock ticks, owner decision 2026-11-05). [`UiFrames::tick`] runs on the UI thread; the scene is shown there, and the calls go to the deliver thread.
@@ -108,28 +122,46 @@ impl UiFrames {
         self.composer.lock().wants_frame()
     }
 
-    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, `present` shows the scene on this thread and says whether the window will paint it.
-    /// The calls (the releases of the buffers the new scene replaced, the transaction callbacks) then wait for that paint ([`UiFrames::painted`]), as SurfaceFlinger sends them after composition; with nothing to paint they go now, in order behind any still waiting.
+    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, and `present` shows the scene on this thread and says whether it took it.
+    /// A taken scene holds the buffers it shows until the window's paint ([`UiFrames::painted`]): the core releases what it replaced then, with the read fences; the tick's calls wait for that paint too, as SurfaceFlinger sends them after composition.
+    /// A scene that was not taken (or no paint is due: `release_after_paint` false) releases what it replaced now, as before the hold set.
     pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene) -> bool) {
         let interval_ns = clock::interval_ns(self.composer.display().refresh_hz);
-        let frame = self.composer.tick(time_ns, interval_ns);
-        let painting =
-            frame.scene.as_ref().is_some_and(present) && self.composer.release_after_paint;
+        let Frame {
+            scene, mut calls, ..
+        } = self.composer.tick(time_ns, interval_ns);
+        let painting = match &scene {
+            Some(scene) => present(scene) && self.composer.release_after_paint,
+            None => false,
+        };
+        if let Some(scene) = &scene {
+            if painting {
+                self.composer.scene_taken(scene);
+            } else {
+                calls.extend(self.composer.release_unpainted());
+            }
+        }
         let mut unpainted = self.unpainted.lock().unwrap_or_else(|e| e.into_inner());
         if painting || !unpainted.is_empty() {
-            unpainted.push_back(frame.calls);
+            unpainted.push_back(calls);
             return;
         }
         drop(unpainted);
-        self.send(frame.calls, HashMap::new());
+        self.send(calls, HashMap::new());
     }
 
     /// The window painted: every waiting tick's calls go to the deliver thread, a release and the completion carrying it with the read fence the window exported for its buffer (`fences`: buffer id -> sync_file; none = released already).
+    /// Then the releases of the buffers this paint stopped showing, and the completions they held back, go as one more frame.
     pub fn painted(&self, fences: Vec<(u64, OwnedFd)>) {
         let waiting =
             std::mem::take(&mut *self.unpainted.lock().unwrap_or_else(|e| e.into_inner()));
         let mut fences: HashMap<u64, OwnedFd> = fences.into_iter().collect();
         for mut calls in waiting {
+            let held = attach_read_fences(&mut calls, &mut fences);
+            self.send(calls, held);
+        }
+        let mut calls = self.composer.painted_calls();
+        if !calls.is_empty() {
             let held = attach_read_fences(&mut calls, &mut fences);
             self.send(calls, held);
         }
@@ -571,6 +603,32 @@ impl Composer {
     }
 
     /// The last reference to a layer's handle went away.
+    /// The presenter took `scene` ([`Compositor::scene_taken`]): its buffers are held until the paint.
+    fn scene_taken(&self, scene: &Scene) {
+        self.lock().compositor.scene_taken(scene);
+    }
+
+    /// Releases for a scene that was not taken: what it replaced is no longer shown by anything, so it goes now, in the in-flight entry of the tick that produced it (the last one).
+    fn release_unpainted(&self) -> Vec<ClientCall> {
+        let mut st = self.lock();
+        let calls = st.compositor.painted();
+        let fds = fds_of(None, &calls);
+        if let Some(last) = st.in_flight.back_mut() {
+            last.extend(fds);
+        }
+        calls
+    }
+
+    /// The presenter's paint: the releases of the buffers it stopped showing and the completions they held back. Their descriptors get an in-flight entry of their own, as a tick's do.
+    fn painted_calls(&self) -> Vec<ClientCall> {
+        let mut st = self.lock();
+        let calls = st.compositor.painted();
+        if !calls.is_empty() {
+            st.in_flight.push_back(fds_of(None, &calls));
+        }
+        calls
+    }
+
     fn layer_dropped(&self, key: u64) {
         let mut st = self.lock();
         let gone = st.objects.remove(key);
@@ -853,8 +911,13 @@ impl Composer {
         let binder = self
             .listener_binder(listener)
             .ok_or_else(|| format!("listener {listener:?} is gone"))?;
-        // a release fence is the frame's own (`fences`, open until these calls are delivered); the call takes a dup of it
-        let resolve_fd = |fd: i32| fences.get(&fd).and_then(|f| f.try_clone().ok());
+        // a release fence is the frame's own (`fences`, open until these calls are delivered), or the acquire fence of a buffer the core released unread (open while its frame is in flight); the call takes a dup of it
+        let resolve_fd = |fd: i32| {
+            fences
+                .get(&fd)
+                .and_then(|f| f.try_clone().ok())
+                .or_else(|| self.lock().fds.get(&fd).and_then(|f| f.try_clone().ok()))
+        };
         listener::call(binder, code, &wire, &|key| self.resolve(key), &resolve_fd)
             .map_err(|e| format!("transaction {code} to the listener: {e:?}"))
     }

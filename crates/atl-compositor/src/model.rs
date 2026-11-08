@@ -172,6 +172,10 @@ pub struct Counters {
     pub completions_sent: u64,
     /// Ticks a transaction queue waited at its front because a buffer's acquire fence had not signalled.
     pub fence_waits: u64,
+    /// Buffers the presenter still held when the core replaced or destroyed them: released at its paint, not at once.
+    pub releases_held: u64,
+    /// Completions held back at creation, until the presenter's paint released the older buffers they name.
+    pub completions_held: u64,
 }
 
 impl Counters {
@@ -198,6 +202,29 @@ struct Held {
     release_listener: StrongBinder,
     /// `releaseBufferEndpoint`: the listener whose completion carries this buffer's release (AOSP `mPreviousReleaseBufferEndpoint`).
     release_endpoint: StrongBinder,
+    /// The last scene the presenter took shows this buffer ([`Compositor::scene_taken`]). Replacing it, the core waits for the presenter's paint ([`Compositor::painted`]).
+    presented: bool,
+}
+
+/// A buffer the presenter may still draw after the core replaced it or destroyed its layer: released at the presenter's next paint.
+#[derive(Debug)]
+struct Retired {
+    /// The layer it was on; that layer's completions wait for it.
+    layer: BinderKey,
+    held: Held,
+    /// The layer's release channel when it was replaced.
+    channel: Option<FdObject>,
+    /// The replacing transaction's completion carries this release (`previousReleaseCallbackId`): the channel write goes first, then that completion.
+    carried: bool,
+}
+
+/// A completion held back until the presenter released the older buffers of every layer it names. BBQ releases each submitted buffer older than the frame a completion names, faking NO_FENCE (BLASTBufferQueue.cpp:415-427), so a completion never overtakes a release it would fake.
+#[derive(Debug)]
+struct Pending {
+    listener: StrongBinder,
+    stats: TransactionStats,
+    /// Each layer the completion names with its latched frame; frame 0 (no buffer) gates nothing.
+    gates: Vec<(BinderKey, u64)>,
 }
 
 impl Held {
@@ -280,6 +307,12 @@ fn fence_of(fd: i32) -> Fence {
         flags: 0,
         cookie: 0,
     }))
+}
+
+/// The release fence of a buffer nothing read: its acquire fence (AOSP `Layer::releasePreviousBuffer` passes `mDrawingState.acquireFence`, Layer.cpp:861-863).
+fn acquire_fence_of(held: &Held) -> Fence {
+    held.acquire_fence
+        .map_or(Fence(None), |f| fence_of(f.raw()))
 }
 
 /// The buffers a call releases: its own release, or the one its completion carries.
@@ -415,6 +448,10 @@ pub struct Compositor {
     counters: Counters,
     /// Whether the acquire fence with this descriptor number has signalled (never waits); see [`Compositor::with_fence_probe`].
     fence_signalled: fn(i32) -> bool,
+    /// Buffers the presenter may still draw after the core replaced or destroyed them: released at its paint ([`Compositor::painted`]).
+    retired: Vec<Retired>,
+    /// Completions held back ([`Pending`]), in the order they were produced.
+    pending: Vec<Pending>,
 }
 
 /// The probe of a compositor whose producers fence nothing (the model tests): every fence counts as signalled.
@@ -435,6 +472,8 @@ impl Compositor {
             dirty: false,
             counters: Counters::default(),
             fence_signalled: every_fence_signalled,
+            retired: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -478,6 +517,11 @@ impl Compositor {
         }
         for b in self.cache.values() {
             fds.extend(b.fds.iter().map(|f| f.fd));
+        }
+        for r in &self.retired {
+            fds.extend(r.channel.map(|f| f.fd));
+            fds.extend(r.held.buffer.fds.iter().map(|f| f.raw()));
+            fds.extend(r.held.acquire_fence.map(SceneFd::raw));
         }
         for t in self.queues.values().flatten() {
             fds.extend(t.fds().into_iter().map(|f| f.fd));
@@ -580,7 +624,18 @@ impl Compositor {
         if let Some(mut layer) = self.layers.remove(&handle) {
             self.dirty = true;
             if let Some(h) = layer.held.take() {
-                self.release(&h, layer.release_channel, &mut calls);
+                if h.presented {
+                    self.counters.releases_held += 1;
+                    self.retired.push(Retired {
+                        layer: handle,
+                        held: h,
+                        channel: layer.release_channel,
+                        carried: false,
+                    });
+                } else {
+                    let fence = acquire_fence_of(&h);
+                    self.release(&h, layer.release_channel, fence, &mut calls);
+                }
             }
         }
         calls
@@ -594,27 +649,40 @@ impl Compositor {
             .push_back(t);
     }
 
-    /// Releases every held buffer (the compositor is going away) and drops what is queued.
+    /// Releases every held buffer (the compositor is going away) and drops what is queued. The presenter is going away too: what it still draws is released with the rest, not at its paint.
     pub fn shutdown(&mut self) -> Vec<ClientCall> {
         self.queues.clear();
+        let mut calls = self.painted();
+        for l in self.layers.values_mut() {
+            if let Some(h) = l.held.as_mut() {
+                h.presented = false;
+            }
+        }
         let keys: Vec<BinderKey> = self.layers.keys().copied().collect();
-        keys.into_iter()
-            .flat_map(|k| self.destroy_layer(k))
-            .collect()
+        for k in keys {
+            calls.extend(self.destroy_layer(k));
+        }
+        calls
     }
 
-    /// The release of `held` with no fence yet: the window's read fence is attached when it paints ([`attach_read_fences`]).
-    fn release_of(&self, held: &Held) -> ReleaseBuffer {
+    /// The release of `held` with `fence`: a retired buffer's read fence is attached when the window paints ([`attach_read_fences`]).
+    fn release_of(&self, held: &Held, fence: Fence) -> ReleaseBuffer {
         ReleaseBuffer {
             callback_id: held.id(),
-            release_fence: Fence(None),
+            release_fence: fence,
             current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
         }
     }
 
-    fn release(&mut self, held: &Held, channel: Option<FdObject>, calls: &mut Vec<ClientCall>) {
+    fn release(
+        &mut self,
+        held: &Held,
+        channel: Option<FdObject>,
+        fence: Fence,
+        calls: &mut Vec<ClientCall>,
+    ) {
         self.counters.buffers_released += 1;
-        let release = self.release_of(held);
+        let release = self.release_of(held, fence);
         if let Some(channel) = channel {
             calls.push(ClientCall::ReleaseOnChannel { channel, release });
         } else if !held.release_listener.is_null() {
@@ -881,8 +949,6 @@ impl Compositor {
         calls: &mut Vec<ClientCall>,
     ) -> BufferChange {
         let channel = self.layers.get(&key).and_then(|l| l.release_channel);
-        // a buffer latched earlier in this tick was never shown: its release is standalone (AOSP's dropped-buffer path, Layer::releasePreviousBuffer)
-        let shown = self.layers.get(&key).is_some_and(|l| !l.latched_this_frame);
         let previous = self.layers.get_mut(&key).and_then(|l| l.held.take());
         let previous_frame = previous.as_ref().map_or(0, |h| h.frame_number);
         let mut new_frame = 0;
@@ -916,6 +982,7 @@ impl Compositor {
                         acquire_fence: bd.acquire_fence.as_ref().and_then(SceneFd::of_fence),
                         release_listener: bd.release_buffer_listener,
                         release_endpoint: bd.release_buffer_endpoint,
+                        presented: false,
                     });
                 }
                 None if cached => {
@@ -931,19 +998,22 @@ impl Compositor {
         }
         let mut carried = None;
         if let Some(p) = previous {
-            if shown && carries_release(listeners, &p.release_endpoint) {
-                // SurfaceFlinger sends a shown buffer's release with the completion of the transaction that replaced it, and writes the channel before any completion of the tick (TransactionCallbackInvoker.cpp:137-161, 170-180)
-                self.counters.buffers_released += 1;
-                self.counters.releases_carried += 1;
-                if let Some(channel) = channel {
-                    calls.push(ClientCall::ReleaseOnChannel {
-                        channel,
-                        release: self.release_of(&p),
-                    });
+            if p.presented {
+                // the presenter may still draw it: the release goes at its paint (`painted`). SurfaceFlinger sends a shown buffer's release with the completion of the transaction that replaced it (TransactionCallbackInvoker.cpp:137-161, 170-180)
+                self.counters.releases_held += 1;
+                if carries_release(listeners, &p.release_endpoint) {
+                    carried = Some((p.id(), p.release_endpoint));
                 }
-                carried = Some((p.id(), p.release_endpoint));
+                self.retired.push(Retired {
+                    layer: key,
+                    held: p,
+                    channel,
+                    carried: carried.is_some(),
+                });
             } else {
-                self.release(&p, channel, calls);
+                // never shown (replaced in the tick it was latched, or outside the scene): released now with its acquire fence (AOSP's dropped-buffer path, Layer.cpp:852-871)
+                let fence = acquire_fence_of(&p);
+                self.release(&p, channel, fence, calls);
             }
         }
         BufferChange {
@@ -954,8 +1024,7 @@ impl Compositor {
     }
 
     fn complete(&mut self, applied: Vec<Applied>, now_ns: i64, calls: &mut Vec<ClientCall>) {
-        // one ListenerStats per listener, one TransactionStats per applied transaction that registered callbacks with it
-        let mut per_listener: Vec<(StrongBinder, ListenerStats)> = Vec::new();
+        // one TransactionStats per applied transaction and listener that registered callbacks with it; they are grouped per listener when they go out (`flush_completions`)
         for a in &applied {
             let mut listeners: Vec<StrongBinder> = Vec::new();
             for lc in a
@@ -1008,21 +1077,111 @@ impl Compositor {
                             .map_or(NO_RELEASE_CALLBACK, |(id, _)| *id),
                     })
                     .collect();
-                let ts = TransactionStats {
+                let gates: Vec<(BinderKey, u64)> = a
+                    .layers
+                    .iter()
+                    .filter(|l| {
+                        l.frame_number > 0 && l.listeners.iter().any(|lc| lc.listener.key() == key)
+                    })
+                    .filter_map(|l| l.handle.key().map(|k| (k, l.frame_number)))
+                    .collect();
+                let stats = TransactionStats {
                     callback_ids: ids,
                     latch_time: now_ns,
                     present_fence: None,
                     surface_stats,
                 };
-                match per_listener.iter_mut().find(|(l, _)| l.key() == key) {
-                    Some((_, stats)) => stats.transaction_stats.push(ts),
-                    None => per_listener.push((
-                        listener,
-                        ListenerStats {
-                            transaction_stats: vec![ts],
-                        },
-                    )),
+                if self.gated(&gates) {
+                    self.counters.completions_held += 1;
                 }
+                self.pending.push(Pending {
+                    listener,
+                    stats,
+                    gates,
+                });
+            }
+        }
+        self.flush_completions(calls);
+    }
+
+    /// The presenter took `scene`, the one the last tick returned, and shows it until its next paint. Each layer's buffer is presented while the scene shows it: replacing a presented buffer, the core
+    /// waits for the paint, while one the scene does not show is released at once. Called once per taken scene, on the thread that ticks (the window's frame clock in UI mode).
+    pub fn scene_taken(&mut self, scene: &Scene) {
+        let shown: BTreeSet<u64> = scene
+            .quads
+            .iter()
+            .filter_map(Quad::buffer)
+            .map(|b| b.buffer.id)
+            .collect();
+        for l in self.layers.values_mut() {
+            if let Some(h) = l.held.as_mut() {
+                h.presented = shown.contains(&h.buffer.id);
+            }
+        }
+    }
+
+    /// The presenter painted, and the buffers it had replaced or destroyed are no longer drawn: each is released now, with a release its completion carries going in the channel write before that
+    /// completion, then the completions they held back follow. The caller attaches the read fences the paint exported ([`attach_read_fences`]). Called once per paint, after its scene was taken.
+    pub fn painted(&mut self) -> Vec<ClientCall> {
+        let mut calls = Vec::new();
+        for r in std::mem::take(&mut self.retired) {
+            if r.carried {
+                self.counters.buffers_released += 1;
+                self.counters.releases_carried += 1;
+                if let Some(channel) = r.channel {
+                    calls.push(ClientCall::ReleaseOnChannel {
+                        channel,
+                        release: self.release_of(&r.held, Fence(None)),
+                    });
+                }
+            } else {
+                self.release(&r.held, r.channel, Fence(None), &mut calls);
+            }
+        }
+        self.flush_completions(&mut calls);
+        calls
+    }
+
+    /// Whether a completion naming `gates` must wait: a buffer older than one of its frames is still held by the presenter.
+    fn gated(&self, gates: &[(BinderKey, u64)]) -> bool {
+        self.retired.iter().any(|r| {
+            gates
+                .iter()
+                .any(|(layer, frame)| *layer == r.layer && r.held.frame_number < *frame)
+        })
+    }
+
+    /// Sends the pending completions whose gates are open. A completion waits behind an earlier one of its listener that still waits, so each listener's order is kept; the listeners are independent.
+    fn flush_completions(&mut self, calls: &mut Vec<ClientCall>) {
+        let mut blocked: Vec<BinderKey> = Vec::new();
+        let mut ready: Vec<(StrongBinder, TransactionStats)> = Vec::new();
+        let mut kept = Vec::new();
+        for p in std::mem::take(&mut self.pending) {
+            let listener = p
+                .listener
+                .key()
+                .expect("a pending completion has a listener");
+            if !blocked.contains(&listener) && !self.gated(&p.gates) {
+                ready.push((p.listener, p.stats));
+            } else {
+                blocked.push(listener);
+                kept.push(p);
+            }
+        }
+        self.pending = kept;
+        let mut per_listener: Vec<(StrongBinder, ListenerStats)> = Vec::new();
+        for (listener, ts) in ready {
+            match per_listener
+                .iter_mut()
+                .find(|(l, _)| l.key() == listener.key())
+            {
+                Some((_, stats)) => stats.transaction_stats.push(ts),
+                None => per_listener.push((
+                    listener,
+                    ListenerStats {
+                        transaction_stats: vec![ts],
+                    },
+                )),
             }
         }
         for (listener, stats) in per_listener {

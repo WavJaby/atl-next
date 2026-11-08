@@ -250,6 +250,7 @@ fn release_goes_to_the_channel_with_the_replaced_buffers_id() {
 }
 
 /// AOSP: a shown buffer's release rides the completion of the transaction that replaced it (`previousReleaseCallbackId`), and no `onReleaseBuffer` call is made for it (Layer.cpp:1270-1271, 826-831; TransactionCallbackInvoker.cpp:137-145).
+/// The presenter takes the scene that shows 201 and draws it until its paint, so the completion waits for that paint and goes with the release then.
 #[test]
 fn release_without_a_channel_rides_the_completion() {
     let layer = local(1);
@@ -259,20 +260,27 @@ fn release_without_a_channel_rides_the_completion() {
     c.queue_transaction(tx(vec![buffer_state(
         &layer, &listener, 201, 1, 8, 8, false, 1,
     )]));
-    c.on_frame(10);
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
     c.queue_transaction(tx(vec![buffer_state(
         &layer, &listener, 202, 2, 8, 8, false, 2,
     )]));
     let out = c.on_frame(20);
     assert!(
-        !out.calls
-            .iter()
-            .any(|c| matches!(c, ClientCall::ReleaseBuffer { .. })),
-        "no onReleaseBuffer for a shown buffer: {:?}",
+        out.calls.is_empty(),
+        "nothing goes before the paint: {:?}",
         out.calls
     );
-    let [ClientCall::TransactionCompleted { stats, .. }] = out.calls.as_slice() else {
-        panic!("expected one completion, got {:?}", out.calls)
+    assert_eq!(c.counters().releases_held, 1);
+    let paint = c.painted();
+    assert!(
+        !paint
+            .iter()
+            .any(|c| matches!(c, ClientCall::ReleaseBuffer { .. })),
+        "no onReleaseBuffer for a shown buffer: {paint:?}"
+    );
+    let [ClientCall::TransactionCompleted { stats, .. }] = paint.as_slice() else {
+        panic!("expected one completion, got {paint:?}")
     };
     let ss = &stats.transaction_stats[0].surface_stats[0];
     assert_eq!(
@@ -285,7 +293,7 @@ fn release_without_a_channel_rides_the_completion() {
     assert_eq!(c.counters().releases_carried, 1);
 }
 
-/// AOSP order within one tick: the replaced buffer's channel write comes first (TransactionCallbackInvoker::sendCallbacks writes `mBufferReleases` before any completion), then the completion of the transaction that replaced it, which carries that release and the new frame number.
+/// AOSP order within one paint: the replaced buffer's channel write comes first (TransactionCallbackInvoker::sendCallbacks writes `mBufferReleases` before any completion), then the completion of the transaction that replaced it, which carries that release and the new frame number.
 #[test]
 fn replaced_buffer_is_released_with_its_completion_after_its_channel_write() {
     let layer = local(1);
@@ -305,19 +313,23 @@ fn replaced_buffer_is_released_with_its_completion_after_its_channel_write() {
         NO_RELEASE_CALLBACK,
         "nothing was replaced by the first buffer"
     );
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
     c.queue_transaction(tx(vec![buffer_state(
         &layer, &listener, 202, 2, 8, 8, false, 2,
     )]));
     let out = c.on_frame(20);
+    assert!(
+        out.calls.is_empty(),
+        "held until the paint: {:?}",
+        out.calls
+    );
+    let paint = c.painted();
     let [
         ClientCall::ReleaseOnChannel { channel, release },
         ClientCall::TransactionCompleted { stats, .. },
-    ] = out.calls.as_slice()
+    ] = paint.as_slice()
     else {
-        panic!(
-            "expected channel release then completion, got {:?}",
-            out.calls
-        )
+        panic!("expected channel release then completion, got {paint:?}")
     };
     assert_eq!(channel.fd, 90);
     assert_eq!(
@@ -355,7 +367,9 @@ fn bbq_accounting_never_fakes_a_release() {
     // buffers as (buffer id, frame number): ReleaseCallbackId is not Ord
     let mut submitted: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut unread: VecDeque<(u64, u64)> = VecDeque::new(); // channel datagrams BBQ has not read
+    let mut drawn: BTreeSet<(u64, u64)> = BTreeSet::new(); // what the window draws: the last taken scene, until its paint
     let mut fakes = 0u64;
+    let mut early = 0u64;
     for frame in 1..=25u64 {
         while submitted.len() as u64 >= limit {
             let id = unread
@@ -378,39 +392,82 @@ fn bbq_accounting_never_fakes_a_release() {
             frame as i64,
         )]));
         let out = c.on_frame(frame as i64 * 16);
-        for call in &out.calls {
-            match call {
-                ClientCall::ReleaseOnChannel { release, .. } => {
-                    let r = release.callback_id;
-                    unread.push_back((r.buffer_id, r.frame_number));
-                }
-                ClientCall::ReleaseBuffer { release, .. } => {
-                    let r = release.callback_id;
-                    submitted.remove(&(r.buffer_id, r.frame_number));
-                }
-                ClientCall::TransactionCompleted { stats, .. } => {
-                    for ts in &stats.transaction_stats {
-                        for ss in &ts.surface_stats {
-                            let carried = ss.previous_release_callback_id;
-                            if carried != NO_RELEASE_CALLBACK {
-                                submitted.remove(&(carried.buffer_id, carried.frame_number));
-                            }
-                            let sweep: Vec<(u64, u64)> = submitted
-                                .iter()
-                                .filter(|(_, frame)| *frame < ss.event_stats.frame_number)
-                                .copied()
-                                .collect();
-                            fakes += sweep.len() as u64;
-                            for k in sweep {
-                                submitted.remove(&k);
-                            }
+        bbq_consume(
+            &out.calls,
+            &mut submitted,
+            &mut unread,
+            &drawn,
+            &mut fakes,
+            &mut early,
+        );
+        // the presenter takes the scene and paints it: the buffer it replaced stops being drawn at that paint
+        if let Some(scene) = &out.scene {
+            c.scene_taken(scene);
+            drawn.insert((buffer_id, frame));
+        }
+        let paint = c.painted();
+        drawn.retain(|k| *k == (buffer_id, frame));
+        bbq_consume(
+            &paint,
+            &mut submitted,
+            &mut unread,
+            &drawn,
+            &mut fakes,
+            &mut early,
+        );
+    }
+    assert_eq!(fakes, 0, "completions faked {fakes} releases");
+    assert_eq!(
+        early, 0,
+        "{early} releases of a buffer the window still draws"
+    );
+}
+
+/// One batch of calls as BBQ takes them: a release removes what it submitted, a channel release queues for BBQ to read, and a completion takes its carried release first, then fakes every older buffer
+/// still submitted. `drawn` is what the window still draws: a release of one of those is counted in `early`, the case a carried release hits when a completion goes before the paint.
+fn bbq_consume(
+    calls: &[ClientCall],
+    submitted: &mut BTreeSet<(u64, u64)>,
+    unread: &mut VecDeque<(u64, u64)>,
+    drawn: &BTreeSet<(u64, u64)>,
+    fakes: &mut u64,
+    early: &mut u64,
+) {
+    for call in calls {
+        match call {
+            ClientCall::ReleaseOnChannel { release, .. } => {
+                let r = release.callback_id;
+                *early += u64::from(drawn.contains(&(r.buffer_id, r.frame_number)));
+                unread.push_back((r.buffer_id, r.frame_number));
+            }
+            ClientCall::ReleaseBuffer { release, .. } => {
+                let r = release.callback_id;
+                *early += u64::from(drawn.contains(&(r.buffer_id, r.frame_number)));
+                submitted.remove(&(r.buffer_id, r.frame_number));
+            }
+            ClientCall::TransactionCompleted { stats, .. } => {
+                for ts in &stats.transaction_stats {
+                    for ss in &ts.surface_stats {
+                        let carried = ss.previous_release_callback_id;
+                        if carried != NO_RELEASE_CALLBACK {
+                            let k = (carried.buffer_id, carried.frame_number);
+                            *early += u64::from(drawn.contains(&k));
+                            submitted.remove(&k);
+                        }
+                        let sweep: Vec<(u64, u64)> = submitted
+                            .iter()
+                            .filter(|(_, frame)| *frame < ss.event_stats.frame_number)
+                            .copied()
+                            .collect();
+                        *fakes += sweep.len() as u64;
+                        for k in sweep {
+                            submitted.remove(&k);
                         }
                     }
                 }
             }
         }
     }
-    assert_eq!(fakes, 0, "completions faked {fakes} releases");
 }
 
 /// Standalone releases still reach the producer (dropped, cache-miss, destroyed layers): a buffer latched and replaced within one tick was never shown, so its release is not carried.
@@ -1229,7 +1286,8 @@ fn unsignalled_acquire_fence_waits_and_keeps_the_shown_buffer() {
     c.queue_transaction(tx(vec![buffer_state(
         &layer, &listener, 401, 1, 8, 8, false, 1,
     )]));
-    c.on_frame(10);
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
     let mut fenced = buffer_state(&layer, &listener, 402, 2, 8, 8, false, 2);
     if let Some(bd) = fenced.buffer_data.as_mut() {
         bd.acquire_fence = Some(Fence(Some(FdObject {
@@ -1249,17 +1307,330 @@ fn unsignalled_acquire_fence_waits_and_keeps_the_shown_buffer() {
     assert_eq!(c.counters().fence_waits, 2);
     FENCE_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
     let out = c.on_frame(40);
-    assert_eq!(
-        out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
-        2
-    );
+    let scene = out.scene.as_ref().expect("a scene");
+    assert_eq!(scene.quads[0].buffer().unwrap().frame_number, 2);
+    // 401 is still drawn until the paint of the scene that shows 402: the completion waits for it
+    assert!(out.calls.is_empty(), "{:?}", out.calls);
+    c.scene_taken(scene);
+    let paint = c.painted();
     // no channel on this layer: the release rides the completion of the transaction that latched 402
-    assert!(releases(&out.calls).is_empty());
+    assert!(releases(&paint).is_empty());
     assert_eq!(
-        carried_releases(&out.calls),
+        carried_releases(&paint),
         [ReleaseCallbackId {
             buffer_id: 401,
             frame_number: 1
         }]
     );
+}
+
+fn with_acquire_fence(mut s: LayerState, fd: i32) -> LayerState {
+    if let Some(bd) = s.buffer_data.as_mut() {
+        bd.acquire_fence = Some(Fence(Some(FdObject::new(fd, false))));
+    }
+    s
+}
+
+/// The presenter's side of BBQ's contract: `held` (buffer id -> frame) is what the presenter still draws, which ends only at its paint. No completion may name a frame while an older buffer is held: BBQ's
+/// sweep would fake that release (BLASTBufferQueue.cpp:415-427), and a completion's carried release would hand a buffer back while the window draws it. `completed` counts the completion stats seen.
+fn check_held(calls: &[ClientCall], held: &BTreeMap<u64, u64>, completed: &mut u64) {
+    for call in calls {
+        if let ClientCall::TransactionCompleted { stats, .. } = call {
+            for ss in stats
+                .transaction_stats
+                .iter()
+                .flat_map(|t| &t.surface_stats)
+            {
+                let frame = ss.event_stats.frame_number;
+                let older: Vec<u64> = held.values().copied().filter(|f| *f < frame).collect();
+                assert!(
+                    older.is_empty(),
+                    "completion for frame {frame} while older frames {older:?} are held"
+                );
+                *completed += 1;
+            }
+        }
+    }
+}
+
+/// AOSP `Layer::releasePreviousBuffer` (Layer.cpp:852-871): a buffer the presenter never took is released when the next buffer latches, through the layer's channel, with its acquire fence as the release
+/// fence (`mDrawingState.acquireFence`). Its completion carries no release: nothing of BBQ's is still drawn.
+#[test]
+fn untaken_buffer_is_released_at_the_next_latch_with_its_acquire_fence() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![with_acquire_fence(
+        buffer_state(&layer, &listener, 201, 1, 8, 8, false, 1),
+        55,
+    )]));
+    c.on_frame(10); // no scene taken: the presenter never shows 201
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    let out = c.on_frame(20);
+    let [
+        ClientCall::ReleaseOnChannel { channel, release },
+        ClientCall::TransactionCompleted { stats, .. },
+    ] = out.calls.as_slice()
+    else {
+        panic!(
+            "expected a channel release then a completion, got {:?}",
+            out.calls
+        )
+    };
+    assert_eq!(channel.fd, 90);
+    assert_eq!(
+        release.callback_id,
+        ReleaseCallbackId {
+            buffer_id: 201,
+            frame_number: 1
+        }
+    );
+    assert_eq!(release.release_fence.0.map(|f| f.fd), Some(55));
+    assert_eq!(
+        stats.transaction_stats[0].surface_stats[0].previous_release_callback_id,
+        NO_RELEASE_CALLBACK
+    );
+    assert_eq!(c.counters().releases_held, 0);
+}
+
+/// The window exports a read fence for each buffer it stops drawing, at its paint (window.rs:101-142). A presented buffer's release goes at that paint with the fence, and so does the copy the
+/// completion that replaced it carries (TransactionCallbackInvoker.cpp:137-161): one fence, both places.
+#[test]
+fn presented_buffer_is_released_at_the_paint_with_its_read_fence() {
+    use std::os::fd::AsRawFd;
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    let out = c.on_frame(20);
+    assert!(
+        out.calls.is_empty(),
+        "nothing goes before the paint: {:?}",
+        out.calls
+    );
+    let (read_fence, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let fd = read_fence.as_raw_fd();
+    let mut fences = HashMap::from([(201u64, OwnedFd::from(read_fence))]);
+    let mut paint = c.painted();
+    let held = attach_read_fences(&mut paint, &mut fences);
+    let [
+        ClientCall::ReleaseOnChannel { release, .. },
+        ClientCall::TransactionCompleted { stats, .. },
+    ] = paint.as_slice()
+    else {
+        panic!("expected channel release then completion, got {paint:?}")
+    };
+    assert_eq!(release.release_fence.0.map(|f| f.fd), Some(fd));
+    let ss = &stats.transaction_stats[0].surface_stats[0];
+    assert_eq!(
+        ss.previous_release_fence
+            .as_ref()
+            .and_then(|f| f.0.map(|x| x.fd)),
+        Some(fd)
+    );
+    assert!(fences.is_empty(), "the fence is taken once, for both");
+    assert_eq!(held.len(), 1);
+}
+
+/// The completion rule over a scripted six-frame run: frame f shows buffer 200 + f, and each replaced buffer is released at the paint after its replacement. Expected: six completions, each after the
+/// release of the frame before it; the last frame stays held (on screen).
+#[test]
+fn no_completion_passes_an_older_buffer_the_presenter_still_holds() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![
+        flags_state(
+            &layer,
+            layer_flags::ENABLE_BACKPRESSURE,
+            layer_flags::ENABLE_BACKPRESSURE,
+        ),
+        channel_state(&layer, 90),
+    ]));
+    c.on_frame(1);
+    let mut held: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut completed = 0u64;
+    for frame in 1..=6u64 {
+        let id = 200 + frame;
+        c.queue_transaction(tx(vec![buffer_state(
+            &layer,
+            &listener,
+            id,
+            frame,
+            64,
+            48,
+            false,
+            frame as i64,
+        )]));
+        let out = c.on_frame(frame as i64 * 16);
+        check_held(&out.calls, &held, &mut completed);
+        if let Some(scene) = &out.scene {
+            c.scene_taken(scene);
+            held.insert(id, frame);
+        }
+        // the paint ends the reads of every buffer the scene it drew no longer shows
+        let paint = c.painted();
+        held.retain(|buffer, _| *buffer == id);
+        check_held(&paint, &held, &mut completed);
+    }
+    assert_eq!(completed, 6);
+    assert_eq!(held.keys().copied().collect::<Vec<_>>(), [206]);
+}
+
+/// A release is never held behind a completion, which takes only what it names. A buffer no scene took is released in its own tick, while an older completion on another layer waits for the paint.
+#[test]
+fn a_release_is_not_held_behind_a_waiting_completion() {
+    let (shown, dropped) = (local(1), local(3));
+    let (listener_shown, listener_dropped) = (local(2), local(4));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(shown, 7, None)).unwrap();
+    c.create_layer(spec(dropped, 8, None)).unwrap();
+    c.queue_transaction(tx(vec![
+        channel_state(&shown, 90),
+        channel_state(&dropped, 91),
+    ]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &shown,
+        &listener_shown,
+        301,
+        1,
+        8,
+        8,
+        false,
+        1,
+    )]));
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
+    // the shown layer replaces 301 (held until the paint); the other layer latches 401 and replaces it in the same tick, so no scene shows it
+    c.queue_transaction(tx(vec![buffer_state(
+        &shown,
+        &listener_shown,
+        302,
+        2,
+        8,
+        8,
+        false,
+        2,
+    )]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &dropped,
+        &listener_dropped,
+        401,
+        1,
+        8,
+        8,
+        false,
+        1,
+    )]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &dropped,
+        &listener_dropped,
+        402,
+        2,
+        8,
+        8,
+        false,
+        2,
+    )]));
+    let out = c.on_frame(20);
+    assert!(
+        out.calls.iter().any(|c| matches!(
+            c,
+            ClientCall::ReleaseOnChannel { release, .. } if release.callback_id.buffer_id == 401
+        )),
+        "401 is released in its tick: {:?}",
+        out.calls
+    );
+    assert!(
+        !out.calls.iter().any(|c| matches!(
+            c,
+            ClientCall::TransactionCompleted { listener, .. } if listener.key() == listener_shown.key()
+        )),
+        "the shown layer's completion waits for its paint: {:?}",
+        out.calls
+    );
+    let paint = c.painted();
+    assert!(paint.iter().any(|c| matches!(
+        c,
+        ClientCall::ReleaseOnChannel { release, .. } if release.callback_id.buffer_id == 301
+    )));
+    assert!(paint.iter().any(|c| matches!(
+        c,
+        ClientCall::TransactionCompleted { listener, .. } if listener.key() == listener_shown.key()
+    )));
+}
+
+/// A layer destroyed while the presenter draws its buffer releases that buffer at the paint: the window still shows it until then.
+#[test]
+fn destroyed_presented_buffer_is_released_at_the_paint() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
+    let end = c.destroy_layer(key(&layer));
+    assert!(releases(&end).is_empty(), "held: {end:?}");
+    let paint = c.painted();
+    assert_eq!(
+        releases(&paint),
+        [ReleaseCallbackId {
+            buffer_id: 201,
+            frame_number: 1
+        }]
+    );
+    assert_eq!(c.counters().releases_held, 1);
+}
+
+/// A scene that no longer shows a layer's buffer does not hold it: the window does not draw it, so replacing it releases it at once.
+#[test]
+fn buffer_the_scene_hides_is_released_at_once() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    let first = c.on_frame(10);
+    c.scene_taken(first.scene.as_ref().expect("a scene"));
+    c.queue_transaction(tx(vec![flags_state(
+        &layer,
+        layer_flags::HIDDEN,
+        layer_flags::HIDDEN,
+    )]));
+    let hidden = c.on_frame(20);
+    c.scene_taken(hidden.scene.as_ref().expect("a scene"));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    let out = c.on_frame(30);
+    assert!(
+        out.calls.iter().any(|c| matches!(
+            c,
+            ClientCall::ReleaseOnChannel { release, .. } if release.callback_id.buffer_id == 201
+        )),
+        "201 is not drawn any more: {:?}",
+        out.calls
+    );
+    assert_eq!(c.counters().releases_held, 0);
 }
