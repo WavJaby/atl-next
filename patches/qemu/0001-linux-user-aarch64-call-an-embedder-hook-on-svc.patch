@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 8 Nov 2026 20:22:26 +0800
+Subject: [PATCH] linux-user: aarch64: call an embedder hook on svc
+
+The engine needs each svc before the syscall path. cpu_loop has no seam
+for that, and a Rust cpu_exec dispatch would copy its cases. The weak
+default returns -1, so an unhooked executable runs the upstream path.
+
+Upstream-Status: Pending
+Patch-Reason: cpu_loop has no seam where an embedder sees EXCP_SWI; a Rust copy of its dispatch would be a second copy to maintain
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ include/user/cpu_loop.h       |  9 ++++++++-
+ linux-user/aarch64/cpu_loop.c | 18 ++++++++++++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/include/user/cpu_loop.h b/include/user/cpu_loop.h
+index c9d49398f01791aab53bc5bc202b98aafb6fa57c..d2d9755d23812f75ed47cb4864951677c35e8915 100644
+--- a/include/user/cpu_loop.h
++++ b/include/user/cpu_loop.h
+@@ -75,7 +75,14 @@ G_NORETURN void cpu_loop_exit_sigbus(CPUState *cpu, vaddr addr,
+                                      MMUAccessType access_type,
+                                      uintptr_t ra);
+ 
+-G_NORETURN void cpu_loop(CPUArchState *env);
++void cpu_loop(CPUArchState *env);
++
++/*
++ * ATL P1: the embedder sees each svc before the syscall path.
++ * Return <0: not taken, the syscall runs; 0: handled, resume at env->pc
++ * with x0 set by the hook; 1: leave cpu_loop (nested call finished).
++ */
++int atl_svc_hook(CPUArchState *env, uint32_t imm);
+ 
+ void target_exception_dump(CPUArchState *env, const char *fmt, int code);
+ #define EXCP_DUMP(env, fmt, code) \
+diff --git a/linux-user/aarch64/cpu_loop.c b/linux-user/aarch64/cpu_loop.c
+index e7f643d69d5617bd94223fe2a0df630bf40778b7..f7465d6799bca330a1f27e803714640f8a516bb7 100644
+--- a/linux-user/aarch64/cpu_loop.c
++++ b/linux-user/aarch64/cpu_loop.c
+@@ -153,6 +153,16 @@ static void signal_for_exception(CPUARMState *env, vaddr addr)
+     force_sig_fault(si_signo, si_code, addr);
+ }
+ 
++/*
++ * ATL P1 default: no embedder, every svc is a syscall. A strong definition
++ * in the embedder replaces this at link time, so the patched executable
++ * behaves as upstream.
++ */
++int __attribute__((weak)) atl_svc_hook(CPUARMState *env, uint32_t imm)
++{
++    return -1;
++}
++
+ /* AArch64 main loop */
+ void cpu_loop(CPUARMState *env)
+ {
+@@ -168,6 +178,14 @@ void cpu_loop(CPUARMState *env)
+ 
+         switch (trapnr) {
+         case EXCP_SWI:
++            /* ATL P1: see atl_svc_hook() in include/user/cpu_loop.h. */
++            ret = atl_svc_hook(env, env->exception.syndrome & 0xffff);
++            if (ret == 0) {
++                break;
++            }
++            if (ret == 1) {
++                return;
++            }
+             /* On syscall, PSTATE.ZA is preserved, PSTATE.SM is cleared. */
+             aarch64_set_svcr(env, 0, R_SVCR_SM_MASK);
+             ret = do_syscall(env,

@@ -54,7 +54,7 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let b = qemu::plan(root, &args.arch, args.out.as_deref())?;
+    let b = qemu::plan(root, &args.arch, args.out.as_deref(), false)?;
     let exe = qemu::execute(root, &b)?;
     let gate = b.dir.join("gate");
     std::fs::create_dir_all(&gate).with_context(|| format!("creating {}", gate.display()))?;

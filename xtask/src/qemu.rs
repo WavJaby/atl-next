@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! `xtask qemu`: the pinned QEMU's user-mode executable for one guest arch, built with no patch (QEMU bridge plan Q1).
 //!
-//! Source: the shared `src/qemu` checkout at the sources.toml `[qemu]` pin. HEAD must be the pin and the tree clean.
+//! Source: the QEMU checkout (`patch::preflight`: the sources.toml `[qemu]` pin + patches/qemu, clean; a task copy when one exists).
 //! Build: QEMU's own `configure` (meson underneath) into `<out>/qemu/<target>-linux-user/build`, then ninja for `qemu-<target>` alone.
+//! `--pic`: the same build with `-fPIC` into `<target>-linux-user-pic`, the objects the spike library links (qemu-spike).
 //! Compilers: the `clang` deps row as host compiler (the converter's toolchain, as BoringSSL's recipe); the NDK clang wrapper of the arch's triple as guest compiler for `tests/tcg` (qemu_gate.rs). One build dir serves both gates.
 //! Traps: configure's default download fetches PyPI wheels into `src/qemu/python/wheels` and meson wraps into `src/qemu/subprojects/`, both git-ignored, so the checkout stays clean. `--disable-download` is refused unless `subprojects/keycodemapdb` exists, which the pin does not check out.
 //! A changed configuration wipes the build dir (stamp `configure.args`); an interrupted configure leaves no stamp, so the next run starts over.
@@ -19,6 +20,7 @@ use crate::build_pool;
 use crate::deps;
 use crate::git::git;
 use crate::jni_fixture::{self, NdkTarget};
+use crate::patch;
 use crate::slot;
 use crate::sources;
 use crate::verdict::Verdict;
@@ -42,6 +44,9 @@ pub struct Args {
     /// Out dir (default: this checkout's slot, see `xtask slot`; else <workspace>/out).
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// The `-fPIC` variant (`<target>-linux-user-pic`) the spike library links, not the executable the gates run.
+    #[arg(long)]
+    pub pic: bool,
     /// Configure and build. Without it: print the plan and build nothing.
     #[arg(long)]
     pub execute: bool,
@@ -53,7 +58,9 @@ pub struct Build {
     pub arch: String,
     /// The `qemu_target` column (`aarch64`); QEMU's target is `<target>-linux-user`.
     pub target: String,
-    /// `<out>/qemu/<target>-linux-user`.
+    /// Whether this is the `-fPIC` variant (`--pic`).
+    pub pic: bool,
+    /// `<out>/qemu/<target>-linux-user`, or `-pic` for the PIC variant.
     pub dir: PathBuf,
     /// The pinned checkout.
     pub src: PathBuf,
@@ -91,7 +98,7 @@ impl Build {
     /// QEMU configure arguments: one linux-user target, no system emulation, no docs, no tools (meson option `tools`).
     /// `--cross-cc-<target>` is what `tests/tcg` builds its guest programs with. Its `-static` flag: the programs run with no dynamic loader.
     pub fn configure_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             format!("--target-list={}", self.name()),
             "--disable-system".to_owned(),
             "--enable-linux-user".to_owned(),
@@ -100,12 +107,17 @@ impl Build {
             format!("--cc={}", self.cc),
             format!("--cross-cc-{}={}", self.target, self.guest_cc.display()),
             format!("--cross-cc-cflags-{}=-static", self.target),
-        ]
+        ];
+        if self.pic {
+            // After meson's -fPIE (b_pie=true): clang keeps the later flag. A shared object needs PIC: TPOFF32 on current_cpu otherwise.
+            args.push("--extra-cflags=-fPIC".to_owned());
+        }
+        args
     }
 }
 
 /// The build of `arch` into `out` (default: this checkout's slot). Reads only: the pin, the NDK and the deps rows, then the out dir (which takes the slot lock, as every build does).
-pub fn plan(root: &Path, arch: &str, out: Option<&Path>) -> Result<Build> {
+pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Build> {
     let arches = arches::load(root)?;
     let target = arches::qemu_target(&arches, arch)?.to_owned();
     let (src, version) = pinned(root)?;
@@ -120,10 +132,14 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>) -> Result<Build> {
         ndk.display()
     );
     let out = slot::out_dir(root, out, "--out", |ws| ws.join("out"))?;
+    let suffix = if pic { "-pic" } else { "" };
     Ok(Build {
         arch: arch.to_owned(),
-        dir: out.join(DIR).join(format!("{target}-linux-user")),
+        dir: out
+            .join(DIR)
+            .join(format!("{target}-linux-user{suffix}")),
         target,
+        pic,
         src,
         version,
         guest_cc,
@@ -132,7 +148,7 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>) -> Result<Build> {
     })
 }
 
-/// The checkout at the sources.toml pin, clean, and the pin's version.
+/// The checkout as `patch::preflight` allows it (pin + patches/qemu, clean), and the pin's version.
 fn pinned(root: &Path) -> Result<(PathBuf, String)> {
     let sources = sources::load(root)?;
     let pin = sources
@@ -147,25 +163,13 @@ fn pinned(root: &Path) -> Result<(PathBuf, String)> {
         .strip_prefix('v')
         .with_context(|| format!("tag {tag} has no `v` prefix"))?;
     let src = Layout::of(root)?.locate(Path::new(UPSTREAM)).dir;
-    let head = git(Some(&src), &["rev-parse", "HEAD^{commit}"]).with_context(|| {
+    git(Some(&src), &["rev-parse", "HEAD^{commit}"]).with_context(|| {
         format!(
             "{}: not fetched (`cargo xtask fetch --execute`)",
             src.display()
         )
     })?;
-    ensure!(
-        head == pin.commit,
-        "{}: HEAD {head} is not the {} pin {}",
-        src.display(),
-        sources::FILE,
-        pin.commit
-    );
-    let dirty = git(Some(&src), &["status", "--porcelain"])?;
-    ensure!(
-        dirty.is_empty(),
-        "{}: uncommitted or untracked files:\n{dirty}",
-        src.display()
-    );
+    patch::preflight(root, [UPSTREAM])?;
     Ok((src, version.to_owned()))
 }
 
@@ -274,7 +278,7 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let b = plan(root, &args.arch, args.out.as_deref())?;
+    let b = plan(root, &args.arch, args.out.as_deref(), args.pic)?;
     if !args.execute {
         println!(
             "qemu: plan for {} (dry run; `--execute` configures and builds)",
@@ -318,6 +322,7 @@ mod tests {
         Build {
             arch: "arm64".to_owned(),
             target: target.to_owned(),
+            pic: false,
             dir: PathBuf::from("/out/qemu/aarch64-linux-user"),
             src: PathBuf::from("/src/qemu"),
             version: "11.1.3".to_owned(),
