@@ -3,9 +3,9 @@
 //! Loads the driver as AOSP's Loader.cpp does (`initialize_api`: each egl* by dlsym, else the driver's eglGetProcAddress; each gl* the same, and the driver must export no gl* name) and calls it as libEGL's fronts would after their own window setup.
 //! The window is this probe's: [`EDGE`]-square RGBA_8888 gralloc buffers (gralloc's GBM backend, LINEAR, pre-filled with [`POISON`]) behind window.h's hooks, recording the transform and fence of each queue.
 //! Per frame, as hwui draws: bind framebuffer 0 and read the binding back (must read 0), invalidate GL_COLOR (an error on an FBO unless the driver maps it), then [`FILLS`] as scissored clears in GL coordinates; swap. [`FRAMES`] frames, so the swap's dequeue-and-rebind is exercised.
-//! Judge: a queued buffer read through our own mapping and shown as its consumer would, i.e. with its transform applied (window.h / hardware.h: FLIP_H, FLIP_V, then ROT_90), must equal the frame's fills with GL's y axis up: display row r = GL row EDGE-1-r.
+//! The probe sets [`APP_TRANSFORM`] on its window first, as an app's `ANativeWindow_setBuffersTransform` does. Judge: every buffer is queued with exactly that transform, and read through our own mapping as stored it equals the frame's fills top-down: buffer row r = GL row EDGE-1-r.
 //! Clear colours are c / 255 (ES 3.2 §2.3.5.2: round(f x 255) gives c back), so the bytes are exact.
-//! Breaks (each must turn the verdict red): `--break flip` -- the window drops the buffer transform (a driver that does not tag FLIP_V); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
+//! Breaks (each must turn the verdict red): `--break flip-y` -- the surface FBO's `GL_MESA_framebuffer_flip_y` undone before drawing (a driver rendering bottom-up); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
 //! The probe implements `perform` without its variadic tail: the driver passes one integer argument, which on the Linux ABIs of every arches.toml host (SysV x86-64, AAPCS64, RISC-V LP64) travels in the register of the third named integer argument.
 
 #![allow(non_snake_case, reason = "window.h hook and GL entry names")]
@@ -37,6 +37,8 @@ const EDGE: i32 = 64;
 const BUFFERS: usize = FRAMES + 1;
 const FRAMES: usize = 2;
 const POISON: u8 = 0xAA;
+/// The transform the probe sets as an app would; a rotation, so a driver that writes any transform of its own (FLIP_V included) changes it.
+const APP_TRANSFORM: u32 = w::NATIVE_WINDOW_TRANSFORM_ROT_90;
 /// (x, y, w, h, rgba) in GL window coordinates (origin bottom-left), drawn in order; asymmetric in both axes, so any flip mismatches.
 const FILLS: [(i32, i32, i32, i32, [u8; 4]); 4] = [
     (0, 0, EDGE, EDGE, [32, 64, 96, 255]),
@@ -50,8 +52,8 @@ const EBUSY: i32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Break {
-    /// The window drops the buffer transform.
-    Flip,
+    /// The surface FBO's flip-y undone before drawing: the buffer then holds GL's bottom-up rows.
+    FlipY,
     /// glBindFramebuffer / glGetIntegerv / glInvalidateFramebuffer from the host's EGL, not the driver.
     Fbo0,
 }
@@ -128,7 +130,6 @@ struct State {
     free: VecDeque<usize>,
     queued: Vec<Queued>,
     transform: u32,
-    drop_transform: bool,
     usage: u64,
 }
 
@@ -178,10 +179,8 @@ unsafe extern "C" fn perform(win: *mut w::ANativeWindow, op: i32, arg: usize) ->
     let mut s = t.state.lock().expect("probe state");
     match op as u32 {
         w::NATIVE_WINDOW_SET_BUFFERS_TRANSFORM => {
-            if !s.drop_transform {
-                // an int argument: its low 32 bits
-                s.transform = arg as u32;
-            }
+            // an int argument: its low 32 bits
+            s.transform = arg as u32;
         }
         w::NATIVE_WINDOW_SET_USAGE64 => s.usage = arg as u64,
         _ => return -EINVAL,
@@ -261,7 +260,7 @@ fn base(magic: u32, size: usize) -> w::android_native_base_t {
     }
 }
 
-fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>> {
+fn window(alloc: Option<&Path>) -> Result<Box<TestWindow>> {
     let backend =
         Backend::start(Path::new(DRM_DIR), alloc).map_err(|e| anyhow!("gralloc backend: {e}"))?;
     out(&format!("gralloc node {}", backend.node().display()));
@@ -345,7 +344,6 @@ fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>>
     };
     let state = State {
         free: (0..BUFFERS).collect(),
-        drop_transform,
         ..State::default()
     };
     Ok(Box::new(TestWindow {
@@ -489,7 +487,22 @@ fn run(args: &Args) -> Result<()> {
     // SAFETY: no arguments.
     let egl_fail = |what: &str| anyhow!("{what}: EGL error {:#x}", unsafe { egl_error() });
 
-    let win = window(args.alloc.as_deref(), args.broken == Some(Break::Flip))?;
+    // the host's own entry, not wrapped by the driver: the flip-y break undoes the driver's setting on the bound FBO
+    let fb_param = entry!(
+        from_host,
+        c"glFramebufferParameteriMESA",
+        g::glFramebufferParameteriMESA
+    );
+    let win = window(args.alloc.as_deref())?;
+    // as an app does before drawing (ANativeWindow_setBuffersTransform -> perform): the driver must queue every buffer with it unchanged
+    // SAFETY: our own window and hook; the op takes one int.
+    unsafe {
+        perform(
+            std::ptr::from_ref(&win.anw).cast_mut(),
+            w::NATIVE_WINDOW_SET_BUFFERS_TRANSFORM as i32,
+            APP_TRANSFORM as usize,
+        )
+    };
     // SAFETY: every call below passes handles the driver returned, NONE-terminated attribute lists and valid out-pointers; GL calls run with the context current.
     unsafe {
         let dpy = get_display(std::ptr::null_mut());
@@ -553,6 +566,13 @@ fn run(args: &Args) -> Result<()> {
                 binding == 0 && err == 0,
                 "frame {frame}: framebuffer 0 reads back as {binding}, invalidate(GL_COLOR) GL error {err:#x}"
             );
+            if args.broken == Some(Break::FlipY) {
+                fb_param(
+                    g::GL_FRAMEBUFFER as u32,
+                    g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,
+                    0,
+                );
+            }
             viewport(0, 0, EDGE, EDGE);
             enable(GL_SCISSOR_TEST);
             for (x, y, fw, fh, rgba) in FILLS {
@@ -605,28 +625,19 @@ fn judge(win: &TestWindow) -> Result<()> {
         begin_cpu_access(slot.dmabuf.as_fd(), SYNC_READ)?;
         let px = map.read();
         end_cpu_access(slot.dmabuf.as_fd(), SYNC_READ)?;
-        if q.transform & !(w::NATIVE_WINDOW_TRANSFORM_FLIP_H | w::NATIVE_WINDOW_TRANSFORM_FLIP_V)
-            != 0
-        {
-            bail!(
-                "frame {frame}: transform {:#x} rotates; the driver only flips",
-                q.transform
-            );
-        }
-        let (flip_h, flip_v) = (
-            q.transform & w::NATIVE_WINDOW_TRANSFORM_FLIP_H != 0,
-            q.transform & w::NATIVE_WINDOW_TRANSFORM_FLIP_V != 0,
+        ensure!(
+            q.transform == APP_TRANSFORM,
+            "frame {frame}: queued with transform {:#x}, the app set {APP_TRANSFORM:#x}: the driver clobbered it",
+            q.transform
         );
         let mut bad = 0;
         let mut first = None;
         for r in 0..EDGE {
             for x in 0..EDGE {
-                // the consumer shows buffer pixel (bx, by) at display (x, r) after the flips
-                let bx = if flip_h { EDGE - 1 - x } else { x };
-                let by = if flip_v { EDGE - 1 - r } else { r };
-                let o = usize::try_from(by)? * slot.pitch as usize + usize::try_from(bx)? * 4;
+                // the buffer as stored, row 0 the window's top (the app's transform applies after, to the whole upright image)
+                let o = usize::try_from(r)? * slot.pitch as usize + usize::try_from(x)? * 4;
                 let got = [px[o], px[o + 1], px[o + 2], px[o + 3]];
-                // display row r is GL row EDGE-1-r
+                // buffer row r is GL row EDGE-1-r
                 let want = expected(frame, x, EDGE - 1 - r);
                 if got != want {
                     bad += 1;

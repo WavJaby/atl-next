@@ -56,18 +56,9 @@ impl Window {
         status(r).map(|_| v)
     }
 
-    /// `perform(op, int)`: the window.h helpers that take one `int` (`native_window_set_buffers_transform`).
-    pub fn perform_int(&self, op: u32, arg: i32) -> Result<(), Status> {
-        // SAFETY: live window; `perform` is variadic and the op's argument is one int (window.h).
-        let r = unsafe {
-            ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
-        };
-        status(r).map(drop)
-    }
-
     /// `perform(op, uint64_t)`: `native_window_set_usage`.
     pub fn perform_u64(&self, op: u32, arg: u64) -> Result<(), Status> {
-        // SAFETY: as perform_int; the op's argument is one uint64_t.
+        // SAFETY: live window; `perform` is variadic and the op's argument is one uint64_t (window.h).
         let r = unsafe {
             ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
         };

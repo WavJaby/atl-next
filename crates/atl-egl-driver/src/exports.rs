@@ -418,6 +418,9 @@ pub unsafe extern "C" fn eglMakeCurrent(
         let ok = unsafe { (d.egl.eglMakeCurrent)(dpy, draw, read, ctx) };
         if ok != 0 {
             fbo0::set_current(None, 0);
+            if !ctx.is_null() {
+                d.log_renderer_once();
+            }
         }
         return ok;
     }
@@ -450,6 +453,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
                     (d.gl.glScissor)(0, 0, s.width, s.height);
                 }
             }
+            d.log_renderer_once();
             e::EGL_TRUE as u32
         }
         Err(err) => {

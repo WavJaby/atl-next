@@ -5,6 +5,7 @@
 use atl_bridgegen::buildscript::{HeaderImport, import_headers};
 
 const EGL_DIR: &str = "frameworks/native/opengl/include";
+const GLES_DIR: &str = "external/mesa3d/include";
 
 /// EGL entries: the driver's exports (Loader.cpp dlsyms them) and every host call.
 const EGL_FUNCTIONS: &[&str] = &[
@@ -76,6 +77,7 @@ const GL_FUNCTIONS: &[&str] = &[
     "glReadPixels",
     "glFlush",
     "glFinish",
+    "glFramebufferParameteriMESA",
 ];
 
 const IMPORTS: &[HeaderImport] = &[
@@ -153,11 +155,12 @@ const IMPORTS: &[HeaderImport] = &[
             "EGL_SYNC_FLUSH_COMMANDS_BIT",
         ],
     },
+    // the Khronos registry's GLES headers as AOSP's external/mesa3d carries them: frameworks/native's gl2ext.h predates GL_MESA_framebuffer_flip_y, which window surfaces need
     HeaderImport {
         name: "gles",
-        source: "frameworks/native/opengl/include/GLES2/gl2ext.h",
-        also: &["frameworks/native/opengl/include/GLES3/gl3.h"],
-        include_dirs: &[EGL_DIR],
+        source: "external/mesa3d/include/GLES2/gl2ext.h",
+        also: &["external/mesa3d/include/GLES3/gl3.h"],
+        include_dirs: &[GLES_DIR],
         defines: &["GL_GLEXT_PROTOTYPES"],
         force_include: Some("GLES3/gl3.h"),
         functions: GL_FUNCTIONS,
@@ -198,6 +201,7 @@ const IMPORTS: &[HeaderImport] = &[
             "GL_UNSIGNED_BYTE",
             "GL_SCISSOR_TEST",
             "GL_COLOR_BUFFER_BIT",
+            "GL_FRAMEBUFFER_FLIP_Y_MESA",
         ],
     },
 ];

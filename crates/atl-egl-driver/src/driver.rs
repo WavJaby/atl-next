@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -87,8 +88,14 @@ host_table!(
         glViewport,
         glScissor,
         glFinish,
+        glGetString,
+        glFramebufferParameteriMESA,
     }
 );
+
+/// The GL extension window surfaces need: FBOs render top-down, as a window buffer is read (Mesa's own Android platform renders window surfaces flipped the same way), so no buffer transform is set and the app's own passes through.
+/// Without it the driver refuses to load (hosts lacking it: NVIDIA, unsupported until gralloc modifiers land).
+pub const FLIP_Y: &str = "GL_MESA_framebuffer_flip_y";
 
 /// Host display extensions passed on: what holds unchanged for the driver's own objects too (images, syncs, contexts, surfaceless).
 /// Left out: surface extensions the host implements for its own surfaces only (partial_update, buffer_age, swap_buffers_with_damage, mutable_render_buffer, gl_colorspace).
@@ -129,6 +136,9 @@ pub struct Driver {
     pub surfaces: Mutex<HashMap<usize, Arc<Mutex<WindowSurface>>>>,
     /// Contexts already made current once: EGL sets viewport and scissor to the surface only the first time.
     pub seen_contexts: Mutex<HashSet<usize>>,
+    /// The device rendered on: its render node / DRM file, or `software`.
+    device: String,
+    renderer_logged: AtomicBool,
 }
 
 // SAFETY: the host display is a process-global EGL handle usable from any thread (EGL 1.5 §3.2); the tables are function pointers; the maps are behind mutexes.
@@ -158,7 +168,17 @@ pub fn get() -> Option<&'static Driver> {
 impl Driver {
     fn load() -> Result<Self> {
         let host = Host::load()?;
-        let display = choose_display(&host)?;
+        let (display, device) = choose_display(&host)?;
+        {
+            // GL extensions need a current context: a throwaway one, released before any app context exists (the driver loads on the first eglGetDisplay)
+            let ctx = display.create_context()?;
+            let gl = ctx.make_current()?;
+            let ext = gl.string(atl_egl_host::ffi::GL_EXTENSIONS);
+            anyhow::ensure!(
+                ext.split_whitespace().any(|x| x == FLIP_Y),
+                "host GL on {device} lacks {FLIP_Y} (window surfaces render top-down through it)"
+            );
+        }
         let egl = HostEgl::resolve(&host)?;
         let gl = HostGl::resolve(&host)?;
         let native_fence = display.has_extension("EGL_ANDROID_native_fence_sync");
@@ -177,7 +197,31 @@ impl Driver {
             extensions: CString::new(ext.join(" "))?,
             surfaces: Mutex::new(HashMap::new()),
             seen_contexts: Mutex::new(HashSet::new()),
+            device,
+            renderer_logged: AtomicBool::new(false),
         })
+    }
+
+    /// On the first make-current with a context: one stderr line (the app's log) naming the device and `GL_RENDERER`, so a run proves which GPU rendered.
+    pub fn log_renderer_once(&self) {
+        if self.renderer_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: a context is current on this thread (the caller's make-current succeeded).
+        let p = unsafe { (self.gl.glGetString)(atl_egl_host::ffi::GL_RENDERER) };
+        let renderer = if p.is_null() {
+            "none".into()
+        } else {
+            // SAFETY: GL returns a static NUL-terminated string for GL_RENDERER.
+            unsafe { CStr::from_ptr(p.cast()) }.to_string_lossy()
+        };
+        #[allow(clippy::print_stderr, reason = "one line, once per process")]
+        {
+            eprintln!(
+                "libGLES_atl: device {} GL_RENDERER {renderer}",
+                self.device
+            );
+        }
     }
 
     pub fn extensions(&self) -> &CStr {
@@ -229,8 +273,8 @@ impl Driver {
     }
 }
 
-/// gralloc's node, then the EGL device on it, else the software device.
-fn choose_display(host: &Arc<Host>) -> Result<Display> {
+/// gralloc's node, then the EGL device on it, else the software device; with the device's name.
+fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
     let node = Backend::start(Path::new(DRM_DIR), None)
         .ok()
         .map(|b| b.node().to_string_lossy().into_owned());
@@ -245,7 +289,12 @@ fn choose_display(host: &Arc<Host>) -> Result<Display> {
         .with_context(|| {
             format!("no EGL device on gralloc's node {node:?} and no software device")
         })?;
-    device.display()
+    let name = device
+        .render_node
+        .clone()
+        .or_else(|| device.drm_file.clone())
+        .unwrap_or_else(|| "software".to_owned());
+    Ok((device.display()?, name))
 }
 
 thread_local! {

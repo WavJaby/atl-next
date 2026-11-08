@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test egl-driver`: the GLES driver over the host's system EGL (crate atl-egl-driver, `libGLES_atl.so`) rendering into an ANativeWindow, every pixel checked, orientation included (atl-egl-driver-probe's module doc has the scenario and the judge).
 //! Runs on this host's own EGL: llvmpipe on WSL, the GPU of gralloc's node on a desktop. No native build and no slot: the driver and the probe are plain cargo outputs (in --out).
-//! Breaks, every run, each must fail: `flip` (the window drops the buffer transform: a driver that does not tag FLIP_V shows upside down) and `fbo0` (framebuffer entries from the host, not the driver: framebuffer 0 is not the window).
-//! On another host: copy `<out>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip|fbo0]`; the probe links no workspace library dynamically.
+//! Breaks, every run, each must fail: `flip-y` (the surface FBO's flip-y undone: a driver rendering bottom-up stores the frame upside down) and `fbo0` (framebuffer entries from the host, not the driver: framebuffer 0 is not the window).
+//! On another host: copy `<out>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -58,7 +58,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if !ok || !text.contains("egl-driver: PASS") {
         bail!("egl-driver: FAILED");
     }
-    for (brk, mark) in [("flip", "orientation red"), ("fbo0", "FAIL")] {
+    for (brk, mark) in [("flip-y", "orientation red"), ("fbo0", "FAIL")] {
         let (passed, text) = go(Some(brk))?;
         let caught = !passed && text.contains(mark);
         println!(
@@ -74,12 +74,34 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             bail!("egl-driver: FAILED control: break {brk} passed");
         }
     }
-    println!("egl-driver: ok (controls: flip, fbo0 red)");
+    println!("egl-driver: ok (controls: flip-y, fbo0 red)");
     Ok(ExitCode::SUCCESS)
 }
 
+/// The value of `ro.hardware.egl` that selects the driver: Loader.cpp opens `libGLES_<value>.so` in the driver dir.
+const HARDWARE: &str = "atl";
+
+/// The app process's GL driver, built and placed as the runtime root holds it: (host file, Android path) pairs -- `libGLES_atl.so` in /vendor's egl dir and a /vendor/build.prop with `ro.hardware.egl` (`<out>/egl`).
+/// It links only system libraries (the host's libEGL is dlopened by atl-egl-host), so no library dir joins the path.
+pub fn placement(root: &Path, out: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let dir = crate::cdylib::stage(root, out, DRIVER_PACKAGE, "egl", atl_egl_driver_name())?;
+    let prop = dir.join("vendor-build.prop");
+    std::fs::write(&prop, format!("ro.hardware.egl={HARDWARE}\n"))?;
+    Ok(vec![
+        (
+            dir.join(atl_egl_driver_name()),
+            format!(
+                "{}/{}",
+                atl_android_paths::VENDOR_EGL,
+                atl_egl_driver_name()
+            ),
+        ),
+        (prop, atl_android_paths::VENDOR_BUILD_PROP.to_owned()),
+    ])
+}
+
 /// The file name AOSP's loader opens for `ro.hardware.egl=atl` (Loader.cpp `libGLES_<name>.so`).
-fn atl_egl_driver_name() -> &'static str {
+pub fn atl_egl_driver_name() -> &'static str {
     "libGLES_atl.so"
 }
 

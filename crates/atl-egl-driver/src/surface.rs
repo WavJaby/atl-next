@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! A window surface: the behaviour of Mesa's platform_android (dequeue on first use, render, queue on swap), over host EGL 1.5 + `EGL_EXT_image_dma_buf_import` + `GL_OES_EGL_image` instead of Mesa's internal `__DRIimage`.
 //! Each dequeued buffer is imported once (cached by its gralloc id, unique among live buffers) and drawn through an FBO per context (FBOs are not shared between contexts), with one depth/stencil renderbuffer per context when the config asks for one.
-//! Swap: native fence (or glFinish where the host has none) -> `NATIVE_WINDOW_TRANSFORM_FLIP_V` -> queueBuffer, then the next buffer is dequeued and bound at once, so framebuffer 0 stays drawable after the swap as EGL requires.
-//! The transform: GL's row 0 is the bottom row, the buffer's consumer reads row 0 as the top; FLIP_V (applied before any rotation, libui Transform `R * (H * V)`) is exactly that difference. The window's own transform is not readable through window.h, so
-//! the driver sets FLIP_V and owns the window's buffer transform while a GL surface is on it (hwui's GL pipeline never sets one).
+//! Swap: native fence (or glFinish where the host has none) -> queueBuffer, then the next buffer is dequeued and bound at once, so framebuffer 0 stays drawable after the swap as EGL requires.
+//! Orientation: each FBO renders top-down (`GL_MESA_framebuffer_flip_y`, as Mesa's platform_android does for its window surfaces), so the buffer is stored as its consumer reads it; the driver sets no buffer transform and the app's own (`ANativeWindow_setBuffersTransform`) passes through.
+//! Damage rects the fronts convert assuming top-down buffers are then right as they are.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -180,12 +180,6 @@ impl WindowSurface {
         };
         let (buf, _) = self.current.take().expect("ensured above");
         self.window
-            .perform_int(
-                w::NATIVE_WINDOW_SET_BUFFERS_TRANSFORM,
-                w::NATIVE_WINDOW_TRANSFORM_FLIP_V as i32,
-            )
-            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        self.window
             .queue(buf, fence)
             .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
         self.bind(d, ctx)
@@ -268,6 +262,12 @@ fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Targe
             g::GL_TEXTURE_2D as u32,
             texture,
             0,
+        );
+        // top-down rendering (driver.rs FLIP_Y, checked at load): row 0 of the buffer is the window's top row
+        (gl.glFramebufferParameteriMESA)(
+            g::GL_FRAMEBUFFER as u32,
+            g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,
+            1,
         );
         if depth != 0 {
             for att in [g::GL_DEPTH_ATTACHMENT, g::GL_STENCIL_ATTACHMENT] {
