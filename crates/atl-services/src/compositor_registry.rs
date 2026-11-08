@@ -17,7 +17,7 @@ pub const SET_BOUNDS: u32 = 2;
 pub const SET_DISPLAY: u32 = 3;
 /// The transaction a UI-mode app process sends when its window is installed, before any Java runs: no arguments. Reply: the size its window opens at, width then height (i32, physical pixels), then the package of its Task (String, empty when it has none). The Task is its launch's (tasks.rs); the size is that activity's initial bounds (desktop_bounds.rs), or for a process with no launch the default activity's bounds on the display. The package is the window's app id (atl-composer ui_window). The caller's pid names the process.
 pub const TASK_INFO: u32 = 4;
-/// The transaction the shell (AID_SHELL 2000) or system (AID_SYSTEM 1000) uid sends to read an app's display: the app's package (String). Reply: the compositor binder of the newest UI-mode launch of that package, or null when there is none. Any other caller is refused with PERMISSION_DENIED (AOSP: captureDisplay needs READ_FRAME_BUFFER, which only those uids hold here).
+/// The transaction the shell (AID_SHELL 2000) or system (AID_SYSTEM 1000) uid sends to read an app's display: the app's package (String). Reply: the AOSP exception header (ok, or SECURITY for any other caller: AOSP's SecurityException, as captureDisplay needs READ_FRAME_BUFFER, which only those uids hold here), then the compositor binder of the newest UI-mode launch of that package, or null when there is none.
 pub const GET_COMPOSER: u32 = 5;
 /// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";

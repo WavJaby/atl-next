@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
-    BinderFeatures, Interface, SpIBinder, StatusCode, ThreadState, declare_binder_interface,
+    BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, ThreadState,
+    declare_binder_interface,
 };
 
 use crate::activity::ActivityManager;
@@ -41,8 +42,8 @@ pub trait ICompositorRegistry: Interface {
         composer: SpIBinder,
     ) -> Result<(), StatusCode>;
 
-    /// GET_COMPOSER once the package is read: the compositor of the newest launch of `package`, for a caller that is the shell or the system uid (compositor_registry.rs GET_COMPOSER).
-    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode>;
+    /// GET_COMPOSER once the package is read: the compositor of the newest launch of `package`, for a caller that is the shell or the system uid; any other caller gets SECURITY (compositor_registry.rs GET_COMPOSER).
+    fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>>;
 
     /// SET_BOUNDS once its arguments are read: Task `task` (its number, tasks.rs) is `width` x `height` physical pixels. The caller's uid must own the Task; a non-positive size is refused; a size change notifies the Task's windows.
     fn set_bounds(
@@ -76,8 +77,14 @@ fn on_transact(
 ) -> Result<(), StatusCode> {
     if code == GET_COMPOSER {
         let package: String = data.read()?;
-        let composer = service.composer(ThreadState::get_calling_uid(), &package)?;
-        return reply.write(&composer);
+        // the reply is AOSP's: the exception header (Status, ok or SECURITY), then the value
+        return match service.composer(ThreadState::get_calling_uid(), &package) {
+            Ok(composer) => {
+                reply.write(&Status::ok())?;
+                reply.write(&composer)
+            }
+            Err(status) => reply.write(&status),
+        };
     }
     if code == SET_BOUNDS {
         let task: i32 = data.read()?;
@@ -121,8 +128,8 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn composer(&self, _: u32, _: &str) -> Result<Option<SpIBinder>, StatusCode> {
-        Err(StatusCode::INVALID_OPERATION)
+    fn composer(&self, _: u32, _: &str) -> binder::Result<Option<SpIBinder>> {
+        Err(Status::from(StatusCode::INVALID_OPERATION))
     }
 }
 
@@ -154,7 +161,7 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.register(caller_uid, ui_agent, composer)
     }
 
-    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode> {
+    fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>> {
         self.0.composer(caller_uid, package)
     }
 }
@@ -295,13 +302,17 @@ impl ICompositorRegistry for Registry {
         Ok(())
     }
 
-    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode> {
+    fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>> {
         if caller_uid != SHELL_UID && caller_uid != SYSTEM_UID {
             let _ = writeln!(
                 std::io::stderr(),
                 "services: composer refused uid {caller_uid}: not the shell or system"
             );
-            return Err(StatusCode::PERMISSION_DENIED);
+            // AOSP's SecurityException: captureDisplay needs READ_FRAME_BUFFER
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some("composer: the caller is not the shell or system"),
+            ));
         }
         let owner = self.tasks.owner_of_package(package);
         let composer = owner.and_then(|uid| {

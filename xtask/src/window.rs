@@ -34,6 +34,7 @@ use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 use atl_cpu_pressure::{Sampler, Samples, judge_window};
 
+mod capture;
 mod dialog;
 mod gles2;
 mod ime;
@@ -117,6 +118,9 @@ pub struct Args {
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
+    /// Stage capture only: the refused caller runs as the shell uid, which the registry serves, so the refusal sub-gate must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_capture_caller: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -159,6 +163,8 @@ enum Stage {
     Portrait,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
     AppId,
+    /// UI mode, the gtk fixture: the display capture through the harness route (atld `capture`, atl-screencap) is the quadrants at the opening size, and a caller that is not the shell or system is refused with SECURITY (xtask/src/window/capture.rs).
+    Capture,
 }
 
 impl Stage {
@@ -183,6 +189,7 @@ impl Stage {
             Stage::Suspended => "suspended",
             Stage::Portrait => "portrait",
             Stage::AppId => "app-id",
+            Stage::Capture => "capture",
         }
     }
 
@@ -199,6 +206,7 @@ impl Stage {
             | Stage::Portrait
             | Stage::AppId => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
+            Stage::Capture => capture::CAPTURE_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
             | Stage::Relaunch
@@ -321,6 +329,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Frames
         | Stage::Input
         | Stage::Gtk
+        | Stage::Capture
         | Stage::Portrait
         | Stage::AppId
         | Stage::Hwui
@@ -1789,6 +1798,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
+        | Stage::Capture
         | Stage::Portrait
         | Stage::AppId
         | Stage::Hwui
@@ -1954,6 +1964,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
+    // the capture stage's probe records its two captures in `captured`; the sub-gates read them once the probe is joined
+    let captured: Arc<Mutex<capture::Seen>> = Arc::default();
+    let capture_probe = matches!(args.stage, Stage::Capture).then(|| capture::Probe {
+        root: run.root.clone(),
+        package: m.name.clone(),
+        opening: opening_size(display),
+        refused_as: if args.break_capture_caller {
+            capture::SHELL_UID
+        } else {
+            APP_UID
+        },
+        out_dir: work.join("capture"),
+        seen: Arc::clone(&captured),
+    });
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -1961,6 +1985,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
+            (Stage::Capture, _, _) => match &capture_probe {
+                Some(capture_probe) => capture::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::Ime, _, Some(ime)) => {
                 ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
             }
@@ -2116,6 +2144,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 app_id_check(&seen, &format!("atl.{}", m.name), &liveness),
             )]
         }
+        (Stage::Capture, Some(_)) => match captured.lock() {
+            Ok(seen) => capture::checks(&seen, &liveness),
+            Err(_) => vec![("capture", Err("the probe panicked".to_owned()))],
+        },
         (Stage::Hwui, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),

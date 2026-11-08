@@ -403,6 +403,22 @@ pub fn control_at(root: &Path, command: &str) -> Result<String> {
     Ok(reply.trim().to_owned())
 }
 
+/// atld's control command `capture <package> <out>` (`capture-as <uid> <package> <out>` when `as_uid` is set): atl-screencap writes the package's window picture, RGBA rows,
+/// to `out` as the shell uid (or `as_uid`). Returns atld's reply line and the bytes in `out`, empty when atld refused. `out` must not hold a space (the control line splits on it).
+pub fn capture_at(
+    root: &Path,
+    as_uid: Option<u32>,
+    package: &str,
+    out: &Path,
+) -> Result<(String, Vec<u8>)> {
+    let command = match as_uid {
+        Some(uid) => format!("capture-as {uid} {package} {}", out.display()),
+        None => format!("capture {package} {}", out.display()),
+    };
+    let reply = control_at(root, &command)?;
+    Ok((reply, std::fs::read(out).unwrap_or_default()))
+}
+
 /// [`Run::app_ended`] over atld's log text.
 fn first_app_ended(atld_log: &str) -> bool {
     let first = atld_log

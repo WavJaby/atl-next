@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! atl-screencap: a display capture as AOSP's screencap takes it (ISurfaceComposer.captureDisplayById, the reply on IScreenCaptureListener), for the harness. atld spawns it as the shell
-//! uid for its control command `capture` (atld main.rs). It asks the registry for the compositor of the package's newest UI-mode launch (GET_COMPOSER), captures the display whole,
-//! waits for the reply's fence, reads the reply's GraphicBuffer, and writes the window picture as RGBA bytes to the output file.
-//! Prints `screencap: WxH fnv1a64=H`. A refused capture, a missing compositor or a missing reply exits 1 with the reason.
+//! atl-screencap: a display capture as AOSP's screencap takes it (ISurfaceComposer.captureDisplayById, the reply on IScreenCaptureListener), for the harness. atld spawns it for its control
+//! commands `capture` (the shell uid) and `capture-as` (any uid, the gate's refused caller; atld main.rs). It asks the registry for the compositor of the package's newest UI-mode launch
+//! (GET_COMPOSER), captures the display whole, waits for the reply's fence, reads the reply's GraphicBuffer, and writes the window picture as RGBA bytes to stdout (atld opens the
+//! caller's file there). The summary `screencap: WxH fnv1a64=H` goes to stderr. A refusal (`refused: SECURITY`), a missing compositor or a missing reply exits 1 with `screencap: error:`.
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
 extern crate binder;
@@ -10,6 +10,7 @@ extern crate gui_aidl_types_rs;
 
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
@@ -21,8 +22,9 @@ use atl_aidl::aidl::android::gui::IScreenCaptureListener::{
 };
 use atl_aidl::aidl::android::gui::ISurfaceComposer::ISurfaceComposer;
 use atl_services::compositor_registry::{GET_COMPOSER, SERVICE};
+use atl_services::registry_service::ICompositorRegistry;
 use binder::binder_impl::IBinderInternal;
-use binder::{BinderFeatures, ProcessState, SpIBinder, Strong};
+use binder::{BinderFeatures, ExceptionCode, ProcessState, SpIBinder, Status, Strong};
 use gui_aidl_types_rs::ScreenCaptureResults;
 
 /// How long the reply may take: the window shows the next published frame, then the readback; the harness polls its digest, this only bounds one call.
@@ -140,12 +142,25 @@ fn wait_fence(fence: std::os::fd::BorrowedFd<'_>) -> Result<()> {
 /// libui's GraphicBuffer magic 'GB01' (GraphicBuffer.cpp flatten).
 const GRAPHIC_BUFFER_MAGIC: i32 = 0x4742_3031;
 
-/// The compositor the registry holds for `package`'s newest UI-mode launch (GET_COMPOSER).
+/// The compositor the registry holds for `package`'s newest UI-mode launch (GET_COMPOSER). The reply starts with its exception header: a caller the registry refuses gets SECURITY.
 fn composer_of(package: &str) -> Result<Strong<dyn ISurfaceComposer>> {
-    let registry = binder::check_service(SERVICE).context("no compositor registry")?;
-    let mut data = registry.prepare_transact()?;
-    data.write(&package.to_owned())?;
-    let reply = registry.submit_transact(GET_COMPOSER, data, 0)?;
+    let binder = binder::check_service(SERVICE).context("no compositor registry")?;
+    // typed as start.rs types its registry: prepare_transact writes the interface token from the binder's class
+    let registry: Strong<dyn ICompositorRegistry> = binder
+        .into_interface()
+        .context("the compositor registry is not ICompositorRegistry")?;
+    let binder = registry.as_binder();
+    let mut data = binder.prepare_transact().context("GET_COMPOSER: prepare")?;
+    data.write(&package.to_owned())
+        .context("GET_COMPOSER: package")?;
+    let reply = binder
+        .submit_transact(GET_COMPOSER, data, 0)
+        .context("GET_COMPOSER: transact")?;
+    let status: Status = reply.read().context("GET_COMPOSER: status")?;
+    if status.exception_code() == ExceptionCode::SECURITY {
+        bail!("refused: SECURITY");
+    }
+    ensure!(status.is_ok(), "composer: {status}");
     let composer: Option<SpIBinder> = reply.read()?;
     let composer =
         composer.with_context(|| format!("{package}: no compositor (no UI-mode launch of it)"))?;
@@ -159,10 +174,20 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "screencap: error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [package, out] = args.as_slice() else {
-        bail!("usage: atl-screencap <package> <out.rgba>");
+    let [package] = args.as_slice() else {
+        bail!("usage: atl-screencap <package> (RGBA bytes to stdout)");
     };
     ProcessState::start_thread_pool();
     let composer = composer_of(package)?;
@@ -181,9 +206,11 @@ fn main() -> Result<()> {
     let picture = rx
         .recv_timeout(REPLY_WAIT)
         .context("no reply from the compositor")??;
-    std::fs::File::create(out)?.write_all(&picture.rgba)?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(&picture.rgba)?;
+    out.flush()?;
     writeln!(
-        std::io::stdout(),
+        std::io::stderr(),
         "screencap: {}x{} fnv1a64={:016x}",
         picture.width,
         picture.height,
