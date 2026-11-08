@@ -358,6 +358,10 @@ impl SampleStream for PolledStream {
         Tier::Polled(self.why)
     }
 
+    fn ts_fallbacks(&self) -> u64 {
+        0
+    }
+
     fn next(&mut self, _timeout: Duration) -> Result<Option<Sample>, SensorError> {
         let t0 = buffer::clock_ns(rustix::time::ClockId::Boottime);
         let mut raw = [0.0f64; 3];

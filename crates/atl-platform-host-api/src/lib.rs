@@ -169,6 +169,9 @@ pub trait SampleStream: Send {
     /// The tier serving this stream, decided when it was opened.
     fn tier(&self) -> Tier;
 
+    /// Samples so far whose stamp was not in the stream's clock, each taken at arrival instead (the `ts-fallback` counter). Zero where stamps never leave their clock.
+    fn ts_fallbacks(&self) -> u64;
+
     /// The newest sample not returned before. Returns as soon as one is ready, or `Ok(None)` after `timeout` with none; the polled tier returns after one read (its span is its interval). The caller paces one call per period and repeats its last sample on `None`.
     fn next(&mut self, timeout: std::time::Duration) -> Result<Option<Sample>, SensorError>;
 }

@@ -368,6 +368,10 @@ impl SampleStream for Stream {
         Tier::Buffered
     }
 
+    fn ts_fallbacks(&self) -> u64 {
+        self.ts_fallbacks
+    }
+
     fn next(&mut self, timeout: Duration) -> Result<Option<Sample>, SensorError> {
         if let Some(sample) = self.pending.take() {
             return Ok(Some(sample));
@@ -683,6 +687,25 @@ mod tests {
         assert!(s.next(Duration::from_millis(100)).expect("reads").is_none());
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(90) && waited < Duration::from_secs(1), "waited {waited:?}");
+        drop(w);
+    }
+
+    /// The `ts-fallback` count: after a fresh open, a scan stamped 5 s ago is returned at arrival time and counted once.
+    #[test]
+    fn stamp_outside_the_clock_counts_a_ts_fallback() {
+        let f = Fake::new("fifo-fallback", &[(&files(&[], &[]), None)]);
+        let node = f.node(0);
+        let _reader = hold_fifo(&node);
+        let mut w = writer(&node);
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime))).expect("write");
+        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
+            .expect("opens");
+        assert!(s.next(Duration::from_millis(100)).expect("reads").is_some());
+        assert_eq!(s.ts_fallbacks(), 0);
+        w.write_all(&scan(2, clock_ns(ClockId::Realtime) - 5 * NS_PER_S)).expect("write");
+        let got = s.next(Duration::from_millis(100)).expect("reads").expect("a sample");
+        assert!((got.boottime_ns - clock_ns(ClockId::Boottime)).abs() < FRESH_AGE_NS, "arrival time used");
+        assert_eq!(s.ts_fallbacks(), 1);
         drop(w);
     }
 

@@ -551,6 +551,8 @@ impl SensorHub {
     fn poll(&self, s: SensorInfo, id: String, stop: Arc<AtomicBool>) {
         let mut stream: Option<Box<dyn SampleStream>> = None;
         let mut last: Option<[f32; 3]> = None;
+        // the open stream's ts-fallbacks already counted
+        let mut ts_seen = 0u64;
         while !stop.load(Ordering::Relaxed) {
             let (period, channels): (i64, Vec<(u64, Arc<Channel>)>) = {
                 let st = self.lock();
@@ -577,6 +579,7 @@ impl SensorHub {
                     Ok(st) => {
                         counters::answered(INTERFACE, &format!("accelerometer tier: {}", st.tier()));
                         stream = Some(st);
+                        ts_seen = 0;
                     }
                     Err(e) => {
                         counters::answered(INTERFACE, &format!("source open failed: {e}"));
@@ -584,6 +587,12 @@ impl SensorHub {
                 }
             }
             let outcome = stream.as_mut().map(|st| st.next(wait));
+            if let Some(st) = stream.as_ref() {
+                for _ in ts_seen..st.ts_fallbacks() {
+                    counters::answered(INTERFACE, "accelerometer ts-fallback");
+                }
+                ts_seen = st.ts_fallbacks();
+            }
             let sample = match outcome {
                 Some(Ok(Some(sm))) => {
                     last = Some(sm.values);
@@ -628,6 +637,9 @@ mod tests {
         fn tier(&self) -> Tier {
             Tier::Buffered
         }
+        fn ts_fallbacks(&self) -> u64 {
+            0
+        }
         fn next(&mut self, _: Duration) -> Result<Option<Sample>, SensorError> {
             Ok(Some(Sample {
                 boottime_ns: boottime_ns(),
@@ -660,6 +672,9 @@ mod tests {
     impl SampleStream for Paused {
         fn tier(&self) -> Tier {
             Tier::Polled(atl_platform_host::Fallback::NoData)
+        }
+        fn ts_fallbacks(&self) -> u64 {
+            0
         }
         fn next(&mut self, timeout: Duration) -> Result<Option<Sample>, SensorError> {
             if !self.sent {
