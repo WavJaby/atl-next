@@ -72,6 +72,8 @@ mod provided_gate;
 mod provider;
 mod providers;
 mod prune;
+mod qemu;
+mod qemu_gate;
 mod remote;
 mod run_apk;
 mod runpath_gate;
@@ -155,6 +157,10 @@ enum Command {
     ///
     /// Writes only under --dest; the out dir is read. Mesa's meson is then run as-is with `--native-file <dest>/native.ini`.
     MesaConfig(mesa::Args),
+    /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
+    ///
+    /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
+    Qemu(qemu::Args),
     /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
     ///
     /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`.
@@ -292,6 +298,10 @@ enum Test {
     ///
     /// Needs the fronts, Mesa, gralloc and the services in --out (`xtask native`).
     Gl(gl_probe::Args),
+    /// QEMU's `qemu-<target>` against ground truth: a bionic hello built by the NDK clang, and QEMU's own tests/tcg smoke programs.
+    ///
+    /// Builds first (as `xtask qemu --execute`). Pass = every program's output and exit status as the checks say; the logs are in `<out>/qemu/<target>-linux-user/gate/`.
+    Qemu(qemu_gate::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -324,6 +334,7 @@ fn main() -> Result<ExitCode> {
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::MesaConfig(args) => mesa::run(&root, &args),
+        Command::Qemu(args) => qemu::run(&root, &args),
         Command::Slot { slot } => slot::run(&root, &slot),
         Command::Patch(args) => patch::run(&root, &args),
         Command::Land(args) => land::run(&root, &args),
@@ -411,6 +422,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Gl(args),
         } => gl_probe::run(&root, &args),
+        Command::Test {
+            test: Test::Qemu(args),
+        } => qemu_gate::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -423,6 +437,7 @@ fn main() -> Result<ExitCode> {
 fn verdict_name(command: &Command) -> Option<&'static str> {
     Some(match command {
         Command::Native(_) => "native",
+        Command::Qemu(_) => "qemu",
         Command::Check(_) => "check",
         Command::Land(_) => "land",
         Command::RunApk(_) => "run-apk",
@@ -452,6 +467,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::TaskBind(_) => "task-bind",
             Test::GlDispatch(_) => "gl-dispatch",
             Test::Gl(_) => "gl",
+            Test::Qemu(_) => "qemu-gate",
         },
         _ => return None,
     })

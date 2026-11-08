@@ -65,7 +65,7 @@ binary = "clang-19"
 min = "19.1.7"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "upstream:qemu"]
 
 # the C++ driver: native's --cxx default and the libc++ gate (libcxx_gate.rs); same package as `clang`
 [clang-cxx]
@@ -130,6 +130,16 @@ arch = "mesa"
 pkgconfig = "gbm"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-gralloc-service"]
+
+# QEMU's GLib (meson.build:1058 glib_req_ver); gmodule, which its TCG plugins load, ships in the same package
+[glib]
+debian = "libglib2.0-dev"
+arch = "glib2"
+pkgconfig = "glib-2.0"
+min = "2.66.0"
+min_reason = "QEMU meson.build:1058 glib_req_ver >=2.66.0"
+scope = ["build"]
+used_by = ["upstream:qemu"]
 
 [git]
 debian = "git"
@@ -252,15 +262,26 @@ min_reason = "observed 2026-11-08; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# Mesa's build: meson_version '>= 1.1.0' (external/mesa3d/meson.build:9); mesa.rs runs `meson setup` with platforms=android
+# the tcg smoke programs of QEMU's tests/tcg run through its generated Makefiles (qemu_gate.rs)
+[make]
+debian = "make"
+arch = "make"
+binary = "make"
+min = "4.4.1"
+min_reason = "observed 2026-11-08; older is untested"
+scope = ["test"]
+used_by = ["upstream:qemu"]
+
+# Mesa's build: meson_version '>= 1.1.0' (external/mesa3d/meson.build:9); mesa.rs runs `meson setup` with platforms=android.
+# QEMU's meson_version '>=1.5.0' (meson.build:1) is the larger; QEMU's own pythondeps.toml accepts the same.
 [meson]
 debian = "meson"
 arch = "meson"
 binary = "meson"
-min = "1.1.0"
-min_reason = "Mesa meson.build:9: meson_version '>= 1.1.0'"
+min = "1.5.0"
+min_reason = "QEMU meson.build:1 meson_version >=1.5.0; Mesa meson.build:9 >=1.1.0"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "upstream:qemu"]
 
 [ninja]
 debian = "ninja-build"
@@ -269,7 +290,7 @@ binary = "ninja"
 min = "1.12.1"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "upstream:qemu"]
 
 # atld's CA store tests: `openssl x509 -subject_hash_old` is the independent oracle of the store's file names; `openssl req` makes the same-subject pair of the collision test
 [openssl]
@@ -303,7 +324,7 @@ binary = "pkg-config"
 min = "1.8.1"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:deps", "xtask:native"]
+used_by = ["xtask:deps", "xtask:native", "upstream:qemu"]
 
 # AOSP genrule scripts run under it (tools/bp2ninja/genrule.go)
 [python3]
@@ -313,7 +334,7 @@ binary = "python3"
 min = "3.13.5"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "upstream:qemu"]
 
 [python3-venv]
 debian = "python3-venv"
@@ -382,3 +403,11 @@ min = "1.2.0"
 min_reason = "libjpeg-turbo BUILDING.md: if using Yasm, 1.2.0 or later is required"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# QEMU's zlib (meson.build:1160, dependency required: true)
+[zlib]
+debian = "zlib1g-dev"
+arch = "zlib"
+pkgconfig = "zlib"
+scope = ["build"]
+used_by = ["upstream:qemu"]

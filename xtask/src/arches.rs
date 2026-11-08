@@ -36,10 +36,6 @@ pub struct Host {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    dead_code,
-    reason = "clang/qemu_target read by xtask fetch/build, not written yet"
-)]
 pub struct Guest {
     pub android_abis: Vec<String>,
     pub clang: String,
@@ -192,6 +188,39 @@ pub fn check_llvm_target(root: &Path, arches: &Arches) -> Result<()> {
     Ok(())
 }
 
+/// The QEMU linux-user target of guest arch `name`: its `qemu_target` column (`aarch64` for `<target>-linux-user`).
+pub fn qemu_target<'a>(arches: &'a Arches, name: &str) -> Result<&'a str> {
+    let arch = arches
+        .get(name)
+        .with_context(|| format!("{FILE}: no arch {name}"))?;
+    let guest = arch
+        .guest
+        .as_ref()
+        .with_context(|| format!("{FILE}: {name} has no [{name}.guest] row"))?;
+    Ok(&guest.qemu_target)
+}
+
+/// Every guest row's `qemu_target` is a linux-user target of the pinned QEMU: `configs/targets/<it>-linux-user.mak` in the checkout `layout` resolves.
+pub fn check_qemu_target(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
+    let configs = layout
+        .locate(Path::new(crate::qemu::UPSTREAM))
+        .dir
+        .join("configs/targets");
+    for (name, arch) in arches {
+        let Some(guest) = &arch.guest else {
+            continue;
+        };
+        let mak = configs.join(format!("{}-linux-user.mak", guest.qemu_target));
+        ensure!(
+            mak.is_file(),
+            "{FILE}: {name}: qemu_target {} has no {} (not a linux-user target of the pinned QEMU)",
+            guest.qemu_target,
+            mak.display()
+        );
+    }
+    Ok(())
+}
+
 /// Every `soong_prebuilt_os` is a value Soong's PrebuiltOS returns on Linux, and `prebuilts/build-tools/<it>/bin` exists in the checkout `layout`
 /// resolves. Which row gets which value (PrebuiltOS keys on Go's GOARCH, a name this table does not carry) is not checked.
 pub fn check_prebuilt_os(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
@@ -251,7 +280,7 @@ fn linux_prebuilt_os(config_go: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_row, kernel_arch_matches, linux_prebuilt_os, parse};
+    use super::{host_row, kernel_arch_matches, linux_prebuilt_os, parse, qemu_target};
 
     #[test]
     fn host_row_by_rust_triple() {
@@ -301,6 +330,18 @@ mod tests {
         let arches = parse(&format!("[a]\npointer_bits = 32\n{K}[a.guest]\n{GUEST}")).unwrap();
         assert_eq!(arches["a"].pointer_bits, 32);
         assert!(arches["a"].host.is_none());
+    }
+
+    #[test]
+    fn qemu_target_is_the_guest_column() {
+        let arches = parse(&format!(
+            "[a]\npointer_bits = 64\n{K}[a.guest]\nandroid_abis = [\"x\"]\nclang = \"c\"\nqemu_target = \"aarch64\"\n[b]\npointer_bits = 64\n{K}[b.host]\nrust = \"t\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\n"
+        ))
+        .unwrap();
+        assert_eq!(qemu_target(&arches, "a").unwrap(), "aarch64");
+        // a host-only row has no QEMU target, an unknown name no row
+        assert!(qemu_target(&arches, "b").is_err());
+        assert!(qemu_target(&arches, "c").is_err());
     }
 
     #[test]

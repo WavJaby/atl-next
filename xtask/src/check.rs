@@ -157,6 +157,7 @@ impl Step {
                 arches::check_kernel_arch(&layout, &arches)?;
                 arches::check_prebuilt_os(&layout, &arches)?;
                 arches::check_llvm_target(root, &arches)?;
+                arches::check_qemu_target(&layout, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

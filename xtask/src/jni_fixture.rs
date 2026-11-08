@@ -129,6 +129,8 @@ pub fn default_ndk(root: &Path) -> Result<PathBuf> {
 pub struct NdkTarget {
     bin: PathBuf,
     target: String,
+    /// `<triple><api>-clang` in the NDK's bin: the same compiler as `cmd("clang")`, as a wrapper that names its target.
+    wrapper: PathBuf,
     /// The arch's `lib/<abi>/` name in an APK: its first arches.toml `android_abis` entry.
     pub abi: String,
     /// The NDK sysroot's per-triple lib dir (libc++_shared.so).
@@ -157,6 +159,7 @@ impl NdkTarget {
         Ok(NdkTarget {
             bin: tc.join("bin"),
             target: format!("--target={}{api}", guest.clang),
+            wrapper: tc.join("bin").join(format!("{}{api}-clang", guest.clang)),
             abi: guest
                 .android_abis
                 .first()
@@ -171,6 +174,11 @@ impl NdkTarget {
         let mut c = Command::new(self.bin.join(tool));
         c.arg(&self.target);
         c
+    }
+
+    /// The per-API clang wrapper (`<triple><api>-clang`): a compiler that needs no `--target` argument, for tools that take a bare compiler path.
+    pub fn wrapper(&self) -> &Path {
+        &self.wrapper
     }
 }
 
