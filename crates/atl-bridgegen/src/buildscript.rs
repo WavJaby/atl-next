@@ -377,6 +377,90 @@ pub fn libcxx_include_dir() -> Result<PathBuf> {
         .with_context(|| format!("{} has no directory", atomic.display()))
 }
 
+/// One AOSP C header a crate calls or implements by its declared types: [`import_headers`] writes `OUT_DIR/<name>.rs` (`rust::import_module`: per function its fn-pointer type, the records with clang's layout asserted, the macros).
+/// Parsed in bionic's view, as every AOSP C header here is; a host-libc crate may use it where the C types have the same sizes on every arches.toml host.
+pub struct HeaderImport {
+    pub name: &'static str,
+    /// The translation unit, relative to the AOSP tree.
+    pub source: &'static str,
+    /// Headers it includes whose declarations belong to the interface.
+    pub also: &'static [&'static str],
+    /// Include dirs, relative to the AOSP tree.
+    pub include_dirs: &'static [&'static str],
+    /// `-D` defines (the Khronos headers declare extension prototypes only under `*_EXT_PROTOTYPES`).
+    pub defines: &'static [&'static str],
+    /// A header the source needs first and does not include itself (Khronos `eglext.h` / `gl2ext.h` use the core header's types; the registry's convention is that the caller includes both).
+    pub force_include: Option<&'static str>,
+    pub functions: &'static [&'static str],
+    pub types: &'static [&'static str],
+    pub macros: &'static [&'static str],
+}
+
+/// A build script's whole job for [`HeaderImport`]s: each generated twice, failing unless byte-identical (bridge control 1), written to `OUT_DIR`, with its rerun lines.
+pub fn import_headers(imports: &[HeaderImport]) -> Result<()> {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let checkout = checkout(&manifest)?;
+    let up = Upstreams::of(&checkout)?;
+    let arches = checkout.join("arches.toml");
+    let host = host_arch(
+        &std::fs::read_to_string(&arches)?,
+        &std::env::var("TARGET")?,
+    )?;
+    let mut rerun = vec![arches];
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    for import in imports {
+        let path = up.file(&format!("aosp/{}", import.source))?;
+        let also = import
+            .also
+            .iter()
+            .map(|f| up.file(&format!("aosp/{f}")))
+            .collect::<Result<Vec<_>>>()?;
+        let mut target = bionic_libc_target(&up, &host, None);
+        target.args.extend(
+            import
+                .include_dirs
+                .iter()
+                .map(|d| format!("-I{}", up.aosp(d).display())),
+        );
+        target
+            .args
+            .extend(import.defines.iter().map(|d| format!("-D{d}")));
+        if let Some(h) = import.force_include {
+            target.args.extend(["-include".to_owned(), h.to_owned()]);
+        }
+        let generate = || -> Result<String> {
+            let src = Source {
+                path: &path,
+                lang: Lang::C,
+                also: &also,
+                macros: import.macros,
+            };
+            let iface =
+                crate::interface(import.name, import.source, &src, std::slice::from_ref(&target))
+                    .context(import.source)?;
+            crate::rust::import_module(&iface, &host.arch, import.functions, import.types)
+        };
+        let code = generate()?;
+        ensure!(
+            code == generate()?,
+            "atl-bridgegen output differs between two runs on the same input"
+        );
+        std::fs::write(out.join(format!("{}.rs", import.name)), code)?;
+        for d in import.include_dirs {
+            rerun.extend(up.rerun_paths(&format!("aosp/{d}")));
+        }
+        rerun.extend(up.rerun_paths(&format!("aosp/{}", import.source)));
+    }
+    #[allow(
+        clippy::print_stdout,
+        reason = "a build script's stdout is cargo's instruction channel"
+    )]
+    for path in rerun {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

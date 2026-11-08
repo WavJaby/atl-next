@@ -6,28 +6,15 @@
 //! Orientation: GL stores row 0 at the bottom, a window buffer is read top-down; the driver renders as GL does and tags every queued buffer FLIP_V, which the composer applies (one path, no per-frame blit).
 
 pub mod abi {
-    //! The C interface, generated from AOSP's headers (build.rs).
-    #![allow(
+    //! The C interface, generated from AOSP's headers: EGL / GLES as atl-egl-host types them (one typing per entry), the window records here (build.rs).
+    pub use atl_egl_host::ffi::abi::{egl, gles};
+    #[allow(
         non_camel_case_types,
         non_snake_case,
         non_upper_case_globals,
         dead_code,
         clippy::all
     )]
-    pub mod egl {
-        include!(concat!(env!("OUT_DIR"), "/egl.rs"));
-        // the generator resolves typedefs to their types; these names keep the handles apart in our signatures (each is `void*` in eglplatform.h / egl.h, so the alias checks still hold)
-        pub type EGLDisplay = *mut ::core::ffi::c_void;
-        pub type EGLConfig = *mut ::core::ffi::c_void;
-        pub type EGLSurface = *mut ::core::ffi::c_void;
-        pub type EGLContext = *mut ::core::ffi::c_void;
-        pub type EGLClientBuffer = *mut ::core::ffi::c_void;
-        pub type EGLImageKHR = *mut ::core::ffi::c_void;
-        pub type EGLNativeWindowType = *mut ANativeWindow;
-    }
-    pub mod gles {
-        include!(concat!(env!("OUT_DIR"), "/gles.rs"));
-    }
     pub mod window {
         include!(concat!(env!("OUT_DIR"), "/window.rs"));
     }

@@ -15,5 +15,9 @@ publish.workspace = true
 anyhow.workspace = true
 libloading.workspace = true
 
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
 [lints]
 workspace = true

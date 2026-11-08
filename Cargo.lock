@@ -275,6 +275,7 @@ name = "atl-egl-host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-bridgegen",
  "libloading",
 ]
 
