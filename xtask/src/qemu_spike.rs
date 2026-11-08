@@ -3,7 +3,7 @@
 //!
 //! Library: the `--pic` build's own link line for `qemu-<target>` (`ninja -t commands`), linked `-shared` instead, `main` aliased `atl_qemu_user_main` (`--defsym`), QEMU's plugin `--dynamic-list` dropped. No QEMU file is compiled differently: this is D7 with a link-time change only.
 //! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`.
-//! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`; its own target dir under the spike dir, so the cfg breaks rebuild only it.
+//! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
 //! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_layout::Layout;
 
+use crate::deps;
 use crate::git::git_raw;
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, Build, GUEST_API};
@@ -23,7 +25,11 @@ const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 5] = ['a', 'b', 'c', 'd', 'e'];
+const GATES: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+/// Per harness run. A run that outlives it hangs (the fatal path in the module doc: QEMU's `die_with_signal`, a SIGSEGV that sigchain's SIG_DFL revert does not end) and counts as failed.
+const RUN_TIMEOUT_SECS: u32 = 240;
+/// `timeout`'s exit status when it killed the command.
+const TIMEOUT_EXIT: i32 = 124;
 /// The non-identity guest base of the `guest-base` break: 1 TiB, free in an x86_64 process (PIE and heap sit near 0x55.., mmap near 0x7f..) and page aligned.
 /// Not 4096: with any nonzero base QEMU also maps guest page 0 (`pgb_addr_set`), and host 4096 is below `mmap_min_addr` (65536), so QEMU refuses to start and gate (c) is never reached.
 const SHIFTED_BASE: &str = "0x10000000000";
@@ -93,6 +99,20 @@ const RUNS: &[RunSpec] = &[
         engine_break: Some("chain-order"),
         red: Some('e'),
     },
+    RunSpec {
+        name: "drop-accerr",
+        unpatched: false,
+        base: "0",
+        engine_break: Some("drop-accerr"),
+        red: Some('f'),
+    },
+    RunSpec {
+        name: "boot-only",
+        unpatched: false,
+        base: "0",
+        engine_break: Some("boot-only"),
+        red: Some('g'),
+    },
 ];
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -102,6 +122,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = link(&b, &dir.join("libqemu-spike.so"), None)?;
     let fixture = fixture(root, &b, &dir)?;
+    let sigchain = sigchain(root, &dir)?;
     let runs: Vec<&RunSpec> = RUNS
         .iter()
         .filter(|r| !args.no_breaks || r.red.is_none())
@@ -117,7 +138,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         } else {
             &so
         };
-        if let Err(e) = harness(root, &b, &dir, spec, lib, &fixture) {
+        if let Err(e) = harness(root, &b, &dir, spec, lib, &fixture, &sigchain) {
             fails.push(Failure::step(spec.name, format!("{e:#}")));
         }
     }
@@ -261,6 +282,45 @@ fn fixture(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
+/// AOSP's libsigchain object (art/sigchainlib/sigchain.cc) built as-is for the host: the chain ART installs its fault handlers on. Build config only: the file uses CHAR_BIT and numeric_limits without including their headers, which bionic and libc++ supply transitively and glibc with libstdc++ does not.
+fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
+    let src = Layout::of(root)?
+        .src()
+        .join("aosp")
+        .join("art")
+        .join("sigchainlib");
+    let cc = deps::binary(root, "clang")?;
+    let obj = dir.join("sigchain.o");
+    let status = Command::new(&cc)
+        .args([
+            "-x",
+            "c++",
+            "-std=gnu++17",
+            "-O1",
+            "-fPIC",
+            "-Wall",
+            "-Wno-unused-function",
+            "-include",
+            "limits.h",
+            "-include",
+            "limits",
+            "-I",
+        ])
+        .arg(&src)
+        .arg("-c")
+        .arg(src.join("sigchain.cc"))
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .context("running clang on sigchain.cc")?;
+    ensure!(
+        status.success(),
+        "clang failed on {}",
+        src.join("sigchain.cc").display()
+    );
+    Ok(obj)
+}
+
 /// One harness run; Ok when it ends as `spec` says.
 fn harness(
     root: &Path,
@@ -269,8 +329,13 @@ fn harness(
     spec: &RunSpec,
     so: &Path,
     fixture: &Path,
+    sigchain: &Path,
 ) -> Result<()> {
-    let mut cmd = crate::cargo_command();
+    // `timeout` kills the run's whole process group: a hung run is a failed run (exit 124)
+    let mut cmd = Command::new("timeout");
+    cmd.args(["-s", "KILL"])
+        .arg(RUN_TIMEOUT_SECS.to_string())
+        .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args([
         "test",
         "--locked",
@@ -287,6 +352,7 @@ fn harness(
     .env("ATL_QEMU_BUILD", b.build_dir())
     .env("ATL_QEMU_SPIKE_SO", so)
     .env("ATL_QEMU_SPIKE_FIXTURE", fixture)
+    .env("ATL_QEMU_SIGCHAIN_OBJ", sigchain)
     .current_dir(root);
     match spec.engine_break {
         Some(x) => cmd.env("ATL_QEMU_ENGINE_BREAK", x),
@@ -298,6 +364,14 @@ fn harness(
         &log,
         [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
     )?;
+    let hung = out.status.code() == Some(TIMEOUT_EXIT);
+    if hung {
+        println!(
+            "qemu-spike: {} hung, killed after {RUN_TIMEOUT_SECS} s (log {})",
+            spec.name,
+            log.display()
+        );
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let ok = |g: char| text.lines().any(|l| l == format!("spike: ({g}) ok"));
     match spec.red {
@@ -305,8 +379,9 @@ fn harness(
             let red: Vec<char> = GATES.into_iter().filter(|g| !ok(*g)).collect();
             ensure!(
                 red.is_empty() && out.status.success(),
-                "gates {red:?} not ok ({}), log {}",
+                "gates {red:?} not ok ({}{}), log {}",
                 out.status,
+                if hung { ", hung" } else { "" },
                 log.display()
             );
         }

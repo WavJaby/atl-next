@@ -25,6 +25,7 @@ pub type OnTrap = fn(Guest, Trap) -> u64;
 type MainFn = unsafe extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) -> c_int;
 type CpuLoopFn = unsafe extern "C" fn(*mut c_void);
 pub(crate) type InCodeGenBufferFn = unsafe extern "C" fn(*const c_void) -> bool;
+pub(crate) type PageGetFlagsFn = unsafe extern "C" fn(u64) -> c_int;
 
 /// The library's entry points and data, resolved once by [`run`].
 pub(crate) struct Lib {
@@ -33,7 +34,11 @@ pub(crate) struct Lib {
     /// `tcg_splitwx_diff` (tcg.h): rw minus rx address of the code buffer; 0 without split w^x.
     pub(crate) splitwx_diff: &'static isize,
     /// `guest_base` (QEMU `main.c`, set by `-B`): host = guest + guest_base.
-    guest_base: &'static usize,
+    pub(crate) guest_base: &'static usize,
+    /// `guest_addr_max` (linux-user/main.c): the highest guest address (`h2g_valid`, include/user/guest-host.h).
+    pub(crate) guest_addr_max: &'static usize,
+    /// `page_get_flags` (accel/tcg/user-exec.c): the QEMU page flags of a guest address.
+    pub(crate) page_get_flags: PageGetFlagsFn,
     /// dlopen handle, for the per-thread symbols resolved later (`helper_retaddr`).
     handle: usize,
     pub(crate) on_trap: OnTrap,
@@ -94,6 +99,8 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
     let in_cgb = sym(handle, c"in_code_gen_buffer")?;
     let splitwx = sym(handle, c"tcg_splitwx_diff")?;
     let guest_base = sym(handle, c"guest_base")?;
+    let guest_addr_max = sym(handle, c"guest_addr_max")?;
+    let page_get_flags = sym(handle, c"page_get_flags")?;
     let lib = Lib {
         // SAFETY: cpu_loop is `void cpu_loop(CPUArchState *)` (include/user/cpu_loop.h with P1).
         cpu_loop: unsafe { std::mem::transmute::<*mut c_void, CpuLoopFn>(cpu_loop) },
@@ -105,6 +112,12 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
         splitwx_diff: unsafe { &*(splitwx as *const isize) },
         // SAFETY: `uintptr_t guest_base` (common-user/probe-guest-base.c), a global of the never-closed library.
         guest_base: unsafe { &*(guest_base as *const usize) },
+        // SAFETY: `unsigned long guest_addr_max`, a global of the never-closed library.
+        guest_addr_max: unsafe { &*(guest_addr_max as *const usize) },
+        // SAFETY: `int page_get_flags(vaddr)` (include/user/page-protection.h).
+        page_get_flags: unsafe {
+            std::mem::transmute::<*mut c_void, PageGetFlagsFn>(page_get_flags)
+        },
         handle,
         on_trap,
     };

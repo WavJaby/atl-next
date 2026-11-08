@@ -15,6 +15,8 @@ pub const RET: u32 = 0x7a11;
 pub const REPORT: u32 = 0x7a12;
 /// Bootstrap: x0 = payload, x1 = the guest's `svc #RET` stub. Installs the fault chain, then runs the callback; its answer lands in x0.
 pub const BOOT: u32 = 0x7a13;
+/// A guest thread's first instruction: registers the thread for fault classification ([`crate::signal::register_thread`]). Answer: none.
+pub const THREAD: u32 = 0x7a14;
 
 const HANDLED: c_int = 0;
 const LEAVE: c_int = 1;
@@ -53,6 +55,10 @@ fn dispatch(g: Guest, imm: u32) -> c_int {
         }
         REPORT => {
             on_trap(g, Trap::Report(g.x(0)));
+            HANDLED
+        }
+        THREAD => {
+            crate::signal::register_thread();
             HANDLED
         }
         _ => NOT_OURS,

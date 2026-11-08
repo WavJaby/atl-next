@@ -17,6 +17,8 @@ const UNIT: &str = "linux-user/aarch64/cpu_loop.c";
 const HEADERS: &[&str] = &["target/arm/cpu.h"];
 
 const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
+/// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it.
+const SIGCHAIN_ENV: &str = "ATL_QEMU_SIGCHAIN_OBJ";
 /// The deliberate breaks: name -> cfg. Red with it, green without (xtask qemu_spike.rs runs each).
 const BREAKS: &[(&str, &str)] = &[
     // gate (a): the CALL trap answers the callback's result with bit 0 flipped
@@ -25,6 +27,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("fault-route", "atl_qe_fault_route"),
     // gate (e): a host-only fault goes to QEMU's handler (which aborts) instead of the pre-QEMU one
     ("chain-order", "atl_qe_chain_order"),
+    // gate (f): a host write to a write-protected translated-code page goes to the previous handler, not to QEMU's (which un-protects it)
+    ("drop-accerr", "atl_qe_drop_accerr"),
+    // gate (g): every thread classifies its faults with the BOOT thread's helper_retaddr
+    ("boot-only", "atl_qe_boot_only"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -165,6 +171,8 @@ fn main() -> Result<()> {
     }
     println!("cargo::rerun-if-env-changed={BREAK_ENV}");
     println!("cargo::rerun-if-env-changed={BUILD_ENV}");
+    println!("cargo::rerun-if-env-changed={SIGCHAIN_ENV}");
+    println!("cargo::rustc-check-cfg=cfg(atl_qe_sigchain)");
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
@@ -187,5 +195,17 @@ fn main() -> Result<()> {
     )?;
     // the spike harness is an executable: P1's call in the dlopened QEMU library binds to this strong definition only if it is in the dynamic symbol table
     println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
+    // ART's sigchain, linked into the harness: its `sigaction` / `signal` / `sigprocmask` are this executable's, and QEMU's library binds to them only if they are exported
+    if let Some(obj) = std::env::var_os(SIGCHAIN_ENV) {
+        println!("cargo::rustc-cfg=atl_qe_sigchain");
+        println!(
+            "cargo::rustc-link-arg-tests={}",
+            PathBuf::from(obj).display()
+        );
+        println!("cargo::rustc-link-arg-tests=-lstdc++");
+        for sym in ["sigaction", "signal", "sigprocmask"] {
+            println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol={sym}");
+        }
+    }
     Ok(())
 }

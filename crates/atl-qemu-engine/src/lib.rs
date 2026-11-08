@@ -4,8 +4,8 @@
 //! Start: [`run`] dlopens the spike library (QEMU's PIC objects linked `-shared`, `main` aliased `atl_qemu_user_main`) and runs QEMU's own `main` on a static guest ELF: QEMU's init, loader and `cpu_loop`, nothing replayed here.
 //! Hand-over: the guest's bootstrap `svc #BOOT` (x0 = payload, x1 = its `svc #RET` stub) reaches P1's hook ([`trap`]); from there the host drives guest calls ([`Guest::call`]) and answers `svc #CALL` traps, all through the one [`OnTrap`] callback.
 //! Exit: the BOOT answer lands in the guest's x0 and the guest exits through QEMU's own syscall path; `run` returns only if QEMU's `main` does.
-//! Faults: [`signal`] puts its handler in front of QEMU's at BOOT (QEMU's `signal_init` overwrites earlier handlers and never chains them): guest faults go to QEMU's, host-only faults to the handler that was installed before `run`.
-//! Single guest thread: per-thread QEMU state (`helper_retaddr`) is resolved on the BOOT thread (Q3 extends it).
+//! Faults: [`signal`] puts its handler in front of QEMU's at BOOT (QEMU's `signal_init` overwrites earlier handlers and never chains them): guest faults go to QEMU's, host-only faults to the handler that was installed before `run`; with libsigchain linked, ART's special handlers run before it.
+//! Guest threads: each registers its per-thread QEMU state (`helper_retaddr`) at its first trap (BOOT, or THREAD in [`trap`]); [`signal`] classifies every fault on the thread that took it.
 #![cfg_attr(
     not(feature = "qemu"),
     doc = "Built without feature `qemu`: no engine code (needs `ATL_QEMU_BUILD`, see Cargo.toml)."
