@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Linux, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs (GDK), the accelerometers through IIO sysfs (iio.rs), the fonts through fontconfig (fonts.rs).
+//! Linux, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs (GDK), the accelerometers through IIO (iio/: the kernel buffer or sysfs), the fonts through fontconfig (fonts.rs).
 //! GDK reports logical geometry and the refresh rate in milli-Hz (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts both.
 #![forbid(unsafe_code)]
 

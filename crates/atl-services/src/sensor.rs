@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use atl_platform_host::{Accelerometer, Sensors};
+use atl_platform_host::{Accelerometer, SampleStream, Sensors};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 
 use crate::counters;
@@ -112,22 +112,18 @@ impl SensorInfo {
     }
 
     fn injected(handle: i32) -> SensorInfo {
-        SensorInfo::accelerometer(
+        SensorInfo {
             handle,
-            &Accelerometer {
-                id: String::new(),
-                name: INJECTED_NAME.to_owned(),
-                max_range: INJECTED_MAX_RANGE,
-                resolution: INJECTED_RESOLUTION,
-                min_period: INJECTED_MIN_PERIOD,
-            },
-        )
-        .with_source(Source::Injected)
-    }
-
-    fn with_source(mut self, source: Source) -> SensorInfo {
-        self.source = source;
-        self
+            name: INJECTED_NAME.to_owned(),
+            sensor_type: layout::ASENSOR_TYPE_ACCELEROMETER_ID,
+            string_type: STRING_TYPE_ACCELEROMETER,
+            max_range: INJECTED_MAX_RANGE,
+            resolution: INJECTED_RESOLUTION,
+            power: 0.0,
+            min_delay_us: i32::try_from(INJECTED_MIN_PERIOD.as_micros().max(1)).unwrap_or(i32::MAX),
+            max_delay_us: 0,
+            source: Source::Injected,
+        }
     }
 
     fn min_delay_ns(&self) -> i64 {
@@ -325,8 +321,11 @@ impl SensorHub {
         injection: Option<&str>,
         focus: Option<Arc<FocusedProcess>>,
     ) -> Arc<SensorHub> {
-        let mut sensors: Vec<SensorInfo> = source
-            .accelerometers()
+        let listed = source.accelerometers();
+        for a in &listed {
+            counters::answered(INTERFACE, &format!("accelerometer tier: {}", a.tier));
+        }
+        let mut sensors: Vec<SensorInfo> = listed
             .iter()
             .zip(1..)
             .map(|(a, h)| SensorInfo::accelerometer(h, a))
@@ -547,8 +546,11 @@ impl SensorHub {
             .collect()
     }
 
-    /// The poll loop of one enabled sensor: read, stamp, send to each subscriber, sleep the shortest asked period.
+    /// The poll loop of one enabled sensor: one `next` per period, each sample to every subscriber. A silent source repeats the last sample with a fresh stamp, so the events keep the asked rate (Android's accelerometer reports continuously).
+    /// The stream opens on the first pass and is reopened after a failure; the loop paces itself to the shortest asked period.
     fn poll(&self, s: SensorInfo, id: String, stop: Arc<AtomicBool>) {
+        let mut stream: Option<Box<dyn SampleStream>> = None;
+        let mut last: Option<[f32; 3]> = None;
         while !stop.load(Ordering::Relaxed) {
             let (period, channels): (i64, Vec<(u64, Arc<Channel>)>) = {
                 let st = self.lock();
@@ -568,20 +570,42 @@ impl SensorHub {
                     .collect();
                 (period, ch)
             };
-            match self.source.read_accel(&id) {
-                Ok(v) => {
-                    let event = encode_event(s.handle, s.sensor_type, boottime_ns(), &v);
-                    for (c, ch) in &channels {
-                        if ch.dead.load(Ordering::Relaxed) || !ch.send(&event) {
-                            self.disable(*c, s.handle);
-                        }
+            let wait = Duration::from_nanos(u64::try_from(period).unwrap_or(0));
+            let started = Instant::now();
+            if stream.is_none() {
+                match self.source.open(&id) {
+                    Ok(st) => {
+                        counters::answered(INTERFACE, &format!("accelerometer tier: {}", st.tier()));
+                        stream = Some(st);
+                    }
+                    Err(e) => {
+                        counters::answered(INTERFACE, &format!("source open failed: {e}"));
                     }
                 }
-                Err(e) => {
+            }
+            let outcome = stream.as_mut().map(|st| st.next(wait));
+            let sample = match outcome {
+                Some(Ok(Some(sm))) => {
+                    last = Some(sm.values);
+                    Some((sm.boottime_ns, sm.values))
+                }
+                Some(Ok(None)) => last.map(|v| (boottime_ns(), v)),
+                Some(Err(e)) => {
                     counters::answered(INTERFACE, &format!("source read failed: {e}"));
+                    stream = None;
+                    None
+                }
+                None => None,
+            };
+            if let Some((ts, v)) = sample {
+                let event = encode_event(s.handle, s.sensor_type, ts, &v);
+                for (c, ch) in &channels {
+                    if ch.dead.load(Ordering::Relaxed) || !ch.send(&event) {
+                        self.disable(*c, s.handle);
+                    }
                 }
             }
-            std::thread::sleep(Duration::from_nanos(u64::try_from(period).unwrap_or(0)));
+            std::thread::sleep(wait.saturating_sub(started.elapsed()));
         }
         log(&format!("{} (handle {}) stopped", s.name, s.handle));
     }
@@ -591,12 +615,26 @@ impl SensorHub {
 mod tests {
     use std::time::Instant;
 
-    use atl_platform_host::SensorError;
+    use atl_platform_host::{Sample, SensorError, Tier};
 
     use super::*;
 
-    /// A test double of the platform source: one accelerometer with fixed values.
+    /// A test double of the platform source: one accelerometer whose stream answers at once with fixed values.
     struct Fixed;
+
+    struct FixedStream;
+
+    impl SampleStream for FixedStream {
+        fn tier(&self) -> Tier {
+            Tier::Buffered
+        }
+        fn next(&mut self, _: Duration) -> Result<Option<Sample>, SensorError> {
+            Ok(Some(Sample {
+                boottime_ns: boottime_ns(),
+                values: [1.0, -2.0, 9.5],
+            }))
+        }
+    }
 
     impl Sensors for Fixed {
         fn accelerometers(&self) -> Vec<Accelerometer> {
@@ -606,10 +644,44 @@ mod tests {
                 max_range: 19.6,
                 resolution: 0.01,
                 min_period: Duration::from_millis(5),
+                tier: Tier::Buffered,
             }]
         }
-        fn read_accel(&self, _: &str) -> Result<[f32; 3], SensorError> {
-            Ok([1.0, -2.0, 9.5])
+        fn open(&self, _: &str) -> Result<Box<dyn SampleStream>, SensorError> {
+            Ok(Box::new(FixedStream))
+        }
+    }
+
+    /// The writer paused: one sample, then nothing; each silent call takes its whole timeout.
+    struct Paused {
+        sent: bool,
+    }
+
+    impl SampleStream for Paused {
+        fn tier(&self) -> Tier {
+            Tier::Polled(atl_platform_host::Fallback::NoData)
+        }
+        fn next(&mut self, timeout: Duration) -> Result<Option<Sample>, SensorError> {
+            if !self.sent {
+                self.sent = true;
+                return Ok(Some(Sample {
+                    boottime_ns: boottime_ns(),
+                    values: [3.0, 3.0, 3.0],
+                }));
+            }
+            std::thread::sleep(timeout);
+            Ok(None)
+        }
+    }
+
+    struct PausedSource;
+
+    impl Sensors for PausedSource {
+        fn accelerometers(&self) -> Vec<Accelerometer> {
+            Fixed.accelerometers()
+        }
+        fn open(&self, _: &str) -> Result<Box<dyn SampleStream>, SensorError> {
+            Ok(Box::new(Paused { sent: false }))
         }
     }
 
@@ -619,7 +691,7 @@ mod tests {
         fn accelerometers(&self) -> Vec<Accelerometer> {
             Vec::new()
         }
-        fn read_accel(&self, id: &str) -> Result<[f32; 3], SensorError> {
+        fn open(&self, id: &str) -> Result<Box<dyn SampleStream>, SensorError> {
             Err(SensorError(id.into()))
         }
     }
@@ -723,6 +795,29 @@ mod tests {
             hub.state.lock().unwrap().active.is_empty(),
             "the last disable stops the source"
         );
+    }
+
+    /// The writer paused (G4 gate): events keep coming at the asked period with the last value, and their stamps move forward.
+    #[test]
+    fn silent_source_repeats_the_last_sample_at_the_asked_rate() {
+        let hub = SensorHub::new(Arc::new(PausedSource), None, None);
+        let ch = Arc::new(Channel::open().unwrap());
+        let rx = ch.take_receive().unwrap();
+        let started = Instant::now();
+        assert_eq!(hub.enable(1, &ch, 1, 20_000_000), OK);
+        let mut stamps = Vec::new();
+        for _ in 0..5 {
+            let e = recv_event(&ch, &rx);
+            let v: Vec<f32> = (0..3)
+                .map(|i| f32::from_ne_bytes(e[24 + 4 * i..28 + 4 * i].try_into().unwrap()))
+                .collect();
+            assert_eq!(v, [3.0, 3.0, 3.0]);
+            stamps.push(i64::from_ne_bytes(e[16..24].try_into().unwrap()));
+        }
+        assert!(stamps.windows(2).all(|w| w[1] > w[0]), "stamps move forward: {stamps:?}");
+        // five events at 20 ms: the first at once, the next four one period apart (not a burst)
+        assert!(started.elapsed() >= Duration::from_millis(60), "{:?}", started.elapsed());
+        hub.drop_connection(1);
     }
 
     #[test]

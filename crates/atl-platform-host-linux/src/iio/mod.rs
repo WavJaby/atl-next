@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Accelerometers from Linux IIO sysfs (kernel Documentation/ABI/testing/sysfs-bus-iio) plus their udev properties, read on demand with std::fs: no D-Bus, no toolkit.
+//! Accelerometers from Linux IIO (kernel Documentation/ABI/testing/sysfs-bus-iio) plus their udev properties, std and rustix only: no D-Bus, no toolkit.
+//! Two tiers behind one [`SampleStream`]: the kernel buffer (`buffer.rs`, char device `/dev/iio:deviceN`) where the environment enabled it, else sysfs reads ([`PolledStream`]). The tier is probed from the kernel's state, never named by machine; the first failing probe step is the fallback label.
 //! iio-sensor-proxy is not used: it publishes only orientation labels, no raw values. Its rules are followed exactly, so a machine its hwdb quirks fix reads right here too (iio-sensor-proxy ca0d5b0).
 //! A device counts as an accelerometer when it has `in_accel_{x,y,z}_raw`. One axis value = (raw + offset) x scale, m/s² (ABI `in_accel_x_raw`: "Units after application of scale and offset are m/s^2"); per-axis `in_accel_<a>_scale` / `_offset` win over the shared ones, offset absent = 0.
 //! Frame, in order:
@@ -7,23 +8,28 @@
 //!    Text "x1, y1, z1; x2, y2, z2; x3, y3, z3", applied as rows: out r = row r . sensor vector (`apply_mount_matrix`, accel-mount-matrix.c:180-182).
 //! 2. canonical -> Android, one fixed conversion [`to_android`].
 //!
-//! Location (accel-attributes.c `setup_accel_location`): udev `ACCEL_LOCATION` (""/display/lid = display, base) -> sysfs `label` (accel-display / accel-base) -> sysfs `location` (as the property) -> display. A `base` device is not listed: Android's
-//! TYPE_ACCELEROMETER is the device's own frame (the display's, SensorEvent docs), and a laptop base's reading equals that only at one hinge angle; without a hinge-angle sensor there is nothing to compensate with, so no accelerometer beats a wrong one.
+//! Location (accel-attributes.c `setup_accel_location`): udev `ACCEL_LOCATION` (""/display/lid = display, base) -> sysfs `label` (accel-display / accel-base) -> sysfs `location` (as the property) -> display. A `base` device is not listed: Android's TYPE_ACCELEROMETER is the device's own frame (the display's, SensorEvent docs), and a laptop base's reading equals that only at one hinge angle; without a hinge-angle sensor there is nothing to compensate with, so no accelerometer beats a wrong one.
 //! udev properties come from the udev database `/run/udev/data/c<major>:<minor>` (`E:KEY=VALUE` lines; the device number from sysfs `dev`), the file libudev itself reads: no libudev link, so this crate stays free of `unsafe`.
+
+mod buffer;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use atl_platform_host_api::{Accelerometer, SensorError, Sensors};
+use atl_platform_host_api::{Accelerometer, Fallback, Sample, SampleStream, SensorError, Sensors, Tier};
 
-/// Where the kernel lists IIO devices; the one product path (a test environment supplies another sysfs by mount namespace, not by a parameter).
+/// Where the kernel lists IIO devices. Product default; tests inject their own root through the field.
 const IIO_DEVICES: &str = "/sys/bus/iio/devices";
 /// systemd-udevd's device database; same rule as [`IIO_DEVICES`].
 const UDEV_DATA: &str = "/run/udev/data";
+/// Where the char devices `/dev/iio:deviceN` are, named as the sysfs entry.
+const DEV: &str = "/dev";
 const AXES: [&str; 3] = ["x", "y", "z"];
 /// Read interval when the device states no sampling frequency: 100 Hz, Android's SENSOR_DELAY_FASTEST class for a phone accelerometer, and 3 small sysfs reads per sample stay cheap at it.
 const DEFAULT_PERIOD: Duration = Duration::from_millis(10);
+/// The polled tier's advertised interval (owner decision D5). One sample is three sysfs reads, 107-121 ms each on the owner's laptop (design section 6), so 3 x 110 ms. The device's 100 ms is not met by this tier.
+const POLLED_PERIOD: Duration = Duration::from_millis(330);
 /// Storage bits assumed when `scan_elements/in_accel_x_type` is absent: 16 is the widest common accelerometer word, so the range is an over-estimate, never a clip.
 const DEFAULT_REAL_BITS: u32 = 16;
 const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -41,6 +47,8 @@ fn to_android(c: [f64; 3]) -> [f64; 3] {
 pub struct IioSensors {
     root: PathBuf,
     udev: PathBuf,
+    /// Where the char devices are; `/dev` in the product.
+    dev: PathBuf,
 }
 
 impl Default for IioSensors {
@@ -48,7 +56,31 @@ impl Default for IioSensors {
         IioSensors {
             root: PathBuf::from(IIO_DEVICES),
             udev: PathBuf::from(UDEV_DATA),
+            dev: PathBuf::from(DEV),
         }
+    }
+}
+
+/// What turns raw counts into the Android frame; read once when a stream opens.
+#[derive(Debug, Clone, Copy)]
+struct Calibration {
+    scale: [f64; 3],
+    offset: [f64; 3],
+    matrix: [[f64; 3]; 3],
+}
+
+impl Calibration {
+    /// (raw + offset) x scale per axis, the mount matrix rows, then [`to_android`].
+    fn frame(&self, raw: [f64; 3]) -> [f32; 3] {
+        let mut v = [0.0f64; 3];
+        for (i, out) in v.iter_mut().enumerate() {
+            *out = (raw[i] + self.offset[i]) * self.scale[i];
+        }
+        let mut canonical = [0.0f64; 3];
+        for (r, row) in self.matrix.iter().enumerate() {
+            canonical[r] = row[0] * v[0] + row[1] * v[1] + row[2] * v[2];
+        }
+        to_android(canonical).map(|x| x as f32)
     }
 }
 
@@ -157,8 +189,21 @@ impl IioSensors {
         v
     }
 
+    /// The char devices of the accelerometers listed now, existing nodes only: the services sandbox's device binds (`--dev-bind`), which the buffered tier reads. Not in [`IioSensors::read_paths`]: a read-only mount of a device node would only be shadowed by the bind.
+    pub fn device_paths(&self) -> Vec<PathBuf> {
+        self.accelerometers()
+            .iter()
+            .map(|a| self.node(&a.id))
+            .filter(|p| p.exists())
+            .collect()
+    }
+
     fn device(&self, id: &str) -> PathBuf {
         self.root.join(id)
+    }
+
+    fn node(&self, id: &str) -> PathBuf {
+        self.dev.join(id)
     }
 
     fn is_accel(dir: &Path) -> bool {
@@ -217,25 +262,53 @@ impl IioSensors {
             .ok_or_else(|| SensorError(format!("{}: no in_accel_scale", dir.display())))
     }
 
+    /// The sample interval the device states: `in_accel_sampling_frequency` (the HID report interval), else `sampling_frequency`; [`DEFAULT_PERIOD`] when neither.
+    fn interval(dir: &Path) -> Result<Duration, SensorError> {
+        let hz = match read_f64(&dir.join("in_accel_sampling_frequency"))? {
+            Some(f) => Some(f),
+            None => read_f64(&dir.join("sampling_frequency"))?,
+        };
+        Ok(hz
+            .filter(|f| *f > 0.0)
+            .map(|f| Duration::from_secs_f64(1.0 / f))
+            .unwrap_or(DEFAULT_PERIOD))
+    }
+
+    fn calibration(&self, dir: &Path) -> Result<Calibration, SensorError> {
+        let mut scale = [0.0f64; 3];
+        let mut offset = [0.0f64; 3];
+        for (i, a) in AXES.iter().enumerate() {
+            scale[i] = Self::scale(dir, a)?;
+            offset[i] = Self::axis_attr(dir, a, "offset")?.unwrap_or(0.0);
+        }
+        Ok(Calibration {
+            scale,
+            offset,
+            matrix: self.matrix(dir),
+        })
+    }
+
+    /// Probes the tier once for the listing: the buffer's state and the char device, then the advertised interval (device interval when buffered, [`POLLED_PERIOD`] otherwise).
     fn describe(&self, id: &str, dir: &Path) -> Result<Accelerometer, SensorError> {
         let scale = Self::scale(dir, "x")?;
         let bits = read_text(&dir.join("scan_elements/in_accel_x_type"))
             .and_then(|t| real_bits(&t))
             .unwrap_or(DEFAULT_REAL_BITS);
-        let hz = match read_f64(&dir.join("in_accel_sampling_frequency"))? {
-            Some(f) => Some(f),
-            None => read_f64(&dir.join("sampling_frequency"))?,
+        let interval = Self::interval(dir)?;
+        let tier = match buffer::probe(&self.root, dir).and_then(|_| buffer::claim(&self.node(id))) {
+            Ok(_) => Tier::Buffered,
+            Err(why) => Tier::Polled(why),
         };
-        let min_period = hz
-            .filter(|f| *f > 0.0)
-            .map(|f| Duration::from_secs_f64(1.0 / f))
-            .unwrap_or(DEFAULT_PERIOD);
         Ok(Accelerometer {
             id: id.to_owned(),
             name: read_text(&dir.join("name")).unwrap_or_else(|| id.to_owned()),
             max_range: (scale * f64::from(1u32 << (bits.clamp(1, 32) - 1))) as f32,
             resolution: scale as f32,
-            min_period,
+            min_period: match tier {
+                Tier::Buffered => interval,
+                Tier::Polled(_) => POLLED_PERIOD,
+            },
+            tier,
         })
     }
 }
@@ -259,46 +332,75 @@ impl Sensors for IioSensors {
             .collect()
     }
 
-    fn read_accel(&self, id: &str) -> Result<[f32; 3], SensorError> {
+    /// The buffered tier when its probe passes ([`buffer::Stream::open`]); otherwise the polled tier, which says why.
+    fn open(&self, id: &str) -> Result<Box<dyn SampleStream>, SensorError> {
         let dir = self.device(id);
-        let mut v = [0.0f64; 3];
+        let calib = self.calibration(&dir)?;
+        let interval = Self::interval(&dir)?;
+        let stream: Box<dyn SampleStream> =
+            match buffer::Stream::open(&self.root, &dir, &self.node(id), interval, calib) {
+                Ok(stream) => Box::new(stream),
+                Err(why) => Box::new(PolledStream { dir, calib, why }),
+            };
+        Ok(stream)
+    }
+}
+
+/// The baseline tier: three sysfs reads per sample, stamped at the middle of the reads (CLOCK_BOOTTIME). It always returns after one read; the caller paces.
+struct PolledStream {
+    dir: PathBuf,
+    calib: Calibration,
+    why: Fallback,
+}
+
+impl SampleStream for PolledStream {
+    fn tier(&self) -> Tier {
+        Tier::Polled(self.why)
+    }
+
+    fn next(&mut self, _timeout: Duration) -> Result<Option<Sample>, SensorError> {
+        let t0 = buffer::clock_ns(rustix::time::ClockId::Boottime);
+        let mut raw = [0.0f64; 3];
         for (i, a) in AXES.iter().enumerate() {
-            let path = dir.join(format!("in_accel_{a}_raw"));
-            let raw = read_f64(&path)?
+            let path = self.dir.join(format!("in_accel_{a}_raw"));
+            raw[i] = read_f64(&path)?
                 .ok_or_else(|| SensorError(format!("{}: unreadable", path.display())))?;
-            let offset = Self::axis_attr(&dir, a, "offset")?.unwrap_or(0.0);
-            v[i] = (raw + offset) * Self::scale(&dir, a)?;
         }
-        let m = self.matrix(&dir);
-        let mut canonical = [0.0f64; 3];
-        for (r, row) in m.iter().enumerate() {
-            canonical[r] = row[0] * v[0] + row[1] * v[1] + row[2] * v[2];
-        }
-        Ok(to_android(canonical).map(|x| x as f32))
+        let t1 = buffer::clock_ns(rustix::time::ClockId::Boottime);
+        Ok(Some(Sample {
+            boottime_ns: t0 + (t1 - t0) / 2,
+            values: self.calib.frame(raw),
+        }))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// A fake sysfs device directory per `(name, files)` plus a fake udev database; device `iio:device<n>` gets `dev` = `250:<n>`.
-    struct Fake(PathBuf);
+    /// A fake sysfs device directory per `(name, files)` plus a fake udev database and `dev` dir; device `iio:device<n>` gets `dev` = `250:<n>`.
+    /// A trigger `trigger0` named `accel_3d-dev0` (the laptop's) is always present; buffer files are per device.
+    pub(crate) struct Fake(pub PathBuf);
 
-    /// One device's sysfs files and its udev entry.
-    type Device<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+    /// One device's sysfs files (relative paths, `dir/name` allowed) and its udev entry.
+    pub(crate) type Device<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
 
     impl Fake {
-        fn new(tag: &str, devices: &[Device<'_>]) -> Fake {
+        pub(crate) fn new(tag: &str, devices: &[Device<'_>]) -> Fake {
             let root = std::env::temp_dir().join(format!("atl-iio-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("udev")).unwrap();
+            std::fs::create_dir_all(root.join("dev")).unwrap();
+            std::fs::create_dir_all(root.join("sys/trigger0")).unwrap();
+            std::fs::write(root.join("sys/trigger0/name"), "accel_3d-dev0\n").unwrap();
             for (n, (files, udev)) in devices.iter().enumerate() {
                 let dev = root.join(format!("sys/iio:device{n}"));
                 std::fs::create_dir_all(dev.join("scan_elements")).unwrap();
                 std::fs::write(dev.join("dev"), format!("250:{n}\n")).unwrap();
                 for (f, t) in *files {
-                    std::fs::write(dev.join(f), format!("{t}\n")).unwrap();
+                    let path = dev.join(f);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, format!("{t}\n")).unwrap();
                 }
                 if let Some(db) = udev {
                     std::fs::write(root.join(format!("udev/c250:{n}")), db).unwrap();
@@ -306,11 +408,23 @@ mod tests {
             }
             Fake(root)
         }
-        fn sensors(&self) -> IioSensors {
+
+        pub(crate) fn sensors(&self) -> IioSensors {
             IioSensors {
                 root: self.0.join("sys"),
                 udev: self.0.join("udev"),
+                dev: self.0.join("dev"),
             }
+        }
+
+        /// The sysfs dir of device `n`.
+        pub(crate) fn dir(&self, n: usize) -> PathBuf {
+            self.0.join(format!("sys/iio:device{n}"))
+        }
+
+        /// The char device node path of device `n` (`dev/iio:device<n>`); the caller creates it.
+        pub(crate) fn node(&self, n: usize) -> PathBuf {
+            self.0.join(format!("dev/iio:device{n}"))
         }
     }
 
@@ -320,14 +434,14 @@ mod tests {
         }
     }
 
-    const RAW: [(&str, &str); 4] = [
+    pub(crate) const RAW: [(&str, &str); 4] = [
         ("in_accel_x_raw", "100"),
         ("in_accel_y_raw", "-200"),
         ("in_accel_z_raw", "1000"),
         ("in_accel_scale", "0.01"),
     ];
 
-    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+    pub(crate) fn close(a: [f32; 3], b: [f32; 3]) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
     }
 
@@ -353,17 +467,19 @@ mod tests {
     }
 
     #[test]
-    fn identity_without_matrix() {
+    fn identity_without_matrix_polled_without_a_layout() {
         let f = Fake::new("id", &[(&RAW, None)]);
         let s = f.sensors();
         let list = s.accelerometers();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].min_period, DEFAULT_PERIOD);
+        // no scan_elements: the buffer's first step fails, and the polled tier advertises its read span (D5)
+        assert_eq!(list[0].tier, Tier::Polled(Fallback::Layout));
+        assert_eq!(list[0].min_period, Duration::from_millis(330));
         // raw x 0.01 = canonical (1, -2, 10); Android negates x and y
-        assert!(close(
-            s.read_accel("iio:device0").unwrap(),
-            [-1.0, 2.0, 10.0]
-        ));
+        let mut st = s.open("iio:device0").unwrap();
+        assert_eq!(st.tier(), Tier::Polled(Fallback::Layout));
+        let got = st.next(Duration::from_millis(100)).unwrap().unwrap();
+        assert!(close(got.values, [-1.0, 2.0, 10.0]));
     }
 
     #[test]
@@ -377,27 +493,26 @@ mod tests {
         let f = Fake::new("mm", &[(&files, None)]);
         let s = f.sensors();
         // sensor = ((100+10), (-200+10), (1000+10)) x 0.01 = (1.1, -1.9, 10.1) -> canonical (-1.9, -1.1, 10.1) -> Android (1.9, 1.1, 10.1)
-        assert!(close(
-            s.read_accel("iio:device0").unwrap(),
-            [1.9, 1.1, 10.1]
-        ));
+        let got = s.open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        assert!(close(got.values, [1.9, 1.1, 10.1]));
         let a = &s.accelerometers()[0];
-        assert_eq!(a.min_period, Duration::from_millis(20));
+        assert_eq!(a.min_period, Duration::from_millis(330));
         // 2^(12-1) steps of 0.01
         assert!((a.max_range - 20.48).abs() < 1e-4);
     }
 
     /// The owner's laptop (TP3607SH, HID accel_3d), measured 2026-11-06, with hwdb `ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, -1`. Raw readings at scale 0.01 and the Android values by hand:
     /// canonical = (x, y, -z), Android = (-x, -y, -z) of the raw. Upright: y = +g, z > 0 (the lid leans back). Flat screen-up: z = +g. Left edge down = right edge up: x = +g.
+    pub(crate) const LAPTOP_CASES: [([&str; 3], [f32; 3]); 3] = [
+        (["-6", "-871", "-374"], [0.06, 8.71, 3.74]),
+        (["14", "63", "-1019"], [-0.14, -0.63, 10.19]),
+        (["-980", "62", "-50"], [9.80, -0.62, 0.50]),
+    ];
+
     #[test]
     fn laptop_readings_reach_the_android_frame() {
-        let cases: [([&str; 3], [f32; 3]); 3] = [
-            (["-6", "-871", "-374"], [0.06, 8.71, 3.74]),
-            (["14", "63", "-1019"], [-0.14, -0.63, 10.19]),
-            (["-980", "62", "-50"], [9.80, -0.62, 0.50]),
-        ];
         let db = "E:ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, -1\nE:ACCEL_LOCATION=display\n";
-        for (raw, want) in cases {
+        for (raw, want) in LAPTOP_CASES {
             let files = [
                 ("in_accel_x_raw", raw[0]),
                 ("in_accel_y_raw", raw[1]),
@@ -407,7 +522,14 @@ mod tests {
                 ("in_accel_mount_matrix", "0, 1, 0; 1, 0, 0; 0, 0, 1"),
             ];
             let f = Fake::new("laptop", &[(&files, Some(db))]);
-            let got = f.sensors().read_accel("iio:device0").unwrap();
+            let got = f
+                .sensors()
+                .open("iio:device0")
+                .unwrap()
+                .next(Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .values;
             assert!(close(got, want), "{raw:?}: got {got:?}, want {want:?}");
         }
     }
@@ -418,18 +540,14 @@ mod tests {
         let mut files = RAW.to_vec();
         files.push(("in_mount_matrix", "0, 1, 0; 1, 0, 0; 0, 0, 1"));
         let f = Fake::new("inmm", &[(&files, None)]);
-        assert!(close(
-            f.sensors().read_accel("iio:device0").unwrap(),
-            [2.0, -1.0, 10.0]
-        ));
+        let got = f.sensors().open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        assert!(close(got.values, [2.0, -1.0, 10.0]));
         // mount_matrix beats in_accel_mount_matrix and in_mount_matrix; an unparsable udev property falls through
         files.push(("in_accel_mount_matrix", "0, 1, 0; 1, 0, 0; 0, 0, 1"));
         files.push(("mount_matrix", "1, 0, 0; 0, 1, 0; 0, 0, -1"));
         let f = Fake::new("mm2", &[(&files, Some("E:ACCEL_MOUNT_MATRIX=bogus\n"))]);
-        assert!(close(
-            f.sensors().read_accel("iio:device0").unwrap(),
-            [-1.0, 2.0, -10.0]
-        ));
+        let got = f.sensors().open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        assert!(close(got.values, [-1.0, 2.0, -10.0]));
     }
 
     #[test]
@@ -463,7 +581,9 @@ mod tests {
         let s = IioSensors {
             root: PathBuf::from("/nonexistent/atl-iio"),
             udev: PathBuf::from("/nonexistent/atl-udev"),
+            dev: PathBuf::from("/nonexistent/atl-dev"),
         };
         assert!(s.accelerometers().is_empty());
+        assert!(s.device_paths().is_empty());
     }
 }

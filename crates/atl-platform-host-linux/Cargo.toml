@@ -14,6 +14,8 @@ publish.workspace = true
 atl-platform-host-api = { path = "../atl-platform-host-api" }
 fontconfig.workspace = true
 gtk4.workspace = true
+rustix.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

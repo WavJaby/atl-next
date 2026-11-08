@@ -1178,12 +1178,16 @@ fn run(a: &Args) -> Result<ExitCode> {
         false,
         Some(control_theirs),
     )?;
-    // sensorservice's source reads the machine's accelerometers (PlatformSensors), which the minimal root does not show
-    let sensor_paths = atl_platform_host::PlatformSensors::default().read_paths();
+    // sensorservice's source reads the machine's accelerometers (PlatformSensors), which the minimal root does not show: their sysfs and udev entries read-only, their char devices bound (the buffered tier)
+    let sensors = atl_platform_host::PlatformSensors::default();
+    let sensor_paths = sensors.read_paths();
     log(format_args!("services: sensor paths {sensor_paths:?}"));
     services_spawn
         .mounts
         .extend(sensor_paths.iter().map(|p| ro_at_own_path(p)));
+    let sensor_devices = sensors.device_paths();
+    log(format_args!("services: sensor devices {sensor_devices:?}"));
+    services_spawn.devices.extend(sensor_devices);
     let mut services = host
         .broker
         .spawn(services_spawn)

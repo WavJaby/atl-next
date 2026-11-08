@@ -41,7 +41,7 @@ pipewire = "0.10.1"
 # xtask only: `run-apk --drive` screenshots
 png = "0.18"
 roxmltree = "0.21"
-rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time"] }
+rustix = { version = "1", features = ["event", "fs", "mm", "net", "param", "process", "stdio", "thread", "time", "linux_4_11"] }
 serde = { version = "1", features = ["derive"] }
 # what a face is (atl-fonts): OS/2 weight + italic, post fixed pitch, fvar axes, name ID 6, cmap + hmtx for the font gate; fontations' parser of untrusted font files (ttf-parser: RUSTSEC-2026-0192 unmaintained)
 read-fonts = "0.46"

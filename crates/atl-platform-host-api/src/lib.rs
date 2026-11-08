@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The platform layer's host side (atld, xtask, the system services) as traits: the desktop's monitors, read once at start: size, refresh rate, scale. Following the window to another monitor or scale is the app side's (the window knows its monitor; atld has no window).
 //! Shaped by the one implementation, GDK on Linux (atl-platform-host-linux): the connection is thread-affine, and a monitor that reports no refresh rate answers `None`.
-//! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO sysfs, which is read on demand (no stream to start or stop), so the caller polls at its own rate.
+//! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
 #![forbid(unsafe_code)]
@@ -38,7 +38,7 @@ pub struct SensorError(
 /// One accelerometer of the machine, as listed by [`Sensors::accelerometers`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Accelerometer {
-    /// Stable key for [`Sensors::read_accel`] while the device exists.
+    /// Stable key for [`Sensors::open`] while the device exists.
     pub id: String,
     /// The device's own name.
     pub name: String,
@@ -46,8 +46,10 @@ pub struct Accelerometer {
     pub max_range: f32,
     /// One raw step, m/s².
     pub resolution: f32,
-    /// Shortest useful read interval.
+    /// Shortest useful read interval of the tier in `tier`: the device's sample interval when buffered, the read span when polled.
     pub min_period: std::time::Duration,
+    /// The tier [`Sensors::open`] serves, probed at listing; a stream opened later may fall back (see [`SampleStream::tier`]).
+    pub tier: Tier,
 }
 
 /// The desktop's font configuration could not be read.
@@ -97,6 +99,76 @@ pub trait Sensors: Send + Sync {
     /// The accelerometers present now; empty when there are none.
     fn accelerometers(&self) -> Vec<Accelerometer>;
 
-    /// One sample of accelerometer `id`: x, y, z.
-    fn read_accel(&self, id: &str) -> Result<[f32; 3], SensorError>;
+    /// A stream of accelerometer `id`. An unusable buffer is not an error: the stream falls back to the baseline tier and says why.
+    fn open(&self, id: &str) -> Result<Box<dyn SampleStream>, SensorError>;
+}
+
+/// How a stream gets its samples. The kernel buffer is the faster tier, used where the environment set it up; sysfs reads are the baseline every machine has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The kernel buffer: one scan per device sample, stamped by the kernel.
+    Buffered,
+    /// Sysfs reads, and why the buffer was not used.
+    Polled(Fallback),
+}
+
+/// Why the buffered tier is not used; the label is the tier counter's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// The scan layout is not one the decoder reads.
+    Layout,
+    /// No trigger, or the named trigger is not on the machine.
+    Trigger,
+    /// The buffer is off: nothing has enabled it.
+    NotEnabled,
+    /// The timestamp clock is not one the kernel offers.
+    Clock,
+    /// This process may not open the char device.
+    NodeDenied,
+    /// Another reader holds the char device.
+    NodeBusy,
+    /// The buffer is on but no fresh scan arrives.
+    NoData,
+}
+
+impl Fallback {
+    /// The reason's label in the tier counter.
+    pub fn label(self) -> &'static str {
+        match self {
+            Fallback::Layout => "layout",
+            Fallback::Trigger => "trigger",
+            Fallback::NotEnabled => "not-enabled",
+            Fallback::Clock => "clock",
+            Fallback::NodeDenied => "node-denied",
+            Fallback::NodeBusy => "node-busy",
+            Fallback::NoData => "no-data",
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tier::Buffered => f.write_str("buffered"),
+            Tier::Polled(why) => write!(f, "polled ({})", why.label()),
+        }
+    }
+}
+
+/// One sample: the frame of [`Sensors`] and the instant it was measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+    /// CLOCK_BOOTTIME, ns: Android's `elapsedRealtimeNanos`.
+    pub boottime_ns: i64,
+    /// x, y, z in the frame of [`Sensors`], m/s².
+    pub values: [f32; 3],
+}
+
+/// One open reading of an accelerometer; dropping it releases the device.
+pub trait SampleStream: Send {
+    /// The tier serving this stream, decided when it was opened.
+    fn tier(&self) -> Tier;
+
+    /// The newest sample not returned before. Returns as soon as one is ready, or `Ok(None)` after `timeout` with none; the polled tier returns after one read (its span is its interval). The caller paces one call per period and repeats its last sample on `None`.
+    fn next(&mut self, timeout: std::time::Duration) -> Result<Option<Sample>, SensorError>;
 }

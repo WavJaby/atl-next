@@ -426,6 +426,8 @@ dependencies = [
  "atl-platform-host-api",
  "fontconfig",
  "gtk4",
+ "rustix",
+ "tracing",
 ]
 
 [[package]]

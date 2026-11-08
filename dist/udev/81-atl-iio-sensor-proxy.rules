@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# ATL owns the display accelerometer's buffer (design §5.3, decision D2): iio-sensor-proxy reads this device by sysfs polling only, so it never enables, disables or frees the buffer ATL reads.
+# Sorts after /usr/lib/udev/rules.d/80-iio-sensor-proxy.rules, so this `=` replaces the `iio-poll-accel iio-buffer-accel` list set there.
+SUBSYSTEM=="iio", KERNEL=="iio:device[0-9]*", ATTR{name}=="accel_3d", ENV{IIO_SENSOR_PROXY_TYPE}="iio-poll-accel"
