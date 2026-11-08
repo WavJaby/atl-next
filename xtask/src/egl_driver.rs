@@ -15,7 +15,7 @@ const PROBE_BIN: &str = "atl-egl-driver-probe";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Output directory (default: <workspace>/out/egl-driver).
+    /// Output directory (default: <workspace>/out/egl-driver/<checkout dir name>; never inside the checkout, whose files the static checks read).
     #[arg(long)]
     out: Option<PathBuf>,
     /// DRM node gralloc allocates on (default: gralloc's own trial, the node the driver renders on).
@@ -24,7 +24,16 @@ pub struct Args {
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let out = args.out.clone().unwrap_or_else(|| root.join("out/egl-driver"));
+    let out = match &args.out {
+        Some(o) => o.clone(),
+        None => {
+            let checkout = root.file_name().context("checkout dir name")?;
+            atl_layout::Layout::of(root)?
+                .workspace()
+                .join("out/egl-driver")
+                .join(checkout)
+        }
+    };
     let dir = crate::cdylib::stage(root, &out, DRIVER_PACKAGE, "egl", atl_egl_driver_name())?;
     let driver = dir.join(atl_egl_driver_name());
     let probe = build_probe(root, &out.join("cargo"))?;
@@ -39,7 +48,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         let o = cmd.output().context("running the probe")?;
         // the host EGL's own warnings go to stderr; the probe's lines are on stdout
-        Ok((o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()))
+        Ok((
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        ))
     };
     let (ok, text) = go(None)?;
     print!("{text}");
@@ -49,7 +61,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for (brk, mark) in [("flip", "orientation red"), ("fbo0", "FAIL")] {
         let (passed, text) = go(Some(brk))?;
         let caught = !passed && text.contains(mark);
-        println!("egl-driver: break {brk}: {}", if caught { "red (expected)" } else { "NOT caught" });
+        println!(
+            "egl-driver: break {brk}: {}",
+            if caught {
+                "red (expected)"
+            } else {
+                "NOT caught"
+            }
+        );
         if !caught {
             print!("{text}");
             bail!("egl-driver: FAILED control: break {brk} passed");
@@ -68,7 +87,15 @@ fn build_probe(root: &Path, target: &Path) -> Result<PathBuf> {
     crate::unit_use::exec(
         crate::cargo_command()
             .current_dir(root)
-            .args(["build", "--release", "-p", PROBE_PACKAGE, "--bin", PROBE_BIN, "--target-dir"])
+            .args([
+                "build",
+                "--release",
+                "-p",
+                PROBE_PACKAGE,
+                "--bin",
+                PROBE_BIN,
+                "--target-dir",
+            ])
             .arg(target),
         "cargo build (egl-driver probe)",
     )?;

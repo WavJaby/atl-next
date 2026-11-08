@@ -42,18 +42,53 @@ macro_rules! host_table {
     };
 }
 
-host_table!(HostEgl, e {
-    eglGetError, eglQueryString, eglChooseConfig, eglGetConfigAttrib, eglDestroySurface, eglQuerySurface,
-    eglSurfaceAttrib, eglMakeCurrent, eglSwapBuffers, eglSwapInterval, eglCreateImageKHR,
-});
+host_table!(
+    HostEgl,
+    e {
+        eglGetError,
+        eglQueryString,
+        eglChooseConfig,
+        eglGetConfigAttrib,
+        eglDestroySurface,
+        eglQuerySurface,
+        eglSurfaceAttrib,
+        eglMakeCurrent,
+        eglSwapBuffers,
+        eglSwapInterval,
+        eglCreateImageKHR,
+    }
+);
 
-host_table!(HostGl, g {
-    glBindFramebuffer, glGetIntegerv, glInvalidateFramebuffer, glInvalidateSubFramebuffer, glDiscardFramebufferEXT,
-    glDrawBuffers, glReadBuffer, glDeleteFramebuffers, glIsFramebuffer, glGenFramebuffers, glGenRenderbuffers,
-    glBindRenderbuffer, glRenderbufferStorage, glFramebufferRenderbuffer, glFramebufferTexture2D,
-    glCheckFramebufferStatus, glGenTextures, glBindTexture, glTexParameteri, glDeleteTextures, glDeleteRenderbuffers,
-    glEGLImageTargetTexture2DOES, glViewport, glScissor, glFinish,
-});
+host_table!(
+    HostGl,
+    g {
+        glBindFramebuffer,
+        glGetIntegerv,
+        glInvalidateFramebuffer,
+        glInvalidateSubFramebuffer,
+        glDiscardFramebufferEXT,
+        glDrawBuffers,
+        glReadBuffer,
+        glDeleteFramebuffers,
+        glIsFramebuffer,
+        glGenFramebuffers,
+        glGenRenderbuffers,
+        glBindRenderbuffer,
+        glRenderbufferStorage,
+        glFramebufferRenderbuffer,
+        glFramebufferTexture2D,
+        glCheckFramebufferStatus,
+        glGenTextures,
+        glBindTexture,
+        glTexParameteri,
+        glDeleteTextures,
+        glDeleteRenderbuffers,
+        glEGLImageTargetTexture2DOES,
+        glViewport,
+        glScissor,
+        glFinish,
+    }
+);
 
 /// Host display extensions passed on: what holds unchanged for the driver's own objects too (images, syncs, contexts, surfaceless).
 /// Left out: surface extensions the host implements for its own surfaces only (partial_update, buffer_age, swap_buffers_with_damage, mutable_render_buffer, gl_colorspace).
@@ -109,7 +144,11 @@ pub fn get() -> Option<&'static Driver> {
         .get_or_init(|| match Driver::load() {
             Ok(d) => Some(d),
             Err(err) => {
-                eprintln!("libGLES_atl: no host EGL device: {err:#}");
+                // the process's stderr is its log (atl-broker); without this line every egl* call would just fail
+                #[allow(clippy::print_stderr, reason = "one line, once per process")]
+                {
+                    eprintln!("libGLES_atl: no host EGL device: {err:#}");
+                }
                 None
             }
         })
@@ -197,13 +236,15 @@ fn choose_display(host: &Arc<Host>) -> Result<Display> {
         .map(|b| b.node().to_string_lossy().into_owned());
     let devices = host.devices()?;
     let on_node = node.as_deref().and_then(|n| {
-        devices.iter().find(|d| {
-            d.render_node.as_deref() == Some(n) || d.drm_file.as_deref() == Some(n)
-        })
+        devices
+            .iter()
+            .find(|d| d.render_node.as_deref() == Some(n) || d.drm_file.as_deref() == Some(n))
     });
     let device = on_node
         .or_else(|| devices.iter().find(|d| d.is_software()))
-        .with_context(|| format!("no EGL device on gralloc's node {node:?} and no software device"))?;
+        .with_context(|| {
+            format!("no EGL device on gralloc's node {node:?} and no software device")
+        })?;
     device.display()
 }
 

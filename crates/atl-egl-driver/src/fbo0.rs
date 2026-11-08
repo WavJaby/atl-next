@@ -4,7 +4,10 @@
 //! bind 0, binding queries, invalidate / discard naming GL_COLOR / GL_DEPTH / GL_STENCIL, GL_BACK in draw / read buffers, delete / isFramebuffer of the FBO's name. Every other GL entry is the host's directly.
 //! Not wrapped (no known caller): glGetIntegeri_v / glGetInteger64v / glGetBooleanv / glGetFloatv of a binding, glGetFramebufferAttachmentParameteriv on framebuffer 0, GLES 1's OES framebuffer entries.
 
-#![allow(non_snake_case, reason = "each wrapper carries the GL entry's name it stands for")]
+#![allow(
+    non_snake_case,
+    reason = "each wrapper carries the GL entry's name it stands for"
+)]
 
 use std::cell::Cell;
 
@@ -78,7 +81,11 @@ unsafe fn mapped(target: u32, n: i32, atts: *const u32) -> Option<Vec<u32>> {
 pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
     let Some(d) = driver::get() else { return };
     let f = fbo();
-    let name = if framebuffer == 0 && f != 0 { f } else { framebuffer };
+    let name = if framebuffer == 0 && f != 0 {
+        f
+    } else {
+        framebuffer
+    };
     // SAFETY: the host entry with the caller's arguments, name translated.
     unsafe { (d.gl.glBindFramebuffer)(target, name) };
 }
@@ -88,7 +95,8 @@ pub unsafe extern "C" fn glGetIntegerv(pname: u32, data: *mut i32) {
     // SAFETY: the host entry with the caller's arguments.
     unsafe { (d.gl.glGetIntegerv)(pname, data) };
     let f = fbo();
-    let binding = pname == g::GL_FRAMEBUFFER_BINDING as u32 || pname == g::GL_READ_FRAMEBUFFER_BINDING as u32;
+    let binding =
+        pname == g::GL_FRAMEBUFFER_BINDING as u32 || pname == g::GL_READ_FRAMEBUFFER_BINDING as u32;
     // SAFETY: a binding query wrote one GLint to the caller's pointer.
     if binding && f != 0 && !data.is_null() && unsafe { *data } == f as i32 {
         // SAFETY: as above.
@@ -107,7 +115,15 @@ pub unsafe extern "C" fn glInvalidateFramebuffer(target: u32, n: i32, atts: *con
     }
 }
 
-pub unsafe extern "C" fn glInvalidateSubFramebuffer(target: u32, n: i32, atts: *const u32, x: i32, y: i32, w: i32, h: i32) {
+pub unsafe extern "C" fn glInvalidateSubFramebuffer(
+    target: u32,
+    n: i32,
+    atts: *const u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
     let Some(d) = driver::get() else { return };
     // SAFETY: the caller passes `n` enums.
     match unsafe { mapped(target, n, atts) } {

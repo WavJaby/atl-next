@@ -8,7 +8,6 @@
 //! Breaks (each must turn the verdict red): `--break flip` -- the window drops the buffer transform (a driver that does not tag FLIP_V); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
 //! The probe implements `perform` without its variadic tail: the driver passes one integer argument, which on the Linux ABIs of every arches.toml host (SysV x86-64, AAPCS64, RISC-V LP64) travels in the register of the third named integer argument.
 
-#![expect(clippy::disallowed_types, reason = "a measurement tool, not a runtime process")]
 #![allow(non_snake_case, reason = "window.h hook and GL entry names")]
 
 use std::collections::VecDeque;
@@ -156,7 +155,10 @@ unsafe extern "C" fn set_swap_interval(_: *mut w::ANativeWindow, _: i32) -> i32 
 
 unsafe extern "C" fn query(win: *const w::ANativeWindow, what: i32, value: *mut i32) -> i32 {
     let v = match what as u32 {
-        w::NATIVE_WINDOW_WIDTH | w::NATIVE_WINDOW_HEIGHT | w::NATIVE_WINDOW_DEFAULT_WIDTH | w::NATIVE_WINDOW_DEFAULT_HEIGHT => EDGE,
+        w::NATIVE_WINDOW_WIDTH
+        | w::NATIVE_WINDOW_HEIGHT
+        | w::NATIVE_WINDOW_DEFAULT_WIDTH
+        | w::NATIVE_WINDOW_DEFAULT_HEIGHT => EDGE,
         w::NATIVE_WINDOW_FORMAT => RGBA_8888,
         w::NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS => 1,
         w::NATIVE_WINDOW_IS_VALID => 1,
@@ -187,7 +189,11 @@ unsafe extern "C" fn perform(win: *mut w::ANativeWindow, op: i32, arg: usize) ->
     0
 }
 
-unsafe extern "C" fn dequeue(win: *mut w::ANativeWindow, buf: *mut *mut w::ANativeWindowBuffer, fence: *mut i32) -> i32 {
+unsafe extern "C" fn dequeue(
+    win: *mut w::ANativeWindow,
+    buf: *mut *mut w::ANativeWindowBuffer,
+    fence: *mut i32,
+) -> i32 {
     // SAFETY: our window.
     let t = unsafe { this(win) };
     let Some(i) = t.state.lock().expect("probe state").free.pop_front() else {
@@ -205,26 +211,42 @@ fn slot_of(t: &TestWindow, buf: *mut w::ANativeWindowBuffer) -> Option<usize> {
     t.slots.iter().position(|s| std::ptr::eq(&*s.buffer, buf))
 }
 
-unsafe extern "C" fn queue(win: *mut w::ANativeWindow, buf: *mut w::ANativeWindowBuffer, fence: i32) -> i32 {
+unsafe extern "C" fn queue(
+    win: *mut w::ANativeWindow,
+    buf: *mut w::ANativeWindowBuffer,
+    fence: i32,
+) -> i32 {
     // SAFETY: our window.
     let t = unsafe { this(win) };
     // SAFETY: the window owns the fence from here (window.h queueBuffer).
     let fence = (fence >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fence) });
-    let Some(slot) = slot_of(t, buf) else { return -EINVAL };
+    let Some(slot) = slot_of(t, buf) else {
+        return -EINVAL;
+    };
     let mut s = t.state.lock().expect("probe state");
     let transform = s.transform;
-    s.queued.push(Queued { slot, transform, fence });
+    s.queued.push(Queued {
+        slot,
+        transform,
+        fence,
+    });
     0
 }
 
-unsafe extern "C" fn cancel(win: *mut w::ANativeWindow, buf: *mut w::ANativeWindowBuffer, fence: i32) -> i32 {
+unsafe extern "C" fn cancel(
+    win: *mut w::ANativeWindow,
+    buf: *mut w::ANativeWindowBuffer,
+    fence: i32,
+) -> i32 {
     // SAFETY: our window.
     let t = unsafe { this(win) };
     if fence >= 0 {
         // SAFETY: as queue.
         drop(unsafe { OwnedFd::from_raw_fd(fence) });
     }
-    let Some(slot) = slot_of(t, buf) else { return -EINVAL };
+    let Some(slot) = slot_of(t, buf) else {
+        return -EINVAL;
+    };
     t.state.lock().expect("probe state").free.push_back(slot);
     0
 }
@@ -240,7 +262,8 @@ fn base(magic: u32, size: usize) -> w::android_native_base_t {
 }
 
 fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>> {
-    let backend = Backend::start(Path::new(DRM_DIR), alloc).map_err(|e| anyhow!("gralloc backend: {e}"))?;
+    let backend =
+        Backend::start(Path::new(DRM_DIR), alloc).map_err(|e| anyhow!("gralloc backend: {e}"))?;
     out(&format!("gralloc node {}", backend.node().display()));
     let checked = Descriptor {
         name: b"egl-driver".to_vec(),
@@ -257,7 +280,9 @@ fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>>
     .map_err(|e| anyhow!("descriptor refused: {e:?}"))?;
     let mut slots = Vec::new();
     for i in 0..BUFFERS {
-        let buf = backend.allocate(&checked).map_err(|e| anyhow!("allocate: {e}"))?;
+        let buf = backend
+            .allocate(&checked)
+            .map_err(|e| anyhow!("allocate: {e}"))?;
         let size = usize::try_from(buf.size)?;
         let map = Mapping::new(buf.fd.as_fd(), size)?;
         begin_cpu_access(buf.fd.as_fd(), SYNC_WRITE)?;
@@ -277,11 +302,20 @@ fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>>
             id: (u64::from(std::process::id()) << 32) | (i as u64 + 1),
         };
         // native_handle_t: version = sizeof(native_handle_t) (3 ints), numFds, numInts, then data
-        let mut h = vec![12, NUM_FDS as i32, NUM_INTS as i32, buf.fd.as_raw_fd(), page.as_raw_fd()];
+        let mut h = vec![
+            12,
+            NUM_FDS as i32,
+            NUM_INTS as i32,
+            buf.fd.as_raw_fd(),
+            page.as_raw_fd(),
+        ];
         h.extend(params.to_ints());
         let handle = h.into_boxed_slice();
         let buffer = Box::new(w::ANativeWindowBuffer {
-            common: base(w::ANDROID_NATIVE_BUFFER_MAGIC, size_of::<w::ANativeWindowBuffer>()),
+            common: base(
+                w::ANDROID_NATIVE_BUFFER_MAGIC,
+                size_of::<w::ANativeWindowBuffer>(),
+            ),
             width: EDGE,
             height: EDGE,
             stride: i32::try_from(buf.pitch / 4)?,
@@ -316,7 +350,10 @@ fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>>
     };
     Ok(Box::new(TestWindow {
         anw: w::ANativeWindow {
-            common: base(w::ANDROID_NATIVE_WINDOW_MAGIC, size_of::<w::ANativeWindow>()),
+            common: base(
+                w::ANDROID_NATIVE_WINDOW_MAGIC,
+                size_of::<w::ANativeWindow>(),
+            ),
             flags: 0,
             minSwapInterval: 0,
             maxSwapInterval: 1,
@@ -343,7 +380,8 @@ fn window(alloc: Option<&Path>, drop_transform: bool) -> Result<Box<TestWindow>>
 
 type EglInitialize = unsafe extern "C" fn(e::EGLDisplay, *mut i32, *mut i32) -> u32;
 type EglBindApi = unsafe extern "C" fn(u32) -> u32;
-type EglCreateContext = unsafe extern "C" fn(e::EGLDisplay, e::EGLConfig, e::EGLContext, *const i32) -> e::EGLContext;
+type EglCreateContext =
+    unsafe extern "C" fn(e::EGLDisplay, e::EGLConfig, e::EGLContext, *const i32) -> e::EGLContext;
 type GlViewport = unsafe extern "C" fn(i32, i32, i32, i32);
 type GlCap = unsafe extern "C" fn(u32);
 type GlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
@@ -365,9 +403,11 @@ struct Loaded {
 impl Loaded {
     fn load(path: &Path) -> Result<Self> {
         // SAFETY: loading the driver runs only its initialisers (none of ours do work).
-        let lib = unsafe { libloading::Library::new(path) }.with_context(|| format!("dlopen {}", path.display()))?;
+        let lib = unsafe { libloading::Library::new(path) }
+            .with_context(|| format!("dlopen {}", path.display()))?;
         // SAFETY: eglGetProcAddress has the header's signature (exports.rs checks it).
-        let gpa = *unsafe { lib.get::<e::eglGetProcAddress>(b"eglGetProcAddress\0") }.context("driver lacks eglGetProcAddress")?;
+        let gpa = *unsafe { lib.get::<e::eglGetProcAddress>(b"eglGetProcAddress\0") }
+            .context("driver lacks eglGetProcAddress")?;
         Ok(Self { _lib: lib, gpa })
     }
 
@@ -378,7 +418,8 @@ impl Loaded {
             return Ok(*f);
         }
         // SAFETY: a NUL-terminated name.
-        let f = unsafe { (self.gpa)(name.as_ptr()) }.with_context(|| format!("driver has no {name:?}"))?;
+        let f = unsafe { (self.gpa)(name.as_ptr()) }
+            .with_context(|| format!("driver has no {name:?}"))?;
         Ok(f as *const c_void)
     }
 
@@ -410,8 +451,11 @@ fn run(args: &Args) -> Result<()> {
         Ok(p)
     };
     let from_drv = |name: &CStr| drv.entry(name);
-    let fbo0_src: &dyn Fn(&CStr) -> Result<*const c_void> =
-        if args.broken == Some(Break::Fbo0) { &from_host } else { &from_drv };
+    let fbo0_src: &dyn Fn(&CStr) -> Result<*const c_void> = if args.broken == Some(Break::Fbo0) {
+        &from_host
+    } else {
+        &from_drv
+    };
 
     let get_display = entry!(from_drv, c"eglGetDisplay", e::eglGetDisplay);
     let initialize = entry!(from_drv, c"eglInitialize", EglInitialize);
@@ -419,14 +463,22 @@ fn run(args: &Args) -> Result<()> {
     let choose = entry!(from_drv, c"eglChooseConfig", e::eglChooseConfig);
     let attrib = entry!(from_drv, c"eglGetConfigAttrib", e::eglGetConfigAttrib);
     let create_ctx = entry!(from_drv, c"eglCreateContext", EglCreateContext);
-    let create_surface = entry!(from_drv, c"eglCreateWindowSurface", e::eglCreateWindowSurface);
+    let create_surface = entry!(
+        from_drv,
+        c"eglCreateWindowSurface",
+        e::eglCreateWindowSurface
+    );
     let make_current = entry!(from_drv, c"eglMakeCurrent", e::eglMakeCurrent);
     let swap = entry!(from_drv, c"eglSwapBuffers", e::eglSwapBuffers);
     let destroy = entry!(from_drv, c"eglDestroySurface", e::eglDestroySurface);
     let egl_error = entry!(from_drv, c"eglGetError", e::eglGetError);
     let bind_fb = entry!(fbo0_src, c"glBindFramebuffer", g::glBindFramebuffer);
     let get_integer = entry!(fbo0_src, c"glGetIntegerv", g::glGetIntegerv);
-    let invalidate = entry!(fbo0_src, c"glInvalidateFramebuffer", g::glInvalidateFramebuffer);
+    let invalidate = entry!(
+        fbo0_src,
+        c"glInvalidateFramebuffer",
+        g::glInvalidateFramebuffer
+    );
     let viewport = entry!(from_drv, c"glViewport", GlViewport);
     let enable = entry!(from_drv, c"glEnable", GlCap);
     let disable = entry!(from_drv, c"glDisable", GlCap);
@@ -443,26 +495,53 @@ fn run(args: &Args) -> Result<()> {
         let dpy = get_display(std::ptr::null_mut());
         ensure!(!dpy.is_null(), egl_fail("eglGetDisplay"));
         let (mut major, mut minor) = (0, 0);
-        ensure!(initialize(dpy, &mut major, &mut minor) != 0, egl_fail("eglInitialize"));
+        ensure!(
+            initialize(dpy, &mut major, &mut minor) != 0,
+            egl_fail("eglInitialize")
+        );
         ensure!(bind_api(EGL_OPENGL_ES_API) != 0, egl_fail("eglBindAPI"));
         // hwui's EglManager config: RGBA8888, stencil 8, window + pbuffer, ES2
         let want = [
-            e::EGL_RED_SIZE, 8, e::EGL_GREEN_SIZE, 8, e::EGL_BLUE_SIZE, 8, e::EGL_ALPHA_SIZE, 8,
-            e::EGL_STENCIL_SIZE, 8, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            e::EGL_SURFACE_TYPE, e::EGL_WINDOW_BIT | e::EGL_PBUFFER_BIT, e::EGL_NONE,
+            e::EGL_RED_SIZE,
+            8,
+            e::EGL_GREEN_SIZE,
+            8,
+            e::EGL_BLUE_SIZE,
+            8,
+            e::EGL_ALPHA_SIZE,
+            8,
+            e::EGL_STENCIL_SIZE,
+            8,
+            EGL_RENDERABLE_TYPE,
+            EGL_OPENGL_ES2_BIT,
+            e::EGL_SURFACE_TYPE,
+            e::EGL_WINDOW_BIT | e::EGL_PBUFFER_BIT,
+            e::EGL_NONE,
         ];
         let (mut config, mut n) = (std::ptr::null_mut(), 0);
-        ensure!(choose(dpy, want.as_ptr(), &mut config, 1, &mut n) != 0 && n == 1, egl_fail("eglChooseConfig(window)"));
+        ensure!(
+            choose(dpy, want.as_ptr(), &mut config, 1, &mut n) != 0 && n == 1,
+            egl_fail("eglChooseConfig(window)")
+        );
         let mut visual = 0;
-        ensure!(attrib(dpy, config, e::EGL_NATIVE_VISUAL_ID, &mut visual) != 0, egl_fail("EGL_NATIVE_VISUAL_ID"));
-        ensure!(visual == RGBA_8888, "config's native visual {visual}, want RGBA_8888 ({RGBA_8888})");
+        ensure!(
+            attrib(dpy, config, e::EGL_NATIVE_VISUAL_ID, &mut visual) != 0,
+            egl_fail("EGL_NATIVE_VISUAL_ID")
+        );
+        ensure!(
+            visual == RGBA_8888,
+            "config's native visual {visual}, want RGBA_8888 ({RGBA_8888})"
+        );
         let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, e::EGL_NONE];
         let ctx = create_ctx(dpy, config, std::ptr::null_mut(), ctx_attribs.as_ptr());
         ensure!(!ctx.is_null(), egl_fail("eglCreateContext(ES3)"));
         let anw = std::ptr::from_ref(&win.anw).cast_mut();
         let surface = create_surface(dpy, config, anw.cast(), std::ptr::null());
         ensure!(!surface.is_null(), egl_fail("eglCreateWindowSurface"));
-        ensure!(make_current(dpy, surface, surface, ctx) != 0, egl_fail("eglMakeCurrent"));
+        ensure!(
+            make_current(dpy, surface, surface, ctx) != 0,
+            egl_fail("eglMakeCurrent")
+        );
         for frame in 0..FRAMES {
             bind_fb(g::GL_FRAMEBUFFER as u32, 0);
             let mut binding = -1;
@@ -470,13 +549,21 @@ fn run(args: &Args) -> Result<()> {
             let color = g::GL_COLOR as u32;
             invalidate(g::GL_FRAMEBUFFER as u32, 1, &color);
             let err = gl_error();
-            ensure!(binding == 0 && err == 0, "frame {frame}: framebuffer 0 reads back as {binding}, invalidate(GL_COLOR) GL error {err:#x}");
+            ensure!(
+                binding == 0 && err == 0,
+                "frame {frame}: framebuffer 0 reads back as {binding}, invalidate(GL_COLOR) GL error {err:#x}"
+            );
             viewport(0, 0, EDGE, EDGE);
             enable(GL_SCISSOR_TEST);
             for (x, y, fw, fh, rgba) in FILLS {
                 let c = fill_colour(frame, rgba);
                 scissor(x, y, fw, fh);
-                clear_color(f32::from(c[0]) / 255.0, f32::from(c[1]) / 255.0, f32::from(c[2]) / 255.0, f32::from(c[3]) / 255.0);
+                clear_color(
+                    f32::from(c[0]) / 255.0,
+                    f32::from(c[1]) / 255.0,
+                    f32::from(c[2]) / 255.0,
+                    f32::from(c[3]) / 255.0,
+                );
                 clear(GL_COLOR_BUFFER_BIT);
             }
             disable(GL_SCISSOR_TEST);
@@ -484,7 +571,15 @@ fn run(args: &Args) -> Result<()> {
             ensure!(err == 0, "frame {frame}: GL error {err:#x}");
             ensure!(swap(dpy, surface) != 0, egl_fail("eglSwapBuffers"));
         }
-        ensure!(make_current(dpy, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) != 0, egl_fail("eglMakeCurrent(none)"));
+        ensure!(
+            make_current(
+                dpy,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ) != 0,
+            egl_fail("eglMakeCurrent(none)")
+        );
         ensure!(destroy(dpy, surface) != 0, egl_fail("eglDestroySurface"));
     }
     judge(&win)
@@ -495,7 +590,11 @@ fn run(args: &Args) -> Result<()> {
 fn judge(win: &TestWindow) -> Result<()> {
     let s = win.state.lock().expect("probe state");
     out(&format!("usage {:#x}, {} queued", s.usage, s.queued.len()));
-    ensure!(s.queued.len() == FRAMES, "{} buffers queued, want {FRAMES}", s.queued.len());
+    ensure!(
+        s.queued.len() == FRAMES,
+        "{} buffers queued, want {FRAMES}",
+        s.queued.len()
+    );
     for (frame, q) in s.queued.iter().enumerate() {
         if let Some(f) = &q.fence {
             let mut fds = [rustix::event::PollFd::new(f, rustix::event::PollFlags::IN)];
@@ -506,8 +605,13 @@ fn judge(win: &TestWindow) -> Result<()> {
         begin_cpu_access(slot.dmabuf.as_fd(), SYNC_READ)?;
         let px = map.read();
         end_cpu_access(slot.dmabuf.as_fd(), SYNC_READ)?;
-        if q.transform & !(w::NATIVE_WINDOW_TRANSFORM_FLIP_H | w::NATIVE_WINDOW_TRANSFORM_FLIP_V) != 0 {
-            bail!("frame {frame}: transform {:#x} rotates; the driver only flips", q.transform);
+        if q.transform & !(w::NATIVE_WINDOW_TRANSFORM_FLIP_H | w::NATIVE_WINDOW_TRANSFORM_FLIP_V)
+            != 0
+        {
+            bail!(
+                "frame {frame}: transform {:#x} rotates; the driver only flips",
+                q.transform
+            );
         }
         let (flip_h, flip_v) = (
             q.transform & w::NATIVE_WINDOW_TRANSFORM_FLIP_H != 0,
@@ -531,7 +635,10 @@ fn judge(win: &TestWindow) -> Result<()> {
             }
         }
         let verdict = if bad == 0 { "ok" } else { "red" };
-        out(&format!("frame {frame}: transform {:#x}, {bad} pixels differ: orientation {verdict}", q.transform));
+        out(&format!(
+            "frame {frame}: transform {:#x}, {bad} pixels differ: orientation {verdict}",
+            q.transform
+        ));
         if let Some((x, r, got, want)) = first {
             // the buffer as stored, row 0 first, one letter per 8x8 block's top-left pixel: what a failure looks like
             for by in (0..EDGE).step_by(8) {

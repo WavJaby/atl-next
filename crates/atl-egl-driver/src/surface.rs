@@ -57,8 +57,12 @@ impl WindowSurface {
         window
             .perform_u64(w::NATIVE_WINDOW_SET_USAGE64, usage::GPU_RENDER_TARGET)
             .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        let width = window.query(w::NATIVE_WINDOW_WIDTH).map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        let height = window.query(w::NATIVE_WINDOW_HEIGHT).map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        let width = window
+            .query(w::NATIVE_WINDOW_WIDTH)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        let height = window
+            .query(w::NATIVE_WINDOW_HEIGHT)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
         Ok(Self {
             window,
             config,
@@ -82,15 +86,17 @@ impl WindowSurface {
         if let Some((_, id)) = &self.current {
             return Ok(*id);
         }
-        let (buf, fence) = self.window.dequeue().map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        let (buf, fence) = self
+            .window
+            .dequeue()
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
         if let Some(f) = fence {
             wait(&f)?;
         }
         let h = buf.handle().ok_or(e::EGL_BAD_NATIVE_WINDOW)?;
         let p = Params::from_handle(h.fds.len(), h.ints).map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        if !self.images.contains_key(&p.id) {
-            let image = import(d, &p, h.fds[FD_DMABUF])?;
-            self.images.insert(p.id, OwnedImage(image));
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.images.entry(p.id) {
+            slot.insert(OwnedImage(import(d, &p, h.fds[FD_DMABUF])?));
         }
         (self.width, self.height) = (buf.width(), buf.height());
         self.current = Some((buf, p.id));
@@ -129,7 +135,12 @@ impl WindowSurface {
             // a resize: the old size's targets in this context go with it
             // SAFETY: names of the current context.
             unsafe { (d.gl.glDeleteRenderbuffers)(1, &rb) };
-            let stale: Vec<_> = self.targets.keys().filter(|k| k.0 == ctx).copied().collect();
+            let stale: Vec<_> = self
+                .targets
+                .keys()
+                .filter(|k| k.0 == ctx)
+                .copied()
+                .collect();
             for k in stale {
                 let t = self.targets.remove(&k).expect("listed");
                 delete_target(d, &t);
@@ -142,7 +153,12 @@ impl WindowSurface {
             (d.gl.glGetIntegerv)(g::GL_RENDERBUFFER_BINDING as u32, &mut prev);
             (d.gl.glGenRenderbuffers)(1, &mut rb);
             (d.gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, rb);
-            (d.gl.glRenderbufferStorage)(g::GL_RENDERBUFFER as u32, g::GL_DEPTH24_STENCIL8 as u32, w, h);
+            (d.gl.glRenderbufferStorage)(
+                g::GL_RENDERBUFFER as u32,
+                g::GL_DEPTH24_STENCIL8 as u32,
+                w,
+                h,
+            );
             (d.gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, prev as u32);
         }
         self.depth.insert(ctx, (rb, w, h));
@@ -164,9 +180,14 @@ impl WindowSurface {
         };
         let (buf, _) = self.current.take().expect("ensured above");
         self.window
-            .perform_int(w::NATIVE_WINDOW_SET_BUFFERS_TRANSFORM, w::NATIVE_WINDOW_TRANSFORM_FLIP_V as i32)
+            .perform_int(
+                w::NATIVE_WINDOW_SET_BUFFERS_TRANSFORM,
+                w::NATIVE_WINDOW_TRANSFORM_FLIP_V as i32,
+            )
             .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        self.window.queue(buf, fence).map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        self.window
+            .queue(buf, fence)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
         self.bind(d, ctx)
     }
 
@@ -227,8 +248,16 @@ fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Targe
         (gl.glGetIntegerv)(g::GL_TEXTURE_BINDING_2D as u32, &mut prev_tex);
         (gl.glGenTextures)(1, &mut texture);
         (gl.glBindTexture)(g::GL_TEXTURE_2D as u32, texture);
-        (gl.glTexParameteri)(g::GL_TEXTURE_2D as u32, g::GL_TEXTURE_MIN_FILTER as u32, g::GL_NEAREST);
-        (gl.glTexParameteri)(g::GL_TEXTURE_2D as u32, g::GL_TEXTURE_MAG_FILTER as u32, g::GL_NEAREST);
+        (gl.glTexParameteri)(
+            g::GL_TEXTURE_2D as u32,
+            g::GL_TEXTURE_MIN_FILTER as u32,
+            g::GL_NEAREST,
+        );
+        (gl.glTexParameteri)(
+            g::GL_TEXTURE_2D as u32,
+            g::GL_TEXTURE_MAG_FILTER as u32,
+            g::GL_NEAREST,
+        );
         (gl.glEGLImageTargetTexture2DOES)(g::GL_TEXTURE_2D as u32, image);
         (gl.glBindTexture)(g::GL_TEXTURE_2D as u32, prev_tex as u32);
         (gl.glGenFramebuffers)(1, &mut fbo);
@@ -242,7 +271,12 @@ fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Targe
         );
         if depth != 0 {
             for att in [g::GL_DEPTH_ATTACHMENT, g::GL_STENCIL_ATTACHMENT] {
-                (gl.glFramebufferRenderbuffer)(g::GL_FRAMEBUFFER as u32, att as u32, g::GL_RENDERBUFFER as u32, depth);
+                (gl.glFramebufferRenderbuffer)(
+                    g::GL_FRAMEBUFFER as u32,
+                    att as u32,
+                    g::GL_RENDERBUFFER as u32,
+                    depth,
+                );
             }
         }
         (gl.glCheckFramebufferStatus)(g::GL_FRAMEBUFFER as u32)

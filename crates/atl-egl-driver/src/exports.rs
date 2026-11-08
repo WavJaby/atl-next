@@ -92,7 +92,8 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> Proc {
     }
     let p = driver::get()?.display.host().proc_address(n);
     // SAFETY: the host's address for `name`, the same contract as ours.
-    (!p.is_null()).then(|| unsafe { std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(p) })
+    (!p.is_null())
+        .then(|| unsafe { std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(p) })
 }
 
 #[unsafe(no_mangle)]
@@ -119,7 +120,11 @@ pub unsafe extern "C" fn eglGetDisplay(native: *mut c_void) -> e::EGLDisplay {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn eglTerminate(dpy: e::EGLDisplay) -> u32 {
     // the host display is shared by everything in the process (atl-egl-host: never terminated); the fronts' own state is theirs
-    if driver_for(dpy).is_some() { e::EGL_TRUE as u32 } else { fail(e::EGL_BAD_DISPLAY, 0) }
+    if driver_for(dpy).is_some() {
+        e::EGL_TRUE as u32
+    } else {
+        fail(e::EGL_BAD_DISPLAY, 0)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -164,11 +169,17 @@ pub unsafe extern "C" fn eglChooseConfig(
     let mut typed = false;
     for (k, v) in pairs {
         match k {
-            e::EGL_RECORDABLE_ANDROID | e::EGL_FRAMEBUFFER_TARGET_ANDROID | e::EGL_NATIVE_RENDERABLE => {}
+            e::EGL_RECORDABLE_ANDROID
+            | e::EGL_FRAMEBUFFER_TARGET_ANDROID
+            | e::EGL_NATIVE_RENDERABLE => {}
             e::EGL_SURFACE_TYPE => {
                 typed = true;
                 window = v != e::EGL_DONT_CARE && v & e::EGL_WINDOW_BIT != 0;
-                let v = if window { (v & !e::EGL_WINDOW_BIT) | e::EGL_PBUFFER_BIT } else { v };
+                let v = if window {
+                    (v & !e::EGL_WINDOW_BIT) | e::EGL_PBUFFER_BIT
+                } else {
+                    v
+                };
                 host_attribs.extend([k, v]);
             }
             _ => host_attribs.extend([k, v]),
@@ -180,13 +191,16 @@ pub unsafe extern "C" fn eglChooseConfig(
     host_attribs.push(e::EGL_NONE);
     let mut n = 0;
     // SAFETY: count only: a null array with size 0.
-    let ok = unsafe { (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), std::ptr::null_mut(), 0, &mut n) };
+    let ok = unsafe {
+        (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), std::ptr::null_mut(), 0, &mut n)
+    };
     if ok == 0 {
         return 0;
     }
     let mut all = vec![std::ptr::null_mut(); usize::try_from(n).unwrap_or(0)];
     // SAFETY: `all` holds `n` slots.
-    let ok = unsafe { (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), all.as_mut_ptr(), n, &mut n) };
+    let ok =
+        unsafe { (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), all.as_mut_ptr(), n, &mut n) };
     if ok == 0 {
         return 0;
     }
@@ -229,7 +243,12 @@ unsafe fn attrib_pairs(attribs: *const i32) -> Vec<(i32, i32)> {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eglGetConfigAttrib(dpy: e::EGLDisplay, config: e::EGLConfig, attr: i32, value: *mut i32) -> u32 {
+pub unsafe extern "C" fn eglGetConfigAttrib(
+    dpy: e::EGLDisplay,
+    config: e::EGLConfig,
+    attr: i32,
+    value: *mut i32,
+) -> u32 {
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
@@ -239,8 +258,14 @@ pub unsafe extern "C" fn eglGetConfigAttrib(dpy: e::EGLDisplay, config: e::EGLCo
     let format = d.window_format(config);
     let v = match attr {
         e::EGL_NATIVE_VISUAL_ID => format.unwrap_or(0),
-        e::EGL_NATIVE_RENDERABLE | e::EGL_RECORDABLE_ANDROID | e::EGL_FRAMEBUFFER_TARGET_ANDROID => {
-            if format.is_some() { e::EGL_TRUE } else { e::EGL_FALSE }
+        e::EGL_NATIVE_RENDERABLE
+        | e::EGL_RECORDABLE_ANDROID
+        | e::EGL_FRAMEBUFFER_TARGET_ANDROID => {
+            if format.is_some() {
+                e::EGL_TRUE
+            } else {
+                e::EGL_FALSE
+            }
         }
         e::EGL_SURFACE_TYPE => match d.host_attrib(config, attr) {
             Some(st) if format.is_some() => st | e::EGL_WINDOW_BIT,
@@ -293,7 +318,11 @@ pub unsafe extern "C" fn eglDestroySurface(dpy: e::EGLDisplay, s: e::EGLSurface)
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
-    let removed = d.surfaces.lock().ok().and_then(|mut m| m.remove(&(s as usize)));
+    let removed = d
+        .surfaces
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&(s as usize)));
     let Some(surface) = removed else {
         // SAFETY: not ours: the host's surface.
         return unsafe { (d.egl.eglDestroySurface)(dpy, s) };
@@ -306,16 +335,22 @@ pub unsafe extern "C" fn eglDestroySurface(dpy: e::EGLDisplay, s: e::EGLSurface)
         Some((_, ctx)) => Some(ctx),
         None => None,
     };
-    if let Ok(m) = Arc::try_unwrap(surface) {
-        if let Ok(s) = m.into_inner() {
-            s.destroy(d, current_ctx);
-        }
+    // another thread still in a call on this surface keeps it alive: its GL names then go with their context
+    if let Ok(m) = Arc::try_unwrap(surface)
+        && let Ok(s) = m.into_inner()
+    {
+        s.destroy(d, current_ctx);
     }
     e::EGL_TRUE as u32
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eglQuerySurface(dpy: e::EGLDisplay, s: e::EGLSurface, attr: i32, value: *mut i32) -> u32 {
+pub unsafe extern "C" fn eglQuerySurface(
+    dpy: e::EGLDisplay,
+    s: e::EGLSurface,
+    attr: i32,
+    value: *mut i32,
+) -> u32 {
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
@@ -326,7 +361,9 @@ pub unsafe extern "C" fn eglQuerySurface(dpy: e::EGLDisplay, s: e::EGLSurface, a
     if value.is_null() {
         return fail(e::EGL_BAD_PARAMETER, 0);
     }
-    let Ok(s) = surface.lock() else { return fail(e::EGL_BAD_SURFACE, 0) };
+    let Ok(s) = surface.lock() else {
+        return fail(e::EGL_BAD_SURFACE, 0);
+    };
     let v = match attr {
         e::EGL_WIDTH => s.width,
         e::EGL_HEIGHT => s.height,
@@ -344,7 +381,12 @@ pub unsafe extern "C" fn eglQuerySurface(dpy: e::EGLDisplay, s: e::EGLSurface, a
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eglSurfaceAttrib(dpy: e::EGLDisplay, s: e::EGLSurface, attr: i32, value: i32) -> u32 {
+pub unsafe extern "C" fn eglSurfaceAttrib(
+    dpy: e::EGLDisplay,
+    s: e::EGLSurface,
+    attr: i32,
+    value: i32,
+) -> u32 {
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
@@ -361,7 +403,12 @@ pub unsafe extern "C" fn eglSurfaceAttrib(dpy: e::EGLDisplay, s: e::EGLSurface, 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eglMakeCurrent(dpy: e::EGLDisplay, draw: e::EGLSurface, read: e::EGLSurface, ctx: e::EGLContext) -> u32 {
+pub unsafe extern "C" fn eglMakeCurrent(
+    dpy: e::EGLDisplay,
+    draw: e::EGLSurface,
+    read: e::EGLSurface,
+    ctx: e::EGLContext,
+) -> u32 {
     let Some(d) = driver_for(dpy) else {
         return fail(e::EGL_BAD_DISPLAY, 0);
     };
@@ -384,11 +431,17 @@ pub unsafe extern "C" fn eglMakeCurrent(dpy: e::EGLDisplay, draw: e::EGLSurface,
     if ok == 0 {
         return 0;
     }
-    let Ok(mut s) = surface.lock() else { return fail(e::EGL_BAD_SURFACE, 0) };
+    let Ok(mut s) = surface.lock() else {
+        return fail(e::EGL_BAD_SURFACE, 0);
+    };
     match s.bind(d, ctx as usize) {
         Ok(fbo) => {
             fbo0::set_current(Some((draw as usize, ctx as usize)), fbo);
-            let first = d.seen_contexts.lock().map(|mut m| m.insert(ctx as usize)).unwrap_or(false);
+            let first = d
+                .seen_contexts
+                .lock()
+                .map(|mut m| m.insert(ctx as usize))
+                .unwrap_or(false);
             if first {
                 // EGL 1.5 §3.7.3: the first make-current of a context sets viewport and scissor to the draw surface
                 // SAFETY: the context is current.
@@ -420,7 +473,9 @@ pub unsafe extern "C" fn eglSwapBuffers(dpy: e::EGLDisplay, s: e::EGLSurface) ->
         return fail(e::EGL_BAD_SURFACE, 0);
     };
     debug_assert_eq!(h, s as usize);
-    let Ok(mut s) = surface.lock() else { return fail(e::EGL_BAD_SURFACE, 0) };
+    let Ok(mut s) = surface.lock() else {
+        return fail(e::EGL_BAD_SURFACE, 0);
+    };
     match s.swap(d, ctx) {
         Ok(fbo) => {
             fbo0::set_fbo(fbo);
@@ -432,7 +487,12 @@ pub unsafe extern "C" fn eglSwapBuffers(dpy: e::EGLDisplay, s: e::EGLSurface) ->
 
 /// The fronts already set the damage on the window (`native_window_set_surface_damage`, egl_platform_entries.cpp); the driver redraws whole buffers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(dpy: e::EGLDisplay, s: e::EGLSurface, _rects: *const i32, _n: i32) -> u32 {
+pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(
+    dpy: e::EGLDisplay,
+    s: e::EGLSurface,
+    _rects: *const i32,
+    _n: i32,
+) -> u32 {
     // SAFETY: the same arguments eglSwapBuffers takes.
     unsafe { eglSwapBuffers(dpy, s) }
 }

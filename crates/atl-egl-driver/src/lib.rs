@@ -7,7 +7,13 @@
 
 pub mod abi {
     //! The C interface, generated from AOSP's headers (build.rs).
-    #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
+    #![allow(
+        non_camel_case_types,
+        non_snake_case,
+        non_upper_case_globals,
+        dead_code,
+        clippy::all
+    )]
     pub mod egl {
         include!(concat!(env!("OUT_DIR"), "/egl.rs"));
         // the generator resolves typedefs to their types; these names keep the handles apart in our signatures (each is `void*` in eglplatform.h / egl.h, so the alias checks still hold)

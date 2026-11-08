@@ -50,21 +50,27 @@ impl Window {
     pub fn query(&self, what: u32) -> Result<i32, Status> {
         let mut v = 0;
         // SAFETY: live window (held); `query` checked present at acquire; `v` is a valid out-pointer.
-        let r = unsafe { ((*self.raw()).query.expect("checked at acquire"))(self.raw(), what as i32, &mut v) };
+        let r = unsafe {
+            ((*self.raw()).query.expect("checked at acquire"))(self.raw(), what as i32, &mut v)
+        };
         status(r).map(|_| v)
     }
 
     /// `perform(op, int)`: the window.h helpers that take one `int` (`native_window_set_buffers_transform`).
     pub fn perform_int(&self, op: u32, arg: i32) -> Result<(), Status> {
         // SAFETY: live window; `perform` is variadic and the op's argument is one int (window.h).
-        let r = unsafe { ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg) };
+        let r = unsafe {
+            ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
+        };
         status(r).map(drop)
     }
 
     /// `perform(op, uint64_t)`: `native_window_set_usage`.
     pub fn perform_u64(&self, op: u32, arg: u64) -> Result<(), Status> {
         // SAFETY: as perform_int; the op's argument is one uint64_t.
-        let r = unsafe { ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg) };
+        let r = unsafe {
+            ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
+        };
         status(r).map(drop)
     }
 
@@ -82,7 +88,13 @@ impl Window {
         let mut buf = std::ptr::null_mut();
         let mut fence = -1;
         // SAFETY: live window; both out-pointers valid.
-        let r = unsafe { ((*self.raw()).dequeueBuffer.expect("checked at acquire"))(self.raw(), &mut buf, &mut fence) };
+        let r = unsafe {
+            ((*self.raw()).dequeueBuffer.expect("checked at acquire"))(
+                self.raw(),
+                &mut buf,
+                &mut fence,
+            )
+        };
         status(r)?;
         // SAFETY: on success `fence` is -1 or a new fd the caller owns (window.h dequeueBuffer).
         let fence = (fence >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fence) });
@@ -95,14 +107,18 @@ impl Window {
     pub fn queue(&self, buf: Buffer, fence: Option<OwnedFd>) -> Result<(), Status> {
         let fd = fence.map_or(-1, IntoRawFd::into_raw_fd);
         // SAFETY: live window; `buf` was dequeued from it; the window owns `fd` from here on, also on failure (window.h).
-        let r = unsafe { ((*self.raw()).queueBuffer.expect("checked at acquire"))(self.raw(), buf.raw(), fd) };
+        let r = unsafe {
+            ((*self.raw()).queueBuffer.expect("checked at acquire"))(self.raw(), buf.raw(), fd)
+        };
         status(r).map(drop)
     }
 
     /// Gives `buf` back unused.
     pub fn cancel(&self, buf: Buffer) {
         // SAFETY: live window; `buf` was dequeued from it; no fence.
-        unsafe { ((*self.raw()).cancelBuffer.expect("checked at acquire"))(self.raw(), buf.raw(), -1) };
+        unsafe {
+            ((*self.raw()).cancelBuffer.expect("checked at acquire"))(self.raw(), buf.raw(), -1)
+        };
     }
 }
 
