@@ -208,8 +208,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
-    /// The GL driver (mesa.rs `driver`), when [`Runtime::with_gl_driver`] asked for it: files placed by atld `--file`, library dirs joining the library path.
-    gl_driver: Option<crate::mesa::Driver>,
+    /// The GL driver and the fronts, when [`Runtime::with_gl_driver`] asked for them: files placed by atld `--file`.
+    gl_driver: Vec<(PathBuf, String)>,
     /// A gate's own test files placed by atld `--file` ([`Runtime::with_fixture_file`]): never shipped, so outside `refuse_test_only`.
     fixture_files: Vec<(PathBuf, String)>,
     /// The native-bridge guest placed by atld `--file` ([`Runtime::with_native_bridge_guest`]): (host file, Android path).
@@ -581,7 +581,7 @@ impl Runtime {
             fonts,
             keychars,
             gralloc: None,
-            gl_driver: None,
+            gl_driver: Vec::new(),
             fixture_files: Vec::new(),
             native_bridge_guest: Vec::new(),
             platform_files,
@@ -628,10 +628,10 @@ impl Runtime {
         Ok(self)
     }
 
-    /// Also places the GL driver `xtask native` built (Mesa for the Android platform, mesa.rs `driver`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop.
+    /// Also builds and places the GL driver (`libGLES_atl.so` over the host's EGL, egl_driver.rs `placement`) where AOSP's libEGL loader finds it: /vendor/lib64/egl and `ro.hardware.egl` in /vendor/build.prop.
     /// Also the fronts at Loader.cpp's `SYSTEM_LIB_PATH` (`/system/lib64` in LP64): it dlopens them there as the "wrapper" libraries (`load_wrapper`) and aborts without them; the links name the files already loaded, so glibc returns the loaded copy (same inode).
-    pub fn with_gl_driver(mut self) -> Result<Self> {
-        let (mut files, dirs) = crate::mesa::driver(&self.out)?;
+    pub fn with_gl_driver(mut self, root: &Path) -> Result<Self> {
+        let mut files = crate::egl_driver::placement(root, &self.out)?;
         let system_lib = atl_android_paths::SYSTEM_LIB;
         for m in gl_front_goals() {
             let lib = gl_front(&self.out, m);
@@ -643,7 +643,7 @@ impl Runtime {
             );
             files.push((lib, format!("{system_lib}/{m}.so")));
         }
-        self.gl_driver = Some((files, dirs));
+        self.gl_driver = files;
         Ok(self)
     }
 
@@ -1028,14 +1028,9 @@ impl Runtime {
             inputs.files.push(allocator.clone());
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
-        if let Some((driver_files, dirs)) = &self.gl_driver {
-            inputs
-                .files
-                .extend(driver_files.iter().map(|(f, _)| f.clone()));
-            for dir in dirs {
-                inputs.files.extend(remote::lib_files(dir)?);
-            }
-        }
+        inputs
+            .files
+            .extend(self.gl_driver.iter().map(|(f, _)| f.clone()));
         inputs
             .files
             .extend(self.fixture_files.iter().map(|(f, _)| f.clone()));
@@ -1120,10 +1115,7 @@ impl Runtime {
         staged.extend(self.fonts.files.iter().map(PathBuf::as_path));
         staged.extend(keychars.iter().map(PathBuf::as_path));
         staged.extend(self.gralloc.iter().map(|(_, dir)| dir.as_path()));
-        if let Some((files, dirs)) = &self.gl_driver {
-            staged.extend(files.iter().map(|(f, _)| f.as_path()));
-            staged.extend(dirs.iter().map(PathBuf::as_path));
-        }
+        staged.extend(self.gl_driver.iter().map(|(f, _)| f.as_path()));
         staged.extend(self.native_bridge_guest.iter().map(|(f, _)| f.as_path()));
         crate::licenses::refuse_test_only(&staged, &self.test_only)?;
         // the staged ART's library dir, the NativeBridge core's, then mapper.atl.so's (a PathBuf would take the absolute second as a replacement)
@@ -1131,10 +1123,6 @@ impl Runtime {
         lib_path.push(":");
         lib_path.push(&self.native_bridge);
         if let Some((_, dir)) = &self.gralloc {
-            lib_path.push(":");
-            lib_path.push(dir);
-        }
-        for dir in self.gl_driver.iter().flat_map(|(_, dirs)| dirs) {
             lib_path.push(":");
             lib_path.push(dir);
         }
@@ -1171,8 +1159,9 @@ impl Runtime {
         for s in &self.omitted_services {
             cmd.args(["--omit-service", s]);
         }
-        let driver_files = self.gl_driver.iter().flat_map(|(files, _)| files);
-        let placed = driver_files
+        let placed = self
+            .gl_driver
+            .iter()
             .chain(&self.native_bridge_guest)
             .chain(&self.fixture_files)
             .chain(&self.platform_files);

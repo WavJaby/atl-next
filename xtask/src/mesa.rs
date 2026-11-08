@@ -57,16 +57,6 @@ pub enum Opt {
 /// The gallium drivers built.
 pub const GALLIUM_DRIVERS: &[&str] = &["llvmpipe", "iris"];
 
-/// Kernel DRM driver -> the gallium driver Mesa takes for a node of it. Intel: iris takes `i915` and `xe` (`iris_predicate`, loader.c L127-131, on the name `loader_get_kernel_driver_name` reads, L108-118).
-/// `vgem` and `virtio_gpu` take kms_swrast on llvmpipe (platform_android.c L1035-1043). Chips in `i915_pci_ids.h` / `crocus_pci_ids.h` (`pci_id_driver_map.h` L57-58) take the classic i915 / crocus drivers, not built here, so no row covers them (unverified on hardware; owner decision).
-/// Read by `gl_probe::expected_tier` from each DRM node the probe holds; a driver with no row fails the gate, naming it.
-pub const KERNEL_DRIVER_TIERS: &[(&str, &str)] = &[
-    ("i915", "iris"),
-    ("xe", "iris"),
-    ("vgem", "llvmpipe"),
-    ("virtio_gpu", "llvmpipe"),
-];
-
 /// Each of [`GALLIUM_DRIVERS`] -> its screen constructor (lp_screen.c, iris_screen.c), which [`driver_links`] requires in [`DRIVER`]'s symtab.
 const DRIVER_SCREENS: &[(&str, &str)] = &[
     ("llvmpipe", "llvmpipe_create_screen"),
@@ -216,45 +206,6 @@ pub const OUTPUTS: &[&str] = &[
     DRIVER,
 ];
 
-/// The Mesa driver's placement: (host file, Android path) pairs, and library dirs.
-pub type Driver = (Vec<(PathBuf, String)>, Vec<PathBuf>);
-
-/// The Mesa driver as the runtime root holds it: (host file, Android path) to place (the [`OUTPUTS`] fronts in the driver dir, a /vendor/build.prop with `ro.hardware.egl`), and the build dirs of what they link (`libglapi`, `libgallium_dri`) for the library path.
-/// Their RUNPATH names those dirs by `$ORIGIN`, which a link placed in /vendor does not keep.
-pub fn driver(out: &Path) -> Result<Driver> {
-    let build = out.join(OUT_SUBDIR).join("build");
-    let suffix = OPTIONS
-        .iter()
-        .find_map(|(k, v)| match (k, v) {
-            (&"egl-lib-suffix", Opt::Str(s)) => Some(*s),
-            _ => None,
-        })
-        .context("mesa OPTIONS: no egl-lib-suffix")?;
-    // Loader.cpp builds `lib<kind>_<ro.hardware.egl>.so`: the property is the suffix without its `_`
-    let hardware = suffix
-        .strip_prefix('_')
-        .context("egl-lib-suffix without `_`")?;
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    for o in OUTPUTS {
-        let path = build.join(o);
-        ensure!(path.is_file(), "missing Mesa output {}", path.display());
-        let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
-            bail!("Mesa output {o} has no file name");
-        };
-        let name = name.to_string_lossy().into_owned();
-        let dir = dir.to_path_buf();
-        if name.ends_with(&format!("{suffix}.so")) {
-            files.push((path, format!("{}/{name}", atl_android_paths::VENDOR_EGL)));
-        } else {
-            dirs.push(dir);
-        }
-    }
-    let prop = out.join(OUT_SUBDIR).join("vendor-build.prop");
-    std::fs::write(&prop, format!("ro.hardware.egl={hardware}\n"))?;
-    files.push((prop, atl_android_paths::VENDOR_BUILD_PROP.to_owned()));
-    Ok((files, dirs))
-}
 
 pub fn read_graph(out: &Path) -> Result<Graph> {
     let graph_file = out.join("graph.json");
@@ -283,10 +234,9 @@ pub fn build_after_ninja(
     )
 }
 
-/// libgallium_dri's link facts (plan llvmpipe S2): its DT_NEEDED list, and the failures: an LLVM or libstdc++ NEEDED, an exported LLVM symbol.
-/// `libunwind.so.1` is listed, not failed: libc++ and libc++abi NEED it, the distro C++ runtime that stays (owner D1).
+/// libgallium_dri's link failures (plan llvmpipe S2): an LLVM or libstdc++ NEEDED, an exported LLVM symbol, a missing driver.
+/// `libunwind.so.1` is not failed: libc++ and libc++abi NEED it, the distro C++ runtime that stays (owner D1).
 pub struct Links {
-    pub needed: Vec<String>,
     pub failures: Vec<String>,
 }
 
@@ -339,7 +289,7 @@ pub fn driver_links(lib: &Path) -> Result<Links> {
             failures.push(format!("{} holds no {d} ({screen})", lib.display()));
         }
     }
-    Ok(Links { needed, failures })
+    Ok(Links { failures })
 }
 
 /// Distro LLVM/Clang libraries that may run only in host tools (intel_clc.rs), never in an app process (owner D1).
@@ -924,31 +874,6 @@ mod tests {
     fn every_driver_has_a_screen_symbol() {
         let named: Vec<&str> = DRIVER_SCREENS.iter().map(|(d, _)| *d).collect();
         assert_eq!(named, GALLIUM_DRIVERS);
-    }
-
-    #[test]
-    fn kernel_driver_tiers_name_built_drivers() {
-        assert!(!KERNEL_DRIVER_TIERS.is_empty());
-        assert!(
-            KERNEL_DRIVER_TIERS
-                .iter()
-                .all(|(_, gallium)| GALLIUM_DRIVERS.contains(gallium))
-        );
-    }
-
-    #[test]
-    fn kernel_driver_rows_are_mesas() {
-        // Mesa's rows, written out from its source (loader.c iris_predicate; platform_android.c L1035-1043)
-        let mut want = vec![
-            ("i915", "iris"),
-            ("xe", "iris"),
-            ("vgem", "llvmpipe"),
-            ("virtio_gpu", "llvmpipe"),
-        ];
-        let mut have = KERNEL_DRIVER_TIERS.to_vec();
-        want.sort();
-        have.sort();
-        assert_eq!(have, want);
     }
 
     #[test]

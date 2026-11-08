@@ -439,7 +439,7 @@ fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?
+    .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?
     .with_ui("gtk");
     let rt = if args.no_app_seccomp {

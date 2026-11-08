@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test gl`: GLES on the real driver in an app process -- AOSP's libEGL / libGLESv2 fronts (slow binding, patches 0009 + 0010) over Mesa, placed as for an app (`Runtime::with_gl_driver`).
+//! `xtask test gl`: GLES on the real driver in an app process -- AOSP's libEGL / libGLESv2 fronts (slow binding, patches 0009 + 0010) over `libGLES_atl.so` (the host's system EGL), placed as for an app (`Runtime::with_gl_driver`).
 //! The fixture (xtask/testdata/gl-probe) runs as a plain app process (`--run-class`): Probe.java makes a GLES3 pbuffer with the framework's EGL14 / GLES20, clears it, reads it back;
 //! its JNI library (jni/, a cargo package of its own for `unsafe`, placed as [`LIB`] in /system's library dir) calls [`EXTENSION`] through eglGetProcAddress.
-//! 0. elf: no Mesa object (mesa::OUTPUTS) has an undefined gl*/egl* dynamic symbol or a dynamic relocation naming one -- such a reference would bind to AOSP's fronts, which call back into Mesa (recursion).
+//! 0. elf: the driver has no undefined gl*/egl* dynamic symbol or a dynamic relocation naming one -- such a reference would bind to AOSP's fronts, which call back into the driver (recursion).
 //!    Break: the probe library built with feature `undefined-gl` (imports glClear) must fail it.
-//! 1. candidates: Mesa's dispatch names (its generated glapi_mapi_tmp.h string pool) that Mesa's API XML enables for ES2+ (`es2="..."`), minus AOSP's entries.in: every name that reaches
-//!    eglGetProcAddress's extension-slot path, where 0010 returns the driver's address instead of the asm forwarder. [`EXTENSION`] must be one; the count is printed.
+//! 1. candidates: [`EXTENSION`] is not in AOSP's entries.in, so it reaches eglGetProcAddress's extension-slot path, where 0010 returns the driver's address (the host's, passed through) instead of the asm forwarder.
 //! 2. pixels: every pixel of the [`SIZE`] pbuffer equals [`CLEAR`]: GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) of c / 255 gives c back, so the bytes are the expectation.
-//! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in a Mesa object, not libEGL.
-//! 4. tier: the DRM nodes the probe holds after eglInitialize (its `drm` line, each with the kernel driver its DRM name gives) give the gallium driver the target's GPU calls for (`expected_tier`, through mesa::KERNEL_DRIVER_TIERS). None held and no render node (`render` line) is the software tier (llvmpipe); a render node with none held fails as a silent fallback.
+//! 3. extension: [`EXTENSION`](GL_MAX_TEXTURE_SIZE) writes the value glGetIntegerv (an entries.in function) gives, and the address lies in the host's GL, not in /system or /vendor (fronts, driver).
+//! 4. tier: the DRM nodes the probe holds after eglInitialize (its `drm` line, each with the kernel driver its DRM name gives) give the host renderer family the target's GPU calls for (`expected_tier`, through [`HOST_TIERS`]). None held and no render node (`render` line) is the software tier (llvmpipe); a render node with none held fails as a silent fallback.
 //! 5. renderer: `GL_RENDERER` starts with the prefix of the tier check 4 gives ([`RENDERERS`]). Break, every run: no other tier's prefix may match it.
 //! 6. scene: the last frame of a timed scene ([`TIMED_SIZE`] pixels; [`FRAMES`] frames after one untimed warm-up, each clear + draw + glFinish) reads back [`TEXEL`] on every pixel.
 //! 7. frames: one wall-clock time per timed frame. The gate prints their median and p95 (nearest rank) with the 1/5/15-minute load average before and after (`uptime`'s figures).
@@ -16,7 +15,7 @@
 //!
 //! Then a deliberate break, every run: the probe skips glClear and the timed draws, and calls a no-op in place of the extension; the pixel, scene and extension checks must fail.
 //! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
-//! 1. GL_VERSION `OpenGL ES-CM 1.`, the tier and renderer of checks 4 and 5 (no other tier's prefix may match); 2. /proc/self/maps maps libGLESv1_CM_mesa.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
+//! 1. GL_VERSION `OpenGL ES-CM 1.`, the tier and renderer of checks 4 and 5 (no other tier's prefix may match); 2. /proc/self/maps maps libGLES_atl.so; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
 //!
 //! Break: the steps marked `break` are dropped (skip glPopMatrix and the GL_COLOR_ARRAY enable); checks 4 and 5 must then mismatch, with a readback present.
 
@@ -30,7 +29,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Run, Runtime, Shell};
 use crate::gl_scene::{self, Judged};
-use crate::{manifest, mesa, remote, tree};
+use crate::{manifest, remote, tree};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -76,16 +75,16 @@ const TEXEL: [u8; 4] = [204, 153, 51, 255];
 const FRAMES: u32 = 60;
 /// Nearest-rank p95 of n samples is the maximum while n < 20 (rank ceil(0.95 n) = n); from 20 on it is not.
 const P95_MIN_FRAMES: u32 = 20;
-/// The software tier: no DRM node held and no render node bound, so Mesa's software path on the host LLVM (llvm_host.rs).
+/// The software tier: no DRM node held and no render node bound, so the host's software device (Mesa llvmpipe, `EGL_MESA_device_software`).
 const SOFTWARE_TIER: &str = "llvmpipe";
-/// Each built gallium driver's GL_RENDERER prefix. llvmpipe: `llvmpipe (LLVM <version>, <bits> bits)` (lp_screen.c L1101); the version is checked against llvm_host::VERSION (unit test). iris: "Mesa " + the device name (iris_screen.c L139, iris_get_name), e.g. `Mesa Intel(R) Graphics (LNL)`.
-const RENDERERS: &[(&str, &str)] = &[
-    ("llvmpipe", "llvmpipe (LLVM 20."),
-    ("iris", "Mesa Intel(R)"),
-];
-/// Test-only break (`remote test --break tier-xe-llvmpipe`): mesa::KERNEL_DRIVER_TIERS with xe -> llvmpipe, so the target's iris renderer must fail the renderer check.
+/// Each host renderer family's GL_RENDERER prefix (the host's Mesa). llvmpipe: `llvmpipe (LLVM <version>, <bits> bits)` (lp_screen.c), the host distro's LLVM. iris: "Mesa " + the device name (iris_screen.c, iris_get_name), e.g. `Mesa Intel(R) Graphics (LNL)`.
+const RENDERERS: &[(&str, &str)] = &[("llvmpipe", "llvmpipe (LLVM "), ("iris", "Mesa Intel(R)")];
+/// Kernel DRM driver of the node the driver renders on -> the host renderer family its EGL device runs. Intel: the host Mesa takes iris for `i915` and `xe` (loader.c `iris_predicate`).
+/// `vgem` has no EGL device: the driver falls back to the host's software device (driver.rs `choose_display`). A driver with no row fails the gate, naming it.
+pub const HOST_TIERS: &[(&str, &str)] = &[("i915", "iris"), ("xe", "iris"), ("vgem", "llvmpipe")];
+/// Test-only break (`remote test --break tier-xe-llvmpipe`): HOST_TIERS with xe -> llvmpipe, so the target's iris renderer must fail the renderer check.
 fn forced_tiers() -> Vec<(&'static str, &'static str)> {
-    mesa::KERNEL_DRIVER_TIERS
+    HOST_TIERS
         .iter()
         .map(|&(driver, gallium)| (driver, if driver == "xe" { "llvmpipe" } else { gallium }))
         .collect()
@@ -95,9 +94,7 @@ const QUIET_LOAD: f64 = 4.0;
 const NS_PER_MS: f64 = 1_000_000.0;
 /// In Mesa's ES dispatch, not in entries.in; observable through a query whose answer an entries.in call also gives.
 const EXTENSION: &str = "glGetInteger64vEXT";
-/// Mesa's generated dispatch table (build-relative) and its API XML (tree-relative); AOSP's entries.in.
-const MAPI_TMP: &str = "build/src/mapi/shared-glapi/glapi_mapi_tmp.h";
-const MESA_XML: &str = "src/mapi/glapi/gen";
+/// AOSP's entries.in.
 const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
 /// Each probe run's time limit: the child is killed past it. A remote run gets the same limit as `timeout` on the target (remote.rs).
 pub const LIMIT: Duration = Duration::from_secs(120);
@@ -115,7 +112,7 @@ pub fn goals() -> crate::gate_goals::Goals {
 
 /// `test gl`: the gate on this host.
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    judge(root, args, remote::Site::Host, mesa::KERNEL_DRIVER_TIERS)
+    judge(root, args, remote::Site::Host, HOST_TIERS)
 }
 
 /// `remote test gl` (remote.rs): the same gate, its atld runs on `site`. `host` is the arches.toml `[host]` row, `out` the slot the bundle was pushed from; `brk` is the test-only tier break, if any.
@@ -137,7 +134,7 @@ pub fn run_on(
     let tiers = match brk {
         Some(remote::Break::TierXeLlvmpipe) => forced.as_slice(),
         Some(remote::Break::DropLibunwind | remote::Break::DropAtld) | None => {
-            mesa::KERNEL_DRIVER_TIERS
+            HOST_TIERS
         }
     };
     judge(root, &args, site, tiers)
@@ -160,49 +157,30 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?
+    .with_gl_driver(root)?
     .with_site(site);
     let tree = tree::shared_tree(&layout);
-    let cands = candidates(
-        &std::fs::read_to_string(rt.out.join(mesa::OUT_SUBDIR).join(MAPI_TMP))?,
-        &es_names(&tree.join(mesa::MESA_TREE).join(MESA_XML))?,
-        &std::fs::read_to_string(tree.join(ENTRIES_IN))?,
-    );
-    let mut ok = cands.iter().any(|c| c == EXTENSION);
+    let mut ok = !entry_names(&std::fs::read_to_string(tree.join(ENTRIES_IN))?)
+        .iter()
+        .any(|n| n == EXTENSION);
     println!(
-        "gl: {} candidates: {} ES names of Mesa's dispatch need eglGetProcAddress's extension path (not in entries.in); {EXTENSION} {}",
+        "gl: {} candidates: {EXTENSION} {} in entries.in, so it reaches eglGetProcAddress's extension path",
         verdict(ok),
-        cands.len(),
-        if ok { "is one" } else { "is NOT one" }
+        if ok { "is not" } else { "IS" }
     );
     let work = rt.out.join("gl");
-    let build = rt.out.join(mesa::OUT_SUBDIR).join("build");
-    let mut found = Vec::new();
-    for o in mesa::OUTPUTS {
-        found.extend(gl_imports(&build.join(o))?);
-    }
+    let driver = rt.out.join("egl").join(crate::egl_driver::atl_egl_driver_name());
+    let found = gl_imports(&driver)?;
     ok &= found.is_empty();
     println!(
-        "gl: {} elf: {} Mesa objects: {}",
+        "gl: {} elf: {}: {}",
         verdict(found.is_empty()),
-        mesa::OUTPUTS.len(),
+        driver.display(),
         if found.is_empty() {
             "no undefined gl*/egl* symbol, no dynamic relocation naming one (none binds back to AOSP's fronts)".to_owned()
         } else {
             found.join("; ")
         }
-    );
-    let links = mesa::driver_links(&build.join(mesa::DRIVER))?;
-    ok &= links.failures.is_empty();
-    println!(
-        "gl: {} driver links: NEEDED {}{}",
-        verdict(links.failures.is_empty()),
-        links.needed.join(" "),
-        links
-            .failures
-            .iter()
-            .map(|f| format!("; {f}"))
-            .collect::<String>()
     );
     let lib = build_lib(root, &work.join("cargo"), &[])?;
     // deliberate break: the probe library built with an undefined glClear
@@ -471,7 +449,7 @@ fn es1(
             ),
             (
                 "2 maps",
-                maps.contains("libGLESv1_CM_mesa.so"),
+                maps.contains(crate::egl_driver::atl_egl_driver_name()),
                 maps.to_owned(),
             ),
             (
@@ -659,7 +637,7 @@ fn judge_renderer(lines: &[String], want: &str) -> Result<String, String> {
 
 /// The tier the target's GPU calls for, from the probe's `drm` and `render` lines.
 struct Tier {
-    /// The gallium driver (mesa::GALLIUM_DRIVERS).
+    /// The host renderer family ([`RENDERERS`]).
     gallium: String,
     /// Its GL_RENDERER prefix ([`RENDERERS`]).
     prefix: &'static str,
@@ -689,7 +667,7 @@ fn expected_tier(lines: &[String], tiers: &[(&str, &str)]) -> Result<Tier, Strin
                 .map(|(_, g)| *g)
                 .ok_or_else(|| {
                     format!(
-                        "{node}: kernel driver `{driver}` has no row in mesa::KERNEL_DRIVER_TIERS"
+                        "{node}: kernel driver `{driver}` has no row in HOST_TIERS"
                     )
                 })?,
         };
@@ -804,7 +782,7 @@ fn fmt_load(load: [f64; 3]) -> String {
     format!("{:.2} {:.2} {:.2}", load[0], load[1], load[2])
 }
 
-/// `ext <EXTENSION> <v> glGetIntegerv <w> from <file>`: v == w > 0, and the address in a Mesa object.
+/// `ext <EXTENSION> <v> glGetIntegerv <w> from <file>`: v == w > 0, and the address in the host's GL.
 fn judge_extension(lines: &[String]) -> Result<String, String> {
     let line = lines
         .iter()
@@ -821,9 +799,10 @@ fn judge_extension(lines: &[String]) -> Result<String, String> {
     if name != EXTENSION || v != g || g <= 0 {
         return Err(format!("{name} wrote {v}, glGetIntegerv gives {g}"));
     }
-    if !file.contains("_mesa") && !file.contains("gallium") && !file.contains("glapi") {
+    // libGLES_atl passes non-own names to the host's eglGetProcAddress: the address is the host GL's, never an AOSP front's or the driver's own
+    if file.starts_with("/system/") || file.starts_with("/vendor/") {
         return Err(format!(
-            "{name}'s address lies in {file}, not a Mesa object"
+            "{name}'s address lies in {file}, not the host's GL"
         ));
     }
     Ok(format!(
@@ -835,55 +814,13 @@ fn no_line(what: &str, lines: &[String]) -> String {
     format!("no `{what}` line (probe said: {})", lines.join(" | "))
 }
 
-/// Function names (with `gl`) that Mesa's API XML in `dir` enables for ES2+: a `<function name="X" ... es2="v">` element.
-fn es_names(dir: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let p = e?.path();
-        if p.extension().is_some_and(|x| x == "xml") {
-            names.extend(es_functions(&std::fs::read_to_string(&p)?));
-        }
-    }
-    Ok(names)
-}
-
-fn es_functions(xml: &str) -> Vec<String> {
-    xml.split("<function ")
-        .skip(1)
-        .filter_map(|el| {
-            let head = &el[..el.find('>')?];
-            let name = head.split_once("name=\"")?.1.split('"').next()?;
-            head.contains(" es2=\"").then(|| format!("gl{name}"))
-        })
-        .collect()
-}
-
-/// Mesa's dispatch names (`public_string_pool` of glapi_mapi_tmp.h, `"Name\0"` lines, prefixed `gl`) in `es`, minus every GL_ENTRY name of entries.in; sorted.
-fn candidates(mapi_tmp: &str, es: &[String], entries_in: &str) -> Vec<String> {
-    let pool = mapi_tmp
-        .split("public_string_pool[] =")
-        .nth(1)
-        .and_then(|s| s.split(';').next())
-        .unwrap_or("");
-    let entries: std::collections::BTreeSet<&str> = entries_in
+/// Every GL_ENTRY name of entries.in (`GL_ENTRY(ret, name, args)`): the names AOSP's fronts dispatch themselves; any other reaches eglGetProcAddress's extension path.
+fn entry_names(entries_in: &str) -> Vec<String> {
+    entries_in
         .split("GL_ENTRY(")
         .skip(1)
-        .filter_map(|e| e.split(',').nth(1).map(str::trim))
-        .collect();
-    let es: std::collections::BTreeSet<&str> = es.iter().map(String::as_str).collect();
-    let mut out: Vec<String> = pool
-        .lines()
-        .filter_map(|l| {
-            l.trim()
-                .strip_prefix('"')?
-                .strip_suffix("\\0\"")
-                .map(|n| format!("gl{n}"))
-        })
-        .filter(|n| es.contains(n.as_str()) && !entries.contains(n.as_str()))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+        .filter_map(|e| e.split(',').nth(1).map(|n| n.trim().to_owned()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -895,18 +832,9 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_es_names_outside_entries_in() {
-        let tmp = "x\nstatic const char public_string_pool[] =\n   \"Accum\\0\"\n   \"GetError\\0\"\n   \"GetInteger64vEXT\\0\";\n";
-        let es = lines(&["glGetError", "glGetInteger64vEXT"]);
-        let entries = "GL_ENTRY(GLenum, glGetError, void)\n";
-        assert_eq!(candidates(tmp, &es, entries), vec!["glGetInteger64vEXT"]);
-    }
-
-    #[test]
-    fn es_attribute_selects() {
-        let xml =
-            r#"<function name="A" es2="3.0"><x/></function><function name="B"><x/></function>"#;
-        assert_eq!(es_functions(xml), vec!["glA"]);
+    fn entry_names_read_the_second_field() {
+        let entries = "GL_ENTRY(GLenum, glGetError, void)\nGL_ENTRY(void, glClear, GLbitfield mask)\n";
+        assert_eq!(entry_names(entries), vec!["glGetError", "glClear"]);
     }
 
     #[test]
@@ -941,8 +869,8 @@ mod tests {
 
     #[test]
     fn held_node_gives_the_tier_of_its_kernel_driver() {
-        // expected values from Mesa (loader.c iris_predicate; platform_android.c L1035-1043), not from the table under test
-        let table = mesa::KERNEL_DRIVER_TIERS;
+        // expected values from host Mesa (loader.c iris_predicate) and the driver's software fallback for vgem (no EGL device), not from the table under test
+        let table = HOST_TIERS;
         let node = "/dev/dri/renderD128";
         assert_eq!(
             tier(&format!("{node}=xe"), node, table),
@@ -956,23 +884,21 @@ mod tests {
             tier("/dev/dri/card0=vgem /dev/dri/renderD128=vgem", node, table),
             Ok("llvmpipe".to_owned())
         );
-        assert_eq!(
-            tier(&format!("{node}=virtio_gpu"), node, table),
-            Ok("llvmpipe".to_owned())
-        );
+        // no row: host Mesa runs virgl there, a family this gate has no renderer name for
+        assert!(tier(&format!("{node}=virtio_gpu"), node, table).is_err());
     }
 
     #[test]
     fn no_node_held_and_no_render_node_is_the_software_tier() {
         assert_eq!(
-            tier("none", "none", mesa::KERNEL_DRIVER_TIERS),
+            tier("none", "none", HOST_TIERS),
             Ok("llvmpipe".to_owned())
         );
     }
 
     #[test]
     fn render_node_with_none_held_fails_as_a_silent_fallback() {
-        let err = tier("none", "/dev/dri/renderD128", mesa::KERNEL_DRIVER_TIERS)
+        let err = tier("none", "/dev/dri/renderD128", HOST_TIERS)
             .err()
             .unwrap_or_default();
         assert!(
@@ -986,7 +912,7 @@ mod tests {
         let split = tier(
             "/dev/dri/card0=vgem /dev/dri/renderD128=xe",
             "/dev/dri/renderD128",
-            mesa::KERNEL_DRIVER_TIERS,
+            HOST_TIERS,
         )
         .err()
         .unwrap_or_default();
@@ -998,7 +924,7 @@ mod tests {
             tier(
                 "/dev/dri/card0=xe /dev/dri/renderD128=xe",
                 "/dev/dri/renderD128",
-                mesa::KERNEL_DRIVER_TIERS
+                HOST_TIERS
             ),
             Ok("iris".to_owned())
         );
@@ -1008,7 +934,7 @@ mod tests {
     fn unknown_or_unreadable_driver_fails_naming_its_node() {
         for driver in ["amdgpu", "unreadable"] {
             let held = format!("/dev/dri/renderD128={driver}");
-            let err = tier(&held, "/dev/dri/renderD128", mesa::KERNEL_DRIVER_TIERS)
+            let err = tier(&held, "/dev/dri/renderD128", HOST_TIERS)
                 .err()
                 .unwrap_or_default();
             assert!(err.contains("renderD128") && err.contains(driver), "{err}");
@@ -1022,7 +948,7 @@ mod tests {
             tier(
                 "/dev/dri/renderD128=xe",
                 "/dev/dri/renderD128 /dev/dri/renderD129",
-                mesa::KERNEL_DRIVER_TIERS
+                HOST_TIERS
             ),
             Ok("iris".to_owned())
         );
@@ -1030,8 +956,8 @@ mod tests {
 
     #[test]
     fn missing_probe_line_fails() {
-        assert!(expected_tier(&lines(&["render none"]), mesa::KERNEL_DRIVER_TIERS).is_err());
-        assert!(expected_tier(&lines(&["drm none"]), mesa::KERNEL_DRIVER_TIERS).is_err());
+        assert!(expected_tier(&lines(&["render none"]), HOST_TIERS).is_err());
+        assert!(expected_tier(&lines(&["drm none"]), HOST_TIERS).is_err());
     }
 
     #[test]
@@ -1070,21 +996,10 @@ mod tests {
     }
 
     #[test]
-    fn every_built_driver_has_a_renderer_name() {
-        let named: Vec<&str> = RENDERERS.iter().map(|(g, _)| *g).collect();
-        assert_eq!(named, mesa::GALLIUM_DRIVERS);
-    }
-
-    #[test]
-    fn llvmpipe_prefix_names_the_pinned_llvm() {
-        let (_, prefix) = RENDERERS
-            .iter()
-            .find(|(g, _)| *g == "llvmpipe")
-            .expect("llvmpipe row");
-        let major_minor = prefix
-            .strip_prefix("llvmpipe (LLVM ")
-            .expect("llvmpipe name");
-        assert!(crate::llvm_host::VERSION.starts_with(major_minor));
+    fn every_tier_has_a_renderer_name() {
+        for (_, family) in HOST_TIERS {
+            assert!(RENDERERS.iter().any(|(g, _)| g == family), "{family}");
+        }
     }
 
     #[test]
@@ -1119,10 +1034,11 @@ mod tests {
     }
 
     #[test]
-    fn extension_needs_the_same_value_from_mesa() {
-        let ok = "ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /vendor/lib64/egl/libGLESv2_mesa.so";
+    fn extension_needs_the_same_value_from_the_host() {
+        let ok = "ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0";
         assert!(judge_extension(&lines(&[ok])).is_ok());
-        assert!(judge_extension(&lines(&["ext glGetInteger64vEXT -1 glGetIntegerv 16384 from /vendor/lib64/egl/libGLESv2_mesa.so"])).is_err());
+        assert!(judge_extension(&lines(&["ext glGetInteger64vEXT -1 glGetIntegerv 16384 from /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0"])).is_err());
+        assert!(judge_extension(&lines(&["ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /vendor/lib64/egl/libGLES_atl.so"])).is_err());
         assert!(
             judge_extension(&lines(&[
                 "ext glGetInteger64vEXT 16384 glGetIntegerv 16384 from /system/lib64/libEGL.so"

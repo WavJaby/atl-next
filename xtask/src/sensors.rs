@@ -612,7 +612,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?;
+    .with_gl_driver(root)?;
     let work = rt.out.join("sensors");
     let sys_bus = work.join("sys-bus");
     let udev = work.join("udev-data");

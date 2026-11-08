@@ -26,5 +26,13 @@ const IMPORTS: &[HeaderImport] = &[HeaderImport {
 }];
 
 fn main() -> anyhow::Result<()> {
+    // the driver's own egl* exports bind to themselves: AOSP's libEGL, loaded first, exports the same names, and a preemptible reference (an address the driver hands out, e.g. from eglGetProcAddress) would resolve to the front, which calls back into the driver (`test gl` elf check)
+    #[allow(
+        clippy::print_stdout,
+        reason = "a build script's stdout is cargo's instruction channel"
+    )]
+    {
+        println!("cargo::rustc-cdylib-link-arg=-Wl,-Bsymbolic");
+    }
     import_headers(IMPORTS)
 }

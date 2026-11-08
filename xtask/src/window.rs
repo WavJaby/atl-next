@@ -1743,7 +1743,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?
+    .with_gl_driver(root)?
     // the native-bridge guest: every window stage carries it, as `app` does (the GLES2 fixture's library is a guest library)
     .with_native_bridge_guest(&args.host)?;
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {

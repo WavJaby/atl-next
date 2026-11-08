@@ -432,7 +432,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     // the activity's window renders through hwui, which needs EGL: the allocator and the GL driver are part of every run (needs a DRM device that allocates, WSL: vgem)
     .with_gralloc(root)?
-    .with_gl_driver()?
+    .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?;
     let rt = match &args.drop_nb_lib {
         Some(file) => rt.without_nb_lib(file)?,

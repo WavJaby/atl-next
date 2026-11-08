@@ -318,7 +318,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?
     .with_gralloc(root)?
-    .with_gl_driver()?
+    .with_gl_driver(root)?
     .with_native_bridge_guest(&args.host)?;
     let rt = if args.break_serve {
         rt.without_audio_service()
