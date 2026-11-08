@@ -387,9 +387,10 @@ fn check_pool(bin: &Path) -> Result<()> {
         .sections()
         .find_map(|s| s.data_range(sym.address(), sym.size()).ok().flatten())
         .with_context(|| format!("{POOL_SYMBOL} is in no section"))?;
-    for (slot, chunk) in bytes.chunks_exact(THUNK_BYTES as usize).enumerate() {
+    let (thunks, _) = bytes.as_chunks::<{ THUNK_BYTES as usize }>();
+    for (slot, thunk) in thunks.iter().enumerate() {
         let word = |at: usize| {
-            u32::from_le_bytes([chunk[at], chunk[at + 1], chunk[at + 2], chunk[at + 3]])
+            u32::from_le_bytes([thunk[at], thunk[at + 1], thunk[at + 2], thunk[at + 3]])
         };
         let got = [word(0), word(4)];
         let want = aarch64::place_words(u32::try_from(slot)?);
