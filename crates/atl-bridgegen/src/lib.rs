@@ -10,6 +10,7 @@
     reason = "a build tool: it runs clang and the converter on the host, never a runtime process"
 )]
 
+pub mod aarch64;
 pub mod buildscript;
 pub mod c;
 pub mod converter;
