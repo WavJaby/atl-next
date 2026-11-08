@@ -1039,10 +1039,9 @@ impl Runtime {
             ensure!(
                 self.fake_devices.is_none()
                     && self.wayland.is_none()
-                    && run.shell.is_none()
                     && run.libraries.is_empty()
                     && (self.ui.is_none() || target.has_session()),
-                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shell commands, shared libraries, and a UI without the target's desktop session need a target runner)",
+                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shared libraries, and a UI without the target's desktop session need a target runner)",
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates
