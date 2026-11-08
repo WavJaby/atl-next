@@ -242,7 +242,7 @@ fn link_words(b: &Build) -> Result<Vec<String>> {
 }
 
 /// Links the PIC build's objects into `so`, `replace` = (object, substitute) swapped in.
-fn link(b: &Build, so: &Path, replace: Option<(&str, &Path)>) -> Result<PathBuf> {
+pub(crate) fn link(b: &Build, so: &Path, replace: Option<(&str, &Path)>) -> Result<PathBuf> {
     let words = link_words(b)?;
     let mut cmd = Command::new(&words[0]);
     let mut it = words[1..].iter();
