@@ -276,6 +276,12 @@ impl Packages {
             .filter(move |p| crate::permission::app_id(p.uid) == app_id)
     }
 
+    /// isSameApp (PackageManagerInternal): `package` runs under `uid`'s app id, shared uids included.
+    pub fn is_same_app(&self, package: &str, uid: u32) -> bool {
+        self.by_app_id(crate::permission::app_id(uid))
+            .any(|p| p.manifest.name == package)
+    }
+
     /// Every package, in install order.
     pub fn all(&self) -> &[PackageRecord] {
         &self.list

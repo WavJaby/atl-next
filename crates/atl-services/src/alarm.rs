@@ -40,11 +40,7 @@ impl Inner {
 
     /// The caller is `package`'s uid, or system / root (notification.rs's rule). AlarmManagerService compares the package's uid (:2694, :2918).
     fn owns(&self, uid: u32, package: &str) -> bool {
-        permission::is_system_or_root(uid)
-            || self
-                .packages
-                .by_app_id(permission::app_id(uid))
-                .any(|p| p.manifest.name == package)
+        permission::is_system_or_root(uid) || self.packages.is_same_app(package, uid)
     }
 }
 
