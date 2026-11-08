@@ -551,6 +551,8 @@ impl SensorHub {
     fn poll(&self, s: SensorInfo, id: String, stop: Arc<AtomicBool>) {
         let mut stream: Option<Box<dyn SampleStream>> = None;
         let mut last: Option<[f32; 3]> = None;
+        // stamp of the last event sent on this stream: each event is stamped past it (Android needs non-decreasing stamps)
+        let mut last_ts = i64::MIN;
         // the open stream's ts-fallbacks already counted
         let mut ts_seen = 0u64;
         while !stop.load(Ordering::Relaxed) {
@@ -610,6 +612,9 @@ impl SensorHub {
                 None => None,
             };
             if let Some((ts, v)) = sample {
+                // a real sample can land after a re-emit whose stamp was taken later (the re-emit stamps when `next` returns): stamp it one ns past the last event
+                let ts = ts.max(last_ts.saturating_add(1));
+                last_ts = ts;
                 let event = encode_event(s.handle, s.sensor_type, ts, &v);
                 for (c, ch) in &channels {
                     if ch.dead.load(Ordering::Relaxed) || !ch.send(&event) {
@@ -700,6 +705,53 @@ mod tests {
         }
         fn open(&self, _: &str) -> Result<Box<dyn SampleStream>, SensorError> {
             Ok(Box::new(Paused { sent: false }))
+        }
+    }
+
+    /// The FIFO race (G4): one sample, then a silent timeout, then a scan measured just before that timeout and delivered after it. The re-emit is stamped when the timeout returns, so the late scan is older than it.
+    struct Late {
+        step: u32,
+        measured: i64,
+    }
+
+    impl SampleStream for Late {
+        fn tier(&self) -> Tier {
+            Tier::Buffered
+        }
+        fn ts_fallbacks(&self) -> u64 {
+            0
+        }
+        fn next(&mut self, timeout: Duration) -> Result<Option<Sample>, SensorError> {
+            self.step += 1;
+            match self.step {
+                1 => Ok(Some(Sample {
+                    boottime_ns: boottime_ns(),
+                    values: [3.0; 3],
+                })),
+                2 => {
+                    self.measured = boottime_ns();
+                    std::thread::sleep(timeout);
+                    Ok(None)
+                }
+                _ => Ok(Some(Sample {
+                    boottime_ns: self.measured,
+                    values: [3.0; 3],
+                })),
+            }
+        }
+    }
+
+    struct LateSource;
+
+    impl Sensors for LateSource {
+        fn accelerometers(&self) -> Vec<Accelerometer> {
+            Fixed.accelerometers()
+        }
+        fn open(&self, _: &str) -> Result<Box<dyn SampleStream>, SensorError> {
+            Ok(Box::new(Late {
+                step: 0,
+                measured: 0,
+            }))
         }
     }
 
@@ -841,6 +893,23 @@ mod tests {
             started.elapsed() >= Duration::from_millis(60),
             "{:?}",
             started.elapsed()
+        );
+        hub.drop_connection(1);
+    }
+
+    /// The race: the late scan takes the stamp just past the re-emit, so the stream's events still strictly increase.
+    #[test]
+    fn late_scan_after_a_silent_timeout_keeps_stamps_increasing() {
+        let hub = SensorHub::new(Arc::new(LateSource), None, None);
+        let ch = Arc::new(Channel::open().unwrap());
+        let rx = ch.take_receive().unwrap();
+        assert_eq!(hub.enable(1, &ch, 1, 20_000_000), OK);
+        let stamps: Vec<i64> = (0..3)
+            .map(|_| i64::from_ne_bytes(recv_event(&ch, &rx)[16..24].try_into().unwrap()))
+            .collect();
+        assert!(
+            stamps.windows(2).all(|w| w[1] > w[0]),
+            "stamps not strictly increasing: {stamps:?}"
         );
         hub.drop_connection(1);
     }
