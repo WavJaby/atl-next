@@ -43,16 +43,16 @@ const REMOTE_ROOT: &str = "atl-next-run";
 pub const REMOTE_DIR: &str = "remote";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
 const MANIFEST: &str = "bundle.manifest";
-/// ssh options: never prompt, never hang. The alias check is the first contact with the host. ServerAlive: a link that dies mid-call fails in about 60 s instead of hanging until the caller's limit.
+/// ssh options: never prompt, never hang. The alias check is the first contact with the host. ServerAlive: a link that dies mid-call fails in about 3 min instead of hanging until the caller's limit.
 const SSH_OPTS: [&str; 8] = [
     "-o",
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=20",
     "-o",
-    "ServerAliveInterval=15",
+    "ServerAliveInterval=30",
     "-o",
-    "ServerAliveCountMax=4",
+    "ServerAliveCountMax=6",
 ];
 const MIB: f64 = 1024.0 * 1024.0;
 
