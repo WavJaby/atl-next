@@ -18,6 +18,7 @@ pub mod broadcast;
 pub mod compositor_registry;
 pub mod config_diff;
 pub mod counters;
+pub mod desktop_bounds;
 pub mod display_model;
 pub mod focus;
 pub mod ime_bind;
