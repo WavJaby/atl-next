@@ -136,6 +136,15 @@ crates = ["atl-gralloc", "atl-gralloc-dmabuf", "atl-gralloc-mapper", "atl-grallo
 exports = ["atl-gralloc", "atl-gralloc-dmabuf"]
 uses = ["aidl", "generators"]
 
+# the GLES driver over the host's system EGL (replan 2026-11-09): the boundary crate holding host libEGL behind safe types (devices, displays, contexts, dma-buf EGLImages, FBOs, native fences); the P0a probe renders a gralloc buffer through it and reads it back
+[egl-host]
+crates = ["atl-egl-host", "atl-egl-probe"]
+exports = ["atl-egl-host"]
+uses = ["gralloc"]
+
+[egl-host.direct_link.gralloc]
+reason = "the P0a probe (atl-egl-probe) allocates through gralloc's GBM backend (atl-gralloc-service), as the allocator service does: the question is whether the host EGL imports the buffer an app would get"
+
 # the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf)
 [platform-ui]
 crates = ["atl-platform-ui-api", "atl-platform-ui-linux", "atl-platform-ui"]

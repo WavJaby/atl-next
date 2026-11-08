@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-egl-host"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The host's system EGL (glvnd libEGL.so.1) behind safe types: devices, displays, contexts, dma-buf EGLImages, FBOs, native fences.
+# Boundary crate (CLAUDE.md "unsafe"): dlopen of the host library and calls through its function pointers; each block says why it holds. Every GL / EGL entry is resolved through eglGetProcAddress, never by symbol name:
+# the app process also holds AOSP's libEGL / libGLESv2 fronts, which export the same names.
+
+[dependencies]
+anyhow.workspace = true
+libloading.workspace = true
+
+[lints]
+workspace = true

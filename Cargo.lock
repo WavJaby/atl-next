@@ -257,6 +257,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-egl-host"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libloading",
+]
+
+[[package]]
+name = "atl-egl-probe"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-egl-host",
+ "atl-gralloc",
+ "atl-gralloc-dmabuf",
+ "atl-gralloc-service",
+ "clap",
+ "gbm",
+ "rustix",
+]
+
+[[package]]
 name = "atl-fonts"
 version = "0.0.0"
 dependencies = [

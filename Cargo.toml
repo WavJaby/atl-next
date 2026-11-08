@@ -28,6 +28,8 @@ icu_locale = "2"
 # SYS_* syscall numbers per target arch (atl-broker seccomp filter); the only use of libc is those constants
 landlock = "0.4.7"
 libc = "0.2"
+# dlopen of the host's system libEGL (atl-egl-host): never linked, its names would collide with AOSP's libEGL fronts in the app process
+libloading = "0.8"
 # libgbm bindings; no wayland / egl import and no drm crate (its 0.14 pins a second rustix): the allocator creates linear buffers and exports them itself (atl-gralloc-service `prime`)
 gbm = { version = "0.18", default-features = false }
 # GLib's unix fd sources (`g_unix_fd_add`), split out of glib-rs in 0.22; same gtk-rs release train as gtk4
