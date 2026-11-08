@@ -38,6 +38,7 @@ mod fetch;
 mod gate_goals;
 mod gdk_dmabuf;
 mod git;
+mod egl_driver;
 mod git_dirs;
 mod gl_dispatch;
 mod gl_probe;
@@ -302,6 +303,10 @@ enum Test {
     ///
     /// Control every run: a libGLESv2 with its own atl-bionic copy (dlmopen) must fail. Needs libEGL + libGLESv2 in --out; no driver.
     GlDispatch(gl_dispatch::Args),
+    /// The GLES driver over the host's system EGL (libGLES_atl.so) rendering into an ANativeWindow of gralloc buffers, loaded as AOSP's loader loads it; every pixel of every queued buffer checked with its transform applied.
+    ///
+    /// Controls every run: a window dropping the buffer transform and framebuffer entries taken from the host must fail. Needs no native build.
+    EglDriver(egl_driver::Args),
     /// GLES on the real driver in an app process: a pbuffer cleared and read back, and an extension outside entries.in through eglGetProcAddress (patch 0010); then a deliberate break that both checks must catch.
     ///
     /// Needs the fronts, Mesa, gralloc and the services in --out (`xtask native`).
@@ -433,6 +438,9 @@ fn main() -> Result<ExitCode> {
             test: Test::GlDispatch(args),
         } => gl_dispatch::run(&root, &args),
         Command::Test {
+            test: Test::EglDriver(args),
+        } => egl_driver::run(&root, &args),
+        Command::Test {
             test: Test::Gl(args),
         } => gl_probe::run(&root, &args),
         Command::Test {
@@ -482,6 +490,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Gles2Fixture(_) => "gles2-fixture",
             Test::TaskBind(_) => "task-bind",
             Test::GlDispatch(_) => "gl-dispatch",
+            Test::EglDriver(_) => "egl-driver",
             Test::Gl(_) => "gl",
             Test::Qemu(_) => "qemu-gate",
             Test::QemuSpike(_) => "qemu-spike",

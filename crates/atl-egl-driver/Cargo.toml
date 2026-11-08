@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-egl-driver"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `libGLES_atl.so`: the GLES driver AOSP's libEGL loader opens by `ro.hardware.egl` (Loader.cpp: `libGLES_<name>.so`, egl* by dlsym then the driver's eglGetProcAddress, gl* through eglGetProcAddress).
+# Renders through the host's system EGL (atl-egl-host); window surfaces are gralloc buffers dequeued from the ANativeWindow, imported as EGLImages and drawn through an FBO the driver presents as framebuffer 0.
+# Boundary crate: C ABI exports, ANativeWindow callbacks, host GL calls. The rlib is for the probe (atl-egl-probe), which loads the cdylib as AOSP's loader does and reads the generated ANativeWindow layout.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+atl-egl-host = { path = "../atl-egl-host" }
+atl-gralloc = { path = "../atl-gralloc" }
+atl-gralloc-service = { path = "../atl-gralloc-service" }
+rustix.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

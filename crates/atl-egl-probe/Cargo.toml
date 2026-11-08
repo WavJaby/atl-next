@@ -9,15 +9,18 @@ publish.workspace = true
 
 # P0a of the system-EGL adapter: a gralloc dma-buf rendered by the host's EGL and read back through our own mapping, per (allocating node, rendering device) pair.
 # Allocates through gralloc's GBM backend as the allocator service does (modules.toml direct_link), so the buffer is the one an app would get.
+# Second binary, atl-egl-driver-probe: the GLES driver (atl-egl-driver) loaded as AOSP's loader loads it, rendering into an ANativeWindow of gralloc buffers; it holds this crate's `unsafe` (dlopen, the window.h hooks), main.rs forbids it.
 
 [dependencies]
 anyhow.workspace = true
+atl-egl-driver = { path = "../atl-egl-driver" }
 atl-egl-host = { path = "../atl-egl-host" }
 atl-gralloc = { path = "../atl-gralloc" }
 atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-gralloc-service = { path = "../atl-gralloc-service" }
 clap.workspace = true
 gbm.workspace = true
+libloading.workspace = true
 rustix.workspace = true
 
 [lints]

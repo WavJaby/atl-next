@@ -22,6 +22,7 @@ pub const SOFTWARE_DEVICE_EXT: &str = "EGL_MESA_device_software";
 /// The loaded host EGL. Every entry is resolved through `eglGetProcAddress`, never by symbol name (see the crate's Cargo.toml).
 pub struct Host {
     fns: Fns,
+    gpa: GetProcAddress,
     _lib: libloading::Library,
 }
 
@@ -38,7 +39,22 @@ impl Host {
         // SAFETY: `name` is a valid NUL-terminated string for the call's duration.
         let fns = Fns::resolve(|name| unsafe { gpa(name.as_ptr()) })
             .map_err(|n| anyhow!("host EGL lacks {n}"))?;
-        Ok(Arc::new(Self { fns, _lib: lib }))
+        Ok(Arc::new(Self {
+            fns,
+            gpa,
+            _lib: lib,
+        }))
+    }
+
+    /// The host's address for `name` (eglGetProcAddress): what the GLES driver forwards every entry it does not implement to. Null when the host has none.
+    pub fn proc_address(&self, name: &CStr) -> *const c_void {
+        // SAFETY: `name` is NUL-terminated and lives for the call; eglGetProcAddress needs no display or context.
+        unsafe { (self.gpa)(name.as_ptr()) }
+    }
+
+    /// The resolved host entries, for callers that pass handles through to the host unchanged (the GLES driver).
+    pub fn fns(&self) -> &Fns {
+        &self.fns
     }
 
     fn error(&self) -> EGLint {
@@ -158,6 +174,15 @@ pub struct DmabufPlane<'fd> {
 impl Display {
     pub fn has_extension(&self, name: &str) -> bool {
         has_ext(&self.extensions, name)
+    }
+
+    /// The host handle: the GLES driver hands it out as its own display, so the fronts' calls it passes through reach the host unchanged.
+    pub fn raw(&self) -> EGLDisplay {
+        self.raw
+    }
+
+    pub fn host(&self) -> &Arc<Host> {
+        &self.host
     }
 
     /// The modifiers the display imports `fourcc` with: (modifier, external_only).
@@ -353,6 +378,19 @@ impl Display {
 pub struct Image<'d> {
     display: &'d Display,
     raw: EGLImage,
+}
+
+impl Image<'_> {
+    pub fn raw(&self) -> EGLImage {
+        self.raw
+    }
+
+    /// Gives the image up to a caller that destroys it through the host (an `eglCreateImageKHR` the app owns).
+    pub fn into_raw(self) -> EGLImage {
+        let raw = self.raw;
+        std::mem::forget(self);
+        raw
+    }
 }
 
 impl Drop for Image<'_> {

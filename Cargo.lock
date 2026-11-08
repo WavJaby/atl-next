@@ -257,6 +257,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-egl-driver"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "atl-egl-host",
+ "atl-gralloc",
+ "atl-gralloc-service",
+ "rustix",
+]
+
+[[package]]
 name = "atl-egl-host"
 version = "0.0.0"
 dependencies = [
@@ -269,12 +281,14 @@ name = "atl-egl-probe"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-egl-driver",
  "atl-egl-host",
  "atl-gralloc",
  "atl-gralloc-dmabuf",
  "atl-gralloc-service",
  "clap",
  "gbm",
+ "libloading",
  "rustix",
 ]
 
