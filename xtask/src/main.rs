@@ -74,6 +74,7 @@ mod providers;
 mod prune;
 mod qemu;
 mod qemu_gate;
+mod qemu_spike;
 mod remote;
 mod run_apk;
 mod runpath_gate;
@@ -302,6 +303,10 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --execute`). Pass = every program's output and exit status as the checks say; the logs are in `<out>/qemu/<target>-linux-user/gate/`.
     Qemu(qemu_gate::Args),
+    /// The QEMU engine spike (atl-qemu-engine, QEMU bridge plan Q2): QEMU's PIC objects linked `-shared` + P1, driven from a host harness; gates (a)-(e), then each break must turn its gate red.
+    ///
+    /// Builds first (as `xtask qemu --pic --execute`). Logs in `<out>/qemu/<target>-linux-user-pic/spike/`.
+    QemuSpike(qemu_spike::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -425,6 +430,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::Qemu(args),
         } => qemu_gate::run(&root, &args),
+        Command::Test {
+            test: Test::QemuSpike(args),
+        } => qemu_spike::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -468,6 +476,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::GlDispatch(_) => "gl-dispatch",
             Test::Gl(_) => "gl",
             Test::Qemu(_) => "qemu-gate",
+            Test::QemuSpike(_) => "qemu-spike",
         },
         _ => return None,
     })

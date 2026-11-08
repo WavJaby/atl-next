@@ -488,6 +488,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-qemu-engine"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "atl-resource-manager"
 version = "0.0.0"
 dependencies = [

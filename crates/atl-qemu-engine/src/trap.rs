@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+//! P1's hook (patches/qemu 0001): QEMU's aarch64 `cpu_loop` calls `atl_svc_hook(env, imm16)` on every `svc`; this strong definition replaces the patch's weak default.
+//! Answer: 0 handled (resume at pc, already past the svc), 1 leave this `cpu_loop` (a guest call returned), <0 not ours (QEMU's syscall path).
+//! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours. The guest fixture (xtask/testdata/qemu-spike/fixture.c) repeats them.
+
+use std::ffi::{c_int, c_void};
+
+use crate::engine::{Guest, Trap, lib};
+
+/// Host call: the callback's answer lands in x0.
+pub const CALL: u32 = 0x7a10;
+/// Return stub: a guest call ([`Guest::call`]) is finished, leave the innermost `cpu_loop`.
+pub const RET: u32 = 0x7a11;
+/// Report a value (x0) for a gate.
+pub const REPORT: u32 = 0x7a12;
+/// Bootstrap: x0 = payload, x1 = the guest's `svc #RET` stub. Installs the fault chain, then runs the callback; its answer lands in x0.
+pub const BOOT: u32 = 0x7a13;
+
+const HANDLED: c_int = 0;
+const LEAVE: c_int = 1;
+const NOT_OURS: c_int = -1;
+
+/// # Safety
+/// Called by QEMU's `cpu_loop` only: `env` is the calling thread's live `CPUArchState`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atl_svc_hook(env: *mut c_void, imm: u32) -> c_int {
+    // a panic must not unwind into QEMU's C frames
+    match std::panic::catch_unwind(|| dispatch(Guest::new(env), imm)) {
+        Ok(r) => r,
+        Err(_) => std::process::abort(),
+    }
+}
+
+fn dispatch(g: Guest, imm: u32) -> c_int {
+    let on_trap = lib().on_trap;
+    match imm {
+        RET => LEAVE,
+        BOOT => {
+            Guest::set_ret_stub(g.x(1));
+            crate::signal::install();
+            let r = on_trap(g, Trap::Boot(g.x(0)));
+            g.set_x(0, r);
+            HANDLED
+        }
+        CALL => {
+            let regs = std::array::from_fn(|i| g.x(i));
+            let r = on_trap(g, Trap::Call(regs));
+            // break `ret-reg` (gate a): the answer arrives corrupted
+            #[cfg(atl_qe_ret_reg)]
+            let r = r ^ 1;
+            g.set_x(0, r);
+            HANDLED
+        }
+        REPORT => {
+            on_trap(g, Trap::Report(g.x(0)));
+            HANDLED
+        }
+        _ => NOT_OURS,
+    }
+}

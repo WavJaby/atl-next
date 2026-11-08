@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-qemu-engine"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The QEMU translator engine (QEMU bridge plan Q2 spike): drives the pinned QEMU's aarch64 linux-user core (+ P1, patches/qemu) as a library.
+# QEMU runs its own `main` (aliased `atl_qemu_user_main`) from a `-shared` link of its PIC objects; the engine dlopens that library, answers P1's svc hook and chains QEMU's fault handler.
+# Boundary crate: `unsafe` for dlopen/dlsym, the C ABI hook, raw CPU state access and sigaction.
+# Feature `qemu`: needs `ATL_QEMU_BUILD` (the PIC build dir, `xtask qemu --pic`) for the CPU layouts; plain workspace builds leave it off and compile no engine code.
+
+[features]
+qemu = []
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+serde_json.workspace = true
+
+# the spike gates (a)-(e), harness-less: QEMU's main owns the thread and ends the process; skips without the feature
+[[test]]
+name = "spike"
+harness = false
+
+[lints]
+workspace = true

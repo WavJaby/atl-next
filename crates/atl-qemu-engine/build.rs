@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MIT
+//! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles `linux-user/aarch64/cpu_loop.c` with -- the file P1's hook is called from.
+//! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
+//! Breaks (`ATL_QEMU_ENGINE_BREAK=<name>[,<name>]`, [`BREAKS`]) turn a cfg on for this package only.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use atl_bridgegen::buildscript;
+use atl_bridgegen::{Lang, Source, Target};
+
+/// The PIC build dir (`<out>/qemu/<target>-linux-user-pic/build`); `xtask test qemu-spike` sets it.
+const BUILD_ENV: &str = "ATL_QEMU_BUILD";
+/// The translation unit whose compile command is reused: P1's call site.
+const UNIT: &str = "linux-user/aarch64/cpu_loop.c";
+/// Headers whose records form the interface, relative to the QEMU tree.
+const HEADERS: &[&str] = &["target/arm/cpu.h"];
+
+const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
+/// The deliberate breaks: name -> cfg. Red with it, green without (xtask qemu_spike.rs runs each).
+const BREAKS: &[(&str, &str)] = &[
+    // gate (a): the CALL trap answers the callback's result with bit 0 flipped
+    ("ret-reg", "atl_qe_ret_reg"),
+    // gate (d): a fault in TCG code goes to the pre-QEMU handler instead of QEMU's
+    ("fault-route", "atl_qe_fault_route"),
+    // gate (e): a host-only fault goes to QEMU's handler (which aborts) instead of the pre-QEMU one
+    ("chain-order", "atl_qe_chain_order"),
+];
+
+fn selected_breaks() -> Result<Vec<&'static str>> {
+    let Ok(value) = std::env::var(BREAK_ENV) else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|name| {
+            BREAKS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|&(_, cfg)| cfg)
+                .with_context(|| {
+                    let known: Vec<&str> = BREAKS.iter().map(|&(n, _)| n).collect();
+                    format!(
+                        "{BREAK_ENV}={name}: no such break (known: {})",
+                        known.join(", ")
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Splits a meson compile command: words by spaces, `'...'` quoted (meson quotes only `-D` values holding `"`).
+fn words(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut any = false;
+    for c in cmd.chars() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                any = true;
+            }
+            ' ' if !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+/// The preprocessor arguments of `cmd` (include dirs absolute against `dir`, defines, the C standard); codegen and output flags are dropped.
+fn preprocessor_args(cmd: &[String], dir: &Path) -> Vec<String> {
+    let abs = |p: &str| dir.join(p).display().to_string();
+    let mut out = Vec::new();
+    let mut it = cmd.iter();
+    while let Some(a) = it.next() {
+        if let Some(p) = a.strip_prefix("-I") {
+            out.push(format!("-I{}", abs(p)));
+        } else if a == "-iquote" || a == "-isystem" {
+            if let Some(p) = it.next() {
+                out.extend([a.clone(), abs(p)]);
+            }
+        } else if let Some(p) = a.strip_prefix("-isystem") {
+            out.extend(["-isystem".to_owned(), abs(p)]);
+        } else if a.starts_with("-D") || a.starts_with("-U") || a.starts_with("-std=") {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
+    let db_path = build.join("compile_commands.json");
+    println!("cargo::rerun-if-changed={}", db_path.display());
+    let db: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&db_path).with_context(|| db_path.display().to_string())?,
+    )?;
+    let entry = db
+        .as_array()
+        .context("compile_commands.json: not an array")?
+        .iter()
+        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(UNIT)))
+        .with_context(|| format!("{}: no entry for {UNIT}", db_path.display()))?;
+    let dir = PathBuf::from(entry["directory"].as_str().context("entry: no directory")?);
+    let file = dir.join(entry["file"].as_str().context("entry: no file")?);
+    let src = file
+        .to_str()
+        .and_then(|f| f.strip_suffix(UNIT))
+        .map(PathBuf::from)
+        .context("entry file does not end with the unit")?;
+    let cmd = words(entry["command"].as_str().context("entry: no command")?);
+    let args = preprocessor_args(&cmd, &dir);
+    ensure!(
+        args.iter().any(|a| a.starts_with("-DCONFIG_TARGET=")),
+        "{UNIT}: compile command defines no CONFIG_TARGET"
+    );
+    let also: Vec<PathBuf> = HEADERS.iter().map(|h| src.join(h)).collect();
+    for h in &also {
+        println!("cargo::rerun-if-changed={}", h.display());
+    }
+    let unit = out.join("qemu_cpu.c");
+    let mut text = String::from("#include \"qemu/osdep.h\"\n");
+    for h in HEADERS {
+        text.push_str(&format!("#include \"{h}\"\n"));
+    }
+    std::fs::write(&unit, text)?;
+    let source = Source {
+        path: &unit,
+        lang: Lang::C,
+        also: &also,
+        macros: &[],
+    };
+    // the host view: the library runs in the host process, compiled by the PIC build's host compiler
+    let target = Target {
+        arch: host.to_owned(),
+        triple: buildscript::clang_triple_from_cargo()?,
+        args,
+    };
+    let iface = atl_bridgegen::interface(
+        "qemu_cpu",
+        "qemu target/arm/cpu.h (aarch64-linux-user, PIC build flags)",
+        &source,
+        std::slice::from_ref(&target),
+    )
+    .context("QEMU CPU layouts")?;
+    atl_bridgegen::rust::layout_module(&iface, host)
+}
+
+fn main() -> Result<()> {
+    for &(_, cfg) in BREAKS {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+    }
+    println!("cargo::rerun-if-env-changed={BREAK_ENV}");
+    println!("cargo::rerun-if-env-changed={BUILD_ENV}");
+    for cfg in selected_breaks()? {
+        println!("cargo::rustc-cfg={cfg}");
+    }
+    if std::env::var_os("CARGO_FEATURE_QEMU").is_none() {
+        return Ok(());
+    }
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let arches = buildscript::checkout(&manifest)?.join("arches.toml");
+    let host = buildscript::host_arch(
+        &std::fs::read_to_string(&arches)?,
+        &std::env::var("TARGET")?,
+    )?;
+    let build = PathBuf::from(std::env::var(BUILD_ENV).with_context(|| {
+        format!("feature qemu needs {BUILD_ENV} (`xtask qemu --pic` build dir)")
+    })?);
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    std::fs::write(
+        out.join("qemu_layout.rs"),
+        layout(&build, &out, &host.arch)?,
+    )?;
+    // the spike harness is an executable: P1's call in the dlopened QEMU library binds to this strong definition only if it is in the dynamic symbol table
+    println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
+    Ok(())
+}
