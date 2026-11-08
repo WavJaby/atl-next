@@ -2,8 +2,8 @@
 //! Stage `capture` (capture-API S3): the window's display capture through the harness route, not the composer's log. UI mode, the gtk fixture draws the quadrants.
 //! (a) atld's control `capture` runs atl-screencap as the shell uid: GET_COMPOSER, captureDisplayById, the reply's fence and GraphicBuffer, the RGBA rows on stdout. Polled until the bytes
 //! are the quadrants at the opening size; the digest is recomputed here from the bytes, and the reply's own digest is only checked against them.
-//! (b) `capture-as` runs it as the fixture's own uid: the registry refuses a caller that is not the shell or system with SECURITY (AOSP: captureDisplay needs READ_FRAME_BUFFER).
-//! `--break-capture-caller` sends (b) as the shell uid instead: the registry serves that, so (b) must fail. The break is the gate's own caller, not a switch in product code.
+//! (b) the fixture itself calls GET_COMPOSER from its own process (Main.java `logComposer`) and logs the status: an app uid must be refused with SECURITY (AOSP: captureDisplay
+//! needs READ_FRAME_BUFFER). `--break-capture-caller` expects `ok` instead, so (b) fails on the real refusal: a harness-side break, the registry is not changed.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,10 +14,10 @@ use super::{
     quadrant_pixels, wait_for_line,
 };
 use crate::atld_run::capture_at;
-use crate::composer::fnv1a64;
+use crate::composer::{fnv1a64, word};
 
-/// The shell uid, the one the registry serves (permission.rs SHELL_UID): what `--break-capture-caller` sends (b) as.
-pub(super) const SHELL_UID: u32 = 2000;
+/// The fixture's log line for its GET_COMPOSER (xtask/testdata/window Main.java): `composer GET_COMPOSER status=<ok|SECURITY|error> uid=<uid>`.
+const COMPOSER_LINE: &str = "composer GET_COMPOSER status=";
 /// How long (a) polls for the quadrants after the first draw. One attempt is a spawn, a GET_COMPOSER and a readback of the frame the window shows. It ends inside the gtk and
 /// hwui windows (GTK_WINDOW_MS after the marker), so a mismatch is reported as the picture's own failure, not as a cut-off control socket.
 const CAPTURE_WAIT: Duration = Duration::from_secs(6);
@@ -39,16 +39,16 @@ pub(super) struct Probe {
     pub package: String,
     /// The window's content size: the display's opening size (window.rs `opening_size`).
     pub opening: (u32, u32),
-    /// The uid of the refused caller: the app's own uid, or [`SHELL_UID`] under `--break-capture-caller`.
-    pub refused_as: u32,
+    /// `--break-capture-caller`: sub-gate (b) expects the fixture served (`ok`), so it fails on the registry's SECURITY.
+    pub break_caller: bool,
     pub out_dir: PathBuf,
     pub seen: Arc<Mutex<Seen>>,
 }
 
-/// The capture stage's probe, from the proxy's side: (a) the picture, then (b) the refused caller, then a ping must be answered.
+/// The capture stage's probe, from the proxy's side: (a) the picture, then (b) the fixture's refusal, then a ping must be answered.
 pub(super) fn drive(proxy: Proxy, app_log: &Path, probe: &Probe) -> Result<Liveness, String> {
     record_picture(app_log, probe, false);
-    let refusal = refused(probe);
+    let refusal = refused(app_log, probe);
     if let Ok(mut seen) = probe.seen.lock() {
         seen.refusal = Some(refusal);
     }
@@ -96,7 +96,7 @@ fn poll_picture(probe: &Probe, swap_rb: bool) -> Result<String, String> {
     loop {
         attempts += 1;
         let (reply, bytes) =
-            capture_at(&probe.root, None, &probe.package, &out).map_err(|e| format!("{e:#}"))?;
+            capture_at(&probe.root, &probe.package, &out).map_err(|e| format!("{e:#}"))?;
         match judge_picture(&reply, &bytes, probe.opening, swap_rb) {
             Ok(pass) => return Ok(format!("{pass}, after {attempts} capture(s)")),
             Err(why) if started.elapsed() >= CAPTURE_WAIT => {
@@ -155,24 +155,30 @@ fn judge_picture(
     ))
 }
 
-/// Sub-gate (b): atld's `capture-as` as `probe.refused_as` must be refused with SECURITY. A served capture, or any other failure, fails it.
-fn refused(probe: &Probe) -> Result<String, String> {
-    let out = probe.out_dir.join("refused.rgba");
-    let (reply, _) = capture_at(&probe.root, Some(probe.refused_as), &probe.package, &out)
-        .map_err(|e| format!("{e:#}"))?;
-    if reply.starts_with("ok ") {
+/// Sub-gate (b): the fixture's own GET_COMPOSER (its log line) must be refused with SECURITY, the status an app uid gets. Under the break, `ok` is the expected status,
+/// so the real refusal fails the sub-gate. A missing line fails it too.
+fn refused(app_log: &Path, probe: &Probe) -> Result<String, String> {
+    if !wait_for_line(app_log, COMPOSER_LINE, ACK_WAIT) {
+        return Err("the fixture never logged its GET_COMPOSER".to_owned());
+    }
+    let text = std::fs::read_to_string(app_log).unwrap_or_default();
+    let line = text
+        .lines()
+        .find(|l| l.contains(COMPOSER_LINE))
+        .unwrap_or_default();
+    let status = word(line, "status").unwrap_or_default();
+    let uid = word(line, "uid").unwrap_or_default();
+    let (want, what) = if probe.break_caller {
+        ("ok", "served")
+    } else {
+        ("SECURITY", "refused with SECURITY")
+    };
+    if status != want {
         return Err(format!(
-            "uid {} was served the composer: {reply}",
-            probe.refused_as
+            "uid {uid} got status {status}, want {want}: {line}"
         ));
     }
-    if reply.contains("refused: SECURITY") {
-        return Ok(format!("uid {} refused with SECURITY", probe.refused_as));
-    }
-    Err(format!(
-        "uid {} not refused with SECURITY: {reply}",
-        probe.refused_as
-    ))
+    Ok(format!("uid {uid} {what}"))
 }
 
 /// The stage's sub-gates: (a) the picture, (b) the refusal, then the liveness the probe's ping showed.

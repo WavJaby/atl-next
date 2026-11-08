@@ -118,7 +118,7 @@ pub struct Args {
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
-    /// Stage capture only: the refused caller runs as the shell uid, which the registry serves, so the refusal sub-gate must fail (the gate's deliberate break).
+    /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
 }
@@ -1962,11 +1962,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             root: run.root.clone(),
             package: m.name.clone(),
             opening: opening_size(display),
-            refused_as: if args.break_capture_caller {
-                capture::SHELL_UID
-            } else {
-                APP_UID
-            },
+            break_caller: args.break_capture_caller,
             out_dir: work.join("capture"),
             seen: Arc::clone(&captured),
         });

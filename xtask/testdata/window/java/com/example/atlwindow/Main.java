@@ -8,6 +8,9 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.os.Bundle;
+import android.os.IBinder;
+import android.os.Parcel;
+import android.os.Process;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.KeyCharacterMap;
@@ -30,6 +33,10 @@ public class Main extends Activity {
     static final String WINDOW_TITLE = "AtlWindowFixture";
     /** Frame callbacks per run (xtask/src/window.rs FRAME_CALLBACKS). */
     static final int FRAME_CALLBACKS = 31;
+    /** The compositor registry's name and descriptor, and its GET_COMPOSER code (atl-services compositor_registry.rs). */
+    static final String COMPOSER_REGISTRY = "atl.compositor_registry";
+    static final String COMPOSER_REGISTRY_DESCRIPTOR = "atl.ICompositorRegistry";
+    static final int GET_COMPOSER = 5;
 
     private int frameCallbacks;
 
@@ -62,6 +69,39 @@ public class Main extends Activity {
         Log.i(TAG, "keymap keyboardType=" + map.getKeyboardType() + " keyA=" + (char) keyA
                 + (keyA == 'a' ? " ok" : " wrong"));
         postFrame();
+        logComposer();
+    }
+
+    /**
+     * The capture stage's refusal probe (xtask/src/window/capture.rs, sub-gate refused): this process is an app, so the registry must refuse its
+     * GET_COMPOSER with SECURITY. The call is the registry's own transaction, the interface token then the package, and the reply starts with
+     * the exception header, which Parcel.readException raises as SecurityException. One line: the status and the uid.
+     */
+    private void logComposer() {
+        String status;
+        try {
+            // ServiceManager is hidden from the SDK stubs this build compiles against: reflection on its greylisted getService
+            IBinder registry = (IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class).invoke(null, COMPOSER_REGISTRY);
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(COMPOSER_REGISTRY_DESCRIPTOR);
+                data.writeString(getPackageName());
+                registry.transact(GET_COMPOSER, data, reply, 0);
+                reply.readException();
+                status = "ok";
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        } catch (SecurityException e) {
+            status = "SECURITY";
+        } catch (Exception e) {
+            status = "error";
+            Log.w(TAG, "composer GET_COMPOSER failed: " + e);
+        }
+        Log.i(TAG, "composer GET_COMPOSER status=" + status + " uid=" + Process.myUid());
     }
 
     /** A configuration change delivered without a relaunch (ActivityConfigurationChangeItem): one line each, with the screenWidthDp it now has. */

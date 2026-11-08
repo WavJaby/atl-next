@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! atl-screencap: a display capture as AOSP's screencap takes it (ISurfaceComposer.captureDisplayById, the reply on IScreenCaptureListener), for the harness. atld spawns it for its control
-//! commands `capture` (the shell uid) and `capture-as` (any uid, the gate's refused caller; atld main.rs). It asks the registry for the compositor of the package's newest UI-mode launch
+//! command `capture` (the shell uid; atld main.rs). It asks the registry for the compositor of the package's newest UI-mode launch
 //! (GET_COMPOSER), captures the display whole, waits for the reply's fence, reads the reply's GraphicBuffer, and writes the window picture as RGBA bytes to stdout (atld opens the
 //! caller's file there). The summary `screencap: WxH fnv1a64=H` goes to stderr. A refusal (`refused: SECURITY`), a missing compositor or a missing reply exits 1 with `screencap: error:`.
 
