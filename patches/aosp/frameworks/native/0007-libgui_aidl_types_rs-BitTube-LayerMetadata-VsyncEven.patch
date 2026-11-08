@@ -1,31 +1,34 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: WavJaby <WavJaby@gmail.com>
 Date: Wed, 4 Nov 2026 09:25:03 +0800
-Subject: [PATCH] libgui_aidl_types_rs: BitTube, LayerMetadata, VsyncEventData
+Subject: [PATCH] libgui_aidl_types_rs: BitTube, LayerMetadata, VsyncEventData,
+ ScreenCaptureResults
 
 The crate's stand-ins for libgui's unstructured parcelables panic
 (todo!()) as soon as one is read or written, so a Rust service of
 android.gui.ISurfaceComposerClient / IDisplayEventConnection dies on
 createSurface, stealReceiveChannel and getLatestVsyncEventData. Give
-the three that the software path crosses their wire form:
+the four that the software path crosses their wire form:
 LayerMetadata is read (count, then key and byte vector), BitTube is
 written (the receive end, then the send end, each a bare fd object:
 BitTube::writeToParcel), VsyncEventData (the Rust type that the AIDL
 type ParcelableVsyncEventData names) is written as the words the caller
-built. The other stand-ins stay.
+built, and ScreenCaptureResults is read and written: buffers and the
+gain map as Parcel::write(Flattenable) framing, the fence as a Fence
+or a status, the rest in libgui's wire order. The other stand-ins stay.
 
 Upstream-Status: Pending
-Patch-Reason: the stand-ins are AOSP's own Rust half of the interface and ship unimplemented; the launcher, loader and environment cannot supply a type that the generated AIDL code names by crate path (rust_type in the .aidl)
+Patch-Reason: the stand-ins are AOSP's own Rust half of the interface and ship unimplemented; the launcher, loader and environment cannot supply a type that the generated AIDL code names by crate path (rust_type in the .aidl). A C++ adapter would need a cxx bridge inside this crate, so the codec is checked against libgui's own writer by the golden in atl-parcel-truth.
 ---
 SPDX-License-Identifier: Apache-2.0
- libs/gui/rust/aidl_types/src/lib.rs | 63 +++++++++++++++++++++++++++--
- 1 file changed, 60 insertions(+), 3 deletions(-)
+ libs/gui/rust/aidl_types/src/lib.rs | 200 +++++++++++++++++++++++++++-
+ 1 file changed, 196 insertions(+), 4 deletions(-)
 
 diff --git a/libs/gui/rust/aidl_types/src/lib.rs b/libs/gui/rust/aidl_types/src/lib.rs
-index 2351df0318b54908e8e7a6461b6eb417334eecfb..24b9eb1c6028136a16aae6dd2de6236c622d16ff 100644
+index 2351df0318b54908e8e7a6461b6eb417334eecfb..31f686b563248bc2f9f9969605a585b665b72190 100644
 --- a/libs/gui/rust/aidl_types/src/lib.rs
 +++ b/libs/gui/rust/aidl_types/src/lib.rs
-@@ -41,12 +41,69 @@ macro_rules! stub_unstructured_parcelable {
+@@ -41,12 +41,204 @@ macro_rules! stub_unstructured_parcelable {
      };
  }
  
@@ -94,7 +97,143 @@ index 2351df0318b54908e8e7a6461b6eb417334eecfb..24b9eb1c6028136a16aae6dd2de6236c
  stub_unstructured_parcelable!(LayerDebugInfo);
 -stub_unstructured_parcelable!(LayerMetadata);
  stub_unstructured_parcelable!(ParcelableVsyncEventData);
- stub_unstructured_parcelable!(ScreenCaptureResults);
+-stub_unstructured_parcelable!(ScreenCaptureResults);
 -stub_unstructured_parcelable!(VsyncEventData);
++/// libui's Flattenable as Parcel::write(Flattenable) frames it: int32 size, int32 fd count, the payload padded to 4 bytes, then the fds as fd objects.
++/// The payload is the type's own flat form (GraphicBuffer's GB01 words), carried unchanged.
++#[derive(Debug)]
++pub struct Flattened {
++    pub payload: Vec<u8>,
++    pub fds: Vec<std::os::fd::OwnedFd>,
++}
++
++/// utils/Errors.h: NO_ERROR.
++const NO_ERROR: i32 = 0;
++/// Dataspace.aidl: V0_SRGB = STANDARD_BT709 | TRANSFER_SRGB | RANGE_FULL (HAL_DATASPACE_V0_SRGB).
++const V0_SRGB: u32 = (1 << 16) | (2 << 22) | (1 << 27);
++
++/// The reply of a display capture (ScreenCaptureResults): buffers and a gain map as Flattenables, a fence or a status, flags, dataspace, ratio.
++#[derive(Debug)]
++pub struct ScreenCaptureResults {
++    /// The captured GraphicBuffer; None when the capture carries none.
++    pub buffer: Option<Flattened>,
++    /// Ok(Some(fd)): a pending fence; Ok(None): no fence; Err(status): the capture failed.
++    pub fence: Result<Option<std::os::fd::OwnedFd>, i32>,
++    pub captured_secure_layers: bool,
++    pub captured_hdr_layers: bool,
++    /// ui::Dataspace, written as uint32.
++    pub captured_dataspace: u32,
++    /// The gain map that lifts the screenshot into HDR; None when there is none.
++    pub optional_gain_map: Option<Flattened>,
++    /// The HDR/SDR ratio that fully applies the gain map.
++    pub hdr_sdr_ratio: f32,
++}
++
++impl Default for ScreenCaptureResults {
++    /// The header's defaults (ScreenCaptureResults.h:29-43).
++    fn default() -> Self {
++        Self {
++            buffer: None,
++            fence: Ok(None),
++            captured_secure_layers: false,
++            captured_hdr_layers: false,
++            captured_dataspace: V0_SRGB,
++            optional_gain_map: None,
++            hdr_sdr_ratio: 1.0,
++        }
++    }
++}
++
++/// Parcel::write(Flattenable): size, fd count, the payload words, then the fds.
++fn write_flattened(parcel: &mut BorrowedParcel, payload: &[u8], fds: &[std::os::fd::OwnedFd]) -> Result<(), StatusCode> {
++    parcel.write(&i32::try_from(payload.len()).map_err(|_| StatusCode::BAD_VALUE)?)?;
++    parcel.write(&i32::try_from(fds.len()).map_err(|_| StatusCode::BAD_VALUE)?)?;
++    for chunk in payload.chunks(4) {
++        let mut word = [0u8; 4];
++        word[..chunk.len()].copy_from_slice(chunk);
++        parcel.write(&i32::from_ne_bytes(word))?;
++    }
++    fds.iter().try_for_each(|fd| parcel.write_dup_file_descriptor(fd))
++}
++
++/// Parcel::read(Flattenable), the inverse of write_flattened.
++fn read_flattened(parcel: &BorrowedParcel) -> Result<Flattened, StatusCode> {
++    let size = usize::try_from(parcel.read::<i32>()?).map_err(|_| StatusCode::BAD_VALUE)?;
++    let fd_count = usize::try_from(parcel.read::<i32>()?).map_err(|_| StatusCode::BAD_VALUE)?;
++    let mut payload = Vec::new();
++    for _ in 0..size.div_ceil(4) {
++        payload.extend_from_slice(&parcel.read::<i32>()?.to_ne_bytes());
++    }
++    payload.truncate(size);
++    let fds = (0..fd_count).map(|_| parcel.read_dup_file_descriptor()).collect::<Result<Vec<_>, _>>()?;
++    Ok(Flattened { payload, fds })
++}
++
++/// A flag, then the Flattenable when the flag is set.
++fn write_optional(parcel: &mut BorrowedParcel, value: Option<&Flattened>) -> Result<(), StatusCode> {
++    parcel.write(&value.is_some())?;
++    value.map_or(Ok(()), |f| write_flattened(parcel, &f.payload, &f.fds))
++}
++
++fn read_optional(parcel: &BorrowedParcel) -> Result<Option<Flattened>, StatusCode> {
++    if parcel.read::<bool>()? { read_flattened(parcel).map(Some) } else { Ok(None) }
++}
++
++impl UnstructuredParcelable for ScreenCaptureResults {
++    fn write_to_parcel(&self, parcel: &mut BorrowedParcel) -> Result<(), StatusCode> {
++        write_optional(parcel, self.buffer.as_ref())?;
++        match &self.fence {
++            // Fence::flatten: one payload word, the fd count (1), then the fd
++            Ok(Some(fd)) => {
++                parcel.write(&true)?;
++                write_flattened(parcel, &1u32.to_ne_bytes(), std::slice::from_ref(fd))?;
++            }
++            // NO_FENCE writes its status (NO_ERROR); an error writes its status
++            Ok(None) => {
++                parcel.write(&false)?;
++                parcel.write(&NO_ERROR)?;
++            }
++            Err(status) => {
++                parcel.write(&false)?;
++                parcel.write(status)?;
++            }
++        }
++        parcel.write(&self.captured_secure_layers)?;
++        parcel.write(&self.captured_hdr_layers)?;
++        parcel.write(&self.captured_dataspace)?;
++        write_optional(parcel, self.optional_gain_map.as_ref())?;
++        parcel.write(&self.hdr_sdr_ratio)
++    }
++
++    fn from_parcel(parcel: &BorrowedParcel) -> Result<Self, StatusCode> {
++        let buffer = read_optional(parcel)?;
++        let fence = if parcel.read::<bool>()? {
++            // Fence::unflatten: one payload word, the fd count (0 or 1), which must match the fds
++            let fence = read_flattened(parcel)?;
++            let num_fds = u32::from_ne_bytes(fence.payload.as_slice().try_into().map_err(|_| StatusCode::BAD_VALUE)?);
++            if num_fds as usize != fence.fds.len() {
++                return Err(StatusCode::BAD_VALUE);
++            }
++            Ok(fence.fds.into_iter().next())
++        } else {
++            match parcel.read::<i32>()? {
++                NO_ERROR => Ok(None),
++                status => Err(status),
++            }
++        };
++        Ok(Self {
++            buffer,
++            fence,
++            captured_secure_layers: parcel.read()?,
++            captured_hdr_layers: parcel.read()?,
++            captured_dataspace: parcel.read()?,
++            optional_gain_map: read_optional(parcel)?,
++            hdr_sdr_ratio: parcel.read()?,
++        })
++    }
++}
++
++impl_deserialize_for_unstructured_parcelable!(ScreenCaptureResults);
++impl_serialize_for_unstructured_parcelable!(ScreenCaptureResults);
  stub_unstructured_parcelable!(WindowInfo);
  stub_unstructured_parcelable!(WindowInfosUpdate);
