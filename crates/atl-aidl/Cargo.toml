@@ -70,6 +70,8 @@ types = [
     "android.content.IClipboard",
     # the alarm service (alarm.rs)
     "android.app.IAlarmManager",
+    # the activity service's PendingIntent records (pending_intent.rs): BnIntentSender
+    "android.content.IIntentSender",
     # the connectivity service (connectivity.rs)
     "android.net.IConnectivityManager",
     # the permissionmgr service (permission_manager.rs)

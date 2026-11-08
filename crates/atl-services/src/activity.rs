@@ -6,6 +6,7 @@
 //! half: registerReceiverWithFeature / unregisterReceiver, non-ordered broadcastIntentWithFeature to registered receivers and explicit-component manifest receivers, stickies, unbroadcastIntent;
 //! the rules are broadcast.rs, the sends broadcast_queue.rs). A manifest receiver whose process is not running gets it started headless (no activity launch); its deliveries wait for the attach.
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); a crash report (handleApplicationCrash) is logged; every other method is counted unimplemented (counters).
+//! PendingIntent records (getIntentSenderWithFeature, cancelIntentSender) are pending_intent.rs's; IIntentSender.send is counted, not modelled.
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
 
@@ -22,6 +23,7 @@ use atl_aidl::aidl::android::app::IInstrumentationWatcher::IInstrumentationWatch
 use atl_aidl::aidl::android::app::IRequestFinishCallback::IRequestFinishCallback;
 use atl_aidl::aidl::android::app::IUiAutomationConnection::IUiAutomationConnection;
 use atl_aidl::aidl::android::content::IIntentReceiver::IIntentReceiver;
+use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_broker::control::StartRequest;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::app::{
@@ -55,6 +57,8 @@ use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
 use crate::display_model::DisplayModel;
 use crate::packages::{ActivityDecl, PackageRecord, Packages};
+use crate::pending_intent::{self, PendingIntents};
+use crate::pending_intent_table::Key;
 use crate::permission::{self, Permissions, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use crate::process_control::ProcessControl;
 use crate::shared_memory::ApplicationSharedMemory;
@@ -495,6 +499,8 @@ struct Inner {
     buckets: Arc<ReportedBuckets>,
     /// the broadcast sender thread (broadcast_queue.rs)
     broadcast_queue: broadcast_queue::Queue,
+    /// the PendingIntent records (pending_intent.rs)
+    pending: PendingIntents,
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -569,6 +575,7 @@ impl ActivityManager {
                     tasks,
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
+                    pending: PendingIntents::default(),
                 }
             }),
         }
@@ -1698,6 +1705,102 @@ impl IActivityManager for ActivityManager {
             inner.finish_instrumentation_locked(&mut st, pid, result_code, results.cloned())
         };
         inner.kill(&pids);
+        Ok(())
+    }
+
+    /// getIntentSenderWithFeature (:5467-5581), the caller owning the record. AOSP's order: the intents (:5492-5541), the owner's package (:5559-5572), then getIntentSender (PendingIntentController.java:120), whose records are pending_intent.rs. The activity-result kind goes to ActivityTaskManager (:5574): counted, not modelled.
+    /// bOptions are send-time data here, not part of the key. The user is the key's only: one user.
+    #[allow(clippy::too_many_arguments)]
+    fn r#getIntentSenderWithFeature(
+        &self,
+        kind: i32,
+        package: Option<&str>,
+        feature_id: Option<&str>,
+        token: Option<&SpIBinder>,
+        result_who: Option<&str>,
+        request_code: i32,
+        intents: Option<&[Option<Intent>]>,
+        resolved_types: Option<&[Option<String>]>,
+        flags: i32,
+        _options: Option<&Bundle>,
+        user_id: i32,
+    ) -> binder::Result<Option<Strong<dyn IIntentSender>>> {
+        let uid = ThreadState::get_calling_uid();
+        if let Some(intents) = intents {
+            if intents.is_empty() {
+                return Err(illegal_argument("Intents array length must be >= 1"));
+            }
+            for intent in intents.iter().flatten() {
+                if kind == pending_intent::INTENT_SENDER_BROADCAST
+                    && intent.flags & FLAG_RECEIVER_BOOT_UPGRADE != 0
+                {
+                    return Err(illegal_argument(
+                        "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
+                    ));
+                }
+            }
+            if resolved_types.is_some_and(|t| t.len() != intents.len()) {
+                return Err(illegal_argument(
+                    "Intent array length does not match resolvedTypes length",
+                ));
+            }
+        }
+        let package = package.unwrap_or_default();
+        let owned =
+            permission::is_system_or_root(uid) || self.inner.packages.is_same_app(package, uid);
+        if !owned {
+            return Err(security(&format!(
+                "Permission Denial: getIntentSender() from uid={uid} is not allowed to send as package {package}"
+            )));
+        }
+        if kind == pending_intent::INTENT_SENDER_ACTIVITY_RESULT {
+            return Err(counters::unimplemented(
+                AM,
+                "getIntentSenderWithFeature (activity result)",
+            ));
+        }
+        let request = intents.and_then(|v| v.last()).and_then(Option::as_ref);
+        let resolved = resolved_types
+            .and_then(|v| v.last())
+            .and_then(Option::as_deref);
+        let key = Key {
+            r#type: kind,
+            package: package.to_owned(),
+            feature_id: feature_id.map(str::to_owned),
+            activity: token.cloned(),
+            who: result_who.map(str::to_owned),
+            request_code,
+            intent: request.map(|i| intent_key(i, None)),
+            resolved_type: resolved.map(str::to_owned),
+            flags: 0,
+            user_id,
+        };
+        let sender = self.inner.pending.get_or_create(key, uid, flags)?;
+        counters::answered(AM, "getIntentSenderWithFeature");
+        Ok(sender)
+    }
+
+    /// cancelIntentSender (:5668 -> PendingIntentController.java:262-283): a record this service holds, cancelled by its creator's app id (AOSP compares the package's uid, :269-271). Any other sender: nothing (:263-264).
+    fn r#cancelIntentSender(
+        &self,
+        sender: Option<&Strong<dyn IIntentSender>>,
+    ) -> binder::Result<()> {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let binder = sender.as_binder();
+        let Some(owner) = self.inner.pending.creator_uid(&binder) else {
+            counters::answered(AM, "cancelIntentSender (no PendingIntent of this service)");
+            return Ok(());
+        };
+        let uid = ThreadState::get_calling_uid();
+        if permission::app_id(owner) != permission::app_id(uid) {
+            return Err(security(&format!(
+                "Permission Denial: cancelIntentSender() from uid={uid} is not allowed to cancel the PendingIntent of uid={owner}"
+            )));
+        }
+        self.inner.pending.cancel(&binder);
+        counters::answered(AM, "cancelIntentSender");
         Ok(())
     }
 

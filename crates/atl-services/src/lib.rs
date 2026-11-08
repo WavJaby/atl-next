@@ -26,6 +26,7 @@ pub mod manifest_flags;
 pub mod native_libs;
 pub mod observer_rules;
 pub mod packages;
+pub mod pending_intent_table;
 pub mod permission;
 pub mod players;
 pub mod process_control;
@@ -61,6 +62,8 @@ pub mod input_method;
 pub mod notification;
 #[cfg(feature = "converter")]
 pub mod package;
+#[cfg(feature = "converter")]
+pub mod pending_intent;
 #[cfg(feature = "converter")]
 pub mod permission_manager;
 #[cfg(feature = "converter")]
