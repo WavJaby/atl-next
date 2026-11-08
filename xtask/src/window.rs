@@ -11,10 +11,13 @@
 //! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
 //! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
+//! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
+//! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -66,6 +69,9 @@ pub struct Args {
     /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-hold/root/log/`.
     #[arg(long, value_name = "SECONDS")]
     hold: Option<u64>,
+    /// The headless compositor's output, WxH (default: GATE_OUTPUT, 1920x1200). Stages gtk, portrait and app-id only: their expectations follow the display.
+    #[arg(long, value_name = "WxH", value_parser = parse_output_size)]
+    output: Option<(i32, i32)>,
     /// Deliberate break (stages surface-view and gles2): the composer orders sibling layers by creation, ignoring z, so the readback check must fail.
     #[arg(long)]
     break_z_order: bool,
@@ -149,6 +155,10 @@ enum Stage {
     Gles2,
     /// UI mode: the probe sends the maximized control, then the suspended state through the proxy; the platform layer must log each as the toplevel's state (xtask/src/window/suspended.rs; window lifecycle S0).
     Suspended,
+    /// UI mode with the portrait fixture (xtask/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
+    Portrait,
+    /// UI mode: the last `xdg_toplevel.set_app_id` the window sends is `atl.<package>` ([`app_id_check`]).
+    AppId,
 }
 
 impl Stage {
@@ -171,6 +181,8 @@ impl Stage {
             Stage::Dialog => "dialog",
             Stage::Gles2 => "gles2",
             Stage::Suspended => "suspended",
+            Stage::Portrait => "portrait",
+            Stage::AppId => "app-id",
         }
     }
 
@@ -179,9 +191,13 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView | Stage::UiBlock | Stage::Hwui | Stage::Gles2 => {
-                GTK_WINDOW_MS
-            }
+            Stage::Gtk
+            | Stage::SurfaceView
+            | Stage::UiBlock
+            | Stage::Hwui
+            | Stage::Gles2
+            | Stage::Portrait
+            | Stage::AppId => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
@@ -208,6 +224,8 @@ const DECLARED_FIXTURE: &str = "xtask/testdata/window-declared";
 const START_FIXTURE: &str = "xtask/testdata/window-start";
 /// FIXTURE hardware accelerated (the stage hwui).
 const HWUI_FIXTURE: &str = "xtask/testdata/window-hwui";
+/// FIXTURE fixed to portrait and resizeable (stage portrait): its java/ links to FIXTURE's.
+const PORTRAIT_FIXTURE: &str = "xtask/testdata/window-portrait";
 /// The fixture's first onDraw on hwui's RecordingCanvas (Canvas.isHardwareAccelerated).
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
@@ -303,6 +321,8 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Frames
         | Stage::Input
         | Stage::Gtk
+        | Stage::Portrait
+        | Stage::AppId
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -682,7 +702,11 @@ fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String>
 
 /// [`gtk_capture_check`]; `swap_rb` = the hwui stage's deliberate break: the expectation's R and B bytes swapped.
 fn capture_check(app: &str, display: DisplayModel, swap_rb: bool) -> Result<String, String> {
-    let (width, height) = opening_size(display);
+    capture_at(app, opening_size(display), swap_rb)
+}
+
+/// [`capture_check`] at `(width, height)`: the readback has that size, and the quadrants' digest at that size.
+fn capture_at(app: &str, (width, height): (u32, u32), swap_rb: bool) -> Result<String, String> {
     let line = capture_line(app)?;
     let size = word(line, "size").unwrap_or("none");
     let want_size = format!("{width}x{height}");
@@ -710,6 +734,60 @@ fn capture_check(app: &str, display: DisplayModel, swap_rb: bool) -> Result<Stri
     Ok(format!(
         "readback {want_size} digest {want:016x} = the quadrants"
     ))
+}
+
+/// The AOSP size of a portrait, resizeable app on a landscape display (`(width, height)`), written out from AOSP, not read from atl-services.
+/// The app's orientation mismatches the display's, so calculateInitialBounds takes its landscape-display branch (DesktopModeBoundsCalculator.java:165-185): the height is the ideal (side x 0.75f, truncated; :50-51, :314-318), the width (int)(tdaHeight / aspect + 0.5f).
+/// The aspect is the display's own, width / height: owner decision 2026-11-08 (option A), DisplayContent.java:6647-6654 ignores orientation requests, so getDesiredAspectRatio takes its branch (c).
+fn portrait_expected((width, height): (i32, i32)) -> (i32, i32) {
+    let aspect = width as f32 / height as f32;
+    (
+        (height as f32 / aspect + 0.5) as i32,
+        (height as f32 * 0.75) as i32,
+    )
+}
+
+/// Stage `portrait` sub-gate (b): every layout's content view (`size=`) and window frame (`window=`, the relayout frame) are `want`, on the gate's display (`display=`).
+/// A layout at another size is the window laid out before its bounds applied, or after they changed.
+fn layout_check(app: &str, want: (i32, i32), display: (i32, i32)) -> Result<String, String> {
+    let layouts: Vec<&str> = app.lines().filter(|l| l.contains(LAYOUT_LINE)).collect();
+    if layouts.is_empty() {
+        return Err("the fixture never laid out".to_owned());
+    }
+    for line in &layouts {
+        let size = word(line, "size").and_then(parse_wxh);
+        let window = word(line, "window").and_then(parse_wxh);
+        let shown = word(line, "display").and_then(parse_wxh);
+        if size != Some(want) || window != Some(want) || shown != Some(display) {
+            return Err(format!(
+                "layout {line}, want size and window {want:?} on display {display:?}"
+            ));
+        }
+    }
+    Ok(format!(
+        "{} layouts at {}x{} (content and window), display {}x{}",
+        layouts.len(),
+        want.0,
+        want.1,
+        display.0,
+        display.1
+    ))
+}
+
+/// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` the window sent is `want`. GTK names the window itself first; the compositor keeps the last one.
+fn app_id_check(
+    ids: &[String],
+    want: &str,
+    liveness: &Result<Liveness, String>,
+) -> Result<String, String> {
+    liveness.as_ref().map_err(Clone::clone)?;
+    match ids.last() {
+        Some(last) if last == want => Ok(format!("set_app_id {ids:?}, last {want}")),
+        Some(last) => Err(format!(
+            "last set_app_id {last}, want {want} (sent {ids:?})"
+        )),
+        None => Err("the window sent no set_app_id".to_owned()),
+    }
 }
 
 /// Stops the app processes atld started, before atld is killed: an app whose atld dies under it aborts on its binder calls (DEAD_OBJECT, ~5 s after onResume). SIGTERM, then up to STOP_WAIT for them to exit.
@@ -902,6 +980,31 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     })
 }
 
+/// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first frame are in the proxy's channel. Its app ids go to `seen`, in order; the settle leaves room for one sent just after the draw.
+fn drive_app_id(
+    proxy: Proxy,
+    app_log: &Path,
+    seen: &Mutex<Vec<String>>,
+) -> Result<Liveness, String> {
+    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never drew")?;
+    std::thread::sleep(INPUT_SETTLE);
+    let events: Vec<ProxyEvent> = proxy.events.try_iter().map(|(_, event)| event).collect();
+    if !events.iter().any(|e| matches!(e, ProxyEvent::Acked { .. })) {
+        return Err("the window never acked a configure".to_owned());
+    }
+    let ids = events
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::AppId { app_id } => Some(app_id),
+            _ => None,
+        })
+        .collect();
+    *seen.lock().map_err(|e| e.to_string())? = ids;
+    Ok(Liveness::default())
+}
+
 /// The resize stage's probe, from the proxy's side: once the window is up and has drawn, it is configured to each of [`RESIZE_STEPS`] in turn. Each configure must be acked; then the probe leaves the client [`RESIZE_SETTLE`] to relayout and present.
 fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
@@ -1034,6 +1137,13 @@ fn resized_counts(services: &str) -> Vec<u32> {
         .filter(|l| l.starts_with("services: resized "))
         .filter_map(|l| l.split_whitespace().nth(2)?.parse().ok())
         .collect()
+}
+
+/// `--output`'s value: a `WxH` of positive sides.
+fn parse_output_size(text: &str) -> Result<(i32, i32), String> {
+    parse_wxh(text)
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .ok_or_else(|| format!("{text}: want WxH"))
 }
 
 /// `WxH`, the form of every size the stage reads.
@@ -1642,6 +1752,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }
+    if args.output.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Portrait | Stage::AppId) {
+        anyhow::bail!("--output needs stage gtk, portrait or app-id");
+    }
     let work_dir = if args.hold.is_some() {
         "window-hold"
     } else {
@@ -1654,6 +1767,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = match args.stage {
         Stage::Input => rt.with_headless_pointer(POINTER_SCRIPT),
         Stage::Gtk
+        | Stage::Portrait
+        | Stage::AppId
         | Stage::Hwui
         | Stage::Widgets
         | Stage::Ime
@@ -1671,11 +1786,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
+                let gate = args.output.map_or(GATE_OUTPUT, |(width, height)| Output {
+                    width,
+                    height,
+                    ..GATE_OUTPUT
+                });
                 let outputs: &[Output] = match args.stage {
                     Stage::Widgets | Stage::Ime => &[widgets::OUTPUT],
                     Stage::SurfaceView => &[surface_view::OUTPUT],
                     Stage::Move => &move_output::OUTPUTS,
-                    _ => &[GATE_OUTPUT],
+                    _ => std::slice::from_ref(&gate),
                 };
                 let n = NestedCompositor::start_with(&work.join("nested"), outputs)?;
                 if matches!(args.stage, Stage::Move) {
@@ -1750,6 +1870,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
         Stage::Gles2 => gles2_fixture::FIXTURE,
+        Stage::Portrait => PORTRAIT_FIXTURE,
         _ => FIXTURE,
     };
     // the GLES2 fixture's library is built for the host arch (the identity guest), as its static gate builds it
@@ -1809,9 +1930,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let stage = args.stage;
     let break_mouse_back = args.break_mouse_back;
     let break_suspended = args.break_suspended;
+    // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
+    let app_ids: Arc<Mutex<Vec<String>>> = Arc::default();
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
+        let seen = Arc::clone(&app_ids);
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
@@ -1826,6 +1950,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 drive_resize(p, &log)
             }
+            (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
             _ => drive(p, &log),
@@ -1943,6 +2068,32 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
             sub
         }
+        (Stage::Portrait, Some(_)) => {
+            let (width, height) = (display.width, display.height);
+            let want = portrait_expected((width, height));
+            vec![
+                ("mapped", gtk_window_check(&app)),
+                (
+                    "content",
+                    capture_at(&app, (want.0 as u32, want.1 as u32), false),
+                ),
+                ("relayout", layout_check(&app, want, (width, height))),
+                (
+                    "touch",
+                    content_origin(&app).and_then(|origin| {
+                        track_check(&after_marker(&app, marker), POINTER_SCRIPT, origin)
+                    }),
+                ),
+                ("pong", pong_check(&liveness)),
+            ]
+        }
+        (Stage::AppId, Some(_)) => {
+            let ids = app_ids.lock().map(|ids| ids.clone()).unwrap_or_default();
+            vec![(
+                "app-id",
+                app_id_check(&ids, &format!("atl.{}", m.name), &liveness),
+            )]
+        }
         (Stage::Hwui, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),
@@ -1967,6 +2118,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             args.stage,
             Stage::Widgets
                 | Stage::Gtk
+                | Stage::Portrait
                 | Stage::Hwui
                 | Stage::Ime
                 | Stage::SurfaceView
@@ -2068,6 +2220,48 @@ mod tests {
             "{RESIZE_SERVICES}services: unimplemented IWindowSession.relayoutAsync 1 at=1794093338.966\n"
         );
         assert!(relayout_async_check(&unserved).is_err());
+    }
+
+    /// `--output` takes `WxH` of two positive sides.
+    #[test]
+    fn output_size_is_wxh() {
+        assert_eq!(parse_output_size("2560x1440"), Ok((2560, 1440)));
+        assert!(parse_output_size("2560").is_err());
+        assert!(parse_output_size("0x1440").is_err());
+    }
+
+    /// AOSP's portrait size on the gate outputs, by hand: 1920x1200 has aspect 1.6, so the width is 1200 / 1.6 = 750 (+0.5, truncated), and the ideal height is 1200 x 0.75 = 900.
+    /// 2560x1440 has aspect 16/9: width 1440 / (16/9) = 810, ideal height 1440 x 0.75 = 1080.
+    #[test]
+    fn portrait_expected_is_aosp_on_the_gate_outputs() {
+        assert_eq!(portrait_expected((1920, 1200)), (750, 900));
+        assert_eq!(portrait_expected((2560, 1440)), (810, 1080));
+    }
+
+    /// Every layout must be the portrait size as content and as window frame, on the gate's display; one layout at another size fails the sub-gate.
+    #[test]
+    fn layout_check_wants_the_portrait_frame_at_every_layout() {
+        let layout = |size: &str| {
+            format!("AtlWindow: size={size} screenWidthDp=750 window={size} display=1920x1200")
+        };
+        let good = format!("{}\n{}\n", layout("750x900"), layout("750x900"));
+        assert!(layout_check(&good, (750, 900), (1920, 1200)).is_ok());
+        let relaid = format!("{good}{}\n", layout("1920x1200"));
+        assert!(layout_check(&relaid, (750, 900), (1920, 1200)).is_err());
+        assert!(layout_check("no layout line\n", (750, 900), (1920, 1200)).is_err());
+    }
+
+    /// The app id is the last `set_app_id` the window sent: GTK's default before it does not count, a missing prefix fails, and no id or a dead probe fails.
+    #[test]
+    fn app_id_check_reads_the_last_set_app_id() {
+        let ok: Result<Liveness, String> = Ok(Liveness::default());
+        let sent = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<String>>();
+        let want = "atl.com.example.atlwindow";
+        assert!(app_id_check(&sent(&["GTK Application", want]), want, &ok).is_ok());
+        assert!(app_id_check(&sent(&[want, "GTK Application"]), want, &ok).is_err());
+        assert!(app_id_check(&sent(&["com.example.atlwindow"]), want, &ok).is_err());
+        assert!(app_id_check(&sent(&[]), want, &ok).is_err());
+        assert!(app_id_check(&sent(&[want]), want, &Err("the fixture never drew".into())).is_err());
     }
 
     /// The counters before the marker are totals; the calls from it on keep their offsets.

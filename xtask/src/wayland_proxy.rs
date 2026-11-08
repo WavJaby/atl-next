@@ -4,7 +4,8 @@
 //! Clients connect to the proxy's socket; every byte and every passed fd is forwarded unchanged to the real compositor and back. On the way it decodes the few messages it needs, whole messages only (8-byte header: object id, `size << 16 | opcode`, native endian):
 //! * `wl_display.get_registry` and `wl_registry.bind` -> which object id is which interface (`xdg_wm_base`, `wl_shm`, ...);
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
-//! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`.
+//! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
+//! * `xdg_toplevel.set_app_id(app_id)` of the window's toplevel (request opcode 3) -> [`Event::AppId`].
 //!
 //! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
@@ -50,6 +51,8 @@ const XDG_SURFACE_ACK_CONFIGURE: u16 = 4;
 const XDG_SURFACE_GET_TOPLEVEL: u16 = 1;
 const XDG_SURFACE_SET_WINDOW_GEOMETRY: u16 = 3;
 const XDG_TOPLEVEL: &str = "xdg_toplevel";
+/// `xdg_toplevel.set_app_id(app_id: string)`, request 3 (xdg-shell.xml).
+const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
 const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
 const XDG_SURFACE_CONFIGURE: u16 = 0;
@@ -131,6 +134,8 @@ pub enum Event {
         width: i32,
         height: i32,
     },
+    /// The client's `xdg_toplevel.set_app_id` on the window: the id the compositor sees the window by. Every one is sent, in order.
+    AppId { app_id: String },
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
     PointerInjected,
     /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
@@ -176,6 +181,13 @@ impl Ids {
 fn word(body: &[u8], at: usize) -> Option<u32> {
     body.get(at..at + 4)
         .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// A wire `string` at `at`: a u32 length that counts the NUL, the bytes, padding to 4 (wayland-util). Lossy UTF-8.
+fn wl_string(body: &[u8], at: usize) -> Option<String> {
+    let len = word(body, at)? as usize;
+    let text = body.get(at + 4..at + 4 + len)?;
+    Some(String::from_utf8_lossy(text.strip_suffix(&[0]).unwrap_or(text)).into_owned())
 }
 
 /// The first complete message of `buf`: (object id, opcode, total size).
@@ -243,6 +255,11 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         return None;
     }
     match (ids.interfaces.get(&object).map(String::as_str), opcode) {
+        (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_APP_ID) if ids.toplevel == Some(object) => {
+            Some(Event::AppId {
+                app_id: wl_string(body, 0)?,
+            })
+        }
         (Some(WM_BASE), XDG_WM_BASE_PONG) => Some(Event::Pong {
             serial: word(body, 0)?,
         }),
@@ -976,6 +993,26 @@ mod tests {
             ]
         );
         assert_eq!(ids.id_of(WM_BASE), Some(7));
+    }
+
+    /// `xdg_toplevel.set_app_id` is request 3; its string is written out by hand (length 26 counts the NUL, 25 letters, 2 pad bytes to 28). Only the window's toplevel reports it.
+    #[test]
+    fn set_app_id_is_an_event() {
+        let mut ids = Ids::default();
+        ids.interfaces.insert(12, XDG_TOPLEVEL.to_owned());
+        ids.toplevel = Some(12);
+        let mut body = 26u32.to_ne_bytes().to_vec();
+        body.extend_from_slice(b"atl.com.example.atlwindow\0\0\0");
+        assert_eq!(
+            note_request(&mut ids, 12, XDG_TOPLEVEL_SET_APP_ID, &body),
+            Some(Event::AppId {
+                app_id: "atl.com.example.atlwindow".into(),
+            })
+        );
+        assert_eq!(
+            note_request(&mut ids, 13, XDG_TOPLEVEL_SET_APP_ID, &body),
+            None
+        );
     }
 
     /// A message cut off mid-body is not consumed: the prefix ends at the last complete message.
