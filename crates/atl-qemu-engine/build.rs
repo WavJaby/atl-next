@@ -35,6 +35,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-fatal", "atl_qe_no_fatal"),
     // gate (k): a host fault with previous action SIG_IGN keeps re-running under sigchain's SIG_IGN return
     ("ign-loop", "atl_qe_ign_loop"),
+    // gate (l): the bind decode tests bit 14, so a binding thunk (bit 15) reaches QEMU's syscall path
+    ("bind-decode", "atl_qe_bind_decode"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

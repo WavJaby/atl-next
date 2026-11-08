@@ -15,6 +15,8 @@ pub enum Trap {
     Boot(u64),
     /// A host call: the guest's x0..x7. The answer becomes the guest's x0.
     Call([u64; 8]),
+    /// A binding thunk (`svc #(BIND | id)`, the pool of atl-bridgegen's `aarch64` emitter): the id and the guest's x0..x7. The answer becomes the guest's x0.
+    Bind { id: u32, args: [u64; 8] },
     /// A value reported for a gate: the guest's x0. The answer is ignored.
     Report(u64),
 }

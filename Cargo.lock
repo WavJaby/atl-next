@@ -2531,6 +2531,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-binderd",
+ "atl-bridgegen",
  "atl-broker",
  "atl-cpu-pressure",
  "atl-fonts",

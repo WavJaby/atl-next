@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! P1's hook (patches/qemu 0001): QEMU's aarch64 `cpu_loop` calls `atl_svc_hook(env, imm16)` on every `svc`; this strong definition replaces the patch's weak default.
 //! Answer: 0 handled (resume at pc, already past the svc), 1 leave this `cpu_loop` (a guest call returned), <0 not ours (QEMU's syscall path).
-//! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours. The guest fixture (xtask/testdata/qemu-spike/fixture.c) repeats them.
+//! Immediates: Linux ignores the svc immediate and bionic uses `svc #0`, so nonzero values in the 0x7a1x range are ours, and so is any immediate with bit 15 ([`BIND`]: a binding thunk, id = the low 15 bits). The guest fixture (xtask/testdata/qemu-spike/fixture.c) repeats them.
 
 use std::ffi::{c_int, c_void};
 
@@ -17,6 +17,13 @@ pub const REPORT: u32 = 0x7a12;
 pub const BOOT: u32 = 0x7a13;
 /// A guest thread's first instruction: registers the thread for fault classification ([`crate::signal::register_thread`]). Answer: none.
 pub const THREAD: u32 = 0x7a14;
+/// Bit 15 of the immediate: a binding thunk (`svc #(BIND | id)`, atl-bridgegen `aarch64`). Answer: the host callback's, in x0.
+pub const BIND: u32 = 0x8000;
+/// The bit the decode tests. Break `bind-decode` (gate l) tests bit 14 instead, so bind thunks fall through to QEMU's syscall path.
+#[cfg(not(atl_qe_bind_decode))]
+const BIND_TEST: u32 = BIND;
+#[cfg(atl_qe_bind_decode)]
+const BIND_TEST: u32 = 0x4000;
 
 const HANDLED: c_int = 0;
 const LEAVE: c_int = 1;
@@ -59,6 +66,18 @@ fn dispatch(g: Guest, imm: u32) -> c_int {
         }
         THREAD => {
             crate::signal::register_thread();
+            HANDLED
+        }
+        _ if imm & BIND_TEST != 0 => {
+            let regs = std::array::from_fn(|i| g.x(i));
+            let r = on_trap(
+                g,
+                Trap::Bind {
+                    id: imm & !BIND,
+                    args: regs,
+                },
+            );
+            g.set_x(0, r);
             HANDLED
         }
         _ => NOT_OURS,

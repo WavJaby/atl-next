@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 atl-binderd = { path = "../crates/atl-binderd" }
 atl-android-paths = { path = "../crates/atl-android-paths" }
+atl-bridgegen = { path = "../crates/atl-bridgegen" }
 atl-broker = { path = "../crates/atl-broker" }
 atl-cpu-pressure = { path = "../crates/atl-cpu-pressure" }
 atl-gralloc = { path = "../crates/atl-gralloc" }

@@ -2,17 +2,19 @@
 //! `xtask test qemu-spike`: the QEMU engine spike (crates/atl-qemu-engine, QEMU bridge plan Q2) against its fixture, then every break.
 //!
 //! Library: the `--pic` build's own link line for `qemu-<target>` (`ninja -t commands`), linked `-shared` instead, `main` aliased `atl_qemu_user_main` (`--defsym`), QEMU's plugin `--dynamic-list` dropped. No QEMU file is compiled differently: this is D7 with a link-time change only.
-//! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`.
+//! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`. Its binding pool (gate l) is `atl_bridgegen::aarch64::pool_asm` text, assembled by the same clang into the fixture; `check_pool` reads the pool back from the built binary.
 //! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
-//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; the rest are atl-qemu-engine build.rs `BREAKS`.
+//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; `bind-id` links a pool whose slots carry id + 1 (xtask side); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
+use atl_bridgegen::aarch64;
 use atl_layout::Layout;
+use object::{Object, ObjectSection, ObjectSymbol};
 
 use crate::deps;
 use crate::git::git_raw;
@@ -25,7 +27,17 @@ const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 11] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'];
+const GATES: [char; 12] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'];
+/// Thunk slots in the fixture's pool: a power of two above the x86 engine's binding count (3860 stub rows and 6 fixed, qemu-thunks-plan 2.2). Gate (l) uses slot 4095.
+const POOL_SLOTS: u32 = 4096;
+/// The pool's symbol and its alignment (`.p2align 12` in `aarch64::pool_asm`).
+const POOL_SYMBOL: &str = "atl_bind_pool";
+const POOL_ALIGN: u64 = 1 << 12;
+/// Bytes per thunk: two words.
+const THUNK_BYTES: u64 = 8;
+const POOL_BYTES: u64 = POOL_SLOTS as u64 * THUNK_BYTES;
+/// The id offset of the `bind-id` break: every slot carries `slot + POOL_SKEW`.
+const POOL_SKEW: u32 = 1;
 /// Per harness run. A run that outlives it hangs (the fatal path in the module doc: QEMU's `die_with_signal`, a SIGSEGV that sigchain's SIG_DFL revert does not end) and counts as failed.
 const RUN_TIMEOUT_SECS: u32 = 240;
 /// `timeout`'s exit status when it killed the command.
@@ -51,6 +63,8 @@ pub struct Args {
 struct RunSpec {
     name: &'static str,
     unpatched: bool,
+    /// The fixture whose pool slots carry `slot + POOL_SKEW` (the `bind-id` break), not the production pool.
+    pool_skew: bool,
     base: &'static str,
     engine_break: Option<&'static str>,
     red: Option<char>,
@@ -60,6 +74,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "plain",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: None,
         red: None,
@@ -67,6 +82,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "no-p1",
         unpatched: true,
+        pool_skew: false,
         base: "0",
         engine_break: None,
         red: Some('a'),
@@ -74,6 +90,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "ret-reg",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("ret-reg"),
         red: Some('a'),
@@ -81,6 +98,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "guest-base",
         unpatched: false,
+        pool_skew: false,
         base: SHIFTED_BASE,
         engine_break: None,
         red: Some('c'),
@@ -88,6 +106,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "fault-route",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("fault-route"),
         red: Some('d'),
@@ -95,6 +114,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "chain-order",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("chain-order"),
         red: Some('e'),
@@ -102,6 +122,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "drop-accerr",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("drop-accerr"),
         red: Some('f'),
@@ -109,6 +130,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "boot-only",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("boot-only"),
         red: Some('g'),
@@ -117,6 +139,7 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "no-fatal",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("no-fatal"),
         red: Some('i'),
@@ -125,9 +148,28 @@ const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "ign-loop",
         unpatched: false,
+        pool_skew: false,
         base: "0",
         engine_break: Some("ign-loop"),
         red: Some('k'),
+    },
+    // gate (l): the bit-14 decode lets the bind thunk's svc reach QEMU's syscall path (getpid), so no bind trap arrives
+    RunSpec {
+        name: "bind-decode",
+        unpatched: false,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("bind-decode"),
+        red: Some('l'),
+    },
+    // gate (l): every pool slot carries the next id, so the trap names the wrong binding
+    RunSpec {
+        name: "bind-id",
+        unpatched: false,
+        pool_skew: true,
+        base: "0",
+        engine_break: None,
+        red: Some('l'),
     },
 ];
 
@@ -137,13 +179,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let dir = b.dir.join("spike");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = link(&b, &dir.join("libqemu-spike.so"), None)?;
-    let fixture = fixture(root, &b, &dir)?;
+    let plain = fixture(root, &b, &dir, "fixture", 0)?;
+    let skewed = fixture(root, &b, &dir, "fixture-skew", POOL_SKEW)?;
     let sigchain = sigchain(root, &dir)?;
     let runs: Vec<&RunSpec> = RUNS
         .iter()
         .filter(|r| !args.no_breaks || r.red.is_none())
         .collect();
     let mut fails = Vec::new();
+    if let Err(e) = check_pool(&plain) {
+        fails.push(Failure::step("pool", format!("{e:#}")));
+    }
     let mut unpatched_so = None;
     for spec in &runs {
         let lib = if spec.unpatched {
@@ -154,7 +200,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         } else {
             &so
         };
-        if let Err(e) = harness(root, &b, &dir, spec, lib, &fixture, &sigchain) {
+        let fx = if spec.pool_skew { &skewed } else { &plain };
+        if let Err(e) = harness(root, &b, &dir, spec, lib, fx, &sigchain) {
             fails.push(Failure::step(spec.name, format!("{e:#}")));
         }
     }
@@ -283,19 +330,72 @@ fn unpatched(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
     link(b, &dir.join("libqemu-spike-no-p1.so"), Some((output, &obj)))
 }
 
-fn fixture(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
+/// The guest fixture `name` (static bionic): fixture.c plus the thunk pool, whose slot k carries binding `k + skew`. The pool is emitted text, assembled by the same NDK clang; no assembly is written by hand.
+fn fixture(root: &Path, b: &Build, dir: &Path, name: &str, skew: u32) -> Result<PathBuf> {
     let ndk = jni_fixture::default_ndk(root)?;
-    let bin = dir.join("fixture");
+    let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
+    let pool_src = dir.join(format!("{name}-pool.s"));
+    std::fs::write(&pool_src, aarch64::pool_asm(POOL_SLOTS, |slot| slot + skew))
+        .with_context(|| format!("writing {}", pool_src.display()))?;
+    let pool_obj = dir.join(format!("{name}-pool.o"));
+    let status = target
+        .cmd("clang")
+        .args(["-c", "-o"])
+        .arg(&pool_obj)
+        .arg(&pool_src)
+        .status()
+        .context("running the NDK clang on the pool")?;
+    ensure!(
+        status.success(),
+        "NDK clang failed on {}",
+        pool_src.display()
+    );
+    let bin = dir.join(name);
     let src = root.join(FIXTURE_SRC);
-    let status = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?
+    let status = target
         .cmd("clang")
         .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
         .arg(&bin)
         .arg(&src)
+        .arg(&pool_obj)
         .status()
         .context("running the NDK clang")?;
     ensure!(status.success(), "NDK clang failed on {}", src.display());
     Ok(bin)
+}
+
+/// The built fixture's pool, read back from its own symbol table: `atl_bind_pool` is page aligned and `POOL_BYTES` long, and slot k holds `aarch64::place_words(k)` (`svc #(BIND | k); ret`).
+/// This checks what the assembler and linker made of the emitted text. The encodings themselves are literal in atl-bridgegen's unit tests.
+fn check_pool(bin: &Path) -> Result<()> {
+    let data = std::fs::read(bin).with_context(|| format!("reading {}", bin.display()))?;
+    let file = object::File::parse(&*data).with_context(|| format!("parsing {}", bin.display()))?;
+    let sym = file
+        .symbols()
+        .find(|s| s.name() == Ok(POOL_SYMBOL))
+        .with_context(|| format!("{}: no {POOL_SYMBOL} in .symtab", bin.display()))?;
+    ensure!(
+        sym.address() % POOL_ALIGN == 0,
+        "{POOL_SYMBOL} at {:#x}: not page aligned",
+        sym.address()
+    );
+    ensure!(
+        sym.size() == POOL_BYTES,
+        "{POOL_SYMBOL}: {} bytes, expected {POOL_BYTES}",
+        sym.size()
+    );
+    let bytes = file
+        .sections()
+        .find_map(|s| s.data_range(sym.address(), sym.size()).ok().flatten())
+        .with_context(|| format!("{POOL_SYMBOL} is in no section"))?;
+    for (slot, chunk) in bytes.chunks_exact(THUNK_BYTES as usize).enumerate() {
+        let word = |at: usize| {
+            u32::from_le_bytes([chunk[at], chunk[at + 1], chunk[at + 2], chunk[at + 3]])
+        };
+        let got = [word(0), word(4)];
+        let want = aarch64::place_words(u32::try_from(slot)?);
+        ensure!(got == want, "slot {slot}: {got:08x?}, expected {want:08x?}");
+    }
+    Ok(())
 }
 
 /// AOSP's libsigchain object (art/sigchainlib/sigchain.cc) built as-is for the host: the chain ART installs its fault handlers on. Build config only: the file uses CHAR_BIT and numeric_limits without including their headers, which bionic and libc++ supply transitively and glibc with libstdc++ does not.

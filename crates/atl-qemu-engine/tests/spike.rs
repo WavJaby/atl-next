@@ -2,7 +2,7 @@
 //! Spike gates (a)-(h) (QEMU bridge plan Q2/Q3), harness-less: QEMU's `main` owns this thread and the guest's exit ends the process with the BOOT answer (0 = every gate ok).
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV).
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -46,16 +46,24 @@ mod spike {
         pub const THREAD_RET: usize = 25;
         pub const FATAL: usize = 26;
         pub const FATAL_THREAD: usize = 27;
-        pub const LEN: usize = 28;
+        pub const BIND_FN: usize = 28;
+        pub const BIND_REPORT: usize = 29;
+        pub const LEN: usize = 30;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
     const A_ANSWER: u64 = 1000;
+    /// What the host answers a binding trap during gate (l); the fixture reports it + 1 (table `BIND_REPORT`).
+    const BIND_ANSWER: u64 = 0x1234;
+    /// Gate (l)'s pool slots: `fx_bind(k)` must reach binding k. Literals here, as the fixture's table is; the pool's layout (slot k = id k) is checked on the built fixture by xtask.
+    const BIND_SLOTS: [u32; 3] = [3, 0, 4095];
 
     thread_local! {
         static TABLE: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
         static GATE: Cell<char> = const { Cell::new(' ') };
         static A_SEEN: Cell<Option<[u64; 8]>> = const { Cell::new(None) };
+        /// The binding traps of the current gate-(l) call: (id, x0..x7).
+        static BINDS: RefCell<Vec<(u32, [u64; 8])>> = const { RefCell::new(Vec::new()) };
     }
 
     /// The guest's reports on any thread: the callback runs on the faulting thread, so this is process-wide.
@@ -223,6 +231,10 @@ mod spike {
                 REPORTS.lock().expect("reports").push(v);
                 0
             }
+            Trap::Bind { id, args } => {
+                BINDS.with(|b| b.borrow_mut().push((id, args)));
+                BIND_ANSWER
+            }
         }
     }
 
@@ -258,6 +270,7 @@ mod spike {
             ('g', gate_g),
             ('i', gate_i),
             ('j', gate_j),
+            ('l', gate_l),
         ] {
             GATE.with(|c| c.set(gate));
             REPORTS.lock().expect("reports").clear();
@@ -480,6 +493,30 @@ mod spike {
     /// Gate (j): the fatal fault on a second guest thread.
     fn gate_j(g: Guest) -> Result<(), String> {
         fatal_gate(g, w(t::FATAL_THREAD))
+    }
+
+    /// Gate (l): binding thunks from the guest pool. `fx_bind(k)` calls slot k with x0..x7 = 1..8; the trap must name binding k with those eight values, and the result and the report are the fixture's (BIND_ANSWER + 1).
+    fn gate_l(g: Guest) -> Result<(), String> {
+        let want_args: [u64; 8] = std::array::from_fn(|i| w(t::A_FIRST) + i as u64);
+        let want = w(t::BIND_REPORT);
+        for slot in BIND_SLOTS {
+            BINDS.with(|b| b.borrow_mut().clear());
+            REPORTS.lock().expect("reports").clear();
+            let r = g.call(w(t::BIND_FN), &[u64::from(slot)]);
+            let binds = BINDS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+            if binds != [(slot, want_args)] {
+                return Err(format!(
+                    "slot {slot}: traps {binds:?}, expected [({slot}, {want_args:?})]"
+                ));
+            }
+            let reports = reports();
+            if reports != [want] || r != want {
+                return Err(format!(
+                    "slot {slot}: returned {r}, reports {reports:?}, expected {want}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Gate (k) in its child: a host-only fault while the previous SIGSEGV action is SIG_IGN. A synchronous fault cannot be ignored, so the child must end by SIGSEGV; surviving the store exits 3.

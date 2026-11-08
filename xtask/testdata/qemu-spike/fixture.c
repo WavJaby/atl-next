@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Guest side of the QEMU engine spike (xtask `test qemu-spike`, QEMU bridge plan Q2/Q3): a static bionic executable QEMU's own main loads and runs.
 // main hands the host the gate table through the BOOT trap; the host then calls the fx_* functions through the engine. Every expected value is in the table below, from this source, never from the engine.
-// Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a10 CALL (x0 = host answer), 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = table, x1 = return stub; x0 = exit status), 0x7a14 THREAD (a guest thread's first instruction).
+// Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a10 CALL (x0 = host answer), 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = table, x1 = return stub; x0 = exit status), 0x7a14 THREAD (a guest thread's first instruction); 0x8000|k a binding thunk (pool slot k, gate l).
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -172,6 +172,37 @@ __attribute__((noinline)) u64 fx_fatal_thread(void) {
     return 0;
 }
 
+// (l) binding thunks: atl_bind_pool is the guest pool xtask emits (atl-bridgegen `aarch64` pool_asm, assembled into this fixture), slot k = `svc #(0x8000|k); ret`.
+// fx_bind(k) calls slot k with x0..x7 = A_FIRST..A_FIRST+7; the host answers (spike.rs BIND_ANSWER), and the result + BIND_ADD goes through REPORT and is returned.
+// The call sets x8 to getpid(2): a run where the svc misses the hook (break `bind-decode`) then makes a harmless syscall instead of one with a stray x8.
+#define BIND_ADD 1
+#define BIND_GETPID 172
+extern const char atl_bind_pool[];
+__attribute__((noinline)) static u64 call_thunk(const char *entry) {
+    register u64 x0 __asm__("x0") = A_FIRST + 0;
+    register u64 x1 __asm__("x1") = A_FIRST + 1;
+    register u64 x2 __asm__("x2") = A_FIRST + 2;
+    register u64 x3 __asm__("x3") = A_FIRST + 3;
+    register u64 x4 __asm__("x4") = A_FIRST + 4;
+    register u64 x5 __asm__("x5") = A_FIRST + 5;
+    register u64 x6 __asm__("x6") = A_FIRST + 6;
+    register u64 x7 __asm__("x7") = A_FIRST + 7;
+    register u64 nr __asm__("x8") = BIND_GETPID;
+    register const char *fn __asm__("x16") = entry;
+    __asm__ volatile("blr %[fn]"
+                     : [fn] "+r"(fn), "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7), "+r"(nr)
+                     :
+                     : "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x17", "x30", "memory", "cc");
+    return x0;
+}
+
+__attribute__((noinline)) u64 fx_bind(u64 slot) {
+    u64 r = call_thunk(atl_bind_pool + 8 * slot) + BIND_ADD;
+    register u64 x0 __asm__("x0") = r;
+    __asm__ volatile("svc #0x7a12" : : "r"(x0) : "memory");
+    return r;
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -193,6 +224,8 @@ static const u64 table[] = {
     (u64)fx_thread_fault, G_RET,
     // 26..27: (i) fatal fault on the main guest thread, (j) on a second one
     (u64)fx_fatal, (u64)fx_fatal_thread,
+    // 28..29: (l) fx_bind, and its report: the host's answer (0x1234) + BIND_ADD
+    (u64)fx_bind, 0x1234 + BIND_ADD,
 };
 
 int main(void) {
