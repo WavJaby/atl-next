@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The PCM output of the platform layer (plan A0): one stream of interleaved F32 samples that the audio server pulls from a callback on its realtime thread.
 //! [`AudioHost`] is the connection to the server, [`PcmOutput`] one stream on it. One implementation (PipeWire, atl-platform-ui-linux), so the shape is that implementation's call sites: open, spec, set_active, rt_fallbacks, underruns.
-//! No server type appears here; device choice is the server's (the default sink), not a parameter.
+//! No server type appears here. The server is named by its socket path, the one parameter of [`AudioHost::connect`]; device choice is the server's (the default sink), not a parameter.
+
+use std::path::Path;
 
 /// Frames per second and interleaved channels of a PCM stream. Samples are F32 in the server's native byte order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,8 +30,8 @@ pub trait AudioHost: Sized {
     /// One output stream on this connection.
     type Output: PcmOutput;
 
-    /// Connects to the server. Fails when none is running.
-    fn connect() -> Result<Self, AudioError>;
+    /// Connects to the server listening on the socket `remote` (an absolute path; the caller names it, nothing is looked up). Fails when nothing listens there.
+    fn connect(remote: &Path) -> Result<Self, AudioError>;
 
     /// Opens an output that pulls samples from `fill` on the server's realtime thread, in the rate and channels the server grants ([`PcmOutput::spec`]; `want` is the request).
     /// `fill` writes every sample of each slice it is given, in calls of one server quantum (at most 8192 frames), and keeps its state between calls.

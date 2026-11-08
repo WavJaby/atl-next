@@ -138,7 +138,10 @@ fn normal(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Result
     let wav = dir.join("recording.wav");
     let routing = Routing::setup(&name)?;
     let recorder = Recorder::start(&routing.name, &wav, args.rate)?;
-    let run = run_client(client, args, &[])?;
+    let remote = atl_platform_host::app_access::pipewire_socket().context(
+        "no PipeWire socket on this desktop: the normal run plays into the desktop's server",
+    )?;
+    let run = run_client(client, args, &[], &remote)?;
     recorder.stop()?;
     drop(routing);
     if let Some(error) = &run.error {
@@ -176,7 +179,7 @@ fn no_target(client: &Path, args: &Args, dir: &Path, report: &mut Report) -> Res
     fs::create_dir_all(&runtime).with_context(|| format!("creating {}", runtime.display()))?;
     let env = [("PIPEWIRE_RUNTIME_DIR", runtime.as_path())];
     let mut server = PrivateServer::start(&runtime, dir)?;
-    let run = run_client(client, args, &env);
+    let run = run_client(client, args, &env, &runtime.join("pipewire-0"));
     server.stop();
     let run = run?;
     match run.error {
@@ -288,8 +291,13 @@ fn build_client(root: &Path) -> Result<PathBuf> {
         .context("cargo reported no audio_pcm executable")
 }
 
-/// Runs the client with the tone parameters of `args` (and a break, if any), returning what it printed.
-fn run_client(client: &Path, args: &Args, env: &[(&str, &Path)]) -> Result<ClientRun> {
+/// Runs the client with the tone parameters of `args` (and a break, if any), connected to the server socket `remote`; returns what it printed.
+fn run_client(
+    client: &Path,
+    args: &Args,
+    env: &[(&str, &Path)],
+    remote: &Path,
+) -> Result<ClientRun> {
     let mut command = Command::new(client);
     command
         .arg("--rate")
@@ -301,7 +309,9 @@ fn run_client(client: &Path, args: &Args, env: &[(&str, &Path)]) -> Result<Clien
         .arg("--dbfs")
         .arg(args.dbfs.to_string())
         .arg("--duration-ms")
-        .arg(args.duration_ms.to_string());
+        .arg(args.duration_ms.to_string())
+        .arg("--remote")
+        .arg(remote);
     if matches!(args.break_, Some(Break::Zeros)) {
         command.args(["--break", "zeros"]);
     }

@@ -208,6 +208,8 @@ pub struct Runtime {
     media_player_service: bool,
     /// Apps' AudioFlinger mixes silence when this is set (`--break-mix`, the audio gate's third break).
     audio_break_mix: bool,
+    /// atld's `PIPEWIRE_REMOTE` (the desktop's server socket, which atld grants the apps) when set: a stale socket file makes an unreachable server (audio_app.rs `--unreachable`).
+    pipewire_remote: Option<PathBuf>,
     /// Window pixels each capture reads back (`ATL_UI_CAPTURE_PIXELS`, atl-composer ui_window.rs), when [`Runtime::with_ui_pixels`] set them.
     ui_pixels: Vec<(u32, u32)>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
@@ -555,6 +557,7 @@ impl Runtime {
             audio_break_cblk: false,
             media_player_service: true,
             audio_break_mix: false,
+            pipewire_remote: None,
             ui_pixels: Vec::new(),
             wayland: None,
             app_seccomp: true,
@@ -728,6 +731,12 @@ impl Runtime {
     /// Apps start with `--break-mix`: their AudioFlinger's mixer plays silence, so no track reaches the sink (audio_app.rs `--break-mix`, test only).
     pub fn with_broken_mix(mut self) -> Self {
         self.audio_break_mix = true;
+        self
+    }
+
+    /// atld starts with `PIPEWIRE_REMOTE` = `socket`: the desktop's audio server is that socket (audio_app.rs `--unreachable`, test only).
+    pub fn with_pipewire_remote(mut self, socket: PathBuf) -> Self {
+        self.pipewire_remote = Some(socket);
         self
     }
 
@@ -1209,6 +1218,9 @@ impl Runtime {
         }
         if self.audio_break_mix {
             cmd.arg("--break-mix");
+        }
+        if let Some(socket) = &self.pipewire_remote {
+            cmd.env("PIPEWIRE_REMOTE", socket);
         }
         if let Some(socket) = &self.wayland {
             cmd.env("WAYLAND_DISPLAY", socket);

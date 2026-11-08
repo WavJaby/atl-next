@@ -4,14 +4,16 @@
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
 //! PCM (A2): the fixture plays a static track, then a streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold two runs of tone with the frequency, length and level the fixture's input gives. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
-//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red.
+//! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use std::os::unix::net::UnixListener;
+
+use anyhow::{Context, Result};
 
 use crate::atld_run::{Run, Runtime, counter_lines};
 use crate::audio_pcm::{Recorder, Recording, Routing, frequency_hz, read_wav, rms};
@@ -43,6 +45,9 @@ pub struct Args {
     /// The third deliberate break: the app starts with `--break-mix`, so the mixer plays silence; the recording holds no tone and the PCM checks must go red.
     #[arg(long)]
     break_mix: bool,
+    /// The unreachable server: atld's desktop names a socket file that nothing listens on. The app must still reach `done`, its track must fail with AOSP's error path (STATE_UNINITIALIZED, counted), and no tone may reach the sink.
+    #[arg(long)]
+    unreachable: bool,
 }
 
 /// The fixture's dir.
@@ -75,7 +80,13 @@ const IN_PROCESS: [&str; 4] = [
 ];
 /// The counter line of a FAST request the server refused (flinger.rs createTrack).
 const FAST_REFUSED: &str = "refused IAudioFlingerService.createTrack.FAST";
-/// AudioTrack.STATE_INITIALIZED; STATE_UNINITIALIZED is 0.
+/// The counter line of a createTrack the server refused for want of an output (flinger.rs createTrack, AOSP AudioFlinger.cpp:1155).
+const OUTPUT_REFUSED: &str = "refused IAudioFlingerService.createTrack.output";
+/// AudioTrack.STATE_UNINITIALIZED: a track whose native setup failed.
+const STATE_UNINITIALIZED: i64 = 0;
+/// The constructor's message when the minimum buffer is refused (AudioTrack.java:2024, from audioBuffSizeCheck at :863).
+const MIN_BUFFER_REFUSED: &str = "Invalid audio buffer size";
+/// AudioTrack.STATE_INITIALIZED.
 const STATE_INITIALIZED: i64 = 1;
 /// AudioTrack.STATE_NO_STATIC_DATA (AudioTrack.java:170): a static track whose native setup succeeded and that has no data yet (set at :907).
 const STATE_NO_STATIC_DATA: i64 = 2;
@@ -149,12 +160,18 @@ fn segments(x: &[f32], threshold: f32, gap: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The presence level: a sample at or above PRESENCE_DB of the tone's peak counts as tone.
+fn presence() -> f32 {
+    let amplitude = 10f64.powf(TONE_DBFS / 20.0);
+    (amplitude * 10f64.powf(PRESENCE_DB / 20.0)) as f32
+}
+
 /// The PCM checks (game audio A2): the recording holds the static tone, then the streaming tone, each a run of samples above the presence level. Length, frequency and level come from the fixture's input (TONE_*), never from the server.
 fn pcm_verdicts(rec: &Recording) -> bool {
     let rate = u64::from(rec.rate);
     let amplitude = 10f64.powf(TONE_DBFS / 20.0);
     let expected_rms = amplitude / std::f64::consts::SQRT_2;
-    let threshold = (amplitude * 10f64.powf(PRESENCE_DB / 20.0)) as f32;
+    let threshold = presence();
     let gap = (GAP_SECONDS * f64::from(rec.rate)) as usize;
     let want = TONE_FRAMES * rate / TONE_RATE_HZ;
     let runs = segments(&rec.channel(0), threshold, gap);
@@ -209,6 +226,69 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     ok
 }
 
+/// A socket file nothing listens on: the unreachable server `--unreachable` names to atld. Dropping a std listener leaves the file, so it stays for the run.
+fn stale_socket(work: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(work)?;
+    let socket = std::path::absolute(work.join("pipewire-stale"))?;
+    let _ = fs::remove_file(&socket);
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    drop(listener);
+    Ok(socket)
+}
+
+/// The unreachable-server checks: the launch survives (the app reaches `done`), the track fails with AOSP's error path (STATE_UNINITIALIZED, the refusal counted), and the sink holds no tone.
+fn unreachable_verdicts(app: &str, services: &str, wav: &Path) -> bool {
+    let mut ok = verdict(
+        "launch",
+        app.contains(DONE),
+        "the app reached `done` with no audio server",
+    );
+    // the streaming track asks getMinBufferSize first; with no output that is an error, so its constructor throws (AudioTrack.java:863, :2024)
+    let track = line_value(app, "track: ");
+    ok &= verdict(
+        "streaming track",
+        track.is_some_and(|l| l.contains(MIN_BUFFER_REFUSED)),
+        &format!(
+            "refused before createTrack, line: {}",
+            track.unwrap_or("no line")
+        ),
+    );
+    // the static track needs no minimum buffer: createTrack itself is refused (AudioFlinger.cpp:1155-1158), so the track is STATE_UNINITIALIZED
+    let stat = line_value(app, "static: ");
+    let stat_state = field(stat, "state");
+    ok &= verdict(
+        "static track",
+        stat_state == Some(STATE_UNINITIALIZED),
+        &format!(
+            "state {stat_state:?} (STATE_UNINITIALIZED), line: {}",
+            stat.unwrap_or("no line")
+        ),
+    );
+    let refused = app.contains(OUTPUT_REFUSED) || services.contains(OUTPUT_REFUSED);
+    ok &= verdict(
+        "refusal counted",
+        refused,
+        "createTrack refused for want of an output",
+    );
+    let recording = fs::read(wav)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| read_wav(&bytes));
+    ok &= match recording {
+        Ok(rec) => {
+            let gap = (GAP_SECONDS * f64::from(rec.rate)) as usize;
+            let runs = segments(&rec.channel(0), presence(), gap).len();
+            verdict(
+                "no sound",
+                runs == 0,
+                &format!("{runs} run(s) of tone in the recording, want 0"),
+            )
+        }
+        Err(e) => verdict("no sound", false, &format!("{e:#}")),
+    };
+    ok
+}
+
 /// The native goals the gate reads: the app gate's (same runtime and APK tooling, native-bridge guest included).
 pub fn goals() -> crate::gate_goals::Goals {
     crate::app::goals()
@@ -243,6 +323,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt
     };
     let work = rt.out.join("audio");
+    let rt = if args.unreachable {
+        rt.with_pipewire_remote(stale_socket(&work)?)
+    } else {
+        rt
+    };
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
@@ -288,6 +373,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     for l in counter_lines(&services) {
         println!("audio-app: counter {l}");
+    }
+    if args.unreachable {
+        let ok = unreachable_verdicts(&app, &services, &wav);
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
 
     let sessions: Vec<i64> = line_value(&app, "session: ")

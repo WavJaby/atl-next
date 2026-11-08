@@ -17,13 +17,19 @@
 
 namespace atl::audio {
 
-/// One track's server side: the proxy over its control block and buffer.
+/// One track's server side: the proxy over its control block and buffer, read as PCM 16-bit and handed to the mixer as float (Track::getNextBuffer).
 struct Track final : public android::AudioBufferProvider {
-    explicit Track(android::sp<android::AudioTrackServerProxy> server);
+    Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame);
     android::status_t getNextBuffer(Buffer* buffer) override;
     void releaseBuffer(Buffer* buffer) override;
 
     android::sp<android::AudioTrackServerProxy> proxy;
+    /// Interleaved channels of the server buffer (1 or 2).
+    size_t channels;
+    /// The float frames the mixer reads: one quantum, sized by mix_add outside the realtime fill.
+    std::vector<float> floats;
+    /// The server buffer the last getNextBuffer obtained; releaseBuffer gives it back.
+    void* server_raw = nullptr;
 };
 
 /// The mixer: AudioMixerBase at `quantum_frames` and `rate`. `out` holds one quantum of mixed stereo float; `next` is the first frame of it not yet handed out.

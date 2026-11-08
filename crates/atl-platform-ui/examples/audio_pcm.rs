@@ -42,6 +42,9 @@ struct Args {
     duration_ms: u64,
     #[arg(long = "break", value_enum)]
     break_: Option<Break>,
+    /// The server's socket (absolute path): the stream connects there, nothing else is looked up.
+    #[arg(long)]
+    remote: std::path::PathBuf,
 }
 
 /// Silence the output keeps after the tone, so the harness's capture sees where the tone ends.
@@ -113,7 +116,7 @@ fn run(args: &Args) -> Result<()> {
         quantum: Arc::clone(&quantum),
     };
 
-    let host = PlatformAudioHost::connect()?;
+    let host = PlatformAudioHost::connect(&args.remote)?;
     say("connected");
     let output = host.open_output(
         PcmSpec {

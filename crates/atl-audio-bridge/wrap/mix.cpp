@@ -18,6 +18,8 @@ static_assert(sizeof(android::audio_track_cblk_t) == kCblkBytes,
 
 /// Interleaved channels of the output: AUDIO_CHANNEL_OUT_STEREO.
 constexpr size_t kOutChannels = 2;
+/// PCM 16-bit to float: Q15, the scale AOSP's memcpy_to_float_from_q15 uses (system/media/audio_utils format.h).
+constexpr float kQ15 = 1.0f / 32768.0f;
 
 void* as_value(uint32_t v) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(v));
@@ -25,26 +27,40 @@ void* as_value(uint32_t v) {
 
 }  // namespace
 
-Track::Track(android::sp<android::AudioTrackServerProxy> server) : proxy(std::move(server)) {}
+Track::Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame)
+    : proxy(std::move(server)), channels(channels_per_frame) {}
 
-// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written.
+// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, PCM 16-bit. The mixer's track input is float (AudioMixerBase's mMixerInFormat), so the frames are converted here, the reformat AudioMixer's BufferProviders do (not built: libaudioprocessing needs libsonic).
 android::status_t Track::getNextBuffer(Buffer* buffer) {
     android::ServerProxy::Buffer buf;
     buf.mFrameCount = buffer->frameCount;
     android::status_t status = proxy->obtainBuffer(&buf);
-    buffer->frameCount = buf.mFrameCount;
-    buffer->raw = buf.mRaw;
+    server_raw = buf.mRaw;
+    // the mixer asks for at most one quantum, and mix_add sized `floats` for that: the realtime fill allocates nothing
+    const size_t frames = std::min<size_t>(buf.mFrameCount, floats.size() / channels);
+    buffer->frameCount = frames;
+    if (frames == 0 || server_raw == nullptr) {
+        buffer->frameCount = 0;
+        buffer->raw = nullptr;
+        return status;
+    }
+    const auto* in = static_cast<const int16_t*>(server_raw);
+    for (size_t i = 0; i < frames * channels; ++i) {
+        floats[i] = static_cast<float>(in[i]) * kQ15;
+    }
+    buffer->raw = floats.data();
     return status;
 }
 
-// TrackBase::releaseBuffer: the frames the mixer consumed go back to the proxy.
+// TrackBase::releaseBuffer: the frames the mixer consumed go back to the proxy, from the server buffer obtained above.
 void Track::releaseBuffer(Buffer* buffer) {
     android::ServerProxy::Buffer buf;
     buf.mFrameCount = buffer->frameCount;
-    buf.mRaw = buffer->raw;
+    buf.mRaw = server_raw;
     buf.mNonContig = 0;
     buffer->frameCount = 0;
     buffer->raw = nullptr;
+    server_raw = nullptr;
     proxy->releaseBuffer(&buf);
 }
 
@@ -71,7 +87,8 @@ std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, size_t fram
         server = new android::AudioTrackServerProxy(cblk, buffer, frames, frame_bytes,
                                                     /*clientInServer=*/false, rate);
     }
-    return std::make_unique<Track>(std::move(server));
+    // PCM 16-bit frames: one int16 per channel (frame_bytes is channels x 2)
+    return std::make_unique<Track>(std::move(server), frame_bytes / sizeof(int16_t));
 }
 
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate) {
@@ -86,6 +103,8 @@ bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t cha
     if (mix.create(name, static_cast<audio_channel_mask_t>(channel_mask), AUDIO_FORMAT_PCM_16_BIT, session) != android::OK) {
         return false;
     }
+    // the conversion target for one quantum of frames (control call: outside the realtime fill)
+    track.floats.resize(mix.quantum * track.channels);
     mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MIXER_FORMAT,
                      as_value(AUDIO_FORMAT_PCM_FLOAT));
     mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MAIN_BUFFER,

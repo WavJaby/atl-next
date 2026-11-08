@@ -546,6 +546,8 @@ struct Host {
     shared_ro: Vec<Mount>,
     /// With `--ui`: what each app's GTK side reads from the desktop, read-only at its own path (atl_platform_host::app_access): the compositor socket, fontconfig's file and font dirs. Headless: none.
     desktop_ro: Vec<Mount>,
+    /// The desktop's PipeWire socket (atl_platform_host::app_access::pipewire_socket): every app process gets it read-only at its own path and names it to its launcher (`--pipewire-socket`). None: no server, and the apps' tracks fail.
+    pipewire: Option<PathBuf>,
     /// The device nodes each app process may open (set where the tier is probed, `run`).
     app_devices: Vec<PathBuf>,
     /// The installed packages: an app process mounts its own directories (package_mounts).
@@ -634,6 +636,11 @@ impl Host {
             [format!("--target-sdk={target_sdk}"), "--app".to_owned()]
                 .into_iter()
                 .chain(
+                    self.pipewire
+                        .iter()
+                        .map(|p| format!("--pipewire-socket={}", p.display())),
+                )
+                .chain(
                     self.no_audio_service
                         .then(|| "--no-audio-service".to_owned()),
                 )
@@ -684,6 +691,7 @@ impl Host {
             // the runtime's shared host paths; the package's own directories come with start_app (package_mounts)
             .chain(self.shared_ro.iter().cloned())
             .chain(self.desktop_ro.iter().cloned())
+            .chain(self.pipewire.iter().map(|p| ro_at_own_path(p)))
             .collect(),
             links: vec![],
             devices: self.app_devices.clone(),
@@ -1107,6 +1115,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         } else {
             vec![]
         },
+        pipewire: atl_platform_host::app_access::pipewire_socket(),
         packages: records,
         root: Root {
             root: r.root.clone(),

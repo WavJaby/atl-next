@@ -81,6 +81,8 @@ mod generated {
     }
 }
 
+use std::path::Path;
+
 use anyhow::{Result, anyhow, bail};
 use atl_platform_ui::Ui;
 
@@ -122,31 +124,31 @@ fn install_service_view() -> Result<()> {
 }
 
 /// Step 1c. The media services this process serves through the view, right after it is installed, found by name in-process: AudioFlinger and AudioPolicyService (atl-audioflinger, `media.audio_flinger` / `media.audio_policy`), the Codec2 store (atl-codec-store, `IComponentStore/default`, which AOSP's Codec2 client walks to) and the resource manager (atl-resource-manager, `media.resource_manager`, which MediaCodec waits for), and the media player service (atl-media-player, `media.player`, which MediaPlayer's native calls wait for; skipped under `--no-media-player-service`, the media player gate's break).
-/// Returns the served PCM output, which the caller holds for the life of the process (dropping it stops the stream).
+/// The PCM output opens on its first use (atl-audioflinger), so the audio server is named here only: an unreachable server does not fail the launch. `pipewire` is atld's grant (`--pipewire-socket`).
 #[cfg(feature = "converter")]
 fn serve_media_services(
     no_audio_service: bool,
     break_cblk: bool,
     no_media_player_service: bool,
     break_mix: bool,
-) -> Result<Option<atl_audioflinger::Served>> {
-    let output = if no_audio_service {
-        None
-    } else {
-        Some(
-            atl_audioflinger::serve(atl_audioflinger::Options {
+    pipewire: Option<&Path>,
+) -> Result<()> {
+    if !no_audio_service {
+        atl_audioflinger::serve(
+            pipewire,
+            atl_audioflinger::Options {
                 break_cblk,
                 break_mix,
-            })
-            .map_err(|e| anyhow!(e))?,
+            },
         )
-    };
+        .map_err(|e| anyhow!(e))?;
+    }
     atl_codec_store::serve().map_err(|e| anyhow!(e))?;
     atl_resource_manager::serve().map_err(|e| anyhow!(e))?;
     if !no_media_player_service {
         atl_media_player::serve().map_err(|e| anyhow!(e))?;
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(not(feature = "converter"))]
@@ -155,6 +157,7 @@ fn serve_media_services(
     _break_cblk: bool,
     _no_media_player_service: bool,
     _break_mix: bool,
+    _pipewire: Option<&Path>,
 ) -> Result<()> {
     Ok(())
 }
@@ -203,20 +206,12 @@ fn run() -> Result<i32> {
         );
     }
     install_service_view()?;
-    // held to the end of the launch: the served PCM output stops when this binding drops
-    #[cfg(feature = "converter")]
-    let _audio_output = serve_media_services(
-        launch.no_audio_service,
-        launch.break_cblk,
-        launch.no_media_player_service,
-        launch.break_mix,
-    )?;
-    #[cfg(not(feature = "converter"))]
     serve_media_services(
         launch.no_audio_service,
         launch.break_cblk,
         launch.no_media_player_service,
         launch.break_mix,
+        launch.pipewire_socket.as_deref(),
     )?;
     load_media_extractors();
     let mut vm_options = launch.vm_options.clone();

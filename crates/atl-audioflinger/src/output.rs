@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: MIT
-//! The PCM output and its mixer (AOSP AudioFlinger's PlaybackThread, Threads.cpp): one output on the platform layer, running from serve on (silence while no track plays), whose each cycle mixes every enabled track into the quantum (atl-audio-bridge, AudioMixerBase).
-//! The output is opened first, so the rate and quantum it grants are the served profile. The mixer passes between the realtime fill and the control calls through [`MixCell`] (one atomic swap each way): the fill never locks or allocates, and a control call that finds the fill mixing waits for its return, one quantum at most.
+//! The PCM output and its mixer (AOSP AudioFlinger's PlaybackThread, Threads.cpp): one output on the platform layer, whose each cycle mixes every enabled track into the quantum (atl-audio-bridge, AudioMixerBase).
+//! The output opens on the first request that needs it (a profile query or createTrack), not at launch: AOSP opens an output when a client first asks for one, and an app that never plays starts without the audio server.
+//! A server that cannot be reached fails those requests with AOSP's no-output answers (AudioFlinger.cpp:1155 BAD_VALUE, :1283-1337 zero), and the next request tries again.
+//! The platform output is not Send (its PipeWire wrappers hold Rc): [`Opener`]'s thread owns it, and the binder threads ask that thread over a channel.
+//! The mixer passes between the realtime fill and the control calls through [`MixCell`] (one atomic swap each way): the fill never locks or allocates, and a control call that finds the fill mixing waits for its return, one quantum at most.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 use atl_audio_bridge::{Mix, MixCell, MixGuard, Track as Server};
 use atl_platform_ui::PlatformAudioHost;
 use atl_platform_ui::audio::{AudioHost, PcmOutput, PcmSpec};
+use atl_services::counters;
 
 use crate::Options;
 
@@ -34,8 +41,15 @@ impl Profile {
 /// The mixer, shared by the output's realtime fill and the control calls (see [`MixCell`]). Installed when the output's quantum is known.
 pub(crate) type Shared = Arc<MixCell>;
 
-/// The open output. Dropping it stops the stream: the launcher holds it for the life of the process.
-pub(crate) struct Output {
+/// What the binder threads read from an open output: its profile, and the mixer the tracks join.
+#[derive(Clone)]
+pub(crate) struct Opened {
+    pub(crate) profile: Profile,
+    pub(crate) mixer: Shared,
+}
+
+/// The open output, held by [`Opener`]'s thread. Dropping it stops the stream.
+struct Output {
     _pcm: atl_platform_ui::PlatformPcmOutput,
 }
 
@@ -51,9 +65,63 @@ impl Drop for Output {
     }
 }
 
-/// Opens the output, starts it and installs the mixer; returns the profile AudioFlinger serves.
-pub(crate) fn open(opts: Options) -> Result<(Output, Profile, Shared), String> {
-    let host = PlatformAudioHost::connect().map_err(|e| e.to_string())?;
+/// Asks the output's thread for [`Opened`]. A request opens the output if it is not open yet; a failed open answers that request with its reason, and the next request tries again.
+pub(crate) struct Opener {
+    requests: Sender<Sender<Result<Opened, String>>>,
+}
+
+impl Opener {
+    /// Starts the output's thread for the server at `remote` (None: none granted). Opens nothing: the first [`Opener::get`] does.
+    pub(crate) fn spawn(remote: Option<PathBuf>, opts: Options) -> Result<Self, String> {
+        let (requests, inbox) = mpsc::channel();
+        thread::Builder::new()
+            .name("atl-pcm-output".to_owned())
+            .spawn(move || owner(inbox, remote, opts))
+            .map_err(|e| format!("starting the PCM output's thread: {e}"))?;
+        Ok(Self { requests })
+    }
+
+    /// The open output, opened by this call if it is not open yet. Err: why it cannot be opened.
+    pub(crate) fn get(&self) -> Result<Opened, String> {
+        let (reply, answer) = mpsc::channel();
+        self.requests
+            .send(reply)
+            .map_err(|_| "the PCM output's thread has ended".to_owned())?;
+        answer
+            .recv()
+            .map_err(|_| "the PCM output's thread has ended".to_owned())?
+    }
+}
+
+/// The output's thread: opens the output on the first request, holds it until the process ends, and answers every request. It ends when no [`Opener`] is left.
+fn owner(inbox: Receiver<Sender<Result<Opened, String>>>, remote: Option<PathBuf>, opts: Options) {
+    let mut open: Option<(Output, Opened)> = None;
+    for reply in inbox {
+        let answer = match open.as_ref() {
+            Some((_, opened)) => Ok(opened.clone()),
+            None => match start(remote.as_deref(), opts) {
+                Ok((output, opened)) => {
+                    open = Some((output, opened.clone()));
+                    Ok(opened)
+                }
+                Err(reason) => {
+                    counters::refused("PcmOutput", "open");
+                    tracing::warn!(%reason, "PCM output unavailable");
+                    Err(reason)
+                }
+            },
+        };
+        // the caller may have given up (its binder call ended): then nothing is waiting for the answer
+        let _ = reply.send(answer);
+    }
+}
+
+/// Connects to the server at `remote`, opens and starts the output, and installs the mixer for the quantum the server ran.
+fn start(remote: Option<&Path>, opts: Options) -> Result<(Output, Opened), String> {
+    let remote = remote.ok_or_else(|| {
+        "no audio server socket granted: atld found no PipeWire socket on the desktop".to_owned()
+    })?;
+    let host = PlatformAudioHost::connect(remote).map_err(|e| e.to_string())?;
     let mixer: Shared = Arc::new(MixCell::default());
     let fill_mixer = Arc::clone(&mixer);
     let silent = opts.break_mix;
@@ -82,7 +150,7 @@ pub(crate) fn open(opts: Options) -> Result<(Output, Profile, Shared), String> {
     }
     pcm.set_active(true).map_err(|e| e.to_string())?;
     tracing::info!(rate = profile.rate_hz, quantum, "PCM output running");
-    Ok((Output { _pcm: pcm }, profile, mixer))
+    Ok((Output { _pcm: pcm }, Opened { profile, mixer }))
 }
 
 /// The realtime fill: one slice of interleaved stereo frames from the mixer, or silence (break, a control call holding the mixer, or no mixer yet).

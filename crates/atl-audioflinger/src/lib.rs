@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! AudioFlinger and AudioPolicyService in the app process (game audio A1a, A1b, A2): the two binders AOSP's audio clients look up by name. They answer the calls that give ids, the output's rate, frame count and latency, and the routing to the output; createTrack hands out a track (`track.rs`) with its control block and an IAudioTrack; the tracks are mixed into one PCM output (`output.rs`), whose granted rate and quantum are the served profile.
+//! AudioFlinger and AudioPolicyService in the app process (game audio A1a, A1b, A2): the two binders AOSP's audio clients look up by name. They answer the calls that give ids, the output's rate, frame count and latency, and the routing to the output; createTrack hands out a track (`track.rs`) with its control block and an IAudioTrack; the tracks are mixed into one PCM output (`output.rs`), whose granted rate and quantum the served profile is.
 //! The interfaces are AOSP's AIDL (libaudioclient `aidl/`), compiled by the converter into `atl_audioflinger_stubs`. Calls not answered here stay UNKNOWN_TRANSACTION and are counted (atl-services counters).
-//! Served by [`serve`] at launch, after `atl_service_view::install` (atl-app-launcher). Core crate: `unsafe` nowhere.
+//! Served by [`serve`] at launch, after `atl_service_view::install` (atl-app-launcher). The PCM output opens on its first use, so an unreachable audio server fails tracks, never the launch. Core crate: `unsafe` nowhere.
 #![forbid(unsafe_code)]
 #![cfg(feature = "converter")]
 
@@ -19,6 +19,8 @@ mod output;
 mod policy;
 mod track;
 
+use std::path::{Path, PathBuf};
+
 /// The name AudioSystem looks AudioFlinger up by (`checkService`).
 pub const FLINGER_NAME: &str = "media.audio_flinger";
 /// The name AudioSystem looks AudioPolicyService up by.
@@ -35,15 +37,11 @@ pub struct Options {
     pub break_mix: bool,
 }
 
-/// The served PCM output. Hold it for the life of the process: dropping it stops the stream.
-pub struct Served {
-    _output: output::Output,
-}
-
-/// Opens the PCM output, starts it, and serves [`FLINGER_NAME`] and [`POLICY_NAME`] to this process. Refused before `atl_service_view::install`. The launcher skips the call under `--no-audio-service` (the audio gate's break).
-pub fn serve(opts: Options) -> Result<Served, String> {
-    let (output, profile, mixer) = output::open(opts)?;
-    atl_service_view::serve(FLINGER_NAME, flinger::new_binder(opts, profile, mixer))?;
+/// Serves [`FLINGER_NAME`] and [`POLICY_NAME`] to this process, with the PCM output connecting to the audio server socket `remote` (granted by atld; None: none granted) on its first use. Refused before `atl_service_view::install`. The launcher skips the call under `--no-audio-service` (the audio gate's break).
+/// Fails only when the services cannot be served: a server that is unreachable is not an error here, and its tracks fail when made (output.rs).
+pub fn serve(remote: Option<&Path>, opts: Options) -> Result<(), String> {
+    let output = output::Opener::spawn(remote.map(PathBuf::from), opts)?;
+    atl_service_view::serve(FLINGER_NAME, flinger::new_binder(opts, output))?;
     atl_service_view::serve(POLICY_NAME, policy::new_binder())?;
-    Ok(Served { _output: output })
+    Ok(())
 }

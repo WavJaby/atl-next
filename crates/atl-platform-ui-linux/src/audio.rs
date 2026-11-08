@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -60,7 +61,10 @@ pub struct PipeWireHost {
 impl AudioHost for PipeWireHost {
     type Output = PipeWireOutput;
 
-    fn connect() -> Result<Self, AudioError> {
+    fn connect(remote: &Path) -> Result<Self, AudioError> {
+        let name = remote
+            .to_str()
+            .ok_or_else(|| AudioError::Unavailable(format!("{}: not UTF-8", remote.display())))?;
         pipewire::init();
         // SAFETY: pipewire-rs documents no precondition for `ThreadLoopRc::new` (its safety section is TODO). The call creates one pw_thread_loop, named here with no properties, not yet running; it is owned by the connection and stopped and destroyed with it.
         let loop_ = unsafe { ThreadLoopRc::new(Some("atl-pcm"), None) }
@@ -70,7 +74,8 @@ impl AudioHost for PipeWireHost {
         loop_.start();
         let core = {
             let _lock = loop_.lock();
-            context.connect_rc(None)
+            // an absolute remote.name is the socket path as given (`pw-cli -r` does the same)
+            context.connect_rc(Some(properties! { *keys::REMOTE_NAME => name }))
         };
         match core {
             Ok(core) => Ok(Self {
@@ -81,7 +86,10 @@ impl AudioHost for PipeWireHost {
             }),
             Err(e) => {
                 loop_.stop();
-                Err(AudioError::Unavailable(format!("connect: {e}")))
+                Err(AudioError::Unavailable(format!(
+                    "connect {}: {e}",
+                    remote.display()
+                )))
             }
         }
     }

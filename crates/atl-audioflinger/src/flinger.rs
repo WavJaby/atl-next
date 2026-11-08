@@ -23,7 +23,7 @@ use atl_audioflinger_stubs::mangled::{
 use atl_services::counters;
 use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
 
-use crate::output::{self, Profile, Shared};
+use crate::output::{self, Opened, Opener};
 use crate::{OUTPUT_CHANNEL_MASK, Options, ids, track};
 
 const INTERFACE: &str = "IAudioFlingerService";
@@ -73,8 +73,23 @@ fn pcm16_layout(config: &AudioConfig) -> Option<(usize, u32)> {
 
 struct AudioFlinger {
     opts: Options,
-    profile: Profile,
-    mixer: Shared,
+    output: Opener,
+}
+
+impl AudioFlinger {
+    /// The open output when `handle` is the one output, opened by this call if needed. None for any other handle, or when the server cannot be reached (refused under `method`, counted).
+    fn output_for(&self, handle: i32, method: &str) -> Option<Opened> {
+        if handle != output_handle() {
+            return None;
+        }
+        match self.output.get() {
+            Ok(opened) => Some(opened),
+            Err(_) => {
+                counters::refused(INTERFACE, method);
+                None
+            }
+        }
+    }
 }
 
 impl Interface for AudioFlinger {}
@@ -86,34 +101,28 @@ impl IAudioFlingerService for AudioFlinger {
         counters::unimplemented(INTERFACE, method)
     }
 
-    /// AudioSystem::getSamplingRate: AOSP answers 0 for a handle it does not have.
+    /// AudioSystem::getSamplingRate: AOSP answers 0 for a handle it does not have (AudioFlinger.cpp:1283-1292), and 0 here when the output cannot open.
     fn r#sampleRate(&self, io_handle: i32) -> binder::Result<i32> {
         counters::answered(INTERFACE, "sampleRate");
-        Ok(if io_handle == output_handle() {
-            self.profile.rate_hz as i32
-        } else {
-            0
-        })
+        Ok(self
+            .output_for(io_handle, "sampleRate")
+            .map_or(0, |o| o.profile.rate_hz as i32))
     }
 
-    /// AudioSystem::getFrameCount: 0 for an unknown handle, as AOSP.
+    /// AudioSystem::getFrameCount: 0 for an unknown handle, as AOSP (AudioFlinger.cpp:1305-1315).
     fn r#frameCount(&self, io_handle: i32) -> binder::Result<i64> {
         counters::answered(INTERFACE, "frameCount");
-        Ok(if io_handle == output_handle() {
-            i64::from(self.profile.quantum)
-        } else {
-            0
-        })
+        Ok(self
+            .output_for(io_handle, "frameCount")
+            .map_or(0, |o| i64::from(o.profile.quantum)))
     }
 
-    /// AudioSystem::getLatency, ms.
+    /// AudioSystem::getLatency, ms (AudioFlinger.cpp:1329-1337: 0 for no playback thread).
     fn r#latency(&self, output: i32) -> binder::Result<i32> {
         counters::answered(INTERFACE, "latency");
-        Ok(if output == output_handle() {
-            self.profile.latency_ms()
-        } else {
-            0
-        })
+        Ok(self
+            .output_for(output, "latency")
+            .map_or(0, |o| o.profile.latency_ms()))
     }
 
     /// AOSP keeps the client for ioConfigChanged; this service never changes an output, so it never calls back.
@@ -184,6 +193,15 @@ impl IAudioFlingerService for AudioFlinger {
             s if s > 0 => s,
             _ => return refused(),
         };
+        // no playback thread for the output is BAD_VALUE (AudioFlinger.cpp:1155-1158); the output opens here on its first use
+        let out = match self.output.get() {
+            Ok(out) => out,
+            Err(reason) => {
+                tracing::warn!(%reason, "createTrack: no PCM output");
+                counters::refused(INTERFACE, "createTrack.output");
+                return refused();
+            }
+        };
         let frame_bytes = channels * BYTES_PER_SAMPLE;
         let (frames, region, server) = match request.sharedBuffer.as_ref() {
             // static: the client's buffer is the track's buffer, and the frames are the buffer's (Threads.cpp:2569: a PCM shared buffer ignores the request's frame count). No roundup (TrackBase:162).
@@ -243,7 +261,7 @@ impl IAudioFlingerService for AudioFlinger {
         if request.flags & AUDIO_OUTPUT_FLAG_FAST != 0 {
             counters::refused(INTERFACE, "createTrack.FAST");
         }
-        let Some(name) = output::add_track(&self.mixer, server, session, channel_mask) else {
+        let Some(name) = output::add_track(&out.mixer, server, session, channel_mask) else {
             counters::refused(INTERFACE, "createTrack.mixer");
             return refused();
         };
@@ -256,29 +274,22 @@ impl IAudioFlingerService for AudioFlinger {
             r#sessionId: session,
             r#sampleRate: config.base.sampleRate,
             r#streamType: AudioStreamType::MUSIC,
-            r#afFrameCount: i64::from(self.profile.quantum),
-            r#afSampleRate: self.profile.rate_hz as i32,
+            r#afFrameCount: i64::from(out.profile.quantum),
+            r#afSampleRate: out.profile.rate_hz as i32,
             r#afChannelMask: Some(output_layout()),
             r#afFormat: Some(output_format()),
-            r#afLatencyMs: self.profile.latency_ms(),
+            r#afLatencyMs: out.profile.latency_ms(),
             r#afTrackFlags: 0,
             r#outputId: output_handle(),
             r#portId: ids::next(ids::USE_CLIENT)
                 .expect("USE_CLIENT is below AUDIO_UNIQUE_ID_USE_MAX"),
-            r#audioTrack: Some(track::new_binder(region, Arc::clone(&self.mixer), name)),
+            r#audioTrack: Some(track::new_binder(region, Arc::clone(&out.mixer), name)),
         }))
     }
 }
 
 /// The binder served as [`crate::FLINGER_NAME`].
-pub(crate) fn new_binder(opts: Options, profile: Profile, mixer: Shared) -> SpIBinder {
-    BnAudioFlingerService::new_binder(
-        AudioFlinger {
-            opts,
-            profile,
-            mixer,
-        },
-        BinderFeatures::default(),
-    )
-    .as_binder()
+pub(crate) fn new_binder(opts: Options, output: Opener) -> SpIBinder {
+    BnAudioFlingerService::new_binder(AudioFlinger { opts, output }, BinderFeatures::default())
+        .as_binder()
 }
