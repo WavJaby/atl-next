@@ -84,7 +84,7 @@ pub struct RemoteArgs {
     /// Keeps the app up this many seconds after its resume, the window open on the target's desktop.
     #[arg(long, value_name = "SECONDS")]
     hold: u64,
-    /// The display atld answers with (`WxH@hz,dpi`): the target's monitor, not this host's. Default: this host's monitor rate, at the gates' size.
+    /// The display atld answers with (`WxH@hz,dpi`), instead of the target's monitor. Default: the target's own monitor, read by atld on the target's desktop.
     #[arg(long, value_name = "DISPLAY")]
     display: Option<String>,
     /// atld `--tilt-keys`, as for `run-apk`.
@@ -293,11 +293,12 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         break_blank_capture: false,
         tilt_keys: a.tilt_keys,
     };
-    let display = match &a.display {
-        Some(display) => display.clone(),
-        None => run_display().to_arg(),
+    // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
+    let rt = runtime(root, &args)?;
+    let rt = match &a.display {
+        Some(display) => rt.with_display(display.clone()),
+        None => rt,
     };
-    let rt = runtime(root, &args)?.with_display(display);
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &a.target, &work)?;
