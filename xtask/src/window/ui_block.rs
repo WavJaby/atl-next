@@ -87,7 +87,7 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
 mod tests {
     use super::*;
 
-    /// At 60 Hz a 2000 ms block is 120 grid points: 118 posts pass, 117 fail; a missing line fails.
+    /// At 60 Hz (period 16.667 ms) a 2000 ms block holds floor(119.99) = 119 grid points, minus SLACK 2: 117 posts pass, 116 fail; a missing line fails.
     #[test]
     fn posts_against_the_grid() {
         let line = |d| {
@@ -95,8 +95,8 @@ mod tests {
                 "1.0 I AtlWindow: ub result posts_during={d} max_gap_ms=20 block_ms=2000 posted=300"
             )
         };
-        assert!(posts_check(&line(118)).is_ok());
-        assert!(posts_check(&line(117)).is_err());
+        assert!(posts_check(&line(117)).is_ok());
+        assert!(posts_check(&line(116)).is_err());
         assert!(posts_check("").is_err());
     }
 }
