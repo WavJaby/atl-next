@@ -14,6 +14,10 @@ extern crate binder;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Mutex;
 
+#[cfg(test)]
+extern crate gui_aidl_types_rs;
+#[cfg(test)]
+mod capture;
 mod compositor;
 
 use atl_parcelables::android::app::ActivityManager_TaskDescription;

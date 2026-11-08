@@ -10,8 +10,9 @@ publish.workspace = true
 # JNI library of `xtask test parcel`: Java's own Parcelables marshalled on host ART are decoded and re-encoded by atl-parcelables' codecs over AOSP's C++ Parcel (libbinder_rs -> libbinder_ndk -> libbinder).
 # Test-only, never shipped. Links the converter's libbinder_rs and libatl_parcelables, so only `xtask native` builds it (feature `converter`); plain workspace builds take an empty library.
 # Also the JNI library of `xtask test compositor` (compositor.rs): atl-compositor's codecs vs libgui's C++ on host ART. It reads a Java Parcel's data and object table through libbinder's C++ accessors, so libbinder is linked directly.
+# Also the golden of ScreenCaptureResults (src/capture.rs, unit tests under the converter): libgui's own writeToParcel / readFromParcel through wrap/capture.{h,cpp} (adapters, no logic) on a parcel libbinder_rs owns.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libbinder"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libbinder", "device/libbinder_ndk", "device/libgui", "device/libgui_aidl_types_rs", "device/libui", "device/libutils"]
 
 [lib]
 crate-type = ["cdylib"]
@@ -22,10 +23,12 @@ converter = []
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
+cxx.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
 atl-bridgegen = { path = "../atl-bridgegen" }
+cxx-build.workspace = true
 
 [lints]
 workspace = true

@@ -397,6 +397,8 @@ dependencies = [
  "atl-bridgegen",
  "atl-compositor",
  "atl-libgui-parcel",
+ "cxx",
+ "cxx-build",
 ]
 
 [[package]]
