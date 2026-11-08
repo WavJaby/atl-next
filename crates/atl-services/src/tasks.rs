@@ -33,9 +33,10 @@ pub struct TaskSize {
     pub height: i32,
 }
 
-/// What the services keep per Task: the uid of the app it belongs to (checked by the registry), and its size: the initial bounds at creation, then each SET_BOUNDS.
+/// What the services keep per Task: the uid of the app it belongs to (checked by the registry), the package of the launch that made it (the window's app id, TASK_INFO), and its size: the initial bounds at creation, then each SET_BOUNDS.
 struct TaskRecord {
     owner: u32,
+    package: String,
     size: TaskSize,
     /// The seq of the override this size makes (config_seq).
     config_seq: i32,
@@ -150,8 +151,8 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A new Task of the app `owner` (its uid), at `size`. The process start that makes the Task calls it once.
-    pub fn new_task(&self, owner: u32, size: TaskSize) -> TaskId {
+    /// A new Task of the app `owner` (its uid) made by the launch of `package`, at `size`. The process start that makes the Task calls it once.
+    pub fn new_task(&self, owner: u32, package: &str, size: TaskSize) -> TaskId {
         let mut st = self.lock();
         st.last_id = st.last_id.checked_add(1).expect("TaskId space exhausted");
         let id = TaskId(st.last_id);
@@ -159,6 +160,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
             id,
             TaskRecord {
                 owner,
+                package: package.to_owned(),
                 size,
                 config_seq: 0,
             },
@@ -169,6 +171,11 @@ impl<C: Clone + PartialEq> Tasks<C> {
     /// The uid of the app `task` belongs to; None for no Task.
     pub fn owner(&self, task: TaskId) -> Option<u32> {
         self.lock().tasks.get(&task).map(|t| t.owner)
+    }
+
+    /// The package of the launch that made `task`; None for no Task.
+    pub fn package(&self, task: TaskId) -> Option<String> {
+        self.lock().tasks.get(&task).map(|t| t.package.clone())
     }
 
     /// Whether the app `owner` has a Task: only such an app reports the monitor (registry SET_DISPLAY).
@@ -355,8 +362,8 @@ mod tests {
     fn tasks_of_one_uid_hold_their_own_bounds() {
         let t = tasks();
         let (main, second) = (
-            t.new_task(10_123, three_quarters()),
-            t.new_task(10_123, three_quarters()),
+            t.new_task(10_123, "com.example.app", three_quarters()),
+            t.new_task(10_123, "com.example.app", three_quarters()),
         );
         assert_ne!(main, second);
         assert_eq!(t.owner(main), Some(10_123));
@@ -370,11 +377,24 @@ mod tests {
         assert_eq!(t.display(), DisplayModel::default());
     }
 
+    /// Each Task keeps the package of the launch that made it: the window's app id is read from its Task, not from the window.
+    #[test]
+    fn a_task_keeps_its_launch_package() {
+        let t = tasks();
+        let (main, other) = (
+            t.new_task(10_123, "com.example.app", three_quarters()),
+            t.new_task(10_124, "com.example.other", three_quarters()),
+        );
+        assert_eq!(t.package(main).as_deref(), Some("com.example.app"));
+        assert_eq!(t.package(other).as_deref(), Some("com.example.other"));
+        assert_eq!(t.package(TaskId::from_raw(99).expect("positive")), None);
+    }
+
     /// Setting the size a Task already has is no change; each change replaces the size, so the last one set is the one kept. Back to the initial size is a change: the entry is kept, not dropped.
     #[test]
     fn set_size_reports_changes_and_keeps_the_last() {
         let t = tasks();
-        let task = t.new_task(7, three_quarters());
+        let task = t.new_task(7, "com.example.app", three_quarters());
         assert!(t.set_size(task, size(1000, 700)));
         assert!(t.set_size(task, size(900, 650)));
         assert!(t.set_size(task, size(800, 600)));
@@ -389,7 +409,7 @@ mod tests {
     #[test]
     fn config_seq_follows_the_size_changes() {
         let t = tasks();
-        let task = t.new_task(7, three_quarters());
+        let task = t.new_task(7, "com.example.app", three_quarters());
         assert_eq!(t.config_seq(task), 0);
         t.set_size(task, size(1000, 700));
         assert_eq!(t.config_seq(task), 1);
@@ -403,8 +423,8 @@ mod tests {
     #[test]
     fn set_display_renumbers_every_task_and_keeps_sizes() {
         let t = tasks();
-        let sized = t.new_task(7, three_quarters());
-        let fresh = t.new_task(8, three_quarters());
+        let sized = t.new_task(7, "com.example.app", three_quarters());
+        let fresh = t.new_task(8, "com.example.other", three_quarters());
         t.set_size(sized, size(1000, 700));
         let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0);
         assert_eq!(t.set_display(monitor), vec![sized, fresh]);
@@ -430,7 +450,7 @@ mod tests {
     #[test]
     fn task_numbers_round_trip_and_refuse_non_positive() {
         let t = tasks();
-        let task = t.new_task(7, three_quarters());
+        let task = t.new_task(7, "com.example.app", three_quarters());
         assert_eq!(TaskId::from_raw(0), None);
         assert_eq!(TaskId::from_raw(-1), None);
         assert_eq!(TaskId::from_raw(task.raw()), Some(task));
@@ -441,8 +461,8 @@ mod tests {
     fn activity_tokens_name_their_task() {
         let t = tasks();
         let (first, second) = (
-            t.new_task(7, three_quarters()),
-            t.new_task(7, three_quarters()),
+            t.new_task(7, "com.example.app", three_quarters()),
+            t.new_task(7, "com.example.app", three_quarters()),
         );
         t.bind_token(1, first);
         assert_eq!(t.task_of_token(Some(&1)), Some(first));
@@ -457,8 +477,8 @@ mod tests {
     fn windows_belong_to_their_task() {
         let t = tasks();
         let (main, second) = (
-            t.new_task(7, three_quarters()),
-            t.new_task(7, three_quarters()),
+            t.new_task(7, "com.example.app", three_quarters()),
+            t.new_task(7, "com.example.app", three_quarters()),
         );
         let p = Placement::default();
         t.add_window(main, 100, p);
@@ -475,7 +495,7 @@ mod tests {
     #[test]
     fn placement_follows_relayout() {
         let t = tasks();
-        let main = t.new_task(7, three_quarters());
+        let main = t.new_task(7, "com.example.app", three_quarters());
         t.add_window(main, 100, Placement::default());
         let popup = Placement {
             r#type: 1000,

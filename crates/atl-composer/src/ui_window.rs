@@ -3,15 +3,15 @@
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's size (registry TASK_BOUNDS, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
+//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use atl_platform_ui::{
-    FrameClock, FrameRequester, InputSource, PhysSize, PlatformUi, PlatformWindow, Ui, UiInvoker,
-    Window, WindowAttributes,
+    FrameClock, FrameRequester, InputSource, PlatformUi, PlatformWindow, Ui, UiInvoker, Window,
+    WindowAttributes,
 };
 
 use atl_services::display_model::DisplayModel;
@@ -27,13 +27,13 @@ const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
 /// Ticks without a new scene after which the picture counts as settled: 1/3 s at 60 Hz, longer than the gaps between the frames of one app redraw.
 const SETTLED_TICKS: u32 = 20;
 
-/// The UI thread's session: the toolkit, the compositor and its mailbox, the input thread, the window's size at install and the window once it exists.
+/// The UI thread's session: the toolkit, the compositor and its mailbox, the input thread, the window's attributes at install (size, app id) and the window once it exists.
 struct Session {
     ui: PlatformUi,
     composer: Arc<Composer>,
     mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
-    size: PhysSize,
+    attributes: WindowAttributes,
     /// the window's size and monitor changes go here (the Task's bounds and the display in the services)
     sender: Arc<TaskSender>,
     window: Option<Rc<PlatformWindow>>,
@@ -61,27 +61,13 @@ pub fn set_pointer_icon(kind: i32) {
     }));
 }
 
-/// The toplevel's application id, named by the services when a window is added (`atl.<package>`); from any thread. Headless (no window) keeps the desktop default.
-pub fn set_app_id(app_id: String) {
-    let Some(invoker) = INVOKER.get() else {
-        return;
-    };
-    invoker.invoke(Box::new(move || {
-        SESSION.with_borrow(|session| {
-            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
-                window.set_app_id(&app_id);
-            }
-        });
-    }));
-}
-
 /// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now (the services expect the Task's window from the start).
 pub fn install(
     ui: PlatformUi,
     composer: Arc<Composer>,
     mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
-    size: PhysSize,
+    attributes: WindowAttributes,
     sender: Arc<TaskSender>,
 ) {
     let _ = INVOKER.set(ui.invoker());
@@ -91,7 +77,7 @@ pub fn install(
             composer,
             mailbox,
             input,
-            size,
+            attributes,
             sender,
             window: None,
         });
@@ -166,11 +152,7 @@ fn open() {
         if session.window.is_some() {
             return;
         }
-        let attributes = WindowAttributes {
-            title: "atl".to_owned(),
-            size: session.size,
-        };
-        let window = match PlatformWindow::create(&session.ui, &attributes) {
+        let window = match PlatformWindow::create(&session.ui, &session.attributes) {
             Ok(window) => Rc::new(window),
             Err(e) => {
                 tracing::error!("atl-composer: ui window: {e}");

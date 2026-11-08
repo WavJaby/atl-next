@@ -12,7 +12,7 @@
 //! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 //! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
-//! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`]).
+//! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first buffer commit is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstBuffer`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -157,7 +157,7 @@ enum Stage {
     Suspended,
     /// UI mode with the portrait fixture (xtask/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
     Portrait,
-    /// UI mode: the last `xdg_toplevel.set_app_id` the window sends is `atl.<package>` ([`app_id_check`]).
+    /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first buffer commit is `atl.<package>` ([`app_id_check`]).
     AppId,
 }
 
@@ -774,19 +774,29 @@ fn layout_check(app: &str, want: (i32, i32), display: (i32, i32)) -> Result<Stri
     ))
 }
 
-/// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` the window sent is `want`. GTK names the window itself first; the compositor keeps the last one.
+/// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` sent before the window's first buffer commit is `want`. The desktop maps the window on that commit and matches its rules then; an id sent after it is too late.
 fn app_id_check(
-    ids: &[String],
+    seen: &AppIdsSeen,
     want: &str,
     liveness: &Result<Liveness, String>,
 ) -> Result<String, String> {
     liveness.as_ref().map_err(Clone::clone)?;
-    match ids.last() {
-        Some(last) if last == want => Ok(format!("set_app_id {ids:?}, last {want}")),
-        Some(last) => Err(format!(
-            "last set_app_id {last}, want {want} (sent {ids:?})"
+    if !seen.first_frame {
+        return Err("the window never committed a buffer".to_owned());
+    }
+    match seen.before_first_frame.last() {
+        Some(last) if last == want => Ok(format!(
+            "set_app_id {:?} before the first frame, last {want}",
+            seen.before_first_frame
         )),
-        None => Err("the window sent no set_app_id".to_owned()),
+        Some(last) => Err(format!(
+            "last set_app_id before the first frame {last}, want {want} (before {:?}, after {:?})",
+            seen.before_first_frame, seen.after_first_frame
+        )),
+        None => Err(format!(
+            "the window sent no set_app_id before its first frame (after {:?})",
+            seen.after_first_frame
+        )),
     }
 }
 
@@ -980,11 +990,19 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     })
 }
 
-/// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first frame are in the proxy's channel. Its app ids go to `seen`, in order; the settle leaves room for one sent just after the draw.
+/// The app ids the window sent, split at its first buffer commit (the first frame), in order; `first_frame` once that commit came.
+#[derive(Clone, Debug, Default)]
+struct AppIdsSeen {
+    before_first_frame: Vec<String>,
+    after_first_frame: Vec<String>,
+    first_frame: bool,
+}
+
+/// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first frame are in the proxy's channel. Its app ids go to `seen`, split at the first frame; the settle leaves room for one sent just after the draw.
 fn drive_app_id(
     proxy: Proxy,
     app_log: &Path,
-    seen: &Mutex<Vec<String>>,
+    seen: &Mutex<AppIdsSeen>,
 ) -> Result<Liveness, String> {
     wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
         .then_some(())
@@ -994,14 +1012,18 @@ fn drive_app_id(
     if !events.iter().any(|e| matches!(e, ProxyEvent::Acked { .. })) {
         return Err("the window never acked a configure".to_owned());
     }
-    let ids = events
-        .into_iter()
-        .filter_map(|event| match event {
-            ProxyEvent::AppId { app_id } => Some(app_id),
-            _ => None,
-        })
-        .collect();
-    *seen.lock().map_err(|e| e.to_string())? = ids;
+    let mut split = AppIdsSeen::default();
+    for event in events {
+        match event {
+            ProxyEvent::AppId { app_id } if split.first_frame => {
+                split.after_first_frame.push(app_id)
+            }
+            ProxyEvent::AppId { app_id } => split.before_first_frame.push(app_id),
+            ProxyEvent::FirstBuffer => split.first_frame = true,
+            _ => {}
+        }
+    }
+    *seen.lock().map_err(|e| e.to_string())? = split;
     Ok(Liveness::default())
 }
 
@@ -1931,7 +1953,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let break_mouse_back = args.break_mouse_back;
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
-    let app_ids: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -2088,10 +2110,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ]
         }
         (Stage::AppId, Some(_)) => {
-            let ids = app_ids.lock().map(|ids| ids.clone()).unwrap_or_default();
+            let seen = app_ids.lock().map(|seen| seen.clone()).unwrap_or_default();
             vec![(
                 "app-id",
-                app_id_check(&ids, &format!("atl.{}", m.name), &liveness),
+                app_id_check(&seen, &format!("atl.{}", m.name), &liveness),
             )]
         }
         (Stage::Hwui, Some(_)) => vec![
@@ -2251,17 +2273,34 @@ mod tests {
         assert!(layout_check("no layout line\n", (750, 900), (1920, 1200)).is_err());
     }
 
-    /// The app id is the last `set_app_id` the window sent: GTK's default before it does not count, a missing prefix fails, and no id or a dead probe fails.
+    /// The app id is the last `set_app_id` sent before the first frame: GTK's default before it does not count, an id sent after the first frame is too late (the old path), a missing prefix fails, and no frame, no id or a dead probe fails.
     #[test]
-    fn app_id_check_reads_the_last_set_app_id() {
+    fn app_id_check_reads_the_last_set_app_id_before_the_first_frame() {
         let ok: Result<Liveness, String> = Ok(Liveness::default());
-        let sent = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<String>>();
         let want = "atl.com.example.atlwindow";
-        assert!(app_id_check(&sent(&["GTK Application", want]), want, &ok).is_ok());
-        assert!(app_id_check(&sent(&[want, "GTK Application"]), want, &ok).is_err());
-        assert!(app_id_check(&sent(&["com.example.atlwindow"]), want, &ok).is_err());
-        assert!(app_id_check(&sent(&[]), want, &ok).is_err());
-        assert!(app_id_check(&sent(&[want]), want, &Err("the fixture never drew".into())).is_err());
+        let seen = |before: &[&str], after: &[&str]| AppIdsSeen {
+            before_first_frame: before.iter().map(|id| id.to_string()).collect(),
+            after_first_frame: after.iter().map(|id| id.to_string()).collect(),
+            first_frame: true,
+        };
+        assert!(app_id_check(&seen(&["GTK Application", want], &[]), want, &ok).is_ok());
+        assert!(app_id_check(&seen(&[want, "GTK Application"], &[]), want, &ok).is_err());
+        assert!(app_id_check(&seen(&["GTK Application"], &[want]), want, &ok).is_err());
+        assert!(app_id_check(&seen(&["com.example.atlwindow"], &[]), want, &ok).is_err());
+        assert!(app_id_check(&seen(&[], &[]), want, &ok).is_err());
+        let no_frame = AppIdsSeen {
+            first_frame: false,
+            ..seen(&[want], &[])
+        };
+        assert!(app_id_check(&no_frame, want, &ok).is_err());
+        assert!(
+            app_id_check(
+                &seen(&[want], &[]),
+                want,
+                &Err("the fixture never drew".into())
+            )
+            .is_err()
+        );
     }
 
     /// The counters before the marker are totals; the calls from it on keep their offsets.

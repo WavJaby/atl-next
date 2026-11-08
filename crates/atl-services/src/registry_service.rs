@@ -11,7 +11,7 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_BOUNDS};
+use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO};
 use crate::counters;
 use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
@@ -21,6 +21,12 @@ use crate::ui_agent::UiAgents;
 
 /// The interface name counters use.
 const INTERFACE: &str = "ICompositorRegistry";
+
+/// TASK_INFO's reply: the window's opening size and its Task's package (empty for a process with no Task).
+pub struct TaskInfo {
+    pub size: TaskSize,
+    pub package: String,
+}
 
 pub trait ICompositorRegistry: Interface {
     /// REGISTER once its argument is read: the agent is kept under `caller_uid`.
@@ -38,8 +44,8 @@ pub trait ICompositorRegistry: Interface {
     /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
     fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
 
-    /// TASK_BOUNDS once the caller's pid is read: the size the process's window opens at (compositor_registry.rs TASK_BOUNDS).
-    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode>;
+    /// TASK_INFO once the caller's pid is read: the size the process's window opens at and its Task's package (compositor_registry.rs TASK_INFO).
+    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode>;
 }
 
 declare_binder_interface! {
@@ -66,10 +72,11 @@ fn on_transact(
         let display: String = data.read()?;
         return service.set_display(ThreadState::get_calling_uid(), &display);
     }
-    if code == TASK_BOUNDS {
-        let size = service.task_bounds(ThreadState::get_calling_pid())?;
-        reply.write(&size.width)?;
-        return reply.write(&size.height);
+    if code == TASK_INFO {
+        let info = service.task_info(ThreadState::get_calling_pid())?;
+        reply.write(&info.size.width)?;
+        reply.write(&info.size.height)?;
+        return reply.write(&info.package);
     }
     if code != REGISTER {
         counters::count_unimplemented(INTERFACE, &format!("code {code}"));
@@ -88,7 +95,7 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn task_bounds(&self, _: i32) -> Result<TaskSize, StatusCode> {
+    fn task_info(&self, _: i32) -> Result<TaskInfo, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -112,8 +119,8 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.set_display(caller_uid, display)
     }
 
-    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode> {
-        self.0.task_bounds(caller_pid)
+    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode> {
+        self.0.task_info(caller_pid)
     }
 
     fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
@@ -154,10 +161,16 @@ impl Registry {
 }
 
 impl ICompositorRegistry for Registry {
-    fn task_bounds(&self, caller_pid: i32) -> Result<TaskSize, StatusCode> {
+    fn task_info(&self, caller_pid: i32) -> Result<TaskInfo, StatusCode> {
         Ok(match self.activities.task_of_process(caller_pid) {
-            Some(task) => self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
-            None => initial_size(&self.tasks.display(), &ActivityInput::no_activity()),
+            Some(task) => TaskInfo {
+                size: self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
+                package: self.tasks.package(task).ok_or(StatusCode::BAD_VALUE)?,
+            },
+            None => TaskInfo {
+                size: initial_size(&self.tasks.display(), &ActivityInput::no_activity()),
+                package: String::new(),
+            },
         })
     }
 

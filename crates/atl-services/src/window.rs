@@ -154,19 +154,6 @@ impl RegisteredAgent {
         }
     }
 
-    /// Names the app's toplevel application id to the agent: `atl.<package>`, the window's LayoutParams.packageName. Counted when the agent refuses it.
-    fn name_app_id(&self, package: &str) {
-        let Some(agent) = self.agent("addToDisplayAsUser") else {
-            return;
-        };
-        if let Err(e) = agent.app_id(&format!("atl.{package}")) {
-            counters::answered(
-                WINDOW_SESSION,
-                &format!("addToDisplayAsUser: UI agent refused the app id: {e:?}"),
-            );
-        }
-    }
-
     /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
     fn give_input_server(&self, token: SpIBinder, fd: OwnedFd, flags: i32) -> bool {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
@@ -489,15 +476,6 @@ impl IWindowSession for Session {
             return Ok(ADD_BAD_APP_TOKEN);
         };
         self.agent.name_task(task);
-        match attrs.package_name.as_deref() {
-            Some(package) => self.agent.name_app_id(package),
-            None => {
-                counters::answered(
-                    WINDOW_SESSION,
-                    "addToDisplayAsUser: no packageName: app id not named",
-                );
-            }
-        }
         // every window but an INPUT_FEATURE_NO_INPUT_CHANNEL one gets a channel (WindowManagerService.addWindow -> openInputChannel), a NOT_TOUCHABLE toast too: ViewRootImpl.setView
         // builds its input receiver on whatever channel it passed in. The flags go to the agent, whose dispatcher skips NOT_TOUCHABLE / NOT_FOCUSABLE windows as InputDispatcher does.
         let (channel, input) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
@@ -898,7 +876,7 @@ mod tests {
             width: 750,
             height: 900,
         };
-        let task = tasks.new_task(1, size);
+        let task = tasks.new_task(1, "com.example.app", size);
         assert_eq!(size_of(&tasks, task, "size-of-test").ok(), Some(size));
     }
 }

@@ -474,6 +474,7 @@ fn main() -> Result<()> {
         &ui,
         &WindowAttributes {
             title: "atl gate".to_owned(),
+            app_id: None,
             size: PhysSize {
                 width: args.width,
                 height: args.height,

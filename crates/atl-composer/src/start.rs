@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atl_services::compositor_registry::{
     DESCRIPTOR, DISPLAY_PROPERTY, POINTER_PROPERTY, REGISTER, SERVICE, SURFACE_FLINGER,
-    SURFACE_FLINGER_AIDL, TASK_BOUNDS, TILT_PROPERTY, TiltConfig,
+    SURFACE_FLINGER_AIDL, TASK_INFO, TILT_PROPERTY, TiltConfig,
 };
 use atl_services::counters;
 use atl_services::display_model::DisplayModel;
@@ -16,7 +16,7 @@ use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCo
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use atl_compositor::model::CompositorConfig;
-use atl_platform_ui::{PhysSize, PlatformUi, Ui};
+use atl_platform_ui::{PhysSize, PlatformUi, Ui, WindowAttributes};
 
 use crate::host::{Composer, ComposerConfig, Presenter, ThreadHost};
 use crate::input::{self, Message};
@@ -95,24 +95,23 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
-/// The TASK_BOUNDS transaction: the size this process's window opens at, from the services (compositor_registry.rs). Both sides must be positive.
-fn task_bounds() -> Result<PhysSize, String> {
+/// The TASK_INFO transaction: the size this process's window opens at and its Task's package, from the services (compositor_registry.rs). The size must be positive; the package is empty for a process with no Task.
+fn task_info() -> Result<(PhysSize, String), String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
     let data = binder.prepare_transact().map_err(|e| e.to_string())?;
     let reply = binder
-        .submit_transact(TASK_BOUNDS, data, 0)
-        .map_err(|e| format!("task bounds: {e}"))?;
-    let width: i32 = reply
+        .submit_transact(TASK_INFO, data, 0)
+        .map_err(|e| format!("task info: {e}"))?;
+    let width: i32 = reply.read().map_err(|e| format!("task info width: {e}"))?;
+    let height: i32 = reply.read().map_err(|e| format!("task info height: {e}"))?;
+    let package: String = reply
         .read()
-        .map_err(|e| format!("task bounds width: {e}"))?;
-    let height: i32 = reply
-        .read()
-        .map_err(|e| format!("task bounds height: {e}"))?;
+        .map_err(|e| format!("task info package: {e}"))?;
     let side = |v: i32| u32::try_from(v).ok().filter(|v| *v > 0);
     match (side(width), side(height)) {
-        (Some(width), Some(height)) => Ok(PhysSize { width, height }),
-        _ => Err(format!("task bounds {width}x{height}: not a size")),
+        (Some(width), Some(height)) => Ok((PhysSize { width, height }, package)),
+        _ => Err(format!("task info {width}x{height}: not a size")),
     }
 }
 
@@ -163,8 +162,13 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     let mut input_method = None;
     let sender = if let Some(ui) = ui {
         input_method = Some(atl_ime::new_binder(Arc::new(ui.invoker())));
-        // the size the services give this process's Task: the window opens at it, so its first bounds report changes nothing
-        let size = task_bounds()?;
+        // the services' size and package for this process's Task: the window opens at the size, so its first bounds report changes nothing; the app id is named before its first commit
+        let (size, package) = task_info()?;
+        let attributes = WindowAttributes {
+            title: "atl".to_owned(),
+            app_id: (!package.is_empty()).then(|| format!("atl.{package}")),
+            size,
+        };
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))
@@ -175,7 +179,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             Arc::clone(&composer),
             mailbox,
             input_tx.clone(),
-            size,
+            attributes,
             Arc::clone(&sender),
         );
         Some(sender)

@@ -841,10 +841,10 @@ impl Inner {
             entry_point: ACTIVITY_THREAD.to_owned(),
             args: vec![format!("{PROC_START_SEQ_IDENT}{start_seq}")],
         })?;
-        // the launch's Task exists before the process attaches: the composer asks for its bounds at its window's install (registry TASK_BOUNDS)
+        // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
         let task = p.launch_activity().filter(|_| launch_activity).map(|decl| {
             let size = initial_size(&self.tasks.display(), &ActivityInput::from_decl(decl));
-            self.tasks.new_task(p.uid, size)
+            self.tasks.new_task(p.uid, &p.name, size)
         });
         st.processes.push(ProcessRecord {
             package: p.name.clone(),

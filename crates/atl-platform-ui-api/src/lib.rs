@@ -170,6 +170,8 @@ pub struct FdEvents {
 pub struct WindowAttributes {
     /// Title in the window chrome.
     pub title: String,
+    /// The toplevel's application id, an opaque string the desktop reads as the app's identity (`atl.<package>`). Named before the window's first commit, so the desktop sees it when it maps the window; None keeps the toolkit's default.
+    pub app_id: Option<String>,
     /// Content size requested; the compositor may grant another.
     pub size: PhysSize,
 }
@@ -189,9 +191,6 @@ pub trait Window: FrameClock + InputSource + Sized {
 
     /// Asks for a content size. A request, not a command: the shell decides.
     fn set_size(&self, size: PhysSize);
-
-    /// Names the toplevel's application id, an opaque string the desktop reads as the app's identity (`atl.<package>`). A window with no toplevel to name (headless) ignores it.
-    fn set_app_id(&self, app_id: &str);
 
     /// Sets the title shown in the window chrome.
     fn set_title(&self, title: &str);
