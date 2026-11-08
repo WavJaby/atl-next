@@ -18,10 +18,10 @@ use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_dis
 use atl_services::packages::Manifest;
 
 use crate::nested_wayland::NestedCompositor;
-use crate::{arches, drive, manifest, remote, test_apks, verdict, window};
+use crate::{arches, drive, manifest, observe, remote, test_apks, verdict, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
-const PRESENT_LINE: &str = "atl-composer: ui: present";
+pub(crate) const PRESENT_LINE: &str = "atl-composer: ui: present";
 /// The staged runtime's name, shared with the window gate: one ART install for both.
 pub(crate) const STAGE: &str = "window-art";
 /// What a remote run returns under its scratch dir besides the logs: atld's log, its exit code (`atld.rc`) and its end time (`end.ms`, the target's clock).
@@ -102,6 +102,12 @@ pub struct RemoteArgs {
     /// Deliberate break (`remote push`'s values): the bundle without the named file, which the check then names.
     #[arg(long = "break", value_enum)]
     brk: Option<remote::Break>,
+    /// Records the target's Hyprland session while the app holds: one record a second in `observe.jsonl` (its `atl.*` windows), and a verdict line. A target without exactly one Hyprland session is skipped, the reason logged.
+    #[arg(long)]
+    observe: bool,
+    /// Shots of the app's window, ms after its first present, comma-separated (`5000,20000`): `grim -g` of the window's rect only, never the desktop. Implies `--observe`.
+    #[arg(long, value_name = "MS", value_delimiter = ',')]
+    shot: Vec<u64>,
 }
 
 impl Args {
@@ -260,6 +266,16 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         a.brk != Some(remote::Break::TierXeLlvmpipe),
         "--break tier-xe-llvmpipe is test-only: `remote test` runs it, run-apk refuses it"
     );
+    let mut shots = a.shot.clone();
+    shots.sort_unstable();
+    shots.dedup();
+    ensure!(
+        shots.iter().all(|&ms| ms > 0 && ms <= a.hold * MS_PER_S),
+        "--shot: each time is ms after the app's first present and within the hold ({} s), got {:?}",
+        a.hold,
+        a.shot
+    );
+    let observe_on = a.observe || !shots.is_empty();
     let (pin, apk_file) = source(root, &a.target)?;
     let arches = arches::load(root)?;
     let (arch, _) = arches::build_machine(root, &arches)?;
@@ -317,6 +333,13 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             a.hold,
             logs.display()
         );
+        if observe_on {
+            println!(
+                "observe: on, shots at {shots:?} ms after the app's first present; --apply records it"
+            );
+        } else {
+            println!("observe: off (--observe or --shot turns it on)");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     target.push()?;
@@ -341,8 +364,32 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
     let rt = rt.with_site(target.run_site(limit, logs.join("transcript.log"), true));
+    // before the transfer: the run's root is cleared on the target then, so a present line the watch reads is this run's
+    let mut watch = if observe_on {
+        let plan = observe::Plan {
+            base: target.base(),
+            root: remote::rel_out(&rt.out, &run.root)?,
+            app_log: remote::rel_out(&rt.out, &run.log(&m.name))?,
+            shots_ms: shots.clone(),
+        };
+        Some(observe::Watch::start(
+            |script: &str, bound: Duration| target.run_bounded(script, bound),
+            plan,
+            &logs,
+        )?)
+    } else {
+        None
+    };
     let mut atld = rt.start_atld(&run)?;
-    let transfer = match wait_transfer(&mut atld, limit + TRANSFER_MARGIN)? {
+    let waited = wait_transfer(&mut atld, limit + TRANSFER_MARGIN, || {
+        if let Some(w) = watch.as_mut() {
+            w.poll();
+        }
+    });
+    if let Some(w) = watch {
+        w.finish();
+    }
+    let transfer = match waited? {
         Some(status) => rt.check_end(status, &run).map_err(|e| format!("{e:#}")),
         None => Err(format!(
             "the transfer to {} did not end within {} s and was stopped",
@@ -467,8 +514,12 @@ fn run_of(work: &Path, apk: PathBuf, m: &Manifest, log_tags: &str) -> Run {
     }
 }
 
-/// Waits for the transfer that runs the app on the target: its status, or `None` once `limit` has passed (the transfer is then killed).
-fn wait_transfer(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>> {
+/// Waits for the transfer that runs the app on the target: its status, or `None` once `limit` has passed (the transfer is then killed). `tick` runs between the status checks.
+fn wait_transfer(
+    child: &mut Child,
+    limit: Duration,
+    mut tick: impl FnMut(),
+) -> Result<Option<ExitStatus>> {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -479,6 +530,7 @@ fn wait_transfer(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus
             child.wait()?;
             return Ok(None);
         }
+        tick();
         std::thread::sleep(window::POLL);
     }
 }

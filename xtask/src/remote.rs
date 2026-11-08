@@ -348,7 +348,7 @@ fn dq(s: &str) -> String {
 }
 
 /// The target's Wayland socket for a session run: the one `wayland-*` socket that is not a lock file, in the desktop session's `$XDG_RUNTIME_DIR` (`/run/user/<uid>`). Sets `WL` to its name. Any other count stops the run with exit 5 before atld starts, and names the count: a second compositor's socket must not be picked by chance.
-fn session_script(tag: &str) -> String {
+pub(crate) fn session_script(tag: &str) -> String {
     format!(
         "WL_DIR=\"/run/user/$(id -u)\"\nWL=\"\"\nWL_N=0\nfor s in \"$WL_DIR\"/wayland-*; do\n  case \"$s\" in *.lock) continue ;; esac\n  [ -S \"$s\" ] || continue\n  WL=${{s##*/}}\n  WL_N=$((WL_N + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
     )
@@ -570,7 +570,7 @@ impl RemoteRun {
 }
 
 /// `path` relative to the slot's out dir: the target keeps that layout. A path outside the slot is refused.
-fn rel_out(out: &Path, path: &Path) -> Result<String> {
+pub(crate) fn rel_out(out: &Path, path: &Path) -> Result<String> {
     let rel = path.strip_prefix(out).with_context(|| {
         format!(
             "{} is not under the slot {}: a remote run keeps its files there",
@@ -729,6 +729,41 @@ impl Host {
         }
         Ok(text)
     }
+
+    /// `script` on the target (`sh -s`), its stdout as bytes, under the host's `timeout` at `limit` (killed 5 s later if it ignores it). A non-zero status is an error with the script's stderr.
+    fn run_bounded(&self, script: &str, limit: Duration) -> Result<Vec<u8>> {
+        let secs = limit.as_secs().max(1).to_string();
+        let mut cmd = Command::new("timeout");
+        cmd.args(["-k", "5", secs.as_str()]);
+        match self {
+            Host::Ssh(alias) => {
+                cmd.arg("ssh").args(SSH_OPTS).arg(alias).args(["sh", "-s"]);
+            }
+            Host::Local(_) => {
+                cmd.args(["sh", "-s"]);
+            }
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("starting a call to {}", self.label()))?;
+        child
+            .stdin
+            .take()
+            .context("no stdin for the target's script")?
+            .write_all(script.as_bytes())?;
+        let out: Output = child.wait_with_output()?;
+        ensure!(
+            out.status.success(),
+            "{} ({}): {}",
+            self.label(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(out.stdout)
+    }
 }
 
 fn ssh(alias: &str) -> Command {
@@ -819,6 +854,16 @@ impl Target {
             log,
             session,
         })
+    }
+
+    /// The bundle dir on the target, where a run's `out/` lives: `~/atl-next-run/<slot>` relative to home, or the local dir.
+    pub fn base(&self) -> String {
+        self.host.base(&self.slot)
+    }
+
+    /// `script` on the target, its stdout as bytes, bounded by `limit` (see `Host::run_bounded`).
+    pub fn run_bounded(&self, script: &str, limit: Duration) -> Result<Vec<u8>> {
+        self.host.run_bounded(script, limit)
     }
 }
 
@@ -1311,7 +1356,7 @@ pub fn prereq_script(base: &str, files: &[String], dirs: &[String]) -> Result<St
 }
 
 /// `s` as one POSIX shell word.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

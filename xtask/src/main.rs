@@ -64,6 +64,7 @@ mod ndk_surface;
 mod nested_wayland;
 mod none_gate;
 mod notice;
+mod observe;
 mod packages;
 mod par;
 mod parcel;
