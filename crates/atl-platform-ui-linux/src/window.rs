@@ -21,7 +21,7 @@ use crate::outputs;
 use crate::scene;
 use crate::text_input::GtkTextInput;
 use crate::ui::GtkUi;
-use crate::view::SceneView;
+use crate::view::{SceneView, logical_px};
 
 /// GDK frame times are microseconds (`g_get_monotonic_time`); ticks and presentation samples are nanoseconds.
 const NS_PER_US: i64 = 1000;
@@ -158,10 +158,6 @@ pub struct GtkWindow {
 }
 
 impl GtkWindow {
-    fn logical(&self, physical: u32) -> i32 {
-        self.view.scale().to_logical(f64::from(physical)).ceil() as i32
-    }
-
     /// The content's origin in the surface, where pointer input is injected: the native's surface transform (the client-side shadow) plus the view's place in the window (the header bar).
     /// GTK's controllers already report content-local points, so a surface point is content-local at `point - origin`.
     fn content_origin(&self) -> Option<(f64, f64)> {
@@ -352,6 +348,33 @@ impl GtkWindow {
     }
 }
 
+/// Sizes the window to the content's wanted physical size at the surface's current scale, keeping the chrome around the content. Runs at each change of either: the window keeps its integer-scale size otherwise, when the fractional scale arrives after the first layout (Hyprland, 1.6).
+fn fit_window(window: &gtk4::Window, view: &SceneView) {
+    if !(window.is_mapped() && window.surface().is_some_and(|s| s.is_mapped())) {
+        return;
+    }
+    let wanted = view.wanted();
+    let scale = view.scale();
+    let (width, height) = (
+        logical_px(scale, wanted.width),
+        logical_px(scale, wanted.height),
+    );
+    // the window is the content plus the chrome around it: keep the chrome, change the content
+    let (chrome_w, chrome_h) = (
+        window.width() - view.width(),
+        window.height() - view.height(),
+    );
+    tracing::info!(
+        "atl-platform-ui: window fit to {}x{} logical at scale {}, content {}x{} physical",
+        width + chrome_w,
+        height + chrome_h,
+        scale.get(),
+        wanted.width,
+        wanted.height,
+    );
+    window.set_default_size(width + chrome_w, height + chrome_h);
+}
+
 /// The scale of the controller's `SceneView` (1 before it is attached).
 fn scale_of(controller: &impl IsA<gtk4::EventController>) -> Scale {
     controller
@@ -370,7 +393,7 @@ impl Window for GtkWindow {
 
     fn create(ui: &GtkUi, attributes: &WindowAttributes) -> Result<Self, UiError> {
         ui.check_thread()?;
-        // GTK takes the xdg app_id from the program name when it realises the toplevel; the first commit carries it and the compositor's window rules read it then, so it is set before `present`
+        // GTK takes the xdg app_id from the program name at realise (inside `present`): the initial commit carries it and the compositor matches window rules on that commit, so it is set first. Process-wide: valid while one Android package runs per app process; a shared-uid second package keeps the first's id.
         if let Some(app_id) = &attributes.app_id {
             glib::set_prgname(Some(app_id.as_str()));
         }
@@ -412,16 +435,24 @@ impl Window for GtkWindow {
         // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor)
         // and its scale (wp_fractional_scale_v1 preferred_scale arrives after realisation): the content's logical size is re-derived from the physical one
         let entered = Rc::clone(&shared);
-        let scaled = view.downgrade();
+        let scaled = (view.downgrade(), window.downgrade());
         window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
                 let entered = Rc::clone(&entered);
                 surface.connect_enter_monitor(move |_, m| follow_monitor(&entered, m));
                 let scaled = scaled.clone();
-                surface.connect_scale_notify(move |_| {
-                    if let Some(view) = scaled.upgrade() {
-                        view.rescale();
-                    }
+                surface.connect_scale_notify(move |s| {
+                    tracing::info!("atl-platform-ui: surface scale {}", s.scale());
+                    // from the next idle, not inside the notification: GTK dropped a default-size request made there (the window kept its integer-scale size)
+                    let scaled = scaled.clone();
+                    glib::idle_add_local_once(move || {
+                        if let (Some(view), Some(window)) = (scaled.0.upgrade(), scaled.1.upgrade())
+                        {
+                            view.rescale();
+                            fit_window(&window, &view);
+                            mirror::resync();
+                        }
+                    });
                 });
                 // the xdg-shell states GDK reports: `suspended` is the hidden signal the window lifecycle consumes (S2); logged per change
                 if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
@@ -466,16 +497,7 @@ impl Window for GtkWindow {
     fn set_size(&self, size: PhysSize) {
         self.requested.set(size);
         self.view.set_wanted(size);
-        if self.is_mapped() {
-            let (width, height) = (self.logical(size.width), self.logical(size.height));
-            // the window is the content plus the chrome around it: keep the chrome, change the content
-            let (chrome_w, chrome_h) = (
-                self.window.width() - self.view.width(),
-                self.window.height() - self.view.height(),
-            );
-            self.window
-                .set_default_size(width + chrome_w, height + chrome_h);
-        }
+        fit_window(&self.window, &self.view);
         // every GTK change this layer makes may attach a source (a layout or paint request of the frame clock): from outside a mirror pass it reaches the Looper only through a sync. The platform layer is the only GTK caller, so its entry points are the complete set.
         mirror::resync();
     }

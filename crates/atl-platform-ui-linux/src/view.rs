@@ -10,6 +10,11 @@ use gtk4::{gdk, glib, graphene, gsk};
 /// A content size change in physical pixels ([`SceneView::connect_allocation`]).
 type AllocateFn = Box<dyn FnMut(atl_platform_ui_api::PhysSize)>;
 
+/// Logical pixels whose physical size at `scale` is nearest `physical`. Rounded, not ceiled: 1125 at 1.6 is 703.125, and ceil's 704 maps back to 1126.
+pub fn logical_px(scale: atl_platform_ui_api::Scale, physical: u32) -> i32 {
+    scale.to_logical(f64::from(physical)).round() as i32
+}
+
 mod imp {
     use super::*;
 
@@ -51,7 +56,7 @@ mod imp {
                 _ => wanted.height,
             };
             // derived at each layout, never stored: the scale is not final until the surface has its fractional scale (GTK's integer scale_factor before it: 2 on a 1.6 output)
-            let natural = self.obj().scale().to_logical(f64::from(physical)).ceil() as i32;
+            let natural = logical_px(self.obj().scale(), physical);
             (0, natural, -1, -1)
         }
 
@@ -126,6 +131,11 @@ impl SceneView {
         self.queue_resize();
     }
 
+    /// The natural size last set by [`SceneView::set_wanted`], in physical pixels: the scale-free value the window's logical size is derived from.
+    pub fn wanted(&self) -> atl_platform_ui_api::PhysSize {
+        self.imp().wanted.get()
+    }
+
     /// The surface's scale changed: lay out again, so the natural size follows it and the next allocation is reported in the new physical pixels even at the same logical size.
     pub fn rescale(&self) {
         self.imp().allocated.set((0, 0));
@@ -140,5 +150,22 @@ impl SceneView {
             .and_then(atl_platform_ui_api::Scale::new)
             .or_else(|| atl_platform_ui_api::Scale::new(f64::from(self.scale_factor())))
             .unwrap_or(atl_platform_ui_api::Scale::ONE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logical_px;
+    use atl_platform_ui_api::Scale;
+
+    /// Derived by hand: 1125 / 1.6 = 703.125 -> 703 (703 x 1.6 = 1124.8 -> 1125); 1350 / 1.6 = 843.75 -> 844 (1350.4 -> 1350). ceil would give 704 -> 1126.
+    #[test]
+    fn logical_size_maps_back_to_the_nearest_physical() {
+        let scale = Scale::new(1.6).unwrap();
+        assert_eq!(logical_px(scale, 1125), 703);
+        assert_eq!(logical_px(scale, 1350), 844);
+        assert_eq!(logical_px(scale, 320), 200);
+        assert_eq!(logical_px(scale, 240), 150);
+        assert_eq!(logical_px(Scale::ONE, 320), 320);
     }
 }

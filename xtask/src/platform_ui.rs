@@ -175,6 +175,10 @@ fn wait_ime_line(client: &mut Client, ime: &mut Ime, prefix: &str) -> Result<Opt
 /// The window content size asked for, physical pixels. Wide enough that the title bar's minimum width does not enlarge the content (WSLg: ~280 px), and at least the composite scene's 256 x 192.
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
+/// GTK's integer scale on a fractional output (wl_output scale 2 for 1.6): the scale the gate's window maps at, before the target one arrives (`late` in `run`).
+const START_SCALE: f64 = 2.0;
+/// Scales compare within this: the gate's scales are read back as text (Rust's float Display: 1.6 -> "1.6").
+const SCALE_TOLERANCE: f64 = 1e-3;
 /// The resize probe's size step, physical pixels per axis: the larger and the smaller size are WIDTH/HEIGHT +- this. The smaller content stays above the title bar's minimum width (WSLg: ~280 px).
 const RESIZE_STEP: u32 = 32;
 /// The presentation samples' period against the monitor's rate: the sample comes from the compositor's wp_presentation refresh (ns), the rate from GDK's milli-Hz.
@@ -464,8 +468,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     // --hold-blocked is watched on the desktop's compositor; every other run maps in the gate's own (outlives the client: declared before it)
+    // the gate's output starts at START_SCALE and takes args.scale once the window has mapped (the client's --await-scale): the fractional scale arrives after the first layout, as on Hyprland
+    let late = args.hold_blocked.is_none() && !args.maximized;
     let output = Output {
-        scale: args.scale,
+        scale: if late { START_SCALE } else { args.scale },
         ..GATE_OUTPUT
     };
     let nested = match args.hold_blocked {
@@ -502,6 +508,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
 
     let stderr_file = out_dir.join("client.stderr");
+    let await_args: Vec<String> = if late {
+        vec!["--await-scale".into(), args.scale.to_string()]
+    } else {
+        Vec::new()
+    };
     let mut child = Command::new(&exe)
         .args(["--out"])
         .arg(&out_dir)
@@ -509,6 +520,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .args(["--width", &WIDTH.to_string(), "--height", &HEIGHT.to_string()])
         .args(["--resize-step", &RESIZE_STEP.to_string()])
         .args(["--timeout-secs", &STARTUP_LIMIT.as_secs().to_string()])
+        .args(&await_args)
         .env("WAYLAND_DISPLAY", &socket)
         .env("GDK_BACKEND", "wayland")
         .env("GSK_RENDERER", &args.gsk_renderer)
@@ -541,6 +553,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
 
     let mut report = Report::default();
+    if let (true, Some(n)) = (late, &nested) {
+        // mapped at START_SCALE; the output takes the target scale now, which the client's frames wait for
+        let mapped_line = client.expect_line("MAPPED", STARTUP_LIMIT)?;
+        client.seen.push(mapped_line);
+        n.control().set_scale(0, args.scale)?;
+    }
     let ready = client.expect_line("READY", STARTUP_LIMIT);
     if let Err(e) = &ready {
         let tail = std::fs::read_to_string(&stderr_file).unwrap_or_default();
@@ -559,6 +577,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "window mapped at its first frame-clock tick",
         &mapped,
     );
+    if late {
+        let scale_of = |line: &str| field(line, "scale").and_then(|s| s.parse::<f64>().ok());
+        let mapped_scale = scale_of(&mapped);
+        let last_frame_scale = client
+            .lines_with("FRAME ")
+            .last()
+            .and_then(|l| scale_of(l.as_str()));
+        report.check(
+            mapped_scale.is_some_and(|s| (s - START_SCALE).abs() < SCALE_TOLERANCE)
+                && last_frame_scale.is_some_and(|s| (s - args.scale).abs() < SCALE_TOLERANCE),
+            "the fractional scale arrives after the window mapped: mapped at the integer scale, the frames at the target",
+            &format!("mapped at {mapped_scale:?}, last frame at {last_frame_scale:?}"),
+        );
+    }
     let frames: Vec<String> = client.lines_with("FRAME ").into_iter().cloned().collect();
     let times: Vec<u64> = frames
         .iter()

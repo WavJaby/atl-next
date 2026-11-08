@@ -52,6 +52,9 @@ use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::io::{read, write};
 use rustix::time::{ClockId, Timespec, clock_gettime};
 
+/// Two scales are the same within this: wp_fractional_scale sends n/120 (1.6 = 192/120, exact), the epsilon absorbs a float's rounding.
+const SCALE_EPSILON: f64 = 1e-3;
+
 #[derive(Parser)]
 struct Args {
     /// Directory the RGBA captures are written to.
@@ -60,6 +63,9 @@ struct Args {
     /// Frames to present, one per frame-clock tick.
     #[arg(long)]
     frames: u32,
+    /// The scale the window waits for before its first frame: the harness changes the output to it once MAPPED is printed, so the fractional scale arrives after the first layout (as on Hyprland). Absent: the output's scale from the start.
+    #[arg(long, value_name = "SCALE")]
+    await_scale: Option<f64>,
     /// Window content width in physical pixels.
     #[arg(long)]
     width: u32,
@@ -501,15 +507,35 @@ fn main() -> Result<()> {
         let (window2, frame, failure) =
             (Rc::clone(&window), Rc::clone(&frame), Rc::clone(&failure));
         let (frames, width, height, out) = (args.frames, args.width, args.height, args.out.clone());
+        let (await_scale, scale_deadline) = (args.await_scale, deadline);
+        let mapped_printed = Rc::new(Cell::new(false));
         window.on_tick(move |tick| {
             let f = frame.get();
             let step = || -> Result<()> {
-                if f == 0 {
+                if f == 0 && !mapped_printed.replace(true) {
                     emit(format_args!(
                         "MAPPED mapped={} scale={}",
                         window2.is_mapped(),
                         window2.scale().get()
                     ));
+                }
+                // no frame until the window is at the target scale with the requested size: the frames then all show the state it ends at
+                let settled = |target: f64| {
+                    let size = window2.size();
+                    (window2.scale().get() - target).abs() <= SCALE_EPSILON
+                        && (size.width, size.height) == (width, height)
+                };
+                if let Some(target) = await_scale.filter(|t| !settled(*t)) {
+                    let size = window2.size();
+                    ensure!(
+                        Instant::now() < scale_deadline,
+                        "the window never settled at scale {target} and {width}x{height}: scale {}, size {}x{}",
+                        window2.scale().get(),
+                        size.width,
+                        size.height
+                    );
+                    window2.request_frame();
+                    return Ok(());
                 }
                 let (_fd, scene) = frame_scene(width, height, f)?;
                 window2.present(&scene)?;

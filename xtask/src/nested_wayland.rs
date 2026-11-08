@@ -547,6 +547,18 @@ impl OutputControl {
         Ok(())
     }
 
+    /// Output `index` takes `scale` in place: the outputs on stay on; a window on it gets the new preferred scale (wp_fractional_scale_v1) after the change, not before.
+    pub fn set_scale(&self, index: usize, scale: f64) -> Result<()> {
+        let mut s = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
+        ensure!(index < s.heads.len(), "no output {index}");
+        s.outputs[index].scale = scale;
+        let on = s.on.clone();
+        s.configure(&on)
+    }
+
     /// Output `index` takes `transform` in place: the outputs on stay on, so windows stay where they are; the compositor sends the new `wl_output.geometry` + `done`.
     pub fn set_transform(&self, index: usize, transform: i32) -> Result<()> {
         let mut s = self
