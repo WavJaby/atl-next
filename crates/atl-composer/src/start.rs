@@ -115,12 +115,13 @@ fn task_info() -> Result<(PhysSize, String), String> {
     }
 }
 
-/// The REGISTER transaction: the UI agent.
-fn register(ui_agent: &SpIBinder) -> Result<(), String> {
+/// The REGISTER transaction: the UI agent, then the compositor (GET_COMPOSER hands it to the shell).
+fn register(ui_agent: &SpIBinder, composer: &SpIBinder) -> Result<(), String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
     let mut data = binder.prepare_transact().map_err(|e| e.to_string())?;
     data.write(ui_agent).map_err(|e| e.to_string())?;
+    data.write(composer).map_err(|e| e.to_string())?;
     binder
         .submit_transact(REGISTER, data, 0)
         .map_err(|e| format!("register: {e}"))?;
@@ -201,6 +202,8 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
     };
     let surface_flinger = surface_flinger::new_binder(Arc::clone(&composer));
     let surface_flinger_aidl = service::new_binder(Arc::clone(&composer));
+    // the registry gets its own reference: the service view takes the object below
+    let registered_composer = surface_flinger_aidl.clone();
     let ui_agent = ui_agent::new_binder(Arc::clone(&composer), input_tx, sender, input_method);
     if std::env::var(BREAK_ENV).as_deref() == Ok(BREAK_NO_SERVE) {
         // the deliberate failure: the binders die with this frame, nothing serves the names
@@ -214,7 +217,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             "composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process"
         );
     }
-    register(&ui_agent)?;
+    register(&ui_agent, &registered_composer)?;
     // the service view holds the binders, the registry the agent; the process holds the compositor (the clock or deliver thread does)
     Ok(composer)
 }

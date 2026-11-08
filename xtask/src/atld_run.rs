@@ -196,6 +196,8 @@ pub struct Runtime {
     services: PathBuf,
     /// atl-am, atld's `--am`: the control command `start`
     am: PathBuf,
+    /// atl-screencap, atld's `--screencap`: the control command `capture`
+    screencap: PathBuf,
     binderd: PathBuf,
     sandbox_stub: PathBuf,
     atld: PathBuf,
@@ -511,6 +513,7 @@ impl Runtime {
         );
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
         let am = packages::bin(root, &out, "atl-services", "atl-am")?;
+        let screencap = packages::bin(root, &out, "atl-services", "atl-screencap")?;
         let binderd = cargo_bin(root, &out, "atl-binderd")?;
         let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
         let atld = cargo_bin(root, &out, "atld")?;
@@ -564,6 +567,7 @@ impl Runtime {
             servicemanager,
             services,
             am,
+            screencap,
             binderd,
             sandbox_stub,
             atld,
@@ -1191,6 +1195,8 @@ impl Runtime {
             .arg(&self.services)
             .arg("--am")
             .arg(&self.am)
+            .arg("--screencap")
+            .arg(&self.screencap)
             .arg("--launcher")
             .arg(&self.art.launcher)
             .arg("--lib-path")

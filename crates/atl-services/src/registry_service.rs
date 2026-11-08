@@ -2,8 +2,9 @@
 //! The compositor registry service (compositor_registry.rs is the protocol). REGISTER takes the app's UI agent (ui_agent.rs), kept under the caller's uid in the table the window service reads:
 //! constructor injection into [`Registry`], so the table is not part of the interface.
 
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
@@ -11,11 +12,14 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::compositor_registry::{DESCRIPTOR, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO};
+use crate::compositor_registry::{
+    DESCRIPTOR, GET_COMPOSER, REGISTER, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
+};
 use crate::counters;
 use crate::desktop_bounds::ActivityInput;
 use crate::display::DisplayCallbacks;
 use crate::display_model::DisplayModel;
+use crate::permission::{SHELL_UID, SYSTEM_UID};
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agent::UiAgents;
 
@@ -29,8 +33,16 @@ pub struct TaskInfo {
 }
 
 pub trait ICompositorRegistry: Interface {
-    /// REGISTER once its argument is read: the agent is kept under `caller_uid`.
-    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode>;
+    /// REGISTER once its arguments are read: the agent and the compositor are kept under `caller_uid`.
+    fn register(
+        &self,
+        caller_uid: u32,
+        ui_agent: SpIBinder,
+        composer: SpIBinder,
+    ) -> Result<(), StatusCode>;
+
+    /// GET_COMPOSER once the package is read: the compositor of the newest launch of `package`, for a caller that is the shell or the system uid (compositor_registry.rs GET_COMPOSER).
+    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode>;
 
     /// SET_BOUNDS once its arguments are read: Task `task` (its number, tasks.rs) is `width` x `height` physical pixels. The caller's uid must own the Task; a non-positive size is refused; a size change notifies the Task's windows.
     fn set_bounds(
@@ -62,6 +74,11 @@ fn on_transact(
     data: &BorrowedParcel<'_>,
     reply: &mut BorrowedParcel<'_>,
 ) -> Result<(), StatusCode> {
+    if code == GET_COMPOSER {
+        let package: String = data.read()?;
+        let composer = service.composer(ThreadState::get_calling_uid(), &package)?;
+        return reply.write(&composer);
+    }
     if code == SET_BOUNDS {
         let task: i32 = data.read()?;
         let width: i32 = data.read()?;
@@ -83,7 +100,8 @@ fn on_transact(
         return Err(StatusCode::UNKNOWN_TRANSACTION);
     }
     let ui_agent: SpIBinder = data.read()?;
-    service.register(ThreadState::get_calling_uid(), ui_agent)
+    let composer: SpIBinder = data.read()?;
+    service.register(ThreadState::get_calling_uid(), ui_agent, composer)
 }
 
 impl ICompositorRegistry for BpCompositorRegistry {
@@ -99,7 +117,11 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn register(&self, _: u32, _: SpIBinder) -> Result<(), StatusCode> {
+    fn register(&self, _: u32, _: SpIBinder, _: SpIBinder) -> Result<(), StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
+    fn composer(&self, _: u32, _: &str) -> Result<Option<SpIBinder>, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 }
@@ -123,8 +145,17 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.task_info(caller_pid)
     }
 
-    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
-        self.0.register(caller_uid, ui_agent)
+    fn register(
+        &self,
+        caller_uid: u32,
+        ui_agent: SpIBinder,
+        composer: SpIBinder,
+    ) -> Result<(), StatusCode> {
+        self.0.register(caller_uid, ui_agent, composer)
+    }
+
+    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode> {
+        self.0.composer(caller_uid, package)
     }
 }
 
@@ -135,6 +166,8 @@ struct Registry {
     activities: ActivityManager,
     /// the display service's callbacks: a display change reaches them (display.rs)
     display_callbacks: Arc<DisplayCallbacks>,
+    /// each registered app's compositor, under its uid (GET_COMPOSER)
+    composers: Mutex<BTreeMap<u32, SpIBinder>>,
 }
 
 impl Interface for Registry {}
@@ -244,13 +277,46 @@ impl ICompositorRegistry for Registry {
         Ok(())
     }
 
-    fn register(&self, caller_uid: u32, ui_agent: SpIBinder) -> Result<(), StatusCode> {
+    fn register(
+        &self,
+        caller_uid: u32,
+        ui_agent: SpIBinder,
+        composer: SpIBinder,
+    ) -> Result<(), StatusCode> {
         self.agents.insert(caller_uid, ui_agent);
+        self.composers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(caller_uid, composer);
         let _ = writeln!(
             std::io::stderr(),
-            "services: registered the UI agent of uid {caller_uid}"
+            "services: registered the UI agent and compositor of uid {caller_uid}"
         );
         Ok(())
+    }
+
+    fn composer(&self, caller_uid: u32, package: &str) -> Result<Option<SpIBinder>, StatusCode> {
+        if caller_uid != SHELL_UID && caller_uid != SYSTEM_UID {
+            let _ = writeln!(
+                std::io::stderr(),
+                "services: composer refused uid {caller_uid}: not the shell or system"
+            );
+            return Err(StatusCode::PERMISSION_DENIED);
+        }
+        let owner = self.tasks.owner_of_package(package);
+        let composer = owner.and_then(|uid| {
+            self.composers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&uid)
+                .cloned()
+        });
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: composer of {package}: uid {owner:?}, {}",
+            if composer.is_some() { "served" } else { "none" }
+        );
+        Ok(composer)
     }
 }
 
@@ -267,6 +333,7 @@ pub fn new_binder(
             tasks,
             activities,
             display_callbacks,
+            composers: Mutex::new(BTreeMap::new()),
         },
         BinderFeatures::default(),
     )

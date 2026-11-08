@@ -120,6 +120,9 @@ struct Args {
     /// atl-am: run as the shell uid for the control command `start` (a startActivity with no caller app). Omitted: `start` is refused.
     #[arg(long)]
     am: Option<PathBuf>,
+    /// atl-screencap: run as the shell uid for the control command `capture` (a display capture of an app's window). Omitted: `capture` is refused.
+    #[arg(long)]
+    screencap: Option<PathBuf>,
     /// A command to run once the services are up, as ActivityThread's sibling `main` class (zygoteInit runs it): the class, then `--run-arg`s. Its exit ends atld.
     #[arg(long, requires_all = ["run_uid", "run_name"])]
     run_class: Option<String>,
@@ -542,6 +545,8 @@ struct Host {
     done: Sender<End>,
     /// atl-am (`--am`): what the control command `start` runs
     am: Option<PathBuf>,
+    /// atl-screencap (`--screencap`): what the control command `capture` runs
+    screencap: Option<PathBuf>,
     /// The host paths every process of the runtime reads, at the same paths (ro_at_own_path): the LD_LIBRARY_PATH dirs, the ART root, the host files /system and /vendor link to.
     shared_ro: Vec<Mount>,
     /// With `--ui`: what each app's GTK side reads from the desktop, read-only at its own path (atl_platform_host::app_access): the compositor socket, fontconfig's file and font dirs. Headless: none.
@@ -882,10 +887,53 @@ impl Host {
             Err(e) => format!("error {e:#}"),
         }
     }
+
+    /// The control command `capture <package> <out>`: atl-screencap as the shell uid, the display capture of the package's app written to `out`; waits for it. Its reply line, `ok <screencap line>` or `error <why>`.
+    fn screencap(&self, package: &str, out: &str) -> String {
+        let Some(screencap) = &self.screencap else {
+            return "error atld has no --screencap".to_owned();
+        };
+        let log = self.root.log("screencap");
+        let spawn = || -> Result<Spawn> {
+            let (stdout, stderr) =
+                to_log(OpenOptions::new().create(true).append(true).open(&log)?)?;
+            Ok(Spawn {
+                uid: AID_SHELL,
+                context_manager: false,
+                mounts: vec![],
+                links: vec![],
+                devices: vec![],
+                property_area: Some(self.root.properties()),
+                rights: vec![],
+                program: screencap.clone(),
+                args: vec![package.into(), out.into()],
+                env: vec![self.lib.clone()],
+                cwd: None,
+                stdin: None,
+                stdout,
+                stderr,
+            })
+        };
+        let outcome = spawn()
+            .and_then(|s| Ok(self.broker.spawn(s)?))
+            .and_then(|mut p| Ok(p.child.wait()?));
+        let last = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("screencap: "))
+            .unwrap_or("")
+            .to_owned();
+        match outcome {
+            Ok(s) if s.success() => format!("ok {last}"),
+            Ok(s) => format!("error atl-screencap {s}: {last}"),
+            Err(e) => format!("error {e:#}"),
+        }
+    }
 }
 
 /// The run's control socket, `<root>/control.sock` (owner decision 2026-11-06: the run ends on an explicit stop, not with an app): one command line per connection, one reply line.
-/// `stop` ends the run (reply `ok`); `start <package>/<class>` starts an activity as `am start` does ([`Host::am_start`]). Anything else: `error unknown command`.
+/// `stop` ends the run (reply `ok`); `start <package>/<class>` starts an activity as `am start` does ([`Host::am_start`]); `capture <package> <out>` writes the package's window picture to `out` ([`Host::screencap`]). Anything else: `error unknown command`.
 fn serve_run_control(host: Arc<Host>, listener: UnixListener) {
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else { continue };
@@ -905,6 +953,14 @@ fn serve_run_control(host: Arc<Host>, listener: UnixListener) {
                 log(format_args!("control: start {component}: {reply}"));
                 reply
             }
+            ("capture", rest) => match rest.split_once(' ') {
+                Some((package, out)) if !package.is_empty() && !out.is_empty() => {
+                    let reply = host.screencap(package, out);
+                    log(format_args!("control: capture {package}: {reply}"));
+                    reply
+                }
+                _ => "error capture takes <package> <out>".to_owned(),
+            },
             _ => "error unknown command".to_owned(),
         };
         let _ = writeln!(conn, "{reply}");
@@ -1109,6 +1165,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         controlled: Mutex::new(BTreeSet::new()),
         done: done_tx,
         am: a.am.clone(),
+        screencap: a.screencap.clone(),
         shared_ro: shared_ro.clone(),
         desktop_ro: if a.ui.is_some() {
             desktop_mounts()?

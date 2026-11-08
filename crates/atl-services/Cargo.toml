@@ -13,7 +13,7 @@ publish.workspace = true
 # plain workspace builds take the policy modules (permission, counters, packages) and their tests.
 # The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs"]
 
 [features]
 converter = ["atl-aidl/converter", "atl-libinput/converter"]
@@ -36,11 +36,19 @@ name = "atl-am"
 path = "src/bin/am.rs"
 required-features = ["converter"]
 
+# The display capture as screencap takes it, as the shell uid; atld spawns it for its control command `capture`.
+[[bin]]
+name = "atl-screencap"
+path = "src/bin/screencap.rs"
+required-features = ["converter"]
+
 [dependencies]
 anyhow.workspace = true
 atl-aidl = { path = "../atl-aidl" }
 atl-android-paths = { path = "../atl-android-paths" }
 atl-broker = { path = "../atl-broker" }
+atl-gralloc = { path = "../atl-gralloc" }
+atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-libgui-parcel = { path = "../atl-libgui-parcel" }
 atl-libinput = { path = "../atl-libinput" }
 atl-platform-host = { path = "../atl-platform-host" }

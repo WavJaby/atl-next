@@ -178,6 +178,16 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.get(&task).map(|t| t.package.clone())
     }
 
+    /// The uid owning the newest Task made by a launch of `package` (GET_COMPOSER finds an app's compositor by its package).
+    pub fn owner_of_package(&self, package: &str) -> Option<u32> {
+        self.lock()
+            .tasks
+            .values()
+            .rev()
+            .find(|t| t.package == package)
+            .map(|t| t.owner)
+    }
+
     /// Whether the app `owner` has a Task: only such an app reports the monitor (registry SET_DISPLAY).
     pub fn owns_any(&self, owner: u32) -> bool {
         self.lock().tasks.values().any(|t| t.owner == owner)

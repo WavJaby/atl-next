@@ -593,6 +593,8 @@ dependencies = [
  "atl-android-paths",
  "atl-bridgegen",
  "atl-broker",
+ "atl-gralloc",
+ "atl-gralloc-dmabuf",
  "atl-libgui-parcel",
  "atl-libinput",
  "atl-platform-host",
