@@ -47,6 +47,8 @@ const TRUTH_LIB: &str = "libatl_parcel_truth.so";
 const RUNTIME: &str = "device/libandroid_runtime/libandroid_runtime.so";
 /// The driver's binder uid: AID_SYSTEM, which servicemanager lets add services (the driver stands in for SurfaceFlinger's registration).
 const AID_SYSTEM: u32 = 1000;
+/// The driver's last stderr lines, printed when the gate fails: the launcher's refusal (no property area) is among them, and the driver prints no case line then.
+const STDERR_LINES: usize = 20;
 /// Every line CompositorTruth.java prints, by case, in its order (`summary` last): a missing one fails the stage.
 const CASES: [&str; 9] = [
     "writer:layer-fields",
@@ -92,9 +94,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         runtime.display()
     );
     let mut extra = vec![lib.display().to_string(), runtime.display().to_string()];
+    // written by the driver: writable inside the sandbox
+    let mut writable = vec![fixture.work.join("data")];
     if let Some(dir) = &args.golden {
         ensure!(dir.is_dir(), "--golden {}: not a directory", dir.display());
         extra.push(std::path::absolute(dir)?.display().to_string());
+        writable.push(std::path::absolute(dir)?);
     }
     // libgui blocks until a "SurfaceFlingerAIDL" service exists (SurfaceComposerClient::onFirstRef), which the driver registers: so a servicemanager, and a driver allowed to add services
     let device = out.join("device");
@@ -122,8 +127,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     let cmd = art.command(&fixture, &fixture.area.1, &[], DRIVER, &extra);
     let what = format!("{cmd:?}");
-    let run =
-        binder::spawn_piped(&broker, &cmd, AID_SYSTEM).and_then(|p| art.finish(&what, p.child));
+    // the sandbox shows only what is mounted (binder::spawn_of): the slot read-only at its own path, so the launcher finds the property area its variable names; ANDROID_DATA and --golden writable (parcel.rs does the same)
+    let run = (|| -> Result<_> {
+        let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
+        s.stdout = std::process::Stdio::piped();
+        s.stderr = std::process::Stdio::piped();
+        s.mounts.push(atl_broker::Mount {
+            host: out.clone(),
+            at: out.clone(),
+            writable: false,
+        });
+        // the staged ART root's links name files outside the slot (ICU data in src/aosp, tzdata): their targets are mounted too (parcel.rs does the same)
+        s.mounts.extend(atl_broker::tree_mounts(&art.art)?);
+        for dir in &writable {
+            s.mounts.push(atl_broker::Mount {
+                host: dir.clone(),
+                at: dir.clone(),
+                writable: true,
+            });
+        }
+        let p = broker
+            .spawn(s)
+            .context("spawning the compositor truth driver")?;
+        art.finish(&what, p.child)
+    })();
     sm.child.kill().ok();
     sm.child.wait().ok();
     drop(broker);
@@ -139,6 +166,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if fails.is_empty() {
         println!("compositor: pass ({} java cases)", passes.len());
         return Ok(ExitCode::SUCCESS);
+    }
+    let stderr: Vec<&str> = run.stderr.lines().collect();
+    for line in &stderr[stderr.len().saturating_sub(STDERR_LINES)..] {
+        println!("compositor: driver stderr: {line}");
     }
     println!("{}", crate::verdict::gate("compositor", &fails));
     Ok(ExitCode::FAILURE)
