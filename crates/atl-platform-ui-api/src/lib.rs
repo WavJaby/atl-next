@@ -190,6 +190,9 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// Asks for a content size. A request, not a command: the shell decides.
     fn set_size(&self, size: PhysSize);
 
+    /// Names the toplevel's application id, an opaque string the desktop reads as the app's identity (`atl.<package>`). A window with no toplevel to name (headless) ignores it.
+    fn set_app_id(&self, app_id: &str);
+
     /// Sets the title shown in the window chrome.
     fn set_title(&self, title: &str);
 

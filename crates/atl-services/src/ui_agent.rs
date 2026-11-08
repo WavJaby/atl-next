@@ -42,6 +42,8 @@ pub const POST_DRAW_TRANSACTION: TransactionCode = 8;
 pub const DIM_LAYER: TransactionCode = 9;
 /// A window's input channel token and its frame in its Task (left, top, right, bottom: i32) in; nothing out. The agent's dispatcher hit-tests and translates that window's pointer events with it.
 pub const INPUT_FRAME: TransactionCode = 10;
+/// A window's toplevel application id (`atl.<package>`) in; nothing out. Sent at each window add: the window's package is its LayoutParams.packageName.
+pub const APP_ID: TransactionCode = 11;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -56,6 +58,8 @@ pub trait IUiAgent: Interface {
     fn input_frame(&self, token: SpIBinder, frame: [i32; 4]) -> Result<(), StatusCode>;
     /// The Task the app's window belongs to, by its number (tasks.rs TaskId::raw): the app's bounds go to it.
     fn task(&self, task: i32) -> Result<(), StatusCode>;
+    /// The window's toplevel application id, an opaque string (`atl.<package>`): the desktop's identity of the app.
+    fn app_id(&self, app_id: &str) -> Result<(), StatusCode>;
     /// The pointer icon the app's view hierarchy resolved (PointerIconType value): the app's window shows it as its cursor.
     fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode>;
     /// The window of layer `layer_id` has its frame at (`x`, `y`) in its Task: its layer is placed there.
@@ -111,6 +115,10 @@ fn on_transact(
         TASK => {
             let task: i32 = data.read()?;
             service.task(task)
+        }
+        APP_ID => {
+            let app_id: String = data.read()?;
+            service.app_id(&app_id)
         }
         POINTER_ICON => {
             let kind: i32 = data.read()?;
@@ -187,6 +195,14 @@ impl IUiAgent for BpUiAgent {
         let mut data = binder.prepare_transact()?;
         data.write(&task)?;
         binder.submit_transact(TASK, data, 0)?;
+        Ok(())
+    }
+
+    fn app_id(&self, app_id: &str) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(app_id)?;
+        binder.submit_transact(APP_ID, data, 0)?;
         Ok(())
     }
 
@@ -312,6 +328,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn task(&self, task: i32) -> Result<(), StatusCode> {
         self.0.task(task)
+    }
+
+    fn app_id(&self, app_id: &str) -> Result<(), StatusCode> {
+        self.0.app_id(app_id)
     }
 
     fn pointer_icon(&self, kind: i32) -> Result<(), StatusCode> {

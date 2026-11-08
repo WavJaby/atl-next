@@ -154,6 +154,19 @@ impl RegisteredAgent {
         }
     }
 
+    /// Names the app's toplevel application id to the agent: `atl.<package>`, the window's LayoutParams.packageName. Counted when the agent refuses it.
+    fn name_app_id(&self, package: &str) {
+        let Some(agent) = self.agent("addToDisplayAsUser") else {
+            return;
+        };
+        if let Err(e) = agent.app_id(&format!("atl.{package}")) {
+            counters::answered(
+                WINDOW_SESSION,
+                &format!("addToDisplayAsUser: UI agent refused the app id: {e:?}"),
+            );
+        }
+    }
+
     /// Hands a window's input channel server end to the agent, which publishes the window's input on it; false, counted, when no agent takes it (the fd then closes and the client reads EOF).
     fn give_input_server(&self, token: SpIBinder, fd: OwnedFd, flags: i32) -> bool {
         let Some(agent) = self.agent("addToDisplayAsUser") else {
@@ -322,17 +335,26 @@ fn display_rect(tasks: &Tasks<SpIBinder>) -> Rect {
     rect(0, 0, display.width, display.height)
 }
 
-/// A window's Task size. A window is only ever on a Task that exists: its token names one (task_of_token), and Tasks are never removed.
-fn size_of(tasks: &Tasks<SpIBinder>, task: TaskId) -> TaskSize {
-    tasks
-        .size(task)
-        .expect("a window's Task has a size: Tasks are never removed")
+/// A window's Task size. A window sits on a Task that exists (its token names one, and Tasks are never removed), so no size is a broken invariant that a client's call can reach:
+/// refused and counted, never a panic (a panic in a system service takes every app down).
+fn size_of<C: Clone + PartialEq>(
+    tasks: &Tasks<C>,
+    task: TaskId,
+    call: &str,
+) -> binder::Result<TaskSize> {
+    tasks.size(task).ok_or_else(|| {
+        counters::refused(
+            WINDOW_SESSION,
+            &format!("{call}: the window's Task has no size"),
+        );
+        StatusCode::BAD_VALUE.into()
+    })
 }
 
 /// A Task's bounds from the origin (tasks.rs): freeform, so the windows' bounds, not the display's.
-fn task_rect(tasks: &Tasks<SpIBinder>, task: TaskId) -> Rect {
-    let size = size_of(tasks, task);
-    rect(0, 0, size.width, size.height)
+fn task_rect(tasks: &Tasks<SpIBinder>, task: TaskId, call: &str) -> binder::Result<Rect> {
+    let size = size_of(tasks, task, call)?;
+    Ok(rect(0, 0, size.width, size.height))
 }
 
 /// The insets a window of the display sees: none (no system bars, no cutout), the display frame.
@@ -467,6 +489,15 @@ impl IWindowSession for Session {
             return Ok(ADD_BAD_APP_TOKEN);
         };
         self.agent.name_task(task);
+        match attrs.package_name.as_deref() {
+            Some(package) => self.agent.name_app_id(package),
+            None => {
+                counters::answered(
+                    WINDOW_SESSION,
+                    "addToDisplayAsUser: no packageName: app id not named",
+                );
+            }
+        }
         // every window but an INPUT_FEATURE_NO_INPUT_CHANNEL one gets a channel (WindowManagerService.addWindow -> openInputChannel), a NOT_TOUCHABLE toast too: ViewRootImpl.setView
         // builds its input receiver on whatever channel it passed in. The flags go to the agent, whose dispatcher skips NOT_TOUCHABLE / NOT_FOCUSABLE windows as InputDispatcher does.
         let (channel, input) = if attrs.input_features & INPUT_FEATURE_NO_INPUT_CHANNEL == 0 {
@@ -517,7 +548,7 @@ impl IWindowSession for Session {
             attrs.flags,
             attrs.dim_amount,
             attrs.surface_insets,
-            show_rect(&task_rect(&self.tasks, task)),
+            show_rect(&task_rect(&self.tasks, task, "addToDisplayAsUser")?),
         ));
         // WMS dispatches the app's visibility to its windows (WindowState's app visibility): ViewRootImpl draws only while its app is visible, and it starts out not.
         if let Err(e) = window.r#dispatchAppVisibility(true) {
@@ -579,7 +610,7 @@ impl IWindowSession for Session {
             record.surface = Some(surface.clone());
         }
         // every relayout returns the window's surface once it has one (the client keeps its copy only while the reply carries it); RELAYOUT_RES_SURFACE_CHANGED marks the creation
-        let frames = client_frames(placement, task_rect(&self.tasks, task), seq);
+        let frames = client_frames(placement, task_rect(&self.tasks, task, "relayout")?, seq);
         let (surface, placed, input) = {
             let windows = self.lock();
             let record = windows.iter().find(|w| w.client == client);
@@ -628,7 +659,7 @@ impl IWindowSession for Session {
                 .dim(layer_id, placement.dim(), &frames.parent_frame);
         }
         let display = self.tasks.display();
-        let size = size_of(&self.tasks, task);
+        let size = size_of(&self.tasks, task, "relayout")?;
         let surface_changed = created.is_some();
         // one line per relayout: the frames the client lays out in
         activity::log(format_args!(
@@ -792,7 +823,9 @@ pub fn new_binder(
 /// forceLayout is set so the app relayouts with the new frames; reportDraw is false: no BLAST sync or draw state is modelled (Session::finishDrawing).
 pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let display = tasks.display();
-    let size = size_of(tasks, task);
+    let Ok(size) = size_of(tasks, task, "resized") else {
+        return 0;
+    };
     let merged = MergedConfiguration {
         global: activity::global_configuration(&display),
         override_config: Configuration {
@@ -817,7 +850,11 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
             }
         };
         // a popup keeps its requested size and gravity, a MATCH_PARENT window takes the new bounds (client_frames, as relayout)
-        let frames = client_frames(*placement, task_rect(tasks, task), tasks.next_seq());
+        let frames = client_frames(
+            *placement,
+            rect(0, 0, size.width, size.height),
+            tasks.next_seq(),
+        );
         let insets = display_insets(tasks);
         if let Err(e) = window.r#resized(
             Some(&frames),
@@ -835,4 +872,33 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
         }
     }
     clients.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display_model::DisplayModel;
+
+    /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.
+    #[test]
+    fn size_of_refuses_a_task_without_a_size() {
+        let tasks = Tasks::<u32>::new(DisplayModel::default());
+        let refused = |label: &str| {
+            counters::counts()
+                .into_iter()
+                .find(|c| c.0 == counters::Kind::Refused && c.2 == label)
+                .map(|c| c.3)
+        };
+        let label = "size-of-test: the window's Task has no size";
+        assert_eq!(refused(label), None);
+        let unknown = TaskId::from_raw(7).expect("a positive TaskId");
+        assert!(size_of(&tasks, unknown, "size-of-test").is_err());
+        assert_eq!(refused(label), Some(1));
+        let size = TaskSize {
+            width: 750,
+            height: 900,
+        };
+        let task = tasks.new_task(1, size);
+        assert_eq!(size_of(&tasks, task, "size-of-test").ok(), Some(size));
+    }
 }

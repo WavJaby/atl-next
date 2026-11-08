@@ -61,6 +61,20 @@ pub fn set_pointer_icon(kind: i32) {
     }));
 }
 
+/// The toplevel's application id, named by the services when a window is added (`atl.<package>`); from any thread. Headless (no window) keeps the desktop default.
+pub fn set_app_id(app_id: String) {
+    let Some(invoker) = INVOKER.get() else {
+        return;
+    };
+    invoker.invoke(Box::new(move || {
+        SESSION.with_borrow(|session| {
+            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
+                window.set_app_id(&app_id);
+            }
+        });
+    }));
+}
+
 /// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now (the services expect the Task's window from the start).
 pub fn install(
     ui: PlatformUi,

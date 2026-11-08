@@ -11,6 +11,7 @@ use atl_platform_ui_api::{
     PhysSize, PointerPhase, PresentError, PresentTiming, QuadRelease, Scale, Scene, TouchPhase,
     UiError, Window, WindowAttributes,
 };
+use gdk4_wayland::WaylandToplevel;
 use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
@@ -366,6 +367,19 @@ impl Window for GtkWindow {
 
     fn text_input(&self) -> &GtkTextInput {
         &self.text_input
+    }
+
+    fn set_app_id(&self, app_id: &str) {
+        match self
+            .window
+            .surface()
+            .and_then(|s| s.downcast::<WaylandToplevel>().ok())
+        {
+            Some(toplevel) => toplevel.set_application_id(app_id),
+            None => tracing::warn!(
+                "atl-platform-ui-linux: app_id {app_id} not set: the window has no Wayland toplevel"
+            ),
+        }
     }
 
     fn create(ui: &GtkUi, attributes: &WindowAttributes) -> Result<Self, UiError> {
