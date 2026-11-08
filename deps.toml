@@ -8,6 +8,7 @@
 #   cargo   cargo, version      crate installed with `cargo install --locked`, exact version
 #   rustup  rustup_target       std of another rustc target for the rust-toolchain.toml toolchain (`rustup target add`)
 #   aosp    aosp                tree path of a [aosp.projects] entry in sources.toml: the pinned copy in src/aosp
+#   sysroot sysroot_debs        Debian packages pinned by exact `name=version`, fetched without root (`xtask deps --fetch`) and unpacked into cache/sysroot/<row>/root; `--check` compares each pin's SHA256 with the apt index
 # Fields:
 #   binary        executable xtask runs: a bare name on PATH (distro), a path inside the project (aosp, optional)
 #   version_arg   argument that prints the version (default `--version`; go: `version`)
@@ -65,7 +66,7 @@ binary = "clang-19"
 min = "19.1.7"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:native", "upstream:qemu"]
+used_by = ["xtask:native", "upstream:qemu", "xtask:cross"]
 
 # the C++ driver: native's --cxx default and the libc++ gate (libcxx_gate.rs); same package as `clang`
 [clang-cxx]
@@ -216,7 +217,7 @@ binary = "ld.lld"
 min = "19.1.7"
 min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "xtask:cross"]
 
 # the archiver (native --ar default; the converter's ninja rules run it)
 [llvm]
@@ -348,6 +349,26 @@ used_by = ["upstream:qemu"]
 rustup_target = "x86_64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native"]
+
+# the riscv64 cross build's std (`xtask cross --arch riscv64`)
+[rust-std-riscv64]
+rustup_target = "riscv64gc-unknown-linux-gnu"
+scope = ["build"]
+used_by = ["xtask:cross"]
+
+# the riscv64 cross link's glibc, kernel headers and GCC runtime: Debian trixie's cross packages (arch all), pinned to trixie main
+# (linux-libc-dev from main, not backports). libgcc-14-dev lays out usr/lib/gcc-cross/riscv64-linux-gnu/14, the GCC install clang
+# finds under the sysroot: crtbeginS.o/crtendS.o, the libgcc_s.so linker script, and (through it) usr/riscv64-linux-gnu/lib's crt1.o.
+[riscv64-sysroot]
+sysroot_debs = [
+    "libc6-riscv64-cross=2.41-11cross1",
+    "libc6-dev-riscv64-cross=2.41-11cross1",
+    "linux-libc-dev-riscv64-cross=6.12.38-1cross1",
+    "libgcc-s1-riscv64-cross=14.2.0-19cross1",
+    "libgcc-14-dev-riscv64-cross=14.2.0-19cross1",
+]
+scope = ["build"]
+used_by = ["xtask:cross"]
 
 # the headless gates' nested compositor (nested_wayland.rs:5-8: labwc over sway)
 [labwc]

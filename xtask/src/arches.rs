@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! `arches.toml`: the only list of architectures. Column meanings live in that file's header.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+
+use crate::deps;
 
 pub const FILE: &str = "arches.toml";
 
@@ -32,6 +35,9 @@ pub struct Host {
     pub archlinux: Option<String>,
     pub soong_prebuilt_os: Option<String>,
     pub llvm_target: Option<String>,
+    pub isa: Option<String>,
+    pub clang: Option<String>,
+    pub sysroot: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +194,85 @@ pub fn check_llvm_target(root: &Path, arches: &Arches) -> Result<()> {
     Ok(())
 }
 
+/// `rv64gc_zba_zbb` -> `["zba", "zbb"]`: the extensions past the base, which the Rust target fixes (`rv64gc`).
+pub fn isa_extensions(isa: &str) -> Result<Vec<String>> {
+    let mut parts = isa.split('_');
+    ensure!(
+        parts.next() == Some("rv64gc"),
+        "isa `{isa}`: the base must be rv64gc, the riscv64gc Rust target's base"
+    );
+    let extensions: Vec<String> = parts.map(str::to_owned).collect();
+    for e in &extensions {
+        ensure!(
+            e.starts_with('z')
+                && e.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "isa `{isa}`: `{e}` is not a Z extension"
+        );
+    }
+    Ok(extensions)
+}
+
+/// The cross columns of every host row that has them: `isa` extensions are rustc target features of its Rust
+/// target, `clang` is a triple clang accepts with the arch name as its arch part, and `sysroot` names a `sysroot_debs` row.
+pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
+    for (name, host) in arches
+        .iter()
+        .filter_map(|(n, a)| Some((n, a.host.as_ref()?)))
+    {
+        if let Some(isa) = &host.isa {
+            let features = rustc_features(root, &host.rust)?;
+            for e in isa_extensions(isa)? {
+                ensure!(
+                    features.contains(&e),
+                    "{FILE}: {name}: isa extension `{e}` is not a rustc target feature of {}",
+                    host.rust
+                );
+            }
+        }
+        if let Some(triple) = &host.clang {
+            let out = Command::new(deps::binary(root, "clang")?)
+                .arg(format!("--target={triple}"))
+                .arg("-print-target-triple")
+                .output()
+                .context("running clang -print-target-triple")?;
+            ensure!(
+                out.status.success() && triple.split('-').next() == Some(name.as_str()),
+                "{FILE}: {name}: clang does not accept {triple} as a target with arch {name}"
+            );
+        }
+        if let Some(sysroot) = &host.sysroot {
+            let row =
+                deps::row(root, sysroot).with_context(|| format!("{FILE}: {name}: sysroot"))?;
+            ensure!(
+                row.sysroot_debs.is_some(),
+                "{FILE}: {name}: sysroot {sysroot} is not a sysroot_debs row in deps.toml"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The target features rustc lists for `triple`: the first word of each indented feature line of `rustc --print target-features`.
+fn rustc_features(root: &Path, triple: &str) -> Result<BTreeSet<String>> {
+    let out = Command::new("rustc")
+        .current_dir(root)
+        .args(["--print", "target-features", "--target", triple])
+        .output()
+        .context("running rustc --print target-features")?;
+    ensure!(
+        out.status.success(),
+        "rustc --print target-features --target {triple}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("    "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// The QEMU linux-user target of guest arch `name`: its `qemu_target` column (`aarch64` for `<target>-linux-user`).
 pub fn qemu_target<'a>(arches: &'a Arches, name: &str) -> Result<&'a str> {
     let arch = arches
@@ -302,6 +387,17 @@ mod tests {
         let go = "func (c *config) PrebuiltOS() string {\n\tswitch runtime.GOOS {\n\tcase \"linux\":\n\t\tswitch runtime.GOARCH {\n\t\tcase \"amd64\":\n\t\t\treturn \"linux-x86\"\n\t\tcase \"arm64\":\n\t\t\treturn \"linux-arm64\"\n\t\tdefault:\n\t\t\tpanic(1)\n\t\t}\n\tcase \"darwin\":\n\t\treturn \"darwin-x86\"\n\t}\n}\n";
         assert_eq!(linux_prebuilt_os(go).unwrap(), ["linux-x86", "linux-arm64"]);
         assert!(linux_prebuilt_os("func other() {}").is_err());
+    }
+
+    #[test]
+    fn isa_extensions_past_the_rv64gc_base() {
+        assert_eq!(
+            super::isa_extensions("rv64gc_zba_zbb").unwrap(),
+            ["zba", "zbb"]
+        );
+        assert!(super::isa_extensions("rv64gcv_zba_zbb").is_err());
+        assert!(super::isa_extensions("rv64gc_v").is_err());
+        assert!(super::isa_extensions("rv64gc_Zba").is_err());
     }
 
     const GUEST: &str = "android_abis = [\"x\"]\nclang = \"c\"\nqemu_target = \"q\"\n";

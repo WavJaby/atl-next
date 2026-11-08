@@ -27,6 +27,7 @@ mod codec2_store;
 mod composer;
 mod compositor;
 mod converter;
+mod cross;
 mod cts;
 mod cts_report;
 mod cts_table;
@@ -127,7 +128,12 @@ enum Command {
     ///
     /// Distro rows: package installed (dpkg-query / pacman), `min` met (pkg-config for libraries,
     /// package version otherwise). Cargo rows: exact version in `cargo install --list`. Read-only.
+    /// Sysroot rows (`sysroot_debs`): `--fetch NAME` downloads and unpacks them without root; dry run without `--execute`.
     Deps(deps::Args),
+    /// Runs cargo for another arch of arches.toml (riscv64 today): target, ISA flags, link driver and sysroot from its rows.
+    ///
+    /// Dry run by default: prints the environment and the cargo command. `--execute` runs it. The sysroot must be fetched first (`deps --fetch`).
+    Cross(cross::Args),
     /// Upstream checkouts under <workspace>/src at the pins in sources.toml. `--test-apks` fetches the test APKs of test-apks.toml instead.
     ///
     /// Dry run by default (offline): shows what each checkout needs. The AOSP manifest (pinned in
@@ -335,6 +341,7 @@ fn main() -> Result<ExitCode> {
     let result = match cli.command {
         Command::Check(args) => check::run(&root, &args),
         Command::Deps(args) => deps::run(&root, &args),
+        Command::Cross(args) => cross::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),

@@ -3,7 +3,7 @@
 //! file's header.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,6 +30,7 @@ pub struct Dep {
     pub version: Option<String>,
     pub rustup_target: Option<String>,
     pub aosp: Option<String>,
+    pub sysroot_debs: Option<Vec<String>>,
     pub binary: Option<String>,
     pub version_arg: Option<String>,
     pub scope: Vec<Scope>,
@@ -125,10 +126,18 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     let cargo = dep.cargo.is_some() || dep.version.is_some();
     let rustup = dep.rustup_target.is_some();
     let aosp = dep.aosp.is_some();
+    let sysroot = dep.sysroot_debs.is_some();
     ensure!(
-        [distro, cargo, rustup, aosp].iter().filter(|s| **s).count() == 1,
-        "exactly one source: debian/arch, cargo + version, rustup_target, or aosp"
+        [distro, cargo, rustup, aosp, sysroot]
+            .iter()
+            .filter(|s| **s)
+            .count()
+            == 1,
+        "exactly one source: debian/arch, cargo + version, rustup_target, aosp, or sysroot_debs"
     );
+    if let Some(pins) = &dep.sysroot_debs {
+        validate_sysroot(dep, pins)?;
+    }
     if let Some(project) = &dep.aosp {
         ensure!(
             consumers.projects.contains(project),
@@ -210,6 +219,41 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     Ok(())
 }
 
+/// A `sysroot_debs` row: non-empty, unique `name=version` pins, and no field of the other sources.
+fn validate_sysroot(dep: &Dep, pins: &[String]) -> Result<()> {
+    ensure!(!pins.is_empty(), "sysroot_debs is empty");
+    ensure!(
+        dep.binary.is_none()
+            && dep.min.is_none()
+            && dep.pkgconfig.is_none()
+            && dep.version_arg.is_none(),
+        "sysroot_debs rows take no binary, min, pkgconfig or version_arg"
+    );
+    for pin in pins {
+        ensure!(is_pin(pin), "`{pin}` is not name=version");
+    }
+    let unique: BTreeSet<&str> = pins.iter().map(String::as_str).collect();
+    ensure!(
+        unique.len() == pins.len(),
+        "repeated package in sysroot_debs"
+    );
+    Ok(())
+}
+
+/// `name=version`: a Debian package name (`a-z 0-9 + - .`) and a non-empty version without spaces or `=`.
+fn is_pin(s: &str) -> bool {
+    s.split_once('=').is_some_and(|(name, version)| {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')
+            })
+            && !version.is_empty()
+            && !version
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b == b'=')
+    })
+}
+
 /// A bare executable name: `ld.lld`, `clang++-19`, `pkg-config`.
 fn is_bin_name(s: &str) -> bool {
     !s.is_empty()
@@ -277,12 +321,18 @@ fn upstream_version(package_version: &str) -> &str {
 
 // ---- xtask deps --check -------------------------------------------------------------------------
 
-/// Check this host against deps.toml. Read-only.
+/// Check this host against deps.toml (read-only). `--fetch NAME` downloads and unpacks sysroot row NAME: a dry run unless `--execute`.
 #[derive(clap::Args)]
 pub struct Args {
-    /// Verify every row is installed at its required version.
-    #[arg(long, required = true)]
+    /// Verify every row is installed at its required version (sysroot rows: fetched at the indexed SHA256).
+    #[arg(long, conflicts_with = "fetch", required_unless_present = "fetch")]
     check: bool,
+    /// Download and unpack the `sysroot_debs` row NAME into cache/sysroot/NAME/root, without root. Needs apt's index (`apt-get update`, as root).
+    #[arg(long, value_name = "NAME", conflicts_with = "check")]
+    fetch: Option<String>,
+    /// With `--fetch`: does it. Without: prints the packages it would fetch.
+    #[arg(long, requires = "fetch")]
+    execute: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -291,7 +341,10 @@ enum Distro {
     Arch,
 }
 
-pub fn run(root: &Path, _args: &Args) -> Result<ExitCode> {
+pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+    if let Some(name) = &args.fetch {
+        return fetch_sysroot(root, name, args.execute);
+    }
     let sources = sources::load(root)?;
     let deps = load(root, &Consumers::new(&workspace::load(root)?, &sources))?;
     let distro = host_distro()?;
@@ -300,7 +353,11 @@ pub fn run(root: &Path, _args: &Args) -> Result<ExitCode> {
     let tree = tree::shared_tree(&Layout::of(root)?);
     let mut problems = Vec::new();
     for (name, dep) in &deps {
-        if let Some(problem) = check_row(dep, distro, &cargo_installed, &rustup_targets, &tree)? {
+        let problem = match &dep.sysroot_debs {
+            Some(pins) => sysroot_problem(root, name, pins)?,
+            None => check_row(dep, distro, &cargo_installed, &rustup_targets, &tree)?,
+        };
+        if let Some(problem) = problem {
             problems.push(format!("{name}: {problem}"));
         }
     }
@@ -503,6 +560,160 @@ fn parse_install_list(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+// ---- sysroots (`sysroot_debs`) ------------------------------------------------------------------
+
+/// `cache/sysroot/<name>/`: `debs/` (the downloads), `root/` (the unpacked tree), `stamp.txt` (written last).
+fn sysroot_dir(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(Layout::of(root)?
+        .workspace()
+        .join("cache")
+        .join("sysroot")
+        .join(name))
+}
+
+/// The unpacked tree of sysroot row `name`, once every pin is fetched at its indexed SHA256. `xtask cross` links against it.
+pub fn sysroot_root(root: &Path, name: &str) -> Result<PathBuf> {
+    let pins = row(root, name)?
+        .sysroot_debs
+        .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))?;
+    if let Some(problem) = sysroot_problem(root, name, &pins)? {
+        bail!("sysroot {name}: {problem}");
+    }
+    Ok(sysroot_dir(root, name)?.join("root"))
+}
+
+/// The SHA256 the apt index gives the exact `name=version`; None when the index has no such version.
+fn index_sha256(pin: &str) -> Result<Option<String>> {
+    let out = Command::new("apt-cache")
+        .args(["show", pin])
+        .output()
+        .context("running apt-cache show")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("SHA256: "))
+        .map(str::to_owned))
+}
+
+/// `stamp.txt`: one `name=version sha256` line per fetched pin.
+fn parse_stamp(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(pin, sha)| (pin.to_owned(), sha.to_owned()))
+        .collect()
+}
+
+/// Why sysroot row `name` is not usable: no tree, a pin the apt index lacks, or a pin not fetched at the indexed bytes.
+fn sysroot_problem(root: &Path, name: &str, pins: &[String]) -> Result<Option<String>> {
+    let dir = sysroot_dir(root, name)?;
+    let fetch = format!("not fetched: cargo xtask deps --fetch {name} --execute");
+    if !dir.join("root").is_dir() {
+        return Ok(Some(fetch));
+    }
+    let stamp = parse_stamp(&std::fs::read_to_string(dir.join("stamp.txt")).unwrap_or_default());
+    for pin in pins {
+        let Some(sha) = index_sha256(pin)? else {
+            return Ok(Some(format!(
+                "{pin} is not in the apt index (apt-get update as root, or fix the pin)"
+            )));
+        };
+        if stamp.get(pin) != Some(&sha) {
+            return Ok(Some(fetch));
+        }
+    }
+    Ok(None)
+}
+
+/// `deps --fetch NAME`: for each pin `apt-get download` (no root), its SHA256 checked against the apt index, `dpkg -x` into `root/`; `stamp.txt` last. Dry run unless `execute`.
+fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
+    let pins = row(root, name)?
+        .sysroot_debs
+        .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))?;
+    let dir = sysroot_dir(root, name)?;
+    if !execute {
+        println!(
+            "deps --fetch {name}: {} packages into {} (--execute fetches):",
+            pins.len(),
+            dir.display()
+        );
+        for pin in &pins {
+            println!("  {pin}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // A half-unpacked tree is not a sysroot: start from nothing.
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    }
+    let debs = dir.join("debs");
+    let tree = dir.join("root");
+    for d in [&debs, &tree] {
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    }
+    let mut stamp = Vec::new();
+    for pin in &pins {
+        let expected = index_sha256(pin)?.with_context(|| {
+            format!("{pin} is not in the apt index (apt-get update as root, or fix the pin)")
+        })?;
+        let deb = download_deb(&debs, pin)?;
+        let got = sha256_file(&deb)?;
+        ensure!(
+            got == expected,
+            "{pin}: {} has sha256 {got}, the apt index says {expected}",
+            deb.display()
+        );
+        let status = Command::new("dpkg")
+            .arg("-x")
+            .arg(&deb)
+            .arg(&tree)
+            .status()
+            .context("running dpkg -x")?;
+        ensure!(status.success(), "dpkg -x {}: {status}", deb.display());
+        stamp.push(format!("{pin} {got}"));
+    }
+    std::fs::write(dir.join("stamp.txt"), stamp.join("\n") + "\n").context("writing stamp.txt")?;
+    println!(
+        "deps --fetch {name}: {} packages unpacked into {}",
+        pins.len(),
+        tree.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `apt-get download <pin>` in `debs`: the one file it creates there.
+fn download_deb(debs: &Path, pin: &str) -> Result<PathBuf> {
+    let before = listing(debs)?;
+    let status = Command::new("apt-get")
+        .current_dir(debs)
+        .args(["download", pin])
+        .status()
+        .context("running apt-get download")?;
+    ensure!(status.success(), "apt-get download {pin}: {status}");
+    let created: Vec<PathBuf> = listing(debs)?.difference(&before).cloned().collect();
+    let [deb] = created.as_slice() else {
+        bail!(
+            "apt-get download {pin} created {} files, expected one",
+            created.len()
+        );
+    };
+    Ok(deb.clone())
+}
+
+fn listing(dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        paths.insert(entry?.path());
+    }
+    Ok(paths)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(crate::test_apks::sha256_hex(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +752,38 @@ mod tests {
         let both = format!("[x]\ndebian = \"x\"\ncargo = \"x\"\nversion = \"1.0.0\"\n{USED}");
         assert!(err(&both).contains("exactly one source"));
         assert!(err(&format!("[x]\n{USED}")).contains("exactly one source"));
+    }
+
+    #[test]
+    fn sysroot_rows_are_exact_pins() {
+        let text = format!("[s]\nsysroot_debs = [\"libc6-riscv64-cross=2.41-11cross1\"]\n{USED}");
+        let deps = parse(&text, &consumers()).unwrap();
+        assert_eq!(deps["s"].sysroot_debs.as_ref().map(Vec::len), Some(1));
+        let row = |pins: &str| err(&format!("[s]\nsysroot_debs = {pins}\n{USED}"));
+        assert!(row("[\"libc6-riscv64-cross\"]").contains("is not name=version"));
+        assert!(row("[\"Libc=1\"]").contains("is not name=version"));
+        assert!(row("[\"a=\"]").contains("is not name=version"));
+        assert!(row("[]").contains("sysroot_debs is empty"));
+        assert!(row("[\"a=1\", \"a=1\"]").contains("repeated package"));
+        assert!(row("[\"a=1\"]\nbinary = \"x\"").contains("take no binary"));
+        assert!(
+            err(&format!(
+                "[s]\ndebian = \"x\"\nsysroot_debs = [\"a=1\"]\n{USED}"
+            ))
+            .contains("exactly one source")
+        );
+    }
+
+    #[test]
+    fn pins_and_stamp_lines() {
+        assert!(is_pin("linux-libc-dev-riscv64-cross=6.12.38-1cross1"));
+        assert!(!is_pin("a=1 b"));
+        let stamp = parse_stamp("libc6=2.41-11cross1 abc123\nlibgcc=14.2.0-19cross1 def456\n");
+        assert_eq!(
+            stamp.get("libc6=2.41-11cross1").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(stamp.len(), 2);
     }
 
     #[test]

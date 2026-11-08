@@ -15,6 +15,9 @@
 #   soong_prebuilt_os Soong's PrebuiltOS on a build machine of this arch (build/soong/android/config.go): `prebuilts/build-tools/<it>/bin` holds the
 #                     prebuilt build-only tools a native build on this host runs (aconfig); absent = Soong ships none. Checked: a linux value PrebuiltOS returns, and the directory exists in the fetched tree.
 #   llvm_target       LLVM target built for this host (`LLVM_TARGETS_TO_BUILD`, llvm_host.rs): the backend the in-process JIT (gallivm) compiles for. Checked: `llvm/lib/Target/<it>` is a tree at the llvm-project pin.
+#   isa               ISA baseline of this host's own code, cross builds only (`xtask cross`): `rv64gc_` + Z extensions. The Rust target fixes the base; each extension becomes a `+ext` rustc target feature. Checked: base is rv64gc, every extension is a rustc feature of `rust`.
+#   clang             clang triple of the cross link driver (`clang --target=<it>`); its arch part is the arch name. Checked: clang accepts it.
+#   sysroot           deps.toml row of the sysroot cross links use (a `sysroot_debs` row). Checked: the row exists.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -61,6 +64,11 @@ kernel_arch = "riscv"
 rust = "riscv64gc-unknown-linux-gnu"
 meson_cpu_family = "riscv64"
 debian = "riscv64"
+llvm_target = "RISCV"
+# owner 2026-11-08: no V, no Zbs (the riscv64 test host has neither; device tree riscv,isa-extensions)
+isa = "rv64gc_zba_zbb"
+clang = "riscv64-linux-gnu"
+sysroot = "riscv64-sysroot"
 
 [riscv64.guest]
 android_abis = ["riscv64"]
