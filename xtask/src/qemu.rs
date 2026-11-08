@@ -109,7 +109,9 @@ impl Build {
             format!("--cross-cc-cflags-{}=-static", self.target),
         ];
         if self.pic {
-            // After meson's -fPIE (b_pie=true): clang keeps the later flag. A shared object needs PIC: TPOFF32 on current_cpu otherwise.
+            // meson's b_pie=true appends -fPIE after --extra-cflags, and -fPIE wins for clang (TPOFF32 on current_cpu in a shared object).
+            // --disable-pie drops -fPIE (meson.build: -fno-pie instead); the explicit -fPIC then sets the codegen.
+            args.push("--disable-pie".to_owned());
             args.push("--extra-cflags=-fPIC".to_owned());
         }
         args
@@ -174,9 +176,10 @@ fn pinned(root: &Path) -> Result<(PathBuf, String)> {
 }
 
 /// Configures `build/` unless it already holds this configuration. A different or interrupted configuration starts from nothing.
+/// The stamp names the source dir too: build.ninja holds the source paths, so a task copy's build dir must not be reused from `src/qemu`.
 fn configure(b: &Build) -> Result<()> {
     let args = b.configure_args();
-    let text = args.join(" ");
+    let text = format!("{} source={}", args.join(" "), b.src.display());
     let stamp = b.dir.join(STAMP);
     let build = b.build_dir();
     if std::fs::read_to_string(&stamp).ok().as_deref() == Some(text.as_str())
@@ -351,5 +354,15 @@ mod tests {
         assert!(args.contains(&"--cc=clang-19".to_owned()));
         assert!(args.contains(&"--cross-cc-aarch64=/ndk/aarch64-linux-android29-clang".to_owned()));
         assert!(args.contains(&"--cross-cc-cflags-aarch64=-static".to_owned()));
+        assert!(!args.iter().any(|a| a.contains("-fPIC") || a == "--disable-pie"));
+    }
+
+    #[test]
+    fn pic_variant_drops_fpie_and_adds_fpic() {
+        let mut b = build("aarch64");
+        b.pic = true;
+        let args = b.configure_args();
+        assert!(args.contains(&"--disable-pie".to_owned()));
+        assert!(args.contains(&"--extra-cflags=-fPIC".to_owned()));
     }
 }
