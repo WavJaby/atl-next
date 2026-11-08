@@ -40,6 +40,7 @@ func main() {
 	abi := flag.String("abi", "", "the first android_abis entry of -arch's arches.toml guest row: lib/<abi>/ in the apks of android apps that have jni_libs")
 	nbArch := flag.String("native-bridge", "", "guest arch of the native bridge side (arches.toml row with [guest]): android properties + target.native_bridge built against bionic into <out>/nb/<arch>; goals `nb:<module>` build there; empty = no native bridge side")
 	nbBits := flag.Int("native-bridge-bits", 0, "pointer width of -native-bridge (its arches.toml pointer_bits)")
+	nbArchVariant := flag.String("native-bridge-arch-variant", "", "Soong arch variant of the native bridge side (its arches.toml soong_arch_variant; empty = Soong's baseline, which arm and arm64 lack); needs -native-bridge")
 	nbProvidedFile := flag.String("nb-provided", "", "JSON file like -provided: the native bridge side's provided modules (the LLVM runtimes built for the guest: libc++_static_noexcept, libc++demangle_noexcept, libunwind, libclang_rt.builtins)")
 	rtInclude := flag.String("clang-rt-include", "", "compiler-rt's include dir (sanitizer/, xray/ headers) for the -native-bridge side's compiles: prebuilts/clang's resource dir carries it, the distro clang's lacks it (bionic's heap_tagging.cpp includes sanitizer/hwasan_interface.h)")
 	bionicStaticRust := flag.String("bionic-static-rust", "", "crate root (crates/atl-guest-dlsym/src/lib.rs) compiled into the Rust staticlib of every static bionic executable: the dlsym rustup's std panic_abort references, which a static bionic executable has no libdl for")
@@ -119,7 +120,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -native-bridge and -native-bridge-bits go together")
 		os.Exit(1)
 	}
-	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits}
+	if *nbArch == "" && *nbArchVariant != "" {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -native-bridge-arch-variant needs -native-bridge")
+		os.Exit(1)
+	}
+	cfg := Config{Arch: *arch, PointerBits: *bits, ArchVariant: *variant, ABI: *abi, NativeBridge: *nbArch, NativeBridgeBits: *nbBits, NativeBridgeArchVariant: *nbArchVariant}
 	// the probe compiles, links nothing: its libc provider may be headers only, so checkLibs does not apply
 	if *cxxProbe != "" {
 		if err := deviceCxxFlags(*tree, *out, cfg, provided, *cxx, *cxxProbe); err != nil {

@@ -132,6 +132,8 @@ type Config struct {
 	// the native bridge guest arch (arches.toml row with `[guest]`) and its pointer width; "" = no native bridge side
 	NativeBridge     string
 	NativeBridgeBits int
+	// the guest row's soong_arch_variant (Soong's TARGET_NATIVE_BRIDGE_ARCH_VARIANT); "" = Soong's baseline
+	NativeBridgeArchVariant string
 }
 
 // Multilib is Soong's multilib name for the arch: `multilib: { lib32/lib64 }` blocks, cc_genrule's CC_MULTILIB.

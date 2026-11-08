@@ -197,10 +197,14 @@ func readGlobalFlags(tree string, cfg Config, dev DeviceArch) (GlobalFlags, erro
 			return g, err
 		}
 	}
-	// android.Arch per side: Soong sets a variant and features for the Android OS only; the native bridge guest takes its arch's baseline (no arches.toml variant for guests)
+	// android.Arch per side (arch.go:1726-1731): the device its arches.toml variant and features, the native bridge guest its row's variant, the host Soong's baseline.
+	// Known gap: Soong also sets NB features from androidArchFeatureMap[arch][variant] (arch.go:1874-1878; x86_64 "" = ssse3, sse4, sse4_1, sse4_2, popcnt), so this side misses their -m flags; fixing it changes x86 NB output.
 	archFields := func(s Side) map[string]any {
 		if s == Device {
 			return map[string]any{"ArchVariant": dev.Variant, "CpuVariant": "", "ArchFeatures": dev.Features}
+		}
+		if s.kind == nativeBridgeSide {
+			return map[string]any{"ArchVariant": cfg.NativeBridgeArchVariant, "CpuVariant": "", "ArchFeatures": []string(nil)}
 		}
 		return map[string]any{"ArchVariant": "", "CpuVariant": "", "ArchFeatures": []string(nil)}
 	}
@@ -748,6 +752,10 @@ func (e *soongEval) eval(x ast.Expr, fr *frame) (any, error) {
 				if err != nil {
 					return nil, err
 				}
+				if v == nil {
+					// a missing map key (index): Go's zero string
+					v = ""
+				}
 				s, ok := v.(string)
 				if !ok {
 					return nil, e.fail(el, "list element %T", v)
@@ -941,6 +949,9 @@ func (e *soongEval) call(c *ast.CallExpr, fr *frame) (any, error) {
 					out = append(out, l...)
 				} else if s, ok := a.(string); ok {
 					out = append(out, s)
+				} else if a == nil {
+					// a missing map key (index): Go's zero string, the only element type a one-value append takes here
+					out = append(out, "")
 				} else {
 					return nil, e.fail(c, "append of %T", a)
 				}
@@ -1158,8 +1169,8 @@ func (e *soongEval) expand(s string) (string, error) {
 	return out, err
 }
 
-// configRef: a reference to a cc/config pctx variable: `${config.X}` from a toolchain method or another package, `${X}` inside the package's own variables (x86_linux_host.go's `--gcc-toolchain=${LinuxGccRoot}`).
-var configRef = regexp.MustCompile(`\$\{(?:config\.)?(\w+)\}`)
+// configRef: a reference to a cc/config pctx variable: `${config.X}` from a toolchain method or another package, `${X}` inside the package's own variables (x86_linux_host.go's `--gcc-toolchain=${LinuxGccRoot}`). X may hold `-`: arm64's variant variables (Arm64armv8-aVariantCflags).
+var configRef = regexp.MustCompile(`\$\{(?:config\.)?([\w-]+)\}`)
 
 // hasToolchain: whether an init registers a toolchain factory for (os, arch identifier).
 func (e *soongEval) hasToolchain(osName, arch string) bool {

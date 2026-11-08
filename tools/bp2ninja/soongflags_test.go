@@ -130,6 +130,7 @@ func (t *toolchainX86_64) ToolchainCflags() string { return t.toolchainCflags }
 func (t *toolchainX86_64) Cflags() string { return "${config.X86_64Cflags}" }
 func (t *toolchainX86_64) Cppflags() string { return "${config.X86_64Cppflags}" }
 func (t *toolchainX86_64) YasmFlags() string { return "${config.X86_64YasmFlags}" }
+func (t *toolchainX86_64) ClangTriple() string { return "x86_64-linux-android" }
 
 func x86_64ToolchainFactory(arch android.Arch) Toolchain {
 	if _, ok := x86_64ArchVariantCflags[arch.ArchVariant]; !ok {
@@ -299,6 +300,58 @@ func init() {
 }
 `
 
+// flagsArm64Variant: flagsArm64 with arm64_device.go's variant map and factory check (its lines 30-33 and 215-217): no "" key, so an empty variant panics.
+const flagsArm64Variant = `package config
+
+var (
+	arm64ArchVariantCflags = map[string][]string{
+		"armv8-a": []string{"-march=armv8-a"},
+	}
+)
+
+func init() {
+	for variant, cflags := range arm64ArchVariantCflags {
+		pctx.StaticVariable("Arm64"+variant+"VariantCflags", strings.Join(cflags, " "))
+	}
+}
+
+type toolchainArm64 struct {
+	toolchainBionic
+	toolchain64Bit
+	toolchainCflags string
+}
+
+func (t *toolchainArm64) ToolchainCflags() string { return t.toolchainCflags }
+func (t *toolchainArm64) Cflags() string { return "" }
+func (t *toolchainArm64) Cppflags() string { return "" }
+func (t *toolchainArm64) ClangTriple() string { return "aarch64-linux-android" }
+
+// variantOrDefault, arm64CpuVariantCflagsVar: as in toolchain.go and arm64_device.go; no "" key, so an empty CpuVariant reads Go's zero string.
+var arm64CpuVariantCflagsVar = map[string]string{
+	"cortex-a53": "${config.Arm64CortexA53Cflags}",
+}
+
+func variantOrDefault(variants map[string]string, choice string) string {
+	if ret, ok := variants[choice]; ok {
+		return ret
+	}
+	return variants[""]
+}
+
+func arm64ToolchainFactory(arch android.Arch) Toolchain {
+	if _, ok := arm64ArchVariantCflags[arch.ArchVariant]; !ok {
+		panic(fmt.Sprintf("Unknown ARM64 architecture version: %q", arch.ArchVariant))
+	}
+	toolchainCflags := []string{"${config.Arm64" + arch.ArchVariant + "VariantCflags}"}
+	toolchainCflags = append(toolchainCflags, variantOrDefault(arm64CpuVariantCflagsVar, arch.CpuVariant))
+	return &toolchainArm64{toolchainCflags: strings.Join(toolchainCflags, " ")}
+}
+
+func init() {
+	registerToolchainFactory(android.Android, android.Arm64, arm64ToolchainFactory)
+}
+`
+
 // flagsPaths: android/paths.go IsThirdPartyPath with two of its exceptions.
 const flagsPaths = `package android
 
@@ -398,6 +451,40 @@ func TestReadGlobalFlags(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want %q", c.name, err, c.want)
 		}
+	}
+}
+
+// The native bridge side builds with its guest row's variant (Soong's TARGET_NATIVE_BRIDGE_ARCH_VARIANT, arch.go:1730). arm64 has no "" baseline, so an empty variant is Soong's panic; x86_64's "" key gives its guest the device's flags.
+func TestNativeBridgeArchVariant(t *testing.T) {
+	// the guest sides' Rust triples are read too (readRustTriples): the rust/config fixtures TestReadRustTriples writes
+	withRust := func(tree string) string {
+		for p, text := range map[string]string{"build/soong/rust/config/toolchain.go": rustToolchain, "build/soong/rust/config/x86_64_device.go": rustX86_64, "build/soong/rust/config/arm64_device.go": rustArm64} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(tree, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tree, p), []byte(text), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return tree
+	}
+	tree := withRust(flagsTree(t, flagsGlobal))
+	if err := os.WriteFile(filepath.Join(tree, "build/soong/cc/config/arm64_device.go"), []byte(flagsArm64Variant), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nb := NativeBridge("arm64")
+	cfg := Config{Arch: "x86_64", PointerBits: 64, NativeBridge: "arm64", NativeBridgeBits: 64, NativeBridgeArchVariant: "armv8-a"}
+	if g, err := readGlobalFlags(tree, cfg, DeviceArch{}); err != nil || g.NoToolchain[nb] != "" || !slices.Contains(g.Tail[nb], "-march=armv8-a") {
+		t.Errorf("armv8-a: tail %q, no toolchain %q, err %v", g.Tail[nb], g.NoToolchain[nb], err)
+	}
+	cfg.NativeBridgeArchVariant = ""
+	if _, err := readGlobalFlags(tree, cfg, DeviceArch{}); err == nil || !strings.Contains(err.Error(), "panics") {
+		t.Errorf("empty variant: err %v, want Soong's factory panic", err)
+	}
+	x86 := NativeBridge("x86_64")
+	g, err := readGlobalFlags(withRust(flagsTree(t, flagsGlobal)), Config{Arch: "x86_64", PointerBits: 64, NativeBridge: "x86_64", NativeBridgeBits: 64}, DeviceArch{})
+	if err != nil || len(g.Tail[x86]) == 0 || !slices.Equal(g.Tail[x86], g.Tail[Device]) {
+		t.Errorf("x86_64 guest: tail %q, device %q, err %v", g.Tail[x86], g.Tail[Device], err)
 	}
 }
 

@@ -596,7 +596,7 @@ const CACHE_SIZE: &str = "2G";
 /// The converter's goal prefix for a native bridge variant (tools/bp2ninja cc.go nbGoalPrefix).
 const NB_GOAL: &str = "nb:";
 
-/// Converter flags of the native bridge side, empty without --native-bridge: the guest row's arch + pointer width, and `-nb-provided` = the guest LLVM runtimes,
+/// Converter flags of the native bridge side, empty without --native-bridge: the guest row's arch, pointer width and Soong arch variant, and `-nb-provided` = the guest LLVM runtimes,
 /// built (runtimes.rs) against the include flags the converter evaluates for bionic's `libc_headers` on that side (`-nb-exports`), so they see the headers the guest libc is compiled with.
 fn native_bridge_flags(
     root: &Path,
@@ -630,6 +630,8 @@ fn native_bridge_flags(
         arch.clone(),
         "-native-bridge-bits".to_owned(),
         row.pointer_bits.to_string(),
+        "-native-bridge-arch-variant".to_owned(),
+        row.soong_arch_variant.clone().unwrap_or_default(),
     ];
     let printed = crate::host_art::output(
         Command::new(converter)
