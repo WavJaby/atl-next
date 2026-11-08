@@ -350,6 +350,12 @@ rustup_target = "x86_64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native"]
 
+# the arm64 native bridge side's Rust std (`--native-bridge arm64`): the same use as the x86-64 row, for arm64_device.go's RustTriple
+[rust-std-android-arm64]
+rustup_target = "aarch64-linux-android"
+scope = ["build"]
+used_by = ["xtask:native"]
+
 # the riscv64 cross build's std (`xtask cross --arch riscv64`)
 [rust-std-riscv64]
 rustup_target = "riscv64gc-unknown-linux-gnu"
