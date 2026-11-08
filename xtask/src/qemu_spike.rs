@@ -5,7 +5,7 @@
 //! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`. Its binding pool (gate l) is `atl_bridgegen::aarch64::pool_asm` text, assembled by the same clang into the fixture; `check_pool` reads the pool back from the built binary.
 //! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
-//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; `bind-id` links a pool whose slots carry id + 1 (xtask side); the rest are atl-qemu-engine build.rs `BREAKS`.
+//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -330,12 +330,28 @@ fn unpatched(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
     link(b, &dir.join("libqemu-spike-no-p1.so"), Some((output, &obj)))
 }
 
+/// The fixture pool's text for `skew`: slot k carries binding `k + skew`. Skew 0 is `aarch64::pool_asm` as emitted; any other skew is a text edit of it: one entry longer, its first `skew` entries (two `.inst` lines each) dropped.
+fn pool_text(skew: u32) -> Result<String> {
+    let text = aarch64::pool_asm(POOL_SLOTS + skew);
+    if skew == 0 {
+        return Ok(text);
+    }
+    let mut lines: Vec<&str> = text.lines().collect();
+    let label = lines
+        .iter()
+        .position(|l| *l == "atl_bind_pool:")
+        .context("pool text has no label")?;
+    let first = label + 1;
+    lines.drain(first..first + 2 * usize::try_from(skew)?);
+    Ok(lines.join("\n") + "\n")
+}
+
 /// The guest fixture `name` (static bionic): fixture.c plus the thunk pool, whose slot k carries binding `k + skew`. The pool is emitted text, assembled by the same NDK clang; no assembly is written by hand.
 fn fixture(root: &Path, b: &Build, dir: &Path, name: &str, skew: u32) -> Result<PathBuf> {
     let ndk = jni_fixture::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
     let pool_src = dir.join(format!("{name}-pool.s"));
-    std::fs::write(&pool_src, aarch64::pool_asm(POOL_SLOTS, |slot| slot + skew))
+    std::fs::write(&pool_src, pool_text(skew)?)
         .with_context(|| format!("writing {}", pool_src.display()))?;
     let pool_obj = dir.join(format!("{name}-pool.o"));
     let status = target

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+//! Always: `OUT_DIR/aarch64_constants.rs`, atl-bridgegen's aarch64 thunk constants (`lib.rs` `thunk`).
 //! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles `linux-user/aarch64/cpu_loop.c` with -- the file P1's hook is called from.
 //! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
 //! Breaks (`ATL_QEMU_ENGINE_BREAK=<name>[,<name>]`, [`BREAKS`]) turn a cfg on for this package only.
@@ -182,6 +183,12 @@ fn main() -> Result<()> {
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    // the thunk ABI's constants (BIND, the trap decode's bit): atl-bridgegen's emitter is the one source, so they cannot drift from the pool
+    std::fs::write(
+        out.join("aarch64_constants.rs"),
+        atl_bridgegen::aarch64::constants_rust(),
+    )?;
     if std::env::var_os("CARGO_FEATURE_QEMU").is_none() {
         return Ok(());
     }
@@ -194,7 +201,6 @@ fn main() -> Result<()> {
     let build = PathBuf::from(std::env::var(BUILD_ENV).with_context(|| {
         format!("feature qemu needs {BUILD_ENV} (`xtask qemu --pic` build dir)")
     })?);
-    let out = PathBuf::from(std::env::var("OUT_DIR")?);
     std::fs::write(
         out.join("qemu_layout.rs"),
         layout(&build, &out, &host.arch)?,

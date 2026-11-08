@@ -23,6 +23,15 @@ mod layout {
     include!(concat!(env!("OUT_DIR"), "/qemu_layout.rs"));
 }
 
+/// atl-bridgegen's aarch64 thunk constants (build.rs writes them for every build; the decode and the pool read one value).
+#[allow(
+    dead_code,
+    reason = "generated: the thunk ABI's constants, not all of them used by the decode"
+)]
+mod thunk {
+    include!(concat!(env!("OUT_DIR"), "/aarch64_constants.rs"));
+}
+
 #[cfg(feature = "qemu")]
 mod engine;
 #[cfg(feature = "qemu")]
