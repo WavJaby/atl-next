@@ -28,6 +28,26 @@ pub struct InstrumentationDecl {
     pub functional_test: bool,
 }
 
+/// ActivityInfo.SCREEN_ORIENTATION_* (ActivityInfo.java:824-909) that the services and the manifest reader name. `-1` is what an unwritten `screenOrientation` means (PackageParser.java:4457-4459).
+pub const SCREEN_ORIENTATION_UNSPECIFIED: i32 = -1;
+pub const SCREEN_ORIENTATION_LANDSCAPE: i32 = 0;
+pub const SCREEN_ORIENTATION_PORTRAIT: i32 = 1;
+pub const SCREEN_ORIENTATION_SENSOR_LANDSCAPE: i32 = 6;
+pub const SCREEN_ORIENTATION_SENSOR_PORTRAIT: i32 = 7;
+pub const SCREEN_ORIENTATION_REVERSE_LANDSCAPE: i32 = 8;
+pub const SCREEN_ORIENTATION_REVERSE_PORTRAIT: i32 = 9;
+pub const SCREEN_ORIENTATION_USER_LANDSCAPE: i32 = 11;
+pub const SCREEN_ORIENTATION_USER_PORTRAIT: i32 = 12;
+
+fn unspecified_orientation() -> i32 {
+    SCREEN_ORIENTATION_UNSPECIFIED
+}
+
+/// Records written before the field existed read as resizable, the AOSP default (see `ActivityDecl::resizeable`).
+fn resizeable_by_default() -> bool {
+    true
+}
+
 /// `<activity>` (ParsedActivity, reduced): its class resolved against the package, whether it handles MAIN + LAUNCHER, and its boolean attributes as written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityDecl {
@@ -53,6 +73,20 @@ pub struct ActivityDecl {
     /// `<activity>`'s `<meta-data>` in manifest order, typed as `<application>`'s (e.g. NativeActivity's `android.app.lib_name`).
     #[serde(default)]
     pub meta_data: Vec<(String, MetaValue)>,
+    /// `android:screenOrientation` as ActivityInfo.screenOrientation; unwritten = SCREEN_ORIENTATION_UNSPECIFIED.
+    #[serde(default = "unspecified_orientation")]
+    pub screen_orientation: i32,
+    /// ActivityInfo.isResizeableMode of the resize mode PackageParser.setActivityResizeMode picks (PackageParser.java:4677-4715): `android:resizeableActivity` on the activity, else on `<application>`, else resizable.
+    /// The targetSdk default is resizable in both of its branches (RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION from targetSdk >= 24, FORCE_RESIZABLE_* below it; isResizeableMode lists both, ActivityInfo.java:2073-2080), so no targetSdk is read.
+    #[serde(default = "resizeable_by_default")]
+    pub resizeable: bool,
+    /// `android:minAspectRatio`, else `<application android:minAspectRatio>` (PackageParser.setMinAspectRatio, :4758-4768); None = not declared.
+    #[serde(default)]
+    pub min_aspect_ratio: Option<f32>,
+    /// `android:maxAspectRatio`, else `<application android:maxAspectRatio>` (PackageParser.setMaxAspectRatio, :4721-4752); None = not declared.
+    /// Not modelled: the pre-O default 1.86 for targetSdk < 26 (DEFAULT_PRE_O_MAX_ASPECT_RATIO, PackageParser.java:176, :4724-4725) and the `android.max_aspect` meta-data (:4730-4747). For the initial-bounds rule it only matters on displays wider than 1.86:1.
+    #[serde(default)]
+    pub max_aspect_ratio: Option<f32>,
 }
 
 /// `<intent-filter>` of a component (ParsedIntentInfo's IntentFilter, reduced to what broadcast matching reads): actions, categories, `<data android:scheme>` and `<data android:mimeType>`.
@@ -495,6 +529,10 @@ mod tests {
             task_affinity: None,
             process: None,
             meta_data: vec![],
+            screen_orientation: SCREEN_ORIENTATION_UNSPECIFIED,
+            resizeable: true,
+            min_aspect_ratio: None,
+            max_aspect_ratio: None,
         };
         let mut r = record("a", 10_001);
         assert!(r.launch_activity().is_none());
@@ -521,6 +559,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<PackageRecord>(&json).expect("decode"),
             r
+        );
+    }
+
+    /// A record written before the activity fields existed reads the AOSP defaults: unspecified orientation (-1, PackageParser.java:4457), resizable, no aspect limits.
+    #[test]
+    fn activity_fields_default_when_a_record_lacks_them() {
+        let old = r#"{"name":"a.A","launcher":true,"theme":0,"config_changes":0,"booleans":{}}"#;
+        let a: ActivityDecl = serde_json::from_str(old).expect("decode");
+        assert_eq!(
+            (
+                a.screen_orientation,
+                a.resizeable,
+                a.min_aspect_ratio,
+                a.max_aspect_ratio
+            ),
+            (-1, true, None, None)
         );
     }
 }

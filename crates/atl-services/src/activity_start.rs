@@ -253,6 +253,10 @@ mod tests {
             task_affinity: None,
             process: None,
             meta_data: vec![],
+            screen_orientation: crate::packages::SCREEN_ORIENTATION_UNSPECIFIED,
+            resizeable: true,
+            min_aspect_ratio: None,
+            max_aspect_ratio: None,
         }
     }
 

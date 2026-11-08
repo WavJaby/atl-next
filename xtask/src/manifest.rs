@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use atl_services::packages::{
     ActivityDecl, InstrumentationDecl, IntentFilterDecl, Manifest, MetaValue, PermissionDecl,
-    ProviderDecl, ReceiverDecl, UsesLibrary,
+    ProviderDecl, ReceiverDecl, SCREEN_ORIENTATION_UNSPECIFIED, UsesLibrary,
 };
 
 use crate::host_art;
@@ -179,6 +179,41 @@ fn launch_mode(element: &Element) -> Result<i32> {
 /// `android:taskAffinity` as written; None = unwritten, the package name is the affinity (ActivityRecord's default).
 fn task_affinity(element: &Element) -> Option<String> {
     element.attr("taskAffinity").map(str::to_owned)
+}
+
+/// `android:screenOrientation` as ActivityInfo.screenOrientation. aapt2 prints the enum in decimal, `-1` for unspecified (aapt2 2.19 on a probe manifest). Unwritten = SCREEN_ORIENTATION_UNSPECIFIED (PackageParser.java:4457-4459).
+fn screen_orientation(element: &Element) -> Result<i32> {
+    let Some(value) = element.attr("screenOrientation") else {
+        return Ok(SCREEN_ORIENTATION_UNSPECIFIED);
+    };
+    value
+        .parse::<i32>()
+        .with_context(|| format!("screenOrientation {value:?} is not an enum value"))
+}
+
+/// `android:resizeableActivity`: the activity's, else `<application>`'s, else true. PackageParser.setActivityResizeMode takes the activity's explicit value, then the application's explicit default, then the targetSdk default (PackageParser.java:4677-4715). That default is resizable in both branches (ActivityInfo.isResizeableMode, ActivityInfo.java:2073-2080), so targetSdk does not enter.
+fn resizeable(activity: &Element, application: Option<&Element>) -> bool {
+    let application = application.is_none_or(|a| a.bool_attr("resizeableActivity", true));
+    activity.bool_attr("resizeableActivity", application)
+}
+
+/// `android:minAspectRatio` (or `maxAspectRatio`): the activity's, else `<application>`'s (PackageParser.setMinAspectRatio / setMaxAspectRatio, PackageParser.java:4758-4768, :4721-4752). None = not declared.
+/// aapt2 prints a float in its shortest form (`1.86`, and `2` for 2.0). A value that does not parse is an error; AOSP ignores a non-float here (PackageParser.java:4472-4481).
+fn aspect_ratio(
+    element: &Element,
+    application: Option<&Element>,
+    name: &str,
+) -> Result<Option<f32>> {
+    let Some(value) = element
+        .attr(name)
+        .or_else(|| application.and_then(|a| a.attr(name)))
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<f32>()
+        .map(Some)
+        .with_context(|| format!("{name}={value:?} is not a float"))
 }
 
 /// `android:process` of an `<application>` or `<activity>` (ParsingUtils.buildProcessName: `:name` is private to the package); None = unwritten, the package's process.
@@ -381,6 +416,10 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 task_affinity: task_affinity(activity),
                 process: process_attr(activity, package),
                 meta_data: meta_data(activity)?,
+                screen_orientation: screen_orientation(activity)?,
+                resizeable: resizeable(activity, application),
+                min_aspect_ratio: aspect_ratio(activity, application, "minAspectRatio")?,
+                max_aspect_ratio: aspect_ratio(activity, application, "maxAspectRatio")?,
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -411,6 +450,10 @@ pub fn parse(text: &str) -> Result<Manifest> {
                 task_affinity: task_affinity(alias),
                 process: process_attr(alias, package),
                 meta_data: meta_data(alias)?,
+                screen_orientation: screen_orientation(alias)?,
+                resizeable: resizeable(alias, application),
+                min_aspect_ratio: aspect_ratio(alias, application, "minAspectRatio")?,
+                max_aspect_ratio: aspect_ratio(alias, application, "maxAspectRatio")?,
             }),
         }
     }
@@ -741,6 +784,67 @@ mod tests {
             ),
             (0, None, None)
         );
+    }
+
+    /// `screenOrientation`, `resizeableActivity` and the aspect limits: the activity's own value, else the application's (PackageParser.setActivityResizeMode, setMinAspectRatio, setMaxAspectRatio).
+    #[test]
+    fn orientation_resizeable_and_aspect_follow_the_manifest() {
+        // targetSdk, the `<application>` attribute lines, the activity's attribute lines. aapt2 prints floats shortest (`1.86`, `2` for 2.0) and the enum in decimal.
+        let xml = |target: i32, application: &str, activity: &str| {
+            format!(
+                r#"  E: manifest (line=3)
+    A: package="com.example.atltest" (Raw: "com.example.atltest")
+      E: uses-sdk (line=4)
+        A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)={target}
+      E: application (line=7)
+{application}
+          E: activity (line=8)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+{activity}
+"#
+            )
+        };
+        let decl = |target: i32, application: &str, activity: &str| {
+            let a = parse(&xml(target, application, activity))
+                .expect("parse")
+                .activities
+                .remove(0);
+            (
+                a.screen_orientation,
+                a.resizeable,
+                a.min_aspect_ratio,
+                a.max_aspect_ratio,
+            )
+        };
+        // The activity's own values.
+        let own = r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=1
+            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=false
+            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=1.86
+            A: http://schemas.android.com/apk/res/android:minAspectRatio(0x0101059b)=0.5"#;
+        assert_eq!(decl(33, "", own), (1, false, Some(0.5), Some(1.86)));
+        // Unwritten on the activity: the application's values.
+        let app = r#"            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=false
+            A: http://schemas.android.com/apk/res/android:minAspectRatio(0x0101059b)=1.5
+            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=2"#;
+        assert_eq!(decl(33, app, ""), (-1, false, Some(1.5), Some(2.0)));
+        // The activity's own value wins over the application's.
+        let wins = r#"            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=true
+            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=1.5"#;
+        assert_eq!(decl(33, app, wins), (-1, true, Some(1.5), Some(1.5)));
+        // Unwritten at both levels: resizable at either targetSdk (AOSP's SDK-24 default and its pre-N FORCE_RESIZABLE are both resizable).
+        assert_eq!(decl(23, "", ""), (-1, true, None, None));
+        assert_eq!(decl(33, "", ""), (-1, true, None, None));
+        // A landscape-family value (sensorLandscape = 6).
+        let sensor = r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=6"#;
+        assert_eq!(decl(33, "", sensor).0, 6);
+        // A value that is not a number of its kind is an error, not a silent default.
+        let bad = |activity: &str| parse(&xml(33, "", activity)).is_err();
+        assert!(bad(
+            r#"            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=abc"#
+        ));
+        assert!(bad(
+            r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=portrait"#
+        ));
     }
 
     #[test]

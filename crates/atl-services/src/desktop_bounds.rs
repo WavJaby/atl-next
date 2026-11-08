@@ -4,6 +4,13 @@
 //! Not modelled: caption height (`:85-87`; maximise runs with 0), user min-aspect and compat-change overrides (DesktopAppCompatAspectRatioPolicy.getMinAspectRatio), fullscreen and windowLayout overrides, ActivityOptions launch bounds, and per-app universal resizability (ActivityRecord.isUniversalResizeable, ActivityRecord.java:3113-3126).
 //! Position: the centred rect of AOSP's rule. xdg-shell gives a client no toplevel position, so the compositor places the window and this origin only records the Task's bounds.
 
+use crate::packages::{
+    SCREEN_ORIENTATION_LANDSCAPE, SCREEN_ORIENTATION_PORTRAIT,
+    SCREEN_ORIENTATION_REVERSE_LANDSCAPE, SCREEN_ORIENTATION_REVERSE_PORTRAIT,
+    SCREEN_ORIENTATION_SENSOR_LANDSCAPE, SCREEN_ORIENTATION_SENSOR_PORTRAIT,
+    SCREEN_ORIENTATION_USER_LANDSCAPE, SCREEN_ORIENTATION_USER_PORTRAIT,
+};
+
 /// `android.graphics.Rect`: left/top inclusive, right/bottom exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -71,16 +78,6 @@ pub struct ActivityInput {
     /// `android:maxAspectRatio`.
     pub max_aspect: Option<f32>,
 }
-
-/// ActivityInfo.SCREEN_ORIENTATION_* (ActivityInfo.java:829-909) that the fixed-orientation predicates accept.
-const SCREEN_ORIENTATION_LANDSCAPE: i32 = 0;
-const SCREEN_ORIENTATION_PORTRAIT: i32 = 1;
-const SCREEN_ORIENTATION_SENSOR_LANDSCAPE: i32 = 6;
-const SCREEN_ORIENTATION_SENSOR_PORTRAIT: i32 = 7;
-const SCREEN_ORIENTATION_REVERSE_LANDSCAPE: i32 = 8;
-const SCREEN_ORIENTATION_REVERSE_PORTRAIT: i32 = 9;
-const SCREEN_ORIENTATION_USER_LANDSCAPE: i32 = 11;
-const SCREEN_ORIENTATION_USER_PORTRAIT: i32 = 12;
 
 /// Ideal size as a share of the display: DESKTOP_MODE_INITIAL_BOUNDS_SCALE = 75 / 100f (DesktopModeBoundsCalculator.java:50-51), AOSP's default for persist.wm.debug.desktop_mode_initial_bounds_scale.
 const IDEAL_SCALE: f32 = 0.75;
