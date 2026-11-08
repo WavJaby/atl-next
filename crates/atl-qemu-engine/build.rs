@@ -31,6 +31,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("drop-accerr", "atl_qe_drop_accerr"),
     // gate (g): every thread classifies its faults with the BOOT thread's helper_retaddr
     ("boot-only", "atl_qe_boot_only"),
+    // gates (i), (j): no fatal special handler, so QEMU's die_with_signal kill is consumed by sigchain's SIG_DFL revert (exit 1 / hang)
+    ("no-fatal", "atl_qe_no_fatal"),
+    // gate (k): a host fault with previous action SIG_IGN keeps re-running under sigchain's SIG_IGN return
+    ("ign-loop", "atl_qe_ign_loop"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

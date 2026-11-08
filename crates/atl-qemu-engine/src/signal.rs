@@ -128,6 +128,10 @@ pub(crate) fn install() {
         let rc = unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "sigaction({sig}) install failed");
     }
+    #[cfg(atl_qe_sigchain)]
+    if !cfg!(atl_qe_no_fatal) {
+        fatal::register();
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -190,6 +194,9 @@ fn classify(info: *mut libc::siginfo_t, uc: *mut c_void) -> Option<Reason> {
 /// Runs `act`'s handler for `sig` as the kernel would have. SIG_DFL / SIG_IGN: restore that disposition and return, so the faulting instruction re-runs under it.
 fn deliver(act: &libc::sigaction, sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_void) {
     match act.sa_sigaction {
+        // The kernel default, not the record: a synchronous fault cannot be ignored, and sigchain's SIG_IGN return re-faults forever (sigchain.cc Handler). Re-run under the default, the kernel ends the process.
+        libc::SIG_DFL | libc::SIG_IGN if !cfg!(atl_qe_ign_loop) => kernel_default(sig),
+        // break `ign-loop` (gate k): the chain records the action only, so a SIG_IGN previous action re-faults forever
         libc::SIG_DFL | libc::SIG_IGN => {
             // SAFETY: act is the complete record captured by sigaction.
             unsafe { libc::sigaction(sig, act, std::ptr::null_mut()) };
@@ -204,6 +211,92 @@ fn deliver(act: &libc::sigaction, sig: c_int, info: *mut libc::siginfo_t, uc: *m
             // SAFETY: a plain handler takes (int).
             let f: extern "C" fn(c_int) = unsafe { std::mem::transmute(h) };
             f(sig);
+        }
+    }
+}
+
+/// Kernel SIG_DFL for `sig`, bypassing sigchain: its `sigaction` only records the action while the signal is claimed, so the kernel would keep the chain's handler. Zeroed kernel `struct sigaction` (handler, flags, restorer, mask) = SIG_DFL, no flags, empty mask.
+fn kernel_default(sig: c_int) {
+    let dfl = [0u64; 4];
+    // SAFETY: raw rt_sigaction(sig, &dfl, NULL, 8); dfl is a kernel sigaction, 8 the kernel sigset size.
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            libc::c_long::from(sig),
+            dfl.as_ptr(),
+            std::ptr::null::<u64>(),
+            8usize,
+        )
+    };
+}
+
+/// QEMU's fatal path under sigchain. `die_with_signal` (linux-user/signal.c) does `sigaction(sig, SIG_DFL)`, `kill(getpid(), sig)`, `sigsuspend`. The chain records SIG_DFL as the user action; its SIG_DFL branch (sigchain.cc Handler) reverts the kernel action and returns, which consumes the signal: exit 1 on one thread, a sleep forever on several.
+#[cfg(atl_qe_sigchain)]
+mod fatal {
+    use std::ffi::{c_int, c_void};
+
+    use super::kernel_default;
+
+    /// `art::SigchainAction` (art/sigchainlib/sigchain.h): one special handler, its mask and flags.
+    #[repr(C)]
+    struct SigchainAction {
+        sc_sigaction: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) -> bool,
+        sc_mask: libc::sigset_t,
+        sc_flags: u64,
+    }
+
+    unsafe extern "C" {
+        fn AddSpecialSignalHandlerFn(signal: c_int, sa: *mut SigchainAction);
+    }
+
+    /// Runs before the chain's user action. A process-sent signal (si_code <= SI_USER) whose user action is SIG_DFL ends the process by that signal; any other fault is declined.
+    extern "C" fn special(sig: c_int, info: *mut libc::siginfo_t, _uc: *mut c_void) -> bool {
+        // SAFETY: the kernel's siginfo of this delivery.
+        if unsafe { (*info).si_code } > libc::SI_USER {
+            return false;
+        }
+        // SAFETY: a zeroed sigaction is a valid out buffer; a null new action is a query, which sigchain answers from its user-action record.
+        let mut user: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: query only (see above).
+        unsafe { libc::sigaction(sig, std::ptr::null(), &mut user) };
+        if user.sa_sigaction != libc::SIG_DFL {
+            return false;
+        }
+        kernel_default(sig);
+        let set = 1u64 << (sig - 1);
+        // SAFETY: raw rt_sigprocmask(SIG_UNBLOCK, &set, NULL, 8) on this thread; set is one kernel sigset word. The chain's sigprocmask would strip the claimed signal from the mask.
+        unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::c_long::from(libc::SIG_UNBLOCK),
+                &raw const set,
+                std::ptr::null::<u64>(),
+                8usize,
+            )
+        };
+        // SAFETY: tgkill to this thread: unblocked now, so it is delivered on the way out of the handler, with the kernel default (process exit).
+        unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                libc::c_long::from(libc::getpid()),
+                libc::c_long::from(libc::gettid()),
+                libc::c_long::from(sig),
+            )
+        };
+        true
+    }
+
+    /// Registers [`special`] for SIGSEGV and SIGBUS. Sigchain keeps two special handlers per signal (`fatal("too many special signal handlers")`); ART's FaultManager takes one.
+    pub(super) fn register() {
+        for sig in [libc::SIGSEGV, libc::SIGBUS] {
+            let mut sa = SigchainAction {
+                sc_sigaction: special,
+                // SAFETY: a zeroed sigset_t is the empty set.
+                sc_mask: unsafe { std::mem::zeroed() },
+                sc_flags: 0,
+            };
+            // SAFETY: sigchain copies sa into its table; special has the special-handler signature.
+            unsafe { AddSpecialSignalHandlerFn(sig, &mut sa) };
         }
     }
 }

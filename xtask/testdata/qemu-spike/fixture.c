@@ -138,6 +138,40 @@ __attribute__((noinline)) u64 fx_thread_fault(void) {
     return G_RET;
 }
 
+// (i) fatal, one thread: the guest restores SIG_DFL, so a store to address 0 has no guest handler. QEMU ends the process with the signal (die_with_signal): the host sees death by SIGSEGV.
+// (j) the same fault on a second guest thread while the main guest thread waits in pthread_join.
+static int default_segv(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    return sigaction(SIGSEGV, &sa, 0);
+}
+
+__attribute__((noinline)) u64 fx_fatal(void) {
+    if (default_segv() != 0) {
+        return 0;
+    }
+    *(volatile u64 *)0 = 1;
+    return 0;
+}
+
+static void *fatal_thread_body(void *arg) {
+    register u64 x0 __asm__("x0") = 0;
+    (void)arg;
+    __asm__ volatile("svc #0x7a14" : "+r"(x0) : : "memory");
+    *(volatile u64 *)0 = 1;
+    return 0;
+}
+
+__attribute__((noinline)) u64 fx_fatal_thread(void) {
+    pthread_t t;
+    if (default_segv() != 0 || pthread_create(&t, 0, fatal_thread_body, 0) != 0) {
+        return 0;
+    }
+    pthread_join(t, 0);
+    return 0;
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -157,10 +191,12 @@ static const u64 table[] = {
     (u64)fx_smc_setup, (u64)fx_smc_run, F_OLD, F_MOVZ_X0_2, F_NEW,
     // 24..25: (g) thread entry, its return
     (u64)fx_thread_fault, G_RET,
+    // 26..27: (i) fatal fault on the main guest thread, (j) on a second one
+    (u64)fx_fatal, (u64)fx_fatal_thread,
 };
 
 int main(void) {
-    // the guest's SIGSEGV handler from startup, as an app installs it: a guest fault with no handler takes QEMU's fatal path, which sigchain's SIG_DFL revert leaves hanging
+    // the guest's SIGSEGV handler from startup, as an app installs it; gates (i) and (j) remove it and take QEMU's fatal path
     install_segv_handler();
     register u64 x0 __asm__("x0") = (u64)table;
     register u64 x1 __asm__("x1") = (u64)fx_ret_stub;

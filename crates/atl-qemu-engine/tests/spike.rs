@@ -2,7 +2,7 @@
 //! Spike gates (a)-(h) (QEMU bridge plan Q2/Q3), harness-less: QEMU's `main` owns this thread and the guest's exit ends the process with the BOOT answer (0 = every gate ok).
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread.
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -10,7 +10,8 @@ mod spike {
     use std::cell::{Cell, RefCell};
     use std::ffi::c_int;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use atl_qemu_engine::{Guest, Trap};
 
@@ -43,7 +44,9 @@ mod spike {
         pub const SMC_NEW: usize = 23;
         pub const THREAD_FN: usize = 24;
         pub const THREAD_RET: usize = 25;
-        pub const LEN: usize = 26;
+        pub const FATAL: usize = 26;
+        pub const FATAL_THREAD: usize = 27;
+        pub const LEN: usize = 28;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -61,6 +64,10 @@ mod spike {
     static SPECIAL_SEEN: AtomicU64 = AtomicU64::new(0);
     /// `SPECIAL_SEEN` at the fork of gates (e) and (h): the child's previous handler checks that exactly one call, its own fault, came since.
     static SEEN_AT_FORK: AtomicU64 = AtomicU64::new(0);
+    /// Gate (k)'s verdict, from its child before QEMU starts (`run_gate_k`); printed with the others.
+    static K_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    /// Set in gate (k)'s child: its BOOT trap runs gate (k) instead of the table gates.
+    static GATE_K_CHILD: AtomicBool = AtomicBool::new(false);
 
     // ART-style managed code: an implicit null check is a load through a register. A fault at a pc in [atl_managed_probe, atl_managed_probe_end) is claimed by the special handler, which moves the pc to atl_npe_stub.
     core::arch::global_asm!(
@@ -167,6 +174,7 @@ mod spike {
             );
         }
         let fixture = fixture.to_string_lossy().into_owned();
+        run_gate_k(&so, &fixture);
         let r = atl_qemu_engine::run(
             std::path::Path::new(&so),
             &["qemu-aarch64", "-B", &base, &fixture],
@@ -196,7 +204,12 @@ mod spike {
 
     fn on_trap(g: Guest, trap: Trap) -> u64 {
         match trap {
-            Trap::Boot(table) => u64::from(!gates(g, table)),
+            Trap::Boot(table) => {
+                if GATE_K_CHILD.load(Ordering::Relaxed) {
+                    gate_k();
+                }
+                u64::from(!gates(g, table))
+            }
             Trap::Call(regs) => match GATE.with(Cell::get) {
                 'a' => {
                     A_SEEN.with(|s| s.set(Some(regs)));
@@ -227,7 +240,13 @@ mod spike {
         // SAFETY: the fixture's static table of t::LEN words, at its host address.
         let words = unsafe { std::slice::from_raw_parts(words, t::LEN) }.to_vec();
         TABLE.with(|t| *t.borrow_mut() = words);
-        let mut ok = true;
+        let mut ok = verdict(
+            'k',
+            K_RESULT
+                .get()
+                .cloned()
+                .unwrap_or_else(|| Err("gate (k) did not run".to_owned())),
+        );
         for (gate, f) in [
             ('a', gate_a as fn(Guest) -> Result<(), String>),
             ('b', gate_b),
@@ -237,6 +256,8 @@ mod spike {
             ('h', gate_h),
             ('f', gate_f),
             ('g', gate_g),
+            ('i', gate_i),
+            ('j', gate_j),
         ] {
             GATE.with(|c| c.set(gate));
             REPORTS.lock().expect("reports").clear();
@@ -418,6 +439,87 @@ mod spike {
             ));
         }
         Ok(())
+    }
+
+    /// The forked child's death signal; a child that exits is an error.
+    fn wait_signal(pid: libc::pid_t) -> Result<c_int, String> {
+        let mut status = 0;
+        // SAFETY: waits for the child just forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            return Err("waitpid failed".to_owned());
+        }
+        if libc::WIFSIGNALED(status) {
+            Ok(libc::WTERMSIG(status))
+        } else {
+            Err(format!(
+                "child exited {}, expected death by signal",
+                libc::WEXITSTATUS(status)
+            ))
+        }
+    }
+
+    /// QEMU's fatal path (die_with_signal): the fixture function `entry` faults with no guest SIGSEGV handler; the child must end by SIGSEGV, not exit (sigchain's revert) or sleep.
+    fn fatal_gate(g: Guest, entry: u64) -> Result<(), String> {
+        let pid = fork_child()?;
+        if pid == 0 {
+            g.call(entry, &[]);
+            // SAFETY: not reached unless the guest survived its fatal fault.
+            unsafe { libc::_exit(0) };
+        }
+        match wait_signal(pid)? {
+            libc::SIGSEGV => Ok(()),
+            sig => Err(format!("child died by signal {sig}, expected SIGSEGV")),
+        }
+    }
+
+    /// Gate (i): the fatal fault on the main guest thread.
+    fn gate_i(g: Guest) -> Result<(), String> {
+        fatal_gate(g, w(t::FATAL))
+    }
+
+    /// Gate (j): the fatal fault on a second guest thread.
+    fn gate_j(g: Guest) -> Result<(), String> {
+        fatal_gate(g, w(t::FATAL_THREAD))
+    }
+
+    /// Gate (k) in its child: a host-only fault while the previous SIGSEGV action is SIG_IGN. A synchronous fault cannot be ignored, so the child must end by SIGSEGV; surviving the store exits 3.
+    fn gate_k() -> ! {
+        // SAFETY: deliberate null store, the fault under test.
+        unsafe { std::ptr::null_mut::<u64>().write_volatile(1) };
+        // SAFETY: not reached unless the store did not fault.
+        unsafe { libc::_exit(3) }
+    }
+
+    /// Gate (k), first: a child sets SIG_IGN before QEMU captures the previous action, so its BOOT trap faults with that action. The verdict waits in `K_RESULT` for `gates`; the parent then runs its own gates.
+    fn run_gate_k(so: &std::ffi::OsStr, fixture: &str) {
+        // SAFETY: fork before QEMU starts, so the child has one thread.
+        let pid = unsafe { libc::fork() };
+        let result = if pid < 0 {
+            Err("fork failed".to_owned())
+        } else if pid == 0 {
+            // SAFETY: a zeroed sigaction with SIG_IGN; the chain records it as the user action.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = libc::SIG_IGN;
+                libc::sigaction(libc::SIGSEGV, &act, std::ptr::null_mut());
+            }
+            GATE_K_CHILD.store(true, Ordering::Relaxed);
+            let r = atl_qemu_engine::run(
+                std::path::Path::new(so),
+                &["qemu-aarch64", "-B", "0", fixture],
+                on_trap,
+            );
+            println!("spike: FAIL gate (k) child: QEMU main returned {r:?}");
+            // SAFETY: async-signal-safe exit, no unwinding.
+            unsafe { libc::_exit(2) }
+        } else {
+            match wait_signal(pid) {
+                Ok(libc::SIGSEGV) => Ok(()),
+                Ok(sig) => Err(format!("child died by signal {sig}, expected SIGSEGV")),
+                Err(e) => Err(e),
+            }
+        };
+        let _ = K_RESULT.set(result);
     }
 }
 

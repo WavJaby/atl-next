@@ -25,7 +25,7 @@ const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+const GATES: [char; 11] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'];
 /// Per harness run. A run that outlives it hangs (the fatal path in the module doc: QEMU's `die_with_signal`, a SIGSEGV that sigchain's SIG_DFL revert does not end) and counts as failed.
 const RUN_TIMEOUT_SECS: u32 = 240;
 /// `timeout`'s exit status when it killed the command.
@@ -112,6 +112,22 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("boot-only"),
         red: Some('g'),
+    },
+    // gate (i) hangs (observed): QEMU's own threads take the kill, the faulting thread sleeps in sigsuspend; the timeout kills the run
+    RunSpec {
+        name: "no-fatal",
+        unpatched: false,
+        base: "0",
+        engine_break: Some("no-fatal"),
+        red: Some('i'),
+    },
+    // gate (k) re-faults under SIG_IGN until the timeout kills it
+    RunSpec {
+        name: "ign-loop",
+        unpatched: false,
+        base: "0",
+        engine_break: Some("ign-loop"),
+        red: Some('k'),
     },
 ];
 
