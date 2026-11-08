@@ -683,15 +683,28 @@ impl Compositor {
     ) {
         self.counters.buffers_released += 1;
         let release = self.release_of(held, fence);
+        self.push_release(release, held.release_listener, channel, calls);
+    }
+
+    /// AOSP `Layer::callReleaseBufferCallback` order: `onReleaseBuffer` on the listener, then the channel write. Binder serialises oneway calls to one node in send order, and the
+    /// completions go to that node, so BBQ releases the replaced buffer before any completion of a later frame. The channel alone is read only when the producer waits in dequeue, and it
+    /// loses that race (`Faking releaseBufferCallback`). The channel write stays: it wakes that wait (BLASTBufferQueue.cpp `waitForBufferRelease`).
+    fn push_release(
+        &mut self,
+        release: ReleaseBuffer,
+        listener: StrongBinder,
+        channel: Option<FdObject>,
+        calls: &mut Vec<ClientCall>,
+    ) {
+        if listener.is_null() && channel.is_none() {
+            self.counters.release_unroutable += 1;
+            return;
+        }
+        if !listener.is_null() {
+            calls.push(ClientCall::ReleaseBuffer { listener, release });
+        }
         if let Some(channel) = channel {
             calls.push(ClientCall::ReleaseOnChannel { channel, release });
-        } else if !held.release_listener.is_null() {
-            calls.push(ClientCall::ReleaseBuffer {
-                listener: held.release_listener,
-                release,
-            });
-        } else {
-            self.counters.release_unroutable += 1;
         }
     }
 
@@ -712,16 +725,7 @@ impl Compositor {
             release_fence: Fence(None),
             current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
         };
-        if let Some(channel) = channel {
-            calls.push(ClientCall::ReleaseOnChannel { channel, release });
-        } else if !bd.release_buffer_listener.is_null() {
-            calls.push(ClientCall::ReleaseBuffer {
-                listener: bd.release_buffer_listener,
-                release,
-            });
-        } else {
-            self.counters.release_unroutable += 1;
-        }
+        self.push_release(release, bd.release_buffer_listener, channel, calls);
     }
 
     /// Whether applying `t` now would give a backpressured layer a second buffer this tick.

@@ -150,14 +150,17 @@ fn carried_releases(calls: &[ClientCall]) -> Vec<ReleaseCallbackId> {
 }
 
 fn releases(calls: &[ClientCall]) -> Vec<ReleaseCallbackId> {
-    calls
+    let mut ids: Vec<ReleaseCallbackId> = calls
         .iter()
         .filter_map(|c| match c {
             ClientCall::ReleaseBuffer { release, .. }
             | ClientCall::ReleaseOnChannel { release, .. } => Some(release.callback_id),
             _ => None,
         })
-        .collect()
+        .collect();
+    // a dropped buffer's release goes to its listener and then its channel, back to back: one release
+    ids.dedup();
+    ids
 }
 
 /// A BBQ-like producer against the model for 25 frames: its accounting (acquired = queued - released) must stay under `max + 2` the whole run, which only holds when every replaced buffer is released.
@@ -222,9 +225,10 @@ fn every_acquired_buffer_is_released_and_the_producer_never_stalls() {
     assert_eq!(c.counters().buffers_released, 25);
 }
 
-/// Release ids are the buffer id and frame number of the replaced buffer, and with a channel registered they go to the channel, not the listener.
+/// AOSP `callReleaseBufferCallback`: a replaced buffer the presenter never took goes to its listener, then to its channel, both with the replaced buffer's id, and both before the
+/// completion of the transaction that replaced it (BBQ fakes a release that a completion overtakes: BLASTBufferQueue.cpp:415-427).
 #[test]
-fn release_goes_to_the_channel_with_the_replaced_buffers_id() {
+fn dropped_release_goes_to_the_listener_then_the_channel_before_the_completion() {
     let layer = local(1);
     let listener = local(2);
     let mut c = Compositor::new(CompositorConfig::default());
@@ -238,26 +242,46 @@ fn release_goes_to_the_channel_with_the_replaced_buffers_id() {
         &layer, &listener, 202, 2, 8, 8, false, 2,
     )]));
     let out = c.on_frame(20);
-    let rel: Vec<_> = out
+    let listener_at = out
         .calls
         .iter()
-        .filter(|c| !matches!(c, ClientCall::TransactionCompleted { .. }))
-        .collect();
-    assert_eq!(rel.len(), 1);
-    match rel[0] {
-        ClientCall::ReleaseOnChannel { channel, release } => {
-            assert_eq!(channel.fd, 90);
-            assert_eq!(
-                release.callback_id,
-                ReleaseCallbackId {
-                    buffer_id: 201,
-                    frame_number: 1
-                }
-            );
-            assert_eq!(release.current_max_acquired_buffer_count, 2);
+        .position(|c| matches!(c, ClientCall::ReleaseBuffer { .. }))
+        .expect("an onReleaseBuffer call");
+    let channel_at = out
+        .calls
+        .iter()
+        .position(|c| matches!(c, ClientCall::ReleaseOnChannel { .. }))
+        .expect("a channel release");
+    let completion_at = out
+        .calls
+        .iter()
+        .position(|c| matches!(c, ClientCall::TransactionCompleted { .. }))
+        .expect("the completion of the replacing transaction");
+    assert!(
+        listener_at < channel_at && channel_at < completion_at,
+        "order: {:?}",
+        out.calls
+    );
+    let ClientCall::ReleaseBuffer {
+        release: on_listener,
+        ..
+    } = &out.calls[listener_at]
+    else {
+        unreachable!()
+    };
+    let ClientCall::ReleaseOnChannel { channel, release } = &out.calls[channel_at] else {
+        unreachable!()
+    };
+    assert_eq!(on_listener, release);
+    assert_eq!(
+        release.callback_id,
+        ReleaseCallbackId {
+            buffer_id: 201,
+            frame_number: 1
         }
-        other => panic!("expected a channel release, got {other:?}"),
-    }
+    );
+    assert_eq!(channel.fd, 90);
+    assert_eq!(release.current_max_acquired_buffer_count, 2);
 }
 
 /// AOSP: a shown buffer's release rides the completion of the transaction that replaced it (`previousReleaseCallbackId`), and no `onReleaseBuffer` call is made for it (Layer.cpp:1270-1271, 826-831; TransactionCallbackInvoker.cpp:137-145).
@@ -1396,8 +1420,8 @@ fn check_held(calls: &[ClientCall], held: &BTreeMap<u64, u64>, completed: &mut u
     }
 }
 
-/// AOSP `Layer::releasePreviousBuffer` (Layer.cpp:852-871): a buffer the presenter never took is released when the next buffer latches, through the layer's channel, with its acquire fence as the release
-/// fence (`mDrawingState.acquireFence`). Its completion carries no release: nothing of BBQ's is still drawn.
+/// AOSP `Layer::releasePreviousBuffer` (Layer.cpp:852-871): a buffer the presenter never took is released when the next buffer latches, to its listener and then the layer's channel, with its
+/// acquire fence as the release fence (`mDrawingState.acquireFence`). Its completion carries no release: nothing of BBQ's is still drawn.
 #[test]
 fn untaken_buffer_is_released_at_the_next_latch_with_its_acquire_fence() {
     let layer = local(1);
@@ -1415,15 +1439,20 @@ fn untaken_buffer_is_released_at_the_next_latch_with_its_acquire_fence() {
     )]));
     let out = c.on_frame(20);
     let [
+        ClientCall::ReleaseBuffer {
+            release: on_listener,
+            ..
+        },
         ClientCall::ReleaseOnChannel { channel, release },
         ClientCall::TransactionCompleted { stats, .. },
     ] = out.calls.as_slice()
     else {
         panic!(
-            "expected a channel release then a completion, got {:?}",
+            "expected an onReleaseBuffer, a channel release, then a completion, got {:?}",
             out.calls
         )
     };
+    assert_eq!(on_listener, release);
     assert_eq!(channel.fd, 90);
     assert_eq!(
         release.callback_id,
