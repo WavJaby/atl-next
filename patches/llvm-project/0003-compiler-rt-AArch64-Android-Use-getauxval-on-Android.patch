@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Kiss <daniel.kiss@arm.com>
+Date: Fri, 30 Aug 2024 08:51:08 +0200
+Subject: [PATCH] [compiler-rt][AArch64][Android] Use getauxval on Android.
+ (#102979)
+
+__getauxval is a libgcc function that doesn't exist on Android.
+Also on Linux let's use getauxval as it is anyway used other places in compiler-rt.
+
+Upstream-Status: Backport [cd634f57]
+Patch-Reason: bionic has no __getauxval (libgcc only), so the pin's sme-abi-init.c leaves it undefined in the Android builtins. A bionic shim is not AOSP's answer: AOSP's PATCHES.json applies this upstream commit for android to clang revisions 530567..548051 (toolchain/llvm_android PATCHES.json:88-101), which include r547379, so it is taken as-is.
+---
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ .../lib/builtins/aarch64/sme-abi-init.c       | 22 +++++++++----------
+ 1 file changed, 10 insertions(+), 12 deletions(-)
+
+diff --git a/compiler-rt/lib/builtins/aarch64/sme-abi-init.c b/compiler-rt/lib/builtins/aarch64/sme-abi-init.c
+index b6ee12170d56dbd4890445ef74d6e76249b66bdb..d3cd8278a5d214ec3a03649cbdfdd3c1a6174de1 100644
+--- a/compiler-rt/lib/builtins/aarch64/sme-abi-init.c
++++ b/compiler-rt/lib/builtins/aarch64/sme-abi-init.c
+@@ -7,24 +7,22 @@ _Bool __aarch64_has_sme_and_tpidr2_el0;
+ 
+ // We have multiple ways to check that the function has SME, depending on our
+ // target.
+-// * For Linux we can use __getauxval().
++// * For Linux/Glibc we can use getauxval().
++// * For Android we can use getauxval().
+ // * For newlib we can use __aarch64_sme_accessible().
+ 
+ #if defined(__linux__)
+ 
+-#ifndef AT_HWCAP2
+-#define AT_HWCAP2 26
++#if defined(__ANDROID__)
++#include <sys/auxv.h>
++#elif __has_include(<sys/auxv.h>)
++#include <sys/auxv.h>
++#else
++#define getauxval(x) 0
+ #endif
++#include "../cpu_model/aarch64/hwcap.inc"
+ 
+-#ifndef HWCAP2_SME
+-#define HWCAP2_SME (1 << 23)
+-#endif
+-
+-extern unsigned long int __getauxval (unsigned long int);
+-
+-static _Bool has_sme(void) {
+-  return __getauxval(AT_HWCAP2) & HWCAP2_SME;
+-}
++static _Bool has_sme(void) { return getauxval(AT_HWCAP2) & HWCAP2_SME; }
+ 
+ #else  // defined(__linux__)
+ 
