@@ -43,8 +43,17 @@ const REMOTE_ROOT: &str = "atl-next-run";
 pub const REMOTE_DIR: &str = "remote";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
 const MANIFEST: &str = "bundle.manifest";
-/// ssh options: never prompt, never hang. The alias check is the first contact with the host.
-const SSH_OPTS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"];
+/// ssh options: never prompt, never hang. The alias check is the first contact with the host. ServerAlive: a link that dies mid-call fails in about 60 s instead of hanging until the caller's limit.
+const SSH_OPTS: [&str; 8] = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=20",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+];
 const MIB: f64 = 1024.0 * 1024.0;
 
 #[derive(clap::Subcommand)]
@@ -693,7 +702,7 @@ impl Host {
         Ok(())
     }
 
-    /// Runs the prerequisite script on the target (`sh -s`, the script on stdin); its stdout. A script that cannot reach its directory fails here.
+    /// Runs the prerequisite script on the target (`sh -s`, the script on stdin); its stdout. Only a zero exit is a result: a dropped ssh leaves partial stdout, which must not read as a verdict. A script that cannot reach its directory exits 2 and fails here.
     fn run_script(&self, script: &str) -> Result<String> {
         let mut cmd = match self {
             Host::Ssh(alias) => {
@@ -719,15 +728,14 @@ impl Host {
             .context("no stdin for the prerequisite script")?
             .write_all(script.as_bytes())?;
         let out: Output = child.wait_with_output()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        if text.is_empty() && !out.status.success() {
-            bail!(
-                "prerequisite check on {} did not run: {}",
-                self.label(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(text)
+        ensure!(
+            out.status.success(),
+            "prerequisite check on {} did not finish ({}): {}",
+            self.label(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// `script` on the target (`sh -s`), its stdout as bytes, under the host's `timeout` at `limit` (killed 5 s later if it ignores it). A non-zero status is an error with the script's stderr.
@@ -1351,7 +1359,8 @@ pub fn prereq_script(base: &str, files: &[String], dirs: &[String]) -> Result<St
     s.push_str(
         "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1; else echo \"!missing $f\"; fi\n",
     );
-    s.push_str("done\n");
+    // exit 0: a failing `ldd` is a finding in the output, not a failed check (`run_script` fails on any other status)
+    s.push_str("done\nexit 0\n");
     Ok(s)
 }
 
@@ -1510,12 +1519,22 @@ mod tests {
             "for f in 'lib/libc++.so.1' 'out/device/x.so'; do\n",
             "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1; else echo \"!missing $f\"; fi\n",
             "done\n",
+            "exit 0\n",
         );
         assert_eq!(s, want);
         // names with shell metacharacters stay one word; a newline cannot be quoted onto one line
         let odd = prereq_script("b", &["a@1.0;x'y.so".to_owned()], &[]).unwrap();
         assert!(odd.contains("for f in 'a@1.0;x'\\''y.so'; do"), "{odd}");
         assert!(prereq_script("b", &["a\nb".to_owned()], &[]).is_err());
+    }
+
+    #[test]
+    fn prerequisite_check_fails_on_a_nonzero_exit_even_with_output() {
+        // a dropped ssh leaves partial stdout and a non-zero status: that is no verdict
+        let host = Host::Local(PathBuf::from("."));
+        assert_eq!(host.run_script("echo PASS\nexit 0\n").unwrap(), "PASS\n");
+        let partial = host.run_script("echo PASS, 19 ELF checked\nexit 3\n");
+        assert!(partial.is_err(), "partial output with exit 3 was accepted");
     }
 
     #[test]
