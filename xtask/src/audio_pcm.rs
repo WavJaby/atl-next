@@ -207,6 +207,16 @@ fn check_recording(
         recording.channels,
         args.rate
     );
+    let bad = out_of_range(&recording.samples);
+    report.check("range", bad == 0, || {
+        format!(
+            "{bad} of {} samples NaN or beyond ±{FULL_SCALE} (full scale)",
+            recording.samples.len()
+        )
+    });
+    if bad > 0 {
+        return Ok(());
+    }
     let amplitude = 10f64.powf(args.dbfs / 20.0);
     let expected_rms = amplitude / std::f64::consts::SQRT_2;
     let threshold = (amplitude * 10f64.powf(PRESENCE_DB / 20.0)) as f32;
@@ -690,6 +700,16 @@ pub(crate) fn rms(x: &[f32]) -> f64 {
     (sum / x.len() as f64).sqrt()
 }
 
+/// Float PCM full scale. A sample beyond it, infinite or NaN is not audio: a mixer fed the wrong sample format writes such values, and a tone check must not pass them.
+pub(crate) const FULL_SCALE: f32 = 1.0;
+
+/// Samples that are NaN, infinite or beyond FULL_SCALE. Every tone check fails on one: its frequency and level readings are meaningless on garbage.
+pub(crate) fn out_of_range(x: &[f32]) -> usize {
+    x.iter()
+        .filter(|s| s.is_nan() || s.abs() > FULL_SCALE)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +734,21 @@ mod tests {
         let x = tone(48000.0, 1000.0, amp, 48000);
         let want = amp / std::f64::consts::SQRT_2;
         assert!((rms(&x) - want).abs() < 1e-4, "{} vs {want}", rms(&x));
+    }
+
+    #[test]
+    fn out_of_range_counts_garbage_not_audio() {
+        // full scale is ±1.0: beyond it, infinite or NaN is not audio, and each counts once
+        let x = [
+            1.0f32,
+            -1.0,
+            0.5,
+            1.0e38,
+            -1.000_001,
+            f32::NAN,
+            f32::INFINITY,
+        ];
+        assert_eq!(out_of_range(&x), 4);
     }
 
     #[test]

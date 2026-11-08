@@ -2,7 +2,7 @@
 //! `xtask test audio-app`: the audio gate of A1a (AudioFlinger and AudioPolicyService served) and A1b (createTrack and IAudioTrack). The test APK (xtask/testdata/audio) is started by atld as the app gate's is; its process asks the audio services for the session ids and the minimum buffer, builds a track and a low-latency track, and logs their state, piid and frame count.
 //! Expected values are AOSP's formulas worked here over the served output, not the code under test: AudioSystem::calculateMinFrameCount (AudioSystem.cpp:486) with sourceFramesNeededWithTimestretch (AudioResamplerPublic.h:84-110) at speed 1.0, and AudioFlinger's streaming-track roundup to a power of two (Tracks.cpp:162).
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
-//! PCM (A2): the fixture plays a static track, then a streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold two runs of tone with the frequency, length and level the fixture's input gives. Expected values come from the constants below, never from the server.
+//! PCM (A2): the fixture plays a static track, then a streaming track, each a tone (Main.java `pcm`). The output's sink is a null sink the gate makes the default for the run, and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold two runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
 //! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 
@@ -16,7 +16,9 @@ use std::os::unix::net::UnixListener;
 use anyhow::{Context, Result};
 
 use crate::atld_run::{Run, Runtime, counter_lines};
-use crate::audio_pcm::{Recorder, Recording, Routing, frequency_hz, read_wav, rms};
+use crate::audio_pcm::{
+    FULL_SCALE, Recorder, Recording, Routing, frequency_hz, out_of_range, read_wav, rms,
+};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -166,8 +168,19 @@ fn presence() -> f32 {
     (amplitude * 10f64.powf(PRESENCE_DB / 20.0)) as f32
 }
 
-/// The PCM checks (game audio A2): the recording holds the static tone, then the streaming tone, each a run of samples above the presence level. Length, frequency and level come from the fixture's input (TONE_*), never from the server.
+/// The PCM checks (game audio A2): the recording holds the static tone, then the streaming tone, each a run of samples above the presence level. Length, frequency and level come from the fixture's input (TONE_*), never from the server. A sample beyond full scale fails the run before any tone is measured.
 fn pcm_verdicts(rec: &Recording) -> bool {
+    let bad = out_of_range(&rec.samples);
+    if !verdict(
+        "pcm range",
+        bad == 0,
+        &format!(
+            "{bad} of {} samples NaN or beyond ±{FULL_SCALE} (full scale)",
+            rec.samples.len()
+        ),
+    ) {
+        return false;
+    }
     let rate = u64::from(rec.rate);
     let amplitude = 10f64.powf(TONE_DBFS / 20.0);
     let expected_rms = amplitude / std::f64::consts::SQRT_2;
