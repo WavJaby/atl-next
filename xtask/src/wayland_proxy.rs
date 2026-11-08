@@ -6,7 +6,7 @@
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
 //! * `xdg_toplevel.set_app_id(app_id)` of the window's toplevel (request opcode 3) -> [`Event::AppId`];
-//! * the window's first `wl_surface.commit` with a buffer attached (`attach` with a non-null buffer, then `commit`) -> [`Event::FirstBuffer`].
+//! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`].
 //!
 //! Injections go to the connection that bound `xdg_wm_base` (the window's); an app's other connections forward only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
@@ -54,8 +54,7 @@ const XDG_SURFACE_SET_WINDOW_GEOMETRY: u16 = 3;
 const XDG_TOPLEVEL: &str = "xdg_toplevel";
 /// `xdg_toplevel.set_app_id(app_id: string)`, request 3 (xdg-shell.xml).
 const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
-/// `wl_surface.attach(buffer, x, y)` request 1 (buffer 0 = none) and `wl_surface.commit` request 6 (wayland.xml).
-const WL_SURFACE_ATTACH: u16 = 1;
+/// `wl_surface.commit` request 6 (wayland.xml).
 const WL_SURFACE_COMMIT: u16 = 6;
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
 const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
@@ -140,8 +139,8 @@ pub enum Event {
     },
     /// The client's `xdg_toplevel.set_app_id` on the window: the id the compositor sees the window by. Every one is sent, in order.
     AppId { app_id: String },
-    /// The window's first `wl_surface.commit` that attaches a buffer: the first frame, which is what the desktop maps the window on.
-    FirstBuffer,
+    /// The window's first `wl_surface.commit`: the initial one, which carries no buffer; the desktop matches the window's rules on it, before any frame.
+    FirstCommit,
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
     PointerInjected,
     /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
@@ -169,9 +168,8 @@ struct Ids {
     seat_version: Option<u32>,
     /// The `wl_surface` of the first `xdg_surface`: the window.
     surface: Option<u32>,
-    /// The window's surface has a buffer attached since its last commit; `first_buffer` once its first buffer commit was reported.
-    pending_buffer: bool,
-    first_buffer: bool,
+    /// The window's first commit was reported.
+    first_commit: bool,
     /// The window's shell roles: its first `xdg_surface` and that surface's `xdg_toplevel`, which [`Proxy::inject_configure`] addresses.
     xdg_surface: Option<u32>,
     toplevel: Option<u32>,
@@ -263,18 +261,10 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         ids.toplevel.get_or_insert(toplevel);
         return None;
     }
-    if Some(object) == ids.surface && opcode == WL_SURFACE_ATTACH {
-        // buffer: object, 0 for none; x and y follow
-        ids.pending_buffer = word(body, 0)? != 0;
-        return None;
-    }
     if Some(object) == ids.surface && opcode == WL_SURFACE_COMMIT {
-        let attached = std::mem::take(&mut ids.pending_buffer);
-        if attached && !ids.first_buffer {
-            ids.first_buffer = true;
-            return Some(Event::FirstBuffer);
-        }
-        return None;
+        let initial = !ids.first_commit;
+        ids.first_commit = true;
+        return initial.then_some(Event::FirstCommit);
     }
     match (ids.interfaces.get(&object).map(String::as_str), opcode) {
         (Some(XDG_TOPLEVEL), XDG_TOPLEVEL_SET_APP_ID) if ids.toplevel == Some(object) => {
@@ -1037,37 +1027,21 @@ mod tests {
         );
     }
 
-    /// The first frame is the window's first `commit` after an `attach` of a non-null buffer. A commit with nothing attached (the configure round trip), a null attach and another surface's commits do not count; later buffer commits do not repeat it.
+    /// The window's first `commit` is [`Event::FirstCommit`], bufferless or not; later commits and another surface's do not report it.
     #[test]
-    fn first_buffer_is_the_first_commit_with_a_buffer() {
+    fn first_commit_is_the_windows_first_commit() {
         let mut ids = Ids {
             surface: Some(5),
             ..Ids::default()
         };
-        // wl_surface.attach(buffer, x, y): 12 bytes
-        let attach = |buffer: u32| [buffer.to_ne_bytes(), [0; 4], [0; 4]].concat();
-        assert_eq!(note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]), None);
         assert_eq!(
-            note_request(&mut ids, 5, WL_SURFACE_ATTACH, &attach(0)),
-            None
-        );
-        assert_eq!(note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]), None);
-        assert_eq!(
-            note_request(&mut ids, 6, WL_SURFACE_ATTACH, &attach(9)),
-            None
-        );
-        assert_eq!(note_request(&mut ids, 6, WL_SURFACE_COMMIT, &[]), None);
-        assert_eq!(
-            note_request(&mut ids, 5, WL_SURFACE_ATTACH, &attach(9)),
-            None
+            note_request(&mut ids, 6, WL_SURFACE_COMMIT, &[]),
+            None,
+            "another surface's commit is not the window's"
         );
         assert_eq!(
             note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]),
-            Some(Event::FirstBuffer)
-        );
-        assert_eq!(
-            note_request(&mut ids, 5, WL_SURFACE_ATTACH, &attach(9)),
-            None
+            Some(Event::FirstCommit)
         );
         assert_eq!(note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]), None);
     }

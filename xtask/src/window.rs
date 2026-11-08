@@ -12,7 +12,7 @@
 //! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 //! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
-//! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first buffer commit is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstBuffer`]).
+//! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first commit (the initial one, no buffer) is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstCommit`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -157,7 +157,7 @@ enum Stage {
     Suspended,
     /// UI mode with the portrait fixture (xtask/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
     Portrait,
-    /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first buffer commit is `atl.<package>` ([`app_id_check`]).
+    /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
     AppId,
 }
 
@@ -774,28 +774,28 @@ fn layout_check(app: &str, want: (i32, i32), display: (i32, i32)) -> Result<Stri
     ))
 }
 
-/// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` sent before the window's first buffer commit is `want`. The desktop maps the window on that commit and matches its rules then; an id sent after it is too late.
+/// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` sent before the window's first commit (the initial one, no buffer) is `want`. The desktop matches the window's rules on that commit; GTK's default id before it does not count, and an id sent after it is too late.
 fn app_id_check(
     seen: &AppIdsSeen,
     want: &str,
     liveness: &Result<Liveness, String>,
 ) -> Result<String, String> {
     liveness.as_ref().map_err(Clone::clone)?;
-    if !seen.first_frame {
-        return Err("the window never committed a buffer".to_owned());
+    if !seen.first_commit {
+        return Err("the window never committed".to_owned());
     }
-    match seen.before_first_frame.last() {
+    match seen.before_first_commit.last() {
         Some(last) if last == want => Ok(format!(
-            "set_app_id {:?} before the first frame, last {want}",
-            seen.before_first_frame
+            "set_app_id {:?} before the first commit, last {want}",
+            seen.before_first_commit
         )),
         Some(last) => Err(format!(
-            "last set_app_id before the first frame {last}, want {want} (before {:?}, after {:?})",
-            seen.before_first_frame, seen.after_first_frame
+            "last set_app_id before the first commit {last}, want {want} (before {:?}, after {:?})",
+            seen.before_first_commit, seen.after_first_commit
         )),
         None => Err(format!(
-            "the window sent no set_app_id before its first frame (after {:?})",
-            seen.after_first_frame
+            "the window sent no set_app_id before its first commit (after {:?})",
+            seen.after_first_commit
         )),
     }
 }
@@ -990,15 +990,15 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     })
 }
 
-/// The app ids the window sent, split at its first buffer commit (the first frame), in order; `first_frame` once that commit came.
+/// The app ids the window sent, split at its first commit (the initial one), in order; `first_commit` once that commit came.
 #[derive(Clone, Debug, Default)]
 struct AppIdsSeen {
-    before_first_frame: Vec<String>,
-    after_first_frame: Vec<String>,
-    first_frame: bool,
+    before_first_commit: Vec<String>,
+    after_first_commit: Vec<String>,
+    first_commit: bool,
 }
 
-/// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first frame are in the proxy's channel. Its app ids go to `seen`, split at the first frame; the settle leaves room for one sent just after the draw.
+/// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first commit are in the proxy's channel. Its app ids go to `seen`, split at the first commit; the settle leaves room for one sent just after the draw.
 fn drive_app_id(
     proxy: Proxy,
     app_log: &Path,
@@ -1015,11 +1015,11 @@ fn drive_app_id(
     let mut split = AppIdsSeen::default();
     for event in events {
         match event {
-            ProxyEvent::AppId { app_id } if split.first_frame => {
-                split.after_first_frame.push(app_id)
+            ProxyEvent::AppId { app_id } if split.first_commit => {
+                split.after_first_commit.push(app_id)
             }
-            ProxyEvent::AppId { app_id } => split.before_first_frame.push(app_id),
-            ProxyEvent::FirstBuffer => split.first_frame = true,
+            ProxyEvent::AppId { app_id } => split.before_first_commit.push(app_id),
+            ProxyEvent::FirstCommit => split.first_commit = true,
             _ => {}
         }
     }
@@ -2273,26 +2273,26 @@ mod tests {
         assert!(layout_check("no layout line\n", (750, 900), (1920, 1200)).is_err());
     }
 
-    /// The app id is the last `set_app_id` sent before the first frame: GTK's default before it does not count, an id sent after the first frame is too late (the old path), a missing prefix fails, and no frame, no id or a dead probe fails.
+    /// The app id is the last `set_app_id` sent before the first commit: GTK's default before it does not count, an id sent after the first commit is too late (the old path: set after `present`, one commit late), a missing prefix fails, and no commit, no id or a dead probe fails.
     #[test]
-    fn app_id_check_reads_the_last_set_app_id_before_the_first_frame() {
+    fn app_id_check_reads_the_last_set_app_id_before_the_first_commit() {
         let ok: Result<Liveness, String> = Ok(Liveness::default());
         let want = "atl.com.example.atlwindow";
         let seen = |before: &[&str], after: &[&str]| AppIdsSeen {
-            before_first_frame: before.iter().map(|id| id.to_string()).collect(),
-            after_first_frame: after.iter().map(|id| id.to_string()).collect(),
-            first_frame: true,
+            before_first_commit: before.iter().map(|id| id.to_string()).collect(),
+            after_first_commit: after.iter().map(|id| id.to_string()).collect(),
+            first_commit: true,
         };
         assert!(app_id_check(&seen(&["GTK Application", want], &[]), want, &ok).is_ok());
         assert!(app_id_check(&seen(&[want, "GTK Application"], &[]), want, &ok).is_err());
         assert!(app_id_check(&seen(&["GTK Application"], &[want]), want, &ok).is_err());
         assert!(app_id_check(&seen(&["com.example.atlwindow"], &[]), want, &ok).is_err());
         assert!(app_id_check(&seen(&[], &[]), want, &ok).is_err());
-        let no_frame = AppIdsSeen {
-            first_frame: false,
+        let no_commit = AppIdsSeen {
+            first_commit: false,
             ..seen(&[want], &[])
         };
-        assert!(app_id_check(&no_frame, want, &ok).is_err());
+        assert!(app_id_check(&no_commit, want, &ok).is_err());
         assert!(
             app_id_check(
                 &seen(&[want], &[]),
