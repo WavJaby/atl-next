@@ -133,9 +133,7 @@ pub fn run_on(
     let forced = forced_tiers();
     let tiers = match brk {
         Some(remote::Break::TierXeLlvmpipe) => forced.as_slice(),
-        Some(remote::Break::DropLibunwind | remote::Break::DropAtld) | None => {
-            HOST_TIERS
-        }
+        Some(remote::Break::DropLibunwind | remote::Break::DropAtld) | None => HOST_TIERS,
     };
     judge(root, &args, site, tiers)
 }
@@ -169,7 +167,10 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
         if ok { "is not" } else { "IS" }
     );
     let work = rt.out.join("gl");
-    let driver = rt.out.join("egl").join(crate::egl_driver::atl_egl_driver_name());
+    let driver = rt
+        .out
+        .join("egl")
+        .join(crate::egl_driver::atl_egl_driver_name());
     let found = gl_imports(&driver)?;
     ok &= found.is_empty();
     println!(
@@ -666,9 +667,7 @@ fn expected_tier(lines: &[String], tiers: &[(&str, &str)]) -> Result<Tier, Strin
                 .find(|(d, _)| *d == driver)
                 .map(|(_, g)| *g)
                 .ok_or_else(|| {
-                    format!(
-                        "{node}: kernel driver `{driver}` has no row in HOST_TIERS"
-                    )
+                    format!("{node}: kernel driver `{driver}` has no row in HOST_TIERS")
                 })?,
         };
         if let Some((first, first_gallium)) = held {
@@ -800,7 +799,8 @@ fn judge_extension(lines: &[String]) -> Result<String, String> {
         return Err(format!("{name} wrote {v}, glGetIntegerv gives {g}"));
     }
     // libGLES_atl passes non-own names to the host's eglGetProcAddress: the address is the host GL's, never an AOSP front's or the driver's own
-    if file.starts_with("/system/") || file.starts_with("/vendor/") {
+    let in_android = |root: &str| Path::new(file).starts_with(root);
+    if in_android(atl_android_paths::SYSTEM) || in_android(atl_android_paths::VENDOR) {
         return Err(format!(
             "{name}'s address lies in {file}, not the host's GL"
         ));
@@ -833,7 +833,8 @@ mod tests {
 
     #[test]
     fn entry_names_read_the_second_field() {
-        let entries = "GL_ENTRY(GLenum, glGetError, void)\nGL_ENTRY(void, glClear, GLbitfield mask)\n";
+        let entries =
+            "GL_ENTRY(GLenum, glGetError, void)\nGL_ENTRY(void, glClear, GLbitfield mask)\n";
         assert_eq!(entry_names(entries), vec!["glGetError", "glClear"]);
     }
 
@@ -890,10 +891,7 @@ mod tests {
 
     #[test]
     fn no_node_held_and_no_render_node_is_the_software_tier() {
-        assert_eq!(
-            tier("none", "none", HOST_TIERS),
-            Ok("llvmpipe".to_owned())
-        );
+        assert_eq!(tier("none", "none", HOST_TIERS), Ok("llvmpipe".to_owned()));
     }
 
     #[test]

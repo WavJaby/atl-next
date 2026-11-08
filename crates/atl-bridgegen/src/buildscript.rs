@@ -435,9 +435,13 @@ pub fn import_headers(imports: &[HeaderImport]) -> Result<()> {
                 also: &also,
                 macros: import.macros,
             };
-            let iface =
-                crate::interface(import.name, import.source, &src, std::slice::from_ref(&target))
-                    .context(import.source)?;
+            let iface = crate::interface(
+                import.name,
+                import.source,
+                &src,
+                std::slice::from_ref(&target),
+            )
+            .context(import.source)?;
             crate::rust::import_module(&iface, &host.arch, import.functions, import.types)
         };
         let code = generate()?;

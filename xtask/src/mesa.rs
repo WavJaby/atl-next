@@ -206,7 +206,6 @@ pub const OUTPUTS: &[&str] = &[
     DRIVER,
 ];
 
-
 pub fn read_graph(out: &Path) -> Result<Graph> {
     let graph_file = out.join("graph.json");
     serde_json::from_slice(

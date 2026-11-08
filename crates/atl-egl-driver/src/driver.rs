@@ -217,10 +217,7 @@ impl Driver {
         };
         #[allow(clippy::print_stderr, reason = "one line, once per process")]
         {
-            eprintln!(
-                "libGLES_atl: device {} GL_RENDERER {renderer}",
-                self.device
-            );
+            eprintln!("libGLES_atl: device {} GL_RENDERER {renderer}", self.device);
         }
     }
 
