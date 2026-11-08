@@ -83,12 +83,13 @@ pub fn read_parcel(
 }
 
 /// Writes `wire` from byte `skip` on (past the interface token the transaction's parcel already holds) into `parcel`: words as int32s, each binder object (its 24 bytes and the stability word
-/// that follows) as `resolve(key)`'s binder. `DEAD_OBJECT` when a key resolves to nothing; `INVALID_OPERATION` for a file descriptor.
+/// that follows) as `resolve(key)`'s binder, each file descriptor object (24 bytes, no stability word) as a dup of `resolve_fd(number)`. `DEAD_OBJECT` when a binder key resolves to nothing, `BAD_VALUE` for a descriptor the core does not hold.
 pub fn write_body(
     parcel: &mut Parcel,
     wire: &WireParcel,
     skip: usize,
     resolve: &dyn Fn(u64) -> Option<SpIBinder>,
+    resolve_fd: &dyn Fn(i32) -> Option<OwnedFd>,
 ) -> Result<(), StatusCode> {
     let data = wire.data();
     let mut objects = wire.objects().iter().copied().peekable();
@@ -97,7 +98,16 @@ pub fn write_body(
         while objects.next_if(|&o| o < at).is_some() {}
         if objects.next_if(|&o| o == at).is_some() {
             if kind_at(data, at) == ObjectKind::Fd {
-                return Err(StatusCode::INVALID_OPERATION);
+                // `binder` holds the descriptor number (wire::set_fd_number); java.io.FileDescriptor writes the object the way libbinder does for a dup
+                let number = u64::from_le_bytes(
+                    data[at + 8..at + 16]
+                        .try_into()
+                        .map_err(|_| StatusCode::BAD_VALUE)?,
+                ) as u32 as i32;
+                let fd = resolve_fd(number).ok_or(StatusCode::BAD_VALUE)?;
+                parcel.write(&FileDescriptor::new(fd))?;
+                at += FLAT_OBJECT_SIZE;
+                continue;
             }
             let key = u64::from_le_bytes(
                 data[at + 16..at + 24]

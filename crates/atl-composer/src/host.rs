@@ -4,7 +4,7 @@
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -14,11 +14,11 @@ use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
 use atl_compositor::event::{ConnectionId, EventThread, FrameTick, VsyncEventData};
 use atl_compositor::model::{
     ClientCall, ColorLayer, Compositor, CompositorConfig, FrameOutput, LayerSpec,
+    attach_read_fences,
 };
 use atl_compositor::scene::{Quad, Scene, SceneFd};
 use atl_libgui_parcel::parcel::WireParcel;
-use atl_libgui_parcel::parcel::{BinderKey, FdObject, StrongBinder};
-use atl_libgui_parcel::state::Fence;
+use atl_libgui_parcel::parcel::{BinderKey, StrongBinder};
 use atl_libgui_parcel::transaction::{Transaction, TransactionState};
 use atl_libgui_parcel::wire::set_binder_key;
 use atl_parcelables::android::view::SurfaceControl_Transaction;
@@ -124,29 +124,13 @@ impl UiFrames {
         self.send(frame.calls, HashMap::new());
     }
 
-    /// The window painted: every waiting tick's calls go to the deliver thread, a release carrying the read fence the window exported for its buffer (`fences`: buffer id -> sync_file; none = released already).
+    /// The window painted: every waiting tick's calls go to the deliver thread, a release and the completion carrying it with the read fence the window exported for its buffer (`fences`: buffer id -> sync_file; none = released already).
     pub fn painted(&self, fences: Vec<(u64, OwnedFd)>) {
         let waiting =
             std::mem::take(&mut *self.unpainted.lock().unwrap_or_else(|e| e.into_inner()));
         let mut fences: HashMap<u64, OwnedFd> = fences.into_iter().collect();
         for mut calls in waiting {
-            let mut held = HashMap::new();
-            for call in &mut calls {
-                let release = match call {
-                    ClientCall::ReleaseBuffer { release, .. }
-                    | ClientCall::ReleaseOnChannel { release, .. } => release,
-                    ClientCall::TransactionCompleted { .. } => continue,
-                };
-                if let Some(fence) = fences.remove(&release.callback_id.buffer_id) {
-                    let fd = fence.as_raw_fd();
-                    release.release_fence = Fence(Some(FdObject {
-                        fd,
-                        flags: 0,
-                        cookie: 0,
-                    }));
-                    held.insert(fd, fence);
-                }
-            }
+            let held = attach_read_fences(&mut calls, &mut fences);
             self.send(calls, held);
         }
         // a fence whose buffer the core released in no waiting tick (the layer still holds it in another place) is dropped: closing a sync_file does not signal or cancel it
@@ -260,7 +244,7 @@ impl State {
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -280,6 +264,7 @@ impl State {
             s.releases_peer_gone,
             s.releases_fenced,
             s.releases_fenced_unmatched,
+            c.releases_carried,
             c.fence_waits,
             self.fds.len(),
             s.fds_taken,
@@ -868,7 +853,9 @@ impl Composer {
         let binder = self
             .listener_binder(listener)
             .ok_or_else(|| format!("listener {listener:?} is gone"))?;
-        listener::call(binder, code, &wire, &|key| self.resolve(key))
+        // a release fence is the frame's own (`fences`, open until these calls are delivered); the call takes a dup of it
+        let resolve_fd = |fd: i32| fences.get(&fd).and_then(|f| f.try_clone().ok());
+        listener::call(binder, code, &wire, &|key| self.resolve(key), &resolve_fd)
             .map_err(|e| format!("transaction {code} to the listener: {e:?}"))
     }
 

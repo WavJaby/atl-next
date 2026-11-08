@@ -13,6 +13,7 @@
 //! Fields of `layer_state_t` the software path does not need are decoded and counted by name in [`Counters::ignored`], never dropped without a trace.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use crate::callbacks::{
@@ -163,6 +164,8 @@ pub struct Counters {
     pub null_listener: u64,
     /// Buffers released (any route).
     pub buffers_released: u64,
+    /// Buffers released through their replacing transaction's completion (`SurfaceStats.previous_release_callback_id`); the channel write, when the layer has one, goes with it.
+    pub releases_carried: u64,
     /// Buffers acquired (accepted into a layer, or dropped on a cache miss).
     pub buffers_acquired: u64,
     /// Transaction-completed stats sent.
@@ -193,6 +196,8 @@ struct Held {
     frame_number: u64,
     acquire_fence: Option<SceneFd>,
     release_listener: StrongBinder,
+    /// `releaseBufferEndpoint`: the listener whose completion carries this buffer's release (AOSP `mPreviousReleaseBufferEndpoint`).
+    release_endpoint: StrongBinder,
 }
 
 impl Held {
@@ -231,6 +236,14 @@ struct Layer {
     seq: u64,
 }
 
+/// What applying a buffer did to its layer: the frame numbers it replaced and took (0 when none), and the replaced buffer's release when its completion carries it.
+#[derive(Debug)]
+struct BufferChange {
+    previous_frame: u64,
+    frame: u64,
+    carried: Option<(ReleaseCallbackId, StrongBinder)>,
+}
+
 /// What a frame knows about one transaction it applied, to answer its callbacks afterwards.
 #[derive(Debug)]
 struct Applied {
@@ -244,6 +257,93 @@ struct AppliedLayer {
     listeners: Vec<ListenerCallbacks>,
     frame_number: u64,
     previous_frame_number: u64,
+    /// The replaced buffer's release, carried by this layer's completion to the listener it names.
+    previous_release: Option<(ReleaseCallbackId, StrongBinder)>,
+}
+
+/// Whether a transaction's completion can carry the release of the buffer it replaced: one of its listeners is the buffer's release endpoint, with a complete callback (BBQ registers one on every buffer transaction).
+fn carries_release(listeners: &[ListenerCallbacks], endpoint: &StrongBinder) -> bool {
+    !endpoint.is_null()
+        && listeners.iter().any(|lc| {
+            !lc.listener.is_null()
+                && lc.listener.key() == endpoint.key()
+                && lc
+                    .callback_ids
+                    .iter()
+                    .any(|id| id.ty == CallbackId::ON_COMPLETE)
+        })
+}
+
+fn fence_of(fd: i32) -> Fence {
+    Fence(Some(FdObject {
+        fd,
+        flags: 0,
+        cookie: 0,
+    }))
+}
+
+/// The buffers a call releases: its own release, or the one its completion carries.
+fn released_buffers(call: &ClientCall) -> Vec<u64> {
+    match call {
+        ClientCall::ReleaseBuffer { release, .. }
+        | ClientCall::ReleaseOnChannel { release, .. } => {
+            vec![release.callback_id.buffer_id]
+        }
+        ClientCall::TransactionCompleted { stats, .. } => stats
+            .transaction_stats
+            .iter()
+            .flat_map(|t| &t.surface_stats)
+            .map(|s| s.previous_release_callback_id)
+            .filter(|id| *id != NO_RELEASE_CALLBACK)
+            .map(|id| id.buffer_id)
+            .collect(),
+    }
+}
+
+/// Gives each release in `calls`, and each completion's carried release, the read fence the window exported for its buffer (`fences`: buffer id -> sync_file). A release and the completion carrying it share one fence, taken from `fences` once; a buffer with none stays NO_FENCE.
+/// Returns the fences by descriptor number: the caller keeps them open until the calls are delivered.
+pub fn attach_read_fences(
+    calls: &mut [ClientCall],
+    fences: &mut HashMap<u64, OwnedFd>,
+) -> HashMap<i32, OwnedFd> {
+    let mut held = HashMap::new();
+    let mut fd_of: HashMap<u64, i32> = HashMap::new();
+    for call in calls.iter() {
+        for buffer_id in released_buffers(call) {
+            if fd_of.contains_key(&buffer_id) {
+                continue;
+            }
+            if let Some(fence) = fences.remove(&buffer_id) {
+                let fd = fence.as_raw_fd();
+                fd_of.insert(buffer_id, fd);
+                held.insert(fd, fence);
+            }
+        }
+    }
+    for call in calls.iter_mut() {
+        match call {
+            ClientCall::ReleaseBuffer { release, .. }
+            | ClientCall::ReleaseOnChannel { release, .. } => {
+                if let Some(&fd) = fd_of.get(&release.callback_id.buffer_id) {
+                    release.release_fence = fence_of(fd);
+                }
+            }
+            ClientCall::TransactionCompleted { stats, .. } => {
+                for s in stats
+                    .transaction_stats
+                    .iter_mut()
+                    .flat_map(|t| t.surface_stats.iter_mut())
+                {
+                    if s.previous_release_callback_id != NO_RELEASE_CALLBACK
+                        && let Some(&fd) = fd_of.get(&s.previous_release_callback_id.buffer_id)
+                    {
+                        s.previous_release_fence = Some(fence_of(fd));
+                    }
+                }
+            }
+        }
+    }
+    held
 }
 
 fn rect_valid(r: &Rect) -> bool {
@@ -503,13 +603,18 @@ impl Compositor {
             .collect()
     }
 
-    fn release(&mut self, held: &Held, channel: Option<FdObject>, calls: &mut Vec<ClientCall>) {
-        self.counters.buffers_released += 1;
-        let release = ReleaseBuffer {
+    /// The release of `held` with no fence yet: the window's read fence is attached when it paints ([`attach_read_fences`]).
+    fn release_of(&self, held: &Held) -> ReleaseBuffer {
+        ReleaseBuffer {
             callback_id: held.id(),
             release_fence: Fence(None),
             current_max_acquired_buffer_count: self.config.max_acquired_buffer_count,
-        };
+        }
+    }
+
+    fn release(&mut self, held: &Held, channel: Option<FdObject>, calls: &mut Vec<ClientCall>) {
+        self.counters.buffers_released += 1;
+        let release = self.release_of(held);
         if let Some(channel) = channel {
             calls.push(ClientCall::ReleaseOnChannel { channel, release });
         } else if !held.release_listener.is_null() {
@@ -674,6 +779,7 @@ impl Compositor {
         let mut handled = 0u64;
         let mut frame_number = 0u64;
         let mut previous_frame_number = 0u64;
+        let mut previous_release = None;
         {
             let l = self.layers.get_mut(&key).expect("checked above");
             if w & what::E_POSITION_CHANGED != 0 {
@@ -745,8 +851,10 @@ impl Compositor {
         }
         if w & what::E_BUFFER_CHANGED != 0 && self.config.latch_buffers {
             handled |= what::E_BUFFER_CHANGED;
-            (previous_frame_number, frame_number) =
-                self.apply_buffer(key, s.buffer_data.as_ref(), calls);
+            let change = self.apply_buffer(key, s.buffer_data.as_ref(), &s.listeners, calls);
+            previous_frame_number = change.previous_frame;
+            frame_number = change.frame;
+            previous_release = change.carried;
         }
         self.dirty = true;
         for &(bit, name) in what::ALL {
@@ -760,17 +868,21 @@ impl Compositor {
             listeners: s.listeners.clone(),
             frame_number,
             previous_frame_number,
+            previous_release,
         })
     }
 
-    /// Gives the layer the buffer `bd` names (or clears it); returns (previous frame number, new frame number), 0 when none.
+    /// Gives the layer the buffer `bd` names (or clears it). The buffer it replaces is released: with its replacing transaction's completion when `listeners` carry it ([`carries_release`]), else standalone.
     fn apply_buffer(
         &mut self,
         key: BinderKey,
         bd: Option<&BufferData>,
+        listeners: &[ListenerCallbacks],
         calls: &mut Vec<ClientCall>,
-    ) -> (u64, u64) {
+    ) -> BufferChange {
         let channel = self.layers.get(&key).and_then(|l| l.release_channel);
+        // a buffer latched earlier in this tick was never shown: its release is standalone (AOSP's dropped-buffer path, Layer::releasePreviousBuffer)
+        let shown = self.layers.get(&key).is_some_and(|l| !l.latched_this_frame);
         let previous = self.layers.get_mut(&key).and_then(|l| l.held.take());
         let previous_frame = previous.as_ref().map_or(0, |h| h.frame_number);
         let mut new_frame = 0;
@@ -803,6 +915,7 @@ impl Compositor {
                         frame_number: bd.frame_number,
                         acquire_fence: bd.acquire_fence.as_ref().and_then(SceneFd::of_fence),
                         release_listener: bd.release_buffer_listener,
+                        release_endpoint: bd.release_buffer_endpoint,
                     });
                 }
                 None if cached => {
@@ -816,10 +929,28 @@ impl Compositor {
             l.held = new_held;
             l.latched_this_frame = true;
         }
+        let mut carried = None;
         if let Some(p) = previous {
-            self.release(&p, channel, calls);
+            if shown && carries_release(listeners, &p.release_endpoint) {
+                // SurfaceFlinger sends a shown buffer's release with the completion of the transaction that replaced it, and writes the channel before any completion of the tick (TransactionCallbackInvoker.cpp:137-161, 170-180)
+                self.counters.buffers_released += 1;
+                self.counters.releases_carried += 1;
+                if let Some(channel) = channel {
+                    calls.push(ClientCall::ReleaseOnChannel {
+                        channel,
+                        release: self.release_of(&p),
+                    });
+                }
+                carried = Some((p.id(), p.release_endpoint));
+            } else {
+                self.release(&p, channel, calls);
+            }
         }
-        (previous_frame, new_frame)
+        BufferChange {
+            previous_frame,
+            frame: new_frame,
+            carried,
+        }
     }
 
     fn complete(&mut self, applied: Vec<Applied>, now_ns: i64, calls: &mut Vec<ClientCall>) {
@@ -870,7 +1001,11 @@ impl Compositor {
                             refresh_start_time: now_ns,
                             ..Default::default()
                         },
-                        previous_release_callback_id: NO_RELEASE_CALLBACK,
+                        previous_release_callback_id: l
+                            .previous_release
+                            .as_ref()
+                            .filter(|(_, endpoint)| endpoint.key() == key)
+                            .map_or(NO_RELEASE_CALLBACK, |(id, _)| *id),
                     })
                     .collect();
                 let ts = TransactionStats {

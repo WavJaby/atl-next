@@ -2,6 +2,8 @@
 //! The calls back into libgui's `TransactionCompletedListener` (hand-written C++, `android.gui.ITransactionComposerListener`: raw one-way transactions, no AIDL). The interface exists here only to make a
 //! proxy: libbinder_rs's `prepare_transact` needs a class associated with the binder, which `into_interface` does (and checks the descriptor against the listener's own).
 
+use std::os::fd::OwnedFd;
+
 use atl_compositor::callbacks::LISTENER_DESCRIPTOR;
 use atl_libgui_parcel::parcel::WireParcel;
 use atl_services::counters;
@@ -33,12 +35,13 @@ fn on_transact(
 impl ITransactionCompletedListener for BpTransactionCompletedListener {}
 impl ITransactionCompletedListener for Binder<BnTransactionCompletedListener> {}
 
-/// Sends `wire` (a call the core encoded: interface token first) to `listener` as one-way transaction `code`; binders in it resolve through `resolve`.
+/// Sends `wire` (a call the core encoded: interface token first) to `listener` as one-way transaction `code`; binders in it resolve through `resolve`, descriptors (a release fence) through `resolve_fd`.
 pub fn call(
     listener: SpIBinder,
     code: TransactionCode,
     wire: &WireParcel,
     resolve: &dyn Fn(u64) -> Option<SpIBinder>,
+    resolve_fd: &dyn Fn(i32) -> Option<OwnedFd>,
 ) -> Result<(), StatusCode> {
     let proxy: Strong<dyn ITransactionCompletedListener> = listener.into_interface()?;
     let binder = proxy.as_binder();
@@ -48,7 +51,7 @@ pub fn call(
         .enforce_interface(LISTENER_DESCRIPTOR)
         .map_err(|_| StatusCode::BAD_VALUE)?;
     let mut parcel = binder.prepare_transact()?;
-    write_body(&mut parcel, wire, reader.position(), resolve)?;
+    write_body(&mut parcel, wire, reader.position(), resolve, resolve_fd)?;
     binder.submit_transact(code, parcel, FLAG_ONEWAY)?;
     Ok(())
 }

@@ -121,6 +121,23 @@ fn channel_state(layer: &StrongBinder, fd: i32) -> LayerState {
     s
 }
 
+/// The releases the completions in `calls` carry (`previous_release_callback_id`), in order.
+fn carried_releases(calls: &[ClientCall]) -> Vec<ReleaseCallbackId> {
+    let mut out = Vec::new();
+    for call in calls {
+        if let ClientCall::TransactionCompleted { stats, .. } = call {
+            for ts in &stats.transaction_stats {
+                for ss in &ts.surface_stats {
+                    if ss.previous_release_callback_id != NO_RELEASE_CALLBACK {
+                        out.push(ss.previous_release_callback_id);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn releases(calls: &[ClientCall]) -> Vec<ReleaseCallbackId> {
     calls
         .iter()
@@ -232,8 +249,9 @@ fn release_goes_to_the_channel_with_the_replaced_buffers_id() {
     }
 }
 
+/// AOSP: a shown buffer's release rides the completion of the transaction that replaced it (`previousReleaseCallbackId`), and no `onReleaseBuffer` call is made for it (Layer.cpp:1270-1271, 826-831; TransactionCallbackInvoker.cpp:137-145).
 #[test]
-fn release_goes_to_the_listener_without_a_channel() {
+fn release_without_a_channel_rides_the_completion() {
     let layer = local(1);
     let listener = local(2);
     let mut c = Compositor::new(CompositorConfig::default());
@@ -246,7 +264,258 @@ fn release_goes_to_the_listener_without_a_channel() {
         &layer, &listener, 202, 2, 8, 8, false, 2,
     )]));
     let out = c.on_frame(20);
-    assert!(out.calls.iter().any(|c| matches!(c, ClientCall::ReleaseBuffer { listener: l, release } if *l == listener && release.callback_id.buffer_id == 201)));
+    assert!(
+        !out.calls
+            .iter()
+            .any(|c| matches!(c, ClientCall::ReleaseBuffer { .. })),
+        "no onReleaseBuffer for a shown buffer: {:?}",
+        out.calls
+    );
+    let [ClientCall::TransactionCompleted { stats, .. }] = out.calls.as_slice() else {
+        panic!("expected one completion, got {:?}", out.calls)
+    };
+    let ss = &stats.transaction_stats[0].surface_stats[0];
+    assert_eq!(
+        ss.previous_release_callback_id,
+        ReleaseCallbackId {
+            buffer_id: 201,
+            frame_number: 1
+        }
+    );
+    assert_eq!(c.counters().releases_carried, 1);
+}
+
+/// AOSP order within one tick: the replaced buffer's channel write comes first (TransactionCallbackInvoker::sendCallbacks writes `mBufferReleases` before any completion), then the completion of the transaction that replaced it, which carries that release and the new frame number.
+#[test]
+fn replaced_buffer_is_released_with_its_completion_after_its_channel_write() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    let first = c.on_frame(10);
+    let [ClientCall::TransactionCompleted { stats, .. }] = first.calls.as_slice() else {
+        panic!("expected one completion, got {:?}", first.calls)
+    };
+    assert_eq!(
+        stats.transaction_stats[0].surface_stats[0].previous_release_callback_id,
+        NO_RELEASE_CALLBACK,
+        "nothing was replaced by the first buffer"
+    );
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    let out = c.on_frame(20);
+    let [
+        ClientCall::ReleaseOnChannel { channel, release },
+        ClientCall::TransactionCompleted { stats, .. },
+    ] = out.calls.as_slice()
+    else {
+        panic!(
+            "expected channel release then completion, got {:?}",
+            out.calls
+        )
+    };
+    assert_eq!(channel.fd, 90);
+    assert_eq!(
+        release.callback_id,
+        ReleaseCallbackId {
+            buffer_id: 201,
+            frame_number: 1
+        }
+    );
+    let ss = &stats.transaction_stats[0].surface_stats[0];
+    assert_eq!(ss.previous_release_callback_id, release.callback_id);
+    assert_eq!(ss.event_stats.frame_number, 2);
+}
+
+/// BBQ's own accounting as the libgui code does it (BLASTBufferQueue.cpp:417-427 sweep, SurfaceComposerClient.cpp:560-578 release-from-completion): a release reaches it from the call that carries it, or from its channel only when it blocks for a free buffer (`readBlocking`); at each completion the carried release comes first, then every older buffer still submitted is faked.
+/// The contract: no completion finds an older buffer still submitted, and the producer never blocks with no release left to read.
+#[test]
+fn bbq_accounting_never_fakes_a_release() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![
+        flags_state(
+            &layer,
+            layer_flags::ENABLE_BACKPRESSURE,
+            layer_flags::ENABLE_BACKPRESSURE,
+        ),
+        channel_state(&layer, 90),
+    ]));
+    c.on_frame(1);
+
+    let max_acquired = u64::from(c.config().max_acquired_buffer_count);
+    let limit = max_acquired + 2; // mNumAcquired >= mMaxAcquiredBuffers + 2 stalls (BLASTBufferQueue.cpp:564)
+    // buffers as (buffer id, frame number): ReleaseCallbackId is not Ord
+    let mut submitted: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut unread: VecDeque<(u64, u64)> = VecDeque::new(); // channel datagrams BBQ has not read
+    let mut fakes = 0u64;
+    for frame in 1..=25u64 {
+        while submitted.len() as u64 >= limit {
+            let id = unread
+                .pop_front()
+                .expect("producer stalled: no release left to read");
+            submitted.remove(&id);
+        }
+        // three buffers rotate (ids 101..=103); the first use of each is a full buffer, later ones are cache hits
+        let first_use = frame <= 3;
+        let buffer_id = 100 + ((frame - 1) % 3) + 1;
+        submitted.insert((buffer_id, frame));
+        c.queue_transaction(tx(vec![buffer_state(
+            &layer,
+            &listener,
+            buffer_id,
+            frame,
+            64,
+            48,
+            !first_use,
+            frame as i64,
+        )]));
+        let out = c.on_frame(frame as i64 * 16);
+        for call in &out.calls {
+            match call {
+                ClientCall::ReleaseOnChannel { release, .. } => {
+                    let r = release.callback_id;
+                    unread.push_back((r.buffer_id, r.frame_number));
+                }
+                ClientCall::ReleaseBuffer { release, .. } => {
+                    let r = release.callback_id;
+                    submitted.remove(&(r.buffer_id, r.frame_number));
+                }
+                ClientCall::TransactionCompleted { stats, .. } => {
+                    for ts in &stats.transaction_stats {
+                        for ss in &ts.surface_stats {
+                            let carried = ss.previous_release_callback_id;
+                            if carried != NO_RELEASE_CALLBACK {
+                                submitted.remove(&(carried.buffer_id, carried.frame_number));
+                            }
+                            let sweep: Vec<(u64, u64)> = submitted
+                                .iter()
+                                .filter(|(_, frame)| *frame < ss.event_stats.frame_number)
+                                .copied()
+                                .collect();
+                            fakes += sweep.len() as u64;
+                            for k in sweep {
+                                submitted.remove(&k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(fakes, 0, "completions faked {fakes} releases");
+}
+
+/// Standalone releases still reach the producer (dropped, cache-miss, destroyed layers): a buffer latched and replaced within one tick was never shown, so its release is not carried.
+#[test]
+fn buffer_replaced_in_the_tick_it_was_latched_is_released_standalone() {
+    let layer = local(1);
+    let listener = local(2);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 7, None)).unwrap();
+    c.queue_transaction(tx(vec![channel_state(&layer, 90)]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 201, 1, 8, 8, false, 1,
+    )]));
+    c.queue_transaction(tx(vec![buffer_state(
+        &layer, &listener, 202, 2, 8, 8, false, 2,
+    )]));
+    let out = c.on_frame(10);
+    assert!(out.calls.iter().any(|c| matches!(
+        c,
+        ClientCall::ReleaseOnChannel { release, .. } if release.callback_id.buffer_id == 201
+    )));
+    assert_eq!(c.counters().releases_carried, 0);
+}
+
+/// The read fence the window exports for a buffer rides both its release and the completion carrying it (one fence, one descriptor); a buffer no paint names stays NO_FENCE on both; a fence no call names is returned unused.
+#[test]
+fn attach_read_fences_shares_one_fence_between_a_release_and_its_completion() {
+    use std::os::fd::AsRawFd;
+    let (fence_a, _peer_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (fence_unused, _peer_u) = std::os::unix::net::UnixStream::pair().unwrap();
+    let fd_a = fence_a.as_raw_fd();
+    let carried = ReleaseCallbackId {
+        buffer_id: 7,
+        frame_number: 3,
+    };
+    let release = |buffer_id| ReleaseBuffer {
+        callback_id: ReleaseCallbackId {
+            buffer_id,
+            frame_number: 3,
+        },
+        release_fence: Fence(None),
+        current_max_acquired_buffer_count: 2,
+    };
+    let completion = |previous: ReleaseCallbackId| ClientCall::TransactionCompleted {
+        listener: local(2),
+        stats: ListenerStats {
+            transaction_stats: vec![TransactionStats {
+                callback_ids: vec![],
+                latch_time: 0,
+                present_fence: None,
+                surface_stats: vec![SurfaceStats {
+                    surface_control: local(1),
+                    acquire_time_or_fence: AcquireTimeOrFence::Time(0),
+                    previous_release_fence: None,
+                    transform_hint: None,
+                    current_max_acquired_buffer_count: 2,
+                    event_stats: FrameEventHistoryStats::default(),
+                    previous_release_callback_id: previous,
+                }],
+            }],
+        },
+    };
+    let mut calls = vec![
+        ClientCall::ReleaseOnChannel {
+            channel: FdObject::new(90, false),
+            release: release(7),
+        },
+        completion(carried),
+        completion(ReleaseCallbackId {
+            buffer_id: 8,
+            frame_number: 3,
+        }),
+    ];
+    let mut fences: HashMap<u64, OwnedFd> = HashMap::new();
+    fences.insert(7, fence_a.into());
+    fences.insert(9, fence_unused.into());
+    let held = attach_read_fences(&mut calls, &mut fences);
+
+    let ClientCall::ReleaseOnChannel { release, .. } = &calls[0] else {
+        panic!("release moved")
+    };
+    assert_eq!(release.release_fence.0.as_ref().map(|f| f.fd), Some(fd_a));
+    let ClientCall::TransactionCompleted { stats, .. } = &calls[1] else {
+        panic!("completion moved")
+    };
+    let carried_fence = stats.transaction_stats[0].surface_stats[0]
+        .previous_release_fence
+        .as_ref()
+        .and_then(|f| f.0.as_ref())
+        .map(|f| f.fd);
+    assert_eq!(carried_fence, Some(fd_a));
+    let ClientCall::TransactionCompleted { stats, .. } = &calls[2] else {
+        panic!("completion moved")
+    };
+    assert!(
+        stats.transaction_stats[0].surface_stats[0]
+            .previous_release_fence
+            .is_none(),
+        "buffer 8 has no fence"
+    );
+    assert_eq!(held.keys().copied().collect::<Vec<_>>(), vec![fd_a]);
+    assert!(
+        fences.contains_key(&9),
+        "an unnamed fence is left for the caller"
+    );
 }
 
 /// With backpressure a layer takes one new buffer per tick; the second transaction waits and the first buffer is released only when the second latches.
@@ -984,8 +1253,10 @@ fn unsignalled_acquire_fence_waits_and_keeps_the_shown_buffer() {
         out.scene.unwrap().quads[0].buffer().unwrap().frame_number,
         2
     );
+    // no channel on this layer: the release rides the completion of the transaction that latched 402
+    assert!(releases(&out.calls).is_empty());
     assert_eq!(
-        releases(&out.calls),
+        carried_releases(&out.calls),
         [ReleaseCallbackId {
             buffer_id: 401,
             frame_number: 1
