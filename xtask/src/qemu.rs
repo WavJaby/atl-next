@@ -137,9 +137,7 @@ pub fn plan(root: &Path, arch: &str, out: Option<&Path>, pic: bool) -> Result<Bu
     let suffix = if pic { "-pic" } else { "" };
     Ok(Build {
         arch: arch.to_owned(),
-        dir: out
-            .join(DIR)
-            .join(format!("{target}-linux-user{suffix}")),
+        dir: out.join(DIR).join(format!("{target}-linux-user{suffix}")),
         target,
         pic,
         src,
@@ -354,7 +352,11 @@ mod tests {
         assert!(args.contains(&"--cc=clang-19".to_owned()));
         assert!(args.contains(&"--cross-cc-aarch64=/ndk/aarch64-linux-android29-clang".to_owned()));
         assert!(args.contains(&"--cross-cc-cflags-aarch64=-static".to_owned()));
-        assert!(!args.iter().any(|a| a.contains("-fPIC") || a == "--disable-pie"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("-fPIC") || a == "--disable-pie")
+        );
     }
 
     #[test]
