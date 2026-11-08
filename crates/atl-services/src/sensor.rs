@@ -577,7 +577,10 @@ impl SensorHub {
             if stream.is_none() {
                 match self.source.open(&id) {
                     Ok(st) => {
-                        counters::answered(INTERFACE, &format!("accelerometer tier: {}", st.tier()));
+                        counters::answered(
+                            INTERFACE,
+                            &format!("accelerometer tier: {}", st.tier()),
+                        );
                         stream = Some(st);
                         ts_seen = 0;
                     }
@@ -829,9 +832,16 @@ mod tests {
             assert_eq!(v, [3.0, 3.0, 3.0]);
             stamps.push(i64::from_ne_bytes(e[16..24].try_into().unwrap()));
         }
-        assert!(stamps.windows(2).all(|w| w[1] > w[0]), "stamps move forward: {stamps:?}");
+        assert!(
+            stamps.windows(2).all(|w| w[1] > w[0]),
+            "stamps move forward: {stamps:?}"
+        );
         // five events at 20 ms: the first at once, the next four one period apart (not a burst)
-        assert!(started.elapsed() >= Duration::from_millis(60), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "{:?}",
+            started.elapsed()
+        );
         hub.drop_connection(1);
     }
 

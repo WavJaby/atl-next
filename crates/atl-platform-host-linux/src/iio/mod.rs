@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use atl_platform_host_api::{Accelerometer, Fallback, Sample, SampleStream, SensorError, Sensors, Tier};
+use atl_platform_host_api::{
+    Accelerometer, Fallback, Sample, SampleStream, SensorError, Sensors, Tier,
+};
 
 /// Where the kernel lists IIO devices. Product default; tests inject their own root through the field.
 const IIO_DEVICES: &str = "/sys/bus/iio/devices";
@@ -295,7 +297,8 @@ impl IioSensors {
             .and_then(|t| real_bits(&t))
             .unwrap_or(DEFAULT_REAL_BITS);
         let interval = Self::interval(dir)?;
-        let tier = match buffer::probe(&self.root, dir).and_then(|_| buffer::claim(&self.node(id))) {
+        let tier = match buffer::probe(&self.root, dir).and_then(|_| buffer::claim(&self.node(id)))
+        {
             Ok(_) => Tier::Buffered,
             Err(why) => Tier::Polled(why),
         };
@@ -497,7 +500,12 @@ pub(crate) mod tests {
         let f = Fake::new("mm", &[(&files, None)]);
         let s = f.sensors();
         // sensor = ((100+10), (-200+10), (1000+10)) x 0.01 = (1.1, -1.9, 10.1) -> canonical (-1.9, -1.1, 10.1) -> Android (1.9, 1.1, 10.1)
-        let got = s.open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        let got = s
+            .open("iio:device0")
+            .unwrap()
+            .next(Duration::ZERO)
+            .unwrap()
+            .unwrap();
         assert!(close(got.values, [1.9, 1.1, 10.1]));
         let a = &s.accelerometers()[0];
         assert_eq!(a.min_period, Duration::from_millis(330));
@@ -544,13 +552,25 @@ pub(crate) mod tests {
         let mut files = RAW.to_vec();
         files.push(("in_mount_matrix", "0, 1, 0; 1, 0, 0; 0, 0, 1"));
         let f = Fake::new("inmm", &[(&files, None)]);
-        let got = f.sensors().open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        let got = f
+            .sensors()
+            .open("iio:device0")
+            .unwrap()
+            .next(Duration::ZERO)
+            .unwrap()
+            .unwrap();
         assert!(close(got.values, [2.0, -1.0, 10.0]));
         // mount_matrix beats in_accel_mount_matrix and in_mount_matrix; an unparsable udev property falls through
         files.push(("in_accel_mount_matrix", "0, 1, 0; 1, 0, 0; 0, 0, 1"));
         files.push(("mount_matrix", "1, 0, 0; 0, 1, 0; 0, 0, -1"));
         let f = Fake::new("mm2", &[(&files, Some("E:ACCEL_MOUNT_MATRIX=bogus\n"))]);
-        let got = f.sensors().open("iio:device0").unwrap().next(Duration::ZERO).unwrap().unwrap();
+        let got = f
+            .sensors()
+            .open("iio:device0")
+            .unwrap()
+            .next(Duration::ZERO)
+            .unwrap()
+            .unwrap();
         assert!(close(got.values, [-1.0, 2.0, -10.0]));
     }
 

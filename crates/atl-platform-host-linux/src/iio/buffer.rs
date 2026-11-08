@@ -8,12 +8,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use atl_platform_host_api::{Fallback, Sample, SampleStream, SensorError, Tier};
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
-use rustix::time::{clock_gettime, ClockId};
+use rustix::time::{ClockId, clock_gettime};
 
-use super::{read_text, Calibration, AXES};
+use super::{AXES, Calibration, read_text};
 
 const NS_PER_S: i64 = 1_000_000_000;
 /// A stamp this far from arrival is not in the clock the kernel names. 1 s is far above poll latency (ms) and far below a stale ring (the ring holds 128 scans = 12.8 s at 10 Hz; design 5.1 P6).
@@ -85,7 +85,10 @@ impl Channel {
         let word = if self.ty.big_endian {
             bytes.iter().fold(0u64, |w, b| (w << 8) | u64::from(*b))
         } else {
-            bytes.iter().rev().fold(0u64, |w, b| (w << 8) | u64::from(*b))
+            bytes
+                .iter()
+                .rev()
+                .fold(0u64, |w, b| (w << 8) | u64::from(*b))
         };
         let mask = if self.ty.bits == 64 {
             u64::MAX
@@ -124,7 +127,10 @@ fn layout_from(read: impl Fn(&str) -> Option<String>) -> Option<Layout> {
         if read(&format!("scan_elements/{name}_en"))? != "1" {
             return None;
         }
-        Some((index, parse_type(&read(&format!("scan_elements/{name}_type"))?)?))
+        Some((
+            index,
+            parse_type(&read(&format!("scan_elements/{name}_type"))?)?,
+        ))
     };
     let [Some(x), Some(y), Some(z)] = AXES.map(|a| chan(&format!("in_accel_{a}"))) else {
         return None;
@@ -397,7 +403,7 @@ mod tests {
     use atl_platform_host_api::Sensors;
 
     use super::*;
-    use crate::iio::tests::{close, Fake, LAPTOP_CASES, RAW};
+    use crate::iio::tests::{Fake, LAPTOP_CASES, RAW, close};
 
     /// The owner's laptop, `scan_elements` as read 2026-11-08 (`run`): x, y, z `le:s32/32>>0` at indices 0-2, the timestamp `le:s64/64>>0` at index 3.
     const LAPTOP_LAYOUT: [(&str, &str); 12] = [
@@ -425,7 +431,10 @@ mod tests {
     const LAPTOP_MATRIX: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]];
 
     /// The laptop's files, with `change` replacing or adding keys and `remove` dropping keys.
-    fn files(change: &[(&'static str, &'static str)], remove: &[&str]) -> Vec<(&'static str, &'static str)> {
+    fn files(
+        change: &[(&'static str, &'static str)],
+        remove: &[&str],
+    ) -> Vec<(&'static str, &'static str)> {
         let mut v: Vec<(&'static str, &'static str)> = RAW
             .iter()
             .chain(LAPTOP_LAYOUT.iter())
@@ -489,7 +498,12 @@ mod tests {
     #[test]
     fn laptop_layout_is_offsets_0_4_8_16_size_24() {
         let l = laptop_layout();
-        let offsets = [l.axes[0].offset, l.axes[1].offset, l.axes[2].offset, l.timestamp.offset];
+        let offsets = [
+            l.axes[0].offset,
+            l.axes[1].offset,
+            l.axes[2].offset,
+            l.timestamp.offset,
+        ];
         assert_eq!(offsets, [0, 4, 8, 16]);
         assert_eq!(l.size, 24);
     }
@@ -556,7 +570,10 @@ mod tests {
             let (r, ts) = layout.decode(&s);
             assert_eq!(ts, 1_234_567_890);
             let buffered = calibration.frame(r);
-            assert!(close(buffered, want), "{raw:?}: buffered {buffered:?}, want {want:?}");
+            assert!(
+                close(buffered, want),
+                "{raw:?}: buffered {buffered:?}, want {want:?}"
+            );
             // the polled path on the same raw counts (no buffer files: it says `not-enabled`)
             let f = Fake::new(
                 "g2",
@@ -580,7 +597,10 @@ mod tests {
                 .expect("reads")
                 .expect("a sample")
                 .values;
-            assert!(close(buffered, polled), "{raw:?}: buffered {buffered:?}, polled {polled:?}");
+            assert!(
+                close(buffered, polled),
+                "{raw:?}: buffered {buffered:?}, polled {polled:?}"
+            );
         }
     }
 
@@ -592,12 +612,18 @@ mod tests {
             probe(&f.0.join("sys"), &f.dir(0)).map(|_| ()).err()
         };
         assert_eq!(reason(&files(&[], &[])), None);
-        assert_eq!(reason(&files(&[], &["scan_elements/in_accel_y_en"])), Some(Fallback::Layout));
+        assert_eq!(
+            reason(&files(&[], &["scan_elements/in_accel_y_en"])),
+            Some(Fallback::Layout)
+        );
         assert_eq!(
             reason(&files(&[("trigger/current_trigger", "missing")], &[])),
             Some(Fallback::Trigger)
         );
-        assert_eq!(reason(&files(&[("buffer/enable", "0")], &[])), Some(Fallback::NotEnabled));
+        assert_eq!(
+            reason(&files(&[("buffer/enable", "0")], &[])),
+            Some(Fallback::NotEnabled)
+        );
         assert_eq!(
             reason(&files(&[("current_timestamp_clock", "tai2")], &[])),
             Some(Fallback::Clock)
@@ -626,7 +652,10 @@ mod tests {
         let started = Instant::now();
         let st = sensors.open("iio:device0").expect("opens");
         assert_eq!(st.tier(), Tier::Polled(Fallback::NoData));
-        assert!(started.elapsed() >= FRESH_WAIT, "waits the open-time window");
+        assert!(
+            started.elapsed() >= FRESH_WAIT,
+            "waits the open-time window"
+        );
     }
 
     /// G4: newest scan wins; the end of a writer's stream is an error. The writer writes and closes before the stream opens, so the open-time wait reads all three.
@@ -637,14 +666,28 @@ mod tests {
         let _reader = hold_fifo(&node);
         let mut w = writer(&node);
         for v in [1, 2, 3] {
-            w.write_all(&scan(v, clock_ns(ClockId::Realtime))).expect("write");
+            w.write_all(&scan(v, clock_ns(ClockId::Realtime)))
+                .expect("write");
         }
         drop(w);
-        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
-            .expect("opens on the fresh scans");
-        let first = s.next(Duration::from_millis(100)).expect("reads").expect("a sample");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens on the fresh scans");
+        let first = s
+            .next(Duration::from_millis(100))
+            .expect("reads")
+            .expect("a sample");
         // x = 3 counts at 0.01 m/s^2, Android x negated
-        assert!(close([first.values[0], 0.0, 0.0], [-0.03, 0.0, 0.0]), "{:?}", first.values);
+        assert!(
+            close([first.values[0], 0.0, 0.0], [-0.03, 0.0, 0.0]),
+            "{:?}",
+            first.values
+        );
         // nothing left, and the writer has gone: an error, not a silent repeat
         assert!(s.next(Duration::from_millis(50)).is_err());
     }
@@ -659,15 +702,35 @@ mod tests {
         let now = clock_ns(ClockId::Realtime);
         w.write_all(&scan(7, now - 5 * NS_PER_S)).expect("write");
         // stale only: the open waits out its window and reports no-data
-        let stale_only = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib());
+        let stale_only = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        );
         assert!(matches!(stale_only, Err(Fallback::NoData)));
         // stale, then a fresh scan
         w.write_all(&scan(7, now - 5 * NS_PER_S)).expect("write");
-        w.write_all(&scan(8, clock_ns(ClockId::Realtime))).expect("write");
-        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
-            .expect("opens on the fresh scan");
-        let first = s.next(Duration::from_millis(50)).expect("reads").expect("a sample");
-        assert!(close([first.values[0], 0.0, 0.0], [-0.08, 0.0, 0.0]), "{:?}", first.values);
+        w.write_all(&scan(8, clock_ns(ClockId::Realtime)))
+            .expect("write");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens on the fresh scan");
+        let first = s
+            .next(Duration::from_millis(50))
+            .expect("reads")
+            .expect("a sample");
+        assert!(
+            close([first.values[0], 0.0, 0.0], [-0.08, 0.0, 0.0]),
+            "{:?}",
+            first.values
+        );
         let age = clock_ns(ClockId::Boottime) - first.boottime_ns;
         assert!(age.abs() < FRESH_AGE_NS, "fresh stamp, age {age} ns");
     }
@@ -679,14 +742,24 @@ mod tests {
         let node = f.node(0);
         let _reader = hold_fifo(&node);
         let mut w = writer(&node);
-        w.write_all(&scan(4, clock_ns(ClockId::Realtime))).expect("write");
-        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
-            .expect("opens");
+        w.write_all(&scan(4, clock_ns(ClockId::Realtime)))
+            .expect("write");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens");
         assert!(s.next(Duration::from_millis(100)).expect("reads").is_some());
         let started = Instant::now();
         assert!(s.next(Duration::from_millis(100)).expect("reads").is_none());
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(90) && waited < Duration::from_secs(1), "waited {waited:?}");
+        assert!(
+            waited >= Duration::from_millis(90) && waited < Duration::from_secs(1),
+            "waited {waited:?}"
+        );
         drop(w);
     }
 
@@ -697,14 +770,28 @@ mod tests {
         let node = f.node(0);
         let _reader = hold_fifo(&node);
         let mut w = writer(&node);
-        w.write_all(&scan(1, clock_ns(ClockId::Realtime))).expect("write");
-        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
-            .expect("opens");
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime)))
+            .expect("write");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens");
         assert!(s.next(Duration::from_millis(100)).expect("reads").is_some());
         assert_eq!(s.ts_fallbacks(), 0);
-        w.write_all(&scan(2, clock_ns(ClockId::Realtime) - 5 * NS_PER_S)).expect("write");
-        let got = s.next(Duration::from_millis(100)).expect("reads").expect("a sample");
-        assert!((got.boottime_ns - clock_ns(ClockId::Boottime)).abs() < FRESH_AGE_NS, "arrival time used");
+        w.write_all(&scan(2, clock_ns(ClockId::Realtime) - 5 * NS_PER_S))
+            .expect("write");
+        let got = s
+            .next(Duration::from_millis(100))
+            .expect("reads")
+            .expect("a sample");
+        assert!(
+            (got.boottime_ns - clock_ns(ClockId::Boottime)).abs() < FRESH_AGE_NS,
+            "arrival time used"
+        );
         assert_eq!(s.ts_fallbacks(), 1);
         drop(w);
     }
@@ -716,12 +803,25 @@ mod tests {
         let node = f.node(0);
         let _reader = hold_fifo(&node);
         let mut w = writer(&node);
-        w.write_all(&scan(1, clock_ns(ClockId::Realtime) + 300_000_000)).expect("write");
-        let mut s = Stream::open(&f.0.join("sys"), &f.dir(0), &node, Duration::from_millis(100), calib())
-            .expect("opens");
-        let got = s.next(Duration::from_millis(100)).expect("reads").expect("a sample");
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime) + 300_000_000))
+            .expect("write");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens");
+        let got = s
+            .next(Duration::from_millis(100))
+            .expect("reads")
+            .expect("a sample");
         let ahead = got.boottime_ns - clock_ns(ClockId::Boottime);
-        assert!((ahead - 300_000_000).abs() < 100_000_000, "mapped {ahead} ns ahead");
+        assert!(
+            (ahead - 300_000_000).abs() < 100_000_000,
+            "mapped {ahead} ns ahead"
+        );
         drop(w);
     }
 }
