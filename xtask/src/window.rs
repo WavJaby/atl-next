@@ -682,7 +682,7 @@ fn picture_check(app: &str, display: DisplayModel, title: &str) -> Result<String
     ))
 }
 
-/// Stage `gtk` sub-gate (a): the window mapped at its first frame-clock tick, and the compositor presented at least [`GTK_PRESENTED`] scenes into it before the readback.
+/// Stage `gtk` sub-gate (a): the window mapped at its first frame-clock tick, and the compositor presented at least [`GTK_PRESENTED`] scenes into it (the `present n=` lines).
 fn gtk_window_check(app: &str) -> Result<String, String> {
     if !app
         .lines()
@@ -690,28 +690,18 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
     {
         return Err("the window never mapped at its first frame-clock tick".to_owned());
     }
-    let line = capture_line(app)?;
-    let presented = word(line, "presented")
-        .and_then(|v| v.parse::<u32>().ok())
-        .ok_or_else(|| format!("no presented count: {line}"))?;
+    let presented = app
+        .lines()
+        .filter(|l| l.contains("atl-composer: ui: present n="))
+        .filter_map(|l| word(l, "n")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
     if presented < GTK_PRESENTED {
         return Err(format!(
-            "{presented} scenes presented before the readback, {GTK_PRESENTED} wanted"
+            "{presented} scenes presented, {GTK_PRESENTED} wanted"
         ));
     }
-    Ok(format!(
-        "mapped, {presented} scenes presented before the readback"
-    ))
-}
-
-/// Stage `gtk` sub-gate (b): the window's readback at the capture frame has the display's size and the quadrants' digest (the expectation of `picture`).
-fn gtk_capture_check(app: &str, display: DisplayModel) -> Result<String, String> {
-    capture_check(app, display, false)
-}
-
-/// [`gtk_capture_check`]; `swap_rb` = the hwui stage's deliberate break: the expectation's R and B bytes swapped.
-fn capture_check(app: &str, display: DisplayModel, swap_rb: bool) -> Result<String, String> {
-    capture_at(app, opening_size(display), swap_rb)
+    Ok(format!("mapped, {presented} scenes presented"))
 }
 
 /// [`capture_check`] at `(width, height)`: the readback has that size, and the quadrants' digest at that size.
@@ -1964,20 +1954,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
-    // the capture stage's probe records its two captures in `captured`; the sub-gates read them once the probe is joined
+    // the probe records its captures in `captured` (capture stage: the picture and the refused caller; gtk and hwui: the readback); the sub-gates read them once the probe is joined
     let captured: Arc<Mutex<capture::Seen>> = Arc::default();
-    let capture_probe = matches!(args.stage, Stage::Capture).then(|| capture::Probe {
-        root: run.root.clone(),
-        package: m.name.clone(),
-        opening: opening_size(display),
-        refused_as: if args.break_capture_caller {
-            capture::SHELL_UID
-        } else {
-            APP_UID
-        },
-        out_dir: work.join("capture"),
-        seen: Arc::clone(&captured),
-    });
+    let swap_rb = matches!(args.stage, Stage::Hwui) && args.break_swap_rb;
+    let capture_probe =
+        matches!(args.stage, Stage::Capture | Stage::Gtk | Stage::Hwui).then(|| capture::Probe {
+            root: run.root.clone(),
+            package: m.name.clone(),
+            opening: opening_size(display),
+            refused_as: if args.break_capture_caller {
+                capture::SHELL_UID
+            } else {
+                APP_UID
+            },
+            out_dir: work.join("capture"),
+            seen: Arc::clone(&captured),
+        });
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -1985,6 +1977,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
+            (Stage::Gtk | Stage::Hwui, _, _) => {
+                if let Some(capture_probe) = &capture_probe {
+                    capture::record_picture(&log, capture_probe, swap_rb);
+                }
+                drive(p, &log)
+            }
             (Stage::Capture, _, _) => match &capture_probe {
                 Some(capture_probe) => capture::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
@@ -2151,11 +2149,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::Hwui, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),
-            ("readback", capture_check(&app, display, args.break_swap_rb)),
+            ("readback", capture::picture(&captured)),
         ],
         (Stage::Gtk, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
-            ("readback", gtk_capture_check(&app, display)),
+            ("readback", capture::picture(&captured)),
             (
                 "touch",
                 content_origin(&app).and_then(|origin| {

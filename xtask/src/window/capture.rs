@@ -18,8 +18,9 @@ use crate::composer::fnv1a64;
 
 /// The shell uid, the one the registry serves (permission.rs SHELL_UID): what `--break-capture-caller` sends (b) as.
 pub(super) const SHELL_UID: u32 = 2000;
-/// How long (a) polls for the quadrants after the first draw. One attempt is a spawn, a GET_COMPOSER and a readback of the frame the window shows.
-const CAPTURE_WAIT: Duration = Duration::from_secs(15);
+/// How long (a) polls for the quadrants after the first draw. One attempt is a spawn, a GET_COMPOSER and a readback of the frame the window shows. It ends inside the gtk and
+/// hwui windows (GTK_WINDOW_MS after the marker), so a mismatch is reported as the picture's own failure, not as a cut-off control socket.
+const CAPTURE_WAIT: Duration = Duration::from_secs(6);
 /// The pause between two attempts of (a).
 const ATTEMPT_GAP: Duration = Duration::from_millis(250);
 /// The stage's watch after the marker: the first draw, then the probe's waits (at most [`CAPTURE_WAIT`] for (a), then (b) and the ping).
@@ -44,32 +45,51 @@ pub(super) struct Probe {
     pub seen: Arc<Mutex<Seen>>,
 }
 
-/// The capture stage's probe, from the proxy's side: once the fixture has drawn, (a) and (b) run through atld, then a ping must be answered.
+/// The capture stage's probe, from the proxy's side: (a) the picture, then (b) the refused caller, then a ping must be answered.
 pub(super) fn drive(proxy: Proxy, app_log: &Path, probe: &Probe) -> Result<Liveness, String> {
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
-    std::thread::sleep(INPUT_SETTLE);
-    std::fs::create_dir_all(&probe.out_dir).map_err(|e| e.to_string())?;
-    let picture = poll_picture(probe);
+    record_picture(app_log, probe, false);
     let refusal = refused(probe);
+    if let Ok(mut seen) = probe.seen.lock() {
+        seen.refusal = Some(refusal);
+    }
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
     let answered = await_event(&proxy.events, PONG_WAIT, |e| {
         *e == ProxyEvent::Pong { serial: 1 }
     })
     .is_some();
-    *probe.seen.lock().map_err(|e| e.to_string())? = Seen {
-        picture: Some(picture),
-        refusal: Some(refusal),
-    };
     Ok(Liveness {
         answered,
         ..Liveness::default()
     })
 }
 
+/// Records sub-gate (a) in the probe: once the fixture has drawn, the picture is polled until it is the quadrants at the opening size. `swap_rb` is the hwui break's
+/// expectation (R and B swapped), which the picture must then fail to match.
+pub(super) fn record_picture(app_log: &Path, probe: &Probe, swap_rb: bool) {
+    let picture = if wait_for_line(app_log, DRAW_LINE, ACK_WAIT) {
+        std::thread::sleep(INPUT_SETTLE);
+        std::fs::create_dir_all(&probe.out_dir)
+            .map_err(|e| e.to_string())
+            .and_then(|()| poll_picture(probe, swap_rb))
+    } else {
+        Err("the fixture never drew".to_owned())
+    };
+    if let Ok(mut seen) = probe.seen.lock() {
+        seen.picture = Some(picture);
+    }
+}
+
+/// Sub-gate (a) as the probe recorded it: gtk and hwui read their readback through here too.
+pub(super) fn picture(seen: &Mutex<Seen>) -> Result<String, String> {
+    seen.lock()
+        .map_err(|e| e.to_string())?
+        .picture
+        .clone()
+        .unwrap_or_else(|| Err("the probe never captured".to_owned()))
+}
+
 /// Sub-gate (a): atld's capture until its bytes are the quadrants at the opening size, or [`CAPTURE_WAIT`] passes.
-fn poll_picture(probe: &Probe) -> Result<String, String> {
+fn poll_picture(probe: &Probe, swap_rb: bool) -> Result<String, String> {
     let started = Instant::now();
     let out = probe.out_dir.join("picture.rgba");
     let mut attempts = 0u32;
@@ -77,7 +97,7 @@ fn poll_picture(probe: &Probe) -> Result<String, String> {
         attempts += 1;
         let (reply, bytes) =
             capture_at(&probe.root, None, &probe.package, &out).map_err(|e| format!("{e:#}"))?;
-        match judge_picture(&reply, &bytes, probe.opening) {
+        match judge_picture(&reply, &bytes, probe.opening, swap_rb) {
             Ok(pass) => return Ok(format!("{pass}, after {attempts} capture(s)")),
             Err(why) if started.elapsed() >= CAPTURE_WAIT => {
                 return Err(format!("after {attempts} captures: {why}"));
@@ -89,7 +109,12 @@ fn poll_picture(probe: &Probe) -> Result<String, String> {
 
 /// Whether atld's reply and the bytes it wrote are the quadrants at `(width, height)`. Size and digest come from the fixture's draw (window.rs `quadrant_pixels`), never from the
 /// reply; the reply's digest must agree with the bytes.
-fn judge_picture(reply: &str, bytes: &[u8], (width, height): (u32, u32)) -> Result<String, String> {
+fn judge_picture(
+    reply: &str,
+    bytes: &[u8],
+    (width, height): (u32, u32),
+    swap_rb: bool,
+) -> Result<String, String> {
     let summary = reply
         .strip_prefix("ok screencap: ")
         .ok_or_else(|| format!("no picture: {reply}"))?;
@@ -100,7 +125,13 @@ fn judge_picture(reply: &str, bytes: &[u8], (width, height): (u32, u32)) -> Resu
             "the capture is {size}, the opening size is {want_size}"
         ));
     }
-    let want = quadrant_pixels(width, height);
+    let mut want = quadrant_pixels(width, height);
+    if swap_rb {
+        want.as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|p| p.swap(0, 2));
+    }
     if bytes.len() != want.len() {
         return Err(format!(
             "the file holds {} bytes, the picture is {}",
