@@ -595,7 +595,13 @@ fn rebuild(u: &Up, stored: &[(String, String)], ident: &Ident) -> Result<()> {
         // `git am` without files reads stdin
         return Ok(());
     }
-    let mut args = vec!["am", "-q", "--committer-date-is-author-date"];
+    // --keep-non-patch: strip only `[PATCH ...]`; the short `-b` is git's no-op --binary here, and without this git drops upstream's `[compiler-rt]`-style prefix
+    let mut args = vec![
+        "am",
+        "-q",
+        "--keep-non-patch",
+        "--committer-date-is-author-date",
+    ];
     args.extend(files.iter().map(String::as_str));
     let Err(e) = git_isolated(dir, &args, Some(ident)) else {
         return Ok(());
@@ -1492,6 +1498,24 @@ mod tests {
                 .contains("int more;")
         );
         assert_eq!(rebase(&u2, &ident()).unwrap(), "already on the pin");
+    }
+
+    /// `git am` strips leading `[...]` from a subject unless told to keep it: the stripped commit is drift.
+    #[test]
+    fn rebuild_keeps_bracketed_subjects() {
+        let f = Fixture::new("keep-subject");
+        let c = f.checkout("v1");
+        let u = f.fetched(&c, "ws");
+        patch_commit(
+            &u,
+            "[compiler-rt][AArch64][Android] fix a\n\nUpstream-Status: Pending\nPatch-Reason: test\n",
+        );
+        export_ok(&u);
+        let stored = stored(&u.patches).unwrap();
+        rebuild(&u, &stored, &ident()).unwrap();
+        let subject = git(Some(&u.checkout), &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject.trim(), "[compiler-rt][AArch64][Android] fix a");
+        assert_eq!(drift_of(&u), Vec::<String>::new());
     }
 
     /// The guards of `xtask native`'s preflight, each made to fire.
