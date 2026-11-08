@@ -256,10 +256,11 @@ pub trait FrameClock {
     /// Asks for one tick; ticks stop again until the next request (`Choreographer.postFrameCallback`'s one-shot shape). Requests before the tick coalesce into it.
     fn request_frame(&self);
 
-    /// A handle that requests a tick from any thread (a binder thread's `requestNextVsync` or transaction); the tick still runs on this window's thread. It names the window weakly: once the window is gone, a request does nothing.
+    /// A handle that requests a tick from any thread (the compositor's clock thread after it published a scene); the tick still runs on this window's thread. It names the window weakly: once the window is gone, a request does nothing.
     fn frame_requester(&self) -> Self::Requester;
 
-    /// Sets the callback run on each tick, replacing the previous one.
+    /// Sets the callback run on each tick, replacing the previous one. A tick means "you may present now": the caller presents the latest scene it has, if any; the compositor's own clock (vsync, latch,
+    /// releases) never waits for a tick.
     fn on_tick<F: FnMut(FrameTick) + 'static>(&self, on_tick: F);
 }
 

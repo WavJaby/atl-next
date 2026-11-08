@@ -18,8 +18,9 @@ use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface}
 use atl_compositor::model::CompositorConfig;
 use atl_platform_ui::{PhysSize, PlatformUi, Ui};
 
-use crate::host::{Composer, ComposerConfig, ThreadHost};
+use crate::host::{Composer, ComposerConfig, Presenter, ThreadHost};
 use crate::input::{self, Message};
+use crate::mailbox::Mailbox;
 use crate::sink::{FirstFrame, ReportSink};
 use crate::task_sender::TaskSender;
 use crate::{service, surface_flinger, ui_agent, ui_window};
@@ -35,8 +36,8 @@ const BREAK_Z_ORDER: &str = "z-order";
 const BREAK_POST_DRAW: &str = "post-draw";
 /// With it no queued buffer is latched (CompositorConfig::latch_buffers).
 const BREAK_QUEUE: &str = "queue";
-/// With it a tick's calls go out before the window painted (ComposerConfig::release_after_paint).
-const BREAK_RELEASE_BEFORE_PAINT: &str = "release-before-paint";
+/// With it the core ignores the window's hold set: a shown buffer is released at the latch that replaces it (ComposerConfig::hold_shown).
+const BREAK_IGNORE_HOLD: &str = "ignore-hold";
 /// With it the compositor is not served by the service view (xtask composer `--break-view`): libgui's lookup must then fail the gate.
 const BREAK_NO_SERVE: &str = "no-serve";
 /// With it the input loop is never woken by a send (input::spawn): messages queue, and the loop sleeps through them.
@@ -107,8 +108,8 @@ fn register(ui_agent: &SpIBinder) -> Result<(), String> {
 }
 
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
-/// Headless (`ui` None): the clock thread and the present thread come from `threads`, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit this UI thread attached): the window's frame clock drives the
-/// compositor and the display is a GTK window ([`ui_window`]); only the deliver thread comes from `threads`. The caller is the UI thread in UI mode.
+/// The clock thread and the present thread come from `threads` in both modes. Headless (`ui` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`ui`: the toolkit
+/// this UI thread attached): scenes go through a mailbox to a GTK window ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode.
 pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Composer>, String> {
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
     let script = match optional_property(POINTER_PROPERTY)? {
@@ -135,7 +136,7 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             ..Default::default()
         },
         post_draw: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_POST_DRAW),
-        release_after_paint: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_RELEASE_BEFORE_PAINT),
+        hold_shown: std::env::var(BREAK_ENV).as_deref() != Ok(BREAK_IGNORE_HOLD),
     });
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
@@ -147,21 +148,32 @@ pub fn start(threads: &dyn ThreadHost, ui: Option<PlatformUi>) -> Result<Arc<Com
             width: u32::try_from(width).unwrap_or(1),
             height: u32::try_from(height).unwrap_or(1),
         };
-        let frames = composer
-            .start_ui(threads)
-            .map_err(|e| format!("deliver thread: {e}"))?;
+        let mailbox = Arc::new(Mailbox::default());
+        composer
+            .start(threads, Presenter::Window(Arc::clone(&mailbox)))
+            .map_err(|e| format!("frame clock thread: {e}"))?;
         let sender = TaskSender::spawn(threads).map_err(|e| format!("task sender thread: {e}"))?;
-        ui_window::install(ui, frames, input_tx.clone(), size, Arc::clone(&sender));
+        ui_window::install(
+            ui,
+            Arc::clone(&composer),
+            mailbox,
+            input_tx.clone(),
+            size,
+            Arc::clone(&sender),
+        );
         Some(sender)
     } else {
         let first_frame = input_tx.clone();
         composer
             .start(
                 threads,
-                Box::new(FirstFrame::new(ReportSink(std::io::stderr()), move || {
-                    // the script goes in at the first frame; the input thread owns the publisher
-                    let _ = first_frame.send(Message::FirstFrame);
-                })),
+                Presenter::Sink(Box::new(FirstFrame::new(
+                    ReportSink(std::io::stderr()),
+                    move || {
+                        // the script goes in at the first frame; the input thread owns the publisher
+                        let _ = first_frame.send(Message::FirstFrame);
+                    },
+                ))),
             )
             .map_err(|e| format!("frame clock thread: {e}"))?;
         None

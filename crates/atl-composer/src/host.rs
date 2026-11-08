@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! The compositor of one app process: the core ([`Compositor`], [`EventThread`]) behind one lock, the binders it knows, the vsync channels, the timer frame clock thread, and the calls into libgui that the core's callbacks become.
-//! Binder threads call in (a transaction arrived, a connection asked for vsync); the clock thread ticks: it applies what is due and writes the vsync events; the present thread then hands the new scene to the [`SceneSink`] (the platform layer, M3 slice 6) and delivers the core's calls to the clients.
+//! The compositor of one app process: the core ([`Compositor`], [`EventThread`]) behind one lock, the binders it knows, the vsync channels, the frame clock thread, and the calls into libgui that the core's callbacks become.
+//! Binder threads call in (a transaction arrived, a connection asked for vsync); the clock thread ticks in both modes (SurfaceFlinger `commit`): it applies what is due, writes the vsync events and hands the
+//! new scene on: headless to the present thread's [`SceneSink`], UI mode to the window's [`Mailbox`] (latest wins). The present thread delivers the core's calls to the clients. Nothing here waits for the
+//! window's thread: it only takes scenes from the mailbox and reports releases into it (owner D1/D3, 2026-11-08).
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use atl_compositor::callbacks::{ON_RELEASE_BUFFER, ON_TRANSACTION_COMPLETED};
@@ -31,6 +33,7 @@ use binder::{
 };
 use rustix::time::{ClockId, clock_gettime};
 
+use crate::mailbox::{Latch, Mailbox};
 use crate::objects::ObjectMap;
 use crate::sink::SceneSink;
 use crate::{bridge, clock, listener, vsync};
@@ -95,89 +98,12 @@ fn fds_of(scene: Option<&Scene>, calls: &[ClientCall]) -> Vec<i32> {
     fds
 }
 
-/// UI mode's frame path (no clock thread: the window's frame clock ticks, owner decision 2026-11-05). [`UiFrames::tick`] runs on the UI thread; the scene is shown there, and the calls go to the deliver thread.
-pub struct UiFrames {
-    composer: Arc<Composer>,
-    frames: SyncSender<Frame>,
-    /// Ticks' calls waiting for the window's paint, oldest first: a release among them names a buffer the window drew until that paint.
-    unpainted: Mutex<VecDeque<Vec<ClientCall>>>,
-}
-
-impl UiFrames {
-    /// The window's monitor as the display ([]); true when it changed.
-    pub fn set_display(&self, display: DisplayModel) -> bool {
-        self.composer.set_display(display)
-    }
-
-    /// The window clock is on demand, as SurfaceFlinger's EventThread is for an app (it sends vsync only to a connection that asked, `requestNextVsync` / `setVsyncRate`; Choreographer asks per frame, `scheduleVsyncLocked`):
-    /// `request` is called whenever a client asks for vsync or sends work (a transaction, a destroyed layer), from any thread, and the UI thread then asks its clock for a tick. Without it nothing ticks.
-    pub fn set_frame_requester(&self, request: Box<dyn Fn() + Send + Sync>) {
-        if self.composer.ui_wake.set(request).is_err() {
-            tracing::warn!("atl-composer: ui: a second frame requester refused");
-        }
-    }
-
-    /// Whether the next tick has anything to do: a connection waits for vsync, a transaction or buffer is queued, or calls wait to be delivered. False: the clock stays stopped until [`UiFrames::set_frame_requester`]'s callback runs.
-    pub fn wants_frame(&self) -> bool {
-        self.composer.lock().wants_frame()
-    }
-
-    /// One frame at `time_ns` (CLOCK_MONOTONIC, the window clock's timestamp): the core applies what is due, vsync goes out, and `present` shows the scene on this thread and says whether it took it.
-    /// A taken scene holds the buffers it shows until the window's paint ([`UiFrames::painted`]): the core releases what it replaced then, with the read fences; the tick's calls wait for that paint too, as SurfaceFlinger sends them after composition.
-    /// A scene that was not taken (or no paint is due: `release_after_paint` false) releases what it replaced now, as before the hold set.
-    pub fn tick(&self, time_ns: i64, present: impl FnOnce(&Scene) -> bool) {
-        let interval_ns = clock::interval_ns(self.composer.display().refresh_hz);
-        let Frame {
-            scene, mut calls, ..
-        } = self.composer.tick(time_ns, interval_ns);
-        let painting = match &scene {
-            Some(scene) => present(scene) && self.composer.release_after_paint,
-            None => false,
-        };
-        if let Some(scene) = &scene {
-            if painting {
-                self.composer.scene_taken(scene);
-            } else {
-                calls.extend(self.composer.release_unpainted());
-            }
-        }
-        let mut unpainted = self.unpainted.lock().unwrap_or_else(|e| e.into_inner());
-        if painting || !unpainted.is_empty() {
-            unpainted.push_back(calls);
-            return;
-        }
-        drop(unpainted);
-        self.send(calls, HashMap::new());
-    }
-
-    /// The window painted: every waiting tick's calls go to the deliver thread, a release and the completion carrying it with the read fence the window exported for its buffer (`fences`: buffer id -> sync_file; none = released already).
-    /// Then the releases of the buffers this paint stopped showing, and the completions they held back, go as one more frame.
-    pub fn painted(&self, fences: Vec<(u64, OwnedFd)>) {
-        let waiting =
-            std::mem::take(&mut *self.unpainted.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut fences: HashMap<u64, OwnedFd> = fences.into_iter().collect();
-        for mut calls in waiting {
-            let held = attach_read_fences(&mut calls, &mut fences);
-            self.send(calls, held);
-        }
-        let mut calls = self.composer.painted_calls();
-        if !calls.is_empty() {
-            let held = attach_read_fences(&mut calls, &mut fences);
-            self.send(calls, held);
-        }
-        // a fence whose buffer the core released in no waiting tick (the layer still holds it in another place) is dropped: closing a sync_file does not signal or cancel it
-        let mut st = self.composer.lock();
-        st.stats.releases_fenced_unmatched += fences.len() as u64;
-    }
-
-    fn send(&self, calls: Vec<ClientCall>, fences: HashMap<i32, OwnedFd>) {
-        // an error means the deliver thread is gone: the process is ending
-        let _ = self.frames.send(Frame {
-            scene: None,
-            calls,
-            fences,
-        });
-    }
+/// Where the clock's scenes go.
+pub enum Presenter {
+    /// Headless: the present thread hands each scene to the sink, then delivers that tick's calls.
+    Sink(Box<dyn SceneSink>),
+    /// UI mode: the clock publishes each scene into the window's mailbox (the window takes the latest on its own thread) and asks the window for a frame ([`Composer::set_frame_requester`]).
+    Window(Arc<Mailbox>),
 }
 
 /// What a compositor is built with.
@@ -188,9 +114,9 @@ pub struct ComposerConfig {
     pub compositor: CompositorConfig,
     /// Post-draw Transactions the window service forwards are applied. false = a gate's deliberate break only (`xtask test window --break-post-draw`): they are counted and dropped.
     pub post_draw: bool,
-    /// UI mode holds a tick's calls until the window painted its scene ([`UiFrames::tick`]). false = a gate's deliberate break only (`xtask test window --break-release-before-paint`): they go at once, so a release
-    /// reaches the producer while the window may still draw the buffer, and the read fence the paint exports finds no release to ride (`releases_fenced_unmatched`).
-    pub release_after_paint: bool,
+    /// UI mode: the core keeps a buffer the window holds (mailbox hold set) until the window reports it released. false = a gate's deliberate break only (`xtask test window --break-ignore-hold`): the hold
+    /// set reads empty, so a shown buffer is released at the latch that replaces it, while the window may still draw it, and the read fence its paint exports finds no release to ride (`releases_fenced_unmatched`).
+    pub hold_shown: bool,
 }
 
 /// What happened, for the log line and the tests: the visible record that the compositor ran.
@@ -250,6 +176,8 @@ struct State {
     /// The last counters line logged, without its `ticks=` field (see `deliver_frame`).
     counters_logged: String,
     stats: Stats,
+    /// UI mode's window mailbox (lock order: this state, then the mailbox); None headless.
+    mailbox: Option<Arc<Mailbox>>,
 }
 
 impl State {
@@ -275,8 +203,9 @@ impl State {
         let c = self.compositor.counters();
         let s = &self.stats;
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
+        let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
+            "composer: counters ticks={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ignored={}",
             s.ticks,
             s.transactions,
             s.layers_created,
@@ -288,6 +217,11 @@ impl State {
             c.buffers_released,
             c.completions_sent,
             s.scenes,
+            m.taken,
+            m.dropped,
+            m.refused,
+            m.reports,
+            m.max_held_per_layer,
             s.vsync_sent,
             s.vsync_dropped,
             s.callbacks_sent,
@@ -313,10 +247,10 @@ impl State {
 /// The compositor of this process.
 pub struct Composer {
     state: Mutex<State>,
-    /// The clock thread parks here while nothing wants a frame.
-    wake: Condvar,
-    /// UI mode's clock restart (UiFrames::set_frame_requester): what [`Composer::notify`] calls besides `wake`.
-    ui_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The clock thread parks on this while nothing wants a frame and no release report waits.
+    wake: clock::Wake,
+    /// UI mode: asks the window for a frame after a publish ([`Composer::set_frame_requester`]).
+    frame_request: OnceLock<Box<dyn Fn() + Send + Sync>>,
     stop: AtomicBool,
     /// the monitor the window is on (UI mode follows it: []); headless keeps the one it starts with
     display: Mutex<DisplayModel>,
@@ -324,8 +258,8 @@ pub struct Composer {
     display_token: SpIBinder,
     /// ComposerConfig::post_draw.
     post_draw: bool,
-    /// ComposerConfig::release_after_paint.
-    release_after_paint: bool,
+    /// ComposerConfig::hold_shown.
+    hold_shown: bool,
 }
 
 pub trait ILayerHandle: Interface {}
@@ -400,22 +334,32 @@ impl Composer {
                 next_vsync_id: 0,
                 counters_logged: String::new(),
                 stats: Stats::default(),
+                mailbox: None,
             }),
-            wake: Condvar::new(),
-            ui_wake: OnceLock::new(),
+            wake: clock::Wake::default(),
+            frame_request: OnceLock::new(),
             stop: AtomicBool::new(false),
             display: Mutex::new(config.display),
             post_draw: config.post_draw,
-            release_after_paint: config.release_after_paint,
+            hold_shown: config.hold_shown,
             display_token,
         })
     }
 
-    /// Something may want a frame now: wakes the clock thread, or asks UI mode's window clock for a tick. Called with the state lock released.
+    /// Something may want a frame now: wakes the clock thread. Called with the state lock released.
     fn notify(&self) {
-        self.wake.notify_all();
-        if let Some(request) = self.ui_wake.get() {
-            request();
+        self.wake.kick();
+    }
+
+    /// UI mode: the window took a scene's buffers off the hold set or refused a take (its thread reported into the mailbox): wakes the clock to release them. Takes no lock of the core.
+    pub fn presenter_reported(&self) {
+        self.wake.kick();
+    }
+
+    /// UI mode: `request` asks the window for one frame, from any thread; the clock calls it after each publish. Set once, when the window exists.
+    pub fn set_frame_requester(&self, request: Box<dyn Fn() + Send + Sync>) {
+        if self.frame_request.set(request).is_err() {
+            tracing::warn!("atl-composer: ui: a second frame requester refused");
         }
     }
 
@@ -604,37 +548,51 @@ impl Composer {
         Ok(())
     }
 
+    /// The hold set the core honours: the mailbox's, or empty under the gate's break (`hold_shown` false).
+    fn held(&self, latch: &Latch<'_>) -> BTreeSet<u64> {
+        if self.hold_shown {
+            latch.held()
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    /// Under the core lock and the mailbox latch: the core learns what the window holds now, and when the window reported, the replaced buffers it no longer holds are released, with the read fences it
+    /// exported (moved into `fences`, open until the calls are delivered), followed by the completions they held back.
+    fn presenter_releases(
+        &self,
+        st: &mut State,
+        latch: &mut Latch<'_>,
+        fences: &mut HashMap<i32, OwnedFd>,
+    ) -> Vec<ClientCall> {
+        let held = self.held(latch);
+        st.compositor.set_held(&held);
+        let Some(mut report) = latch.take_report() else {
+            return Vec::new();
+        };
+        let mut calls = st.compositor.painted(&held);
+        fences.extend(attach_read_fences(&mut calls, &mut report));
+        // a fence whose buffer the core released already (never retired) is dropped: closing a sync_file does not signal or cancel it
+        st.stats.releases_fenced_unmatched += report.len() as u64;
+        calls
+    }
+
     /// The last reference to a layer's handle went away.
-    /// The presenter took `scene` ([`Compositor::scene_taken`]): its buffers are held until the paint.
-    fn scene_taken(&self, scene: &Scene) {
-        self.lock().compositor.scene_taken(scene);
-    }
-
-    /// Releases for a scene that was not taken: what it replaced is no longer shown by anything, so it goes now, in the in-flight entry of the tick that produced it (the last one).
-    fn release_unpainted(&self) -> Vec<ClientCall> {
-        let mut st = self.lock();
-        let calls = st.compositor.painted();
-        let fds = fds_of(None, &calls);
-        if let Some(last) = st.in_flight.back_mut() {
-            last.extend(fds);
-        }
-        calls
-    }
-
-    /// The presenter's paint: the releases of the buffers it stopped showing and the completions they held back. Their descriptors get an in-flight entry of their own, as a tick's do.
-    fn painted_calls(&self) -> Vec<ClientCall> {
-        let mut st = self.lock();
-        let calls = st.compositor.painted();
-        if !calls.is_empty() {
-            st.in_flight.push_back(fds_of(None, &calls));
-        }
-        calls
-    }
-
     fn layer_dropped(&self, key: u64) {
         let mut st = self.lock();
         let gone = st.objects.remove(key);
+        let mailbox = st.mailbox.clone();
+        let mut latch = mailbox.as_deref().map(Mailbox::latch);
+        if let Some(l) = &latch {
+            let held = self.held(l);
+            st.compositor.set_held(&held);
+        }
         let calls = st.compositor.destroy_layer(BinderKey::Local(key));
+        // a buffer released now may be in the scene waiting in the mailbox: that scene goes, the next tick publishes one without the layer
+        if let Some(l) = latch.as_mut().filter(|_| !calls.is_empty()) {
+            l.clear();
+        }
+        drop(latch);
         st.pending_calls.extend(calls);
         drop(st);
         // a weak reference: dropping it takes no lock of ours
@@ -716,8 +674,15 @@ impl Composer {
     pub fn start(
         self: &Arc<Self>,
         threads: &dyn ThreadHost,
-        sink: Box<dyn SceneSink>,
+        presenter: Presenter,
     ) -> std::io::Result<()> {
+        let sink = match presenter {
+            Presenter::Sink(sink) => Some(sink),
+            Presenter::Window(mailbox) => {
+                self.lock().mailbox = Some(mailbox);
+                None
+            }
+        };
         let (frames, queue) = sync_channel(FRAMES_QUEUED);
         let me = Arc::clone(self);
         threads.spawn(
@@ -728,21 +693,6 @@ impl Composer {
         threads.spawn("atl-frame-clock", Box::new(move || me.run(frames)))
     }
 
-    /// UI mode: one deliver thread from `threads` writes each frame's calls; the frame clock is the window's ([`UiFrames`]), so no clock thread runs. Called once, on the UI thread's startup path.
-    pub fn start_ui(self: &Arc<Self>, threads: &dyn ThreadHost) -> std::io::Result<UiFrames> {
-        let (frames, queue) = sync_channel(FRAMES_QUEUED);
-        let me = Arc::clone(self);
-        threads.spawn(
-            "atl-frame-deliver",
-            Box::new(move || me.deliver_frames(queue)),
-        )?;
-        Ok(UiFrames {
-            composer: Arc::clone(self),
-            frames,
-            unpainted: Mutex::default(),
-        })
-    }
-
     /// Ends the clock thread and closes the descriptors held.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -751,32 +701,73 @@ impl Composer {
         self.notify();
     }
 
+    /// The clock: parks while nothing wants a frame and no release report waits; a report alone is answered at once (its releases are what a blocked producer waits for), work waits for the next grid point.
+    /// The interval follows the display (UI mode: the window's monitor) from tick to tick.
     fn run(&self, frames: SyncSender<Frame>) {
-        let interval = clock::interval_ns(self.display().refresh_hz);
         let origin = monotonic_ns();
         loop {
-            {
-                let mut st = self.lock();
-                while !self.stop.load(Ordering::Acquire) && !st.wants_frame() {
-                    st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
-                }
-                if self.stop.load(Ordering::Acquire) {
-                    return;
-                }
+            let seen = self.wake.generation();
+            if self.stop.load(Ordering::Acquire) {
+                return;
             }
+            let (wants, mailbox) = {
+                let st = self.lock();
+                (st.wants_frame(), st.mailbox.clone())
+            };
+            let reported = mailbox.as_deref().is_some_and(Mailbox::has_report);
+            if !wants {
+                if reported {
+                    // an error means the present thread is gone: the process is ending
+                    let _ = frames.send(self.release_frame());
+                } else {
+                    self.wake.park(seen);
+                }
+                continue;
+            }
+            let interval = clock::interval_ns(self.display().refresh_hz);
             let now = monotonic_ns();
             let at = clock::next_tick(origin, interval, now);
             std::thread::sleep(Duration::from_nanos(u64::try_from(at - now).unwrap_or(0)));
-            let frame = self.tick(at, interval);
-            // an error means the present thread is gone: the process is ending
+            let (frame, published) = self.tick(at, interval);
             let _ = frames.send(frame);
+            if published && let Some(request) = self.frame_request.get() {
+                request();
+            }
         }
     }
 
-    /// One frame clock tick at `at_ns`: the core applies what is due, vsync goes out, and the frame is returned for its thread to show and deliver. Nothing here waits on pixels: a tick that did would miss the next grid point, and every client's vsync with it.
-    fn tick(&self, at_ns: i64, interval_ns: i64) -> Frame {
+    /// The window's release report between ticks, as a frame of its own for the present thread.
+    fn release_frame(&self) -> Frame {
+        let mut st = self.lock();
+        let mut fences = HashMap::new();
+        let mailbox = st.mailbox.clone();
+        let mut calls = Vec::new();
+        if let Some(m) = mailbox.as_deref() {
+            let mut latch = m.latch();
+            calls = self.presenter_releases(&mut st, &mut latch, &mut fences);
+        }
+        let frame = Frame {
+            scene: None,
+            calls,
+            fences,
+        };
+        st.in_flight.push_back(frame.fds());
+        frame
+    }
+
+    /// One frame clock tick at `at_ns`: the core applies what is due, vsync goes out, and the frame is returned for the present thread to show (headless) and deliver; UI mode publishes the scene
+    /// into the mailbox under the same hold of both locks, so the window never takes a scene whose buffers this latch released. True when a scene was published. Nothing here waits on pixels or on the window:
+    /// a tick that did would miss the next grid point, and every client's vsync with it.
+    fn tick(&self, at_ns: i64, interval_ns: i64) -> (Frame, bool) {
         let mut st = self.lock();
         st.stats.ticks += 1;
+        let mailbox = st.mailbox.clone();
+        let mut latch = mailbox.as_deref().map(Mailbox::latch);
+        let mut all = std::mem::take(&mut st.pending_calls);
+        let mut fences = HashMap::new();
+        if let Some(l) = latch.as_mut() {
+            all.extend(self.presenter_releases(&mut st, l, &mut fences));
+        }
         let FrameOutput { scene, calls } = st.compositor.on_frame(at_ns);
         st.next_vsync_id += 1;
         let tick = FrameTick {
@@ -798,33 +789,32 @@ impl Composer {
         if scene.is_some() {
             st.stats.scenes += 1;
         }
-        let mut all = std::mem::take(&mut st.pending_calls);
         all.extend(calls);
+        let (scene, published) = match (latch.as_mut(), scene) {
+            (Some(l), Some(scene)) => {
+                l.publish(scene);
+                (None, true)
+            }
+            (_, scene) => (scene, false),
+        };
+        drop(latch);
         let frame = Frame {
             scene,
             calls: all,
-            fences: HashMap::new(),
+            fences,
         };
         st.in_flight.push_back(frame.fds());
-        frame
+        (frame, published)
     }
 
-    /// The present thread: each tick's output in order, the scene to the sink and then the calls to the clients. The order is what lets a sink read a buffer here: the release of a buffer comes in a later tick's calls than the scene that shows it, so the producer cannot rewrite it during the read.
-    fn present_frames(&self, mut sink: Box<dyn SceneSink>, frames: Receiver<Frame>) {
+    /// The present thread: each frame in order, the scene to the sink (headless) and then the calls to the clients. The order is what lets a sink read a buffer here: the release of a buffer comes in a later tick's calls than the scene that shows it, so the producer cannot rewrite it during the read.
+    fn present_frames(&self, mut sink: Option<Box<dyn SceneSink>>, frames: Receiver<Frame>) {
         for frame in frames {
-            if let Some(scene) = &frame.scene {
+            if let (Some(sink), Some(scene)) = (sink.as_mut(), &frame.scene) {
                 sink.present(scene);
             }
+            self.lock().stats.releases_fenced += frame.fences.len() as u64;
             self.deliver_frame(frame.calls, &frame.fences);
-        }
-    }
-
-    /// UI mode's deliver thread: each frame's calls, after the UI thread painted its scene.
-    fn deliver_frames(&self, frames: Receiver<Frame>) {
-        for frame in frames {
-            self.deliver_frame(frame.calls, &frame.fences);
-            let fenced = frame.fences.len() as u64;
-            self.lock().stats.releases_fenced += fenced;
         }
     }
 

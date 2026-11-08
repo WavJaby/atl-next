@@ -37,6 +37,7 @@ mod ime;
 mod move_output;
 mod surface_view;
 mod suspended;
+mod ui_block;
 mod widgets;
 
 #[derive(clap::Args)]
@@ -83,9 +84,9 @@ pub struct Args {
     /// Deliberate break (stages widgets, dialog and the other nested-compositor UI stages): the composer's input loop is never woken by a send (atl-composer start.rs BREAK_INPUT_NO_WAKE), so its messages wait and the input checks must fail.
     #[arg(long)]
     break_input_no_wake: bool,
-    /// Deliberate break (any UI stage that replaces buffers): the composer sends a tick's releases before the window painted, so the release check must fail.
+    /// Deliberate break (any UI stage that replaces buffers): the composer ignores the window's hold set and releases a shown buffer at the latch that replaces it, before the window's paint, so the release check must fail.
     #[arg(long)]
-    break_release_before_paint: bool,
+    break_ignore_hold: bool,
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
@@ -138,6 +139,8 @@ enum Stage {
     Move,
     /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/surface_view.rs).
     SurfaceView,
+    /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask/src/window/ui_block.rs; composer threading S2).
+    UiBlock,
     /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the composer's readback as the quadrants.
     Hwui,
     /// UI mode: a dimming dialog with surfaceInsets and a popup near the bottom over a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/dialog.rs).
@@ -163,6 +166,7 @@ impl Stage {
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
             Stage::SurfaceView => "surface-view",
+            Stage::UiBlock => "ui-block",
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
             Stage::Gles2 => "gles2",
@@ -175,7 +179,9 @@ impl Stage {
         match self {
             Stage::Resume => WINDOW_MS,
             Stage::Frames | Stage::Input => FRAMES_WINDOW_MS,
-            Stage::Gtk | Stage::SurfaceView | Stage::Hwui | Stage::Gles2 => GTK_WINDOW_MS,
+            Stage::Gtk | Stage::SurfaceView | Stage::UiBlock | Stage::Hwui | Stage::Gles2 => {
+                GTK_WINDOW_MS
+            }
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::Widgets | Stage::Ime => WIDGETS_WINDOW_MS,
             Stage::Resize
@@ -305,6 +311,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move
+        | Stage::UiBlock
         | Stage::Suspended => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::Dialog => dialog::MARKER,
@@ -1514,7 +1521,7 @@ fn dmabuf_check(app: &str) -> Result<String, String> {
 }
 
 /// The release of a replaced buffer waited for the window's paint: every read fence a paint exported rode a release (none unmatched), and when buffers went back at all, at least one carried its fence.
-/// A release sent before the paint (`--break-release-before-paint`) leaves the fence of that paint with no release to ride.
+/// A release sent before the paint (`--break-ignore-hold`) leaves the fence of that paint with no release to ride.
 fn release_check(app: &str) -> Result<String, String> {
     let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
     let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
@@ -1656,6 +1663,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::StartFinish
         | Stage::Move
         | Stage::SurfaceView
+        | Stage::UiBlock
         | Stage::Dialog
         | Stage::Gles2
         | Stage::Suspended => {
@@ -1682,8 +1690,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     rt.with_ui_break("post-draw")
                 } else if args.break_queue {
                     rt.with_ui_break("queue")
-                } else if args.break_release_before_paint {
-                    rt.with_ui_break("release-before-paint")
+                } else if args.break_ignore_hold {
+                    rt.with_ui_break("ignore-hold")
                 } else if args.break_input_frames {
                     rt.with_ui_break("input-frames")
                 } else if args.break_input_no_wake {
@@ -1738,6 +1746,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Declared => DECLARED_FIXTURE,
         Stage::StartFinish => START_FIXTURE,
         Stage::SurfaceView => surface_view::FIXTURE,
+        Stage::UiBlock => ui_block::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
         Stage::Gles2 => gles2_fixture::FIXTURE,
@@ -1811,6 +1820,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
             (Stage::Widgets, _, _) => widgets::drive(p, &log, break_mouse_back),
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
+            (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
             (Stage::Dialog, _, _) => dialog::drive(p, &log),
             (Stage::Gles2, _, _) => gles2::drive(p, &log),
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
@@ -1892,6 +1902,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ("touch-mode", touch_mode_check(&services)),
         ],
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
+        (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness),
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),

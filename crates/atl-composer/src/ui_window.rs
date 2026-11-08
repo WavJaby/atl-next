@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. Its frame clock ticks the compositor ([`UiFrames::tick`], no clock thread) and its pointer events reach the input thread ([`Message::Event`]).
+//! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. The compositor's clock thread publishes each scene into the [`Mailbox`] and
+//! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
+//! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the UI thread only: [`install`] keeps the session in a thread-local on the thread that attached the toolkit (the launcher's startup) and opens the window there, before any client; no other thread touches GTK.
 //! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process, opened at install at its Task's opening size (DisplayModel::opening_size) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_sender.rs); the monitor is also this process's compositor display (Composer::set_display).
 
@@ -14,8 +16,9 @@ use atl_platform_ui::{
 
 use atl_services::display_model::DisplayModel;
 
-use crate::host::UiFrames;
+use crate::host::Composer;
 use crate::input::{InputSender, Message};
+use crate::mailbox::Mailbox;
 use crate::sink::fnv1a64;
 use crate::task_sender::TaskSender;
 
@@ -24,10 +27,11 @@ const CAPTURE_ENV: &str = "ATL_UI_CAPTURE";
 /// Ticks without a new scene after which the picture counts as settled: 1/3 s at 60 Hz, longer than the gaps between the frames of one app redraw.
 const SETTLED_TICKS: u32 = 20;
 
-/// The UI thread's session: the toolkit, the compositor's frame path, the input thread, the window's opening size and the window once it exists.
+/// The UI thread's session: the toolkit, the compositor and its mailbox, the input thread, the window's opening size and the window once it exists.
 struct Session {
     ui: PlatformUi,
-    frames: Arc<UiFrames>,
+    composer: Arc<Composer>,
+    mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
     size: PhysSize,
     /// the window's size and monitor changes go here (the Task's bounds and the display in the services)
@@ -57,10 +61,11 @@ pub fn set_pointer_icon(kind: i32) {
     }));
 }
 
-/// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now. The window cannot wait for the first client: the app's first traversal waits for a vsync, and vsync comes from this window's frame clock.
+/// Keeps the session on the calling thread, which must be the UI thread that attached `ui`, and opens the window now (the services expect the Task's window from the start).
 pub fn install(
     ui: PlatformUi,
-    frames: UiFrames,
+    composer: Arc<Composer>,
+    mailbox: Arc<Mailbox>,
     input: InputSender<Message>,
     size: PhysSize,
     sender: Arc<TaskSender>,
@@ -69,7 +74,8 @@ pub fn install(
     SESSION.with(|cell| {
         *cell.borrow_mut() = Some(Session {
             ui,
-            frames: Arc::new(frames),
+            composer,
+            mailbox,
             input,
             size,
             sender,
@@ -135,13 +141,6 @@ fn capture_report(window: &PlatformWindow, presented: u32) {
     }
 }
 
-/// Whether the window clock asks for another tick: only while the compositor wants one (a vsync request, a queued transaction or buffer, calls to deliver: UiFrames::wants_frame) or a gate's readback waits for the picture to settle.
-/// Otherwise it stops, as an app's vsync does on Android: SurfaceFlinger's EventThread (EventThread.cpp:622 `shouldConsumeEvent`) sends a connection vsync only after its `requestNextVsync` (:401), which DisplayEventDispatcher::scheduleVsync (DisplayEventDispatcher.cpp:79-93) makes for Choreographer.scheduleVsyncLocked (Choreographer.java:1214), one frame at a time.
-/// Any later request restarts it (UiFrames::set_frame_requester).
-fn keep_ticking(wants_frame: bool, settling: bool) -> bool {
-    wants_frame || settling
-}
-
 /// Creates the window, once, on the UI thread.
 fn open() {
     SESSION.with(|cell| {
@@ -172,37 +171,44 @@ fn open() {
         let shown = Rc::clone(&window);
         // the scripted pointer (run-apk --pointer) starts at the first present, as the headless one at its first frame
         let first_frame = session.input.clone();
-        let frames = Arc::clone(&session.frames);
+        let mailbox = Arc::clone(&session.mailbox);
+        let composer = Arc::clone(&session.composer);
         let capture = std::env::var_os(CAPTURE_ENV).is_some();
         let (mut tick_count, mut presented, mut quiet_ticks) = (0u32, 0u32, 0u32);
-        // ticks that ran with nothing wanting them (not the opening tick): the on-demand clock keeps this 0
+        // ticks that found no scene and were not the opening or a settling tick: the clock is asked only by a publish, so this stays near 0 (two publishes between ticks leave one empty tick)
         let mut unwanted = 0u32;
         let requester = window.frame_requester();
         session
-            .frames
+            .composer
             .set_frame_requester(Box::new(move || requester.request_frame()));
         window.on_tick(move |tick| {
-            let time_ns = i64::try_from(tick.time_ns).unwrap_or(i64::MAX);
+            let time_ns = tick.time_ns;
             let settling = capture && presented > 0 && quiet_ticks < SETTLED_TICKS;
-            if tick_count > 0 && !frames.wants_frame() && !settling {
-                unwanted += 1;
-            }
             quiet_ticks = quiet_ticks.saturating_add(1);
-            frames.tick(time_ns, |scene| {
-                presented += 1;
-                quiet_ticks = 0;
-                if presented == 1 {
-                    let _ = first_frame.send(Message::FirstFrame);
-                }
-                tracing::debug!("atl-composer: ui: present n={presented} time_ns={time_ns}");
-                match shown.present(scene) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!("atl-composer: ui present: {e}");
-                        false
+            match mailbox.take() {
+                Some(taken) => {
+                    tracing::debug!(
+                        "atl-composer: ui: present n={} time_ns={time_ns}",
+                        presented + 1
+                    );
+                    match shown.present(&taken.scene) {
+                        Ok(()) => {
+                            presented += 1;
+                            quiet_ticks = 0;
+                            if presented == 1 {
+                                let _ = first_frame.send(Message::FirstFrame);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("atl-composer: ui present: {e}");
+                            mailbox.refused(taken);
+                            composer.presenter_reported();
+                        }
                     }
                 }
-            });
+                None if tick_count > 0 && !settling => unwanted += 1,
+                None => {}
+            }
             if tick_count == 0 {
                 tracing::info!("atl-composer: ui: first frame mapped={}", shown.is_mapped());
             }
@@ -210,31 +216,31 @@ fn open() {
                 capture_report(&shown, presented);
             }
             tick_count += 1;
-            let settling = capture && presented > 0 && quiet_ticks < SETTLED_TICKS;
-            if keep_ticking(frames.wants_frame(), settling) {
+            if capture && presented > 0 && quiet_ticks < SETTLED_TICKS {
                 shown.request_frame();
-            } else if capture {
-                // gates only (one line per stop: an animating app stops and restarts every frame)
+            } else if capture && quiet_ticks == SETTLED_TICKS {
+                // gates only: the readback settled, the clock waits for the next publish
                 tracing::info!(
                     "atl-composer: ui: clock stopped ticks={tick_count} unwanted={unwanted}"
                 );
             }
         });
-        // a paint ends the GPU reads of the buffers it stopped showing: their releases go out now, with the read fences
-        let painted = Arc::clone(&session.frames);
+        // a paint ends the GPU reads of the buffers it stopped showing: they leave the hold set with their read fences (none = export failed, reusable now), and the clock releases them
+        let reports = Arc::clone(&session.mailbox);
+        let composer = Arc::clone(&session.composer);
         window.on_painted(move |p| {
-            painted.painted(
+            reports.released(
                 p.releases
                     .into_iter()
-                    .filter_map(|r| r.release_fence.map(|f| (r.buffer_key, f)))
-                    .collect(),
-            )
+                    .map(|r| (r.buffer_key, r.release_fence)),
+            );
+            composer.presenter_reported();
         });
         let sizes = Arc::clone(&session.sender);
         window.on_resize(move |size| sizes.submit_size(size));
         // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)
         let monitors = Arc::clone(&session.sender);
-        let frames = Arc::clone(&session.frames);
+        let frames = Arc::clone(&session.composer);
         window.on_monitor(move |m| {
             let model = DisplayModel::from_monitor(
                 m.size.width,

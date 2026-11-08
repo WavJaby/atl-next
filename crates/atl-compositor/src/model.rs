@@ -202,7 +202,7 @@ struct Held {
     release_listener: StrongBinder,
     /// `releaseBufferEndpoint`: the listener whose completion carries this buffer's release (AOSP `mPreviousReleaseBufferEndpoint`).
     release_endpoint: StrongBinder,
-    /// The last scene the presenter took shows this buffer ([`Compositor::scene_taken`]). Replacing it, the core waits for the presenter's paint ([`Compositor::painted`]).
+    /// The presenter holds this buffer ([`Compositor::set_held`]). Replacing it, the core waits for the presenter's paint ([`Compositor::painted`]).
     presented: bool,
 }
 
@@ -652,7 +652,7 @@ impl Compositor {
     /// Releases every held buffer (the compositor is going away) and drops what is queued. The presenter is going away too: what it still draws is released with the rest, not at its paint.
     pub fn shutdown(&mut self) -> Vec<ClientCall> {
         self.queues.clear();
-        let mut calls = self.painted();
+        let mut calls = self.painted(&BTreeSet::new());
         for l in self.layers.values_mut() {
             if let Some(h) = l.held.as_mut() {
                 h.presented = false;
@@ -1104,27 +1104,25 @@ impl Compositor {
         self.flush_completions(calls);
     }
 
-    /// The presenter took `scene`, the one the last tick returned, and shows it until its next paint. Each layer's buffer is presented while the scene shows it: replacing a presented buffer, the core
-    /// waits for the paint, while one the scene does not show is released at once. Called once per taken scene, on the thread that ticks (the window's frame clock in UI mode).
-    pub fn scene_taken(&mut self, scene: &Scene) {
-        let shown: BTreeSet<u64> = scene
-            .quads
-            .iter()
-            .filter_map(Quad::buffer)
-            .map(|b| b.buffer.id)
-            .collect();
+    /// The buffers the presenter holds now, by `GraphicBuffer::id`: taken in a scene and not yet reported released. A layer's buffer is presented while held: replacing it, the core waits for
+    /// [`painted`](Compositor::painted); one not held is released at once. Called before every tick and every destroy, so the core never releases a buffer the presenter may still draw.
+    pub fn set_held(&mut self, held: &BTreeSet<u64>) {
         for l in self.layers.values_mut() {
             if let Some(h) = l.held.as_mut() {
-                h.presented = shown.contains(&h.buffer.id);
+                h.presented = held.contains(&h.buffer.id);
             }
         }
     }
 
-    /// The presenter painted, and the buffers it had replaced or destroyed are no longer drawn: each is released now, with a release its completion carries going in the channel write before that
-    /// completion, then the completions they held back follow. The caller attaches the read fences the paint exported ([`attach_read_fences`]). Called once per paint, after its scene was taken.
-    pub fn painted(&mut self) -> Vec<ClientCall> {
+    /// The presenter reported releases; `held` is what it still holds. Each replaced or destroyed buffer no longer held is released now, a release its completion carries going in the channel write
+    /// before that completion, then the completions they held back follow; one still held stays retired. The caller attaches the read fences ([`attach_read_fences`]).
+    pub fn painted(&mut self, held: &BTreeSet<u64>) -> Vec<ClientCall> {
         let mut calls = Vec::new();
-        for r in std::mem::take(&mut self.retired) {
+        let (kept, released): (Vec<Retired>, Vec<Retired>) = std::mem::take(&mut self.retired)
+            .into_iter()
+            .partition(|r| held.contains(&r.held.buffer.id));
+        self.retired = kept;
+        for r in released {
             if r.carried {
                 self.counters.buffers_released += 1;
                 self.counters.releases_carried += 1;
