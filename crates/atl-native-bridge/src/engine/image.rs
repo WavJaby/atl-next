@@ -32,6 +32,24 @@ fn page() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
+/// Writes `bytes` at `addr` in sealed image text: the pages holding it are writable for the copy only, then read + exec again (a stub rewrite after `seal`).
+pub fn write_sealed(addr: usize, bytes: &[u8]) {
+    let size = page();
+    let pg = addr & !(size - 1);
+    let last = addr + bytes.len() - 1;
+    let len = (last & !(size - 1)) + size - pg;
+    // SAFETY: the image's own text pages around `addr`: RWX for the copy, then RX again; the caller passes an address inside a sealed image it mapped.
+    unsafe {
+        libc::mprotect(
+            pg as *mut _,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+        libc::mprotect(pg as *mut _, len, libc::PROT_READ | libc::PROT_EXEC);
+    }
+}
+
 fn err(what: &str, path: &Path) -> String {
     format!(
         "{}: {what}: {}",

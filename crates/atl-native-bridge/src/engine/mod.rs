@@ -4,9 +4,12 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing of the host arch (FS on x86_64; `tpidr_el0` / `tp` modules for arm64 / riscv64 later).
-#[cfg(target_arch = "x86_64")]
+/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...).
+#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
 #[path = "x86_64.rs"]
+pub mod arch;
+#[cfg(feature = "qemu-guest")]
+#[path = "arch/qemu.rs"]
 pub mod arch;
 mod args;
 pub mod bindings;
@@ -15,6 +18,7 @@ mod intercepts;
 pub mod jni;
 mod ndk;
 mod provider;
+#[cfg(not(feature = "qemu-guest"))]
 pub mod signal;
 pub mod thread;
 pub mod vdso;
@@ -25,6 +29,7 @@ pub use arch::HostThread;
 use image::Image;
 
 /// Host `sigaction(sig)`, then `signal::rewrap_all`: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
+#[cfg(not(feature = "qemu-guest"))]
 pub fn install_signal(
     sig: i32,
     handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void),
@@ -94,6 +99,7 @@ pub struct Guest {
     /// the main executable's entry `__linker_init` returned
     pub exe_entry: usize,
     /// the starting thread's record: valid while that thread lives (force_host_fs only)
+    #[cfg(not(feature = "qemu-guest"))]
     start_thread: *mut HostThread,
 }
 
@@ -137,6 +143,7 @@ impl Guest {
             linker,
             vdso,
             exe_entry,
+            #[cfg(not(feature = "qemu-guest"))]
             start_thread,
         })
     }
@@ -157,6 +164,7 @@ impl Guest {
     }
 
     /// Puts the host thread pointer back on the starting thread. Only for a probe that found the crossing left the guest's in place (g1's break): host TLS is unreadable then, so the record comes from `self`.
+    #[cfg(not(feature = "qemu-guest"))]
     pub fn force_host_fs(&self) {
         // SAFETY: the starting thread's record (the probe runs on it, which has not exited); host_fs is the value the crossing read before entering the guest.
         unsafe { arch::set_fs_base((*self.start_thread).host_fs()) }

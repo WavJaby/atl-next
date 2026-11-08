@@ -41,10 +41,8 @@ pub struct Lib {
     pub stubs: &'static [(&'static str, Entry)],
 }
 
-/// Fixed bindings besides the table: the NBS vdso's four entries and the linker's two hooks (vdso.rs `bind`, `bind_linker`).
-const FIXED_BINDINGS: usize = 6;
-/// The thunk pool: one per binding, rounded to a power of two (x86_64.rs `THUNKS`).
-pub const THUNKS: usize = (table::STUB_COUNT + FIXED_BINDINGS).next_power_of_two();
+/// The thunk pool: one per binding (build.rs: the stub rows and the fixed bindings, rounded to a power of two). The x86 thunks and the QEMU pool (`arch/qemu.rs`) are this size.
+pub const THUNKS: usize = table::THUNKS;
 
 /// One row of the table, for gates outside the engine (xtask `gl-proxies`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +86,7 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_key_delete" => super::intercepts::pthread_key_delete as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
+        #[cfg(not(feature = "qemu-guest"))]
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,
         "AAssetManager_fromJava" => super::ndk::asset_manager_from_java as *const () as usize,
         "AndroidBitmap_getInfo" => super::ndk::bitmap_get_info as *const () as usize,
@@ -210,6 +209,10 @@ mod tests {
     #[test]
     fn every_shim_has_an_arm() {
         for (lib, name, b) in rows() {
+            // the QEMU build leaves sigaction unarmed (its signals are QEMU's): the rows bind absent there
+            if cfg!(feature = "qemu-guest") && matches!(name, "sigaction" | "sigaction64") {
+                continue;
+            }
             if b == Binding::Shim {
                 assert!(
                     shim(name).is_some(),

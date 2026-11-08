@@ -444,6 +444,8 @@ fn missing_prototype(soname: &str) -> &'static str {
     }
 }
 
+/// Fixed bindings besides the stub rows: the NBS vdso's four entries and the linker's two hooks (engine/vdso.rs `bind`, `bind_linker`).
+const FIXED_BINDINGS: usize = 6;
 /// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
 /// `Entry::Generic(host, symbol)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing; `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
@@ -605,8 +607,18 @@ fn bindings_table(
         code.push_str("        ],\n    },\n");
     }
     code.push_str("];\n\n");
+    // one pool slot per binding, rounded to a power of two; the QEMU pool (engine/arch/qemu.rs) is generated at this size (aarch64_pool.rs)
+    let thunks = (total + FIXED_BINDINGS).next_power_of_two();
+    std::fs::write(
+        out.join("aarch64_pool.rs"),
+        format!(
+            "{}{}",
+            atl_bridgegen::aarch64::constants_rust(),
+            atl_bridgegen::aarch64::pool_rust(u32::try_from(thunks)?)
+        ),
+    )?;
     code.push_str(&format!(
-        "/// Stub names over all libraries: each binds one thunk.\npub const STUB_COUNT: usize = {total};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
+        "/// Thunk pool slots: the stub rows and the fixed bindings, rounded to a power of two.\npub const THUNKS: usize = {thunks};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
     ));
     code.push_str("/// Per `Entry::Trap(i)`: library, name, why trapped.\npub const TRAP_NAMES: &[(&str, &str, &str)] = &[\n");
     for (lib, name, why) in &traps {
@@ -641,6 +653,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("no_fs_restore", "atl_nb_no_fs_restore"),
     // g4 (tests/g4.rs): a syscall in the host target, must leave the band
     ("g4_break", "atl_g4_break"),
+    // Q4-2 (engine/arch/qemu.rs `is_stub`): the placeholder check decides on its first two bytes only (unit test stub_shape_is_the_whole_placeholder)
+    ("qe_prefix", "atl_nb_qe_prefix"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.

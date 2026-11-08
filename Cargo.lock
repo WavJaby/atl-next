@@ -421,6 +421,7 @@ dependencies = [
  "atl-android-paths",
  "atl-bridgegen",
  "atl-cpu-pressure",
+ "atl-qemu-engine",
  "libc",
  "object",
 ]

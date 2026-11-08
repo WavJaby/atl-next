@@ -7,6 +7,8 @@
 
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use super::image::Image;
+
 /// Guest->host frames one thread can nest (JNI down -> up -> Java -> down chains); overflow traps (`ud2`) instead of writing past the record.
 const SHADOW_FRAMES: usize = 64;
 /// Words per frame, both directions: return address, guest FS (up) / guest target (down), host target (up) / unused (down), the caller's `%rbx`.
@@ -855,7 +857,47 @@ pub fn down(target: usize, kind: Down) -> Result<usize, String> {
 }
 
 /// x86_64 `movabs $imm64, %r11` opcode bytes (REX.W+B, B8+r): the NBS x86_64 interceptable stub starts with it, then `jmp *%r11`.
-pub const STUB_PREFIX: [u8; 2] = [0x49, 0xbb];
+const STUB_PREFIX: [u8; 2] = [0x49, 0xbb];
+/// x86_64 `movabs $imm64, %r11; jmp *%r11`: 13 bytes.
+const JUMP_LEN: usize = 13;
+
+/// Whether `addr` holds an unbound interceptable stub: the `movabs $0, %r11` prefix.
+pub fn is_stub(addr: usize) -> bool {
+    // SAFETY: `addr` is a guest libc text address the guest itself passed; its first two bytes are readable.
+    unsafe { std::slice::from_raw_parts(addr as *const u8, 2) == STUB_PREFIX }
+}
+
+/// Points the stub at `addr` at `thunk` (from `bind`): rewrites its `movabs` immediate. The guest text is sealed, so the write goes through `image::write_sealed`. False when `addr` is no stub.
+pub fn patch_site(addr: usize, thunk: usize) -> bool {
+    if !is_stub(addr) {
+        return false;
+    }
+    super::image::write_sealed(addr + STUB_PREFIX.len(), &thunk.to_ne_bytes());
+    true
+}
+
+/// Rewrites the NBS linker hook at `at` (a naked `ud2`, then int3 padding up to the next 16-byte function) to jump to a thunk of `host`; before `seal`.
+pub fn patch_hook(at: usize, host: usize) -> Result<(), &'static str> {
+    // SAFETY: the hook's bytes in our still-writable mapping of the linker's text.
+    let body = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, JUMP_LEN) };
+    // ud2, then alignment padding (int3) up to the next 16-byte function: room for the jump
+    if body[..2] != [0x0f, 0x0b] || body[2..].iter().any(|&b| b != 0xcc) {
+        return Err("not the 16-byte ud2 hook this engine rewrites");
+    }
+    let thunk = bind(host).ok_or("out of thunks")?;
+    body[..2].copy_from_slice(&STUB_PREFIX);
+    body[2..10].copy_from_slice(&thunk.to_ne_bytes());
+    body[10..].copy_from_slice(&[0x41, 0xff, 0xe3]);
+    Ok(())
+}
+
+/// Points the NB vdso entry whose `st_value` lies at `value_at` (the mapped copy) at a thunk of `host`: the value is the thunk minus the image bias, so the loader's `bias + value` lands on it. Before `seal`.
+pub fn patch_entry(vdso: &Image, value_at: usize, host: usize) -> Result<(), &'static str> {
+    let thunk = bind(host).ok_or("out of thunks")?;
+    // SAFETY: the st_value field of a .dynsym entry in our still-writable mapping of the vdso.
+    unsafe { std::ptr::write_unaligned(value_at as *mut usize, thunk.wrapping_sub(vdso.bias)) };
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

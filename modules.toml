@@ -193,12 +193,13 @@ uses = ["generators"]
 [native-bridge]
 crates = ["atl-native-bridge", "atl-guest-dlsym"]
 exports = ["atl-native-bridge"]
-# cpu-pressure: g4's starvation share over its run (test-only dev-dependency)
-uses = ["generators", "android-paths", "cpu-pressure"]
+# cpu-pressure: g4's starvation share over its run (test-only dev-dependency); qemu-engine: the QEMU crossing's `Trap` (feature qemu-guest only)
+uses = ["generators", "android-paths", "cpu-pressure", "qemu-engine"]
 
-# the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h
+# the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h; exports its `Trap` to the native bridge's QEMU crossing (Q4)
 [qemu-engine]
 crates = ["atl-qemu-engine"]
+exports = ["atl-qemu-engine"]
 uses = ["generators"]
 
 [generators]
