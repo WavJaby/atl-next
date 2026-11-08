@@ -159,6 +159,32 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
     Ok(rows)
 }
 
+/// The namespace script of [`Runtime::atld_command`]: `$0` fake `/sys/bus`, `$1` fake udev database, `$2` a directory for the host's `/dev`, then `name host` pairs (char devices), `--`, atld's command.
+/// `/dev` is rebuilt, not bound over: a mount point cannot be made in the host's devtmpfs from a user namespace, so a tmpfs takes `/dev`'s place and every host entry is bound back into it.
+const FAKE_KERNEL: &str = r#"set -eu
+mount --bind "$0" /sys/bus
+mount --bind "$1" /run/udev/data
+mount --rbind /dev "$2"
+mount -t tmpfs tmpfs /dev
+for n in $(ls -A "$2"); do
+  if [ -L "$2/$n" ]; then ln -s "$(readlink "$2/$n")" "/dev/$n"
+  elif [ -d "$2/$n" ]; then mkdir "/dev/$n" && mount --rbind "$2/$n" "/dev/$n"
+  else : > "/dev/$n" && mount --bind "$2/$n" "/dev/$n"
+  fi
+done
+shift 2
+while [ "$1" != "--" ]; do : > "/dev/$1" && mount --bind "$2" "/dev/$1"; shift 2; done
+shift
+exec "$@""#;
+
+/// The sensors gate's fake kernel views (see [`Runtime::with_fake_devices`]).
+struct FakeDevices {
+    sys_bus: PathBuf,
+    udev_data: PathBuf,
+    /// `(name under /dev, host node)`.
+    nodes: Vec<(String, PathBuf)>,
+}
+
 /// The staged runtime and the tools around it.
 pub struct Runtime {
     pub art: HostArt,
@@ -232,8 +258,8 @@ pub struct Runtime {
     omitted_services: Vec<String>,
     /// atld `--tilt-keys` plus these extra atld args (`--tilt-max-deg` ...), when set.
     tilt_keys: Option<Vec<String>>,
-    /// Directories atld sees as `/sys/bus` and `/run/udev/data` (sensors gate: a fake IIO sysfs and its udev database): atld then runs in a private user + mount namespace (`unshare -Urm`) with them bind-mounted there; the product reads the fixed paths.
-    fake_devices: Option<(PathBuf, PathBuf)>,
+    /// Sensors gate kernel fakes: atld runs in a private user + mount namespace (`unshare -Urm`) that shows these as the fixed paths the product reads.
+    fake_devices: Option<FakeDevices>,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
     gate: String,
     /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
@@ -800,9 +826,18 @@ impl Runtime {
         self
     }
 
-    /// atld (and so every process it starts) sees `sys_bus` as `/sys/bus` and `udev_data` as `/run/udev/data` (the udev database: the host's must exist as the mount point).
-    pub fn with_fake_devices(mut self, sys_bus: PathBuf, udev_data: PathBuf) -> Self {
-        self.fake_devices = Some((sys_bus, udev_data));
+    /// atld (and so every process it starts) sees `sys_bus` as `/sys/bus`, `udev_data` as `/run/udev/data` (the udev database), and the host's `/dev` plus each `(name, host node)` as `/dev/<name>`.
+    pub fn with_fake_devices(
+        mut self,
+        sys_bus: PathBuf,
+        udev_data: PathBuf,
+        nodes: Vec<(String, PathBuf)>,
+    ) -> Self {
+        self.fake_devices = Some(FakeDevices {
+            sys_bus,
+            udev_data,
+            nodes,
+        });
         self
     }
 }
@@ -1108,18 +1143,19 @@ impl Runtime {
         // unshare and sh both exec (no --fork): the child's pid stays atld's, so stop() still reaches it
         let mut cmd = match &self.fake_devices {
             None => Command::new(&self.atld),
-            Some((sys_bus, udev_data)) => {
+            Some(fake) => {
+                let saved = run.scratch.join("host-dev");
+                std::fs::create_dir_all(&saved)
+                    .with_context(|| format!("creating {}", saved.display()))?;
                 let mut c = Command::new("unshare");
-                c.args([
-                    "-Urm",
-                    "--",
-                    "sh",
-                    "-c",
-                    r#"mount --bind "$0" /sys/bus && mount --bind "$1" /run/udev/data && shift && exec "$@""#,
-                ])
-                .arg(sys_bus)
-                .arg(udev_data)
-                .arg(&self.atld);
+                c.args(["-Urm", "--", "sh", "-c", FAKE_KERNEL])
+                    .arg(&fake.sys_bus)
+                    .arg(&fake.udev_data)
+                    .arg(&saved);
+                for (name, host) in &fake.nodes {
+                    c.arg(name).arg(host);
+                }
+                c.arg("--").arg(&self.atld);
                 c
             }
         };

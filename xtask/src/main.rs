@@ -274,7 +274,7 @@ enum Test {
     Window(window::Args),
     /// `run-apk --drive` on fixtures, judged from its PNGs: a shot's pixels are the known quadrants (also after `resize`), and a tap visibly changes the frame. `--break-blank` and `--break-colour` must turn it red.
     Drive(drive_gate::Args),
-    /// The sensor service: a fixture (xtask/testdata/sensors) uses SensorManager under atld with a fake `/sys/bus` (private mount namespace). `--stage empty`: no sensor, no stall; `--stage iio`: a fake IIO accelerometer's events with hand-derived values. `--break` must turn it red.
+    /// The sensor service: a fixture (xtask/testdata/sensors) uses SensorManager under atld with a fake `/sys/bus` (private mount namespace). `--stage empty`: no sensor, no stall; `--stage iio`: a fake IIO accelerometer's events with hand-derived values; `--stage buffer`: the same on its kernel buffer (a FIFO at `/dev/iio:device0`). `--break` must turn it red.
     Sensors(sensors::Args),
     /// The GTK platform layer (M3 slice 6) on a real Wayland compositor: a window maps, frame-clock ticks present scenes, GSK readback equals the pattern, a blocked UI thread answers no `xdg_wm_base` ping.
     ///

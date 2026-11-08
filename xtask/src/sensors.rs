@@ -4,6 +4,8 @@
 //! Stage `iio`: two fake accelerometers, the owner's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
 //! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
 //! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
+//! Stage `buffer`: the iio stage's display accelerometer with its kernel buffer on (the laptop's layout and trigger, realtime stamps, 10 Hz). A FIFO at `/dev/iio:device0` in atld's namespace stands in for the char device; a writer thread fills it with scans while `buffer/enable` reads 1, and holds them for [`HOLD_FOR`] after the app registers (the silent path: re-emits, then samples again). Pass = the iio checks, and the tier counters say buffered with no ts-fallback.
+//! Breaks: `offset` (stamp at byte 12) and `node-denied` (FIFO mode 000) and `enable-off` select the polled tier (`no-data`, `node-denied`, `not-enabled`); `clock` (stamps 1 s ahead) fails the timestamp base; `order` (y and z indices swapped) fails the values.
 //! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`] (incl. the unfocused probe: 90 deg readings until the first focus), the headless script [`TILT_SCRIPT`] (unfocused, focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
 //! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line and their count of the refused probe. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one),
 //! `focus` (services `--no-sensor-focus-check`: the probe reaches the app). Each must fail.
@@ -11,11 +13,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::atld_run::{Run, Runtime, counter_lines};
+use crate::atld_run::{Run, Runtime, counter_lines, counters};
 use crate::window::{self, WINDOW_MS};
 use crate::{manifest, verdict};
 
@@ -23,6 +29,7 @@ use crate::{manifest, verdict};
 pub enum Stage {
     Empty,
     Iio,
+    Buffer,
     Tilt,
 }
 
@@ -44,6 +51,16 @@ pub enum Break {
     Real,
     /// stage tilt: the services accept injection from a process without the focused window
     Focus,
+    /// stage buffer: the scan's stamp at byte 12, not 16: no fresh scan at open, so the polled tier (`no-data`)
+    Offset,
+    /// stage buffer: stamps 1 s ahead of the realtime clock: fresh by the open's 1 s rule, so buffered, and the app's timestamp base fails
+    Clock,
+    /// stage buffer: y and z indices swapped in the layout: buffered, the values fail
+    Order,
+    /// stage buffer: `buffer/enable` reads 0: the polled tier (`not-enabled`)
+    EnableOff,
+    /// stage buffer: the FIFO is mode 000: the polled tier (`node-denied`)
+    NodeDenied,
 }
 
 #[derive(clap::Args)]
@@ -123,6 +140,31 @@ const TILT_SCRIPT: &str = "wait:500 focus:in wait:1500 key-down:105 wait:1500 ke
 const GRAVITY: f64 = 9.806_65;
 /// float32 trig and the Java log's decimal form.
 const TILT_TOLERANCE: f64 = 1e-3;
+
+/// Stage buffer: the display device's node name, `/dev/iio:device0`.
+const NODE: &str = "iio:device0";
+/// The laptop's trigger (`accel_3d-dev0`, trigger0) and ring rate (`in_accel_sampling_frequency` 10: the device floor, 100 ms).
+const TRIGGER: &str = "accel_3d-dev0";
+const BUFFER_HZ: u64 = 10;
+const BUFFER_PERIOD: Duration = Duration::from_millis(1_000 / BUFFER_HZ);
+/// The FIFO's mode: owner rw. The services' sandbox runs as this uid's mapping, so the owner bits are the ones it uses.
+const NODE_MODE: u32 = 0o600;
+/// Scan layout (Documentation/iio/iio_devbuf.rst): x, y, z as s32 at 0, 4, 8; the realtime stamp as s64 at 16; 24 bytes.
+const SCAN_BYTES: usize = 24;
+const AXIS_BYTES: usize = 4;
+const STAMP_AT: usize = 16;
+const STAMP_BYTES: usize = 8;
+/// Where the `offset` break writes its stamp: a byte the kernel does not use.
+const OFFSET_AT: usize = 12;
+const NS_PER_S: i64 = 1_000_000_000;
+/// The ring is held this long from the app's listener registration: the stream's silent path (re-emits at the asked rate), then samples again. The fixture stops after 5 events at 100 ms, so the hold must start at once and end before the fifth.
+const HOLD_FOR: Duration = Duration::from_millis(250);
+/// The gate's log poll: fast enough that the hold starts within one device period of the registration.
+const APP_POLL: Duration = Duration::from_millis(20);
+/// The services' counter names (sensor.rs): the tier at listing and at each open, and stamps taken at arrival.
+const TIER_COUNTER: &str = "accelerometer tier: ";
+const BUFFERED_COUNTER: &str = "accelerometer tier: buffered";
+const TS_FALLBACK_COUNTER: &str = "accelerometer ts-fallback";
 
 /// The stage tilt's checks over the event values in order; empty = pass.
 fn check_tilt(values: &[Vec<f64>]) -> Vec<String> {
@@ -231,7 +273,13 @@ fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) 
             brk == Some(Break::Location),
         ),
     ];
+    if stage == Stage::Buffer {
+        buffer_files(&sys_bus.join("iio/devices"), brk)?;
+    }
     for (id, name, dev_no, db, skip_db) in devices {
+        if stage == Stage::Buffer && id != NODE {
+            continue;
+        }
         let dev = sys_bus.join("iio/devices").join(id);
         std::fs::create_dir_all(&dev)?;
         let files = [
@@ -253,6 +301,150 @@ fn write_devices(sys_bus: &Path, udev: &Path, stage: Stage, brk: Option<Break>) 
         }
     }
     Ok(())
+}
+
+/// The buffered tier's kernel state as the laptop reads it (`run`, 2026-11-08): x, y, z s32 at indices 0-2 and the stamp s64 at 3, all enabled; trigger [`TRIGGER`]; realtime stamps; [`BUFFER_HZ`].
+/// `order` swaps the y and z indices; `enable-off` writes `buffer/enable` 0.
+fn buffer_files(devices: &Path, brk: Option<Break>) -> Result<()> {
+    let (y, z) = if brk == Some(Break::Order) {
+        (2, 1)
+    } else {
+        (1, 2)
+    };
+    let enable = if brk == Some(Break::EnableOff) {
+        "0"
+    } else {
+        "1"
+    };
+    let dev = devices.join(NODE);
+    let files = [
+        ("scan_elements/in_accel_x_index", "0".to_owned()),
+        ("scan_elements/in_accel_x_type", "le:s32/32>>0".to_owned()),
+        ("scan_elements/in_accel_x_en", "1".to_owned()),
+        ("scan_elements/in_accel_y_index", y.to_string()),
+        ("scan_elements/in_accel_y_type", "le:s32/32>>0".to_owned()),
+        ("scan_elements/in_accel_y_en", "1".to_owned()),
+        ("scan_elements/in_accel_z_index", z.to_string()),
+        ("scan_elements/in_accel_z_type", "le:s32/32>>0".to_owned()),
+        ("scan_elements/in_accel_z_en", "1".to_owned()),
+        ("scan_elements/in_timestamp_index", "3".to_owned()),
+        ("scan_elements/in_timestamp_type", "le:s64/64>>0".to_owned()),
+        ("scan_elements/in_timestamp_en", "1".to_owned()),
+        ("buffer/enable", enable.to_owned()),
+        ("trigger/current_trigger", TRIGGER.to_owned()),
+        ("current_timestamp_clock", "realtime".to_owned()),
+        ("in_accel_sampling_frequency", BUFFER_HZ.to_string()),
+    ];
+    for (n, t) in files {
+        let path = dev.join(n);
+        std::fs::create_dir_all(path.parent().unwrap_or(&dev))?;
+        std::fs::write(&path, format!("{t}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    let trigger = devices.join("trigger0");
+    std::fs::create_dir_all(&trigger)?;
+    std::fs::write(trigger.join("name"), format!("{TRIGGER}\n"))?;
+    Ok(())
+}
+
+fn realtime_ns() -> i64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    t.tv_sec * NS_PER_S + t.tv_nsec
+}
+
+/// One scan of the laptop's layout: RAW as s32 at 0, 4, 8 (the layout's x, y, z), the realtime stamp as s64 at 16. `offset` writes the stamp at 12; `clock` stamps a second ahead.
+fn scan_bytes(brk: Option<Break>) -> [u8; SCAN_BYTES] {
+    let mut s = [0u8; SCAN_BYTES];
+    for (i, r) in RAW.iter().enumerate() {
+        let at = i * AXIS_BYTES;
+        let v = i32::try_from(*r).expect("RAW is s32");
+        s[at..at + AXIS_BYTES].copy_from_slice(&v.to_le_bytes());
+    }
+    let late = if brk == Some(Break::Clock) {
+        NS_PER_S
+    } else {
+        0
+    };
+    let at = if brk == Some(Break::Offset) {
+        OFFSET_AT
+    } else {
+        STAMP_AT
+    };
+    s[at..at + STAMP_BYTES].copy_from_slice(&(realtime_ns() + late).to_le_bytes());
+    s
+}
+
+/// The kernel ring's stand-in: a FIFO that gets a scan every [`BUFFER_PERIOD`] while `enable` reads 1 and the ring is not held. Opened read-write, so the open never blocks and a reader's close never gives the writer SIGPIPE. A full FIFO drops the scan, where the kernel's ring would overwrite the oldest.
+struct Ring {
+    stop: Arc<AtomicBool>,
+    held: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Ring {
+    fn start(fifo: &Path, enable: &Path, brk: Option<Break>) -> Result<Ring> {
+        let fd = rustix::fs::open(
+            fifo,
+            OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening {}", fifo.display()))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let (s, h, enable) = (Arc::clone(&stop), Arc::clone(&held), enable.to_owned());
+        let thread = std::thread::spawn(move || {
+            let mut next = Instant::now();
+            while !s.load(Ordering::Relaxed) {
+                let on = std::fs::read_to_string(&enable).is_ok_and(|t| t.trim() == "1");
+                if on && !h.load(Ordering::Relaxed) {
+                    // EAGAIN (full) drops the scan; any other error leaves the reader with nothing, which the gate reports
+                    let _ = rustix::io::write(&fd, &scan_bytes(brk));
+                }
+                next += BUFFER_PERIOD;
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        });
+        Ok(Ring {
+            stop,
+            held,
+            thread: Some(thread),
+        })
+    }
+
+    fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Stage buffer, on top of the iio checks: every tier counter says buffered (at listing and at each open), and no stamp was taken at arrival.
+fn check_buffer(services: &str) -> Vec<String> {
+    let all = counters(services);
+    let tiers: Vec<&str> = all
+        .iter()
+        .map(|c| c.name.as_str())
+        .filter(|n| n.contains(TIER_COUNTER))
+        .collect();
+    let mut whys = Vec::new();
+    if tiers.is_empty() || tiers.iter().any(|n| !n.ends_with(BUFFERED_COUNTER)) {
+        whys.push(format!(
+            "tier counters {tiers:?}, want only `{BUFFERED_COUNTER}`"
+        ));
+    }
+    if all.iter().any(|c| c.name.contains(TS_FALLBACK_COUNTER)) {
+        whys.push(format!(
+            "`{TS_FALLBACK_COUNTER}` counted: a stamp left the clock's window"
+        ));
+    }
+    whys
 }
 
 fn tail(text: &str, n: usize) -> String {
@@ -301,7 +493,7 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
                 ));
             }
         }
-        Stage::Iio => {
+        Stage::Iio | Stage::Buffer => {
             if n != Some(1) {
                 whys.push(format!("sensor count {n:?}, want 1"));
             }
@@ -389,6 +581,9 @@ fn check(stage: Stage, msgs: &[String], services: &str, want: [f64; 3]) -> Vec<S
             }
         }
     }
+    if stage == Stage::Buffer {
+        whys.extend(check_buffer(services));
+    }
     if find("done").is_none() {
         whys.push("no done line".to_owned());
     }
@@ -404,6 +599,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let name = match args.stage {
         Stage::Empty => "sensors-empty",
         Stage::Iio => "sensors-iio",
+        Stage::Buffer => "sensors-buffer",
         Stage::Tilt => "sensors-tilt",
     };
     let mut rt = Runtime::new(
@@ -421,7 +617,34 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let sys_bus = work.join("sys-bus");
     let udev = work.join("udev-data");
     write_devices(&sys_bus, &udev, args.stage, args.break_)?;
-    rt = rt.with_fake_devices(sys_bus.clone(), udev);
+    let mut nodes = Vec::new();
+    // kept to the end of the run: its drop stops the writer
+    let mut ring = None;
+    if args.stage == Stage::Buffer {
+        let dir = work.join("dev-node");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let fifo = dir.join(NODE);
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            FileType::Fifo,
+            Mode::from_raw_mode(NODE_MODE),
+            0,
+        )
+        .with_context(|| format!("mkfifo {}", fifo.display()))?;
+        let enable = sys_bus.join("iio/devices").join(NODE).join("buffer/enable");
+        // opened before any chmod: the writer keeps its fd when the node is then denied
+        ring = Some(Ring::start(&fifo, &enable, args.break_)?);
+        if args.break_ == Some(Break::NodeDenied) {
+            rustix::fs::chmod(&fifo, Mode::empty())
+                .with_context(|| format!("chmod 000 {}", fifo.display()))?;
+        }
+        nodes.push((NODE.to_owned(), fifo));
+    }
+    rt = rt.with_fake_devices(sys_bus.clone(), udev, nodes);
     if args.break_ == Some(Break::Unregistered) {
         rt = rt.without_sensor_service();
     }
@@ -455,10 +678,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let start = Instant::now();
     let mut started_at: Option<Instant> = None;
     let mut lookup_at: Option<Instant> = None;
+    let mut registered_at: Option<Instant> = None;
     let mut ended = None;
     // until done; a start line without a lookup line within the limit is the stall (no need to sit out SensorManager's wait)
     loop {
         let msgs = messages(&read(&app_log));
+        if let Some(r) = &ring {
+            if registered_at.is_none() && msgs.iter().any(|m| m == "register=true") {
+                registered_at = Some(Instant::now());
+            }
+            if let Some(t) = registered_at {
+                r.hold(t.elapsed() < HOLD_FOR);
+            }
+        }
         if msgs.iter().any(|m| m == "done" || m.starts_with("done ")) {
             break;
         }
@@ -490,7 +722,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if start.elapsed() > LIMIT {
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(APP_POLL);
     }
     // the poll's stop line follows unregisterListener
     let services_path = run.log("services");
@@ -608,6 +840,36 @@ mod tests {
         // the canonical (unconverted) values
         iio[4] = ev(100, "-0.06,-8.71,3.74");
         assert!(!check(Stage::Iio, &iio, &stopped, want).is_empty());
+    }
+
+    #[test]
+    fn scan_is_the_laptops_layout() {
+        // s32 x, y, z at 0, 4, 8; the s64 stamp at 16; 24 bytes (iio_devbuf.rst). The offset break moves the stamp to 12.
+        let s = scan_bytes(None);
+        assert_eq!(s.len(), SCAN_BYTES);
+        assert_eq!(
+            i32::from_le_bytes(s[4..8].try_into().unwrap()),
+            RAW[1] as i32
+        );
+        let stamp = i64::from_le_bytes(s[16..24].try_into().unwrap());
+        assert!((stamp - realtime_ns()).abs() < NS_PER_S);
+        let o = scan_bytes(Some(Break::Offset));
+        let moved = i64::from_le_bytes(o[12..20].try_into().unwrap());
+        assert!((moved - realtime_ns()).abs() < NS_PER_S);
+    }
+
+    #[test]
+    fn buffer_counters_say_buffered_and_no_fallback() {
+        let ok = "services: answered ISensorServer.accelerometer tier: buffered 2 at=100.006\n";
+        assert!(check_buffer(ok).is_empty());
+        let polled = "services: answered ISensorServer.accelerometer tier: buffered 1 at=100.006\n\
+                      services: answered ISensorServer.accelerometer tier: polled (no-data) 1 at=100.900\n";
+        assert!(!check_buffer(polled).is_empty());
+        let fallback = format!(
+            "{ok}services: answered ISensorServer.accelerometer ts-fallback 1 at=101.000\n"
+        );
+        assert!(!check_buffer(&fallback).is_empty());
+        assert!(!check_buffer("").is_empty(), "no tier counter at all");
     }
 
     #[test]
