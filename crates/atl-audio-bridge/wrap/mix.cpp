@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <new>
 
+#include "audio_utils/format.h"
 #include "audio_utils/minifloat.h"
 #include "system/audio.h"
 
@@ -18,8 +19,6 @@ static_assert(sizeof(android::audio_track_cblk_t) == kCblkBytes,
 
 /// Interleaved channels of the output: AUDIO_CHANNEL_OUT_STEREO.
 constexpr size_t kOutChannels = 2;
-/// PCM 16-bit to float: Q15, the scale AOSP's memcpy_to_float_from_q15 uses (system/media/audio_utils format.h).
-constexpr float kQ15 = 1.0f / 32768.0f;
 
 void* as_value(uint32_t v) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(v));
@@ -30,7 +29,7 @@ void* as_value(uint32_t v) {
 Track::Track(android::sp<android::AudioTrackServerProxy> server, size_t channels_per_frame)
     : proxy(std::move(server)), channels(channels_per_frame) {}
 
-// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, PCM 16-bit. The mixer's track input is float (AudioMixerBase's mMixerInFormat), so the frames are converted here, the reformat AudioMixer's BufferProviders do (not built: libaudioprocessing needs libsonic).
+// Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, PCM 16-bit. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412). That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
 android::status_t Track::getNextBuffer(Buffer* buffer) {
     android::ServerProxy::Buffer buf;
     buf.mFrameCount = buffer->frameCount;
@@ -44,10 +43,7 @@ android::status_t Track::getNextBuffer(Buffer* buffer) {
         buffer->raw = nullptr;
         return status;
     }
-    const auto* in = static_cast<const int16_t*>(server_raw);
-    for (size_t i = 0; i < frames * channels; ++i) {
-        floats[i] = static_cast<float>(in[i]) * kQ15;
-    }
+    memcpy_by_audio_format(floats.data(), AUDIO_FORMAT_PCM_FLOAT, server_raw, AUDIO_FORMAT_PCM_16_BIT, frames * channels);
     buffer->raw = floats.data();
     return status;
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! AOSP's server side of a track and its mixer, behind the cxx bridge in src/bridge.rs.
 //! Track: AudioTrackServerProxy (streaming) or StaticAudioTrackServerProxy (shared buffer) over the control block Rust maps, read by the mixer through AudioBufferProvider (Tracks.cpp Track::getNextBuffer / releaseBuffer).
-//! Mix: AudioMixerBase at the output's quantum and rate, float mixing, stereo out. AudioMixerBase has no setBufferProvider in this AOSP (AudioMixer, which has one, needs external/sonic), so Mix sets its tracks' providers itself, as AudioMixer::setBufferProvider does.
+//! Mix: AudioMixerBase at the output's quantum and rate, float mixing, stereo out. AudioMixerBase has no setBufferProvider in this AOSP (AudioMixer, which has one, is not built: its BufferProviders need libaudiohal and external/sonic), so Mix sets its tracks' providers itself, as AudioMixer::setBufferProvider does.
 //! Forward only: types are converted and calls forwarded; the protocol and the mix are AOSP's.
 #pragma once
 
