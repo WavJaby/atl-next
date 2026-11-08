@@ -40,4 +40,4 @@ pub mod signal;
 pub mod trap;
 
 #[cfg(feature = "qemu")]
-pub use engine::{Guest, OnTrap, Trap, run};
+pub use engine::{Guest, OnTrap, Trap, page, run};

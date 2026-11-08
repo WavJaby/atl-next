@@ -28,6 +28,17 @@ type MainFn = unsafe extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) ->
 type CpuLoopFn = unsafe extern "C" fn(*mut c_void);
 pub(crate) type InCodeGenBufferFn = unsafe extern "C" fn(*const c_void) -> bool;
 pub(crate) type PageGetFlagsFn = unsafe extern "C" fn(u64) -> c_int;
+pub(crate) type PageSetFlagsFn = unsafe extern "C" fn(u64, u64, c_int, c_int);
+pub(crate) type MmapLockFn = unsafe extern "C" fn();
+
+/// QEMU's user-mode page flags (include/exec/page-protection.h:12-16), the `set` argument of [`Guest::map_pages`].
+pub mod page {
+    pub const READ: i32 = 0x1;
+    pub const WRITE: i32 = 0x2;
+    pub const EXEC: i32 = 0x4;
+    /// The page is mapped for the guest; a page without it is unmapped and a fetch from it faults.
+    pub const VALID: i32 = 0x8;
+}
 
 /// The library's entry points and data, resolved once by [`run`].
 pub(crate) struct Lib {
@@ -41,6 +52,11 @@ pub(crate) struct Lib {
     pub(crate) guest_addr_max: &'static usize,
     /// `page_get_flags` (accel/tcg/user-exec.c): the QEMU page flags of a guest address.
     pub(crate) page_get_flags: PageGetFlagsFn,
+    /// `page_set_flags(start, last, set, clear)` (accel/tcg/user-exec.c): `last` inclusive, needs the mmap lock.
+    pub(crate) page_set_flags: PageSetFlagsFn,
+    /// `mmap_lock` / `mmap_unlock` (linux-user/mmap.c): the lock `page_set_flags` asserts.
+    pub(crate) mmap_lock: MmapLockFn,
+    pub(crate) mmap_unlock: MmapLockFn,
     /// dlopen handle, for the per-thread symbols resolved later (`helper_retaddr`).
     handle: usize,
     pub(crate) on_trap: OnTrap,
@@ -103,6 +119,9 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
     let guest_base = sym(handle, c"guest_base")?;
     let guest_addr_max = sym(handle, c"guest_addr_max")?;
     let page_get_flags = sym(handle, c"page_get_flags")?;
+    let page_set_flags = sym(handle, c"page_set_flags")?;
+    let mmap_lock = sym(handle, c"mmap_lock")?;
+    let mmap_unlock = sym(handle, c"mmap_unlock")?;
     let lib = Lib {
         // SAFETY: cpu_loop is `void cpu_loop(CPUArchState *)` (include/user/cpu_loop.h with P1).
         cpu_loop: unsafe { std::mem::transmute::<*mut c_void, CpuLoopFn>(cpu_loop) },
@@ -120,6 +139,14 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
         page_get_flags: unsafe {
             std::mem::transmute::<*mut c_void, PageGetFlagsFn>(page_get_flags)
         },
+        // SAFETY: `void page_set_flags(vaddr start, vaddr last, int set, int clear)` (include/user/page-protection.h).
+        page_set_flags: unsafe {
+            std::mem::transmute::<*mut c_void, PageSetFlagsFn>(page_set_flags)
+        },
+        // SAFETY: `void mmap_lock(void)` (linux-user/mmap.c, declared include/exec/mmap-lock.h).
+        mmap_lock: unsafe { std::mem::transmute::<*mut c_void, MmapLockFn>(mmap_lock) },
+        // SAFETY: `void mmap_unlock(void)`, as mmap_lock.
+        mmap_unlock: unsafe { std::mem::transmute::<*mut c_void, MmapLockFn>(mmap_unlock) },
         handle,
         on_trap,
     };
@@ -190,6 +217,31 @@ impl Guest {
     /// The host address of guest address `addr` (`g2h`: plus `guest_base`; identity at `-B 0`).
     pub fn host_addr(&self, addr: u64) -> usize {
         (addr as usize).wrapping_add(*lib().guest_base)
+    }
+
+    /// Marks the guest pages of `[start, start + len)` as mapped with `flags` (`page::*`, `VALID` added here), identity: guest address = host address (`guest_base` 0). Host memory outside this table is unmapped to the guest, so a fetch from a page not marked faults.
+    /// Needs a trap context (QEMU's page table is live from `main`, and the calling thread takes the mmap lock). Before the first guest fetch from the range.
+    pub fn map_pages(&self, start: usize, len: usize, flags: i32) -> Result<(), String> {
+        let last = start
+            .checked_add(len)
+            .and_then(|end| end.checked_sub(1))
+            .map(|last| last as u64)
+            .ok_or("map_pages: empty or wrapping range")?;
+        let lib = lib();
+        // QEMU asserts `last <= guest_addr_max`; refuse here instead of aborting in its assert
+        if last > *lib.guest_addr_max as u64 {
+            return Err(format!(
+                "map_pages {start:#x}+{len:#x}: beyond guest_addr_max {:#x}",
+                *lib.guest_addr_max
+            ));
+        }
+        // SAFETY: the mmap lock and `page_set_flags` are QEMU's own (linux-user/mmap.c, accel/tcg/user-exec.c); called on the guest thread, in a trap, so QEMU's page table is initialised and the range is within `guest_addr_max`.
+        unsafe {
+            (lib.mmap_lock)();
+            (lib.page_set_flags)(start as u64, last, flags | page::VALID, 0);
+            (lib.mmap_unlock)();
+        }
+        Ok(())
     }
 
     /// Calls guest function `f` with `args` in x0.. and returns its x0. Nested: may run from inside a trap callback, which may itself call again.
