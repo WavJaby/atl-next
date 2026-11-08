@@ -121,7 +121,7 @@ pub enum Fallback {
     Trigger,
     /// The buffer is off: nothing has enabled it.
     NotEnabled,
-    /// The timestamp clock is not one the kernel offers.
+    /// The timestamp clock is not one the kernel offers, or scan stamps are ahead of arrival (not in that clock).
     Clock,
     /// This process may not open the char device.
     NodeDenied,

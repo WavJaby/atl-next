@@ -5,7 +5,7 @@
 //! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
 //! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
 //! Stage `buffer`: the iio stage's display accelerometer with its kernel buffer on (the laptop's layout and trigger, realtime stamps, 10 Hz). A FIFO at `/dev/iio:device0` in atld's namespace stands in for the char device; a writer thread fills it with scans while `buffer/enable` reads 1, and holds them for [`HOLD_FOR`] after the app registers (the silent path: re-emits, then samples again). Pass = the iio checks, and the tier counters say buffered with no ts-fallback.
-//! Breaks: `offset` (stamp at byte 12) and `node-denied` (FIFO mode 000) and `enable-off` select the polled tier (`no-data`, `node-denied`, `not-enabled`); `clock` (stamps 1 s ahead) fails the timestamp base; `order` (y and z indices swapped) fails the values.
+//! Breaks: `offset` (stamp at byte 12) and `node-denied` (FIFO mode 000) and `enable-off` select the polled tier (`no-data`, `node-denied`, `not-enabled`); `clock` (stamps 1 s ahead) selects the polled tier (`clock`); `order` (y and z indices swapped) fails the values.
 //! Stage `tilt`: no IIO device, atld `--tilt-keys` with [`TILT_ARGS`] (incl. the unfocused probe: 90 deg readings until the first focus), the headless script [`TILT_SCRIPT`] (unfocused, focus in, hold Left, hold Right, then hold Left and lose focus). Pass = the injected accelerometer listed, every event of magnitude g with y = 0, level first,
 //! the Left plateau x = +g sin(max) before the Right plateau x = -g sin(max), no |x| beyond it, level last (the focus loss), the services' injection-on line and their count of the refused probe. Breaks: `off` (no `--tilt-keys`: nothing listed), `real` (the iio stage's devices present: the services refuse injection and list the real one),
 //! `focus` (services `--no-sensor-focus-check`: the probe reaches the app). Each must fail.
@@ -53,7 +53,7 @@ pub enum Break {
     Focus,
     /// stage buffer: the scan's stamp at byte 12, not 16: no fresh scan at open, so the polled tier (`no-data`)
     Offset,
-    /// stage buffer: stamps 1 s ahead of the realtime clock: fresh by the open's 1 s rule, so buffered, and the app's timestamp base fails
+    /// stage buffer: stamps 1 s ahead of the realtime clock: not fresh at open, so the polled tier (`clock`)
     Clock,
     /// stage buffer: y and z indices swapped in the layout: buffered, the values fail
     Order,
@@ -865,6 +865,12 @@ mod tests {
         let polled = "services: answered ISensorServer.accelerometer tier: buffered 1 at=100.006\n\
                       services: answered ISensorServer.accelerometer tier: polled (no-data) 1 at=100.900\n";
         assert!(!check_buffer(polled).is_empty());
+        let clock =
+            "services: answered ISensorServer.accelerometer tier: polled (clock) 1 at=100.900\n";
+        assert!(
+            !check_buffer(clock).is_empty(),
+            "a stamp ahead fails at open"
+        );
         let fallback = format!(
             "{ok}services: answered ISensorServer.accelerometer ts-fallback 1 at=101.000\n"
         );

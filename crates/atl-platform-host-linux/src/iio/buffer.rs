@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The buffered tier: the IIO char device `/dev/iio:deviceN` read as a stream of scans (kernel Documentation/iio/iio_devbuf.rst), where the environment enabled the buffer (udev rule 71). Nothing here writes sysfs.
 //! [`probe`] reads the buffer's state in the design's order (layout, trigger, enabled, clock, node); the first failing step is the fallback label. [`Stream::open`] adds the fresh-data wait (P6).
-//! Scans are decoded by the layout the kernel announces in `scan_elements`, never by a fixed offset. Stamps are kernel clock values mapped to CLOCK_BOOTTIME per read (`ts - (clock_now - boottime_now)`): no root write, one path for all four clocks.
+//! Scans are decoded by the layout the kernel announces in `scan_elements`, never by a fixed offset. Stamps are kernel clock values mapped to CLOCK_BOOTTIME per read (`ts - (named_now - boottime_mid)`, see [`Stream::stamp`]): no root write, one path for all four clocks.
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -16,8 +16,10 @@ use rustix::time::{ClockId, clock_gettime};
 use super::{AXES, Calibration, read_text};
 
 const NS_PER_S: i64 = 1_000_000_000;
-/// A stamp this far from arrival is not in the clock the kernel names. 1 s is far above poll latency (ms) and far below a stale ring (the ring holds 128 scans = 12.8 s at 10 Hz; design 5.1 P6).
+/// The oldest a fresh stamp may be: far above poll latency (ms), far below a stale ring (128 scans = 12.8 s at 10 Hz; design 5.1 P6). A stamp ahead of arrival is judged by the mapping's error instead, see [`Stream::stamp`].
 const FRESH_AGE_NS: i64 = NS_PER_S;
+/// Slack on a stamp ahead of arrival, beyond the read bracket: a coarse clocksource can read the same value twice, so the bracket can be zero while the error is a tick. 1 ms = one jiffy at HZ=1000.
+const TICK_NS: i64 = 1_000_000;
 /// Open-time wait for a fresh scan: this long, or [`FRESH_INTERVALS`] device intervals when longer (design 5.1 P6).
 const FRESH_WAIT: Duration = Duration::from_millis(500);
 const FRESH_INTERVALS: u32 = 3;
@@ -245,14 +247,22 @@ pub(super) struct Stream {
     pending: Option<Sample>,
     /// Bytes of a scan not yet complete.
     partial: Vec<u8>,
-    /// Scans stamped outside [`FRESH_AGE_NS`] of arrival; each took the arrival time (ts-fallback).
+    /// Scans not fresh (stale, or stamped ahead of arrival); each took the arrival time (ts-fallback).
     ts_fallbacks: u64,
 }
 
-/// One drained batch's newest scan, stamped. `fresh` is false when the stamp was not in the named clock.
+/// One drained batch's newest scan, stamped.
 struct Stamped {
     sample: Sample,
-    fresh: bool,
+    freshness: Freshness,
+}
+
+/// Where a stamp sits against arrival: `Fresh` in the window, `Ahead` past the mapping's error (not in the named clock), `Stale` older than [`FRESH_AGE_NS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    Fresh,
+    Ahead,
+    Stale,
 }
 
 impl Stream {
@@ -279,20 +289,29 @@ impl Stream {
         Ok(stream)
     }
 
-    /// P6: a fresh scan within `window`, kept as the first sample. Any read failure, or no fresh scan in time, is `no-data`.
+    /// P6: a fresh scan within `window`, kept as the first sample. A stamp ahead of arrival means the stamps are not in the named clock (`clock`); no fresh scan otherwise, or a read failure, is `no-data`.
     fn first_fresh(&mut self, window: Duration) -> Result<(), Fallback> {
         let deadline = Instant::now() + window;
+        let mut ahead = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(Fallback::NoData);
+                return Err(if ahead {
+                    Fallback::Clock
+                } else {
+                    Fallback::NoData
+                });
             }
             match self.read_within(left) {
-                Ok(Some(s)) if s.fresh => {
-                    self.pending = Some(s.sample);
-                    return Ok(());
-                }
-                Ok(_) => {}
+                Ok(Some(s)) => match s.freshness {
+                    Freshness::Fresh => {
+                        self.pending = Some(s.sample);
+                        return Ok(());
+                    }
+                    Freshness::Ahead => ahead = true,
+                    Freshness::Stale => {}
+                },
+                Ok(None) => {}
                 Err(_) => return Err(Fallback::NoData),
             }
         }
@@ -343,17 +362,32 @@ impl Stream {
         }
     }
 
-    /// The stamp mapped to CLOCK_BOOTTIME: `ts - (clock_now - boottime_now)`, both read here. Outside [`FRESH_AGE_NS`] of arrival it is not in that clock: arrival time is used and the scan is not fresh.
+    /// The stamp mapped to CLOCK_BOOTTIME: `ts - (named_now - boottime_mid)`. The named clock is read between two boottime reads, so the mapping is off by at most their gap plus [`TICK_NS`]; the midpoint is the arrival reference. A stamp ahead of arrival by more than that is not in the named clock: arrival time is used and the scan is not fresh.
     fn stamp(&self, raw: [f64; 3], ts: i64) -> Stamped {
-        let boot = clock_ns(ClockId::Boottime);
-        let mapped = ts - (clock_ns(self.clock) - boot);
-        let fresh = (boot - mapped).abs() <= FRESH_AGE_NS;
+        let before = clock_ns(ClockId::Boottime);
+        let named = clock_ns(self.clock);
+        let after = clock_ns(ClockId::Boottime);
+        let arrival = (before + after) / 2;
+        let mapped = ts - (named - arrival);
+        let ahead_limit = (after - before) + TICK_NS;
+        let age = arrival - mapped;
+        let freshness = if age < -ahead_limit {
+            Freshness::Ahead
+        } else if age > FRESH_AGE_NS {
+            Freshness::Stale
+        } else {
+            Freshness::Fresh
+        };
         Stamped {
             sample: Sample {
-                boottime_ns: if fresh { mapped } else { boot },
+                boottime_ns: if freshness == Freshness::Fresh {
+                    mapped
+                } else {
+                    arrival
+                },
                 values: self.calib.frame(raw),
             },
-            fresh,
+            freshness,
         }
     }
 
@@ -384,7 +418,7 @@ impl SampleStream for Stream {
         }
         match self.read_within(timeout)? {
             Some(s) => {
-                if !s.fresh {
+                if s.freshness != Freshness::Fresh {
                     self.count_fallback();
                 }
                 Ok(Some(s.sample))
@@ -796,14 +830,14 @@ mod tests {
         drop(w);
     }
 
-    /// The stamp mapping for `realtime`: a scan stamped 300 ms ahead of the realtime clock lands 300 ms ahead of CLOCK_BOOTTIME.
+    /// The stamp mapping for `realtime`: a scan stamped 300 ms before the realtime clock lands 300 ms before CLOCK_BOOTTIME. A stamp ahead is not in the clock: see `stamp_ahead_of_arrival_is_not_fresh_and_opens_as_clock`.
     #[test]
     fn realtime_stamps_map_to_boottime() {
         let f = Fake::new("fifo-clock", &[(&files(&[], &[]), None)]);
         let node = f.node(0);
         let _reader = hold_fifo(&node);
         let mut w = writer(&node);
-        w.write_all(&scan(1, clock_ns(ClockId::Realtime) + 300_000_000))
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime) - 300_000_000))
             .expect("write");
         let mut s = Stream::open(
             &f.0.join("sys"),
@@ -817,11 +851,58 @@ mod tests {
             .next(Duration::from_millis(100))
             .expect("reads")
             .expect("a sample");
-        let ahead = got.boottime_ns - clock_ns(ClockId::Boottime);
+        let behind = clock_ns(ClockId::Boottime) - got.boottime_ns;
         assert!(
-            (ahead - 300_000_000).abs() < 100_000_000,
-            "mapped {ahead} ns ahead"
+            (behind - 300_000_000).abs() < 100_000_000,
+            "mapped {behind} ns behind"
         );
+        drop(w);
+    }
+
+    /// A stamp a second ahead of arrival is not in the realtime clock: the open finds no fresh scan and falls back as `clock`.
+    #[test]
+    fn stamp_ahead_of_arrival_is_not_fresh_and_opens_as_clock() {
+        let f = Fake::new("fifo-ahead", &[(&files(&[], &[]), None)]);
+        let node = f.node(0);
+        let _reader = hold_fifo(&node);
+        let mut w = writer(&node);
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime) + NS_PER_S))
+            .expect("write");
+        let sensors = f.sensors();
+        let st = sensors.open("iio:device0").expect("opens");
+        assert_eq!(st.tier(), Tier::Polled(Fallback::Clock));
+        drop(w);
+    }
+
+    /// A scan stamped ahead of arrival after the open is returned at arrival time and counted, as a stale one is.
+    #[test]
+    fn ahead_scan_after_open_is_a_ts_fallback() {
+        let f = Fake::new("fifo-ahead-run", &[(&files(&[], &[]), None)]);
+        let node = f.node(0);
+        let _reader = hold_fifo(&node);
+        let mut w = writer(&node);
+        w.write_all(&scan(1, clock_ns(ClockId::Realtime)))
+            .expect("write");
+        let mut s = Stream::open(
+            &f.0.join("sys"),
+            &f.dir(0),
+            &node,
+            Duration::from_millis(100),
+            calib(),
+        )
+        .expect("opens");
+        assert!(s.next(Duration::from_millis(100)).expect("reads").is_some());
+        w.write_all(&scan(2, clock_ns(ClockId::Realtime) + NS_PER_S))
+            .expect("write");
+        let got = s
+            .next(Duration::from_millis(100))
+            .expect("reads")
+            .expect("a sample");
+        assert!(
+            (got.boottime_ns - clock_ns(ClockId::Boottime)).abs() < FRESH_AGE_NS,
+            "arrival time used"
+        );
+        assert_eq!(s.ts_fallbacks(), 1);
         drop(w);
     }
 }
