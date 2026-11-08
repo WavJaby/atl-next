@@ -1012,7 +1012,7 @@ impl Runtime {
     }
 
     /// Records what `run` reads for `xtask remote push` (remote.rs `write_record`): the runtime's inputs, the run's packages and boot jars. Written before atld starts, so a run that fails still leaves its record.
-    fn record_inputs(&self, run: &Run) -> Result<()> {
+    pub fn record_inputs(&self, run: &Run) -> Result<()> {
         let mut inputs = self.runtime_inputs()?;
         inputs
             .files
@@ -1035,15 +1035,14 @@ impl Runtime {
         }
         let (mut cmd, mut written) = self.atld_command(run)?;
         if let remote::Site::Remote(target) = &self.site {
+            // a UI window needs the target's desktop session (its WAYLAND_DISPLAY, remote.rs `session`); this host's socket has no target
             ensure!(
                 self.fake_devices.is_none()
                     && self.wayland.is_none()
-                    && self.ui.is_none()
-                    && self.display.is_none()
-                    && self.headless_pointer.is_none()
-                    && run.launch.is_none()
-                    && run.libraries.is_empty(),
-                "remote run {}: not remotable yet (live UI, display, sensor injection, launch and shared libraries need a target runner)",
+                    && run.shell.is_none()
+                    && run.libraries.is_empty()
+                    && (self.ui.is_none() || target.has_session()),
+                "remote run {}: not remotable yet (sensor injection, a gate's own Wayland socket, shell commands, shared libraries, and a UI without the target's desktop session need a target runner)",
                 run.root.display()
             );
             // fontconfig's `<dir>` and `<cachedir>` name this host's paths: the run reads a copy that the script relocates

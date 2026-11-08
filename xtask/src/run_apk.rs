@@ -6,21 +6,28 @@
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
 //! `--drive <script>`: once that wait is over, the script runs against the window (drive.rs for its grammar); a failed step fails the run, and the verdict covers the run up to the script's end.
+//! `remote run-apk` ([`remote`]): the same run on a target's desktop. The bundle goes there and is checked, atld runs there for `--hold`, and the logs come back when the run ends; the verdict is read from them, against the target's end record.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, ExitCode, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::atld_run::{MS_PER_S, Run, Runtime, last_resumed, parse_stamp, run_display, settled};
+use atl_services::packages::Manifest;
+
 use crate::nested_wayland::NestedCompositor;
-use crate::{drive, manifest, test_apks, window};
+use crate::{arches, drive, manifest, remote, test_apks, verdict, window};
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
 const PRESENT_LINE: &str = "atl-composer: ui: present";
 /// The staged runtime's name, shared with the window gate: one ART install for both.
 pub(crate) const STAGE: &str = "window-art";
+/// What a remote run returns under its scratch dir besides the logs: atld's log, its exit code (`atld.rc`) and its end time (`end.ms`, the target's clock).
+const END_FILES: [&str; 3] = ["atld.log", "atld.rc", "end.ms"];
+/// How long past the target's limit the transfer may run (its tar and ssh) before it is stopped and the run fails.
+const TRANSFER_MARGIN: Duration = Duration::from_secs(60);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -63,6 +70,38 @@ pub struct Args {
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
+}
+
+/// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
+#[derive(clap::Args)]
+pub struct RemoteArgs {
+    /// A row of test-apks.toml, or an APK file path, as for `run-apk`.
+    #[arg(value_name = "ROW|PATH")]
+    target: String,
+    /// ssh alias from WSL `~/.ssh/config` (its `Host` name), or `local:<absolute dir>` (a directory standing in for the target).
+    #[arg(long)]
+    host: String,
+    /// Keeps the app up this many seconds after its resume, the window open on the target's desktop.
+    #[arg(long, value_name = "SECONDS")]
+    hold: u64,
+    /// The display atld answers with (`WxH@hz,dpi`): the target's monitor, not this host's. Default: this host's monitor rate, at the gates' size.
+    #[arg(long, value_name = "DISPLAY")]
+    display: Option<String>,
+    /// atld `--tilt-keys`, as for `run-apk`.
+    #[arg(long)]
+    tilt_keys: bool,
+    /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
+    #[arg(long, value_name = "SCRIPT")]
+    pointer: Option<String>,
+    /// The native out dir holding the record, the bundle and the run (default: this checkout's slot, see `xtask slot`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Pushes the bundle, runs the check there, then the app. Without it: prints the plan.
+    #[arg(long)]
+    apply: bool,
+    /// Deliberate break (`remote push`'s values): the bundle without the named file, which the check then names.
+    #[arg(long = "break", value_enum)]
+    brk: Option<remote::Break>,
 }
 
 impl Args {
@@ -108,33 +147,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         None => None,
     };
-    let rt = Runtime::new(
-        root,
-        "run-apk",
-        &args.host,
-        args.out.as_deref(),
-        args.java_out.as_deref(),
-        STAGE,
-        args.verbose,
-    )?
-    .with_gralloc(root)?
-    .with_gl_driver()?
-    .with_native_bridge_guest(&args.host)?
-    .with_ui("gtk");
-    let rt = if args.no_app_seccomp {
-        rt.without_app_seccomp()
-    } else {
-        rt
-    };
-    let rt = match &args.pointer {
-        Some(script) => rt.with_headless_pointer(script),
-        None => rt,
-    };
-    let rt = if args.tilt_keys {
-        rt.with_tilt_keys(&[])
-    } else {
-        rt
-    };
+    let rt = runtime(root, args)?;
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     // without --hold nobody watches the window: it maps in the gate's own compositor, which outlives atld (declared before it)
@@ -158,47 +171,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .with_display(n.display().to_arg()),
         (None, _) => rt.with_display(run_display().to_arg()),
     };
-    let apk = work.join("base.apk");
-    std::fs::copy(&apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
-    let m = manifest::read(&rt.apk.aapt2, &apk)?;
-    if let Some(row) = &pin {
-        test_apks::check_identity(
-            &args.target,
-            row,
-            &m.name,
-            m.version_code,
-            m.version_name.as_deref(),
-        )?;
-    }
-    let activity = m
-        .launch_activity()
-        .map(|a| a.name.clone())
-        .context("the APK has no launcher activity")?;
-    println!(
-        "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity})",
-        apk_file.display(),
-        m.name,
-        m.version_code,
-        m.min_sdk,
-        m.target_sdk
-    );
-    if pin.is_none() {
-        println!(
-            "run-apk: UNPINNED: {} is not a row of {}; no sha256, size or signer check ran",
-            apk_file.display(),
-            test_apks::FILE
-        );
-    }
-    let run = Run {
-        root: work.join("root"),
-        scratch: work.join("scratch"),
-        launch: Some(m.name.clone()),
-        packages: vec![(apk, m.clone())],
-        first_uid: window::APP_UID,
-        libraries: vec![],
-        shell: None,
-        log_tags: args.log_tags.clone(),
-    };
+    let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &args.target, &work)?;
+    let run = run_of(&work, apk, &m, &args.log_tags);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
@@ -258,42 +232,353 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    let scripted = args.pointer.is_some() || args.drive.is_some();
-    let fault_ms = match (scripted, last_resumed(&services)) {
-        (true, Some(r)) => watch_ms.max(window::now_ms().saturating_sub(r.ms)),
-        _ => watch_ms,
+    let ending = Ending {
+        complete,
+        atld_exited: ended.is_some(),
+        end_ms: window::now_ms(),
     };
-    let outcome = judge(&services, &app, complete, ended.is_some(), fault_ms);
+    let scripted = args.pointer.is_some() || args.drive.is_some();
+    let outcome = judge_ending(&services, &app, &ending, watch_ms, scripted);
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
     let outcome = match (driven, args.drive.is_some()) {
         (Some(Err(e)), _) => Err(format!("drive: {e:#}")),
         (None, true) => outcome.and(Err("the script never ran".to_owned())),
         _ => outcome,
     };
+    Ok(finish(
+        outcome,
+        &app,
+        &services,
+        &run.atld_log(),
+        &run.root.join("log"),
+    ))
+}
+
+/// `xtask remote run-apk` (see [`RemoteArgs`]): the run on a target's desktop. Dry run by default: prints the bundle and the plan. `--apply` records the run, pushes the bundle, runs the target's check, then runs atld there with its limit at `window::LIMIT` + the hold (+ a pointer script's waits). The logs come back when the run ends, and the verdict is `run-apk`'s, on the target's clock.
+pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
+    ensure!(
+        a.brk != Some(remote::Break::TierXeLlvmpipe),
+        "--break tier-xe-llvmpipe is test-only: `remote test` runs it, run-apk refuses it"
+    );
+    let (pin, apk_file) = source(root, &a.target)?;
+    let arches = arches::load(root)?;
+    let (arch, _) = arches::build_machine(root, &arches)?;
+    let args = Args {
+        target: a.target.clone(),
+        host: arch.to_owned(),
+        out: a.out.clone(),
+        java_out: None,
+        hold: Some(a.hold),
+        log_tags: "*:i".to_owned(),
+        verbose: false,
+        no_app_seccomp: false,
+        pointer: a.pointer.clone(),
+        drive: None,
+        break_blank_capture: false,
+        tilt_keys: a.tilt_keys,
+    };
+    let display = match &a.display {
+        Some(display) => display.clone(),
+        None => run_display().to_arg(),
+    };
+    let rt = runtime(root, &args)?.with_display(display);
+    let work = rt.out.join("run-apk");
+    std::fs::create_dir_all(&work)?;
+    let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &a.target, &work)?;
+    let run = run_of(&work, apk, &m, &args.log_tags);
+    // the record first: the bundle is what the run reads (remote.rs `Target::of`)
+    rt.record_inputs(&run)?;
+    let target = remote::Target::of(&rt.out, "run-apk", &a.host, a.brk)?;
+    let stem = if test_apks::names_row(&a.target) {
+        a.target.clone()
+    } else {
+        apk_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("apk")
+            .to_owned()
+    };
+    let logs = rt
+        .out
+        .join(remote::REMOTE_DIR)
+        .join(target.log_dir())
+        .join("run-apk")
+        .join(&stem);
+    let script = Duration::from_millis(a.pointer.as_deref().map_or(0, script_wait_ms));
+    let limit = window::LIMIT + Duration::from_secs(a.hold) + script;
+    if !a.apply {
+        println!("{}", target.summary());
+        println!(
+            "dry run: pushes the bundle to {}, checks {} ELF files there, then runs {} with atld's limit at {} s (--hold {} s after the resume); logs to {}; --apply runs it",
+            target.target(),
+            target.elf_count(),
+            m.name,
+            limit.as_secs(),
+            a.hold,
+            logs.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    target.push()?;
+    let prereq = target.check()?;
+    let problems = prereq.problems();
+    if !problems.is_empty() {
+        for p in &problems {
+            println!("remote prereq run-apk: {p}");
+        }
+        println!("{}", verdict::gate("remote run-apk", &problems));
+        return Ok(ExitCode::FAILURE);
+    }
+    println!(
+        "remote prereq run-apk: PASS, {} ELF checked on {}",
+        prereq.checked,
+        target.label()
+    );
+    // what an earlier run left here is not this run's: a run that ends before its logs return reads none of it
+    let _ = std::fs::remove_dir_all(&logs);
+    std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
+    for name in END_FILES {
+        let _ = std::fs::remove_file(run.scratch.join(name));
+    }
+    let rt = rt.with_site(target.run_site(limit, logs.join("transcript.log"), true));
+    let mut atld = rt.start_atld(&run)?;
+    let transfer = match wait_transfer(&mut atld, limit + TRANSFER_MARGIN)? {
+        Some(status) => rt.check_end(status, &run).map_err(|e| format!("{e:#}")),
+        None => Err(format!(
+            "the transfer to {} did not end within {} s and was stopped",
+            target.label(),
+            (limit + TRANSFER_MARGIN).as_secs()
+        )),
+    };
+    let watch_ms = a.hold * MS_PER_S;
+    let app_log = run.log(&m.name);
+    let services_log = run.log("services");
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let app = read(&app_log);
+    let services = read(&services_log);
+    let outcome = transfer.and_then(|()| {
+        let (rc, end_ms) = end_record(&run.scratch)?;
+        let ending = Ending {
+            complete: watch_complete(&services, watch_ms, end_ms),
+            atld_exited: !stopped_at_limit(rc),
+            end_ms,
+        };
+        judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
+    });
+    copy_logs(&run, &logs)?;
+    println!(
+        "remote run-apk: transcript {}",
+        logs.join("transcript.log").display()
+    );
+    Ok(finish(
+        outcome,
+        &app,
+        &services,
+        &logs.join("atld.log"),
+        &logs,
+    ))
+}
+
+/// The staged runtime of a run of `args`: the window gate's staging, with the GL driver, the native bridge guest and the GTK UI. Its display is set by the caller.
+fn runtime(root: &Path, args: &Args) -> Result<Runtime> {
+    let rt = Runtime::new(
+        root,
+        "run-apk",
+        &args.host,
+        args.out.as_deref(),
+        args.java_out.as_deref(),
+        STAGE,
+        args.verbose,
+    )?
+    .with_gralloc(root)?
+    .with_gl_driver()?
+    .with_native_bridge_guest(&args.host)?
+    .with_ui("gtk");
+    let rt = if args.no_app_seccomp {
+        rt.without_app_seccomp()
+    } else {
+        rt
+    };
+    let rt = match &args.pointer {
+        Some(script) => rt.with_headless_pointer(script),
+        None => rt,
+    };
+    let rt = if args.tilt_keys {
+        rt.with_tilt_keys(&[])
+    } else {
+        rt
+    };
+    Ok(rt)
+}
+
+/// Copies the APK into the run's work dir and reads its manifest. A row's pin is checked against the manifest. Prints the package's line, and that it is unpinned when no row names it.
+fn package(
+    rt: &Runtime,
+    apk_file: &Path,
+    pin: Option<&test_apks::Row>,
+    target: &str,
+    work: &Path,
+) -> Result<(PathBuf, Manifest)> {
+    let apk = work.join("base.apk");
+    std::fs::copy(apk_file, &apk).with_context(|| format!("copying {}", apk_file.display()))?;
+    let m = manifest::read(&rt.apk.aapt2, &apk)?;
+    if let Some(row) = pin {
+        test_apks::check_identity(
+            target,
+            row,
+            &m.name,
+            m.version_code,
+            m.version_name.as_deref(),
+        )?;
+    }
+    let activity = m
+        .launch_activity()
+        .map(|a| a.name.clone())
+        .context("the APK has no launcher activity")?;
+    println!(
+        "run-apk: {} ({} versionCode {}, sdk {}..{}, launcher activity {activity})",
+        apk_file.display(),
+        m.name,
+        m.version_code,
+        m.min_sdk,
+        m.target_sdk
+    );
+    if pin.is_none() {
+        println!(
+            "run-apk: UNPINNED: {} is not a row of {}; no sha256, size or signer check ran",
+            apk_file.display(),
+            test_apks::FILE
+        );
+    }
+    Ok((apk, m))
+}
+
+/// The run's dirs and its one package, started at its launcher activity.
+fn run_of(work: &Path, apk: PathBuf, m: &Manifest, log_tags: &str) -> Run {
+    Run {
+        root: work.join("root"),
+        scratch: work.join("scratch"),
+        launch: Some(m.name.clone()),
+        packages: vec![(apk, m.clone())],
+        first_uid: window::APP_UID,
+        libraries: vec![],
+        shell: None,
+        log_tags: log_tags.to_owned(),
+    }
+}
+
+/// Waits for the transfer that runs the app on the target: its status, or `None` once `limit` has passed (the transfer is then killed).
+fn wait_transfer(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        std::thread::sleep(window::POLL);
+    }
+}
+
+/// The target's end record of a remote run (remote.rs `Plan::script`): atld's exit status (`timeout`'s, when the limit ended it) and the end's time in ms on the target's clock.
+fn end_record(scratch: &Path) -> Result<(i32, u64), String> {
+    let read = |name: &str| {
+        std::fs::read_to_string(scratch.join(name))
+            .map(|text| text.trim().to_owned())
+            .map_err(|_| format!("the target returned no {name}: see the transcript"))
+    };
+    let rc = read("atld.rc")?
+        .parse::<i32>()
+        .map_err(|_| "atld.rc is not an exit code".to_owned())?;
+    let end_ms = read("end.ms")?
+        .parse::<u64>()
+        .map_err(|_| "end.ms is not a time".to_owned())?;
+    Ok((rc, end_ms))
+}
+
+/// Whether the target's `timeout` ended atld: 124 when the limit did, 137 when its KILL did (timeout(1)). Any other status is atld's own end.
+fn stopped_at_limit(rc: i32) -> bool {
+    matches!(rc, 124 | 137)
+}
+
+/// Whether a remote run's watch ran to its end: the target's end came `watch_ms` after the last resume. Both times are on the target's clock.
+fn watch_complete(services: &str, watch_ms: u64, end_ms: u64) -> bool {
+    last_resumed(services).is_some_and(|r| end_ms >= r.ms + watch_ms)
+}
+
+/// How a run ended, as the judge reads it: the watch ran to its end, atld ended before its end by itself, and the end's time on the clock the logs carry (this host's, or the target's).
+struct Ending {
+    complete: bool,
+    atld_exited: bool,
+    end_ms: u64,
+}
+
+/// The verdict of a run that ended: [`judge`], with the fault window widened to the run's end when the run was scripted.
+fn judge_ending(
+    services: &str,
+    app: &str,
+    ending: &Ending,
+    watch_ms: u64,
+    scripted: bool,
+) -> Result<String, String> {
+    let fault_ms = match (scripted, last_resumed(services)) {
+        (true, Some(r)) => watch_ms.max(ending.end_ms.saturating_sub(r.ms)),
+        _ => watch_ms,
+    };
+    judge(services, app, ending.complete, ending.atld_exited, fault_ms)
+}
+
+/// Copies a run's logs to `to`: the app's and the services' logs (`root/log`), and atld's log and end record (`END_FILES`). Files the run did not write are skipped.
+fn copy_logs(run: &Run, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    let mut from: Vec<PathBuf> = std::fs::read_dir(run.root.join("log"))
+        .map(|dir| dir.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    from.extend(END_FILES.iter().map(|name| run.scratch.join(name)));
+    for path in from.into_iter().filter(|p| p.is_file()) {
+        let name = path.file_name().context("a log without a file name")?;
+        std::fs::copy(&path, to.join(name))
+            .with_context(|| format!("copying {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines, and where the logs are.
+fn finish(
+    outcome: Result<String, String>,
+    app: &str,
+    services: &str,
+    atld_log: &Path,
+    log_dir: &Path,
+) -> ExitCode {
     match &outcome {
         Ok(s) => println!("run-apk: ok {s}"),
         Err(s) => {
             println!("run-apk: FAILED {s}");
-            println!("---- app log tail\n{}", window::tail(&app, window::TAIL));
+            println!("---- app log tail\n{}", window::tail(app, window::TAIL));
             println!(
                 "---- services log tail\n{}",
-                window::tail(&services, window::TAIL)
+                window::tail(services, window::TAIL)
             );
         }
     }
     // the app's end as its parent saw it: a signal leaves no line of its own in the app's or the services' log
-    for line in read(&run.atld_log())
+    for line in std::fs::read_to_string(atld_log)
+        .unwrap_or_default()
         .lines()
         .filter(|l| l.contains(" ended: "))
     {
         println!("run-apk: {line}");
     }
-    println!("run-apk: logs {}", run.root.join("log").display());
-    Ok(if outcome.is_ok() {
+    println!("run-apk: logs {}", log_dir.display());
+    if outcome.is_ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    })
+    }
 }
 
 /// The APK to run: a row's pinned file (verified by `test_apks::ensure`), or the file a path names, which no row pins.
@@ -443,5 +728,35 @@ mod tests {
     fn judge_ignores_a_fault_after_the_watch() {
         let app = format!("{PRESENT}102.500 E AndroidRuntime: FATAL EXCEPTION: main\n");
         assert!(judge(RESUME, &app, true, false, 2_000).is_ok());
+    }
+
+    /// A remote run's watch is complete when the target's end came `watch_ms` after the resume (both on the target's clock): RESUME's resume is at 100 000 ms, so a 2 s watch is over at 102 000 ms.
+    #[test]
+    fn remote_watch_is_complete_at_the_target_end_after_the_watch() {
+        assert!(watch_complete(RESUME, 2_000, 102_000));
+        assert!(!watch_complete(RESUME, 2_000, 101_999));
+        assert!(!watch_complete("", 2_000, 200_000));
+    }
+
+    /// timeout(1) exit codes: 124 when the limit ends the command, 137 when its KILL does; any other status is atld's own end.
+    #[test]
+    fn timeout_codes_mean_the_limit_ended_atld() {
+        assert!(stopped_at_limit(124));
+        assert!(stopped_at_limit(137));
+        assert!(!stopped_at_limit(0));
+        assert!(!stopped_at_limit(1));
+    }
+
+    /// The remote verdict is run-apk's: a run whose end came before the watch's end fails as "ended before", one whose end is past it passes.
+    #[test]
+    fn remote_end_is_judged_on_the_watch_it_reached() {
+        let ending = |end_ms| Ending {
+            complete: watch_complete(RESUME, 2_000, end_ms),
+            atld_exited: false,
+            end_ms,
+        };
+        assert!(judge_ending(RESUME, PRESENT, &ending(102_000), 2_000, false).is_ok());
+        let err = judge_ending(RESUME, PRESENT, &ending(101_000), 2_000, false).unwrap_err();
+        assert!(err.contains("ended before"), "{err}");
     }
 }

@@ -40,7 +40,7 @@ const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree"
 /// The target's directory for a slot's bundle, relative to the host's home: `~/atl-next-run/<slot>/`.
 const REMOTE_ROOT: &str = "atl-next-run";
 /// `<out>/remote/...`: the record and the staged bundle.
-const REMOTE_DIR: &str = "remote";
+pub const REMOTE_DIR: &str = "remote";
 /// The manifest file at the bundle's root: `sha256  size  name` per file, `link  target  name` per link.
 const MANIFEST: &str = "bundle.manifest";
 /// ssh options: never prompt, never hang. The alias check is the first contact with the host.
@@ -58,6 +58,10 @@ pub enum Remote {
     ///
     /// Dry run by default: prints the check it would run. `--apply` runs it over ssh (or locally for `local:`). Run `push --apply` first: a file the push did not deliver is named as missing.
     Test(TestArgs),
+    /// `run-apk` on the target: pushes the bundle of the run's record (its APK, the runtime, `lib/`), checks it there, then runs the APK under atld on the target's desktop for `--hold` seconds, with run-apk's verdict.
+    ///
+    /// Dry run by default: prints the bundle and the plan. `--apply` pushes, checks and runs. The window is the target's, on its Wayland session; the logs come back when the run ends.
+    RunApk(crate::run_apk::RemoteArgs),
 }
 
 #[derive(clap::Args)]
@@ -114,6 +118,7 @@ pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
     match cmd {
         Remote::Push(a) => push(root, a),
         Remote::Test(a) => test(root, a),
+        Remote::RunApk(a) => crate::run_apk::remote(root, a),
     }
 }
 
@@ -122,51 +127,42 @@ fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
         a.brk != Some(Break::TierXeLlvmpipe),
         "--break tier-xe-llvmpipe is test-only: `remote test` runs it, push refuses it"
     );
-    let host = Host::parse(&a.host)?;
     let out = out_of(root, a.out.as_deref())?;
-    let slot = slot_name(&out)?;
-    let bundle = Bundle::of(&a.gate, &out, a.brk)?;
+    let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
     if a.list {
-        for e in &bundle.entries {
+        for e in target.entries() {
             println!("{}\t{}", e.name, e.src.display());
         }
     }
-    println!("{}", bundle.summary());
+    println!("{}", target.summary());
     let stage = stage_dir(&out, &a.gate);
     if !a.apply {
         println!(
             "dry run: would stage {} and rsync -a --delete it to {}; --apply copies",
             stage.display(),
-            host.target(&slot)
+            target.target()
         );
         return Ok(ExitCode::SUCCESS);
     }
-    host.reach()?;
-    bundle.stage(&stage)?;
-    host.sync(&stage, &slot)?;
+    target.push()?;
     println!(
         "pushed {} entries to {}",
-        bundle.entries.len(),
-        host.target(&slot)
+        target.entries().len(),
+        target.target()
     );
     Ok(ExitCode::SUCCESS)
 }
 
 fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
-    let host = Host::parse(&a.host)?;
     let out = out_of(root, a.out.as_deref())?;
-    let slot = slot_name(&out)?;
-    let bundle = Bundle::of(&a.gate, &out, a.brk)?;
-    let elf = bundle.elf_names()?;
-    let dirs = bundle.lib_dirs(&elf);
-    let script = prereq_script(&host.base(&slot), &elf, &dirs)?;
+    let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
     if !a.apply {
-        println!("{}", bundle.summary());
+        println!("{}", target.summary());
         println!(
             "dry run: prerequisite check on {}: ldd over {} ELF files, {} library dirs on LD_LIBRARY_PATH; --apply runs it",
-            host.target(&slot),
-            elf.len(),
-            dirs.len()
+            target.target(),
+            target.elf_count(),
+            target.dir_count()
         );
         println!(
             "dry run: the gate's runtime half would follow: `{}` runs its atld runs on the target (--apply)",
@@ -174,15 +170,14 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let text = host.run_script(&script)?;
-    let prereq = parse_prereq(&text);
+    let prereq = target.check()?;
     let mut fails = prereq.problems();
     if fails.is_empty() {
         println!(
             "remote prereq {}: PASS, {} ELF checked on {}",
             a.gate,
             prereq.checked,
-            host.label()
+            target.label()
         );
     } else {
         for f in &fails {
@@ -190,7 +185,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
         }
     }
     if fails.is_empty() {
-        match runtime_half(root, a, &host, &slot, &out, dirs) {
+        match runtime_half(root, a, &target, &out) {
             Ok(true) => {}
             Ok(false) => fails.push(format!(
                 "gate `{}`: a check failed, see its lines above",
@@ -212,14 +207,7 @@ fn test(root: &Path, a: &TestArgs) -> Result<ExitCode> {
 
 /// The gate's runtime half on the target. The gate runs here; each atld run it starts runs on the target from the bundle, so its judge reads the logs the target returned and prints what the local gate prints.
 /// Only `gl`: its runs are one-shot probes. The other runtime gates drive a live atld (control socket, windows, sensors), which one transfer per run cannot serve. Returns whether the gate passed.
-fn runtime_half(
-    root: &Path,
-    a: &TestArgs,
-    host: &Host,
-    slot: &str,
-    out: &Path,
-    lib_dirs: Vec<String>,
-) -> Result<bool> {
+fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Result<bool> {
     ensure!(
         a.gate == "gl",
         "gate `{}`: its runtime half is not remotable yet (only `gl`: its runs are one-shot; the others drive a live runtime)",
@@ -227,17 +215,11 @@ fn runtime_half(
     );
     let arches = arches::load(root)?;
     let (arch, _) = arches::build_machine(root, &arches)?;
-    let dir = out.join(REMOTE_DIR).join(host.log_dir());
+    let dir = out.join(REMOTE_DIR).join(target.log_dir());
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-    let site = Site::Remote(RemoteRun {
-        host: host.clone(),
-        base: host.base(slot),
-        lib_dirs,
-        limit: gl_probe::LIMIT,
-        log: log.clone(),
-    });
+    let site = target.run_site(gl_probe::LIMIT, log.clone(), false);
     let code = gl_probe::run_on(root, arch, out, site, a.brk)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
@@ -258,10 +240,12 @@ pub struct RemoteRun {
     base: String,
     /// Bundle names of the directories holding ELF files: the search path the prerequisite check ran with, and the run's `LD_LIBRARY_PATH`.
     lib_dirs: Vec<String>,
-    /// atld's limit on the target (`timeout`); the caller's own limit is the same value.
+    /// atld's limit on the target (`timeout`): the run ends there even if atld does not.
     limit: Duration,
     /// Each run's header, then the stderr of its transfer.
     log: PathBuf,
+    /// The target's desktop session supplies `WAYLAND_DISPLAY`: its one Wayland socket ([`session_script`]).
+    session: bool,
 }
 
 /// The host roots a runtime names, absolute on this host: the slot, the java out and the AOSP tree. Their bundle names are [`ROOT_NAMES`].
@@ -363,6 +347,13 @@ fn dq(s: &str) -> String {
         .replace('`', "\\`")
 }
 
+/// The target's Wayland socket for a session run: the one `wayland-*` socket that is not a lock file, in the desktop session's `$XDG_RUNTIME_DIR` (`/run/user/<uid>`). Sets `WL` to its name. Any other count stops the run with exit 5 before atld starts, and names the count: a second compositor's socket must not be picked by chance.
+fn session_script(tag: &str) -> String {
+    format!(
+        "WL_DIR=\"/run/user/$(id -u)\"\nWL=\"\"\nWL_N=0\nfor s in \"$WL_DIR\"/wayland-*; do\n  case \"$s\" in *.lock) continue ;; esac\n  [ -S \"$s\" ] || continue\n  WL=${{s##*/}}\n  WL_N=$((WL_N + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
+    )
+}
+
 /// One atld run as the target runs it: the command, its environment, and the files this host wrote for it, all with bundle paths (`@BASE@`). `root` and `scratch` are relative to the slot's out dir, where the logs return.
 struct Plan {
     /// The run's name, its dir under the slot, e.g. `gl/run`.
@@ -376,6 +367,8 @@ struct Plan {
     files: Vec<(String, String)>,
     lib_dirs: Vec<String>,
     limit: u64,
+    /// `WAYLAND_DISPLAY` comes from the target's session: [`session_script`] finds the socket.
+    session: bool,
 }
 
 fn out_path(rel: &str) -> String {
@@ -383,7 +376,7 @@ fn out_path(rel: &str) -> String {
 }
 
 impl Plan {
-    /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, then its logs as a tar on stdout. The script's exit is the tar's.
+    /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, in the background so its process group can be ended after it; then its logs and end record (`atld.rc`: the exit code, `end.ms`: the end's time on the target's clock) as a tar on stdout. The script's exit is the tar's.
     fn script(&self, base: &str) -> String {
         let mut s = format!(
             "# xtask remote run {}: written by remote.rs, do not edit\ncd {} || exit 2\nset -u\nBASE=$(pwd)\n",
@@ -409,6 +402,9 @@ impl Plan {
             self.tag,
             dq(&shown)
         ));
+        if self.session {
+            s.push_str(&session_script(&self.tag));
+        }
         let lib_path: Vec<String> = self
             .lib_dirs
             .iter()
@@ -418,32 +414,52 @@ impl Plan {
             "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH={}",
             word(&lib_path.join(":"))
         ));
+        if self.session {
+            s.push_str(" WAYLAND_DISPLAY=\"$WL\"");
+        }
         for (key, value) in &self.env {
             s.push_str(&format!(" {key}={}", word(value)));
         }
         let args: Vec<String> = self.args.iter().map(|a| word(a)).collect();
+        // background: `$!` is timeout's pid, which timeout makes its process group's id; the group is ended after the run, so an app that stayed in it leaves no window behind
         s.push_str(&format!(
-            " timeout -k {KILL_GRACE} {} {} {} < /dev/null > {} 2>&1\n",
+            " timeout -k {KILL_GRACE} {} {} {} < /dev/null > {} 2>&1 &\n",
             self.limit,
             word(&self.program),
             args.join(" "),
             word(&out_path(&format!("{}/atld.log", self.scratch)))
         ));
-        s.push_str("rc=$?\n");
+        s.push_str("pid=$!\nwait \"$pid\"\nrc=$?\n");
+        s.push_str("kill -KILL -- \"-$pid\" 2>/dev/null || true\n");
+        s.push_str(&format!(
+            "printf '%s\\n' \"$rc\" > {}\n",
+            word(&out_path(&format!("{}/atld.rc", self.scratch)))
+        ));
+        s.push_str(&format!(
+            "date +%s%3N > {}\n",
+            word(&out_path(&format!("{}/end.ms", self.scratch)))
+        ));
         s.push_str(&format!(
             "echo \"atld rc=$rc, remote run {}\" >&2\n",
             self.tag
         ));
         s.push_str(&format!(
-            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {}\n",
+            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {} {} {}\n",
             sh_quote(&format!("{}/log", self.root)),
-            sh_quote(&format!("{}/atld.log", self.scratch))
+            sh_quote(&format!("{}/atld.log", self.scratch)),
+            sh_quote(&format!("{}/atld.rc", self.scratch)),
+            sh_quote(&format!("{}/end.ms", self.scratch))
         ));
         s
     }
 }
 
 impl RemoteRun {
+    /// Whether the target's desktop session supplies `WAYLAND_DISPLAY` (`session`).
+    pub fn has_session(&self) -> bool {
+        self.session
+    }
+
     /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the slot's out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
     pub fn spawn(
         &self,
@@ -494,6 +510,7 @@ impl RemoteRun {
             files,
             lib_dirs: self.lib_dirs.clone(),
             limit: self.limit.as_secs(),
+            session: self.session,
         };
         let script = scratch.join(REMOTE_SCRIPT);
         std::fs::write(&script, plan.script(&self.base))
@@ -718,6 +735,91 @@ fn ssh(alias: &str) -> Command {
     let mut c = Command::new("ssh");
     c.args(SSH_OPTS).arg(alias);
     c
+}
+
+/// A gate's bundle on one host: what `push`, the prerequisite check and a remote run share.
+pub struct Target {
+    host: Host,
+    slot: String,
+    bundle: Bundle,
+    /// Bundle names of the ELF files, and of the directories holding them: the check's search path, and a run's `LD_LIBRARY_PATH`.
+    elf: Vec<String>,
+    lib_dirs: Vec<String>,
+    stage: PathBuf,
+}
+
+impl Target {
+    /// The bundle of gate `gate`'s record in `out`, with `brk` applied, for the host `host` (an ssh alias or `local:<dir>`). Its ELF files and library dirs are read here.
+    pub fn of(out: &Path, gate: &str, host: &str, brk: Option<Break>) -> Result<Target> {
+        let host = Host::parse(host)?;
+        let slot = slot_name(out)?;
+        let bundle = Bundle::of(gate, out, brk)?;
+        let elf = bundle.elf_names()?;
+        let lib_dirs = bundle.lib_dirs(&elf);
+        Ok(Target {
+            host,
+            slot,
+            bundle,
+            elf,
+            lib_dirs,
+            stage: stage_dir(out, gate),
+        })
+    }
+
+    pub fn summary(&self) -> String {
+        self.bundle.summary()
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.bundle.entries
+    }
+
+    /// `alias:~/atl-next-run/<slot>/` (or the local dir): where the bundle goes.
+    pub fn target(&self) -> String {
+        self.host.target(&self.slot)
+    }
+
+    pub fn label(&self) -> String {
+        self.host.label()
+    }
+
+    /// The host's transcript dir under `out/remote/`.
+    pub fn log_dir(&self) -> String {
+        self.host.log_dir()
+    }
+
+    pub fn elf_count(&self) -> usize {
+        self.elf.len()
+    }
+
+    pub fn dir_count(&self) -> usize {
+        self.lib_dirs.len()
+    }
+
+    /// Stages the bundle and copies it to the target (`rsync -a --delete`). Fails first when the host does not answer.
+    pub fn push(&self) -> Result<()> {
+        self.host.reach()?;
+        self.bundle.stage(&self.stage)?;
+        self.host.sync(&self.stage, &self.slot)
+    }
+
+    /// The prerequisite check on the target: `ldd` over every ELF file of the bundle.
+    pub fn check(&self) -> Result<Prereq> {
+        let script = prereq_script(&self.host.base(&self.slot), &self.elf, &self.lib_dirs)?;
+        Ok(parse_prereq(&self.host.run_script(&script)?))
+    }
+
+    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `session`: the target's desktop session supplies `WAYLAND_DISPLAY`.
+    pub fn run_site(&self, limit: Duration, log: PathBuf, session: bool) -> Site {
+        Site::Remote(RemoteRun {
+            host: self.host.clone(),
+            base: self.host.base(&self.slot),
+            lib_dirs: self.lib_dirs.clone(),
+            limit,
+            log,
+            session,
+        })
+    }
 }
 
 /// An ssh alias: a `Host` name, never `user@address` or `host:path`. It names a transcript directory under out/remote/, so dot-only names (`.`, `..`) are refused.
@@ -1223,8 +1325,8 @@ pub struct Prereq {
 }
 
 impl Prereq {
-    /// One line per problem, as `test` prints and fails on.
-    fn problems(&self) -> Vec<String> {
+    /// One line per problem, as `test` and `run-apk` print and fail on.
+    pub fn problems(&self) -> Vec<String> {
         let mut p: Vec<String> = self
             .unresolved
             .iter()
@@ -1444,6 +1546,7 @@ mod tests {
             lib_dirs: Vec::new(),
             limit: Duration::from_secs(1),
             log: log.clone(),
+            session: false,
         };
         // a wait status: exit code 2 is `2 << 8`
         let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
@@ -1540,6 +1643,7 @@ mod tests {
             )],
             lib_dirs: vec!["lib".to_owned()],
             limit: 120,
+            session: false,
         };
         let want = concat!(
             "# xtask remote run gl/run: written by remote.rs, do not edit\n",
@@ -1552,12 +1656,72 @@ mod tests {
             "{\"apk\": \"@BASE@/out/gl/apk/x.apk\"}\n",
             "ATL_EOF\n",
             "[ -x \"$BASE/out/cargo/release/atld\" ] || { echo \"remote run gl/run: out/cargo/release/atld is not an executable\" >&2; exit 4; }\n",
-            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" FONTCONFIG_FILE=\"$BASE/out/gl/run/scratch/fonts.conf\" timeout -k 10 120 \"$BASE/out/cargo/release/atld\" \"--root\" \"$BASE/out/gl/run/root\" < /dev/null > \"$BASE/out/gl/run/scratch/atld.log\" 2>&1\n",
+            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" FONTCONFIG_FILE=\"$BASE/out/gl/run/scratch/fonts.conf\" timeout -k 10 120 \"$BASE/out/cargo/release/atld\" \"--root\" \"$BASE/out/gl/run/root\" < /dev/null > \"$BASE/out/gl/run/scratch/atld.log\" 2>&1 &\n",
+            "pid=$!\n",
+            "wait \"$pid\"\n",
             "rc=$?\n",
+            "kill -KILL -- \"-$pid\" 2>/dev/null || true\n",
+            "printf '%s\\n' \"$rc\" > \"$BASE/out/gl/run/scratch/atld.rc\"\n",
+            "date +%s%3N > \"$BASE/out/gl/run/scratch/end.ms\"\n",
             "echo \"atld rc=$rc, remote run gl/run\" >&2\n",
-            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log'\n",
+            "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms'\n",
         );
         assert_eq!(plan.script("atl-next-run/slot-9"), want);
+    }
+
+    /// A session run: after the launcher check, the one `wayland-*` socket of the desktop session is found, and atld's environment names it. The count check is what refuses a second compositor's socket.
+    #[test]
+    fn session_run_names_the_targets_one_wayland_socket() {
+        let plan = Plan {
+            tag: "run-apk/app".to_owned(),
+            root: "run-apk/root".to_owned(),
+            scratch: "run-apk/scratch".to_owned(),
+            env: vec![("ATL_UI_CAPTURE".to_owned(), "1".to_owned())],
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: vec!["--ui".to_owned(), "gtk".to_owned()],
+            files: Vec::new(),
+            lib_dirs: vec!["lib".to_owned()],
+            limit: 300,
+            session: true,
+        };
+        let s = plan.script("atl-next-run/slot-3");
+        let launcher = s.find("is not an executable").expect("launcher check");
+        let discover = s.find("WL_DIR=\"/run/user/$(id -u)\"").expect("discovery");
+        let env_line = s.find("env -i PATH=").expect("env line");
+        assert!(launcher < discover && discover < env_line, "{s}");
+        assert!(s.contains("for s in \"$WL_DIR\"/wayland-*; do\n"), "{s}");
+        assert!(
+            s.contains("case \"$s\" in *.lock) continue ;; esac\n"),
+            "{s}"
+        );
+        assert!(s.contains("WL=${s##*/}\n"), "{s}");
+        assert!(
+            s.contains(
+                "[ \"$WL_N\" -eq 1 ] || { echo \"remote run run-apk/app: $WL_N Wayland sockets"
+            ),
+            "{s}"
+        );
+        assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" ATL_UI_CAPTURE=\"1\" timeout -k 10 300 "), "{s}");
+    }
+
+    /// A run without a session has no discovery: its environment names no Wayland socket.
+    #[test]
+    fn plain_run_has_no_session_discovery() {
+        let plan = Plan {
+            tag: "gl/run".to_owned(),
+            root: "gl/run/root".to_owned(),
+            scratch: "gl/run/scratch".to_owned(),
+            env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: Vec::new(),
+            files: Vec::new(),
+            lib_dirs: Vec::new(),
+            limit: 120,
+            session: false,
+        };
+        let s = plan.script("b");
+        assert!(!s.contains("WL_DIR"), "{s}");
+        assert!(!s.contains("WAYLAND_DISPLAY"), "{s}");
     }
 
     /// A record of one slot file, one slot tree holding a link to itself (`com.android.art -> .`, the ART staging's alias) and one AOSP file: the names, `lib/` from the LLVM runtimes, the link kept as a link in the stage, and the break removing exactly `lib/libunwind.so.1`.
