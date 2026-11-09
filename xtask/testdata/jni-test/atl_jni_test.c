@@ -227,6 +227,28 @@ static GLuint gles_shader(GLenum type, const char *src)
     return ok ? s : 0;
 }
 
+// GLSurfaceView's ComponentSizeChooser: the first listed config with RGBA exactly 8 each. EGL's *_SIZE attributes are
+// minimums, so the list leads with 16-bit configs, which read back zeros on the test host.
+static EGLConfig exact_8888_config(EGLDisplay dpy, const EGLint *attr)
+{
+    EGLConfig all[64];
+    EGLint n = 0;
+    if (!eglChooseConfig(dpy, attr, all, 64, &n))
+        return NULL;
+    if (n > 64)
+        n = 64;
+    for (EGLint i = 0; i < n; i++) {
+        EGLint r = 0, g = 0, b = 0, a = 0;
+        eglGetConfigAttrib(dpy, all[i], EGL_RED_SIZE, &r);
+        eglGetConfigAttrib(dpy, all[i], EGL_GREEN_SIZE, &g);
+        eglGetConfigAttrib(dpy, all[i], EGL_BLUE_SIZE, &b);
+        eglGetConfigAttrib(dpy, all[i], EGL_ALPHA_SIZE, &a);
+        if (r == 8 && g == 8 && b == 8 && a == 8)
+            return all[i];
+    }
+    return NULL;
+}
+
 JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
 {
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -234,9 +256,8 @@ JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
         return -1;
     const EGLint cfg_attr[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
                                 EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
-    EGLConfig cfg;
-    EGLint n = 0;
-    if (!eglChooseConfig(dpy, cfg_attr, &cfg, 1, &n) || n < 1)
+    EGLConfig cfg = exact_8888_config(dpy, cfg_attr);
+    if (cfg == NULL)
         return -1;
     const EGLint pb_attr[] = { EGL_WIDTH, GLES_W, EGL_HEIGHT, GLES_H, EGL_NONE };
     EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pb_attr);

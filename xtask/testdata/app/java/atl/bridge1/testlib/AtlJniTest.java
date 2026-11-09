@@ -82,17 +82,37 @@ public final class AtlJniTest {
             EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8, EGL10.EGL_ALPHA_SIZE, 8,
             EGL10.EGL_NONE,
         };
-        EGLConfig[] cfg = new EGLConfig[1];
-        int[] n = new int[1];
-        if (!egl.eglChooseConfig(dpy, cfgAttr, cfg, 1, n) || n[0] < 1) {
+        EGLConfig cfg = exact8888(egl, dpy, cfgAttr);
+        android.util.Log.w("AtlEs1", "begin chooseConfig exact 8888 " + cfg + " err 0x" + Integer.toHexString(egl.eglGetError()));
+        if (cfg == null) {
             return false;
         }
-        surf = egl.eglCreatePbufferSurface(dpy, cfg[0], new int[] {
+        surf = egl.eglCreatePbufferSurface(dpy, cfg, new int[] {
             EGL10.EGL_WIDTH, ES1_SIZE, EGL10.EGL_HEIGHT, ES1_SIZE, EGL10.EGL_NONE,
         });
-        ctx = egl.eglCreateContext(dpy, cfg[0], EGL10.EGL_NO_CONTEXT, new int[] { EGL10.EGL_NONE });
+        ctx = egl.eglCreateContext(dpy, cfg, EGL10.EGL_NO_CONTEXT, new int[] { EGL10.EGL_NONE });
         return surf != EGL10.EGL_NO_SURFACE && ctx != EGL10.EGL_NO_CONTEXT
                 && egl.eglMakeCurrent(dpy, surf, surf, ctx);
+    }
+
+    /** GLSurfaceView's ComponentSizeChooser: the first listed config with RGBA exactly 8 each (EGL's *_SIZE attributes are minimums); null when none. */
+    private static EGLConfig exact8888(EGL10 egl, EGLDisplay dpy, int[] attr) {
+        EGLConfig[] all = new EGLConfig[64];
+        int[] n = new int[1];
+        if (!egl.eglChooseConfig(dpy, attr, all, all.length, n)) {
+            return null;
+        }
+        int[] v = new int[1];
+        for (int i = 0; i < Math.min(n[0], all.length); i++) {
+            boolean exact = true;
+            for (int size : new int[] { EGL10.EGL_RED_SIZE, EGL10.EGL_GREEN_SIZE, EGL10.EGL_BLUE_SIZE, EGL10.EGL_ALPHA_SIZE }) {
+                exact &= egl.eglGetConfigAttrib(dpy, all[i], size, v) && v[0] == 8;
+            }
+            if (exact) {
+                return all[i];
+            }
+        }
+        return null;
     }
 
     /** Releases es1Begin's context and pbuffer; true when EGL released both. */
