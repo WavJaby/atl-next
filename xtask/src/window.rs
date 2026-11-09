@@ -8,8 +8,8 @@
 //! Stage `frames` (M3 slice 5) runs the same verdict over its longer window, then two sub-gates on the fixture's frames: (a) the first frame reaches the compositor and its pixels are the
 //! quadrants ([`picture_check`]); (b) the Choreographer callbacks come once per display period ([`cadence_check`]).
 //! Stage `input` (M3 slice 5 sub-gate c): the resume verdict over the frames window, then the touches the fixture logs are the ones the injected [`POINTER_SCRIPT`] makes ([`input_check`]).
-//! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the composer's readback at each size and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
-//! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the composer's readback at its probes are the expectation ([`gles2::checks`]).
+//! Stage `resize` (freeform: the display is the monitor, a window's size is its Task's bounds): UI mode, then the probe configures the window larger and then smaller ([`drive_resize`]); [`resize_checks`] reads the services' bounds, the app's layouts, the window's picture at each size ([`capture::Probe`]) and the display's metrics. A click and a burst of configures follow ([`burst_check`]). Stages `relaunch` and `declared` run it on the fixture variants, and [`lifecycle_check`] judges the activity's life.
+//! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the harness's picture at its probes are the expectation ([`gles2::checks`]).
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 //! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
 //! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first commit (the initial one, no buffer) is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstCommit`]).
@@ -216,6 +216,22 @@ impl Stage {
             | Stage::Suspended => RESIZE_WINDOW_MS,
         }
     }
+}
+
+/// The stages whose probe takes pictures of the window through [`capture::Probe`] (the harness route, not the composer's log).
+fn takes_pictures(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::Capture
+            | Stage::Gtk
+            | Stage::Hwui
+            | Stage::Portrait
+            | Stage::Gles2
+            | Stage::Resize
+            | Stage::Relaunch
+            | Stage::Declared
+            | Stage::StartFinish
+    )
 }
 
 /// One sub-gate's result under its name (printed `window: <name>: pass|FAIL`); the name travels with the result, so no list of names can fall out of step with the checks.
@@ -704,37 +720,6 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
     Ok(format!("mapped, {presented} scenes presented"))
 }
 
-/// [`capture_check`] at `(width, height)`: the readback has that size, and the quadrants' digest at that size.
-fn capture_at(app: &str, (width, height): (u32, u32), swap_rb: bool) -> Result<String, String> {
-    let line = capture_line(app)?;
-    let size = word(line, "size").unwrap_or("none");
-    let want_size = format!("{width}x{height}");
-    if size != want_size {
-        return Err(format!(
-            "readback is {size}, the opening size is {want_size}"
-        ));
-    }
-    let digest = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
-    let got = u64::from_str_radix(digest, 16).map_err(|e| format!("digest {digest:?}: {e}"))?;
-    let mut pixels = quadrant_pixels(width, height);
-    if swap_rb {
-        pixels
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .for_each(|p| p.swap(0, 2));
-    }
-    let want = fnv1a64(&pixels);
-    if got != want {
-        return Err(format!(
-            "readback digest {got:016x}, the quadrants {want:016x}"
-        ));
-    }
-    Ok(format!(
-        "readback {want_size} digest {want:016x} = the quadrants"
-    ))
-}
-
 /// The AOSP size of a portrait, resizeable app on a landscape display (`(width, height)`), written out from AOSP, not read from atl-services.
 /// The app's orientation mismatches the display's, so calculateInitialBounds takes its landscape-display branch (DesktopModeBoundsCalculator.java:165-185): the height is the ideal (side x 0.75f, truncated; :50-51, :314-318), the width (int)(tdaHeight / aspect + 0.5f).
 /// The aspect is the display's own, width / height: owner decision 2026-11-08 (option A), DisplayContent.java:6647-6654 ignores orientation requests, so getDesiredAspectRatio takes its branch (c).
@@ -1027,7 +1012,8 @@ fn drive_app_id(
 }
 
 /// The resize stage's probe, from the proxy's side: once the window is up and has drawn, it is configured to each of [`RESIZE_STEPS`] in turn. Each configure must be acked; then the probe leaves the client [`RESIZE_SETTLE`] to relayout and present.
-fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+/// The window's picture is recorded after each of the two steps' settle, so the pictures are grow's, then shrink's ([`frame_check`]).
+fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -1049,6 +1035,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         Ok(acked)
     };
     configured.push(step(grow)?);
+    probe.record_settled();
     for (width, height, serial) in BURST_STEPS {
         proxy
             .inject_configure(width, height, serial, &[])
@@ -1057,6 +1044,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     }
     std::thread::sleep(RESIZE_SETTLE);
     configured.push(step(shrink)?);
+    probe.record_settled();
     // the window still takes input at its new size; in the relaunch stage this is the relaunched instance
     let (x, y) = CLICK_POINT;
     for action in [
@@ -1241,29 +1229,16 @@ fn relayout_check(app: &str, steps: &Result<Steps, String>) -> Result<String, St
     Ok(format!("laid out at {layouts:?}"))
 }
 
-/// Stage `resize` sub-gate (d): the composer's readback at grow is the quadrants at grow's size, and its last readback is the quadrants at shrink's (the digest as gtk_capture_check).
-fn frame_check(app: &str, steps: &Result<Steps, String>) -> Result<String, String> {
+/// Stage `resize` sub-gate (d): the picture recorded after grow is the quadrants at grow's Task size, the one after shrink the quadrants at shrink's (the pictures are the window's content).
+fn frame_check(
+    seen: &Mutex<capture::Seen>,
+    steps: &Result<Steps, String>,
+) -> Result<String, String> {
     let &(grow, shrink) = steps.as_ref().map_err(Clone::clone)?;
-    let readbacks: Vec<((i32, i32), &str)> = app
-        .lines()
-        .filter(|l| l.contains("atl-composer: ui: capture "))
-        .filter_map(|l| Some((parse_wxh(word(l, "size")?)?, word(l, "fnv1a64")?)))
-        .collect();
-    let quadrants =
-        |(w, h): (i32, i32)| format!("{:016x}", fnv1a64(&quadrant_pixels(w as u32, h as u32)));
-    let (grow_digest, shrink_digest) = (quadrants(grow), quadrants(shrink));
-    let grow_seen = readbacks
-        .iter()
-        .any(|&(size, digest)| size == grow && digest == grow_digest.as_str());
-    let shrink_last = readbacks
-        .last()
-        .is_some_and(|&(size, digest)| size == shrink && digest == shrink_digest.as_str());
-    if !grow_seen || !shrink_last {
-        return Err(format!(
-            "readbacks {readbacks:?}, want the quadrants at grow {grow:?} and the last at shrink {shrink:?}"
-        ));
-    }
-    Ok("readbacks at grow and shrink are the quadrants at their sizes".to_owned())
+    let size = |(w, h): (i32, i32)| (w as u32, h as u32);
+    let grow_line = capture::judged(seen, 0, size(grow), false)?;
+    let shrink_line = capture::judged(seen, 1, size(shrink), false)?;
+    Ok(format!("grow: {grow_line}; shrink: {shrink_line}"))
 }
 
 /// The layout lines, less each that the next onCreate replaces with no layout between. The relaunch item is queued behind a traversal whose relayout already returns the Task's new size, so the old instance lays out once at that size on its old configuration. That layout is of an instance about to go, so its stale bounds are not a defect. Every other layout is judged.
@@ -1362,6 +1337,7 @@ fn resize_checks(
     services: &str,
     display: DisplayModel,
     liveness: &Result<Liveness, String>,
+    seen: &Mutex<capture::Seen>,
 ) -> Vec<Sub> {
     let steps = resize_steps(&task_bounds(services), opening_size_i32(display));
     vec![
@@ -1369,7 +1345,7 @@ fn resize_checks(
         ("bounds", bounds_check(services, &steps)),
         ("relayout", relayout_check(app, &steps)),
         ("relayoutAsync", relayout_async_check(services)),
-        ("frame", frame_check(app, &steps)),
+        ("frame", frame_check(seen, &steps)),
         ("display", display_check(app, display)),
     ]
 }
@@ -1856,11 +1832,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
     let rt = rt.with_display(display.to_arg());
-    // the composed picture at the GLES2 probes: each capture logs its pixels there (window/gles2.rs)
-    let rt = match args.stage {
-        Stage::Gles2 => rt.with_ui_pixels(gles2::composer_points(display)),
-        _ => rt,
-    };
     let rt = if args.break_ime_death {
         rt.without_ime_death_link()
     } else {
@@ -1954,18 +1925,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
-    // the probe records its captures in `captured` (capture stage: the picture and the refused caller; gtk and hwui: the readback); the sub-gates read them once the probe is joined
+    // the probe records its pictures (and the capture stage's refused caller) in `captured`; the sub-gates read them once the probe is joined
     let captured: Arc<Mutex<capture::Seen>> = Arc::default();
-    let swap_rb = matches!(args.stage, Stage::Hwui) && args.break_swap_rb;
-    let capture_probe =
-        matches!(args.stage, Stage::Capture | Stage::Gtk | Stage::Hwui).then(|| capture::Probe {
-            root: run.root.clone(),
-            package: m.name.clone(),
-            opening: opening_size(display),
-            break_caller: args.break_capture_caller,
-            out_dir: work.join("capture"),
-            seen: Arc::clone(&captured),
-        });
+    let capture_probe = takes_pictures(args.stage).then(|| capture::Probe {
+        root: run.root.clone(),
+        package: m.name.clone(),
+        out_dir: work.join("capture"),
+        break_caller: args.break_capture_caller,
+        seen: Arc::clone(&captured),
+    });
     let probe = proxy.map(|p| {
         let log = run.log(&m.name);
         let services_log = run.log("services");
@@ -1973,12 +1941,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let fake_ime = fake_ime.take();
         let relaunch = (run.root.clone(), format!("{}/{activity}", m.name));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Gtk | Stage::Hwui, _, _) => {
-                if let Some(capture_probe) = &capture_probe {
-                    capture::record_picture(&log, capture_probe, swap_rb);
+            (Stage::Gtk | Stage::Hwui | Stage::Portrait, _, _) => match &capture_probe {
+                Some(capture_probe) => {
+                    capture_probe.record_after_draw(&log);
+                    drive(p, &log)
                 }
-                drive(p, &log)
-            }
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::Capture, _, _) => match &capture_probe {
                 Some(capture_probe) => capture::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
@@ -1990,9 +1959,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
             (Stage::Dialog, _, _) => dialog::drive(p, &log),
-            (Stage::Gles2, _, _) => gles2::drive(p, &log),
+            (Stage::Gles2, _, _) => match &capture_probe {
+                Some(capture_probe) => gles2::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
-                drive_resize(p, &log)
+                match &capture_probe {
+                    Some(capture_probe) => drive_resize(p, &log, capture_probe),
+                    None => Err("no capture probe".to_owned()),
+                }
             }
             (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
@@ -2073,7 +2048,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
         (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness),
-        (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness),
+        (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness);
@@ -2098,7 +2073,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 _ => Lifecycle::Kept,
             };
             let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
-            let mut sub = resize_checks(&app, &services, display, &liveness);
+            let mut sub = resize_checks(&app, &services, display, &liveness, &captured);
             sub.push((
                 "click",
                 content_origin(&app).and_then(|origin| {
@@ -2119,7 +2094,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 ("mapped", gtk_window_check(&app)),
                 (
                     "content",
-                    capture_at(&app, (want.0 as u32, want.1 as u32), false),
+                    capture::judged(&captured, 0, (want.0 as u32, want.1 as u32), false),
                 ),
                 ("relayout", layout_check(&app, want, (width, height))),
                 (
@@ -2138,18 +2113,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 app_id_check(&seen, &format!("atl.{}", m.name), &liveness),
             )]
         }
-        (Stage::Capture, Some(_)) => match captured.lock() {
-            Ok(seen) => capture::checks(&seen, &liveness),
-            Err(_) => vec![("capture", Err("the probe panicked".to_owned()))],
-        },
+        (Stage::Capture, Some(_)) => capture::checks(&captured, opening_size(display), &liveness),
         (Stage::Hwui, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
             ("hardware", hardware_check(&app)),
-            ("readback", capture::picture(&captured)),
+            (
+                "readback",
+                capture::judged(&captured, 0, opening_size(display), args.break_swap_rb),
+            ),
         ],
         (Stage::Gtk, Some(_)) => vec![
             ("mapped", gtk_window_check(&app)),
-            ("readback", capture::picture(&captured)),
+            (
+                "readback",
+                capture::judged(&captured, 0, opening_size(display), false),
+            ),
             (
                 "touch",
                 content_origin(&app).and_then(|origin| {
@@ -2405,10 +2383,14 @@ mod tests {
         format!("AtlWindow: size={w}x{h} screenWidthDp={dp} window={w}x{h} display=6x3")
     }
 
-    /// The composer's readback line at `w`x`h`. Its digest is the gate's quadrant pattern, which the gtk stage checks against the live readback.
-    fn readback(w: u32, h: u32) -> String {
-        let digest = fnv1a64(&quadrant_pixels(w, h));
-        format!("atl-composer: ui: capture presented=3 size={w}x{h} fnv1a64={digest:016x}")
+    /// The picture the probe records at `w`x`h` when the fixture has drawn the quadrants there (the fixture's draw, quadrant_pixels).
+    fn quad(w: u32, h: u32) -> Result<capture::Shot, String> {
+        let rgba = quadrant_pixels(w, h);
+        Ok(capture::Shot {
+            size: (w, h),
+            digest: fnv1a64(&rgba),
+            rgba,
+        })
     }
 
     /// The services' log of a Task opened at 4x2 resized to 6x4 (grow) and 3x1 (shrink). A Task opens at its opening size, so only the changes are logged.
@@ -2419,7 +2401,12 @@ mod tests {
         sub.iter().any(|(n, r)| *n == name && r.is_err())
     }
 
-    fn resize_run(app: &[String], services: &str, configured: Vec<bool>) -> Vec<Sub> {
+    fn resize_run(
+        app: &[String],
+        services: &str,
+        configured: Vec<bool>,
+        pictures: Vec<Result<capture::Shot, String>>,
+    ) -> Vec<Sub> {
         // opens at 4x2: 3/4 of 6x3, truncated (opening_size)
         let display = DisplayModel {
             width: 6,
@@ -2432,81 +2419,75 @@ mod tests {
             resumed_ms: None,
             configured,
         });
-        resize_checks(&app.join("\n"), services, display, &liveness)
+        let seen = Mutex::new(capture::Seen {
+            pictures,
+            ..Default::default()
+        });
+        resize_checks(&app.join("\n"), services, display, &liveness, &seen)
     }
 
     /// The consistent run passes every sub-gate; each defect fails the sub-gate that names it. Sizes and pattern come from the spec, not from the code under test.
     #[test]
     fn resize_checks_pass_a_consistent_run_and_fail_each_defect() {
-        let good = vec![
-            layout(4, 2, 4),
-            layout(6, 4, 6),
-            layout(3, 1, 3),
-            readback(6, 4),
-            readback(3, 1),
-        ];
-        let ok = resize_run(&good, RESIZE_SERVICES, vec![true, true]);
+        let good = [layout(4, 2, 4), layout(6, 4, 6), layout(3, 1, 3)];
+        let pictures = || vec![quad(6, 4), quad(3, 1)];
+        let ok = resize_run(&good, RESIZE_SERVICES, vec![true, true], pictures());
         assert!(ok.iter().all(|(_, r)| r.is_ok()), "{ok:?}");
 
-        let acks = resize_run(&good, RESIZE_SERVICES, vec![true, false]);
+        let acks = resize_run(&good, RESIZE_SERVICES, vec![true, false], pictures());
         assert!(
             failed(&acks, "configure"),
             "a configure not acked: {acks:?}"
         );
 
         let services = RESIZE_SERVICES.replace("bounds 6x4", "bounds 4x4");
-        let grow = resize_run(&good, &services, vec![true, true]);
+        let grow = resize_run(&good, &services, vec![true, true], pictures());
         assert!(
             failed(&grow, "bounds"),
             "grow not over the display: {grow:?}"
         );
 
-        let no_grow = [
-            layout(4, 2, 4),
-            layout(3, 1, 3),
-            readback(6, 4),
-            readback(3, 1),
-        ];
-        let relayout = resize_run(&no_grow, RESIZE_SERVICES, vec![true, true]);
+        let no_grow = [layout(4, 2, 4), layout(3, 1, 3)];
+        let relayout = resize_run(&no_grow, RESIZE_SERVICES, vec![true, true], pictures());
         assert!(
             failed(&relayout, "relayout"),
             "no layout at grow: {relayout:?}"
         );
 
-        let stale = [
-            layout(4, 2, 4),
-            layout(6, 4, 6),
-            layout(3, 1, 3),
-            readback(6, 4),
-            "atl-composer: ui: capture presented=3 size=3x1 fnv1a64=0000000000000000".to_owned(),
+        let stale = vec![
+            quad(6, 4),
+            Ok(capture::Shot {
+                size: (3, 1),
+                digest: 0,
+                rgba: vec![0; 12],
+            }),
         ];
-        let frame = resize_run(&stale, RESIZE_SERVICES, vec![true, true]);
+        let frame = resize_run(&good, RESIZE_SERVICES, vec![true, true], stale);
         assert!(
             failed(&frame, "frame"),
-            "shrink readback has other pixels: {frame:?}"
+            "shrink picture has other pixels: {frame:?}"
+        );
+
+        let unsettled = vec![quad(6, 4), Err("no two captures agreed".to_owned())];
+        let frame = resize_run(&good, RESIZE_SERVICES, vec![true, true], unsettled);
+        assert!(
+            failed(&frame, "frame"),
+            "shrink picture never settled: {frame:?}"
         );
 
         let moved = [
             layout(4, 2, 4),
             layout(6, 4, 6),
             layout(3, 1, 3).replace("display=6x3", "display=8x4"),
-            readback(6, 4),
-            readback(3, 1),
         ];
-        let display = resize_run(&moved, RESIZE_SERVICES, vec![true, true]);
+        let display = resize_run(&moved, RESIZE_SERVICES, vec![true, true], pictures());
         assert!(
             failed(&display, "display"),
             "the display moved with the window: {display:?}"
         );
 
-        let same_dp = [
-            layout(4, 2, 4),
-            layout(6, 4, 4),
-            layout(3, 1, 3),
-            readback(6, 4),
-            readback(3, 1),
-        ];
-        let dp = resize_run(&same_dp, RESIZE_SERVICES, vec![true, true]);
+        let same_dp = [layout(4, 2, 4), layout(6, 4, 4), layout(3, 1, 3)];
+        let dp = resize_run(&same_dp, RESIZE_SERVICES, vec![true, true], pictures());
         assert!(
             failed(&dp, "display"),
             "screenWidthDp did not change with the grow: {dp:?}"

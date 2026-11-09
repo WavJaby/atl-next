@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! Stage `gles2` of `xtask test window` (GS2.5): the GLES2 fixture (xtask/testdata/gles2, Main.java) in UI mode on the gate's compositor, its `.so` a guest library through the native bridge, so every GL call crosses it and the frame reaches the composer's readback.
-//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the composer captured it), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the composer's readback at each probe is the expectation), `present` (no failed present), `balance` (the bridge's exit accounting).
-//! The expectation is [`gles2_fixture::PROBES`], worked out from the scene in Main.java. GL's window origin is bottom-left, the composer's top-left: probe (x, y) is composed at row `height - 1 - y`, `height` the window's opening height (the capture's size, checked).
+//! Stage `gles2` of `xtask test window` (GS2.5): the GLES2 fixture (xtask/testdata/gles2, Main.java) in UI mode on the gate's compositor, its `.so` a guest library through the native bridge, so every GL call crosses it and the frame reaches the window's picture ([`capture::Probe`]).
+//! Sub-gates ([`checks`]): `probe` (the window acked, the fixture read back, the picture settled), `readback` (the app's glReadPixels at each probe is the expectation), `composed` (the picture at each probe is the expectation), `present` (no failed present), `balance` (the bridge's exit accounting).
+//! The expectation is [`gles2_fixture::PROBES`], worked out from the scene in Main.java. GL's window origin is bottom-left, the picture's top-left: probe (x, y) is in the picture at row `height - 1 - y`, `height` the window's opening height (the picture's size, checked).
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
 
 use atl_services::display_model::DisplayModel;
 
+use super::capture;
 use super::{ACK_WAIT, Liveness, Sub, await_event, opening_size, wait_for_line};
-use crate::composer::word;
 use crate::gles2_fixture::PROBES;
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
@@ -19,33 +19,20 @@ pub const MARKER: &str = "AtlGles2: surface ";
 const READBACK_LINE: &str = "AtlGles2: readback";
 const READBACK_PASS: &str = "AtlGles2: readback pass";
 const READBACK_FAIL: &str = "AtlGles2: readback FAIL";
-/// The composer's lines (atl-composer ui_window.rs): the capture, its pixel at each ATL_UI_CAPTURE_PIXELS point, and a failed present.
-const CAPTURE_LINE: &str = "atl-composer: ui: capture presented=";
-const PIXEL_LINE: &str = "atl-composer: ui: capture pixel ";
+/// The composer's failed present (atl-composer ui_window.rs).
 const PRESENT_WARN: &str = "atl-composer: ui present:";
 /// The bridge's exit line (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`.
 const DETACH_LINE: &str = "atl-native-bridge: thread detached (attached ";
-/// The pixel lines follow the settled capture, which comes about 1/3 s after the app's last present: the probe waits this long for them.
-const CAPTURE_WAIT: Duration = Duration::from_secs(10);
 /// Per-channel slack of Main.java's `matches` (`SLACK`): the clear colour goes float -> unorm8.
 const SLACK: u32 = 1;
 
-/// Row `y` of GL's bottom-left origin in a window `height` tall, as the composer's top-left row; None when `y` is outside.
+/// Row `y` of GL's bottom-left origin in a window `height` tall, as the picture's top-left row; None when `y` is outside.
 fn composed_row(height: u32, y: u32) -> Option<u32> {
     height.checked_sub(1)?.checked_sub(y)
 }
 
-/// The window pixels the composer reads back: each probe's composed point at the window's opening size.
-pub fn composer_points(display: DisplayModel) -> Vec<(u32, u32)> {
-    let (_, height) = opening_size(display);
-    PROBES
-        .iter()
-        .filter_map(|&(x, y, _)| Some((x, composed_row(height, y)?)))
-        .collect()
-}
-
-/// The probe: the window is acked, the fixture has read back, and the composer has logged the pixels of its settled capture. The proxy stays up until then.
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+/// The probe: the window is acked, the fixture has read back, and its picture has settled (after the app's last present).
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -53,14 +40,17 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     wait_for_line(app_log, READBACK_LINE, ACK_WAIT)
         .then_some(())
         .ok_or("the fixture never read back")?;
-    wait_for_line(app_log, PIXEL_LINE, CAPTURE_WAIT)
-        .then_some(())
-        .ok_or("the composer never captured the window")?;
+    probe.record_settled();
     Ok(Liveness::default())
 }
 
-/// The sub-gates; `display` gives the window's opening size, the size the composed picture must have.
-pub fn checks(app: &str, display: DisplayModel, liveness: &Result<Liveness, String>) -> Vec<Sub> {
+/// The sub-gates; `display` gives the window's opening size, the size the picture must have.
+pub fn checks(
+    app: &str,
+    display: DisplayModel,
+    liveness: &Result<Liveness, String>,
+    seen: &Mutex<capture::Seen>,
+) -> Vec<Sub> {
     let (width, height) = opening_size(display);
     vec![
         (
@@ -71,7 +61,7 @@ pub fn checks(app: &str, display: DisplayModel, liveness: &Result<Liveness, Stri
             },
         ),
         ("readback", readback_check(app)),
-        ("composed", composed_check(app, width, height)),
+        ("composed", composed_check(seen, width, height)),
         ("present", present_check(app)),
         ("balance", balance_check(app)),
     ]
@@ -91,17 +81,15 @@ fn readback_check(app: &str) -> Result<String, String> {
     }
 }
 
-/// `(x, y, RRGGBBAA)` of the pixel lines of capture `presented`.
-fn composed_pixels(app: &str, presented: &str) -> Vec<(u32, u32, u32)> {
-    app.lines()
-        .filter(|l| l.contains(PIXEL_LINE) && word(l, "presented") == Some(presented))
-        .filter_map(|l| {
-            let x = word(l, "x")?.parse().ok()?;
-            let y = word(l, "y")?.parse().ok()?;
-            let rgba = u32::from_str_radix(word(l, "rgba")?, 16).ok()?;
-            Some((x, y, rgba))
-        })
-        .collect()
+/// The RRGGBBAA of the picture's pixel at column `x`, row `y` (top-left origin); the caller keeps both inside the picture.
+fn pixel(shot: &capture::Shot, x: u32, y: u32) -> u32 {
+    let i = (y as usize * shot.size.0 as usize + x as usize) * 4;
+    u32::from_be_bytes([
+        shot.rgba[i],
+        shot.rgba[i + 1],
+        shot.rgba[i + 2],
+        shot.rgba[i + 3],
+    ])
 }
 
 /// Each channel within [`SLACK`] of the expectation.
@@ -111,38 +99,29 @@ fn same(got: u32, want: u32) -> bool {
         .all(|shift| ((got >> shift) & 0xff).abs_diff((want >> shift) & 0xff) <= SLACK)
 }
 
-/// The composer's readback at each probe: the last capture's pixel at the probe's composed row, within [`SLACK`]. The capture must be the window's opening size.
-fn composed_check(app: &str, width: u32, height: u32) -> Result<String, String> {
-    let capture = app
-        .lines()
-        .rfind(|l| l.contains(CAPTURE_LINE))
-        .ok_or("no composer capture")?;
-    let size = word(capture, "size").unwrap_or("none");
-    let want_size = format!("{width}x{height}");
-    if size != want_size {
+/// The window's picture at each probe: the settled picture, at the window's opening size, holds PROBES at their composed rows, each channel within [`SLACK`].
+fn composed_check(seen: &Mutex<capture::Seen>, width: u32, height: u32) -> Result<String, String> {
+    let shot = capture::picture(seen, 0)?;
+    if shot.size != (width, height) {
         return Err(format!(
-            "the last capture is {size}, the window {want_size}"
+            "the picture is {}x{}, the window {width}x{height}",
+            shot.size.0, shot.size.1
         ));
     }
-    let presented = word(capture, "presented").ok_or("no presented= in the capture line")?;
-    let got = composed_pixels(app, presented);
     let mut fails = Vec::new();
     for (x, y, want) in PROBES {
-        let Some(row) = composed_row(height, y) else {
+        let Some(row) = composed_row(height, y).filter(|_| x < width) else {
             fails.push(format!("({x},{y}) outside the window"));
             continue;
         };
-        match got.iter().find(|&&(gx, gy, _)| gx == x && gy == row) {
-            Some(&(_, _, rgba)) if same(rgba, want) => {}
-            Some(&(_, _, rgba)) => {
-                fails.push(format!("({x},{y}) composed {rgba:08x}, want {want:08x}"));
-            }
-            None => fails.push(format!("({x},{y}) no pixel line at row {row}")),
+        let got = pixel(&shot, x, row);
+        if !same(got, want) {
+            fails.push(format!("({x},{y}) composed {got:08x}, want {want:08x}"));
         }
     }
     if fails.is_empty() {
         Ok(format!(
-            "the composer's readback (capture {want_size}, presented {presented}) = PROBES at {} points",
+            "the picture ({width}x{height}) = PROBES at {} points",
             PROBES.len()
         ))
     } else {
@@ -187,22 +166,29 @@ fn balance_check(app: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// The window's height at the gate's display (opening size: 3/4 of 800).
+    /// The window's size at the gate's display (opening size: 3/4 of 1280x800).
+    const WIDTH: u32 = 960;
     const HEIGHT: u32 = 600;
 
-    /// The composer's lines of a 960x600 capture: its line, then one pixel line per `(x, y, RRGGBBAA)`.
-    fn capture_log(pixels: &[(u32, u32, u32)]) -> String {
-        let mut log =
-            format!("1.0 I atl-composer: ui: capture presented=3 size=960x{HEIGHT} fnv1a64=0\n");
-        for &(x, y, rgba) in pixels {
-            log.push_str(&format!(
-                "1.0 I atl-composer: ui: capture pixel presented=3 x={x} y={y} rgba={rgba:08x}\n"
-            ));
+    /// The probe's record of a picture of `WIDTH`x`height` with `pixels` (`(x, y, RRGGBBAA)` in the picture's rows) and black elsewhere.
+    fn seen_with(height: u32, pixels: &[(u32, u32, u32)]) -> Mutex<capture::Seen> {
+        let mut rgba = vec![0u8; (WIDTH * height * 4) as usize];
+        for &(x, y, word) in pixels {
+            let i = ((y * WIDTH + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&word.to_be_bytes());
         }
-        log
+        let shot = capture::Shot {
+            size: (WIDTH, height),
+            digest: 0,
+            rgba,
+        };
+        Mutex::new(capture::Seen {
+            pictures: vec![Ok(shot)],
+            ..Default::default()
+        })
     }
 
-    /// PROBES at the rows the composer draws them on.
+    /// PROBES at the rows the picture draws them on.
     fn composed_probes() -> Vec<(u32, u32, u32)> {
         PROBES
             .iter()
@@ -211,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn gl_rows_flip_onto_the_composer_rows() {
+    fn gl_rows_flip_onto_the_picture_rows() {
         assert_eq!(composed_row(HEIGHT, 8), Some(591));
         assert_eq!(composed_row(HEIGHT, 599), Some(0));
         assert_eq!(composed_row(HEIGHT, 600), None);
@@ -220,27 +206,29 @@ mod tests {
 
     #[test]
     fn composed_probes_pass_and_a_wrong_one_is_named() {
-        assert!(composed_check(&capture_log(&composed_probes()), 960, HEIGHT).is_ok());
+        assert!(composed_check(&seen_with(HEIGHT, &composed_probes()), WIDTH, HEIGHT).is_ok());
         let mut bad = composed_probes();
         bad[0].2 = 0x00ff_00ff;
-        let err = composed_check(&capture_log(&bad), 960, HEIGHT).expect_err("a wrong pixel");
+        let err =
+            composed_check(&seen_with(HEIGHT, &bad), WIDTH, HEIGHT).expect_err("a wrong pixel");
         assert!(
             err.contains("(8,8) composed 00ff00ff, want ff0000ff"),
             "{err}"
         );
     }
 
-    /// Control: the probes at their GL rows, not the composer's, are not where the composer draws them, so the gate rejects them.
+    /// Control: the probes at their GL rows, not the picture's, are not where the picture draws them, so the gate rejects them.
     #[test]
     fn unflipped_rows_are_rejected() {
         let unflipped: Vec<(u32, u32, u32)> = PROBES.to_vec();
-        assert!(composed_check(&capture_log(&unflipped), 960, HEIGHT).is_err());
+        assert!(composed_check(&seen_with(HEIGHT, &unflipped), WIDTH, HEIGHT).is_err());
     }
 
     #[test]
-    fn a_capture_of_another_size_is_named() {
-        let err = composed_check(&capture_log(&composed_probes()), 1280, 800).expect_err("a size");
-        assert!(err.contains("the last capture is 960x600"), "{err}");
+    fn a_picture_of_another_size_is_named() {
+        let err =
+            composed_check(&seen_with(HEIGHT, &composed_probes()), 1280, 800).expect_err("a size");
+        assert!(err.contains("the picture is 960x600"), "{err}");
     }
 
     #[test]
