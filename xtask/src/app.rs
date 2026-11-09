@@ -4,7 +4,7 @@
 //! The APK is built here as an app is built (atld_run.rs); the package record atld installs is read back from it (`aapt2 dump xmltree`, manifest.rs), not restated.
 //! Every run has the graphics allocator HAL (it must register with servicemanager, the VINTF-declared way) and the GL driver (`Runtime::with_gl_driver`).
 //! Fonts sub-gate ([`FONTS`]): the app's text advances equal the pinned test fonts' hmtx sums, i.e. atld's font list (atl-fonts via fontconfig) reached Typeface; `--font-break` must fail it.
-//! Config row ([`FIRST_CONFIG`]): the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces reports an Android pixel format. The GL driver's break `ATL_EGL_BREAK=no_config_filter` (set in this run's environment, staged with the driver) must fail it.
+//! Config row ([`FIRST_CONFIG`]): the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces reports a FIXED Android pixel format (no float config for a request that omits the component type). The GL driver's break `ATL_EGL_BREAK=no_config_filter` (set in this run's environment, staged with the driver) must fail it.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`], then the startActivityForResult round trip after it ([`result_failures`]; `--result-break` must fail it). Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
 use std::collections::BTreeMap;
@@ -184,9 +184,9 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
 /// Main.bridge1Calls' firstConfig row: `r=<r> g=<g> b=<b> a=<a> visual=<v>`, the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces (atl_jni_test.c firstConfig).
 /// The driver orders the list as the host does, so the row is judged ([`first_config_why`]), not compared with a fixed line.
 const FIRST_CONFIG: &str = "firstConfig";
-/// The Android pixel formats (hardware/interfaces/graphics/common/aidl PixelFormat.aidl): RGBA_8888 0x1, RGBX_8888 0x2, RGB_565 0x4, RGBA_FP16 0x16, RGBA_1010102 0x2B.
-/// A driver lists only configs that map to one of these (real Android drivers do the same), so the row's visual must be one.
-const ANDROID_FORMATS: [i32; 5] = [0x1, 0x2, 0x4, 0x16, 0x2B];
+/// The Android pixel formats (hardware/interfaces/graphics/common/aidl PixelFormat.aidl) the row's visual may be, all FIXED: RGBA_8888 0x1, RGBX_8888 0x2, RGB_565 0x4, RGBA_1010102 0x2B.
+/// A driver lists only configs that map to an Android format (real Android drivers do the same). RGBA_FP16 (0x16) is out: the row's request omits EGL_COLOR_COMPONENT_TYPE_EXT, whose default is FIXED, so its first config is never a float one.
+const FIXED_FORMATS: [i32; 4] = [0x1, 0x2, 0x4, 0x2B];
 /// The line atl_jni_test.c `guestLog` writes through the guest's liblog, as the launcher's logdw receiver records it (`<W> liblog/<tag>: <text>`, log.rs `format`): priority, tag and text all checked.
 const GUEST_LOG: &str = " W liblog/AtlJniGuest: guest liblog 42";
 /// The NativeBridge core's line at each thread's detach (atl-native-bridge engine/thread.rs `detach`): `attached A, detached D`. By the run's end every thread that ran guest code has exited except the main thread: A = D + 1.
@@ -249,7 +249,7 @@ fn bridge1_call_failures(app: &str) -> Vec<String> {
     }
     whys
 }
-/// The firstConfig row's judge: its visual (EGL_NATIVE_VISUAL_ID) must be one of [`ANDROID_FORMATS`]. The sizes sit in the reason, so a failure shows which config came first. `None`: the row passes.
+/// The firstConfig row's judge: its visual (EGL_NATIVE_VISUAL_ID) must be one of [`FIXED_FORMATS`]. The sizes sit in the reason, so a failure shows which config came first. `None`: the row passes.
 fn first_config_why(value: Option<&str>) -> Option<String> {
     let Some(value) = value else {
         return Some("no line".to_owned());
@@ -259,9 +259,9 @@ fn first_config_why(value: Option<&str>) -> Option<String> {
         .find_map(|w| w.strip_prefix("visual="))
         .and_then(|v| v.parse::<i32>().ok());
     match visual {
-        Some(v) if ANDROID_FORMATS.contains(&v) => None,
+        Some(v) if FIXED_FORMATS.contains(&v) => None,
         _ => Some(format!(
-            "{value:?}: visual {visual:?}, want one of {ANDROID_FORMATS:?}"
+            "{value:?}: visual {visual:?}, want one of {FIXED_FORMATS:?}"
         )),
     }
 }
@@ -817,15 +817,16 @@ mod tests {
         )
     }
 
-    /// Each Android format passes. Fails: the host's 16-bit FIXED layout (visual 0: no format, the driver does not hand it out), RGB_888 (PixelFormat.aidl 0x3, not in the list), a visual that is not a number, a placeholder line, and no line.
+    /// Each FIXED Android format passes. Fails: RGBA_FP16 (0x16: a float config as the default request's first, round 6's ANGLE result), the host's 16-bit FIXED layout (visual 0: no format, the driver does not hand it out), RGB_888 (PixelFormat.aidl 0x3, not in the list), a visual that is not a number, a placeholder line, and no line.
     #[test]
-    fn first_config_visual_must_be_an_android_format() {
-        for v in ANDROID_FORMATS {
+    fn first_config_visual_must_be_a_fixed_android_format() {
+        for v in FIXED_FORMATS {
             assert_eq!(
                 first_config_why(Some(&format!("r=8 g=8 b=8 a=8 visual={v}"))),
                 None
             );
         }
+        assert!(first_config_why(Some("r=16 g=16 b=16 a=16 visual=22")).is_some());
         assert!(first_config_why(Some("r=16 g=16 b=16 a=16 visual=0")).is_some());
         assert!(first_config_why(Some("r=8 g=8 b=8 a=0 visual=3")).is_some());
         assert!(first_config_why(Some("r=8 g=8 b=8 a=8 visual=x")).is_some());

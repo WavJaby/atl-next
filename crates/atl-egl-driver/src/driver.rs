@@ -103,6 +103,8 @@ pub const FLIP_Y: &str = "GL_MESA_framebuffer_flip_y";
 const PASSED_EXTENSIONS: &[&str] = &[
     "EGL_ANDROID_native_fence_sync",
     "EGL_EXT_create_context_robustness",
+    // ANGLE's DisplayEGL reads EGL_COLOR_COMPONENT_TYPE_EXT of each native config only when this is advertised; without it every config is FIXED and a 16-bit float config passes a default request
+    "EGL_EXT_pixel_format_float",
     "EGL_IMG_context_priority",
     "EGL_KHR_config_attribs",
     "EGL_KHR_create_context",
