@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 9 Nov 2026 21:40:39 +0800
+Subject: [PATCH] linux-user: access_ok identity
+
+Under identity mapping (guest_base == 0) guest pointers are host
+pointers. Host heap memory (glibc malloc) is then guest memory that
+QEMU never maps, so page_check_range() fails every syscall buffer in
+it with EFAULT. Accept a range that no QEMU page covers: the host
+kernel checks it on access. The test runs under the mmap lock, since a
+lockless lookup can miss a mapped page. A range with any QEMU-known
+page keeps the flag check, so page_unprotect() still runs for
+translated guest code.
+
+Upstream-Status: Inappropriate [identity mapping is ATL-only]
+Patch-Reason: identity mapping makes host heap guest memory; QEMU cannot register every host allocation
+---
+SPDX-License-Identifier: GPL-2.0-or-later
+ linux-user/qemu.h | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/linux-user/qemu.h b/linux-user/qemu.h
+index ef7aed2daec6fc71be9b9202597f05344b75d787..486e148f05ac8d64aed955ff6dd68dea434923c0 100644
+--- a/linux-user/qemu.h
++++ b/linux-user/qemu.h
+@@ -7,6 +7,7 @@
+ #include "user/abitypes.h"
+ #include "user/page-protection.h"
+ #include "exec/page-protection.h"
++#include "exec/mmap-lock.h"
+ 
+ #include "syscall_defs.h"
+ #include "target_syscall.h"
+@@ -186,11 +187,28 @@ ssize_t do_guest_readlink(const char *pathname, char *buf, size_t bufsiz);
+ 
+ static inline bool access_ok_untagged(int type, abi_ulong addr, abi_ulong size)
+ {
++    bool locked;
++    bool unmapped;
++
+     if (size == 0
+         ? !guest_addr_valid_untagged(addr)
+         : !guest_range_valid_untagged(addr, size)) {
+         return false;
+     }
++    /* ATL identity map: unmapped host memory is checked by the host kernel */
++    if (guest_base == 0 && size != 0) {
++        locked = have_mmap_lock();
++        if (!locked) {
++            mmap_lock();
++        }
++        unmapped = page_check_range_empty((vaddr)addr, (vaddr)addr + size - 1);
++        if (!locked) {
++            mmap_unlock();
++        }
++        if (unmapped) {
++            return true;
++        }
++    }
+     return page_check_range((target_ulong)addr, size, type);
+ }
+ 
