@@ -83,7 +83,6 @@ public final class AtlJniTest {
             EGL10.EGL_NONE,
         };
         EGLConfig cfg = exact8888(egl, dpy, cfgAttr);
-        android.util.Log.w("AtlEs1", "begin chooseConfig exact 8888 " + cfg + " err 0x" + Integer.toHexString(egl.eglGetError()));
         if (cfg == null) {
             return false;
         }
