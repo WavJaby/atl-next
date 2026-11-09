@@ -19,7 +19,7 @@ use atl_engine_api::{
 use super::bindings::THUNKS;
 use super::image::{Image, write_sealed};
 use super::thread::layout::{MAX_TLS_SLOT, MIN_TLS_SLOT};
-use super::{Config, unsupported};
+use super::{Config, Engine as _, unsupported};
 
 /// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): QEMU runs aarch64 guests.
 pub const GUEST_ISA: &str = "arm64";
@@ -321,16 +321,11 @@ pub fn supported() -> bool {
 /// bionic's TCB slots on arm64, `MIN_TLS_SLOT..=MAX_TLS_SLOT` around the thread pointer (tls_defines.h).
 const TCB_WORDS: usize = (MAX_TLS_SLOT - MIN_TLS_SLOT + 1) as usize;
 
-/// Starts (Some) or ends (None) the bootstrap call: `__linker_init` runs on a zeroed scratch TCB, so a TLS or stack-guard read before the linker's own `__set_tls` (NBS `__libc_init_main_thread_early`) sees zeros, not address 0. Leaked: a few words per process.
-/// The x86 crossing's bootstrap record (host FS during the call) has no counterpart: the host thread pointer is never the guest's here.
-pub fn set_bootstrap(ht: Option<*mut HostThread>) {
-    let Some(ht) = ht else { return };
+/// A scratch TCB's thread pointer for `Tp::Bootstrap`: `__linker_init` runs on a zeroed TCB, so a TLS or stack-guard read before the linker's own `__set_tls` (NBS `__libc_init_main_thread_early`) sees zeros, not address 0. Leaked: a few words per call. The x86 crossing's bootstrap record (host FS during the call) has no counterpart: the host thread pointer is never the guest's here.
+fn bootstrap_tcb() -> usize {
     let tcb: &'static mut [usize; TCB_WORDS] = Box::leak(Box::new([0; TCB_WORDS]));
     // TP = &slot 0: -MIN_TLS_SLOT words into the TCB
-    let tp =
-        tcb.as_ptr() as usize + MIN_TLS_SLOT.unsigned_abs() as usize * std::mem::size_of::<usize>();
-    // SAFETY: `ht` is the caller's live record (Guest::start's, leaked).
-    unsafe { (*ht).set_guest_fs(tp) };
+    tcb.as_ptr() as usize + MIN_TLS_SLOT.unsigned_abs() as usize * std::mem::size_of::<usize>()
 }
 
 /// The arch's own words of guest TCB `tp`: none. arm64 bionic's TCB has no self pointer (TP = &slot 0, tls_defines.h), and this crossing finds its state without the TCB (a trap runs on the host thread pointer), so `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` stays zero.
@@ -339,23 +334,52 @@ pub fn set_bootstrap(ht: Option<*mut HostThread>) {
 /// As the x86 seam's: `tp` is a guest TCB, live while `ht` is used on it.
 pub unsafe fn init_tcb(_tp: usize, _ht: *mut HostThread) {}
 
-/// Calls guest `f(a, b, c, d)` on this thread's guest CPU with TPIDR_EL0 = the record's `guest_fs`, and stores back the thread pointer the guest returned with (the linker installs its own during `__linker_init`).
-///
-/// # Safety
-/// As the x86 seam's: `f` is guest code with up to four integer arguments, `ht` this thread's record.
-pub unsafe fn call_guest(
-    ht: &mut HostThread,
-    f: usize,
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-) -> usize {
-    let args = [a, b, c, d].map(|v| v as u64);
-    let mut tp = ht.guest_fs as u64;
-    let r = call_on(&mut tp, f as u64, &args);
-    ht.guest_fs = tp as usize;
-    r as usize
+/// The QEMU crossing, the seam's second implementation. Its CPU is the calling thread's own (`attach_current`); the record holds the guest thread pointer.
+pub struct Qemu;
+
+/// The seam's QEMU implementation, the one a `qemu-guest` build selects (`mod.rs` `call_guest`).
+pub const CROSSING: Qemu = Qemu;
+
+impl super::Engine for Qemu {
+    type Cpu = HostThread;
+
+    /// The engine's `map`: marks `[start, start + len)` as guest memory with `prot` (`PROT_*`; identity addresses). Refused before the engine is up.
+    fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String> {
+        let e = engine();
+        let f = e
+            .table
+            .map
+            .unwrap_or_else(|| unsupported("engine table has no map"));
+        // SAFETY: the engine handle is live; the range is host memory the caller owns (identity, the ABI's contract).
+        let rc = unsafe { f(e.handle, start as u64, len as u64, prot) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("map {start:#x}+{len:#x}: {}", errno_text(rc)))
+        }
+    }
+
+    /// Calls guest `f(a, b, c, d)` on this thread's guest CPU with TPIDR_EL0 = the record's guest thread pointer, and stores back the one the guest returned with (the linker installs its own during `__linker_init`).
+    ///
+    /// # Safety
+    /// As the x86 seam's: `f` is guest code with up to four integer arguments, `cpu` this thread's record.
+    unsafe fn call(
+        &self,
+        cpu: &mut HostThread,
+        tp: super::Tp,
+        f: usize,
+        args: &[usize; 4],
+    ) -> usize {
+        cpu.set_guest_fs(match tp {
+            super::Tp::Bootstrap => bootstrap_tcb(),
+            super::Tp::Guest(t) => t,
+        });
+        let args = args.map(|v| v as u64);
+        let mut guest_tp = cpu.guest_fs() as u64;
+        let r = call_on(&mut guest_tp, f as u64, &args);
+        cpu.set_guest_fs(guest_tp as usize);
+        r as usize
+    }
 }
 
 /// A guest-callable address that crosses to host function `target`: the address of a free pool slot, which [`on_trap`] routes to `target`. None when the pool is used up.
@@ -482,25 +506,9 @@ pub fn patch_entry(vdso: &Image, value_at: usize, host: usize) -> Result<(), &'s
     Ok(())
 }
 
-/// The engine's `map`: marks `[start, start + len)` as guest memory with `prot` (`PROT_*`; identity addresses). Refused before the engine is up.
-fn map(start: usize, len: usize, prot: u32) -> Result<(), String> {
-    let e = engine();
-    let f = e
-        .table
-        .map
-        .unwrap_or_else(|| unsupported("engine table has no map"));
-    // SAFETY: the engine handle is live; the range is host memory the caller owns (identity, the ABI's contract).
-    let rc = unsafe { f(e.handle, start as u64, len as u64, prot) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(format!("map {start:#x}+{len:#x}: {}", errno_text(rc)))
-    }
-}
-
 /// Maps a host data range as readable guest memory, for a call that passes its address (a page-aligned static of the gate; the engine maps whole pages).
 pub fn register_data(start: usize, len: usize) -> Result<(), String> {
-    map(start, len, PROT_READ)
+    CROSSING.map(start, len, PROT_READ)
 }
 
 /// Registers the host pool (executable) and every segment of `images` with QEMU, identity mapped, so a guest fetch from them does not fault. Call before the first guest fetch from them.
@@ -508,14 +516,14 @@ pub fn register_data(start: usize, len: usize) -> Result<(), String> {
 #[cfg(not(atl_nb_qe_nomap))]
 pub fn register(images: &[&Image]) -> Result<(), String> {
     let pool_start = (&raw const pool::POOL) as usize;
-    map(
+    CROSSING.map(
         pool_start,
         std::mem::size_of::<pool::Pool>(),
         PROT_READ | PROT_EXEC,
     )?;
     for image in images {
         for &(start, len, prot) in image.segments() {
-            map(
+            CROSSING.map(
                 start,
                 len,
                 (prot as u32) & (PROT_READ | PROT_WRITE | PROT_EXEC),

@@ -4,7 +4,7 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below: `Engine::call` under identity, QEMU's own crossing under `qemu-guest` until Q5-5.
+/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `arch::CROSSING` in both builds.
 #[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
 #[path = "x86_64.rs"]
 pub mod arch;
@@ -101,10 +101,12 @@ pub enum Tp {
     Guest(usize),
 }
 
-/// Runs guest code on a host thread's CPU. One implementation (`arch::Identity`): the trait is shaped by it, and grows when QEMU joins (plan Q5-5).
+/// Runs guest code on a host thread's CPU and registers guest memory. Two implementations, one per build: `arch::Identity` (the host's FS switch) and `arch::Qemu` (QEMU's crossing); `arch::CROSSING` is the one this build selects.
 pub trait Engine {
-    /// The host thread's guest CPU. Identity: its crossing record.
+    /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`arch::attach_current`).
     type Cpu;
+    /// Registers guest memory `[start, start + len)` with `prot` (`PROT_*`). Identity: nothing to register, host memory is guest memory. QEMU: page flags.
+    fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String>;
     /// Runs guest `f(args)` on `cpu` with thread pointer `tp`; returns x0. Nests: may run from inside a host function the guest called.
     ///
     /// # Safety
@@ -116,7 +118,6 @@ pub trait Engine {
 ///
 /// # Safety
 /// As [`Engine::call`]; `cpu` is the calling thread's own record.
-#[cfg(not(feature = "qemu-guest"))]
 pub(crate) unsafe fn call_guest(
     cpu: &mut HostThread,
     f: usize,
@@ -127,14 +128,13 @@ pub(crate) unsafe fn call_guest(
 ) -> usize {
     let tp = Tp::Guest(cpu.guest_fs());
     // SAFETY: caller contract.
-    unsafe { arch::Identity.call(cpu, tp, f, &[a, b, c, d]) }
+    unsafe { arch::CROSSING.call(cpu, tp, f, &[a, b, c, d]) }
 }
 
 /// `Guest::start`'s bootstrap call (`Tp::Bootstrap`).
 ///
 /// # Safety
 /// As [`call_guest`].
-#[cfg(not(feature = "qemu-guest"))]
 pub(crate) unsafe fn call_bootstrap(
     cpu: &mut HostThread,
     f: usize,
@@ -144,45 +144,7 @@ pub(crate) unsafe fn call_bootstrap(
     d: usize,
 ) -> usize {
     // SAFETY: caller contract.
-    unsafe { arch::Identity.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
-}
-
-// Q5-5: QEMU's crossing moves onto `Engine` (plan section 6); these two qemu-guest arms go with it.
-/// [`call_guest`] under `qemu-guest`: QEMU's crossing, which reads the record's guest thread pointer itself.
-///
-/// # Safety
-/// As [`call_guest`].
-#[cfg(feature = "qemu-guest")]
-pub(crate) unsafe fn call_guest(
-    cpu: &mut HostThread,
-    f: usize,
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-) -> usize {
-    // SAFETY: caller contract.
-    unsafe { arch::call_guest(cpu, f, a, b, c, d) }
-}
-
-/// [`call_bootstrap`] under `qemu-guest`: the bootstrap record gives the call a scratch TCB (`arch::set_bootstrap`).
-///
-/// # Safety
-/// As [`call_guest`].
-#[cfg(feature = "qemu-guest")]
-pub(crate) unsafe fn call_bootstrap(
-    cpu: &mut HostThread,
-    f: usize,
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-) -> usize {
-    arch::set_bootstrap(Some(&raw mut *cpu));
-    // SAFETY: caller contract.
-    let ret = unsafe { arch::call_guest(cpu, f, a, b, c, d) };
-    arch::set_bootstrap(None);
-    ret
+    unsafe { arch::CROSSING.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
 }
 
 /// A started guest: the linker initialised, its libraries constructed.

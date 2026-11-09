@@ -727,8 +727,15 @@ pub fn set_signal_handler(sig: usize, handler: usize) {
 /// The identity engine: the host arch's crossing, one `atl_nb_call_guest` per call.
 pub struct Identity;
 
+/// The identity implementation of the seam, the one a native build selects (`mod.rs` `call_guest`).
+pub const CROSSING: Identity = Identity;
+
 impl super::Engine for Identity {
     type Cpu = HostThread;
+
+    fn map(&self, _start: usize, _len: usize, _prot: u32) -> Result<(), String> {
+        Ok(())
+    }
 
     unsafe fn call(
         &self,
