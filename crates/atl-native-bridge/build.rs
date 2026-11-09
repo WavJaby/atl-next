@@ -469,6 +469,8 @@ fn missing_prototype(soname: &str) -> &'static str {
 
 /// Fixed bindings besides the stub rows: the NBS vdso's four entries and the linker's two hooks (engine/vdso.rs `bind`, `bind_linker`).
 const FIXED_BINDINGS: usize = 6;
+/// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today, `JNIInvokeInterface` fewer; engine/jni.rs asserts the fit), rounded up to 256. The x86 engine's stub array has this length; the QEMU engine reserves as many pool slots.
+const JNI_STUBS: usize = 256;
 /// `bindings_table.rs` (module `bindings`): every guest library whose stubs the engine binds -- the GL / window / NDK proxies and libc -- with its NBS stub names in list order, each with the entry it binds. The one table `native_bridge_intercept_symbol` resolves (library, name) in.
 /// `Entry::Generic(host, symbol)` binds `symbol` looked up on that host library's own handle (a GL front, the bionic provider, glibc's libc.so.6) through the generic crossing; `Entry::Shim` a hand-written host side; `Entry::Trap(i)` `TRAPS[i]`, a named trap (`TRAP_NAMES[i]`).
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
@@ -637,8 +639,8 @@ fn bindings_table(
         code.push_str("        ],\n    },\n");
     }
     code.push_str("];\n\n");
-    // one pool slot per binding, rounded to a power of two; the QEMU pool (engine/arch/qemu.rs) is generated at this size (aarch64_pool.rs)
-    let thunks = (total + FIXED_BINDINGS).next_power_of_two();
+    // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/arch/qemu.rs) is generated at this size (aarch64_pool.rs)
+    let thunks = (total + FIXED_BINDINGS + JNI_STUBS).next_power_of_two();
     std::fs::write(
         out.join("aarch64_pool.rs"),
         format!(
@@ -648,7 +650,7 @@ fn bindings_table(
         ),
     )?;
     code.push_str(&format!(
-        "/// Thunk pool slots: the stub rows and the fixed bindings, rounded to a power of two.\npub const THUNKS: usize = {thunks};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
+        "/// Thunk pool slots: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two.\npub const THUNKS: usize = {thunks};\n\n/// JNI stubs: one per slot of the largest JNI table (build.rs `JNI_STUBS`).\npub const JNI_STUBS: usize = {JNI_STUBS};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
     ));
     code.push_str("/// Per `Entry::Trap(i)`: library, name, why trapped.\npub const TRAP_NAMES: &[(&str, &str, &str)] = &[\n");
     for (lib, name, why) in &traps {

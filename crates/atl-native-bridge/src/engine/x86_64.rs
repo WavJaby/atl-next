@@ -692,8 +692,8 @@ extern "C" fn up_failed(
 // the `.rept` counts above are THUNKS and JNI_STUBS; the index arithmetic in atl_nb_cross_to_host / atl_nb_jni_up is THUNK_BYTES = one table slot; frames are 32 bytes in the asm
 const _: () = assert!(JNI_STUBS == 256 && THUNK_BYTES == 8 && FRAME_WORDS * 8 == 32);
 
-/// JNI stubs: one per slot of the largest JNI table (`JNINativeInterface`: 233 in jni.h today; jni.rs asserts the fit).
-pub const JNI_STUBS: usize = 256;
+/// JNI stubs (bindings.rs `JNI_STUBS`, from build.rs); the asm's `.rept` above is its literal value.
+pub const JNI_STUBS: usize = super::bindings::JNI_STUBS;
 
 /// The guest-callable address of JNI table slot `slot` (jni.rs): crosses to the host object's own slot with the object rewritten.
 pub fn jni_stub(slot: usize) -> usize {
