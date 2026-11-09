@@ -449,7 +449,7 @@ fn prune_slots_after_land(repo: &Path, ws: &Path) {
     }
 }
 
-/// The task copies, then the state note (kept in out/), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
+/// The task copies, then the state note (kept in out/), the checkout's target (`slot::leave`), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
 fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
     let copies = copies_of(&Layout::new(ws, Some(branch)), &sources::load(wt)?);
     if !copies.is_empty() {
@@ -463,11 +463,12 @@ fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
         let kept = out.join(format!("{branch}-state-note.md"));
         std::fs::copy(&note, &kept).with_context(|| format!("keeping {}", note.display()))?;
     }
+    let target = slot::leave(wt, ws, slot::record_slot(wt)?)?;
     let wt_arg = wt.display().to_string();
     git(Some(repo), &["worktree", "remove", "--force", &wt_arg])?;
     git(Some(repo), &["branch", "-d", branch])?;
     Ok(format!(
-        "{} task copies, worktree {wt_arg}, branch {branch}",
+        "{} task copies, {target}, worktree {wt_arg}, branch {branch}",
         copies.len()
     ))
 }
@@ -819,6 +820,26 @@ mod tests {
         );
         assert!(!copy.exists(), "the task copy is kept");
         assert!(up.is_dir(), "the shared checkout went with the copy");
+    }
+
+    #[test]
+    fn clean_up_removes_the_checkouts_target_and_its_slot_build() {
+        let env = Env::new("target");
+        let ws = env.root.join("ws");
+        let slot_target = ws.join("out/slot-1/target");
+        std::fs::create_dir_all(slot_target.join("debug")).unwrap();
+        write(&slot_target.join("debug"), "build.txt", "x\n");
+        std::os::unix::fs::symlink(&slot_target, env.wt.join("target")).unwrap();
+        std::fs::write(env.repo.join(".git/worktrees/land/atl-out-slot"), "1\n").unwrap();
+        // `branch -d` in clean_up refuses a branch that is not merged into the checked-out main
+        git(Some(&env.repo), &["merge", "-q", "--ff-only", "land"]).unwrap();
+        let summary = clean_up(&env.repo, &ws, &env.wt, "land").expect("clean up");
+        assert!(summary.contains("target removed:"), "{summary}");
+        assert!(
+            !slot_target.exists(),
+            "the slot's build leaves with its holder"
+        );
+        assert!(!env.wt.exists(), "the worktree is removed");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! A process that resolves a slot holds its slot lock (`build_pool::hold_slot`) until it exits; `slot prune` skips a slot whose lock it cannot take.
 //! A slotted checkout's `target/` is a symlink to `out/slot-<n>/target`, so every cargo build there (xtask, `cargo test`, clippy) builds into its slot: one target dir per slot. A symlink because it is the only per-checkout switch cargo reads with no tracked file or env var; `.gitignore`'s `/target` matches it (`/target/` does not match a symlink).
 //! `cargo clean` unlinks the link and keeps the slot's files: the checkout then builds into a real `target/` until `slot assign --execute` relinks it (`slot show` reports which).
+//! A slot's target leaves with its holder: land removes it (`leave`); an assign wipes it when its holder is stale or its checkout moves to another slot.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -491,6 +492,42 @@ fn describe_entry(e: &Entry, want: &Path) -> String {
     }
 }
 
+/// The slot in a checkout's record; None when it holds none.
+pub fn record_slot(checkout: &Path) -> Result<Option<u32>> {
+    read_record(&record_of(checkout)?)
+}
+
+/// Land: the checkout's `target/` leaves with it. Its link or real dir goes, and so does the target of its slot (`slot`, from its record): the holder is leaving.
+/// Returns land's summary line.
+pub fn leave(root: &Path, ws: &Path, slot: Option<u32>) -> Result<String> {
+    let link = root.join(TARGET);
+    let mut removed = Vec::new();
+    match entry(&link)? {
+        Entry::Link(_) => {
+            std::fs::remove_file(&link).with_context(|| format!("unlinking {}", link.display()))?;
+            removed.push(link.display().to_string());
+        }
+        Entry::Dir => {
+            std::fs::remove_dir_all(&link)
+                .with_context(|| format!("removing {}", link.display()))?;
+            removed.push(link.display().to_string());
+        }
+        Entry::Absent | Entry::Other => {}
+    }
+    if let Some(n) = slot {
+        let dir = slot_target(ws, n);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+            removed.push(dir.display().to_string());
+        }
+    }
+    Ok(if removed.is_empty() {
+        "no target".to_owned()
+    } else {
+        format!("target removed: {}", removed.join(", "))
+    })
+}
+
 pub fn run(root: &Path, cmd: &Slot) -> Result<ExitCode> {
     let layout = Layout::of(root)?;
     let ws = layout.workspace();
@@ -926,6 +963,29 @@ mod tests {
             entry(&root.join(TARGET)).expect("entry"),
             Entry::Link(slot_target(&ws, 2))
         );
+        std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
+    }
+
+    #[test]
+    fn land_removes_the_link_and_the_slot_target_it_held() {
+        let (ws, root) = fixture("leave-slot");
+        put(&slot_target(&ws, 1).join("build.txt"));
+        link(&slot_target(&ws, 1), &root.join(TARGET));
+        let summary = leave(&root, &ws, Some(1)).expect("leave");
+        assert!(summary.starts_with("target removed:"), "{summary}");
+        assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Absent);
+        assert!(!slot_target(&ws, 1).exists());
+        std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
+    }
+
+    #[test]
+    fn land_removes_a_real_target_when_the_checkout_has_no_slot() {
+        let (ws, root) = fixture("leave-real");
+        put(&root.join(TARGET).join("own.txt"));
+        let summary = leave(&root, &ws, None).expect("leave");
+        assert!(summary.starts_with("target removed:"), "{summary}");
+        assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Absent);
+        assert_eq!(leave(&root, &ws, None).expect("again"), "no target");
         std::fs::remove_dir_all(ws.parent().expect("scratch")).expect("cleanup");
     }
 

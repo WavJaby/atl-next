@@ -188,7 +188,7 @@ enum Command {
     /// Lands a task branch on origin/main, after the branch's own patches pass the full check.
     ///
     /// Dry run by default: prints the steps after a read-only preflight (the branch is a fast-forward of origin/main; the main checkout is on origin/main, clean and in step; the branch's worktree is clean).
-    /// `--execute` runs them: task copies for the upstreams whose patches/ or pin differ from origin/main's, `cargo xtask check` in the branch's worktree, push, `fetch --execute` in the main checkout, `cargo xtask check` there, then removal of the copies, worktree and branch.
+    /// `--execute` runs them: task copies for the upstreams whose patches/ or pin differ from origin/main's, `cargo xtask check` in the branch's worktree, push, `fetch --execute` in the main checkout, `cargo xtask check` there, then removal of the copies, the checkout's target, worktree and branch.
     /// Nothing is pushed unless the branch's check passes. `--execute` fetches origin first; a dry run judges origin/main as last fetched.
     Land(land::Args),
     /// Licence of every source file in a fetched upstream checkout (read-only).
