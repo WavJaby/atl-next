@@ -193,7 +193,12 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
     let front = crate::atld_run::gl_front(&rt.out, ES1_FRONT);
     let lib = build_lib(root, &work.join("cargo"), &[], &front)?;
     // deliberate break: the probe library built with an undefined glClear
-    let broken = build_lib(root, &work.join("cargo-undefined-gl"), &[UNDEFINED_GL], &front)?;
+    let broken = build_lib(
+        root,
+        &work.join("cargo-undefined-gl"),
+        &[UNDEFINED_GL],
+        &front,
+    )?;
     let hits = gl_imports(&broken)?;
     let fired = !hits.is_empty();
     ok &= fired;
