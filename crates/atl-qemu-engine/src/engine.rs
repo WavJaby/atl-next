@@ -105,7 +105,8 @@ pub(crate) fn helper_retaddr_slot() -> Result<*const usize, String> {
 /// Call once per process; the calling thread becomes the guest thread.
 pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String> {
     let path = CString::new(library.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to the executable's definition, which comes first in global lookup order
+    hook_in_global_scope()?;
+    // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to ours, which `hook_in_global_scope` put first in lookup order
     // SAFETY: path is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration).
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
@@ -166,6 +167,42 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
     Ok(unsafe { main(argc, ptrs.as_mut_ptr(), process_environ()) })
 }
 
+/// Makes P1's call in the QEMU library bind to our `atl_svc_hook`. glibc resolves a dlopened object's references in the global scope first, then its own local scope -- where QEMU's weak default comes first, and glibc ignores weak vs strong at run time.
+/// So a DT_NEEDED from the QEMU library on our object would still bind the default; the definition must be global. An executable defining it is global when it exports it (build.rs); a library loaded RTLD_LOCAL (ART dlopens the NB core so) is promoted with `RTLD_NOLOAD | RTLD_GLOBAL`.
+/// Fails closed: afterwards the global lookup (`RTLD_DEFAULT`) must answer our address, else BOOT would fall to QEMU's syscall path.
+fn hook_in_global_scope() -> Result<(), String> {
+    let ours = crate::trap::atl_svc_hook as *const () as usize;
+    let global = || {
+        // SAFETY: dlsym on the global scope with a NUL-terminated name.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"atl_svc_hook".as_ptr()) as usize }
+    };
+    if global() == ours {
+        return Ok(());
+    }
+    // SAFETY: a zeroed Dl_info is a valid out-parameter; `ours` is a function of this process.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::dladdr(ours as *const c_void, &mut info) } == 0 || info.dli_fname.is_null() {
+        return Err("atl_svc_hook: dladdr finds no object".to_owned());
+    }
+    // SAFETY: dli_fname is the NUL-terminated path of the loaded object; RTLD_NOLOAD loads nothing new, it only widens that object's scope (the handle is kept: the object stays loaded anyway).
+    let promoted = unsafe {
+        libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_GLOBAL,
+        )
+    };
+    if promoted.is_null() || global() != ours {
+        // SAFETY: non-null, NUL-terminated (checked above).
+        let name = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        return Err(format!(
+            "atl_svc_hook of {name} is not in the global scope (an executable must export it: --export-dynamic-symbol): {}",
+            dlerror()
+        ));
+    }
+    Ok(())
+}
+
 fn process_environ() -> *mut *mut c_char {
     unsafe extern "C" {
         static mut environ: *mut *mut c_char;
@@ -173,6 +210,10 @@ fn process_environ() -> *mut *mut c_char {
     // SAFETY: glibc's process environment pointer, read once here.
     unsafe { environ }
 }
+
+/// Byte offset of TPIDR_EL0 in `CPUArchState` (clang's `offsetof`, a `size_t` the generator types u64; an offset inside a 79 KB record fits any usize).
+const TPIDR_EL0: usize = crate::layout::ATL_OFFSET_TPIDR_EL0 as usize;
+const _: () = assert!(TPIDR_EL0 + 8 <= Env::SIZE);
 
 /// The guest CPU as P1's hook received it (`CPUArchState *`), valid while the hook runs.
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +255,15 @@ impl Guest {
         self.reg(Env::pc)
     }
 
+    /// The guest thread pointer, TPIDR_EL0 (what the guest's `msr tpidr_el0` and linux-user's `cpu_set_tls` write).
+    pub fn tp(&self) -> u64 {
+        self.reg(TPIDR_EL0)
+    }
+
+    pub fn set_tp(&self, v: u64) {
+        self.set_reg(TPIDR_EL0, v);
+    }
+
     /// The host address of guest address `addr` (`g2h`: plus `guest_base`; identity at `-B 0`).
     pub fn host_addr(&self, addr: u64) -> usize {
         (addr as usize).wrapping_add(*lib().guest_base)
@@ -244,15 +294,21 @@ impl Guest {
         Ok(())
     }
 
-    /// Calls guest function `f` with `args` in x0.. and returns its x0. Nested: may run from inside a trap callback, which may itself call again.
-    /// The whole CPU state is saved and restored around the call, so the interrupted guest code resumes exactly where its trap left it.
+    /// Calls guest function `f` with `args` in x0.. and returns its x0, on the interrupted code's thread pointer. As [`Guest::call_on`].
     pub fn call(&self, f: u64, args: &[u64]) -> u64 {
+        self.call_on(self.tp(), f, args).0
+    }
+
+    /// Calls guest function `f` with `args` in x0.. on thread pointer `tp`; returns its x0 and the thread pointer it returned with. Nested: may run from inside a trap callback, which may itself call again.
+    /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
+    pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
         assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
         let ret = RET_STUB.with(Cell::get);
         assert!(ret != 0, "no BOOT trap yet: no return stub");
         let mut saved = vec![0u8; Env::SIZE];
         // SAFETY: env is a live CPUArchState of Env::SIZE bytes (clang layout); saved is that long.
         unsafe { std::ptr::copy_nonoverlapping(self.env, saved.as_mut_ptr(), Env::SIZE) };
+        self.set_tp(tp);
         for (i, a) in args.iter().enumerate() {
             self.set_x(i, *a);
         }
@@ -263,9 +319,14 @@ impl Guest {
         self.set_reg(Env::pc, f);
         // SAFETY: cpu_loop on this thread's CPU; P1 makes it return when the guest reaches `svc #RET` (trap.rs).
         unsafe { (lib().cpu_loop)(self.env.cast()) };
-        let r = self.x(0);
+        let r = (self.x(0), self.tp());
         // SAFETY: as for the save.
         unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.env, Env::SIZE) };
         r
+    }
+
+    /// Whether guest and host addresses are the same (`guest_base` 0, `-B 0`). Not merely a convenience: with a nonzero base TCG on an x86_64 host sets GS to it (tcg/x86_64/tcg-target.c.inc, `ARCH_SET_GS`), which ART owns on every thread.
+    pub fn identity(&self) -> bool {
+        *lib().guest_base == 0
     }
 }

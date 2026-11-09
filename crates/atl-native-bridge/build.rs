@@ -49,7 +49,7 @@ const THREAD_INCLUDE_DIRS: &[&str] = &[
     "frameworks/libs/native_bridge_support/android_api/linker/include",
 ];
 
-/// `layout_module` of `THREAD_HEADERS` in the guest's bionic view (the identity engine: the host arch).
+/// `layout_module` of `THREAD_HEADERS` in the guest's bionic view: `guest` is the host arch for the identity engine, arm64 for the QEMU guest.
 /// C++: the bionic headers are C++-only (classes, `_Atomic` next to `<atomic>`), parsed with libc++ first as
 /// bionic's own C++ sources are.
 fn bionic_thread(
@@ -74,8 +74,12 @@ fn bionic_thread(
         path: &unit,
         lang: Lang::Cxx,
         also: &also,
-        // the guest TCB slot that holds the engine's per-thread record (x86_64 crossing: guest->host and signal entries find it there)
-        macros: &["TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE"],
+        // the guest TCB slot that holds the engine's per-thread record (x86_64 crossing: guest->host and signal entries find it there); the slot range (the QEMU crossing's scratch TCB)
+        macros: &[
+            "TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE",
+            "MIN_TLS_SLOT",
+            "MAX_TLS_SLOT",
+        ],
     };
     let iface = atl_bridgegen::interface(
         "bionic_thread",
@@ -166,10 +170,9 @@ const SHIMS: &[&str] = &[
     // provider.rs: the provider calls a host trampoline that crosses to the guest callback
     "__system_property_foreach",
     "__system_property_read_callback",
-    // signal.rs: the guest handler registered with sigchain behind ART's claims
-    "sigaction",
-    "sigaction64",
 ];
+/// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
+const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
 /// NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs): the generic crossing would hand the host library the guest's env, so each binds `Entry::Shim` in its library. Any NDK proxy library may list them; each must be in one (`bindings_table`).
 const NDK_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
@@ -328,8 +331,19 @@ const PROXY_LIBS: &[(&str, &str)] = &[
     ("libandroid_runtime.so", "libandroid_runtime"),
     ("libjnigraphics.so", "libjnigraphics"),
 ];
-/// The guest libc's stub list (NBS, x86_64 entries; patch 0003 adds sigaction / sigaction64).
-const LIBC_STUBS: &str = "frameworks/libs/native_bridge_support/android_api/libc/stubs_x86_64.cpp";
+/// The guest libc's stub list (NBS), per guest ISA: x86_64 for the identity guest (patch 0003 adds sigaction / sigaction64); arm64 for the QEMU guest, which has no sigaction stub (its guest libc's own syscall reaches QEMU's signal emulation) but setjmp / longjmp ones.
+fn libc_stubs(qemu: bool) -> &'static str {
+    if qemu {
+        "frameworks/libs/native_bridge_support/android_api/libc/stubs_arm64.cpp"
+    } else {
+        "frameworks/libs/native_bridge_support/android_api/libc/stubs_x86_64.cpp"
+    }
+}
+
+/// Why a Shim row traps in the QEMU guest (plan O2): every hand-written host side calls guest code on a guest thread or converts guest records, which needs the QEMU crossing's guest calls on any thread (Q5).
+const QEMU_SHIM_PENDING: &str = "pending: shim under QEMU, Q5";
+/// The QEMU guest's arches.toml row (engine/arch/qemu.rs `GUEST_ISA`).
+const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
 const PROTOTYPE_HEADERS: &[&str] = &[
     "EGL/egl.h",
@@ -399,16 +413,19 @@ fn stub_names(up: &Upstreams, rel: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`], [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
+/// The libc rows: per NBS libc stub, its entry -- [`SHIMS`] (+ [`SIGNAL_SHIMS`] for the x86_64 list; a trap under QEMU), [`GLIBC`], the provider's [`PROVIDER_APIS`], else a named trap. A name in those lists that the stub list lacks fails the build (a stale row).
 fn libc_entries(
     names: &[String],
+    qemu: bool,
     trap: &mut dyn FnMut(&str, &'static str) -> String,
 ) -> Result<Vec<String>> {
     let provider: Vec<&str> = PROVIDER_APIS
         .iter()
         .flat_map(|(_, f)| f.iter().copied())
         .collect();
-    for n in SHIMS
+    let signal: &[&str] = if qemu { &[] } else { SIGNAL_SHIMS };
+    let shims: Vec<&str> = SHIMS.iter().chain(signal).copied().collect();
+    for n in shims
         .iter()
         .chain(GLIBC.iter().map(|(n, _)| n))
         .chain(&provider)
@@ -421,8 +438,12 @@ fn libc_entries(
     Ok(names
         .iter()
         .map(|name| {
-            if SHIMS.contains(&name.as_str()) {
-                "Entry::Shim".to_owned()
+            if shims.contains(&name.as_str()) {
+                if qemu {
+                    trap(name, QEMU_SHIM_PENDING)
+                } else {
+                    "Entry::Shim".to_owned()
+                }
             } else if let Some((_, sym)) = GLIBC.iter().find(|(n, _)| n == name) {
                 format!("Entry::Generic(Host::Glibc, {sym:?})")
             } else if provider.contains(&name.as_str()) {
@@ -454,6 +475,7 @@ fn bindings_table(
     host: &buildscript::HostArch,
     out: &std::path::Path,
     provider_soname: &str,
+    qemu: bool,
 ) -> Result<String> {
     let mut lists: Vec<(&str, Vec<String>)> = Vec::new();
     for &(soname, dir) in PROXY_LIBS {
@@ -464,7 +486,7 @@ fn bindings_table(
         .with_context(|| soname.to_owned())?;
         lists.push((soname, names));
     }
-    let libc_names = stub_names(up, LIBC_STUBS)?;
+    let libc_names = stub_names(up, libc_stubs(qemu))?;
     for n in NDK_SHIMS {
         ensure!(
             lists
@@ -566,7 +588,11 @@ fn bindings_table(
             };
             let entry = match (guest_view.functions.get(name), host_ir.functions.get(name)) {
                 (Some(_), Some(_)) if NDK_SHIMS.contains(&name.as_str()) => {
-                    "Entry::Shim".to_owned()
+                    if qemu {
+                        trap(QEMU_SHIM_PENDING)
+                    } else {
+                        "Entry::Shim".to_owned()
+                    }
                 }
                 (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
                     trap("pending: annotated, GS2.2")
@@ -578,15 +604,17 @@ fn bindings_table(
                 (Some(_), Some(_)) => format!("Entry::Generic(Host::System, {name:?})"),
                 _ => trap(missing_prototype(soname)),
             };
+            let prototyped =
+                guest_view.functions.contains_key(name) && host_ir.functions.contains_key(name);
             ensure!(
-                !NDK_SHIMS.contains(&name.as_str()) || entry == "Entry::Shim",
+                !NDK_SHIMS.contains(&name.as_str()) || prototyped,
                 "{name}: an NDK shim without a prototype in the set ({PROTOTYPE_HEADERS:?})"
             );
             entries.push((name.clone(), entry));
         }
         rows.push((soname, entries));
     }
-    let libc = libc_entries(&libc_names, &mut |name, why| {
+    let libc = libc_entries(&libc_names, qemu, &mut |name, why| {
         traps.push(("libc.so".to_owned(), name.to_owned(), why));
         format!("Entry::Trap({})", traps.len() - 1)
     })?;
@@ -659,6 +687,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_site", "atl_nb_qe_site"),
     // Q4-3 (engine/arch/qemu.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
     ("qe_nomap", "atl_nb_qe_nomap"),
+    // Q4-4 (engine/arch/qemu.rs `GUEST_BASE`): QEMU runs with a nonzero guest base, which `map_guest` refuses
+    ("qe_guest_base", "atl_nb_qe_guest_base"),
+    // Q4-4 (engine/arch/qemu.rs `map_data`): the argument block is not registered with QEMU, so the guest linker's open of argv[1] fails (EFAULT)
+    ("qe_nodata", "atl_nb_qe_nodata"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
@@ -695,18 +727,23 @@ fn main() -> Result<()> {
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
-    // Q4-3 gate (tests/qemu_linker.rs): QEMU's library calls P1's hook by name, and the executable must export it; without this, QEMU's weak default answers "not ours" and BOOT falls to the syscall path
-    if std::env::var_os("CARGO_FEATURE_QEMU_GUEST").is_some() {
+    // QEMU gates (tests/qemu_*.rs): QEMU's library calls P1's hook by name, and the executable must export it; without this, QEMU's weak default answers "not ours" and BOOT falls to the syscall path
+    let qemu = std::env::var_os("CARGO_FEATURE_QEMU_GUEST").is_some();
+    if qemu {
         println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
     let arches = checkout.join("arches.toml");
-    let host = buildscript::host_arch(
-        &std::fs::read_to_string(&arches)?,
-        &std::env::var("TARGET")?,
-    )?;
+    let arches_text = std::fs::read_to_string(&arches)?;
+    let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
+    // the guest's bionic view: the identity guest is the host arch, the QEMU guest arm64 (engine/arch/qemu.rs GUEST_ISA)
+    let guest = if qemu {
+        buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?
+    } else {
+        host.clone()
+    };
     let path = up.file(&format!("aosp/{HEADER}"))?;
     let target = Target {
         arch: host.arch.clone(),
@@ -750,13 +787,13 @@ fn main() -> Result<()> {
     std::fs::write(out.join("native_bridge.rs"), code)?;
     std::fs::write(
         out.join("bionic_thread.rs"),
-        bionic_thread(&up, &host, &out)?,
+        bionic_thread(&up, &guest, &out)?,
     )?;
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
     std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
     std::fs::write(
         out.join("bindings_table.rs"),
-        bindings_table(&up, &host, &out, &provider_soname(&manifest)?)?,
+        bindings_table(&up, &host, &out, &provider_soname(&manifest)?, qemu)?,
     )?;
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)

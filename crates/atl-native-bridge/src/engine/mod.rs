@@ -75,9 +75,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`): the identity guest's ISA is the host's own.
+    /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`), for the crossing's guest ISA (identity: the host's own; QEMU: arm64).
     pub fn installed() -> Config {
-        let isa = std::env::consts::ARCH;
+        let isa = arch::GUEST_ISA;
         let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
         let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa));
         Config {
@@ -124,7 +124,9 @@ impl Guest {
         let init = linker
             .symbol("__dl___linker_init")
             .ok_or("linker64 has no __dl___linker_init")?;
-        let block = args::build(cfg, &linker, &vdso)?;
+        let block = args::build(cfg, &linker, &vdso, &arch::kernel_auxv()?)?;
+        arch::map_guest(&[&linker, &vdso], &block.ranges)?;
+        let block = block.addr;
         let thread = HostThread::leak();
         arch::set_bootstrap(Some(&raw mut *thread));
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.

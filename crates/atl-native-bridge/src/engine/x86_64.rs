@@ -101,6 +101,19 @@ pub unsafe fn init_tcb(tp: usize, ht: *mut HostThread) {
     }
 }
 
+/// The guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory): the identity guest is the host's own.
+pub const GUEST_ISA: &str = std::env::consts::ARCH;
+
+/// The kernel's auxv for this guest: the process's own, the identity guest runs on the real kernel.
+pub fn kernel_auxv() -> Result<Vec<(usize, usize)>, String> {
+    super::args::process_auxv()
+}
+
+/// Makes `images` and the host `data` ranges reachable by guest code: nothing to do, guest memory is host memory here.
+pub fn map_guest(_images: &[&Image], _data: &[(usize, usize)]) -> Result<(), String> {
+    Ok(())
+}
+
 /// Whether the CPU and kernel let user code run `rdfsbase`/`wrfsbase` (else they fault with SIGILL).
 pub fn supported() -> bool {
     const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;

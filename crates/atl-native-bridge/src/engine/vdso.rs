@@ -67,7 +67,9 @@ extern "C" fn trace() {}
 
 /// `__native_bridge_get_host_pthread()`: the bionic thread record the guest main thread reuses (NBS linker `__libc_init_main_thread_early`: `__init_tcb(temp_tcb, host_thread)`, then `TLS_SLOT_BIONIC_TLS = host_thread->bionic_tls`).
 /// Built by `thread::current` (our host is glibc, so the record is ours, not host `pthread_self()` as berberis's bionic host answers).
+pub static HOST_PTHREADS: AtomicU32 = AtomicU32::new(0);
 extern "C" fn get_host_pthread() -> usize {
+    HOST_PTHREADS.fetch_add(1, Ordering::Relaxed);
     super::thread::current()
 }
 

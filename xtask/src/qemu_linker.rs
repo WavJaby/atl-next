@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test qemu-linker`: the QEMU crossing's placement on the real arm64 NB images (QEMU bridge plan Q4-3) against its fixture, then each break.
+//! `xtask test qemu-linker`: the QEMU crossing on the real arm64 NB images, two harnesses, each plain then with each of its breaks (QEMU bridge plan Q4-3, Q4-4).
 //!
-//! Library: the spike's `-shared` QEMU library (`qemu_spike::link`). Fixture: `xtask/testdata/qemu-linker/fixture.c`, static bionic by the NDK clang.
+//! Library: the spike's `-shared` QEMU library (`qemu_spike::link`). Fixtures in `xtask/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `boot.c` (static, the Q4-4 boot executable), `exe.c` (PIE without libc, the main executable the guest linker loads).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`, from `xtask native --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso`): `native_bridge_guest_linker/linker64` and `libnative_bridge_vdso/libnative_bridge_vdso.so`.
-//! Harness: `cargo test -p atl-native-bridge --features qemu-guest --test qemu_linker`, harness-less; its header lists the env and the checks (p, r, t, a, s).
-//! Pass: every check prints ok and the run exits 0. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults). Each must turn its run red.
-//! Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
+//! Harnesses: `cargo test -p atl-native-bridge --features qemu-guest --test <name>`, harness-less; each header lists its env and checks.
+//! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults).
+//! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_guest_base` (QEMU at a nonzero guest base: BOOT refuses), `qe_nodata` (the argument block unregistered with QEMU: the linker cannot open argv[1]).
+//!
+//! Pass: every check prints ok and the run exits 0; each break must turn its run red. Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -13,18 +15,37 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, ensure};
 
 use crate::jni_fixture::{self, NdkTarget};
-use crate::qemu::{self, Build, GUEST_API};
+use crate::qemu::{self, GUEST_API};
 use crate::qemu_spike;
 use crate::verdict::{Failure, Verdict};
 
-const FIXTURE_SRC: &str = "xtask/testdata/qemu-linker/fixture.c";
+const TESTDATA: &str = "xtask/testdata/qemu-linker";
 const PACKAGE: &str = "atl-native-bridge";
-/// The checks the harness prints (its header): placement, registration, trap ids, arguments, answers.
-const CHECKS: [char; 5] = ['p', 'r', 't', 'a', 's'];
-/// The breaks: `ATL_NB_BREAK` names, each its run must go red.
-const BREAKS: [&str; 2] = ["qe_site", "qe_nomap"];
 /// Per harness run. A run that outlives it hangs (a guest fault QEMU does not end) and counts as failed.
 const RUN_TIMEOUT_SECS: u32 = 240;
+
+/// One harness: its cargo test, the prefix and letters of its check lines, its breaks.
+struct Harness {
+    test: &'static str,
+    prefix: &'static str,
+    checks: &'static [char],
+    breaks: &'static [&'static str],
+}
+
+const HARNESSES: [Harness; 2] = [
+    Harness {
+        test: "qemu_linker",
+        prefix: "qemu-linker",
+        checks: &['p', 'r', 't', 'a', 's'],
+        breaks: &["qe_site", "qe_nomap"],
+    },
+    Harness {
+        test: "qemu_start",
+        prefix: "qemu-start",
+        checks: &['s', 'e', 't', 'h', 'g'],
+        breaks: &["qe_guest_base", "qe_nodata"],
+    },
+];
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -37,7 +58,7 @@ pub struct Args {
     /// The arm64 NB out dir (`<out>/nb/arm64`): holds `native_bridge_guest_linker/linker64` and `libnative_bridge_vdso/libnative_bridge_vdso.so`.
     #[arg(long)]
     pub nb: PathBuf,
-    /// Only the plain run, no breaks.
+    /// Only the plain runs, no breaks.
     #[arg(long)]
     pub no_breaks: bool,
 }
@@ -48,7 +69,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let dir = b.dir.join("qemu-linker");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let so = qemu_spike::link(&b, &dir.join("libqemu-spike.so"), None)?;
-    let fixture = fixture(root, &b, &dir)?;
     let linker = args.nb.join("native_bridge_guest_linker/linker64");
     let vdso = args
         .nb
@@ -59,24 +79,39 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         linker.display(),
         vdso.display()
     );
-    let mut runs: Vec<Option<&str>> = vec![None];
-    if !args.no_breaks {
-        runs.extend(BREAKS.iter().map(|b| Some(*b)));
-    }
+    let ndk = jni_fixture::default_ndk(root)?;
+    let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
+    let fixture = guest_build(root, &target, &dir, "fixture", &["-static"])?;
+    let boot = guest_build(root, &target, &dir, "boot", &["-static"])?;
+    let exe = guest_build(root, &target, &dir, "exe", &["-nostdlib", "-fPIE", "-pie"])?;
+    let build_dir = b.build_dir();
+    let env: [(&str, &Path); 7] = [
+        ("ATL_QEMU_BUILD", &build_dir),
+        ("ATL_QEMU_SPIKE_SO", &so),
+        ("ATL_QEMU_SPIKE_FIXTURE", &fixture),
+        ("ATL_NB_BOOT", &boot),
+        ("ATL_NB_EXE", &exe),
+        ("ATL_NB_LINKER", &linker),
+        ("ATL_NB_VDSO", &vdso),
+    ];
     let mut fails = Vec::new();
-    for brk in &runs {
-        let name = brk.unwrap_or("plain");
-        let images = Images {
-            linker: &linker,
-            vdso: &vdso,
-        };
-        if let Err(e) = harness(root, &b, &dir, &so, &fixture, &images, *brk) {
-            fails.push(Failure::step(name, format!("{e:#}")));
+    let mut total = 0;
+    for h in &HARNESSES {
+        let mut runs: Vec<Option<&str>> = vec![None];
+        if !args.no_breaks {
+            runs.extend(h.breaks.iter().map(|b| Some(*b)));
+        }
+        for brk in runs {
+            total += 1;
+            let name = format!("{}-{}", h.test, brk.unwrap_or("plain"));
+            if let Err(e) = harness(root, &dir, h, &env, brk, &name) {
+                fails.push(Failure::step(&name, format!("{e:#}")));
+            }
         }
     }
     let verdict = Verdict {
         cmd: "qemu-linker",
-        total: Some((runs.len(), "runs")),
+        total: Some((total, "runs")),
         skipped: Vec::new(),
         failures: fails,
     };
@@ -88,37 +123,36 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// The arm64 NB artifacts the harness maps and places.
-struct Images<'a> {
-    linker: &'a Path,
-    vdso: &'a Path,
-}
-
-/// The guest static executable: fixture.c, built as the spike's fixture is.
-fn fixture(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
-    let ndk = jni_fixture::default_ndk(root)?;
-    let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
-    let bin = dir.join("fixture");
+/// `<TESTDATA>/<stem>.c` built for the guest by the NDK clang with `flags`, as `<dir>/<stem>`.
+fn guest_build(
+    root: &Path,
+    target: &NdkTarget,
+    dir: &Path,
+    stem: &str,
+    flags: &[&str],
+) -> Result<PathBuf> {
+    let src = root.join(TESTDATA).join(format!("{stem}.c"));
+    let bin = dir.join(stem);
     let status = target
         .cmd("clang")
-        .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
+        .args(flags)
+        .args(["-O1", "-Wall", "-Werror", "-o"])
         .arg(&bin)
-        .arg(root.join(FIXTURE_SRC))
+        .arg(&src)
         .status()
         .context("running the NDK clang")?;
-    ensure!(status.success(), "NDK clang failed on {FIXTURE_SRC}");
+    ensure!(status.success(), "NDK clang failed on {}", src.display());
     Ok(bin)
 }
 
-/// One harness run: plain (every check ok, exit 0) or a break (not every check ok, or a nonzero exit).
+/// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit).
 fn harness(
     root: &Path,
-    b: &Build,
     dir: &Path,
-    so: &Path,
-    fixture: &Path,
-    images: &Images,
+    h: &Harness,
+    env: &[(&str, &Path)],
     brk: Option<&str>,
+    name: &str,
 ) -> Result<()> {
     // `timeout` kills the run's whole process group: a hung run is a failed run (exit 124)
     let mut cmd = Command::new("timeout");
@@ -133,33 +167,28 @@ fn harness(
         "--features",
         "qemu-guest",
         "--test",
-        "qemu_linker",
+        h.test,
         "--target-dir",
     ])
     .arg(dir.join("cargo"))
     .args(["--"])
-    .env("ATL_QEMU_BUILD", b.build_dir())
-    .env("ATL_QEMU_SPIKE_SO", so)
-    .env("ATL_QEMU_SPIKE_FIXTURE", fixture)
-    .env("ATL_NB_LINKER", images.linker)
-    .env("ATL_NB_VDSO", images.vdso)
+    .envs(env.iter().copied())
     .current_dir(root);
     match brk {
-        Some(name) => cmd.env("ATL_NB_BREAK", name),
+        Some(b) => cmd.env("ATL_NB_BREAK", b),
         None => cmd.env_remove("ATL_NB_BREAK"),
     };
     let out = cmd.output().context("running cargo test")?;
-    let name = brk.unwrap_or("plain");
     let log = dir.join(format!("{name}.log"));
     std::fs::write(
         &log,
         [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
     )?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let ok = |c: char| text.lines().any(|l| l == format!("qemu-linker: ({c}) ok"));
+    let ok = |c: char| text.lines().any(|l| l == format!("{}: ({c}) ok", h.prefix));
     match brk {
         None => {
-            let red: Vec<char> = CHECKS.into_iter().filter(|&c| !ok(c)).collect();
+            let red: Vec<char> = h.checks.iter().copied().filter(|&c| !ok(c)).collect();
             ensure!(
                 red.is_empty() && out.status.success(),
                 "checks {red:?} not ok ({}), log {}",
@@ -169,7 +198,7 @@ fn harness(
         }
         Some(_) => {
             ensure!(
-                !CHECKS.into_iter().all(ok),
+                !h.checks.iter().all(|&c| ok(c)),
                 "break left every check ok, log {}",
                 log.display()
             );

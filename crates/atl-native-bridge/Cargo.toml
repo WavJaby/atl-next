@@ -49,6 +49,12 @@ name = "qemu_linker"
 harness = false
 required-features = ["qemu-guest"]
 
+# Q4-4 gate: the real arm64 guest linker's __linker_init runs under QEMU from a BOOT trap and returns the main executable's entry (QEMU bridge plan Q4-4); needs feature qemu-guest and the spike library
+[[test]]
+name = "qemu_start"
+harness = false
+required-features = ["qemu-guest"]
+
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }
 atl-qemu-engine = { path = "../atl-qemu-engine" }

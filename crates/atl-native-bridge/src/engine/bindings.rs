@@ -209,10 +209,6 @@ mod tests {
     #[test]
     fn every_shim_has_an_arm() {
         for (lib, name, b) in rows() {
-            // the QEMU build leaves sigaction unarmed (its signals are QEMU's): the rows bind absent there
-            if cfg!(feature = "qemu-guest") && matches!(name, "sigaction" | "sigaction64") {
-                continue;
-            }
             if b == Binding::Shim {
                 assert!(
                     shim(name).is_some(),

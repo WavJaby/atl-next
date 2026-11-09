@@ -251,6 +251,19 @@ pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<HostArch> {
                 == Some(rust_target)
         })
         .with_context(|| format!("arches.toml: no host row with rust = {rust_target}"))?;
+    arch_row(arch, row)
+}
+
+/// The row `arch` (an arches.toml key), read from arches.toml's text: the bionic view of a guest arch that is not the host's (the QEMU guest).
+pub fn guest_arch(arches_toml: &str, arch: &str) -> Result<HostArch> {
+    let table: toml::Table = toml::from_str(arches_toml).context("parsing arches.toml")?;
+    let row = table
+        .get(arch)
+        .with_context(|| format!("arches.toml: no row {arch}"))?;
+    arch_row(arch, row)
+}
+
+fn arch_row(arch: &str, row: &toml::Value) -> Result<HostArch> {
     let kernel_arch = row
         .get("kernel_arch")
         .and_then(|k| k.as_str())
@@ -261,7 +274,7 @@ pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<HostArch> {
         .and_then(|c| c.as_str())
         .with_context(|| format!("arches.toml [{arch}.guest]: no clang triple"))?;
     Ok(HostArch {
-        arch: arch.clone(),
+        arch: arch.to_owned(),
         kernel_arch: kernel_arch.to_owned(),
         bionic_clang: bionic_clang.to_owned(),
     })

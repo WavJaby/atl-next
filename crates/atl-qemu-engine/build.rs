@@ -16,6 +16,12 @@ const BUILD_ENV: &str = "ATL_QEMU_BUILD";
 const UNIT: &str = "linux-user/aarch64/cpu_loop.c";
 /// Headers whose records form the interface, relative to the QEMU tree.
 const HEADERS: &[&str] = &["target/arm/cpu.h"];
+/// Offsets the engine reads by field path, evaluated by clang in the unit: (macro name, `offsetof` expression).
+/// TPIDR_EL0 = `cp15.tpidr_el[0]`, the register linux-user's `cpu_set_tls` writes (linux-user/aarch64/target_cpu.h).
+const FIELD_OFFSETS: &[(&str, &str)] = &[(
+    "ATL_OFFSET_TPIDR_EL0",
+    "offsetof(CPUARMState, cp15.tpidr_el[0])",
+)];
 
 const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
 /// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it.
@@ -149,12 +155,17 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
     for h in HEADERS {
         text.push_str(&format!("#include \"{h}\"\n"));
     }
+    // fields inside anonymous unions get generated names (`cp15.anon13`) that renumber when cpu.h gains a union: name the path instead, clang evaluates it
+    for (name, expr) in FIELD_OFFSETS {
+        text.push_str(&format!("#define {name} {expr}\n"));
+    }
     std::fs::write(&unit, text)?;
+    let macros: Vec<&str> = FIELD_OFFSETS.iter().map(|&(n, _)| n).collect();
     let source = Source {
         path: &unit,
         lang: Lang::C,
         also: &also,
-        macros: &[],
+        macros: &macros,
     };
     // the host view: the library runs in the host process, compiled by the PIC build's host compiler
     let target = Target {
