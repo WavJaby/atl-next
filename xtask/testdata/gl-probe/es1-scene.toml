@@ -1,21 +1,12 @@
 # SPDX-License-Identifier: MIT
-# ES1 scene of `xtask test gl` (mode es1): the one description. Read by xtask/src/gl_scene.rs (probe program and reference expectation) and by the probe's two interpreters (java/com/example/atlgl/Es1Scene.java, jni/es1.rs).
+# ES1 scene of `xtask test app`'s guest GLES1 fixture: the one description. Read by xtask/src/gl_scene.rs (program and reference expectation) and jni_fixture.rs (the fixture's C).
 # A step's text is one GL call by name, without the GL_ prefix; colours are 0-255 ints, geometry is GL units. The steps run in order on both paths.
 # Vocabulary: clear R G B A | color R G B A | enable|disable SCISSOR_TEST|BLEND|TEXTURE_2D | client_enable|client_disable VERTEX_ARRAY|COLOR_ARRAY|TEXTURE_COORD_ARRAY|POINT_SIZE_ARRAY_OES | scissor X Y W H | matrix MODELVIEW|PROJECTION | load_identity | ortho L R B T N F | push | pop | translate X Y Z | rotate A X Y Z | scale X Y Z | vertices X Y ... | colors R G B A ... | texcoords S T ... | point_sizes S ... | elements I ... (triangles, u16) | points FIRST COUNT | blend_func SRC DST | bind_texture N | texture W H R G B A ... (RGBA8) | texture_filter NEAREST | read W H
-# Deliberate break: a step with `break = true` is dropped from the broken run (skip glPopMatrix and the GL_COLOR_ARRAY enable). Checks 4 and 5 must then fail.
+# Deliberate break (jni_fixture.rs `es1` break): a step with `break = true` is dropped from the broken run (skip glPopMatrix and the GL_COLOR_ARRAY enable); the readback must then mismatch.
 
 [surface]
 width = 64
 height = 64
-
-[hj]
-# Happy Jump 1.12.2 GLES1 imports: UND of libndksetup.so (game-scan 2026-11-06, readelf --dyn-syms). Check 6 resolves these from libGLESv1_CM.so.
-names = [
-  "glBindTexture", "glBlendFunc", "glClear", "glColorPointer", "glDisable", "glDisableClientState",
-  "glDrawArrays", "glDrawElements", "glEnable", "glEnableClientState", "glMatrixMode",
-  "glPointSizePointerOES", "glPopMatrix", "glPushMatrix", "glRotatef", "glScalef", "glScissor",
-  "glTexCoordPointer", "glTranslatef", "glVertexPointer",
-]
 
 # Background B (30 60 200) everywhere; A (200 30 40) left of x = 32 via the scissored clear.
 [[step]]

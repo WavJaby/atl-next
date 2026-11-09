@@ -16,28 +16,30 @@
 
 static GLubyte es1_px[ES1_W * ES1_H * 4];
 
-// 1 when the current context reports GLES 1.1 by GL_VERSION: "OpenGL ES-CM 1." (the common profile of a native ES1 driver) or "OpenGL ES 1.1" (ANGLE's GLES1 frontend); else 0 (no current context: 0).
+// 1 when GL_VERSION is GLES 1.x served by ANGLE ("OpenGL ES 1." and "ANGLE"; ES1 is ANGLE-only, gl_driver.rs), else 0 (no current context: 0).
 JNI_FN(jint, es1Version)(JNIEnv *env, jclass cls)
 {
     const char *v = (const char *)glGetString(GL_VERSION);
     if (v == NULL)
         return 0;
     __android_log_print(ANDROID_LOG_WARN, ES1_TAG, "version %s", v);
-    return strncmp(v, "OpenGL ES-CM 1.", 15) == 0 || strncmp(v, "OpenGL ES 1.1", 13) == 0;
+    return strncmp(v, "OpenGL ES 1.", 12) == 0 && strstr(v, "ANGLE") != NULL;
 }
 
-// 1 when /proc/self/maps names ANGLE's GL backend libGLESv2_angle.so (the ES1 context runs through ANGLE), 0 when not, -1 when unreadable.
+// 1 when /proc/self/maps names ANGLE's GL backend libGLESv2_angle.so and our driver libGLES_atl.so (the ES1 context runs through ANGLE over the driver), 0 when not, -1 when unreadable.
 JNI_FN(jint, es1Driver)(JNIEnv *env, jclass cls)
 {
     FILE *f = fopen("/proc/self/maps", "re");
     if (f == NULL)
         return -1;
     char line[4096];
-    jint found = 0;
-    while (!found && fgets(line, sizeof line, f) != NULL)
-        found = strstr(line, "libGLESv2_angle.so") != NULL;
+    jint angle = 0, driver = 0;
+    while (fgets(line, sizeof line, f) != NULL) {
+        angle |= strstr(line, "libGLESv2_angle.so") != NULL;
+        driver |= strstr(line, "libGLES_atl.so") != NULL;
+    }
     fclose(f);
-    return found;
+    return angle && driver;
 }
 
 // The scene on the current context, then its rows logged. Returns 1 when no GL error came back; the pixels themselves are judged by app.rs from the rows, not here.

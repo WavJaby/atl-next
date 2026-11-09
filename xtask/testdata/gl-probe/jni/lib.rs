@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! JNI natives of com.example.atlgl.Probe: `ext64` calls glGetInteger64vEXT(GL_MAX_TEXTURE_SIZE) through the address AOSP libEGL's eglGetProcAddress returns (patch 0010: the driver's, not a
 //! forwarder); `owner` names the object that address lies in (dladdr); `drmDriver` names the kernel driver of a DRM fd (DRM_IOCTL_VERSION, the name Mesa's loader reads). Test fixture: glibc's dl* and ioctl directly, no crates.
-//! `es1Scene` (es1.rs) runs the ES1 scene's program through libGLESv1_CM.so, resolved by dlsym, so this library imports no gl* symbol.
 
-mod es1;
-
-use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 
 #[repr(C)]
 struct DlInfo {
@@ -151,6 +148,17 @@ const fn iowr(ty: u8, nr: u8, size: usize) -> u32 {
 /// drm.h `DRM_IOCTL_VERSION` (L1037) = `DRM_IOWR(0x00, struct drm_version)`; the size is the struct's for this pointer width.
 const DRM_IOCTL_VERSION: u32 = iowr(b'd', 0x00, std::mem::size_of::<DrmVersion>());
 
+/// JNI NewStringUTF of `text`; a NUL inside it makes the string empty (CString).
+fn new_string(env: *mut *const *const c_void, text: &str) -> *mut c_void {
+    type New = unsafe extern "C" fn(*mut *const *const c_void, *const c_char) -> *mut c_void;
+    let c = CString::new(text).unwrap_or_default();
+    // SAFETY: env is the JNIEnv* JNI passes; slot NEW_STRING_UTF is NewStringUTF(JNIEnv*, const char*); c is NUL-terminated and outlives the call.
+    unsafe {
+        let new: New = std::mem::transmute(*(*env).add(NEW_STRING_UTF));
+        new(env, c.as_ptr())
+    }
+}
+
 /// The kernel driver of an open DRM fd, the name `drmGetVersion(fd)->name` gives (loader.c L108-118); null when the ioctl fails or the name does not fit NAME_CAP.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_example_atlgl_Probe_drmDriver(
@@ -176,7 +184,7 @@ pub extern "C" fn Java_com_example_atlgl_Probe_drmDriver(
         return std::ptr::null_mut();
     }
     match std::str::from_utf8(&name[..v.name_len]) {
-        Ok(text) => es1::new_string(env, text),
+        Ok(text) => new_string(env, text),
         Err(_) => std::ptr::null_mut(),
     }
 }

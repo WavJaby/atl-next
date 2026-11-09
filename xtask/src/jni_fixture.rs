@@ -324,7 +324,6 @@ fn es1_c(scene: &Scene, broken: bool) -> Result<String> {
 }
 
 /// C for one scene program (`Scene::program`): `es1_program(px)` makes its calls in order, and `read` ends in glReadPixels into `px`.
-/// `resolve` makes no call: the scene's own calls name the functions, and DT_NEEDED `libGLESv1_CM.so` supplies them (`es1_failures`).
 fn c_program(size: (usize, usize), program: &[String]) -> Result<String> {
     let mut out = format!("#define ES1_W {}\n#define ES1_H {}\n", size.0, size.1);
     out.push_str("static void es1_program(GLubyte *px)\n{\n");
@@ -520,7 +519,6 @@ fn c_statements(line: &str, size: (usize, usize), arrays: &mut usize) -> Result<
                 size.0, size.1
             )]
         }
-        "resolve" => Vec::new(),
         _ => bail!("unknown scene step `{op}`"),
     };
     Ok(stmts)
@@ -977,7 +975,6 @@ mod tests {
                 ),
                 1
             );
-            assert_eq!(count(c, "resolve"), 0, "resolve makes no call");
         }
     }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The ES1 scene of `xtask test gl` (mode es1), read from `xtask/testdata/gl-probe/es1-scene.toml`.
-//! [`Scene::program`] gives the probe's lines: Es1Scene.java and jni/es1.rs run the same steps through GL10 and through libGLESv1_CM.so.
+//! The ES1 scene of `xtask test app`'s guest GLES1 fixture, read from `xtask/testdata/gl-probe/es1-scene.toml`.
+//! [`Scene::program`] gives its steps; jni_fixture.rs turns them into the fixture's C calls on libGLESv1_CM.so.
 //! [`Scene::judge`] compares a probe readback with [`Scene::expect`], a reference model written from ES 1.1 and the scene's own numbers, never from driver output.
 //! Edge pixels (the 1 px band around every primitive) are excluded; interiors and exteriors compare exactly; blended pixels allow 1 LSB.
 //! The model handles only what the scene uses (axis-aligned quads and points, flat or per-vertex colour, 2x2 NEAREST texture) and fails on anything else.
@@ -14,7 +14,6 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub struct Scene {
     surface: Surface,
-    hj: Hj,
     step: Vec<Step>,
 }
 
@@ -22,11 +21,6 @@ pub struct Scene {
 struct Surface {
     width: usize,
     height: usize,
-}
-
-#[derive(Deserialize)]
-struct Hj {
-    names: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,21 +61,13 @@ impl Scene {
         (self.surface.width, self.surface.height)
     }
 
-    /// The probe's program: every step (without the breakable ones when `broken`), then `resolve` of the Happy Jump names.
+    /// The scene's steps as program lines, without the breakable ones when `broken`.
     pub fn program(&self, broken: bool) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .step
+        self.step
             .iter()
             .filter(|s| !(broken && s.breakable))
             .map(|s| s.text.clone())
-            .collect();
-        lines.push(format!("resolve {}", self.hj.names.join(" ")));
-        lines
-    }
-
-    /// The Happy Jump GLES1 names check 6 resolves.
-    pub fn names(&self) -> &[String] {
-        &self.hj.names
+            .collect()
     }
 
     /// The expectation, row-major with row 0 first (GL window order, y up). Always the unbroken scene.
@@ -736,11 +722,6 @@ mod tests {
             full.iter().any(|l| l == "client_enable COLOR_ARRAY")
                 && !broken.iter().any(|l| l == "client_enable COLOR_ARRAY")
         );
-        assert_eq!(
-            full.last().map(String::as_str),
-            Some(format!("resolve {}", s.names().join(" ")).as_str())
-        );
-        assert_eq!(s.names().len(), 20, "Happy Jump imports 20 GLES1 names");
     }
 
     /// Expected values derived by hand from the spec (see the toml comments), not from the model.

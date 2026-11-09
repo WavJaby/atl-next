@@ -14,13 +14,7 @@
 //!    A baseline only while the 1-minute load before the run is below [`QUIET_LOAD`]; the gate never fails on it.
 //!
 //! Then a deliberate break, every run: the probe skips glClear and the timed draws, and calls a no-op in place of the extension; the pixel, scene and extension checks must fail.
-//! Mode es1 (es1-scene.toml, gl_scene.rs; Happy Jump's GLES1 path, S1 of gs22-plan): the scene through Java GL10 and through libGLESv1_CM.so, every pixel judged against the scene's reference model.
-//! ES1 is served by ANGLE only. The es1 run's package carries the library, built with a real DT_NEEDED on the host's libGLESv1_CM.so as an ES1 app's native library has, so the install-time rule (atld install, gl_driver.rs `select`) gives the package ANGLE. The clear runs' package carries no native library and keeps the native driver. Known gap: a run-class process (atld `run_class`) never gets bindApplication, so the package's coreSettings GL selection never reaches it; the es1 section stays red until the probe runs as an app process.
-//! 1. GL_VERSION `OpenGL ES 1.` and `ANGLE`, the tier and renderer of checks 4 and 5 as `ANGLE (Mesa, <host renderer>)` (no other tier's prefix may match); 2. /proc/self/maps maps ANGLE's GL library and libGLES_atl.so, its backend; 3. no unimplemented-stub line; 4. Java pixels; 5. native pixels; 6. the 20 names resolve into libGLESv1_CM.so.
-//!
-//! Break: the steps marked `break` are dropped (skip glPopMatrix and the GL_COLOR_ARRAY enable); checks 4 and 5 must then mismatch, with a readback present.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
@@ -28,8 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use atl_layout::Layout;
 
-use crate::atld_run::{NativeLibs, Run, Runtime, Shell};
-use crate::gl_scene::{self, Judged};
+use crate::atld_run::{Run, Runtime, Shell};
+use crate::gl_scene;
 use crate::{manifest, remote, tree};
 
 #[derive(clap::Args)]
@@ -58,22 +52,11 @@ const PROBE_NAME: &str = "gl-probe";
 const APP_UID: u32 = 10_124;
 /// The JNI library; the sandbox sees it in atl_android_paths::SYSTEM_LIB (atld `--file`).
 const LIB: &str = "libatl_gl_probe.so";
-/// The GLES1 library the probe's library links (DT_NEEDED). ES1 is served by ANGLE only, and the install-time rule keys on the name (gl_driver.rs `ES1_LIB`).
-const ES1_FRONT: &str = "libGLESv1_CM";
-/// The fixture manifest's minSdkVersion.
-const MIN_SDK: u32 = 21;
 /// The pbuffer's size and clear colour (bytes): odd sizes so no row or tile alignment hides a stray pixel; each channel a k / 255 value away from 0 and 255.
 const SIZE: (u32, u32) = (67, 33);
 const CLEAR: [u8; 4] = [51, 102, 204, 255];
-/// The probe's first shell argument after the library: the clear test or the ES1 scene (Probe.java dispatches on it).
-const CLEAR_MODE: &str = "clear";
-const ES1_MODE: &str = "es1";
-/// ANGLE's GL backend: mapped into an app process whose GL selection is ANGLE (gl_driver.rs), then its GLES1 renderer is "ANGLE (Mesa, <host renderer>)".
-const ANGLE_GL_LIB: &str = "libGLESv2_angle.so";
-/// The ES1 scene (mode es1), read by gl_scene.rs; its program is the probe's arguments.
+/// The ES1 scene, read by [`load_scene`].
 const SCENE: &str = "es1-scene.toml";
-/// The message AOSP's libEGL logs when a hook falls to the unimplemented stub (egl.cpp:177): check 3 fails on it.
-const UNIMPLEMENTED: &str = "called unimplemented OpenGL ES API";
 /// The timed scene's surface. A multiple of the grid size (Probe.java `GRID`), so the cell edges fall on pixel boundaries and no pixel centre sits on one.
 const TIMED_SIZE: (u32, u32) = (256, 256);
 /// The scene's texel: every scene pixel must read it back. Its fragment loop sums 64 terms of texel / 64, exact up to float rounding, which the unorm8 conversion absorbs.
@@ -107,7 +90,7 @@ const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
 pub const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 
-/// The ES1 scene, read by the host probe, the guest fixture's generator (jni_fixture.rs) and the app gate (app.rs): one description.
+/// The ES1 scene, read by the guest fixture's generator (jni_fixture.rs) and the app gate (app.rs): one description.
 pub fn load_scene(root: &Path) -> Result<gl_scene::Scene> {
     gl_scene::Scene::load(&root.join(FIXTURE).join(SCENE))
 }
@@ -190,15 +173,9 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
             found.join("; ")
         }
     );
-    let front = crate::atld_run::gl_front(&rt.out, ES1_FRONT);
-    let lib = build_lib(root, &work.join("cargo"), &[], &front)?;
+    let lib = build_lib(root, &work.join("cargo"), &[])?;
     // deliberate break: the probe library built with an undefined glClear
-    let broken = build_lib(
-        root,
-        &work.join("cargo-undefined-gl"),
-        &[UNDEFINED_GL],
-        &front,
-    )?;
+    let broken = build_lib(root, &work.join("cargo-undefined-gl"), &[UNDEFINED_GL])?;
     let hits = gl_imports(&broken)?;
     let fired = !hits.is_empty();
     ok &= fired;
@@ -212,34 +189,16 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
         }
     );
     let lib_at = format!("{}/{LIB}", atl_android_paths::SYSTEM_LIB);
-    // the es1 run's package carries the library: atld install reads its DT_NEEDED and gives the package ANGLE. The probe still loads the fixture copy at lib_at: a run-class process cannot open the installed one (/data/app/<pkg>/lib/<abi>, ENOENT)
-    let es1_libs = NativeLibs {
-        abi: args.host.clone(),
-        libs: vec![lib.clone()],
-        min_sdk: MIN_SDK,
-    };
     let rt = rt.with_fixture_file(lib, &lib_at);
     let apk = rt
         .apk
         .build(&root.join(FIXTURE), &work.join("apk"), &[], None, None)?;
-    let es1_apk = rt.apk.build(
-        &root.join(FIXTURE),
-        &work.join("apk-es1"),
-        &[],
-        Some(&es1_libs),
-        None,
-    )?;
-    let scene = load_scene(root)?;
     // the normal run's frame times, its renderer, and the load average around it
     let mut timed = None;
     for broken in [false, true] {
         let tag = if broken { "break" } else { "run" };
-        let mut shell_args: Vec<String> = vec![
-            lib_at.clone(),
-            CLEAR_MODE.to_owned(),
-            SIZE.0.to_string(),
-            SIZE.1.to_string(),
-        ];
+        let mut shell_args: Vec<String> =
+            vec![lib_at.clone(), SIZE.0.to_string(), SIZE.1.to_string()];
         shell_args.extend(CLEAR.iter().map(u8::to_string));
         shell_args.extend(
             [TIMED_SIZE.0, TIMED_SIZE.1, args.frames]
@@ -331,7 +290,6 @@ fn judge(root: &Path, args: &Args, site: remote::Site, tiers: &[(&str, &str)]) -
             if before[0] < QUIET_LOAD { "yes" } else { "no" }
         );
     }
-    ok &= es1(&rt, &es1_apk, &work, &lib_at, &scene, args.verbose, tiers)?;
     println!(
         "{}",
         crate::verdict::gate(
@@ -393,181 +351,23 @@ fn run_probe(
     Ok(log)
 }
 
-/// Mode es1: the scene through Java GL10 and through libGLESv1_CM.so, read back and judged (checks 1-6). Then the deliberate break: checks 4 and 5 must fail.
-fn es1(
-    rt: &Runtime,
-    apk: &Path,
-    work: &Path,
-    lib_at: &str,
-    scene: &gl_scene::Scene,
-    verbose: bool,
-    tiers: &[(&str, &str)],
-) -> Result<bool> {
-    let mut ok = true;
-    for broken in [false, true] {
-        let tag = if broken { "es1-break" } else { "es1-run" };
-        let (w, h) = scene.size();
-        let mut args = vec![
-            lib_at.to_owned(),
-            ES1_MODE.to_owned(),
-            w.to_string(),
-            h.to_string(),
-        ];
-        args.extend(scene.program(broken));
-        let log = run_probe(rt, apk, &work.join(tag), args, verbose, tag)?;
-        let lines = probe_lines(&log);
-        let java = scene.judge(&rows(&lines, "java row"))?;
-        let native = scene.judge(&rows(&lines, "native row"))?;
-        for line in lines.iter().filter(|l| l.contains(" error ")) {
-            ok = false;
-            println!("gl: FAIL es1 probe said: {line}");
-        }
-        if broken {
-            for (who, j) in [("java", &java), ("native", &native)] {
-                let fired = matches!(j, Judged::Mismatch(_));
-                ok &= fired;
-                match j {
-                    Judged::Mismatch(m) => {
-                        println!("gl: pass es1 break {who} pixels: fails as it must: {m}")
-                    }
-                    other => println!("gl: FAIL es1 break {who} pixels: {}", describe(other)),
-                }
-            }
-            continue;
-        }
-        let version = first_line(&lines, "version ").unwrap_or("none");
-        let maps = first_line(&lines, "maps ").unwrap_or("none");
-        // ES1 is served by ANGLE only (gl_driver.rs): GL_RENDERER is "ANGLE (Mesa, <host renderer>)"
-        let tier = expected_tier(&lines, tiers);
-        let renderer = match &tier {
-            Ok(t) => judge_renderer(&lines, &format!("ANGLE (Mesa, {})", t.prefix)),
-            Err(e) => Err(format!("no tier to check against: {e}")),
-        };
-        let wrong = tier
-            .as_ref()
-            .ok()
-            .and_then(|t| other_tier_match(&lines, &t.gallium));
-        let unimplemented = log.contains(UNIMPLEMENTED);
-        let dl = dladdr(&lines);
-        let dl_ok = scene.names().iter().all(|n| {
-            dl.iter()
-                .any(|(name, file)| name == n && file.ends_with("libGLESv1_CM.so"))
-        });
-        let checks: [(&str, bool, String); 8] = [
-            (
-                "1 version",
-                version.starts_with("OpenGL ES 1.") && version.contains("ANGLE"),
-                version.to_owned(),
-            ),
-            (
-                "1 tier",
-                tier.is_ok(),
-                tier.as_ref()
-                    .map_or_else(|e| e.clone(), |t| format!("{} ({})", t.gallium, t.facts)),
-            ),
-            (
-                "1 renderer",
-                renderer.is_ok(),
-                renderer.unwrap_or_else(|e| e),
-            ),
-            (
-                "1 break renderer",
-                tier.is_ok() && wrong.is_none(),
-                break_detail(&tier, wrong, &lines),
-            ),
-            (
-                "2 maps",
-                maps.contains(ANGLE_GL_LIB)
-                    && maps.contains(crate::egl_driver::atl_egl_driver_name()),
-                maps.to_owned(),
-            ),
-            (
-                "3 unimplemented",
-                !unimplemented,
-                if unimplemented {
-                    UNIMPLEMENTED.to_owned()
-                } else {
-                    "none".to_owned()
-                },
-            ),
-            (
-                "4 java pixels",
-                matches!(java, Judged::Match(_)),
-                describe(&java),
-            ),
-            (
-                "5 native pixels",
-                matches!(native, Judged::Match(_)),
-                describe(&native),
-            ),
-        ];
-        for (what, pass, detail) in checks {
-            ok &= pass;
-            println!("gl: {} es1 {what}: {detail}", verdict(pass));
-        }
-        ok &= dl_ok;
-        println!(
-            "gl: {} es1 6 dladdr: {} of {} names resolve into libGLESv1_CM.so",
-            verdict(dl_ok),
-            dl.iter()
-                .filter(|(_, f)| f.ends_with("libGLESv1_CM.so"))
-                .count(),
-            scene.names().len()
-        );
-    }
-    Ok(ok)
-}
-
-/// The `<prefix> <y> <hex>` lines of a probe, as row y -> hex.
-fn rows(lines: &[String], prefix: &str) -> BTreeMap<usize, String> {
-    lines
-        .iter()
-        .filter_map(|l| {
-            let (y, hex) = l.strip_prefix(prefix)?.strip_prefix(' ')?.split_once(' ')?;
-            Some((y.parse().ok()?, hex.to_owned()))
-        })
-        .collect()
-}
-
-/// The `native dladdr <name> <file>` lines: name and the object its address lies in.
-fn dladdr(lines: &[String]) -> Vec<(String, String)> {
-    lines
-        .iter()
-        .filter_map(|l| {
-            let (name, file) = l.strip_prefix("native dladdr ")?.split_once(' ')?;
-            Some((name.to_owned(), file.to_owned()))
-        })
-        .collect()
-}
-
 fn first_line<'a>(lines: &'a [String], prefix: &str) -> Option<&'a str> {
     lines.iter().find_map(|l| l.strip_prefix(prefix))
-}
-
-fn describe(j: &Judged) -> String {
-    match j {
-        Judged::Match(n) => format!("all {n} non-edge pixels match"),
-        Judged::Mismatch(m) => m.clone(),
-        Judged::Missing(m) => format!("no readback: {m}"),
-    }
 }
 
 fn verdict(ok: bool) -> &'static str {
     if ok { "pass" } else { "FAIL" }
 }
 
-/// Builds the JNI library into `target`; returns the .so. `front` (the host's libGLESv1_CM.so) is linked with `--no-as-needed`, so the library gets a real DT_NEEDED on it: rustc's `as-needed` would drop an import-less link.
-fn build_lib(root: &Path, target: &Path, features: &[&str], front: &Path) -> Result<PathBuf> {
+/// Builds the JNI library into `target`; returns the .so.
+fn build_lib(root: &Path, target: &Path, features: &[&str]) -> Result<PathBuf> {
     let status = crate::unit_use::status(
         Command::new(env!("CARGO"))
-            .args(["rustc", "--release", "--quiet", "--manifest-path"])
+            .args(["build", "--release", "--quiet", "--manifest-path"])
             .arg(root.join(FIXTURE).join("jni/Cargo.toml"))
             .arg(format!("--features={}", features.join(",")))
             .arg("--target-dir")
-            .arg(target)
-            .args(["--", "-C", "link-arg=-Wl,--no-as-needed", "-C"])
-            .arg(format!("link-arg={}", front.display()))
-            .args(["-C", "link-arg=-Wl,--as-needed"]),
+            .arg(target),
     )
     .context("running cargo for the gl-probe library")?;
     ensure!(status.success(), "building the gl-probe library failed");
