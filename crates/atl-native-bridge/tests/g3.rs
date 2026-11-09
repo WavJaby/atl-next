@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use atl_native_bridge::engine::{self, HostThread, arch};
+use atl_native_bridge::engine::{self, Engine, HostThread, Tp, arch};
 use common::{host_intact, need};
 
 /// Words of the stand-in guest TCB of stage A (as g1 stage 0).
@@ -112,11 +112,17 @@ fn fault_a() -> Result<(usize, usize, usize, usize), String> {
     let ht = HostThread::leak();
     // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
     unsafe { arch::init_tcb(tcb, &raw mut *ht) };
-    ht.set_guest_fs(tcb);
     reset();
     MODE.store(0, Ordering::SeqCst);
     // SAFETY: g3_guest_load reads [rdi] (NULL -> the handler resumes it) and touches no TLS.
-    let ret = unsafe { arch::call_guest(ht, g3_guest_load as *const () as usize, 0, 0, 0, 0) };
+    let ret = unsafe {
+        arch::Identity.call(
+            ht,
+            Tp::Guest(tcb),
+            g3_guest_load as *const () as usize,
+            &[0; 4],
+        )
+    };
     if arch::fs_base() != host {
         // SAFETY: this thread's own thread pointer, read above.
         unsafe { arch::set_fs_base(host) };

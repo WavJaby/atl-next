@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! Host sides of the guest libc stubs whose host is the bionic-only API glibc lacks: the process's bionic provider (`libatl_bionic`, loaded in every ART process) exports each under its bionic name with bionic's signature, so the guest shares the host's one property store and abort message.
 //! The names and signatures are generated from bionic's headers (build.rs `PROVIDER_APIS` -> `provider.rs`), the same headers atl-bionic implements them from: guest view == provider view, so the stub passes straight through to the provider (`Generic(Host::Provider)` rows of the binding table, no shell),
-//! except where the guest hands the provider a guest function -- `__system_property_foreach` and `__system_property_read_callback` -- which get own host sides (`Shim` rows, here): the provider calls a host trampoline that crosses to the guest callback (`arch::call_guest`), as pthread_create's start routine does (intercepts.rs).
+//! except where the guest hands the provider a guest function -- `__system_property_foreach` and `__system_property_read_callback` -- which get own host sides (`Shim` rows, here): the provider calls a host trampoline that crosses to the guest callback (`call_guest`), as pthread_create's start routine does (intercepts.rs).
 //! Resolved on the provider's own handle (bindings.rs `provider_symbol`), never the global scope.
 
 use std::ffi::{c_char, c_void};
 
-use super::{arch, bindings, thread};
+use super::{bindings, call_guest, thread};
 
 // pass-through functions' aliases are unused: their stubs jump straight to the provider (guest view == provider view: one header, one arch, atl-bionic's implementation check)
 #[allow(dead_code)]
@@ -40,7 +40,7 @@ unsafe extern "C" fn foreach_one(pi: *const api::prop_info, g: *mut c_void) {
     let g = unsafe { &*g.cast::<Guest>() };
     let ht = thread::attach_current();
     // SAFETY: the guest's `void (*)(const prop_info*, void*)`, this thread's record.
-    unsafe { arch::call_guest(&mut *ht, g.f, pi as usize, g.cookie, 0, 0) };
+    unsafe { call_guest(&mut *ht, g.f, pi as usize, g.cookie, 0, 0) };
 }
 
 /// `void __system_property_read_callback(const prop_info*, void (*)(void*, const char*, const char*, uint32_t), void*)`.
@@ -69,7 +69,7 @@ unsafe extern "C" fn read_one(
     let ht = thread::attach_current();
     // SAFETY: the guest's `void (*)(void*, const char*, const char*, uint32_t)`, this thread's record.
     unsafe {
-        arch::call_guest(
+        call_guest(
             &mut *ht,
             g.f,
             g.cookie,

@@ -4,7 +4,7 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...).
+/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below: `Engine::call` under identity, QEMU's own crossing under `qemu-guest` until Q5-5.
 #[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
 #[path = "x86_64.rs"]
 pub mod arch;
@@ -92,6 +92,99 @@ impl Config {
 /// NBS's vdso file name (soname `linux-vdso.so.1`), installed among the guest libraries.
 pub const VDSO_FILE: &str = "libnative_bridge_vdso.so";
 
+/// The thread pointer one guest call runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tp {
+    /// `__linker_init` and the constructors it runs, before the linker has a TCB of its own. Identity: runs on the host's thread pointer, with the bootstrap record armed for this call only. QEMU (Q5-5): a scratch TCB.
+    Bootstrap,
+    /// A guest TCB, installed for the call. The thread pointer the guest leaves stays on the CPU for its next call.
+    Guest(usize),
+}
+
+/// Runs guest code on a host thread's CPU. One implementation (`arch::Identity`): the trait is shaped by it, and grows when QEMU joins (plan Q5-5).
+pub trait Engine {
+    /// The host thread's guest CPU. Identity: its crossing record.
+    type Cpu;
+    /// Runs guest `f(args)` on `cpu` with thread pointer `tp`; returns x0. Nests: may run from inside a host function the guest called.
+    ///
+    /// # Safety
+    /// `f` must be guest code taking up to four integer arguments, pointer arguments valid for it; `cpu` is the calling thread's own.
+    unsafe fn call(&self, cpu: &mut Self::Cpu, tp: Tp, f: usize, args: &[usize; 4]) -> usize;
+}
+
+/// The core's guest call on `cpu`, with the thread pointer its record holds.
+///
+/// # Safety
+/// As [`Engine::call`]; `cpu` is the calling thread's own record.
+#[cfg(not(feature = "qemu-guest"))]
+pub(crate) unsafe fn call_guest(
+    cpu: &mut HostThread,
+    f: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> usize {
+    let tp = Tp::Guest(cpu.guest_fs());
+    // SAFETY: caller contract.
+    unsafe { arch::Identity.call(cpu, tp, f, &[a, b, c, d]) }
+}
+
+/// `Guest::start`'s bootstrap call (`Tp::Bootstrap`).
+///
+/// # Safety
+/// As [`call_guest`].
+#[cfg(not(feature = "qemu-guest"))]
+pub(crate) unsafe fn call_bootstrap(
+    cpu: &mut HostThread,
+    f: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> usize {
+    // SAFETY: caller contract.
+    unsafe { arch::Identity.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
+}
+
+// Q5-5: QEMU's crossing moves onto `Engine` (plan section 6); these two qemu-guest arms go with it.
+/// [`call_guest`] under `qemu-guest`: QEMU's crossing, which reads the record's guest thread pointer itself.
+///
+/// # Safety
+/// As [`call_guest`].
+#[cfg(feature = "qemu-guest")]
+pub(crate) unsafe fn call_guest(
+    cpu: &mut HostThread,
+    f: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> usize {
+    // SAFETY: caller contract.
+    unsafe { arch::call_guest(cpu, f, a, b, c, d) }
+}
+
+/// [`call_bootstrap`] under `qemu-guest`: the bootstrap record gives the call a scratch TCB (`arch::set_bootstrap`).
+///
+/// # Safety
+/// As [`call_guest`].
+#[cfg(feature = "qemu-guest")]
+pub(crate) unsafe fn call_bootstrap(
+    cpu: &mut HostThread,
+    f: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> usize {
+    arch::set_bootstrap(Some(&raw mut *cpu));
+    // SAFETY: caller contract.
+    let ret = unsafe { arch::call_guest(cpu, f, a, b, c, d) };
+    arch::set_bootstrap(None);
+    ret
+}
+
 /// A started guest: the linker initialised, its libraries constructed.
 pub struct Guest {
     pub linker: Image,
@@ -127,10 +220,8 @@ impl Guest {
         let block = args::build(cfg, &linker, &vdso, &arch::kernel_auxv()?)?;
         arch::map_guest(&[&linker, &vdso])?;
         let thread = HostThread::leak();
-        arch::set_bootstrap(Some(&raw mut *thread));
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
-        let exe_entry = unsafe { arch::call_guest(thread, init, block, 0, 0, 0) };
-        arch::set_bootstrap(None);
+        let exe_entry = unsafe { call_bootstrap(thread, init, block, 0, 0, 0) };
         // the linker ran on a temporary TCB in its own (now returned) frame; NBS leaves the main thread's static TLS to the host
         let tls = thread::static_tls()
             .ok_or("the guest linker reported no static TLS (__native_bridge_config_static_tls)")?;
@@ -155,7 +246,7 @@ impl Guest {
     /// `f` must be guest code with an integer signature of at most three arguments; pointer arguments must be valid for it.
     pub unsafe fn call(&mut self, f: usize, a: usize, b: usize, c: usize) -> usize {
         // SAFETY: caller contract; the record is this thread's.
-        unsafe { arch::call_guest(&mut *thread::attach_current(), f, a, b, c, 0) }
+        unsafe { call_guest(&mut *thread::attach_current(), f, a, b, c, 0) }
     }
 
     /// The calling thread's record (attached first if needed).

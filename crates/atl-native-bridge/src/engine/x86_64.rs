@@ -41,7 +41,7 @@ const _: () = {
     assert!(std::mem::offset_of!(HostThread, shadow_end) == 24);
 };
 
-/// Bootstrap record: the starting thread's, while `Guest::start` runs `__linker_init`.
+/// Bootstrap record: the starting thread's, while its `Tp::Bootstrap` call runs (`Identity::call`: `Guest::start`'s `__linker_init`).
 /// Defends against: the NBS linker runs `__linker_init` and the guest libc constructors (which already call the host: vdso `native_bridge_intercept_symbol`) first on the host's FS, then on its own stack `temp_tcb` (bionic `__libc_init_main_thread_early`), whose slot the engine cannot write; the main thread's real TCB is the engine's (`Guest::start`, after `__native_bridge_config_static_tls`).
 /// Delete when the guest main thread's first TCB carries the slot (e.g. NBS asks the host for it at `__libc_init_main_thread_early`).
 #[unsafe(no_mangle)]
@@ -49,13 +49,6 @@ static atl_nb_bootstrap: AtomicUsize = AtomicUsize::new(0);
 /// The bootstrap thread's tid: a signal on another thread during bootstrap must not get its host FS.
 #[unsafe(no_mangle)]
 static atl_nb_bootstrap_tid: AtomicI32 = AtomicI32::new(0);
-
-/// Makes `ht` the bootstrap record for the calling thread (Some) or ends bootstrap (None).
-pub fn set_bootstrap(ht: Option<*mut HostThread>) {
-    // SAFETY: gettid has no memory effects.
-    atl_nb_bootstrap_tid.store(unsafe { libc::gettid() }, Ordering::Release);
-    atl_nb_bootstrap.store(ht.map_or(0, |p| p as usize), Ordering::Release);
-}
 
 impl HostThread {
     /// A record for the calling thread; leaked: its guest TCB keeps pointing at it.
@@ -731,20 +724,45 @@ pub fn set_signal_handler(sig: usize, handler: usize) {
     atl_nb_signal_handlers[sig].store(handler, Ordering::Release);
 }
 
-/// Calls guest function `f(a, b, c, d)` on the guest thread pointer (none before the first crossing: the guest linker installs its own).
-///
-/// # Safety
-/// `f` must be guest code taking up to four integer arguments, `ht` this thread's record.
-pub unsafe fn call_guest(
-    ht: &mut HostThread,
-    f: usize,
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-) -> usize {
-    // SAFETY: caller contract; the asm keeps callee-saved registers and restores GS/FS.
-    unsafe { atl_nb_call_guest(ht, f, a, b, c, d) }
+/// The identity engine: the host arch's crossing, one `atl_nb_call_guest` per call.
+pub struct Identity;
+
+impl super::Engine for Identity {
+    type Cpu = HostThread;
+
+    unsafe fn call(
+        &self,
+        cpu: &mut HostThread,
+        tp: super::Tp,
+        f: usize,
+        args: &[usize; 4],
+    ) -> usize {
+        let bootstrap = match tp {
+            // host FS: the asm installs guest_fs only when it is nonzero, so 0 keeps the call on the host thread pointer
+            super::Tp::Bootstrap => {
+                cpu.set_guest_fs(0);
+                true
+            }
+            super::Tp::Guest(t) => {
+                // a guest call with no TCB would run on the host TLS; attach and `Guest::start` always install one
+                assert!(t != 0, "guest call with no guest thread pointer");
+                // deliberate break of gate g1 (`ATL_NB_BREAK=swap_tp`): the guest enters on the host thread pointer
+                cpu.set_guest_fs(if cfg!(atl_nb_swap_tp) { fs_base() } else { t });
+                false
+            }
+        };
+        if bootstrap {
+            // SAFETY: gettid has no memory effects.
+            atl_nb_bootstrap_tid.store(unsafe { libc::gettid() }, Ordering::Release);
+            atl_nb_bootstrap.store(cpu as *mut HostThread as usize, Ordering::Release);
+        }
+        // SAFETY: `f` is guest code per the trait contract and `cpu` is this thread's record; the asm keeps callee-saved registers, restores the host FS and stores the thread pointer the guest left into `cpu`.
+        let ret = unsafe { atl_nb_call_guest(cpu, f, args[0], args[1], args[2], args[3]) };
+        if bootstrap {
+            atl_nb_bootstrap.store(0, Ordering::Release);
+        }
+        ret
+    }
 }
 
 /// A guest-callable address that crosses to host function `target`; None when the thunks are used up.
@@ -924,5 +942,16 @@ mod tests {
         assert!(maps_line_covers(line, 0x7f0f));
         assert!(!maps_line_covers(line, 0x7f10));
         assert!(!maps_line_covers(b"not a mapping\n", 0x7f00));
+    }
+
+    /// The guard in `Identity::call`: a guest call with no TCB panics before any guest code runs.
+    #[test]
+    #[should_panic(expected = "no guest thread pointer")]
+    fn guest_call_without_tcb_is_refused() {
+        use super::Identity;
+        use crate::engine::{Engine, Tp};
+        let ht = super::HostThread::leak();
+        // SAFETY: the assert fires before the crossing; `ht` is leaked.
+        unsafe { Identity.call(ht, Tp::Guest(0), 0, &[0; 4]) };
     }
 }

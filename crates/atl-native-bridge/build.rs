@@ -683,6 +683,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("nbfp_false", "atl_nb_nbfp_false"),
     // spike gates g1/g2 (engine::x86_64): the host->guest crossing without its FS restore
     ("no_fs_restore", "atl_nb_no_fs_restore"),
+    // Q5-4 (engine/x86_64.rs `Identity::call`): the guest enters on the host thread pointer, so g1 stage 0's guest FS check fails
+    ("swap_tp", "atl_nb_swap_tp"),
     // g4 (tests/g4.rs): a syscall in the host target, must leave the band
     ("g4_break", "atl_g4_break"),
     // Q4-2 (engine/arch/qemu.rs `is_stub`): the placeholder check decides on its first two bytes only (unit test stub_shape_is_the_whole_placeholder)

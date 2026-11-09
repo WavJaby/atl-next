@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::thread::layout;
-use super::{arch, thread};
+use super::{arch, call_guest, thread};
 
 /// bionic LP64 `struct sigaction` / `sigaction64` (bits/signal_types.h `__SIGACTION_BODY`), offsets gated against the generated layout.
 #[repr(C)]
@@ -143,7 +143,7 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     }
     // SAFETY: the guest's handler (SA_SIGINFO signature; a plain one ignores the extra arguments under the SysV ABI); `siginfo_t` is the kernel's for both libcs and `uc` the kernel frame.
     unsafe {
-        arch::call_guest(
+        call_guest(
             &mut *thread::attach_current(),
             f,
             sig as usize,

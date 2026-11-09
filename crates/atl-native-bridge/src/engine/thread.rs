@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{HostThread, arch};
+use super::{HostThread, arch, call_guest};
 
 /// Generated layouts (`SIZE`, `ALIGN`, one offset per field, `bits::<field>` = (shift, width) of a bit-field).
 #[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
@@ -119,7 +119,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
             // SAFETY: as above; `dtor` is the guest's `void (*)(void*)`, `ht` this thread's record.
             unsafe {
                 libc::pthread_setspecific(key, std::ptr::null());
-                arch::call_guest(&mut *ht, dtor, v as usize, 0, 0, 0);
+                call_guest(&mut *ht, dtor, v as usize, 0, 0, 0);
             }
         }
         if !ran {
