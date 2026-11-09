@@ -159,5 +159,7 @@ fn run() -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    common::verdict("g4", [Some(run().map(|m| println!("g4: {m}")))])
+    let mut v = common::Verdict::new("g4");
+    v.stage(Some(run().map(|m| println!("g4: {m}"))));
+    v.finish()
 }

@@ -128,5 +128,7 @@ fn main() -> ExitCode {
             None
         }
     };
-    common::verdict("g2", [stage])
+    let mut v = common::Verdict::new("g2");
+    v.stage(stage);
+    v.finish()
 }

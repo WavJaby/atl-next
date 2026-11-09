@@ -233,14 +233,15 @@ fn stage_b(env: &common::Nb) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let a = stage_a();
-    let c = control();
-    let b = match common::nb_env() {
+    let mut v = common::Verdict::new("g3");
+    v.stage(Some(stage_a()));
+    v.stage(Some(control()));
+    v.stage(match common::nb_env() {
         Some(env) => Some(stage_b(&env)),
         None => {
             println!("g3: stage B SKIP (ATL_NB / ATL_NB_LIBCXX unset)");
             None
         }
-    };
-    common::verdict("g3", [Some(a), Some(c), b])
+    });
+    v.finish()
 }

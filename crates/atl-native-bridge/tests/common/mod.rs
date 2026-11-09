@@ -128,19 +128,34 @@ pub fn host_intact(
     probe(self0).map_err(|e| format!("after {after}: {e}"))
 }
 
-/// Prints the failures, returns the exit code.
-pub fn verdict(
-    gate: &str,
-    results: impl IntoIterator<Item = Option<Result<(), String>>>,
-) -> std::process::ExitCode {
-    let mut failed = false;
-    for e in results.into_iter().flatten().filter_map(Result::err) {
-        eprintln!("{gate}: FAILED: {e}");
-        failed = true;
+/// One gate's verdict, streamed: a failed stage is printed when it ends, so a later stage's crash cannot hide it. The caller runs each stage and passes its result to `stage` before the next one starts.
+pub struct Verdict {
+    gate: &'static str,
+    failed: bool,
+}
+
+impl Verdict {
+    pub fn new(gate: &'static str) -> Self {
+        Self {
+            gate,
+            failed: false,
+        }
     }
-    if failed {
-        return std::process::ExitCode::FAILURE;
+
+    /// Records a stage's result; None is a skipped stage (the stage reported its own skip).
+    pub fn stage(&mut self, result: Option<Result<(), String>>) {
+        if let Some(Err(e)) = result {
+            eprintln!("{}: FAILED: {e}", self.gate);
+            self.failed = true;
+        }
     }
-    println!("{gate}: ok");
-    std::process::ExitCode::SUCCESS
+
+    /// Prints the gate's `ok` line when no stage failed; returns the exit code.
+    pub fn finish(self) -> std::process::ExitCode {
+        if self.failed {
+            return std::process::ExitCode::FAILURE;
+        }
+        println!("{}: ok", self.gate);
+        std::process::ExitCode::SUCCESS
+    }
 }

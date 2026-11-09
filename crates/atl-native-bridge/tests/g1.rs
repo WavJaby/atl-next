@@ -205,5 +205,8 @@ fn stage2() -> Option<Result<(), String>> {
 
 fn main() -> ExitCode {
     // every stage runs (a failed probe puts the host FS back), so the break shows in each stage's probe
-    common::verdict("g1", [Some(crossing()), stage2()])
+    let mut v = common::Verdict::new("g1");
+    v.stage(Some(crossing()));
+    v.stage(stage2());
+    v.finish()
 }
