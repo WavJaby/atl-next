@@ -155,8 +155,7 @@ mod capi {
 
     unsafe extern "C" fn create(
         host: *const AtlHostV1,
-        argc: c_int,
-        argv: *const *mut c_char,
+        boot_exe: *const c_char,
         out: *mut *mut AtlEngine,
     ) -> c_int {
         // SAFETY: the host passes its struct for the duration of the call (the ABI).
@@ -165,8 +164,7 @@ mod capi {
         };
         if h.major != ABI_MAJOR
             || (h.size as usize) < core::mem::size_of::<AtlHostV1>()
-            || argc < 1
-            || argv.is_null()
+            || boot_exe.is_null()
             || out.is_null()
         {
             return -libc::EINVAL;
@@ -174,26 +172,19 @@ mod capi {
         let Some(trap) = h.trap else {
             return -libc::EINVAL;
         };
-        let mut owned: Vec<String> = Vec::new();
-        for i in 0..argc as usize {
-            // SAFETY: argv has argc entries (the ABI), each a NUL-terminated string.
-            let p = unsafe { *argv.add(i) };
-            if p.is_null() {
-                return -libc::EINVAL;
-            }
-            // SAFETY: p is a NUL-terminated string (above).
-            let Ok(s) = unsafe { CStr::from_ptr(p) }.to_str() else {
-                return -libc::EINVAL;
-            };
-            owned.push(s.to_owned());
+        // SAFETY: boot_exe is a NUL-terminated string (the ABI; checked non-null above).
+        let Ok(exe) = unsafe { CStr::from_ptr(boot_exe) }.to_str() else {
+            return -libc::EINVAL;
+        };
+        if exe.is_empty() {
+            return -libc::EINVAL;
         }
-        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         if HOST.set(HostRef { ctx: h.ctx, trap }).is_err() {
             return -libc::EEXIST;
         }
         // SAFETY: out is non-null (checked); the handle is published before QEMU runs, so BOOT's callbacks reach the engine through it.
         unsafe { *out = (&raw const ENGINE).cast_mut().cast() };
-        match start_linked(&args, host_trap) {
+        match start_linked(exe, host_trap) {
             Ok(booted) => {
                 let _ = BOOTED.set(booted);
                 0

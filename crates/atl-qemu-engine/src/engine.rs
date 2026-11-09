@@ -280,10 +280,10 @@ pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, S
     boot_on_helper(move || run_spike(&path, &args, on_trap))
 }
 
-/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols.
+/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), and the host names only `boot_exe`.
 #[cfg(feature = "engine-so")]
-pub(crate) fn start_linked(argv: &[&str], on_trap: OnTrap) -> Result<Booted, String> {
-    let args = c_args(argv)?;
+pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, String> {
+    let args = c_args(&["qemu-aarch64", "-B", "0", boot_exe])?;
     boot_on_helper(move || run_main(self_handle()?, &args, on_trap))
 }
 

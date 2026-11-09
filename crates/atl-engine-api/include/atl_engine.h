@@ -42,8 +42,8 @@ typedef struct atl_host_v1 {
 
 typedef struct atl_engine_v1 {
     uint32_t major, minor, size;
-    /* argv as for the QEMU command line (argv[0] = "qemu-aarch64"): a static guest executable, boot CPU runs QEMU's main on a helper thread. *out is written before QEMU runs; returns after BOOT. */
-    int (*create)(const atl_host_v1 *host, int argc, char *const argv[], atl_engine **out);
+    /* boot_exe: NUL-terminated path of a static guest executable; the engine runs its own QEMU main on a helper thread with its own command line (the host passes no QEMU flags). *out is written before QEMU runs; returns after BOOT. */
+    int (*create)(const atl_host_v1 *host, const char *boot_exe, atl_engine **out);
     void (*destroy)(atl_engine *engine);
     /* Marks [start, start + len) as guest-mapped with prot (identity addresses: guest = host). */
     int (*map)(atl_engine *engine, uint64_t start, uint64_t len, uint32_t prot);

@@ -856,7 +856,7 @@ fn main() {
 /// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
 #[cfg(feature = "qemu")]
 mod engine_so {
-    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::ffi::{CStr, CString, c_void};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use atl_engine_api::{ABI_MAJOR, ABI_MINOR, AtlEngine, AtlEngineV1, AtlHostV1, TrapKind};
@@ -935,18 +935,10 @@ mod engine_so {
             ctx: std::ptr::null_mut(),
             trap: Some(trap),
         };
-        let mut argv: Vec<CString> = ["qemu-aarch64", "-B", "0"]
-            .iter()
-            .map(|a| CString::new(*a).map_err(|e| e.to_string()))
-            .collect::<Result<_, _>>()?;
-        argv.push(boot);
-        let argc = i32::try_from(argv.len()).map_err(|e| e.to_string())?;
-        let mut ptrs: Vec<*mut c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
-        ptrs.push(std::ptr::null_mut());
         let mut engine: *mut AtlEngine = std::ptr::null_mut();
         let create = table.create.ok_or("engine table has no create")?;
-        // SAFETY: host, argv (NULL-terminated, argc entries) and out outlive the call; the ABI's create.
-        let rc = unsafe { create(&host, argc, ptrs.as_mut_ptr(), &mut engine) };
+        // SAFETY: host, boot (NUL-terminated, outlives the call) and out outlive the call; the ABI's create.
+        let rc = unsafe { create(&host, boot.as_ptr(), &mut engine) };
         if rc != 0 {
             return Err(format!("create returned {rc}"));
         }

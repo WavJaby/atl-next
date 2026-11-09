@@ -57,11 +57,10 @@ pub struct AtlHostV1 {
     pub trap: Option<TrapFn>,
 }
 
-/// `atl_engine_v1::create`.
+/// `atl_engine_v1::create`: `boot_exe` is a NUL-terminated path; QEMU's flags are the engine's own.
 pub type CreateFn = unsafe extern "C" fn(
     host: *const AtlHostV1,
-    argc: c_int,
-    argv: *const *mut c_char,
+    boot_exe: *const c_char,
     out: *mut *mut AtlEngine,
 ) -> c_int;
 /// `atl_engine_v1::destroy`.
