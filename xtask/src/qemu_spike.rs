@@ -692,6 +692,20 @@ fn engine_so(
             "the boot gate is green with create returning before BOOT".to_owned(),
         ));
     }
+    let nodrain = engine_staticlib(root, b, &out, "no-init-drain", Some("no-init-drain"))?;
+    let nodrain = engine_link(
+        b,
+        &nodrain,
+        &out,
+        "no-init-drain.so",
+        engine_abi::TLS_EXPORTS,
+    )?;
+    if boot_gate(root, b, &out, "no-init-drain", &nodrain, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break no-init-drain",
+            "the boot gate is green with attach skipping the copy's queued work".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -864,7 +878,9 @@ fn boot_gate(
     std::fs::write(&log, [o.stdout.as_slice(), o.stderr.as_slice()].concat())?;
     let text = String::from_utf8_lossy(&o.stdout);
     ensure!(
-        o.status.success() && text.lines().any(|l| l == "spike: (q) ok"),
+        o.status.success()
+            && text.lines().any(|l| l == "spike: (q) ok")
+            && text.lines().any(|l| l == "spike: (r) ok"),
         "engine boot gate ({tag}) not ok ({}), log {}",
         o.status,
         log.display()

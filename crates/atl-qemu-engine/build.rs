@@ -91,6 +91,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("boot-late", "atl_qe_boot_late"),
     // gate (q, D9): the creator returns before BOOT (no wait on the boot helper)
     ("no-boot-join", "atl_qe_no_boot_join"),
+    // gate (r): attach skips the copy's queued work (its plugin init hook), so detach's exit hook asserts (plugins/core.c:293)
+    ("no-init-drain", "atl_qe_no_init_drain"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

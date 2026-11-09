@@ -855,6 +855,7 @@ fn main() {
 /// Gate (q), the engine `.so` through its C ABI (QEMU bridge plan Q5-1a), in a process of its own: dlopen the library, refuse it unless its table speaks the host's major and fits its size, resolve the TLS exports, create the engine on the boot executable, and read the auxv QEMU built for it at BOOT. Its AT_ENTRY must equal `ATL_ENGINE_ENTRY` (xtask: llvm-readelf's e_entry of that executable).
 /// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
 /// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
+/// Gate (r), after (q) in the same process: `attach` then `detach` of a CPU on a thread of its own.
 #[cfg(feature = "qemu")]
 mod engine_so {
     use std::ffi::{CStr, CString, c_void};
@@ -892,7 +893,7 @@ mod engine_so {
         0
     }
 
-    /// D9 at BOOT: `map` a host page, then `attach` a CPU from a thread of its own, both inside the trap. Attach runs on another thread: a boot thread attaching itself would register its RCU state twice. That thread parks with its CPU, since a thread that exits while registered with RCU leaves a dangling registry node. It is not detached: `Cpu::drop` aborts in QEMU's plugin exit hook (the copied CPU is not in `plugin.cpu_ht`), a defect of detach this gate does not cover.
+    /// D9 at BOOT: `map` a host page, then `attach` a CPU from a thread of its own, both inside the trap. Attach runs on another thread: a boot thread attaching itself would register its RCU state twice. That thread parks with its CPU, since a thread that exits while registered with RCU leaves a dangling registry node; gate (r) detaches its own.
     fn boot_probe(p: &Probe) -> Result<(), String> {
         let engine = p.engine.load(Ordering::SeqCst);
         if engine.is_null() {
@@ -964,7 +965,7 @@ mod engine_so {
         }
     }
 
-    fn run() -> Result<(), String> {
+    fn run() -> Result<(&'static AtlEngineV1, *mut AtlEngine), String> {
         let so = CString::new(env("ATL_ENGINE_SO")?).map_err(|e| e.to_string())?;
         let boot = CString::new(env("ATL_ENGINE_BOOT")?).map_err(|e| e.to_string())?;
         let want = u64::from_str_radix(env("ATL_ENGINE_ENTRY")?.trim_start_matches("0x"), 16)
@@ -1021,12 +1022,44 @@ mod engine_so {
                 "AT_ENTRY {entry:#x} != llvm-readelf e_entry {want:#x}"
             ));
         }
-        Ok(())
+        Ok((table, probe.engine.load(Ordering::SeqCst)))
+    }
+
+    /// Gate (r): `attach` then `detach` on a thread of its own, the thread that attached (the ABI's rule), with no guest call between. The copied CPU has not run its queued work, so detach must enter it in `plugin.cpu_ht` itself: without that, plugins/core.c:293 aborts.
+    fn detach_probe(table: &AtlEngineV1, engine: *mut AtlEngine) -> Result<(), String> {
+        let attach = table.attach.ok_or("engine table has no attach")?;
+        let detach = table.detach.ok_or("engine table has no detach")?;
+        let engine = engine as usize;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        std::thread::spawn(move || {
+            let engine = engine as *mut AtlEngine;
+            let mut cpu: *mut AtlCpu = std::ptr::null_mut();
+            // SAFETY: engine is live; cpu is an out parameter.
+            let rc = unsafe { attach(engine, &mut cpu) };
+            if rc != 0 {
+                let _ = tx.send(Err(format!("attach for detach: {rc}")));
+                return;
+            }
+            // SAFETY: engine is live, and cpu is the CPU this thread attached: detach runs on the attaching thread.
+            unsafe { detach(engine, cpu) };
+            let _ = tx.send(Ok(()));
+        });
+        rx.recv()
+            .map_err(|_| "detach thread ended without an answer".to_owned())?
     }
 
     pub(super) fn main() {
         match run() {
-            Ok(()) => println!("spike: (q) ok"),
+            Ok((table, engine)) => {
+                println!("spike: (q) ok");
+                match detach_probe(table, engine) {
+                    Ok(()) => println!("spike: (r) ok"),
+                    Err(e) => {
+                        println!("spike: FAIL (r) {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(e) => {
                 println!("spike: FAIL (q) {e}");
                 std::process::exit(1);

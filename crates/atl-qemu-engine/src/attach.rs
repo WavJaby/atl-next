@@ -37,6 +37,8 @@ pub(crate) struct Api {
     tcg_cflags_set: CflagsSetFn,
     /// `void tb_flush__exclusive_or_serial(void)` (accel/tcg/tb-maint.c).
     tb_flush: VoidFn,
+    /// `void process_queued_cpu_work(CPUState *)` (cpu-common.c): runs a CPU's queued work (see attach).
+    process_queued_cpu_work: PtrFn,
 }
 
 /// dlsym `$name` and type it as `$ty`, the prototype the field doc names.
@@ -62,6 +64,7 @@ impl Api {
             tcg_cflags_has: func!(h, c"tcg_cflags_has", CflagsHasFn),
             tcg_cflags_set: func!(h, c"tcg_cflags_set", CflagsSetFn),
             tb_flush: func!(h, c"tb_flush__exclusive_or_serial", VoidFn),
+            process_queued_cpu_work: func!(h, c"process_queued_cpu_work", PtrFn),
         })
     }
 }
@@ -181,6 +184,11 @@ pub(crate) fn attach(boot_env: usize) -> Result<Cpu, String> {
     if !ts.is_null() {
         // SAFETY: ts is this CPU's TaskState (task_state).
         unsafe { (api.task_settid)(ts.cast()) };
+    }
+    if !cfg!(atl_qe_no_init_drain) {
+        // The copy's queued work is its plugin init hook (plugins/core.c qemu_plugin_vcpu_init__async), which enters the CPU in `plugin.cpu_ht`. Clone's child runs it before its first guest instruction; an attached CPU may never run guest code, and detach asserts the entry (plugins/core.c:293), so attach runs it here.
+        // SAFETY: cpu is this thread's complete CPU (cpu_copy, TaskState); the work runs on the thread that owns it.
+        unsafe { (api.process_queued_cpu_work)(cpu.cast()) };
     }
     crate::signal::register_thread();
     let stack = guest_stack()?;

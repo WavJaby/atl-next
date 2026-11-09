@@ -142,6 +142,7 @@ mod linked_syms {
         pub(super) fn mmap_lock();
         pub(super) fn mmap_unlock();
         pub(super) fn cpu_copy();
+        pub(super) fn process_queued_cpu_work();
         pub(super) fn init_task_state();
         pub(super) fn task_settid();
         pub(super) fn rcu_register_thread();
@@ -171,6 +172,7 @@ fn linked(name: &[u8]) -> Option<*mut c_void> {
         b"mmap_lock" => s::mmap_lock as *const (),
         b"mmap_unlock" => s::mmap_unlock as *const (),
         b"cpu_copy" => s::cpu_copy as *const (),
+        b"process_queued_cpu_work" => s::process_queued_cpu_work as *const (),
         b"init_task_state" => s::init_task_state as *const (),
         b"task_settid" => s::task_settid as *const (),
         b"rcu_register_thread" => s::rcu_register_thread as *const (),
