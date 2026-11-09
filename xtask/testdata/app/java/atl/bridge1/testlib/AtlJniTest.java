@@ -59,8 +59,8 @@ public final class AtlJniTest {
     /** GLES2 through the GL proxies: pixels equal to the scene (4096 = all of a 64x64 pbuffer), -1 on an EGL or GL error (atl_jni_test.c). */
     public static native int glesPbuffer();
 
-    /** After glesPbuffer: 1 when /proc/self/maps names the host driver ("mesa"), 0 when not, -1 when unreadable (atl_jni_test.c). */
-    public static native int mesaMapped();
+    /** After glesPbuffer: 1 when /proc/self/maps names libGLES_atl.so, 0 when not, -1 when unreadable (atl_jni_test.c). */
+    public static native int driverMapped();
 
     /** The ES1 context the es1 natives draw on: an EGL10 pbuffer and context made by es1Begin on the calling thread, as GLSurfaceView makes them for Happy Jump (plan gs3 S3). */
     private static EGL10 egl;

@@ -179,7 +179,7 @@ public class Main extends Activity {
         bridge1Call(jni, "propCallbacks", "propCallbacks");
         bridge1Call(jni, "firstConfig", "firstConfig");
         bridge1Call(jni, "glesPbuffer", "glesPbuffer");
-        bridge1Call(jni, "mesaMapped", "mesaMapped");
+        bridge1Call(jni, "driverMapped", "driverMapped");
         // S3 (plan gs3): the ES1 scene through libGLESv1_CM.so on an EGL10 context made here, as Happy Jump's GLSurfaceView makes one
         bridge1Call(jni, "es1Begin", "es1Begin");
         bridge1Call(jni, "es1Version", "es1Version");

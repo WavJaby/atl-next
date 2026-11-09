@@ -151,8 +151,8 @@ const BRIDGE1_CALLS: &[(&str, &str)] = &[
     ("propCallbacks", "11"),
     // GLES2 through the GL proxies: 64x64 pixels that equal the scene's geometry (jni-test atl_jni_test.c glesPbuffer)
     ("glesPbuffer", "4096"),
-    // after glesPbuffer, the process maps the host driver (a /proc/self/maps line naming "mesa"): the proxies reached Mesa, not a stand-in
-    ("mesaMapped", "1"),
+    // after glesPbuffer, the process maps libGLES_atl.so (a /proc/self/maps line naming it): the proxies reached the driver, not a stand-in
+    ("driverMapped", "1"),
     // S3 guest ES1 (plan gs3 S3): es1Begin makes an EGL10 pbuffer and ES1 context on this thread, as Happy Jump's GLSurfaceView does; es1Pixels is 1 when the scene ran with no GL error, and its rows are judged by es1_pixels
     ("es1Begin", "true"),
     ("es1Version", "1"),

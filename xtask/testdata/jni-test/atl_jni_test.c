@@ -337,8 +337,8 @@ JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
     return matches;
 }
 
-// After glesPbuffer: 1 when the process maps the host GL driver (a /proc/self/maps line naming "mesa", e.g. libEGL_mesa.so), 0 when not, -1 when maps cannot be read: the guest's GL reached the real driver, not a stand-in.
-JNI_FN(jint, mesaMapped)(JNIEnv *env, jclass cls)
+// After glesPbuffer: 1 when the process maps libGLES_atl.so (a /proc/self/maps line naming it), 0 when not, -1 when maps cannot be read: the guest's GL reached the driver, not a stand-in.
+JNI_FN(jint, driverMapped)(JNIEnv *env, jclass cls)
 {
     FILE *f = fopen("/proc/self/maps", "re");
     if (f == NULL)
@@ -346,7 +346,7 @@ JNI_FN(jint, mesaMapped)(JNIEnv *env, jclass cls)
     char line[4096];
     jint found = 0;
     while (!found && fgets(line, sizeof(line), f) != NULL)
-        found = strstr(line, "mesa") != NULL;
+        found = strstr(line, "libGLES_atl.so") != NULL;
     fclose(f);
     return found;
 }
