@@ -295,69 +295,69 @@ pub fn clang_triple_from_cargo() -> Result<String> {
     ))
 }
 
-/// bionic's kernel uapi include directories for `host`, as Soong's `libc_uapi_headers` exports them:
+/// bionic's kernel uapi include directories for `row`, as Soong's `libc_uapi_headers` exports them:
 /// the generic uapi, Android's additions (`linux/compiler_types.h`), the arch's `asm-<kernel_arch>`.
 /// Paths relative to `src/`, for `Upstreams::path` / `rerun_paths`.
-pub fn bionic_uapi_dirs(host: &ArchRow) -> Vec<String> {
+pub fn bionic_uapi_dirs(row: &ArchRow) -> Vec<String> {
     let kernel = "aosp/bionic/libc/kernel";
     vec![
         format!("{kernel}/uapi"),
         format!("{kernel}/android/uapi"),
-        format!("{kernel}/uapi/asm-{}", host.kernel_arch),
+        format!("{kernel}/uapi/asm-{}", row.kernel_arch),
     ]
 }
 
-/// The target to parse a bionic kernel-uapi header for `host`: no system headers, only
+/// The target to parse a bionic kernel-uapi header for `row`: no system headers, only
 /// `bionic_uapi_dirs`.
-pub fn bionic_uapi_target(up: &Upstreams, host: &ArchRow, clang_triple: &str) -> Target {
+pub fn bionic_uapi_target(up: &Upstreams, row: &ArchRow, clang_triple: &str) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     args.extend(
-        bionic_uapi_dirs(host)
+        bionic_uapi_dirs(row)
             .iter()
             .map(|d| format!("-isystem{}", up.path(d).display())),
     );
     Target {
-        arch: host.arch.clone(),
+        arch: row.arch.clone(),
         triple: clang_triple.to_owned(),
         args,
     }
 }
 
-/// The target to parse bionic's own libc headers in: bionic's triple for `host`'s arch, no system
+/// The target to parse bionic's own libc headers in: bionic's triple for `row`'s arch, no system
 /// headers, bionic's `libc/include` then its kernel uapi. `cxx_include`: a C++ standard library to put
 /// first (C++ sources); bionic ships none.
-pub fn bionic_libc_target(up: &Upstreams, host: &ArchRow, cxx_include: Option<&Path>) -> Target {
+pub fn bionic_libc_target(up: &Upstreams, row: &ArchRow, cxx_include: Option<&Path>) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     let dirs = cxx_include
         .map(Path::to_path_buf)
         .into_iter()
         .chain(std::iter::once(up.aosp("bionic/libc/include")))
-        .chain(bionic_uapi_dirs(host).into_iter().map(|d| up.path(&d)));
+        .chain(bionic_uapi_dirs(row).into_iter().map(|d| up.path(&d)));
     args.extend(dirs.map(|d| format!("-isystem{}", d.display())));
     Target {
-        arch: host.arch.clone(),
-        triple: host.bionic_clang.clone(),
+        arch: row.arch.clone(),
+        triple: row.bionic_clang.clone(),
         args,
     }
 }
 
 /// The level platform code is built for: bionic's `__ANDROID_API_FUTURE__` (Soong's FutureApiLevelInt, which the converter checks equal). Headers are read at it, so no declaration is hidden behind an availability guard.
-pub fn future_level(up: &Upstreams, host: &ArchRow) -> Result<u64> {
+pub fn future_level(up: &Upstreams, row: &ArchRow) -> Result<u64> {
     let path = up.aosp("bionic/libc/include/android/api-level.h");
     let src = Source::c(&path, &["__ANDROID_API_FUTURE__"]);
-    let target = bionic_libc_target(up, host, None);
+    let target = bionic_libc_target(up, row, None);
     let iface = crate::interface("api_level", "api-level.h", &src, &[target])?;
-    Ok(iface.arches[&host.arch].constants["__ANDROID_API_FUTURE__"].bits)
+    Ok(iface.arches[&row.arch].constants["__ANDROID_API_FUTURE__"].bits)
 }
 
 /// [`bionic_libc_target`] at API `level` (the triple's suffix): platform code's view at [`future_level`].
 pub fn bionic_platform_target(
     up: &Upstreams,
-    host: &ArchRow,
+    row: &ArchRow,
     level: u64,
     cxx: Option<&Path>,
 ) -> Target {
-    let mut target = bionic_libc_target(up, host, cxx);
+    let mut target = bionic_libc_target(up, row, cxx);
     target.triple = format!("{}{level}", target.triple);
     target
 }
