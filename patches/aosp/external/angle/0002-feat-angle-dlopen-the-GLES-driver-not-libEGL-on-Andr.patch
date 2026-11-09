@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 9 Nov 2026 17:44:13 +0800
+Subject: [PATCH] feat(angle): dlopen the GLES driver, not libEGL, on Android
+
+- DisplayEGL::getEGLPath: /vendor/lib64/egl/libGLES_atl.so (and
+  /vendor/lib/egl/ for 32-bit), the driver AOSP's Loader opens for
+  ro.hardware.egl=atl, in place of /system/lib64/libEGL.so
+
+Upstream-Status: Pending
+Patch-Reason: on Android the native EGL is the loader itself. dlopen of
+ /system/lib64/libEGL.so returns AOSP's libEGL, whose eglGetProcAddress
+ resolves into ANGLE, so the display would call back into ANGLE. The
+ Loader's driver path is static (Loader.cpp VENDOR_LIB_EGL_DIR) and not
+ reachable from ANGLE, so the vendor path is fixed here.
+---
+SPDX-License-Identifier: BSD-3-Clause
+ src/libANGLE/renderer/gl/egl/DisplayEGL.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
+index acada69f43589682252c47fbab66e4c12aaacf4d..732b7c92cea6f1a0896eea40ec093e09264877b9 100644
+--- a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
++++ b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
+@@ -102,11 +102,12 @@ EGLSyncImpl *DisplayEGL::createSync()
+ 
+ const char *DisplayEGL::getEGLPath() const
+ {
++    // Android: the native EGL is the GLES driver (AOSP Loader: vendor egl dir), not libEGL, which is the loader and would recurse into ANGLE.
+ #if defined(ANGLE_PLATFORM_ANDROID)
+ #    if defined(__LP64__)
+-    return "/system/lib64/libEGL.so";
++    return "/vendor/lib64/egl/libGLES_atl.so";
+ #    else
+-    return "/system/lib/libEGL.so";
++    return "/vendor/lib/egl/libGLES_atl.so";
+ #    endif
+ #else
+     return "libEGL.so.1";
