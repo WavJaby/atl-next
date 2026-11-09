@@ -921,6 +921,8 @@ struct Liveness {
     resumed_ms: Option<u128>,
     /// Resize stage: whether the client acked each of [`RESIZE_STEPS`], in order (empty in the other stages).
     configured: Vec<bool>,
+    /// Widgets stage: the idle window's log offsets (None in the other stages).
+    idle: Option<widgets::Idle>,
 }
 
 /// The gtk stage's probe, from the proxy's side: the window's configure is acked; a ping is answered; the pointer script goes in; then a click whose UP sleeps the UI thread (past BLOCK_MIN_X). A ping sent meanwhile gets no pong until the sleep ends.
@@ -974,6 +976,7 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         silent,
         resumed_ms,
         configured: Vec::new(),
+        idle: None,
     })
 }
 
@@ -1069,6 +1072,7 @@ fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<
         silent: false,
         resumed_ms: None,
         configured,
+        idle: None,
     })
 }
 
@@ -2424,6 +2428,7 @@ mod tests {
             silent: false,
             resumed_ms: None,
             configured,
+            idle: None,
         });
         let seen = Mutex::new(capture::Seen {
             pictures,

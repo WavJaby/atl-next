@@ -36,6 +36,8 @@ public class Main extends Activity {
     static final int SETTLE_FRAMES = 30;
     /** Frames after Main resumes again before the probe taps: 0.2 s at 60 Hz, past Second's destroy and window removal. */
     static final int BACK_FRAMES = 12;
+    /** The Button's click count after the idle window (widgets.rs drive): its tap posts one frame callback, the resume check's line. */
+    static final int RESUME_CLICK = 3;
     /** MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE (API 34), written out. */
     static final int CLASSIFICATION_TWO_FINGER_SWIPE = 3;
 
@@ -232,6 +234,16 @@ public class Main extends Activity {
         });
     }
 
+    /** One frame callback requested by the resume tap: the idle probe's proof that input asks for a frame again (`frame resume`). Nothing else requests frames after the cadence run. */
+    private void postResumeFrame() {
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            @Override
+            public void doFrame(long frameTimeNanos) {
+                Log.i(TAG, "frame resume time=" + frameTimeNanos);
+            }
+        });
+    }
+
     /** The window's focus, as the input channel's focus event delivers it (ViewRootImpl onFocusEvent). */
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
@@ -256,6 +268,9 @@ public class Main extends Activity {
         clicks++;
         label.setText("Clicked " + clicks);
         Log.i(TAG, "click count=" + clicks);
+        if (clicks == RESUME_CLICK) {
+            postResumeFrame();
+        }
         // the next draw carries the new text; a same-size text change has no layout pass, so no global layout callback
         final ViewTreeObserver observer = label.getViewTreeObserver();
         observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {

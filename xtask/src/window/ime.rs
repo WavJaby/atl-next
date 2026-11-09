@@ -204,6 +204,7 @@ pub fn drive(
         silent: true,
         resumed_ms: None,
         configured: Vec::new(),
+        idle: None,
     })
 }
 

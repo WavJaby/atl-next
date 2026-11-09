@@ -3,7 +3,9 @@
 //! The probe presses the header bar, then taps the Button and the EditText, hovers, turns the wheel and swipes the touchpad over the ListView, and drags it, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
 //! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first picture's digest, so the text is in the capture),
 //! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last picture is the fixture's final frame and differs from the first),
-//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage). No sub-gate for the on-demand clock: the product logs no clock state, and nothing else shows an idle tick.
+//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage),
+//! idle (no fixture frame callback over IDLE_WINDOW after the settle), resume (the tap after the idle window draws a frame callback).
+//! What `idle` proves: the app requests no frame while nothing is injected. It does not observe the composer's clock: the composer logs nothing while it is parked, so whether the clock parks is not directly observed here.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -62,6 +64,21 @@ const SWIPE_STEP_PX: f64 = 6.0;
 const SWIPE_STEP_MS: u64 = 10;
 /// How long the swipe's fling may run before the list is idle again.
 const FLING_WAIT: Duration = Duration::from_secs(5);
+/// The idle window: after the settle (in-flight frames land before `from`), nothing is injected for IDLE_WINDOW, then the Button's tap (RESUME_CLICK, Main.java) wakes the app.
+/// IDLE_WINDOW is one second: 60 periods at 60 Hz; the checks count periods at the display's rate.
+const IDLE_SETTLE: Duration = Duration::from_millis(250);
+const IDLE_WINDOW: Duration = Duration::from_secs(1);
+/// The fixture's lines at the resume tap (Main.java RESUME_CLICK, postResumeFrame) and every frame callback line it logs.
+const RESUME_CLICK_LINE: &str = "AtlWindow: click count=3";
+const RESUME_LINE: &str = "AtlWindow: frame resume";
+const FRAME_PREFIX: &str = "AtlWindow: frame ";
+
+/// The idle window's log offsets (bytes): `from` after the settle, `to` at the resume tap.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Idle {
+    pub from: usize,
+    pub to: usize,
+}
 /// A list position's row weight: larger than any row height, so (first row, its offset) orders as one number.
 const LIST_ROW_SCALE: i64 = 100_000;
 /// MotionEvent actions and the touchpad swipe's classification (NDK input.h).
@@ -695,6 +712,7 @@ pub fn checks(
     pressure: &Samples,
     pictures: &Mutex<capture::Seen>,
 ) -> Vec<Sub> {
+    let idle = probe.as_ref().ok().and_then(|l| l.idle);
     vec![
         (
             "probe",
@@ -724,7 +742,59 @@ pub fn checks(
             "cadence",
             cadence_check(after, display.refresh_hz, pressure),
         ),
+        ("idle", idle_check(idle, app, display.refresh_hz)),
+        ("resume", resume_check(idle, app)),
     ]
+}
+
+/// The app log text the idle window covers, and the text from the resume tap on.
+fn idle_span(app: &str, idle: Option<Idle>) -> Result<(&str, &str), String> {
+    let idle = idle.ok_or("the probe did not reach the idle window")?;
+    let window = app
+        .get(idle.from..idle.to)
+        .ok_or("the idle window's offsets are not in the app log")?;
+    let resumed = app
+        .get(idle.to..)
+        .ok_or("the idle window's offsets are not in the app log")?;
+    Ok((window, resumed))
+}
+
+/// Sub-gate idle: no fixture frame callback in the idle window (the app requests no frame while nothing is injected).
+fn idle_check(idle: Option<Idle>, app: &str, refresh_hz: f32) -> Result<String, String> {
+    let (window, _) = idle_span(app, idle)?;
+    let frames = window.lines().filter(|l| l.contains(FRAME_PREFIX)).count();
+    let periods = IDLE_WINDOW.as_secs_f64() * f64::from(refresh_hz);
+    if frames > 0 {
+        return Err(format!(
+            "{frames} frame callbacks in the {periods:.0}-period idle window, want 0"
+        ));
+    }
+    Ok(format!(
+        "0 frame callbacks in {periods:.0} periods ({} s at {refresh_hz} Hz)",
+        IDLE_WINDOW.as_secs_f64()
+    ))
+}
+
+/// Sub-gate resume: the tap after the idle window reached Main and drew a frame callback (the input asks for a frame again).
+fn resume_check(idle: Option<Idle>, app: &str) -> Result<String, String> {
+    let (_, resumed) = idle_span(app, idle)?;
+    if !resumed.contains(RESUME_CLICK_LINE) {
+        return Err(format!(
+            "no `{RESUME_CLICK_LINE}` line after the idle window"
+        ));
+    }
+    let frames = resumed.lines().filter(|l| l.contains(RESUME_LINE)).count();
+    if frames == 0 {
+        return Err("the tap after the idle window drew no frame callback".to_owned());
+    }
+    Ok(format!("the tap drew {frames} frame callback(s)"))
+}
+
+/// The length of the app log in bytes: the offsets [`Idle`] records.
+fn log_len(app_log: &Path) -> Result<usize, String> {
+    std::fs::metadata(app_log)
+        .map(|m| m.len() as usize)
+        .map_err(|e| e.to_string())
 }
 
 pub(super) fn press(pressed: bool) -> PointerAction {
@@ -945,17 +1015,51 @@ pub fn drive(
         ],
     )?;
     wait_until(app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
+    // the idle window: nothing is injected, so the app must request no frame (`idle`); the composer's parking is not observed
+    std::thread::sleep(IDLE_SETTLE);
+    let from = log_len(app_log)?;
+    std::thread::sleep(IDLE_WINDOW);
+    let to = log_len(app_log)?;
+    tap(centre("button")?)?;
+    wait_line(app_log, RESUME_CLICK_LINE)?;
+    wait_until(app_log, LINE_WAIT, |t| t.contains(RESUME_LINE));
     Ok(Liveness {
         answered: false,
         silent: false,
         resumed_ms: None,
         configured: Vec::new(),
+        idle: Some(Idle { from, to }),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log with one line before the idle window, the window's text, then the resume tap's lines.
+    fn idle_log(window: &str) -> (String, Idle) {
+        let before = "AtlWindow: list state=0\n";
+        let resumed = format!("{RESUME_CLICK_LINE}\n{RESUME_LINE} time=7\n");
+        let idle = Idle {
+            from: before.len(),
+            to: before.len() + window.len(),
+        };
+        (format!("{before}{window}{resumed}"), idle)
+    }
+
+    /// `idle` wants no frame callback in the window; `resume` wants the tap's frame callback after it.
+    #[test]
+    fn idle_checks_want_no_frame_in_the_window_and_a_resume_frame() {
+        let hz = 60.0;
+        let (quiet, idle) = idle_log("");
+        assert!(idle_check(Some(idle), &quiet, hz).is_ok());
+        assert!(resume_check(Some(idle), &quiet).is_ok());
+        // the fixture keeps invalidating: a frame callback in the window
+        let (busy, idle) = idle_log("AtlWindow: frame 32 time=9\n");
+        assert!(idle_check(Some(idle), &busy, hz).is_err());
+        // no resume tap in the log: nothing after the window
+        assert!(resume_check(Some(Idle { from: 0, to: 0 }), "no tap\n").is_err());
+    }
 
     /// The Button at left 16, top 49, 88x48: centre (60, 73), as a real run logs it.
     const BUTTON: &str = "AtlWindow: layout button left=16 top=49 width=88 height=48\n";

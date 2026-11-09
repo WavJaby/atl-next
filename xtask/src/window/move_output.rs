@@ -64,6 +64,7 @@ pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liv
         silent: false,
         resumed_ms: None,
         configured: Vec::new(),
+        idle: None,
     })
 }
 
