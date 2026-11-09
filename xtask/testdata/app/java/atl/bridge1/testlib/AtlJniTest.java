@@ -53,6 +53,9 @@ public final class AtlJniTest {
     /** Guest callbacks of __system_property_read_callback / __system_property_foreach run on the caller's guest thread: 11 (atl_jni_test.c). */
     public static native int propCallbacks();
 
+    /** The first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces: `r=<r> g=<g> b=<b> a=<a> visual=<EGL_NATIVE_VISUAL_ID>` (atl_jni_test.c firstConfig; app.rs judges the visual). */
+    public static native String firstConfig();
+
     /** GLES2 through the GL proxies: pixels equal to the scene (4096 = all of a 64x64 pbuffer), -1 on an EGL or GL error (atl_jni_test.c). */
     public static native int glesPbuffer();
 

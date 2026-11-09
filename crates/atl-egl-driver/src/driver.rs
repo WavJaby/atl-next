@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow};
 use atl_egl_host::{Display, Host};
-use atl_gralloc::format::{RGBA_8888, RGBX_8888};
+use atl_gralloc::format::{self, RGBA_8888, RGBX_8888};
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
 
 use crate::abi::egl as e;
@@ -48,6 +48,7 @@ host_table!(
     e {
         eglGetError,
         eglQueryString,
+        eglGetConfigs,
         eglChooseConfig,
         eglGetConfigAttrib,
         eglDestroySurface,
@@ -250,23 +251,108 @@ impl Driver {
         Some(v)
     }
 
-    /// The HAL pixel format a window surface of `config` gets (the config's `EGL_NATIVE_VISUAL_ID`): RGBA / RGBX 8888 on a config the host renders off-screen (PBUFFER), else none.
+    /// The Android format a config maps to ([`FORMATS`] on its color layout), else none: the config is not handed out.
+    pub fn android_format(&self, config: e::EGLConfig) -> Option<i32> {
+        let size = |a| self.host_attrib(config, a);
+        let rgba = [
+            size(e::EGL_RED_SIZE)?,
+            size(e::EGL_GREEN_SIZE)?,
+            size(e::EGL_BLUE_SIZE)?,
+            size(e::EGL_ALPHA_SIZE)?,
+        ];
+        // a host without EGL_EXT_pixel_format_float refuses the attribute (host_attrib clears the refusal): every config is FIXED
+        let float = self.host_attrib(config, e::EGL_COLOR_COMPONENT_TYPE_EXT)
+            == Some(e::EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT);
+        format_of(rgba, float)
+    }
+
+    /// The HAL format a window surface of `config` gets: [`Self::android_format`] on a config the host renders off-screen (PBUFFER), and only a format atl-gralloc has a row for, so a window never asks the allocator for a buffer it refuses.
     pub fn window_format(&self, config: e::EGLConfig) -> Option<i32> {
         let st = self.host_attrib(config, e::EGL_SURFACE_TYPE)?;
         if st & e::EGL_PBUFFER_BIT == 0 {
             return None;
         }
-        let size = |a| self.host_attrib(config, a);
-        match (
-            size(e::EGL_RED_SIZE)?,
-            size(e::EGL_GREEN_SIZE)?,
-            size(e::EGL_BLUE_SIZE)?,
-            size(e::EGL_ALPHA_SIZE)?,
-        ) {
-            (8, 8, 8, 8) => Some(RGBA_8888),
-            (8, 8, 8, 0) => Some(RGBX_8888),
-            _ => None,
-        }
+        self.android_format(config)
+            .filter(|&f| format::lookup(f).is_some())
+    }
+}
+
+/// A color layout: R, G, B, A sizes in bits, and the component type (`float`: EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT, else FIXED).
+struct Layout {
+    rgba: [i32; 4],
+    float: bool,
+    format: i32,
+}
+
+/// `PixelFormat` values with no atl-gralloc row (hardware/interfaces/graphics/common/aidl PixelFormat.aidl). A config mapped to one is listed by eglGetConfigs / eglChooseConfig, but no window gets it.
+const RGB_565: i32 = 0x4;
+const RGBA_FP16: i32 = 0x16;
+const RGBA_1010102: i32 = 0x2B;
+
+/// The Android formats a config can map to, by its color layout: a host config matching no row is not handed out.
+/// Rows: the channel sizes of each format's packing. AOSP's getNativePixelFormat (egl_platform_entries.cpp) maps the 16-bit FIXED layout to RGBA_1010102 by a colour-depth test; no row here, so those configs are not listed.
+const FORMATS: &[Layout] = &[
+    // 4 x 8 bits: a 32-bit pixel with alpha
+    Layout {
+        rgba: [8, 8, 8, 8],
+        float: false,
+        format: RGBA_8888,
+    },
+    // RGBA_8888 without alpha: byte 3 is padding
+    Layout {
+        rgba: [8, 8, 8, 0],
+        float: false,
+        format: RGBX_8888,
+    },
+    // 5 + 6 + 5 bits in 16, no alpha
+    Layout {
+        rgba: [5, 6, 5, 0],
+        float: false,
+        format: RGB_565,
+    },
+    // four 16-bit half floats: a 64-bit pixel
+    Layout {
+        rgba: [16, 16, 16, 16],
+        float: true,
+        format: RGBA_FP16,
+    },
+    // 10 + 10 + 10 + 2 in 32 bits
+    Layout {
+        rgba: [10, 10, 10, 2],
+        float: false,
+        format: RGBA_1010102,
+    },
+];
+
+/// The Android format of a color layout: its [`FORMATS`] row, if any.
+fn format_of(rgba: [i32; 4], float: bool) -> Option<i32> {
+    FORMATS
+        .iter()
+        .find(|l| l.rgba == rgba && l.float == float)
+        .map(|l| l.format)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expected values from PixelFormat.aidl (RGBA_8888 0x1, RGBX_8888 0x2, RGB_565 0x4, RGBA_FP16 0x16, RGBA_1010102 0x2B) and the channel sizes of each packing; not from the table.
+    #[test]
+    fn each_packing_maps_to_its_format() {
+        assert_eq!(format_of([8, 8, 8, 8], false), Some(0x1));
+        assert_eq!(format_of([8, 8, 8, 0], false), Some(0x2));
+        assert_eq!(format_of([5, 6, 5, 0], false), Some(0x4));
+        assert_eq!(format_of([16, 16, 16, 16], true), Some(0x16));
+        assert_eq!(format_of([10, 10, 10, 2], false), Some(0x2B));
+    }
+
+    /// Layouts that are no Android format: the host's 16-bit FIXED configs (ids 51-60 on the WSL llvmpipe host), RGBA_5551, R_8, and a float layout with FIXED sizes.
+    #[test]
+    fn other_layouts_map_to_none() {
+        assert_eq!(format_of([16, 16, 16, 16], false), None);
+        assert_eq!(format_of([5, 5, 5, 1], false), None);
+        assert_eq!(format_of([8, 0, 0, 0], false), None);
+        assert_eq!(format_of([8, 8, 8, 8], true), None);
     }
 }
 

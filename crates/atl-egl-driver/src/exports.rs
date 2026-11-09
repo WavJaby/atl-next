@@ -18,6 +18,7 @@ const _: e::eglGetError = eglGetError;
 const _: e::eglGetDisplay = eglGetDisplay;
 const _: e::eglTerminate = eglTerminate;
 const _: e::eglQueryString = eglQueryString;
+const _: e::eglGetConfigs = eglGetConfigs;
 const _: e::eglChooseConfig = eglChooseConfig;
 const _: e::eglGetConfigAttrib = eglGetConfigAttrib;
 const _: e::eglCreateWindowSurface = eglCreateWindowSurface;
@@ -71,6 +72,7 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> Proc {
         b"eglGetDisplay" => Some(eglGetDisplay as *const ()),
         b"eglTerminate" => Some(eglTerminate as *const ()),
         b"eglQueryString" => Some(eglQueryString as *const ()),
+        b"eglGetConfigs" => Some(eglGetConfigs as *const ()),
         b"eglChooseConfig" => Some(eglChooseConfig as *const ()),
         b"eglGetConfigAttrib" => Some(eglGetConfigAttrib as *const ()),
         b"eglCreateWindowSurface" => Some(eglCreateWindowSurface as *const ()),
@@ -146,7 +148,86 @@ pub unsafe extern "C" fn eglQueryString(dpy: e::EGLDisplay, name: i32) -> *const
     }
 }
 
-/// eglChooseConfig with window surfaces asked for as the host's off-screen (PBUFFER) configs, then only those [`Driver::window_format`] accepts.
+/// The host's configs for one host query (`host(configs, size, num)`: the host's entry with the caller's arguments), counted first, then filled.
+fn host_list(host: impl Fn(*mut e::EGLConfig, i32, *mut i32) -> u32) -> Option<Vec<e::EGLConfig>> {
+    let mut n = 0;
+    if host(std::ptr::null_mut(), 0, &mut n) == 0 {
+        return None;
+    }
+    let mut all = vec![std::ptr::null_mut(); usize::try_from(n).unwrap_or(0)];
+    if host(all.as_mut_ptr(), n, &mut n) == 0 {
+        return None;
+    }
+    all.truncate(usize::try_from(n).unwrap_or(0));
+    Some(all)
+}
+
+/// A host config the driver hands out: its color layout maps to an Android format ([`Driver::android_format`]), and a window request also needs [`Driver::window_format`].
+#[cfg(not(atl_egl_no_config_filter))]
+fn handed_out(d: &Driver, config: e::EGLConfig, window: bool) -> bool {
+    if window {
+        d.window_format(config).is_some()
+    } else {
+        d.android_format(config).is_some()
+    }
+}
+
+/// The `no_config_filter` break (build.rs `BREAKS`): every host config is handed out, as before the filter.
+#[cfg(atl_egl_no_config_filter)]
+fn handed_out(_: &Driver, _: e::EGLConfig, _: bool) -> bool {
+    true
+}
+
+/// Writes a config list: its count when `configs` is null, else up to `size` of them.
+///
+/// # Safety
+/// `num` is non-null; `configs` is null or holds `size` slots.
+unsafe fn write_configs(
+    all: &[e::EGLConfig],
+    configs: *mut e::EGLConfig,
+    size: i32,
+    num: *mut i32,
+) {
+    if configs.is_null() {
+        // SAFETY: `num` is non-null (the caller's contract).
+        unsafe { *num = all.len() as i32 };
+    } else {
+        let k = all.len().min(usize::try_from(size).unwrap_or(0));
+        // SAFETY: the caller's array holds `size` slots; `k` <= size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(all.as_ptr(), configs, k);
+            *num = k as i32;
+        }
+    }
+}
+
+/// eglGetConfigs: the host's configs [`handed_out`] keeps, by layout alone. eglChooseConfig filters the same list, so the two agree.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eglGetConfigs(
+    dpy: e::EGLDisplay,
+    configs: *mut e::EGLConfig,
+    size: i32,
+    num: *mut i32,
+) -> u32 {
+    let Some(d) = driver_for(dpy) else {
+        return fail(e::EGL_BAD_DISPLAY, 0);
+    };
+    if num.is_null() {
+        return fail(e::EGL_BAD_PARAMETER, 0);
+    }
+    let Some(mut all) = host_list(|c, s, n| {
+        // SAFETY: the host display; the caller's array of `s` slots (count only: null, 0).
+        unsafe { (d.egl.eglGetConfigs)(dpy, c, s, n) }
+    }) else {
+        return 0;
+    };
+    all.retain(|&c| handed_out(d, c, false));
+    // SAFETY: `num` is non-null (checked above); `configs` is null or the caller's `size` slots.
+    unsafe { write_configs(&all, configs, size, num) };
+    e::EGL_TRUE as u32
+}
+
+/// eglChooseConfig over the host's configs for the attributes, kept by [`handed_out`]: a window request (no EGL_SURFACE_TYPE, or one with EGL_WINDOW_BIT) takes the host's off-screen (PBUFFER) configs [`Driver::window_format`] accepts.
 /// With EGL_CONFIG_ID the other attributes are ignored, window defaults included: ANGLE's DisplayEGL finds the native config of each surface this way.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn eglChooseConfig(
@@ -195,36 +276,15 @@ pub unsafe extern "C" fn eglChooseConfig(
         host_attribs.extend([e::EGL_SURFACE_TYPE, e::EGL_PBUFFER_BIT]);
     }
     host_attribs.push(e::EGL_NONE);
-    let mut n = 0;
-    // SAFETY: count only: a null array with size 0.
-    let ok = unsafe {
-        (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), std::ptr::null_mut(), 0, &mut n)
+    let Some(mut all) = host_list(|c, s, n| {
+        // SAFETY: the host display, the NONE-terminated list above, the caller's array of `s` slots (count only: null, 0).
+        unsafe { (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), c, s, n) }
+    }) else {
+        return 0;
     };
-    if ok == 0 {
-        return 0;
-    }
-    let mut all = vec![std::ptr::null_mut(); usize::try_from(n).unwrap_or(0)];
-    // SAFETY: `all` holds `n` slots.
-    let ok =
-        unsafe { (d.egl.eglChooseConfig)(dpy, host_attribs.as_ptr(), all.as_mut_ptr(), n, &mut n) };
-    if ok == 0 {
-        return 0;
-    }
-    all.truncate(usize::try_from(n).unwrap_or(0));
-    if window {
-        all.retain(|&c| d.window_format(c).is_some());
-    }
-    if configs.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { *num = all.len() as i32 };
-    } else {
-        let k = all.len().min(usize::try_from(size).unwrap_or(0));
-        // SAFETY: the caller's array holds `size` slots; `k` <= size.
-        unsafe {
-            std::ptr::copy_nonoverlapping(all.as_ptr(), configs, k);
-            *num = k as i32;
-        }
-    }
+    all.retain(|&c| handed_out(d, c, window));
+    // SAFETY: `num` is non-null (checked above); `configs` is null or the caller's `size` slots.
+    unsafe { write_configs(&all, configs, size, num) };
     e::EGL_TRUE as u32
 }
 
@@ -261,20 +321,21 @@ pub unsafe extern "C" fn eglGetConfigAttrib(
     if value.is_null() {
         return fail(e::EGL_BAD_PARAMETER, 0);
     }
-    let format = d.window_format(config);
+    let window = d.window_format(config).is_some();
     let v = match attr {
-        e::EGL_NATIVE_VISUAL_ID => format.unwrap_or(0),
+        // the HAL format the config maps to (0: none, a config the driver does not hand out)
+        e::EGL_NATIVE_VISUAL_ID => d.android_format(config).unwrap_or(0),
         e::EGL_NATIVE_RENDERABLE
         | e::EGL_RECORDABLE_ANDROID
         | e::EGL_FRAMEBUFFER_TARGET_ANDROID => {
-            if format.is_some() {
+            if window {
                 e::EGL_TRUE
             } else {
                 e::EGL_FALSE
             }
         }
         e::EGL_SURFACE_TYPE => match d.host_attrib(config, attr) {
-            Some(st) if format.is_some() => st | e::EGL_WINDOW_BIT,
+            Some(st) if window => st | e::EGL_WINDOW_BIT,
             Some(st) => st,
             None => return fail(e::EGL_BAD_CONFIG, 0),
         },

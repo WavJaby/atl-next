@@ -249,6 +249,29 @@ static EGLConfig exact_8888_config(EGLDisplay dpy, const EGLint *attr)
     return NULL;
 }
 
+// The first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces: its sizes and EGL_NATIVE_VISUAL_ID (the HAL format the driver maps it to), `r=.. g=.. b=.. a=.. visual=..`.
+// app.rs judges the visual against PixelFormat.aidl's list; the line carries the sizes for the record. The window default (no EGL_SURFACE_TYPE) leaves out the pbuffer-only 16-bit configs, so it cannot show them first.
+JNI_FN(jstring, firstConfig)(JNIEnv *env, jclass cls)
+{
+    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, NULL, NULL))
+        return (*env)->NewStringUTF(env, "no display");
+    const EGLint attr[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+    EGLConfig first = NULL;
+    EGLint n = 0;
+    if (!eglChooseConfig(dpy, attr, &first, 1, &n) || n == 0)
+        return (*env)->NewStringUTF(env, "no config");
+    EGLint r = 0, g = 0, b = 0, a = 0, visual = 0;
+    eglGetConfigAttrib(dpy, first, EGL_RED_SIZE, &r);
+    eglGetConfigAttrib(dpy, first, EGL_GREEN_SIZE, &g);
+    eglGetConfigAttrib(dpy, first, EGL_BLUE_SIZE, &b);
+    eglGetConfigAttrib(dpy, first, EGL_ALPHA_SIZE, &a);
+    eglGetConfigAttrib(dpy, first, EGL_NATIVE_VISUAL_ID, &visual);
+    char out[96];
+    snprintf(out, sizeof out, "r=%d g=%d b=%d a=%d visual=%d", r, g, b, a, visual);
+    return (*env)->NewStringUTF(env, out);
+}
+
 JNI_FN(jint, glesPbuffer)(JNIEnv *env, jclass cls)
 {
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
