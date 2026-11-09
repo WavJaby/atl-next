@@ -147,6 +147,7 @@ pub unsafe extern "C" fn eglQueryString(dpy: e::EGLDisplay, name: i32) -> *const
 }
 
 /// eglChooseConfig with window surfaces asked for as the host's off-screen (PBUFFER) configs, then only those [`Driver::window_format`] accepts.
+/// With EGL_CONFIG_ID the other attributes are ignored, window defaults included: ANGLE's DisplayEGL finds the native config of each surface this way.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn eglChooseConfig(
     dpy: e::EGLDisplay,
@@ -162,11 +163,16 @@ pub unsafe extern "C" fn eglChooseConfig(
         return fail(e::EGL_BAD_PARAMETER, 0);
     }
     // SAFETY: a non-null list is NONE-terminated (EGL's contract).
-    let pairs = unsafe { attrib_pairs(attribs) };
+    let mut pairs = unsafe { attrib_pairs(attribs) };
+    // EGL: with EGL_CONFIG_ID every other attribute is ignored (Mesa's eglconfig.c does the same); the window filter below would drop a 16-bit pbuffer config.
+    let by_id = pairs.iter().any(|&(k, _)| k == e::EGL_CONFIG_ID);
+    if by_id {
+        pairs.retain(|&(k, _)| k == e::EGL_CONFIG_ID);
+    }
     let mut host_attribs = Vec::with_capacity(pairs.len() * 2 + 3);
     // EGL's default EGL_SURFACE_TYPE is EGL_WINDOW_BIT
-    let mut window = true;
-    let mut typed = false;
+    let mut window = !by_id;
+    let mut typed = by_id;
     for (k, v) in pairs {
         match k {
             e::EGL_RECORDABLE_ANDROID
