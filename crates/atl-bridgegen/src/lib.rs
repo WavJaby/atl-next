@@ -14,6 +14,7 @@ pub mod aarch64;
 pub mod buildscript;
 pub mod c;
 pub mod converter;
+pub mod engine_abi;
 pub mod front;
 pub mod ir;
 pub mod report;

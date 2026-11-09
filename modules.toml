@@ -200,7 +200,13 @@ uses = ["generators", "android-paths", "cpu-pressure", "qemu-engine"]
 [qemu-engine]
 crates = ["atl-qemu-engine"]
 exports = ["atl-qemu-engine"]
-uses = ["generators"]
+uses = ["generators", "engine-api"]
+
+# the engine C ABI (QEMU bridge plan Q5-1a): include/atl_engine.h and its Rust mirror, the table the engine `.so` exports as atl_engine_v1; no code of its own
+[engine-api]
+crates = ["atl-engine-api"]
+exports = ["atl-engine-api"]
+uses = []
 
 [generators]
 crates = ["atl-bridgegen"]

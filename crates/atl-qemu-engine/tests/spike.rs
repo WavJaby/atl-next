@@ -841,8 +841,135 @@ mod spike {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--engine-so") {
+        #[cfg(feature = "qemu")]
+        engine_so::main();
+        return;
+    }
     #[cfg(feature = "qemu")]
     spike::main();
     #[cfg(not(feature = "qemu"))]
     println!("spike: SKIP (feature qemu off)");
+}
+
+/// Gate (q), the engine `.so` through its C ABI (QEMU bridge plan Q5-1a), in a process of its own: dlopen the library, refuse it unless its table speaks the host's major and fits its size, resolve the TLS exports, create the engine on the boot executable, and read the auxv QEMU built for it at BOOT. Its AT_ENTRY must equal `ATL_ENGINE_ENTRY` (xtask: llvm-readelf's e_entry of that executable).
+/// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
+#[cfg(feature = "qemu")]
+mod engine_so {
+    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use atl_engine_api::{ABI_MAJOR, ABI_MINOR, AtlEngine, AtlEngineV1, AtlHostV1, TrapKind};
+
+    /// The auxv pointer BOOT delivered (x0), written by the host trap on the boot helper.
+    static AUXV: AtomicU64 = AtomicU64::new(0);
+
+    /// The host's trap: BOOT records x0; nothing else is expected in this gate.
+    unsafe extern "C" fn trap(_ctx: *mut c_void, kind: u32, _id: u32, regs: *const u64) -> u64 {
+        if kind == TrapKind::Boot as u32 {
+            // SAFETY: regs points at the eight registers the ABI passes (atl_engine.h).
+            AUXV.store(unsafe { *regs }, Ordering::SeqCst);
+        }
+        0
+    }
+
+    fn env(name: &str) -> Result<String, String> {
+        std::env::var(name).map_err(|_| format!("{name} unset"))
+    }
+
+    fn dlsym_in(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
+        // SAFETY: handle is a dlopen handle that is never closed; name is NUL-terminated.
+        let p = unsafe { libc::dlsym(handle, name.as_ptr()) };
+        if p.is_null() {
+            Err(format!("dlsym {}: not exported", name.to_string_lossy()))
+        } else {
+            Ok(p)
+        }
+    }
+
+    /// AT_ENTRY from the auxv at `auxv` (identity addresses: the host address is the guest's).
+    fn at_entry(auxv: u64) -> Result<u64, String> {
+        let mut p = auxv as *const u64;
+        loop {
+            // SAFETY: auxv is QEMU's (type, value) array for the boot executable, ended by AT_NULL; its stack stays mapped (the boot thread is parked in BOOT).
+            let (t, v) = unsafe { (*p, *p.add(1)) };
+            if t == libc::AT_NULL as u64 {
+                return Err("auxv has no AT_ENTRY".to_owned());
+            }
+            if t == libc::AT_ENTRY as u64 {
+                return Ok(v);
+            }
+            // SAFETY: as above; the next pair is inside the array, which AT_NULL ends.
+            p = unsafe { p.add(2) };
+        }
+    }
+
+    fn run() -> Result<(), String> {
+        let so = CString::new(env("ATL_ENGINE_SO")?).map_err(|e| e.to_string())?;
+        let boot = CString::new(env("ATL_ENGINE_BOOT")?).map_err(|e| e.to_string())?;
+        let want = u64::from_str_radix(env("ATL_ENGINE_ENTRY")?.trim_start_matches("0x"), 16)
+            .map_err(|e| e.to_string())?;
+        // SAFETY: so is NUL-terminated; RTLD_LOCAL keeps the library's symbols out of the global scope.
+        let handle = unsafe { libc::dlopen(so.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if handle.is_null() {
+            return Err("dlopen the engine library failed".to_owned());
+        }
+        let table = dlsym_in(handle, c"atl_engine_v1")?.cast::<AtlEngineV1>();
+        // SAFETY: the table is a static of the loaded library, read-only.
+        let table = unsafe { &*table };
+        if table.major != ABI_MAJOR || (table.size as usize) < std::mem::size_of::<AtlEngineV1>() {
+            return Err(format!(
+                "engine ABI major {} size {}: this host speaks major {ABI_MAJOR} minor {ABI_MINOR} (size {}), refused",
+                table.major,
+                table.size,
+                std::mem::size_of::<AtlEngineV1>()
+            ));
+        }
+        for tls in [c"thread_cpu", c"helper_retaddr"] {
+            dlsym_in(handle, tls)?;
+        }
+        let host = AtlHostV1 {
+            major: ABI_MAJOR,
+            minor: ABI_MINOR,
+            size: std::mem::size_of::<AtlHostV1>() as u32,
+            ctx: std::ptr::null_mut(),
+            trap: Some(trap),
+        };
+        let mut argv: Vec<CString> = ["qemu-aarch64", "-B", "0"]
+            .iter()
+            .map(|a| CString::new(*a).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        argv.push(boot);
+        let argc = i32::try_from(argv.len()).map_err(|e| e.to_string())?;
+        let mut ptrs: Vec<*mut c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
+        ptrs.push(std::ptr::null_mut());
+        let mut engine: *mut AtlEngine = std::ptr::null_mut();
+        let create = table.create.ok_or("engine table has no create")?;
+        // SAFETY: host, argv (NULL-terminated, argc entries) and out outlive the call; the ABI's create.
+        let rc = unsafe { create(&host, argc, ptrs.as_mut_ptr(), &mut engine) };
+        if rc != 0 {
+            return Err(format!("create returned {rc}"));
+        }
+        let auxv = AUXV.load(Ordering::SeqCst);
+        if auxv == 0 {
+            return Err("create returned without BOOT".to_owned());
+        }
+        let entry = at_entry(auxv)?;
+        if entry != want {
+            return Err(format!(
+                "AT_ENTRY {entry:#x} != llvm-readelf e_entry {want:#x}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn main() {
+        match run() {
+            Ok(()) => println!("spike: (q) ok"),
+            Err(e) => {
+                println!("spike: FAIL (q) {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }

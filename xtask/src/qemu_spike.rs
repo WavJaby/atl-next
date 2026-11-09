@@ -8,11 +8,12 @@
 //! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `no-access-ok` relinks with the pin's `uaccess.c` and `qemu.h` (upstream access_ok: gate (o) red); `whole-range` relinks with access_ok as one range, before the page walk (gate (p) red);`guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_bridgegen::aarch64;
+use atl_bridgegen::{aarch64, engine_abi};
 use atl_layout::Layout;
 use object::{Object, ObjectSection, ObjectSymbol};
 
@@ -24,6 +25,12 @@ use crate::sources;
 use crate::verdict::{Failure, Verdict};
 
 const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
+/// The Q4-4 boot executable (BOOT with its auxv in x0): the engine `.so` gate boots it through the C ABI.
+const BOOT_SRC: &str = "xtask/testdata/qemu-linker/boot.c";
+/// The engine `.so`'s file name per arch (`libatl_engine_arm64.so`, plan Q5-1a).
+fn engine_name(arch: &str) -> String {
+    format!("libatl_engine_{arch}.so")
+}
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
@@ -320,6 +327,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .filter(|r| !args.no_breaks || r.red.is_none())
         .collect();
     let mut fails = Vec::new();
+    engine_so(root, &b, &dir, args.no_breaks, &mut fails)?;
     if let Err(e) = check_pool(&plain) {
         fails.push(Failure::step("pool", format!("{e:#}")));
     }
@@ -371,6 +379,16 @@ fn link_words(b: &Build) -> Result<Vec<String>> {
 
 /// Links the PIC build's objects into `so`, `replace` = (object, substitute) swapped in.
 pub(crate) fn link(b: &Build, so: &Path, replace: Option<(&str, &Path)>) -> Result<PathBuf> {
+    link_with(b, so, replace, &[])
+}
+
+/// [`link`] with `extra` words after the objects (the engine `.so`'s archive, version script and libraries).
+fn link_with(
+    b: &Build,
+    so: &Path,
+    replace: Option<(&str, &Path)>,
+    extra: &[String],
+) -> Result<PathBuf> {
     let words = link_words(b)?;
     let mut cmd = Command::new(&words[0]);
     let mut it = words[1..].iter();
@@ -404,7 +422,8 @@ pub(crate) fn link(b: &Build, so: &Path, replace: Option<(&str, &Path)>) -> Resu
         "{:?}: not in the link line",
         replace.map(|r| r.0)
     );
-    cmd.arg("-Wl,--defsym=atl_qemu_user_main=main")
+    cmd.args(extra)
+        .arg("-Wl,--defsym=atl_qemu_user_main=main")
         .current_dir(b.build_dir());
     let log = so.with_extension("link.log");
     let out = cmd.output().context("linking the spike library")?;
@@ -599,6 +618,228 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
         src.join("sigchain.cc").display()
     );
     Ok(obj)
+}
+
+/// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine_v1` and the TLS exports.
+/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable and its AT_ENTRY equals llvm-readelf's e_entry. Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red).
+fn engine_so(
+    root: &Path,
+    b: &Build,
+    dir: &Path,
+    no_breaks: bool,
+    fails: &mut Vec<Failure>,
+) -> Result<()> {
+    let out = dir.join("engine");
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    let boot = boot_fixture(root, b, &out)?;
+    let entry = llvm_entry(&boot)?;
+    let expected: BTreeSet<String> = std::iter::once(engine_abi::TABLE)
+        .chain(engine_abi::TLS_EXPORTS.iter().copied())
+        .map(str::to_owned)
+        .collect();
+    let staticlib = engine_staticlib(root, b, &out, "plain", None)?;
+    let so = engine_link(
+        b,
+        &staticlib,
+        &out,
+        &engine_name(&b.arch),
+        engine_abi::TLS_EXPORTS,
+    )?;
+    if let Err(e) = exports_gate(&so, &expected) {
+        fails.push(Failure::step("engine-so exports", format!("{e:#}")));
+    }
+    if let Err(e) = boot_gate(root, b, &out, "plain", &so, &boot, entry) {
+        fails.push(Failure::step("engine-so boot", format!("{e:#}")));
+    }
+    if no_breaks {
+        return Ok(());
+    }
+    let short = engine_link(
+        b,
+        &staticlib,
+        &out,
+        "drop-tls.so",
+        &engine_abi::TLS_EXPORTS[1..],
+    )?;
+    if exports_gate(&short, &expected).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break drop-tls",
+            "exports gate green without thread_cpu".to_owned(),
+        ));
+    }
+    let next = engine_staticlib(root, b, &out, "major-next", Some("abi-major-next"))?;
+    let refused = engine_link(b, &next, &out, "major-next.so", engine_abi::TLS_EXPORTS)?;
+    if boot_gate(root, b, &out, "major-next", &refused, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break abi-major-next",
+            "the host accepted a table at major + 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The engine's staticlib (`libatl_qemu_engine.a`) built with feature `engine-so`; `brk` selects a break's cfg. Copied to `out` under `tag`, so later builds do not overwrite it.
+fn engine_staticlib(
+    root: &Path,
+    b: &Build,
+    out: &Path,
+    tag: &str,
+    brk: Option<&str>,
+) -> Result<PathBuf> {
+    let target = out.join("cargo-so");
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.args([
+        "rustc",
+        "--locked",
+        "-p",
+        PACKAGE,
+        "--features",
+        "qemu,engine-so",
+        "--lib",
+        "--crate-type",
+        "staticlib",
+        "--target-dir",
+    ])
+    .arg(&target)
+    .env("ATL_QEMU_BUILD", b.build_dir())
+    .current_dir(root);
+    match brk {
+        Some(x) => cmd.env("ATL_QEMU_ENGINE_BREAK", x),
+        None => cmd.env_remove("ATL_QEMU_ENGINE_BREAK"),
+    };
+    let o = cmd
+        .output()
+        .context("running cargo rustc (engine staticlib)")?;
+    let log = out.join(format!("staticlib-{tag}.log"));
+    std::fs::write(&log, [o.stdout.as_slice(), o.stderr.as_slice()].concat())?;
+    ensure!(
+        o.status.success(),
+        "engine staticlib ({tag}) failed, log {}",
+        log.display()
+    );
+    let kept = out.join(format!("libatl_qemu_engine-{tag}.a"));
+    std::fs::copy(target.join("debug/libatl_qemu_engine.a"), &kept)
+        .with_context(|| format!("keeping {}", kept.display()))?;
+    Ok(kept)
+}
+
+/// Links the PIC build's objects with `staticlib` into `out/name`, exporting `atl_engine_v1` and `exports` only (the version script is written beside it). `-u` keeps the table and the P1 hook in the link: QEMU's object sees the hook as weak until the archive member is pulled.
+fn engine_link(
+    b: &Build,
+    staticlib: &Path,
+    out: &Path,
+    name: &str,
+    exports: &[&str],
+) -> Result<PathBuf> {
+    let map = out.join(format!("{name}.map"));
+    std::fs::write(&map, engine_abi::version_script(exports))
+        .with_context(|| format!("writing {}", map.display()))?;
+    let mut extra = vec![
+        "-Wl,-u,atl_engine_v1".to_owned(),
+        "-Wl,-u,atl_svc_hook".to_owned(),
+        format!("-Wl,--version-script={}", map.display()),
+        staticlib.display().to_string(),
+    ];
+    // the Rust standard library's native dependencies (`rustc --print native-static-libs` on linux-gnu)
+    extra.extend(["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl"].map(str::to_owned));
+    link_with(b, &out.join(name), None, &extra)
+}
+
+/// The nm gate: the library's defined dynamic symbols are exactly `expected`.
+fn exports_gate(so: &Path, expected: &BTreeSet<String>) -> Result<()> {
+    let data = std::fs::read(so).with_context(|| format!("reading {}", so.display()))?;
+    let file = object::File::parse(&*data).with_context(|| format!("parsing {}", so.display()))?;
+    let mut got = BTreeSet::new();
+    for sym in file.dynamic_symbols() {
+        if !sym.is_undefined() {
+            got.insert(sym.name().context("dynamic symbol name")?.to_owned());
+        }
+    }
+    ensure!(
+        &got == expected,
+        "defined dynamic symbols {got:?}, expected {expected:?}"
+    );
+    Ok(())
+}
+
+/// The Q4-4 boot executable, NDK-built static as the other fixtures.
+fn boot_fixture(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
+    let ndk = jni_fixture::default_ndk(root)?;
+    let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
+    let bin = out.join("boot");
+    let status = target
+        .cmd("clang")
+        .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
+        .arg(&bin)
+        .arg(root.join(BOOT_SRC))
+        .status()
+        .context("running the NDK clang")?;
+    ensure!(status.success(), "NDK clang failed on {BOOT_SRC}");
+    Ok(bin)
+}
+
+/// e_entry as `llvm-readelf -h` prints it: the expected value, read without the engine.
+fn llvm_entry(bin: &Path) -> Result<u64> {
+    let out = Command::new("llvm-readelf")
+        .arg("-h")
+        .arg(bin)
+        .output()
+        .context("running llvm-readelf")?;
+    ensure!(
+        out.status.success(),
+        "llvm-readelf -h {} failed",
+        bin.display()
+    );
+    let text = String::from_utf8(out.stdout)?;
+    let hex = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Entry point address:"))
+        .map(str::trim)
+        .context("llvm-readelf: no `Entry point address` line")?;
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16).with_context(|| format!("entry {hex}"))
+}
+
+/// The boot gate: the spike harness in its own process (`--engine-so`) loads `so` through the C ABI and boots `boot`; its AT_ENTRY must be `entry`.
+fn boot_gate(
+    root: &Path,
+    b: &Build,
+    out: &Path,
+    tag: &str,
+    so: &Path,
+    boot: &Path,
+    entry: u64,
+) -> Result<()> {
+    let o = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            PACKAGE,
+            "--features",
+            "qemu",
+            "--test",
+            "spike",
+            "--target-dir",
+        ])
+        .arg(out.join("cargo"))
+        .args(["--", "--engine-so"])
+        .env("ATL_QEMU_BUILD", b.build_dir())
+        .env("ATL_ENGINE_SO", so)
+        .env("ATL_ENGINE_BOOT", boot)
+        .env("ATL_ENGINE_ENTRY", format!("{entry:#x}"))
+        .current_dir(root)
+        .output()
+        .context("running cargo test --test spike --engine-so")?;
+    let log = out.join(format!("boot-{tag}.log"));
+    std::fs::write(&log, [o.stdout.as_slice(), o.stderr.as_slice()].concat())?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    ensure!(
+        o.status.success() && text.lines().any(|l| l == "spike: (q) ok"),
+        "engine boot gate ({tag}) not ok ({}), log {}",
+        o.status,
+        log.display()
+    );
+    Ok(())
 }
 
 /// One harness run; Ok when it ends as `spec` says.

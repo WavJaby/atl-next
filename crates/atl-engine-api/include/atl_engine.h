@@ -1,0 +1,57 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * The engine C ABI. The engine `.so` (libatl_engine_<arch>.so) exports one table, atl_engine_v1, through its version script (atl_bridgegen::engine_abi::version_script), plus the TLS names the engine reads with dlsym (thread_cpu, helper_retaddr). The Rust mirror is crates/atl-engine-api/src/lib.rs; atl-qemu-engine's build script checks every layout and value here through clang.
+ * Host: refuses an engine whose major differs from its own, or whose size is below atl_engine_v1's size as the host knows it. Minor versions only append fields.
+ * One engine per process: create once. The booted engine lives until the process ends (QEMU's main never returns), so destroy has nothing to free.
+ * Threads: create, map and destroy run on any thread. attach gives the calling thread its CPU; call and detach take that CPU and must run on the thread that attached it.
+ * Errors: 0 or -errno: -EINVAL (bad argument or state), -EEXIST (second create), -EIO (boot or mapping failed). A call on a bad engine or CPU aborts the process.
+ */
+#ifndef ATL_ENGINE_H
+#define ATL_ENGINE_H
+
+#include <stdint.h>
+
+#define ATL_ENGINE_ABI_MAJOR 1
+#define ATL_ENGINE_ABI_MINOR 0
+
+/* Page protection, QEMU's page flags (include/exec/page-protection.h). */
+#define ATL_PROT_READ 0x1u
+#define ATL_PROT_WRITE 0x2u
+#define ATL_PROT_EXEC 0x4u
+
+enum atl_trap_kind {
+    /* regs[0] = auxv (x0), regs[1] = return stub (x1); the answer is the boot executable's exit status. */
+    ATL_TRAP_BOOT = 0,
+    /* A host call (svc #CALL): regs[0..7] = x0..x7; the answer is x0. */
+    ATL_TRAP_CALL = 1,
+    /* A binding thunk: id = its slot; regs[0..7] = x0..x7; the answer is x0. */
+    ATL_TRAP_BIND = 2,
+    /* A value reported for a gate: regs[0] = x0; the answer is ignored. */
+    ATL_TRAP_REPORT = 3,
+};
+
+typedef struct atl_engine atl_engine; /* opaque, one per process */
+typedef struct atl_cpu atl_cpu;       /* opaque, one per attached host thread */
+
+typedef struct atl_host_v1 {
+    uint32_t major, minor, size;
+    void *ctx;
+    /* Called on the guest's thread, inside the trap; may call back into the engine (create published the handle before BOOT). */
+    uint64_t (*trap)(void *ctx, uint32_t kind, uint32_t id, const uint64_t regs[8]);
+} atl_host_v1;
+
+typedef struct atl_engine_v1 {
+    uint32_t major, minor, size;
+    /* argv as for the QEMU command line (argv[0] = "qemu-aarch64"): a static guest executable, boot CPU runs QEMU's main on a helper thread. *out is written before QEMU runs; returns after BOOT. */
+    int (*create)(const atl_host_v1 *host, int argc, char *const argv[], atl_engine **out);
+    void (*destroy)(atl_engine *engine);
+    /* Marks [start, start + len) as guest-mapped with prot (identity addresses: guest = host). */
+    int (*map)(atl_engine *engine, uint64_t start, uint64_t len, uint32_t prot);
+    /* Gives the calling thread its guest CPU (a copy of the boot CPU, as clone makes one). */
+    int (*attach)(atl_engine *engine, atl_cpu **out);
+    void (*detach)(atl_engine *engine, atl_cpu *cpu);
+    /* Runs guest f(args...) on cpu; *tp is the thread pointer in and out; returns x0. */
+    uint64_t (*call)(atl_engine *engine, atl_cpu *cpu, uint64_t *tp, uint64_t f, const uint64_t args[4]);
+} atl_engine_v1;
+
+#endif /* ATL_ENGINE_H */

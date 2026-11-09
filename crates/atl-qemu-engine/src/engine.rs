@@ -4,6 +4,7 @@
 #[cfg(atl_qe_ret_stub_local)]
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+#[cfg(not(feature = "engine-so"))]
 use std::path::Path;
 #[cfg(not(atl_qe_ret_stub_local))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +63,7 @@ pub(crate) struct Lib {
     pub(crate) mmap_unlock: MmapLockFn,
     /// What a host-attached CPU needs from linux-user (attach.rs).
     pub(crate) thread: crate::attach::Api,
-    /// dlopen handle, for the per-thread symbols resolved later (`helper_retaddr`, `thread_cpu`).
+    /// Handle of the QEMU library (the spike's, or this engine `.so`): `helper_retaddr` and `thread_cpu` are dlsym'd on it later.
     pub(crate) handle: usize,
     pub(crate) on_trap: OnTrap,
 }
@@ -103,15 +104,107 @@ fn set_ret_stub(addr: u64) {
     RET_STUB.with(|s| s.set(addr));
 }
 
-/// dlsym of `name` in `handle`, or the dlerror text.
+/// QEMU's symbol `name` in the library behind `handle`: dlsym in the spike's library (rlib build), the linked address in the engine `.so` ([`linked`]). The TLS names are dlsym'd on `handle` in both builds.
+#[cfg(not(feature = "engine-so"))]
 pub(crate) fn sym(handle: usize, name: &CStr) -> Result<*mut c_void, String> {
-    // SAFETY: handle came from dlopen and is never closed; name is NUL-terminated.
+    dlsym(handle, name)
+}
+
+#[cfg(feature = "engine-so")]
+pub(crate) fn sym(handle: usize, name: &CStr) -> Result<*mut c_void, String> {
+    if name == c"thread_cpu" || name == c"helper_retaddr" {
+        return dlsym(handle, name);
+    }
+    linked(name.to_bytes())
+        .ok_or_else(|| format!("{}: not linked into the engine", name.to_string_lossy()))
+}
+
+/// dlsym of `name` in `handle`, or the dlerror text.
+fn dlsym(handle: usize, name: &CStr) -> Result<*mut c_void, String> {
+    // SAFETY: handle came from dlopen (or dladdr + RTLD_NOLOAD) and is never closed; name is NUL-terminated.
     let p = unsafe { libc::dlsym(handle as *mut c_void, name.as_ptr()) };
     if p.is_null() {
         Err(format!("{}: {}", name.to_string_lossy(), dlerror()))
     } else {
         Ok(p)
     }
+}
+
+/// QEMU's symbols as the engine `.so` links them. The version script keeps them local, so dlsym cannot find them; the link resolves them. The declared types are placeholders: only addresses are taken, and the users cast them to their C prototypes (`Lib`, attach.rs `Api`).
+#[cfg(feature = "engine-so")]
+mod linked_syms {
+    unsafe extern "C" {
+        pub(super) fn atl_qemu_user_main();
+        pub(super) fn cpu_loop();
+        pub(super) fn in_code_gen_buffer();
+        pub(super) fn page_get_flags();
+        pub(super) fn page_set_flags();
+        pub(super) fn mmap_lock();
+        pub(super) fn mmap_unlock();
+        pub(super) fn cpu_copy();
+        pub(super) fn init_task_state();
+        pub(super) fn task_settid();
+        pub(super) fn rcu_register_thread();
+        pub(super) fn rcu_unregister_thread();
+        pub(super) fn tcg_register_thread();
+        pub(super) fn object_unparent();
+        pub(super) fn object_unref();
+        pub(super) fn tcg_cflags_has();
+        pub(super) fn tcg_cflags_set();
+        pub(super) fn tb_flush__exclusive_or_serial();
+        pub(super) static tcg_splitwx_diff: isize;
+        pub(super) static guest_base: usize;
+        pub(super) static guest_addr_max: usize;
+    }
+}
+
+/// The address of a linked QEMU symbol, or None for a name the engine does not link.
+#[cfg(feature = "engine-so")]
+fn linked(name: &[u8]) -> Option<*mut c_void> {
+    use linked_syms as s;
+    let p: *const () = match name {
+        b"atl_qemu_user_main" => s::atl_qemu_user_main as *const (),
+        b"cpu_loop" => s::cpu_loop as *const (),
+        b"in_code_gen_buffer" => s::in_code_gen_buffer as *const (),
+        b"page_get_flags" => s::page_get_flags as *const (),
+        b"page_set_flags" => s::page_set_flags as *const (),
+        b"mmap_lock" => s::mmap_lock as *const (),
+        b"mmap_unlock" => s::mmap_unlock as *const (),
+        b"cpu_copy" => s::cpu_copy as *const (),
+        b"init_task_state" => s::init_task_state as *const (),
+        b"task_settid" => s::task_settid as *const (),
+        b"rcu_register_thread" => s::rcu_register_thread as *const (),
+        b"rcu_unregister_thread" => s::rcu_unregister_thread as *const (),
+        b"tcg_register_thread" => s::tcg_register_thread as *const (),
+        b"object_unparent" => s::object_unparent as *const (),
+        b"object_unref" => s::object_unref as *const (),
+        b"tcg_cflags_has" => s::tcg_cflags_has as *const (),
+        b"tcg_cflags_set" => s::tcg_cflags_set as *const (),
+        b"tb_flush__exclusive_or_serial" => s::tb_flush__exclusive_or_serial as *const (),
+        b"tcg_splitwx_diff" => return Some(&raw const s::tcg_splitwx_diff as *mut c_void),
+        b"guest_base" => return Some(&raw const s::guest_base as *mut c_void),
+        b"guest_addr_max" => return Some(&raw const s::guest_addr_max as *mut c_void),
+        _ => return None,
+    };
+    Some(p as *mut c_void)
+}
+
+/// This `.so`'s own handle: dladdr of a function here, then dlopen RTLD_NOLOAD (the object is already loaded; the handle only names it). The TLS names are dlsym'd on it.
+#[cfg(feature = "engine-so")]
+fn self_handle() -> Result<usize, String> {
+    let here = self_handle as *const () as *const c_void;
+    // SAFETY: a zeroed Dl_info is a valid out-parameter; `here` is a function of this object.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::dladdr(here, &mut info) } == 0 || info.dli_fname.is_null() {
+        return Err("engine: dladdr finds no object".to_owned());
+    }
+    // SAFETY: dli_fname is the NUL-terminated path of this loaded object; RTLD_NOLOAD loads nothing new.
+    let handle = unsafe { libc::dlopen(info.dli_fname, libc::RTLD_NOW | libc::RTLD_NOLOAD) };
+    if handle.is_null() {
+        return Err(format!("dlopen (this engine): {}", dlerror()));
+    }
+    Ok(handle as usize)
 }
 
 fn dlerror() -> String {
@@ -180,17 +273,35 @@ impl Booted {
 
 /// Boots QEMU on a helper thread: it loads `library` and runs QEMU's `main` with `argv` (argv[0] first) and this process's environment. The guest's BOOT trap runs `on_trap(Boot)` on that thread, publishes the answer, and parks the thread for good: QEMU's `main` never returns to a library caller (linux-user/main.c runs `cpu_loop` last), so this needs no QEMU change.
 /// Returns once BOOT ran, or with why the helper ended without it. Call once per process. dlopen runs on the helper too, so QEMU's constructors (RCU's thread registration) belong to the thread that runs `main`.
+#[cfg(not(feature = "engine-so"))]
 pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, String> {
     let path = CString::new(library.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    let args: Vec<CString> = argv
-        .iter()
+    let args = c_args(argv)?;
+    boot_on_helper(move || run_spike(&path, &args, on_trap))
+}
+
+/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols.
+#[cfg(feature = "engine-so")]
+pub(crate) fn start_linked(argv: &[&str], on_trap: OnTrap) -> Result<Booted, String> {
+    let args = c_args(argv)?;
+    boot_on_helper(move || run_main(self_handle()?, &args, on_trap))
+}
+
+fn c_args(argv: &[&str]) -> Result<Vec<CString>, String> {
+    argv.iter()
         .map(|a| CString::new(*a).map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
+
+/// Spawns the boot helper on `body`, then waits for BOOT (or for the helper to end without it).
+fn boot_on_helper(
+    body: impl FnOnce() -> Result<i32, String> + Send + 'static,
+) -> Result<Booted, String> {
     let helper = std::thread::Builder::new()
         .name("qemu-boot".to_owned())
         .stack_size(BOOT_STACK)
         .spawn(move || {
-            let why = match run_main(&path, &args, on_trap) {
+            let why = match body() {
                 Ok(status) => format!("QEMU main returned {status} without BOOT"),
                 Err(e) => e,
             };
@@ -231,8 +342,9 @@ pub(crate) fn boot(g: Guest) -> ! {
     }
 }
 
-/// The helper's body: dlopen `path`, resolve, run QEMU's `main`. Returns `main`'s status if it returns.
-fn run_main(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, String> {
+/// The spike's helper body: dlopen `path` (its initialisers run on this thread), then [`run_main`]. P1's hook is promoted to the global scope first ([`hook_in_global_scope`]).
+#[cfg(not(feature = "engine-so"))]
+fn run_spike(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, String> {
     hook_in_global_scope()?;
     // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to ours, which `hook_in_global_scope` put first in lookup order
     // SAFETY: path is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration).
@@ -240,7 +352,11 @@ fn run_main(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, Strin
     if handle.is_null() {
         return Err(format!("dlopen {}: {}", path.to_string_lossy(), dlerror()));
     }
-    let handle = handle as usize;
+    run_main(handle as usize, args, on_trap)
+}
+
+/// `handle` is the QEMU library (the spike's, or this engine `.so`): resolve its symbols, run QEMU's `main`. Returns `main`'s status if it returns.
+fn run_main(handle: usize, args: &[CString], on_trap: OnTrap) -> Result<i32, String> {
     let main = sym(handle, c"atl_qemu_user_main")?;
     let cpu_loop = sym(handle, c"cpu_loop")?;
     let in_cgb = sym(handle, c"in_code_gen_buffer")?;
@@ -295,6 +411,7 @@ fn run_main(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, Strin
 /// Makes P1's call in the QEMU library bind to our `atl_svc_hook`. glibc resolves a dlopened object's references in the global scope first, then its own local scope -- where QEMU's weak default comes first, and glibc ignores weak vs strong at run time.
 /// So a DT_NEEDED from the QEMU library on our object would still bind the default; the definition must be global. An executable defining it is global when it exports it (build.rs); a library loaded RTLD_LOCAL (ART dlopens the NB core so) is promoted with `RTLD_NOLOAD | RTLD_GLOBAL`.
 /// Fails closed: afterwards the global lookup (`RTLD_DEFAULT`) must answer our address, else BOOT would fall to QEMU's syscall path.
+#[cfg(not(feature = "engine-so"))]
 fn hook_in_global_scope() -> Result<(), String> {
     let ours = crate::trap::atl_svc_hook as *const () as usize;
     let global = || {

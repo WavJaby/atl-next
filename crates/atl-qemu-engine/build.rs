@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Always: `OUT_DIR/aarch64_constants.rs`, atl-bridgegen's aarch64 thunk constants (`lib.rs` `thunk`).
 //! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles `linux-user/aarch64/cpu_loop.c` with -- the file P1's hook is called from.
+//! With feature `qemu`: `OUT_DIR/engine_abi_layout.rs`, the engine C ABI's sizes, offsets and values from atl-engine-api's `atl_engine.h` (atl-bridgegen `engine_abi`); lib.rs checks the Rust mirror against them.
 //! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
 //! Breaks (`ATL_QEMU_ENGINE_BREAK=<name>[,<name>]`, [`BREAKS`]) turn a cfg on for this package only.
 
@@ -84,6 +85,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("skip-tcg", "atl_qe_skip_tcg"),
     // gate (m): the `svc #RET` stub address stays thread-local, set only on the BOOT thread
     ("ret-stub-local", "atl_qe_ret_stub_local"),
+    // gate (q, Q5-1a): the engine table says major + 1: the host refuses the library
+    ("abi-major-next", "atl_qe_abi_major_next"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -256,6 +259,13 @@ fn main() -> Result<()> {
     std::fs::write(
         out.join("qemu_layout.rs"),
         layout(&build, &out, &host.arch)?,
+    )?;
+    // the engine C ABI's facts, read from the header by clang; lib.rs checks atl-engine-api's Rust mirror against them
+    let header = manifest.join("../atl-engine-api/include/atl_engine.h");
+    println!("cargo::rerun-if-changed={}", header.display());
+    std::fs::write(
+        out.join("engine_abi_layout.rs"),
+        atl_bridgegen::engine_abi::layout_module(&header, &out, &host.arch)?,
     )?;
     // the spike harness is an executable: P1's call in the dlopened QEMU library binds to this strong definition only if it is in the dynamic symbol table
     println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
