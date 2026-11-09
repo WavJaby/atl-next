@@ -716,18 +716,13 @@ impl Host {
                 c
             }
         };
-        let mut child = cmd
+        let child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("starting the prerequisite check on {}", self.label()))?;
-        child
-            .stdin
-            .take()
-            .context("no stdin for the prerequisite script")?
-            .write_all(script.as_bytes())?;
-        let out: Output = child.wait_with_output()?;
+        let out = feed_and_wait(child, script)?;
         ensure!(
             out.status.success(),
             "prerequisite check on {} did not finish ({}): {}",
@@ -751,18 +746,13 @@ impl Host {
                 cmd.args(["sh", "-s"]);
             }
         }
-        let mut child = cmd
+        let child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("starting a call to {}", self.label()))?;
-        child
-            .stdin
-            .take()
-            .context("no stdin for the target's script")?
-            .write_all(script.as_bytes())?;
-        let out: Output = child.wait_with_output()?;
+        let out = feed_and_wait(child, script)?;
         ensure!(
             out.status.success(),
             "{} ({}): {}",
@@ -772,6 +762,23 @@ impl Host {
         );
         Ok(out.stdout)
     }
+}
+
+/// Sends `script` to `child`'s stdin and collects its output. The script is written from its own thread: `sh -s` runs it while
+/// reading it, so its stdout can fill our pipe before the whole script is sent — writing first and reading afterwards deadlocks
+/// (2026-11-09: a 376-ELF ldd check stalled ssh until its ServerAlive gave up with "server not responding").
+fn feed_and_wait(mut child: Child, script: &str) -> Result<Output> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("no stdin for the target's script")?;
+    let body = script.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&body));
+    let out = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| anyhow!("the script writer panicked"))??;
+    Ok(out)
 }
 
 fn ssh(alias: &str) -> Command {
