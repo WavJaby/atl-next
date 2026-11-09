@@ -1740,7 +1740,7 @@ mod tests {
             tag: "run-apk/app".to_owned(),
             root: "run-apk/root".to_owned(),
             scratch: "run-apk/scratch".to_owned(),
-            env: vec![("ATL_UI_CAPTURE".to_owned(), "1".to_owned())],
+            env: vec![("RUST_LOG".to_owned(), "info".to_owned())],
             program: "@BASE@/out/cargo/release/atld".to_owned(),
             args: vec!["--ui".to_owned(), "gtk".to_owned()],
             files: Vec::new(),
@@ -1765,7 +1765,7 @@ mod tests {
             ),
             "{s}"
         );
-        assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" ATL_UI_CAPTURE=\"1\" timeout -k 10 300 "), "{s}");
+        assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" RUST_LOG=\"info\" timeout -k 10 300 "), "{s}");
     }
 
     /// A run without a session has no discovery: its environment names no Wayland socket.
