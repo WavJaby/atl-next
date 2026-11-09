@@ -262,7 +262,7 @@ fn harness(
     brk: Option<&str>,
     name: &str,
 ) -> Result<()> {
-    // `timeout` kills the run's whole process group: a hung run is a failed run (exit 124)
+    // `timeout -s KILL` kills the run's whole process group and exits 137 (not 124): a hung run is a failed run either way
     let mut cmd = Command::new("timeout");
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())

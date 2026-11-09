@@ -40,8 +40,10 @@ const POOL_BYTES: u64 = POOL_SLOTS as u64 * THUNK_BYTES;
 const POOL_SKEW: u32 = 1;
 /// Per harness run. A run that outlives it hangs (the fatal path in the module doc: QEMU's `die_with_signal`, a SIGSEGV that sigchain's SIG_DFL revert does not end) and counts as failed.
 const RUN_TIMEOUT_SECS: u32 = 240;
-/// `timeout`'s exit status when it killed the command.
-const TIMEOUT_EXIT: i32 = 124;
+/// Whether `timeout` ended the command: 124 when the limit did, 137 when the `-s KILL` both harnesses pass did (timeout(1); run_apk.rs `stopped_at_limit` reads the same two).
+fn killed_at_limit(code: Option<i32>) -> bool {
+    matches!(code, Some(124 | 137))
+}
 /// The non-identity guest base of the `guest-base` break: 1 TiB, free in an x86_64 process (PIE and heap sit near 0x55.., mmap near 0x7f..) and page aligned.
 /// Not 4096: with any nonzero base QEMU also maps guest page 0 (`pgb_addr_set`), and host 4096 is below `mmap_min_addr` (65536), so QEMU refuses to start and gate (c) is never reached.
 const SHIFTED_BASE: &str = "0x10000000000";
@@ -464,7 +466,7 @@ fn harness(
     fixture: &Path,
     sigchain: &Path,
 ) -> Result<()> {
-    // `timeout` kills the run's whole process group: a hung run is a failed run (exit 124)
+    // `timeout -s KILL` kills the run's whole process group and exits 137 (not 124): see `killed_at_limit`
     let mut cmd = Command::new("timeout");
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())
@@ -497,7 +499,7 @@ fn harness(
         &log,
         [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
     )?;
-    let hung = out.status.code() == Some(TIMEOUT_EXIT);
+    let hung = killed_at_limit(out.status.code());
     if hung {
         println!(
             "qemu-spike: {} hung, killed after {RUN_TIMEOUT_SECS} s (log {})",
@@ -528,4 +530,20 @@ fn harness(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::killed_at_limit;
+
+    /// timeout(1): 124 at the limit, 137 for `-s KILL` (128 + SIGKILL 9); any other status is the command's own.
+    #[test]
+    fn timeout_kill_counts_as_hung() {
+        assert!(killed_at_limit(Some(124)));
+        assert!(killed_at_limit(Some(137)));
+        assert!(!killed_at_limit(Some(0)));
+        assert!(!killed_at_limit(Some(1)));
+        assert!(!killed_at_limit(Some(134)));
+        assert!(!killed_at_limit(None));
+    }
 }
