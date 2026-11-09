@@ -1363,8 +1363,10 @@ pub fn prereq_script(base: &str, files: &[String], dirs: &[String]) -> Result<St
         s.push_str(&sh_quote(f));
     }
     s.push_str("; do\n");
+    // only the lines `parse_prereq` reads leave the target: full `ldd` output of a bundle is ~400 KB, and on the laptop -> WSL NAT path
+    // one lost segment whose retransmits never arrive stalled that stream until ServerAlive gave up (2026-11-09, sshd Send-Q 400 KB, backoff 9); filtered it is ~15 KB
     s.push_str(
-        "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1; else echo \"!missing $f\"; fi\n",
+        "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1 | grep -e '=> not found' -e '^ldd:'; else echo \"!missing $f\"; fi\n",
     );
     // exit 0: a failing `ldd` is a finding in the output, not a failed check (`run_script` fails on any other status)
     s.push_str("done\nexit 0\n");
@@ -1524,7 +1526,7 @@ mod tests {
             "LD_LIBRARY_PATH=\"$PWD\"/'lib':\"$PWD\"/'out/device'\n",
             "export LD_LIBRARY_PATH\n",
             "for f in 'lib/libc++.so.1' 'out/device/x.so'; do\n",
-            "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1; else echo \"!missing $f\"; fi\n",
+            "if [ -f \"$f\" ]; then echo \"== $f\"; ldd \"$f\" 2>&1 | grep -e '=> not found' -e '^ldd:'; else echo \"!missing $f\"; fi\n",
             "done\n",
             "exit 0\n",
         );
@@ -1533,6 +1535,25 @@ mod tests {
         let odd = prereq_script("b", &["a@1.0;x'y.so".to_owned()], &[]).unwrap();
         assert!(odd.contains("for f in 'a@1.0;x'\\''y.so'; do"), "{odd}");
         assert!(prereq_script("b", &["a\nb".to_owned()], &[]).is_err());
+    }
+
+    #[test]
+    fn prereq_output_carries_only_parsed_lines() {
+        // resolved ldd lines must not leave the target: the full listing is what stalled the laptop link
+        let dir = temp("prereq-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy("/bin/sh", dir.join("sh")).unwrap();
+        let script = prereq_script(
+            dir.to_str().unwrap(),
+            &["sh".to_owned(), "gone.so".to_owned()],
+            &[],
+        )
+        .unwrap();
+        let out = Host::Local(PathBuf::from(".")).run_script(&script).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(out, "== sh\n!missing gone.so\n");
+        let p = parse_prereq(&out);
+        assert_eq!((p.checked, p.missing.len()), (1, 1));
     }
 
     #[test]
