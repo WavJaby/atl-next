@@ -61,6 +61,7 @@ mod mesa;
 mod modules;
 mod native;
 mod native_load;
+mod nb_identity;
 mod ndk_surface;
 mod nested_wayland;
 mod none_gate;
@@ -324,6 +325,10 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
     QemuLinker(qemu_linker::Args),
+    /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
+    ///
+    /// Needs the x86_64 NB build and `xtask test app` (it stages `app/root` and `app/jni-fixture`). Logs in `<out>/nb-identity/`.
+    NbIdentity(nb_identity::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -457,6 +462,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::QemuLinker(args),
         } => qemu_linker::run(&root, &args),
+        Command::Test {
+            test: Test::NbIdentity(args),
+        } => nb_identity::run(&root, &args),
     };
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
@@ -503,6 +511,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Qemu(_) => "qemu-gate",
             Test::QemuSpike(_) => "qemu-spike",
             Test::QemuLinker(_) => "qemu-linker",
+            Test::NbIdentity(_) => "nb-identity",
         },
         _ => return None,
     })

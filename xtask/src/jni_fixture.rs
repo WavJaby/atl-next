@@ -116,7 +116,7 @@ pub struct Built {
 }
 
 /// The NDK's llvm prebuilt dir for this build machine.
-fn toolchain(ndk: &Path) -> PathBuf {
+pub fn toolchain(ndk: &Path) -> PathBuf {
     ndk.join("toolchains/llvm/prebuilt/linux-x86_64")
 }
 
