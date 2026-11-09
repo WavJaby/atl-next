@@ -369,7 +369,7 @@ pub fn elf_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 /// `path`'s PT_INTERP and DT_NEEDED names.
-fn elf_deps(path: &Path) -> io::Result<(Option<PathBuf>, Vec<String>)> {
+pub fn elf_deps(path: &Path) -> io::Result<(Option<PathBuf>, Vec<String>)> {
     use object::read::elf::{Dyn, ElfFile64, ProgramHeader};
     let data = std::fs::read(path)?;
     let elf = ElfFile64::<object::Endianness>::parse(&*data)

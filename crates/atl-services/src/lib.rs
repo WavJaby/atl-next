@@ -55,6 +55,7 @@ pub mod connectivity;
 pub mod content;
 #[cfg(feature = "converter")]
 pub mod display;
+pub mod gl_driver;
 #[cfg(feature = "converter")]
 pub mod input;
 #[cfg(feature = "converter")]

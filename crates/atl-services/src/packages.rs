@@ -225,6 +225,9 @@ pub struct PackageRecord {
     /// The install-time grants (the host's install step, permission::install_grants): what checkPermission answers GRANTED for this uid.
     #[serde(default)]
     pub granted_permissions: Vec<String>,
+    /// The GL driver the app process gets (gl_driver.rs): the owner list, else the ES1 rule; the install step sets it.
+    #[serde(default)]
+    pub gl_driver: crate::gl_driver::GlDriver,
 }
 
 impl Deref for PackageRecord {
@@ -417,6 +420,7 @@ mod tests {
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
             granted_permissions: vec![],
+            gl_driver: crate::gl_driver::GlDriver::Native,
         }
     }
 

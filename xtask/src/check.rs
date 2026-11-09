@@ -217,6 +217,12 @@ impl Step {
                     "tables: fonts.toml ok ({} rows = AOSP's named families)",
                     fonts.rows.len()
                 );
+                // gl-drivers.toml: the owner list atld's install step and atl-services read, parsed by the same code
+                let gl = atl_services::gl_driver::owner_table(&std::fs::read_to_string(
+                    root.join("gl-drivers.toml"),
+                )?)
+                .map_err(anyhow::Error::msg)?;
+                eprintln!("tables: gl-drivers.toml ok ({} rows)", gl.len());
                 Ok(())
             }
             Step::Modules => {

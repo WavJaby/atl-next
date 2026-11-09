@@ -574,6 +574,7 @@ mod tests {
             data_dir: String::new(),
             device_protected_data_dir: String::new(),
             granted_permissions: vec![],
+            gl_driver: crate::gl_driver::GlDriver::Native,
         }
     }
 

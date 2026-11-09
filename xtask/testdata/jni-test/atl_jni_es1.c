@@ -16,17 +16,17 @@
 
 static GLubyte es1_px[ES1_W * ES1_H * 4];
 
-// 1 when the current context reports GL_VERSION "OpenGL ES-CM 1.", else 0 (no current context: 0).
+// 1 when the current context reports GLES 1.1 by GL_VERSION: "OpenGL ES-CM 1." (the common profile of a native ES1 driver) or "OpenGL ES 1.1" (ANGLE's GLES1 frontend); else 0 (no current context: 0).
 JNI_FN(jint, es1Version)(JNIEnv *env, jclass cls)
 {
     const char *v = (const char *)glGetString(GL_VERSION);
     if (v == NULL)
         return 0;
     __android_log_print(ANDROID_LOG_WARN, ES1_TAG, "version %s", v);
-    return strncmp(v, "OpenGL ES-CM 1.", 15) == 0;
+    return strncmp(v, "OpenGL ES-CM 1.", 15) == 0 || strncmp(v, "OpenGL ES 1.1", 13) == 0;
 }
 
-// 1 when /proc/self/maps names the ES1 driver libGLESv1_CM_mesa.so, 0 when not, -1 when unreadable.
+// 1 when /proc/self/maps names ANGLE's GL backend libGLESv2_angle.so (the ES1 context runs through ANGLE), 0 when not, -1 when unreadable.
 JNI_FN(jint, es1Driver)(JNIEnv *env, jclass cls)
 {
     FILE *f = fopen("/proc/self/maps", "re");
@@ -35,7 +35,7 @@ JNI_FN(jint, es1Driver)(JNIEnv *env, jclass cls)
     char line[4096];
     jint found = 0;
     while (!found && fgets(line, sizeof line, f) != NULL)
-        found = strstr(line, "libGLESv1_CM_mesa.so") != NULL;
+        found = strstr(line, "libGLESv2_angle.so") != NULL;
     fclose(f);
     return found;
 }

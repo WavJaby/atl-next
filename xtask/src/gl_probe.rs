@@ -63,6 +63,8 @@ const CLEAR: [u8; 4] = [51, 102, 204, 255];
 /// The probe's first shell argument after the library: the clear test or the ES1 scene (Probe.java dispatches on it).
 const CLEAR_MODE: &str = "clear";
 const ES1_MODE: &str = "es1";
+/// ANGLE's GL backend: mapped into an app process whose GL selection is ANGLE (gl_driver.rs), then its GLES1 renderer is "ANGLE (Mesa, <host renderer>)".
+const ANGLE_GL_LIB: &str = "libGLESv2_angle.so";
 /// The ES1 scene (mode es1), read by gl_scene.rs; its program is the probe's arguments.
 const SCENE: &str = "es1-scene.toml";
 /// The message AOSP's libEGL logs when a hook falls to the unimplemented stub (egl.cpp:177): check 3 fails on it.
@@ -410,16 +412,25 @@ fn es1(
             continue;
         }
         let version = first_line(&lines, "version ").unwrap_or("none");
+        let maps = first_line(&lines, "maps ").unwrap_or("none");
+        // the probe's own maps decide what the GLES1 context must say: through ANGLE, GL_RENDERER is "ANGLE (Mesa, <host renderer>)"
+        let angle = maps.contains(ANGLE_GL_LIB);
         let tier = expected_tier(&lines, tiers);
         let renderer = match &tier {
-            Ok(t) => judge_renderer(&lines, t.prefix),
+            Ok(t) => {
+                let want = if angle {
+                    format!("ANGLE (Mesa, {})", t.prefix)
+                } else {
+                    t.prefix.to_owned()
+                };
+                judge_renderer(&lines, &want)
+            }
             Err(e) => Err(format!("no tier to check against: {e}")),
         };
         let wrong = tier
             .as_ref()
             .ok()
             .and_then(|t| other_tier_match(&lines, &t.gallium));
-        let maps = first_line(&lines, "maps ").unwrap_or("none");
         let unimplemented = log.contains(UNIMPLEMENTED);
         let dl = dladdr(&lines);
         let dl_ok = scene.names().iter().all(|n| {
@@ -429,7 +440,8 @@ fn es1(
         let checks: [(&str, bool, String); 8] = [
             (
                 "1 version",
-                version.starts_with("OpenGL ES-CM 1."),
+                version.starts_with("OpenGL ES-CM 1.")
+                    || (angle && version.starts_with("OpenGL ES 1.1")),
                 version.to_owned(),
             ),
             (

@@ -197,6 +197,7 @@ pub fn stage(
         data_dir: format!("{DATA_USER}/0/{APP}"),
         device_protected_data_dir: format!("{DATA_USER_DE}/0/{APP}"),
         granted_permissions: vec![],
+        gl_driver: atl_services::gl_driver::GlDriver::Native,
     };
     let packages_file = test_root.join("packages.json");
     std::fs::write(&packages_file, serde_json::to_vec_pretty(&[&record])?)?;

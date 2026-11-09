@@ -106,10 +106,10 @@ public final class AtlJniTest {
         return ok;
     }
 
-    /** GL_VERSION of the current context starts "OpenGL ES-CM 1.": 1 when so, 0 when not, 0 with no current context (atl_jni_es1.c). */
+    /** GL_VERSION of the current context starts "OpenGL ES-CM 1." or "OpenGL ES 1.1" (ANGLE): 1 when so, 0 when not, 0 with no current context (atl_jni_es1.c). */
     public static native int es1Version();
 
-    /** After es1Begin: 1 when /proc/self/maps names libGLESv1_CM_mesa.so, 0 when not, -1 when unreadable (atl_jni_es1.c). */
+    /** After es1Begin: 1 when /proc/self/maps names ANGLE's libGLESv2_angle.so, 0 when not, -1 when unreadable (atl_jni_es1.c). */
     public static native int es1Driver();
 
     /** The scene (es1-scene.toml, through es1_scene.inc) on the current context: 1 when no GL error came back. Its rows are logged as `row <y> <hex>`, and app.rs judges them (atl_jni_es1.c). */

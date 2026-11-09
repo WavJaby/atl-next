@@ -59,6 +59,9 @@ pub struct Args {
     /// The media player break: the app starts with `--no-media-player-service` (atld, then the launcher), so the view answers no media.player; the probe's lookup is never answered and its line reads "no answer", so the gate must go red.
     #[arg(long)]
     media_player_break: bool,
+    /// The GL selection break: packages install with the native GL driver (atld `--no-gl-selection`), so the ES1 scene's EGL10 context cannot be made and the es1 lines must go red.
+    #[arg(long)]
+    gl_selection_break: bool,
     /// The result break: the services owe no start its result (atld `--no-activity-result`), so Main's startActivityForResult answers never arrive and the result lines must go red.
     #[arg(long)]
     result_break: bool,
@@ -454,6 +457,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .fold(rt, |rt, s| rt.without_service(s));
     let rt = if args.media_player_break {
         rt.without_media_player_service()
+    } else {
+        rt
+    };
+    let rt = if args.gl_selection_break {
+        rt.without_gl_selection()
     } else {
         rt
     };

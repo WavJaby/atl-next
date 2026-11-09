@@ -25,6 +25,8 @@ use crate::{manifest, packages, remote, slot, tree};
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// AOSP Loader.cpp `load_wrapper`'s libraries: the GL fronts the converter builds.
 const GL_FRONTS: [&str; 4] = ["libEGL", "libGLESv1_CM", "libGLESv2", "libGLESv3"];
+/// ANGLE's three libraries: AOSP's Loader dlopens them by name in the default namespace when an app's GL selection is ANGLE (Loader.cpp `load_angle`), so they are placed beside the fronts.
+const ANGLE_FRONTS: [&str; 3] = ["libEGL_angle", "libGLESv1_CM_angle", "libGLESv2_angle"];
 
 /// The native goals (= module names) of the GL fronts: what `with_gl_driver` places and the `gl-proxies` check reads.
 pub fn gl_front_goals() -> &'static [&'static str] {
@@ -74,6 +76,7 @@ const NDK_HOST_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
 /// and the host LLVM that Mesa's llvmpipe JITs through (llvm_host.rs): every gate whose native build builds Mesa declares it here, once.
 pub fn gralloc_goals() -> Goals {
     Goals::host(&GL_FRONTS)
+        .with(Goals::host(&ANGLE_FRONTS))
         .with(Goals::host(&[
             "android.hardware.graphics.allocator-V2-rust",
         ]))
@@ -234,6 +237,8 @@ pub struct Runtime {
     audio_break_cblk: bool,
     /// Apps serve media.player unless this is cleared (`--no-media-player-service`, the media player gate's break).
     media_player_service: bool,
+    /// Packages take their GL driver from the owner list and the ES1 rule unless this is cleared (`--no-gl-selection`, the GL selection gate's break).
+    gl_selection: bool,
     /// Apps' AudioFlinger mixes silence when this is set (`--break-mix`, the audio gate's third break).
     audio_break_mix: bool,
     /// atld's `PIPEWIRE_REMOTE` (the desktop's server socket, which atld grants the apps) when set: a stale socket file makes an unreachable server (audio_app.rs `--unreachable`).
@@ -592,6 +597,7 @@ impl Runtime {
             audio_service: true,
             audio_break_cblk: false,
             media_player_service: true,
+            gl_selection: true,
             audio_break_mix: false,
             pipewire_remote: None,
             wayland: None,
@@ -633,7 +639,7 @@ impl Runtime {
     pub fn with_gl_driver(mut self, root: &Path) -> Result<Self> {
         let mut files = crate::egl_driver::placement(root, &self.out)?;
         let system_lib = atl_android_paths::SYSTEM_LIB;
-        for m in gl_front_goals() {
+        for &m in gl_front_goals().iter().chain(ANGLE_FRONTS.iter()) {
             let lib = gl_front(&self.out, m);
             ensure!(
                 lib.is_file(),
@@ -760,6 +766,12 @@ impl Runtime {
     /// Apps start with `--no-media-player-service`: they serve no media.player (app.rs `--media-player-break`, test only).
     pub fn without_media_player_service(mut self) -> Self {
         self.media_player_service = false;
+        self
+    }
+
+    /// Packages install with the native GL driver: no owner row, no ES1 rule (app.rs `--gl-selection-break`, test only).
+    pub fn without_gl_selection(mut self) -> Self {
+        self.gl_selection = false;
         self
     }
 
@@ -1234,6 +1246,9 @@ impl Runtime {
         }
         if !self.media_player_service {
             cmd.arg("--no-media-player-service");
+        }
+        if !self.gl_selection {
+            cmd.arg("--no-gl-selection");
         }
         if self.audio_break_mix {
             cmd.arg("--break-mix");

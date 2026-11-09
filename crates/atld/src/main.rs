@@ -34,6 +34,7 @@ use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
 use atl_services::compositor_registry;
 use atl_services::display_model::DisplayModel;
+use atl_services::gl_driver;
 use atl_services::native_libs::{self, SupportedAbi};
 use atl_services::packages::{Library, Manifest, PackageRecord, PermissionDecl};
 use clap::Parser;
@@ -184,6 +185,9 @@ struct Args {
     /// Test only: apps start with `--no-media-player-service` (their launcher serves no media.player), the deliberate break of the media player gate.
     #[arg(long)]
     no_media_player_service: bool,
+    /// Test only: every package installs with the native GL driver (no owner row, no ES1 rule), the GL selection gate's break.
+    #[arg(long)]
+    no_gl_selection: bool,
     /// Test only: apps start with `--break-mix` (their AudioFlinger's mixer plays silence), the audio gate's third break.
     #[arg(long)]
     break_mix: bool,
@@ -412,6 +416,26 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((PathBuf::from(host), rel.to_path_buf()))
 }
 
+/// Whether a native library under `lib/<isa>/` DT_NEEDs [`gl_driver::ES1_LIB`]: the install-time ES1 rule (an ES1 app links it, or a JNI fixture of one does).
+fn needs_es1(lib: &Path) -> Result<bool> {
+    if !lib.is_dir() {
+        return Ok(false);
+    }
+    for isa in std::fs::read_dir(lib)? {
+        for entry in std::fs::read_dir(isa?.path())? {
+            let so = entry?.path();
+            if so.extension().is_some_and(|e| e == "so") {
+                let (_, needed) = atl_broker::elf_deps(&so)
+                    .with_context(|| format!("reading {}", so.display()))?;
+                if needed.iter().any(|n| n == gl_driver::ES1_LIB) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The install step, until the package manager installs from a real APK (the installer process: AOSP ParsingPackageUtils on ART, plan 4b): for each package its uid, `/data/app/<package>/base.apk` (the APK copied), its
 /// native libraries (`lib/<isa>/`, [`native_libs::extract`]), credential- and device-protected data directories, and ART's dalvik-cache; the records the services read.
 fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
@@ -421,6 +445,7 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
         a.first_uid
     );
     std::fs::create_dir_all(r.data().join("dalvik-cache"))?;
+    let owner = gl_driver::owner_table(gl_driver::OWNER_TABLE).map_err(anyhow::Error::msg)?;
     let mut records = Vec::new();
     for (i, file) in a.packages.iter().enumerate() {
         let text =
@@ -451,7 +476,14 @@ fn install(a: &Args, r: &Root) -> Result<Vec<PackageRecord>> {
             &format!("{DATA}/{app}"),
             &source.abis,
         )?;
+        let gl = if a.no_gl_selection {
+            gl_driver::GlDriver::Native
+        } else {
+            let needs = needs_es1(&r.data().join(&app).join(native_libs::LIB_DIR_NAME))?;
+            gl_driver::select(&owner, name, needs)
+        };
         records.push(PackageRecord {
+            gl_driver: gl,
             uid: a.first_uid + u32::try_from(i)?,
             source_dir: format!("{DATA}/{app}/base.apk"),
             primary_cpu_abi: libs.primary_cpu_abi,

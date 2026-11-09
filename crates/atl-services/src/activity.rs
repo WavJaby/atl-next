@@ -1353,10 +1353,16 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
-        let core_settings = Bundle::default();
+        let core_settings = match crate::gl_driver::selection(inner.packages.all()) {
+            Some((pkgs, values)) => Bundle::from_strings(&[
+                (crate::gl_driver::SELECTION_PKGS, pkgs.as_str()),
+                (crate::gl_driver::SELECTION_VALUES, values.as_str()),
+            ]),
+            None => Bundle::default(),
+        };
         // what attachApplicationLocked passes for a plain app start (no profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
-        // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings an empty Bundle, never null (attachApplicationLocked passes
-        // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); no settings are mirrored into it yet.
+        // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings never null (empty unless an app takes ANGLE) (attachApplicationLocked passes
+        // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); its keys are the GL driver selection (gl_driver.rs), nothing else.
         // An instrumentation passes its class, arguments, watcher and UiAutomation connection (:4723-4737).
         let (test_name, test_arguments, test_watcher, test_ui) = match instr {
             Some(i) => (

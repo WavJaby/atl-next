@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Owner list of GL drivers per package: AOSP's `angle_gl_driver_selection_pkgs` / `_values` (GraphicsEnvironment.queryAngleChoice), served to app processes as coreSettings at bindApplication by atl-services (gl_driver.rs).
+# Row = one `[[package]]`. Keys:
+#   name     the package name: dot-separated lower-case segments, at least two (checked by `xtask check`, step tables; parsed by gl_driver.rs `owner_table`).
+#   driver   `angle` (the app's GL runs through ANGLE over libGLES_atl.so) or `native` (AOSP's default: our driver is the app's native EGL).
+#   reason   why the row exists (required, prose; not checked beyond non-empty).
+# A row overrides the install-time rule: a package without a row gets `angle` when one of its native libraries has DT_NEEDED libGLESv1_CM.so (ES1 is served by ANGLE only, our driver has no ES1), else `native` (atld install, gl_driver.rs `select`).
+
+[[package]]
+name = "com.noodlecake.happyjump"
+driver = "angle"
+reason = "Happy Jump 1.12.2: ES1 game, libndksetup.so needs libGLESv1_CM.so; the row is the owner's pick, not the install-time rule"
