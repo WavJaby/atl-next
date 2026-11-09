@@ -5,7 +5,7 @@
 //! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`. Its binding pool (gate l) is `atl_bridgegen::aarch64::pool_asm` text, assembled by the same clang into the fixture; `check_pool` reads the pool back from the built binary.
 //! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
-//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `no-access-ok` relinks with the pin's `uaccess.c` and `qemu.h` (upstream access_ok: gate (o) red); `guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
+//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `no-access-ok` relinks with the pin's `uaccess.c` and `qemu.h` (upstream access_ok: gate (o) red); `whole-range` relinks with access_ok as one range, before the page walk (gate (p) red);`guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -29,8 +29,8 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 15] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+const GATES: [char; 16] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -65,23 +65,80 @@ pub struct Args {
     pub no_breaks: bool,
 }
 
-/// A break that compiles one pin file in place of the build's copy. `beside`: pin files written next to it, since a quoted include resolves from the including file's directory first.
+/// A break that compiles one pin file in place of the build's copy. `beside`: pin files written next to it, since a quoted include resolves from the including file's directory first. `whole_range`: the `qemu.h` beside is the build's, with access_ok in its pre-page-walk form, not the pin's.
 #[derive(Clone, Copy)]
 struct Swap {
     file: &'static str,
     beside: &'static [&'static str],
+    whole_range: bool,
 }
 
 /// P1 removed: the pin's `cpu_loop.c`.
 const NO_P1: Swap = Swap {
     file: CPU_LOOP,
     beside: &[],
+    whole_range: false,
 };
 /// access_ok as upstream: the pin's `uaccess.c`, with the pin's `qemu.h` beside it (`uaccess.c` includes it quoted).
 const NO_ACCESS_OK: Swap = Swap {
     file: UACCESS,
     beside: &[QEMU_H],
+    whole_range: false,
 };
+/// access_ok with the identity check as one range (the form before the page walk): the build's `uaccess.c` and `qemu.h`, the latter with [`WHOLE_RANGE_ACCESS_OK`] in place of `access_ok_untagged`. A range straddling a QEMU-known page and host memory fails (gate (p) red).
+const WHOLE_RANGE: Swap = Swap {
+    file: UACCESS,
+    beside: &[QEMU_H],
+    whole_range: true,
+};
+/// The identity check as one range: accepted when no QEMU page covers the range, else the upstream flag check. The page-walk patch replaces it; this text is the break's.
+const WHOLE_RANGE_ACCESS_OK: &str = r#"static inline bool access_ok_untagged(int type, abi_ulong addr, abi_ulong size)
+{
+    bool locked;
+    bool unmapped;
+
+    if (size == 0
+        ? !guest_addr_valid_untagged(addr)
+        : !guest_range_valid_untagged(addr, size)) {
+        return false;
+    }
+    if (guest_base == 0 && size != 0) {
+        locked = have_mmap_lock();
+        if (!locked) {
+            mmap_lock();
+        }
+        unmapped = page_check_range_empty((vaddr)addr, (vaddr)addr + size - 1);
+        if (!locked) {
+            mmap_unlock();
+        }
+        if (unmapped) {
+            return true;
+        }
+    }
+    return page_check_range((target_ulong)addr, size, type);
+}
+"#;
+
+/// The build's `qemu.h` with its `access_ok_untagged` replaced by [`WHOLE_RANGE_ACCESS_OK`] (the function ends at its first `\n}\n`).
+fn whole_range_header(src: &Path) -> Result<String> {
+    const HEAD: &str = "static inline bool access_ok_untagged(";
+    let text =
+        std::fs::read_to_string(src.join(QEMU_H)).with_context(|| format!("reading {QEMU_H}"))?;
+    ensure!(
+        text.matches(HEAD).count() == 1,
+        "{QEMU_H}: {HEAD} is not present exactly once"
+    );
+    let start = text.find(HEAD).context("access_ok_untagged")?;
+    let close = text[start..]
+        .find("\n}\n")
+        .with_context(|| format!("{QEMU_H}: access_ok_untagged has no closing brace"))?;
+    let end = start + close + "\n}\n".len();
+    Ok(format!(
+        "{}{WHOLE_RANGE_ACCESS_OK}{}",
+        &text[..start],
+        &text[end..]
+    ))
+}
 
 /// One harness run: which library, guest base and engine break, and the gate it must turn red (None = all green).
 struct RunSpec {
@@ -118,6 +175,14 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: None,
         red: Some('o'),
+    },
+    RunSpec {
+        name: "whole-range",
+        swap: Some(WHOLE_RANGE),
+        pool_skew: false,
+        base: "0",
+        engine_break: None,
+        red: Some('p'),
     },
     RunSpec {
         name: "ret-reg",
@@ -359,7 +424,11 @@ fn unpatched(root: &Path, b: &Build, dir: &Path, name: &str, swap: Swap) -> Resu
     let flat = dir.join(name);
     std::fs::create_dir_all(&flat).with_context(|| format!("creating {}", flat.display()))?;
     for rel in std::iter::once(swap.file).chain(swap.beside.iter().copied()) {
-        let text = git_raw(&b.src, &["show", &format!("{pin}:{rel}")])?;
+        let text = if swap.whole_range && rel == QEMU_H {
+            whole_range_header(&b.src)?
+        } else {
+            git_raw(&b.src, &["show", &format!("{pin}:{rel}")])?
+        };
         std::fs::write(flat.join(basename(rel)?), text)?;
     }
     let src = flat.join(basename(swap.file)?);

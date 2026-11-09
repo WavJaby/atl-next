@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (m), (o) on their own guest CPUs, and the process exits 0 when every gate is ok.
+//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (m), (o), (p) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) the first syscall on host heap memory: observed -EFAULT (QEMU's access_ok), the case Q5-3's patch turns.
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -12,7 +12,7 @@ mod spike {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Barrier, Mutex, OnceLock};
 
-    use atl_qemu_engine::{Booted, Guest, Trap};
+    use atl_qemu_engine::{Booted, Guest, Trap, page};
 
     /// Exit status of the previous handler (gates e, h): the fault reached it after the special handler declined it, in sigchain's order.
     const PREVIOUS_EXIT: c_int = 43;
@@ -70,6 +70,8 @@ mod spike {
     const M_ROUNDS: usize = 20;
     /// Gate (o): bytes of the host heap buffer handed to write(2).
     const O_LEN: usize = 64;
+    /// Gate (p): bytes of the straddling buffer handed to write(2), half in each page.
+    const P_LEN: usize = 64;
 
     /// The fixture's table, from its BOOT trap; read by every thread.
     static TABLE: OnceLock<Vec<u64>> = OnceLock::new();
@@ -215,6 +217,7 @@ mod spike {
             ('n', gate_n as fn(&Booted) -> Result<(), String>),
             ('m', gate_m),
             ('o', gate_o),
+            ('p', gate_p),
         ] {
             // a panic (an engine assert on this thread) is the gate's failure, not the harness's
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&booted)))
@@ -723,6 +726,68 @@ mod spike {
             if r != O_LEN as u64 || !bytes_ok {
                 return Err(format!(
                     "write returned {}, expected {O_LEN} bytes of 0xa5 ({} reached the pipe)",
+                    r as i64,
+                    got.len()
+                ));
+            }
+            Ok(())
+        })();
+        close(fds);
+        r
+    }
+
+    /// Gate (p): a write(2) whose buffer starts in a page QEMU maps (registered here, read-write) and runs into the next page, which no QEMU page covers (host memory, mapped). The per-page access_ok accepts the range; the whole-range form (break `whole-range`) refuses it with EFAULT.
+    fn gate_p(booted: &Booted) -> Result<(), String> {
+        let fds = pipe()?;
+        // SAFETY: sysconf has no memory effects
+        let psize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        // SAFETY: a fresh anonymous mapping of two pages; it stays mapped, since QEMU's page table still names its first page
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * psize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if region == libc::MAP_FAILED {
+            close(fds);
+            return Err("mmap of two pages failed".to_owned());
+        }
+        let region = region as usize;
+        let r = (|| {
+            let cpu = booted.attach()?;
+            let g = cpu.guest();
+            // the first page is QEMU's; the second is host memory QEMU never maps
+            g.map_pages(region, psize, page::READ | page::WRITE)?;
+            let at = region + psize - P_LEN / 2;
+            // SAFETY: the mapping covers [at, at + P_LEN)
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0x3c, P_LEN) };
+            let flags = (
+                g.page_flags(at as u64),
+                g.page_flags((region + psize) as u64),
+            );
+            let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+            let (r, _) = g.call_on(
+                tcb.as_ptr() as u64,
+                w(t::WRITE),
+                &[fds.1 as u64, at as u64, P_LEN as u64],
+            );
+            drop(cpu);
+            let got = drain(fds.0);
+            println!(
+                "spike: (p) observed write(pipe, straddle {at:#x}, {P_LEN}) = {} with QEMU page flags {:#x} then {:#x}; {} bytes reached the pipe",
+                r as i64,
+                flags.0,
+                flags.1,
+                got.len()
+            );
+            let bytes_ok = got.len() == P_LEN && got.iter().all(|&b| b == 0x3c);
+            if r != P_LEN as u64 || !bytes_ok {
+                return Err(format!(
+                    "write returned {}, expected {P_LEN} bytes of 0x3c ({} reached the pipe)",
                     r as i64,
                     got.len()
                 ));
