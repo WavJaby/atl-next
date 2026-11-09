@@ -96,7 +96,7 @@ public class Probe {
         return "none";
     }
 
-    /// Mode es1 (EGL10 as GLSurfaceView does it, a 16-bit depth buffer): the program through GL10 on the first pbuffer, then through libGLESv1_CM.so on a second one of the same context.
+    /// Mode es1 (EGL10 as GLSurfaceView does it: the first exact 8888 config, a 16-bit depth buffer): the program through GL10 on the first pbuffer, then through libGLESv1_CM.so on a second one of the same context.
     static void es1(int w, int h, String[] ops) {
         EGL10 egl = (EGL10) javax.microedition.khronos.egl.EGLContext.getEGL();
         javax.microedition.khronos.egl.EGLDisplay d = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY);
@@ -105,14 +105,13 @@ public class Probe {
         int[] attrs = {EGL10.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES_BIT, EGL10.EGL_SURFACE_TYPE, EGL10.EGL_PBUFFER_BIT,
             EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8, EGL10.EGL_ALPHA_SIZE, 8,
             EGL10.EGL_DEPTH_SIZE, 16, EGL10.EGL_NONE};
-        javax.microedition.khronos.egl.EGLConfig[] config = new javax.microedition.khronos.egl.EGLConfig[1];
-        int[] n = new int[1];
-        if (!egl.eglChooseConfig(d, attrs, config, 1, n) || n[0] != 1) die(egl, "eglChooseConfig");
-        javax.microedition.khronos.egl.EGLContext c = egl.eglCreateContext(d, config[0], EGL10.EGL_NO_CONTEXT,
+        javax.microedition.khronos.egl.EGLConfig config = exact8888(egl, d, attrs);
+        if (config == null) die(egl, "no exact 8888 config");
+        javax.microedition.khronos.egl.EGLContext c = egl.eglCreateContext(d, config, EGL10.EGL_NO_CONTEXT,
             new int[] {EGL_CONTEXT_CLIENT_VERSION, 1, EGL10.EGL_NONE});
         if (c == EGL10.EGL_NO_CONTEXT) die(egl, "eglCreateContext");
         int[] size = {EGL10.EGL_WIDTH, w, EGL10.EGL_HEIGHT, h, EGL10.EGL_NONE};
-        javax.microedition.khronos.egl.EGLSurface s1 = egl.eglCreatePbufferSurface(d, config[0], size);
+        javax.microedition.khronos.egl.EGLSurface s1 = egl.eglCreatePbufferSurface(d, config, size);
         if (s1 == EGL10.EGL_NO_SURFACE || !egl.eglMakeCurrent(d, s1, s1, c)) die(egl, "eglMakeCurrent");
         say("version " + GLES10.glGetString(GLES10.GL_VERSION));
         say("renderer " + GLES10.glGetString(GLES10.GL_RENDERER));
@@ -122,13 +121,29 @@ public class Probe {
         } catch (RuntimeException e) {
             say("java error " + e);
         }
-        javax.microedition.khronos.egl.EGLSurface s2 = egl.eglCreatePbufferSurface(d, config[0], size);
+        javax.microedition.khronos.egl.EGLSurface s2 = egl.eglCreatePbufferSurface(d, config, size);
         if (s2 == EGL10.EGL_NO_SURFACE || !egl.eglMakeCurrent(d, s2, s2, c)) die(egl, "eglMakeCurrent (second pbuffer)");
         for (String line : es1Scene(String.join("\n", ops)).split("\n")) say("native " + line);
         egl.eglMakeCurrent(d, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT);
         egl.eglTerminate(d);
         say("done");
         System.exit(0);
+    }
+
+    /** GLSurfaceView's ComponentSizeChooser, as AtlJniTest.exact8888: the first listed config with RGBA exactly 8 each (EGL's *_SIZE attributes are minimums); null when none. */
+    static javax.microedition.khronos.egl.EGLConfig exact8888(EGL10 egl, javax.microedition.khronos.egl.EGLDisplay d, int[] attrs) {
+        javax.microedition.khronos.egl.EGLConfig[] all = new javax.microedition.khronos.egl.EGLConfig[64];
+        int[] n = new int[1];
+        if (!egl.eglChooseConfig(d, attrs, all, all.length, n)) return null;
+        int[] v = new int[1];
+        for (int i = 0; i < Math.min(n[0], all.length); i++) {
+            boolean exact = true;
+            for (int size : new int[] {EGL10.EGL_RED_SIZE, EGL10.EGL_GREEN_SIZE, EGL10.EGL_BLUE_SIZE, EGL10.EGL_ALPHA_SIZE}) {
+                exact &= egl.eglGetConfigAttrib(d, all[i], size, v) && v[0] == 8;
+            }
+            if (exact) return all[i];
+        }
+        return null;
     }
 
     /// `what <r,g,b,a>x<count> ...`: every distinct RGBA value of the first `count` pixels in `buf` and how often, so the gate needs no image.
