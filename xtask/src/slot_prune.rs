@@ -364,18 +364,28 @@ fn prune_trees(
     for f in found {
         let root = relative(ws, &f.root);
         let tree = relative(ws, &f.dir);
-        match hold_tree(&f.dir)? {
-            None => plans.push(TreePlan {
+        // a dry run only probes: it creates no lock file
+        let busy = if execute {
+            match hold_tree(&f.dir)? {
+                Some(lock) => {
+                    locks.push(lock);
+                    false
+                }
+                None => true,
+            }
+        } else {
+            lock_held(&f.dir.join(CARGO_LOCK))?
+        };
+        if busy {
+            plans.push(TreePlan {
                 root,
                 tree,
                 dir: f.dir.clone(),
                 busy: true,
                 ..TreePlan::default()
-            }),
-            Some(lock) => {
-                locks.push(lock);
-                plans.push(plan_tree(&f.dir, root, tree, now, cutoff)?);
-            }
+            });
+        } else {
+            plans.push(plan_tree(&f.dir, root, tree, now, cutoff)?);
         }
     }
     if execute {
@@ -1076,6 +1086,19 @@ mod tests {
         let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
         assert_eq!(plan.kept, 1, "FRESH");
         assert_eq!(plan.unrecorded, 9);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A dry run writes nothing: no `.cargo-lock` appears in a tree that has none. Break target: a dry run that takes the lock with create fails here.
+    #[test]
+    fn dry_run_creates_no_cargo_lock() {
+        let ws = scratch("dry-lock");
+        let tree = tree_fixture(&ws);
+        only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("dry run"));
+        assert!(
+            !tree.join(CARGO_LOCK).exists(),
+            "dry run created a lock file"
+        );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
