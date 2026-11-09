@@ -83,16 +83,16 @@ extern "C" fn config_static_tls(config: *const c_void) {
 
 /// Routes the linker's two NB hooks (NBS linker `init_static_tls_*`: naked bodies in their own slot) to host thunks, as berberis `InitializeLinker` binds them; before `seal`.
 pub fn bind_linker(linker: &Image) -> Result<(), String> {
-    let hooks: [(&str, usize); 2] = [
-        (
-            "__dl___native_bridge_get_host_pthread",
-            get_host_pthread as *const () as usize,
-        ),
-        (
-            "__dl___native_bridge_config_static_tls",
-            config_static_tls as *const () as usize,
-        ),
-    ];
+    let mut hooks: Vec<(&str, usize)> = vec![(
+        "__dl___native_bridge_get_host_pthread",
+        get_host_pthread as *const () as usize,
+    )];
+    // the `qe_no_tls` break (`ATL_NB_BREAK`) leaves this placeholder unpatched: the linker's `bl` branches to 0
+    #[cfg(not(atl_nb_qe_no_tls))]
+    hooks.push((
+        "__dl___native_bridge_config_static_tls",
+        config_static_tls as *const () as usize,
+    ));
     for (name, host) in hooks {
         let at = linker
             .symbol(name)

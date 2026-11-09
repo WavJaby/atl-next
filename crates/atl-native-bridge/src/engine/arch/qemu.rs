@@ -392,9 +392,18 @@ fn boot(g: Guest, auxv: u64) -> u64 {
     (b.then)(super::Guest::start(&b.cfg))
 }
 
+/// Added to a trap's id before its slot is read: 0 in every build; the `qe_id` break (`ATL_NB_BREAK`) makes it 1, so each binding calls its neighbour's host function.
+#[cfg(not(atl_nb_qe_id))]
+const ID_SKEW: usize = 0;
+#[cfg(atl_nb_qe_id)]
+const ID_SKEW: usize = 1;
+
 /// Calls the host function of slot `id` with the guest's eight integer argument words. Integer arguments only: floats (v0..v7) are Q6. A callee with fewer arguments ignores the rest, under AAPCS64 and SysV alike.
 fn call_binding(id: u32, args: [u64; 8]) -> u64 {
-    let Some(slot) = usize::try_from(id).ok().and_then(|i| TARGETS.get(i)) else {
+    let Some(slot) = usize::try_from(id)
+        .ok()
+        .and_then(|i| TARGETS.get(i + ID_SKEW))
+    else {
         unsupported("qemu crossing: binding id past the pool")
     };
     let target = slot.load(Ordering::Acquire);

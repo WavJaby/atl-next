@@ -693,6 +693,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_guest_base", "atl_nb_qe_guest_base"),
     // Q4-4 (engine/arch/qemu.rs `map_data`): the argument block is not registered with QEMU, so the guest linker's open of argv[1] fails (EFAULT)
     ("qe_nodata", "atl_nb_qe_nodata"),
+    // Q4-3 (engine/arch/qemu.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
+    ("qe_id", "atl_nb_qe_id"),
+    // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
+    ("qe_no_tls", "atl_nb_qe_no_tls"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
