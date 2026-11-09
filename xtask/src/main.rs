@@ -320,9 +320,9 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`). Logs in `<out>/qemu/<target>-linux-user-pic/spike/`.
     QemuSpike(qemu_spike::Args),
-    /// The QEMU crossing's placement on the real arm64 NB images (QEMU bridge plan Q4-3): the six entries placed in place, pages registered with QEMU, a guest calls each site; then each break must turn it red.
+    /// The QEMU crossing on the real arm64 NB images (QEMU bridge plan Q4-3..Q4-5): the six entries placed in place, the guest linker's init, a guest dlopen with DT_NEEDED; then each break must turn its run red.
     ///
-    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
+    /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (`xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-linker/`.
     QemuLinker(qemu_linker::Args),
 }
 
