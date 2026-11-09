@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
 /// The tone's frequency in Hz, the client's `--freq` default.
@@ -275,27 +276,22 @@ fn check_recording(
 
 /// Builds the client example and returns its path.
 fn build_client(root: &Path) -> Result<PathBuf> {
-    let out = crate::cargo_command()
-        .current_dir(root)
-        .args([
-            "build",
-            "--locked",
-            "-p",
-            "atl-platform-ui",
-            "--example",
-            "audio_pcm",
-            "--message-format=json-render-diagnostics",
-        ])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("running cargo build")?;
+    let mut cmd = crate::cargo_command();
+    cmd.current_dir(root).args([
+        "build",
+        "--locked",
+        "-p",
+        "atl-platform-ui",
+        "--example",
+        "audio_pcm",
+    ]);
+    let run = unit_use::run(&mut cmd, Units::Recorded, Echo::Both)?;
     ensure!(
-        out.status.success(),
+        run.status.success(),
         "cargo build of the audio_pcm client failed"
     );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    run.messages
+        .iter()
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "audio_pcm")
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
         .context("cargo reported no audio_pcm executable")

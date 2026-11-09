@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+use crate::unit_use::{self, Echo, Units};
 use crate::{arches, provided_gate};
 
 /// The package feature that links converter modules (atl-bridgegen converter.rs `FEATURE`).
@@ -310,17 +311,17 @@ pub fn aidl_crates(
 
 /// `cargo metadata --no-deps` of checkout `root`.
 fn workspace_metadata(root: &Path) -> Result<String> {
-    let out = crate::cargo_command()
-        .current_dir(root)
-        .args(["metadata", "--no-deps", "--format-version", "1", "--locked"])
-        .output()
-        .context("running cargo metadata")?;
+    let mut cmd = crate::cargo_command();
+    cmd.current_dir(root)
+        .args(["metadata", "--no-deps", "--format-version", "1", "--locked"]);
+    let out =
+        unit_use::run(&mut cmd, Units::Plain, Echo::Nothing).context("running cargo metadata")?;
     ensure!(
         out.status.success(),
         "cargo metadata failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        out.stderr
     );
-    Ok(String::from_utf8(out.stdout)?)
+    Ok(out.stdout)
 }
 
 /// The workspace packages of checkout `root` naming converter modules.

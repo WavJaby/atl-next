@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! `xtask check`: the static + unit test tiers.
 
-use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
-use std::thread;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, arches, converter, cts_table, deps, libcxx_gate, licenses, modules, packages, patch,
     providers, prune, service_mirrors, slot, sources, spdx, test_apks, workspace,
 };
 use atl_layout::Layout;
-
-/// Read size of the cargo tee: 8 KiB, the usual pipe buffer. A chunk size, no measured value behind it.
-const TEE_CHUNK: usize = 8192;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -157,7 +153,7 @@ impl Step {
 
     fn run_whole(self, root: &Path) -> Result<()> {
         match self {
-            Step::Fmt => cargo(root, &["fmt", "--all", "--check"]),
+            Step::Fmt => cargo(root, &["fmt", "--all", "--check"], Units::Plain),
             Step::Spdx => spdx::check(root),
             Step::Tables => {
                 let arches = arches::load(root)?;
@@ -260,14 +256,15 @@ impl Step {
                     "-D",
                     "warnings",
                 ],
+                Units::Recorded,
             ),
             Step::Deny => {
                 // a missing tool fails the step; skipping would report a check that never ran
-                cargo(root, &["deny", "--version"])
+                cargo(root, &["deny", "--version"], Units::Plain)
                     .context("cargo-deny not installed: cargo install --locked cargo-deny")?;
-                cargo(root, &["deny", "--locked", "check"])
+                cargo(root, &["deny", "--locked", "check"], Units::Plain)
             }
-            Step::Test => cargo(root, &["test", "--workspace", "--locked"]),
+            Step::Test => cargo(root, &["test", "--workspace", "--locked"], Units::Recorded),
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
@@ -324,73 +321,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// A cargo step: its output shown live as before, and kept, so a failure's first error line can name the cause.
-fn cargo(root: &Path, args: &[&str]) -> Result<()> {
+fn cargo(root: &Path, args: &[&str], units: Units) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(args).current_dir(root);
-    let (status, stdout, stderr) =
-        run_teed(cmd).with_context(|| format!("spawning cargo {}", args.join(" ")))?;
-    if status.success() {
+    let run = unit_use::run(&mut cmd, units, Echo::Both)
+        .with_context(|| format!("spawning cargo {}", args.join(" ")))?;
+    if run.status.success() {
         return Ok(());
     }
-    let exit = format!("cargo {} exited with {status}", args.join(" "));
-    match verdict::first_failure_line(&format!("{stdout}{stderr}")) {
+    let exit = format!("cargo {} exited with {}", args.join(" "), run.status);
+    match verdict::first_failure_line(&format!("{}{}", run.stdout, run.stderr)) {
         Some(line) => bail!("{line}\n{exit}"),
         None => bail!("{exit}"),
     }
-}
-
-/// Runs `cmd` with its stdout and stderr shown as they arrive and kept: returns the status, then the captured stdout and stderr.
-/// Colour and progress stay on only when this process's stderr is a terminal, so cargo's output looks as it did when inherited.
-pub(crate) fn run_teed(mut cmd: Command) -> Result<(ExitStatus, String, String)> {
-    let when = if std::io::stderr().is_terminal() {
-        "always"
-    } else {
-        "never"
-    };
-    let mut child = cmd
-        .env("CARGO_TERM_COLOR", when)
-        .env("CARGO_TERM_PROGRESS_WHEN", when)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let out = tee(child.stdout.take().context("cargo stdout")?, true);
-    let err = tee(child.stderr.take().context("cargo stderr")?, false);
-    let status = child.wait()?;
-    Ok((
-        status,
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    ))
-}
-
-/// Copies `from` to our stdout (or stderr) as it arrives and returns everything read, lossily decoded.
-/// A failed write stops the showing, never the capture: the first error line must survive a closed terminal.
-fn tee<R: Read + Send + 'static>(mut from: R, to_stdout: bool) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut chunk = [0u8; TEE_CHUNK];
-        let mut showing = true;
-        loop {
-            match from.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    captured.extend_from_slice(&chunk[..n]);
-                    if showing {
-                        let shown = if to_stdout {
-                            let mut out = std::io::stdout().lock();
-                            out.write_all(&chunk[..n]).and_then(|()| out.flush())
-                        } else {
-                            std::io::stderr().write_all(&chunk[..n])
-                        };
-                        showing = shown.is_ok();
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        String::from_utf8_lossy(&captured).into_owned()
-    })
 }
 
 #[cfg(test)]

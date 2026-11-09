@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: MIT
-//! `cargo xtask slot prune`: deletes the cargo units of a slot's target trees that no cargo build used for `--older-than` days.
-//! Use is the record each build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry was not used since the record's `since`, so it is stale only once the record itself is that old.
-//! Trees under `<ws>/out/slot-<n>`: `cargo/<profile>`, `cargo/<triple>/<profile>`, `cargo-converter/<profile>`.
+//! `cargo xtask slot prune`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
+//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each slot's `cargo`, `cargo-converter`, `target` (the default of a slotted checkout) and `gl/cargo*`; with `--all` also `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no slot owns.
+//! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
+//! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
 //! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its slot.
-//! Busy: a build holds the slot's lock (`build_pool::hold_slot`); prune takes it exclusive without waiting and skips the slot.
-//! Symlinks are refused, never followed: a link under the slot could point the prune outside it.
+//! Busy: a slot's build holds the slot lock (`build_pool::hold_slot`); prune takes it exclusive without waiting and skips the slot. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
+//! Symlinks are refused, never followed: a link under a root could point the prune outside it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
+use rustix::fs::{FlockOperation, flock};
 
 use crate::build_pool;
 use crate::slot::{self, Holder, SLOTS};
@@ -26,8 +28,23 @@ pub const PRUNE_AFTER_DAYS: u64 = 14;
 const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
 const GIB: f64 = 1_073_741_824.0;
-/// Cargo target roots under a slot: `out/cargo` and `out/cargo-converter`.
-const TREE_ROOTS: [&str; 2] = ["cargo", "cargo-converter"];
+/// Target roots directly under a slot: xtask's `--target-dir` names, and `target`, the default a slotted checkout links to (slot.rs).
+const SLOT_ROOTS: [&str; 3] = ["cargo", "cargo-converter", "target"];
+/// `<slot>/gl/cargo*`: the GL probes' target roots.
+const GL_DIR: &str = "gl";
+/// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a slot.
+const EGL_DIR: &str = "egl-driver";
+/// Prefix of the root names under `gl/` and `egl-driver/<checkout>/`.
+const CARGO_ROOT: &str = "cargo";
+/// cargo's lock on a build dir; a build holds it for its whole run.
+const CARGO_LOCK: &str = ".cargo-lock";
+/// rustc's incremental names: `s-<t>-<sess>-<svh|working>`, lock `s-<t>-<sess>.lock`; `t` is base-36 micros since the epoch.
+const SESSION: &str = "s";
+const INCREMENTAL: &str = "incremental";
+const WORKING: &str = "-working";
+const LOCK_EXT: &str = ".lock";
+/// rustc's grace before it collects a `-working` session (fs.rs `is_old_enough_to_be_collected`), in micros.
+const SESSION_GRACE_MICROS: u64 = 10_000_000;
 
 /// What one slot's prune found: no out dir, a build holds it, or one plan per target tree.
 #[derive(Debug)]
@@ -37,28 +54,39 @@ pub enum Outcome {
     Done(Vec<TreePlan>),
 }
 
-/// One target tree: its units, and what its stale units take.
+/// One target tree: its units and incremental sessions, and what the stale ones take. `busy`: a cargo build holds the tree; nothing is planned.
 #[derive(Debug, Default)]
 pub struct TreePlan {
-    /// Path under the slot, e.g. `cargo/release`.
+    /// The root it sits under, relative to the workspace, e.g. `out/slot-1/cargo`.
+    pub root: String,
+    /// The tree relative to the workspace, e.g. `out/slot-1/cargo/release`.
     pub tree: String,
     pub dir: PathBuf,
+    pub busy: bool,
     /// Fingerprint entries in the tree.
     pub units: usize,
     pub stale: Vec<Unit>,
     pub kept: usize,
-    /// Units with no record entry; counted in `kept` or `stale` too.
+    /// Units with no record entry; judged by mtime. Counted in `kept` or `stale` too.
     pub unrecorded: usize,
     /// Fingerprint entries that are no unit. Kept.
     pub unattributed: usize,
     /// `deps/` and `examples/` files no unit owns. Kept.
     pub orphans: usize,
     pub orphan_bytes: u64,
+    /// Incremental sessions and lock files to remove.
+    pub sessions: Vec<Session>,
+    /// Incremental sessions and lock files kept (held, newest, young, or not a session).
+    pub kept_sessions: usize,
 }
 
 impl TreePlan {
     fn stale_bytes(&self) -> u64 {
         self.stale.iter().map(|u| u.bytes).sum()
+    }
+
+    fn session_bytes(&self) -> u64 {
+        self.sessions.iter().map(|s| s.bytes).sum()
     }
 }
 
@@ -70,15 +98,30 @@ pub struct Unit {
     pub bytes: u64,
 }
 
-/// Totals of one sweep: stale units and their bytes, and the slots that failed.
+/// A stale incremental session: its dir (None for a lock file whose session is gone), its lock file if any, and the bytes its dir holds.
+#[derive(Debug)]
+pub struct Session {
+    pub dir: Option<PathBuf>,
+    pub lock: Option<PathBuf>,
+    pub bytes: u64,
+}
+
+/// Totals of one sweep: stale units, stale sessions and their bytes, and the slots or trees that failed.
 #[derive(Debug, Default)]
 pub struct Sweep {
     pub units: usize,
+    pub sessions: usize,
     pub bytes: u64,
     pub failed: usize,
 }
 
-/// `cargo xtask slot prune`. Exactly one of `slot` / `all` names the slots. A dry run unless `execute`.
+/// A target tree found under a root.
+struct Found {
+    root: PathBuf,
+    dir: PathBuf,
+}
+
+/// `cargo xtask slot prune`. Exactly one of `slot` / `all` names the scope; `all` adds the trees no slot owns. A dry run unless `execute`.
 pub fn run(
     ws: &Path,
     holders: &[Holder],
@@ -98,7 +141,7 @@ pub fn run(
         }
         None => (1..=SLOTS).collect(),
     };
-    let sweep = sweep(ws, holders, &slots, older_than, execute)?;
+    let sweep = sweep(ws, holders, &slots, all, older_than, execute)?;
     Ok(if sweep.failed == 0 {
         ExitCode::SUCCESS
     } else {
@@ -106,11 +149,12 @@ pub fn run(
     })
 }
 
-/// Prunes each slot of `slots`, printing one line per target tree and a summary. Busy and failed slots are reported; a failure is counted in `failed`, not returned.
+/// Prunes each slot of `slots`, then with `unslotted` the trees no slot owns. Prints one line per target tree, one per root and a summary. Busy and failed scopes are reported; a failure is counted in `failed`, not returned.
 pub fn sweep(
     ws: &Path,
     holders: &[Holder],
     slots: &[u32],
+    unslotted: bool,
     older_than: u64,
     execute: bool,
 ) -> Result<Sweep> {
@@ -119,6 +163,7 @@ pub fn sweep(
         .with_context(|| format!("--older-than {older_than} days is too large"))?;
     let now = unit_use::now()?;
     let mut total = Sweep::default();
+    let mut roots: BTreeMap<String, Sweep> = BTreeMap::new();
     for &n in slots {
         match prune_slot(ws, n, cutoff, now, execute) {
             Ok(Outcome::NotBuilt) => println!("slot {n}: not built"),
@@ -136,29 +181,30 @@ pub fn sweep(
                 println!("slot {n}: busy, skipped: a build holds its lock{record}");
             }
             Ok(Outcome::Done(plans)) if plans.is_empty() => println!("slot {n}: no cargo trees"),
-            Ok(Outcome::Done(plans)) => {
-                for plan in plans {
-                    println!(
-                        "slot {n} {}: units {}, stale {} ({}), kept {} (unrecorded {}), unattributed {}, orphan deps {} ({})",
-                        plan.tree,
-                        plan.units,
-                        plan.stale.len(),
-                        human(plan.stale_bytes()),
-                        plan.kept,
-                        plan.unrecorded,
-                        plan.unattributed,
-                        plan.orphans,
-                        human(plan.orphan_bytes)
-                    );
-                    total.units += plan.stale.len();
-                    total.bytes += plan.stale_bytes();
-                }
-            }
+            Ok(Outcome::Done(plans)) => report(&plans, &mut total, &mut roots),
             Err(e) => {
                 total.failed += 1;
                 println!("slot {n}: FAILED: {e:#}");
             }
         }
+    }
+    if unslotted {
+        match prune_unslotted(ws, cutoff, now, execute) {
+            Ok(plans) if plans.is_empty() => println!("unslotted: no cargo trees"),
+            Ok(plans) => report(&plans, &mut total, &mut roots),
+            Err(e) => {
+                total.failed += 1;
+                println!("unslotted: FAILED: {e:#}");
+            }
+        }
+    }
+    for (root, sum) in &roots {
+        println!(
+            "root {root}: units {}, sessions {}, {}",
+            sum.units,
+            sum.sessions,
+            human(sum.bytes)
+        );
     }
     let verb = if execute {
         "removed"
@@ -166,14 +212,47 @@ pub fn sweep(
         "dry run, would remove (add --execute)"
     };
     println!(
-        "slot prune: {verb} {} stale units, {}",
+        "slot prune: {verb} {} stale units and {} stale sessions, {}",
         total.units,
+        total.sessions,
         human(total.bytes)
     );
     Ok(total)
 }
 
-/// Plans slot `n`'s prune and, with `execute`, removes its stale units and their record entries. Holds the slot's lock for the whole call.
+/// Prints each plan's line and adds it to `total` and to its root's sum. Busy trees are reported and add nothing.
+fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sweep>) {
+    for plan in plans {
+        if plan.busy {
+            println!("{}: busy, skipped: a cargo build holds its lock", plan.tree);
+            continue;
+        }
+        println!(
+            "{}: units {}, stale {} ({}), kept {} (unrecorded {}), unattributed {}, orphan deps {} ({}), sessions stale {} ({}), kept {}",
+            plan.tree,
+            plan.units,
+            plan.stale.len(),
+            human(plan.stale_bytes()),
+            plan.kept,
+            plan.unrecorded,
+            plan.unattributed,
+            plan.orphans,
+            human(plan.orphan_bytes),
+            plan.sessions.len(),
+            human(plan.session_bytes()),
+            plan.kept_sessions
+        );
+        let bytes = plan.stale_bytes() + plan.session_bytes();
+        let sum = roots.entry(plan.root.clone()).or_default();
+        for target in [&mut *total, sum] {
+            target.units += plan.stale.len();
+            target.sessions += plan.sessions.len();
+            target.bytes += bytes;
+        }
+    }
+}
+
+/// Plans slot `n`'s prune and, with `execute`, removes what it names. Holds the slot's lock for the whole call.
 pub fn prune_slot(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Result<Outcome> {
     let dir = slot::slot_dir(ws, n);
     match fs::symlink_metadata(&dir) {
@@ -189,24 +268,16 @@ pub fn prune_slot(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Re
     let Some(_lock) = build_pool::try_prune_slot(ws, n)? else {
         return Ok(Outcome::Busy);
     };
-    let mut plans = Vec::new();
-    for tree in trees(&dir)? {
-        plans.push(plan_tree(&dir, &tree, now, cutoff)?);
-    }
-    if execute {
-        for plan in &plans {
-            for unit in &plan.stale {
-                for path in &unit.paths {
-                    remove(&dir, path)?;
-                }
-            }
-            let hashes: Vec<String> = plan.stale.iter().map(|u| u.hash.clone()).collect();
-            if !hashes.is_empty() {
-                unit_use::forget(&plan.dir, &hashes)?;
-            }
-        }
-    }
-    Ok(Outcome::Done(plans))
+    let found = trees_under(&slot_roots(&dir)?)?;
+    Ok(Outcome::Done(prune_trees(
+        ws, &found, cutoff, now, execute,
+    )?))
+}
+
+/// The trees no slot owns (`--all`): `repo/target` and the EGL driver probes. Each is busy-checked by its own `.cargo-lock`.
+pub fn prune_unslotted(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
+    let found = trees_under(&unslotted_roots(ws)?)?;
+    prune_trees(ws, &found, cutoff, now, execute)
 }
 
 /// The pool number `n` when `dir` is exactly `<ws>/out/slot-<n>` with `n` in the pool.
@@ -227,18 +298,48 @@ fn check_slot_dir(ws: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Every target tree under `slot`: a child of a root that holds `.fingerprint`, or a grandchild (`<triple>/<profile>`).
-fn trees(slot: &Path) -> Result<Vec<PathBuf>> {
+/// The roots of slot `slot`: `cargo`, `cargo-converter`, `target`, and `gl/cargo*`.
+fn slot_roots(slot: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots: Vec<PathBuf> = SLOT_ROOTS.iter().map(|name| slot.join(name)).collect();
+    roots.extend(prefixed(&slot.join(GL_DIR), CARGO_ROOT)?);
+    Ok(roots)
+}
+
+/// The roots no slot owns: the main checkout's default target, and each EGL driver checkout's `cargo*`.
+fn unslotted_roots(ws: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = vec![ws.join("repo").join("target")];
+    for checkout in children(&ws.join("out").join(EGL_DIR))? {
+        roots.extend(prefixed(&checkout, CARGO_ROOT)?);
+    }
+    Ok(roots)
+}
+
+/// The entries of `dir` whose name starts with `prefix`. Missing dir: none.
+fn prefixed(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    Ok(children(dir)?
+        .into_iter()
+        .filter(|path| file_name(path).starts_with(prefix))
+        .collect())
+}
+
+/// Every target tree under `roots`: a child of a root that holds `.fingerprint`, or a grandchild (`<triple>/<profile>`).
+fn trees_under(roots: &[PathBuf]) -> Result<Vec<Found>> {
     let mut found = Vec::new();
-    for root in TREE_ROOTS {
-        for child in children(&slot.join(root))? {
+    for root in roots {
+        for child in children(root)? {
             if is_tree(&child)? {
-                found.push(child);
+                found.push(Found {
+                    root: root.clone(),
+                    dir: child,
+                });
                 continue;
             }
             for grand in children(&child)? {
                 if is_tree(&grand)? {
-                    found.push(grand);
+                    found.push(Found {
+                        root: root.clone(),
+                        dir: grand,
+                    });
                 }
             }
         }
@@ -250,15 +351,83 @@ fn is_tree(dir: &Path) -> Result<bool> {
     Ok(real_dir(dir)? && real_dir(&dir.join(FINGERPRINT))?)
 }
 
-/// The plan for one tree. Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. Stale when the unit's last use (its record entry, else the record's `since`) is older than the cutoff.
-fn plan_tree(slot: &Path, tree: &Path, now: u64, cutoff: u64) -> Result<TreePlan> {
-    let label = tree
-        .strip_prefix(slot)
-        .unwrap_or(tree)
-        .display()
-        .to_string();
+/// Plans every tree of `found`, then with `execute` removes what the plans name. A tree whose `.cargo-lock` a build holds is reported busy. Each held lock lasts from its tree's plan to its removal, and a plan error stops the call before anything is removed.
+fn prune_trees(
+    ws: &Path,
+    found: &[Found],
+    cutoff: u64,
+    now: u64,
+    execute: bool,
+) -> Result<Vec<TreePlan>> {
+    let mut plans = Vec::new();
+    let mut locks = Vec::new();
+    for f in found {
+        let root = relative(ws, &f.root);
+        let tree = relative(ws, &f.dir);
+        match hold_tree(&f.dir)? {
+            None => plans.push(TreePlan {
+                root,
+                tree,
+                dir: f.dir.clone(),
+                busy: true,
+                ..TreePlan::default()
+            }),
+            Some(lock) => {
+                locks.push(lock);
+                plans.push(plan_tree(&f.dir, root, tree, now, cutoff)?);
+            }
+        }
+    }
+    if execute {
+        for plan in &plans {
+            if !plan.busy {
+                remove_plan(plan)?;
+            }
+        }
+    }
+    drop(locks);
+    Ok(plans)
+}
+
+/// Removes what `plan` names: stale units (their record entries go after), then stale sessions.
+fn remove_plan(plan: &TreePlan) -> Result<()> {
+    for unit in &plan.stale {
+        for path in &unit.paths {
+            remove(&plan.dir, path)?;
+        }
+    }
+    let hashes: Vec<String> = plan.stale.iter().map(|u| u.hash.clone()).collect();
+    if !hashes.is_empty() {
+        unit_use::forget(&plan.dir, &hashes)?;
+    }
+    for session in &plan.sessions {
+        remove_session(&plan.dir, session)?;
+    }
+    Ok(())
+}
+
+/// cargo's build-dir lock of `tree`, taken without waiting: a build holds it for its whole run. None when one does.
+fn hold_tree(tree: &Path) -> Result<Option<File>> {
+    let path = tree.join(CARGO_LOCK);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("flock {}", path.display())),
+    }
+}
+
+/// The plan for one tree (its `.cargo-lock` held by the caller). Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. A unit's last use is its record entry; without one, its fingerprint dir's mtime. Stale when that is older than the cutoff.
+fn plan_tree(tree: &Path, root: String, label: String, now: u64, cutoff: u64) -> Result<TreePlan> {
     let record = unit_use::load(tree)?;
     let mut plan = TreePlan {
+        root,
         tree: label,
         dir: tree.to_owned(),
         ..TreePlan::default()
@@ -301,18 +470,11 @@ fn plan_tree(slot: &Path, tree: &Path, now: u64, cutoff: u64) -> Result<TreePlan
         }
     }
     for (dir, hash) in units {
-        let last_use = match &record {
-            Some(record) => match record.units.get(&hash) {
-                Some(&at) => at,
-                None => {
-                    plan.unrecorded += 1;
-                    record.since
-                }
-            },
+        let last_use = match record.as_ref().and_then(|r| r.units.get(&hash)) {
+            Some(&at) => at,
             None => {
                 plan.unrecorded += 1;
-                plan.kept += 1;
-                continue;
+                mtime_secs(&dir)?
             }
         };
         if !is_stale(last_use, now, cutoff) {
@@ -340,12 +502,183 @@ fn plan_tree(slot: &Path, tree: &Path, now: u64, cutoff: u64) -> Result<TreePlan
             plan.orphan_bytes += unique_bytes(std::slice::from_ref(path))?;
         }
     }
+    let (sessions, kept) = stale_sessions(tree, now)?;
+    plan.sessions = sessions;
+    plan.kept_sessions = kept;
     Ok(plan)
 }
 
 /// Stale when the last use is more than `cutoff` seconds before `now`. A use in the future, or a sum that overflows, is kept.
 fn is_stale(last_use: u64, now: u64, cutoff: u64) -> bool {
     last_use.saturating_add(cutoff) < now
+}
+
+/// Unix seconds of `path`'s mtime.
+fn mtime_secs(path: &Path) -> Result<u64> {
+    let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    u64::try_from(meta.mtime()).with_context(|| format!("{} is dated before 1970", path.display()))
+}
+
+/// The incremental sessions of `tree` no load reads, and how many entries are kept. Per crate dir: the newest finalized session stays, as rustc loads it; other finalized sessions go; `-working` sessions go once older than the grace; a lock held by a process keeps its session; lock files whose session is gone go once older than the grace. Session names that match no rustc shape are kept.
+fn stale_sessions(tree: &Path, now: u64) -> Result<(Vec<Session>, usize)> {
+    let now_micros = now.saturating_mul(1_000_000);
+    let mut stale = Vec::new();
+    let mut kept = 0;
+    for crate_dir in children(&tree.join(INCREMENTAL))? {
+        if !real_dir(&crate_dir)? {
+            continue;
+        }
+        let (dirs, locks) = session_entries(&crate_dir)?;
+        let newest = newest_finalized(&dirs);
+        for dir in &dirs {
+            let name = file_name(dir);
+            let Some(t) = session_time(&name) else {
+                kept += 1;
+                continue;
+            };
+            let lock = crate_dir.join(lock_name(&name));
+            if lock_held(&lock)? {
+                kept += 1;
+                continue;
+            }
+            let finalized = is_finalized(&name);
+            if finalized && newest == Some(dir) {
+                kept += 1;
+                continue;
+            }
+            if !finalized && !old_enough(t, now_micros) {
+                kept += 1;
+                continue;
+            }
+            stale.push(Session {
+                dir: Some(dir.clone()),
+                lock: exists(&lock)?.then_some(lock),
+                bytes: unique_bytes(std::slice::from_ref(dir))?,
+            });
+        }
+        for lock in &locks {
+            let name = file_name(lock);
+            if dirs.iter().any(|dir| lock_name(&file_name(dir)) == name) {
+                continue;
+            }
+            let Some(t) = lock_time(&name) else {
+                kept += 1;
+                continue;
+            };
+            if lock_held(lock)? || !old_enough(t, now_micros) {
+                kept += 1;
+                continue;
+            }
+            stale.push(Session {
+                dir: None,
+                lock: Some(lock.clone()),
+                bytes: 0,
+            });
+        }
+    }
+    Ok((stale, kept))
+}
+
+/// The `s-` session dirs and lock files directly in a crate dir.
+fn session_entries(crate_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut dirs = Vec::new();
+    let mut locks = Vec::new();
+    for entry in children(crate_dir)? {
+        let name = file_name(&entry);
+        if !name.starts_with(SESSION) {
+            continue;
+        }
+        if name.ends_with(LOCK_EXT) {
+            locks.push(entry);
+        } else if real_dir(&entry)? {
+            dirs.push(entry);
+        }
+    }
+    Ok((dirs, locks))
+}
+
+/// The finalized session rustc loads: the greatest timestamp (`find_source_directory_in_iter`; the first of equal ones wins).
+fn newest_finalized(dirs: &[PathBuf]) -> Option<&PathBuf> {
+    let mut best: Option<(u64, &PathBuf)> = None;
+    for dir in dirs {
+        let name = file_name(dir);
+        if !is_finalized(&name) {
+            continue;
+        }
+        let Some(t) = session_time(&name) else {
+            continue;
+        };
+        if best.is_none_or(|(at, _)| t > at) {
+            best = Some((t, dir));
+        }
+    }
+    best.map(|(_, dir)| dir)
+}
+
+fn is_finalized(name: &str) -> bool {
+    !name.ends_with(WORKING)
+}
+
+/// The timestamp of a session dir `s-<t>-<sess>-<svh|working>`, in micros since the epoch.
+fn session_time(name: &str) -> Option<u64> {
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() != 4 || parts[0] != SESSION {
+        return None;
+    }
+    u64::from_str_radix(parts[1], 36).ok()
+}
+
+/// The timestamp of a lock file `s-<t>-<sess>.lock`, in micros since the epoch.
+fn lock_time(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(LOCK_EXT)?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() != 3 || parts[0] != SESSION {
+        return None;
+    }
+    u64::from_str_radix(parts[1], 36).ok()
+}
+
+/// The lock file of a session dir: its name up to the third dash, plus `.lock` (rustc's `lock_file_path`).
+fn lock_name(session: &str) -> String {
+    let head: Vec<&str> = session.split('-').take(3).collect();
+    format!("{}{LOCK_EXT}", head.join("-"))
+}
+
+/// rustc's rule: a session started less than the grace ago may still be starting.
+fn old_enough(t_micros: u64, now_micros: u64) -> bool {
+    t_micros.saturating_add(SESSION_GRACE_MICROS) < now_micros
+}
+
+/// Whether a process holds `lock`: an exclusive flock by another open file. A missing lock file is not held. The probe takes the lock and drops it at once.
+fn lock_held(lock: &Path) -> Result<bool> {
+    let file = match OpenOptions::new().read(true).open(lock) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", lock.display())),
+    };
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(false),
+        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("flock {}", lock.display())),
+    }
+}
+
+/// Removes a stale session: a held lock leaves it alone; otherwise the dir, then its lock file.
+fn remove_session(tree: &Path, session: &Session) -> Result<()> {
+    if let Some(lock) = &session.lock
+        && lock_held(lock)?
+    {
+        return Ok(());
+    }
+    if let Some(dir) = &session.dir {
+        remove(tree, dir)?;
+    }
+    if let Some(lock) = &session.lock
+        && exists(lock)?
+    {
+        remove(tree, lock)?;
+    }
+    Ok(())
 }
 
 /// Apparent bytes under `paths`, each inode once: an uplifted link and its deps file are one copy on disk.
@@ -370,13 +703,13 @@ fn add_bytes(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> Re
     Ok(())
 }
 
-/// Removes a unit's path. Refused outside the slot; a symlink is removed as a link.
-fn remove(slot: &Path, path: &Path) -> Result<()> {
+/// Removes a path under `tree`. Refused outside it; a symlink is removed as a link.
+fn remove(tree: &Path, path: &Path) -> Result<()> {
     ensure!(
-        path.starts_with(slot),
+        path.starts_with(tree),
         "refused: {} is outside {}",
         path.display(),
-        slot.display()
+        tree.display()
     );
     let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let removed = if meta.is_dir() {
@@ -432,6 +765,11 @@ fn children(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// `path` relative to the workspace, for display and for the record of what a root is.
+fn relative(ws: &Path, path: &Path) -> String {
+    path.strip_prefix(ws).unwrap_or(path).display().to_string()
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -452,23 +790,25 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::os::unix::fs::symlink;
+    use std::time::{Duration, UNIX_EPOCH};
 
-    /// Fixture clock, literal seconds since the epoch. Every use and record time below is relative to it.
+    /// Fixture clock, literal seconds since the epoch. Every use and mtime below is relative to it.
     const NOW: u64 = 1_800_000_000;
-    /// The default cutoff (14 days), written out rather than taken from the code under test.
+    /// Day length and the default cutoff (14 days), written out rather than taken from the code under test.
     const DAY: u64 = 86_400;
     const CUTOFF: u64 = 14 * DAY;
 
-    // Unit names; the hash ends each name. Each row says when the fixture's record puts its last use.
-    const STALE: &str = "atl-stale-0123456789abcdef"; // 30 days ago: stale
-    const JUST: &str = "atl-just-bbbbbbbbbbbbbbbb"; // cutoff + 1 s ago: stale
-    const EDGE: &str = "atl-edge-cccccccccccccccc"; // exactly the cutoff ago: kept
-    const LIVE: &str = "atl-live-dddddddddddddddd"; // 1 day ago: kept
-    const OLD: &str = "atl-old-eeeeeeeeeeeeeeee"; // superseded generation, 20 days ago: stale
-    const NEW: &str = "atl-old-ffffffffffffffff"; // its newer generation, 2 days ago: kept
-    const NEVER: &str = "atl-never-1111111111111111"; // no entry: stale while the record is older than the cutoff
-    const EXAMPLE: &str = "atl-ex-2222222222222222"; // examples/ file + uplifted link, 30 days ago: stale
-    const NOHASH: &str = "not-a-unit"; // entry that is no unit: kept
+    // Unit names; the hash ends each name. The record rows say when a recorded last use is; a unit without a row is judged by its fingerprint mtime.
+    const STALE: &str = "atl-stale-0123456789abcdef"; // recorded 30 days ago: stale
+    const JUST: &str = "atl-just-bbbbbbbbbbbbbbbb"; // recorded cutoff + 1 s ago: stale
+    const EDGE: &str = "atl-edge-cccccccccccccccc"; // recorded exactly the cutoff ago: kept
+    const LIVE: &str = "atl-live-dddddddddddddddd"; // recorded 1 day ago: kept
+    const OLD: &str = "atl-old-eeeeeeeeeeeeeeee"; // superseded generation, recorded 20 days ago: stale
+    const NEW: &str = "atl-old-ffffffffffffffff"; // its newer generation, recorded 2 days ago: kept
+    const NEVER: &str = "atl-never-1111111111111111"; // no row, mtime 30 days ago: stale
+    const FRESH: &str = "atl-fresh-7777777777777777"; // no row, mtime 1 day ago: kept
+    const EXAMPLE: &str = "atl-ex-2222222222222222"; // examples/ file + uplifted link, recorded 30 days ago: stale
+    const NOHASH: &str = "not-a-unit"; // fingerprint entry that is no unit: kept
 
     // Apparent bytes the fixture writes, summed by hand.
     const STALE_BYTES: u64 = 10 + 300 + 1000 + 200 + 50;
@@ -491,7 +831,16 @@ mod tests {
         len as u64
     }
 
-    /// `cargo/release` of slot 1 with one unit per name above, two orphan `deps/` files, and no record.
+    /// Sets a directory's mtime to `secs` since the epoch.
+    fn set_mtime(path: &Path, secs: u64) {
+        let when = UNIX_EPOCH + Duration::from_secs(secs);
+        fs::File::open(path)
+            .expect("open dir")
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// `cargo/release` of slot 1 with one unit per name above, two orphan `deps/` files, and no record. Every fingerprint dir's mtime is 30 days old, except FRESH's, a day old.
     fn tree_fixture(ws: &Path) -> PathBuf {
         let tree = ws.join("out/slot-1/cargo/release");
         let fp = tree.join(FINGERPRINT);
@@ -513,6 +862,7 @@ mod tests {
         sized(&deps.join("libatl_old-ffffffffffffffff.rlib"), 700);
         sized(&fp.join(NEVER).join("lib-atl_never"), 8);
         sized(&deps.join("libatl_never-1111111111111111.rlib"), 800);
+        sized(&fp.join(FRESH).join("lib-atl_fresh"), 12);
         sized(&fp.join(EXAMPLE).join("lib-atl_ex"), 9);
         let example = tree.join(EXAMPLES).join("ex-2222222222222222");
         sized(&example, 900);
@@ -520,21 +870,25 @@ mod tests {
         sized(&fp.join(NOHASH).join("lib-x"), 11);
         sized(&deps.join("libatl_gone-9999999999999999.rlib"), 700);
         sized(&deps.join("unrelated.rlib"), 400);
+        for name in [STALE, JUST, EDGE, LIVE, OLD, NEW, NEVER, EXAMPLE, NOHASH] {
+            set_mtime(&fp.join(name), NOW - 30 * DAY);
+        }
+        set_mtime(&fp.join(FRESH), NOW - DAY);
         tree
     }
 
-    /// A use record for `tree`: `since`, and (unit name, last use) pairs keyed by each name's hash.
-    fn write_record(tree: &Path, since: u64, uses: &[(&str, u64)]) {
+    /// A record for `tree` holding (unit name, last use) pairs, keyed by each name's hash.
+    fn write_record(tree: &Path, uses: &[(&str, u64)]) {
         let units: BTreeMap<String, u64> = uses
             .iter()
             .map(|(name, at)| (name.rsplit_once('-').expect("hash").1.to_owned(), *at))
             .collect();
         fs::create_dir_all(tree).expect("tree");
-        let text = json!({"since": since, "units": units}).to_string();
+        let text = json!({"units": units}).to_string();
         fs::write(tree.join(".atl-unit-use.json"), text).expect("record");
     }
 
-    /// The uses of the fixture that a day-old record holds; every other unit has no entry.
+    /// The uses of the fixture that a record holds; NEVER and FRESH have no row.
     fn recent_uses() -> Vec<(&'static str, u64)> {
         vec![
             (STALE, NOW - 30 * DAY),
@@ -549,7 +903,7 @@ mod tests {
 
     /// Tries before a slot lock released a moment ago reads as free (the fork race in build_pool.rs tests): FREE_TRIES x FREE_POLL.
     const FREE_TRIES: u32 = 100;
-    const FREE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    const FREE_POLL: Duration = Duration::from_millis(10);
 
     /// `prune_slot` again once the lock is free. A `Busy` answer while the previous hold drains is retried, never accepted as the answer.
     fn prune_once_free(ws: &Path, n: u32, cutoff: u64, now: u64, execute: bool) -> Outcome {
@@ -569,19 +923,24 @@ mod tests {
         }
     }
 
+    fn stale_names(plan: &TreePlan) -> Vec<String> {
+        let mut names: Vec<String> = plan.stale.iter().map(|u| file_name(&u.paths[0])).collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn stale_units_are_planned_by_recorded_use() {
+    fn stale_units_are_planned_by_recorded_use_or_mtime() {
         let ws = scratch("plan");
         let tree = tree_fixture(&ws);
-        write_record(&tree, NOW - 60 * DAY, &recent_uses());
+        write_record(&tree, &recent_uses());
         let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
-        assert_eq!(plan.tree, "cargo/release");
-        let mut stale: Vec<String> = plan.stale.iter().map(|u| file_name(&u.paths[0])).collect();
-        stale.sort();
-        assert_eq!(stale, [EXAMPLE, JUST, NEVER, OLD, STALE]);
-        assert_eq!(plan.units, 9, "every fingerprint entry");
-        assert_eq!(plan.kept, 3, "EDGE, LIVE, NEW");
-        assert_eq!(plan.unrecorded, 1, "NEVER");
+        assert_eq!(plan.tree, "out/slot-1/cargo/release");
+        assert_eq!(plan.root, "out/slot-1/cargo");
+        assert_eq!(stale_names(&plan), [EXAMPLE, JUST, NEVER, OLD, STALE]);
+        assert_eq!(plan.units, 10, "every fingerprint entry");
+        assert_eq!(plan.kept, 4, "EDGE, LIVE, NEW, FRESH");
+        assert_eq!(plan.unrecorded, 2, "NEVER and FRESH: judged by mtime");
         assert_eq!(plan.unattributed, 1, "NOHASH");
         assert_eq!(plan.orphans, 2, "libatl_gone and unrelated");
         assert_eq!(plan.orphan_bytes, ORPHAN_BYTES);
@@ -612,7 +971,7 @@ mod tests {
     fn execute_removes_stale_units_outputs_and_their_record_entries() {
         let ws = scratch("execute");
         let tree = tree_fixture(&ws);
-        write_record(&tree, NOW - 60 * DAY, &recent_uses());
+        write_record(&tree, &recent_uses());
         let dry = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("dry run"));
         assert_eq!(dry[0].stale.len(), 5);
         assert!(
@@ -643,6 +1002,7 @@ mod tests {
             fp.join(EDGE),
             fp.join(LIVE),
             fp.join(NEW),
+            fp.join(FRESH),
             fp.join(NOHASH),
             deps.join("libatl_edge-cccccccccccccccc.rlib"),
             deps.join("libatl_live-dddddddddddddddd.rlib"),
@@ -674,34 +1034,48 @@ mod tests {
     fn a_unit_cargo_reused_is_kept_though_its_last_rebuild_is_old() {
         let ws = scratch("reused");
         let tree = tree_fixture(&ws);
-        write_record(&tree, NOW - 60 * DAY, &[]);
+        write_record(&tree, &[]);
         let reused = json!({"reason": "compiler-artifact", "package_id": "path+file:///ws/atl-stale#0.1.0",
             "filenames": [tree.join("deps/libatl_stale-0123456789abcdef.rlib").display().to_string()],
             "executable": null, "fresh": true});
         unit_use::record(&[reused], NOW).expect("record the reuse");
         let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
-        let stale: Vec<String> = plan.stale.iter().map(|u| file_name(&u.paths[0])).collect();
+        let stale = stale_names(&plan);
         assert!(
             !stale.contains(&STALE.to_owned()),
             "reused unit planned for removal: {stale:?}"
         );
         assert!(
             stale.contains(&JUST.to_owned()),
-            "control: JUST has no entry in a 60-day record"
+            "control: JUST has no row and an old mtime"
         );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
+    /// With no row a unit is judged by its mtime alone: the record's age does not enter. Expected values: 9 hashed units, FRESH (mtime a day old) the only one kept.
     #[test]
-    fn a_unit_without_an_entry_is_kept_while_the_record_is_young() {
-        let ws = scratch("young");
+    fn units_without_a_row_are_judged_by_mtime_whatever_the_record_age() {
+        let ws = scratch("mtime");
         let tree = tree_fixture(&ws);
-        write_record(&tree, NOW - 3 * DAY, &[]);
+        write_record(&tree, &[]);
         let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
-        assert!(plan.stale.is_empty(), "stale under a 3-day record");
-        assert_eq!(plan.kept, 8, "every hashed unit");
-        assert_eq!(plan.unrecorded, 8);
+        assert_eq!(
+            stale_names(&plan),
+            [EDGE, EXAMPLE, JUST, LIVE, NEVER, OLD, NEW, STALE]
+        );
+        assert_eq!(plan.kept, 1, "FRESH");
+        assert_eq!(plan.unrecorded, 9, "every hashed unit");
         assert_eq!(plan.unattributed, 1, "NOHASH");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn no_record_file_judges_every_unit_by_mtime_too() {
+        let ws = scratch("no-record");
+        tree_fixture(&ws);
+        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        assert_eq!(plan.kept, 1, "FRESH");
+        assert_eq!(plan.unrecorded, 9);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -709,7 +1083,7 @@ mod tests {
     fn busy_slot_is_skipped_and_untouched() {
         let ws = scratch("busy");
         let tree = tree_fixture(&ws);
-        write_record(&tree, NOW - 60 * DAY, &recent_uses());
+        write_record(&tree, &recent_uses());
         let build = build_pool::hold_slot(&ws, 1, || {}).expect("build holds slot 1");
         assert!(matches!(
             prune_slot(&ws, 1, CUTOFF, NOW, true).expect("prune"),
@@ -724,6 +1098,25 @@ mod tests {
             prune_once_free(&ws, 1, CUTOFF, NOW, false),
             Outcome::Done(_)
         ));
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A cargo build that does not go through xtask holds only its tree's `.cargo-lock`: that tree is reported busy and left alone, while the slot is pruned as usual.
+    #[test]
+    fn a_tree_whose_cargo_lock_is_held_is_busy_and_untouched() {
+        let ws = scratch("tree-busy");
+        let tree = tree_fixture(&ws);
+        write_record(&tree, &recent_uses());
+        let build = fs::File::create(tree.join(CARGO_LOCK)).expect("cargo lock");
+        flock(&build, FlockOperation::NonBlockingLockExclusive).expect("hold");
+        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, true).expect("prune")).remove(0);
+        assert!(plan.busy);
+        assert!(plan.stale.is_empty() && plan.sessions.is_empty());
+        assert!(
+            tree.join(FINGERPRINT).join(STALE).exists(),
+            "busy tree pruned"
+        );
+        drop(build);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -790,8 +1183,9 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
+    /// The trees under the roots: profiles and triple profiles only. `gl/other` and `cargo/cxxbridge` hold no root or no tree.
     #[test]
-    fn trees_are_profiles_and_triple_profiles_only() {
+    fn trees_are_profiles_and_triple_profiles_under_the_roots_only() {
         let ws = scratch("trees");
         let slot = ws.join("out/slot-1");
         sized(&slot.join("cargo/release/.fingerprint/x/y"), 1);
@@ -800,28 +1194,227 @@ mod tests {
             1,
         );
         sized(&slot.join("cargo-converter/release/.fingerprint/x/y"), 1);
+        sized(&slot.join("target/debug/.fingerprint/x/y"), 1);
+        sized(
+            &slot.join("gl/cargo-undefined-gl/release/.fingerprint/x/y"),
+            1,
+        );
+        sized(&slot.join("gl/other/debug/.fingerprint/x/y"), 1);
         sized(&slot.join("cargo/cxxbridge/somecrate/src/lib.rs"), 1);
         sized(&slot.join("cargo/tmp/file"), 1);
-        let mut found: Vec<String> = trees(&slot)
+        let mut found: Vec<String> = trees_under(&slot_roots(&slot).expect("roots"))
             .expect("trees")
             .iter()
-            .map(|p| {
-                p.strip_prefix(&slot)
-                    .expect("under slot")
-                    .display()
-                    .to_string()
-            })
+            .map(|f| relative(&ws, &f.dir))
             .collect();
         found.sort();
         assert_eq!(
             found,
             [
-                "cargo-converter/release",
-                "cargo/release",
-                "cargo/x86_64-unknown-linux-gnu/release"
+                "out/slot-1/cargo-converter/release",
+                "out/slot-1/cargo/release",
+                "out/slot-1/cargo/x86_64-unknown-linux-gnu/release",
+                "out/slot-1/gl/cargo-undefined-gl/release",
+                "out/slot-1/target/debug",
             ]
         );
         fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The root names of a slot: the three target names xtask gives cargo, and the `cargo*` probes under `gl/`.
+    #[test]
+    fn slot_roots_are_the_target_names_and_the_gl_cargo_probes() {
+        let ws = scratch("roots");
+        let slot = ws.join("out/slot-2");
+        fs::create_dir_all(slot.join("gl/cargo")).expect("gl");
+        fs::create_dir_all(slot.join("gl/cargo-undefined-gl")).expect("gl");
+        fs::create_dir_all(slot.join("gl/other")).expect("gl");
+        let mut names: Vec<String> = slot_roots(&slot)
+            .expect("roots")
+            .iter()
+            .map(|p| relative(&slot, p))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "cargo",
+                "cargo-converter",
+                "gl/cargo",
+                "gl/cargo-undefined-gl",
+                "target"
+            ]
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The trees no slot owns: the main checkout's default target, and each EGL driver checkout's `cargo*` roots only.
+    #[test]
+    fn unslotted_roots_are_repo_target_and_the_egl_driver_cargo_probes() {
+        let ws = scratch("unslotted");
+        sized(&ws.join("repo/target/debug/.fingerprint/x/y"), 1);
+        sized(
+            &ws.join("repo/target/x86_64-unknown-linux-gnu/release/.fingerprint/x/y"),
+            1,
+        );
+        sized(&ws.join("repo/target/bp2ninja/bin/tool"), 1);
+        sized(
+            &ws.join("out/egl-driver/chk/cargo/release/.fingerprint/x/y"),
+            1,
+        );
+        sized(
+            &ws.join("out/egl-driver/chk/other/release/.fingerprint/x/y"),
+            1,
+        );
+        sized(
+            &ws.join("out/egl-driver/chk2/cargo-probe/debug/.fingerprint/x/y"),
+            1,
+        );
+        let mut found: Vec<String> = trees_under(&unslotted_roots(&ws).expect("roots"))
+            .expect("trees")
+            .iter()
+            .map(|f| relative(&ws, &f.dir))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "out/egl-driver/chk/cargo/release",
+                "out/egl-driver/chk2/cargo-probe/debug",
+                "repo/target/debug",
+                "repo/target/x86_64-unknown-linux-gnu/release",
+            ]
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Two crate dirs. `atl_x`: finalized `t` 1 (not newest), 2 (lock held), 9 (newest); `-working` 4 (lock free), 5 (lock held); orphan lock 7 (free), 8 (held); `s-x` matches no rustc shape. `atl_y`: a `-working` session younger than the grace (its `t` is far in the future).
+    fn incremental_fixture(tree: &Path) -> PathBuf {
+        let x = tree.join("incremental/atl_x-0123456789abcdef");
+        for (name, len) in [
+            ("s-1-a-svh1", 100usize),
+            ("s-2-b-svh2", 200),
+            ("s-9-z-svh9", 900),
+            ("s-4-d-working", 40),
+            ("s-5-e-working", 50),
+            ("s-x", 7),
+        ] {
+            sized(&x.join(name).join("query-cache.bin"), len);
+        }
+        for lock in [
+            "s-1-a.lock",
+            "s-2-b.lock",
+            "s-9-z.lock",
+            "s-4-d.lock",
+            "s-5-e.lock",
+            "s-7-g.lock",
+            "s-8-h.lock",
+        ] {
+            fs::write(x.join(lock), "").expect("lock");
+        }
+        sized(
+            &tree.join("incremental/atl_y-0123456789abcdef/s-zzzzzzzzzz-y-working/query-cache.bin"),
+            30,
+        );
+        x
+    }
+
+    /// The fixture's held locks: `s-2-b`, `s-5-e` and orphan `s-8-h`. The returned files keep the flocks while the test runs.
+    fn hold_incremental_locks(x: &Path) -> Vec<File> {
+        ["s-2-b.lock", "s-5-e.lock", "s-8-h.lock"]
+            .iter()
+            .map(|lock| {
+                let file = File::open(x.join(lock)).expect("open lock");
+                flock(&file, FlockOperation::NonBlockingLockExclusive).expect("hold");
+                file
+            })
+            .collect()
+    }
+
+    /// Stale: `s-1-a` (finalized, not newest) and `-working` `s-4-d` (lock free, older than the grace), with their locks, and orphan lock `s-7-g` (free, old). Kept: the newest `s-9-z`, held `s-2-b` and `s-5-e`, the malformed `s-x`, held orphan `s-8-h`, and crate `atl_y`'s young `-working` session. Bytes: 100 + 40.
+    #[test]
+    fn incremental_keeps_the_newest_finalized_session_and_every_held_or_young_one() {
+        let ws = scratch("incremental");
+        let tree = ws.join("out/slot-1/cargo/debug");
+        fs::create_dir_all(tree.join(FINGERPRINT)).expect("fingerprint");
+        let x = incremental_fixture(&tree);
+        let _held = hold_incremental_locks(&x);
+        let plan = only_plan(prune_slot(&ws, 1, CUTOFF, NOW, false).expect("prune")).remove(0);
+        let mut dirs: Vec<String> = plan
+            .sessions
+            .iter()
+            .filter_map(|s| s.dir.as_ref().map(|d| file_name(d)))
+            .collect();
+        dirs.sort();
+        assert_eq!(dirs, ["s-1-a-svh1", "s-4-d-working"]);
+        let mut locks: Vec<String> = plan
+            .sessions
+            .iter()
+            .filter_map(|s| s.lock.as_ref().map(|l| file_name(l)))
+            .collect();
+        locks.sort();
+        assert_eq!(locks, ["s-1-a.lock", "s-4-d.lock", "s-7-g.lock"]);
+        assert_eq!(plan.sessions.len(), 3, "two sessions and one orphan lock");
+        assert_eq!(plan.session_bytes(), 100 + 40);
+        assert_eq!(
+            plan.kept_sessions, 6,
+            "s-2-b, s-5-e, s-9-z, s-x, orphan s-8-h, and atl_y's young working session"
+        );
+        assert!(x.join("s-1-a-svh1").exists(), "dry run removed");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn incremental_removal_takes_the_stale_sessions_and_their_locks_only() {
+        let ws = scratch("incremental-exec");
+        let tree = ws.join("out/slot-1/cargo/debug");
+        fs::create_dir_all(tree.join(FINGERPRINT)).expect("fingerprint");
+        let x = incremental_fixture(&tree);
+        let _held = hold_incremental_locks(&x);
+        only_plan(prune_once_free(&ws, 1, CUTOFF, NOW, true));
+        for gone in [
+            "s-1-a-svh1",
+            "s-1-a.lock",
+            "s-4-d-working",
+            "s-4-d.lock",
+            "s-7-g.lock",
+        ] {
+            assert!(!x.join(gone).exists(), "{gone} survived");
+        }
+        for kept in [
+            "s-2-b-svh2",
+            "s-2-b.lock",
+            "s-5-e-working",
+            "s-5-e.lock",
+            "s-8-h.lock",
+            "s-9-z-svh9",
+            "s-9-z.lock",
+            "s-x",
+        ] {
+            assert!(x.join(kept).exists(), "{kept} was removed");
+        }
+        assert!(
+            tree.join("incremental/atl_y-0123456789abcdef/s-zzzzzzzzzz-y-working")
+                .exists(),
+            "a young working session was removed"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// `session_time` and `lock_time` read only the shapes rustc writes: base-36 `t` in the second dash field.
+    #[test]
+    fn session_names_parse_only_in_rustcs_shapes() {
+        assert_eq!(session_time("s-9-z-svh9"), Some(9));
+        assert_eq!(
+            session_time("s-zzzzzzzzzz-y-working"),
+            Some(3_656_158_440_062_975)
+        );
+        assert_eq!(session_time("s-x"), None);
+        assert_eq!(session_time("s-1-a"), None, "three fields: a lock stem");
+        assert_eq!(lock_time("s-7-g.lock"), Some(7));
+        assert_eq!(lock_time("s-7-g-svh.lock"), None);
+        assert_eq!(lock_name("s-9-z-svh9"), "s-9-z.lock");
+        assert_eq!(lock_name("s-4-d-working"), "s-4-d.lock");
     }
 
     #[test]

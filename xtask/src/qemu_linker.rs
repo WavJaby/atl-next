@@ -19,6 +19,7 @@ use object::{Object, ObjectSection};
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, GUEST_API};
 use crate::qemu_spike;
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
 const TESTDATA: &str = "xtask/testdata/qemu-linker";
@@ -288,21 +289,22 @@ fn harness(
         Some(b) if b != SKIP_RELOC => cmd.env("ATL_NB_BREAK", b),
         _ => cmd.env_remove("ATL_NB_BREAK"),
     };
-    let out = cmd.output().context("running cargo test")?;
+    let run =
+        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{name}.log"));
     std::fs::write(
         &log,
-        [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+        [run.stdout.as_bytes(), run.stderr.as_bytes()].concat(),
     )?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = &run.stdout;
     let ok = |c: char| text.lines().any(|l| l == format!("{}: ({c}) ok", h.prefix));
     match brk {
         None => {
             let red: Vec<char> = h.checks.iter().copied().filter(|&c| !ok(c)).collect();
             ensure!(
-                red.is_empty() && out.status.success(),
+                red.is_empty() && run.status.success(),
                 "checks {red:?} not ok ({}), log {}",
-                out.status,
+                run.status,
                 log.display()
             );
         }
@@ -313,7 +315,7 @@ fn harness(
                 log.display()
             );
             ensure!(
-                !out.status.success(),
+                !run.status.success(),
                 "break run exited 0, log {}",
                 log.display()
             );

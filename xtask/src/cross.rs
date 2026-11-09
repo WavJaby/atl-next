@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::unit_use::{self, Echo, Units};
 use crate::{arches, deps};
 
 #[derive(clap::Args)]
@@ -47,7 +48,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for (key, value) in &plan.env {
         cargo.env(key, value);
     }
-    let status = cargo.status().context("running cargo")?;
+    // only the build-like subcommands take --message-format; the others run unrecorded
+    let units = match plan.args.first().map(String::as_str) {
+        Some("build" | "check" | "clippy" | "run" | "test" | "bench") => Units::Recorded,
+        _ => Units::Plain,
+    };
+    let status = unit_use::run(&mut cargo, units, Echo::Both)
+        .context("running cargo")?
+        .status;
     Ok(if status.success() {
         ExitCode::SUCCESS
     } else {

@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: MIT
-//! Cargo unit use per target tree: the record `slot prune` reads instead of rebuild times.
+//! The one way xtask runs cargo, and the unit use it records per target tree: the record `slot prune` reads instead of rebuild times.
 //!
-//! Every cargo build xtask runs on a target tree goes through [`status`] or [`exec`]. Both add `--message-format=json-render-diagnostics` (human diagnostics stay on stderr, JSON messages come on stdout) and record each unit that a `compiler-artifact` or `build-script-executed` message names, fresh ones included. Cargo reports every unit of a build's graph on every build, reused or not, so the last build that reports a unit is its last use. Schema: cargo book, External tools, JSON messages (https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages). `compiler-artifact` carries `package_id`, `filenames`, `executable`, `fresh`; `build-script-executed` carries `package_id`, `out_dir`.
+//! [`run`] is the only spawn point. A `Units::Recorded` run (build, test, clippy) gets `--message-format=json-render-diagnostics` (human diagnostics stay on stderr, JSON messages come on stdout), returns those messages, and records each unit that a `compiler-artifact` or `build-script-executed` message names, fresh ones included. Cargo reports every unit of a build's graph on every build, reused or not, so the last build that reports a unit is its last use. Schema: cargo book, External tools, JSON messages (https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages). `compiler-artifact` carries `package_id`, `filenames`, `executable`, `fresh`; `build-script-executed` carries `package_id`, `out_dir`.
+//!
+//! `Units::Plain` runs add no flag and record nothing: `cargo metadata`, `fmt`, `deny` and `install --list` take no `--message-format`, and the `cargo xtask` alias would hand it to xtask. The alias's own units (xtask and its dependencies) are compiled before any xtask code runs, so no run records them; `slot prune` judges them by mtime.
 //!
 //! A unit is named by the 16-hex-digit hash in its paths: `deps/<crate>-<hash>.*`, `examples/<name>-<hash>`, `build/<pkg>-<hash>/`, `.fingerprint/<pkg>-<hash>/`. An uplifted output (`<tree>/<name>`) is a hard link of its hashed file, so its inode names the hash. An output with no hash (a cdylib's `deps/lib<x>.so`) names only its package: every fingerprint dir of that package in the tree is recorded, superseded ones included. That keeps more, never less.
 //!
-//! The record `<tree>/.atl-unit-use.json` holds `since` (when it was created) and `units` (hash -> last use, unix seconds). A unit without an entry was not used since `since`. Updates take `flock` on `<tree>/.atl-unit-use.lock` and replace the file by rename. An unreadable record is replaced by a new one (`since` = now): every unit then survives another cutoff, and prune refuses the tree until that happens.
-//!
-//! Not covered: cargo runs whose target dir is not a pool tree (check's test, fmt and deny steps, `cargo metadata`, the nested `cargo xtask` runs, build_client's default `target/`). Prune never reads those trees.
+//! The record `<tree>/.atl-unit-use.json` holds `units` (hash -> last use, unix seconds). A unit without an entry has no recorded use: `slot prune` judges it by its fingerprint dir's mtime. Updates take `flock` on `<tree>/.atl-unit-use.lock` and replace the file by rename. An unreadable record is an error for prune; the next recorded build replaces it with an empty record.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -27,6 +28,8 @@ use serde_json::Value;
 const MESSAGE_FORMAT: &str = "--message-format=json-render-diagnostics";
 /// Cargo writes a unit hash as `{:016x}`: 16 lowercase hex digits ending the unit's name.
 const HASH_HEX_LEN: usize = 16;
+/// Chunk size of the stderr copy that shows a live run.
+const TEE_CHUNK: usize = 8192;
 pub const FINGERPRINT: &str = ".fingerprint";
 pub const BUILD: &str = "build";
 pub const DEPS: &str = "deps";
@@ -36,12 +39,10 @@ const RECORD: &str = ".atl-unit-use.json";
 const RECORD_TMP: &str = ".atl-unit-use.json.tmp";
 const RECORD_LOCK: &str = ".atl-unit-use.lock";
 
-/// `<tree>/.atl-unit-use.json`.
+/// `<tree>/.atl-unit-use.json`. An older record may still carry `since`: serde ignores it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Record {
-    /// Unix seconds when the record was created: a unit with no entry was not used since then.
-    pub since: u64,
-    /// Unit hash -> unix seconds of its last use.
+    /// Unit hash -> unix seconds of its last use. A unit with no entry is judged by its fingerprint dir mtime.
     pub units: BTreeMap<String, u64>,
 }
 
@@ -53,65 +54,160 @@ pub fn now() -> Result<u64> {
         .as_secs())
 }
 
-/// Runs `cmd`, a cargo build of a target tree, and records its units. Its stderr shows as it runs; returns the status.
-pub fn status(cmd: &mut Command) -> Result<ExitStatus> {
-    Ok(run(cmd, false)?.0)
+/// What a cargo run is for: a build whose units are recorded, or a subcommand that takes no `--message-format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Units {
+    /// build, test, clippy, run: the run adds the flag, returns the messages, records their units.
+    Recorded,
+    /// metadata, fmt, deny, `install --list`, the `cargo xtask` alias: no flag, no record.
+    Plain,
 }
 
-/// [`status`] for a build whose output is not shown: stderr is kept and shown only when the build fails.
-pub fn exec(cmd: &mut Command, what: &str) -> Result<()> {
-    let (status, stderr) = run(cmd, true)?;
-    ensure!(status.success(), "{what} failed ({status}):\n{stderr}");
-    Ok(())
+/// What a run shows while it runs. Its output is kept for the caller in every mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    /// stdout and stderr as they arrive, as an inherited child would show them.
+    Both,
+    /// stdout as it arrives; stderr kept for the caller, who shows it on failure.
+    Stdout,
+    /// nothing: the caller prints what it keeps.
+    Nothing,
 }
 
-/// The cargo run: JSON messages are read as they come (other stdout lines are shown), then recorded whatever the status.
-fn run(cmd: &mut Command, capture_stderr: bool) -> Result<(ExitStatus, String)> {
-    ensure!(
-        !cmd.get_args()
-            .any(|a| a.to_string_lossy().starts_with("--message-format")),
-        "{:?} sets --message-format itself; unit_use sets it",
-        cmd.get_program()
-    );
-    let mut child_cmd = with_message_format(cmd);
-    child_cmd.stdout(Stdio::piped());
-    if capture_stderr {
-        child_cmd.stderr(Stdio::piped());
+/// One finished cargo run.
+#[derive(Debug)]
+pub struct Run {
+    pub status: ExitStatus,
+    /// stdout without the JSON messages; every line keeps its newline.
+    pub stdout: String,
+    pub stderr: String,
+    /// The JSON messages (objects with a `reason`), in order. Empty for `Units::Plain`.
+    pub messages: Vec<Value>,
+}
+
+/// Runs `cmd` and returns its [`Run`]. A recorded run records its units whatever the status: a failed build still reports the units it finished. `cmd` may be a wrapper (`timeout -s KILL <secs> cargo ...`): the flag goes before its first `--`.
+pub fn run(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
+    let mut child_cmd = with_units(cmd, units)?;
+    child_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if echo == Echo::Both {
+        // stderr is a pipe here: cargo would drop colour and progress without these
+        let when = if std::io::stderr().is_terminal() {
+            "always"
+        } else {
+            "never"
+        };
+        child_cmd
+            .env("CARGO_TERM_COLOR", when)
+            .env("CARGO_TERM_PROGRESS_WHEN", when);
     }
     let mut child = child_cmd
         .spawn()
         .with_context(|| format!("running {:?}", cmd.get_program()))?;
-    // read stderr beside stdout: a full stderr pipe would block cargo
-    let stderr = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = pipe.read_to_string(&mut text);
-            text
-        })
-    });
-    let stdout = child.stdout.take().context("cargo stdout is not piped")?;
+    // stderr is drained beside stdout: a full stderr pipe would block cargo
+    let stderr_pipe = child.stderr.take().context("cargo stderr is not piped")?;
+    let show_stderr = echo == Echo::Both;
+    let stderr = thread::spawn(move || drain(stderr_pipe, show_stderr));
+    let stdout_pipe = child.stdout.take().context("cargo stdout is not piped")?;
+    let mut reader = BufReader::new(stdout_pipe);
+    let mut text = String::new();
     let mut messages = Vec::new();
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("reading cargo stdout")?;
-        match serde_json::from_str::<Value>(&line) {
-            Ok(message) if message.get("reason").is_some() => messages.push(message),
-            _ => println!("{line}"),
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if reader
+            .read_until(b'\n', &mut raw)
+            .context("reading cargo stdout")?
+            == 0
+        {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
+        let message = match units {
+            Units::Recorded => serde_json::from_str::<Value>(line.trim_end())
+                .ok()
+                .filter(|m| m.get("reason").is_some()),
+            Units::Plain => None,
+        };
+        match message {
+            Some(message) => messages.push(message),
+            None => {
+                if echo != Echo::Nothing {
+                    print!("{line}");
+                }
+                text.push_str(&line);
+            }
         }
     }
     let status = child.wait().context("waiting for cargo")?;
-    let stderr = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
-    record(&messages, now()?).context("recording cargo unit use")?;
-    Ok((status, stderr))
+    let stderr = stderr.join().unwrap_or_default();
+    if units == Units::Recorded {
+        record(&messages, now()?).context("recording cargo unit use")?;
+    }
+    Ok(Run {
+        status,
+        stdout: text,
+        stderr,
+        messages,
+    })
 }
 
-/// `cmd` with the message format added before its first `--`: clippy's `-- -D warnings` must not receive it.
-fn with_message_format(cmd: &Command) -> Command {
+/// [`run`] for a build whose output shows as it runs: returns the status.
+pub fn status(cmd: &mut Command) -> Result<ExitStatus> {
+    Ok(run(cmd, Units::Recorded, Echo::Both)?.status)
+}
+
+/// [`run`] for a build whose stderr shows only when it fails.
+pub fn exec(cmd: &mut Command, what: &str) -> Result<()> {
+    let run = run(cmd, Units::Recorded, Echo::Stdout)?;
+    ensure!(
+        run.status.success(),
+        "{what} failed ({}):\n{}",
+        run.status,
+        run.stderr
+    );
+    Ok(())
+}
+
+/// Reads `from` to its end. With `show`, each chunk also goes to our stderr as it arrives; a failed write stops the showing, never the capture.
+fn drain(mut from: impl Read, show: bool) -> String {
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; TEE_CHUNK];
+    let mut showing = show;
+    loop {
+        match from.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                captured.extend_from_slice(&chunk[..n]);
+                if showing {
+                    let mut err = std::io::stderr().lock();
+                    let written = err.write_all(&chunk[..n]);
+                    showing = written.and_then(|()| err.flush()).is_ok();
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+/// `cmd` as a new command, with the message format added before its first `--` (clippy's `-- -D warnings` must not receive it). `Recorded` refuses a `--message-format` the caller set: the run owns it.
+fn with_units(cmd: &Command, units: Units) -> Result<Command> {
     let mut args: Vec<&OsStr> = cmd.get_args().collect();
-    let at = args
-        .iter()
-        .position(|a| *a == OsStr::new("--"))
-        .unwrap_or(args.len());
-    args.insert(at, OsStr::new(MESSAGE_FORMAT));
+    if units == Units::Recorded {
+        ensure!(
+            !args
+                .iter()
+                .any(|a| a.to_string_lossy().starts_with("--message-format")),
+            "{:?} sets --message-format itself; the recorded run owns it",
+            cmd.get_program()
+        );
+        let at = args
+            .iter()
+            .position(|a| *a == OsStr::new("--"))
+            .unwrap_or(args.len());
+        args.insert(at, OsStr::new(MESSAGE_FORMAT));
+    }
     let mut out = Command::new(cmd.get_program());
     out.args(args);
     if let Some(dir) = cmd.get_current_dir() {
@@ -123,7 +219,7 @@ fn with_message_format(cmd: &Command) -> Command {
             None => out.env_remove(key),
         };
     }
-    out
+    Ok(out)
 }
 
 /// Records the units `messages` name as used at `now`, in each tree they name.
@@ -133,7 +229,7 @@ pub fn record(messages: &[Value], now: u64) -> Result<()> {
         for package in &uses.packages {
             hashes.extend(fingerprints_of(&tree, package)?);
         }
-        update(&tree, now, |record| {
+        update(&tree, |record| {
             for hash in hashes {
                 record.units.insert(hash, now);
             }
@@ -147,7 +243,7 @@ pub fn forget(tree: &Path, hashes: &[String]) -> Result<()> {
     if load(tree)?.is_none() {
         return Ok(());
     }
-    update(tree, now()?, |record| {
+    update(tree, |record| {
         for hash in hashes {
             record.units.remove(hash);
         }
@@ -166,8 +262,8 @@ pub fn load(tree: &Path) -> Result<Option<Record>> {
     }
 }
 
-/// Applies `change` to the record of `tree` under its lock. A missing record starts with `since` = `now`; an unreadable one is replaced the same way, with a note.
-fn update(tree: &Path, now: u64, change: impl FnOnce(&mut Record)) -> Result<()> {
+/// Applies `change` to the record of `tree` under its lock. A missing record starts empty; an unreadable one is replaced the same way, with a note.
+fn update(tree: &Path, change: impl FnOnce(&mut Record)) -> Result<()> {
     let lock_path = tree.join(RECORD_LOCK);
     let lock = OpenOptions::new()
         .create(true)
@@ -179,18 +275,12 @@ fn update(tree: &Path, now: u64, change: impl FnOnce(&mut Record)) -> Result<()>
         .with_context(|| format!("flock {}", lock_path.display()))?;
     let mut record = match load(tree) {
         Ok(Some(record)) => record,
-        Ok(None) => Record {
-            since: now,
-            ..Record::default()
-        },
+        Ok(None) => Record::default(),
         Err(e) => {
             eprintln!(
-                "{e:#}: replaced by a new record; its units count as unrecorded until it ages out"
+                "{e:#}: replaced by an empty record; its units are judged by mtime until used again"
             );
-            Record {
-                since: now,
-                ..Record::default()
-            }
+            Record::default()
         }
     };
     change(&mut record);
@@ -422,6 +512,16 @@ mod tests {
         ]
     }
 
+    /// The unit hashes `fixture` + `messages` record, derived by hand from the names above.
+    const FIXTURE_UNITS: [&str; 6] = [
+        "1111111111111111",
+        "4d8b50e752b24547",
+        "6478fe1bccb24b75",
+        "6870961078c9e1fc",
+        "82c9bf5494a1a958",
+        "98196d3cfe1a415c",
+    ];
+
     #[test]
     fn each_output_names_its_unit_and_an_unhashed_one_its_package() {
         let root = scratch("map");
@@ -430,18 +530,9 @@ mod tests {
         let record = load(&tree).expect("load").expect("record exists");
         let got: Vec<&str> = record.units.keys().map(String::as_str).collect();
         assert_eq!(
-            got,
-            [
-                "1111111111111111",
-                "4d8b50e752b24547",
-                "6478fe1bccb24b75",
-                "6870961078c9e1fc",
-                "82c9bf5494a1a958",
-                "98196d3cfe1a415c",
-            ],
+            got, FIXTURE_UNITS,
             "lib deps files, build-script run dir, uplifted bin and example by inode, cdylib by package (both generations)"
         );
-        assert_eq!(record.since, NOW);
         assert!(record.units.values().all(|&at| at == NOW));
         fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -463,14 +554,14 @@ mod tests {
     }
 
     #[test]
-    fn since_stays_and_the_last_use_moves_forward() {
+    fn the_last_use_moves_forward() {
         let root = scratch("merge");
         let tree = fixture(&root);
         record(&messages(&tree, false), NOW).expect("first build");
         record(&messages(&tree, true), NOW + 100).expect("second build");
         let record = load(&tree).expect("load").expect("record exists");
-        assert_eq!(record.since, NOW);
         assert_eq!(record.units.get("82c9bf5494a1a958"), Some(&(NOW + 100)));
+        assert_eq!(record.units.get("6478fe1bccb24b75"), Some(&(NOW + 100)));
         assert!(!tree.join(RECORD_TMP).exists(), "temp file left behind");
         fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -483,7 +574,25 @@ mod tests {
         assert!(load(&tree).is_err(), "garbage read as a record");
         record(&messages(&tree, true), NOW).expect("the build still records");
         let record = load(&tree).expect("load").expect("record exists");
-        assert_eq!(record.since, NOW, "replacement starts a new record");
+        let got: Vec<&str> = record.units.keys().map(String::as_str).collect();
+        assert_eq!(
+            got, FIXTURE_UNITS,
+            "replacement holds only this build's units"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A record written before `since` was dropped still reads: serde ignores the field.
+    #[test]
+    fn a_record_with_since_still_loads() {
+        let root = scratch("since");
+        let tree = fixture(&root);
+        file(
+            &tree.join(RECORD),
+            r#"{"since":1700000000,"units":{"82c9bf5494a1a958":1800000000}}"#,
+        );
+        let record = load(&tree).expect("load").expect("record exists");
+        assert_eq!(record.units.get("82c9bf5494a1a958"), Some(&NOW));
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -523,17 +632,109 @@ mod tests {
         assert_eq!(unit_hash("0123456789abcdef"), None);
     }
 
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn message_format_goes_before_the_first_double_dash() {
         let mut cmd = Command::new("cargo");
         cmd.args(["clippy", "--lib", "--", "-D", "warnings"]);
-        let args: Vec<String> = with_message_format(&cmd)
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let out = with_units(&cmd, Units::Recorded).expect("recorded");
         assert_eq!(
-            args,
+            args_of(&out),
             ["clippy", "--lib", MESSAGE_FORMAT, "--", "-D", "warnings"]
         );
+    }
+
+    #[test]
+    fn a_wrapped_cargo_gets_the_flag_before_its_double_dash() {
+        let mut cmd = Command::new("timeout");
+        cmd.args(["-s", "KILL", "600", "cargo", "test", "--", "--nocapture"]);
+        let out = with_units(&cmd, Units::Recorded).expect("recorded");
+        assert_eq!(out.get_program(), "timeout");
+        assert_eq!(
+            args_of(&out),
+            [
+                "-s",
+                "KILL",
+                "600",
+                "cargo",
+                "test",
+                MESSAGE_FORMAT,
+                "--",
+                "--nocapture"
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_run_adds_no_message_format() {
+        let mut cmd = Command::new("cargo");
+        cmd.args(["metadata", "--format-version", "1"]);
+        let out = with_units(&cmd, Units::Plain).expect("plain");
+        assert_eq!(args_of(&out), ["metadata", "--format-version", "1"]);
+    }
+
+    #[test]
+    fn recorded_run_refuses_a_message_format_it_would_duplicate() {
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "--message-format=short"]);
+        let err = with_units(&cmd, Units::Recorded).expect_err("duplicate flag");
+        assert!(format!("{err:#}").contains("owns it"), "{err:#}");
+    }
+
+    /// Prints the messages of `fixture` as cargo would, one per line, then `plain` as an ordinary line. The script's own arguments land after the sh `--`, so the appended flag is `$0`-style noise it ignores.
+    fn shell_run(root: &Path, tree: &Path, units: Units) -> Run {
+        let jsonl = root.join("messages.jsonl");
+        let text: String = messages(tree, false)
+            .iter()
+            .map(|m| format!("{m}\n"))
+            .collect();
+        fs::write(&jsonl, text).expect("messages");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo plain line; cat \"$1\"", "sh"])
+            .arg(&jsonl);
+        run(&mut cmd, units, Echo::Nothing).expect("run")
+    }
+
+    #[test]
+    fn runner_returns_messages_records_their_units_and_keeps_plain_lines_apart() {
+        let root = scratch("runner");
+        let tree = fixture(&root);
+        let run = shell_run(&root, &tree, Units::Recorded);
+        assert!(run.status.success());
+        assert_eq!(run.messages.len(), 6, "every JSON message is returned");
+        assert_eq!(run.stdout, "plain line\n", "messages are not stdout text");
+        let record = load(&tree).expect("load").expect("record exists");
+        let got: Vec<&str> = record.units.keys().map(String::as_str).collect();
+        assert_eq!(got, FIXTURE_UNITS);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn plain_run_returns_text_and_records_nothing() {
+        let root = scratch("plain");
+        let tree = fixture(&root);
+        let run = shell_run(&root, &tree, Units::Plain);
+        assert!(run.messages.is_empty());
+        assert!(run.stdout.starts_with("plain line\n"));
+        assert!(run.stdout.contains("\"reason\":\"compiler-artifact\""));
+        assert!(
+            load(&tree).expect("load").is_none(),
+            "a plain run wrote a record"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn exit_status_comes_back_and_the_stderr_is_kept() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo oops >&2; exit 3"]);
+        let run = run(&mut cmd, Units::Plain, Echo::Nothing).expect("run");
+        assert_eq!(run.status.code(), Some(3));
+        assert_eq!(run.stderr, "oops\n");
     }
 }

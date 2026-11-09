@@ -82,9 +82,9 @@ pub enum Slot {
         #[arg(long)]
         force: bool,
     },
-    /// Deletes the cargo units of each slot's target trees that no cargo build used for `--older-than` days (dry run unless --execute).
+    /// Deletes the cargo units and incremental sessions of the target trees that no build used for `--older-than` days (dry run unless --execute).
     ///
-    /// Name a slot, or `--all` for the whole pool. A slot a build holds is skipped with a line saying so. Use is what each build recorded (`<tree>/.atl-unit-use.json`, `unit_use`); a unit with no entry is stale once the record is `--older-than` days old.
+    /// Name a slot, or `--all` for every slot plus the trees no slot owns (`repo/target`, `out/egl-driver/*/cargo*`). A slot a build holds, and a tree whose `.cargo-lock` a build holds, is skipped with a line saying so. Use is what each recorded build wrote (`<tree>/.atl-unit-use.json`, `unit_use`); a unit with no entry is judged by its fingerprint dir's mtime. Incremental: per crate, the newest finalized session stays, with the held and the young ones.
     Prune {
         /// Slot number, 1..=SLOTS.
         #[arg(conflicts_with = "all")]

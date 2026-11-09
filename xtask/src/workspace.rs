@@ -7,6 +7,8 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+use crate::unit_use::{self, Echo, Units};
+
 pub struct Workspace {
     pub crates: BTreeSet<String>,
     /// (dependent, dependency) between member crates, every dependency kind and target.
@@ -38,17 +40,14 @@ struct Node {
 }
 
 pub fn load(root: &Path) -> Result<Workspace> {
-    let out = crate::cargo_command()
-        .args(["metadata", "--offline", "--locked", "--format-version", "1"])
-        .current_dir(root)
-        .output()
-        .context("running cargo metadata")?;
-    ensure!(
-        out.status.success(),
-        "cargo metadata: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: Metadata = serde_json::from_slice(&out.stdout).context("parsing cargo metadata")?;
+    let mut cmd = crate::cargo_command();
+    cmd.args(["metadata", "--offline", "--locked", "--format-version", "1"])
+        .current_dir(root);
+    let out =
+        unit_use::run(&mut cmd, Units::Plain, Echo::Nothing).context("running cargo metadata")?;
+    ensure!(out.status.success(), "cargo metadata: {}", out.stderr);
+    let meta: Metadata =
+        serde_json::from_slice(out.stdout.as_bytes()).context("parsing cargo metadata")?;
     Ok(from_metadata(meta))
 }
 

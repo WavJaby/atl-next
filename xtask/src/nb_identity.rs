@@ -15,6 +15,7 @@ use anyhow::{Context, Result, ensure};
 use crate::arches;
 use crate::jni_fixture;
 use crate::slot;
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
 const PACKAGE: &str = "atl-native-bridge";
@@ -90,21 +91,21 @@ fn identity_env(root: &Path, out: &Path) -> Result<Vec<(&'static str, OsString)>
 
 /// One gate: its cargo test under `env`, log to `dir/<gate>.log`; a nonzero exit fails it.
 fn gate_run(root: &Path, dir: &Path, env: &[(&'static str, OsString)], gate: &str) -> Result<()> {
-    let out = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["test", "--locked", "-p", PACKAGE, "--test", gate])
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.args(["test", "--locked", "-p", PACKAGE, "--test", gate])
         .envs(env.iter().map(|(k, v)| (*k, v)))
-        .current_dir(root)
-        .output()
-        .context("running cargo test")?;
+        .current_dir(root);
+    let run =
+        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{gate}.log"));
     std::fs::write(
         &log,
-        [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+        [run.stdout.as_bytes(), run.stderr.as_bytes()].concat(),
     )?;
     ensure!(
-        out.status.success(),
+        run.status.success(),
         "{gate} exited {}, log {}",
-        out.status,
+        run.status,
         log.display()
     );
     Ok(())

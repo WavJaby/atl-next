@@ -21,10 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::Value;
 
 use crate::gdk_dmabuf;
 use crate::nested_wayland::{Arg, GATE_OUTPUT, Ime, NestedCompositor, Output, im_op};
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 use crate::wayland_proxy::{Event, Proxy};
 
@@ -387,27 +387,22 @@ impl Probe {
 
 /// Build `gate` and return its path.
 fn build_client(root: &Path) -> Result<PathBuf> {
-    let out = crate::cargo_command()
-        .current_dir(root)
-        .args([
-            "build",
-            "--locked",
-            "-p",
-            "atl-platform-ui",
-            "--example",
-            "gate",
-            "--message-format=json-render-diagnostics",
-        ])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("running cargo build")?;
+    let mut cmd = crate::cargo_command();
+    cmd.current_dir(root).args([
+        "build",
+        "--locked",
+        "-p",
+        "atl-platform-ui",
+        "--example",
+        "gate",
+    ]);
+    let run = unit_use::run(&mut cmd, Units::Recorded, Echo::Both)?;
     ensure!(
-        out.status.success(),
+        run.status.success(),
         "cargo build of the gate client failed"
     );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    run.messages
+        .iter()
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "gate")
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
         .context("cargo reported no gate executable")

@@ -11,13 +11,13 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::{Layout, MAIN};
 
-use crate::check;
 use crate::fetch;
 use crate::git::{Ident, git, git_raw};
 use crate::patch;
 use crate::slot::{self, SLOTS};
 use crate::slot_prune;
 use crate::sources::{self, Sources};
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 
 /// The note a task keeps in its worktree: untracked by design, copied to `out/` when the branch lands.
@@ -376,12 +376,16 @@ impl Plan {
 fn check_verdict(dir: &Path) -> Result<String> {
     let mut cmd = crate::cargo_command();
     cmd.args(["xtask", "check"]).current_dir(dir);
-    let (status, stdout, _) = check::run_teed(cmd)
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
         .with_context(|| format!("running cargo xtask check in {}", dir.display()))?;
-    let line = verdict::last_line(&stdout, "check")
+    let line = verdict::last_line(&run.stdout, "check")
         .unwrap_or("check: no verdict line")
         .to_owned();
-    ensure!(status.success() && passed(&line), "{line} ({status})");
+    ensure!(
+        run.status.success() && passed(&line),
+        "{line} ({})",
+        run.status
+    );
     Ok(line)
 }
 
@@ -389,11 +393,12 @@ fn check_verdict(dir: &Path) -> Result<String> {
 fn fetch_execute(dir: &Path) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(["xtask", "fetch", "--execute"]).current_dir(dir);
-    let (status, _, _) = check::run_teed(cmd)
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
         .with_context(|| format!("running cargo xtask fetch in {}", dir.display()))?;
     ensure!(
-        status.success(),
-        "cargo xtask fetch --execute exited with {status}"
+        run.status.success(),
+        "cargo xtask fetch --execute exited with {}",
+        run.status
     );
     Ok(())
 }
@@ -404,16 +409,17 @@ fn cleanup_execute(repo: &Path, branch: &str) -> Result<String> {
     let mut cmd = crate::cargo_command();
     cmd.args(["xtask", "land", branch, "--cleanup", "--execute"])
         .current_dir(repo);
-    let (status, stdout, stderr) = check::run_teed(cmd)
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Both)
         .with_context(|| format!("running cargo xtask land --cleanup in {}", repo.display()))?;
     ensure!(
-        status.success(),
-        "{status}: {}",
-        stderr
+        run.status.success(),
+        "{}: {}",
+        run.status,
+        run.stderr
             .rfind("Error:")
-            .map_or(stderr.trim_end(), |at| stderr[at..].trim_end())
+            .map_or(run.stderr.trim_end(), |at| run.stderr[at..].trim_end())
     );
-    stdout
+    run.stdout
         .lines()
         .rev()
         .map(str::trim)
@@ -433,11 +439,18 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
     Ok(note)
 }
 
-/// After a land: `slot prune --all --execute`. A busy slot is skipped; a failure is logged, never fatal, since the land is already pushed.
+/// After a land: `slot prune --execute` over the pool's slots. The trees no slot owns (`repo/target`, EGL probes) are not pruned here: `slot prune --all` does that by hand. A busy slot is skipped; a failure is logged, never fatal, since the land is already pushed.
 fn prune_slots_after_land(repo: &Path, ws: &Path) {
     let slots: Vec<u32> = (1..=SLOTS).collect();
     let swept = slot::holders_of(repo).and_then(|holders| {
-        slot_prune::sweep(ws, &holders, &slots, slot_prune::PRUNE_AFTER_DAYS, true)
+        slot_prune::sweep(
+            ws,
+            &holders,
+            &slots,
+            false,
+            slot_prune::PRUNE_AFTER_DAYS,
+            true,
+        )
     });
     match swept {
         Ok(sweep) if sweep.failed == 0 => {}

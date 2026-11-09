@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::sources::{self, Sources};
 use crate::tree;
+use crate::unit_use::{self, Echo, Units};
 use crate::workspace::{self, Workspace};
 
 pub const FILE: &str = "deps.toml";
@@ -515,16 +516,12 @@ fn package_version(distro: Distro, package: &str) -> Result<Option<String>> {
 }
 
 fn cargo_installed() -> Result<BTreeMap<String, String>> {
-    let out = crate::cargo_command()
-        .args(["install", "--list"])
-        .output()
+    let mut cmd = crate::cargo_command();
+    cmd.args(["install", "--list"]);
+    let out = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
         .context("running cargo install --list")?;
-    ensure!(
-        out.status.success(),
-        "cargo install --list: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(parse_install_list(&String::from_utf8_lossy(&out.stdout)))
+    ensure!(out.status.success(), "cargo install --list: {}", out.stderr);
+    Ok(parse_install_list(&out.stdout))
 }
 
 /// The std targets installed for the pinned toolchain: rustup run in `root` reads rust-toolchain.toml.

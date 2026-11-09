@@ -22,6 +22,7 @@ use crate::git::git_raw;
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, Build, GUEST_API};
 use crate::sources;
+use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
 const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
@@ -879,13 +880,14 @@ fn harness(
         Some(x) => cmd.env("ATL_QEMU_ENGINE_BREAK", x),
         None => cmd.env_remove("ATL_QEMU_ENGINE_BREAK"),
     };
-    let out = cmd.output().context("running cargo test")?;
+    let run =
+        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{}.log", spec.name));
     std::fs::write(
         &log,
-        [out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+        [run.stdout.as_bytes(), run.stderr.as_bytes()].concat(),
     )?;
-    let hung = killed_at_limit(out.status.code());
+    let hung = killed_at_limit(run.status.code());
     if hung {
         println!(
             "qemu-spike: {} hung, killed after {RUN_TIMEOUT_SECS} s (log {})",
@@ -893,15 +895,15 @@ fn harness(
             log.display()
         );
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = &run.stdout;
     let ok = |g: char| text.lines().any(|l| l == format!("spike: ({g}) ok"));
     match spec.red {
         None => {
             let red: Vec<char> = GATES.into_iter().filter(|g| !ok(*g)).collect();
             ensure!(
-                red.is_empty() && out.status.success(),
+                red.is_empty() && run.status.success(),
                 "gates {red:?} not ok ({}{}), log {}",
-                out.status,
+                run.status,
                 if hung { ", hung" } else { "" },
                 log.display()
             );
@@ -909,7 +911,7 @@ fn harness(
         Some(g) => {
             ensure!(!ok(g), "break left gate ({g}) ok, log {}", log.display());
             ensure!(
-                !out.status.success(),
+                !run.status.success(),
                 "break run exited 0, log {}",
                 log.display()
             );
