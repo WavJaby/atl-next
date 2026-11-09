@@ -602,7 +602,7 @@ fn relinked(out: &Path, artifacts: &[PathBuf]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-fn ninja(out: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn ninja(out: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("ninja")
         .arg("-C")
         .arg(out)
@@ -701,7 +701,7 @@ fn parse_query(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
 }
 
 /// `ninja -t deps`: target -> the dependencies its depfile recorded (an object's source first, then its headers).
-fn parse_deps(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+pub(crate) fn parse_deps(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     let mut out: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     let mut target = None::<PathBuf>;
     for line in text.lines() {

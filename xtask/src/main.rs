@@ -51,6 +51,7 @@ mod host_disk;
 mod instrument;
 mod intel_clc;
 mod jni_fixture;
+mod keepset;
 mod land;
 mod libcxx_gate;
 mod licence_gate;
@@ -154,6 +155,10 @@ enum Command {
     /// index; `--which` reads it. Names come from each module's literal `name:` only: a name built
     /// from variables is not indexed.
     Aosp(aosp::Args),
+    /// The `[aosp.sparse]` keep-sets derived from the build graphs: each project's reads, the minimal dir cover, and rows checked against them (`--check`) or written (`--write --project`).
+    ///
+    /// Reads come from every out dir's build.ninja, deps log and graph.json, the Android.bp of the modules they name, `cts.toml` rows and `arches.toml` host rows. Read-only unless `--write`; a checkout changes only through `xtask fetch --recreate`.
+    Keepset(keepset::Args),
     /// AOSP native modules built for this Linux host by our Blueprint converter (tools/bp2ninja).
     ///
     /// Runtime libraries come from each module's android source set compiled for glibc, build tools
@@ -361,6 +366,7 @@ fn main() -> Result<ExitCode> {
         Command::Cross(args) => cross::run(&root, &args),
         Command::Fetch(args) => fetch::run(&root, &args),
         Command::Aosp(args) => aosp::run(&root, &args),
+        Command::Keepset(args) => keepset::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::MesaConfig(args) => mesa::run(&root, &args),
         Command::Qemu(args) => qemu::run(&root, &args),

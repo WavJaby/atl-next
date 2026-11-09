@@ -37,6 +37,8 @@ enum Step {
     Spdx,
     /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks) parse with their schema and invariants
     Tables,
+    /// every [aosp.sparse] row covers the reads of every workspace out dir's build graph (keepset.rs); skipped without one
+    Keepset,
     /// modules.toml equals the real cross-module crate graph
     Modules,
     /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
@@ -67,10 +69,11 @@ enum Step {
     GlProxies,
 }
 
-const ALL: [Step; 17] = [
+const ALL: [Step; 18] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
+    Step::Keepset,
     Step::Modules,
     Step::Drift,
     Step::Seam,
@@ -93,6 +96,7 @@ impl Step {
             Step::Fmt => "fmt",
             Step::Spdx => "spdx",
             Step::Tables => "tables",
+            Step::Keepset => "keepset",
             Step::Modules => "modules",
             Step::Drift => "drift",
             Step::Seam => "seam",
@@ -126,6 +130,10 @@ impl Step {
 
     /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
     fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
+        if self == Step::Keepset {
+            // reads the workspace's graphs (every out/slot-<n>), not this checkout's out dir
+            return crate::keepset::check_workspace(root);
+        }
         if self == Step::ConverterPackages {
             // the packages link the slot's converter rlibs: a slot built before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do
             crate::build_state::ensure_current(root, out)?;
@@ -263,6 +271,7 @@ impl Step {
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
+            Step::Keepset => unreachable!("run handles keepset"),
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
         }

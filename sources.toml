@@ -12,6 +12,7 @@
 #             (checkout src/aosp/<path>, patches patches/aosp/<path>/; `xtask fetch --add` adds rows)
 #   sparse    optional, `[aosp.sparse]`: AOSP tree path (a `projects` key) -> keep-set, cone-mode directories (tree-relative; root files always kept). Absent = whole tree.
 #             A keep-set checkout is a blobless partial clone; each listed dir must exist at the pin; the keep-set is fixed at creation.
+#             Derived by `cargo xtask keepset --write --project <path>` from the build graphs; applied by `cargo xtask fetch --recreate <path>`.
 # [<name>] -- any other git upstream (checkout src/<name>, patches patches/<name>/):
 #   git       clone URL
 #   tag       release tag; or
@@ -262,14 +263,16 @@ sdk = "31cc765be3e9407422fb47dafbef9434b051868e"
 "tools/metalava" = "a2548e478c121d5801137d636f6e83af37eafc99"
 "tools/platform-compat" = "db0de6104d8527114a7ae441b0a9c35f885d2876"
 
-# Keep-sets of the prebuilts-audit "safe now" verdicts: each drops subtrees with no slot-1 read and no known consumer. Everything not named in a row's comment is kept (unmeasured dirs included).
-# Rows are hand-declared, not yet checked against build.ninja (audit Method); the fetch checks each dir exists at the pin.
+# Keep-sets. A row's comment, when it has one, names what the row drops and why. Rows without one were derived by `keepset --write`: each keeps the dirs the build graphs read and drops the rest. Cone mode keeps whole dirs, so a file read keeps its entire parent dir.
+# Rows are checked against the build graphs by `cargo xtask keepset --check` (step `keepset` of `xtask check`): every read of a graph must fall in its project's dirs. The fetch checks each dir exists at the pin.
 [aosp.sparse]
 "prebuilts/build-tools" = ["linux-arm64", "linux-x86/bin", "linux-x86/lib64", "tests"] # linux-x86/lib64: RUNPATH of bin/zipalign and friends ($ORIGIN/../lib64 -> libc++.so); drops darwin-x86, linux_musl-x86, sysroots, common, linux-x86/asan, path (Soong's PATH sandbox; 75 of its symlinks point into darwin-x86)
 "prebuilts/jdk/jdk21" = ["linux-x86"] # drops darwin-arm64, darwin-x86, windows-x86
 "external/cronet" = ["android", "stable", "test_runner"] # drops tot/ (0 reads; its 102 Android.bp are still parsed today)
 "packages/modules/NeuralNetworks" = ["apex", "extensions", "flags", "framework", "service", "shim_and_sl"] # drops runtime, tools, driver, common
 "packages/modules/Virtualization" = ["android", "apex", "build", "libs", "microfuchsia"] # drops guest, tests, docs
+"prebuilts/sdk" = ["28/public", "29/public", "30/public", "31/public", "34/public", "35", "36", "9/public", "current", "tools"]
+"prebuilts/misc" = ["common/androidx-test/androidx/test/core/1.6.0", "common/androidx-test/androidx/test/ext/junit/1.2.0", "common/androidx-test/androidx/test/monitor/1.7.0", "common/androidx-test/androidx/test/rules/1.6.0", "common/androidx-test/androidx/test/runner/1.6.0", "common/androidx-test/androidx/test/services/storage/1.5.0", "common/androidx-test/manifests/androidx.test.core", "common/androidx-test/manifests/androidx.test.ext.junit", "common/androidx-test/manifests/androidx.test.monitor", "common/androidx-test/manifests/androidx.test.rules", "common/androidx-test/manifests/androidx.test.runner", "common/androidx-test/manifests/androidx.test.services.storage", "common/asm", "common/commons-cli", "common/ub-uiautomator"]
 
 # toolchain/llvm_android: read-only reference for the runtimes variants (xtask runtimes.rs mirrors its builders.py), never built.
 # clang-r547379/clang_source_info.md names 9596955b, the merge into llvm-r547379-release; no published branch or tag reaches

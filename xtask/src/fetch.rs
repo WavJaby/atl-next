@@ -120,6 +120,9 @@ pub struct Args {
     /// Instead of the checkouts: every test APK of test-apks.toml into `<workspace>/cache/test-apks`, verified (size, sha256, signing certificate). Dry run unless --execute, which downloads what is missing or damaged.
     #[arg(long, conflicts_with_all = ["bump", "add", "migrate_git_dirs"])]
     test_apks: bool,
+    /// Delete and clone again the checkouts of these pinned AOSP projects (tree paths) whose keep-set differs from sources.toml [aosp.sparse]: a keep-set is fixed at creation. Only a checkout at its pin with no uncommitted changes; the remote must still resolve the pin. Dry run unless --execute.
+    #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with_all = ["bump", "add", "migrate_git_dirs", "test_apks"])]
+    recreate: Vec<String>,
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -156,6 +159,7 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
         jobs: None,
         migrate_git_dirs: false,
         test_apks: false,
+        recreate: Vec::new(),
     };
     ensure!(fetch(root, &args)?, "fetch failed (rows above)");
     Ok(())
@@ -165,6 +169,12 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
 fn fetch(root: &Path, args: &Args) -> Result<bool> {
     let layout = Layout::of(root)?;
     let mut sources = sources::load(root)?;
+    for p in &args.recreate {
+        ensure!(
+            sources.aosp.projects.contains_key(p),
+            "--recreate {p}: not a pinned [aosp.projects] path"
+        );
+    }
     let ctx = Ctx {
         root,
         layout: &layout,
@@ -177,6 +187,7 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
         // only `git am` needs it, and only then is its absence an error
         ident: Ident::of_repo(root).ok(),
         execute: args.execute,
+        recreate: &args.recreate,
     };
     let mut rows = Rows::default();
     // the manifest first: it names every other AOSP project's repository
@@ -230,6 +241,8 @@ struct Ctx<'a> {
     licenses: Licenses,
     ident: Option<Ident>,
     execute: bool,
+    /// `--recreate` projects: their keep-set mismatch may be fixed by deleting the checkout.
+    recreate: &'a [String],
 }
 
 /// One checkout's sync: what moving it to its pin needs, then what applying its patches needs.
@@ -246,7 +259,11 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let local = inspect(dir)?;
     let mut action = decide(&local, &c.commit, u.branch());
     if let Some(why) = keep_mismatch(&local, &c.sparse) {
-        action = Action::Blocked(why);
+        action = if recreates(ctx, c, &local) {
+            Action::Recreate(why)
+        } else {
+            Action::Blocked(why)
+        };
     }
     if ctx.execute {
         apply(&action, c, dir, &ctx.layout.git_dir(&c.dir))?;
@@ -382,6 +399,8 @@ enum Action {
     PatchBranch,
     /// On a branch that is not ours.
     LeaveBranch(String),
+    /// Keep-set differs and `--recreate` names the project: delete the checkout, clone it again (the why).
+    Recreate(String),
     Blocked(String),
 }
 
@@ -395,6 +414,7 @@ impl Action {
             Action::MoveToPin => "elsewhere -> move to pin".into(),
             Action::PatchBranch => "on its patch branch".into(),
             Action::LeaveBranch(b) => format!("on branch {b}, left alone"),
+            Action::Recreate(why) => format!("{why} -> delete, clone again"),
             Action::Blocked(why) => format!("blocked: {why}"),
         }
     }
@@ -490,6 +510,25 @@ fn keep_mismatch(local: &Local, want: &[String]) -> Option<String> {
     })
 }
 
+/// A keep-set mismatch that `--recreate` names and the checkout can lose: at its pin, nothing uncommitted.
+fn recreates(ctx: &Ctx, c: &Checkout, local: &Local) -> bool {
+    let named = matches!(&c.pin, Pin::Aosp(p) if ctx.recreate.contains(p));
+    named && matches!(local, Local::Present { head, dirty: false, .. } if *head == c.commit)
+}
+
+/// Deletes a checkout and its git dir (outside the tree); the caller clones it again.
+fn remove_checkout(dir: &Path, git_dir: &Path) -> Result<()> {
+    for d in [dir, git_dir] {
+        match std::fs::remove_dir_all(d) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {}", d.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `git_dir`: where a new checkout's git dir goes (`Layout::git_dir`); Clone and Reclone only happen to shared checkouts.
 fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()> {
     match action {
@@ -504,14 +543,13 @@ fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()
             Ok(())
         }
         Action::Reclone => {
-            for d in [dir, git_dir] {
-                match std::fs::remove_dir_all(d) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(e).with_context(|| format!("removing {}", d.display()));
-                    }
-                    _ => {}
-                }
-            }
+            remove_checkout(dir, git_dir)?;
+            apply(&Action::Clone, c, dir, git_dir)
+        }
+        Action::Recreate(_) => {
+            // the remote must still resolve the pin before the only copy of the checkout is deleted
+            verify_ref(c)?;
+            remove_checkout(dir, git_dir)?;
             apply(&Action::Clone, c, dir, git_dir)
         }
         Action::MoveToPin => {
@@ -1025,6 +1063,7 @@ mod tests {
             licenses: licenses(),
             ident: Some(ident()),
             execute,
+            recreate: &[],
         }
     }
 
