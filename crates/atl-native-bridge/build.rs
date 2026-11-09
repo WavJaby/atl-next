@@ -342,6 +342,8 @@ fn libc_stubs(qemu: bool) -> &'static str {
 
 /// Why a Shim row traps in the QEMU guest (plan O2): every hand-written host side calls guest code on a guest thread or converts guest records, which needs the QEMU crossing's guest calls on any thread (Q5).
 const QEMU_SHIM_PENDING: &str = "pending: shim under QEMU, Q5";
+/// Shims the QEMU guest binds despite [`QEMU_SHIM_PENDING`]: `pthread_key_create` and `pthread_key_delete` store the guest destructor as the x86 crossing does (intercepts.rs); a destructor runs at thread exit, which traps under QEMU (thread.rs `detach`, plan O2). Delete this list when Q5 binds the other shims.
+const QEMU_BOUND_SHIMS: &[&str] = &["pthread_key_create", "pthread_key_delete"];
 /// The QEMU guest's arches.toml row (engine/arch/qemu.rs `GUEST_ISA`).
 const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
@@ -439,7 +441,7 @@ fn libc_entries(
         .iter()
         .map(|name| {
             if shims.contains(&name.as_str()) {
-                if qemu {
+                if qemu && !QEMU_BOUND_SHIMS.contains(&name.as_str()) {
                     trap(name, QEMU_SHIM_PENDING)
                 } else {
                     "Entry::Shim".to_owned()

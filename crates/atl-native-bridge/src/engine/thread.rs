@@ -110,6 +110,12 @@ extern "C" fn detach(value: *mut libc::c_void) {
                 continue;
             }
             ran = true;
+            // plan O2 (Q5): under QEMU a guest destructor needs the crossing on the exiting thread; only the boot thread has one until guest threads land (Q5), so a non-NULL value traps here. Delete with the QEMU shim list in build.rs.
+            if cfg!(feature = "qemu-guest") {
+                super::unsupported(
+                    "qemu crossing: a guest destructor runs at thread exit: pending: shim under QEMU, Q5",
+                );
+            }
             // SAFETY: as above; `dtor` is the guest's `void (*)(void*)`, `ht` this thread's record.
             unsafe {
                 libc::pthread_setspecific(key, std::ptr::null());

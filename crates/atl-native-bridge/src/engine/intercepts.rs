@@ -46,7 +46,7 @@ extern "C" fn run(start: *mut c_void) -> *mut c_void {
     unsafe { arch::call_guest(&mut *ht, routine, arg, 0, 0, 0) as *mut c_void }
 }
 
-/// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's runs at detach.
+/// `int pthread_key_create(pthread_key_t*, void (*)(void*))`: glibc's key without a destructor; the guest's is stored here and runs at thread exit (thread.rs `detach`). The store is the same under QEMU; a non-NULL value at exit traps there (plan O2, Q5).
 pub(super) extern "C" fn pthread_key_create(key: *mut libc::pthread_key_t, dtor: usize) -> i32 {
     // SAFETY: `key` is the guest's, same ABI (gated above).
     let rc = unsafe { libc::pthread_key_create(key, None) };
