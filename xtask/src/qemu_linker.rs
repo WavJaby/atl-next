@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test qemu-linker`: the QEMU crossing on the real arm64 NB images, three harnesses, each plain then with each of its breaks (QEMU bridge plan Q4-3, Q4-4, Q4-5).
 //!
-//! Library: the spike's `-shared` QEMU library (`qemu_spike::link`). Fixtures in `xtask/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `boot.c` (static, the Q4-4 boot executable), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so).
+//! Library: the engine `.so` (`qemu_spike::engine_so_file`, QEMU bridge plan Q5-1b), which the core dlopens through its C ABI; the rlib route is retired. Fixtures in `xtask/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `boot.c` (static, the Q4-4 boot executable), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`, from `xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`): `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest library directories `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android` that the Q4-5 harness puts on the guest's library path.
 //! Harnesses: `cargo test -p atl-native-bridge --features qemu-guest --test <name>`, harness-less; each header lists its env and checks.
 //! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
-//! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_guest_base` (QEMU at a nonzero guest base: BOOT refuses), `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
+//! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). `qe_guest_base` is retired (Q5-1b): the engine's command line is `-B 0` and the C ABI has no base argument, so there is no nonzero-base run to refuse. The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
 //! - `qemu_dlopen` (Q4-5 guest dlopen): checks s (started), i (the stub libc intercepted stubs), d (dlopen returned a handle), y (dlsym found both functions), c (libfix's constructor saw libdep's relocated value), v (fix_value()). Break: `skip_reloc` (harness-level: the run's libdep.so has DT_ANDROID_RELRSZ zeroed, so its packed RELATIVE relocations are not applied; no product cfg). The AT_RANDOM break was dropped: nothing on this path aborts without AT_RANDOM.
 //!
 //! Pass: every check prints ok and the run exits 0; each break must turn its run red. Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
@@ -48,7 +48,7 @@ const HARNESSES: [Harness; 3] = [
         test: "qemu_start",
         prefix: "qemu-start",
         checks: &['s', 'e', 't', 'h', 'g'],
-        breaks: &["qe_guest_base", "qe_no_tls"],
+        breaks: &["qe_no_tls"],
     },
     Harness {
         test: "qemu_dlopen",
@@ -79,7 +79,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     qemu::execute(root, &b)?;
     let dir = b.dir.join("qemu-linker");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let so = qemu_spike::link(&b, &dir.join("libqemu-spike.so"), None)?;
+    let so = qemu_spike::engine_so_file(root, &b, &dir.join("engine"))?;
     let linker = args.nb.join("native_bridge_guest_linker/linker64");
     let vdso = args
         .nb
@@ -151,10 +151,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     skip_relative(&libdep, &skipped.join("libdep.so"))?;
     std::fs::copy(&libfix, skipped.join("libfix.so"))
         .with_context(|| format!("copying {}", libfix.display()))?;
-    let build_dir = b.build_dir();
-    let env: [(&str, &Path); 8] = [
-        ("ATL_QEMU_BUILD", &build_dir),
-        ("ATL_QEMU_SPIKE_SO", &so),
+    let env: [(&str, &Path); 7] = [
+        ("ATL_ENGINE_SO", &so),
         ("ATL_QEMU_SPIKE_FIXTURE", &fixture),
         ("ATL_NB_BOOT", &boot),
         ("ATL_NB_EXE", &exe),

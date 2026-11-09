@@ -679,6 +679,19 @@ fn engine_so(
     Ok(())
 }
 
+/// The engine `.so` of build `b` in `out` (QEMU bridge plan Q5-1b): the plain staticlib linked with the PIC objects, exporting `atl_engine_v1` and the TLS names. The file the core dlopens (`ATL_ENGINE_SO` in the gates).
+pub(crate) fn engine_so_file(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let staticlib = engine_staticlib(root, b, out, "plain", None)?;
+    engine_link(
+        b,
+        &staticlib,
+        out,
+        &engine_name(&b.arch),
+        engine_abi::TLS_EXPORTS,
+    )
+}
+
 /// The engine's staticlib (`libatl_qemu_engine.a`) built with feature `engine-so`; `brk` selects a break's cfg. Copied to `out` under `tag`, so later builds do not overwrite it.
 fn engine_staticlib(
     root: &Path,

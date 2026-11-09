@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Q4-3 gate (QEMU bridge plan Q4-3), harness-less: the six NB entries are placed in place on the real arm64 `linker64` and vdso (`vdso::bind_linker`, `vdso::bind`), and their placed words are checked before QEMU starts. QEMU then runs the fixture. At BOOT the pool and both images are registered with QEMU; the fixture calls each placed site as its AOSP prototype says, and the host answers each binding trap and checks ids and arguments.
-//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_QEMU_SPIKE_SO (the spike library), ATL_QEMU_SPIKE_FIXTURE (testdata/qemu-linker/fixture.c, built static), ATL_NB_LINKER (arm64 linker64), ATL_NB_VDSO (arm64 libnative_bridge_vdso.so).
+//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_SPIKE_FIXTURE (testdata/qemu-linker/fixture.c, built static), ATL_NB_LINKER (arm64 linker64), ATL_NB_VDSO (arm64 libnative_bridge_vdso.so).
 //! Expected values: the AOSP prototypes and the fixture's literals (fixture.c), never the engine. A placed id is read back from the svc immediate (ARM ARM: imm16 at bits 20:5) and must match the id of the trap that arrives.
 //! Output: `qemu-linker: (x) ok` per check, `(x) FAIL <why>` otherwise. Checks: (p) placement, (r) registration, (t) trap ids and order, (a) arguments, (s) answers. Exit 0 when all pass.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
@@ -12,10 +12,10 @@
 use std::ffi::{CStr, c_char};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use atl_native_bridge::engine::{arch, image::Image, thread, vdso};
-use atl_qemu_engine::{Guest, Trap};
 
 // ARM ARM encodings, written out here: atl-bridgegen's constants are the code under test.
 /// `svc #0`: the base encoding, imm16 at bits 20:5.
@@ -68,6 +68,13 @@ struct Plan {
 }
 
 static PLAN: OnceLock<Plan> = OnceLock::new();
+
+/// The six site addresses `run_sites` reads through its argument, in fixture order. One page, mapped readable before the call: the engine's call passes four arguments, so the call gets this page's address.
+#[repr(C, align(4096))]
+struct SitePage([AtomicU64; 512]);
+static SITES: SitePage = SitePage([const { AtomicU64::new(0) }; 512]);
+/// BOOT's x0: the fixture's `run_sites`, recorded by the BOOT callback before the checks run.
+static RUN_SITES: AtomicU64 = AtomicU64::new(0);
 /// Every binding trap the guest raised: (id, x0..x7), in arrival order.
 static TRAPS: Mutex<Vec<(u32, [u64; 8])>> = Mutex::new(Vec::new());
 /// Every REPORT: R0 the stub's address, R1 get_host_pthread's answer, R2 the stub's answer, R3 call_guest's answer.
@@ -177,10 +184,14 @@ fn patch_stub(stub: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn on_trap(g: Guest, trap: Trap) -> u64 {
+/// The engine's trap callback for this gate. BOOT only records the fixture's `run_sites`: the engine answers BOOT at once, and [`checks`] runs on the attached thread after it.
+fn on_trap(trap: arch::Trap) -> u64 {
     match trap {
-        Trap::Boot(run_sites) => boot(g, run_sites),
-        Trap::Report(v) => {
+        arch::Trap::Boot(run_sites) => {
+            RUN_SITES.store(run_sites, Ordering::Relaxed);
+            0
+        }
+        arch::Trap::Report(v) => {
             let first = {
                 let mut reports = REPORTS.lock().expect("reports");
                 reports.push(v);
@@ -191,35 +202,31 @@ fn on_trap(g: Guest, trap: Trap) -> u64 {
             }
             0
         }
-        Trap::Bind { id, args } => {
+        arch::Trap::Bind { id, args } => {
             TRAPS.lock().expect("traps").push((id, args));
             match PLAN.get() {
                 Some(plan) if id == plan.ids[POST_INIT] => 0,
                 Some(plan) if id == plan.ids[CALL_GUEST] => CALL_GUEST_ANSWER,
-                _ => arch::on_trap(g, trap),
+                _ => arch::on_trap(trap),
             }
         }
-        other => arch::on_trap(g, other),
+        other => arch::on_trap(other),
     }
 }
 
-/// BOOT: registers the pool and images with QEMU, runs the fixture's `run_sites` with the six sites, then checks what came back. Its answer is the guest's exit status (0 = every check passed).
-fn boot(g: Guest, run_sites: u64) -> u64 {
+/// Runs on the attached main thread after BOOT answered: registers the pool, the images and the site page with QEMU, runs the fixture's `run_sites` on the page, then checks what came back. Its answer is the exit status (0 = every check passed). Identity addresses (guest = host) are the engine's contract, not checked here.
+fn checks(run_sites: u64) -> u64 {
     let Some(plan) = PLAN.get() else {
         println!("qemu-linker: (r) FAIL no plan");
         return 1;
     };
-    // identity addresses: the host address of a guest address is the address itself
-    let identity = if g.host_addr(0x1000) == 0x1000 {
-        Ok(())
-    } else {
-        Err(format!("guest base {:#x}, expected 0", g.host_addr(0)))
-    };
-    let registered = identity.and_then(|()| arch::register(&g, &[&plan.linker, &plan.vdso]));
+    let page = (&raw const SITES) as usize;
+    let registered = arch::register(&[&plan.linker, &plan.vdso])
+        .and_then(|()| arch::register_data(page, std::mem::size_of::<SitePage>()));
     if !check('r', registered) {
         return 1;
     }
-    g.call(run_sites, &plan.sites.map(|a| a as u64));
+    arch::call(run_sites, &[page as u64]);
     u64::from(!verify(plan))
 }
 
@@ -296,13 +303,13 @@ fn verify(plan: &Plan) -> bool {
 
 fn main() -> ExitCode {
     let (Some(so), Some(fixture), Some(linker), Some(vdso)) = (
-        std::env::var_os("ATL_QEMU_SPIKE_SO"),
+        std::env::var_os("ATL_ENGINE_SO"),
         std::env::var_os("ATL_QEMU_SPIKE_FIXTURE"),
         std::env::var_os("ATL_NB_LINKER"),
         std::env::var_os("ATL_NB_VDSO"),
     ) else {
         println!(
-            "qemu-linker: SKIP (ATL_QEMU_SPIKE_SO / ATL_QEMU_SPIKE_FIXTURE / ATL_NB_LINKER / ATL_NB_VDSO unset)"
+            "qemu-linker: SKIP (ATL_ENGINE_SO / ATL_QEMU_SPIKE_FIXTURE / ATL_NB_LINKER / ATL_NB_VDSO unset)"
         );
         return ExitCode::SUCCESS;
     };
@@ -314,24 +321,23 @@ fn main() -> ExitCode {
         }
     };
     println!("qemu-linker: (p) ok");
+    // the sites go to the page `run_sites` reads, mapped readable by `checks`
+    for (k, &site) in plan.sites.iter().enumerate() {
+        SITES.0[k].store(site as u64, Ordering::Relaxed);
+    }
     if PLAN.set(plan).is_err() {
         println!("qemu-linker: FAIL plan set twice");
         return ExitCode::from(2);
     }
-    // the object defining P1's hook is linked only when named: build.rs exports it, and this reference keeps it in
-    let _ = atl_qemu_engine::trap::atl_svc_hook as *const ();
-    let fixture = fixture.to_string_lossy().into_owned();
-    // `-B 0`: identity addresses (plan C6); without it QEMU picks a nonzero guest base for the guest ELF
-    match atl_qemu_engine::start(
-        Path::new(&so),
-        &["qemu-aarch64", "-B", "0", &fixture],
-        on_trap,
-    ) {
-        // the BOOT answer: 0 = every check passed
-        Ok(booted) => ExitCode::from(u8::try_from(booted.answer()).unwrap_or(u8::MAX)),
-        Err(e) => {
-            println!("qemu-linker: FAIL boot: {e}");
-            ExitCode::from(2)
-        }
+    // BOOT answers at once; the engine is then up, and the checks run on this thread
+    if let Err(e) = arch::boot(Path::new(&so), Path::new(&fixture), on_trap) {
+        println!("qemu-linker: FAIL boot: {e}");
+        return ExitCode::from(2);
     }
+    if let Err(e) = arch::attach_current() {
+        println!("qemu-linker: FAIL attach: {e}");
+        return ExitCode::from(2);
+    }
+    // 0 = every check passed
+    ExitCode::from(u8::try_from(checks(RUN_SITES.load(Ordering::Relaxed))).unwrap_or(u8::MAX))
 }

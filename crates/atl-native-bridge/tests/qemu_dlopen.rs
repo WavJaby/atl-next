@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Q4-5 gate (QEMU bridge plan Q4-5), harness-less: the guest's dlopen path under QEMU. The real arm64 guest linker starts the main executable (`dl_exe.c`, PIE with DT_NEEDED on libc.so and libdl.so); `libc.so` resolves to the stub libc, whose constructor intercepts its stubs. After the start the host calls the executable's functions through the crossing: its `dlopen("libfix.so")` loads a guest library whose DT_NEEDED is `libdep.so`, and `fix_value()` runs through both.
-//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_QEMU_SPIKE_SO (the spike library), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_DLEXE (dl_exe.c, PIE), ATL_NB_DLLIBS (the directory holding libfix.so and libdep.so; break `skip_reloc` passes a copy of libdep.so with DT_ANDROID_RELRSZ zeroed, so its RELATIVE relocations are not applied), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images, `<nb>/libnative_bridge_guest_libc` among the guest library directories).
+//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_DLEXE (dl_exe.c, PIE), ATL_NB_DLLIBS (the directory holding libfix.so and libdep.so; break `skip_reloc` passes a copy of libdep.so with DT_ANDROID_RELRSZ zeroed, so its RELATIVE relocations are not applied), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images, `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the fixtures' C source, never from the engine: libdep.c `table[1]` = 0x51a2 (dep_value, through the RELATIVE relocation of `self_addr`); libfix.c fix_ctor = dep_value() = 0x51a2 (run by the constructor after libdep's), fix_value() = dep_value() + 0x10 = 0x51b2. The function addresses come from the executable's ELF symbol table (`object`) plus the load bias (entry - e_entry).
 //! Checks: (s) started, (i) the stub libc intercepted at least one stub (vdso BOUND > 0), (d) dlopen returned a handle, (y) dlsym found fix_value and fix_ctor_value, (c) libfix's constructor saw 0x51a2, (v) fix_value() = 0x51b2.
 //! Output: `qemu-dlopen: (x) ok` per check, `(x) FAIL <why>` otherwise; exit 0 when all pass. A start error prints `qemu-dlopen: (s) FAIL <error>`.
@@ -194,7 +194,7 @@ fn started(r: Result<Guest, String>) -> u64 {
 
 fn main() -> ExitCode {
     let vars = [
-        "ATL_QEMU_SPIKE_SO",
+        "ATL_ENGINE_SO",
         "ATL_NB_BOOT",
         "ATL_NB_DLEXE",
         "ATL_NB_DLLIBS",
@@ -212,7 +212,7 @@ fn main() -> ExitCode {
     ] = vars
     else {
         println!(
-            "qemu-dlopen: SKIP (ATL_QEMU_SPIKE_SO / ATL_NB_BOOT / ATL_NB_DLEXE / ATL_NB_DLLIBS / ATL_NB_LINKER / ATL_NB_VDSO unset)"
+            "qemu-dlopen: SKIP (ATL_ENGINE_SO / ATL_NB_BOOT / ATL_NB_DLEXE / ATL_NB_DLLIBS / ATL_NB_LINKER / ATL_NB_VDSO unset)"
         );
         return ExitCode::SUCCESS;
     };
@@ -225,8 +225,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    // the object defining P1's hook is linked only when named: build.rs exports it, and this reference keeps it in
-    let _ = atl_qemu_engine::trap::atl_svc_hook as *const ();
     // the arm64 NB directory: the linker is at <nb>/native_bridge_guest_linker/linker64; the stub libc, libdl, ld-android and libm sit beside it
     let nb = linker
         .parent()

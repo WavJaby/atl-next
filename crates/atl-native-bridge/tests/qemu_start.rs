@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Q4-4 gate (QEMU bridge plan Q4-4), harness-less: the real arm64 guest linker's `__linker_init` runs to completion under QEMU and returns the main executable's entry. The production start runs: `arch::run` boots QEMU on the boot executable, whose BOOT trap runs `Guest::start` (map, place, register, argument block from QEMU's auxv, `__linker_init` on the scratch TCB, static TLS of the main thread).
-//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_QEMU_SPIKE_SO (the spike library), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_EXE (testdata/qemu-linker/exe.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images).
+//! Q4-4 gate (QEMU bridge plan Q4-4), harness-less: the real arm64 guest linker's `__linker_init` runs to completion under QEMU and returns the main executable's entry. The production start runs: `arch::run` boots the engine on the boot executable (BOOT answers at once), attaches this thread, and runs `Guest::start` (map, place, register, argument block from QEMU's auxv, `__linker_init` on the scratch TCB, static TLS of the main thread).
+//! Env (xtask qemu_linker.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_EXE (testdata/qemu-linker/exe.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images).
 //! Expected values come from the executable's ELF file (read here with `object`), the AArch64 TLS ABI and bionic's headers (`MIN_TLS_SLOT`), never from the engine: (e) the entry is `e_entry` plus a load bias at which /proc/self/maps shows the executable's first page; (t) one static-TLS report whose init image holds the executable's `.tdata` at TP + round_up(16, p_align) (ELF TLS variant I, AArch64), with `tpoff` at least bionic's slots below the TP; (h) `get_host_pthread` ran; (g) the host's GS base is unchanged and addresses are identity.
 //! Output: `qemu-start: (x) ok` per check, `(x) FAIL <why>` otherwise; exit 0 when all pass. A start error prints `qemu-start: (s) FAIL <error>`.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
@@ -212,7 +212,7 @@ fn page() -> u64 {
 
 fn main() -> ExitCode {
     let vars = [
-        "ATL_QEMU_SPIKE_SO",
+        "ATL_ENGINE_SO",
         "ATL_NB_BOOT",
         "ATL_NB_EXE",
         "ATL_NB_LINKER",
@@ -228,7 +228,7 @@ fn main() -> ExitCode {
     ] = vars
     else {
         println!(
-            "qemu-start: SKIP (ATL_QEMU_SPIKE_SO / ATL_NB_BOOT / ATL_NB_EXE / ATL_NB_LINKER / ATL_NB_VDSO unset)"
+            "qemu-start: SKIP (ATL_ENGINE_SO / ATL_NB_BOOT / ATL_NB_EXE / ATL_NB_LINKER / ATL_NB_VDSO unset)"
         );
         return ExitCode::SUCCESS;
     };
@@ -241,8 +241,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    // the object defining P1's hook is linked only when named: build.rs exports it, and this reference keeps it in
-    let _ = atl_qemu_engine::trap::atl_svc_hook as *const ();
     let lib_dir = linker
         .parent()
         .and_then(Path::parent)

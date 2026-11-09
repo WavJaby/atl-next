@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Guest side of the Q4-3 placement gate (xtask `test qemu-linker`, QEMU bridge plan Q4-3): a static bionic executable that QEMU's main loads.
-// main hands the host `run_sites` through BOOT; the host calls it with the six placed NB sites in x0..x5. Each site is called as its AOSP prototype says (vdso.h, __libc_init_main_thread.cpp, static_tls_config.h); the answers go back as REPORT traps, in order: R0 the stub address, R1 get_host_pthread, R2 the stub's answer, R3 call_guest's answer.
+// main hands the host `run_sites` through BOOT; the host calls it with x0 = a page holding the six placed NB sites. Each site is called as its AOSP prototype says (vdso.h, __libc_init_main_thread.cpp, static_tls_config.h); the answers go back as REPORT traps, in order: R0 the stub address, R1 get_host_pthread, R2 the stub's answer, R3 call_guest's answer.
 // Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = run_sites, x1 = return stub; x0 = exit status).
 // Every literal below is what the host checks (xtask/testdata/qemu-linker is the only copy the gate reads).
 #include <stdint.h>
@@ -51,7 +51,9 @@ __attribute__((noinline)) static void report(u64 v) {
 }
 
 // The six sites in order (get_host_pthread, config_static_tls, trace, intercept_symbol, post_init, call_guest); each is a plain C call through the address the host passed.
-__attribute__((noinline)) u64 run_sites(u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5) {
+// sites points at the host's page of the six addresses: the engine's call passes four arguments, so the host passes a pointer.
+__attribute__((noinline)) u64 run_sites(const u64 *sites) {
+    const u64 s0 = sites[0], s1 = sites[1], s2 = sites[2], s3 = sites[3], s4 = sites[4], s5 = sites[5];
     static const struct tls_config cfg = {0x1000, 0x40, tls_init_img, 1, 2};
     report((u64)fx_stub);                                                    // R0
     report(((u64 (*)(void))s0)());                                           // get_host_pthread(): pthread_t

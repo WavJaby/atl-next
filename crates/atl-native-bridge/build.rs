@@ -691,8 +691,6 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_site", "atl_nb_qe_site"),
     // Q4-3 (engine/arch/qemu.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
     ("qe_nomap", "atl_nb_qe_nomap"),
-    // Q4-4 (engine/arch/qemu.rs `GUEST_BASE`): QEMU runs with a nonzero guest base, which `boot` refuses
-    ("qe_guest_base", "atl_nb_qe_guest_base"),
     // Q4-3 (engine/arch/qemu.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
     ("qe_id", "atl_nb_qe_id"),
     // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
@@ -733,11 +731,7 @@ fn main() -> Result<()> {
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
-    // QEMU gates (tests/qemu_*.rs): QEMU's library calls P1's hook by name, and the executable must export it; without this, QEMU's weak default answers "not ours" and BOOT falls to the syscall path
     let qemu = std::env::var_os("CARGO_FEATURE_QEMU_GUEST").is_some();
-    if qemu {
-        println!("cargo::rustc-link-arg-tests=-Wl,--export-dynamic-symbol=atl_svc_hook");
-    }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;

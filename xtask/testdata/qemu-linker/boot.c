@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Boot executable of the Q4-4 start gate (xtask `test qemu-linker`, QEMU bridge plan Q4-4): a static bionic executable that QEMU's main loads. main hands the host the auxv QEMU built for it through BOOT; the host starts the guest linker from that trap (engine/arch/qemu.rs `run`) and answers with this process's exit status.
+// Boot executable of the Q4-4 start gate (xtask `test qemu-linker`, QEMU bridge plan Q4-4): a static bionic executable that QEMU's main loads. main hands the host the auxv QEMU built for it through BOOT; the host records that trap, attaches a CPU and starts the guest linker from it (engine/arch/qemu.rs `run`); its answer is this process's exit status.
 // Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a11 RET (a host call returns), 0x7a13 BOOT (x0 = auxv, x1 = return stub; x0 = exit status).
 #include <stdint.h>
 

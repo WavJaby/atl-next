@@ -342,11 +342,10 @@ pub(crate) fn boot(g: Guest) -> ! {
     }
 }
 
-/// The spike's helper body: dlopen `path` (its initialisers run on this thread), then [`run_main`]. P1's hook is promoted to the global scope first ([`hook_in_global_scope`]).
+/// The spike's helper body: dlopen `path` (its initialisers run on this thread), then [`run_main`]. P1's `atl_svc_hook` binds to the test executable's own definition, which build.rs exports to the global scope.
 #[cfg(not(feature = "engine-so"))]
 fn run_spike(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, String> {
-    hook_in_global_scope()?;
-    // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to ours, which `hook_in_global_scope` put first in lookup order
+    // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to the executable's exported definition
     // SAFETY: path is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration).
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
@@ -406,43 +405,6 @@ fn run_main(handle: usize, args: &[CString], on_trap: OnTrap) -> Result<i32, Str
     let main = unsafe { std::mem::transmute::<*mut c_void, MainFn>(main) };
     // SAFETY: as above.
     Ok(unsafe { main(argc, ptrs.as_mut_ptr(), process_environ()) })
-}
-
-/// Makes P1's call in the QEMU library bind to our `atl_svc_hook`. glibc resolves a dlopened object's references in the global scope first, then its own local scope -- where QEMU's weak default comes first, and glibc ignores weak vs strong at run time.
-/// So a DT_NEEDED from the QEMU library on our object would still bind the default; the definition must be global. An executable defining it is global when it exports it (build.rs); a library loaded RTLD_LOCAL (ART dlopens the NB core so) is promoted with `RTLD_NOLOAD | RTLD_GLOBAL`.
-/// Fails closed: afterwards the global lookup (`RTLD_DEFAULT`) must answer our address, else BOOT would fall to QEMU's syscall path.
-#[cfg(not(feature = "engine-so"))]
-fn hook_in_global_scope() -> Result<(), String> {
-    let ours = crate::trap::atl_svc_hook as *const () as usize;
-    let global = || {
-        // SAFETY: dlsym on the global scope with a NUL-terminated name.
-        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"atl_svc_hook".as_ptr()) as usize }
-    };
-    if global() == ours {
-        return Ok(());
-    }
-    // SAFETY: a zeroed Dl_info is a valid out-parameter; `ours` is a function of this process.
-    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { libc::dladdr(ours as *const c_void, &mut info) } == 0 || info.dli_fname.is_null() {
-        return Err("atl_svc_hook: dladdr finds no object".to_owned());
-    }
-    // SAFETY: dli_fname is the NUL-terminated path of the loaded object; RTLD_NOLOAD loads nothing new, it only widens that object's scope (the handle is kept: the object stays loaded anyway).
-    let promoted = unsafe {
-        libc::dlopen(
-            info.dli_fname,
-            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_GLOBAL,
-        )
-    };
-    if promoted.is_null() || global() != ours {
-        // SAFETY: non-null, NUL-terminated (checked above).
-        let name = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
-        return Err(format!(
-            "atl_svc_hook of {name} is not in the global scope (an executable must export it: --export-dynamic-symbol): {}",
-            dlerror()
-        ));
-    }
-    Ok(())
 }
 
 fn process_environ() -> *mut *mut c_char {
