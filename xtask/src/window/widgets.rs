@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Stage `widgets` of `xtask test window`: the widget fixture (xtask/testdata/widgets, real resources under the Material theme) in UI mode, checked from the fixture's log lines.
 //! The probe presses the header bar, then taps the Button and the EditText, hovers, turns the wheel and swipes the touchpad over the ListView, and drags it, at the fixture's own rectangles shifted by the content origin the platform logs (the proxy injects surface points).
-//! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first readback's digest, so the text is in the capture),
-//! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last readback is the fixture's final frame and differs from the first),
-//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage), on-demand (the window clock stops once nothing asks for a frame).
+//! Sub-gates ([`checks`]): probe (every injection got its answer), layout (geometry from the XML), text (the fixture's settled software frame is the first picture's digest, so the text is in the capture),
+//! header (the press reached the client, no touch reached Android), click, focus, window (the second activity the focus starts and finishes leaves input on Main), hover, wheel, swipe (fake finger + fling), list (the drag), readback (the last picture is the fixture's final frame and differs from the first),
+//! presents (more than 2 scenes), cadence (the frame callbacks while the list redraws, as the frames stage). No sub-gate for the on-demand clock: the product logs no clock state, and nothing else shows an idle tick.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use atl_cpu_pressure::Samples;
 pub const FIXTURE: &str = "xtask/testdata/widgets";
 /// The fixture's first-frame line, after which it takes taps (`first` exists for `changed`).
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
-/// The fixture's line after the cadence run: the picture the last readback must show.
+/// The fixture's line after the cadence run: the picture the last one must show.
 const FINAL_LINE: &str = "AtlWindow: final frame";
 /// The fixture's lines around its second window (activity .Second, started by the EditText's focus; `closed` once Main is back and Second's window is gone).
 const SECOND_SHOWN: &str = "AtlWindow: window second shown";

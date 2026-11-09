@@ -118,7 +118,7 @@ pub fn drive(
         matches!(e, ProxyEvent::Acked { .. })
     })
     .ok_or("the window never acked a configure")?;
-    // the content origin is logged at the window's first present, the sync point the readback line was
+    // the content origin is logged at the window's first present: the window has shown a frame
     wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
         .then_some(())
         .ok_or("the window never presented")?;

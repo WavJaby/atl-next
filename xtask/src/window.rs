@@ -151,11 +151,11 @@ enum Stage {
     SurfaceView,
     /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask/src/window/ui_block.rs; composer threading S2).
     UiBlock,
-    /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the composer's readback as the quadrants.
+    /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the window's picture as the quadrants.
     Hwui,
     /// UI mode: a dimming dialog with surfaceInsets and a popup near the bottom over a software window; the readback against the picture worked out from the fixture's spec (xtask/src/window/dialog.rs).
     Dialog,
-    /// The GLES2 fixture in UI mode, its `.so` a guest library through the native bridge: the app's readback and the composer's readback at its probes are the expectation (xtask/src/window/gles2.rs; GS2.5).
+    /// The GLES2 fixture in UI mode, its `.so` a guest library through the native bridge: the app's readback and the window's picture at its probes are the expectation (xtask/src/window/gles2.rs; GS2.5).
     Gles2,
     /// UI mode: the probe sends the maximized control, then the suspended state through the proxy; the platform layer must log each as the toplevel's state (xtask/src/window/suspended.rs; window lifecycle S0).
     Suspended,
@@ -1438,7 +1438,6 @@ fn lifecycle_check(
     }
 }
 
-/// The composer's readback line of the gtk stage (`atl-composer: ui: capture presented=N size=WxH fnv1a64=H`).
 /// Stage `hwui`: the fixture drew on hwui's RecordingCanvas. Else the first onDraw line, or that none came, plus hwui's own fatal line (EglManager's `LOG_ALWAYS_FATAL` text names the failing EGL call and its error).
 fn hardware_check(app: &str) -> Result<String, String> {
     if app.contains(HARDWARE_DRAW_LINE) {
