@@ -33,6 +33,7 @@ reason = "dEQP conformance runner (EGL/GLES ground-truth suite of the GL bridge,
 # TU-Berlin-2.0: accepted 2026-11-07 (libgsm, via the GSM soft decoder the Codec2 store lists); all-permissive (use/copy/modify/distribute for any purpose if the notice is kept), the same class as LicenseRef-AGG-2.3, GPL-3-compatible.
 # CC0-1.0, NCSA: owner decision 2026-11-07, for the host LLVM build (llvm_host.rs, plan llvmpipe S1): BLAKE3 (llvm/lib/Support/BLAKE3, `SPDX-License-Identifier: CC0-1.0`, a public-domain dedication, the class of LicenseRef-Public-Domain but a named instrument) and LLVM's legacy University-of-Illinois header (llvm/lib/TargetParser/CSKYTargetParser.cpp). Both permissive and on the FSF list of GPL-compatible licences.
 # GPL-1.0-or-later WITH Linux-syscall-note: owner decision 2026-11-08, following the 2026-10-31 syscall-note decision (Mesa's copy of the kernel uapi sync_file.h, pulled in by iris); "or later" makes it GPL-3-compatible, and the note frees uapi-header users as above.
+# GPL-3.0-or-later WITH Bison-exception-2.2: plan angle S0 (owner 2026-11-09, "全部照建議"); checked-in Bison parser output of ANGLE's translator and preprocessor and of third_party/glslang. The notice is GPL-3.0-or-later plus the Bison skeleton exception, which frees a parser's users (as GCC-exception-3.1 does); the phrase rules read it.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -45,6 +46,7 @@ allow = [
     "GPL-1.0-or-later WITH Linux-syscall-note",
     "GPL-2.0-only WITH Classpath-exception-2.0",
     "GPL-2.0-only WITH Linux-syscall-note",
+    "GPL-3.0-or-later WITH Bison-exception-2.2",
     "HPND-sell-variant",
     "ICU",
     "IJG",
@@ -372,6 +374,31 @@ reason = "Mesa default (docs/license.rst), no grant in the file"
 [upstream.aosp.paths."external/mesa3d/src/util/u_atomic.h"]
 licence = "MIT"
 reason = "Mesa default (docs/license.rst); the file says \"No copyright claimed on this file.\", which is no dedication"
+
+# ANGLE (plan angle S0, 2026-11-09). Its Android.bp names several licence kinds for the package, so a file whose notice the phrase rules do not read needs a row.
+[upstream.aosp.paths."external/angle/src/third_party/volk/"]
+licence = "MIT"
+reason = "volk (zeux): notice reads \"distributed under the MIT License. See notice at the end of this file\" (volk.h), a pointer the phrase rules do not follow; MIT text in volk.h and LICENSE.md"
+
+[upstream.aosp.paths."external/angle/src/libANGLE/Overlay_font_autogen.cpp"]
+licence = "BSD-3-Clause AND Apache-2.0"
+reason = "generated overlay font data: ANGLE's BSD-style notice (ANGLE LICENSE, BSD-3-Clause) plus \"Font copyright Google\" Apache-2.0 for RobotoMono-Bold; both notices apply"
+
+[upstream.aosp.paths."external/angle/src/libGLESv2/resource.h"]
+licence = "BSD-3-Clause"
+reason = "Microsoft Visual C++ resource-ID header (\"generated include file\"), no notice; ANGLE's own file under ANGLE's BSD-3-Clause LICENSE"
+
+[upstream.aosp.paths."external/angle/angle_commit.h"]
+licence = "BSD-3-Clause"
+reason = "ANGLE build-info stub (commit hash and date defines), no notice; ANGLE's BSD-3-Clause LICENSE covers the repository (included by src/common/angle_version.h)"
+
+[upstream.aosp.paths."external/angle/third_party/abseil-cpp/absl/time/internal/cctz/src/tzfile.h"]
+licence = "LicenseRef-Public-Domain"
+reason = "cctz copy of Arthur David Olson's TZif layout header: \"This file is in the public domain, so clarified as of 1996-06-05\"; a dedication, the class of LicenseRef-Public-Domain"
+
+[upstream.aosp.paths."external/angle/third_party/abseil-cpp/absl/time/internal/get_current_time_posix.inc"]
+licence = "Apache-2.0"
+reason = "abseil-cpp .inc included by absl/time/clock.cc, no notice of its own; abseil's LICENSE is Apache-2.0"
 
 [upstream.aosp.paths."external/dng_sdk/"]
 licence = "LicenseRef-Adobe-DNG-SDK"
