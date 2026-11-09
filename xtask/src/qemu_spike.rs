@@ -5,7 +5,7 @@
 //! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`. Its binding pool (gate l) is `atl_bridgegen::aarch64::pool_asm` text, assembled by the same clang into the fixture; `check_pool` reads the pool back from the built binary.
 //! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
-//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
+//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `no-access-ok` relinks with the pin's `uaccess.c` and `qemu.h` (upstream access_ok: gate (o) red); `guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -26,6 +26,8 @@ use crate::verdict::{Failure, Verdict};
 const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
+const UACCESS: &str = "linux-user/uaccess.c";
+const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
 const GATES: [char; 15] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
@@ -63,10 +65,28 @@ pub struct Args {
     pub no_breaks: bool,
 }
 
+/// A break that compiles one pin file in place of the build's copy. `beside`: pin files written next to it, since a quoted include resolves from the including file's directory first.
+#[derive(Clone, Copy)]
+struct Swap {
+    file: &'static str,
+    beside: &'static [&'static str],
+}
+
+/// P1 removed: the pin's `cpu_loop.c`.
+const NO_P1: Swap = Swap {
+    file: CPU_LOOP,
+    beside: &[],
+};
+/// access_ok as upstream: the pin's `uaccess.c`, with the pin's `qemu.h` beside it (`uaccess.c` includes it quoted).
+const NO_ACCESS_OK: Swap = Swap {
+    file: UACCESS,
+    beside: &[QEMU_H],
+};
+
 /// One harness run: which library, guest base and engine break, and the gate it must turn red (None = all green).
 struct RunSpec {
     name: &'static str,
-    unpatched: bool,
+    swap: Option<Swap>,
     /// The fixture whose pool slots carry `slot + POOL_SKEW` (the `bind-id` break), not the production pool.
     pool_skew: bool,
     base: &'static str,
@@ -77,7 +97,7 @@ struct RunSpec {
 const RUNS: &[RunSpec] = &[
     RunSpec {
         name: "plain",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: None,
@@ -85,15 +105,23 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "no-p1",
-        unpatched: true,
+        swap: Some(NO_P1),
         pool_skew: false,
         base: "0",
         engine_break: None,
         red: Some('a'),
     },
     RunSpec {
+        name: "no-access-ok",
+        swap: Some(NO_ACCESS_OK),
+        pool_skew: false,
+        base: "0",
+        engine_break: None,
+        red: Some('o'),
+    },
+    RunSpec {
         name: "ret-reg",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("ret-reg"),
@@ -101,7 +129,7 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "guest-base",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: SHIFTED_BASE,
         engine_break: None,
@@ -109,7 +137,7 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "fault-route",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("fault-route"),
@@ -117,7 +145,7 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "chain-order",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("chain-order"),
@@ -125,7 +153,7 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "drop-accerr",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("drop-accerr"),
@@ -133,7 +161,7 @@ const RUNS: &[RunSpec] = &[
     },
     RunSpec {
         name: "boot-only",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("boot-only"),
@@ -142,7 +170,7 @@ const RUNS: &[RunSpec] = &[
     // gate (i) hangs (observed): QEMU's own threads take the kill, the faulting thread sleeps in sigsuspend; the timeout kills the run
     RunSpec {
         name: "no-fatal",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("no-fatal"),
@@ -151,7 +179,7 @@ const RUNS: &[RunSpec] = &[
     // gate (k) re-faults under SIG_IGN until the timeout kills it
     RunSpec {
         name: "ign-loop",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("ign-loop"),
@@ -160,7 +188,7 @@ const RUNS: &[RunSpec] = &[
     // gate (l): the bit-14 decode lets the bind thunk's svc reach QEMU's syscall path (getpid), so no bind trap arrives
     RunSpec {
         name: "bind-decode",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("bind-decode"),
@@ -169,7 +197,7 @@ const RUNS: &[RunSpec] = &[
     // gate (l): every pool slot carries the next id, so the trap names the wrong binding
     RunSpec {
         name: "bind-id",
-        unpatched: false,
+        swap: None,
         pool_skew: true,
         base: "0",
         engine_break: None,
@@ -178,7 +206,7 @@ const RUNS: &[RunSpec] = &[
     // gate (m): both host threads run on the boot CPU's one state
     RunSpec {
         name: "shared-cpu",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("shared-cpu"),
@@ -187,7 +215,7 @@ const RUNS: &[RunSpec] = &[
     // gate (m): lock_user reads a NULL thread_cpu at the first write(2)
     RunSpec {
         name: "skip-thread-cpu",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("skip-thread-cpu"),
@@ -196,7 +224,7 @@ const RUNS: &[RunSpec] = &[
     // gate (m): the attached thread's first translation runs with a NULL tcg_ctx
     RunSpec {
         name: "skip-tcg",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("skip-tcg"),
@@ -205,7 +233,7 @@ const RUNS: &[RunSpec] = &[
     // gate (m): an attached thread has no return stub, so its first guest call asserts
     RunSpec {
         name: "ret-stub-local",
-        unpatched: false,
+        swap: None,
         pool_skew: false,
         base: "0",
         engine_break: Some("ret-stub-local"),
@@ -230,18 +258,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Err(e) = check_pool(&plain) {
         fails.push(Failure::step("pool", format!("{e:#}")));
     }
-    let mut unpatched_so = None;
     for spec in &runs {
-        let lib = if spec.unpatched {
-            match &unpatched_so {
-                Some(p) => p,
-                None => unpatched_so.insert(unpatched(root, &b, &dir)?),
-            }
-        } else {
-            &so
+        let lib = match spec.swap {
+            Some(swap) => unpatched(root, &b, &dir, spec.name, swap)?,
+            None => so.clone(),
         };
         let fx = if spec.pool_skew { &skewed } else { &plain };
-        if let Err(e) = harness(root, &b, &dir, spec, lib, fx, &sigchain) {
+        if let Err(e) = harness(root, &b, &dir, spec, &lib, fx, &sigchain) {
             fails.push(Failure::step(spec.name, format!("{e:#}")));
         }
     }
@@ -325,49 +348,64 @@ pub(crate) fn link(b: &Build, so: &Path, replace: Option<(&str, &Path)>) -> Resu
     Ok(so.to_owned())
 }
 
-/// The library with the pin's `cpu_loop.c` (P1 removed), compiled by the build's own command for that file.
-fn unpatched(root: &Path, b: &Build, dir: &Path) -> Result<PathBuf> {
+/// The library with `swap.file` compiled from the pin in place of the build's copy, by the build's own command for that file. The pin's `swap.beside` files go into the same directory.
+fn unpatched(root: &Path, b: &Build, dir: &Path, name: &str, swap: Swap) -> Result<PathBuf> {
     let pin = sources::load(root)?
         .git
         .get(qemu::UPSTREAM)
         .context("no [qemu] pin")?
         .commit
         .clone();
-    let text = git_raw(&b.src, &["show", &format!("{pin}:{CPU_LOOP}")])?;
-    let src = dir.join("cpu_loop.unpatched.c");
-    std::fs::write(&src, text)?;
+    let flat = dir.join(name);
+    std::fs::create_dir_all(&flat).with_context(|| format!("creating {}", flat.display()))?;
+    for rel in std::iter::once(swap.file).chain(swap.beside.iter().copied()) {
+        let text = git_raw(&b.src, &["show", &format!("{pin}:{rel}")])?;
+        std::fs::write(flat.join(basename(rel)?), text)?;
+    }
+    let src = flat.join(basename(swap.file)?);
     let db_path = b.build_dir().join("compile_commands.json");
     let db: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&db_path)?)?;
     let entry = db
         .as_array()
         .context("compile_commands.json: not an array")?
         .iter()
-        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(CPU_LOOP)))
-        .with_context(|| format!("no {CPU_LOOP} entry"))?;
+        .find(|e| e["file"].as_str().is_some_and(|f| f.ends_with(swap.file)))
+        .with_context(|| format!("no {} entry", swap.file))?;
     let (Some(command), Some(file), Some(output)) = (
         entry["command"].as_str(),
         entry["file"].as_str(),
         entry["output"].as_str(),
     ) else {
-        bail!("{CPU_LOOP} entry lacks command/file/output");
+        bail!("{} entry lacks command/file/output", swap.file);
     };
-    let obj = dir.join("cpu_loop.unpatched.o");
+    let obj = flat.join("swapped.o");
     let cmd = command
         .replace(output, &obj.display().to_string())
         .replace(file, &src.display().to_string());
-    let log = dir.join("cpu_loop.unpatched.log");
+    let log = dir.join(format!("{name}.log"));
     let out = Command::new("sh")
         .args(["-c", &cmd])
         .current_dir(b.build_dir())
         .output()
-        .context("compiling the unpatched cpu_loop.c")?;
+        .with_context(|| format!("compiling the {name} swap"))?;
     std::fs::write(&log, [out.stdout, out.stderr].concat())?;
     ensure!(
         out.status.success(),
-        "unpatched cpu_loop.c failed, log {}",
+        "{name} swap failed to compile, log {}",
         log.display()
     );
-    link(b, &dir.join("libqemu-spike-no-p1.so"), Some((output, &obj)))
+    link(
+        b,
+        &dir.join(format!("libqemu-spike-{name}.so")),
+        Some((output, &obj)),
+    )
+}
+
+fn basename(path: &str) -> Result<&str> {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{path}: no file name"))
 }
 
 /// The fixture pool's text for `skew`: slot k carries binding `k + skew`. Skew 0 is `aarch64::pool_asm` as emitted; any other skew is a text edit of it: one entry longer, its first `skew` entries (two `.inst` lines each) dropped.

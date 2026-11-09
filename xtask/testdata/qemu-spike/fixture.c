@@ -208,7 +208,7 @@ __attribute__((noinline)) u64 fx_bind(u64 slot) {
 // fx_sum(n): 0 + 1 + ... + (n - 1) through a volatile stack slot, long enough that two host threads overlap; the table holds n(n-1)/2.
 // fx_tp(): the thread pointer the call runs with (TPIDR_EL0).
 // fx_write_msg(fd): raw write(2) of the static message (fixture data, mapped for the guest), so QEMU's lock_user runs (it reads thread_cpu); returns the raw result (count or -errno).
-// fx_write(fd, buf, n): the same on a host buffer (o): glibc heap the guest never mapped, QEMU's access_ok refuses it.
+// fx_write(fd, buf, n): the same on a host buffer (o): glibc heap the guest never mapped, which access_ok accepts under identity mapping.
 #define M_N1 100000ull
 #define M_N2 200000ull
 #define NR_WRITE 64
@@ -272,8 +272,8 @@ static const u64 table[] = {
     (u64)fx_sum, M_N1, M_N1 * (M_N1 - 1) / 2, M_N2, M_N2 * (M_N2 - 1) / 2,
     // 35..38: (m) fx_tp, fx_write_msg, the message and its length
     (u64)fx_tp, (u64)fx_write_msg, (u64)msg, MSG_LEN,
-    // 39..40: (o) fx_write, and what write(2) answers for a buffer the guest cannot access
-    (u64)fx_write, (u64)-EFAULT,
+    // 39: (o) fx_write, a write(2) on a host buffer the guest never mapped
+    (u64)fx_write,
 };
 
 int main(void) {

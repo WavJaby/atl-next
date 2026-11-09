@@ -57,8 +57,7 @@ mod spike {
         pub const MSG: usize = 37;
         pub const MSG_LEN: usize = 38;
         pub const WRITE: usize = 39;
-        pub const NEG_EFAULT: usize = 40;
-        pub const LEN: usize = 41;
+        pub const LEN: usize = 40;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -697,7 +696,7 @@ mod spike {
         r
     }
 
-    /// Gate (o), an observation for Q5-3: the guest's write(2) on a host heap buffer (glibc malloc, never mapped for the guest). QEMU's `lock_user` checks the range with `access_ok` against its page table, which does not know the page: -EFAULT. Ok when that is what happens; the line prints the evidence.
+    /// Gate (o): the guest's write(2) on a host heap buffer (glibc malloc, never mapped for the guest). Under identity mapping QEMU's `lock_user` accepts a range no QEMU page covers (linux-user/qemu.h, patch 0002), so the host does the copy: the write returns the length and the bytes reach the pipe.
     fn gate_o(booted: &Booted) -> Result<(), String> {
         let fds = pipe()?;
         // a Box, not an array on the stack: the buffer must be glibc heap
@@ -714,16 +713,18 @@ mod spike {
                 &[fds.1 as u64, at, O_LEN as u64],
             );
             drop(cpu);
-            let landed = drain(fds.0).len();
+            let got = drain(fds.0);
             println!(
-                "spike: (o) observed write(pipe, heap {at:#x}, {O_LEN}) = {} with QEMU page flags {flags:#x}; {landed} bytes reached the pipe",
-                r as i64
+                "spike: (o) observed write(pipe, heap {at:#x}, {O_LEN}) = {} with QEMU page flags {flags:#x}; {} bytes reached the pipe",
+                r as i64,
+                got.len()
             );
-            if r != w(t::NEG_EFAULT) || landed != 0 {
+            let bytes_ok = got.len() == O_LEN && got.iter().all(|&b| b == 0xa5);
+            if r != O_LEN as u64 || !bytes_ok {
                 return Err(format!(
-                    "write returned {}, expected -EFAULT ({}) and nothing written",
+                    "write returned {}, expected {O_LEN} bytes of 0xa5 ({} reached the pipe)",
                     r as i64,
-                    w(t::NEG_EFAULT) as i64
+                    got.len()
                 ));
             }
             Ok(())
