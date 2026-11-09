@@ -592,15 +592,24 @@ fn touch_field(line: &str, key: &str) -> Option<i64> {
     word(rest, key)?.parse().ok()
 }
 
-/// The mouse drag (the last plain mouse DOWN: class 0, source mouse) scrolled the list toward its end.
+/// The mouse drag scrolled the list toward its end. The drag is the last plain mouse press that moves (DOWN, then MOVE before its UP); a click after it (the idle probe's tap: DOWN, UP) is not a drag.
 fn list_check(app: &str) -> Result<String, String> {
     let lines: Vec<&str> = app.lines().collect();
-    let down = lines
+    let presses: Vec<(usize, u32)> = lines
         .iter()
-        .rposition(|l| {
-            touch(l) == Some((ACTION_DOWN, 0)) && touch_field(l, "source") == Some(SOURCE_MOUSE)
+        .enumerate()
+        .filter(|(_, l)| touch_field(l, "source") == Some(SOURCE_MOUSE))
+        .filter_map(|(i, l)| {
+            touch(l)
+                .filter(|&(_, class)| class == 0)
+                .map(|(action, _)| (i, action))
         })
-        .ok_or("no mouse DOWN at all")?;
+        .collect();
+    let down = presses
+        .windows(2)
+        .rposition(|w| w[0].1 == ACTION_DOWN && w[1].1 == ACTION_MOVE)
+        .map(|k| presses[k].0)
+        .ok_or("no mouse press that moves: no drag")?;
     let before = position_before(&lines, down);
     let after = lines[down..]
         .iter()
