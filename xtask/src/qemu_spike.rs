@@ -622,7 +622,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine_v1` and the TLS exports.
-/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable and its AT_ENTRY equals llvm-readelf's e_entry. Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red).
+/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red).
 fn engine_so(
     root: &Path,
     b: &Build,
@@ -674,6 +674,22 @@ fn engine_so(
         fails.push(Failure::step(
             "engine-so break abi-major-next",
             "the host accepted a table at major + 1".to_owned(),
+        ));
+    }
+    let late = engine_staticlib(root, b, &out, "boot-late", Some("boot-late"))?;
+    let late = engine_link(b, &late, &out, "boot-late.so", engine_abi::TLS_EXPORTS)?;
+    if boot_gate(root, b, &out, "boot-late", &late, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break boot-late",
+            "the boot gate is green with the boot env published after BOOT's callback".to_owned(),
+        ));
+    }
+    let nojoin = engine_staticlib(root, b, &out, "no-boot-join", Some("no-boot-join"))?;
+    let nojoin = engine_link(b, &nojoin, &out, "no-boot-join.so", engine_abi::TLS_EXPORTS)?;
+    if boot_gate(root, b, &out, "no-boot-join", &nojoin, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break no-boot-join",
+            "the boot gate is green with create returning before BOOT".to_owned(),
         ));
     }
     Ok(())

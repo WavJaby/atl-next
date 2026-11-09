@@ -101,15 +101,13 @@ mod capi {
         PROT_WRITE, TrapFn, TrapKind,
     };
 
-    use crate::engine::{set_pages, start_linked};
-    use crate::{Booted, Cpu, Guest, Trap, page};
+    use crate::engine::{boot_env, set_pages, start_linked};
+    use crate::{Cpu, Guest, Trap, page};
 
     /// The engine handle: this static's address, the only one there is.
     static ENGINE: u8 = 0;
     /// The host, set by create before QEMU runs (BOOT's callbacks need it).
     static HOST: OnceLock<HostRef> = OnceLock::new();
-    /// The booted engine, set by create after BOOT; attach needs it.
-    static BOOTED: OnceLock<Booted> = OnceLock::new();
 
     struct HostRef {
         ctx: *mut c_void,
@@ -182,10 +180,7 @@ mod capi {
         // SAFETY: out is non-null (checked); the handle is published before QEMU runs, so BOOT's callbacks reach the engine through it.
         unsafe { *out = (&raw const ENGINE).cast_mut().cast() };
         match start_linked(exe, host_trap) {
-            Ok(booted) => {
-                let _ = BOOTED.set(booted);
-                0
-            }
+            Ok(_) => 0,
             Err(e) => {
                 note(&e);
                 -libc::EIO
@@ -202,7 +197,7 @@ mod capi {
 
     unsafe extern "C" fn map(engine: *mut AtlEngine, start: u64, len: u64, prot: u32) -> c_int {
         let known = PROT_READ | PROT_WRITE | PROT_EXEC;
-        if !is_engine(engine) || BOOTED.get().is_none() || len == 0 || prot & !known != 0 {
+        if !is_engine(engine) || boot_env().is_none() || len == 0 || prot & !known != 0 {
             return -libc::EINVAL;
         }
         let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(len)) else {
@@ -218,13 +213,13 @@ mod capi {
     }
 
     unsafe extern "C" fn attach(engine: *mut AtlEngine, out: *mut *mut AtlCpu) -> c_int {
-        let Some(booted) = BOOTED.get() else {
+        let Some(env) = boot_env() else {
             return -libc::EINVAL;
         };
         if !is_engine(engine) || out.is_null() {
             return -libc::EINVAL;
         }
-        match booted.attach() {
+        match crate::attach::attach(env) {
             Ok(cpu) => {
                 // SAFETY: out is non-null (checked); detach frees this box, on the attaching thread.
                 unsafe { *out = Box::into_raw(Box::new(cpu)).cast() };

@@ -854,23 +854,83 @@ fn main() {
 
 /// Gate (q), the engine `.so` through its C ABI (QEMU bridge plan Q5-1a), in a process of its own: dlopen the library, refuse it unless its table speaks the host's major and fits its size, resolve the TLS exports, create the engine on the boot executable, and read the auxv QEMU built for it at BOOT. Its AT_ENTRY must equal `ATL_ENGINE_ENTRY` (xtask: llvm-readelf's e_entry of that executable).
 /// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
+/// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
 #[cfg(feature = "qemu")]
 mod engine_so {
     use std::ffi::{CStr, CString, c_void};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-    use atl_engine_api::{ABI_MAJOR, ABI_MINOR, AtlEngine, AtlEngineV1, AtlHostV1, TrapKind};
+    use atl_engine_api::{
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, PROT_READ, TrapKind,
+    };
 
     /// The auxv pointer BOOT delivered (x0), written by the host trap on the boot helper.
     static AUXV: AtomicU64 = AtomicU64::new(0);
+    /// The BOOT probe's result, written by the host trap on the boot helper.
+    static BOOT_PROBE: OnceLock<Result<(), String>> = OnceLock::new();
 
-    /// The host's trap: BOOT records x0; nothing else is expected in this gate.
-    unsafe extern "C" fn trap(_ctx: *mut c_void, kind: u32, _id: u32, regs: *const u64) -> u64 {
+    /// The host context: the table, and the engine handle `create` writes before BOOT.
+    struct Probe {
+        table: &'static AtlEngineV1,
+        engine: AtomicPtr<AtlEngine>,
+    }
+
+    /// A host page for the probe's `map`, page-aligned.
+    #[repr(align(4096))]
+    struct Page([u8; 4096]);
+    static PAGE: Page = Page([0; 4096]);
+
+    /// The host's trap: BOOT records x0 and runs the probe; nothing else is expected in this gate.
+    unsafe extern "C" fn trap(ctx: *mut c_void, kind: u32, _id: u32, regs: *const u64) -> u64 {
         if kind == TrapKind::Boot as u32 {
             // SAFETY: regs points at the eight registers the ABI passes (atl_engine.h).
             AUXV.store(unsafe { *regs }, Ordering::SeqCst);
+            // SAFETY: ctx is the leaked Probe that `run` passed as the host context.
+            let _ = BOOT_PROBE.set(boot_probe(unsafe { &*ctx.cast::<Probe>() }));
         }
         0
+    }
+
+    /// D9 at BOOT: `map` a host page, then `attach` a CPU from a thread of its own, both inside the trap. Attach runs on another thread: a boot thread attaching itself would register its RCU state twice. That thread parks with its CPU, since a thread that exits while registered with RCU leaves a dangling registry node. It is not detached: `Cpu::drop` aborts in QEMU's plugin exit hook (the copied CPU is not in `plugin.cpu_ht`), a defect of detach this gate does not cover.
+    fn boot_probe(p: &Probe) -> Result<(), String> {
+        let engine = p.engine.load(Ordering::SeqCst);
+        if engine.is_null() {
+            return Err("create wrote no handle before BOOT".to_owned());
+        }
+        let map = p.table.map.ok_or("engine table has no map")?;
+        let attach = p.table.attach.ok_or("engine table has no attach")?;
+        // SAFETY: engine is the handle create wrote; PAGE is a live host page of this process (the ABI's map).
+        let rc = unsafe {
+            map(
+                engine,
+                PAGE.0.as_ptr() as u64,
+                PAGE.0.len() as u64,
+                PROT_READ,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("map inside BOOT: {rc}"));
+        }
+        let engine = engine as usize;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<i32>(1);
+        std::thread::spawn(move || {
+            let engine = engine as *mut AtlEngine;
+            let mut cpu: *mut AtlCpu = std::ptr::null_mut();
+            // SAFETY: engine is live; cpu is an out parameter.
+            let rc = unsafe { attach(engine, &mut cpu) };
+            let _ = tx.send(rc);
+            if rc == 0 {
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+        match rx.recv() {
+            Ok(0) => Ok(()),
+            Ok(rc) => Err(format!("attach inside BOOT: {rc}")),
+            Err(_) => Err("attach thread ended without an answer".to_owned()),
+        }
     }
 
     fn env(name: &str) -> Result<String, String> {
@@ -928,23 +988,32 @@ mod engine_so {
         for tls in [c"thread_cpu", c"helper_retaddr"] {
             dlsym_in(handle, tls)?;
         }
+        // leaked: the boot helper reads it inside BOOT and never returns from there
+        let probe: &'static Probe = Box::leak(Box::new(Probe {
+            table,
+            engine: AtomicPtr::new(std::ptr::null_mut()),
+        }));
         let host = AtlHostV1 {
             major: ABI_MAJOR,
             minor: ABI_MINOR,
             size: std::mem::size_of::<AtlHostV1>() as u32,
-            ctx: std::ptr::null_mut(),
+            ctx: std::ptr::from_ref(probe).cast_mut().cast(),
             trap: Some(trap),
         };
-        let mut engine: *mut AtlEngine = std::ptr::null_mut();
         let create = table.create.ok_or("engine table has no create")?;
-        // SAFETY: host, boot (NUL-terminated, outlives the call) and out outlive the call; the ABI's create.
-        let rc = unsafe { create(&host, boot.as_ptr(), &mut engine) };
+        // SAFETY: host, boot (NUL-terminated) and the handle out parameter (in the leaked probe) outlive the call; the ABI's create.
+        let rc = unsafe { create(&host, boot.as_ptr(), probe.engine.as_ptr()) };
         if rc != 0 {
             return Err(format!("create returned {rc}"));
         }
         let auxv = AUXV.load(Ordering::SeqCst);
         if auxv == 0 {
             return Err("create returned without BOOT".to_owned());
+        }
+        match BOOT_PROBE.get() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e.clone()),
+            None => return Err("the BOOT probe did not run".to_owned()),
         }
         let entry = at_entry(auxv)?;
         if entry != want {

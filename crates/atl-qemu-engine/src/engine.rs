@@ -310,7 +310,8 @@ fn boot_on_helper(
         .map_err(|e| format!("spawning the boot helper: {e}"))?;
     let (m, c) = &BOOT;
     let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    while matches!(*state, BootState::Pending) {
+    // break no-boot-join (gate q): the creator returns without waiting for BOOT
+    while matches!(*state, BootState::Pending) && !cfg!(atl_qe_no_boot_join) {
         state = c
             .wait(state)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -322,8 +323,22 @@ fn boot_on_helper(
             helper,
         }),
         BootState::Ended(why) => Err(why.clone()),
+        BootState::Pending if cfg!(atl_qe_no_boot_join) => Ok(Booted {
+            answer: 0,
+            boot_env: 0,
+            helper,
+        }),
         BootState::Pending => unreachable!("loop above"),
     }
+}
+
+/// The boot CPU's `CPUArchState *`, published when BOOT is entered and before its callback: from then on the callback may map and attach (D9). Once per process.
+static BOOT_ENV: OnceLock<usize> = OnceLock::new();
+
+/// The boot CPU that [`crate::attach`] copies from; None before BOOT.
+#[cfg(feature = "engine-so")]
+pub(crate) fn boot_env() -> Option<usize> {
+    BOOT_ENV.get().copied()
 }
 
 /// The BOOT trap, on the boot helper: fault chain, parallel code, the callback, then the answer to [`start`] and a park that never ends.
@@ -331,7 +346,12 @@ pub(crate) fn boot(g: Guest) -> ! {
     set_ret_stub(g.x(1));
     crate::signal::install();
     crate::attach::parallel(g.env.cast());
+    // break boot-late (gate q): the env is published after the callback, so map and attach inside BOOT fail
+    #[cfg(not(atl_qe_boot_late))]
+    let _ = BOOT_ENV.set(g.env as usize);
     let answer = (lib().on_trap)(g, Trap::Boot(g.x(0)));
+    #[cfg(atl_qe_boot_late)]
+    let _ = BOOT_ENV.set(g.env as usize);
     publish(BootState::Ready {
         answer,
         env: g.env as usize,

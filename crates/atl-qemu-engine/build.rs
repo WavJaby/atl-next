@@ -87,6 +87,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("ret-stub-local", "atl_qe_ret_stub_local"),
     // gate (q, Q5-1a): the engine table says major + 1: the host refuses the library
     ("abi-major-next", "atl_qe_abi_major_next"),
+    // gate (q, D9): the boot env is published after BOOT's callback, so map and attach inside BOOT fail
+    ("boot-late", "atl_qe_boot_late"),
+    // gate (q, D9): the creator returns before BOOT (no wait on the boot helper)
+    ("no-boot-join", "atl_qe_no_boot_join"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {
