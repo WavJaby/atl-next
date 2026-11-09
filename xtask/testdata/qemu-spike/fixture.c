@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Guest side of the QEMU engine spike (xtask `test qemu-spike`, QEMU bridge plan Q2/Q3): a static bionic executable QEMU's own main loads and runs.
 // main hands the host the gate table through the BOOT trap; the host then calls the fx_* functions through the engine. Every expected value is in the table below, from this source, never from the engine.
-// Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a10 CALL (x0 = host answer), 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = table, x1 = return stub; x0 = exit status), 0x7a14 THREAD (a guest thread's first instruction); 0x8000|k a binding thunk (pool slot k, gate l).
+// Trap immediates, as crates/atl-qemu-engine/src/trap.rs: 0x7a10 CALL (x0 = host answer), 0x7a11 RET (a host call returns), 0x7a12 REPORT (x0 = value), 0x7a13 BOOT (x0 = table, x1 = return stub; never returns: the host parks the boot thread), 0x7a14 THREAD (a guest thread's first instruction); 0x8000|k a binding thunk (pool slot k, gate l).
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -203,6 +204,47 @@ __attribute__((noinline)) u64 fx_bind(u64 slot) {
     return r;
 }
 
+// (m), (n), (o): host-attached CPUs. The host calls these on its own threads, each on its own guest CPU (atl-qemu-engine `Booted::attach`), after BOOT parked the boot thread.
+// fx_sum(n): 0 + 1 + ... + (n - 1) through a volatile stack slot, long enough that two host threads overlap; the table holds n(n-1)/2.
+// fx_tp(): the thread pointer the call runs with (TPIDR_EL0).
+// fx_write_msg(fd): raw write(2) of the static message (fixture data, mapped for the guest), so QEMU's lock_user runs (it reads thread_cpu); returns the raw result (count or -errno).
+// fx_write(fd, buf, n): the same on a host buffer (o): glibc heap the guest never mapped, QEMU's access_ok refuses it.
+#define M_N1 100000ull
+#define M_N2 200000ull
+#define NR_WRITE 64
+__attribute__((noinline)) u64 fx_sum(u64 n) {
+    volatile u64 acc = 0;
+    for (u64 i = 0; i < n; i++) {
+        acc += i;
+    }
+    return acc;
+}
+
+__attribute__((noinline)) u64 fx_tp(void) {
+    u64 tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    return tp;
+}
+
+__attribute__((noinline)) static u64 raw_write(u64 fd, const void *buf, u64 n) {
+    register u64 x0 __asm__("x0") = fd;
+    register const void *x1 __asm__("x1") = buf;
+    register u64 x2 __asm__("x2") = n;
+    register u64 x8 __asm__("x8") = NR_WRITE;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory");
+    return x0;
+}
+
+static const char msg[] = "q5-2\n";
+#define MSG_LEN (sizeof msg - 1)
+__attribute__((noinline)) u64 fx_write_msg(u64 fd) {
+    return raw_write(fd, msg, MSG_LEN);
+}
+
+__attribute__((noinline)) u64 fx_write(u64 fd, u64 buf, u64 n) {
+    return raw_write(fd, (const void *)(uintptr_t)buf, n);
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -226,6 +268,12 @@ static const u64 table[] = {
     (u64)fx_fatal, (u64)fx_fatal_thread,
     // 28..29: (l) fx_bind, and its report: the host's answer (0x1234) + BIND_ADD
     (u64)fx_bind, 0x1234 + BIND_ADD,
+    // 30..34: (m) fx_sum, two n and their sums n(n-1)/2
+    (u64)fx_sum, M_N1, M_N1 * (M_N1 - 1) / 2, M_N2, M_N2 * (M_N2 - 1) / 2,
+    // 35..38: (m) fx_tp, fx_write_msg, the message and its length
+    (u64)fx_tp, (u64)fx_write_msg, (u64)msg, MSG_LEN,
+    // 39..40: (o) fx_write, and what write(2) answers for a buffer the guest cannot access
+    (u64)fx_write, (u64)-EFAULT,
 };
 
 int main(void) {

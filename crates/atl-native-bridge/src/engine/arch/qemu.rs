@@ -41,19 +41,22 @@ thread_local! {
     static CPU: Cell<Option<Guest>> = const { Cell::new(None) };
 }
 
-/// Runs QEMU's `main` (library `library`, the spike's `-shared` link) on the static aarch64 `boot_exe`, which must raise BOOT with its auxv in x0 and its return stub in x1. At BOOT, `Guest::start(&cfg)` runs and `then` gets its result; `then`'s answer is the boot executable's exit status. Returns only if QEMU's `main` does; once per process.
+/// Boots QEMU (library `library`, the spike's `-shared` link) on the static aarch64 `boot_exe`, which must raise BOOT with its auxv in x0 and its return stub in x1. At BOOT, `Guest::start(&cfg)` runs and `then` gets its result; `then`'s answer is the process's exit status. Returns only if the boot fails; once per process.
 pub fn run(
     library: &Path,
     boot_exe: &Path,
     cfg: Config,
     then: fn(Result<super::Guest, String>) -> u64,
-) -> Result<i32, String> {
+) -> Result<std::convert::Infallible, String> {
     BOOT.set(Boot { cfg, then })
         .map_err(|_| "qemu crossing: run called twice".to_owned())?;
     let exe = boot_exe
         .to_str()
         .ok_or_else(|| format!("{}: not UTF-8", boot_exe.display()))?;
-    atl_qemu_engine::run(library, &["qemu-aarch64", "-B", GUEST_BASE, exe], on_trap)
+    let booted =
+        atl_qemu_engine::start(library, &["qemu-aarch64", "-B", GUEST_BASE, exe], on_trap)?;
+    // the boot thread stays parked in its BOOT trap; the answer ends the process, as the guest's exit did before the helper-thread boot
+    std::process::exit(i32::try_from(booted.answer()).unwrap_or(i32::MAX))
 }
 
 /// The calling thread's guest CPU; aborts on a thread that raised no BOOT (guest threads: Q5).
@@ -143,7 +146,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 const _: () = assert!(std::mem::size_of::<pool::Pool>() == THUNKS * THUNK_BYTES);
 
 /// JNI table slots, as the x86 engine (`JNINativeInterface` has 233). The QEMU JNI stubs come with the JNI slice (Q5).
-pub const JNI_STUBS: usize = 256;
+pub const JNI_STUBS: usize = super::bindings::JNI_STUBS;
 
 /// The crossing record of a thread. The QEMU thread pointer lives in the engine's CPU state, so the record holds only the guest thread pointer that thread.rs reads and writes.
 pub struct HostThread {

@@ -322,11 +322,16 @@ fn main() -> ExitCode {
     let _ = atl_qemu_engine::trap::atl_svc_hook as *const ();
     let fixture = fixture.to_string_lossy().into_owned();
     // `-B 0`: identity addresses (plan C6); without it QEMU picks a nonzero guest base for the guest ELF
-    let r = atl_qemu_engine::run(
+    match atl_qemu_engine::start(
         Path::new(&so),
         &["qemu-aarch64", "-B", "0", &fixture],
         on_trap,
-    );
-    println!("qemu-linker: FAIL QEMU main returned {r:?}");
-    ExitCode::from(2)
+    ) {
+        // the BOOT answer: 0 = every check passed
+        Ok(booted) => ExitCode::from(u8::try_from(booted.answer()).unwrap_or(u8::MAX)),
+        Err(e) => {
+            println!("qemu-linker: FAIL boot: {e}");
+            ExitCode::from(2)
+        }
+    }
 }

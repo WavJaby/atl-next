@@ -5,7 +5,7 @@
 //! Fixture: `xtask/testdata/qemu-spike/fixture.c`, static bionic by the NDK clang; QEMU's `main` loads it with `-B <guest base>`. Its binding pool (gate l) is `atl_bridgegen::aarch64::pool_asm` text, assembled by the same clang into the fixture; `check_pool` reads the pool back from the built binary.
 //! Harness: `cargo test -p atl-qemu-engine --features qemu --test spike` with `ATL_QEMU_BUILD` (layouts), `ATL_QEMU_SPIKE_SO`, `ATL_QEMU_SPIKE_FIXTURE`, `ATL_QEMU_SIGCHAIN_OBJ` (AOSP libsigchain's object, built here from `art/sigchainlib/sigchain.cc` as-is); its own target dir under the spike dir, so the cfg breaks rebuild only it.
 //! Pass: the plain run prints `spike: (x) ok` for every gate and exits 0; each break run leaves its gate without `ok` and exits nonzero.
-//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B 4096`; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
+//! Breaks: `no-p1` relinks with the pin's unpatched `cpu_loop.c` (compiled with the build's own command: P1 removed, nothing else); `guest-base` runs `-B` [`SHIFTED_BASE`]; `bind-id` links a pool whose slots carry id + 1 (a text edit of the emitted pool, `pool_text`); the rest are atl-qemu-engine build.rs `BREAKS`.
 //! Output: `<out>/qemu/<target>-linux-user-pic/spike/`: the libraries, the fixture, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -27,9 +27,11 @@ const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
 /// P1's call site: the one object the `no-p1` break replaces.
 const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 12] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'];
-/// Thunk slots in the fixture's pool: a power of two above the x86 engine's binding count (3860 stub rows and 6 fixed, qemu-thunks-plan 2.2). Gate (l) uses slot 4095.
-const POOL_SLOTS: u32 = 4096;
+const GATES: [char; 15] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+];
+/// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
+const POOL_SLOTS: u32 = 8192;
 /// The pool's symbol and its alignment (`.p2align 12` in `aarch64::pool_asm`).
 const POOL_SYMBOL: &str = "atl_bind_pool";
 const POOL_ALIGN: u64 = 1 << 12;
@@ -172,6 +174,42 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: None,
         red: Some('l'),
+    },
+    // gate (m): both host threads run on the boot CPU's one state
+    RunSpec {
+        name: "shared-cpu",
+        unpatched: false,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("shared-cpu"),
+        red: Some('m'),
+    },
+    // gate (m): lock_user reads a NULL thread_cpu at the first write(2)
+    RunSpec {
+        name: "skip-thread-cpu",
+        unpatched: false,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("skip-thread-cpu"),
+        red: Some('m'),
+    },
+    // gate (m): the attached thread's first translation runs with a NULL tcg_ctx
+    RunSpec {
+        name: "skip-tcg",
+        unpatched: false,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("skip-tcg"),
+        red: Some('m'),
+    },
+    // gate (m): an attached thread has no return stub, so its first guest call asserts
+    RunSpec {
+        name: "ret-stub-local",
+        unpatched: false,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("ret-stub-local"),
+        red: Some('m'),
     },
 ];
 

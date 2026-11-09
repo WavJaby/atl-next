@@ -5,7 +5,7 @@
 //! With libsigchain linked (AOSP art/sigchainlib: this executable's `sigaction`), the order per signal is sigchain's special handlers (ART's fault manager), then [`atl_fault`], then QEMU's handler for a guest fault or the previous handler for a host fault.
 //! A fault is a guest fault when its thread is a guest thread and QEMU's own tests say so, in QEMU's order: `helper_retaddr != 0` (a helper or the translator touching guest memory, accel/tcg/user-exec.c `adjust_signal_pc`); the host pc in the code buffer (`in_code_gen_buffer(pc - tcg_splitwx_diff)`); or a write with SEGV_ACCERR to a guest page with `PAGE_WRITE_ORG`, which QEMU write-protected for translated code.
 //! The last case is the one QEMU un-protects (`page_unprotect` invalidates the translations; the host write retries). For any other SEGV_ACCERR write QEMU dies, so only that case is routed.
-//! A guest thread registers its `helper_retaddr` at its first trap (BOOT, or the THREAD trap in trap.rs). A thread that faults before that is classified as a host fault; closing that window needs a QEMU thread-start hook, which is a patch (owner decision).
+//! A guest thread registers its `helper_retaddr` at its first trap (BOOT, or the THREAD trap in trap.rs for a guest-created thread), a host-attached one in attach.rs; detach unregisters it. A guest-created thread that faults before its first trap is classified as a host fault; closing that window needs a QEMU thread-start hook, which is a patch (owner decision).
 //! Signal context: atomics, thread-local `Cell`s, data set before install, `in_code_gen_buffer`, `page_get_flags` (QEMU's own handler calls it in the same context; it may take QEMU's mmap lock) and `sigaction`; nothing allocates. [`atl_fault`] holds no value with a destructor: QEMU's handler may longjmp over its frame.
 
 use std::cell::Cell;
@@ -106,6 +106,11 @@ pub(crate) fn register_thread() -> usize {
     let slot = helper_retaddr_slot().expect("QEMU library exports helper_retaddr") as usize;
     SLOT.with(|s| s.set(slot));
     slot
+}
+
+/// The calling thread is no guest thread any more (its CPU is detached): its faults go to the previous handler.
+pub(crate) fn unregister_thread() {
+    SLOT.with(|s| s.set(0));
 }
 
 /// Puts [`atl_fault`] in front of QEMU's handlers and registers the BOOT thread. At BOOT: after QEMU's `signal_init`, on the guest thread.

@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! Spike gates (a)-(h) (QEMU bridge plan Q2/Q3), harness-less: QEMU's `main` owns this thread and the guest's exit ends the process with the BOOT answer (0 = every gate ok).
+//! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (m), (o) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot).
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) the first syscall on host heap memory: observed -EFAULT (QEMU's access_ok), the case Q5-3's patch turns.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
 mod spike {
     use std::cell::{Cell, RefCell};
     use std::ffi::c_int;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Barrier, Mutex, OnceLock};
 
-    use atl_qemu_engine::{Guest, Trap};
+    use atl_qemu_engine::{Booted, Guest, Trap};
 
     /// Exit status of the previous handler (gates e, h): the fault reached it after the special handler declined it, in sigchain's order.
     const PREVIOUS_EXIT: c_int = 43;
@@ -48,7 +47,18 @@ mod spike {
         pub const FATAL_THREAD: usize = 27;
         pub const BIND_FN: usize = 28;
         pub const BIND_REPORT: usize = 29;
-        pub const LEN: usize = 30;
+        pub const SUM: usize = 30;
+        pub const M_N1: usize = 31;
+        pub const M_S1: usize = 32;
+        pub const M_N2: usize = 33;
+        pub const M_S2: usize = 34;
+        pub const TP: usize = 35;
+        pub const WRITE_MSG: usize = 36;
+        pub const MSG: usize = 37;
+        pub const MSG_LEN: usize = 38;
+        pub const WRITE: usize = 39;
+        pub const NEG_EFAULT: usize = 40;
+        pub const LEN: usize = 41;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -56,10 +66,16 @@ mod spike {
     /// What the host answers a binding trap during gate (l); the fixture reports it + 1 (table `BIND_REPORT`).
     const BIND_ANSWER: u64 = 0x1234;
     /// Gate (l)'s pool slots: `fx_bind(k)` must reach binding k. Literals here, as the fixture's table is; the pool's layout (slot k = id k) is checked on the built fixture by xtask.
-    const BIND_SLOTS: [u32; 3] = [3, 0, 4095];
+    const BIND_SLOTS: [u32; 3] = [3, 0, 8191];
+    /// Gate (m): calls per host thread, each fx_sum + fx_tp + fx_write_msg. Enough rounds that the two threads' guest code overlaps.
+    const M_ROUNDS: usize = 20;
+    /// Gate (o): bytes of the host heap buffer handed to write(2).
+    const O_LEN: usize = 64;
+
+    /// The fixture's table, from its BOOT trap; read by every thread.
+    static TABLE: OnceLock<Vec<u64>> = OnceLock::new();
 
     thread_local! {
-        static TABLE: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
         static GATE: Cell<char> = const { Cell::new(' ') };
         static A_SEEN: Cell<Option<[u64; 8]>> = const { Cell::new(None) };
         /// The binding traps of the current gate-(l) call: (id, x0..x7).
@@ -183,13 +199,30 @@ mod spike {
         }
         let fixture = fixture.to_string_lossy().into_owned();
         run_gate_k(&so, &fixture);
-        let r = atl_qemu_engine::run(
+        let booted = match atl_qemu_engine::start(
             std::path::Path::new(&so),
             &["qemu-aarch64", "-B", &base, &fixture],
             on_trap,
-        );
-        println!("spike: FAIL QEMU main returned {r:?}");
-        std::process::exit(2);
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("spike: FAIL boot: {e}");
+                std::process::exit(2);
+            }
+        };
+        // the BOOT answer: 0 = gates (a)-(l) ok on the boot thread
+        let mut ok = booted.answer() == 0;
+        for (gate, f) in [
+            ('n', gate_n as fn(&Booted) -> Result<(), String>),
+            ('m', gate_m),
+            ('o', gate_o),
+        ] {
+            // a panic (an engine assert on this thread) is the gate's failure, not the harness's
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&booted)))
+                .unwrap_or_else(|_| Err("panicked".to_owned()));
+            ok &= verdict(gate, r);
+        }
+        std::process::exit(i32::from(!ok));
     }
 
     /// The process's pre-QEMU handler. Gates (e) and (h) expect host faults here, after the special handler declined them.
@@ -203,7 +236,7 @@ mod spike {
     }
 
     fn w(i: usize) -> u64 {
-        TABLE.with(|t| t.borrow()[i])
+        TABLE.get().expect("table from BOOT")[i]
     }
 
     fn reports() -> Vec<u64> {
@@ -251,7 +284,7 @@ mod spike {
         let words = g.host_addr(table) as *const u64;
         // SAFETY: the fixture's static table of t::LEN words, at its host address.
         let words = unsafe { std::slice::from_raw_parts(words, t::LEN) }.to_vec();
-        TABLE.with(|t| *t.borrow_mut() = words);
+        let _ = TABLE.set(words);
         let mut ok = verdict(
             'k',
             K_RESULT
@@ -519,6 +552,186 @@ mod spike {
         Ok(())
     }
 
+    /// A pipe for the guest's write(2) calls: (read end, write end), both non-blocking.
+    fn pipe() -> Result<(c_int, c_int), String> {
+        let mut fds = [0; 2];
+        // SAFETY: fds is a valid out array of two ints.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err("pipe2 failed".to_owned());
+        }
+        Ok((fds[0], fds[1]))
+    }
+
+    /// Everything the pipe holds now.
+    fn drain(fd: c_int) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            // SAFETY: buf is a writable buffer of its length.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let Ok(n) = usize::try_from(n) else { break };
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn close(fds: (c_int, c_int)) {
+        // SAFETY: the two descriptors pipe() opened.
+        unsafe {
+            libc::close(fds.0);
+            libc::close(fds.1);
+        }
+    }
+
+    /// The fixture's message bytes (table MSG, MSG_LEN), read at the guest's static data, identity addresses.
+    fn message() -> Vec<u8> {
+        let len = usize::try_from(w(t::MSG_LEN)).expect("message length");
+        // SAFETY: the fixture's static message of MSG_LEN bytes, mapped for the life of the process.
+        unsafe { std::slice::from_raw_parts(w(t::MSG) as *const u8, len) }.to_vec()
+    }
+
+    /// One host thread's share of gates (m)/(n): attach, then `rounds` × (fx_sum(n) = sum, fx_tp() = its own thread pointer, fx_write_msg(fd) = MSG_LEN), detach.
+    fn attached_calls(
+        booted: &Booted,
+        n: u64,
+        sum: u64,
+        fd: c_int,
+        rounds: usize,
+        start: Option<&Barrier>,
+    ) -> Result<(), String> {
+        let cpu = booted.attach()?;
+        let g = cpu.guest();
+        // the thread pointer: a host block of this thread, never dereferenced by fx_tp
+        let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+        let tp = tcb.as_ptr() as u64;
+        if let Some(b) = start {
+            b.wait();
+        }
+        for round in 0..rounds {
+            let (got, _) = g.call_on(tp, w(t::SUM), &[n]);
+            if got != sum {
+                return Err(format!(
+                    "round {round}: fx_sum({n}) = {got}, expected {sum}"
+                ));
+            }
+            let (seen, _) = g.call_on(tp, w(t::TP), &[]);
+            if seen != tp {
+                return Err(format!(
+                    "round {round}: TPIDR_EL0 {seen:#x}, expected this thread's {tp:#x}"
+                ));
+            }
+            let (wrote, _) = g.call_on(tp, w(t::WRITE_MSG), &[fd as u64]);
+            if wrote != w(t::MSG_LEN) {
+                return Err(format!(
+                    "round {round}: write = {:#x}, expected {}",
+                    wrote,
+                    w(t::MSG_LEN)
+                ));
+            }
+        }
+        drop(cpu);
+        Ok(())
+    }
+
+    /// The pipe holds exactly `writes` copies of the fixture message.
+    fn check_pipe(fd: c_int, writes: usize) -> Result<(), String> {
+        let got = drain(fd);
+        let want = message().repeat(writes);
+        if got != want {
+            return Err(format!(
+                "pipe holds {} bytes, expected {writes} messages ({} bytes)",
+                got.len(),
+                want.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gate (n): the helper boot. `start` returned on this (creator) thread with BOOT's answer; the helper thread is still there, parked; this thread attaches, calls, detaches, and attaches again (a detach leaves the engine usable).
+    fn gate_n(booted: &Booted) -> Result<(), String> {
+        if !booted.helper_parked() {
+            return Err("the boot helper thread ended".to_owned());
+        }
+        let fds = pipe()?;
+        let r = (|| {
+            attached_calls(booted, w(t::M_N1), w(t::M_S1), fds.1, 1, None)?;
+            attached_calls(booted, w(t::M_N1), w(t::M_S1), fds.1, 1, None)?;
+            check_pipe(fds.0, 2)
+        })();
+        close(fds);
+        r?;
+        if !booted.helper_parked() {
+            return Err("the boot helper thread ended after the calls".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Gate (m): two host threads attach and call at once, each on its own CPU, thread pointer and guest stack: fx_sum with its own n, fx_tp, fx_write_msg. Every result is the fixture's.
+    fn gate_m(booted: &Booted) -> Result<(), String> {
+        let fds = pipe()?;
+        let start = Barrier::new(2);
+        let jobs = [(w(t::M_N1), w(t::M_S1)), (w(t::M_N2), w(t::M_S2))];
+        let r = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs
+                .iter()
+                .map(|&(n, sum)| {
+                    let start = &start;
+                    s.spawn(move || attached_calls(booted, n, sum, fds.1, M_ROUNDS, Some(start)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("panicked".to_owned()))
+                        .map_err(|e| format!("thread {i}: {e}"))
+                })
+                .collect::<Result<Vec<()>, String>>()
+        })
+        .and_then(|_| check_pipe(fds.0, jobs.len() * M_ROUNDS));
+        close(fds);
+        r
+    }
+
+    /// Gate (o), an observation for Q5-3: the guest's write(2) on a host heap buffer (glibc malloc, never mapped for the guest). QEMU's `lock_user` checks the range with `access_ok` against its page table, which does not know the page: -EFAULT. Ok when that is what happens; the line prints the evidence.
+    fn gate_o(booted: &Booted) -> Result<(), String> {
+        let fds = pipe()?;
+        // a Box, not an array on the stack: the buffer must be glibc heap
+        let heap = Box::new([0xa5u8; O_LEN]);
+        let at = heap.as_ptr() as u64;
+        let r = (|| {
+            let cpu = booted.attach()?;
+            let g = cpu.guest();
+            let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+            let flags = g.page_flags(at);
+            let (r, _) = g.call_on(
+                tcb.as_ptr() as u64,
+                w(t::WRITE),
+                &[fds.1 as u64, at, O_LEN as u64],
+            );
+            drop(cpu);
+            let landed = drain(fds.0).len();
+            println!(
+                "spike: (o) observed write(pipe, heap {at:#x}, {O_LEN}) = {} with QEMU page flags {flags:#x}; {landed} bytes reached the pipe",
+                r as i64
+            );
+            if r != w(t::NEG_EFAULT) || landed != 0 {
+                return Err(format!(
+                    "write returned {}, expected -EFAULT ({}) and nothing written",
+                    r as i64,
+                    w(t::NEG_EFAULT) as i64
+                ));
+            }
+            Ok(())
+        })();
+        close(fds);
+        r
+    }
+
     /// Gate (k) in its child: a host-only fault while the previous SIGSEGV action is SIG_IGN. A synchronous fault cannot be ignored, so the child must end by SIGSEGV; surviving the store exits 3.
     fn gate_k() -> ! {
         // SAFETY: deliberate null store, the fault under test.
@@ -541,12 +754,13 @@ mod spike {
                 libc::sigaction(libc::SIGSEGV, &act, std::ptr::null_mut());
             }
             GATE_K_CHILD.store(true, Ordering::Relaxed);
-            let r = atl_qemu_engine::run(
+            let r = atl_qemu_engine::start(
                 std::path::Path::new(so),
                 &["qemu-aarch64", "-B", "0", fixture],
                 on_trap,
-            );
-            println!("spike: FAIL gate (k) child: QEMU main returned {r:?}");
+            )
+            .map(|b| b.answer());
+            println!("spike: FAIL gate (k) child: the boot ended {r:?}");
             // SAFETY: async-signal-safe exit, no unwinding.
             unsafe { libc::_exit(2) }
         } else {

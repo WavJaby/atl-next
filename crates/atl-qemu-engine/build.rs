@@ -16,12 +16,44 @@ const BUILD_ENV: &str = "ATL_QEMU_BUILD";
 const UNIT: &str = "linux-user/aarch64/cpu_loop.c";
 /// Headers whose records form the interface, relative to the QEMU tree.
 const HEADERS: &[&str] = &["target/arm/cpu.h"];
-/// Offsets the engine reads by field path, evaluated by clang in the unit: (macro name, `offsetof` expression).
+/// Headers the unit also includes for [`FIELD_OFFSETS`] only; their records are not part of the interface. linux-user/qemu.h: `TaskState`; exec/translation-block.h: `CF_PARALLEL`.
+const OFFSET_HEADERS: &[&str] = &["linux-user/qemu.h", "exec/translation-block.h"];
+/// Offsets, sizes and flag values the engine reads, evaluated by clang in the unit: (macro name, C integer expression).
 /// TPIDR_EL0 = `cp15.tpidr_el[0]`, the register linux-user's `cpu_set_tls` writes (linux-user/aarch64/target_cpu.h).
-const FIELD_OFFSETS: &[(&str, &str)] = &[(
-    "ATL_OFFSET_TPIDR_EL0",
-    "offsetof(CPUARMState, cp15.tpidr_el[0])",
-)];
+/// The rest is what a host-attached CPU needs (attach.rs), as linux-user's clone path builds a thread (syscall.c `do_fork`): `env_cpu` = env - sizeof(CPUState) (include/exec/cpu-common.h), `CPUState.opaque` = the TaskState, the TaskState fields `do_fork` copies from the parent, GCS state, and `CF_PARALLEL` (`begin_parallel_context`, linux-user/user-internals.h).
+const FIELD_OFFSETS: &[(&str, &str)] = &[
+    (
+        "ATL_OFFSET_TPIDR_EL0",
+        "offsetof(CPUARMState, cp15.tpidr_el[0])",
+    ),
+    ("ATL_SIZEOF_CPUSTATE", "sizeof(CPUState)"),
+    ("ATL_OFFSET_CPU_OPAQUE", "offsetof(CPUState, opaque)"),
+    ("ATL_SIZEOF_TASKSTATE", "sizeof(TaskState)"),
+    ("ATL_OFFSET_TS_INFO", "offsetof(TaskState, info)"),
+    ("ATL_OFFSET_TS_BPRM", "offsetof(TaskState, bprm)"),
+    (
+        "ATL_OFFSET_TS_SIGNAL_MASK",
+        "offsetof(TaskState, signal_mask)",
+    ),
+    (
+        "ATL_SIZEOF_TS_SIGNAL_MASK",
+        "sizeof(((TaskState *)0)->signal_mask)",
+    ),
+    (
+        "ATL_OFFSET_TS_GCS_EL0_LOCKED",
+        "offsetof(TaskState, gcs_el0_locked)",
+    ),
+    (
+        "ATL_OFFSET_GCSPR_EL0",
+        "offsetof(CPUARMState, cp15.gcspr_el[0])",
+    ),
+    (
+        "ATL_OFFSET_GCSCR_EL0",
+        "offsetof(CPUARMState, cp15.gcscr_el[0])",
+    ),
+    ("ATL_GCSCR_PCRSEL", "GCSCR_PCRSEL"),
+    ("ATL_CF_PARALLEL", "CF_PARALLEL"),
+];
 
 const BREAK_ENV: &str = "ATL_QEMU_ENGINE_BREAK";
 /// AOSP libsigchain's object (art/sigchainlib/sigchain.cc, built as-is by `xtask test qemu-spike`); the spike harness links it.
@@ -44,6 +76,14 @@ const BREAKS: &[(&str, &str)] = &[
     ("ign-loop", "atl_qe_ign_loop"),
     // gate (l): the bind decode tests bit 14, so a binding thunk (bit 15) reaches QEMU's syscall path
     ("bind-decode", "atl_qe_bind_decode"),
+    // gate (m): attach hands every host thread the boot CPU instead of a `cpu_copy`
+    ("shared-cpu", "atl_qe_shared_cpu"),
+    // gate (m): attach leaves `thread_cpu` NULL, which `lock_user` (linux-user/uaccess.c) reads on every syscall buffer
+    ("skip-thread-cpu", "atl_qe_skip_thread_cpu"),
+    // gate (m): attach skips `tcg_register_thread`, so the thread's `tcg_ctx` stays NULL for its first translation
+    ("skip-tcg", "atl_qe_skip_tcg"),
+    // gate (m): the `svc #RET` stub address stays thread-local, set only on the BOOT thread
+    ("ret-stub-local", "atl_qe_ret_stub_local"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {
@@ -147,12 +187,13 @@ fn layout(build: &Path, out: &Path, host: &str) -> Result<String> {
         "{UNIT}: compile command defines no CONFIG_TARGET"
     );
     let also: Vec<PathBuf> = HEADERS.iter().map(|h| src.join(h)).collect();
-    for h in &also {
+    let offset_headers: Vec<PathBuf> = OFFSET_HEADERS.iter().map(|h| src.join(h)).collect();
+    for h in also.iter().chain(&offset_headers) {
         println!("cargo::rerun-if-changed={}", h.display());
     }
     let unit = out.join("qemu_cpu.c");
     let mut text = String::from("#include \"qemu/osdep.h\"\n");
-    for h in HEADERS {
+    for h in HEADERS.iter().chain(OFFSET_HEADERS) {
         text.push_str(&format!("#include \"{h}\"\n"));
     }
     // fields inside anonymous unions get generated names (`cp15.anon13`) that renumber when cpu.h gains a union: name the path instead, clang evaluates it

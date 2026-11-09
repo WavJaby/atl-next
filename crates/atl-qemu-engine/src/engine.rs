@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! Library load, QEMU's `main`, and guest calls on the CPU state P1's hook hands over.
 
+#[cfg(atl_qe_ret_stub_local)]
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
-use std::sync::OnceLock;
+#[cfg(not(atl_qe_ret_stub_local))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::layout::CPUArchState as Env;
 
@@ -57,20 +60,47 @@ pub(crate) struct Lib {
     /// `mmap_lock` / `mmap_unlock` (linux-user/mmap.c): the lock `page_set_flags` asserts.
     pub(crate) mmap_lock: MmapLockFn,
     pub(crate) mmap_unlock: MmapLockFn,
-    /// dlopen handle, for the per-thread symbols resolved later (`helper_retaddr`).
-    handle: usize,
+    /// What a host-attached CPU needs from linux-user (attach.rs).
+    pub(crate) thread: crate::attach::Api,
+    /// dlopen handle, for the per-thread symbols resolved later (`helper_retaddr`, `thread_cpu`).
+    pub(crate) handle: usize,
     pub(crate) on_trap: OnTrap,
 }
 
 static LIB: OnceLock<Lib> = OnceLock::new();
 
 pub(crate) fn lib() -> &'static Lib {
-    LIB.get().expect("atl-qemu-engine: run() not called")
+    LIB.get().expect("atl-qemu-engine: start() not called")
 }
 
+/// The guest's `svc #RET` stub, from its BOOT trap (x1): guest calls return there. One address for the process: the boot executable's code is mapped for every CPU.
+#[cfg(not(atl_qe_ret_stub_local))]
+static RET_STUB: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(atl_qe_ret_stub_local))]
+fn ret_stub() -> u64 {
+    RET_STUB.load(Ordering::Acquire)
+}
+
+#[cfg(not(atl_qe_ret_stub_local))]
+fn set_ret_stub(addr: u64) {
+    RET_STUB.store(addr, Ordering::Release);
+}
+
+// break `ret-stub-local` (gate m): the stub is known on the BOOT thread only
+#[cfg(atl_qe_ret_stub_local)]
 thread_local! {
-    /// The guest's `svc #RET` stub, from its BOOT trap (x1): guest calls return there.
     static RET_STUB: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(atl_qe_ret_stub_local)]
+fn ret_stub() -> u64 {
+    RET_STUB.with(Cell::get)
+}
+
+#[cfg(atl_qe_ret_stub_local)]
+fn set_ret_stub(addr: u64) {
+    RET_STUB.with(|s| s.set(addr));
 }
 
 /// dlsym of `name` in `handle`, or the dlerror text.
@@ -101,16 +131,114 @@ pub(crate) fn helper_retaddr_slot() -> Result<*const usize, String> {
     sym(lib().handle, c"helper_retaddr").map(|p| p as *const usize)
 }
 
-/// Loads `library` and runs QEMU's `main` with `argv` (argv[0] first) and this process's environment. Returns `main`'s status if it returns; the guest normally exits the process itself.
-/// Call once per process; the calling thread becomes the guest thread.
-pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String> {
+/// Host stack of the boot helper thread: 8 MiB, the main thread's usual RLIMIT_STACK, which QEMU's `main` expects to run on (and the BOOT callback runs on top of it).
+const BOOT_STACK: usize = 8 << 20;
+
+/// Where the boot stands: the creator in [`start`] waits until the helper leaves `Pending`.
+enum BootState {
+    Pending,
+    /// BOOT ran: the callback's answer and the boot CPU (`CPUArchState *`).
+    Ready {
+        answer: u64,
+        env: usize,
+    },
+    /// The helper ended without BOOT: why.
+    Ended(String),
+}
+
+static BOOT: (Mutex<BootState>, Condvar) = (Mutex::new(BootState::Pending), Condvar::new());
+
+fn publish(state: BootState) {
+    let (m, c) = &BOOT;
+    *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    c.notify_all();
+}
+
+/// The engine after BOOT: QEMU's boot thread is parked in its BOOT trap for the life of the process; host threads become guest CPUs with [`Booted::attach`].
+pub struct Booted {
+    answer: u64,
+    boot_env: usize,
+    helper: std::thread::JoinHandle<()>,
+}
+
+impl Booted {
+    /// What the BOOT callback answered.
+    pub fn answer(&self) -> u64 {
+        self.answer
+    }
+
+    /// Whether the boot helper thread still exists (parked after BOOT). It never ends while the process runs.
+    pub fn helper_parked(&self) -> bool {
+        !self.helper.is_finished()
+    }
+
+    /// The calling host thread gets its own guest CPU, a copy of the boot CPU as linux-user's clone makes one. Detached when the [`crate::Cpu`] drops, on this thread.
+    pub fn attach(&self) -> Result<crate::Cpu, String> {
+        crate::attach::attach(self.boot_env)
+    }
+}
+
+/// Boots QEMU on a helper thread: it loads `library` and runs QEMU's `main` with `argv` (argv[0] first) and this process's environment. The guest's BOOT trap runs `on_trap(Boot)` on that thread, publishes the answer, and parks the thread for good: QEMU's `main` never returns to a library caller (linux-user/main.c runs `cpu_loop` last), so this needs no QEMU change.
+/// Returns once BOOT ran, or with why the helper ended without it. Call once per process. dlopen runs on the helper too, so QEMU's constructors (RCU's thread registration) belong to the thread that runs `main`.
+pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, String> {
     let path = CString::new(library.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    let args: Vec<CString> = argv
+        .iter()
+        .map(|a| CString::new(*a).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    let helper = std::thread::Builder::new()
+        .name("qemu-boot".to_owned())
+        .stack_size(BOOT_STACK)
+        .spawn(move || {
+            let why = match run_main(&path, &args, on_trap) {
+                Ok(status) => format!("QEMU main returned {status} without BOOT"),
+                Err(e) => e,
+            };
+            publish(BootState::Ended(why));
+        })
+        .map_err(|e| format!("spawning the boot helper: {e}"))?;
+    let (m, c) = &BOOT;
+    let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while matches!(*state, BootState::Pending) {
+        state = c
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    match &*state {
+        BootState::Ready { answer, env } => Ok(Booted {
+            answer: *answer,
+            boot_env: *env,
+            helper,
+        }),
+        BootState::Ended(why) => Err(why.clone()),
+        BootState::Pending => unreachable!("loop above"),
+    }
+}
+
+/// The BOOT trap, on the boot helper: fault chain, parallel code, the callback, then the answer to [`start`] and a park that never ends.
+pub(crate) fn boot(g: Guest) -> ! {
+    set_ret_stub(g.x(1));
+    crate::signal::install();
+    crate::attach::parallel(g.env.cast());
+    let answer = (lib().on_trap)(g, Trap::Boot(g.x(0)));
+    publish(BootState::Ready {
+        answer,
+        env: g.env as usize,
+    });
+    // the boot CPU stays outside `cpu_exec` (the hook runs between `cpu_exec_end` and the next start), so QEMU's exclusive sections never wait for it
+    loop {
+        std::thread::park();
+    }
+}
+
+/// The helper's body: dlopen `path`, resolve, run QEMU's `main`. Returns `main`'s status if it returns.
+fn run_main(path: &CStr, args: &[CString], on_trap: OnTrap) -> Result<i32, String> {
     hook_in_global_scope()?;
     // RTLD_LOCAL: P1's call to `atl_svc_hook` still binds to ours, which `hook_in_global_scope` put first in lookup order
     // SAFETY: path is NUL-terminated; the library's initialisers are QEMU's own (QOM type registration).
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
-        return Err(format!("dlopen {}: {}", library.display(), dlerror()));
+        return Err(format!("dlopen {}: {}", path.to_string_lossy(), dlerror()));
     }
     let handle = handle as usize;
     let main = sym(handle, c"atl_qemu_user_main")?;
@@ -148,16 +276,13 @@ pub fn run(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<i32, String
         mmap_lock: unsafe { std::mem::transmute::<*mut c_void, MmapLockFn>(mmap_lock) },
         // SAFETY: `void mmap_unlock(void)`, as mmap_lock.
         mmap_unlock: unsafe { std::mem::transmute::<*mut c_void, MmapLockFn>(mmap_unlock) },
+        thread: crate::attach::Api::resolve(handle)?,
         handle,
         on_trap,
     };
     LIB.set(lib)
-        .map_err(|_| "atl-qemu-engine: run() called twice".to_owned())?;
+        .map_err(|_| "atl-qemu-engine: start() called twice".to_owned())?;
     crate::signal::capture_previous();
-    let args: Vec<CString> = argv
-        .iter()
-        .map(|a| CString::new(*a).map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
     let mut ptrs: Vec<*mut c_char> = args.iter().map(|a| a.as_ptr().cast_mut()).collect();
     ptrs.push(std::ptr::null_mut());
     let argc = c_int::try_from(args.len()).map_err(|e| e.to_string())?;
@@ -211,6 +336,30 @@ fn process_environ() -> *mut *mut c_char {
     unsafe { environ }
 }
 
+/// `page_set_flags(start, last, set, clear)` over `[start, start + len)` under QEMU's mmap lock. `clear` with `VALID` unmaps the range (QEMU's own munmap does the same, linux-user/mmap.c).
+pub(crate) fn set_pages(start: usize, len: usize, set: i32, clear: i32) -> Result<(), String> {
+    let last = start
+        .checked_add(len)
+        .and_then(|end| end.checked_sub(1))
+        .map(|last| last as u64)
+        .ok_or("set_pages: empty or wrapping range")?;
+    let lib = lib();
+    // QEMU asserts `last <= guest_addr_max`; refuse here instead of aborting in its assert
+    if last > *lib.guest_addr_max as u64 {
+        return Err(format!(
+            "set_pages {start:#x}+{len:#x}: beyond guest_addr_max {:#x}",
+            *lib.guest_addr_max
+        ));
+    }
+    // SAFETY: the mmap lock and `page_set_flags` are QEMU's own (linux-user/mmap.c, accel/tcg/user-exec.c); QEMU's page table is live once `lib()` is set and BOOT ran, and the range is within `guest_addr_max`.
+    unsafe {
+        (lib.mmap_lock)();
+        (lib.page_set_flags)(start as u64, last, set, clear);
+        (lib.mmap_unlock)();
+    }
+    Ok(())
+}
+
 /// Byte offset of TPIDR_EL0 in `CPUArchState` (clang's `offsetof`, a `size_t` the generator types u64; an offset inside a 79 KB record fits any usize).
 const TPIDR_EL0: usize = crate::layout::ATL_OFFSET_TPIDR_EL0 as usize;
 const _: () = assert!(TPIDR_EL0 + 8 <= Env::SIZE);
@@ -224,10 +373,6 @@ pub struct Guest {
 impl Guest {
     pub(crate) fn new(env: *mut c_void) -> Self {
         Self { env: env.cast() }
-    }
-
-    pub(crate) fn set_ret_stub(addr: u64) {
-        RET_STUB.with(|s| s.set(addr));
     }
 
     fn reg(&self, offset: usize) -> u64 {
@@ -269,29 +414,16 @@ impl Guest {
         (addr as usize).wrapping_add(*lib().guest_base)
     }
 
+    /// QEMU's page flags (`page::*`) for guest address `addr`; 0 = not mapped for the guest, so syscalls on it fail `access_ok`.
+    pub fn page_flags(&self, addr: u64) -> i32 {
+        // SAFETY: page_get_flags takes any guest address and answers 0 for one it does not track.
+        unsafe { (lib().page_get_flags)(addr) }
+    }
+
     /// Marks the guest pages of `[start, start + len)` as mapped with `flags` (`page::*`, `VALID` added here), identity: guest address = host address (`guest_base` 0). Host memory outside this table is unmapped to the guest, so a fetch from a page not marked faults.
-    /// Needs a trap context (QEMU's page table is live from `main`, and the calling thread takes the mmap lock). Before the first guest fetch from the range.
+    /// Needs QEMU booted (its page table is live from `main`); any thread, which takes the mmap lock. Before the first guest fetch from the range.
     pub fn map_pages(&self, start: usize, len: usize, flags: i32) -> Result<(), String> {
-        let last = start
-            .checked_add(len)
-            .and_then(|end| end.checked_sub(1))
-            .map(|last| last as u64)
-            .ok_or("map_pages: empty or wrapping range")?;
-        let lib = lib();
-        // QEMU asserts `last <= guest_addr_max`; refuse here instead of aborting in its assert
-        if last > *lib.guest_addr_max as u64 {
-            return Err(format!(
-                "map_pages {start:#x}+{len:#x}: beyond guest_addr_max {:#x}",
-                *lib.guest_addr_max
-            ));
-        }
-        // SAFETY: the mmap lock and `page_set_flags` are QEMU's own (linux-user/mmap.c, accel/tcg/user-exec.c); called on the guest thread, in a trap, so QEMU's page table is initialised and the range is within `guest_addr_max`.
-        unsafe {
-            (lib.mmap_lock)();
-            (lib.page_set_flags)(start as u64, last, flags | page::VALID, 0);
-            (lib.mmap_unlock)();
-        }
-        Ok(())
+        set_pages(start, len, flags | page::VALID, 0)
     }
 
     /// Calls guest function `f` with `args` in x0.. and returns its x0, on the interrupted code's thread pointer. As [`Guest::call_on`].
@@ -303,7 +435,7 @@ impl Guest {
     /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
     pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
         assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
-        let ret = RET_STUB.with(Cell::get);
+        let ret = ret_stub();
         assert!(ret != 0, "no BOOT trap yet: no return stub");
         let mut saved = vec![0u8; Env::SIZE];
         // SAFETY: env is a live CPUArchState of Env::SIZE bytes (clang layout); saved is that long.
