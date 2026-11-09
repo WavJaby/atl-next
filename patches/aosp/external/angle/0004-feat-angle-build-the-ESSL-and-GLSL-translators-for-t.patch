@@ -23,21 +23,10 @@ SPDX-License-Identifier: BSD-3-Clause
  1 file changed, 12 insertions(+)
 
 diff --git a/Android.bp b/Android.bp
-index 2412a222ca9a63e715383362b68c73012d720ec5..f3c62dc205d5d6eff13ff07adc4e1b8ae48d44c3 100644
+index 2412a222ca9a63e715383362b68c73012d720ec5..a3dc1574edf64a2ba778d3dad27c0486f3411a11 100644
 --- a/Android.bp
 +++ b/Android.bp
-@@ -149,8 +149,10 @@ cc_defaults {
-         "-DABSL_ALLOCATOR_NOTHROW=1",
-         "-DANGLE_ENABLE_CONTEXT_MUTEX=1",
-         "-DANGLE_ENABLE_CONTEXT_MUTEX_RECURSION=1",
-+        "-DANGLE_ENABLE_ESSL",
-         "-DANGLE_ENABLE_GLOBAL_MUTEX_LOAD_TIME_ALLOCATE=1",
-         "-DANGLE_ENABLE_GLOBAL_MUTEX_RECURSION=1",
-+        "-DANGLE_ENABLE_GLSL",
-         "-DANGLE_ENABLE_SHARE_CONTEXT_LOCK=1",
-         "-DANGLE_ENABLE_VULKAN",
-         "-DANGLE_TEST_ENABLE_SYSTEM_EGL",
-@@ -2716,8 +2718,18 @@ cc_library_static {
+@@ -2716,8 +2716,18 @@ cc_library_static {
          "src/compiler/translator/ValidateVaryingLocations.cpp",
          "src/compiler/translator/VariablePacker.cpp",
          "src/compiler/translator/blocklayout.cpp",
@@ -56,3 +45,12 @@ index 2412a222ca9a63e715383362b68c73012d720ec5..f3c62dc205d5d6eff13ff07adc4e1b8a
          "src/compiler/translator/glslang_lex_autogen.cpp",
          "src/compiler/translator/glslang_tab_autogen.cpp",
          "src/compiler/translator/spirv/BuildSPIRV.cpp",
+@@ -2862,6 +2872,8 @@ cc_library_static {
+         "-Wno-gnu-statement-expression",
+         "-Wno-gnu-zero-variadic-macro-arguments",
+         "-Wno-zero-length-array",
++        "-DANGLE_ENABLE_ESSL",
++        "-DANGLE_ENABLE_GLSL",
+     ],
+     sdk_version: "current",
+     stl: "libc++_static",
