@@ -176,9 +176,6 @@ mod capi {
         let Ok(exe) = unsafe { CStr::from_ptr(boot_exe) }.to_str() else {
             return -libc::EINVAL;
         };
-        if exe.is_empty() {
-            return -libc::EINVAL;
-        }
         if HOST.set(HostRef { ctx: h.ctx, trap }).is_err() {
             return -libc::EEXIST;
         }
