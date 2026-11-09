@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 9 Nov 2026 20:00:34 +0800
+Subject: [PATCH] feat(angle): give each context its own native context
+
+- DisplayEGL::createContext: a context without
+  EGL_CONTEXT_VIRTUALIZATION_GROUP_ANGLE gets a renderer of its own
+  (createRenderer), native-shared with its share context, or with
+  mRenderer under EGL_DISPLAY_TEXTURE_SHARE_GROUP_ANGLE, as the group
+  path does. A virtualization group still shares one renderer
+- Cost: one native context per ANGLE context
+
+Upstream-Status: Pending
+Patch-Reason: a native context is current on one thread at a time:
+ eglMakeCurrent with a context bound to another thread fails with
+ EGL_BAD_ACCESS (Mesa eglcontext.c). ANGLE's default shares mRenderer's
+ one native context among all contexts, and display init leaves it
+ current on the initialising thread (makeNewContextCurrent). Measured
+ in the ATL app gate: the first eglMakeCurrent of an app context fails
+ with EGL_BAD_ACCESS under ANGLE, and the same call succeeds without
+ ANGLE (selection on vs off). Cause inferred, not yet logged: another
+ thread holds the shared native context (hwui's RenderThread is the
+ likely holder). A loader or environment switch cannot pick the
+ renderer: the app's attribute does it, and ANGLE has no feature flag
+ for a default. The driver-side alternative (per-thread host contexts
+ in libGLES_atl) is a new mechanism in our layer.
+---
+SPDX-License-Identifier: BSD-3-Clause
+ src/libANGLE/renderer/gl/egl/DisplayEGL.cpp | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
+index 732b7c92cea6f1a0896eea40ec093e09264877b9..ef3cb4ad13accc5591d0879e9dbe8399f02d70e8 100644
+--- a/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
++++ b/src/libANGLE/renderer/gl/egl/DisplayEGL.cpp
+@@ -498,7 +498,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+     bool globalTextureShareGroup =
+         attribs.get(EGL_DISPLAY_TEXTURE_SHARE_GROUP_ANGLE, EGL_FALSE) == EGL_TRUE;
+ 
+-    std::shared_ptr<RendererEGL> renderer = mRenderer;
++    // Android: a context without a virtualization group gets a renderer (native context) of its
++    // own, not mRenderer's. EGL binds a native context to one thread at a time, so a shared one
++    // held by another thread fails every other thread's eglMakeCurrent. A group still shares one.
++    std::shared_ptr<RendererEGL> renderer;
+     if (usingExternalContext)
+     {
+         ASSERT(!shareContext);
+@@ -509,9 +512,12 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+             return nullptr;
+         }
+     }
+-    else if (virtualizationGroup != EGL_DONT_CARE)
++    else
+     {
+-        renderer = mVirtualizationGroups[virtualizationGroup].lock();
++        if (virtualizationGroup != EGL_DONT_CARE)
++        {
++            renderer = mVirtualizationGroups[virtualizationGroup].lock();
++        }
+         if (!renderer)
+         {
+             // If the user requested a dispaly-level texture share group, all contexts must be in
+@@ -535,7 +541,10 @@ ContextImpl *DisplayEGL::createContext(const gl::State &state,
+                 return nullptr;
+             }
+ 
+-            mVirtualizationGroups[virtualizationGroup] = renderer;
++            if (virtualizationGroup != EGL_DONT_CARE)
++            {
++                mVirtualizationGroups[virtualizationGroup] = renderer;
++            }
+         }
+     }
+     ASSERT(renderer);
