@@ -3,7 +3,7 @@
 //! Loads the driver as AOSP's Loader.cpp does (`initialize_api`: each egl* by dlsym, else the driver's eglGetProcAddress; each gl* the same, and the driver must export no gl* name) and calls it as libEGL's fronts would after their own window setup.
 //! The window is this probe's: [`EDGE`]-square RGBA_8888 gralloc buffers (gralloc's GBM backend, LINEAR, pre-filled with [`POISON`]) behind window.h's hooks, recording the transform and fence of each queue.
 //! Per frame, as hwui draws: bind framebuffer 0 and read the binding back (must read 0), invalidate GL_COLOR (an error on an FBO unless the driver maps it), then [`FILLS`] as scissored clears in GL coordinates; swap. [`FRAMES`] frames, so the swap's dequeue-and-rebind is exercised.
-//! The probe sets [`APP_TRANSFORM`] on its window first, as an app's `ANativeWindow_setBuffersTransform` does. Judge: every buffer is queued with exactly that transform, and read through our own mapping as stored it equals the frame's fills top-down: buffer row r = GL row EDGE-1-r.
+//! The probe sets [`APP_TRANSFORM`] on its window first, as an app's `ANativeWindow_setBuffersTransform` does. Judge: every buffer is queued with exactly that transform, and read through our own mapping as stored it equals the frame's fills top-down: buffer row r = GL row EDGE-1-r. The window starts unconnected: the driver must connect it before the first dequeue (BufferQueue refuses a dequeue with no connected API) and give the connection back after the last queue (format 0, then disconnect, egl_object.cpp's order).
 //! Clear colours are c / 255 (ES 3.2 §2.3.5.2: round(f x 255) gives c back), so the bytes are exact.
 //! Breaks (each must turn the verdict red): `--break flip-y` -- the surface FBO's `GL_MESA_framebuffer_flip_y` undone before drawing (a driver rendering bottom-up); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
 //! The probe implements `perform` without its variadic tail: the driver passes one integer argument, which on the Linux ABIs of every arches.toml host (SysV x86-64, AAPCS64, RISC-V LP64) travels in the register of the third named integer argument.
@@ -49,6 +49,7 @@ const FILLS: [(i32, i32, i32, i32, [u8; 4]); 4] = [
 /// Linux errno values (asm-generic/errno-base.h).
 const EINVAL: i32 = 22;
 const EBUSY: i32 = 16;
+const ENODEV: i32 = 19;
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Break {
@@ -125,12 +126,23 @@ struct Queued {
     fence: Option<OwnedFd>,
 }
 
+/// The window's EGL-API calls, in order (judged at the end).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hook {
+    Connect(u32),
+    Format(u32),
+    Disconnect(u32),
+}
+
 #[derive(Default)]
 struct State {
     free: VecDeque<usize>,
     queued: Vec<Queued>,
     transform: u32,
     usage: u64,
+    /// The API the window is connected to: BufferQueueProducer's mConnectedApi.
+    api: Option<u32>,
+    events: Vec<Hook>,
 }
 
 /// window.h's ANativeWindow first, so a hook's `ANativeWindow*` is this object's address.
@@ -183,6 +195,23 @@ unsafe extern "C" fn perform(win: *mut w::ANativeWindow, op: i32, arg: usize) ->
             s.transform = arg as u32;
         }
         w::NATIVE_WINDOW_SET_USAGE64 => s.usage = arg as u64,
+        // BufferQueueProducer::connect: BAD_VALUE while another API is connected
+        w::NATIVE_WINDOW_API_CONNECT => {
+            if s.api.is_some() {
+                return -EINVAL;
+            }
+            s.api = Some(arg as u32);
+            s.events.push(Hook::Connect(arg as u32));
+        }
+        // BufferQueueProducer::disconnect: only the connected API
+        w::NATIVE_WINDOW_API_DISCONNECT => {
+            if s.api != Some(arg as u32) {
+                return -EINVAL;
+            }
+            s.api = None;
+            s.events.push(Hook::Disconnect(arg as u32));
+        }
+        w::NATIVE_WINDOW_SET_BUFFERS_FORMAT => s.events.push(Hook::Format(arg as u32)),
         _ => return -EINVAL,
     }
     0
@@ -195,9 +224,15 @@ unsafe extern "C" fn dequeue(
 ) -> i32 {
     // SAFETY: our window.
     let t = unsafe { this(win) };
-    let Some(i) = t.state.lock().expect("probe state").free.pop_front() else {
+    let mut s = t.state.lock().expect("probe state");
+    // BufferQueueProducer::dequeueBuffer: no connected producer is NO_INIT
+    if s.api.is_none() {
+        return -ENODEV;
+    }
+    let Some(i) = s.free.pop_front() else {
         return -EBUSY;
     };
+    drop(s);
     // SAFETY: the hook's out-pointers; the buffer lives as long as the window.
     unsafe {
         *buf = std::ptr::from_ref(&*t.slots[i].buffer).cast_mut();
@@ -610,6 +645,24 @@ fn run(args: &Args) -> Result<()> {
 fn judge(win: &TestWindow) -> Result<()> {
     let s = win.state.lock().expect("probe state");
     out(&format!("usage {:#x}, {} queued", s.usage, s.queued.len()));
+    // the driver's connection: connected once before the first dequeue, given back last (format 0, then disconnect), nothing left connected
+    ensure!(
+        s.events.first() == Some(&Hook::Connect(w::NATIVE_WINDOW_API_EGL)),
+        "window events {:?}: want the driver's connect first",
+        s.events
+    );
+    ensure!(
+        s.events
+            .ends_with(&[Hook::Format(0), Hook::Disconnect(w::NATIVE_WINDOW_API_EGL)]),
+        "window events {:?}: want format 0, then disconnect, last",
+        s.events
+    );
+    ensure!(
+        s.api.is_none(),
+        "window still connected to API {:?} after destroy",
+        s.api
+    );
+    out(&format!("window events {:?}", s.events));
     ensure!(
         s.queued.len() == FRAMES,
         "{} buffers queued, want {FRAMES}",

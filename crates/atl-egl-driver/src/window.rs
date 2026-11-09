@@ -5,6 +5,7 @@
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::ptr::NonNull;
 
+use crate::abi::window as w;
 use crate::abi::window::{ANativeWindow, ANativeWindowBuffer, android_native_base_t};
 
 /// A window, referenced (`common.incRef`) while this lives.
@@ -63,6 +64,41 @@ impl Window {
             ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
         };
         status(r).map(drop)
+    }
+
+    /// `perform(op, int)`: the window.h helpers that take one int (`native_window_api_connect`, `native_window_set_buffers_format`).
+    pub fn perform_int(&self, op: u32, arg: i32) -> Result<(), Status> {
+        // SAFETY: live window; `perform` is variadic and these ops take one int (window.h).
+        let r = unsafe {
+            ((*self.raw()).perform.expect("checked at acquire"))(self.raw(), op as i32, arg)
+        };
+        status(r).map(drop)
+    }
+
+    /// `native_window_api_connect(EGL)`: `Ok(true)` when this call connected the window; `Ok(false)` when it was connected already (BufferQueueProducer::connect answers BAD_VALUE, so a front connected it).
+    pub fn connect_egl(&self) -> Result<bool, Status> {
+        match self.perform_int(
+            w::NATIVE_WINDOW_API_CONNECT,
+            w::NATIVE_WINDOW_API_EGL as i32,
+        ) {
+            Ok(()) => Ok(true),
+            Err(r) if r == -EINVAL => Ok(false),
+            Err(r) => Err(r),
+        }
+    }
+
+    /// `native_window_set_buffers_format`: the pixel format the producer allocates from now on.
+    pub fn set_buffers_format(&self, format: i32) -> Result<(), Status> {
+        self.perform_int(w::NATIVE_WINDOW_SET_BUFFERS_FORMAT, format)
+    }
+
+    /// Gives back a connection `connect_egl` made, in egl_object.cpp's order: format 0, then disconnect. The format's result is not checked there either.
+    pub fn disconnect_egl(&self) -> Result<(), Status> {
+        let _ = self.set_buffers_format(0);
+        self.perform_int(
+            w::NATIVE_WINDOW_API_DISCONNECT,
+            w::NATIVE_WINDOW_API_EGL as i32,
+        )
     }
 
     pub fn set_swap_interval(&self, interval: i32) -> Result<(), Status> {

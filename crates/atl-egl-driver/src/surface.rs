@@ -33,6 +33,8 @@ struct Target {
 
 pub struct WindowSurface {
     window: Window,
+    /// This surface connected the window to EGL, so its teardown is ours (Drop); false when a front connected it first.
+    connected_here: bool,
     pub config: e::EGLConfig,
     depth_stencil: bool,
     pub width: i32,
@@ -53,27 +55,41 @@ impl WindowSurface {
     pub fn new(d: &Driver, window: Window, config: e::EGLConfig) -> Result<Self, EglError> {
         let bits = |a| d.host_attrib(config, a).unwrap_or(0);
         let depth_stencil = bits(e::EGL_DEPTH_SIZE) > 0 || bits(e::EGL_STENCIL_SIZE) > 0;
-        // Mesa's platform_android asks for GRALLOC_USAGE_HW_RENDER the same way (window.h native_window_set_usage)
-        window
-            .perform_u64(w::NATIVE_WINDOW_SET_USAGE64, usage::GPU_RENDER_TARGET)
-            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        let width = window
-            .query(w::NATIVE_WINDOW_WIDTH)
-            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        let height = window
-            .query(w::NATIVE_WINDOW_HEIGHT)
-            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
-        Ok(Self {
+        let connected_here = connect(&window)?;
+        // from here on a failure drops `s`, which gives back a connection this surface made (Drop)
+        let mut s = Self {
             window,
+            connected_here,
             config,
             depth_stencil,
-            width,
-            height,
+            width: 0,
+            height: 0,
             images: HashMap::new(),
             targets: HashMap::new(),
             depth: HashMap::new(),
             current: None,
-        })
+        };
+        if connected_here {
+            // the front sets the buffers format to the config's on create (egl_platform_entries.cpp); the producer's own format may differ (Happy Jump's SurfaceView asked RGB_565, which atl-gralloc has no row for)
+            let format = d.window_format(config).ok_or(e::EGL_BAD_MATCH)?;
+            s.window
+                .set_buffers_format(format)
+                .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+            log(&format!("window format {format} (the config's)"));
+        }
+        // Mesa's platform_android asks for GRALLOC_USAGE_HW_RENDER the same way (window.h native_window_set_usage)
+        s.window
+            .perform_u64(w::NATIVE_WINDOW_SET_USAGE64, usage::GPU_RENDER_TARGET)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        s.width = s
+            .window
+            .query(w::NATIVE_WINDOW_WIDTH)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        s.height = s
+            .window
+            .query(w::NATIVE_WINDOW_HEIGHT)
+            .map_err(|_| e::EGL_BAD_NATIVE_WINDOW)?;
+        Ok(s)
     }
 
     pub fn set_swap_interval(&self, interval: i32) {
@@ -200,6 +216,51 @@ impl WindowSurface {
                 // SAFETY: a name of the current context.
                 unsafe { (d.gl.glDeleteRenderbuffers)(1, &rb) };
             }
+        }
+    }
+}
+
+/// Connects the window to the EGL API unless a front already did. The lowest layer that dequeues owns the connect (as libvulkan's swapchain does under Vulkan; the front skips it under ANGLE, egl_platform_entries.cpp).
+/// `Ok(true)`: this surface connected it, so its teardown is ours. `Ok(false)`: a front did. A failed connect fails the create with EGL_BAD_ALLOC, the front's error for it.
+#[cfg(not(atl_egl_no_window_connect))]
+fn connect(window: &Window) -> Result<bool, EglError> {
+    match window.connect_egl() {
+        Ok(true) => {
+            log("window connect: driver owns");
+            Ok(true)
+        }
+        Ok(false) => {
+            log("window connect: front owns (already connected)");
+            Ok(false)
+        }
+        Err(r) => {
+            log(&format!("window connect: failed ({r}), EGL_BAD_ALLOC"));
+            Err(e::EGL_BAD_ALLOC)
+        }
+    }
+}
+
+/// The `no_window_connect` break (build.rs `BREAKS`): nothing connects the window, so its dequeue has no connected producer, as before this connect existed.
+#[cfg(atl_egl_no_window_connect)]
+fn connect(_: &Window) -> Result<bool, EglError> {
+    log("window connect: skipped (break no_window_connect)");
+    Ok(false)
+}
+
+/// One stderr line per window event (the app's log), so a run shows which path ran.
+#[allow(
+    clippy::print_stderr,
+    reason = "one line per window connect or teardown, which path ran"
+)]
+fn log(line: &str) {
+    eprintln!("libGLES_atl: {line}");
+}
+
+impl Drop for WindowSurface {
+    /// Runs after `destroy` cancelled the held buffer, and also when a create fails after the connect: format 0, then disconnect (egl_object.cpp's order).
+    fn drop(&mut self) {
+        if self.connected_here && self.window.disconnect_egl().is_err() {
+            log("window disconnect failed");
         }
     }
 }

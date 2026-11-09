@@ -31,6 +31,8 @@ const BREAK_ENV: &str = "ATL_EGL_BREAK";
 const BREAKS: &[(&str, &str)] = &[
     // the app gate's firstConfig row (exports.rs `handed_out`): every host config is handed out again, the 16-bit ones first
     ("no_config_filter", "atl_egl_no_config_filter"),
+    // the window connect (surface.rs `connect`): no window is connected to EGL, so every dequeue has no connected producer (the Happy Jump failure)
+    ("no_window_connect", "atl_egl_no_window_connect"),
 ];
 
 /// The cfgs `ATL_EGL_BREAK` names; an unknown name fails the build, naming it and the known ones.
