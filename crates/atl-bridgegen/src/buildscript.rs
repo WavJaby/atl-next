@@ -176,9 +176,9 @@ pub fn api_crate(apis: &[Api], implementation: &str) -> Result<Vec<PathBuf>> {
     Ok(rerun)
 }
 
-/// The arches.toml row of a host target.
+/// The arches.toml row of a target: the host's or a guest's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostArch {
+pub struct ArchRow {
     /// arches.toml key.
     pub arch: String,
     /// Linux kernel arch (`asm-<kernel_arch>` uapi directory).
@@ -240,7 +240,7 @@ impl Upstreams {
 }
 
 /// The row whose `[<arch>.host] rust` is `rust_target`, read from arches.toml's text.
-pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<HostArch> {
+pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<ArchRow> {
     let table: toml::Table = toml::from_str(arches_toml).context("parsing arches.toml")?;
     let (arch, row) = table
         .iter()
@@ -255,7 +255,7 @@ pub fn host_arch(arches_toml: &str, rust_target: &str) -> Result<HostArch> {
 }
 
 /// The row `arch` (an arches.toml key), read from arches.toml's text: the bionic view of a guest arch that is not the host's (the QEMU guest).
-pub fn guest_arch(arches_toml: &str, arch: &str) -> Result<HostArch> {
+pub fn guest_arch(arches_toml: &str, arch: &str) -> Result<ArchRow> {
     let table: toml::Table = toml::from_str(arches_toml).context("parsing arches.toml")?;
     let row = table
         .get(arch)
@@ -263,7 +263,7 @@ pub fn guest_arch(arches_toml: &str, arch: &str) -> Result<HostArch> {
     arch_row(arch, row)
 }
 
-fn arch_row(arch: &str, row: &toml::Value) -> Result<HostArch> {
+fn arch_row(arch: &str, row: &toml::Value) -> Result<ArchRow> {
     let kernel_arch = row
         .get("kernel_arch")
         .and_then(|k| k.as_str())
@@ -273,7 +273,7 @@ fn arch_row(arch: &str, row: &toml::Value) -> Result<HostArch> {
         .and_then(|g| g.get("clang"))
         .and_then(|c| c.as_str())
         .with_context(|| format!("arches.toml [{arch}.guest]: no clang triple"))?;
-    Ok(HostArch {
+    Ok(ArchRow {
         arch: arch.to_owned(),
         kernel_arch: kernel_arch.to_owned(),
         bionic_clang: bionic_clang.to_owned(),
@@ -298,7 +298,7 @@ pub fn clang_triple_from_cargo() -> Result<String> {
 /// bionic's kernel uapi include directories for `host`, as Soong's `libc_uapi_headers` exports them:
 /// the generic uapi, Android's additions (`linux/compiler_types.h`), the arch's `asm-<kernel_arch>`.
 /// Paths relative to `src/`, for `Upstreams::path` / `rerun_paths`.
-pub fn bionic_uapi_dirs(host: &HostArch) -> Vec<String> {
+pub fn bionic_uapi_dirs(host: &ArchRow) -> Vec<String> {
     let kernel = "aosp/bionic/libc/kernel";
     vec![
         format!("{kernel}/uapi"),
@@ -309,7 +309,7 @@ pub fn bionic_uapi_dirs(host: &HostArch) -> Vec<String> {
 
 /// The target to parse a bionic kernel-uapi header for `host`: no system headers, only
 /// `bionic_uapi_dirs`.
-pub fn bionic_uapi_target(up: &Upstreams, host: &HostArch, clang_triple: &str) -> Target {
+pub fn bionic_uapi_target(up: &Upstreams, host: &ArchRow, clang_triple: &str) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     args.extend(
         bionic_uapi_dirs(host)
@@ -326,7 +326,7 @@ pub fn bionic_uapi_target(up: &Upstreams, host: &HostArch, clang_triple: &str) -
 /// The target to parse bionic's own libc headers in: bionic's triple for `host`'s arch, no system
 /// headers, bionic's `libc/include` then its kernel uapi. `cxx_include`: a C++ standard library to put
 /// first (C++ sources); bionic ships none.
-pub fn bionic_libc_target(up: &Upstreams, host: &HostArch, cxx_include: Option<&Path>) -> Target {
+pub fn bionic_libc_target(up: &Upstreams, host: &ArchRow, cxx_include: Option<&Path>) -> Target {
     let mut args = vec!["-nostdlibinc".to_owned()];
     let dirs = cxx_include
         .map(Path::to_path_buf)
@@ -342,7 +342,7 @@ pub fn bionic_libc_target(up: &Upstreams, host: &HostArch, cxx_include: Option<&
 }
 
 /// The level platform code is built for: bionic's `__ANDROID_API_FUTURE__` (Soong's FutureApiLevelInt, which the converter checks equal). Headers are read at it, so no declaration is hidden behind an availability guard.
-pub fn future_level(up: &Upstreams, host: &HostArch) -> Result<u64> {
+pub fn future_level(up: &Upstreams, host: &ArchRow) -> Result<u64> {
     let path = up.aosp("bionic/libc/include/android/api-level.h");
     let src = Source::c(&path, &["__ANDROID_API_FUTURE__"]);
     let target = bionic_libc_target(up, host, None);
@@ -353,7 +353,7 @@ pub fn future_level(up: &Upstreams, host: &HostArch) -> Result<u64> {
 /// [`bionic_libc_target`] at API `level` (the triple's suffix): platform code's view at [`future_level`].
 pub fn bionic_platform_target(
     up: &Upstreams,
-    host: &HostArch,
+    host: &ArchRow,
     level: u64,
     cxx: Option<&Path>,
 ) -> Target {
@@ -386,7 +386,7 @@ mod tests {
         let text = "[a]\nkernel_arch = \"ka\"\n[a.host]\nrust = \"a-unknown-linux-gnu\"\n[a.guest]\nclang = \"a-linux-android\"\n[b]\nkernel_arch = \"kb\"\n[b.guest]\nclang = \"b-linux-android\"\n";
         assert_eq!(
             host_arch(text, "a-unknown-linux-gnu").unwrap(),
-            HostArch {
+            ArchRow {
                 arch: "a".into(),
                 kernel_arch: "ka".into(),
                 bionic_clang: "a-linux-android".into(),

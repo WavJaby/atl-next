@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use atl_bridgegen::buildscript::{self, Api, DECLARATIONS, HostArch, Upstreams};
+use atl_bridgegen::buildscript::{self, Api, ArchRow, DECLARATIONS, Upstreams};
 use atl_bridgegen::c::Kept;
 use atl_bridgegen::ir::{ArchView, Interface, Ty};
 use atl_bridgegen::{Lang, Source, Target, front, shape};
@@ -558,7 +558,7 @@ use buildscript::{bionic_platform_target as bionic_target, future_level};
 const GNU_VIEW: &str = "-D_GNU_SOURCE";
 
 /// The host libc's view, as device compiles see it.
-fn host_target(host: &HostArch) -> Result<Target> {
+fn host_target(host: &ArchRow) -> Result<Target> {
     Ok(Target {
         arch: host.arch.clone(),
         triple: buildscript::clang_triple_from_cargo()?,
@@ -567,7 +567,7 @@ fn host_target(host: &HostArch) -> Result<Target> {
 }
 
 /// Whether the host's `header`, with `_GNU_SOURCE`, declares `functions`: all (true), none (false); some fails.
-fn host_declares(host: &HostArch, header: &str, functions: &[&str]) -> Result<bool> {
+fn host_declares(host: &ArchRow, header: &str, functions: &[&str]) -> Result<bool> {
     let mut target = host_target(host)?;
     target.args.push(GNU_VIEW.to_owned());
     let probes = front::probe_includes(Lang::C, &target, &[header])?;
@@ -588,7 +588,7 @@ fn host_declares(host: &HostArch, header: &str, functions: &[&str]) -> Result<bo
     Ok(!has.is_empty())
 }
 
-fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Result<Generated> {
+fn generate(up: &Upstreams, host: &ArchRow, libcxx: &Path, out: &Path) -> Result<Generated> {
     let mut files = Outputs::new();
     let level = future_level(up, host)?;
     let mut extra: Vec<(&str, &str)> = EXTRA_INCLUDES.to_vec();
@@ -686,7 +686,7 @@ fn generate(up: &Upstreams, host: &HostArch, libcxx: &Path, out: &Path) -> Resul
 /// The header declaring `row`'s records as bionic's uapi does, with their layout asserted.
 fn uapi_records(
     up: &Upstreams,
-    host: &HostArch,
+    host: &ArchRow,
     level: u64,
     row: &UapiRecords,
 ) -> Result<(PathBuf, String)> {
@@ -718,7 +718,7 @@ struct ShapeOut {
     host_inputs: BTreeSet<PathBuf>,
 }
 
-fn shape(up: &Upstreams, host: &HostArch, level: u64, extra: &[(&str, &str)]) -> Result<ShapeOut> {
+fn shape(up: &Upstreams, host: &ArchRow, level: u64, extra: &[(&str, &str)]) -> Result<ShapeOut> {
     let include = up.aosp(BIONIC_INCLUDE);
     let public: Vec<String> = headers_under(&include)?
         .into_iter()
@@ -943,7 +943,7 @@ fn prop_area(up: &Upstreams, mut target: Target, out: &Path) -> Result<Interface
 /// bionic's view and in the host libc's, which must agree -- bionic's header declares the parameter,
 /// glibc-built callers pass glibc's struct (Rust callers built for Android pass the `libc` crate's
 /// bionic one). The result is bionic's view, its constants named after `TIMESPEC_PROBE`'s macros.
-fn timespec(up: &Upstreams, host: &HostArch, level: u64, out: &Path) -> Result<Interface> {
+fn timespec(up: &Upstreams, host: &ArchRow, level: u64, out: &Path) -> Result<Interface> {
     let unit = out.join("timespec_layout.c");
     std::fs::write(&unit, TIMESPEC_PROBE)?;
     let src = Source::c(&unit, &["TIMESPEC_*"]);

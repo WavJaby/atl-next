@@ -54,7 +54,7 @@ const THREAD_INCLUDE_DIRS: &[&str] = &[
 /// bionic's own C++ sources are.
 fn bionic_thread(
     up: &Upstreams,
-    host: &buildscript::HostArch,
+    host: &buildscript::ArchRow,
     out: &std::path::Path,
 ) -> Result<String> {
     let mut target =
@@ -123,7 +123,7 @@ const PROVIDER_FILES: &[&str] = &[
 ];
 
 /// `provider.rs`: `NAMES` (every `PROVIDER_APIS` function) and per function its fn-pointer type from the guest's bionic view (`import_module`), parsed as bionic's C++ sources are.
-fn provider(up: &Upstreams, host: &buildscript::HostArch, out: &std::path::Path) -> Result<String> {
+fn provider(up: &Upstreams, host: &buildscript::ArchRow, out: &std::path::Path) -> Result<String> {
     // the platform level, as atl-bionic reads them: `__system_property_read_callback` sits behind an availability guard (26)
     let mut target = buildscript::bionic_platform_target(
         up,
@@ -472,7 +472,7 @@ const FIXED_BINDINGS: usize = 6;
 /// The proxy prototypes come from one unit parsed for two views: `guest` (bionic, as NDK apps compile) and `host` (glibc). A stub whose prototype differs between the views fails the build, naming it.
 fn bindings_table(
     up: &Upstreams,
-    host: &buildscript::HostArch,
+    host: &buildscript::ArchRow,
     out: &std::path::Path,
     provider_soname: &str,
     qemu: bool,
