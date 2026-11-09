@@ -15,10 +15,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+use std::sync::Mutex;
+
+use super::capture;
 use super::widgets::{BTN_SIDE, inject, press, wait_until};
 use super::{
-    ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event, capture_line, content_origin,
-    wait_for_line,
+    ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event, content_origin, wait_for_line,
 };
 use crate::composer::{fnv1a64, word};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
@@ -184,26 +186,21 @@ fn picture(l: &Layout, rules: Rules) -> Vec<u8> {
     out
 }
 
-/// The last readback before Main's onDestroy, its size and digest against [`picture`]. The back-close case closes Main last, and the teardown captured after its onDestroy is not the dialog.
-fn readback_check(app: &str) -> Result<String, String> {
+/// The picture drive takes before Main's Back, its size and digest against [`picture`]. The back-close case closes Main last, so the picture comes before its onDestroy.
+fn readback_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
     let l = layout(app)?;
-    let judged = app.find(DESTROYED).map_or(app, |i| &app[..i]);
-    capture_line(judged)?;
-    let line = judged
-        .lines()
-        .rfind(|line| line.contains(super::widgets::CAPTURE_LINE))
-        .ok_or("no readback")?;
-    let size = word(line, "size").unwrap_or("none");
+    let shot = capture::picture(pictures, 0)?;
+    let size = format!("{}x{}", shot.size.0, shot.size.1);
     let want_size = format!("{}x{}", l.width, l.height);
     if size != want_size {
-        return Err(format!("last readback is {size}, the window {want_size}"));
+        return Err(format!("the picture is {size}, the window {want_size}"));
     }
-    let got = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
+    let got = format!("{:016x}", shot.digest);
     let want = format!("{:016x}", fnv1a64(&picture(&l, ALL)));
     if got != want {
-        return Err(format!("last readback {got}, the picture {want}"));
+        return Err(format!("picture {got}, the picture {want}"));
     }
-    Ok(format!("last readback {want_size} = the picture ({want})"))
+    Ok(format!("picture {want_size} = the picture ({want})"))
 }
 
 /// Each picture with one rule broken differs from the real one; with the real readback passing, each would fail it.
@@ -315,7 +312,12 @@ fn touch_check(app: &str) -> Result<String, String> {
 }
 
 /// The sub-gates. `services` is the services log: the back-close case reads the window removals there.
-pub fn checks(app: &str, services: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
+pub fn checks(
+    app: &str,
+    services: &str,
+    liveness: &Result<Liveness, String>,
+    pictures: &Mutex<capture::Seen>,
+) -> Vec<Sub> {
     vec![
         // first: the probe's first step, and a break of it leaves Sub on top for everything after
         ("back-close", back_close_check(app, services)),
@@ -323,7 +325,7 @@ pub fn checks(app: &str, services: &str, liveness: &Result<Liveness, String>) ->
             "shown",
             layout(app).map(|l| format!("window {}x{}, anchor {:?}", l.width, l.height, l.anchor)),
         ),
-        ("readback", readback_check(app)),
+        ("readback", readback_check(pictures, app)),
         (
             "pong",
             match liveness {
@@ -438,7 +440,7 @@ fn root_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
 
 /// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
 /// The back-close case's Sub Back comes first, before any other input (Sub covers the dialog until it pops); Main's Back comes last, since the window goes away with it.
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -466,6 +468,8 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     std::thread::sleep(RESIZE_SETTLE);
     drag(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
+    // the picture of the dialog as the last drag left it, before Main's Back closes Main
+    probe.record_settled();
     root_back(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     Ok(Liveness {

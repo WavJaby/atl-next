@@ -227,6 +227,9 @@ fn takes_pictures(stage: Stage) -> bool {
             | Stage::Hwui
             | Stage::Portrait
             | Stage::Gles2
+            | Stage::Widgets
+            | Stage::SurfaceView
+            | Stage::Dialog
             | Stage::Resize
             | Stage::Relaunch
             | Stage::Declared
@@ -1452,12 +1455,6 @@ fn hardware_check(app: &str) -> Result<String, String> {
     Err(format!("{draw}; {fatal}"))
 }
 
-fn capture_line(app: &str) -> Result<&str, String> {
-    app.lines()
-        .find(|l| l.contains("atl-composer: ui: capture "))
-        .ok_or_else(|| "no readback line: the window never reached its capture frame".to_owned())
-}
-
 /// The frame time (ns) of an `AtlWindow: frame N time=T` line: the fixture's Choreographer callback.
 fn frame_time(line: &str) -> Option<u64> {
     let (_, rest) = line.split_once("AtlWindow: frame ")?;
@@ -1955,10 +1952,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             (Stage::Ime, _, Some(ime)) => {
                 ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
             }
-            (Stage::Widgets, _, _) => widgets::drive(p, &log, break_mouse_back),
-            (Stage::SurfaceView, _, _) => surface_view::drive(p, &log),
+            (Stage::Widgets, _, _) => match &capture_probe {
+                Some(capture_probe) => widgets::drive(p, &log, break_mouse_back, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
+            (Stage::SurfaceView, _, _) => match &capture_probe {
+                Some(capture_probe) => surface_view::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
-            (Stage::Dialog, _, _) => dialog::drive(p, &log),
+            (Stage::Dialog, _, _) => match &capture_probe {
+                Some(capture_probe) => dialog::drive(p, &log, capture_probe),
+                None => Err("no capture probe".to_owned()),
+            },
             (Stage::Gles2, _, _) => match &capture_probe {
                 Some(capture_probe) => gles2::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
@@ -2045,9 +2051,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ),
             ("touch-mode", touch_mode_check(&services)),
         ],
-        (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness),
+        (Stage::SurfaceView, Some(_)) => surface_view::checks(&app, &liveness, &captured),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app),
-        (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness),
+        (Stage::Dialog, Some(_)) => dialog::checks(&app, &services, &liveness, &captured),
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
@@ -2061,6 +2067,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             &liveness,
             display,
             &pressure,
+            &captured,
         ),
         (Stage::Move, Some(_)) => match moved {
             Some(moved) => move_output::checks(&app, &services, &liveness, display, moved),

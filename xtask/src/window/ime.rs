@@ -19,7 +19,7 @@ use crate::nested_wayland::{Arg, Ime, im_op};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 use super::{
-    ACK_WAIT, Liveness, Sub, await_event, content_origin, wait_for_line,
+    ACK_WAIT, CONTENT_ORIGIN_LINE, Liveness, Sub, await_event, content_origin, wait_for_line,
     widgets::{self},
 };
 
@@ -118,9 +118,10 @@ pub fn drive(
         matches!(e, ProxyEvent::Acked { .. })
     })
     .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, widgets::CAPTURE_LINE, ACK_WAIT)
+    // the content origin is logged at the window's first present, the sync point the readback line was
+    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
         .then_some(())
-        .ok_or("the window never read back")?;
+        .ok_or("the window never presented")?;
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = content_origin(&text)?;
     let r = widgets::widget(&text, "input")?;

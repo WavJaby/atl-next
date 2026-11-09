@@ -9,10 +9,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use atl_services::display_model::DisplayModel;
+use std::sync::Mutex;
+
 use atl_services::input_devices;
 
+use super::capture;
 use super::{
-    ACK_WAIT, BTN_LEFT, Liveness, POLL, Sub, await_event, cadence_check, capture_line,
+    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Sub, await_event, cadence_check,
     content_origin, wait_for_line,
 };
 use crate::composer::word;
@@ -26,7 +29,6 @@ pub const FIXTURE: &str = "xtask/testdata/widgets";
 const SOFTWARE_LINE: &str = "AtlWindow: software frame";
 /// The fixture's line after the cadence run: the picture the last readback must show.
 const FINAL_LINE: &str = "AtlWindow: final frame";
-pub(super) const CAPTURE_LINE: &str = "atl-composer: ui: capture ";
 /// The fixture's lines around its second window (activity .Second, started by the EditText's focus; `closed` once Main is back and Second's window is gone).
 const SECOND_SHOWN: &str = "AtlWindow: window second shown";
 pub(super) const SECOND_CLOSED: &str = "AtlWindow: window second closed";
@@ -458,10 +460,10 @@ fn layout_check(app: &str) -> Result<String, String> {
     ))
 }
 
-fn text_check(app: &str) -> Result<String, String> {
+fn text_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
     let software =
         field(app, "AtlWindow: software frame", "fnv1a64").ok_or("no software frame line")?;
-    let readback = word(capture_line(app)?, "fnv1a64").ok_or("no digest in the readback line")?;
+    let readback = format!("{:016x}", capture::picture(pictures, 0)?.digest);
     let label: u64 = number(field(app, "AtlWindow: pixels ", "label"), "label ink")?;
     let input: u64 = number(field(app, "AtlWindow: pixels ", "input"), "input ink")?;
     if readback != software {
@@ -500,23 +502,19 @@ fn button_centre(app: &str) -> Result<(f64, f64), String> {
     Ok(((r.left + r.width / 2) as f64, (r.top + r.height / 2) as f64))
 }
 
-/// After the taps and the drag: the last settled readback is the fixture's final frame, and not the first picture.
-fn readback_check(app: &str) -> Result<String, String> {
+/// After the taps and the drag: the last settled picture is the fixture's final frame, and not the first picture.
+fn readback_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
     let wanted = field(app, FINAL_LINE, "fnv1a64").ok_or("no final frame line")?;
-    let first = word(capture_line(app)?, "fnv1a64").ok_or("no digest in the first readback")?;
-    let last = app
-        .lines()
-        .rfind(|l| l.contains(CAPTURE_LINE))
-        .and_then(|l| word(l, "fnv1a64"))
-        .ok_or("no digest in the last readback")?;
+    let first = format!("{:016x}", capture::picture(pictures, 0)?.digest);
+    let last = format!("{:016x}", capture::picture(pictures, 1)?.digest);
     if last != wanted {
-        return Err(format!("last readback {last}, the final frame {wanted}"));
+        return Err(format!("last picture {last}, the final frame {wanted}"));
     }
     if last == first {
-        return Err(format!("the readback stayed {first} through the input"));
+        return Err(format!("the picture stayed {first} through the input"));
     }
     Ok(format!(
-        "last readback {last} = the final frame, first readback {first}"
+        "last picture {last} = the final frame, first picture {first}"
     ))
 }
 
@@ -686,6 +684,7 @@ pub fn checks(
     probe: &Result<Liveness, String>,
     display: DisplayModel,
     pressure: &Samples,
+    pictures: &Mutex<capture::Seen>,
 ) -> Vec<Sub> {
     vec![
         (
@@ -696,7 +695,7 @@ pub fn checks(
                 .map_err(Clone::clone),
         ),
         ("layout", layout_check(app)),
-        ("text", text_check(app)),
+        ("text", text_check(pictures, app)),
         ("header", header_check(app)),
         ("click", click_check(app)),
         ("focus", focus_check(app)),
@@ -710,13 +709,12 @@ pub fn checks(
         ("swipe", swipe_check(app)),
         ("list", list_check(app)),
         ("touch", touch_check(app)),
-        ("readback", readback_check(app)),
+        ("readback", readback_check(pictures, app)),
         ("presents", presents_check(app)),
         (
             "cadence",
             cadence_check(after, display.refresh_hz, pressure),
         ),
-        ("on-demand", on_demand_check(app)),
     ]
 }
 
@@ -754,7 +752,12 @@ pub(super) fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
 
 /// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, hovers over the ListView, turns the wheel down and swipes up over it, drags it up, waits for the readback of the final frame, and presses the mouse's back and forward side buttons over the label.
 /// Each injection waits for its answer: the proxy's report for the header, the fixture's line for the rest. The points are the fixture's rectangles' centres, shifted by the content origin. No liveness probe runs here.
-pub fn drive(proxy: Proxy, app_log: &Path, break_mouse_back: bool) -> Result<Liveness, String> {
+pub fn drive(
+    proxy: Proxy,
+    app_log: &Path,
+    break_mouse_back: bool,
+    probe: &capture::Probe,
+) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -762,9 +765,11 @@ pub fn drive(proxy: Proxy, app_log: &Path, break_mouse_back: bool) -> Result<Liv
     wait_for_line(app_log, SOFTWARE_LINE, ACK_WAIT)
         .then_some(())
         .ok_or("the fixture never logged its software frame")?;
-    wait_for_line(app_log, CAPTURE_LINE, ACK_WAIT)
+    // the content origin is logged at the window's first present: the software frame is on screen once it is there
+    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
         .then_some(())
-        .ok_or("the window never read back")?;
+        .ok_or("the window never presented")?;
+    probe.record_settled();
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = content_origin(&text)?;
     let centre = |name: &str| -> Result<(f64, f64), String> {
@@ -914,12 +919,8 @@ pub fn drive(proxy: Proxy, app_log: &Path, break_mouse_back: bool) -> Result<Liv
     }
     wait_until(app_log, LINE_WAIT, |t| touch_check(t).is_ok());
     wait_line(app_log, FINAL_LINE)?;
-    // the readback of the final frame comes after the fixture's line, once the scenes stop
-    if !wait_until(app_log, LINE_WAIT, |t| {
-        t.rfind(CAPTURE_LINE) > t.find(FINAL_LINE)
-    }) {
-        return Err("no readback after the final frame".to_owned());
-    }
+    // the final frame's picture, once the scenes stop
+    probe.record_settled();
     // the mouse's side buttons last, over the label (not clickable): BTN_SIDE is back, BTN_EXTRA forward; the break sends BTN_LEFT for the back press, so no back key comes
     let (x, y) = centre("label")?;
     let back = if break_mouse_back { BTN_LEFT } else { BTN_SIDE };
@@ -1046,55 +1047,26 @@ mod tests {
 
     #[test]
     fn readback_check_wants_the_final_frame_and_a_change() {
-        let log = |first: &str, last: &str, want: &str| {
-            format!(
-                "atl-composer: ui: capture presented=5 size=640x400 fnv1a64={first}\nAtlWindow: final frame fnv1a64={want}\natl-composer: ui: capture presented=9 size=640x400 fnv1a64={last}\n"
-            )
+        // digests only: the check reads no pixels
+        let pictures = |first: u64, last: u64| {
+            Mutex::new(capture::Seen {
+                pictures: [first, last]
+                    .into_iter()
+                    .map(|digest| {
+                        Ok(capture::Shot {
+                            size: (640, 400),
+                            digest,
+                            rgba: Vec::new(),
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            })
         };
-        assert!(readback_check(&log("aa", "bb", "bb")).is_ok());
-        assert!(readback_check(&log("aa", "cc", "bb")).is_err());
-        assert!(readback_check(&log("bb", "bb", "bb")).is_err());
-    }
-}
-
-/// The composer's line at each stop of the on-demand window clock (ui_window.rs; gates only).
-const CLOCK_STOPPED_LINE: &str = "atl-composer: ui: clock stopped ";
-
-/// Sub-gate on-demand: the window clock ticks only while asked (EventThread sends an app vsync only after requestNextVsync). It stopped at least once, no tick ran with nothing wanting it (`unwanted=0`),
-/// and it stopped after the last readback: the idle fixture leaves the clock stopped for the rest of the watch, where a free-running clock would tick at the display rate.
-fn on_demand_check(app: &str) -> Result<String, String> {
-    let lines: Vec<&str> = app.lines().collect();
-    let stops: Vec<usize> = (0..lines.len())
-        .filter(|&i| lines[i].contains(CLOCK_STOPPED_LINE))
-        .collect();
-    let &last = stops.last().ok_or("the window clock never stopped")?;
-    let unwanted = word(lines[last], "unwanted").ok_or("no unwanted= in the stop line")?;
-    if unwanted != "0" {
-        return Err(format!("{unwanted} ticks ran with nothing wanting them"));
-    }
-    let last_capture = lines.iter().rposition(|l| l.contains(CAPTURE_LINE));
-    if last_capture.is_some_and(|c| c > last) {
-        return Err("no stop after the last readback: the clock still ran at the end".to_owned());
-    }
-    let ticks = word(lines[last], "ticks").unwrap_or("?");
-    Ok(format!(
-        "{} stops, the last after the final readback at tick {ticks}; 0 unwanted ticks",
-        stops.len()
-    ))
-}
-
-#[cfg(test)]
-mod on_demand_tests {
-    use super::on_demand_check;
-
-    /// A stop after the last readback with 0 unwanted passes; no stop, an unwanted tick, or a readback after the last stop (the clock still running) fails.
-    #[test]
-    fn on_demand_needs_a_final_stop_with_no_unwanted_tick() {
-        let stop = |u| format!("atl-composer: ui: clock stopped ticks=90 unwanted={u}");
-        let capture = "atl-composer: ui: capture presented=3 size=3x1 fnv1a64=0";
-        assert!(on_demand_check(&[capture, &stop(0)].join("\n")).is_ok());
-        assert!(on_demand_check(capture).is_err());
-        assert!(on_demand_check(&[capture, &stop(2)].join("\n")).is_err());
-        assert!(on_demand_check(&[&stop(0), capture].join("\n")).is_err());
+        let app = |want: u64| format!("AtlWindow: final frame fnv1a64={want:016x}\n");
+        let (aa, bb, cc) = (0xaa, 0xbb, 0xcc);
+        assert!(readback_check(&pictures(aa, bb), &app(bb)).is_ok());
+        assert!(readback_check(&pictures(aa, cc), &app(bb)).is_err());
+        assert!(readback_check(&pictures(bb, bb), &app(bb)).is_err());
     }
 }

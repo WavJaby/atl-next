@@ -8,7 +8,10 @@
 
 use std::path::Path;
 
-use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, capture_line, wait_for_line};
+use std::sync::Mutex;
+
+use super::capture;
+use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, wait_for_line};
 use crate::composer::{fnv1a64, word};
 use crate::nested_wayland::{GATE_OUTPUT, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
@@ -152,29 +155,25 @@ fn drawn_check(app: &str) -> Result<String, String> {
     Ok("A and B drew with lockCanvas, C left undrawn".to_owned())
 }
 
-/// The last readback's size and digest against [`picture`] under `rules`.
-fn readback(app: &str, l: &Layout, rules: Rules) -> Result<String, String> {
-    capture_line(app)?;
-    let line = app
-        .lines()
-        .rfind(|line| line.contains("atl-composer: ui: capture "))
-        .ok_or("no readback")?;
-    let size = word(line, "size").unwrap_or("none");
+/// The settled picture's size and digest against [`picture`] under `rules`.
+fn readback(pictures: &Mutex<capture::Seen>, l: &Layout, rules: Rules) -> Result<String, String> {
+    let shot = capture::picture(pictures, 0)?;
+    let size = format!("{}x{}", shot.size.0, shot.size.1);
     let want_size = format!("{}x{}", l.width, l.height);
     if size != want_size {
-        return Err(format!("last readback is {size}, the window {want_size}"));
+        return Err(format!("the picture is {size}, the window {want_size}"));
     }
-    let got = word(line, "fnv1a64").ok_or_else(|| format!("no digest: {line}"))?;
+    let got = format!("{:016x}", shot.digest);
     let want = format!("{:016x}", fnv1a64(&picture(l, rules)));
     if got != want {
-        return Err(format!("last readback {got}, the picture {want}"));
+        return Err(format!("picture {got}, the picture {want}"));
     }
-    Ok(format!("last readback {want_size} = the picture ({want})"))
+    Ok(format!("picture {want_size} = the picture ({want})"))
 }
 
-fn readback_check(app: &str) -> Result<String, String> {
+fn readback_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
     let l = layout(app)?;
-    readback(app, &l, ALL)
+    readback(pictures, &l, ALL)
 }
 
 /// Each picture with one rule broken differs from the real one; with the real readback passing, each would fail it.
@@ -211,10 +210,14 @@ fn controls(app: &str) -> Result<String, String> {
 }
 
 /// The sub-gates.
-pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
+pub fn checks(
+    app: &str,
+    liveness: &Result<Liveness, String>,
+    pictures: &Mutex<capture::Seen>,
+) -> Vec<Sub> {
     vec![
         ("drawn", drawn_check(app)),
-        ("readback", readback_check(app)),
+        ("readback", readback_check(pictures, app)),
         (
             "pong",
             match liveness {
@@ -228,7 +231,7 @@ pub fn checks(app: &str, liveness: &Result<Liveness, String>) -> Vec<Sub> {
 }
 
 /// The probe: the window's configure is acked, the fixture laid out, then one ping.
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -241,6 +244,7 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         *e == ProxyEvent::Pong { serial: 1 }
     })
     .is_some();
+    probe.record_settled();
     Ok(Liveness {
         answered,
         ..Liveness::default()
