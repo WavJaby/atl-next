@@ -80,7 +80,11 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
     // SAFETY: handle is the library's, and the name is NUL-terminated.
     let table = unsafe { libc::dlsym(handle, c"atl_engine_v1".as_ptr()) }.cast::<AtlEngineV1>();
     if table.is_null() {
-        return Err(format!("{}: no atl_engine_v1: {}", library.display(), dlerror()));
+        return Err(format!(
+            "{}: no atl_engine_v1: {}",
+            library.display(),
+            dlerror()
+        ));
     }
     // SAFETY: the symbol is the engine's table, a static of the never-closed library.
     let table = unsafe { *table };
@@ -146,7 +150,9 @@ unsafe extern "C" fn host_trap(_ctx: *mut c_void, kind: u32, id: u32, regs: *con
 
 /// The process's engine, from [`boot`].
 fn engine() -> &'static Engine {
-    ENGINE.get().unwrap_or_else(|| unsupported("qemu crossing: no engine (boot has not run)"))
+    ENGINE
+        .get()
+        .unwrap_or_else(|| unsupported("qemu crossing: no engine (boot has not run)"))
 }
 
 /// Gives the calling thread a guest CPU (`atl_engine_v1.attach`: a copy of the boot CPU) and makes it this thread's CPU for [`call_guest`], [`call`] and [`register`]. Once per thread, after [`boot`]; the CPU lives until the process ends.
@@ -219,7 +225,9 @@ fn dlerror() -> String {
         return "no dlerror message".to_owned();
     }
     // SAFETY: non-null and NUL-terminated, owned by libc until the next dl call.
-    unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(msg) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The engine's failure (a negative errno, ABI) as text.
@@ -507,7 +515,11 @@ pub fn register(images: &[&Image]) -> Result<(), String> {
     )?;
     for image in images {
         for &(start, len, prot) in image.segments() {
-            map(start, len, (prot as u32) & (PROT_READ | PROT_WRITE | PROT_EXEC))?;
+            map(
+                start,
+                len,
+                (prot as u32) & (PROT_READ | PROT_WRITE | PROT_EXEC),
+            )?;
         }
     }
     Ok(())
