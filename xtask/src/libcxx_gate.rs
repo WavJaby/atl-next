@@ -280,7 +280,7 @@ mod tests {
 
     /// The driver native would compile with (deps.toml row clang-cxx).
     fn cxx_row() -> String {
-        crate::deps::binary(&crate::repo_root().unwrap(), "clang-cxx").unwrap()
+        crate::deps::binary(&crate::checkout_root().unwrap(), "clang-cxx").unwrap()
     }
 
     /// A fake libc++: one header `<fake>` the probe includes, shaped by `body`.

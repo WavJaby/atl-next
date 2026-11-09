@@ -126,7 +126,7 @@ pub fn union(names: &[String]) -> Result<Goals> {
 fn resolve(mut g: Goals) -> Result<Goals> {
     if std::mem::take(&mut g.store) {
         g.host
-            .extend(crate::codec2_store::libraries(&crate::repo_root()?)?);
+            .extend(crate::codec2_store::libraries(&crate::checkout_root()?)?);
     }
     Ok(g)
 }
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn store_libraries_reach_every_runtime_gate() {
         // the store's own list (C2Store.cpp) is the expectation; no literal names
-        let root = crate::repo_root().expect("repo root");
+        let root = crate::checkout_root().expect("checkout root");
         let libs = crate::codec2_store::libraries(&root).expect("store list");
         assert!(!libs.is_empty());
         for gate in ["app", "native-load", "run-apk"] {

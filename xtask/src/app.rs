@@ -874,7 +874,9 @@ mod tests {
 
     #[test]
     fn es1_rows_judge_against_the_scene_model() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/gl-probe/es1-scene.toml");
+        let path = crate::checkout_root()
+            .expect("checkout root")
+            .join("xtask/testdata/gl-probe/es1-scene.toml");
         let scene = Scene::load(&path).expect("the ES1 scene parses");
         let (w, h) = scene.size();
         let px = scene.expect().expect("the model runs");

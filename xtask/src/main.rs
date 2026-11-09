@@ -108,7 +108,7 @@ mod window;
 mod workspace;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -333,7 +333,7 @@ enum Test {
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let root = repo_root()?;
+    let root = checkout_root()?;
     let name = verdict_name(&cli.command);
     // the commands that read src/aosp see the task copies through it (tree.rs)
     let shell = match &cli.command {
@@ -530,11 +530,62 @@ pub fn cargo_command() -> std::process::Command {
     std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
 
-/// The checkout being worked on (main repo or a worktree), i.e. the parent of `xtask/`.
-fn repo_root() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
+/// The checkout the command runs in (main repo or worktree): the git toplevel of the cwd. Not the checkout that compiled the binary; a binary built in main also runs in worktrees.
+fn checkout_root() -> Result<PathBuf> {
+    toplevel_in(&std::env::current_dir().context("reading the current directory")?)
+}
+
+/// Git toplevel of `dir`. Outside a checkout it is an error, never a fallback to a compiled-in path.
+fn toplevel_in(dir: &Path) -> Result<PathBuf> {
+    git::git(Some(dir), &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
-        .context("xtask manifest dir has no parent")
+        .with_context(|| {
+            format!(
+                "{} is not inside a checkout: run xtask from the main repo or a worktree",
+                dir.display()
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Repo `<tmp>/<name>/main` with worktree `<tmp>/<name>/wt` on branch `task`; canonical paths.
+    fn repo_and_worktree(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("xtask-root-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (main, wt) = (base.join("main"), base.join("wt"));
+        std::fs::create_dir_all(&main).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| git::git(Some(dir), args).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["config", "user.name", "xtask"]);
+        git_in(&main, &["config", "user.email", "xtask@example.invalid"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_in(
+            &main,
+            &["worktree", "add", "-q", "-b", "task", wt.to_str().unwrap()],
+        );
+        (main.canonicalize().unwrap(), wt.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn checkout_root_is_the_toplevel_of_where_it_runs() {
+        let (main, wt) = repo_and_worktree("toplevel");
+        let sub = wt.join("xtask").join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(toplevel_in(&main).unwrap(), main);
+        assert_eq!(toplevel_in(&wt).unwrap(), wt);
+        assert_eq!(toplevel_in(&sub).unwrap(), wt);
+        std::fs::remove_dir_all(main.parent().unwrap()).unwrap();
+    }
+
+    /// Assumes the OS temp dir is not inside a checkout.
+    #[test]
+    fn outside_a_checkout_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("xtask-root-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(toplevel_in(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
