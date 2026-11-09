@@ -12,21 +12,10 @@ use super::image::Image;
 /// Elf64_Phdr size (AT_PHENT).
 const PHENT: usize = 56;
 
-/// The argument block and the host memory the guest reads through it.
-pub struct Block {
-    /// The block's address (`__linker_init`'s argument).
-    pub addr: usize,
-    /// (start, length) of the block and of each string it points to: guest syscalls take these pointers (the linker `open`s argv[1]), and an emulator checks them (`arch::map_guest`).
-    pub ranges: Vec<(usize, usize)>,
-}
-
-/// A leaked C string of `bytes`: its address, its range recorded in `ranges`.
-fn leak_cstr(bytes: &[u8], ranges: &mut Vec<(usize, usize)>) -> Result<usize, String> {
+/// A leaked C string of `bytes`: its address.
+fn leak_cstr(bytes: &[u8]) -> Result<usize, String> {
     let c = CString::new(bytes).map_err(|e| e.to_string())?;
-    let len = c.as_bytes_with_nul().len();
-    let at = c.into_raw() as usize;
-    ranges.push((at, len));
-    Ok(at)
+    Ok(c.into_raw() as usize)
 }
 
 /// This process's auxv (`/proc/self/auxv`), AT_NULL dropped: the identity guest's kernel auxv.
@@ -53,23 +42,22 @@ pub fn process_auxv() -> Result<Vec<(usize, usize)>, String> {
         .collect())
 }
 
-/// The block. `kernel`: the kernel's auxv for this guest (`arch::kernel_auxv`), AT_NULL excluded.
+/// The block's address. `kernel`: the kernel's auxv for this guest (`arch::kernel_auxv`), AT_NULL excluded.
 pub fn build(
     cfg: &Config,
     linker: &Image,
     vdso: &Image,
     kernel: &[(usize, usize)],
-) -> Result<Block, String> {
-    let mut ranges = Vec::new();
-    let argv0 = leak_cstr(cfg.linker.as_os_str().as_bytes(), &mut ranges)?;
-    let argv1 = leak_cstr(cfg.exe.as_os_str().as_bytes(), &mut ranges)?;
+) -> Result<usize, String> {
+    let argv0 = leak_cstr(cfg.linker.as_os_str().as_bytes())?;
+    let argv1 = leak_cstr(cfg.exe.as_os_str().as_bytes())?;
     let path = cfg
         .library_path
         .iter()
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join(":");
-    let env0 = leak_cstr(format!("LD_LIBRARY_PATH={path}").as_bytes(), &mut ranges)?;
+    let env0 = leak_cstr(format!("LD_LIBRARY_PATH={path}").as_bytes())?;
     let replaced: &[(libc::c_ulong, usize)] = &[
         (libc::AT_PHDR, linker.phdr),
         (libc::AT_PHNUM, linker.phnum),
@@ -90,7 +78,5 @@ pub fn build(
     }
     block.extend([libc::AT_NULL as usize, 0]);
     let words = Box::leak(block.into_boxed_slice());
-    let addr = words.as_ptr() as usize;
-    ranges.push((addr, std::mem::size_of_val(words)));
-    Ok(Block { addr, ranges })
+    Ok(words.as_ptr() as usize)
 }

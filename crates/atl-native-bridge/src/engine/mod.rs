@@ -125,8 +125,7 @@ impl Guest {
             .symbol("__dl___linker_init")
             .ok_or("linker64 has no __dl___linker_init")?;
         let block = args::build(cfg, &linker, &vdso, &arch::kernel_auxv()?)?;
-        arch::map_guest(&[&linker, &vdso], &block.ranges)?;
-        let block = block.addr;
+        arch::map_guest(&[&linker, &vdso])?;
         let thread = HostThread::leak();
         arch::set_bootstrap(Some(&raw mut *thread));
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.

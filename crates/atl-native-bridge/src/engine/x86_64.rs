@@ -109,8 +109,8 @@ pub fn kernel_auxv() -> Result<Vec<(usize, usize)>, String> {
     super::args::process_auxv()
 }
 
-/// Makes `images` and the host `data` ranges reachable by guest code: nothing to do, guest memory is host memory here.
-pub fn map_guest(_images: &[&Image], _data: &[(usize, usize)]) -> Result<(), String> {
+/// Makes `images` reachable by guest code: nothing to do, guest memory is host memory here.
+pub fn map_guest(_images: &[&Image]) -> Result<(), String> {
     Ok(())
 }
 
