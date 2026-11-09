@@ -5,7 +5,7 @@
 use atl_bridgegen::buildscript::{HeaderImport, import_headers};
 
 const EGL_DIR: &str = "frameworks/native/opengl/include";
-const GLES_DIR: &str = "external/mesa3d/include";
+const GLES_DIR: &str = "external/angle/include";
 
 /// EGL entries: the driver's exports (Loader.cpp dlsyms them) and every host call.
 const EGL_FUNCTIONS: &[&str] = &[
@@ -159,11 +159,11 @@ const IMPORTS: &[HeaderImport] = &[
             "EGL_SYNC_FLUSH_COMMANDS_BIT",
         ],
     },
-    // the Khronos registry's GLES headers as AOSP's external/mesa3d carries them: frameworks/native's gl2ext.h predates GL_MESA_framebuffer_flip_y, which window surfaces need
+    // the Khronos registry's GLES headers as AOSP's external/angle/include carries them: frameworks/native's gl2ext.h predates GL_MESA_framebuffer_flip_y, which window surfaces need
     HeaderImport {
         name: "gles",
-        source: "external/mesa3d/include/GLES2/gl2ext.h",
-        also: &["external/mesa3d/include/GLES3/gl3.h"],
+        source: "external/angle/include/GLES2/gl2ext.h",
+        also: &["external/angle/include/GLES3/gl3.h"],
         include_dirs: &[GLES_DIR],
         defines: &["GL_GLEXT_PROTOTYPES"],
         force_include: Some("GLES3/gl3.h"),
