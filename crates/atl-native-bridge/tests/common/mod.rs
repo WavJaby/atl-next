@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Shared by the spike gates g1-g4: the host probe, the native-bridge build env, guest start.
-//! Env (stages needing them print SKIP without): `ATL_NB=<out>/nb/x86_64`, `ATL_NB_LIBCXX=<dir of the guest libc++_shared.so>`, g2 also `ATL_NB_TESTLIB=<dir of the NDK-built libatl-jni-test.so>:<NDK sysroot usr/lib/x86_64-linux-android>` (a path list).
+//! Env (stages needing them print SKIP without): `ATL_NB=<out>/nb/x86_64`, `ATL_NB_LIBCXX=<out>/upstream/llvm-project/x86_64/libcxx-shared/build/lib` (the guest platform `libc++.so`: no `nb:` goal, pass 2 of `xtask native --native-bridge x86_64` builds it there, xtask runtimes.rs `shared_libcxx`), g2 also `ATL_NB_TESTLIB=<dir of the NDK-built libatl-jni-test.so>:<NDK sysroot usr/lib/x86_64-linux-android>` (a path list).
 #![allow(dead_code, reason = "each gate uses a subset")]
 
 use std::path::{Path, PathBuf};

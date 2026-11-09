@@ -119,13 +119,15 @@ fn started(r: Result<Guest, String>) -> u64 {
     println!("qemu-start: (s) ok");
     let tls = thread::static_tls();
     println!(
-        "qemu-start: values entry {:#x} e_entry {:#x} tls size {:#x} tpoff {:#x} exe p_align {} host_pthread calls {}",
+        "qemu-start: values entry {:#x} e_entry {:#x} tls size {:#x} tpoff {:#x} exe p_align {} host_pthread calls {} stubs bound {} unbound {}",
         guest.exe_entry,
         x.e_entry,
         tls.map_or(0, |t| t.size),
         tls.map_or(0, |t| t.tpoff),
         x.tls_align,
-        vdso::HOST_PTHREADS.load(Ordering::Relaxed)
+        vdso::HOST_PTHREADS.load(Ordering::Relaxed),
+        vdso::BOUND.load(Ordering::Relaxed),
+        vdso::UNBOUND.load(Ordering::Relaxed)
     );
     let mut ok = true;
     ok &= check('e', {
