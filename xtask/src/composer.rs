@@ -415,9 +415,9 @@ fn served_line() -> String {
     format!("composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process")
 }
 
-/// The registry's line once the client's UI agent is registered (registry_service.rs).
+/// The registry's line once the client's UI agent and compositor are registered (registry_service.rs).
 fn agent_line() -> String {
-    format!("services: registered the UI agent of uid {APP_UID}")
+    format!("services: registered the UI agent and compositor of uid {APP_UID}")
 }
 
 /// One synthetic run and the checks that must fail on it (empty: the run must pass).
