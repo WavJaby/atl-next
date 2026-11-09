@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Mon, 9 Nov 2026 20:44:10 +0800
+Subject: [PATCH] feat(angle): build the ESSL and GLSL translators for the GL
+ backend
+
+- Android.bp angle_translator: add the translator sources upstream GN
+  compiles for angle_enable_gl (src/compiler.gni: essl, glsl and
+  tree_ops/glsl lists) and define ANGLE_ENABLE_ESSL and ANGLE_ENABLE_GLSL
+  (BUILD.gn, CodeGen.cpp). The GL backend's shaders go out as ESSL
+
+Upstream-Status: Pending
+Patch-Reason: the GL backend (patch 0001) compiles shaders through the
+ translator's ESSL output. Without ANGLE_ENABLE_ESSL, CodeGen.cpp builds no
+ translator for SH_ESSL_OUTPUT, so every shader source is empty and the
+ native driver fails each compile ("syntax error, unexpected end of file"),
+ measured on the ATL app gate for the GLES2 and ES1 paths. GN sets both
+ defines and sources together for angle_enable_gl (gni/angle.gni:250-251),
+ so this mirrors upstream's own configuration; no code changes.
+---
+SPDX-License-Identifier: BSD-3-Clause
+ Android.bp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/Android.bp b/Android.bp
+index 2412a222ca9a63e715383362b68c73012d720ec5..f3c62dc205d5d6eff13ff07adc4e1b8ae48d44c3 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -149,8 +149,10 @@ cc_defaults {
+         "-DABSL_ALLOCATOR_NOTHROW=1",
+         "-DANGLE_ENABLE_CONTEXT_MUTEX=1",
+         "-DANGLE_ENABLE_CONTEXT_MUTEX_RECURSION=1",
++        "-DANGLE_ENABLE_ESSL",
+         "-DANGLE_ENABLE_GLOBAL_MUTEX_LOAD_TIME_ALLOCATE=1",
+         "-DANGLE_ENABLE_GLOBAL_MUTEX_RECURSION=1",
++        "-DANGLE_ENABLE_GLSL",
+         "-DANGLE_ENABLE_SHARE_CONTEXT_LOCK=1",
+         "-DANGLE_ENABLE_VULKAN",
+         "-DANGLE_TEST_ENABLE_SYSTEM_EGL",
+@@ -2716,8 +2718,18 @@ cc_library_static {
+         "src/compiler/translator/ValidateVaryingLocations.cpp",
+         "src/compiler/translator/VariablePacker.cpp",
+         "src/compiler/translator/blocklayout.cpp",
++        "src/compiler/translator/glsl/BuiltInFunctionEmulatorGLSL.cpp",
++        "src/compiler/translator/glsl/ExtensionGLSL.cpp",
++        "src/compiler/translator/glsl/OutputESSL.cpp",
+         "src/compiler/translator/glsl/OutputGLSL.cpp",
+         "src/compiler/translator/glsl/OutputGLSLBase.cpp",
++        "src/compiler/translator/glsl/TranslatorESSL.cpp",
++        "src/compiler/translator/glsl/TranslatorGLSL.cpp",
++        "src/compiler/translator/glsl/VersionGLSL.cpp",
++        "src/compiler/translator/tree_ops/glsl/RegenerateStructNames.cpp",
++        "src/compiler/translator/tree_ops/glsl/RewriteRepeatedAssignToSwizzled.cpp",
++        "src/compiler/translator/tree_ops/glsl/ScalarizeVecAndMatConstructorArgs.cpp",
++        "src/compiler/translator/tree_ops/glsl/UseInterfaceBlockFields.cpp",
+         "src/compiler/translator/glslang_lex_autogen.cpp",
+         "src/compiler/translator/glslang_tab_autogen.cpp",
+         "src/compiler/translator/spirv/BuildSPIRV.cpp",
