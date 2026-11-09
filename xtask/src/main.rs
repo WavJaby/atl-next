@@ -174,7 +174,7 @@ enum Command {
     Qemu(qemu::Args),
     /// Build-output slots: the out dir each checkout builds into by default (`show`, `list`, `assign`).
     ///
-    /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`.
+    /// The pool is `slot::SLOTS` dirs <workspace>/out/slot-<n>; a checkout holds at most one, recorded in its git dir. `native`, `check` and `test` build into it without `--out` / `--java-out`. A slotted checkout's `target/` links to the slot's `target/`, so its cargo builds go there too.
     Slot {
         #[command(subcommand)]
         slot: slot::Slot,

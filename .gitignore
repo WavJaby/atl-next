@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: MIT
 # Upstream checkouts, build output and caches live outside the repo (~/atl-next/{src,out,cache}).
-/target/
+# `<checkout>/target` is a real dir or, for a slotted checkout, a symlink to its slot's target: a trailing slash would not match the link.
+/target
