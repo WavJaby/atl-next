@@ -78,6 +78,31 @@ fn host_row<'a>(arches: &'a Arches, triple: &str) -> Result<(&'a str, &'a Arch)>
         .with_context(|| format!("no {FILE} [host] row has rust = {triple:?}"))
 }
 
+/// What a host of another arch than the build machine is compiled and linked for: its `[host]` row's clang, sysroot and isa.
+#[derive(Debug, PartialEq)]
+pub struct CrossTarget {
+    pub clang: String,
+    pub sysroot: String,
+    pub isa: String,
+}
+
+/// The cross target of host `name` when the build machine is `build` (build_machine's name): None for the build machine itself; another arch needs all three columns of its row.
+pub fn cross_target(name: &str, host: &Host, build: &str) -> Result<Option<CrossTarget>> {
+    if name == build {
+        return Ok(None);
+    }
+    match (&host.clang, &host.sysroot, &host.isa) {
+        (Some(clang), Some(sysroot), Some(isa)) => Ok(Some(CrossTarget {
+            clang: clang.clone(),
+            sysroot: sysroot.clone(),
+            isa: isa.clone(),
+        })),
+        _ => bail!(
+            "{FILE}: {name} is not the build machine ({build}): a cross host needs clang, sysroot and isa in its [host] row"
+        ),
+    }
+}
+
 fn parse(text: &str) -> Result<Arches> {
     let arches: Arches = toml::from_str(text)?;
     validate(&arches)?;
@@ -364,6 +389,45 @@ mod tests {
         assert!(super::isa_extensions("rv64gcv_zba_zbb").is_err());
         assert!(super::isa_extensions("rv64gc_v").is_err());
         assert!(super::isa_extensions("rv64gc_Zba").is_err());
+    }
+
+    #[test]
+    fn cross_target_needs_all_three_columns_off_the_build_machine() {
+        let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
+            rust: "t".into(),
+            meson_cpu_family: "m".into(),
+            debian: "d".into(),
+            archlinux: None,
+            soong_prebuilt_os: None,
+            isa: isa.map(Into::into),
+            clang: clang.map(Into::into),
+            sysroot: sysroot.map(Into::into),
+        };
+        // the build machine's own row is native, whatever it lists
+        assert_eq!(
+            super::cross_target("x86_64", &row(None, None, None), "x86_64").unwrap(),
+            None
+        );
+        // another arch takes its row's clang, sysroot and isa
+        let riscv = row(
+            Some("riscv64-linux-gnu"),
+            Some("riscv64-sysroot"),
+            Some("rv64gc_zba_zbb"),
+        );
+        assert_eq!(
+            super::cross_target("riscv64", &riscv, "x86_64").unwrap(),
+            Some(super::CrossTarget {
+                clang: "riscv64-linux-gnu".into(),
+                sysroot: "riscv64-sysroot".into(),
+                isa: "rv64gc_zba_zbb".into(),
+            })
+        );
+        // another arch with no or a partial row: an error, never the build machine's flags
+        assert!(super::cross_target("arm64", &row(None, None, None), "x86_64").is_err());
+        assert!(
+            super::cross_target("riscv64", &row(Some("c"), None, Some("rv64gc")), "x86_64")
+                .is_err()
+        );
     }
 
     const GUEST: &str = "android_abis = [\"x\"]\nclang = \"c\"\nqemu_target = \"q\"\n";

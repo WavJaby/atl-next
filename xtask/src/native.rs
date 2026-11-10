@@ -30,7 +30,7 @@ pub struct Args {
     /// Also build the goals these gates declare (gate_goals.rs GATES; `all-gates` = every gate), comma-separated. Gates needing the native-bridge guest set --native-bridge to --host.
     #[arg(long = "for", value_delimiter = ',')]
     for_gates: Vec<String>,
-    /// The host arch (an arches.toml row with `[host]`); also Soong's arch name.
+    /// The host arch (an arches.toml row with `[host]`); also Soong's arch name. An arch other than the build machine's is cross-built with its row's clang, sysroot and isa.
     #[arg(long)]
     host: String,
     /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts
@@ -123,6 +123,22 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
     }
 }
 
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot and its isa. Empty for the build machine, whose compiler already targets it.
+fn cross_args(root: &Path, cross: Option<&arches::CrossTarget>) -> Result<Vec<String>> {
+    let Some(c) = cross else {
+        return Ok(Vec::new());
+    };
+    let sysroot = deps::sysroot_root(root, &c.sysroot)?;
+    Ok(vec![
+        "-host-target".to_owned(),
+        c.clang.clone(),
+        "-host-sysroot".to_owned(),
+        sysroot.display().to_string(),
+        "-host-isa".to_owned(),
+        c.isa.clone(),
+    ])
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let args = &args.resolved()?;
     crate::host_disk::check(crate::host_disk::Limits {
@@ -130,7 +146,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         compact_gib: args.host_free_compact_gib,
     })?;
     let arches = arches::load(root)?;
-    let (pointer_bits, arch_variant, abi, prebuilt_os) = match arches.get(&args.host) {
+    let (pointer_bits, arch_variant, abi, host) = match arches.get(&args.host) {
         Some(a @ arches::Arch { host: Some(h), .. }) => (
             a.pointer_bits.to_string(),
             a.soong_arch_variant.clone().unwrap_or_default(),
@@ -139,15 +155,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 .as_ref()
                 .and_then(|g| g.android_abis.first().cloned())
                 .unwrap_or_default(),
-            h.soong_prebuilt_os.clone().with_context(|| {
-                format!(
-                    "{}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)",
-                    args.host
-                )
-            })?,
+            h,
         ),
         _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
     };
+    // the converter and its prebuilt build-only tools run on the build machine, so the prebuilt directory is that row's whatever the host; a host of another arch is compiled for its own row's target
+    let (build_name, build) = arches::build_machine(root, &arches)?;
+    let prebuilt_os = build
+        .host
+        .as_ref()
+        .and_then(|h| h.soong_prebuilt_os.clone())
+        .with_context(|| {
+            format!(
+                "{build_name}: no soong_prebuilt_os (the JDK and build tools the converter's host Java tools need)"
+            )
+        })?;
+    let cross = arches::cross_target(&args.host, host, build_name)?;
+    let cross_flags = cross_args(root, cross.as_ref())?;
     let layout = Layout::of(root)?;
     let ws = layout.workspace();
     // the task copies are bound over it: main entered the namespace (tree::enter)
@@ -215,11 +239,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let libcxx = PathBuf::from(
         crate::host_art::output(
-            Command::new(&converter).args([
-                "-libcxx-headers",
-                "-cxx",
-                &flag_or_row(&args.cxx, root, "clang-cxx")?,
-            ]),
+            Command::new(&converter)
+                .args([
+                    "-libcxx-headers",
+                    "-cxx",
+                    &flag_or_row(&args.cxx, root, "clang-cxx")?,
+                ])
+                .args(&cross_flags),
             "bp2ninja -libcxx-headers",
         )?
         .trim(),
@@ -320,6 +346,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&build_tools)
             .arg("-out")
             .arg(&out)
+            .args(&cross_flags)
             .args([
                 "-arch",
                 &args.host,
