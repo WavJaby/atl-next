@@ -14,8 +14,16 @@ mod slots {
 }
 use slots::{env, vm};
 
+/// Per slot, the lane descriptor (build.rs `jni_lanes`); not read yet: the QEMU JNI route takes it (Q6-3).
+mod lanes {
+    include!(concat!(env!("OUT_DIR"), "/jni_lanes.rs"));
+}
+
 const _: () = assert!(
     env::SLOTS.len() <= super::bindings::JNI_STUBS && vm::SLOTS.len() <= super::bindings::JNI_STUBS
+);
+const _: () = assert!(
+    lanes::env::LANES.len() == env::SLOTS.len() && lanes::vm::LANES.len() == vm::SLOTS.len()
 );
 
 /// jni.h `JNI_OK`.

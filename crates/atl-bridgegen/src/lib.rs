@@ -17,6 +17,7 @@ pub mod converter;
 pub mod engine_abi;
 pub mod front;
 pub mod ir;
+pub mod jni;
 pub mod report;
 pub mod rust;
 pub mod shape;
