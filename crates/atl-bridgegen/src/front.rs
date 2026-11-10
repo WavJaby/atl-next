@@ -495,19 +495,19 @@ fn args(lang: Lang, t: &Target) -> Vec<String> {
     args
 }
 
-/// bindgen's extra clang args for this build script's target, read as bindgen reads them (its `get_target_dependent_env_var`): `BINDGEN_EXTRA_CLANG_ARGS_<TARGET>` (`-` as `_`), else the unscoped one. Only xtask's cross sets the scoped one, to the target sysroot (cross.rs cargo_target); a build machine sets neither. Whitespace split, not shlex: cross refuses whitespace in these paths.
+/// bindgen's extra clang args for this build script's target, read as bindgen reads them (its `get_target_dependent_env_var`): `BINDGEN_EXTRA_CLANG_ARGS_<TARGET>` (`-` as `_`) only; the unscoped variable is never read, since it would reach every target, the x86 probes included. Only xtask's cross sets the scoped one, to the target sysroot (cross.rs cargo_target); a build machine sets neither. Whitespace split, not shlex: cross refuses whitespace in these paths.
 fn extra_clang_args() -> Vec<String> {
     const VAR: &str = "BINDGEN_EXTRA_CLANG_ARGS";
-    let scoped = std::env::var("TARGET").ok().and_then(|target| {
-        [
-            format!("{VAR}_{target}"),
-            format!("{VAR}_{}", target.replace('-', "_")),
-        ]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok())
-    });
-    scoped
-        .or_else(|| std::env::var(VAR).ok())
+    std::env::var("TARGET")
+        .ok()
+        .and_then(|target| {
+            [
+                format!("{VAR}_{target}"),
+                format!("{VAR}_{}", target.replace('-', "_")),
+            ]
+            .into_iter()
+            .find_map(|key| std::env::var(key).ok())
+        })
         .map(|value| value.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
 }
