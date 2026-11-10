@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atl_engine_api::{PROT_EXEC, PROT_READ, PROT_WRITE};
 
+use crate::engine::Engine as _;
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::dispatch::TARGETS;
 use crate::engine::image::{Image, write_sealed};
-use crate::engine::{Engine as _, unsupported};
 
 use super::CROSSING;
 
@@ -24,13 +24,13 @@ pub(super) mod pool {
 
 /// Bytes per thunk: two instruction words.
 pub(super) const THUNK_BYTES: usize = 8;
-/// Next free pool slot.
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Next free pool slot: past the JNI ids `0..JNI_STUBS` (`jni_stub`), so `bind` never hands out a JNI id.
+static NEXT: AtomicUsize = AtomicUsize::new(JNI_STUBS);
 
 // one generated slot per binding: the pool and the table are sized by the same build-time count
 const _: () = assert!(std::mem::size_of::<pool::Pool>() == THUNKS * THUNK_BYTES);
 
-/// JNI table slots, as the x86 engine (`JNINativeInterface` has 233). The QEMU JNI stubs come with the JNI slice (Q6).
+/// JNI pool ids: id `k` < `JNI_STUBS` is JNI table entry `k`, for env and vm alike (`jni_stub`). Ids from here up are bound host functions.
 pub const JNI_STUBS: usize = crate::engine::bindings::JNI_STUBS;
 
 /// A guest-callable address that crosses to host function `target`: the address of a free pool slot, which the binding trap routes to `target`. None when the pool is used up.
@@ -43,9 +43,10 @@ pub fn bind(target: usize) -> Option<usize> {
     Some((&raw const pool::POOL) as usize + slot * THUNK_BYTES)
 }
 
-/// The guest-callable address of JNI table slot `slot`. Aborts until the QEMU JNI stubs land (Q6).
-pub fn jni_stub(_slot: usize) -> usize {
-    unsupported("qemu crossing: JNI stubs land in Q6")
+/// The guest-callable address of JNI table slot `slot`: pool slot `slot` itself. Its trap is routed by id to the host object's own table (`dispatch::call_jni`), not through `TARGETS`.
+pub fn jni_stub(slot: usize) -> usize {
+    assert!(slot < JNI_STUBS, "JNI slot {slot} past the stub array");
+    (&raw const pool::POOL) as usize + slot * THUNK_BYTES
 }
 
 /// The two instruction words at `addr`.

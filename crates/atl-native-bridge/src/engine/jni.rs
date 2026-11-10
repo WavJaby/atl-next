@@ -63,10 +63,14 @@ fn direct_break(_slot: usize, _host: usize) -> Option<usize> {
 ///
 /// # Safety
 /// `obj` is a live host `JNIEnv*` / `JavaVM*`, `slot` within its table.
-unsafe fn host_slot(obj: usize, slot: usize) -> usize {
+pub(super) unsafe fn host_slot(obj: usize, slot: usize) -> usize {
     // SAFETY: caller contract: word 0 of a JNI object is its function table.
     unsafe { *(*(obj as *const *const usize)).add(slot) }
 }
+
+/// Deliberate break `jni_swap` (dispatch.rs `call_jni`): the one entry whose variadic lanes it exchanges. Other entries keep their order: GetStaticMethodID's x3 is its signature.
+#[cfg(atl_nb_jni_swap)]
+pub(super) const CALL_STATIC_INT_METHOD: usize = env::CallStaticIntMethod;
 
 static ENV_TABLE: OnceLock<Box<[usize]>> = OnceLock::new();
 static VM: OnceLock<usize> = OnceLock::new();
@@ -143,11 +147,13 @@ pub fn guest_vm(host: usize) -> usize {
     p
 }
 
+/// The host object behind guest JNI object `guest` (its word 1): a guest JNI call runs on it (dispatch.rs `call_jni`).
+///
 /// # Safety
-/// `obj` is a guest object made here.
-unsafe fn host_of(obj: *const GuestObj) -> usize {
+/// `guest` is a guest env or vm made by `guest_env` / `guest_vm`.
+pub(super) unsafe fn host_of(guest: usize) -> usize {
     // SAFETY: caller contract.
-    unsafe { (*obj).host }
+    unsafe { (*(guest as *const GuestObj)).host }
 }
 
 /// The host env behind guest env `guest` (0 = 0), for the NDK shims (ndk.rs): an NDK function takes a `JNIEnv*` and calls the host library through it.
@@ -161,7 +167,7 @@ pub(super) unsafe fn host_env(guest: usize) -> usize {
         return 0;
     }
     // SAFETY: caller contract.
-    unsafe { host_of(guest as *const GuestObj) }
+    unsafe { host_of(guest) }
 }
 
 /// # Safety
@@ -175,7 +181,7 @@ pub(super) unsafe fn host_env(guest: usize) -> usize {
 extern "C" fn get_java_vm(env: *const GuestObj, out: *mut usize) -> i32 {
     // SAFETY: the guest's own env and out-parameter, as jni.h's GetJavaVM takes them.
     unsafe {
-        let host = host_of(env);
+        let host = host_of(env as usize);
         let f: extern "C" fn(usize, *mut usize) -> i32 =
             std::mem::transmute(host_slot(host, env::GetJavaVM));
         let rc = f(host, out);
@@ -190,7 +196,7 @@ extern "C" fn get_java_vm(env: *const GuestObj, out: *mut usize) -> i32 {
 extern "C" fn get_env(vm: *const GuestObj, out: *mut usize, version: i32) -> i32 {
     // SAFETY: as jni.h's GetEnv.
     unsafe {
-        let host = host_of(vm);
+        let host = host_of(vm as usize);
         let f: extern "C" fn(usize, *mut usize, i32) -> i32 =
             std::mem::transmute(host_slot(host, vm::GetEnv));
         let rc = f(host, out, version);
@@ -208,7 +214,7 @@ extern "C" fn get_env(vm: *const GuestObj, out: *mut usize, version: i32) -> i32
 unsafe fn attach(vm: *const GuestObj, out: *mut usize, args: usize, slot: usize) -> i32 {
     // SAFETY: caller contract.
     unsafe {
-        let host = host_of(vm);
+        let host = host_of(vm as usize);
         let f: extern "C" fn(usize, *mut usize, usize) -> i32 =
             std::mem::transmute(host_slot(host, slot));
         let rc = f(host, out, args);

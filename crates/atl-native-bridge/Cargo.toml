@@ -64,6 +64,11 @@ harness = false
 name = "qemu_thread"
 harness = false
 
+# Q6-2 gate: guest JNI calls under QEMU, integer lanes: the fixture's JNI calls reach a fake host JNIEnv, GetJavaVM (a special) routes to its own thunk (QEMU bridge plan Q6-2); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
+[[test]]
+name = "qemu_jni"
+harness = false
+
 # Q5-8 gate: the crossing counter under QEMU: a fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once (QEMU bridge plan Q5-8); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and feature `crossing-count`
 [[test]]
 name = "qemu_crossing"

@@ -717,6 +717,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
+    // Q6-2 (engine/dispatch.rs `call_jni`): the host JNI function gets the guest's env instead of the host object (qemu-jni gate, `e`)
+    ("jni_guest_env", "atl_nb_jni_guest_env"),
+    // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
+    ("jni_swap", "atl_nb_jni_swap"),
     // Q5-7 (bridgegen x86.rs `entries_asm`, disp_bias): every identity pool call's displacement one byte short, so each lands one byte past its shell (identity gates g1-g5 and unit test `thunk_slots_call_their_shell`)
     ("x86_disp", X86_DISP_CFG),
     // Q5-8b (bridgegen x86.rs `entries_asm`, `counted`): the identity shells call no counter, so every identity crossing counts 0 (identity gate `identity_crossing`, check t)

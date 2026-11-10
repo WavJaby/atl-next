@@ -77,6 +77,7 @@ mod providers;
 mod prune;
 mod qemu;
 mod qemu_gate;
+mod qemu_jni;
 mod qemu_linker;
 mod qemu_spike;
 mod qemu_thread;
@@ -328,6 +329,8 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
     QemuThread(qemu_thread::Args),
+    /// Guest JNI calls under the QEMU crossing, integer lanes (QEMU bridge plan Q6-2): a fixture's JNI calls reach a fake host JNIEnv, GetJavaVM routes to its own thunk; the `jni_guest_env` and `jni_swap` breaks must turn it red. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-jni/`.
+    QemuJni(qemu_jni::Args),
     /// The crossing counter of both engines (QEMU bridge plan Q5-8, feature `crossing-count`): identity host-thunk and JNI shells, then QEMU; the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once; the `id_count` and `qe_id` breaks must turn it red; the library without the feature has no counter symbol. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-thread`) and `--nb` pointing at its `<out>/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/crossing/`.
     Crossing(crossing::Args),
     /// The identity native-bridge gates g1-g5 (x86_64 engine, no QEMU) with their `ATL_NB*` env taken from this checkout's out dir (`nb/x86_64`, the staged `app/`), not set by hand.
@@ -468,6 +471,9 @@ fn main() -> Result<ExitCode> {
             test: Test::QemuThread(args),
         } => qemu_thread::run(&root, &args),
         Command::Test {
+            test: Test::QemuJni(args),
+        } => qemu_jni::run(&root, &args),
+        Command::Test {
             test: Test::Crossing(args),
         } => crossing::run(&root, &args),
         Command::Test {
@@ -519,6 +525,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::QemuSpike(_) => "qemu-spike",
             Test::QemuLinker(_) => "qemu-linker",
             Test::QemuThread(_) => "qemu-thread",
+            Test::QemuJni(_) => "qemu-jni",
             Test::Crossing(_) => "crossing",
             Test::NbIdentity(_) => "nb-identity",
         },
