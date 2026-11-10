@@ -1,13 +1,51 @@
 <!-- SPDX-License-Identifier: MIT -->
 # AGENTS.md -- coding conventions
 
-Applies to every agent and subagent working in this repo. Tools enforce; this file only explains. **Definition of done for any change: `cargo xtask check` passes** (`cargo xtask check --help` lists its steps). Every subagent runs it before handing back; every delegation brief says so.
+Applies to every agent and subagent working in this repo. Tools enforce; this file only explains. **Definition of done for any change: `cargo xtask check` passes** (`cargo xtask check --help` lists its steps). Every subagent runs it before handing back, except a stop at its context cap: that hands back a state note, and the continuation child runs it.
 
 ## Workspace
 
 - `~/atl-next/` (WSL ext4, never an NTFS drive): `repo/` main checkout; `wt/<task>/` one git worktree per task / subagent; `src/<upstream>/` `xtask fetch` checkouts at pinned commits + origin/main's patches, shared by all checkouts; `src-wt/<task>/<upstream>/` task copies (`<task>` = the repo checkout's branch) of upstreams a task patches; `out/slot-<n>/` build output of the checkout holding slot n (`cargo xtask slot`; `native`, `check` and `test` build there by default) (`bin`, `lib`, `include`, `share`, `gen/`); `cache/` sccache, downloads, test APKs; `tools/` test-environment tools.
 - The repo holds only our code, the manifests and `patches/<upstream>/`. Never commit upstream sources, imported AOSP Java or generated code.
 - `cargo xtask` is the only build/test driver. Read-only or dry-run by default.
+
+## Design
+
+- **Upgradable layers.** Each layer (ART/libcore, guest bionic, QEMU, AOSP-derived libs) takes a new upstream version with little merge pain. Layers meet only at standard seams: JNI invocation API, AOSP libnativeloader API, NativeBridge callbacks, NDK/bionic ABI, public `android.*` API. No layer reaches under its seam; extend the seam instead.
+- **Patch scope.** Prefer adapting ATL over patching AOSP. Every AOSP/QEMU patch states why the launcher, loader or environment cannot do it. Small rebase-stable patches are fine; deep or sprawling ones are not. A one-line patch beats widening a seam's contract: a wider contract is a behaviour every user of that seam inherits.
+- **System services are Rust by default** (the system_server role): minimal, extended as apps need, checked against AOSP's service code as the reference. A service whose AOSP behaviour changes often goes back to AOSP, or calls a reusable AOSP module already in the app process. A Java-only, fast-moving service is discussed with the owner first.
+- **Delete legacy in the change that replaces it.** No compatibility shims, dual paths or "keep the old one for now".
+- **No heavy VM.** In-process user-mode translation; native Linux APIs directly (Wayland, GTK4, EGL/Vulkan, PipeWire, portals). Daily-usable desktop software: system theme, IME, HiDPI and notifications follow the Linux desktop.
+- **UI.** Android renders all app UI: AOSP framework Java → GPU hwui (Skia/Vulkan) → our `ANativeWindow` → dmabuf → GSK texture in the GTK window. Adapt hwui by implementing the Android interfaces it consumes, not by rewriting its call sites. No per-widget GTK peers: the desktop look comes from mapping portal appearance settings (dark mode, accent, contrast, font scale) into Android theming. GTK only for window chrome, IME bridge, portals and WebView/SurfaceView holes.
+- **One implementation per concept, a seam for the next.** Translator engine (QEMU), media backend (ffmpeg) and similar get a minimal interface and one implementation. A trait is shaped by its first implementation's needs and generalised when the second is built. No stubs, and no user choice between parallel implementations until a second exists. In-repo traits carry no version (plan F3).
+- **Host OS behind one platform layer.** Window/surface, input, clipboard, notifications, intents/IPC, file picker, audio and WebView are reached only through it. No Wayland, GTK-backend, D-Bus or portal call outside it. Only `-<os>` crates may depend on GTK, Wayland or Windows crates (cargo-deny `bans`). OS selection is compile-time (`cfg(target_os)` only inside the platform crates). Two groups (plan S1): `atl-platform-ui` for app processes, `atl-platform-host` for `atld`; each is `-api` / `-<os>` / facade. Trait signatures use only our opaque handles. Platform-decided choices are static; user- or app-decided ones become runtime enums once a second implementation exists (plan F5/F6). Linux is the only implementation now; native Windows is later (plan D7-9), with no GTK there (plan Q2).
+- **Target is real Linux; WSL2 is a test environment only.** Reference target: the owner's x86_64 Arch laptop. Never change the architecture or add a product code path to make WSL work; test environments get no product code path. WSL is made to fit by environment-side setup only (a kernel module for dmabuf allocation, a nested compositor for missing protocols, an audio tunnel, per-run GPU driver variables). Code above the layer is single-path. What WSL cannot provide is tested on the laptop.
+- **No environment-variable switches in product code, and no test-only product paths** (owner rule). Platform differences are environment-side setup, or `cfg(target_os)` inside the platform crates.
+- **Bridges (ABI translation) have four things.** (1) Entry shells generated from one interface description. (2) Layouts checked at compile time against upstream headers fetched at build time. (3) Pass-through only where a gate proves the ABI identical, never assumed. (4) A named ground-truth suite (CTS, dEQP or the upstream's own tests). Plan S11 lists them per bridge.
+- **Module boundaries by table.** `modules.toml` declares each module's crates, provided interfaces and allowed `uses`. Cross-module edges reach only the target's exports, unless a `direct_link` entry covers them with its reason (declared, so part of the interface, not a bypass). The gate fails on an undeclared edge or an unused declared one. Diagrams come from `xtask doc`. Hot paths (frames, input, audio) do not cross processes.
+- **Feature groups by table.** `features.toml` is the only list of feature groups (planned; created in phase 3). Never delete public API classes to save space.
+- **Arch-neutral.** `arches.toml` is the only list of arches. Per-arch code sits in per-arch modules behind traits. Pointer width is a parameter. Tier 1 hosts: x86_64, arm64, riscv64. Adding an arch edits only its table row and module.
+- **Sandbox.** Every app process runs under bubblewrap, Landlock and seccomp; the broker is the only launcher. Rights come from the manifest permissions plus the user's grants (PermissionController), never configured per app by hand. Desktop access only via portals.
+- **Old native games are a requirement:** arm32/arm64/x86/x86_64 `.so`; x86_64 first, riscv64 later.
+
+## Clean-room
+
+- Implement from AOSP sources and docs, `current.txt`, Android docs and CTS, and measurements on real Android.
+- ATL, bionic_translation and art_standalone code is never copied, and is never open while writing the component it covers.
+- Reading it to learn how a behaviour works is allowed. The conclusion is written up as our own design in `docs/`; that write-up is the only input used while writing the component.
+- ATL's behaviour is a hypothesis, never ground truth. A behaviour counts as settled only once confirmed against AOSP source, Android docs or CTS, or a measurement on real Android. The doc states which.
+
+## Licence
+
+Goal: our code is MIT; third-party components keep their own licences; copyleft is confined, not banned. Plan Q9 and `licenses.toml` are the detail.
+
+- No GPL-3 code linked into the runtime (ART process, `atld`, our libraries) unless it carries a listed exception: `<id> WITH <exception>` in `licenses.toml` (e.g. GCC Runtime Library Exception, Bison exception).
+- The one named exception is the QEMU bridge: a separate `dlopen`ed `.so`, distributed as GPL-3.0-or-later. Every licence in a process that loads it must be GPL-3-compatible; `licenses.toml` keeps the runtime allow list a subset of the bridge's. That is why OpenSSL-licensed BoringSSL and dng_sdk (field-of-use patent grant) are not shipped; wolfSSL is out (Conscrypt/BoringSSL instead).
+- No GPL-2.0-only code without a linking exception anywhere in a process. `GPL-2.0-only WITH Classpath-exception-2.0` (libcore `ojluni`, libjdwp) is allowed: the exception permits linking with independent modules of any licence.
+- Optional user-system libraries loaded at runtime via `dlopen` behind a seam (e.g. distro ffmpeg, GPL-3) are allowed.
+- Before any binary with GPL code (QEMU bridge, libcore) is distributed, its corresponding source must be obtainable: the repo public, or a source archive of pins and patches.
+- Build-time licence gate: fails on a GPL-2.0-only file without a linking exception in the compiled set, and on any undeclared licence. The checked set is what reaches a shipped binary: linked objects (by symbol), headers pulled in through depfiles, Java sources, resources, guest code. A file's licence is its SPDX tag, else its notice identified by deterministic phrase rules, else an explicit per-path entry in `licenses.toml`. An unrecognised notice fails; no similarity guessing (askalono-style matching confuses GPL-2 and GPL-3 notices).
+- Patches carry the licence of the file they patch: AOSP Apache-2.0; QEMU `GPL-2.0-or-later`. Never the deprecated SPDX id `GPL-2.0`, which means GPL-2.0-only.
 
 ## Tables
 
@@ -41,8 +79,16 @@ Applies to every agent and subagent working in this repo. Tools enforce; this fi
 
 ## Languages
 
-- Rust for everything we write, tools and generators included. Java only for the api-impl surface ART requires. Go only for the Blueprint -> ninja converter. C++ only as cxx-bridge wrapper files inside a Rust boundary crate that call the public API of AOSP C++ classes (`crates/atl-libinput/wrap/`); wrappers only adapt types and forward, no logic. No Python. Assembly only inside Rust (`global_asm!` / naked functions).
-- Every file carries an SPDX header; our code is `MIT`. A patch carries the licence of the file it patches.
+- Rust for everything we write, tools and generators included. Each other language has a named reason:
+  - Java: only the api-impl surface ART requires, and forwarders where AOSP Java needs an object implementing a Java interface that JNI cannot create (owner, 2026-11-06; first use: the installer's `ParsingPackageUtils.Callback`). A forwarder only adapts and forwards; no logic.
+  - Go: only the Blueprint → ninja converter, because the official Blueprint parser is Go.
+  - C++: only cxx-bridge wrapper files inside a Rust boundary crate that call the public API of AOSP C++ classes (`crates/atl-libinput/wrap/`; owner, 2026-11-04). cxx cannot call constructors or build `std::shared_ptr` / `ui::Transform`; an AOSP patch carrying wrappers must be rebased on every upgrade, and mangled C++ symbols called from Rust break silently. Wrappers only adapt types and forward; no logic.
+  - C/C++ test fixtures that stand in for third-party app native code (NDK-built `.so` or executables, never shipped; owner, 2026-11-06). The thing under test is NDK clang output linked against bionic and `libc++_shared`, which a Rust build does not exercise (C++ exceptions, libc++, emulated vs ELF TLS).
+  - Assembly: only inside Rust (`global_asm!` or naked functions) where Rust cannot express the ABI, e.g. the aarch64 TLSDESC resolver. No separate `.S` files.
+- No Python of our own (owner, 2026-10-29).
+- Upstream build tools run as-is, never extended or wrapped: meson (QEMU; Mesa, whose only supported build is meson), CMake (upstream BoringSSL; llvm-project runtimes libcxx, libcxxabi, libunwind, compiler-rt builtins for the bionic targets), AOSP genrule scripts (Python, run by upstream's build).
+- Soong is retired (2026-11-04, `a84d9b6`): never run it. The converter reads Soong's Go sources as the reference for build behaviour only.
+- Every file carries an SPDX header; our code is `MIT`.
 
 ## Format
 
