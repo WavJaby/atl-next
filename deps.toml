@@ -21,7 +21,11 @@
 # Every row:
 #   scope    build | runtime | test (static checks count as test)
 #   used_by  typed references, each checked to exist: crate:<workspace crate>,
-#            upstream:<sources.toml name or aosp>, xtask:<subcommand>
+#            upstream:<sources.toml name or aosp>, xtask:<subcommand>, host:<arch> (the sysroot named by
+#            arches.toml [<arch>.host]: that cross host's native build uses it; checked against that row)
+# Cross-only row: every used_by is xtask:cross or host:<arch>. Plain `check` and `deps --check` skip it and name it;
+# `deps --check --host <arch>` checks it, and so does `cross --arch <arch>` at start (its sysroot and the rustup
+# target of its [<arch>.host] rust). `native --host <arch>` checks its sysroot.
 # Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle,
 # the Android SDK and apkeep (no repo consumer: the test APKs are pinned in test-apks.toml and downloaded with curl).
 # Rows are added when a consumer first needs them.
@@ -339,7 +343,7 @@ sysroot_debs = [
     "libatomic1=14.2.0-19",
 ]
 scope = ["build"]
-used_by = ["xtask:cross"]
+used_by = ["xtask:cross", "host:riscv64"]
 
 # the headless gates' nested compositor (nested_wayland.rs:5-8: labwc over sway)
 [labwc]

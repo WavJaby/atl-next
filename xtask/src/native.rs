@@ -211,7 +211,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .context("building bp2ninja")?;
     let sources = sources::load(root)?;
     let workspace = workspace::load(root)?;
-    let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources))?;
+    let deps = deps::load(root, &deps::Consumers::new(&workspace, &sources, &arches))?;
     let providers = providers::load(
         root,
         &providers::Targets::new(&workspace.crates, &sources, &deps),

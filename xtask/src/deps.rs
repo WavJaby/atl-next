@@ -61,15 +61,21 @@ pub struct Consumers {
     pub xtask: BTreeSet<String>,
     /// `[aosp.projects]` paths of sources.toml: what an `aosp` row may name.
     pub projects: BTreeSet<String>,
+    /// Cross hosts (arches.toml `[<arch>.host]` with a `sysroot`): arch -> the sysroot row it names. What `host:<arch>` may name.
+    pub hosts: BTreeMap<String, String>,
 }
 
 impl Consumers {
-    pub fn new(workspace: &Workspace, sources: &Sources) -> Self {
+    pub fn new(workspace: &Workspace, sources: &Sources, arches: &arches::Arches) -> Self {
         Self {
             crates: workspace.crates.clone(),
             upstreams: sources.upstream_names(),
             xtask: crate::subcommands(),
             projects: sources.aosp.projects.keys().cloned().collect(),
+            hosts: arches
+                .iter()
+                .filter_map(|(arch, a)| Some((arch.clone(), a.host.as_ref()?.sysroot.clone()?)))
+                .collect(),
         }
     }
 
@@ -121,7 +127,7 @@ pub fn aosp_project(root: &Path, name: &str) -> Result<String> {
 fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
     let deps: Deps = toml::from_str(text)?;
     for (name, dep) in &deps {
-        validate(dep, consumers).with_context(|| format!("[{name}]"))?;
+        validate(name, dep, consumers).with_context(|| format!("[{name}]"))?;
         ensure!(
             sources::is_name(name),
             "[{name}]: name must be [a-z0-9-], starting alphanumeric"
@@ -130,7 +136,7 @@ fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
     Ok(deps)
 }
 
-fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
+fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
     let distro = dep.debian.is_some() || dep.arch.is_some();
     let cargo = dep.cargo.is_some() || dep.version.is_some();
     let rustup = dep.rustup_target.is_some();
@@ -223,7 +229,14 @@ fn validate(dep: &Dep, consumers: &Consumers) -> Result<()> {
     );
     ensure!(!dep.used_by.is_empty(), "empty used_by");
     for reference in &dep.used_by {
-        consumers.resolve(reference)?;
+        match reference.strip_prefix(HOST_REF) {
+            // the native build of cross host `arch` uses this row only if its arches.toml [<arch>.host] names it as sysroot
+            Some(arch) => ensure!(
+                consumers.hosts.get(arch).is_some_and(|row| row == name),
+                "`{reference}`: arches.toml [{arch}.host] does not name this row as its sysroot"
+            ),
+            None => consumers.resolve(reference)?,
+        }
     }
     Ok(())
 }
@@ -342,6 +355,14 @@ pub struct Args {
     /// With `--fetch`: does it. Without: prints the packages it would fetch.
     #[arg(long, requires = "fetch")]
     execute: bool,
+    /// With `--check`: also checks the cross rows of arch ARCH (its `[<arch>.host]` sysroot and rust std), which plain `--check` skips.
+    #[arg(
+        long,
+        value_name = "ARCH",
+        requires = "check",
+        conflicts_with = "fetch"
+    )]
+    host: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -354,39 +375,130 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(name) = &args.fetch {
         return fetch_sysroot(root, name, args.execute);
     }
-    let (rows, problems) = host_problems(root)?;
-    for p in &problems {
+    let report = host_problems(root, args.host.as_deref())?;
+    for p in &report.problems {
         println!("deps: {p}");
     }
-    if problems.is_empty() {
-        println!("deps: ok ({rows} rows)");
+    if report.problems.is_empty() {
+        println!("deps: {}", report.ok_line());
         Ok(ExitCode::SUCCESS)
     } else {
-        println!("deps: {} of {rows} rows not satisfied", problems.len());
+        println!(
+            "deps: {} of {} rows not satisfied",
+            report.problems.len(),
+            report.rows
+        );
         Ok(ExitCode::FAILURE)
     }
 }
 
-/// Every deps.toml row against this host, read-only: the row count and one `name: problem` per unmet row.
-/// `deps --check` and `xtask check`'s deps step both run it.
-pub fn host_problems(root: &Path) -> Result<(usize, Vec<String>)> {
+/// The `used_by` prefix of a cross host's native build: `host:<arch>` names the sysroot of its `[<arch>.host]` row.
+const HOST_REF: &str = "host:";
+/// The `used_by` reference of a cross build (`xtask cross --arch`).
+const CROSS_TASK: &str = "xtask:cross";
+
+/// A row only cross builds need: every consumer is `xtask:cross` or `host:<arch>`. Plain `check` and `deps --check` skip it.
+pub fn cross_only(dep: &Dep) -> bool {
+    dep.used_by
+        .iter()
+        .all(|r| r == CROSS_TASK || r.starts_with(HOST_REF))
+}
+
+/// A cross row of host `arch` (rust target `rust`): its sysroot (`host:<arch>`) or the rust std of its target.
+fn is_host_row(dep: &Dep, arch: &str, rust: &str) -> bool {
+    dep.used_by
+        .iter()
+        .any(|r| r.strip_prefix(HOST_REF) == Some(arch))
+        || dep.rustup_target.as_deref() == Some(rust)
+}
+
+/// The rust target triple of cross host `arch`: its `[<arch>.host]` row's `rust`.
+fn host_rust(arches: &arches::Arches, arch: &str) -> Result<String> {
+    arches
+        .get(arch)
+        .and_then(|a| a.host.as_ref())
+        .map(|h| h.rust.clone())
+        .with_context(|| format!("{}: no [{arch}.host] row", arches::FILE))
+}
+
+/// What a deps check found: rows checked, one `name: problem` per unmet row, and the cross-only rows left out.
+#[derive(Default)]
+pub struct Report {
+    pub rows: usize,
+    pub problems: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+impl Report {
+    /// The `deps: ok` line, naming each skipped row so a machine that skips one can see it.
+    pub fn ok_line(&self) -> String {
+        if self.skipped.is_empty() {
+            return format!("ok ({} rows)", self.rows);
+        }
+        format!(
+            "ok ({} rows, {} cross-only skipped: {})",
+            self.rows,
+            self.skipped.len(),
+            self.skipped.join(", ")
+        )
+    }
+}
+
+/// Every deps.toml row against this host, read-only: required rows always, cross-only rows only when `host`
+/// names their arch. `deps --check` and `xtask check`'s deps step both run it.
+pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
+    let arches = arches::load(root)?;
+    let target = match host {
+        Some(arch) => Some((arch, host_rust(&arches, arch)?)),
+        None => None,
+    };
+    check_rows(root, &arches, |_, dep| {
+        !cross_only(dep)
+            || target
+                .as_ref()
+                .is_some_and(|(arch, rust)| is_host_row(dep, arch, rust))
+    })
+}
+
+/// The cross rows of host `arch` unmet on this host. `cross --arch` runs it before cargo, so the fetch or
+/// `rustup target add` command comes first.
+pub fn host_rows_problems(root: &Path, arch: &str) -> Result<Vec<String>> {
+    let arches = arches::load(root)?;
+    let rust = host_rust(&arches, arch)?;
+    Ok(check_rows(root, &arches, |_, dep| is_host_row(dep, arch, &rust))?.problems)
+}
+
+/// The rows `select` picks, checked against this host; every other row is listed as skipped.
+fn check_rows(
+    root: &Path,
+    arches: &arches::Arches,
+    select: impl Fn(&str, &Dep) -> bool,
+) -> Result<Report> {
     let sources = sources::load(root)?;
-    let deps = load(root, &Consumers::new(&workspace::load(root)?, &sources))?;
+    let deps = load(
+        root,
+        &Consumers::new(&workspace::load(root)?, &sources, arches),
+    )?;
     let distro = host_distro()?;
     let cargo_installed = cargo_installed()?;
     let rustup_targets = rustup_targets(root)?;
     let tree = tree::shared_tree(&Layout::of(root)?);
-    let mut problems = Vec::new();
+    let mut report = Report::default();
     for (name, dep) in &deps {
+        if !select(name.as_str(), dep) {
+            report.skipped.push(name.clone());
+            continue;
+        }
+        report.rows += 1;
         let problem = match &dep.sysroot_debs {
             Some(pins) => sysroot_problem(root, name, pins)?,
             None => check_row(dep, distro, &cargo_installed, &rustup_targets, &tree)?,
         };
         if let Some(problem) = problem {
-            problems.push(format!("{name}: {problem}"));
+            report.problems.push(format!("{name}: {problem}"));
         }
     }
-    Ok((deps.len(), problems))
+    Ok(report)
 }
 
 fn check_row(
@@ -839,8 +951,9 @@ mod tests {
         Consumers {
             crates: set(&["xtask"]),
             upstreams: set(&["aosp"]),
-            xtask: set(&["check"]),
+            xtask: set(&["check", "cross"]),
             projects: set(&["prebuilts/jdk/jdk21", "prebuilts/r8"]),
+            hosts: BTreeMap::from([("riscv64".to_owned(), "riscv64-sysroot".to_owned())]),
         }
     }
 
@@ -852,6 +965,47 @@ mod tests {
     }
 
     const USED: &str = "scope = [\"test\"]\nused_by = [\"xtask:check\"]\n";
+
+    #[test]
+    fn host_ref_names_the_sysroot_of_its_arch() {
+        let pins = "sysroot_debs = [\"a=1\"]\nscope = [\"build\"]\n";
+        let ok =
+            format!("[riscv64-sysroot]\n{pins}used_by = [\"xtask:cross\", \"host:riscv64\"]\n");
+        assert!(parse(&ok, &consumers()).is_ok());
+        let other = format!("[other]\n{pins}used_by = [\"host:riscv64\"]\n");
+        assert!(err(&other).contains("does not name this row as its sysroot"));
+        let unknown = format!("[riscv64-sysroot]\n{pins}used_by = [\"host:x86_64\"]\n");
+        assert!(err(&unknown).contains("does not name this row as its sysroot"));
+    }
+
+    #[test]
+    fn cross_only_means_every_consumer_is_a_cross_build() {
+        let row = |used: &str| -> Dep {
+            toml::from_str(&format!("scope = [\"build\"]\nused_by = {used}\n")).unwrap()
+        };
+        assert!(cross_only(&row("[\"xtask:cross\"]")));
+        assert!(cross_only(&row("[\"xtask:cross\", \"host:riscv64\"]")));
+        assert!(!cross_only(&row("[\"xtask:cross\", \"xtask:native\"]")));
+        assert!(!cross_only(&row("[\"xtask:native\"]")));
+    }
+
+    #[test]
+    fn skipped_rows_are_named_in_the_ok_line() {
+        let report = Report {
+            rows: 3,
+            problems: Vec::new(),
+            skipped: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(report.ok_line(), "ok (3 rows, 2 cross-only skipped: a, b)");
+        assert_eq!(
+            Report {
+                rows: 3,
+                ..Report::default()
+            }
+            .ok_line(),
+            "ok (3 rows)"
+        );
+    }
 
     #[test]
     fn distro_and_cargo_rows() {

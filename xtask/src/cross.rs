@@ -75,6 +75,13 @@ fn plan(root: &Path, arch: &str, cargo: &[String]) -> Result<Plan> {
             arches::FILE
         );
     };
+    // the cross rows (sysroot, rust std) first: a missing one names its fetch or `rustup target add` command
+    let problems = deps::host_rows_problems(root, arch)?;
+    ensure!(
+        problems.is_empty(),
+        "cross --arch {arch}: {}",
+        problems.join("; ")
+    );
     let sysroot = deps::sysroot_root(root, sysroot)?;
     let lib = sysroot.join("usr").join(clang).join("lib");
     ensure!(lib.is_dir(), "sysroot has no {}", lib.display());

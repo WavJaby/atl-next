@@ -175,7 +175,7 @@ impl Step {
                     sources.git.len()
                 );
                 let workspace = workspace::load(root)?;
-                let consumers = deps::Consumers::new(&workspace, &sources);
+                let consumers = deps::Consumers::new(&workspace, &sources, &arches);
                 let deps = deps::load(root, &consumers)?;
                 eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
                 let providers = providers::load(
@@ -233,15 +233,16 @@ impl Step {
                 Ok(())
             }
             Step::Deps => {
-                let (rows, problems) = deps::host_problems(root)?;
-                if !problems.is_empty() {
+                let report = deps::host_problems(root, None)?;
+                if !report.problems.is_empty() {
                     bail!(
-                        "{} of {rows} rows not satisfied: {}",
-                        problems.len(),
-                        problems.join("; ")
+                        "{} of {} rows not satisfied: {}",
+                        report.problems.len(),
+                        report.rows,
+                        report.problems.join("; ")
                     );
                 }
-                eprintln!("deps: ok ({rows} rows)");
+                eprintln!("deps: {}", report.ok_line());
                 Ok(())
             }
             Step::Modules => {
