@@ -5,7 +5,7 @@
 //! Per frame, as hwui draws: bind framebuffer 0 and read the binding back (must read 0), invalidate GL_COLOR (an error on an FBO unless the driver maps it), then [`FILLS`] as scissored clears in GL coordinates; swap. [`FRAMES`] frames, so the swap's dequeue-and-rebind is exercised.
 //! The probe sets [`APP_TRANSFORM`] on its window first, as an app's `ANativeWindow_setBuffersTransform` does. Judge: every buffer is queued with exactly that transform, and read through our own mapping as stored it equals the frame's fills top-down: buffer row r = GL row EDGE-1-r. The window starts unconnected: the driver must connect it before the first dequeue (BufferQueue refuses a dequeue with no connected API) and give the connection back after the last queue (format 0, then disconnect, egl_object.cpp's order).
 //! Clear colours are c / 255 (ES 3.2 §2.3.5.2: round(f x 255) gives c back), so the bytes are exact.
-//! Breaks (each must turn the verdict red): `--break flip-y` -- the surface FBO's `GL_MESA_framebuffer_flip_y` undone before drawing (a driver rendering bottom-up); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
+//! Breaks (each must turn the verdict red): `--break flip-y` -- the surface FBO's `GL_MESA_framebuffer_flip_y` undone before drawing (a driver rendering bottom-up; meaningful on the driver's FlipY tier only); `--break fbo0` -- framebuffer entries taken from the host's EGL instead of the driver (FBO 0 unwrapped).
 //! The probe implements `perform` without its variadic tail: the driver passes one integer argument, which on the Linux ABIs of every arches.toml host (SysV x86-64, AAPCS64, RISC-V LP64) travels in the register of the third named integer argument.
 
 #![allow(non_snake_case, reason = "window.h hook and GL entry names")]
@@ -522,12 +522,16 @@ fn run(args: &Args) -> Result<()> {
     // SAFETY: no arguments.
     let egl_fail = |what: &str| anyhow!("{what}: EGL error {:#x}", unsafe { egl_error() });
 
-    // the host's own entry, not wrapped by the driver: the flip-y break undoes the driver's setting on the bound FBO
-    let fb_param = entry!(
-        from_host,
-        c"glFramebufferParameteriMESA",
-        g::glFramebufferParameteriMESA
-    );
+    // the host's own entry, not wrapped by the driver: the flip-y break undoes the driver's setting on the bound FBO; resolved only for it (a host without flip-y has no entry)
+    let fb_param = if args.broken == Some(Break::FlipY) {
+        Some(entry!(
+            from_host,
+            c"glFramebufferParameteriMESA",
+            g::glFramebufferParameteriMESA
+        ))
+    } else {
+        None
+    };
     let win = window(args.alloc.as_deref())?;
     // as an app does before drawing (ANativeWindow_setBuffersTransform -> perform): the driver must queue every buffer with it unchanged
     // SAFETY: our own window and hook; the op takes one int.
@@ -601,7 +605,7 @@ fn run(args: &Args) -> Result<()> {
                 binding == 0 && err == 0,
                 "frame {frame}: framebuffer 0 reads back as {binding}, invalidate(GL_COLOR) GL error {err:#x}"
             );
-            if args.broken == Some(Break::FlipY) {
+            if let Some(fb_param) = fb_param {
                 fb_param(
                     g::GL_FRAMEBUFFER as u32,
                     g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,

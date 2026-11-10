@@ -33,7 +33,29 @@ const BREAKS: &[(&str, &str)] = &[
     ("no_config_filter", "atl_egl_no_config_filter"),
     // the window connect (surface.rs `connect`): no window is connected to EGL, so every dequeue has no connected producer (the Happy Jump failure)
     ("no_window_connect", "atl_egl_no_window_connect"),
+    // the Blit orientation tier's copy (surface.rs `flip_into_buffer`) keeps GL's bottom-up rows: egl-driver's orientation check on that tier
+    ("no_blit_flip", "atl_egl_no_blit_flip"),
 ];
+
+/// `ATL_EGL_TIER=<name>` selects a [`TIERS`] row: the orientation probe (driver.rs `Orientation::probe`) then reads its capability as absent, so a gate runs the baseline tier on a host that has the fast one. Not a break: green either way.
+const TIER_ENV: &str = "ATL_EGL_TIER";
+const TIERS: &[(&str, &str)] = &[("blit", "atl_egl_tier_blit")];
+
+/// The cfg `ATL_EGL_TIER` names, if set; an unknown name fails the build.
+fn selected_tier() -> anyhow::Result<Option<&'static str>> {
+    let Ok(value) = std::env::var(TIER_ENV) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    TIERS
+        .iter()
+        .find(|(n, _)| *n == value)
+        .map(|&(_, cfg)| Some(cfg))
+        .ok_or_else(|| anyhow::anyhow!("{TIER_ENV}={value}: no such tier (known: blit)"))
+}
 
 /// The cfgs `ATL_EGL_BREAK` names; an unknown name fails the build, naming it and the known ones.
 fn selected_breaks() -> anyhow::Result<Vec<&'static str>> {
@@ -68,11 +90,12 @@ fn main() -> anyhow::Result<()> {
     // the driver's own egl* exports bind to themselves: AOSP's libEGL, loaded first, exports the same names, and a preemptible reference (an address the driver hands out, e.g. from eglGetProcAddress) would resolve to the front, which calls back into the driver (`test gl` elf check)
     println!("cargo::rustc-cdylib-link-arg=-Wl,-Bsymbolic");
     // every break's cfg is declared, so an unselected one is no unexpected-cfg warning
-    for &(_, cfg) in BREAKS {
+    for &(_, cfg) in BREAKS.iter().chain(TIERS) {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
     }
     println!("cargo::rerun-if-env-changed={BREAK_ENV}");
-    for cfg in selected_breaks()? {
+    println!("cargo::rerun-if-env-changed={TIER_ENV}");
+    for cfg in selected_breaks()?.into_iter().chain(selected_tier()?) {
         println!("cargo::rustc-cfg={cfg}");
     }
     import_headers(IMPORTS)

@@ -90,13 +90,45 @@ host_table!(
         glScissor,
         glFinish,
         glGetString,
-        glFramebufferParameteriMESA,
+        glBlitFramebuffer,
+        glIsEnabled,
+        glEnable,
+        glDisable,
     }
 );
 
-/// The GL extension window surfaces need: FBOs render top-down, as a window buffer is read (Mesa's own Android platform renders window surfaces flipped the same way), so no buffer transform is set and the app's own passes through.
-/// Without it the driver refuses to load (hosts lacking it: NVIDIA, unsupported until gralloc modifiers land).
+/// The GL extension of the fast orientation tier: surface FBOs render top-down, as a window buffer is read (Mesa's own Android platform renders window surfaces flipped the same way).
 pub const FLIP_Y: &str = "GL_MESA_framebuffer_flip_y";
+
+/// How a window buffer comes to hold the frame top-down, as its consumer reads it; either way no buffer transform is set, the app's own passes through, and the stored rows are the same.
+/// One concept, two capability tiers (chosen by [`Orientation::probe`] on the host's GL extensions, never by vendor): `Blit` is the baseline every host runs, `FlipY` the fast path.
+#[derive(Clone, Copy)]
+pub enum Orientation {
+    /// Fast tier: the buffer's FBO is framebuffer 0 and renders top-down through [`FLIP_Y`]; no per-frame copy.
+    FlipY(g::glFramebufferParameteriMESA),
+    /// Baseline: framebuffer 0 is a per-context back FBO rendering bottom-up as GL does; swap copies it into the buffer with one vertical-flip blit.
+    Blit,
+}
+
+impl Orientation {
+    /// The tier for a host whose GL extension string is `ext`: `FlipY` when it lists [`FLIP_Y`] and its entry resolves, else `Blit`.
+    /// cfg `atl_egl_tier_blit` (build.rs `TIERS`, `ATL_EGL_TIER=blit`) reads the extension as absent, so a gate runs the baseline on a flip-y host through this same probe.
+    fn probe(host: &Host, ext: &str) -> (Self, &'static str) {
+        if cfg!(atl_egl_tier_blit) {
+            return (Self::Blit, "blit (build ATL_EGL_TIER=blit)");
+        }
+        if !ext.split_whitespace().any(|x| x == FLIP_Y) {
+            return (Self::Blit, "blit (host lacks GL_MESA_framebuffer_flip_y)");
+        }
+        let p = host.proc_address(c"glFramebufferParameteriMESA");
+        if p.is_null() {
+            return (Self::Blit, "blit (glFramebufferParameteriMESA unresolved)");
+        }
+        // SAFETY: the host's non-null address for this registry name, whose signature is the AOSP header's (the alias).
+        let f = unsafe { std::mem::transmute::<*const c_void, g::glFramebufferParameteriMESA>(p) };
+        (Self::FlipY(f), "flip_y (GL_MESA_framebuffer_flip_y)")
+    }
+}
 
 /// Host display extensions passed on: what holds unchanged for the driver's own objects too (images, syncs, contexts, surfaceless).
 /// Left out: surface extensions the host implements for its own surfaces only (partial_update, buffer_age, swap_buffers_with_damage, mutable_render_buffer, gl_colorspace).
@@ -134,6 +166,8 @@ pub struct Driver {
     pub gl: HostGl,
     /// The host has EGL_ANDROID_native_fence_sync: swap hands the consumer a sync_file instead of finishing on the CPU.
     pub native_fence: bool,
+    /// The orientation tier window surfaces run, probed once at load.
+    pub orientation: Orientation,
     extensions: CString,
     /// Window surfaces by handle (the boxed surface's address).
     pub surfaces: Mutex<HashMap<usize, Arc<Mutex<WindowSurface>>>>,
@@ -172,15 +206,15 @@ impl Driver {
     fn load() -> Result<Self> {
         let host = Host::load()?;
         let (display, device) = choose_display(&host)?;
-        {
+        let (orientation, tier) = {
             // GL extensions need a current context: a throwaway one, released before any app context exists (the driver loads on the first eglGetDisplay)
             let ctx = display.create_context()?;
             let gl = ctx.make_current()?;
-            let ext = gl.string(atl_egl_host::ffi::GL_EXTENSIONS);
-            anyhow::ensure!(
-                ext.split_whitespace().any(|x| x == FLIP_Y),
-                "host GL on {device} lacks {FLIP_Y} (window surfaces render top-down through it)"
-            );
+            Orientation::probe(&host, &gl.string(atl_egl_host::ffi::GL_EXTENSIONS))
+        };
+        #[allow(clippy::print_stderr, reason = "one line, once per process: which tier ran")]
+        {
+            eprintln!("libGLES_atl: window tier {tier}");
         }
         let egl = HostEgl::resolve(&host)?;
         let gl = HostGl::resolve(&host)?;
@@ -197,6 +231,7 @@ impl Driver {
             egl,
             gl,
             native_fence,
+            orientation,
             extensions: CString::new(ext.join(" "))?,
             surfaces: Mutex::new(HashMap::new()),
             seen_contexts: Mutex::new(HashSet::new()),

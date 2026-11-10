@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test egl-driver`: the GLES driver over the host's system EGL (crate atl-egl-driver, `libGLES_atl.so`) rendering into an ANativeWindow, every pixel checked, orientation included (atl-egl-driver-probe's module doc has the scenario and the judge).
 //! Runs on this host's own EGL: llvmpipe on WSL, the GPU of gralloc's node on a desktop. No native build and no slot: the driver and the probe are plain cargo outputs (in --out).
-//! Breaks, every run, each must fail: `flip-y` (the surface FBO's flip-y undone: a driver rendering bottom-up stores the frame upside down) and `fbo0` (framebuffer entries from the host, not the driver: framebuffer 0 is not the window).
-//! On another host: copy `<out>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
+//! Two runs, one per orientation tier (driver.rs `Orientation`): the driver as built for this host (its probe picks the tier, logged), then built with `ATL_EGL_TIER=blit` (the baseline, forced through the probe's input). Both must pass.
+//! Breaks, each must fail: `fbo0` on both (framebuffer entries from the host, not the driver: framebuffer 0 is not the window); on a FlipY run `flip-y` (the surface FBO's flip-y undone: the frame stored upside down); on a Blit run the driver break `no_blit_flip` (the swap's copy not inverted).
+//! On another host: copy `<out>/<host|blit>/egl/libGLES_atl.so` and the probe (`<out>/cargo/release/atl-egl-driver-probe`) and run `atl-egl-driver-probe --driver libGLES_atl.so [--break flip-y|fbo0]`; the probe links no workspace library dynamically.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -34,12 +35,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 .join(checkout)
         }
     };
-    let dir = crate::cdylib::stage(root, &out, DRIVER_PACKAGE, "egl", atl_egl_driver_name())?;
-    let driver = dir.join(atl_egl_driver_name());
     let probe = build_probe(root, &out.join("cargo"))?;
-    let go = |brk: Option<&str>| -> Result<(bool, String)> {
+    let stage = |sub: &str, tier: Option<&str>, brk: Option<&str>| -> Result<PathBuf> {
+        let env = [(TIER_ENV, tier), (BREAK_ENV, brk)];
+        let dir = crate::cdylib::stage_with(
+            root,
+            &out.join(sub),
+            DRIVER_PACKAGE,
+            "egl",
+            atl_egl_driver_name(),
+            &env,
+        )?;
+        Ok(dir.join(atl_egl_driver_name()))
+    };
+    // (passed, the probe's stdout, the tier the driver logged)
+    let go = |driver: &Path, brk: Option<&str>| -> Result<(bool, String, String)> {
         let mut cmd = Command::new(&probe);
-        cmd.arg("--driver").arg(&driver);
+        cmd.arg("--driver").arg(driver);
         if let Some(a) = &args.alloc {
             cmd.arg("--alloc").arg(a);
         }
@@ -47,22 +59,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             cmd.args(["--break", b]);
         }
         let o = cmd.output().context("running the probe")?;
-        // the host EGL's own warnings go to stderr; the probe's lines are on stdout
+        // the host EGL's own warnings and the driver's lines go to stderr; the probe's lines are on stdout
+        let tier = String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .find_map(|l| l.strip_prefix(TIER_LINE).map(str::to_owned))
+            .unwrap_or_else(|| "none logged".to_owned());
         Ok((
             o.status.success(),
             String::from_utf8_lossy(&o.stdout).into_owned(),
+            tier,
         ))
     };
-    let (ok, text) = go(None)?;
-    print!("{text}");
-    if !ok || !text.contains("egl-driver: PASS") {
-        bail!("egl-driver: FAILED");
-    }
-    for (brk, mark) in [("flip-y", "orientation red"), ("fbo0", "FAIL")] {
-        let (passed, text) = go(Some(brk))?;
+    let control = |name: &str, (passed, text, _): (bool, String, String), mark: &str| {
         let caught = !passed && text.contains(mark);
         println!(
-            "egl-driver: break {brk}: {}",
+            "egl-driver: break {name}: {}",
             if caught {
                 "red (expected)"
             } else {
@@ -71,12 +82,39 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         if !caught {
             print!("{text}");
-            bail!("egl-driver: FAILED control: break {brk} passed");
+            bail!("egl-driver: FAILED control: break {name} passed");
         }
+        Ok(())
+    };
+    // the host's own tier, then the baseline forced through the probe's input (build.rs `TIERS`): every host runs the baseline
+    for (sub, forced) in [("host", None), ("blit", Some("blit"))] {
+        let driver = stage(sub, forced, None)?;
+        let (ok, text, tier) = go(&driver, None)?;
+        print!("{text}");
+        println!("egl-driver: [{sub}] tier {tier}");
+        if !ok || !text.contains("egl-driver: PASS") {
+            bail!("egl-driver: FAILED ({sub} build, tier {tier})");
+        }
+        if tier.starts_with("flip_y") {
+            control("flip-y", go(&driver, Some("flip-y"))?, ORIENTATION_RED)?;
+        } else if tier.starts_with("blit") {
+            let broken = stage(&format!("{sub}-no-blit-flip"), forced, Some("no_blit_flip"))?;
+            control("no_blit_flip", go(&broken, None)?, ORIENTATION_RED)?;
+        } else {
+            bail!("egl-driver: FAILED ({sub} build): tier {tier}");
+        }
+        control("fbo0", go(&driver, Some("fbo0"))?, "FAIL")?;
     }
-    println!("egl-driver: ok (controls: flip-y, fbo0 red)");
+    println!("egl-driver: ok (both tiers; controls: flip-y or no_blit_flip, fbo0 red)");
     Ok(ExitCode::SUCCESS)
 }
+
+/// atl-egl-driver build.rs selectors, set explicitly per stage so the caller's environment never picks the tier or a break.
+const TIER_ENV: &str = "ATL_EGL_TIER";
+const BREAK_ENV: &str = "ATL_EGL_BREAK";
+/// The driver's one stderr line naming the tier that ran (driver.rs `Driver::load`).
+const TIER_LINE: &str = "libGLES_atl: window tier ";
+const ORIENTATION_RED: &str = "orientation red";
 
 /// The value of `ro.hardware.egl` that selects the driver: Loader.cpp opens `libGLES_<value>.so` in the driver dir.
 const HARDWARE: &str = "atl";

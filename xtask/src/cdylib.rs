@@ -7,12 +7,29 @@ use anyhow::{Context, Result, ensure};
 
 /// Builds cdylib `package` (release, into `<out>/cargo`) and installs it as `<out>/<dir>/<name>`; returns `<out>/<dir>`, for LD_LIBRARY_PATH.
 pub fn stage(root: &Path, out: &Path, package: &str, dir: &str, name: &str) -> Result<PathBuf> {
-    let status = crate::unit_use::status(
-        crate::cargo_command()
-            .args(["build", "--release", "-p", package, "--target-dir"])
-            .arg(out.join("cargo"))
-            .current_dir(root),
-    )?;
+    stage_with(root, out, package, dir, name, &[])
+}
+
+/// [`stage`] with each `env` name's inherited value replaced (`None` removes it): a build script's selector (e.g. atl-egl-driver's `ATL_EGL_TIER`).
+pub fn stage_with(
+    root: &Path,
+    out: &Path,
+    package: &str,
+    dir: &str,
+    name: &str,
+    env: &[(&str, Option<&str>)],
+) -> Result<PathBuf> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["build", "--release", "-p", package, "--target-dir"])
+        .arg(out.join("cargo"))
+        .current_dir(root);
+    for &(k, v) in env {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+    let status = crate::unit_use::status(&mut cmd)?;
     ensure!(status.success(), "building {package} failed");
     let dir = out.join(dir);
     std::fs::create_dir_all(&dir)?;

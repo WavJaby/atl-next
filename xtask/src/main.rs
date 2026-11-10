@@ -252,7 +252,7 @@ enum Test {
     ///
     /// Failure prints the app log's last lines; the services' unimplemented-call counters are printed either way.
     /// NativeBridge breaks: `ATL_NB_BREAK=<name>[,<name>]` in this run's environment; the run stages the core with it (names: atl-native-bridge build.rs `BREAKS`).
-    /// GL driver breaks: `ATL_EGL_BREAK=<name>[,<name>]` in this run's environment; the run stages libGLES_atl.so with it (names: atl-egl-driver build.rs `BREAKS`).
+    /// GL driver breaks: `ATL_EGL_BREAK=<name>[,<name>]` in this run's environment; the run stages libGLES_atl.so with it (names: atl-egl-driver build.rs `BREAKS`). `ATL_EGL_TIER=blit` the same way stages the baseline orientation tier (build.rs `TIERS`).
     App(app::Args),
     /// The A1a audio gate (xtask/testdata/audio): AudioSystem's session ids, AudioTrack's minimum buffer and a track's player id, served by atl-audioflinger in the app process (audio_app.rs).
     AudioApp(audio_app::Args),

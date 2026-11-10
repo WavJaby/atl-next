@@ -2,7 +2,9 @@
 //! A window surface: the behaviour of Mesa's platform_android (dequeue on first use, render, queue on swap), over host EGL 1.5 + `EGL_EXT_image_dma_buf_import` + `GL_OES_EGL_image` instead of Mesa's internal `__DRIimage`.
 //! Each dequeued buffer is imported once (cached by its gralloc id, unique among live buffers) and drawn through an FBO per context (FBOs are not shared between contexts), with one depth/stencil renderbuffer per context when the config asks for one.
 //! Swap: native fence (or glFinish where the host has none) -> queueBuffer, then the next buffer is dequeued and bound at once, so framebuffer 0 stays drawable after the swap as EGL requires.
-//! Orientation: each FBO renders top-down (`GL_MESA_framebuffer_flip_y`, as Mesa's platform_android does for its window surfaces), so the buffer is stored as its consumer reads it; the driver sets no buffer transform and the app's own (`ANativeWindow_setBuffersTransform`) passes through.
+//! Orientation (driver.rs `Orientation`): the buffer is stored top-down, as its consumer reads it; the driver sets no buffer transform and the app's own (`ANativeWindow_setBuffersTransform`) passes through.
+//! - `FlipY` tier: framebuffer 0 is the buffer's FBO, rendering top-down (`GL_MESA_framebuffer_flip_y`, as Mesa's platform_android does for its window surfaces).
+//! - `Blit` tier: framebuffer 0 is a per-context back FBO (colour + depth/stencil, rendering bottom-up as GL does); swap blits it into the buffer's colour-only FBO with y inverted. Cost: one full-surface copy per frame + one colour renderbuffer per context.
 //! Damage rects the fronts convert assuming top-down buffers are then right as they are.
 
 use std::collections::HashMap;
@@ -16,7 +18,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use crate::abi::egl as e;
 use crate::abi::gles as g;
 use crate::abi::window as w;
-use crate::driver::Driver;
+use crate::driver::{Driver, Orientation};
 use crate::window::{Buffer, Window};
 
 /// A host image the surface owns.
@@ -31,6 +33,14 @@ struct Target {
     texture: u32,
 }
 
+/// `Blit` tier: a context's framebuffer 0 at one size.
+struct Back {
+    fbo: u32,
+    color: u32,
+    width: i32,
+    height: i32,
+}
+
 pub struct WindowSurface {
     window: Window,
     /// This surface connected the window to EGL, so its teardown is ours (Drop); false when a front connected it first.
@@ -42,6 +52,7 @@ pub struct WindowSurface {
     images: HashMap<u64, OwnedImage>,
     targets: HashMap<(usize, u64), Target>,
     depth: HashMap<usize, (u32, i32, i32)>,
+    backs: HashMap<usize, Back>,
     current: Option<(Buffer, u64)>,
 }
 
@@ -67,6 +78,7 @@ impl WindowSurface {
             images: HashMap::new(),
             targets: HashMap::new(),
             depth: HashMap::new(),
+            backs: HashMap::new(),
             current: None,
         };
         if connected_here {
@@ -122,20 +134,116 @@ impl WindowSurface {
     /// Makes the held buffer (dequeued now if needed) the draw target of the current context `ctx`; returns the FBO now standing for framebuffer 0.
     pub fn bind(&mut self, d: &'static Driver, ctx: usize) -> Result<u32, EglError> {
         let id = self.ensure_buffer(d)?;
-        let fbo = match self.targets.get(&(ctx, id)) {
-            Some(t) => t.fbo,
-            None => {
-                let depth = self.depth_rb(d, ctx);
-                let image = self.images[&id].0.raw();
-                let t = target(d, image, depth)?;
-                let fbo = t.fbo;
-                self.targets.insert((ctx, id), t);
-                fbo
-            }
+        let fbo = match d.orientation {
+            Orientation::FlipY(_) => self.buffer_fbo(d, ctx, id)?,
+            Orientation::Blit => self.back(d, ctx)?,
         };
         // SAFETY: `fbo` is a framebuffer of the context current on this thread.
         unsafe { (d.gl.glBindFramebuffer)(g::GL_FRAMEBUFFER as u32, fbo) };
         Ok(fbo)
+    }
+
+    /// The FBO on buffer `id` in `ctx`, made once: in the `FlipY` tier framebuffer 0 itself (flip-y + depth/stencil), in `Blit` the copy's colour-only destination.
+    fn buffer_fbo(&mut self, d: &'static Driver, ctx: usize, id: u64) -> Result<u32, EglError> {
+        if let Some(t) = self.targets.get(&(ctx, id)) {
+            return Ok(t.fbo);
+        }
+        let flip = match d.orientation {
+            Orientation::FlipY(f) => Some(f),
+            Orientation::Blit => None,
+        };
+        let depth = if flip.is_some() {
+            self.depth_rb(d, ctx)
+        } else {
+            0
+        };
+        let image = self.images[&id].0.raw();
+        let t = target(d, image, depth, flip)?;
+        let fbo = t.fbo;
+        self.targets.insert((ctx, id), t);
+        Ok(fbo)
+    }
+
+    /// `Blit` tier: the context's back FBO at the current size (remade on a resize), with the depth/stencil renderbuffer when the config has one.
+    fn back(&mut self, d: &'static Driver, ctx: usize) -> Result<u32, EglError> {
+        let (w, h) = (self.width, self.height);
+        if let Some(b) = self.backs.get(&ctx) {
+            if (b.width, b.height) == (w, h) {
+                return Ok(b.fbo);
+            }
+            let b = self.backs.remove(&ctx).expect("present");
+            delete_back(d, &b);
+        }
+        let depth = self.depth_rb(d, ctx);
+        let gl = &d.gl;
+        let (mut fbo, mut color, mut prev) = (0, 0, 0);
+        // SAFETY: the current context; name slots; the renderbuffer binding restored (the app's state), the FBO left bound (the caller binds next).
+        let status = unsafe {
+            (gl.glGetIntegerv)(g::GL_RENDERBUFFER_BINDING as u32, &mut prev);
+            (gl.glGenRenderbuffers)(1, &mut color);
+            (gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, color);
+            // both window formats (RGBA_8888, RGBX_8888) are 8-bit normalized: a blit between them converts nothing but the ignored X byte
+            (gl.glRenderbufferStorage)(g::GL_RENDERBUFFER as u32, g::GL_RGBA8 as u32, w, h);
+            (gl.glBindRenderbuffer)(g::GL_RENDERBUFFER as u32, prev as u32);
+            (gl.glGenFramebuffers)(1, &mut fbo);
+            (gl.glBindFramebuffer)(g::GL_FRAMEBUFFER as u32, fbo);
+            (gl.glFramebufferRenderbuffer)(
+                g::GL_FRAMEBUFFER as u32,
+                g::GL_COLOR_ATTACHMENT0 as u32,
+                g::GL_RENDERBUFFER as u32,
+                color,
+            );
+            attach_depth(d, depth);
+            (gl.glCheckFramebufferStatus)(g::GL_FRAMEBUFFER as u32)
+        };
+        let b = Back {
+            fbo,
+            color,
+            width: w,
+            height: h,
+        };
+        if status != g::GL_FRAMEBUFFER_COMPLETE as u32 {
+            delete_back(d, &b);
+            return Err(e::EGL_BAD_ALLOC);
+        }
+        self.backs.insert(ctx, b);
+        Ok(fbo)
+    }
+
+    /// `Blit` tier, at swap: the back FBO into the held buffer, y inverted, so the buffer's row 0 is GL's top row. Leaves both framebuffer bindings to the caller's rebind.
+    fn flip_into_buffer(&mut self, d: &'static Driver, ctx: usize) -> Result<(), EglError> {
+        let id = self.ensure_buffer(d)?;
+        let src = self.back(d, ctx)?;
+        let dst = self.buffer_fbo(d, ctx, id)?;
+        let (w, h) = (self.width, self.height);
+        // the `no_blit_flip` break (build.rs `BREAKS`): the copy keeps GL's bottom-up rows
+        let (y0, y1) = if cfg!(atl_egl_no_blit_flip) { (0, h) } else { (h, 0) };
+        let gl = &d.gl;
+        // SAFETY: the current context; both FBOs are its own and complete; the app's scissor test (the one fragment state a blit obeys) is restored.
+        unsafe {
+            let scissor = (gl.glIsEnabled)(g::GL_SCISSOR_TEST as u32) != 0;
+            if scissor {
+                (gl.glDisable)(g::GL_SCISSOR_TEST as u32);
+            }
+            (gl.glBindFramebuffer)(g::GL_READ_FRAMEBUFFER as u32, src);
+            (gl.glBindFramebuffer)(g::GL_DRAW_FRAMEBUFFER as u32, dst);
+            (gl.glBlitFramebuffer)(
+                0,
+                0,
+                w,
+                h,
+                0,
+                y0,
+                w,
+                y1,
+                g::GL_COLOR_BUFFER_BIT as u32,
+                g::GL_NEAREST as u32,
+            );
+            if scissor {
+                (gl.glEnable)(g::GL_SCISSOR_TEST as u32);
+            }
+        }
+        Ok(())
     }
 
     /// The context's depth/stencil renderbuffer at the current size; 0 when the config has neither.
@@ -187,6 +295,9 @@ impl WindowSurface {
             // a swap with nothing drawn still presents a buffer (EGL: contents undefined)
             self.ensure_buffer(d)?;
         }
+        if let Orientation::Blit = d.orientation {
+            self.flip_into_buffer(d, ctx)?;
+        }
         let fence = if d.native_fence {
             Some(d.display.export_fence().map_err(|_| e::EGL_BAD_ALLOC)?)
         } else {
@@ -211,6 +322,9 @@ impl WindowSurface {
                 if c == ctx {
                     delete_target(d, &t);
                 }
+            }
+            if let Some(b) = self.backs.remove(&ctx) {
+                delete_back(d, &b);
             }
             if let Some((rb, _, _)) = self.depth.remove(&ctx) {
                 // SAFETY: a name of the current context.
@@ -294,8 +408,32 @@ pub fn import(d: &'static Driver, p: &Params, fd: i32) -> Result<Image<'static>,
         .map_err(|_| e::EGL_BAD_ALLOC)
 }
 
-/// A texture on `image` and an FBO with it as colour (plus `depth` as depth and stencil when non-zero), in the current context; the app's texture binding is restored.
-fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Target, EglError> {
+/// `depth` as depth and stencil of the bound FBO, when non-zero.
+/// SAFETY: a context is current with the FBO bound; `depth` is 0 or its renderbuffer.
+unsafe fn attach_depth(d: &'static Driver, depth: u32) {
+    if depth == 0 {
+        return;
+    }
+    for att in [g::GL_DEPTH_ATTACHMENT, g::GL_STENCIL_ATTACHMENT] {
+        // SAFETY: the caller's.
+        unsafe {
+            (d.gl.glFramebufferRenderbuffer)(
+                g::GL_FRAMEBUFFER as u32,
+                att as u32,
+                g::GL_RENDERBUFFER as u32,
+                depth,
+            );
+        }
+    }
+}
+
+/// A texture on `image` and an FBO with it as colour (plus `depth` as depth and stencil when non-zero, top-down through `flip` when given), in the current context; the app's texture binding is restored.
+fn target(
+    d: &'static Driver,
+    image: e::EGLImageKHR,
+    depth: u32,
+    flip: Option<g::glFramebufferParameteriMESA>,
+) -> Result<Target, EglError> {
     let gl = &d.gl;
     let (mut texture, mut fbo, mut prev_tex) = (0, 0, 0);
     // SAFETY: the current context; name slots; the image is live (the surface owns it); bindings restored except the FBO, which the caller binds next.
@@ -324,22 +462,15 @@ fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Targe
             texture,
             0,
         );
-        // top-down rendering (driver.rs FLIP_Y, checked at load): row 0 of the buffer is the window's top row
-        (gl.glFramebufferParameteriMESA)(
-            g::GL_FRAMEBUFFER as u32,
-            g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,
-            1,
-        );
-        if depth != 0 {
-            for att in [g::GL_DEPTH_ATTACHMENT, g::GL_STENCIL_ATTACHMENT] {
-                (gl.glFramebufferRenderbuffer)(
-                    g::GL_FRAMEBUFFER as u32,
-                    att as u32,
-                    g::GL_RENDERBUFFER as u32,
-                    depth,
-                );
-            }
+        if let Some(set) = flip {
+            // FlipY tier: row 0 of the buffer is the window's top row
+            set(
+                g::GL_FRAMEBUFFER as u32,
+                g::GL_FRAMEBUFFER_FLIP_Y_MESA as u32,
+                1,
+            );
         }
+        attach_depth(d, depth);
         (gl.glCheckFramebufferStatus)(g::GL_FRAMEBUFFER as u32)
     };
     let t = Target { fbo, texture };
@@ -348,6 +479,14 @@ fn target(d: &'static Driver, image: e::EGLImageKHR, depth: u32) -> Result<Targe
         return Err(e::EGL_BAD_ALLOC);
     }
     Ok(t)
+}
+
+fn delete_back(d: &'static Driver, b: &Back) {
+    // SAFETY: names of the current context, deleted once.
+    unsafe {
+        (d.gl.glDeleteFramebuffers)(1, &b.fbo);
+        (d.gl.glDeleteRenderbuffers)(1, &b.color);
+    }
 }
 
 fn delete_target(d: &'static Driver, t: &Target) {

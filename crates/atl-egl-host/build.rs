@@ -79,6 +79,8 @@ const GL_FUNCTIONS: &[&str] = &[
     "glFlush",
     "glFinish",
     "glFramebufferParameteriMESA",
+    "glBlitFramebuffer",
+    "glIsEnabled",
 ];
 
 const IMPORTS: &[HeaderImport] = &[
@@ -159,7 +161,7 @@ const IMPORTS: &[HeaderImport] = &[
             "EGL_SYNC_FLUSH_COMMANDS_BIT",
         ],
     },
-    // the Khronos registry's GLES headers as AOSP's external/angle/include carries them: frameworks/native's gl2ext.h predates GL_MESA_framebuffer_flip_y, which window surfaces need
+    // the Khronos registry's GLES headers as AOSP's external/angle/include carries them: frameworks/native's gl2ext.h predates GL_MESA_framebuffer_flip_y, the window surfaces' fast orientation tier
     HeaderImport {
         name: "gles",
         source: "external/angle/include/GLES2/gl2ext.h",
@@ -202,6 +204,7 @@ const IMPORTS: &[HeaderImport] = &[
             "GL_STENCIL_INDEX8",
             "GL_FRAMEBUFFER_COMPLETE",
             "GL_RGBA",
+            "GL_RGBA8",
             "GL_UNSIGNED_BYTE",
             "GL_SCISSOR_TEST",
             "GL_COLOR_BUFFER_BIT",
