@@ -108,10 +108,10 @@ impl Active {
     }
 
     /// Gives the calling thread its guest CPU ([`Engine::attach`]).
-    fn attach(self) -> Result<(), String> {
+    fn attach(self, req: StackReq) -> Result<Stack, String> {
         match self {
-            Active::Identity => identity::CROSSING.attach(),
-            Active::Qemu => qemu::CROSSING.attach(),
+            Active::Identity => identity::CROSSING.attach(req),
+            Active::Qemu => qemu::CROSSING.attach(req),
         }
     }
 
@@ -319,6 +319,22 @@ pub enum Tp {
     Guest(usize),
 }
 
+/// The guest stack a thread asks for at attach (a guest `pthread_create` attr's stack and guard size); 0 = the engine's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StackReq {
+    pub size: usize,
+    pub guard: usize,
+}
+
+/// The stack a thread's guest code runs on, as bionic's `pthread_getattr_np` reports one: usable `[base, base + len)`, sp starts at the top, `guard` bytes of guard right below `base`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stack {
+    pub base: usize,
+    pub len: usize,
+    pub guard: usize,
+}
+
 /// Runs guest code on a host thread's CPU and registers guest memory. Two implementations: `identity::Identity` (the host's FS switch) and `qemu::Qemu` (QEMU's crossing); [`Active`] dispatches to the process's one.
 pub trait Engine {
     /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`qemu::attach_current`).
@@ -327,8 +343,8 @@ pub trait Engine {
     fn start(&self) -> Result<(), String>;
     /// Registers guest memory `[start, start + len)` with `prot` (`PROT_*`). Identity: nothing to register, host memory is guest memory. QEMU: page flags.
     fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String>;
-    /// Gives the calling thread its guest CPU before its first guest call (thread.rs `attach_current`: a guest `pthread_create` thread, or any host thread that runs guest code). Once per thread; a second call is a no-op. Identity: nothing, the thread's `HostThread` record is its CPU. QEMU: an engine CPU (`atl_engine.attach`).
-    fn attach(&self) -> Result<(), String>;
+    /// Gives the calling thread its guest CPU before its first guest call (thread.rs `attach_current`: a guest `pthread_create` thread, or any host thread that runs guest code). Once per thread; a second call keeps the first CPU and answers its stack (`req` unused). Returns the stack guest code on this thread runs on. Identity: no CPU to make, the thread's `HostThread` record is its CPU, and guest code runs on the host thread's own stack (glibc `pthread_getattr_np`; `req` sized it already, as the host thread's attr). QEMU: an engine CPU on a guest stack sized by `req` (`atl_engine.attach_ex`).
+    fn attach(&self, req: StackReq) -> Result<Stack, String>;
     /// Takes the calling thread's guest CPU back at thread exit, after its guest destructors ran (thread.rs `detach`). Identity: nothing. QEMU: `atl_engine.detach`.
     fn detach(&self);
     /// Runs guest `f(args)` on `cpu` with thread pointer `tp`; returns x0. Nests: may run from inside a host function the guest called.

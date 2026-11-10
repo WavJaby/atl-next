@@ -167,6 +167,8 @@ const SHIMS: &[&str] = &[
     "pthread_create",
     "pthread_key_create",
     "pthread_key_delete",
+    // intercepts.rs: reports the guest stack of the thread, not glibc's view of a bionic record
+    "pthread_getattr_np",
     // provider.rs: the provider calls a host trampoline that crosses to the guest callback
     "__system_property_foreach",
     "__system_property_read_callback",
@@ -226,7 +228,6 @@ const GLIBC: &[(&str, &str)] = &[
     ("pthread_attr_setstack", "pthread_attr_setstack"),
     ("pthread_attr_setstacksize", "pthread_attr_setstacksize"),
     ("pthread_detach", "pthread_detach"),
-    ("pthread_getattr_np", "pthread_getattr_np"),
     ("pthread_getcpuclockid", "pthread_getcpuclockid"),
     ("pthread_getname_np", "pthread_getname_np"),
     ("pthread_getschedparam", "pthread_getschedparam"),
@@ -467,10 +468,13 @@ fn libc_entries(
             "libc.so: {n} is in a binding list but not an NBS libc stub"
         );
     }
+    let getattr_glibc = selected_breaks()?.contains(&"atl_nb_qt_getattr_glibc");
     Ok(names
         .iter()
         .map(|name| {
-            if shims.contains(&name.as_str()) {
+            if getattr_glibc && name == "pthread_getattr_np" {
+                format!("Entry::Generic(Host::Glibc, {name:?}, Class::Int)")
+            } else if shims.contains(&name.as_str()) {
                 "Entry::Shim".to_owned()
             } else if let Some((_, sym)) = GLIBC.iter().find(|(n, _)| n == name) {
                 format!("Entry::Generic(Host::Glibc, {sym:?}, Class::Int)")
@@ -745,6 +749,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qt_skip_dtor", "atl_nb_qt_skip_dtor"),
     // Q5-6 (engine/intercepts.rs `run`): a guest thread's routine gets the wrong argument (qemu-thread gate, `qt_join`)
     ("qt_routine_arg", "atl_nb_qt_routine_arg"),
+    // R10 S3 (engine/intercepts.rs `pthread_create`): the guest attr's stack size is not passed to attach, every guest stack is the default (qemu-thread gate, `g`)
+    ("qt_attr_size", "atl_nb_qt_attr_size"),
+    // R10 S3 (build.rs `libc_entries`): pthread_getattr_np bound to glibc again, which reads the bionic record as a glibc thread (qemu-thread gate, `g`)
+    ("qt_getattr_glibc", "atl_nb_qt_getattr_glibc"),
     // Q6-2 (engine/dispatch.rs `call_jni`): the host JNI function gets the guest's env instead of the host object (qemu-jni gate, `e`)
     ("jni_guest_env", "atl_nb_jni_guest_env"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)

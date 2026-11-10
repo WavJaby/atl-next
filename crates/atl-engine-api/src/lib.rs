@@ -53,13 +53,13 @@ pub struct AtlLanes {
     pub stack: [u64; 8],
 }
 
-/// `atl_stack`: the guest stack of an attach ([`AtlEngine::attach_ex`]). `size` and `guard` in (rounded up to pages; 0 = default: 1 MiB, one page); `base` and `len` out, the usable stack (sp starts at `base + len`; the guard lies right below `base`).
+/// `atl_stack`: the guest stack of an attach ([`AtlEngine::attach_ex`]). `size` and `guard` in (rounded up to pages; 0 = default: 1 MiB, one page); `base` and `len` out, the usable stack (sp starts at `base + len`; the guard lies right below `base`); `guard` out too, the guard actually made.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AtlStack {
     /// Requested stack bytes; 0 = default.
     pub size: u64,
-    /// Requested guard bytes below the stack; 0 = default.
+    /// Requested guard bytes below the stack, 0 = default; out: the guard made.
     pub guard: u64,
     /// Lowest usable byte.
     pub base: u64,

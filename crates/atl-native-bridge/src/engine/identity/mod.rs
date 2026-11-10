@@ -37,6 +37,8 @@ pub struct HostThread {
     guest_fs: usize,
     shadow_end: *mut usize,
     shadow: [usize; SHADOW_FRAMES * FRAME_WORDS],
+    /// The stack this thread's guest code runs on (`Engine::attach`'s answer); the guest's `pthread_getattr_np` reports it.
+    stack: super::Stack,
 }
 
 const _: () = {
@@ -64,6 +66,7 @@ impl HostThread {
             guest_fs: 0,
             shadow_end: std::ptr::null_mut(),
             shadow: [0; SHADOW_FRAMES * FRAME_WORDS],
+            stack: super::Stack::default(),
         }));
         let range = t.shadow.as_mut_ptr_range();
         t.shadow_sp = range.start;
@@ -81,6 +84,15 @@ impl HostThread {
         self.guest_fs = v;
     }
 
+    /// The stack this thread's guest code runs on.
+    pub fn stack(&self) -> super::Stack {
+        self.stack
+    }
+
+    pub fn set_stack(&mut self, s: super::Stack) {
+        self.stack = s;
+    }
+
     /// The host thread pointer the last crossing into the guest saved.
     pub fn host_fs(&self) -> usize {
         self.host_fs
@@ -96,6 +108,30 @@ pub unsafe fn init_tcb(tp: usize, ht: *mut HostThread) {
     unsafe {
         (tp as *mut usize).write(tp);
         ((tp + SLOT_OFFSET) as *mut usize).write(ht as usize);
+    }
+}
+
+/// The calling host thread's stack, as glibc's `pthread_getattr_np` reports it: `[addr, addr + size)` usable, `guardsize` below. The main thread reports guard 0 (glibc: its stack grows, no guard of its own).
+pub fn host_stack() -> Result<super::Stack, String> {
+    // SAFETY: an attr glibc initialises (getattr_np) before any read and destroys after; the out parameters are locals.
+    unsafe {
+        let mut attr = std::mem::zeroed::<libc::pthread_attr_t>();
+        let rc = libc::pthread_getattr_np(libc::pthread_self(), &mut attr);
+        if rc != 0 {
+            return Err(format!("pthread_getattr_np: error {rc}"));
+        }
+        let (mut addr, mut size, mut guard) = (std::ptr::null_mut(), 0usize, 0usize);
+        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size)
+            | libc::pthread_attr_getguardsize(&attr, &mut guard);
+        libc::pthread_attr_destroy(&mut attr);
+        if rc != 0 {
+            return Err(format!("pthread_attr_getstack/guardsize: error {rc}"));
+        }
+        Ok(super::Stack {
+            base: addr as usize,
+            len: size,
+            guard,
+        })
     }
 }
 
@@ -718,9 +754,9 @@ impl super::Engine for Identity {
         Ok(())
     }
 
-    /// Nothing per thread: the thread's `HostThread` record (thread.rs) is its guest CPU.
-    fn attach(&self) -> Result<(), String> {
-        Ok(())
+    /// No CPU to make: the thread's `HostThread` record (thread.rs) is its guest CPU. Guest code runs on the host thread's own stack, so that is the answer (glibc `pthread_getattr_np`; a guest `pthread_create` thread's attr sized it).
+    fn attach(&self, _req: super::StackReq) -> Result<super::Stack, String> {
+        host_stack()
     }
 
     fn detach(&self) {}

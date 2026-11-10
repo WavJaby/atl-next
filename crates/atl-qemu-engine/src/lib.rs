@@ -283,6 +283,7 @@ mod capi {
             Ok(cpu) => {
                 stack.base = cpu.stack_base() as u64;
                 stack.len = (cpu.stack_top() - cpu.stack_base()) as u64;
+                stack.guard = cpu.stack_guard() as u64;
                 // SAFETY: out is non-null (checked); detach frees this box, on the attaching thread.
                 unsafe { *out = Box::into_raw(Box::new(cpu)).cast() };
                 0

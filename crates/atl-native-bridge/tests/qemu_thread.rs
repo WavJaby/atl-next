@@ -3,8 +3,12 @@
 //! The guest's threads are glibc threads (the stub libc's `pthread_create` is the host shim). Each attaches its own engine CPU on its first guest call, runs its routine, and at exit runs its guest key destructor through a crossing on that thread.
 //! Env (xtask qemu_thread.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_THREADEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
 //! Expected values come from the property store and the fixture's C source, never from the engine: xtask seeds `atl.qt.p.<i>` and `atl.qt.expect` into the area (ATL_PROP_AREA), and the provider's foreach must count exactly `atl.qt.expect` of them; qt_join(x) = x + 1000 (fixture.c `QT_JOIN_OFFSET`); the destructor stores the value its thread's key held at exit.
-//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value.
+//! Checks: (s) started, (p) foreach counts the seeded properties, (j) pthread_create's routine got its argument and its result reached pthread_join, (d) the key destructor ran at thread exit with the thread's value, (g) a guest thread's `pthread_getattr_np(pthread_self())` contains its sp and reports the size its attr asked for (fixture.c `QT_SMALL_STACK`), or 1 MiB without an attr, with a guard of one host page (the engine's default, bionic `PTHREAD_GUARD_SIZE`), (i) two host threads in concurrent down calls each keep a 64 KiB stack pattern intact while the other's is live, with sp in their own reported range and the two ranges disjoint.
 //! Output: `qemu-thread: (x) ok` per check, `(x) FAIL <why>` otherwise, and one `qemu-thread: call-cost` line (not a check: the round trip of a no-op guest call on this thread). Exit 0 when all pass.
+#![expect(
+    clippy::disallowed_types,
+    reason = "a test: check (g) runs as a child of this test binary"
+)]
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 #![allow(
     unsafe_code,
@@ -20,14 +24,26 @@ use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The fixture functions the host calls, in the order `Expected::values` holds them.
-const SYMBOLS: [&str; 6] = [
+const SYMBOLS: [&str; 14] = [
     "qt_props_count",
     "qt_props_expected",
     "qt_join",
     "qt_key_run",
     "qt_last_value",
     "qt_nop",
+    "qt_stack_run",
+    "qt_small_stack",
+    "qt_size_seen",
+    "qt_guard_seen",
+    "qt_fill_reset",
+    "qt_stack_fill",
+    "qt_fill_base_at",
+    "qt_fill_size_at",
 ];
+/// bionic `PTHREAD_STACK_SIZE_DEFAULT` order (1 MiB; R-10 plan D2): the guest stack of a thread created without an attr.
+const DEFAULT_STACK: u64 = 1 << 20;
+/// Concurrent down-call threads of check (i); fixture.c `qt_stack_fill` waits for exactly two.
+const FILLERS: usize = 2;
 /// The argument `qt_join` is given; its routine returns it plus `JOIN_OFFSET`.
 const JOIN_ARG: u64 = 41;
 /// fixture.c `QT_JOIN_OFFSET`: the routine's addend.
@@ -107,6 +123,23 @@ fn started(r: Result<Guest, String>) -> u64 {
     println!("qemu-thread: (s) ok");
     let bias = (guest.exe_entry as u64).wrapping_sub(x.e_entry);
     let addr = |i: usize| bias.wrapping_add(x.values[i]) as usize;
+    if std::env::var_os(STACK_CHILD).is_some() {
+        let mut bad = false;
+        for (c, r) in [
+            ('g', stacks(&mut guest, addr(6), addr(7), addr(8), addr(9))),
+            (
+                'i',
+                isolation(&mut guest, addr(10), addr(11), addr(12), addr(13)),
+            ),
+        ] {
+            println!(
+                "{STACK_LINE}{c} {}",
+                r.as_ref().err().map_or("ok", String::as_str)
+            );
+            bad |= r.is_err();
+        }
+        return u64::from(bad);
+    }
     let (props_count, props_expected, join, key_run, last_value, nop) =
         (addr(0), addr(1), addr(2), addr(3), addr(4), addr(5));
     let mut ok = true;
@@ -154,6 +187,11 @@ fn started(r: Result<Guest, String>) -> u64 {
         },
     );
 
+    // SAFETY: page size, no memory effects.
+    let [g, i] = stack_child();
+    ok &= check('g', g);
+    ok &= check('i', i);
+
     let t = Instant::now();
     for _ in 0..COST_CALLS {
         // SAFETY: qt_nop takes no arguments and returns 0.
@@ -164,6 +202,146 @@ fn started(r: Result<Guest, String>) -> u64 {
         "qemu-thread: call-cost {ns} ns per guest call round trip (qt_nop, {COST_CALLS} calls, this thread)"
     );
     u64::from(!ok)
+}
+
+/// Set on the child run of checks (g) and (i): it boots, runs only [`stacks`] and [`isolation`] and prints a [`STACK_LINE`] for each. A child, because a wrong `pthread_getattr_np` (glibc reading a bionic record as its own, break `qt_getattr_glibc`) may kill or hang the process: the parent turns either into FAIL lines.
+const STACK_CHILD: &str = "ATL_QT_STACK_CHILD";
+/// The child's verdict lines: this prefix, the check letter, a space, then `ok` or why not.
+const STACK_LINE: &str = "qemu-thread-stack: ";
+/// Bound on the child: a plain one boots and runs four threads in about a second; past this it hangs (glibc waiting on a lock word of a foreign struct) and is killed.
+const STACK_CHILD_SECS: u64 = 30;
+/// Poll interval while waiting for the child.
+const STACK_POLL_MS: u64 = 50;
+
+/// Checks (g) and (i) in a child run of this harness (same env + [`STACK_CHILD`]): each its verdict line, else how the child died or that it hung.
+fn stack_child() -> [Result<(), String>; 2] {
+    match stack_child_text() {
+        Ok((text, status)) => ['g', 'i'].map(|c| {
+            let tag = format!("{STACK_LINE}{c} ");
+            match text.lines().find_map(|l| l.strip_prefix(tag.as_str())) {
+                Some("ok") => Ok(()),
+                Some(why) => Err(why.to_owned()),
+                None => Err(format!("stack child printed no ({c}) verdict ({status})")),
+            }
+        }),
+        Err(e) => [Err(e.clone()), Err(e)],
+    }
+}
+
+/// Runs the child to its exit or the deadline (then kills it); its stdout and how it ended.
+fn stack_child_text() -> Result<(String, String), String> {
+    use std::io::Read;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new(exe)
+        .env(STACK_CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + std::time::Duration::from_secs(STACK_CHILD_SECS);
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
+            break s.to_string();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break format!("hung past {STACK_CHILD_SECS} s, killed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(STACK_POLL_MS));
+    };
+    let mut text = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut text);
+    }
+    Ok((text, status))
+}
+
+/// Check (g)'s body: `qt_stack_run` with and without a `qt_small_stack` attr; each thread's sp inside its reported stack, size = the attr's (else [`DEFAULT_STACK`]), guard one host page.
+fn stacks(
+    guest: &mut Guest,
+    run: usize,
+    small: usize,
+    size_seen: usize,
+    guard_seen: usize,
+) -> Result<(), String> {
+    // SAFETY: page size, no memory effects.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    // SAFETY: fixture functions, as in `started`; qt_stack_run creates one thread and joins it.
+    let small = unsafe { guest.call(small, 0, 0, 0) } as u64;
+    for (arg, want) in [(1, small), (0, DEFAULT_STACK)] {
+        // SAFETY: as above.
+        let (rc, size, guard) = unsafe {
+            (
+                guest.call(run, arg, 0, 0) as i64,
+                guest.call(size_seen, 0, 0, 0) as u64,
+                guest.call(guard_seen, 0, 0, 0) as u64,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "attr {arg}: qt_stack_check step {rc} failed (1 getattr, 2 getstack, 3 sp outside)"
+            ));
+        }
+        if size != want || guard != page {
+            return Err(format!(
+                "attr {arg}: reported size {size:#x} guard {guard:#x}, expected {want:#x} / {page:#x}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The guest, shared by the filler threads: `Guest::call` uses only the calling thread's own record.
+struct Shared(*mut Guest);
+// SAFETY: each thread's call runs on its own record and CPU (thread.rs `attach_current`); the Guest is not otherwise touched while they run.
+unsafe impl Send for Shared {}
+// SAFETY: as for Send.
+unsafe impl Sync for Shared {}
+
+/// Check (i): `FILLERS` host threads each make the down call `qt_stack_fill(slot)` at once; each must find its pattern intact and sp in its reported stack, and the reported stacks must be disjoint.
+fn isolation(
+    guest: &mut Guest,
+    reset: usize,
+    fill: usize,
+    base_at: usize,
+    size_at: usize,
+) -> Result<(), String> {
+    // SAFETY: fixture functions, as in `started`.
+    unsafe { guest.call(reset, 0, 0, 0) };
+    let shared = Shared(guest);
+    let results: Vec<i64> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..FILLERS)
+            .map(|slot| {
+                let g = &shared;
+                // SAFETY: as for Shared; qt_stack_fill takes its slot.
+                s.spawn(move || unsafe { (*g.0).call(fill, slot, 0, 0) } as i64)
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap_or(i64::MIN))
+            .collect()
+    });
+    let mut ranges = Vec::new();
+    for (slot, r) in results.iter().enumerate() {
+        if *r != 0 {
+            return Err(format!(
+                "filler {slot}: {r:#x} (low 32 bits: mismatched bytes; high: qt_stack_check step; -1: partner never came)"
+            ));
+        }
+        // SAFETY: as above.
+        let (b, n) = unsafe {
+            (
+                guest.call(base_at, slot, 0, 0) as u64,
+                guest.call(size_at, slot, 0, 0) as u64,
+            )
+        };
+        ranges.push((b, b + n));
+    }
+    let (a, b) = (ranges[0], ranges[1]);
+    if a.0 < b.1 && b.0 < a.1 {
+        return Err(format!("stacks overlap: {a:x?} and {b:x?}"));
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

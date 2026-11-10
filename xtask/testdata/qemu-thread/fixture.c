@@ -100,6 +100,132 @@ long qt_nop(void) {
     return 0;
 }
 
+// R10 S3 stack gate (check g): a thread created with this attr stack size must report exactly it
+#define QT_SMALL_STACK (256 * 1024)
+// bytes each concurrent down call (check i) fills on its own stack
+#define QT_FILL_BYTES (64 * 1024)
+// spin bound while waiting for the other filler: a lost partner is an error, not a hang
+#define QT_SPIN_LIMIT 2000000000L
+
+// pthread_getattr_np(pthread_self()) on the calling thread; 0 when a local lies inside the reported [base, base + size), else 1..3 by the step that failed. Stores base, size, guard.
+static long qt_stack_check(uintptr_t *base_out, size_t *size_out, size_t *guard_out) {
+    pthread_attr_t a;
+    void *base = 0;
+    size_t size = 0;
+    size_t guard = 0;
+    if (pthread_getattr_np(pthread_self(), &a) != 0) {
+        return 1;
+    }
+    int rc = pthread_attr_getstack(&a, &base, &size);
+    if (rc == 0) {
+        rc = pthread_attr_getguardsize(&a, &guard);
+    }
+    (void)pthread_attr_destroy(&a);
+    if (rc != 0) {
+        return 2;
+    }
+    *base_out = (uintptr_t)base;
+    *size_out = size;
+    *guard_out = guard;
+    volatile char local = 0;
+    uintptr_t sp = (uintptr_t)&local;
+    if (sp < (uintptr_t)base || sp >= (uintptr_t)base + size) {
+        return 3;
+    }
+    return 0;
+}
+
+// what qt_stack_run's thread saw (read after join)
+static uintptr_t qt_run_base;
+static size_t qt_run_size;
+static size_t qt_run_guard;
+
+static void *qt_stack_routine(void *arg) {
+    (void)arg;
+    return (void *)(uintptr_t)qt_stack_check(&qt_run_base, &qt_run_size, &qt_run_guard);
+}
+
+// One thread, with a QT_SMALL_STACK attr when small != 0 (else no attr), runs qt_stack_check and is joined; returns its result (-1 when create fails). qt_size_seen / qt_guard_seen read what it saw.
+long qt_stack_run(long small) {
+    pthread_attr_t a;
+    pthread_attr_t *ap = 0;
+    qt_run_size = 0;
+    qt_run_guard = 0;
+    if (small) {
+        if (pthread_attr_init(&a) != 0 || pthread_attr_setstacksize(&a, QT_SMALL_STACK) != 0) {
+            return -1;
+        }
+        ap = &a;
+    }
+    pthread_t t;
+    void *ret = (void *)(uintptr_t)-1;
+    int rc = pthread_create(&t, ap, qt_stack_routine, 0);
+    if (ap) {
+        (void)pthread_attr_destroy(ap);
+    }
+    if (rc != 0) {
+        return -1;
+    }
+    (void)pthread_join(t, &ret);
+    return (long)(uintptr_t)ret;
+}
+
+long qt_small_stack(void) {
+    return QT_SMALL_STACK;
+}
+
+long qt_size_seen(void) {
+    return (long)qt_run_size;
+}
+
+long qt_guard_seen(void) {
+    return (long)qt_run_guard;
+}
+
+// fillers that reached the barrier in qt_stack_fill
+static long qt_arrived;
+// each filler's reported stack, by slot (0 or 1)
+static uintptr_t qt_fill_base[2];
+static size_t qt_fill_size[2];
+
+void qt_fill_reset(void) {
+    __atomic_store_n(&qt_arrived, 0, __ATOMIC_SEQ_CST);
+}
+
+// One of two concurrent down calls (check i), slot 0 or 1: fills QT_FILL_BYTES of its own stack with a slot pattern, waits until both fillers arrived (both buffers live at once), then verifies. Returns mismatched bytes, plus (1 << 32) * the qt_stack_check step that failed; -1 when the partner never came.
+long qt_stack_fill(long slot) {
+    volatile unsigned char buf[QT_FILL_BYTES];
+    long pattern = 0x11 + slot * 0x66;
+    for (long i = 0; i < QT_FILL_BYTES; i++) {
+        buf[i] = (unsigned char)(pattern + i);
+    }
+    __atomic_add_fetch(&qt_arrived, 1, __ATOMIC_SEQ_CST);
+    long spins = 0;
+    while (__atomic_load_n(&qt_arrived, __ATOMIC_SEQ_CST) < 2) {
+        if (++spins > QT_SPIN_LIMIT) {
+            return -1;
+        }
+    }
+    long bad = 0;
+    for (long i = 0; i < QT_FILL_BYTES; i++) {
+        if (buf[i] != (unsigned char)(pattern + i)) {
+            bad++;
+        }
+    }
+    size_t guard = 0;
+    long step = qt_stack_check(&qt_fill_base[slot & 1], &qt_fill_size[slot & 1], &guard);
+    return bad + (step << 32);
+}
+
+// filler slot's reported stack (after qt_stack_fill), for the harness's disjointness check
+long qt_fill_base_at(long slot) {
+    return (long)qt_fill_base[slot & 1];
+}
+
+long qt_fill_size_at(long slot) {
+    return (long)qt_fill_size[slot & 1];
+}
+
 int main(void) {
     return 0;
 }

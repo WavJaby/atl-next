@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{Active, HostThread, active, call_guest};
+use super::{Active, HostThread, Stack, StackReq, active, call_guest};
 
 /// Generated layouts, one per engine's guest bionic view (`SIZE`, `ALIGN`, one offset per field, `bits::<field>` = (shift, width) of a bit-field, the TLS slot macros): `identity` = the host arch, `qemu` = arm64. tls_defines.h slots differ per arch (x86_64 0..10, arm64 -3..7).
 pub(super) mod layout {
@@ -107,20 +107,54 @@ pub fn set_guest_dtor(key: libc::pthread_key_t, dtor: usize) {
     }
 }
 
-/// Makes `ht` the calling thread's record (the thread that started the guest: its TCB came from `Guest::start`).
+/// Every attached thread's guest stack, by both handles the guest may hold for it: its bionic record (guest `pthread_self`) and its glibc `pthread_t` (guest `pthread_create`'s out-handle). The guest's `pthread_getattr_np` reads it ([`stack_of`]); detach removes the thread's entries.
+static STACKS: Mutex<Vec<(usize, Stack)>> = Mutex::new(Vec::new());
+
+/// The guest stack of the thread `handle` names (its record or its glibc `pthread_t`); None for a handle of no attached thread.
+pub fn stack_of(handle: usize) -> Option<Stack> {
+    let v = STACKS.lock().ok()?;
+    v.iter().find(|&&(h, _)| h == handle).map(|&(_, s)| s)
+}
+
+/// This thread's two handles ([`STACKS`]).
+fn handles() -> [usize; 2] {
+    // SAFETY: no arguments.
+    [current(), unsafe { libc::pthread_self() } as usize]
+}
+
+/// Makes `ht` the calling thread's record (the thread that started the guest: its TCB came from `Guest::start`, its CPU from `Engine::start`).
 pub fn adopt(ht: *mut HostThread) {
+    let stack = active()
+        .attach(StackReq::default())
+        .unwrap_or_else(|e| super::unsupported(&e));
+    adopt_on(ht, stack);
+}
+
+fn adopt_on(ht: *mut HostThread, stack: Stack) {
+    // SAFETY: `ht` is this thread's record, leaked until its detach; no other borrow is live.
+    unsafe { (*ht).set_stack(stack) };
+    if let Ok(mut v) = STACKS.lock() {
+        v.extend(handles().map(|h| (h, stack)));
+    }
     CURRENT.with(|c| c.set(ht));
     ATTACHED.fetch_add(1, Ordering::Relaxed);
     register_detach(ht);
 }
 
-/// The calling thread's record, attaching it first: the engine's guest CPU (`Engine::attach`), guest static TLS (`alloc_static_tls`, the TCB words) and a crossing record. Aborts if no guest runs (a down stub exists only for a loaded library, so a guest does).
+/// The calling thread's record, attaching it first on a default guest stack ([`attach_with`]).
 pub fn attach_current() -> *mut HostThread {
+    attach_with(StackReq::default())
+}
+
+/// The calling thread's record, attaching it first: the engine's guest CPU on a stack sized by `req` (`Engine::attach`; `req` unused if already attached), guest static TLS (`alloc_static_tls`, the TCB words) and a crossing record. Aborts if no guest runs (a down stub exists only for a loaded library, so a guest does).
+pub fn attach_with(req: StackReq) -> *mut HostThread {
     let cur = CURRENT.with(Cell::get);
     if !cur.is_null() {
         return cur;
     }
-    active().attach().unwrap_or_else(|e| super::unsupported(&e));
+    let stack = active()
+        .attach(req)
+        .unwrap_or_else(|e| super::unsupported(&e));
     let ht = static_tls()
         .ok_or_else(|| "attach: no guest static TLS (guest not started)".to_owned())
         .and_then(|t| alloc_static_tls(&t))
@@ -134,7 +168,7 @@ pub fn attach_current() -> *mut HostThread {
             ht
         })
         .unwrap_or_else(|e| super::unsupported(&e));
-    adopt(ht);
+    adopt_on(ht, stack);
     ht
 }
 
@@ -187,6 +221,10 @@ extern "C" fn detach(value: *mut libc::c_void) {
             free(tp - t.tpoff, t.size, page_size());
         }
         drop(Box::from_raw(ht));
+    }
+    let gone = handles();
+    if let Ok(mut v) = STACKS.lock() {
+        v.retain(|(h, _)| !gone.contains(h));
     }
     release_record();
     CURRENT.with(|c| c.set(std::ptr::null_mut()));

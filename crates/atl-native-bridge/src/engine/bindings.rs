@@ -118,6 +118,7 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_create" => super::intercepts::pthread_create as *const () as usize,
         "pthread_key_create" => super::intercepts::pthread_key_create as *const () as usize,
         "pthread_key_delete" => super::intercepts::pthread_key_delete as *const () as usize,
+        "pthread_getattr_np" => super::intercepts::pthread_getattr_np as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,

@@ -58,6 +58,8 @@ static BOOT_AUXV: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     /// This thread's attached guest CPU ([`attach_current`]): the state guest calls run on. Null before attach.
     static CPU: Cell<*mut AtlCpu> = const { Cell::new(std::ptr::null_mut()) };
+    /// The guest stack `attach_ex` gave this thread's CPU (base, len, guard filled); zero before attach.
+    static STACK: Cell<AtlStack> = const { Cell::new(AtlStack { size: 0, guard: 0, base: 0, len: 0 }) };
 }
 
 /// Boots the engine `library` (the engine `.so`) on the static aarch64 `boot_exe`, which must raise BOOT with its auxv in x0. `on_trap` gets every trap of the engine on the trapping thread, BOOT included. Returns once BOOT ran and the engine is up; the guest runs after [`attach_current`]. Once per process.
@@ -205,6 +207,7 @@ pub fn attach_current_ex(mut stack: AtlStack) -> Result<Option<AtlStack>, String
         return Err(format!("attach: {}", errno_text(rc)));
     }
     CPU.with(|c| c.set(cpu));
+    STACK.with(|s| s.set(stack));
     Ok(Some(stack))
 }
 
@@ -214,6 +217,7 @@ pub fn detach_current() {
     if cpu.is_null() {
         return;
     }
+    STACK.with(|s| s.set(AtlStack::default()));
     let e = engine();
     let detach = e
         .table
@@ -390,9 +394,19 @@ impl super::Engine for Qemu {
         }
     }
 
-    /// The calling thread's CPU ([`attach_current`]): once per thread, so the thread's first guest call has one.
-    fn attach(&self) -> Result<(), String> {
-        attach_current()
+    /// The calling thread's CPU ([`attach_current_ex`] with `req`): once per thread, so the thread's first guest call has one. Answers the CPU's guest stack, the first attach's on a repeat.
+    fn attach(&self, req: super::StackReq) -> Result<super::Stack, String> {
+        attach_current_ex(AtlStack {
+            size: req.size as u64,
+            guard: req.guard as u64,
+            ..AtlStack::default()
+        })?;
+        let s = STACK.with(Cell::get);
+        Ok(super::Stack {
+            base: s.base as usize,
+            len: s.len as usize,
+            guard: s.guard as usize,
+        })
     }
 
     /// Takes the calling thread's CPU back ([`detach_current`]) at thread exit, after its guest destructors.

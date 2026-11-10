@@ -170,6 +170,11 @@ impl Cpu {
     pub fn stack_base(&self) -> usize {
         self.stack
     }
+
+    /// Guard bytes right below [`Cpu::stack_base`] (the request rounded up, or the default).
+    pub fn stack_guard(&self) -> usize {
+        self.guard
+    }
 }
 
 fn read_u64(base: *const u8, offset: usize) -> u64 {
