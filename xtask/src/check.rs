@@ -65,9 +65,11 @@ enum Step {
     ConverterPackages,
     /// the guest GL proxies cover the NDK maps and the host fronts export every bound stub (gl_proxies.rs), on the native out dir; skipped without its guest proxies and fronts
     GlProxies,
+    /// atl-bionic's generation (its build script, `cargo check --target`) for every cross host whose sysroot and rust std are present, so a cross-only refusal shows before a cross build; a host without them is skipped and named
+    CrossBionic,
 }
 
-const ALL: [Step; 19] = [
+const ALL: [Step; 20] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -87,6 +89,7 @@ const ALL: [Step; 19] = [
     Step::Runtimes,
     Step::ConverterPackages,
     Step::GlProxies,
+    Step::CrossBionic,
 ];
 
 impl Step {
@@ -111,6 +114,7 @@ impl Step {
             Step::Runtimes => "runtimes",
             Step::ConverterPackages => "converter-packages",
             Step::GlProxies => "gl-proxies",
+            Step::CrossBionic => "cross-bionic",
         }
     }
 
@@ -151,6 +155,9 @@ impl Step {
             // reads built binaries: a slot from another source state would check stale proxies
             crate::build_state::ensure_current(root, out)?;
             return crate::gl_proxies::check(root, out, arch);
+        }
+        if self == Step::CrossBionic {
+            return cross_bionic(root);
         }
         self.run_whole(root).map(|()| None)
     }
@@ -289,6 +296,7 @@ impl Step {
             Step::Keepset => unreachable!("run handles keepset"),
             Step::ConverterPackages => unreachable!("run handles converter-packages"),
             Step::GlProxies => unreachable!("run handles gl-proxies"),
+            Step::CrossBionic => unreachable!("run handles cross-bionic"),
         }
     }
 }
@@ -338,10 +346,51 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
+/// The cross-bionic step: `cargo check -p atl-bionic --target <rust>` with the cross environment (cross::cargo_target) of every arches.toml host other than the build machine that names a sysroot. Its build script is the generation; `check` runs it without compiling the crate for the target.
+/// A host whose rows are unmet (sysroot not fetched, rust std not added) is skipped and named, as `deps --check` skips cross-only rows.
+fn cross_bionic(root: &Path) -> Result<Option<String>> {
+    let arches = arches::load(root)?;
+    let (build, _) = arches::build_machine(root, &arches)?;
+    let mut skipped = Vec::new();
+    for (arch, a) in &arches {
+        if arch == build || a.host.as_ref().is_none_or(|h| h.sysroot.is_none()) {
+            continue;
+        }
+        let problems = deps::host_rows_problems(root, arch)?;
+        if !problems.is_empty() {
+            skipped.push(format!("{arch} ({})", problems.join("; ")));
+            continue;
+        }
+        let target = crate::cross::cargo_target(root, arch)?;
+        cargo_with(
+            root,
+            &[
+                "check",
+                "-p",
+                "atl-bionic",
+                "--locked",
+                "--target",
+                &target.triple,
+            ],
+            Units::Recorded,
+            &target.env,
+        )
+        .with_context(|| format!("atl-bionic generation for host {arch}"))?;
+        eprintln!("cross-bionic: {arch} ok");
+    }
+    Ok((!skipped.is_empty()).then(|| format!("not checked: {}", skipped.join(", "))))
+}
+
 /// A cargo step: its output shown live as before, and kept, so a failure's first error line can name the cause.
 fn cargo(root: &Path, args: &[&str], units: Units) -> Result<()> {
+    cargo_with(root, args, units, &[])
+}
+
+/// [`cargo`] with extra environment (a cross host's linker, RUSTFLAGS and probe args).
+fn cargo_with(root: &Path, args: &[&str], units: Units, env: &[(String, String)]) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(args).current_dir(root);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
     let run = unit_use::run(&mut cmd, units, Echo::Both)
         .with_context(|| format!("spawning cargo {}", args.join(" ")))?;
     if run.status.success() {
