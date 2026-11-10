@@ -172,7 +172,7 @@ impl Image {
         })
     }
 
-    /// (page start, length, `PROT_*` of the segment) per `PT_LOAD`, page-rounded: the ranges a guest maps (`arch::qemu` registers them with QEMU).
+    /// (page start, length, `PROT_*` of the segment) per `PT_LOAD`, page-rounded: the ranges a guest maps (`qemu::register` registers them with QEMU).
     pub fn segments(&self) -> &[(usize, usize, i32)] {
         &self.segments
     }

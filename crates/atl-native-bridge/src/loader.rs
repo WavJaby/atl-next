@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::engine::{Config, Guest, arch};
+use crate::engine::{Config, Guest, active};
 
 /// bionic `RTLD_NOW` (dlfcn.h): what the guest dlopen gets whatever ART's flag; `RTLD_LOCAL` = 0.
 const RTLD_NOW: usize = 2;
@@ -136,15 +136,15 @@ pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
 }
 
 /// A host-callable trampoline into guest function `f` taking a first argument of `kind` (one per function and kind: ART may ask again for the same symbol).
-pub fn trampoline(f: usize, kind: arch::Down) -> Result<usize, String> {
-    static STUBS: Mutex<Vec<(usize, arch::Down, usize)>> = Mutex::new(Vec::new());
+pub fn trampoline(f: usize, kind: active::Down) -> Result<usize, String> {
+    static STUBS: Mutex<Vec<(usize, active::Down, usize)>> = Mutex::new(Vec::new());
     let mut stubs = STUBS
         .lock()
         .map_err(|_| "trampolines poisoned".to_owned())?;
     if let Some(&(_, _, t)) = stubs.iter().find(|&&(g, k, _)| g == f && k == kind) {
         return Ok(t);
     }
-    let t = arch::down(f, kind)?;
+    let t = active::down(f, kind)?;
     stubs.push((f, kind, t));
     Ok(t)
 }

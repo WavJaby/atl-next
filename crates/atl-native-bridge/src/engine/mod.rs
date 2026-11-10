@@ -4,16 +4,17 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing: the host arch's FS switch (`identity/mod.rs`), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `identity/mod.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `arch::CROSSING` in both builds.
+/// The crossing: the host arch's FS switch (`identity/mod.rs`), or with feature `qemu-guest` QEMU's binding thunks (`qemu/mod.rs`, placement in `qemu/place.rs`). Both provide the functions shared code calls (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `active::CROSSING` in both builds.
 #[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
 #[path = "identity/mod.rs"]
 pub mod identity;
-// Shared code reaches the selected engine as `arch::` in both builds; identity builds alias it here.
-#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
-pub use identity as arch;
 #[cfg(feature = "qemu-guest")]
-#[path = "arch/qemu.rs"]
-pub mod arch;
+pub mod qemu;
+/// The engine this build selects: shared code reaches it as `active::` in both builds.
+#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
+pub use identity as active;
+#[cfg(feature = "qemu-guest")]
+pub use qemu as active;
 mod args;
 pub mod bindings;
 pub mod image;
@@ -28,7 +29,7 @@ pub mod vdso;
 
 use std::path::PathBuf;
 
-pub use arch::HostThread;
+pub use active::HostThread;
 use image::Image;
 
 /// Host `sigaction(sig)`, then `signal::rewrap_all`: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
@@ -80,7 +81,7 @@ pub struct Config {
 impl Config {
     /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`), for the crossing's guest ISA (identity: the host's own; QEMU: arm64).
     pub fn installed() -> Config {
-        let isa = arch::GUEST_ISA;
+        let isa = active::GUEST_ISA;
         let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
         let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa));
         Config {
@@ -104,9 +105,9 @@ pub enum Tp {
     Guest(usize),
 }
 
-/// Runs guest code on a host thread's CPU and registers guest memory. Two implementations, one per build: `arch::Identity` (the host's FS switch) and `arch::Qemu` (QEMU's crossing); `arch::CROSSING` is the one this build selects.
+/// Runs guest code on a host thread's CPU and registers guest memory. Two implementations, one per build: `identity::Identity` (the host's FS switch) and `qemu::Qemu` (QEMU's crossing); `active::CROSSING` is the one this build selects.
 pub trait Engine {
-    /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`arch::attach_current`).
+    /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`active::attach_current`).
     type Cpu;
     /// Registers guest memory `[start, start + len)` with `prot` (`PROT_*`). Identity: nothing to register, host memory is guest memory. QEMU: page flags.
     fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String>;
@@ -131,7 +132,7 @@ pub(crate) unsafe fn call_guest(
 ) -> usize {
     let tp = Tp::Guest(cpu.guest_fs());
     // SAFETY: caller contract.
-    unsafe { arch::CROSSING.call(cpu, tp, f, &[a, b, c, d]) }
+    unsafe { active::CROSSING.call(cpu, tp, f, &[a, b, c, d]) }
 }
 
 /// `Guest::start`'s bootstrap call (`Tp::Bootstrap`).
@@ -147,7 +148,7 @@ pub(crate) unsafe fn call_bootstrap(
     d: usize,
 ) -> usize {
     // SAFETY: caller contract.
-    unsafe { arch::CROSSING.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
+    unsafe { active::CROSSING.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
 }
 
 /// A started guest: the linker initialised, its libraries constructed.
@@ -167,7 +168,7 @@ unsafe impl Send for Guest {}
 impl Guest {
     /// Maps and initialises the guest. Returns right after the crossing back, before any allocation, so a probe can run on whatever thread pointer the crossing left.
     pub fn start(cfg: &Config) -> Result<Guest, String> {
-        if !arch::supported() {
+        if !active::supported() {
             return Err(
                 "FSGSBASE not available (HWCAP2_FSGSBASE): no user-mode thread-pointer switch"
                     .into(),
@@ -182,8 +183,8 @@ impl Guest {
         let init = linker
             .symbol("__dl___linker_init")
             .ok_or("linker64 has no __dl___linker_init")?;
-        let block = args::build(cfg, &linker, &vdso, &arch::kernel_auxv()?)?;
-        arch::map_guest(&[&linker, &vdso])?;
+        let block = args::build(cfg, &linker, &vdso, &active::kernel_auxv()?)?;
+        active::map_guest(&[&linker, &vdso])?;
         let thread = HostThread::leak();
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
         let exe_entry = unsafe { call_bootstrap(thread, init, block, 0, 0, 0) };
@@ -192,7 +193,7 @@ impl Guest {
             .ok_or("the guest linker reported no static TLS (__native_bridge_config_static_tls)")?;
         let tp = thread::alloc_static_tls(&tls)?;
         // SAFETY: `tp` is a fresh guest TCB inside static TLS (bionic's TCB words lie in it); the record is leaked.
-        unsafe { arch::init_tcb(tp, &raw mut *thread) };
+        unsafe { active::init_tcb(tp, &raw mut *thread) };
         thread.set_guest_fs(tp);
         let start_thread: *mut HostThread = thread;
         thread::adopt(start_thread);
@@ -224,6 +225,6 @@ impl Guest {
     #[cfg(not(feature = "qemu-guest"))]
     pub fn force_host_fs(&self) {
         // SAFETY: the starting thread's record (the probe runs on it, which has not exited); host_fs is the value the crossing read before entering the guest.
-        unsafe { arch::set_fs_base((*self.start_thread).host_fs()) }
+        unsafe { active::set_fs_base((*self.start_thread).host_fs()) }
     }
 }

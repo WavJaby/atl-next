@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{HostThread, arch, call_guest};
+use super::{HostThread, active, call_guest};
 
 /// Generated layouts (`SIZE`, `ALIGN`, one offset per field, `bits::<field>` = (shift, width) of a bit-field).
 #[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
@@ -74,7 +74,7 @@ pub fn attach_current() -> *mut HostThread {
             let ht: *mut HostThread = HostThread::leak();
             // SAFETY: `tp` is a fresh guest TCB inside static TLS; `ht` is leaked until this thread's detach, after which no guest code runs on `tp`.
             unsafe {
-                arch::init_tcb(tp, ht);
+                active::init_tcb(tp, ht);
                 (*ht).set_guest_fs(tp);
             }
             ht
@@ -231,7 +231,7 @@ pub unsafe fn configure(config: *const u8) {
     }
 }
 
-/// The calling thread's guest static TLS, as bionic's `__allocate_thread` + `__init_tcb` make one (pthread_create.cpp): `init_img` copied, the thread-id slot = this thread's record, the bionic-TLS slot = its `bionic_tls`. Returns the thread pointer; the arch's own TCB words (x86 self pointer) are `arch::init_tcb`'s. Leaked: the thread's for its life.
+/// The calling thread's guest static TLS, as bionic's `__allocate_thread` + `__init_tcb` make one (pthread_create.cpp): `init_img` copied, the thread-id slot = this thread's record, the bionic-TLS slot = its `bionic_tls`. Returns the thread pointer; the arch's own TCB words (x86 self pointer) are `active::init_tcb`'s. Leaked: the thread's for its life.
 /// Pointer-sized slots are host words: the identity engine's guest has the host's pointer width.
 pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
     if t.tpoff > t.size || t.size == 0 {

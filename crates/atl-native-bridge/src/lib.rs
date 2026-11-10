@@ -3,7 +3,7 @@
 //!
 //! - `exports`: `NativeBridgeItf` and the functions behind its entries, whose shells build.rs generates from native_bridge.h (atl-bridgegen).
 //! - `elf`: which libraries are ours to load: the host's ELF machine and a bionic marker.
-//! - `engine`: the identity engine (route N): guest bionic built for the host arch, run natively; crossings switch the thread pointer only. Feature `qemu-guest`: the QEMU crossing instead (`engine/arch/qemu.rs`).
+//! - `engine`: the identity engine (route N): guest bionic built for the host arch, run natively; crossings switch the thread pointer only. Feature `qemu-guest`: the QEMU crossing instead (`engine/qemu/mod.rs`).
 //! - `loader`: the process's guest, started by the first `loadLibrary`, and the libraries loaded into it.
 //!
 //! Feature `qemu-guest` builds `engine` alone: the NB core (`exports`, `loader`, the generated shells) is ART's entry point, and only the identity engine serves it.

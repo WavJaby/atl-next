@@ -12,7 +12,7 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# QEMU guest (QEMU bridge plan Q4, Q5-1b): the engine crosses through QEMU's aarch64 user-mode core (`engine/arch/qemu.rs`), not the FS switch; the NB core ART loads is not built. The engine is the engine `.so` behind its C ABI (atl-engine-api), dlopened at run time: no cargo edge to the QEMU engine crate.
+# QEMU guest (QEMU bridge plan Q4, Q5-1b): the engine crosses through QEMU's aarch64 user-mode core (`engine/qemu/mod.rs`), not the FS switch; the NB core ART loads is not built. The engine is the engine `.so` behind its C ABI (atl-engine-api), dlopened at run time: no cargo edge to the QEMU engine crate.
 [features]
 qemu-guest = []
 

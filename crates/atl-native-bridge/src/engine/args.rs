@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The kernel argument block the guest linker reads (bionic `KernelArgumentBlock`): `argc`, argv pointers, NULL, envp pointers, NULL, auxv pairs, AT_NULL -- the layout fs/binfmt_elf.c `create_elf_tables` puts at the initial stack pointer.
-//! auxv = the kernel's for this guest (`arch::kernel_auxv`: hwcaps, page size, clock tick, ids, AT_SECURE, AT_RANDOM, AT_MINSIGSTKSZ as the kernel -- or QEMU, for an emulated guest -- gave them) with the entries that describe the image replaced as the kernel sets them for a directly run interpreter: AT_PHDR/AT_PHNUM/AT_PHENT = the linker's, AT_BASE = 0, AT_ENTRY = the linker's entry, AT_EXECFN = its path; AT_SYSINFO_EHDR = the NB vdso.
+//! auxv = the kernel's for this guest (`active::kernel_auxv`: hwcaps, page size, clock tick, ids, AT_SECURE, AT_RANDOM, AT_MINSIGSTKSZ as the kernel -- or QEMU, for an emulated guest -- gave them) with the entries that describe the image replaced as the kernel sets them for a directly run interpreter: AT_PHDR/AT_PHNUM/AT_PHENT = the linker's, AT_BASE = 0, AT_ENTRY = the linker's entry, AT_EXECFN = its path; AT_SYSINFO_EHDR = the NB vdso.
 //! Leaked: bionic keeps pointers into it for the process's life (`environ`, `__libc_shared_globals()->auxv`).
 
 use std::ffi::CString;
@@ -23,7 +23,7 @@ fn leak_cstr(bytes: &[u8]) -> Result<usize, String> {
     feature = "qemu-guest",
     allow(
         dead_code,
-        reason = "the QEMU guest's kernel auxv is QEMU's (arch::kernel_auxv)"
+        reason = "the QEMU guest's kernel auxv is QEMU's (active::kernel_auxv)"
     )
 )]
 pub fn process_auxv() -> Result<Vec<(usize, usize)>, String> {
@@ -42,7 +42,7 @@ pub fn process_auxv() -> Result<Vec<(usize, usize)>, String> {
         .collect())
 }
 
-/// The block's address. `kernel`: the kernel's auxv for this guest (`arch::kernel_auxv`), AT_NULL excluded.
+/// The block's address. `kernel`: the kernel's auxv for this guest (`active::kernel_auxv`), AT_NULL excluded.
 pub fn build(
     cfg: &Config,
     linker: &Image,

@@ -344,7 +344,7 @@ fn libc_stubs(qemu: bool) -> &'static str {
 const QEMU_SHIM_PENDING: &str = "pending: shim under QEMU, Q5";
 /// Shims the QEMU guest binds despite [`QEMU_SHIM_PENDING`]: `pthread_key_create` and `pthread_key_delete` store the guest destructor as the x86 crossing does (intercepts.rs); a destructor runs at thread exit, which traps under QEMU (thread.rs `detach`, plan O2). Delete this list when Q5 binds the other shims.
 const QEMU_BOUND_SHIMS: &[&str] = &["pthread_key_create", "pthread_key_delete"];
-/// The QEMU guest's arches.toml row (engine/arch/qemu.rs `GUEST_ISA`).
+/// The QEMU guest's arches.toml row (engine/qemu/mod.rs `GUEST_ISA`).
 const QEMU_GUEST_ARCH: &str = "arm64";
 /// The prototypes of the proxy libraries: EGL and the GLES 1.x / 2.x / 3.x headers with their extensions (AOSP's Khronos headers), parsed once per view.
 const PROTOTYPE_HEADERS: &[&str] = &[
@@ -687,13 +687,13 @@ const BREAKS: &[(&str, &str)] = &[
     ("swap_tp", "atl_nb_swap_tp"),
     // g4 (tests/g4.rs): a syscall in the host target, must leave the band
     ("g4_break", "atl_g4_break"),
-    // Q4-2 (engine/arch/qemu.rs `is_stub`): the placeholder check decides on its first two bytes only (unit test stub_shape_is_the_whole_placeholder)
+    // Q4-2 (engine/qemu/place.rs `is_stub`): the placeholder check decides on its first two bytes only (unit test stub_shape_is_the_whole_placeholder)
     ("qe_prefix", "atl_nb_qe_prefix"),
-    // Q4-3 (engine/arch/qemu.rs `ENTRY_BODY_BYTES`): a vdso entry's placeholder is searched at the symbol only, so native_bridge_call_guest (placeholder at +8) fails closed
+    // Q4-3 (engine/qemu/place.rs `ENTRY_BODY_BYTES`): a vdso entry's placeholder is searched at the symbol only, so native_bridge_call_guest (placeholder at +8) fails closed
     ("qe_site", "atl_nb_qe_site"),
-    // Q4-3 (engine/arch/qemu.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
+    // Q4-3 (engine/qemu/place.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
     ("qe_nomap", "atl_nb_qe_nomap"),
-    // Q4-3 (engine/arch/qemu.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
+    // Q4-3 (engine/qemu/mod.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
     ("qe_id", "atl_nb_qe_id"),
     // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
     ("qe_no_tls", "atl_nb_qe_no_tls"),
@@ -740,7 +740,7 @@ fn main() -> Result<()> {
     let arches = checkout.join("arches.toml");
     let arches_text = std::fs::read_to_string(&arches)?;
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
-    // the guest's bionic view: the identity guest is the host arch, the QEMU guest arm64 (engine/arch/qemu.rs GUEST_ISA)
+    // the guest's bionic view: the identity guest is the host arch, the QEMU guest arm64 (engine/qemu/mod.rs GUEST_ISA)
     let guest = if qemu {
         buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?
     } else {

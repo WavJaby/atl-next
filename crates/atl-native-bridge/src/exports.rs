@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use crate::elf::{self, Verdict};
 use crate::engine::Config;
-use crate::engine::arch::Down;
+use crate::engine::active::Down;
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
     kJNICallTypeCriticalNative, kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,

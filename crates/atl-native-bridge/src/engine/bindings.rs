@@ -41,7 +41,7 @@ pub struct Lib {
     pub stubs: &'static [(&'static str, Entry)],
 }
 
-/// The thunk pool: one per binding (build.rs: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two). The x86 thunks and the QEMU pool (`arch/qemu.rs`) are this size.
+/// The thunk pool: one per binding (build.rs: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two). The x86 thunks and the QEMU pool (`qemu/place.rs`) are this size.
 pub const THUNKS: usize = table::THUNKS;
 /// JNI stubs per engine: one per slot of the largest JNI table (build.rs `JNI_STUBS`).
 pub const JNI_STUBS: usize = table::JNI_STUBS;
