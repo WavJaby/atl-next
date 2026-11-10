@@ -330,6 +330,9 @@ used_by = ["xtask:cross"]
 # the riscv64 cross link's glibc, kernel headers and GCC runtime: Debian trixie's cross packages (arch all), pinned to trixie main
 # (linux-libc-dev from main, not backports). libgcc-14-dev lays out usr/lib/gcc-cross/riscv64-linux-gnu/14, the GCC install clang
 # finds under the sysroot: crtbeginS.o/crtendS.o, the libgcc_s.so linker script, and (through it) usr/riscv64-linux-gnu/lib's crt1.o.
+# libc++ is the native riscv64 pair of trixie's llvm-toolchain-19 (trixie ships no libc++ cross packages): the Depends closure of
+# libc++-19-dev, all 1:19.1.7-3+b1. Headers under usr/lib/llvm-19/include/c++/v1 (bp2ninja -libcxx-headers); the .so.1 runtimes
+# (libc++, libc++abi, libunwind) for the link and NEEDED. libatomic1, which the runtimes Depends on, is not pinned.
 [riscv64-sysroot]
 sysroot_debs = [
     "libc6-riscv64-cross=2.41-11cross1",
@@ -337,6 +340,12 @@ sysroot_debs = [
     "linux-libc-dev-riscv64-cross=6.12.38-1cross1",
     "libgcc-s1-riscv64-cross=14.2.0-19cross1",
     "libgcc-14-dev-riscv64-cross=14.2.0-19cross1",
+    "libc++-19-dev=1:19.1.7-3+b1",
+    "libc++abi-19-dev=1:19.1.7-3+b1",
+    "libunwind-19-dev=1:19.1.7-3+b1",
+    "libc++1-19=1:19.1.7-3+b1",
+    "libc++abi1-19=1:19.1.7-3+b1",
+    "libunwind-19=1:19.1.7-3+b1",
 ]
 scope = ["build"]
 used_by = ["xtask:cross"]
