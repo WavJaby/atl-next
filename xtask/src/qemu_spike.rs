@@ -638,7 +638,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine` and the TLS exports.
-/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red).
+/// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
 fn engine_so(
     root: &Path,
     b: &Build,
@@ -721,6 +721,15 @@ fn engine_so(
             "engine-so break no-init-drain",
             "the boot gate is green with attach skipping the copy's queued work".to_owned(),
         ));
+    }
+    // the plain engine with a boot executable that never traps BOOT: the host never attaches
+    let skip = qemu::boot_exe_break(root, b, &out.join("skip-boot"), Some(qemu::SKIP_BOOT))?;
+    match boot_gate(root, b, &out, "skip-boot", &so, &skip, llvm_entry(&skip)?) {
+        Ok(()) => fails.push(Failure::step(
+            "engine-so break skip-boot",
+            "the boot gate is green with the boot executable skipping BOOT".to_owned(),
+        )),
+        Err(e) => println!("qemu-spike: break skip-boot red: {e:#}"),
     }
     Ok(())
 }
