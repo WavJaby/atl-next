@@ -98,12 +98,13 @@ pub struct Unit {
     pub bytes: u64,
 }
 
-/// A stale incremental session: its dir (None for a lock file whose session is gone), its lock file if any, and the bytes its dir holds.
+/// A stale incremental session: its dir (None for a lock file whose session is gone), its lock file if any, and the bytes its dir holds. `_held`: the lock's flock, taken when planned and kept until the plan is dropped, so no process takes it before removal.
 #[derive(Debug)]
 pub struct Session {
     pub dir: Option<PathBuf>,
     pub lock: Option<PathBuf>,
     pub bytes: u64,
+    _held: Option<File>,
 }
 
 /// Totals of one sweep: stale units, stale sessions and their bytes, and the slots or trees that failed.
@@ -546,24 +547,21 @@ fn stale_sessions(tree: &Path, now: u64) -> Result<(Vec<Session>, usize)> {
                 kept += 1;
                 continue;
             };
-            let lock = crate_dir.join(lock_name(&name));
-            if lock_held(&lock)? {
-                kept += 1;
-                continue;
-            }
             let finalized = is_finalized(&name);
-            if finalized && newest == Some(dir) {
+            if (finalized && newest == Some(dir)) || (!finalized && !old_enough(t, now_micros)) {
                 kept += 1;
                 continue;
             }
-            if !finalized && !old_enough(t, now_micros) {
+            let lock = crate_dir.join(lock_name(&name));
+            let Lock::Free(held) = take_lock(&lock)? else {
                 kept += 1;
                 continue;
-            }
+            };
             stale.push(Session {
                 dir: Some(dir.clone()),
-                lock: exists(&lock)?.then_some(lock),
+                lock: held.is_some().then_some(lock),
                 bytes: unique_bytes(std::slice::from_ref(dir))?,
+                _held: held,
             });
         }
         for lock in &locks {
@@ -575,14 +573,20 @@ fn stale_sessions(tree: &Path, now: u64) -> Result<(Vec<Session>, usize)> {
                 kept += 1;
                 continue;
             };
-            if lock_held(lock)? || !old_enough(t, now_micros) {
+            if !old_enough(t, now_micros) {
                 kept += 1;
                 continue;
             }
+            let Lock::Free(held @ Some(_)) = take_lock(lock)? else {
+                // held, or gone since the listing
+                kept += 1;
+                continue;
+            };
             stale.push(Session {
                 dir: None,
                 lock: Some(lock.clone()),
                 bytes: 0,
+                _held: held,
             });
         }
     }
@@ -659,27 +663,36 @@ fn old_enough(t_micros: u64, now_micros: u64) -> bool {
     t_micros.saturating_add(SESSION_GRACE_MICROS) < now_micros
 }
 
-/// Whether a process holds `lock`: an exclusive flock by another open file. A missing lock file is not held. The probe takes the lock and drops it at once.
-fn lock_held(lock: &Path) -> Result<bool> {
+/// A lock file's state as [`take_lock`] found it.
+enum Lock {
+    /// Another open file holds the exclusive flock.
+    Held,
+    /// Free: the file holding the flock now, or None when the lock file does not exist.
+    Free(Option<File>),
+}
+
+/// Takes `lock`'s exclusive flock without waiting. The caller keeps the returned file while it acts on the lock's state: a flock taken and dropped can still be held after the drop by a child this process forked meanwhile (the open file is shared until the child's exec), so a second probe of a lock this process freed may read it as held.
+fn take_lock(lock: &Path) -> Result<Lock> {
     let file = match OpenOptions::new().read(true).open(lock) {
         Ok(file) => file,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Lock::Free(None)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", lock.display())),
     };
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(false),
-        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(true),
+        Ok(()) => Ok(Lock::Free(Some(file))),
+        Err(e) if std::io::Error::from(e).kind() == ErrorKind::WouldBlock => Ok(Lock::Held),
         Err(e) => Err(e).with_context(|| format!("flock {}", lock.display())),
     }
 }
 
+/// Whether a process holds `lock` (a dry run's busy probe): the flock is taken and dropped at once.
+fn lock_held(lock: &Path) -> Result<bool> {
+    Ok(matches!(take_lock(lock)?, Lock::Held))
+}
+
 /// Removes a stale session: a held lock leaves it alone; otherwise the dir, then its lock file.
 fn remove_session(tree: &Path, session: &Session) -> Result<()> {
-    if let Some(lock) = &session.lock
-        && lock_held(lock)?
-    {
-        return Ok(());
-    }
+    // no re-probe: the plan holds the lock since it was planned (Session `_held`)
     if let Some(dir) = &session.dir {
         remove(tree, dir)?;
     }
