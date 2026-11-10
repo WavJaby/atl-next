@@ -25,7 +25,7 @@ mod place;
 
 pub use super::dispatch::{Answer, OnTrap, Trap, on_trap};
 pub use place::{
-    JNI_STUBS, bind, is_stub, jni_stub, patch_entry, patch_hook, patch_site, register,
+    JNI_STUBS, bind, bind_result, is_stub, jni_stub, patch_entry, patch_hook, patch_site, register,
     register_data,
 };
 
@@ -422,6 +422,7 @@ mod tests {
     use super::place::{THUNK_BYTES, pool};
     use super::*;
     use crate::engine::dispatch::call_binding;
+    use crate::engine::jni::Class;
 
     /// A binding trap runs the host function of its slot with the eight argument words and answers with its result.
     #[test]
@@ -447,5 +448,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(call_binding(id, &lanes).x0, 108);
+    }
+
+    /// A binding bound with class Fp answers its host function's xmm0 result in v0, and x0 = 0. The target is a host double function of 5.0 halved (its one parameter is the first fp lane).
+    #[test]
+    fn binding_trap_answers_an_fp_result_in_v0() {
+        extern "C" fn half(v0: f64) -> f64 {
+            v0 * 0.5
+        }
+        let thunk = bind_result(half as *const () as usize, Class::Fp).expect("a free pool slot");
+        let base = &raw const pool::POOL as usize;
+        let id = u32::try_from((thunk - base) / THUNK_BYTES).expect("slot fits an id");
+        let lanes = atl_engine_api::AtlLanesV1 {
+            v: [5.0f64.to_bits(), 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let answer = call_binding(id, &lanes);
+        assert_eq!((answer.x0, answer.v0), (0, 2.5f64.to_bits()));
     }
 }

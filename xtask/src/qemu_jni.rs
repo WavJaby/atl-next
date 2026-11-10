@@ -3,7 +3,7 @@
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/qemu-jni/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: `xtask/testdata/qemu-linker/boot.c` (static).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-linker`.
-//! Harness: `tests/qemu_jni.rs` (harness-less; checks s, v, e, c, j, t, d, f, and the refusals r, l, g, each run in a child process) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `jni_guest_env` (the host function gets the guest env, check e), `jni_swap` (x3 and x4 exchanged, check c), `v_drop` (fp lanes zeroed, checks d), `drop_stack` (stack words one early, check d), `ret_int` (fp results read from x0, checks d and f).
+//! Harness: `tests/qemu_jni.rs` (harness-less; checks s, v, e, c, j, t, d, f, a, p, and the refusals r, l, g, each run in a child process) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `jni_guest_env` (the host function gets the guest env, check e), `jni_swap` (x3 and x4 exchanged, check c), `v_drop` (fp lanes zeroed, checks d), `drop_stack` (stack words one early, check d), `ret_int` (fp results read from x0, checks d and f), `al_zero` (host calls with %al = 0, check p).
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-jni/`, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -21,13 +21,16 @@ const TESTDATA: &str = "xtask/testdata/qemu-jni";
 const HARNESS: Harness = Harness {
     test: "qemu_jni",
     prefix: "qemu-jni",
-    checks: &['s', 'v', 'e', 'c', 'j', 't', 'd', 'f', 'r', 'l', 'g'],
+    checks: &[
+        's', 'v', 'e', 'c', 'j', 't', 'd', 'f', 'a', 'p', 'r', 'l', 'g',
+    ],
     breaks: &[
         "jni_guest_env",
         "jni_swap",
         "v_drop",
         "drop_stack",
         "ret_int",
+        "al_zero",
     ],
 };
 

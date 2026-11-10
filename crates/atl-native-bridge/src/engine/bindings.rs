@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
 
+use super::jni::Class;
 use super::{Active, active, unsupported};
 
 /// The identity engine's table: the host arch's NBS libc stub list, every shim bound.
@@ -59,8 +60,8 @@ pub enum Host {
 /// What a stub binds to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// this symbol of that host library
-    Generic(Host, &'static str),
+    /// this symbol of that host library, whose result is of class `Class` (the proxy prototype's `ret`; integer for every libc row)
+    Generic(Host, &'static str, Class),
     /// [`shim`] of the stub's name
     Shim,
     /// `table::TRAPS[i]`
@@ -95,7 +96,7 @@ pub fn rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
     t.libs.iter().flat_map(move |l| {
         l.stubs.iter().map(move |&(name, e)| {
             let b = match e {
-                Entry::Generic(host, symbol) => Binding::Generic { host, symbol },
+                Entry::Generic(host, symbol, _) => Binding::Generic { host, symbol },
                 Entry::Shim => Binding::Shim,
                 Entry::Trap(i) => Binding::Trap(t.trap_names[i].2),
             };
@@ -135,19 +136,21 @@ fn shim(name: &str) -> Option<usize> {
     })
 }
 
-/// What a stub binds to, with its host address (a thunk is made of it by the caller).
+/// What a stub binds to, with its host address and result class (a thunk is made of it by the caller).
 pub enum Target {
-    Host(usize),
+    Host(usize, Class),
+    /// a trap aborts, so its class is never read: integer
     Trap(usize),
     /// no host symbol: the stub stays unbound
     Absent,
 }
 
 impl Target {
-    /// The address the stub's thunk crosses to; None when absent.
-    pub fn address(self) -> Option<usize> {
+    /// The host function the stub's thunk crosses to and its result class; None when absent.
+    pub fn callee(self) -> Option<(usize, Class)> {
         match self {
-            Target::Host(a) | Target::Trap(a) => Some(a),
+            Target::Host(a, ret) => Some((a, ret)),
+            Target::Trap(a) => Some((a, Class::Int)),
             Target::Absent => None,
         }
     }
@@ -224,13 +227,13 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
     let table = table();
     let lib = table.libs.iter().find(|l| l.soname == soname)?;
     let entry = lib.stubs.iter().find(|(n, _)| *n == name).map(|&(_, e)| e);
-    let found = |a: Option<usize>| match a {
-        Some(a) => (Target::Host(a), 0),
+    let found = |a: Option<usize>, ret: Class| match a {
+        Some(a) => (Target::Host(a, ret), 0),
         None => (Target::Absent, 3),
     };
     let (t, outcome) = match entry {
-        Some(Entry::Generic(host, sym)) => found(symbol(host, lib.soname, sym)),
-        Some(Entry::Shim) => found(shim(name)),
+        Some(Entry::Generic(host, sym, ret)) => found(symbol(host, lib.soname, sym), ret),
+        Some(Entry::Shim) => found(shim(name), Class::Int),
         Some(Entry::Trap(i)) => {
             let why = table.trap_names[i].2;
             let outcome = if why.starts_with("unbound") { 1 } else { 2 };

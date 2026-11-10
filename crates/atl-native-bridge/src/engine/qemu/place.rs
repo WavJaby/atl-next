@@ -9,6 +9,7 @@ use crate::engine::Engine as _;
 use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::dispatch::TARGETS;
 use crate::engine::image::{Image, write_sealed};
+use crate::engine::jni::Class;
 
 use super::CROSSING;
 
@@ -33,13 +34,20 @@ const _: () = assert!(std::mem::size_of::<pool::Pool>() == THUNKS * THUNK_BYTES)
 /// JNI pool ids: id `k` < `JNI_STUBS` is JNI table entry `k`, for env and vm alike (`jni_stub`). Ids from here up are bound host functions.
 pub const JNI_STUBS: usize = crate::engine::bindings::JNI_STUBS;
 
-/// A guest-callable address that crosses to host function `target`: the address of a free pool slot, which the binding trap routes to `target`. None when the pool is used up.
+/// A guest-callable address that crosses to host function `target` with an integer result ([`bind_result`]). None when the pool is used up.
 pub fn bind(target: usize) -> Option<usize> {
+    bind_result(target, Class::Int)
+}
+
+/// A guest-callable address that crosses to host function `target`, whose result is of class `ret`: the address of a free pool slot, which the binding trap routes to `target` and answers by `ret` (dispatch.rs `call_binding`). None when the pool is used up.
+pub fn bind_result(target: usize, ret: Class) -> Option<usize> {
     let slot = NEXT.fetch_add(1, Ordering::Relaxed);
     if slot >= THUNKS {
         return None;
     }
-    TARGETS[slot].store(target, Ordering::Release);
+    TARGETS[slot]
+        .set((target, ret))
+        .expect("a pool slot is bound once: NEXT only grows");
     Some((&raw const pool::POOL) as usize + slot * THUNK_BYTES)
 }
 

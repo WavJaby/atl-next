@@ -3,7 +3,7 @@
 //! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. CallStaticDoubleMethod and CallStaticFloatMethod check the lanes they were given (the stack spill, the fp arguments) and answer from them.
 //! Driver: run without `ATL_QJ_CASE`, it first runs each refusal case in a child process (QEMU starts once per process), then the plain case in this process. A refusal case must abort by name: SIGABRT and its message on stderr.
 //! Env (xtask qemu_jni.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (testdata/qemu-linker/boot.c, static), ATL_NB_JNIEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
-//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (r) a reserved slot, (l) a va_list entry, (g) a forged id past the table: each refused by name.
+//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (r) a reserved slot, (l) a va_list entry, (g) a forged id past the table: each refused by name.
 //! Output: `qemu-jni: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -15,14 +15,14 @@
     reason = "a fake JNIEnv and JavaVM in the C ABI take and answer raw JNI pointers; calls the guest through Guest::call"
 )]
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_int};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-use atl_native_bridge::engine::jni::{guest_env, guest_vm};
+use atl_native_bridge::engine::jni::{Class, guest_env, guest_vm};
 use atl_native_bridge::engine::{Config, Guest, qemu};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
@@ -64,8 +64,20 @@ const VM_SLOTS: usize = 8;
 const FORGED_SLOT: usize = 240;
 /// The JNI calls fixture.c makes: GetVersion, FindClass, GetStaticMethodID, CallStaticIntMethod, GetJavaVM, NewStringUTF, GetStringUTFChars, ReleaseStringUTFChars, SetDoubleField, CallStaticDoubleMethod, CallStaticFloatMethod.
 const CALLS: usize = 11;
-/// The words fixture.c writes to `out`.
-const OUT_WORDS: usize = 8;
+/// The words of `out`: fixture.c's results at 0..7; the snprintf row (`p`) takes the pool address of its binding at 8, the buffer's address at 9, its size at 11 and returns snprintf's result at 10; the atof row (`a`) takes its binding at 12 and its argument at 13 and returns the result's bits at 14.
+const OUT_WORDS: usize = 15;
+/// The snprintf row (`p`): glibc's `snprintf("%d %.2f", 7, 2.5)` (C99 7.21.6.1: `%d` writes 7, `%.2f` writes 2.50), so the text and its length. The buffer has room for it and its NUL.
+const SNPRINTF_EXPECT: &str = "7 2.50";
+const SNP_CAP: usize = 16;
+/// The atof row (`a`): glibc's `atof("2.5")`, a double result in xmm0 that the binding answers in v0 (class Fp).
+const ATOF_TEXT: &[u8] = b"2.5\0";
+const ATOF_EXPECT: f64 = 2.5;
+
+// glibc's snprintf and atof, bound through the engine for their rows: the fixture calls them as guest functions
+unsafe extern "C" {
+    fn snprintf(buf: *mut c_char, n: usize, fmt: *const c_char, ...) -> c_int;
+    fn atof(s: *const c_char) -> f64;
+}
 
 /// The fake's handles and the string it hands out (NUL-terminated, so `GetStringUTFChars` returns its address).
 const CLASS: usize = 0x0c_1a55;
@@ -367,6 +379,15 @@ fn started(r: Result<Guest, String>) -> u64 {
     } else {
         0
     };
+    // the snprintf row (`p`): glibc's snprintf bound through the engine (a pool slot the guest calls), and the host buffer it writes
+    let mut text = [0u8; SNP_CAP];
+    out[8] = qemu::bind(snprintf as *const () as usize).expect("a free pool slot") as i64;
+    out[9] = text.as_mut_ptr() as i64;
+    out[11] = SNP_CAP as i64;
+    // the atof row (`a`): glibc's atof bound with result class Fp (the proxy table's one fp row, glGetPathLengthNV, needs the GL front this gate does not load); its argument is host memory
+    out[12] =
+        qemu::bind_result(atof as *const () as usize, Class::Fp).expect("a free pool slot") as i64;
+    out[13] = ATOF_TEXT.as_ptr() as i64;
     // SAFETY: `run` is qj_run (ELF symbol plus the load bias), a function of a JNIEnv*, a long long[OUT_WORDS] and a long long (fixture.c); `env` is this thread's guest env and `out` stays writable for the call.
     unsafe { guest.call(run, env, out.as_mut_ptr() as usize, refuse as usize) };
     if refuse != 0 {
@@ -471,6 +492,34 @@ fn started(r: Result<Guest, String>) -> u64 {
                 "CallStaticFloatMethod: {float_bad} wrong args, returned bits {:#x} (expected {:#x})",
                 out[6],
                 FLOAT_EXPECT.to_bits()
+            ))
+        },
+    );
+    let printed = CStr::from_bytes_until_nul(&text)
+        .map_or_else(|_| String::new(), |c| c.to_string_lossy().into_owned());
+    let atof_bits = ATOF_EXPECT.to_bits() as i64;
+    ok &= check(
+        'a',
+        if out[14] == atof_bits {
+            Ok(())
+        } else {
+            Err(format!(
+                "atof through the Fp binding returned bits {:#x}, expected {atof_bits:#x} ({ATOF_EXPECT})",
+                out[14]
+            ))
+        },
+    );
+    ok &= check(
+        'p',
+        if usize::try_from(out[10]).ok() == Some(SNPRINTF_EXPECT.len())
+            && printed == SNPRINTF_EXPECT
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "snprintf returned {}, wrote {printed:?}; expected {}, {SNPRINTF_EXPECT:?}",
+                out[10],
+                SNPRINTF_EXPECT.len()
             ))
         },
     );

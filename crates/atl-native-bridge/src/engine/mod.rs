@@ -161,11 +161,16 @@ impl Active {
         }
     }
 
-    /// A guest-callable address that crosses to host function `target`; None when the engine's thunks are used up.
+    /// A guest-callable address that crosses to host function `target` with an integer result; None when the engine's thunks are used up.
     pub fn bind(self, target: usize) -> Option<usize> {
+        self.bind_result(target, jni::Class::Int)
+    }
+
+    /// [`Active::bind`] for a host function whose result is of class `ret`: the QEMU engine answers the binding trap in x0 or v0 by it. Identity's native call returns in its own registers, so it ignores `ret`.
+    pub fn bind_result(self, target: usize, ret: jni::Class) -> Option<usize> {
         match self {
             Active::Identity => identity::bind(target),
-            Active::Qemu => qemu::bind(target),
+            Active::Qemu => qemu::bind_result(target, ret),
         }
     }
 

@@ -27,7 +27,8 @@ static void call_valist(JNIEnv *env, ...) {
     va_end(ap);
 }
 
-// out[0] GetVersion, out[1] CallStaticIntMethod(ADD_A, ADD_B), out[2] GetJavaVM's result, out[3] the vm it gave, out[4] 1 when NewStringUTF("abc") reads back "abc",
+// out[8] (in) the pool address of the snprintf binding, out[9] (in) its buffer, out[11] (in) the buffer size, out[10] (out) snprintf's result: the `p` row.
+// out[0] GetVersion, out[1] CallStaticIntMethod(ADD_A, ADD_B),out[2] GetJavaVM's result, out[3] the vm it gave, out[4] 1 when NewStringUTF("abc") reads back "abc",
 // out[5] the bits of CallStaticDoubleMethod's result, out[6] the bits of CallStaticFloatMethod's result, out[7] (refuse == REFUSE_FORGED) the address of a JNI stub past the table
 void qj_run(JNIEnv *env, long long *out, long long refuse) {
     if (refuse == REFUSE_RESERVED) {
@@ -67,6 +68,16 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     } fu;
     fu.f = f;
     out[6] = fu.i;
+    // Q6-3 part 2b, the snprintf row (p): glibc's snprintf through the binding the host made (out[8]); its buffer (out[9]) and size (out[11]) are host memory the host call writes; the double vararg needs the host call's %al
+    out[10] = ((int (*)(char *, unsigned long, const char *, ...))(intptr_t)out[8])((char *)(intptr_t)out[9], (unsigned long)out[11], "%d %.2f", 7, 2.5);
+    // the atof row (a): glibc's atof through the binding the host made with result class Fp (out[12]); its argument (out[13]) is host memory; the double comes back in v0
+    double a = ((double (*)(const char *))(intptr_t)out[12])((const char *)(intptr_t)out[13]);
+    union {
+        double d;
+        long long i;
+    } au;
+    au.d = a;
+    out[14] = au.i;
 }
 
 // the executable needs a main (as qemu-thread's fixture has one); the guest linker starts it, the host calls qj_run

@@ -98,16 +98,21 @@ fn function(ty: &Ty) -> Option<&Signature> {
 
 fn lane(name: &str, sig: &Signature) -> Result<Lane> {
     let params = sig.params.iter().map(param).collect::<Result<Vec<_>>>()?;
-    let ret = match sig.ret.resolved() {
-        Ty::Void => Class::Void,
-        _ => scalar(&sig.ret)?,
-    };
+    let ret = result_class(&sig.ret)?;
     Ok(Lane {
         name: name.to_owned(),
         params,
         ret,
         variadic: sig.variadic,
     })
+}
+
+/// A result's class: `void` is [`Class::Void`], else the class of its type. Shared by a JNI slot's result and a proxy binding's (bindings.rs `Entry::Generic`), so both answer in the same register.
+pub fn result_class(ty: &Ty) -> Result<Class> {
+    match ty.resolved() {
+        Ty::Void => Ok(Class::Void),
+        _ => scalar(ty),
+    }
 }
 
 /// A parameter's class. `va_list` is matched by name first: the IR keeps the typedef name, and its type differs by platform (an array on x86-64, a struct on AArch64).
@@ -206,6 +211,22 @@ mod tests {
         );
         assert!(err.contains("JNINativeInterface.Take"), "{err}");
         assert!(err.contains("no lane class"), "{err}");
+    }
+
+    /// Expected classes written from the C shapes, not from the code under test: void, an enum and a boolean (int lanes), a pointer (int), float and double (fp).
+    #[test]
+    fn result_classes_follow_the_return_banks() {
+        use Class::{Fp, Int, Void};
+        let iface = parse(
+            "results",
+            "typedef unsigned int GLenum;\ntypedef unsigned char GLboolean;\ntypedef float GLfloat;\ntypedef double GLdouble;\nvoid f_void(void);\nGLenum f_enum(void);\nGLboolean f_bool(void);\nvoid *f_ptr(void);\nGLfloat f_float(void);\nGLdouble f_double(void);\n",
+        );
+        let view = &iface.arches["x86_64"];
+        let got: Vec<Class> = ["f_void", "f_enum", "f_bool", "f_ptr", "f_float", "f_double"]
+            .iter()
+            .map(|name| result_class(&view.functions[*name].ret).unwrap())
+            .collect();
+        assert_eq!(got, [Void, Int, Int, Int, Fp, Fp]);
     }
 
     /// The emitted text type-checks under rustc, with one 8-slot table.

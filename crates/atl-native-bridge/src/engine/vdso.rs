@@ -28,16 +28,16 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
         return;
     }
     // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope
-    let host = super::bindings::target(&lib, &name).and_then(|t| t.address());
+    let host = super::bindings::target(&lib, &name).and_then(|t| t.callee());
     // deliberate break of the app gate's glesPbuffer (`ATL_NB_BREAK=gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
     #[cfg(atl_nb_gl_direct)]
     let bound = if name == "glClear" {
-        host
+        host.map(|(h, _)| h)
     } else {
-        host.and_then(|h| engine.bind(h))
+        host.and_then(|(h, ret)| engine.bind_result(h, ret))
     };
     #[cfg(not(atl_nb_gl_direct))]
-    let bound = host.and_then(|h| engine.bind(h));
+    let bound = host.and_then(|(h, ret)| engine.bind_result(h, ret));
     match bound {
         Some(thunk) if engine.patch_site(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);

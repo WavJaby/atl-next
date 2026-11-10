@@ -18,7 +18,8 @@ use slots::{env, vm};
 mod lanes {
     include!(concat!(env!("OUT_DIR"), "/jni_lanes.rs"));
 }
-pub(super) use lanes::Class;
+/// Public: the result class a QEMU binding is bound with (`Active::bind_result`).
+pub use lanes::Class;
 
 const _: () = assert!(
     env::SLOTS.len() <= super::bindings::JNI_STUBS && vm::SLOTS.len() <= super::bindings::JNI_STUBS
