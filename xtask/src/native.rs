@@ -220,9 +220,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         fetch::add_and_fetch(root, &[])?;
     }
     // modules provided outside the tree, before the converter: it links their artifacts; each provider is built or resolved once (crates by cargo-c, upstreams by their own build system, system libraries as installed), then each module gets one entry joining its row's providers in order
-    let crates = build_crates(root, &out, &providers)?;
+    // plan A3: a cross host builds no providers (the build machine's compiler and pkg-config would build them for the wrong arch), so the build steps below see an empty table; the converter fails a goal closure that reaches a provided module (-cross-providers)
+    let cross_names: Vec<&str> = providers
+        .iter()
+        .filter(|(_, row)| {
+            !row.is_none()
+                && !row.provider.as_deref().is_some_and(|p| p.starts_with("module:"))
+                && (row.provider.is_some() || !row.srcs.is_empty())
+        })
+        .map(|(m, _)| m.as_str())
+        .collect();
+    let cross_provider_args: Vec<String> = if cross.is_some() {
+        vec!["-cross-providers".to_owned(), cross_names.join(",")]
+    } else {
+        Vec::new()
+    };
+    let unbuilt = providers::Providers::new();
+    let to_build = if cross.is_some() { &unbuilt } else { &providers };
+    let crates = build_crates(root, &out, to_build)?;
     let mut systems = BTreeMap::new();
-    for (_, row) in providers::systems(&providers) {
+    for (_, row) in providers::systems(to_build) {
         if systems.contains_key(row) {
             continue;
         }
@@ -258,7 +275,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let checkouts = sources.checkouts(None);
     // by module: a recipe installs one artifact per module it provides
     let mut upstreams = BTreeMap::new();
-    for name in providers::upstreams(&providers) {
+    for name in providers::upstreams(to_build) {
         let recipe = upstream::recipe(name).context("providers.toml checked the recipe")?;
         let c = checkouts
             .iter()
@@ -274,7 +291,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .into_iter()
         .map(|(m, _)| m)
         .collect();
-    for (module, row) in providers
+    for (module, row) in to_build
         .iter()
         .filter(|(m, row)| !row.is_none() && !stood.contains(m.as_str()))
     {
@@ -301,7 +318,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         provided.insert(module.as_str(), p);
     }
     // a srcs row's provider stands in for some sources of its module, not for the module
-    let partial: BTreeMap<&str, Partial> = providers::partial(&providers)
+    let partial: BTreeMap<&str, Partial> = providers::partial(to_build)
         .into_iter()
         .map(|(module, row)| {
             let provider = provided.remove(module);
@@ -314,7 +331,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let srcs_file = out.join("srcs.json");
     std::fs::write(&srcs_file, serde_json::to_string_pretty(&partial)?)?;
     // workspace packages' AIDL crates (packages.rs aidl_crates): always converted and built, so those packages build whatever the goals
-    let (aidl_crates, aidl_goals) = packages::workspace_aidl_crates(root)?;
+    // cross host: not converted, their packages are not built (plan A3)
+    let (aidl_crates, aidl_goals) = if cross.is_some() {
+        (BTreeMap::new(), Vec::new())
+    } else {
+        packages::workspace_aidl_crates(root)?
+    };
     let aidl_crates_file = out.join("aidl-crates.json");
     std::fs::write(
         &aidl_crates_file,
@@ -347,6 +369,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg("-out")
             .arg(&out)
             .args(&cross_flags)
+            .args(&cross_provider_args)
             .args([
                 "-arch",
                 &args.host,
@@ -491,7 +514,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if status.success() {
         println!("native: built -> {}", out.display());
-        for built in packages::build(root, &out)? {
+        let packages_built = if cross.is_some() {
+            println!("native: cross host: workspace packages not built (plan A3)");
+            Vec::new()
+        } else {
+            packages::build(root, &out)?
+        };
+        for built in packages_built {
             for bin in built.bins {
                 println!("native: package {} -> {}", built.package, bin.display());
             }
