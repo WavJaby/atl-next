@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 1;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 0;
+pub const ABI_MINOR: u32 = 1;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -37,9 +37,25 @@ pub enum AtlEngine {}
 /// Opaque guest CPU of one attached host thread (`atl_cpu`).
 pub enum AtlCpu {}
 
-/// The trap callback of [`AtlHostV1`]: `kind` is a [`TrapKind`], `regs` points at eight u64.
+/// The trap callback of [`AtlHostV1`] for BOOT and REPORT: `kind` is a [`TrapKind`], `regs` points at eight u64.
 pub type TrapFn =
     unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, regs: *const u64) -> u64;
+
+/// `atl_lanes_v1` (minor 1): the lanes of a host call or trap beyond the integer registers. `x` is x0..x7 and `v` the low 64 bits of v0..v7 (both in); `stack` the eight words at the guest's sp (in). The answer is `x[0]` and `v[0]`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlLanesV1 {
+    /// x0..x7.
+    pub x: [u64; 8],
+    /// The low 64 bits of v0..v7.
+    pub v: [u64; 8],
+    /// The eight words at sp.
+    pub stack: [u64; 8],
+}
+
+/// The trap callback of [`AtlHostV1`] for CALL and BIND (minor 1): `lanes` is read, then answered in `x[0]` and `v[0]`.
+pub type TrapExFn =
+    unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanesV1);
 
 /// `atl_host_v1`: what the host hands the engine in `create`.
 #[repr(C)]
@@ -51,10 +67,12 @@ pub struct AtlHostV1 {
     pub minor: u32,
     /// Size of this struct as the host compiled it.
     pub size: u32,
-    /// Passed back to `trap`.
+    /// Passed back to `trap` and `trap_ex`.
     pub ctx: *mut c_void,
-    /// The trap callback.
+    /// The trap callback for BOOT and REPORT.
     pub trap: Option<TrapFn>,
+    /// The trap callback for CALL and BIND (minor 1).
+    pub trap_ex: Option<TrapExFn>,
 }
 
 /// `atl_engine_v1::create`: `boot_exe` is a NUL-terminated path; QEMU's flags are the engine's own.

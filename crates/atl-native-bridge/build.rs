@@ -721,6 +721,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("jni_guest_env", "atl_nb_jni_guest_env"),
     // Q6-2 (engine/dispatch.rs `call_jni`): x3 and x4 exchanged, so CallStaticIntMethod(2, 3) reaches the host as (3, 2) (qemu-jni gate, `c`)
     ("jni_swap", "atl_nb_jni_swap"),
+    // Q6-1 (engine/qemu/mod.rs `host_trap_ex`): the stack words a trap delivers arrive one word late (qemu-abi gate, `k`)
+    ("qa_stack_off", "atl_qa_stack_off"),
+    // Q6-1 (engine/qemu/mod.rs `host_trap_ex`): the FP lanes a trap delivers arrive one register late (qemu-abi gate, `v`)
+    ("qa_v_lane", "atl_qa_v_lane"),
     // Q5-7 (bridgegen x86.rs `entries_asm`, disp_bias): every identity pool call's displacement one byte short, so each lands one byte past its shell (identity gates g1-g5 and unit test `thunk_slots_call_their_shell`)
     ("x86_disp", X86_DISP_CFG),
     // Q5-8b (bridgegen x86.rs `entries_asm`, `counted`): the identity shells call no counter, so every identity crossing counts 0 (identity gate `identity_crossing`, check t)

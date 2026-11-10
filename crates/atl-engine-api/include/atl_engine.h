@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #define ATL_ENGINE_ABI_MAJOR 1
-#define ATL_ENGINE_ABI_MINOR 0
+#define ATL_ENGINE_ABI_MINOR 1
 
 /* Page protection, QEMU's page flags (include/exec/page-protection.h). */
 #define ATL_PROT_READ 0x1u
@@ -22,9 +22,9 @@
 enum atl_trap_kind {
     /* regs[0] = auxv (x0), regs[1] = return stub (x1); the answer is the boot executable's exit status. */
     ATL_TRAP_BOOT = 0,
-    /* A host call (svc #CALL): regs[0..7] = x0..x7; the answer is x0. */
+    /* A host call (svc #CALL): trap_ex, lanes in; the answer is lanes->x[0] and lanes->v[0]. */
     ATL_TRAP_CALL = 1,
-    /* A binding thunk: id = its slot; regs[0..7] = x0..x7; the answer is x0. */
+    /* A binding thunk: id = its slot; trap_ex, lanes in; the answer is lanes->x[0] and lanes->v[0]. */
     ATL_TRAP_BIND = 2,
     /* A value reported for a gate: regs[0] = x0; the answer is ignored. */
     ATL_TRAP_REPORT = 3,
@@ -33,11 +33,20 @@ enum atl_trap_kind {
 typedef struct atl_engine atl_engine; /* opaque, one per process */
 typedef struct atl_cpu atl_cpu;       /* opaque, one per attached host thread */
 
+/* Minor 1: the lanes of a host call or trap beyond the integer registers. x = x0..x7 and v = the low 64 bits of v0..v7 (in); stack = the eight words at the guest's sp (in). The answer is x[0] and v[0]. */
+typedef struct atl_lanes_v1 {
+    uint64_t x[8];
+    uint64_t v[8];
+    uint64_t stack[8];
+} atl_lanes_v1;
+
 typedef struct atl_host_v1 {
     uint32_t major, minor, size;
     void *ctx;
-    /* Called on the guest's thread, inside the trap; may call back into the engine (create published the handle before BOOT). */
+    /* BOOT and REPORT. Called on the guest's thread, inside the trap; may call back into the engine (create published the handle before BOOT). */
     uint64_t (*trap)(void *ctx, uint32_t kind, uint32_t id, const uint64_t regs[8]);
+    /* Minor 1: CALL and BIND, the same contract with lanes; the answer is lanes->x[0] and lanes->v[0]. */
+    void (*trap_ex)(void *ctx, uint32_t kind, uint32_t id, atl_lanes_v1 *lanes);
 } atl_host_v1;
 
 typedef struct atl_engine_v1 {

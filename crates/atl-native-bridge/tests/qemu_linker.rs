@@ -185,11 +185,11 @@ fn patch_stub(stub: usize) -> Result<(), String> {
 }
 
 /// The engine's trap callback for this gate. BOOT only records the fixture's `run_sites`: the engine answers BOOT at once, and [`checks`] runs on the attached thread after it.
-fn on_trap(trap: qemu::Trap) -> u64 {
+fn on_trap(trap: qemu::Trap) -> qemu::Answer {
     match trap {
         qemu::Trap::Boot(run_sites) => {
             RUN_SITES.store(run_sites, Ordering::Relaxed);
-            0
+            qemu::Answer::default()
         }
         qemu::Trap::Report(v) => {
             let first = {
@@ -200,13 +200,16 @@ fn on_trap(trap: qemu::Trap) -> u64 {
             if first && let Err(e) = patch_stub(v as usize) {
                 println!("qemu-linker: (s) FAIL stub: {e}");
             }
-            0
+            qemu::Answer::default()
         }
-        qemu::Trap::Bind { id, args } => {
-            TRAPS.lock().expect("traps").push((id, args));
+        qemu::Trap::Bind { id, lanes } => {
+            TRAPS.lock().expect("traps").push((id, lanes.x));
             match PLAN.get() {
-                Some(plan) if id == plan.ids[POST_INIT] => 0,
-                Some(plan) if id == plan.ids[CALL_GUEST] => CALL_GUEST_ANSWER,
+                Some(plan) if id == plan.ids[POST_INIT] => qemu::Answer::default(),
+                Some(plan) if id == plan.ids[CALL_GUEST] => qemu::Answer {
+                    x0: CALL_GUEST_ANSWER,
+                    v0: 0,
+                },
                 _ => qemu::on_trap(trap),
             }
         }

@@ -464,6 +464,11 @@ pub(crate) fn set_pages(start: usize, len: usize, set: i32, clear: i32) -> Resul
 /// Byte offset of TPIDR_EL0 in `CPUArchState` (clang's `offsetof`, a `size_t` the generator types u64; an offset inside a 79 KB record fits any usize).
 const TPIDR_EL0: usize = crate::layout::ATL_OFFSET_TPIDR_EL0 as usize;
 const _: () = assert!(TPIDR_EL0 + 8 <= Env::SIZE);
+/// `vfp.zregs` (v<i> is zregs[i]; its low 64 bits are `d[0]`): offsets and stride from clang (build.rs `FIELD_OFFSETS`).
+const ZREGS: usize = crate::layout::ATL_OFFSET_ZREGS as usize;
+const ZREG_SIZE: usize = crate::layout::ATL_SIZEOF_ZREG as usize;
+const ZREG_D: usize = crate::layout::ATL_OFFSET_ZREG_D as usize;
+const _: () = assert!(ZREGS + 32 * ZREG_SIZE <= Env::SIZE);
 
 /// The guest CPU as P1's hook received it (`CPUArchState *`), valid while the hook runs.
 #[derive(Clone, Copy, Debug)]
@@ -495,6 +500,28 @@ impl Guest {
     pub fn set_x(&self, i: usize, v: u64) {
         assert!(i < 32, "x{i}");
         self.set_reg(Env::xregs + 8 * i, v);
+    }
+
+    /// v<i> (0..=31): its low 64 bits, the lane a `double` argument or result uses.
+    pub fn v(&self, i: usize) -> u64 {
+        assert!(i < 32, "v{i}");
+        self.reg(ZREGS + ZREG_SIZE * i + ZREG_D)
+    }
+
+    /// Sets v<i>'s low 64 bits and clears the high 64, as a write to d<i> does.
+    pub fn set_v(&self, i: usize, v: u64) {
+        assert!(i < 32, "v{i}");
+        let at = ZREGS + ZREG_SIZE * i + ZREG_D;
+        self.set_reg(at, v);
+        self.set_reg(at + 8, 0);
+    }
+
+    /// Stack word `i` (0..8) at the guest's sp: where a call's stack arguments sit. Guest = host (identity), so the word is read at its host address. Words past sp can run past a shallow thread's stack top (QEMU bridge plan R-5); the trap reads all eight.
+    pub fn stack_word(&self, i: usize) -> u64 {
+        assert!(i < 8, "stack word {i}");
+        let sp = self.x(31) + 8 * i as u64;
+        // SAFETY: sp is the guest's stack in the identity map (the trapping CPU's own sp); the host address is mapped while the guest runs, and an unaligned read is fine for any alignment.
+        unsafe { (self.host_addr(sp) as *const u64).read_unaligned() }
     }
 
     pub fn pc(&self) -> u64 {

@@ -58,7 +58,9 @@ mod abi_layout {
 mod abi_check {
     use core::mem::{offset_of, size_of};
 
-    use atl_engine_api::{AtlEngineV1, AtlHostV1, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind};
+    use atl_engine_api::{
+        AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind,
+    };
 
     use super::abi_layout as l;
 
@@ -78,6 +80,11 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlHostV1, size) as u64 == l::ATL_OFFSET_HOST_SIZE);
     const _: () = assert!(offset_of!(AtlHostV1, ctx) as u64 == l::ATL_OFFSET_HOST_CTX);
     const _: () = assert!(offset_of!(AtlHostV1, trap) as u64 == l::ATL_OFFSET_HOST_TRAP);
+    const _: () = assert!(offset_of!(AtlHostV1, trap_ex) as u64 == l::ATL_OFFSET_HOST_TRAP_EX);
+    const _: () = assert!(size_of::<AtlLanesV1>() as u64 == l::ATL_SIZEOF_LANES_V1);
+    const _: () = assert!(offset_of!(AtlLanesV1, x) as u64 == l::ATL_OFFSET_LANES_X);
+    const _: () = assert!(offset_of!(AtlLanesV1, v) as u64 == l::ATL_OFFSET_LANES_V);
+    const _: () = assert!(offset_of!(AtlLanesV1, stack) as u64 == l::ATL_OFFSET_LANES_STACK);
     const _: () = assert!(size_of::<AtlEngineV1>() as u64 == l::ATL_SIZEOF_ENGINE_V1);
     const _: () = assert!(offset_of!(AtlEngineV1, major) as u64 == l::ATL_OFFSET_ENGINE_MAJOR);
     const _: () = assert!(offset_of!(AtlEngineV1, minor) as u64 == l::ATL_OFFSET_ENGINE_MINOR);
@@ -97,8 +104,8 @@ mod capi {
     use std::sync::OnceLock;
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, PROT_EXEC, PROT_READ,
-        PROT_WRITE, TrapFn, TrapKind,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_EXEC,
+        PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
     };
 
     use crate::engine::{boot_env, set_pages, start_linked};
@@ -112,6 +119,7 @@ mod capi {
     struct HostRef {
         ctx: *mut c_void,
         trap: TrapFn,
+        trap_ex: TrapExFn,
     }
 
     // SAFETY: the ABI's contract: the host keeps ctx and trap valid until the process ends, and only reads this struct after create.
@@ -136,19 +144,36 @@ mod capi {
         engine as usize == &raw const ENGINE as usize
     }
 
-    /// The engine's `OnTrap` for the C host: BOOT, CALL, BIND and REPORT as the ABI's kinds, with the guest's x0..x7.
+    /// BOOT and REPORT through the minor-0 callback: eight registers in, x0 out.
+    fn host_word(host: &HostRef, kind: TrapKind, regs: [u64; 8]) -> u64 {
+        // SAFETY: host.trap and host.ctx are the host's, valid by the ABI (HostRef); regs holds the eight u64 the call reads.
+        unsafe { (host.trap)(host.ctx, kind as u32, 0, regs.as_ptr()) }
+    }
+
+    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` (minor 1) with the guest's x0..x7, v0..v7 and eight stack words. The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
     fn host_trap(g: Guest, t: Trap) -> u64 {
         let host = HOST
             .get()
             .expect("atl-engine: create sets the host before BOOT");
-        let (kind, id, regs) = match t {
-            Trap::Boot(x0) => (TrapKind::Boot, 0, [x0, g.x(1), 0, 0, 0, 0, 0, 0]),
+        let (kind, id, x) = match t {
+            Trap::Boot(x0) => {
+                return host_word(host, TrapKind::Boot, [x0, g.x(1), 0, 0, 0, 0, 0, 0]);
+            }
+            Trap::Report(x0) => {
+                return host_word(host, TrapKind::Report, [x0, 0, 0, 0, 0, 0, 0, 0]);
+            }
             Trap::Call(a) => (TrapKind::Call, 0, a),
             Trap::Bind { id, args } => (TrapKind::Bind, id, args),
-            Trap::Report(x0) => (TrapKind::Report, 0, [x0, 0, 0, 0, 0, 0, 0, 0]),
         };
-        // SAFETY: host.trap and host.ctx are the host's, valid by the ABI (HostRef); regs holds the eight u64 the call reads.
-        unsafe { (host.trap)(host.ctx, kind as u32, id, regs.as_ptr()) }
+        let mut lanes = AtlLanesV1 {
+            x,
+            v: std::array::from_fn(|i| g.v(i)),
+            stack: std::array::from_fn(|i| g.stack_word(i)),
+        };
+        // SAFETY: host.trap_ex and host.ctx are the host's, valid by the ABI (HostRef); lanes is a live AtlLanesV1 that the host reads and answers.
+        unsafe { (host.trap_ex)(host.ctx, kind as u32, id, &mut lanes) };
+        g.set_v(0, lanes.v[0]);
+        lanes.x[0]
     }
 
     unsafe extern "C" fn create(
@@ -167,14 +192,21 @@ mod capi {
         {
             return -libc::EINVAL;
         }
-        let Some(trap) = h.trap else {
+        let (Some(trap), Some(trap_ex)) = (h.trap, h.trap_ex) else {
             return -libc::EINVAL;
         };
         // SAFETY: boot_exe is a NUL-terminated string (the ABI; checked non-null above).
         let Ok(exe) = unsafe { CStr::from_ptr(boot_exe) }.to_str() else {
             return -libc::EINVAL;
         };
-        if HOST.set(HostRef { ctx: h.ctx, trap }).is_err() {
+        if HOST
+            .set(HostRef {
+                ctx: h.ctx,
+                trap,
+                trap_ex,
+            })
+            .is_err()
+        {
             return -libc::EEXIST;
         }
         // SAFETY: out is non-null (checked); the handle is published before QEMU runs, so BOOT's callbacks reach the engine through it.

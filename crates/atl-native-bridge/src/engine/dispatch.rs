@@ -3,35 +3,52 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use atl_engine_api::AtlLanesV1;
+
 use super::jni;
 use super::unsupported;
 use crate::engine::bindings::JNI_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
 
-/// A trap from the engine, decoded from `atl_trap_kind`: `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` x0..x7; `Report` x0.
+/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes_v1`: x0..x7, v0..v7, eight stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]
 pub enum Trap {
     /// BOOT: the boot executable's auxv (x0).
     Boot(u64),
-    /// `svc #CALL`: x0..x7.
-    Call([u64; 8]),
-    /// A pool thunk: its id (a JNI slot below `JNI_STUBS`, else a bound host function), and x0..x7.
-    Bind { id: u32, args: [u64; 8] },
+    /// `svc #CALL`: the guest's lanes.
+    Call(AtlLanesV1),
+    /// A pool thunk: its id (a JNI slot below `JNI_STUBS`, else a bound host function), and its lanes.
+    Bind { id: u32, lanes: AtlLanesV1 },
     /// A value reported for a gate: x0.
     Report(u64),
 }
 
-/// A trap callback. Its answer is the guest's x0 (ignored for REPORT).
-pub type OnTrap = fn(Trap) -> u64;
+/// What a trap answers: x0 (every trap; BOOT's exit status) and v0 (CALL and BIND: the FP result lane, 0 when the callee returns an integer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Answer {
+    /// The guest's x0.
+    pub x0: u64,
+    /// The guest's v0, low 64 bits.
+    pub v0: u64,
+}
+
+/// A trap callback. Its answer is [`Answer`] (REPORT ignores it).
+pub type OnTrap = fn(Trap) -> Answer;
 
 /// The host target of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement writes it (`qemu::place::bind`).
 pub(super) static TARGETS: [AtomicUsize; THUNKS] = [const { AtomicUsize::new(0) }; THUNKS];
 
-/// The default trap callback: a JNI trap calls the host object's table (`call_jni`), a binding trap its host target (`call_binding`), and each answers with its result (the guest's x0). Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
-pub fn on_trap(trap: Trap) -> u64 {
+/// The default trap callback: a JNI trap calls the host object's table (`call_jni`), a binding trap its host target (`call_binding`), and each answers with its result in x0 (v0 is 0 until Q6-3). Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
+pub fn on_trap(trap: Trap) -> Answer {
     match trap {
-        Trap::Bind { id, args } if (id as usize) < JNI_STUBS => call_jni(id, args),
-        Trap::Bind { id, args } => call_binding(id, args),
+        Trap::Bind { id, lanes } if (id as usize) < JNI_STUBS => Answer {
+            x0: call_jni(id, lanes.x),
+            v0: 0,
+        },
+        Trap::Bind { id, lanes } => Answer {
+            x0: call_binding(id, lanes.x),
+            v0: 0,
+        },
         other => unsupported(&format!("qemu crossing: {other:?} is not routed yet")),
     }
 }

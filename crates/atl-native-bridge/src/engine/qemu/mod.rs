@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atl_engine_api::{
-    ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, PROT_EXEC, PROT_READ,
-    PROT_WRITE, TrapKind,
+    ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_EXEC,
+    PROT_READ, PROT_WRITE, TrapKind,
 };
 
 use super::image::Image;
@@ -23,7 +23,7 @@ use super::{Config, HostThread, unsupported};
 
 mod place;
 
-pub use super::dispatch::{OnTrap, Trap, on_trap};
+pub use super::dispatch::{Answer, OnTrap, Trap, on_trap};
 pub use place::{
     JNI_STUBS, bind, is_stub, jni_stub, patch_entry, patch_hook, patch_site, register,
     register_data,
@@ -102,6 +102,7 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
         size: std::mem::size_of::<AtlHostV1>() as u32,
         ctx: std::ptr::null_mut(),
         trap: Some(host_trap),
+        trap_ex: Some(host_trap_ex),
     };
     let mut engine = std::ptr::null_mut();
     // SAFETY: host and exe live for the call (the ABI); engine is an out parameter. create returns after BOOT answered.
@@ -117,27 +118,65 @@ pub fn boot(library: &Path, boot_exe: &Path, on_trap: OnTrap) -> Result<(), Stri
         .map_err(|_| "qemu crossing: engine set twice".to_owned())
 }
 
-/// The engine's host trap (`atl_host_v1.trap`): decodes the ABI kind, records BOOT's auxv, and calls the callback [`boot`] installed.
+/// The engine's host trap for BOOT and REPORT (`atl_host_v1.trap`, minor 0): decodes the kind, records BOOT's auxv, and calls the callback [`boot`] installed. Answers x0.
 ///
 /// # Safety
 /// The engine calls it with `regs` pointing at eight readable u64 (the ABI).
-unsafe extern "C" fn host_trap(_ctx: *mut c_void, kind: u32, id: u32, regs: *const u64) -> u64 {
+unsafe extern "C" fn host_trap(_ctx: *mut c_void, kind: u32, _id: u32, regs: *const u64) -> u64 {
     // SAFETY: eight u64 at regs, per the ABI; an unaligned read is fine for any alignment.
     let r = unsafe { regs.cast::<[u64; 8]>().read_unaligned() };
     const BOOT: u32 = TrapKind::Boot as u32;
-    const CALL: u32 = TrapKind::Call as u32;
-    const BIND: u32 = TrapKind::Bind as u32;
     const REPORT: u32 = TrapKind::Report as u32;
     let trap = match kind {
         BOOT => Trap::Boot(r[0]),
-        CALL => Trap::Call(r),
-        BIND => Trap::Bind { id, args: r },
         REPORT => Trap::Report(r[0]),
-        other => unsupported(&format!("qemu crossing: engine trap kind {other}")),
+        other => unsupported(&format!(
+            "qemu crossing: engine trap kind {other} on the minor-0 entry"
+        )),
     };
     if let Trap::Boot(auxv) = trap {
         BOOT_AUXV.store(auxv as usize, Ordering::Release);
     }
+    dispatch_trap(trap).x0
+}
+
+/// The engine's host trap for CALL and BIND (`atl_host_v1.trap_ex`, minor 1): the lanes in, the callback's answer out as `x[0]` and `v[0]`.
+///
+/// # Safety
+/// The engine calls it with `lanes` pointing at one live `AtlLanesV1` (the ABI), read and answered before it returns.
+unsafe extern "C" fn host_trap_ex(_ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanesV1) {
+    const CALL: u32 = TrapKind::Call as u32;
+    const BIND: u32 = TrapKind::Bind as u32;
+    // SAFETY: one AtlLanesV1 at lanes, per the ABI.
+    let l = unsafe { lanes.read() };
+    // break `qa_v_lane` (qemu-abi gate, `v`): FP lane i arrives as lane i+1
+    #[cfg(atl_qa_v_lane)]
+    let l = AtlLanesV1 {
+        v: std::array::from_fn(|i| l.v[(i + 1) % 8]),
+        ..l
+    };
+    // break `qa_stack_off` (qemu-abi gate, `k`): stack word i arrives as word i+1
+    #[cfg(atl_qa_stack_off)]
+    let l = AtlLanesV1 {
+        stack: std::array::from_fn(|i| l.stack[(i + 1) % 8]),
+        ..l
+    };
+    let trap = match kind {
+        CALL => Trap::Call(l),
+        BIND => Trap::Bind { id, lanes: l },
+        other => unsupported(&format!(
+            "qemu crossing: engine trap kind {other} on the minor-1 entry"
+        )),
+    };
+    let answer = dispatch_trap(trap);
+    // SAFETY: lanes is the engine's and still live (the ABI); the engine sets the guest's v0 and x0 from these two answers.
+    let out = unsafe { &mut *lanes };
+    out.x[0] = answer.x0;
+    out.v[0] = answer.v0;
+}
+
+/// The callback [`boot`] installed, on one trap.
+fn dispatch_trap(trap: Trap) -> Answer {
     let on_trap = ON_TRAP
         .get()
         .unwrap_or_else(|| unsupported("qemu crossing: a trap before boot installed its callback"));
@@ -224,9 +263,9 @@ pub fn run(
 }
 
 /// The trap callback of [`run`]: BOOT is the start, which `run` does itself, so it answers 0; the rest is [`on_trap`].
-fn on_boot(trap: Trap) -> u64 {
+fn on_boot(trap: Trap) -> Answer {
     match trap {
-        Trap::Boot(_) => 0,
+        Trap::Boot(_) => Answer::default(),
         other => on_trap(other),
     }
 }

@@ -863,7 +863,8 @@ mod engine_so {
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, PROT_READ, TrapKind,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_READ,
+        TrapKind,
     };
 
     /// The auxv pointer BOOT delivered (x0), written by the host trap on the boot helper.
@@ -891,6 +892,14 @@ mod engine_so {
             let _ = BOOT_PROBE.set(boot_probe(unsafe { &*ctx.cast::<Probe>() }));
         }
         0
+    }
+
+    /// The host's trap for CALL and BIND (minor 1). Nothing but BOOT is expected in this probe, so it answers what `trap` answers: x0 = 0, v0 left as the guest had it.
+    unsafe extern "C" fn trap_ex(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanesV1) {
+        // SAFETY: lanes is the engine's live AtlLanesV1 for this call (the ABI).
+        let lanes = unsafe { &mut *lanes };
+        // SAFETY: the same trap as `trap`, with the x lanes it reads.
+        lanes.x[0] = unsafe { trap(ctx, kind, id, lanes.x.as_ptr()) };
     }
 
     /// D9 at BOOT: `map` a host page, then `attach` a CPU from a thread of its own, both inside the trap. Attach runs on another thread: a boot thread attaching itself would register its RCU state twice. That thread parks with its CPU, since a thread that exits while registered with RCU leaves a dangling registry node; gate (r) detaches its own.
@@ -1000,6 +1009,7 @@ mod engine_so {
             size: std::mem::size_of::<AtlHostV1>() as u32,
             ctx: std::ptr::from_ref(probe).cast_mut().cast(),
             trap: Some(trap),
+            trap_ex: Some(trap_ex),
         };
         let create = table.create.ok_or("engine table has no create")?;
         // SAFETY: host, boot (NUL-terminated) and the handle out parameter (in the leaked probe) outlive the call; the ABI's create.

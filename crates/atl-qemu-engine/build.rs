@@ -27,6 +27,10 @@ const FIELD_OFFSETS: &[(&str, &str)] = &[
         "ATL_OFFSET_TPIDR_EL0",
         "offsetof(CPUARMState, cp15.tpidr_el[0])",
     ),
+    // v<i>'s low lane is `vfp.zregs[i].d[0]` (target/arm/cpu.h:675, vector-type.h:35); the stride is one ARMVectorReg (Q6-1)
+    ("ATL_OFFSET_ZREGS", "offsetof(CPUARMState, vfp.zregs)"),
+    ("ATL_SIZEOF_ZREG", "sizeof(ARMVectorReg)"),
+    ("ATL_OFFSET_ZREG_D", "offsetof(ARMVectorReg, d)"),
     ("ATL_SIZEOF_CPUSTATE", "sizeof(CPUState)"),
     ("ATL_OFFSET_CPU_OPAQUE", "offsetof(CPUState, opaque)"),
     ("ATL_SIZEOF_TASKSTATE", "sizeof(TaskState)"),
