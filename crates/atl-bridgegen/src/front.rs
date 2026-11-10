@@ -491,7 +491,25 @@ fn args(lang: Lang, t: &Target) -> Vec<String> {
         args.push(format!("-resource-dir={}", dir.display()));
     }
     args.extend(t.args.iter().cloned());
+    args.extend(extra_clang_args());
     args
+}
+
+/// bindgen's extra clang args for this build script's target, read as bindgen reads them (its `get_target_dependent_env_var`): `BINDGEN_EXTRA_CLANG_ARGS_<TARGET>` (`-` as `_`), else the unscoped one. Only xtask's cross sets the scoped one, to the target sysroot (cross.rs cargo_target); a build machine sets neither. Whitespace split, not shlex: cross refuses whitespace in these paths.
+fn extra_clang_args() -> Vec<String> {
+    const VAR: &str = "BINDGEN_EXTRA_CLANG_ARGS";
+    let scoped = std::env::var("TARGET").ok().and_then(|target| {
+        [
+            format!("{VAR}_{target}"),
+            format!("{VAR}_{}", target.replace('-', "_")),
+        ]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok())
+    });
+    scoped
+        .or_else(|| std::env::var(VAR).ok())
+        .map(|value| value.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// clang's resource dir (builtin headers: `stddef.h`, `stdarg.h` ...), from the clang binary `clang_sys::support::Clang::find` pairs with libclang (bindgen's lookup), `-print-resource-dir`.
@@ -1283,16 +1301,20 @@ fn ty(t: &Type, unit: &Unit) -> Result<Ty> {
         TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype => {
             Ty::Function(Box::new(signature(t, unit)?))
         }
-        TypeKind::ConstantArray => {
+        // a flexible array member (`char vreg[]`, riscv uapi ptrace.h) has no length in its type: zero-length, as C sizes it; clang's layout checks hold it to that
+        TypeKind::ConstantArray | TypeKind::IncompleteArray => {
             // the written element type keeps typedef names
             let elem = t
                 .get_element_type()
                 .or_else(|| c.get_element_type())
                 .context("array without element type")?;
-            let len = c.get_size().context("array without length")?;
+            let len = match c.get_kind() {
+                TypeKind::IncompleteArray => 0,
+                _ => c.get_size().context("array without length")? as u64,
+            };
             Ty::Array {
                 elem: Box::new(ty(&elem, unit)?),
-                len: len as u64,
+                len,
             }
         }
         other => bail!("{}: unsupported type kind {other:?}", t.get_display_name()),
