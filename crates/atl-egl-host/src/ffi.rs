@@ -75,6 +75,8 @@ typed!(e:
     EGL_OPENGL_ES_API: EGLenum,
     EGL_CONTEXT_MAJOR_VERSION: EGLint,
     EGL_PLATFORM_DEVICE_EXT: EGLenum,
+    EGL_PLATFORM_WAYLAND_KHR: EGLenum,
+    EGL_DEVICE_EXT: EGLint,
     EGL_DRM_DEVICE_FILE_EXT: EGLint,
     EGL_DRM_RENDER_NODE_FILE_EXT: EGLint,
     EGL_LINUX_DMA_BUF_EXT: EGLenum,
@@ -140,6 +142,6 @@ macro_rules! table {
 }
 
 table! {
-    e: eglGetError, eglQueryDevicesEXT, eglQueryDeviceStringEXT, eglGetPlatformDisplayEXT, eglInitialize, eglTerminate, eglQueryString, eglBindAPI, eglChooseConfig, eglCreateContext, eglDestroyContext, eglMakeCurrent, eglCreateImageKHR, eglDestroyImageKHR, eglQueryDmaBufModifiersEXT, eglCreateSyncKHR, eglDestroySyncKHR, eglClientWaitSyncKHR, eglWaitSyncKHR, eglDupNativeFenceFDANDROID;
+    e: eglGetError, eglQueryDevicesEXT, eglQueryDeviceStringEXT, eglGetPlatformDisplayEXT, eglQueryDisplayAttribEXT, eglInitialize, eglTerminate, eglQueryString, eglBindAPI, eglChooseConfig, eglCreateContext, eglDestroyContext, eglMakeCurrent, eglCreateImageKHR, eglDestroyImageKHR, eglQueryDmaBufModifiersEXT, eglCreateSyncKHR, eglDestroySyncKHR, eglClientWaitSyncKHR, eglWaitSyncKHR, eglDupNativeFenceFDANDROID;
     g: glGetError, glGetString, glGenTextures, glDeleteTextures, glBindTexture, glTexParameteri, glEGLImageTargetTexture2DOES, glEGLImageTargetRenderbufferStorageOES, glGenRenderbuffers, glDeleteRenderbuffers, glBindRenderbuffer, glFramebufferRenderbuffer, glGenFramebuffers, glDeleteFramebuffers, glBindFramebuffer, glFramebufferTexture2D, glCheckFramebufferStatus, glViewport, glEnable, glDisable, glScissor, glClearColor, glClear, glReadPixels, glFlush, glFinish;
 }

@@ -30,6 +30,7 @@ use atl_android_paths::{
 };
 use atl_broker::control::{self, Request, Response, StartRequest};
 use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox, to_log};
+use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
 use atl_services::compositor_registry;
@@ -65,6 +66,10 @@ struct Args {
     /// Omitted: no graphics buffers (headless runs on a host without a DRM device). The mapper library `mapper.atl.so` it names to libui must be in `--lib-path`.
     #[arg(long)]
     gralloc: Option<PathBuf>,
+    /// atl-egl-probe executable: with `--gralloc` and `--ui`, run once (`--display-node`) to ask the desktop's Wayland EGL display which GPU it renders on; gralloc and every app then use that node (atl_gralloc::node).
+    /// Needed whenever both are given. Headless runs, and displays naming no node, keep gralloc's own trial (the baseline tier).
+    #[arg(long)]
+    gpu_probe: Option<PathBuf>,
     /// atl-app-launcher executable.
     #[arg(long)]
     launcher: PathBuf,
@@ -206,7 +211,7 @@ const SERVICES_POLL: Duration = Duration::from_millis(200);
 const READY: Duration = Duration::from_secs(20);
 /// What atl-system-services prints once registered.
 const READY_LINE: &str = "services: ready";
-/// What atl-gralloc-allocator prints once registered.
+/// What atl-gralloc-allocator prints once registered: `gralloc: ready (<DRM node>)`.
 const GRALLOC_READY_LINE: &str = "gralloc: ready";
 /// The DRM device directory the allocator opens (atl_gralloc_service::backend::DRM_DIR); the sandbox's `/dev` is otherwise minimal.
 const DRM_DIR: &str = "/dev/dri";
@@ -587,6 +592,8 @@ struct Host {
     pipewire: Option<PathBuf>,
     /// The device nodes each app process may open (set where the tier is probed, `run`).
     app_devices: Vec<PathBuf>,
+    /// The run's GPU: gralloc's DRM node and how it was chosen, pushed to each app process (atl_gralloc::node). None: no gralloc in this run.
+    gpu: Option<(String, NodeSource)>,
     /// The installed packages: an app process mounts its own directories (package_mounts).
     packages: Vec<PackageRecord>,
 }
@@ -650,6 +657,10 @@ impl Host {
         }
         if let Some(tilt) = &self.tilt {
             props.push((compositor_registry::TILT_PROPERTY.to_owned(), tilt.to_arg()));
+        }
+        if let Some((node, source)) = &self.gpu {
+            props.push((node::RENDER_NODE_PROPERTY.to_owned(), node.clone()));
+            props.push((node::NODE_SOURCE_PROPERTY.to_owned(), source.name().to_owned()));
         }
         let path = self.root.process_properties(uid, name);
         std::fs::write(&path, atl_property_service::area(&props)?)
@@ -1023,6 +1034,15 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
     }
 }
 
+/// The node in gralloc's ready line (`gralloc: ready (<node>)`).
+fn gralloc_node(log: &str) -> Option<String> {
+    let rest = log
+        .lines()
+        .find_map(|l| l.strip_prefix(GRALLOC_READY_LINE))?;
+    let node = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+    Some(node.to_owned())
+}
+
 /// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after [`READY`].
 fn wait_ready(child: &mut Child, log: &Path, line: &str, what: &str) -> Result<()> {
     let start = Instant::now();
@@ -1164,6 +1184,77 @@ fn run(a: &Args) -> Result<ExitCode> {
         )?)
         .context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
+    // gralloc before any app can start (a --launch request may come with the services' first breath): the node it allocates on goes into every app's properties
+    let mut gralloc = None;
+    let mut gpu = None;
+    if let Some(program) = &a.gralloc {
+        let display_node = match (&a.ui, &a.gpu_probe) {
+            (None, _) => Err("headless run".to_owned()),
+            (Some(_), None) => bail!("--gralloc with --ui needs --gpu-probe (atl-egl-probe)"),
+            (Some(_), Some(probe)) => {
+                let mut spawn = system_spawn(
+                    "gpu-probe",
+                    probe,
+                    vec!["--display-node".into()],
+                    false,
+                    None,
+                )?;
+                spawn.devices = vec![PathBuf::from(DRM_DIR)];
+                spawn.mounts.extend(desktop_mounts()?);
+                let mut p = broker
+                    .spawn(spawn)
+                    .with_context(|| format!("starting {}", probe.display()))?;
+                let status = p.child.wait()?;
+                let text = std::fs::read_to_string(r.log("gpu-probe"))?;
+                let (node, renderer) = node::parse_display_line(&text)
+                    .filter(|_| status.success())
+                    .with_context(|| {
+                        format!(
+                            "{} --display-node exited {status}:\n{}",
+                            probe.display(),
+                            text.trim()
+                        )
+                    })?;
+                node.map(|n| (n, renderer.clone()))
+                    .ok_or(format!("renderer {renderer}"))
+            }
+        };
+        let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
+        spawn.devices = vec![PathBuf::from(DRM_DIR)];
+        if let Ok((n, _)) = &display_node {
+            spawn.args = vec!["--drm-node".into(), n.into()];
+        }
+        let mut p = broker
+            .spawn(spawn)
+            .context("starting atl-gralloc-allocator")?;
+        wait_ready(
+            &mut p.child,
+            &r.log("gralloc"),
+            GRALLOC_READY_LINE,
+            "atl-gralloc-allocator",
+        )?;
+        let allocated = gralloc_node(&std::fs::read_to_string(r.log("gralloc"))?)
+            .context("gralloc's ready line names no node")?;
+        log(format_args!("gralloc ready"));
+        gralloc = Some(p);
+        let source = match display_node {
+            Ok((n, renderer)) => {
+                ensure!(
+                    allocated == n,
+                    "gralloc allocates on {allocated}, the display renders on {n}"
+                );
+                log(format_args!("gpu: node {n} (display, renderer {renderer})"));
+                NodeSource::Display
+            }
+            Err(why) => {
+                log(format_args!(
+                    "gpu: display reports no node ({why}); allocator node {allocated} by trial"
+                ));
+                NodeSource::Trial
+            }
+        };
+        gpu = Some((allocated, source));
+    }
     let (control_ours, control_theirs) = socketpair(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
@@ -1175,6 +1266,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     let display = a.display.unwrap_or_else(host_display);
     let host = Arc::new(Host {
         app_devices,
+        gpu,
         broker,
         launcher: a.launcher.clone(),
         lib: lib.clone(),
@@ -1293,23 +1385,6 @@ fn run(a: &Args) -> Result<ExitCode> {
         "atl-system-services",
     )?;
     log(format_args!("services ready"));
-    let mut gralloc = None;
-    if let Some(program) = &a.gralloc {
-        let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
-        spawn.devices = vec![PathBuf::from(DRM_DIR)];
-        let mut p = host
-            .broker
-            .spawn(spawn)
-            .context("starting atl-gralloc-allocator")?;
-        wait_ready(
-            &mut p.child,
-            &r.log("gralloc"),
-            GRALLOC_READY_LINE,
-            "atl-gralloc-allocator",
-        )?;
-        log(format_args!("gralloc ready"));
-        gralloc = Some(p);
-    }
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
@@ -1387,5 +1462,18 @@ fn main() -> ExitCode {
             log(format_args!("{e:#}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gralloc_node_is_the_ready_lines_parenthesis() {
+        // the allocator's stderr: its counters line, then the ready line (atl-gralloc-allocator main)
+        let log = "gralloc: counters allocate=0\ngralloc: ready (/dev/dri/renderD128)\n";
+        assert_eq!(gralloc_node(log).as_deref(), Some("/dev/dri/renderD128"));
+        assert_eq!(gralloc_node("gralloc: ready\n"), None);
     }
 }

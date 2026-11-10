@@ -5,6 +5,7 @@
 //! then map the dma-buf (atl-gralloc-dmabuf, DMA_BUF_IOCTL_SYNC bracket) and compare every pixel with what [`FILLS`] gives at that pixel (last fill wins; GL's origin is the buffer's first row).
 //! Clear colours are c / 255, which GL's float -> unorm8 conversion (ES 3.2 §2.3.5.2, round(f x 255)) maps back to c, so the expected bytes are exact.
 //! `--matrix` runs every pair, each in a child process of its own so one driver crash names its pair and the rest still run. Output: one `p0a:` line per pair.
+//! `--display-node`: the GPU selector atld runs once per UI run (gpu-selection G1): the Wayland display's device render node + renderer, one `gpu-probe:` line.
 
 #![forbid(unsafe_code)]
 #![expect(
@@ -23,7 +24,7 @@ use atl_egl_host::ffi::{GL_EXTENSIONS, GL_RENDERER, GL_VERSION};
 use atl_egl_host::{Device, DmabufPlane, Host};
 use atl_gralloc::descriptor::Descriptor;
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR, RGBA_8888};
-use atl_gralloc::usage;
+use atl_gralloc::{node, usage};
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
 use clap::Parser;
@@ -59,10 +60,25 @@ struct Args {
     /// Answers whether a GPU that refuses LINEAR render targets (NVIDIA lists LINEAR external-only) renders at all.
     #[arg(long)]
     native: bool,
+    /// Print the render node of the desktop's Wayland EGL display's device and its renderer (atl_gralloc::node::display_line), under this process's environment; atld runs this once per run to pick the GPU.
+    #[arg(long)]
+    display_node: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    if args.display_node {
+        return match Host::load().and_then(|h| h.wayland_display_node()) {
+            Ok(n) => {
+                out(&node::display_line(n.render_node.as_deref(), &n.renderer));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                out(&format!("{} FAIL {e:#}", node::DISPLAY_LINE));
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = if args.matrix {
         matrix()
     } else {

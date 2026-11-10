@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! The process's one driver instance: the host display it renders on, the host entries it calls, the window surfaces it made, the per-thread error.
-//! Device: the EGL device of the DRM node gralloc allocates on (gralloc's own trial, atl-gralloc-service `Backend::start`), else the host's software device -- a node without an EGL device (the kernel's vgem on WSL) only allocates.
+//! Device: the EGL device of the DRM node gralloc allocates on, as atld names it in the process's properties (atl_gralloc::node, read through bionic's `__system_property_get` in the process's global scope); on the trial tier a node without an EGL device (the kernel's vgem on WSL) only allocates and the software device renders.
 //! Rendering stays on that device: P0a measured a LINEAR buffer from one GPU failing to render on the other in both directions (owner decision 2026-11-09: no cross-GPU).
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow};
 use atl_egl_host::{Display, Host};
 use atl_gralloc::format::{self, RGBA_8888, RGBX_8888};
-use atl_gralloc_service::backend::{Backend, DRM_DIR};
+use atl_gralloc::node::{self, NodeSource};
 
 use crate::abi::egl as e;
 use crate::abi::gles as g;
@@ -396,28 +395,63 @@ mod tests {
     }
 }
 
-/// gralloc's node, then the EGL device on it, else the software device; with the device's name.
+/// The EGL device of the node atld named (atl_gralloc::node): on the display tier exactly that node's device, else an error naming it; on the trial tier that node's device, else the software device (a node that only allocates, vgem).
 fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
-    let node = Backend::start(Path::new(DRM_DIR), None)
-        .ok()
-        .map(|b| b.node().to_string_lossy().into_owned());
+    let get = |name: &str| {
+        property(name)?.with_context(|| {
+            format!("{name} is unset: no gralloc node in this process (atld names it with --gralloc)")
+        })
+    };
+    let node = get(node::RENDER_NODE_PROPERTY)?;
+    let source = get(node::NODE_SOURCE_PROPERTY)?;
+    let source = NodeSource::parse(&source)
+        .with_context(|| format!("{}={source}: unknown", node::NODE_SOURCE_PROPERTY))?;
     let devices = host.devices()?;
-    let on_node = node.as_deref().and_then(|n| {
-        devices
-            .iter()
-            .find(|d| d.render_node.as_deref() == Some(n) || d.drm_file.as_deref() == Some(n))
+    let on_node = devices.iter().find(|d| {
+        d.render_node.as_deref() == Some(node.as_str())
+            || d.drm_file.as_deref() == Some(node.as_str())
     });
-    let device = on_node
-        .or_else(|| devices.iter().find(|d| d.is_software()))
-        .with_context(|| {
-            format!("no EGL device on gralloc's node {node:?} and no software device")
-        })?;
+    let device = match source {
+        NodeSource::Display => on_node.with_context(|| {
+            let listed: Vec<_> = devices.iter().map(|d| d.render_node.clone()).collect();
+            format!("gralloc's node {node} (display) has no EGL device; devices {listed:?}")
+        })?,
+        NodeSource::Trial => on_node
+            .or_else(|| devices.iter().find(|d| d.is_software()))
+            .with_context(|| {
+                format!("no EGL device on gralloc's node {node} and no software device")
+            })?,
+    };
     let name = device
         .render_node
         .clone()
         .or_else(|| device.drm_file.clone())
         .unwrap_or_else(|| "software".to_owned());
     Ok((device.display()?, name))
+}
+
+/// bionic `__system_property_get` as the process's global scope has it (atl-bionic in an app process; the driver probe exports its own): the value, None when unset or empty.
+fn property(name: &str) -> Result<Option<String>> {
+    type Get = unsafe extern "C" fn(*const std::ffi::c_char, *mut std::ffi::c_char) -> i32;
+    // bionic's PROP_VALUE_MAX (sys/system_properties.h)
+    const PROP_VALUE_MAX: usize = 92;
+    let this = libloading::os::unix::Library::this();
+    // SAFETY: the symbol, where present, is bionic's `int __system_property_get(const char*, char*)`.
+    let get: libloading::os::unix::Symbol<Get> = unsafe { this.get(b"__system_property_get\0") }
+        .context("__system_property_get not in the process: not an app process atld started")?;
+    let cname = CString::new(name)?;
+    let mut value = [0 as std::ffi::c_char; PROP_VALUE_MAX];
+    // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer, bionic's contract.
+    let len = unsafe { get(cname.as_ptr(), value.as_mut_ptr()) };
+    if len <= 0 {
+        return Ok(None);
+    }
+    // SAFETY: bionic NUL-terminates the value within the buffer.
+    Ok(Some(
+        unsafe { CStr::from_ptr(value.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    ))
 }
 
 thread_local! {

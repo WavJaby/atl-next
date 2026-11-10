@@ -217,6 +217,8 @@ pub struct Runtime {
     keychars: PathBuf,
     /// The graphics allocator HAL and the directory of `mapper.atl.so`, when [`Runtime::with_gralloc`] asked for them.
     gralloc: Option<(PathBuf, PathBuf)>,
+    /// atl-egl-probe, atld's GPU selector (`--gpu-probe`), with [`Runtime::with_gralloc`].
+    gpu_probe: Option<PathBuf>,
     /// The GL driver and the fronts, when [`Runtime::with_gl_driver`] asked for them: files placed by atld `--file`.
     gl_driver: Vec<(PathBuf, String)>,
     /// A gate's own test files placed by atld `--file` ([`Runtime::with_fixture_file`]): never shipped, so outside `refuse_test_only`.
@@ -592,6 +594,7 @@ impl Runtime {
             fonts,
             keychars,
             gralloc: None,
+            gpu_probe: None,
             gl_driver: Vec::new(),
             fixture_files: Vec::new(),
             native_bridge_guest: Vec::new(),
@@ -637,6 +640,7 @@ impl Runtime {
         )?;
         let lib = crate::gralloc::stage_mapper(root, &self.out)?;
         self.gralloc = Some((allocator, lib));
+        self.gpu_probe = Some(cargo_bin(root, &self.out, "atl-egl-probe")?);
         Ok(self)
     }
 
@@ -1046,6 +1050,7 @@ impl Runtime {
             inputs.files.push(allocator.clone());
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
+        inputs.files.extend(self.gpu_probe.iter().cloned());
         inputs
             .files
             .extend(self.gl_driver.iter().map(|(f, _)| f.clone()));
@@ -1185,6 +1190,9 @@ impl Runtime {
             .chain(&self.platform_files);
         for (host, at) in placed {
             cmd.arg("--file").arg(format!("{}={at}", host.display()));
+        }
+        if let Some(probe) = &self.gpu_probe {
+            cmd.arg("--gpu-probe").arg(probe);
         }
         if let Some((allocator, _)) = &self.gralloc {
             cmd.arg("--gralloc").arg(allocator);

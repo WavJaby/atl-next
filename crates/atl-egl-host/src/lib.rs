@@ -104,6 +104,71 @@ impl Host {
             })
             .collect())
     }
+
+    /// What the desktop's Wayland-platform display renders on, under this process's environment: the render node of its EGL device (`EGL_EXT_device_query` -> `EGL_DRM_RENDER_NODE_FILE_EXT`), None when that device has none (WSLg's d3d12, a software device), and its GL_RENDERER.
+    /// The native display is EGL_DEFAULT_DISPLAY: the vendor's Wayland platform connects to the default compositor itself (`WAYLAND_DISPLAY`), so no Wayland call is made here. Only the Wayland platform expresses the desktop's GPU choice; device enumeration order is glvnd's vendor order (gpu-selection S1).
+    pub fn wayland_display_node(self: &Arc<Self>) -> Result<WaylandNode> {
+        let f = &self.fns;
+        let attribs = [EGL_NONE];
+        // SAFETY: a null native display is EGL_DEFAULT_DISPLAY, which EGL_KHR_platform_wayland lets the implementation resolve; NONE-terminated attributes.
+        let raw = unsafe {
+            (f.eglGetPlatformDisplayEXT)(
+                EGL_PLATFORM_WAYLAND_KHR,
+                std::ptr::null_mut(),
+                attribs.as_ptr(),
+            )
+        };
+        ensure!(
+            !raw.is_null(),
+            self.egl_fail("eglGetPlatformDisplayEXT(wayland)")
+        );
+        let (mut major, mut minor) = (0, 0);
+        // SAFETY: `raw` is a display EGL returned; the out-pointers are valid.
+        let ok = unsafe { (f.eglInitialize)(raw, &mut major, &mut minor) };
+        ensure!(ok != EGL_FALSE, self.egl_fail("eglInitialize(wayland)"));
+        // EGLAttrib (intptr_t) in the generated alias's own spelling
+        let mut device = 0;
+        // SAFETY: an initialised display, EGL_DEVICE_EXT is the query EGL_EXT_device_query defines, `device` is a valid out-pointer.
+        let ok = unsafe { (f.eglQueryDisplayAttribEXT)(raw, EGL_DEVICE_EXT, &mut device) };
+        let render_node = if ok == EGL_FALSE || device == 0 {
+            self.error();
+            None
+        } else {
+            // SAFETY: `device` is the display's EGLDeviceEXT (an attribute holds the handle); the query returns null or a string EGL owns for the process.
+            let p = unsafe {
+                (f.eglQueryDeviceStringEXT)(device as EGLDevice, EGL_DRM_RENDER_NODE_FILE_EXT)
+            };
+            self.error();
+            (!p.is_null()).then(|| cstr(p))
+        };
+        // SAFETY: binding the GLES API is valid on any thread.
+        let ok = unsafe { (f.eglBindAPI)(EGL_OPENGL_ES_API) };
+        ensure!(ok != EGL_FALSE, self.egl_fail("eglBindAPI(GLES)"));
+        // SAFETY: an initialised display; each result is a string EGL owns.
+        let q = |name| cstr(unsafe { (f.eglQueryString)(raw, name) });
+        let display = Display {
+            host: self.clone(),
+            raw,
+            version: (major, minor),
+            vendor: q(EGL_VENDOR),
+            extensions: q(EGL_EXTENSIONS),
+        };
+        let renderer = {
+            let ctx = display.create_context()?;
+            let gl = ctx.make_current()?;
+            gl.string(GL_RENDERER)
+        };
+        Ok(WaylandNode {
+            render_node,
+            renderer,
+        })
+    }
+}
+
+/// The Wayland display's device, as [`Host::wayland_display_node`] found it.
+pub struct WaylandNode {
+    pub render_node: Option<String>,
+    pub renderer: String,
 }
 
 /// One EGL device: a GPU (named by its DRM nodes) or Mesa's software rasteriser.

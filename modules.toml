@@ -143,7 +143,7 @@ exports = ["atl-egl-host", "atl-egl-driver"]
 uses = ["gralloc", "generators"]
 
 [egl-host.direct_link.gralloc]
-reason = "the driver renders on the EGL device of the node gralloc allocates on, found by gralloc's own trial (atl-gralloc-service Backend::start), so both pick the same node by one rule; the probes allocate through the same GBM backend as the allocator service, so the buffer is the one an app would get"
+reason = "the probes allocate through the same GBM backend as the allocator service (atl-gralloc-service Backend::start), so the buffer is the one an app would get; the driver itself takes gralloc's node from atld (atl_gralloc::node), not from a second trial"
 
 # the app-process half of the platform layer (M3 slice 6, plan S1 `atl-platform-ui`): the -api traits (window, frame clock, input, main loop), the GTK4 implementation (the one crate deny.toml lets depend on GTK) and the facade core crates use; presents the compositor's Scene, importing each quad's dma-buf as a GTK dmabuf texture (layout through scene-buffer, the read fence through gralloc-dmabuf)
 [platform-ui]

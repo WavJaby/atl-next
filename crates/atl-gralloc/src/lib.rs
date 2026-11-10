@@ -12,6 +12,7 @@ pub mod format;
 pub mod handle;
 pub mod layout;
 pub mod metadata;
+pub mod node;
 pub mod shared;
 pub mod usage;
 pub mod vintf;

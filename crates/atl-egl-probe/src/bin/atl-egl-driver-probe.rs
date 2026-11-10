@@ -11,12 +11,12 @@
 #![allow(non_snake_case, reason = "window.h hook and GL entry names")]
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use atl_egl_driver::abi::egl as e;
@@ -26,6 +26,7 @@ use atl_gralloc::descriptor::Descriptor;
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, RGBA_8888};
 use atl_gralloc::handle::{NUM_FDS, NUM_INTS, Params};
 use atl_gralloc::shared::PAGE_SIZE;
+use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::usage;
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
@@ -64,7 +65,7 @@ struct Args {
     /// The driver library (libGLES_atl.so).
     #[arg(long)]
     driver: PathBuf,
-    /// DRM node gralloc allocates on (default: gralloc's own trial, as the driver chooses its device).
+    /// DRM node gralloc allocates on (default: gralloc's own trial); the driver is handed it as an app is by atld (trial tier).
     #[arg(long)]
     alloc: Option<PathBuf>,
     /// Break one thing the verdict depends on; the run must then fail.
@@ -295,10 +296,45 @@ fn base(magic: u32, size: usize) -> w::android_native_base_t {
     }
 }
 
+/// The properties the driver reads in an app process (atl_gralloc::node), as atld would write them for this probe's gralloc node: the trial tier, the probe's node being gralloc's own trial or `--alloc`.
+static PROPERTIES: OnceLock<Vec<(CString, CString)>> = OnceLock::new();
+
+/// bionic's `__system_property_get`, exported from this executable (build.rs) so the driver finds it in the global scope as it does in an app process: copies the value and returns its length, 0 when unset.
+/// SAFETY: the caller passes a NUL-terminated name and a buffer of PROP_VALUE_MAX (92) bytes, bionic's contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __system_property_get(
+    name: *const std::ffi::c_char,
+    value: *mut std::ffi::c_char,
+) -> i32 {
+    // SAFETY: the caller's.
+    let name = unsafe { CStr::from_ptr(name) };
+    let found = PROPERTIES
+        .get()
+        .and_then(|p| p.iter().find(|(k, _)| k.as_c_str() == name));
+    let bytes = found.map_or(&[0u8][..], |(_, v)| v.as_bytes_with_nul());
+    // SAFETY: the caller's buffer holds PROP_VALUE_MAX bytes; a node path is shorter.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), value, bytes.len()) };
+    i32::try_from(bytes.len() - 1).unwrap_or(0)
+}
+
 fn window(alloc: Option<&Path>) -> Result<Box<TestWindow>> {
     let backend =
         Backend::start(Path::new(DRM_DIR), alloc).map_err(|e| anyhow!("gralloc backend: {e}"))?;
     out(&format!("gralloc node {}", backend.node().display()));
+    let props = vec![
+        (
+            CString::new(node::RENDER_NODE_PROPERTY)?,
+            CString::new(backend.node().as_os_str().as_encoded_bytes())?,
+        ),
+        (
+            CString::new(node::NODE_SOURCE_PROPERTY)?,
+            CString::new(NodeSource::Trial.name())?,
+        ),
+    ];
+    ensure!(
+        PROPERTIES.set(props).is_ok(),
+        "one window per probe run (the properties are set once)"
+    );
     let checked = Descriptor {
         name: b"egl-driver".to_vec(),
         width: EDGE,
@@ -472,6 +508,8 @@ macro_rules! entry {
 }
 
 fn run(args: &Args) -> Result<()> {
+    // the window first: its gralloc node is the property the driver reads when it loads (as atld writes an app's properties before the app starts)
+    let win = window(args.alloc.as_deref())?;
     let drv = Loaded::load(&args.driver)?;
     for name in [c"glBindFramebuffer", c"glGetIntegerv", c"glClear"] {
         // Loader.cpp dlsyms gl* first: an exported gl* name would bind before eglGetProcAddress and bypass the FBO-0 wrappers
@@ -532,7 +570,6 @@ fn run(args: &Args) -> Result<()> {
     } else {
         None
     };
-    let win = window(args.alloc.as_deref())?;
     // as an app does before drawing (ANativeWindow_setBuffersTransform -> perform): the driver must queue every buffer with it unchanged
     // SAFETY: our own window and hook; the op takes one int.
     unsafe {
