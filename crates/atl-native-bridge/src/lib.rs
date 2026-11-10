@@ -6,9 +6,12 @@
 //! - `engine`: both engines, one chosen per process (`engine::Active`): identity (route N, guest bionic built for the host arch, crossings switch the thread pointer) and QEMU (a foreign ISA, the engine `.so`, `engine/qemu/mod.rs`).
 //! - `loader`: the process's guest, started by the first `loadLibrary`, and the libraries loaded into it.
 //!
-//! Boundary crate: `unsafe` only in `exports`, `engine`, `loader` and the generated shells.
+//! Boundary crate: `unsafe` only in `exports`, `engine`, `loader`, `counters` (feature `crossing-count`) and the generated shells.
 #![deny(unsafe_code)]
 
+#[cfg(feature = "crossing-count")]
+#[allow(unsafe_code)]
+pub mod counters;
 pub mod elf;
 #[allow(unsafe_code)]
 pub mod engine;

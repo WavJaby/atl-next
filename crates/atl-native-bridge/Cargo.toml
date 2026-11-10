@@ -12,6 +12,10 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Q5-8 crossing counter (QEMU bridge plan section 5; counters.rs): compiled out of shipped builds, so the library has no counter symbol without it. Counts QEMU binding crossings per host target and the memcpy/memset/memcmp sizes; gate `xtask test crossing`.
+[features]
+crossing-count = []
+
 # Both engines are in every build, one chosen per process at NB `initialize` (engine/mod.rs `Active`). The QEMU engine is the engine `.so` behind its C ABI (atl-engine-api), dlopened at run time: no cargo edge to the QEMU engine crate.
 
 # spike gates g1-g4 (bridge-1 route N), harness-less (main thread only, no runner threads touching TLS); env in tests/common/mod.rs, stages needing a native-bridge build skip without one
@@ -59,6 +63,12 @@ harness = false
 [[test]]
 name = "qemu_thread"
 harness = false
+
+# Q5-8 gate: the crossing counter under QEMU: a fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump once (QEMU bridge plan Q5-8); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and feature `crossing-count`
+[[test]]
+name = "qemu_crossing"
+harness = false
+required-features = ["crossing-count"]
 
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }

@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: MIT
+//! The trap body (QEMU bridge plan 2.6(3), Q5-8): the trap type, the callback the QEMU engine installs, and a binding trap's dispatch to its host target. Moved here from `engine/qemu/mod.rs`, so the identity side can share it. The crossing counter (`counters.rs`, feature `crossing-count`) counts each binding crossing here, where the slot is chosen.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use super::unsupported;
+use crate::engine::bindings::qemu::THUNKS;
+
+/// A trap from the engine, decoded from `atl_trap_kind`: `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` x0..x7; `Report` x0.
+#[derive(Clone, Copy, Debug)]
+pub enum Trap {
+    /// BOOT: the boot executable's auxv (x0).
+    Boot(u64),
+    /// `svc #CALL`: x0..x7.
+    Call([u64; 8]),
+    /// A binding thunk: its pool slot `id`, and x0..x7.
+    Bind { id: u32, args: [u64; 8] },
+    /// A value reported for a gate: x0.
+    Report(u64),
+}
+
+/// A trap callback. Its answer is the guest's x0 (ignored for REPORT).
+pub type OnTrap = fn(Trap) -> u64;
+
+/// The host target of each pool slot, read by the binding trap ([`call_binding`]). The QEMU placement writes it (`qemu::place::bind`).
+pub(super) static TARGETS: [AtomicUsize; THUNKS] = [const { AtomicUsize::new(0) }; THUNKS];
+
+/// The default trap callback: a binding trap calls its host target and answers with its result (the guest's x0). Other kinds abort until a route is built; BOOT is the start, answered by `qemu::run` or by the gate's own callback.
+pub fn on_trap(trap: Trap) -> u64 {
+    match trap {
+        Trap::Bind { id, args } => call_binding(id, args),
+        other => unsupported(&format!("qemu crossing: {other:?} is not routed yet")),
+    }
+}
+
+/// Added to a trap's id before its slot is read: 0 in every build; the `qe_id` break (`ATL_NB_BREAK`) makes it 1, so each binding calls its neighbour's host function.
+#[cfg(not(atl_nb_qe_id))]
+const ID_SKEW: usize = 0;
+#[cfg(atl_nb_qe_id)]
+const ID_SKEW: usize = 1;
+
+/// Calls the host function of the slot `id + ID_SKEW` with the guest's eight integer argument words. Integer arguments only: floats (v0..v7) are Q6. A callee with fewer arguments ignores the rest, under AAPCS64 and SysV alike. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
+pub(super) fn call_binding(id: u32, args: [u64; 8]) -> u64 {
+    let Some(slot) = usize::try_from(id)
+        .ok()
+        .map(|i| i + ID_SKEW)
+        .filter(|&s| s < THUNKS)
+    else {
+        unsupported("qemu crossing: binding id past the pool")
+    };
+    let target = TARGETS[slot].load(Ordering::Acquire);
+    if target == 0 {
+        unsupported("qemu crossing: binding trap for an unbound slot")
+    }
+    #[cfg(feature = "crossing-count")]
+    crate::counters::count_binding(slot, target);
+    type Host = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: `target` is the host function `bind` stored for this slot, a pointer to a C-ABI function that takes integer arguments only; the call passes it the guest's argument words.
+    let host: Host = unsafe { std::mem::transmute::<usize, Host>(target) };
+    let [a0, a1, a2, a3, a4, a5, a6, a7] = args;
+    host(a0, a1, a2, a3, a4, a5, a6, a7)
+}

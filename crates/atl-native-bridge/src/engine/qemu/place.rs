@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use atl_engine_api::{PROT_EXEC, PROT_READ, PROT_WRITE};
 
 use crate::engine::bindings::qemu::THUNKS;
+use crate::engine::dispatch::TARGETS;
 use crate::engine::image::{Image, write_sealed};
 use crate::engine::{Engine as _, unsupported};
 
@@ -23,8 +24,6 @@ pub(super) mod pool {
 
 /// Bytes per thunk: two instruction words.
 pub(super) const THUNK_BYTES: usize = 8;
-/// The host target of each pool slot, read by the binding trap (`call_binding` in `mod.rs`).
-pub(super) static TARGETS: [AtomicUsize; THUNKS] = [const { AtomicUsize::new(0) }; THUNKS];
 /// Next free pool slot.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 

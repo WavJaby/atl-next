@@ -173,6 +173,8 @@ const SHIMS: &[&str] = &[
 ];
 /// Shims of the x86_64 stub list only (`libc_stubs`): signal.rs registers the guest handler with sigchain behind ART's claims.
 const SIGNAL_SHIMS: &[&str] = &["sigaction", "sigaction64"];
+/// Q5-8: the QEMU table's libc rows that bind to counted shims under `crossing-count` (counters.rs `memcpy`, `memset`, `memcmp`), which record the size argument and then run glibc's.
+const COUNTED_SHIMS: &[&str] = &["memcpy", "memset", "memcmp"];
 /// NDK functions taking a `JNIEnv*` (C3, engine/ndk.rs): the generic crossing would hand the host library the guest's env, so each binds `Entry::Shim` in its library. Any NDK proxy library may list them; each must be in one (`bindings_table`).
 const NDK_SHIMS: &[&str] = &[
     "AAssetManager_fromJava",
@@ -424,7 +426,13 @@ fn libc_entries(
         .flat_map(|(_, f)| f.iter().copied())
         .collect();
     let signal: &[&str] = if qemu { &[] } else { SIGNAL_SHIMS };
-    let shims: Vec<&str> = SHIMS.iter().chain(signal).copied().collect();
+    // cargo sets CARGO_FEATURE_<NAME> for build scripts; identity and shipped builds keep the glibc rows
+    let counted: &[&str] = if qemu && std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some() {
+        COUNTED_SHIMS
+    } else {
+        &[]
+    };
+    let shims: Vec<&str> = SHIMS.iter().chain(signal).chain(counted).copied().collect();
     for n in shims
         .iter()
         .chain(GLIBC.iter().map(|(n, _)| n))
@@ -696,7 +704,7 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_site", "atl_nb_qe_site"),
     // Q4-3 (engine/qemu/place.rs `register`): no page is registered with QEMU, so a guest fetch from a placed site faults
     ("qe_nomap", "atl_nb_qe_nomap"),
-    // Q4-3 (engine/qemu/mod.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
+    // Q4-3 (engine/dispatch.rs `call_binding`, `ID_SKEW`): a binding trap calls its neighbour's host function, so each placed site answers the wrong sentinel
     ("qe_id", "atl_nb_qe_id"),
     // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
     ("qe_no_tls", "atl_nb_qe_no_tls"),

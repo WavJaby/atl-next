@@ -6,6 +6,7 @@
 
 mod args;
 pub mod bindings;
+mod dispatch;
 /// The crossings, both compiled into every core: the host arch's FS switch (`identity/mod.rs`) and QEMU's binding thunks (`qemu/mod.rs`, placement in `qemu/place.rs`). Shared code reaches the process's one through [`active`] (an [`Active`]), whose methods dispatch to the functions both provide (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...).
 #[cfg(target_arch = "x86_64")]
 pub mod identity;

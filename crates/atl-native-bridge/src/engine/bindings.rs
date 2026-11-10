@@ -15,7 +15,7 @@ pub(super) mod identity {
 }
 
 /// The QEMU engine's table: the arm64 NBS libc stub list; the NDK shims trap until Q6 (build.rs `QEMU_NDK_PENDING`).
-pub(super) mod qemu {
+pub(crate) mod qemu {
     include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu.rs"));
 }
 
@@ -124,6 +124,13 @@ fn shim(name: &str) -> Option<usize> {
         "AndroidBitmap_getInfo" => super::ndk::bitmap_get_info as *const () as usize,
         "AndroidBitmap_lockPixels" => super::ndk::bitmap_lock_pixels as *const () as usize,
         "AndroidBitmap_unlockPixels" => super::ndk::bitmap_unlock_pixels as *const () as usize,
+        // Q5-8: the QEMU table's counted libc rows (build.rs `COUNTED_SHIMS`); identity never binds them
+        #[cfg(feature = "crossing-count")]
+        "memcpy" => crate::counters::memcpy as *const () as usize,
+        #[cfg(feature = "crossing-count")]
+        "memset" => crate::counters::memset as *const () as usize,
+        #[cfg(feature = "crossing-count")]
+        "memcmp" => crate::counters::memcmp as *const () as usize,
         _ => return None,
     })
 }
