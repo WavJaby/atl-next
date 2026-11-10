@@ -33,6 +33,8 @@ enum Step {
     Spdx,
     /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks) parse with their schema and invariants
     Tables,
+    /// deps.toml rows against this host: installed at the required version (`deps --check`)
+    Deps,
     /// every [aosp.sparse] row covers the reads of every workspace out dir's build graph (keepset.rs); skipped without one
     Keepset,
     /// modules.toml equals the real cross-module crate graph
@@ -65,10 +67,11 @@ enum Step {
     GlProxies,
 }
 
-const ALL: [Step; 18] = [
+const ALL: [Step; 19] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
+    Step::Deps,
     Step::Keepset,
     Step::Modules,
     Step::Drift,
@@ -92,6 +95,7 @@ impl Step {
             Step::Fmt => "fmt",
             Step::Spdx => "spdx",
             Step::Tables => "tables",
+            Step::Deps => "deps",
             Step::Keepset => "keepset",
             Step::Modules => "modules",
             Step::Drift => "drift",
@@ -226,6 +230,18 @@ impl Step {
                 )?)
                 .map_err(anyhow::Error::msg)?;
                 eprintln!("tables: gl-drivers.toml ok ({} rows)", gl.len());
+                Ok(())
+            }
+            Step::Deps => {
+                let (rows, problems) = deps::host_problems(root)?;
+                if !problems.is_empty() {
+                    bail!(
+                        "{} of {rows} rows not satisfied: {}",
+                        problems.len(),
+                        problems.join("; ")
+                    );
+                }
+                eprintln!("deps: ok ({rows} rows)");
                 Ok(())
             }
             Step::Modules => {

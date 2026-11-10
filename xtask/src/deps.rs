@@ -346,6 +346,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(name) = &args.fetch {
         return fetch_sysroot(root, name, args.execute);
     }
+    let (rows, problems) = host_problems(root)?;
+    for p in &problems {
+        println!("deps: {p}");
+    }
+    if problems.is_empty() {
+        println!("deps: ok ({rows} rows)");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("deps: {} of {rows} rows not satisfied", problems.len());
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// Every deps.toml row against this host, read-only: the row count and one `name: problem` per unmet row.
+/// `deps --check` and `xtask check`'s deps step both run it.
+pub fn host_problems(root: &Path) -> Result<(usize, Vec<String>)> {
     let sources = sources::load(root)?;
     let deps = load(root, &Consumers::new(&workspace::load(root)?, &sources))?;
     let distro = host_distro()?;
@@ -362,20 +378,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             problems.push(format!("{name}: {problem}"));
         }
     }
-    for p in &problems {
-        println!("deps: {p}");
-    }
-    if problems.is_empty() {
-        println!("deps: ok ({} rows)", deps.len());
-        Ok(ExitCode::SUCCESS)
-    } else {
-        println!(
-            "deps: {} of {} rows not satisfied",
-            problems.len(),
-            deps.len()
-        );
-        Ok(ExitCode::FAILURE)
-    }
+    Ok((deps.len(), problems))
 }
 
 fn check_row(
