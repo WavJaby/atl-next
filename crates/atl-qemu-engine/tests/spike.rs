@@ -863,8 +863,8 @@ mod engine_so {
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_READ,
-        TrapKind,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, PROT_READ,
+        TrapKind, check_engine_table,
     };
 
     /// The auxv pointer BOOT delivered (x0), written by the host trap on the boot helper.
@@ -874,8 +874,8 @@ mod engine_so {
 
     /// The host context: the table, and the engine handle `create` writes before BOOT.
     struct Probe {
-        table: &'static AtlEngineV1,
-        engine: AtomicPtr<AtlEngine>,
+        table: &'static AtlEngine,
+        engine: AtomicPtr<AtlEngineHandle>,
     }
 
     /// A host page for the probe's `map`, page-aligned.
@@ -894,9 +894,9 @@ mod engine_so {
         0
     }
 
-    /// The host's trap for CALL and BIND (minor 1). Nothing but BOOT is expected in this probe, so it answers what `trap` answers: x0 = 0, v0 left as the guest had it.
-    unsafe extern "C" fn trap_ex(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanesV1) {
-        // SAFETY: lanes is the engine's live AtlLanesV1 for this call (the ABI).
+    /// The host's trap for CALL and BIND. Nothing but BOOT is expected in this probe, so it answers what `trap` answers: x0 = 0, v0 left as the guest had it.
+    unsafe extern "C" fn trap_ex(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanes) {
+        // SAFETY: lanes is the engine's live AtlLanes for this call (the ABI).
         let lanes = unsafe { &mut *lanes };
         // SAFETY: the same trap as `trap`, with the x lanes it reads.
         lanes.x[0] = unsafe { trap(ctx, kind, id, lanes.x.as_ptr()) };
@@ -925,7 +925,7 @@ mod engine_so {
         let engine = engine as usize;
         let (tx, rx) = std::sync::mpsc::sync_channel::<i32>(1);
         std::thread::spawn(move || {
-            let engine = engine as *mut AtlEngine;
+            let engine = engine as *mut AtlEngineHandle;
             let mut cpu: *mut AtlCpu = std::ptr::null_mut();
             // SAFETY: engine is live; cpu is an out parameter.
             let rc = unsafe { attach(engine, &mut cpu) };
@@ -974,7 +974,7 @@ mod engine_so {
         }
     }
 
-    fn run() -> Result<(&'static AtlEngineV1, *mut AtlEngine), String> {
+    fn run() -> Result<(&'static AtlEngine, *mut AtlEngineHandle), String> {
         let so = CString::new(env("ATL_ENGINE_SO")?).map_err(|e| e.to_string())?;
         let boot = CString::new(env("ATL_ENGINE_BOOT")?).map_err(|e| e.to_string())?;
         let want = u64::from_str_radix(env("ATL_ENGINE_ENTRY")?.trim_start_matches("0x"), 16)
@@ -984,17 +984,10 @@ mod engine_so {
         if handle.is_null() {
             return Err("dlopen the engine library failed".to_owned());
         }
-        let table = dlsym_in(handle, c"atl_engine_v1")?.cast::<AtlEngineV1>();
+        let table = dlsym_in(handle, c"atl_engine")?.cast::<AtlEngine>();
         // SAFETY: the table is a static of the loaded library, read-only.
         let table = unsafe { &*table };
-        if table.major != ABI_MAJOR || (table.size as usize) < std::mem::size_of::<AtlEngineV1>() {
-            return Err(format!(
-                "engine ABI major {} size {}: this host speaks major {ABI_MAJOR} minor {ABI_MINOR} (size {}), refused",
-                table.major,
-                table.size,
-                std::mem::size_of::<AtlEngineV1>()
-            ));
-        }
+        check_engine_table(table)?;
         for tls in [c"thread_cpu", c"helper_retaddr"] {
             dlsym_in(handle, tls)?;
         }
@@ -1003,10 +996,10 @@ mod engine_so {
             table,
             engine: AtomicPtr::new(std::ptr::null_mut()),
         }));
-        let host = AtlHostV1 {
+        let host = AtlHost {
             major: ABI_MAJOR,
             minor: ABI_MINOR,
-            size: std::mem::size_of::<AtlHostV1>() as u32,
+            size: std::mem::size_of::<AtlHost>() as u32,
             ctx: std::ptr::from_ref(probe).cast_mut().cast(),
             trap: Some(trap),
             trap_ex: Some(trap_ex),
@@ -1036,13 +1029,13 @@ mod engine_so {
     }
 
     /// Gate (r): `attach` then `detach` on a thread of its own, the thread that attached (the ABI's rule), with no guest call between. The copied CPU has not run its queued work, so detach must enter it in `plugin.cpu_ht` itself: without that, plugins/core.c:293 aborts.
-    fn detach_probe(table: &AtlEngineV1, engine: *mut AtlEngine) -> Result<(), String> {
+    fn detach_probe(table: &AtlEngine, engine: *mut AtlEngineHandle) -> Result<(), String> {
         let attach = table.attach.ok_or("engine table has no attach")?;
         let detach = table.detach.ok_or("engine table has no detach")?;
         let engine = engine as usize;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         std::thread::spawn(move || {
-            let engine = engine as *mut AtlEngine;
+            let engine = engine as *mut AtlEngineHandle;
             let mut cpu: *mut AtlCpu = std::ptr::null_mut();
             // SAFETY: engine is live; cpu is an out parameter.
             let rc = unsafe { attach(engine, &mut cpu) };

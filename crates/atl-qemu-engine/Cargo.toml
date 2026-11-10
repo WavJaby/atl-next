@@ -11,7 +11,7 @@ publish.workspace = true
 # QEMU runs its own `main` (aliased `atl_qemu_user_main`) from a `-shared` link of its PIC objects; the engine dlopens that library, answers P1's svc hook and chains QEMU's fault handler.
 # Boundary crate: `unsafe` for dlopen/dlsym, the C ABI hook, raw CPU state access and sigaction.
 # Feature `qemu`: needs `ATL_QEMU_BUILD` (the PIC build dir, `xtask qemu --pic`) for the CPU layouts; plain workspace builds leave it off and compile no engine code.
-# Feature `engine-so` (QEMU bridge plan Q5-1a): the static library xtask links into the engine `.so` (libatl_engine_<arch>.so). QEMU's symbols are then linked, not dlsym'd (the version script hides them); the C ABI atl_engine_v1 (atl-engine-api) is exported. The rlib spike build does not enable it.
+# Feature `engine-so` (QEMU bridge plan Q5-1a): the static library xtask links into the engine `.so` (libatl_engine_<arch>.so). QEMU's symbols are then linked, not dlsym'd (the version script hides them); the C ABI atl_engine (atl-engine-api) is exported. The rlib spike build does not enable it.
 # Rlib and `engine-so` are two builds of one source: the cfg splits are `sym` (engine.rs) and the C ABI exports (lib.rs).
 
 [features]

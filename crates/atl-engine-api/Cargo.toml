@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The engine C ABI (include/atl_engine.h): the table the engine `.so` exports as atl_engine_v1, and its Rust mirror. No code, no dependencies; the layouts are checked against the header by atl-qemu-engine's build script.
+# The engine C ABI (include/atl_engine.h): the table the engine `.so` exports as atl_engine, and its Rust mirror. No code, no dependencies; the layouts are checked against the header by atl-qemu-engine's build script.
 
 [lints]
 workspace = true

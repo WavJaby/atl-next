@@ -6,9 +6,9 @@
 use core::ffi::{c_char, c_int, c_void};
 
 /// Major version: a host refuses an engine with another major.
-pub const ABI_MAJOR: u32 = 1;
+pub const ABI_MAJOR: u32 = 2;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 1;
+pub const ABI_MINOR: u32 = 0;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -31,20 +31,20 @@ pub enum TrapKind {
     Report = 3,
 }
 
-/// Opaque engine handle (`atl_engine`).
-pub enum AtlEngine {}
+/// Opaque engine handle (`atl_engine_handle`).
+pub enum AtlEngineHandle {}
 
 /// Opaque guest CPU of one attached host thread (`atl_cpu`).
 pub enum AtlCpu {}
 
-/// The trap callback of [`AtlHostV1`] for BOOT and REPORT: `kind` is a [`TrapKind`], `regs` points at eight u64.
+/// The trap callback of [`AtlHost`] for BOOT and REPORT: `kind` is a [`TrapKind`], `regs` points at eight u64.
 pub type TrapFn =
     unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, regs: *const u64) -> u64;
 
-/// `atl_lanes_v1` (minor 1): the lanes of a host call or trap beyond the integer registers. `x` is x0..x7 and `v` the low 64 bits of v0..v7 (both in); `stack` the eight words at the guest's sp (in). The answer is `x[0]` and `v[0]`.
+/// `atl_lanes`: the lanes of a host call or trap beyond the integer registers. `x` is x0..x7 and `v` the low 64 bits of v0..v7 (both in); `stack` the eight words at the guest's sp (in). The answer is `x[0]` and `v[0]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AtlLanesV1 {
+pub struct AtlLanes {
     /// x0..x7.
     pub x: [u64; 8],
     /// The low 64 bits of v0..v7.
@@ -53,14 +53,14 @@ pub struct AtlLanesV1 {
     pub stack: [u64; 8],
 }
 
-/// The trap callback of [`AtlHostV1`] for CALL and BIND (minor 1): `lanes` is read, then answered in `x[0]` and `v[0]`.
+/// The trap callback of [`AtlHost`] for CALL and BIND: `lanes` is read, then answered in `x[0]` and `v[0]`.
 pub type TrapExFn =
-    unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanesV1);
+    unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanes);
 
-/// `atl_host_v1`: what the host hands the engine in `create`.
+/// `atl_host`: what the host hands the engine in `create`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AtlHostV1 {
+pub struct AtlHost {
     /// ABI major the host speaks.
     pub major: u32,
     /// ABI minor the host speaks.
@@ -71,38 +71,39 @@ pub struct AtlHostV1 {
     pub ctx: *mut c_void,
     /// The trap callback for BOOT and REPORT.
     pub trap: Option<TrapFn>,
-    /// The trap callback for CALL and BIND (minor 1).
+    /// The trap callback for CALL and BIND.
     pub trap_ex: Option<TrapExFn>,
 }
 
-/// `atl_engine_v1::create`: `boot_exe` is a NUL-terminated path; QEMU's flags are the engine's own.
+/// `atl_engine::create`: `boot_exe` is a NUL-terminated path; QEMU's flags are the engine's own.
 pub type CreateFn = unsafe extern "C" fn(
-    host: *const AtlHostV1,
+    host: *const AtlHost,
     boot_exe: *const c_char,
-    out: *mut *mut AtlEngine,
+    out: *mut *mut AtlEngineHandle,
 ) -> c_int;
-/// `atl_engine_v1::destroy`.
-pub type DestroyFn = unsafe extern "C" fn(engine: *mut AtlEngine);
-/// `atl_engine_v1::map`.
+/// `atl_engine::destroy`.
+pub type DestroyFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle);
+/// `atl_engine::map`.
 pub type MapFn =
-    unsafe extern "C" fn(engine: *mut AtlEngine, start: u64, len: u64, prot: u32) -> c_int;
-/// `atl_engine_v1::attach`.
-pub type AttachFn = unsafe extern "C" fn(engine: *mut AtlEngine, out: *mut *mut AtlCpu) -> c_int;
-/// `atl_engine_v1::detach`.
-pub type DetachFn = unsafe extern "C" fn(engine: *mut AtlEngine, cpu: *mut AtlCpu);
-/// `atl_engine_v1::call_ex` (minor 1): `tp` in and out; `lanes` in and out (the answer is `x[0]` and `v[0]`).
+    unsafe extern "C" fn(engine: *mut AtlEngineHandle, start: u64, len: u64, prot: u32) -> c_int;
+/// `atl_engine::attach`.
+pub type AttachFn =
+    unsafe extern "C" fn(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int;
+/// `atl_engine::detach`.
+pub type DetachFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle, cpu: *mut AtlCpu);
+/// `atl_engine::call_ex`: `tp` in and out; `lanes` in and out (the answer is `x[0]` and `v[0]`).
 pub type CallExFn = unsafe extern "C" fn(
-    engine: *mut AtlEngine,
+    engine: *mut AtlEngineHandle,
     cpu: *mut AtlCpu,
     tp: *mut u64,
     f: u64,
-    lanes: *mut AtlLanesV1,
+    lanes: *mut AtlLanes,
 );
 
-/// `atl_engine_v1`: the table the engine `.so` exports as `atl_engine_v1`.
+/// `atl_engine`: the table the engine `.so` exports as `atl_engine`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AtlEngineV1 {
+pub struct AtlEngine {
     /// ABI major the engine speaks.
     pub major: u32,
     /// ABI minor the engine speaks.
@@ -117,10 +118,51 @@ pub struct AtlEngineV1 {
     pub map: Option<MapFn>,
     /// Gives the calling thread a guest CPU.
     pub attach: Option<AttachFn>,
-    /// Releases a CPU from [`AtlEngineV1::attach`].
+    /// Releases a CPU from [`AtlEngine::attach`].
     pub detach: Option<DetachFn>,
-    /// Minor 0's `call`, retired in minor 1: NULL. Keeps `call_ex`'s offset.
-    pub retired_call: Option<unsafe extern "C" fn()>,
-    /// Minor 1: runs guest code with lanes on a CPU.
+    /// Runs guest code with lanes on a CPU.
     pub call_ex: Option<CallExFn>,
+}
+
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, and a size below this host's table size (minor versions only append). The core loader and the gate both call it.
+pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
+    if table.major != ABI_MAJOR {
+        return Err(format!(
+            "engine ABI {}.{} refused, host speaks {ABI_MAJOR}.{ABI_MINOR}",
+            table.major, table.minor
+        ));
+    }
+    let host_size = core::mem::size_of::<AtlEngine>();
+    if (table.size as usize) < host_size {
+        return Err(format!(
+            "engine ABI {}.{} table size {} below the host's {host_size}",
+            table.major, table.minor, table.size
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_a_major_1_engine_by_name() {
+        let table = AtlEngine {
+            major: 1,
+            minor: 1,
+            size: core::mem::size_of::<AtlEngine>() as u32,
+            create: None,
+            destroy: None,
+            map: None,
+            attach: None,
+            detach: None,
+            call_ex: None,
+        };
+        // "2.0" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+        assert_eq!(
+            check_engine_table(&table),
+            Err("engine ABI 1.1 refused, host speaks 2.0".to_owned())
+        );
+    }
 }

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
-use atl_engine_api::AtlLanesV1;
+use atl_engine_api::AtlLanes;
 
 use crate::layout::CPUArchState as Env;
 
@@ -567,7 +567,7 @@ impl Guest {
     /// Calls guest function `f` with `args` in x0.. on thread pointer `tp`; returns its x0 and the thread pointer it returned with. The integer lanes of [`Guest::call_lanes`].
     pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
         assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
-        let mut lanes = AtlLanesV1::default();
+        let mut lanes = AtlLanes::default();
         lanes.x[..args.len()].copy_from_slice(args);
         let tp_out = self.call_lanes(tp, f, &mut lanes);
         (lanes.x[0], tp_out)
@@ -575,7 +575,7 @@ impl Guest {
 
     /// Calls guest function `f` with `lanes` on thread pointer `tp`: x0..x7, v0..v7 (low 64 bits) and the eight stack words at the callee's sp. The answer is `lanes.x[0]` and `lanes.v[0]`; returns the thread pointer the call returned with. Nested: may run from inside a trap callback, which may itself call again.
     /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
-    pub fn call_lanes(&self, tp: u64, f: u64, lanes: &mut AtlLanesV1) -> u64 {
+    pub fn call_lanes(&self, tp: u64, f: u64, lanes: &mut AtlLanes) -> u64 {
         let ret = ret_stub();
         assert!(ret != 0, "no BOOT trap yet: no return stub");
         let mut saved = vec![0u8; Env::SIZE];

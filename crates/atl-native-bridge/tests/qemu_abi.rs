@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Q6-1 gate, harness-less (QEMU bridge plan Q6-1): the engine ABI minor 1 in both directions. The trap side: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0. The call side: `call_ex` puts the host's lanes in the guest's registers and stack words, and returns the callee's FP result.
+//! Q6-1 gate, harness-less (QEMU bridge plan Q6-1): the engine ABI in both directions. The trap side: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0. The call side: `call_ex` puts the host's lanes in the guest's registers and stack words, and returns the callee's FP result.
 //! The fixture (`xtask/testdata/qemu-abi/fixture.c`, static) raises BOOT with a table of three entries, which the host calls: `qa_run` (checks x, v, k, r), `qa_sum` (d), `qa_edge` (e).
 //! Env (xtask qemu_abi.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_ABI_FIXTURE (fixture.c, built static).
 //! Expected values are the fixture's literals, written out here again (never read from the engine): x0..x7 = 0x101 + i, v0..v7 = 1.5 + i and the stack words s0, s1 (x, v, k); the answer 3.25 is no input lane, so `qa_run` returns its bits (r); `qa_sum` returns [`SUM_EXPECT`] (d); `qa_edge` stores [`EDGE_S0`], [`EDGE_S1`] and reads its last six stack words past the mapped page as 0 (e).
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use atl_engine_api::{AtlLanesV1, PROT_READ, PROT_WRITE};
+use atl_engine_api::{AtlLanes, PROT_READ, PROT_WRITE};
 use atl_native_bridge::engine::{self, Engine as _, qemu};
 
 /// fixture.c `qa_run`: x0..x7 = 0x101 + i.
@@ -41,7 +41,7 @@ const MARKER: u64 = 0xdead_beef_dead_beef;
 /// BOOT's payload: the address of the fixture's entry table (`qa_run`, `qa_sum`, `qa_edge`); identity, so the host reads it directly.
 static TABLE: AtomicU64 = AtomicU64::new(0);
 /// The lanes of the gate's last host call (checks x, v, k, e), as the host received them.
-static LAST: Mutex<Option<AtlLanesV1>> = Mutex::new(None);
+static LAST: Mutex<Option<AtlLanes>> = Mutex::new(None);
 
 fn check(letter: char, result: Result<(), String>) -> bool {
     match result {
@@ -116,7 +116,7 @@ fn two_pages() -> Result<usize, String> {
 
 /// Check d: `qa_sum` through `call_ex`, its ninth int and ninth double as stack arguments. The double result is the answer lane v0.
 fn check_sum(sum: u64) -> Result<(), String> {
-    let mut lanes = AtlLanesV1::default();
+    let mut lanes = AtlLanes::default();
     lanes.x[..8].copy_from_slice(&SUM_INTS[..8]);
     lanes.stack[0] = SUM_INTS[8];
     for (v, d) in lanes.v.iter_mut().zip(SUM_DOUBLES) {
@@ -131,7 +131,7 @@ fn check_sum(sum: u64) -> Result<(), String> {
 fn check_edge(edge: u64) -> Result<(), String> {
     let base = two_pages()?;
     qemu::CROSSING.map(base, PAGE, PROT_READ | PROT_WRITE)?;
-    let mut lanes = AtlLanesV1::default();
+    let mut lanes = AtlLanes::default();
     lanes.x[0] = (base + PAGE - 16) as u64;
     qemu::call_ex(edge, &mut lanes);
     let seen = LAST.lock().expect("last").take().unwrap_or_default().stack;

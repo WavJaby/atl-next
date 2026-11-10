@@ -26,7 +26,7 @@ pub fn native_bridge_bin(isa: &str) -> String {
     format!("{SYSTEM_BIN}/{isa}")
 }
 
-/// The translating engine `.so` for guest ISA `isa` (a host library, C ABI `atl_engine_v1`): the NB core dlopens it when ART's `initialize` names a foreign ISA. ART hands `initialize` only an app-private directory, so the location is fixed here.
+/// The translating engine `.so` for guest ISA `isa` (a host library, C ABI `atl_engine`): the NB core dlopens it when ART's `initialize` names a foreign ISA. ART hands `initialize` only an app-private directory, so the location is fixed here.
 pub fn engine_library(isa: &str) -> String {
     format!("{SYSTEM_LIB}/libatl_engine_{isa}.so")
 }

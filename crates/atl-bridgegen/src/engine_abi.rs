@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::{Lang, Source, Target, buildscript, interface, rust};
 
 /// The table's exported name.
-pub const TABLE: &str = "atl_engine_v1";
+pub const TABLE: &str = "atl_engine";
 
 /// The engine `.so`'s exports besides [`TABLE`]: QEMU's `__thread` state of the calling host thread, read by the engine with dlsym on its own handle (`thread_cpu`: the thread's CPUState; `helper_retaddr`: its fault slot). Everything else in the `.so` is local.
 pub const TLS_EXPORTS: &[&str] = &["thread_cpu", "helper_retaddr"];
@@ -25,46 +25,27 @@ const FACTS: &[(&str, &str)] = &[
     ("ATL_VALUE_TRAP_CALL", "ATL_TRAP_CALL"),
     ("ATL_VALUE_TRAP_BIND", "ATL_TRAP_BIND"),
     ("ATL_VALUE_TRAP_REPORT", "ATL_TRAP_REPORT"),
-    ("ATL_SIZEOF_HOST_V1", "sizeof(atl_host_v1)"),
-    ("ATL_OFFSET_HOST_MAJOR", "offsetof(atl_host_v1, major)"),
-    ("ATL_OFFSET_HOST_MINOR", "offsetof(atl_host_v1, minor)"),
-    ("ATL_OFFSET_HOST_SIZE", "offsetof(atl_host_v1, size)"),
-    ("ATL_OFFSET_HOST_CTX", "offsetof(atl_host_v1, ctx)"),
-    ("ATL_OFFSET_HOST_TRAP", "offsetof(atl_host_v1, trap)"),
-    ("ATL_OFFSET_HOST_TRAP_EX", "offsetof(atl_host_v1, trap_ex)"),
-    ("ATL_SIZEOF_LANES_V1", "sizeof(atl_lanes_v1)"),
-    ("ATL_OFFSET_LANES_X", "offsetof(atl_lanes_v1, x)"),
-    ("ATL_OFFSET_LANES_V", "offsetof(atl_lanes_v1, v)"),
-    ("ATL_OFFSET_LANES_STACK", "offsetof(atl_lanes_v1, stack)"),
-    ("ATL_SIZEOF_ENGINE_V1", "sizeof(atl_engine_v1)"),
-    ("ATL_OFFSET_ENGINE_MAJOR", "offsetof(atl_engine_v1, major)"),
-    ("ATL_OFFSET_ENGINE_MINOR", "offsetof(atl_engine_v1, minor)"),
-    ("ATL_OFFSET_ENGINE_SIZE", "offsetof(atl_engine_v1, size)"),
-    (
-        "ATL_OFFSET_ENGINE_CREATE",
-        "offsetof(atl_engine_v1, create)",
-    ),
-    (
-        "ATL_OFFSET_ENGINE_DESTROY",
-        "offsetof(atl_engine_v1, destroy)",
-    ),
-    ("ATL_OFFSET_ENGINE_MAP", "offsetof(atl_engine_v1, map)"),
-    (
-        "ATL_OFFSET_ENGINE_ATTACH",
-        "offsetof(atl_engine_v1, attach)",
-    ),
-    (
-        "ATL_OFFSET_ENGINE_DETACH",
-        "offsetof(atl_engine_v1, detach)",
-    ),
-    (
-        "ATL_OFFSET_ENGINE_RETIRED_CALL",
-        "offsetof(atl_engine_v1, retired_call)",
-    ),
-    (
-        "ATL_OFFSET_ENGINE_CALL_EX",
-        "offsetof(atl_engine_v1, call_ex)",
-    ),
+    ("ATL_SIZEOF_HOST", "sizeof(atl_host)"),
+    ("ATL_OFFSET_HOST_MAJOR", "offsetof(atl_host, major)"),
+    ("ATL_OFFSET_HOST_MINOR", "offsetof(atl_host, minor)"),
+    ("ATL_OFFSET_HOST_SIZE", "offsetof(atl_host, size)"),
+    ("ATL_OFFSET_HOST_CTX", "offsetof(atl_host, ctx)"),
+    ("ATL_OFFSET_HOST_TRAP", "offsetof(atl_host, trap)"),
+    ("ATL_OFFSET_HOST_TRAP_EX", "offsetof(atl_host, trap_ex)"),
+    ("ATL_SIZEOF_LANES", "sizeof(atl_lanes)"),
+    ("ATL_OFFSET_LANES_X", "offsetof(atl_lanes, x)"),
+    ("ATL_OFFSET_LANES_V", "offsetof(atl_lanes, v)"),
+    ("ATL_OFFSET_LANES_STACK", "offsetof(atl_lanes, stack)"),
+    ("ATL_SIZEOF_ENGINE", "sizeof(atl_engine)"),
+    ("ATL_OFFSET_ENGINE_MAJOR", "offsetof(atl_engine, major)"),
+    ("ATL_OFFSET_ENGINE_MINOR", "offsetof(atl_engine, minor)"),
+    ("ATL_OFFSET_ENGINE_SIZE", "offsetof(atl_engine, size)"),
+    ("ATL_OFFSET_ENGINE_CREATE", "offsetof(atl_engine, create)"),
+    ("ATL_OFFSET_ENGINE_DESTROY", "offsetof(atl_engine, destroy)"),
+    ("ATL_OFFSET_ENGINE_MAP", "offsetof(atl_engine, map)"),
+    ("ATL_OFFSET_ENGINE_ATTACH", "offsetof(atl_engine, attach)"),
+    ("ATL_OFFSET_ENGINE_DETACH", "offsetof(atl_engine, detach)"),
+    ("ATL_OFFSET_ENGINE_CALL_EX", "offsetof(atl_engine, call_ex)"),
 ];
 
 /// The Rust module (`pub const ATL_...: u64`) of [`FACTS`] for the header at `header`, read by clang for `host`. The C unit goes into `out`.

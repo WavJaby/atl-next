@@ -621,7 +621,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(obj)
 }
 
-/// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine_v1` and the TLS exports.
+/// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine` and the TLS exports.
 /// Gates: the defined dynamic symbols are exactly those names; the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red).
 fn engine_so(
     root: &Path,
@@ -709,7 +709,7 @@ fn engine_so(
     Ok(())
 }
 
-/// The engine `.so` of build `b` in `out` (QEMU bridge plan Q5-1b): the plain staticlib linked with the PIC objects, exporting `atl_engine_v1` and the TLS names. The file the core dlopens (`ATL_ENGINE_SO` in the gates).
+/// The engine `.so` of build `b` in `out` (QEMU bridge plan Q5-1b): the plain staticlib linked with the PIC objects, exporting `atl_engine` and the TLS names. The file the core dlopens (`ATL_ENGINE_SO` in the gates).
 pub(crate) fn engine_so_file(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     let staticlib = engine_staticlib(root, b, out, "plain", None)?;
@@ -779,7 +779,7 @@ fn engine_staticlib(
     Ok(kept)
 }
 
-/// Links the PIC build's objects with `staticlib` into `out/name`, exporting `atl_engine_v1` and `exports` only (the version script is written beside it). `-u` keeps the table and the P1 hook in the link: QEMU's object sees the hook as weak until the archive member is pulled.
+/// Links the PIC build's objects with `staticlib` into `out/name`, exporting `atl_engine` and `exports` only (the version script is written beside it). `-u` keeps the table and the P1 hook in the link: QEMU's object sees the hook as weak until the archive member is pulled.
 fn engine_link(
     b: &Build,
     staticlib: &Path,
@@ -791,7 +791,7 @@ fn engine_link(
     std::fs::write(&map, engine_abi::version_script(exports))
         .with_context(|| format!("writing {}", map.display()))?;
     let mut extra = vec![
-        "-Wl,-u,atl_engine_v1".to_owned(),
+        "-Wl,-u,atl_engine".to_owned(),
         "-Wl,-u,atl_svc_hook".to_owned(),
         format!("-Wl,--version-script={}", map.display()),
         staticlib.display().to_string(),

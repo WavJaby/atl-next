@@ -59,7 +59,7 @@ mod abi_check {
     use core::mem::{offset_of, size_of};
 
     use atl_engine_api::{
-        AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind,
+        AtlEngine, AtlHost, AtlLanes, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind,
     };
 
     use super::abi_layout as l;
@@ -74,39 +74,37 @@ mod abi_check {
     const _: () = assert!(TrapKind::Call as u64 == l::ATL_VALUE_TRAP_CALL as u64);
     const _: () = assert!(TrapKind::Bind as u64 == l::ATL_VALUE_TRAP_BIND as u64);
     const _: () = assert!(TrapKind::Report as u64 == l::ATL_VALUE_TRAP_REPORT as u64);
-    const _: () = assert!(size_of::<AtlHostV1>() as u64 == l::ATL_SIZEOF_HOST_V1);
-    const _: () = assert!(offset_of!(AtlHostV1, major) as u64 == l::ATL_OFFSET_HOST_MAJOR);
-    const _: () = assert!(offset_of!(AtlHostV1, minor) as u64 == l::ATL_OFFSET_HOST_MINOR);
-    const _: () = assert!(offset_of!(AtlHostV1, size) as u64 == l::ATL_OFFSET_HOST_SIZE);
-    const _: () = assert!(offset_of!(AtlHostV1, ctx) as u64 == l::ATL_OFFSET_HOST_CTX);
-    const _: () = assert!(offset_of!(AtlHostV1, trap) as u64 == l::ATL_OFFSET_HOST_TRAP);
-    const _: () = assert!(offset_of!(AtlHostV1, trap_ex) as u64 == l::ATL_OFFSET_HOST_TRAP_EX);
-    const _: () = assert!(size_of::<AtlLanesV1>() as u64 == l::ATL_SIZEOF_LANES_V1);
-    const _: () = assert!(offset_of!(AtlLanesV1, x) as u64 == l::ATL_OFFSET_LANES_X);
-    const _: () = assert!(offset_of!(AtlLanesV1, v) as u64 == l::ATL_OFFSET_LANES_V);
-    const _: () = assert!(offset_of!(AtlLanesV1, stack) as u64 == l::ATL_OFFSET_LANES_STACK);
-    const _: () = assert!(size_of::<AtlEngineV1>() as u64 == l::ATL_SIZEOF_ENGINE_V1);
-    const _: () = assert!(offset_of!(AtlEngineV1, major) as u64 == l::ATL_OFFSET_ENGINE_MAJOR);
-    const _: () = assert!(offset_of!(AtlEngineV1, minor) as u64 == l::ATL_OFFSET_ENGINE_MINOR);
-    const _: () = assert!(offset_of!(AtlEngineV1, size) as u64 == l::ATL_OFFSET_ENGINE_SIZE);
-    const _: () = assert!(offset_of!(AtlEngineV1, create) as u64 == l::ATL_OFFSET_ENGINE_CREATE);
-    const _: () = assert!(offset_of!(AtlEngineV1, destroy) as u64 == l::ATL_OFFSET_ENGINE_DESTROY);
-    const _: () = assert!(offset_of!(AtlEngineV1, map) as u64 == l::ATL_OFFSET_ENGINE_MAP);
-    const _: () = assert!(offset_of!(AtlEngineV1, attach) as u64 == l::ATL_OFFSET_ENGINE_ATTACH);
-    const _: () = assert!(offset_of!(AtlEngineV1, detach) as u64 == l::ATL_OFFSET_ENGINE_DETACH);
-    const _: () =
-        assert!(offset_of!(AtlEngineV1, retired_call) as u64 == l::ATL_OFFSET_ENGINE_RETIRED_CALL);
-    const _: () = assert!(offset_of!(AtlEngineV1, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
+    const _: () = assert!(size_of::<AtlHost>() as u64 == l::ATL_SIZEOF_HOST);
+    const _: () = assert!(offset_of!(AtlHost, major) as u64 == l::ATL_OFFSET_HOST_MAJOR);
+    const _: () = assert!(offset_of!(AtlHost, minor) as u64 == l::ATL_OFFSET_HOST_MINOR);
+    const _: () = assert!(offset_of!(AtlHost, size) as u64 == l::ATL_OFFSET_HOST_SIZE);
+    const _: () = assert!(offset_of!(AtlHost, ctx) as u64 == l::ATL_OFFSET_HOST_CTX);
+    const _: () = assert!(offset_of!(AtlHost, trap) as u64 == l::ATL_OFFSET_HOST_TRAP);
+    const _: () = assert!(offset_of!(AtlHost, trap_ex) as u64 == l::ATL_OFFSET_HOST_TRAP_EX);
+    const _: () = assert!(size_of::<AtlLanes>() as u64 == l::ATL_SIZEOF_LANES);
+    const _: () = assert!(offset_of!(AtlLanes, x) as u64 == l::ATL_OFFSET_LANES_X);
+    const _: () = assert!(offset_of!(AtlLanes, v) as u64 == l::ATL_OFFSET_LANES_V);
+    const _: () = assert!(offset_of!(AtlLanes, stack) as u64 == l::ATL_OFFSET_LANES_STACK);
+    const _: () = assert!(size_of::<AtlEngine>() as u64 == l::ATL_SIZEOF_ENGINE);
+    const _: () = assert!(offset_of!(AtlEngine, major) as u64 == l::ATL_OFFSET_ENGINE_MAJOR);
+    const _: () = assert!(offset_of!(AtlEngine, minor) as u64 == l::ATL_OFFSET_ENGINE_MINOR);
+    const _: () = assert!(offset_of!(AtlEngine, size) as u64 == l::ATL_OFFSET_ENGINE_SIZE);
+    const _: () = assert!(offset_of!(AtlEngine, create) as u64 == l::ATL_OFFSET_ENGINE_CREATE);
+    const _: () = assert!(offset_of!(AtlEngine, destroy) as u64 == l::ATL_OFFSET_ENGINE_DESTROY);
+    const _: () = assert!(offset_of!(AtlEngine, map) as u64 == l::ATL_OFFSET_ENGINE_MAP);
+    const _: () = assert!(offset_of!(AtlEngine, attach) as u64 == l::ATL_OFFSET_ENGINE_ATTACH);
+    const _: () = assert!(offset_of!(AtlEngine, detach) as u64 == l::ATL_OFFSET_ENGINE_DETACH);
+    const _: () = assert!(offset_of!(AtlEngine, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
 }
 
-/// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine_v1` and its functions, contract in `include/atl_engine.h`. One engine per process.
+/// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine` and its functions, contract in `include/atl_engine.h`. One engine per process.
 #[cfg(feature = "engine-so")]
 mod capi {
     use std::ffi::{CStr, c_char, c_int, c_void};
     use std::sync::OnceLock;
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineV1, AtlHostV1, AtlLanesV1, PROT_EXEC,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, PROT_EXEC,
         PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
     };
 
@@ -142,17 +140,17 @@ mod capi {
         std::process::abort()
     }
 
-    fn is_engine(engine: *mut AtlEngine) -> bool {
+    fn is_engine(engine: *mut AtlEngineHandle) -> bool {
         engine as usize == &raw const ENGINE as usize
     }
 
-    /// BOOT and REPORT through the minor-0 callback: eight registers in, x0 out.
+    /// BOOT and REPORT through the trap callback: eight registers in, x0 out.
     fn host_word(host: &HostRef, kind: TrapKind, regs: [u64; 8]) -> u64 {
         // SAFETY: host.trap and host.ctx are the host's, valid by the ABI (HostRef); regs holds the eight u64 the call reads.
         unsafe { (host.trap)(host.ctx, kind as u32, 0, regs.as_ptr()) }
     }
 
-    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` (minor 1) with the guest's x0..x7, v0..v7 and eight stack words (a word past the guest's mapped memory is 0). The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
+    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` with the guest's x0..x7, v0..v7 and eight stack words (a word past the guest's mapped memory is 0). The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
     fn host_trap(g: Guest, t: Trap) -> u64 {
         let host = HOST
             .get()
@@ -167,28 +165,28 @@ mod capi {
             Trap::Call(a) => (TrapKind::Call, 0, a),
             Trap::Bind { id, args } => (TrapKind::Bind, id, args),
         };
-        let mut lanes = AtlLanesV1 {
+        let mut lanes = AtlLanes {
             x,
             v: std::array::from_fn(|i| g.v(i)),
             stack: std::array::from_fn(|i| g.stack_word(i).unwrap_or(0)),
         };
-        // SAFETY: host.trap_ex and host.ctx are the host's, valid by the ABI (HostRef); lanes is a live AtlLanesV1 that the host reads and answers.
+        // SAFETY: host.trap_ex and host.ctx are the host's, valid by the ABI (HostRef); lanes is a live AtlLanes that the host reads and answers.
         unsafe { (host.trap_ex)(host.ctx, kind as u32, id, &mut lanes) };
         g.set_v(0, lanes.v[0]);
         lanes.x[0]
     }
 
     unsafe extern "C" fn create(
-        host: *const AtlHostV1,
+        host: *const AtlHost,
         boot_exe: *const c_char,
-        out: *mut *mut AtlEngine,
+        out: *mut *mut AtlEngineHandle,
     ) -> c_int {
         // SAFETY: the host passes its struct for the duration of the call (the ABI).
         let Some(h) = (unsafe { host.as_ref() }) else {
             return -libc::EINVAL;
         };
         if h.major != ABI_MAJOR
-            || (h.size as usize) < core::mem::size_of::<AtlHostV1>()
+            || (h.size as usize) < core::mem::size_of::<AtlHost>()
             || boot_exe.is_null()
             || out.is_null()
         {
@@ -222,14 +220,19 @@ mod capi {
         }
     }
 
-    unsafe extern "C" fn destroy(engine: *mut AtlEngine) {
+    unsafe extern "C" fn destroy(engine: *mut AtlEngineHandle) {
         if !is_engine(engine) {
             fail("destroy: not this process's engine");
         }
         // the booted engine lives until the process ends: QEMU's main never returns, and its helper parks in BOOT
     }
 
-    unsafe extern "C" fn map(engine: *mut AtlEngine, start: u64, len: u64, prot: u32) -> c_int {
+    unsafe extern "C" fn map(
+        engine: *mut AtlEngineHandle,
+        start: u64,
+        len: u64,
+        prot: u32,
+    ) -> c_int {
         let known = PROT_READ | PROT_WRITE | PROT_EXEC;
         if !is_engine(engine) || boot_env().is_none() || len == 0 || prot & !known != 0 {
             return -libc::EINVAL;
@@ -246,7 +249,7 @@ mod capi {
         }
     }
 
-    unsafe extern "C" fn attach(engine: *mut AtlEngine, out: *mut *mut AtlCpu) -> c_int {
+    unsafe extern "C" fn attach(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int {
         let Some(env) = boot_env() else {
             return -libc::EINVAL;
         };
@@ -266,7 +269,7 @@ mod capi {
         }
     }
 
-    unsafe extern "C" fn detach(engine: *mut AtlEngine, cpu: *mut AtlCpu) {
+    unsafe extern "C" fn detach(engine: *mut AtlEngineHandle, cpu: *mut AtlCpu) {
         if !is_engine(engine) || cpu.is_null() {
             fail("detach: not this process's engine, or no CPU");
         }
@@ -275,25 +278,25 @@ mod capi {
     }
 
     unsafe extern "C" fn call_ex(
-        engine: *mut AtlEngine,
+        engine: *mut AtlEngineHandle,
         cpu: *mut AtlCpu,
         tp: *mut u64,
         f: u64,
-        lanes: *mut AtlLanesV1,
+        lanes: *mut AtlLanes,
     ) {
         if !is_engine(engine) || cpu.is_null() || tp.is_null() || lanes.is_null() {
             fail("call_ex: not this process's engine, or no CPU, thread pointer or lanes");
         }
         // SAFETY: cpu came from attach and lives until detach, on this thread (the ABI).
         let cpu = unsafe { &*cpu.cast::<Cpu>() };
-        // SAFETY: lanes is a live AtlLanesV1 that the call reads and answers, and tp is writable (the ABI).
+        // SAFETY: lanes is a live AtlLanes that the call reads and answers, and tp is writable (the ABI).
         let (lanes, t) = unsafe { (&mut *lanes, *tp) };
         let tp_out = cpu.guest().call_lanes(t, f, lanes);
         // SAFETY: tp is writable (the ABI).
         unsafe { *tp = tp_out };
     }
 
-    /// The table the engine `.so` exports (version script: `atl_engine_v1` is the only global symbol of its kind).
+    /// The table the engine `.so` exports (version script: `atl_engine` is the only global symbol of its kind).
     #[cfg(atl_qe_abi_major_next)]
     const BREAK_MAJOR: u32 = 1;
     #[cfg(not(atl_qe_abi_major_next))]
@@ -301,16 +304,15 @@ mod capi {
 
     #[unsafe(no_mangle)]
     #[allow(non_upper_case_globals, reason = "the exported ABI name")]
-    pub static atl_engine_v1: AtlEngineV1 = AtlEngineV1 {
+    pub static atl_engine: AtlEngine = AtlEngine {
         major: ABI_MAJOR + BREAK_MAJOR,
         minor: ABI_MINOR,
-        size: core::mem::size_of::<AtlEngineV1>() as u32,
+        size: core::mem::size_of::<AtlEngine>() as u32,
         create: Some(create),
         destroy: Some(destroy),
         map: Some(map),
         attach: Some(attach),
         detach: Some(detach),
-        retired_call: None,
         call_ex: Some(call_ex),
     };
 }

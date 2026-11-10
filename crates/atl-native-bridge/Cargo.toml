@@ -69,7 +69,7 @@ harness = false
 name = "qemu_jni"
 harness = false
 
-# Q6-1 gate: the engine ABI minor 1, trap side: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in v0 (QEMU bridge plan Q6-1); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and the static fixture (ATL_QEMU_ABI_FIXTURE)
+# Q6-1 gate: the engine ABI, trap side: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in v0 (QEMU bridge plan Q6-1); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO) and the static fixture (ATL_QEMU_ABI_FIXTURE)
 [[test]]
 name = "qemu_abi"
 harness = false

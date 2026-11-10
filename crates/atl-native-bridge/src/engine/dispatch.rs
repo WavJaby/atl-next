@@ -4,22 +4,22 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use atl_engine_api::AtlLanesV1;
+use atl_engine_api::AtlLanes;
 
 use super::jni::{self, Class, Refused};
 use super::unsupported;
 use crate::engine::bindings::JNI_STUBS;
 use crate::engine::bindings::qemu::THUNKS;
 
-/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes_v1`: x0..x7, v0..v7, eight stack words); `Report` x0.
+/// A trap from the engine, decoded from `atl_trap_kind`. `Boot` x0 = the auxv QEMU built for the boot executable (x1, its return stub, the engine keeps); `Call` and `Bind` carry their lanes (`atl_lanes`: x0..x7, v0..v7, eight stack words); `Report` x0.
 #[derive(Clone, Copy, Debug)]
 pub enum Trap {
     /// BOOT: the boot executable's auxv (x0).
     Boot(u64),
     /// `svc #CALL`: the guest's lanes.
-    Call(AtlLanesV1),
+    Call(AtlLanes),
     /// A pool thunk: its id (a JNI slot below `JNI_STUBS`, else a bound host function), and its lanes.
-    Bind { id: u32, lanes: AtlLanesV1 },
+    Bind { id: u32, lanes: AtlLanes },
     /// A value reported for a gate: x0.
     Report(u64),
 }
@@ -55,7 +55,7 @@ const ID_SKEW: usize = 0;
 const ID_SKEW: usize = 1;
 
 /// Calls the host function of the slot `id + ID_SKEW` with the guest's lanes ([`call_host`], answered by the slot's result class). Every argument lane is forwarded, fp included. The counter sees the slot that ran, so a skewed dispatch shows up as a wrong count.
-pub(super) fn call_binding(id: u32, lanes: &AtlLanesV1) -> Answer {
+pub(super) fn call_binding(id: u32, lanes: &AtlLanes) -> Answer {
     let Some(slot) = usize::try_from(id)
         .ok()
         .map(|i| i + ID_SKEW)
@@ -73,7 +73,7 @@ pub(super) fn call_binding(id: u32, lanes: &AtlLanesV1) -> Answer {
 
 /// A guest JNI call (pool id `id` < `JNI_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
 /// Deliberate breaks: `jni_swap` exchanges x3 and x4 of CallStaticIntMethod only; `jni_guest_env` passes the guest's env through unmapped.
-fn call_jni(id: u32, lanes: &AtlLanesV1) -> Answer {
+fn call_jni(id: u32, lanes: &AtlLanes) -> Answer {
     let guest = lanes.x[0] as usize;
     let lane = jni::lane_of(guest, id as usize).unwrap_or_else(|r| refuse(r));
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
@@ -103,7 +103,7 @@ type HostFp = unsafe extern "C" fn(u64, ...) -> f64;
 
 /// Calls `target` with the guest lanes `lanes` and answers its result by `ret`: a double or float from xmm0 (its bits in v0), a void as x0 = 0, anything else from x0.
 /// Breaks: `v_drop` zeroes the fp lanes; `drop_stack` moves the stack words down one; `ret_int` reads an fp result from x0; `al_zero` makes the call with %al = 0 ([`call_al0`]).
-fn call_host(target: usize, lanes: &AtlLanesV1, ret: Class) -> Answer {
+fn call_host(target: usize, lanes: &AtlLanes, ret: Class) -> Answer {
     let [x0, x1, x2, x3, x4, x5, x6, x7] = lanes.x;
     #[cfg(not(atl_nb_v_drop))]
     let [v0, v1, v2, v3, v4, v5, v6, v7] = lanes.v.map(f64::from_bits);
