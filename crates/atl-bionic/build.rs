@@ -747,6 +747,9 @@ fn shape(up: &Upstreams, host: &ArchRow, level: u64, extra: &[(&str, &str)]) -> 
     // as device C++ includes them: the linkage they give their functions
     let host_cxx = front::probe_includes(Lang::Cxx, &gnu(self::host_target(host)?), &strs(&names))
         .context("the host's headers as C++")?;
+    let cxx_std = front::resolve_include(Lang::Cxx, &gnu(self::host_target(host)?), "new")
+        .context("the host's C++ standard library")?;
+    let cxx_std = cxx_std.parent().context("<new> has no directory")?;
     let kernel = kernel_headers(&uapi)?;
     let scan = front::resolve_includes(
         Lang::C,
@@ -779,6 +782,7 @@ fn shape(up: &Upstreams, host: &ArchRow, level: u64, extra: &[(&str, &str)]) -> 
         kernel: &kernel,
         extra,
         cxx: &host_cxx,
+        cxx_std,
     })?;
     shape::check_guards(derived.wrappers.keys())?;
     let mut wrappers: Vec<(String, String)> = derived

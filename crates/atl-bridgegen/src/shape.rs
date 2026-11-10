@@ -49,6 +49,8 @@
 //! header whose own file declares functions with C++ linkage when read as C++ (`Inputs::cxx`; glibc
 //! 2.41's `sys/pidfd.h` has no `__BEGIN_DECLS`) is included inside `extern "C"` in C++, so a C++ caller
 //! references the C symbol the host library defines. A private file doing so fails: no wrapper reaches it.
+//! Exempt: the C++ standard library's own files (`Inputs::cxx_std`), C++ by design (libc++'s `<new>` declares
+//! `operator delete` with no `extern "C++"`; libstdc++ wraps its own in one, so it never showed).
 //!
 //! Known excess: a glibc header including `x` where bionic's does not (`sys/types.h` -> `sys/select.h`)
 //! now also gets the wrapper's additions to `x`.
@@ -142,6 +144,10 @@ pub struct Inputs<'a> {
     /// The host's view of every name in `host_names` read as C++ with `_GNU_SOURCE`, as device C++
     /// includes them (`Reached::cxx_linkage`).
     pub cxx: &'a BTreeMap<String, Probe>,
+    /// The C++ standard library's header directory `cxx` read: the one holding the file `<new>` resolves
+    /// to under the same arguments (`front::resolve_include`), native or cross alike. Files under it may
+    /// declare C++ linkage.
+    pub cxx_std: &'a Path,
 }
 
 /// One generated header.
@@ -378,7 +384,7 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
             },
         );
     }
-    for name in cxx_linkage(inputs.cxx)? {
+    for name in cxx_linkage(inputs.cxx, inputs.cxx_std)? {
         out.entry(name).or_default().c_linkage = true;
     }
     // the hidden names: host headers using an emitted macro as an identifier, whichever view reaches them;
@@ -417,8 +423,9 @@ pub fn derive(inputs: &Inputs) -> Result<Shape> {
 }
 
 /// The host headers (include names) whose own file declares functions with C++ linkage in C++ `cxx`
-/// probes. Fails on another file doing so: a private one, which no wrapper includes by its name.
-fn cxx_linkage(cxx: &BTreeMap<String, Probe>) -> Result<BTreeSet<String>> {
+/// probes. Fails on another file doing so: a private one, which no wrapper includes by its name. Files under
+/// the C++ standard library's directory `std` are C++ by design and skipped.
+fn cxx_linkage(cxx: &BTreeMap<String, Probe>, std: &Path) -> Result<BTreeSet<String>> {
     let own: BTreeMap<&PathBuf, &String> = cxx
         .iter()
         .filter(|(_, p)| p.usable())
@@ -427,7 +434,7 @@ fn cxx_linkage(cxx: &BTreeMap<String, Probe>) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for probe in cxx.values() {
         for (file, reached) in &probe.files {
-            if reached.cxx_linkage.is_empty() {
+            if reached.cxx_linkage.is_empty() || file.starts_with(std) {
                 continue;
             }
             let name = own.get(file).with_context(|| {
@@ -1424,6 +1431,7 @@ mod tests {
             kernel: &kernel,
             extra,
             cxx: &cxx,
+            cxx_std: &dir.0.join("c++"),
         })
     }
 
@@ -1470,23 +1478,38 @@ mod tests {
             ("a.h", "#include <bits/b.h>\n"),
             ("bits/b.h", "int b_fn(void);\n"),
             ("c.h", "int c_fn(void);\n"),
+            // a C header reaching the C++ standard library (bionic stdatomic.h -> <atomic> -> libc++ <new>)
+            ("s.h", "#include <new>\n"),
+            // libc++'s <new> style: no extern "C++" around its operators
+            ("v1/new", "void operator delete(void *) noexcept;\n"),
         ] {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        let t = sysroot(std::slice::from_ref(&dir.0));
+        let t = sysroot(&[dir.0.clone(), dir.0.join("v1")]);
+        // derived as build.rs derives it: the directory of what <new> resolves to
+        let std = front::resolve_include(Lang::Cxx, &t, "new").unwrap();
+        let std = std.parent().unwrap();
         let cxx = front::probe_includes(Lang::Cxx, &t, &["c.h"]).unwrap();
         assert_eq!(
-            cxx_linkage(&cxx).unwrap(),
+            cxx_linkage(&cxx, std).unwrap(),
             BTreeSet::from(["c.h".to_owned()])
         );
         // read as C, nothing has C++ linkage
         let c = front::probe_includes(Lang::C, &t, &["c.h"]).unwrap();
-        assert!(cxx_linkage(&c).unwrap().is_empty());
+        assert!(cxx_linkage(&c, std).unwrap().is_empty());
+        // the standard library's own files are C++ by design
+        let cxx = front::probe_includes(Lang::Cxx, &t, &["s.h"]).unwrap();
+        assert!(cxx_linkage(&cxx, std).unwrap().is_empty());
+        // ... and only those: outside the std directory, the same file refuses
+        let err = cxx_linkage(&cxx, &root.join("elsewhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("v1/new") && err.contains("operator delete"), "{err}");
         // a private file has no wrapper to put it in extern "C"
         let cxx = front::probe_includes(Lang::Cxx, &t, &["a.h"]).unwrap();
-        let err = cxx_linkage(&cxx).unwrap_err().to_string();
+        let err = cxx_linkage(&cxx, std).unwrap_err().to_string();
         assert!(err.contains("bits/b.h") && err.contains("b_fn"), "{err}");
     }
 
@@ -1706,6 +1729,7 @@ mod tests {
             kernel: &kernel,
             extra: &[],
             cxx: &cxx,
+            cxx_std: &dir.0.join("c++"),
         })
     }
 
