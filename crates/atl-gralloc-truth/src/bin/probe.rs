@@ -162,7 +162,7 @@ struct Args {
 #[derive(Subcommand)]
 enum Role {
     Writer {
-        /// An inherited unix socket to the reader.
+        /// An inherited unix socket to the reader (the broker passes it as stdin, fd 0).
         #[arg(long)]
         sock: i32,
     },
@@ -543,7 +543,8 @@ fn main() -> Result<ExitCode> {
     // SAFETY: liblog accepts its own stderr logger as the process logger; it is set before any other thread exists.
     unsafe { __android_log_set_logger(Some(__android_log_stderr_logger)) };
     let adopt = |fd: i32| -> Result<OwnedFd> {
-        ensure!(fd >= 3, "--sock {fd}: not an inherited descriptor");
+        // the broker passes the socket as stdin (fd 0), so any non-negative descriptor is valid
+        ensure!(fd >= 0, "--sock {fd}: not a descriptor");
         // SAFETY: the harness passes an open socket as this descriptor and nothing else in this process owns it.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     };
