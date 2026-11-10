@@ -245,6 +245,44 @@ __attribute__((noinline)) u64 fx_write(u64 fd, u64 buf, u64 n) {
     return raw_write(fd, (const void *)(uintptr_t)buf, n);
 }
 
+// (s) per-CPU guest stacks: fx_stack_fill(pattern) fills S_WORDS stack words with pattern + i, hands the host the buffer address (CALL, x0 = buf), which holds every thread at one barrier, then counts words that no longer read pattern + i. Own stacks -> 0; one shared stack -> the last filler wins and the others count S_WORDS.
+// S_WORDS = 64 KiB of u64, far above any frame noise and far below the 1 MiB stack.
+#define S_WORDS 8192
+__attribute__((noinline)) u64 fx_stack_fill(u64 pattern) {
+    volatile u64 buf[S_WORDS];
+    for (u64 i = 0; i < S_WORDS; i++) {
+        buf[i] = pattern + i;
+    }
+    call_host((u64)(uintptr_t)buf);
+    u64 bad = 0;
+    for (u64 i = 0; i < S_WORDS; i++) {
+        bad += buf[i] != pattern + i;
+    }
+    return bad;
+}
+
+// (t) the stack guard: fx_guard_store(addr) stores to addr (the host passes stack base - 8, inside the guard page). The handler reports si_addr (REPORT), restores SIG_DFL and returns, so the store re-runs with no handler and QEMU ends the process by SIGSEGV. Without a guard the store succeeds and the call returns T_SURVIVED.
+#define T_SURVIVED 11
+static void guard_handler(int sig, siginfo_t *info, void *ucv) {
+    (void)sig;
+    (void)ucv;
+    register u64 x0 __asm__("x0") = (u64)(uintptr_t)info->si_addr;
+    __asm__ volatile("svc #0x7a12" : : "r"(x0) : "memory");
+    default_segv();
+}
+
+__attribute__((noinline)) u64 fx_guard_store(u64 addr) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = guard_handler;
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGSEGV, &sa, 0) != 0) {
+        return 0;
+    }
+    *(volatile u64 *)(uintptr_t)addr = 1;
+    return T_SURVIVED;
+}
+
 // The gate table, read by the host (crates/atl-qemu-engine/tests/spike.rs `t`): u64 words, in this order.
 static const u64 table[] = {
     // 0..3: entry points
@@ -274,6 +312,10 @@ static const u64 table[] = {
     (u64)fx_tp, (u64)fx_write_msg, (u64)msg, MSG_LEN,
     // 39: (o) fx_write, a write(2) on a host buffer the guest never mapped
     (u64)fx_write,
+    // 40..41: (s) fx_stack_fill and its word count
+    (u64)fx_stack_fill, S_WORDS,
+    // 42..43: (t) fx_guard_store and its return when the store did not fault
+    (u64)fx_guard_store, T_SURVIVED,
 };
 
 int main(void) {

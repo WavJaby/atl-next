@@ -101,6 +101,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("call-stack", "atl_qe_call_stack"),
     // gate (qemu-abi, d): call_ex sets no FP lane, so the callee's double arguments read the CPU's own v0..v7
     ("call-v", "atl_qe_call_v"),
+    // gate (s): every attached CPU gets the first CPU's guest stack, so concurrent guest frames overwrite each other
+    ("shared-stack", "atl_qe_shared_stack"),
+    // gate (t): the guard page below each guest stack is RW and VALID, so a store below the stack succeeds
+    ("no-guard", "atl_qe_no_guard"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

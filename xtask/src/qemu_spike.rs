@@ -37,8 +37,8 @@ const CPU_LOOP: &str = "linux-user/aarch64/cpu_loop.c";
 const UACCESS: &str = "linux-user/uaccess.c";
 const QEMU_H: &str = "linux-user/qemu.h";
 const PACKAGE: &str = "atl-qemu-engine";
-const GATES: [char; 16] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+const GATES: [char; 18] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't',
 ];
 /// Thunk slots in the fixture's pool, as the NB pool is sized (atl-native-bridge build.rs: stub rows + fixed bindings + JNI slots, rounded to a power of two; 3860 + 6 + 256 > 4096). Gate (l) uses the last slot, 8191.
 const POOL_SLOTS: u32 = 8192;
@@ -311,6 +311,24 @@ const RUNS: &[RunSpec] = &[
         base: "0",
         engine_break: Some("ret-stub-local"),
         red: Some('m'),
+    },
+    // gate (s): every attached CPU runs on one guest stack, so the last filler's words replace the others'
+    RunSpec {
+        name: "shared-stack",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("shared-stack"),
+        red: Some('s'),
+    },
+    // gate (t): the guard page is ordinary stack memory, so the store below the stack succeeds
+    RunSpec {
+        name: "no-guard",
+        swap: None,
+        pool_skew: false,
+        base: "0",
+        engine_break: Some("no-guard"),
+        red: Some('t'),
     },
 ];
 

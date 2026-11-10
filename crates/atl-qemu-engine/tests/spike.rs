@@ -2,7 +2,7 @@
 //! Spike gates (QEMU bridge plan Q2/Q3, Q5-2), harness-less: `start` boots QEMU on its helper thread, whose BOOT trap runs gates (a)-(l) there and parks; the host threads then run (n), (m), (o), (p) on their own guest CPUs, and the process exits 0 when every gate is ok.
 //! Env (xtask qemu_spike.rs sets it; without it the run prints SKIP): `ATL_QEMU_SPIKE_SO` = the spike library, `ATL_QEMU_SPIKE_FIXTURE` = the static guest program, `ATL_QEMU_SIGCHAIN_OBJ` = AOSP libsigchain's object (build.rs links it and sets cfg `atl_qe_sigchain`). Args: `--guest-base <n>` (QEMU's `-B`, default 0 = identity).
 //! Expected values come from the fixture's table (fixture.c), never from the engine. One line per gate: `spike: (x) ok` or `spike: (x) FAIL <why>`.
-//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map.
+//! Gates: (a) trap arguments, (b) nested host/guest calls, (c) host memory, (d) guest store fault, (e) host fault order behind sigchain, (h) implicit null check through sigchain, (f) write into translated code, (g) second guest thread, (i) fatal guest fault on one thread, (j) the same on a second thread (both end by SIGSEGV), (k) host fault with previous action SIG_IGN (ends by SIGSEGV), (l) binding thunks from the guest pool (bit 15 of the svc immediate, id = slot); (n) helper boot: `start` returned with the BOOT answer, the helper stays parked, the creator thread attaches and calls; (m) two host threads attach at once and call concurrently, each with its own thread pointer and syscalls; (o) a write(2) on host heap memory, accepted under identity mapping (access_ok patch 0002), (p) a write straddling a QEMU-mapped page into host memory QEMU does not map; (s) four attached threads fill their guest stacks across one barrier and find their own words intact; (t) a guest store into the guard page below an attached CPU's stack is a guest SIGSEGV at that address (forked child).
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
 #[cfg(feature = "qemu")]
@@ -57,7 +57,11 @@ mod spike {
         pub const MSG: usize = 37;
         pub const MSG_LEN: usize = 38;
         pub const WRITE: usize = 39;
-        pub const LEN: usize = 40;
+        pub const STACK_FILL: usize = 40;
+        pub const S_WORDS: usize = 41;
+        pub const GUARD_STORE: usize = 42;
+        pub const T_SURVIVED: usize = 43;
+        pub const LEN: usize = 44;
     }
 
     /// What the host answers a CALL with during gate (a): any value the guest cannot produce itself.
@@ -73,12 +77,24 @@ mod spike {
     /// Gate (p): bytes of the straddling buffer handed to write(2), half in each page.
     const P_LEN: usize = 64;
 
+    /// Gate (s): host threads, each on its own CPU and guest stack. Four, so a shared stack has three losers rather than one coin flip.
+    const S_THREADS: usize = 4;
+    /// Gate (t) child: exit status when the guard fault reported an address other than the store's.
+    const T_ADDR_EXIT: c_int = 47;
+
+    /// Gate (s): every thread's fx_stack_fill holds here (its CALL) until all have filled.
+    static S_BARRIER: Barrier = Barrier::new(S_THREADS);
+    /// Gate (t) child: the address the guest store must fault at (stack base - 8).
+    static T_ADDR: AtomicU64 = AtomicU64::new(0);
+
     /// The fixture's table, from its BOOT trap; read by every thread.
     static TABLE: OnceLock<Vec<u64>> = OnceLock::new();
 
     thread_local! {
         static GATE: Cell<char> = const { Cell::new(' ') };
         static A_SEEN: Cell<Option<[u64; 8]>> = const { Cell::new(None) };
+        /// Gate (s): the guest buffer address fx_stack_fill passed in its CALL.
+        static S_BUF: Cell<u64> = const { Cell::new(0) };
         /// The binding traps of the current gate-(l) call: (id, x0..x7).
         static BINDS: RefCell<Vec<(u32, [u64; 8])>> = const { RefCell::new(Vec::new()) };
     }
@@ -218,6 +234,8 @@ mod spike {
             ('m', gate_m),
             ('o', gate_o),
             ('p', gate_p),
+            ('s', gate_s),
+            ('t', gate_t),
         ] {
             // a panic (an engine assert on this thread) is the gate's failure, not the harness's
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&booted)))
@@ -260,8 +278,22 @@ mod spike {
                 }
                 // fx_outer's CALL(i): answer with the guest's own fx_inner(i), a nested host->guest call
                 'b' => g.call(w(t::INNER), &[regs[0]]),
+                's' => {
+                    S_BUF.with(|b| b.set(regs[0]));
+                    S_BARRIER.wait();
+                    0
+                }
                 other => panic!("CALL during gate {other:?}"),
             },
+            Trap::Report(v) if GATE.with(Cell::get) == 't' => {
+                let want = T_ADDR.load(Ordering::Relaxed);
+                println!("spike: (t) child: guest SIGSEGV at {v:#x}, store at {want:#x}");
+                if v != want {
+                    // SAFETY: the forked child ends here; the parent reads the status.
+                    unsafe { libc::_exit(T_ADDR_EXIT) };
+                }
+                0
+            }
             Trap::Report(v) => {
                 REPORTS.lock().expect("reports").push(v);
                 0
@@ -796,6 +828,117 @@ mod spike {
         })();
         close(fds);
         r
+    }
+
+    /// One gate-(s) thread: attach, fx_stack_fill(pattern) -> (stack base, top, guest buffer, mismatched words).
+    fn stack_fill(booted: &Booted, pattern: u64) -> Result<(usize, usize, u64, u64), String> {
+        let cpu = booted.attach()?;
+        GATE.with(|c| c.set('s'));
+        let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+        let (bad, _) = cpu
+            .guest()
+            .call_on(tcb.as_ptr() as u64, w(t::STACK_FILL), &[pattern]);
+        let r = (
+            cpu.stack_base(),
+            cpu.stack_top(),
+            S_BUF.with(Cell::get),
+            bad,
+        );
+        drop(cpu);
+        Ok(r)
+    }
+
+    /// Gate (s): S_THREADS host threads attach; each fills S_WORDS words of its guest stack with its own pattern ((i + 1) << 32, so no two threads' words coincide), all wait at one barrier inside the call, then each counts its words that changed. Expected: 0 mismatches each, every buffer inside its own CPU's [base, top), the stacks disjoint.
+    fn gate_s(booted: &Booted) -> Result<(), String> {
+        let words = w(t::S_WORDS);
+        let seen = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..S_THREADS)
+                .map(|i| s.spawn(move || stack_fill(booted, (i as u64 + 1) << 32)))
+                .collect();
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("panicked".to_owned()))
+                        .map_err(|e| format!("thread {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        for (i, &(base, top, buf, bad)) in seen.iter().enumerate() {
+            println!(
+                "spike: (s) thread {i}: stack [{base:#x}, {top:#x}), buffer {buf:#x}, {bad} of {words} words changed"
+            );
+        }
+        for (i, &(base, top, buf, bad)) in seen.iter().enumerate() {
+            if bad != 0 {
+                return Err(format!(
+                    "thread {i}: {bad} of {words} stack words changed under it (expected 0)"
+                ));
+            }
+            let end = buf + words * 8;
+            if buf < base as u64 || end > top as u64 {
+                return Err(format!(
+                    "thread {i}: buffer [{buf:#x}, {end:#x}) outside its stack [{base:#x}, {top:#x})"
+                ));
+            }
+            for (j, &(b2, t2, ..)) in seen.iter().enumerate().skip(i + 1) {
+                if base < t2 && b2 < top {
+                    return Err(format!(
+                        "threads {i} and {j} share stack memory: [{base:#x}, {top:#x}) and [{b2:#x}, {t2:#x})"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Gate (t): in a forked child, an attached CPU stores at its stack base - 8, inside the guard page. Expected: a guest SIGSEGV whose si_addr is that address (the child's REPORT check), then death by SIGSEGV once the handler restored SIG_DFL. A child that exits T_SURVIVED's status 0 stored into the guard.
+    fn gate_t(booted: &Booted) -> Result<(), String> {
+        let pid = fork_child()?;
+        if pid == 0 {
+            GATE.with(|c| c.set('t'));
+            let code = match booted.attach() {
+                Ok(cpu) => {
+                    let at = cpu.stack_base() as u64 - 8;
+                    T_ADDR.store(at, Ordering::Relaxed);
+                    let tcb: Box<[u64; 8]> = Box::new([0; 8]);
+                    let (r, _) = cpu
+                        .guest()
+                        .call_on(tcb.as_ptr() as u64, w(t::GUARD_STORE), &[at]);
+                    println!(
+                        "spike: (t) child: store at {at:#x} returned {r} (T_SURVIVED {})",
+                        w(t::T_SURVIVED)
+                    );
+                    0
+                }
+                Err(e) => {
+                    println!("spike: (t) child: attach failed: {e}");
+                    1
+                }
+            };
+            // SAFETY: the child ends without running the parent's exit path.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            return Err("waitpid failed".to_owned());
+        }
+        if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV {
+            return Ok(());
+        }
+        Err(
+            match (libc::WIFSIGNALED(status), libc::WEXITSTATUS(status)) {
+                (true, _) => format!(
+                    "child died by signal {}, expected SIGSEGV",
+                    libc::WTERMSIG(status)
+                ),
+                (false, T_ADDR_EXIT) => "the guard fault reported another address".to_owned(),
+                (false, 0) => "the store below the stack succeeded: no guard page".to_owned(),
+                (false, c) => format!("child exited {c}, expected death by SIGSEGV"),
+            },
+        )
     }
 
     /// Gate (k) in its child: a host-only fault while the previous SIGSEGV action is SIG_IGN. A synchronous fault cannot be ignored, so the child must end by SIGSEGV; surviving the store exits 3.
