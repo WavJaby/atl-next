@@ -36,6 +36,11 @@ const FACTS: &[(&str, &str)] = &[
     ("ATL_OFFSET_LANES_X", "offsetof(atl_lanes, x)"),
     ("ATL_OFFSET_LANES_V", "offsetof(atl_lanes, v)"),
     ("ATL_OFFSET_LANES_STACK", "offsetof(atl_lanes, stack)"),
+    ("ATL_SIZEOF_STACK", "sizeof(atl_stack)"),
+    ("ATL_OFFSET_STACK_SIZE", "offsetof(atl_stack, size)"),
+    ("ATL_OFFSET_STACK_GUARD", "offsetof(atl_stack, guard)"),
+    ("ATL_OFFSET_STACK_BASE", "offsetof(atl_stack, base)"),
+    ("ATL_OFFSET_STACK_LEN", "offsetof(atl_stack, len)"),
     ("ATL_SIZEOF_ENGINE", "sizeof(atl_engine)"),
     ("ATL_OFFSET_ENGINE_MAJOR", "offsetof(atl_engine, major)"),
     ("ATL_OFFSET_ENGINE_MINOR", "offsetof(atl_engine, minor)"),
@@ -46,6 +51,10 @@ const FACTS: &[(&str, &str)] = &[
     ("ATL_OFFSET_ENGINE_ATTACH", "offsetof(atl_engine, attach)"),
     ("ATL_OFFSET_ENGINE_DETACH", "offsetof(atl_engine, detach)"),
     ("ATL_OFFSET_ENGINE_CALL_EX", "offsetof(atl_engine, call_ex)"),
+    (
+        "ATL_OFFSET_ENGINE_ATTACH_EX",
+        "offsetof(atl_engine, attach_ex)",
+    ),
 ];
 
 /// The Rust module (`pub const ATL_...: u64`) of [`FACTS`] for the header at `header`, read by clang for `host`. The C unit goes into `out`.

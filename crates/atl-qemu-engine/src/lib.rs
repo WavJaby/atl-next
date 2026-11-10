@@ -59,7 +59,7 @@ mod abi_check {
     use core::mem::{offset_of, size_of};
 
     use atl_engine_api::{
-        AtlEngine, AtlHost, AtlLanes, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind,
+        AtlEngine, AtlHost, AtlLanes, AtlStack, PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind,
     };
 
     use super::abi_layout as l;
@@ -95,6 +95,13 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlEngine, attach) as u64 == l::ATL_OFFSET_ENGINE_ATTACH);
     const _: () = assert!(offset_of!(AtlEngine, detach) as u64 == l::ATL_OFFSET_ENGINE_DETACH);
     const _: () = assert!(offset_of!(AtlEngine, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
+    const _: () =
+        assert!(offset_of!(AtlEngine, attach_ex) as u64 == l::ATL_OFFSET_ENGINE_ATTACH_EX);
+    const _: () = assert!(size_of::<AtlStack>() as u64 == l::ATL_SIZEOF_STACK);
+    const _: () = assert!(offset_of!(AtlStack, size) as u64 == l::ATL_OFFSET_STACK_SIZE);
+    const _: () = assert!(offset_of!(AtlStack, guard) as u64 == l::ATL_OFFSET_STACK_GUARD);
+    const _: () = assert!(offset_of!(AtlStack, base) as u64 == l::ATL_OFFSET_STACK_BASE);
+    const _: () = assert!(offset_of!(AtlStack, len) as u64 == l::ATL_OFFSET_STACK_LEN);
 }
 
 /// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine` and its functions, contract in `include/atl_engine.h`. One engine per process.
@@ -104,8 +111,8 @@ mod capi {
     use std::sync::OnceLock;
 
     use atl_engine_api::{
-        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, PROT_EXEC,
-        PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
+        ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, AtlStack,
+        PROT_EXEC, PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
     };
 
     use crate::engine::{boot_env, set_pages, start_linked};
@@ -250,14 +257,32 @@ mod capi {
     }
 
     unsafe extern "C" fn attach(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int {
+        let mut stack = AtlStack::default();
+        // SAFETY: stack is a live local; out is passed through (the ABI).
+        unsafe { attach_ex(engine, &mut stack, out) }
+    }
+
+    unsafe extern "C" fn attach_ex(
+        engine: *mut AtlEngineHandle,
+        stack: *mut AtlStack,
+        out: *mut *mut AtlCpu,
+    ) -> c_int {
         let Some(env) = boot_env() else {
             return -libc::EINVAL;
         };
-        if !is_engine(engine) || out.is_null() {
+        if !is_engine(engine) || out.is_null() || stack.is_null() {
             return -libc::EINVAL;
         }
-        match crate::attach::attach(env) {
+        // SAFETY: stack is non-null and a live atl_stack (the ABI).
+        let stack = unsafe { &mut *stack };
+        let (Ok(size), Ok(guard)) = (usize::try_from(stack.size), usize::try_from(stack.guard))
+        else {
+            return -libc::EINVAL;
+        };
+        match crate::attach::attach(env, size, guard) {
             Ok(cpu) => {
+                stack.base = cpu.stack_base() as u64;
+                stack.len = (cpu.stack_top() - cpu.stack_base()) as u64;
                 // SAFETY: out is non-null (checked); detach frees this box, on the attaching thread.
                 unsafe { *out = Box::into_raw(Box::new(cpu)).cast() };
                 0
@@ -314,5 +339,6 @@ mod capi {
         attach: Some(attach),
         detach: Some(detach),
         call_ex: Some(call_ex),
+        attach_ex: Some(attach_ex),
     };
 }

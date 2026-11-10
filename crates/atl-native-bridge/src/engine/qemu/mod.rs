@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atl_engine_api::{
-    ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, PROT_EXEC,
-    PROT_READ, PROT_WRITE, TrapKind, check_engine_table,
+    ABI_MAJOR, ABI_MINOR, AtlCpu, AtlEngine, AtlEngineHandle, AtlHost, AtlLanes, AtlStack,
+    PROT_EXEC, PROT_READ, PROT_WRITE, TrapKind, check_engine_table,
 };
 
 use super::image::Image;
@@ -185,22 +185,27 @@ fn engine() -> &'static Engine {
 
 /// Gives the calling thread a guest CPU (`atl_engine.attach`: a copy of the boot CPU) and makes it this thread's CPU for [`call_guest`], [`call`] and [`register`]. Once per thread, after [`boot`]: a second call keeps the first CPU. [`detach_current`] takes it back at thread exit.
 pub fn attach_current() -> Result<(), String> {
+    attach_current_ex(AtlStack::default()).map(|_| ())
+}
+
+/// [`attach_current`] on a guest stack sized by `stack.size` and `stack.guard` (0 = the engine's default; `atl_engine.attach_ex`). Returns the stack with `base` and `len` filled; `None` when this thread already had its CPU (its stack unchanged).
+pub fn attach_current_ex(mut stack: AtlStack) -> Result<Option<AtlStack>, String> {
     if !CPU.with(Cell::get).is_null() {
-        return Ok(());
+        return Ok(None);
     }
     let e = engine();
-    let attach = e
+    let attach_ex = e
         .table
-        .attach
-        .unwrap_or_else(|| unsupported("engine table has no attach"));
+        .attach_ex
+        .unwrap_or_else(|| unsupported("engine table has no attach_ex"));
     let mut cpu = std::ptr::null_mut();
-    // SAFETY: the handle is the one create returned; cpu is an out parameter.
-    let rc = unsafe { attach(e.handle, &mut cpu) };
+    // SAFETY: the handle is the one create returned; stack is a live atl_stack, cpu an out parameter.
+    let rc = unsafe { attach_ex(e.handle, &mut stack, &mut cpu) };
     if rc != 0 {
         return Err(format!("attach: {}", errno_text(rc)));
     }
     CPU.with(|c| c.set(cpu));
-    Ok(())
+    Ok(Some(stack))
 }
 
 /// Takes the calling thread's CPU back (`atl_engine.detach`) after its last guest call; a thread without one does nothing. Detached on the thread that attached it (the ABI).

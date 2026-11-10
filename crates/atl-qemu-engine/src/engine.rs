@@ -271,7 +271,12 @@ impl Booted {
 
     /// The calling host thread gets its own guest CPU, a copy of the boot CPU as linux-user's clone makes one. Detached when the [`crate::Cpu`] drops, on this thread.
     pub fn attach(&self) -> Result<crate::Cpu, String> {
-        crate::attach::attach(self.boot_env)
+        self.attach_sized(0, 0)
+    }
+
+    /// [`Self::attach`] on a guest stack of `size` bytes above a `guard` (rounded up to pages; 0 = default: 1 MiB, one page).
+    pub fn attach_sized(&self, size: usize, guard: usize) -> Result<crate::Cpu, String> {
+        crate::attach::attach(self.boot_env, size, guard)
     }
 }
 

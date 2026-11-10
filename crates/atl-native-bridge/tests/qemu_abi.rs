@@ -3,7 +3,7 @@
 //! The fixture (`xtask/testdata/qemu-abi/fixture.c`, static) raises BOOT with a table of three entries, which the host calls: `qa_run` (checks x, v, k, r), `qa_sum` (d), `qa_edge` (e).
 //! Env (xtask qemu_abi.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_QEMU_ABI_FIXTURE (fixture.c, built static).
 //! Expected values are the fixture's literals, written out here again (never read from the engine): x0..x7 = 0x101 + i, v0..v7 = 1.5 + i and the stack words s0, s1 (x, v, k); the answer 3.25 is no input lane, so `qa_run` returns its bits (r); `qa_sum` returns [`SUM_EXPECT`] (d); `qa_edge` stores [`EDGE_S0`], [`EDGE_S1`] and reads its last six stack words past the mapped page as 0 (e).
-//! Checks: (s) started (BOOT delivered, the thread attached); (x) integer lanes; (v) FP lanes; (k) stack words; (r) the value `qa_run` returned; (d) `call_ex` lanes into `qa_sum`; (e) stack words past the mapped page.
+//! Checks: (s) started (BOOT delivered, the thread attached); (x) integer lanes; (v) FP lanes; (k) stack words; (r) the value `qa_run` returned; (d) `call_ex` lanes into `qa_sum`; (e) stack words past the mapped page; (z) `attach_ex` stack size: default 1 MiB, a requested 256 KiB round-trips and holds the guest's sp.
 //! Output: `qemu-abi: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![allow(clippy::print_stdout, reason = "test harness output is its verdict")]
 
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use atl_engine_api::{AtlLanes, PROT_READ, PROT_WRITE};
+use atl_engine_api::{AtlLanes, AtlStack, PROT_READ, PROT_WRITE};
 use atl_native_bridge::engine::{self, Engine as _, qemu};
 
 /// fixture.c `qa_run`: x0..x7 = 0x101 + i.
@@ -37,6 +37,11 @@ const EDGE_S1: u64 = 0x1716_1514_1312_1110;
 const PAGE: usize = 4096;
 /// The first word of the unmapped page: a stack read that reached it would return this.
 const MARKER: u64 = 0xdead_beef_dead_beef;
+
+/// Check z: `attach_ex` with size 0 gets the default guest stack, 1 MiB (owner D2, bionic's default order).
+const DEFAULT_STACK: u64 = 1 << 20;
+/// Check z: the requested stack, 256 KiB (plan G3), page-aligned so no rounding applies.
+const SIZED_STACK: u64 = 256 << 10;
 
 /// BOOT's payload: the address of the fixture's entry table (`qa_run`, `qa_sum`, `qa_edge`); identity, so the host reads it directly.
 static TABLE: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +148,41 @@ fn check_edge(edge: u64) -> Result<(), String> {
     )
 }
 
+/// Check z, `attach_ex` (ABI 2.1): the main thread's default stack is [`DEFAULT_STACK`]; a second thread asks for [`SIZED_STACK`], gets exactly that, and `qa_run` on it stores its stack words (`K_EXPECT`) inside `[base, base + len)`, so the guest's sp lives in the reported range.
+fn check_stack(default: AtlStack, run: u64) -> Result<(), String> {
+    same("default stack len", default.len, DEFAULT_STACK)?;
+    std::thread::spawn(move || -> Result<(), String> {
+        let request = AtlStack {
+            size: SIZED_STACK,
+            ..AtlStack::default()
+        };
+        let stack = qemu::attach_current_ex(request)?.ok_or("fresh thread had a CPU already")?;
+        qemu::call(run, &[]);
+        // the scan runs before detach, which unmaps the stack
+        let found = holds_pair(stack, K_EXPECT);
+        qemu::detach_current();
+        same("256 KiB stack len", stack.len, SIZED_STACK)?;
+        if found {
+            Ok(())
+        } else {
+            Err(format!(
+                "qa_run's stack words not in [{:#x}, +{:#x}): sp outside the reported stack",
+                stack.base, stack.len
+            ))
+        }
+    })
+    .join()
+    .map_err(|_| "sized-stack thread panicked".to_owned())?
+}
+
+/// Whether two adjacent words `pair` lie inside `stack`'s usable range (identity: guest memory is host memory).
+fn holds_pair(stack: AtlStack, pair: [u64; 2]) -> bool {
+    let words = stack.len as usize / 8;
+    // SAFETY: [base, base + len) is the calling thread's attached guest stack, mapped read/write until detach.
+    let s = unsafe { std::slice::from_raw_parts(stack.base as *const u64, words) };
+    s.windows(2).any(|w| w == pair)
+}
+
 /// Runs the checks in order against the fixture's entries. Returns true when every check passed.
 fn checks([run, sum, edge]: [u64; 3]) -> bool {
     let returned = qemu::call(run, &[]);
@@ -185,10 +225,17 @@ fn main() -> ExitCode {
         println!("qemu-abi: (s) FAIL boot: {e}");
         return ExitCode::from(2);
     }
-    if let Err(e) = qemu::attach_current() {
-        println!("qemu-abi: (s) FAIL attach: {e}");
-        return ExitCode::from(2);
-    }
+    let default_stack = match qemu::attach_current_ex(AtlStack::default()) {
+        Ok(Some(stack)) => stack,
+        Ok(None) => {
+            println!("qemu-abi: (s) FAIL attach: the main thread had a CPU already");
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            println!("qemu-abi: (s) FAIL attach: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let entries = match entries(TABLE.load(Ordering::Relaxed)) {
         Ok(entries) => entries,
         Err(why) => {
@@ -199,7 +246,7 @@ fn main() -> ExitCode {
     if !check('s', Ok(())) {
         return ExitCode::FAILURE;
     }
-    if checks(entries) {
+    if checks(entries) & check('z', check_stack(default_stack, entries[0])) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

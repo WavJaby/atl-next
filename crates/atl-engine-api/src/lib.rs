@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// Major version: a host refuses an engine with another major.
 pub const ABI_MAJOR: u32 = 2;
 /// Minor version: additions only, appended to a struct.
-pub const ABI_MINOR: u32 = 0;
+pub const ABI_MINOR: u32 = 1;
 
 /// `ATL_PROT_READ`.
 pub const PROT_READ: u32 = 0x1;
@@ -53,6 +53,20 @@ pub struct AtlLanes {
     pub stack: [u64; 8],
 }
 
+/// `atl_stack`: the guest stack of an attach ([`AtlEngine::attach_ex`]). `size` and `guard` in (rounded up to pages; 0 = default: 1 MiB, one page); `base` and `len` out, the usable stack (sp starts at `base + len`; the guard lies right below `base`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlStack {
+    /// Requested stack bytes; 0 = default.
+    pub size: u64,
+    /// Requested guard bytes below the stack; 0 = default.
+    pub guard: u64,
+    /// Lowest usable byte.
+    pub base: u64,
+    /// Usable bytes.
+    pub len: u64,
+}
+
 /// The trap callback of [`AtlHost`] for CALL and BIND: `lanes` is read, then answered in `x[0]` and `v[0]`.
 pub type TrapExFn =
     unsafe extern "C" fn(ctx: *mut c_void, kind: u32, id: u32, lanes: *mut AtlLanes);
@@ -89,6 +103,12 @@ pub type MapFn =
 /// `atl_engine::attach`.
 pub type AttachFn =
     unsafe extern "C" fn(engine: *mut AtlEngineHandle, out: *mut *mut AtlCpu) -> c_int;
+/// `atl_engine::attach_ex` (2.1): `stack` in and out.
+pub type AttachExFn = unsafe extern "C" fn(
+    engine: *mut AtlEngineHandle,
+    stack: *mut AtlStack,
+    out: *mut *mut AtlCpu,
+) -> c_int;
 /// `atl_engine::detach`.
 pub type DetachFn = unsafe extern "C" fn(engine: *mut AtlEngineHandle, cpu: *mut AtlCpu);
 /// `atl_engine::call_ex`: `tp` in and out; `lanes` in and out (the answer is `x[0]` and `v[0]`).
@@ -122,9 +142,11 @@ pub struct AtlEngine {
     pub detach: Option<DetachFn>,
     /// Runs guest code with lanes on a CPU.
     pub call_ex: Option<CallExFn>,
+    /// 2.1: gives the calling thread a guest CPU on a sized guest stack.
+    pub attach_ex: Option<AttachExFn>,
 }
 
-/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, and a size below this host's table size (minor versions only append). The core loader and the gate both call it.
+/// Admits an engine table this host can drive, or refuses it by name. Refuses another major, a size below this host's table size (minor versions only append), and a minor below 1 or a table without `attach_ex`. The core loader and the gate both call it.
 pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
     if table.major != ABI_MAJOR {
         return Err(format!(
@@ -137,6 +159,13 @@ pub fn check_engine_table(table: &AtlEngine) -> Result<(), String> {
         return Err(format!(
             "engine ABI {}.{} table size {} below the host's {host_size}",
             table.major, table.minor, table.size
+        ));
+    }
+    // host and engine are built together, so no older-minor fallback: the host calls attach_ex (2.1) unconditionally
+    if table.minor < 1 || table.attach_ex.is_none() {
+        return Err(format!(
+            "engine ABI {}.{} has no attach_ex, host needs 2.1",
+            table.major, table.minor
         ));
     }
     Ok(())
@@ -158,11 +187,32 @@ mod tests {
             attach: None,
             detach: None,
             call_ex: None,
+            attach_ex: None,
         };
-        // "2.0" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
+        // "2.1" is the spec, typed here: ABI_MAJOR/ABI_MINOR are the code under test
         assert_eq!(
             check_engine_table(&table),
-            Err("engine ABI 1.1 refused, host speaks 2.0".to_owned())
+            Err("engine ABI 1.1 refused, host speaks 2.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn refuses_a_2_0_engine_without_attach_ex_by_name() {
+        let table = AtlEngine {
+            major: 2,
+            minor: 0,
+            size: core::mem::size_of::<AtlEngine>() as u32,
+            create: None,
+            destroy: None,
+            map: None,
+            attach: None,
+            detach: None,
+            call_ex: None,
+            attach_ex: None,
+        };
+        assert_eq!(
+            check_engine_table(&table),
+            Err("engine ABI 2.0 has no attach_ex, host needs 2.1".to_owned())
         );
     }
 }

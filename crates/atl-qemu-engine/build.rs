@@ -105,6 +105,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("shared-stack", "atl_qe_shared_stack"),
     // gate (t): the guard page below each guest stack is RW and VALID, so a store below the stack succeeds
     ("no-guard", "atl_qe_no_guard"),
+    // gate (qemu-abi, z): attach_ex drops the requested stack size, every stack gets the 1 MiB default
+    ("ignore-size", "atl_qe_ignore_size"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

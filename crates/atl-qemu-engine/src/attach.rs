@@ -87,13 +87,31 @@ const _: () = assert!(
         && TS_SIGNAL_MASK + SIZEOF_TS_SIGNAL_MASK <= SIZEOF_TASKSTATE
 );
 
-/// Guest stack per attached CPU: 1 MiB, bionic's default pthread stack order (D2). A host thread's own stack cannot serve: its `cpu_loop` frames live there while the guest runs.
-const GUEST_STACK: usize = 1 << 20;
+/// Default guest stack per attached CPU (attach_ex size 0): 1 MiB, bionic's default pthread stack order (D2). A host thread's own stack cannot serve: its `cpu_loop` frames live there while the guest runs.
+const DEFAULT_STACK: usize = 1 << 20;
 
-/// Bytes of the guard below each guest stack: one host page (bionic `PTHREAD_GUARD_SIZE`, D2). Host PROT_NONE + not VALID in QEMU's page table, so a guest store there faults in TCG code and QEMU raises guest SIGSEGV/MAPERR instead of writing the mapping below.
-fn guard_size() -> usize {
+fn page_size() -> usize {
     // SAFETY: sysconf has no memory effects.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+/// `(stack, guard)` bytes for a request: each rounded up to pages, 0 = default. Default guard: one host page (bionic `PTHREAD_GUARD_SIZE`, D2). The guard is host PROT_NONE + not VALID in QEMU's page table, so a guest store there faults in TCG code and QEMU raises guest SIGSEGV/MAPERR instead of writing the mapping below.
+fn stack_sizes(size: usize, guard: usize) -> Result<(usize, usize), String> {
+    let page = page_size();
+    // break `ignore-size`: the requested size is dropped, every stack gets the default
+    let size = if size == 0 || cfg!(atl_qe_ignore_size) {
+        DEFAULT_STACK
+    } else {
+        size
+    };
+    let guard = if guard == 0 { page } else { guard };
+    match (
+        size.checked_next_multiple_of(page),
+        guard.checked_next_multiple_of(page),
+    ) {
+        (Some(s), Some(g)) if s.checked_add(g).is_some() => Ok((s, g)),
+        _ => Err("attach: guest stack size overflows".to_owned()),
+    }
 }
 
 /// Break `shared-stack`: the first stack attach made, handed to every later CPU too (never freed).
@@ -131,7 +149,10 @@ pub struct Cpu {
     env: *mut u8,
     /// The TaskState this attach allocated; null when the CPU is not this thread's own (break `shared-cpu`).
     ts: *mut u8,
+    /// Lowest usable byte of the guest stack; `len` bytes above it, `guard` bytes of guard below it.
     stack: usize,
+    len: usize,
+    guard: usize,
 }
 
 impl Cpu {
@@ -142,10 +163,10 @@ impl Cpu {
 
     /// Top of this CPU's guest stack.
     pub fn stack_top(&self) -> usize {
-        self.stack + GUEST_STACK
+        self.stack + self.len
     }
 
-    /// Lowest usable byte of this CPU's guest stack; the guard page lies right below it.
+    /// Lowest usable byte of this CPU's guest stack; the guard lies right below it.
     pub fn stack_base(&self) -> usize {
         self.stack
     }
@@ -161,7 +182,9 @@ fn write_u64(base: *mut u8, offset: usize, v: u64) {
     unsafe { base.add(offset).cast::<u64>().write_unaligned(v) }
 }
 
-pub(crate) fn attach(boot_env: usize) -> Result<Cpu, String> {
+/// `size` and `guard` as [`stack_sizes`] reads them.
+pub(crate) fn attach(boot_env: usize, size: usize, guard: usize) -> Result<Cpu, String> {
+    let (len, guard) = stack_sizes(size, guard)?;
     let lib = lib();
     let api = &lib.thread;
     let boot_env = boot_env as *mut u8;
@@ -206,9 +229,15 @@ pub(crate) fn attach(boot_env: usize) -> Result<Cpu, String> {
         unsafe { (api.process_queued_cpu_work)(cpu.cast()) };
     }
     crate::signal::register_thread();
-    let stack = guest_stack()?;
-    Guest::new(env.cast()).set_x(31, (stack + GUEST_STACK) as u64);
-    Ok(Cpu { env, ts, stack })
+    let stack = guest_stack(len, guard)?;
+    Guest::new(env.cast()).set_x(31, (stack + len) as u64);
+    Ok(Cpu {
+        env,
+        ts,
+        stack,
+        len,
+        guard,
+    })
 }
 
 /// `do_fork`'s TaskState for the new CPU `env`: zeroed, `init_task_state`, the boot thread's `bprm`, `info`, `signal_mask`, `gcs_el0_locked`; hung on `CPUState.opaque`. GCSPR_EL0 = 0, as `do_fork` sets it with GCS off.
@@ -240,18 +269,17 @@ fn task_state(api: &Api, boot_env: *mut u8, env: *mut u8) -> Result<*mut u8, Str
     Ok(ts)
 }
 
-/// One mapping of guard + GUEST_STACK, bionic's layout (`__allocate_thread_mapping`): the low guard page PROT_NONE and never registered with QEMU, the stack above it registered read/write so syscalls on stack buffers pass QEMU's checks. Returns the stack's base (mapping + guard).
-fn guest_stack() -> Result<usize, String> {
+/// One mapping of `guard` + `len` bytes (page multiples), bionic's layout (`__allocate_thread_mapping`): the low guard PROT_NONE and never registered with QEMU, the stack above it registered read/write so syscalls on stack buffers pass QEMU's checks. Returns the stack's base (mapping + guard).
+fn guest_stack(len: usize, guard: usize) -> Result<usize, String> {
     #[cfg(atl_qe_shared_stack)]
     if let Some(&s) = SHARED_STACK.get() {
         return Ok(s);
     }
-    let guard = guard_size();
     // SAFETY: a fresh private anonymous mapping, all PROT_NONE; unmapped in detach.
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            guard + GUEST_STACK,
+            guard + len,
             libc::PROT_NONE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -264,22 +292,22 @@ fn guest_stack() -> Result<usize, String> {
     // break `no-guard`: the guard page is ordinary stack memory, RW on the host and VALID for QEMU
     let low = if cfg!(atl_qe_no_guard) { 0 } else { guard };
     let open = p as usize + low;
-    // SAFETY: [open, p + guard + GUEST_STACK) lies inside the mapping just made.
+    // SAFETY: [open, p + guard + len) lies inside the mapping just made.
     if unsafe {
         libc::mprotect(
             open as *mut c_void,
-            guard + GUEST_STACK - low,
+            guard + len - low,
             libc::PROT_READ | libc::PROT_WRITE,
         )
     } != 0
     {
         // SAFETY: the mapping just made, unused.
-        unsafe { libc::munmap(p, guard + GUEST_STACK) };
+        unsafe { libc::munmap(p, guard + len) };
         return Err("attach: mprotect of the guest stack failed".to_owned());
     }
     set_pages(
         open,
-        guard + GUEST_STACK - low,
+        guard + len - low,
         page::READ | page::WRITE | page::VALID,
         0,
     )?;
@@ -297,12 +325,12 @@ impl Drop for Cpu {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !cfg!(atl_qe_shared_stack) {
-            let guard = guard_size();
+            let (guard, len) = (self.guard, self.len);
             let map = self.stack - guard;
             // clearing VALID on the never-registered guard is a no-op; covering it keeps the no-guard break's pages consistent too
-            let _ = set_pages(map, guard + GUEST_STACK, 0, page::VALID);
+            let _ = set_pages(map, guard + len, 0, page::VALID);
             // SAFETY: the mapping guest_stack made (guard + stack); no guest code runs on it any more.
-            unsafe { libc::munmap(map as *mut c_void, guard + GUEST_STACK) };
+            unsafe { libc::munmap(map as *mut c_void, guard + len) };
         }
         crate::signal::unregister_thread();
         if !self.ts.is_null() {
