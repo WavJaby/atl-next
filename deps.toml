@@ -78,7 +78,7 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["build"]
 used_by = ["xtask:native", "xtask:check"]
 
-# CMake is the build system of upstream BoringSSL, the LLVM runtimes (runtimes.rs) and the host LLVM (llvm_host.rs): their only supported build (CLAUDE.md). BoringSSL's CMakeLists.txt needs 3.22
+# CMake is the build system of upstream BoringSSL and the LLVM runtimes (runtimes.rs): their only supported build (CLAUDE.md). BoringSSL's CMakeLists.txt needs 3.22
 [cmake]
 debian = "cmake"
 arch = "cmake"
@@ -239,14 +239,13 @@ min_reason = "observed 2026-11-08; older is untested"
 scope = ["test"]
 used_by = ["upstream:qemu"]
 
-# Mesa's build: meson_version '>= 1.1.0' (external/mesa3d/meson.build:9); mesa.rs runs `meson setup` with platforms=android.
-# QEMU's meson_version '>=1.5.0' (meson.build:1) is the larger; QEMU's own pythondeps.toml accepts the same.
+# QEMU's meson_version '>=1.5.0' (meson.build:1) sets the minimum; QEMU's own pythondeps.toml accepts the same.
 [meson]
 debian = "meson"
 arch = "meson"
 binary = "meson"
 min = "1.5.0"
-min_reason = "QEMU meson.build:1 meson_version >=1.5.0; Mesa meson.build:9 >=1.1.0"
+min_reason = "QEMU meson.build:1 meson_version >=1.5.0"
 scope = ["build"]
 used_by = ["xtask:native", "upstream:qemu"]
 

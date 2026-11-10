@@ -425,8 +425,8 @@ fn elf_runpath(path: &Path) -> io::Result<Vec<String>> {
     Ok(if runpath.is_empty() { rpath } else { runpath })
 }
 
-/// The sysfs a process with DRM nodes `devices` (nodes, or dirs of them) reads, and no more: libdrm (drmGetDevice2, xf86drm.c) and Mesa's loader resolve a node's `/sys/dev/char/<major>:<minor>` link into its device's dir under `/sys/devices` and read its `uevent`, PCI ids and `subsystem` link name there;
-/// `/sys/class/drm/<node>` is the same link by name. Returns that device dir read-only at its own path, and the two links recreated as the host has them. Without them Mesa falls back to the render node alone, whose dumb buffers EACCES.
+/// The sysfs a process with DRM nodes `devices` (nodes, or dirs of them) reads, and no more: libdrm (drmGetDevice2, xf86drm.c) and the host GL driver's loader (Mesa's loader.c) resolve a node's `/sys/dev/char/<major>:<minor>` link into its device's dir under `/sys/devices` and read its `uevent`, PCI ids and `subsystem` link name there;
+/// `/sys/class/drm/<node>` is the same link by name. Returns that device dir read-only at its own path, and the two links recreated as the host has them. Without them the host driver falls back to the render node alone, whose dumb buffers EACCES.
 pub fn drm_sysfs(devices: &[PathBuf]) -> io::Result<(Vec<Mount>, Vec<Link>)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let mut nodes = Vec::new();

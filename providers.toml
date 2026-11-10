@@ -74,7 +74,7 @@ reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsam
 provider = "module:libartpalette_fake"
 reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (owner 2026-11-02)"
 
-# GL: AOSP's libEGL / libGLES* fronts are built from the tree and load Mesa built for the Android platform as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06); only their GL dispatch binding differs.
+# GL: AOSP's libEGL / libGLES* fronts are built from the tree and load libGLES_atl.so as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06); only their GL dispatch binding differs.
 ["libEGL"]
 defines = ["USE_SLOW_BINDING=1"]
 reason = "GL dispatch through getGlThreadSpecific() -> __get_tls() (atl-bionic's per-thread slot array) instead of per-arch asm reading the thread pointer, which on glibc is glibc's TCB (patches/aosp/frameworks/native 0009 makes the macro settable, 0010 has eglGetProcAddress return the driver entry instead of the asm extension forwarders; precondition: one GL driver per process). Rung 4 because: as-is (1) the asm reads a glibc TCB field; no environment setting (2) or supplied definition (3) reaches inline asm or a hard #define. Cost: one indirect call per GL call (G1 measurement)"

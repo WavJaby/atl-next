@@ -1056,7 +1056,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
     let defaults = property_area(a, &r, tier)?;
-    // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): Mesa renders into, and imports, the gralloc dmabufs through them; without them it falls back to pure swrast, which cannot import a window's buffers.
+    // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them; without them it falls back to the software device, which cannot import a window's buffers.
     // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
     let app_devices = std::iter::once(PathBuf::from(DRM_DIR))
         .chain(

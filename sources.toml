@@ -120,7 +120,6 @@ cts = "d3cf8ecdfe20325e5d0815c9ef527b332b041d61"
 "external/llvm-libc" = "549bb629f8325dc9f5221bb16a3de908a753c304"
 "external/lz4" = "f072532f6846b40417438d29daa8183a8e53b63c"
 "external/lzma" = "c1bc713526e9740aec88f0f18e0bca0b0c54f1f9"
-"external/mesa3d" = "1ab807486dbc8cd2a1bb6c10d2ebebc5e545faca"
 "external/mime-support" = "c347c3d8fa4992e655674e6c9f2baa6e18e44ead"
 "external/mockito" = "770ab8835bf0830a64aa833275c513281c47325c"
 "external/modp_b64" = "576d46f65ee032ef584bd9f56a9cd68eb22f2cb9"
@@ -302,9 +301,9 @@ commit = "d3bf4795ad5b79d646cddf2fec687da5b9b502db"
 git = "https://android.googlesource.com/toolchain/llvm-project"
 branch = "llvm-r547379-release"
 commit = "b718bcaf8c198c82f3021447d943401e3ab5bd54"
-# Host LLVM (llvm_host.rs, `native --for llvm`) builds the llvm/ project. CMake adds every non-Target llvm/lib dir unconditionally (llvm/lib/CMakeLists.txt), so all 46 are kept;
-# of llvm/lib/Target: X86 (built) and ARM, AArch64, RISCV, whose .td files llvm/include/llvm/TargetParser/CMakeLists.txt tablegens for every target (not built: no source is compiled).
-# llvm/projects is an empty stub CMake adds unconditionally.
+# The llvm/ entries were the keep-set of the host LLVM build (llvm_host.rs, deleted). CMake adds every non-Target llvm/lib dir unconditionally (llvm/lib/CMakeLists.txt), so all 46 were kept;
+# of llvm/lib/Target: X86 (was built) and ARM, AArch64, RISCV (.td files only, tablegen'd for every target by llvm/include/llvm/TargetParser/CMakeLists.txt).
+# llvm/projects is an empty stub CMake adds unconditionally. Not re-derived since: a keep-set change blocks `xtask fetch` on the present checkout (fetch.rs keep_mismatch) until it is recreated.
 sparse = [
     "cmake", "compiler-rt", "libc", "libcxx", "libcxxabi", "libunwind", "llvm/cmake", "llvm/utils/llvm-lit", "runtimes", "third-party",
     "llvm/include", "llvm/projects", "llvm/utils/TableGen", "llvm/tools/llvm-config", "llvm/tools/lli", "llvm/lib/Target/X86",
