@@ -10,12 +10,20 @@ use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
 use serde::Deserialize;
 
+use crate::arches;
 use crate::sources::{self, Sources};
 use crate::tree;
 use crate::unit_use::{self, Echo, Units};
 use crate::workspace::{self, Workspace};
 
 pub const FILE: &str = "deps.toml";
+
+/// The archive the sysroot pins come from. Every sysroot row is pinned to trixie main (deps.toml), so one suite.
+/// The mirror is transport only: apt verifies the index signature with `DEBIAN_KEYRING`.
+const DEBIAN_ARCHIVE: &str = "https://deb.debian.org/debian";
+const DEBIAN_SUITE: &str = "trixie";
+/// The keyring of `debian-archive-keyring`, the package the host's own Debian sources verify with.
+const DEBIAN_KEYRING: &str = "/usr/share/keyrings/debian-archive-keyring.gpg";
 
 pub type Deps = BTreeMap<String, Dep>;
 
@@ -328,7 +336,7 @@ pub struct Args {
     /// Verify every row is installed at its required version (sysroot rows: fetched at the indexed SHA256).
     #[arg(long, conflicts_with = "fetch", required_unless_present = "fetch")]
     check: bool,
-    /// Download and unpack the `sysroot_debs` row NAME into cache/sysroot/NAME/root, without root. Needs apt's index (`apt-get update`, as root).
+    /// Download and unpack the `sysroot_debs` row NAME into cache/sysroot/NAME/root, without root. `--execute` refreshes the row's private apt index (cache/apt/<arch>) first.
     #[arg(long, value_name = "NAME", conflicts_with = "check")]
     fetch: Option<String>,
     /// With `--fetch`: does it. Without: prints the packages it would fetch.
@@ -582,9 +590,109 @@ pub fn sysroot_root(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(sysroot_dir(root, name)?.join("root"))
 }
 
-/// The SHA256 the apt index gives the exact `name=version`; None when the index has no such version.
-fn index_sha256(pin: &str) -> Result<Option<String>> {
-    let out = Command::new("apt-cache")
+/// apt state private to one Debian architecture: `cache/apt/<arch>/`, refreshed by `apt-get update` without root.
+/// The host's lists are amd64 only and its dpkg status is the host's, so every apt call names this state with
+/// `-o` options. `/etc/apt` still applies: the host's proxy settings reach the mirror.
+struct PrivateApt {
+    arch: String,
+    dir: PathBuf,
+}
+
+impl PrivateApt {
+    /// The state of sysroot row `name`: the arch of the arches.toml `[<arch>.host]` row whose `sysroot` names it.
+    fn of_sysroot(root: &Path, name: &str) -> Result<Self> {
+        let arches = arches::load(root)?;
+        let mut hosts = arches
+            .values()
+            .filter_map(|arch| arch.host.as_ref())
+            .filter(|host| host.sysroot.as_deref() == Some(name));
+        let host = hosts
+            .next()
+            .with_context(|| format!("no [<arch>.host] row in arches.toml names sysroot {name}"))?;
+        ensure!(
+            hosts.next().is_none(),
+            "more than one [<arch>.host] row in arches.toml names sysroot {name}"
+        );
+        let arch = host.debian.clone();
+        let dir = Layout::of(root)?
+            .workspace()
+            .join("cache")
+            .join("apt")
+            .join(&arch);
+        Ok(Self { arch, dir })
+    }
+
+    /// `tool` (`apt-get`, `apt-cache`) with this state's options first.
+    fn command(&self, tool: &str) -> Command {
+        let mut cmd = Command::new(tool);
+        cmd.args(self.options());
+        cmd
+    }
+
+    fn options(&self) -> Vec<String> {
+        let state = self.dir.join("state");
+        [
+            format!("Dir::State={}", state.display()),
+            format!("Dir::State::status={}", state.join("status").display()),
+            format!("Dir::Cache={}", self.dir.join("cache").display()),
+            format!(
+                "Dir::Etc::sourcelist={}",
+                self.dir.join("sources.list").display()
+            ),
+            // `-`: no sources.list.d, the host's sources name other suites
+            "Dir::Etc::sourceparts=-".to_owned(),
+            format!("APT::Architecture={}", self.arch),
+            format!("APT::Architectures::={}", self.arch),
+            // no translation indexes: nothing here reads them
+            "Acquire::Languages=none".to_owned(),
+        ]
+        .into_iter()
+        .flat_map(|option| ["-o".to_owned(), option])
+        .collect()
+    }
+
+    /// The only source: `DEBIAN_SUITE` main for this arch, signed for `DEBIAN_KEYRING`.
+    fn sources_text(&self) -> String {
+        format!(
+            "deb [arch={} signed-by={DEBIAN_KEYRING}] {DEBIAN_ARCHIVE} {DEBIAN_SUITE} main\n",
+            self.arch
+        )
+    }
+
+    /// Rewrites the source and an empty dpkg status (nothing installed), then runs `apt-get update` into the state.
+    fn update(&self) -> Result<()> {
+        ensure!(
+            Path::new(DEBIAN_KEYRING).is_file(),
+            "{DEBIAN_KEYRING} is missing: apt cannot verify {DEBIAN_SUITE} without it"
+        );
+        let state = self.dir.join("state");
+        for dir in [
+            state.join("lists").join("partial"),
+            self.dir.join("cache").join("archives").join("partial"),
+        ] {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(state.join("status"), "").context("writing the empty dpkg status")?;
+        std::fs::write(self.dir.join("sources.list"), self.sources_text())
+            .context("writing sources.list")?;
+        let status = self
+            .command("apt-get")
+            .arg("update")
+            .status()
+            .context("running apt-get update")?;
+        ensure!(
+            status.success(),
+            "apt-get update into {}: {status}",
+            self.dir.display()
+        );
+        Ok(())
+    }
+}
+
+/// The SHA256 the private index gives the exact `name=version`; None when the index has no such version.
+fn index_sha256(apt: &PrivateApt, pin: &str) -> Result<Option<String>> {
+    let out = apt
+        .command("apt-cache")
         .args(["show", pin])
         .output()
         .context("running apt-cache show")?;
@@ -613,10 +721,12 @@ fn sysroot_problem(root: &Path, name: &str, pins: &[String]) -> Result<Option<St
         return Ok(Some(fetch));
     }
     let stamp = parse_stamp(&std::fs::read_to_string(dir.join("stamp.txt")).unwrap_or_default());
+    let apt = PrivateApt::of_sysroot(root, name)?;
     for pin in pins {
-        let Some(sha) = index_sha256(pin)? else {
+        let Some(sha) = index_sha256(&apt, pin)? else {
             return Ok(Some(format!(
-                "{pin} is not in the apt index (apt-get update as root, or fix the pin)"
+                "{pin} is not in the private apt index {} (cargo xtask deps --fetch {name} --execute refreshes it, or fix the pin)",
+                apt.dir.display()
             )));
         };
         if stamp.get(pin) != Some(&sha) {
@@ -626,12 +736,13 @@ fn sysroot_problem(root: &Path, name: &str, pins: &[String]) -> Result<Option<St
     Ok(None)
 }
 
-/// `deps --fetch NAME`: for each pin `apt-get download` (no root), its SHA256 checked against the apt index, `dpkg -x` into `root/`; `stamp.txt` last. Dry run unless `execute`.
+/// `deps --fetch NAME`: refreshes the private index, then for each pin `apt-get download` (no root), its SHA256 checked against that index, `dpkg -x` into `root/`; `stamp.txt` last. Dry run unless `execute`.
 fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
     let pins = row(root, name)?
         .sysroot_debs
         .with_context(|| format!("{FILE}: row `{name}` is not a sysroot_debs row"))?;
     let dir = sysroot_dir(root, name)?;
+    let apt = PrivateApt::of_sysroot(root, name)?;
     if !execute {
         println!(
             "deps --fetch {name}: {} packages into {} (--execute fetches):",
@@ -643,6 +754,7 @@ fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    apt.update()?;
     // A half-unpacked tree is not a sysroot: start from nothing.
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -654,10 +766,13 @@ fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
     }
     let mut stamp = Vec::new();
     for pin in &pins {
-        let expected = index_sha256(pin)?.with_context(|| {
-            format!("{pin} is not in the apt index (apt-get update as root, or fix the pin)")
+        let expected = index_sha256(&apt, pin)?.with_context(|| {
+            format!(
+                "{pin} is not in {DEBIAN_SUITE} main for {} (fix the pin)",
+                apt.arch
+            )
         })?;
-        let deb = download_deb(&debs, pin)?;
+        let deb = download_deb(&apt, &debs, pin)?;
         let got = sha256_file(&deb)?;
         ensure!(
             got == expected,
@@ -682,10 +797,11 @@ fn fetch_sysroot(root: &Path, name: &str, execute: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `apt-get download <pin>` in `debs`: the one file it creates there.
-fn download_deb(debs: &Path, pin: &str) -> Result<PathBuf> {
+/// `apt-get download <pin>` in `debs` from the private index: the one file it creates there.
+fn download_deb(apt: &PrivateApt, debs: &Path, pin: &str) -> Result<PathBuf> {
     let before = listing(debs)?;
-    let status = Command::new("apt-get")
+    let status = apt
+        .command("apt-get")
         .current_dir(debs)
         .args(["download", pin])
         .status()
@@ -784,6 +900,40 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(stamp.len(), 2);
+    }
+
+    #[test]
+    fn private_apt_names_only_its_state() {
+        let apt = PrivateApt {
+            arch: "riscv64".to_owned(),
+            dir: PathBuf::from("/c/apt/riscv64"),
+        };
+        let options = apt.options();
+        for want in [
+            "Dir::State=/c/apt/riscv64/state",
+            "Dir::State::status=/c/apt/riscv64/state/status",
+            "Dir::Cache=/c/apt/riscv64/cache",
+            "Dir::Etc::sourcelist=/c/apt/riscv64/sources.list",
+            "Dir::Etc::sourceparts=-",
+            "APT::Architecture=riscv64",
+            "APT::Architectures::=riscv64",
+        ] {
+            assert!(options.iter().any(|o| o == want), "{want}");
+        }
+        assert!(options.chunks(2).all(|pair| pair[0] == "-o"));
+        assert_eq!(
+            apt.sources_text(),
+            "deb [arch=riscv64 signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian trixie main\n"
+        );
+    }
+
+    #[test]
+    fn sysroot_arch_comes_from_arches() {
+        let root = crate::checkout_root().unwrap();
+        let apt = PrivateApt::of_sysroot(&root, "riscv64-sysroot").unwrap();
+        assert_eq!(apt.arch, "riscv64");
+        assert!(apt.dir.ends_with("cache/apt/riscv64"));
+        assert!(PrivateApt::of_sysroot(&root, "no-such-sysroot").is_err());
     }
 
     #[test]

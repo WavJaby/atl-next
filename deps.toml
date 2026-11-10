@@ -8,7 +8,7 @@
 #   cargo   cargo, version      crate installed with `cargo install --locked`, exact version
 #   rustup  rustup_target       std of another rustc target for the rust-toolchain.toml toolchain (`rustup target add`)
 #   aosp    aosp                tree path of a [aosp.projects] entry in sources.toml: the pinned copy in src/aosp
-#   sysroot sysroot_debs        Debian packages pinned by exact `name=version`, fetched without root (`xtask deps --fetch`) and unpacked into cache/sysroot/<row>/root; `--check` compares each pin's SHA256 with the apt index
+#   sysroot sysroot_debs        Debian packages pinned by exact `name=version`, fetched without root (`xtask deps --fetch`) and unpacked into cache/sysroot/<row>/root; `--check` compares each pin's SHA256 with the private apt index cache/apt/<arch> (`--fetch --execute` refreshes it; <arch>: the debian column of the arches.toml host row naming the row)
 # Fields:
 #   binary        executable xtask runs: a bare name on PATH (distro), a path inside the project (aosp, optional)
 #   version_arg   argument that prints the version (default `--version`; go: `version`)

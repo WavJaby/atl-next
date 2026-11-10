@@ -10,7 +10,7 @@
 # `[<arch>.host]` present = we build and run on it (one 64-bit process per app):
 #   rust              Rust target triple of the host build
 #   meson_cpu_family  meson `cpu_family` (QEMU cross files)
-#   debian            Debian architecture name
+#   debian            Debian architecture name; for a sysroot row, the arch of its private apt index (cache/apt/<debian>)
 #   archlinux         Arch Linux architecture; absent where Arch has no official port
 #   soong_prebuilt_os Soong's PrebuiltOS of the BUILD MACHINE, whatever this row's arch (build/soong/android/config.go): `prebuilts/build-tools/<it>/bin` holds the
 #                     prebuilt build-only tools the converter runs (aconfig, ...). xtask native reads the build machine's row (the one whose `rust` is rustc's host), so a cross host row has none.
