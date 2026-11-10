@@ -526,6 +526,17 @@ func libcHeaderLinks(provided map[string]Provided) (map[string]string, error) {
 	return out, nil
 }
 
+// hasDeviceObjs: the plan has a device-side object, the readers of compat/ (ninja.go compileFlags). Call after emit, which fills n.objs.
+// Asm-only device sources count too: their flags do not read compat/, so the answer errs toward writing it.
+func (g *Graph) hasDeviceObjs() bool {
+	for _, n := range g.order {
+		if n.side == Device && len(n.objs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // writeCompat fills <out>/compat: cxx and device link their tree headers, device also the libc provider's (libcCompat), libcxx holds the shims.
 // An entry is written only when its target or text changed, so an unchanged header keeps its mtime for ninja; an entry no longer wanted is removed.
 func writeCompat(tree, out string, provided map[string]Provided) error {

@@ -387,8 +387,11 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossPro
 	if g.java != nil {
 		ninja += g.java.ninja(g)
 	}
-	if err := writeCompat(tree, out, provided); err != nil {
-		return err
+	// compat/ has one reader, the device-side compile (ninja.go compileFlags): a plan without one writes nothing and needs no libc provider for api-level.h
+	if g.hasDeviceObjs() {
+		if err := writeCompat(tree, out, provided); err != nil {
+			return err
+		}
 	}
 	if err := g.writeGenFiles(); err != nil {
 		return err

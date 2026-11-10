@@ -110,3 +110,20 @@ func TestLibcxxInSysroot(t *testing.T) {
 		}
 	}
 }
+
+// compat/ is read by device-side compiles only: a cross host's plan of host objects needs no compat/, so writeCompat (which wants the libc provider for api-level.h) is skipped.
+// Break: a device object in the plan brings the libc requirement back -- writeCompat fails with "no provider for libc".
+func TestCompatNeedsDeviceObjs(t *testing.T) {
+	g := &Graph{order: []*Node{{key: key{name: "lib", side: Host, kind: Shared}, objs: []string{"lib.o"}}}}
+	if g.hasDeviceObjs() {
+		t.Fatal("host objects only: device objects reported")
+	}
+	g.order = append(g.order, &Node{key: key{name: "lib", side: Device, kind: Shared}, objs: []string{"lib-dev.o"}})
+	if !g.hasDeviceObjs() {
+		t.Fatal("device object not reported")
+	}
+	err := writeCompat(t.TempDir(), t.TempDir(), map[string]Provided{})
+	if err == nil || !strings.Contains(err.Error(), "no provider for libc") {
+		t.Errorf("writeCompat without a libc provider: %v", err)
+	}
+}
