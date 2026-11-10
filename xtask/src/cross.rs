@@ -143,8 +143,8 @@ fn bindgen_key(triple: &str) -> String {
 }
 
 /// The sysroot's libc++ headers: the one `c++/v1` directory holding `__config`, with `__config_site` beside it.
-/// Same rule as bp2ninja stl.go `libcxxSysrootDir` (the converter's copy, used by `native`): keep the two in step.
-fn libcxx_dir(sysroot: &Path) -> Result<PathBuf> {
+/// The one derivation: `native` passes this dir to bp2ninja (`-host-libcxx`), which derives nothing itself.
+pub(crate) fn libcxx_dir(sysroot: &Path) -> Result<PathBuf> {
     let mut found = Vec::new();
     config_dirs(sysroot, &mut found)?;
     ensure!(

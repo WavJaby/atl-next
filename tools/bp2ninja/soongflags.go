@@ -95,9 +95,10 @@ type HostCross struct {
 	Target  string // clang --target
 	Sysroot string // the sysroot directory (a fetched sysroot_debs row)
 	ISA     string // -march
+	Libcxx  string // the sysroot's libc++ headers (xtask cross::libcxx_dir): the one c++/v1 holding __config
 }
 
-// set: the host is cross. main.go requires its three fields together.
+// set: the host is cross. main.go requires its four fields together.
 func (h HostCross) set() bool { return h != (HostCross{}) }
 
 // compileFlags: the target flags of every host compile, ahead of the Soong toolchain's (instruction set first, compiler.go).

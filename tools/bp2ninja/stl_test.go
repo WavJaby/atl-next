@@ -215,36 +215,17 @@ func TestLibcxxProviderIsCompilersHeaders(t *testing.T) {
 	}
 }
 
-// libcxxSysrootDir: the one c++/v1 under the sysroot that holds __config, with __config_site beside it. Another c++/v1, experimental/__config
-// and a split install (__config_site in another directory) are refused.
-func TestLibcxxSysrootDir(t *testing.T) {
-	const dir = "usr/lib/llvm-19/include/c++/v1"
-	for _, c := range []struct {
-		name  string
-		files []string
-		ok    bool
-	}{
-		{"beside", []string{dir + "/__config", dir + "/__config_site", dir + "/experimental/__config"}, true},
-		{"no __config", []string{dir + "/__config_site"}, false},
-		{"two c++/v1", []string{dir + "/__config", dir + "/__config_site", "usr/include/c++/v1/__config"}, false},
-		{"split", []string{dir + "/__config", "usr/include/riscv64-linux-gnu/c++/v1/__config_site"}, false},
-	} {
-		root := t.TempDir()
-		for _, f := range c.files {
-			p := filepath.Join(root, f)
-			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(p, nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}
-		got, err := libcxxSysrootDir(root)
-		if (err == nil) != c.ok || (c.ok && got != filepath.Join(root, dir)) {
-			t.Errorf("%s: %q (%v), want ok %v at %s", c.name, got, err, c.ok, filepath.Join(root, dir))
-		}
+// libcxxProvider on a cross host: the -host-libcxx dir xtask derived, no probe. A dir outside the sysroot (the build machine's libc++) is refused.
+// The one-copy / split-install rules are xtask cross::libcxx_dir's tests.
+func TestLibcxxProviderCrossIsTheGivenDir(t *testing.T) {
+	sysroot := t.TempDir()
+	dir := filepath.Join(sysroot, "usr/lib/llvm-19/include/c++/v1")
+	cross := HostCross{Target: "riscv64-linux-gnu", Sysroot: sysroot, ISA: "rv64gc_zba_zbb", Libcxx: dir}
+	if got, err := libcxxProvider("", cross); err != nil || got != dir {
+		t.Errorf("got %q (%v), want %q", got, err, dir)
 	}
-	if _, err := libcxxSysrootDir(filepath.Join(t.TempDir(), "absent")); err == nil {
-		t.Error("absent sysroot accepted")
+	cross.Libcxx = "/usr/lib/llvm-19/include/c++/v1"
+	if _, err := libcxxProvider("", cross); err == nil {
+		t.Error("a libc++ outside the sysroot accepted")
 	}
 }

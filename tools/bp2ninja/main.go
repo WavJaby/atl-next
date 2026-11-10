@@ -69,15 +69,16 @@ func main() {
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
-	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs): the one -cxx searches, or a cross host's sysroot copy (-cxx unused then); takes -cxx and the -host-* flags too")
-	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot and -host-isa, all three or none")
+	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs): the one -cxx searches, or a cross host's -host-libcxx (-cxx unused then); takes -cxx and the -host-* flags too")
+	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot, -host-isa and -host-libcxx, all four or none")
 	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
+	hostLibcxx := flag.String("host-libcxx", "", "cross host: the sysroot's libc++ headers directory, derived by xtask (cross::libcxx_dir: the one c++/v1 holding __config); under -host-sysroot")
 	nbExports := flag.String("nb-exports", "", "module: instead of a build, print as JSON the include flags its -native-bridge variant hands dependents (exportsOf), for builds outside the converter that compile against bionic's headers (xtask runtimes: libc_headers); takes no goals")
 	flag.Parse()
-	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA}
-	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "") {
-		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot and -host-isa go together")
+	cross := HostCross{Target: *hostTarget, Sysroot: *hostSysroot, ISA: *hostISA, Libcxx: *hostLibcxx}
+	if cross.set() && (cross.Target == "" || cross.Sysroot == "" || cross.ISA == "" || cross.Libcxx == "") {
+		fmt.Fprintln(os.Stderr, "bp2ninja: -host-target, -host-sysroot, -host-isa and -host-libcxx go together")
 		os.Exit(2)
 	}
 	if *libcxxHeaders {
