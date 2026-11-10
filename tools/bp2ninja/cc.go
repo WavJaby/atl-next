@@ -197,6 +197,8 @@ type Graph struct {
 	dropped map[string]bool
 	// providers.toml rows built outside the tree (provided.go)
 	provided map[string]Provided
+	// cross host: the providers.toml rows built outside the tree, named but never built here (plan A3); crossProviderUse fails a goal closure that reaches one
+	crossProviders map[string]bool
 	// bionic sides' provided modules: the LLVM runtimes archives built for the guest (xtask runtimes) under Soong's module names (libc++_static_noexcept, libclang_rt.builtins, ...)
 	nbProvided map[string]Provided
 	// providers.toml rows replacing only some sources of a module, and the "module\x00file" ones dropped (provided.go)
@@ -286,11 +288,32 @@ func (g *Graph) noDeviceVariant(m *Module) bool {
 }
 
 // ccGoalSide: a C/C++/Rust goal builds its device variant; a host-only one (aapt2's cc_binary_host) its host one -- a device variant would be a build tool linked as if shipped, its closure (libprotobuf-cpp-full) under the licence gate.
+// A cross host builds its host variant for every goal: the device variant needs the guest's bionic and device ISA flags (plan B1). HostCross is set exactly when the host arch is not the build machine's, so this is a host-vs-build relation, not an arch test.
 func (g *Graph) ccGoalSide(goal string) Side {
+	if g.cfg.HostCross.set() {
+		return Host
+	}
 	if m := g.lookup(goal, Device); m != nil && g.noDeviceVariant(m) {
 		return Host
 	}
 	return Device
+}
+
+// crossProviderUse: a cross host builds no providers yet (plan A3), so a goal closure reaching one fails here rather than linking the tree's copy built for the wrong arch.
+func (g *Graph) crossProviderUse() error {
+	if !g.cfg.HostCross.set() {
+		return nil
+	}
+	used := map[string]bool{}
+	for k := range g.nodes {
+		if g.crossProviders[k.name] {
+			used[k.name] = true
+		}
+	}
+	if len(used) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cross host: providers not supported until A3: %s", strings.Join(sortedKeys(used), " "))
 }
 
 // lookup finds a module by Soong reference: `name`, `//dir:name`, `name#tag`; prebuilts, imports

@@ -59,6 +59,7 @@ func main() {
 	providedFile := flag.String("provided", "", "JSON file: module -> {libs, include, defines} of modules built outside the tree (providers.toml `crate:`, `upstream:` and `system:`, provided.go)")
 	aidlCratesFile := flag.String("aidl-crates", "", "JSON file: interface name -> {include_dirs, types, parcelables}: unstable aidl_interfaces defined at the tree root over the import closure of types, whose -rust backends workspace packages link (Cargo.toml `[package.metadata.atl.aidl]`, aidlcrates.go)")
 	srcsFile := flag.String("srcs", "", "JSON file: module -> {srcs, provider} of modules built without some of their sources (providers.toml rows with `srcs`, provided.go Partial); a listed file that is not a source of the module fails")
+	crossProviders := flag.String("cross-providers", "", "cross host only: comma-separated providers.toml modules built outside the tree (crate:, system:, upstream: and srcs rows); a goal closure reaching one fails until plan A3, since a cross host builds no providers")
 	rustAndroid := flag.String("rust-android", "", "comma-separated device Rust modules compiled as Android userspace: android target blocks + --cfg "+rustAndroidCfg+" (providers.toml `rust_os = \"android\"`, rust.go rustOSSide)")
 	defines := flag.String("defines", "", "comma-separated module:MACRO (NAME or NAME=VALUE): macros the module's device C/C++ compiles get as -D, read by a patch to its source (providers.toml `defines`, provided.go parseDefines)")
 	standIn := flag.String("stand-in", "", "comma-separated module=tree-module pairs: the tree module is built wherever the module is named, and must install under its name (stem + suffix) (providers.toml `module:`)")
@@ -102,6 +103,7 @@ func main() {
 		return out
 	}
 	omitted, android := set(*omit), set(*rustAndroid)
+	crossProvided := set(*crossProviders)
 	stand := map[string]string{}
 	for _, pair := range strings.Split(*standIn, ",") {
 		if pair == "" {
@@ -160,7 +162,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -provided / -srcs:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust}, javaSetup{jt, *release, *measure}, omitted, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust}, javaSetup{jt, *release, *measure}, omitted, crossProvided, provided, nbProvided, partial, android, moduleDefines, stand, aidlCrates, *nbExports, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -219,7 +221,7 @@ type javaSetup struct {
 	measure bool
 }
 
-func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
+func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit, crossProviders map[string]bool, provided, nbProvided map[string]Provided, partial map[string]Partial, rustAndroid map[string]bool, defines map[string][]string, stand map[string]string, aidlCrates map[string]AidlCrate, nbExports string, goals []string) error {
 	files, err := discover(tree)
 	if err != nil {
 		return err
@@ -230,7 +232,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	// not passed (toolchainLocation, keepFlag): reported on every run, so a change in what is dropped shows
 	fmt.Printf("bp2ninja: Soong global flags not passed (diagnostics, debug info, prebuilt toolchain location): %s\n", strings.Join(soong.Flags.Skipped, " "))
-	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
+	g := &Graph{tree: tree, out: out, cfg: cfg, soong: soong, omit: omit, crossProviders: crossProviders, provided: provided, nbProvided: nbProvided, partial: partial, rustAndroid: rustAndroid, defines: defines, stand: stand, rtInclude: tools.RtInclude, bionicStaticRust: tools.BionicStaticRust, nodes: map[key]*Node{}}
 	if g.libcxx, err = libcxxProvider(tools.CXX, cfg.HostCross); err != nil {
 		return err
 	}
@@ -289,6 +291,7 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 	}
 	names = append(names, sortedKeys(rustAndroid)...)
 	names = append(names, sortedKeys(keysOf(defines))...)
+	names = append(names, sortedKeys(crossProviders)...)
 	// a `module:` row's key may be absent (libartpalette-system: system/libartpalette is not fetched); its stand-in must exist, and node checks it installs under the key
 	for _, alt := range stand {
 		names = append(names, alt)
@@ -373,6 +376,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		if n := g.node(goal, g.ccGoalSide(goal), Shared, "goal"); n != nil {
 			ccGoals = append(ccGoals, n)
 		}
+	}
+	if err := g.crossProviderUse(); err != nil {
+		return err
 	}
 	if err := g.checkPartial(); err != nil {
 		return err

@@ -54,6 +54,45 @@ func TestHostCrossHostSide(t *testing.T) {
 	}
 }
 
+// A cross host builds every cc goal's host variant: the device variant needs the guest's bionic (plan B1). The build machine's own host keeps the device side.
+func TestCrossGoalSide(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `cc_binary_host { name: "tool" }
+cc_library { name: "lib" }
+cc_library { name: "optout", device_supported: false }`})
+	if got := g.ccGoalSide("lib"); got != Device {
+		t.Fatalf("build machine's host: side %v, want device", got)
+	}
+	g.cfg.HostCross = riscvCross
+	for goal, want := range map[string]Side{"tool": Host, "lib": Host, "optout": Host} {
+		if got := g.ccGoalSide(goal); got != want {
+			t.Errorf("%s: side %v, want %v", goal, got, want)
+		}
+	}
+}
+
+// A cross host builds no providers (plan A3): a goal whose closure reaches a provided module fails, naming it; a closure without one passes.
+func TestCrossProviderUse(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+cc_library { name: "libgoal", host_supported: true, shared_libs: ["libprovided"] }
+cc_library { name: "libfree", host_supported: true }
+cc_library { name: "libprovided", host_supported: true }
+`})
+	g.cfg.HostCross = riscvCross
+	g.crossProviders = map[string]bool{"libprovided": true}
+	if g.node("libfree", Host, Shared, "goal") == nil {
+		t.Fatal("libfree: no host node")
+	}
+	if err := g.crossProviderUse(); err != nil {
+		t.Errorf("closure without a provider: %v", err)
+	}
+	if g.node("libgoal", Host, Shared, "goal") == nil {
+		t.Fatal("libgoal: no host node")
+	}
+	if err := g.crossProviderUse(); err == nil || !strings.Contains(err.Error(), "cross host: providers not supported until A3: libprovided") {
+		t.Errorf("closure reaching a provider: %v", err)
+	}
+}
+
 // A cross host's libc++ headers must lie under its sysroot: the distro's own include dir is the build machine's libc++. The sysroot prefix ends at a separator, so root-other is not under root.
 func TestLibcxxInSysroot(t *testing.T) {
 	for _, c := range []struct {
