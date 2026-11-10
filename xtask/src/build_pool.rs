@@ -291,6 +291,8 @@ mod tests {
             .arg(path(&dir, 1))
             .args(["sleep", "60"])
             .stdout(Stdio::null())
+            // the orphaned sleep must not hold the test binary's stderr open (a piped `cargo test` would wait 60 s)
+            .stderr(Stdio::null())
             .spawn()
             .expect("flock(1) from util-linux");
         // wait until the child holds it
