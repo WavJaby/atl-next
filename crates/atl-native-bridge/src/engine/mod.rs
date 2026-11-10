@@ -4,10 +4,13 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing: the host arch's FS switch (x86_64), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `x86_64.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `arch::CROSSING` in both builds.
+/// The crossing: the host arch's FS switch (`identity/mod.rs`), or with feature `qemu-guest` QEMU's binding thunks (`arch/qemu.rs`). Both provide the seam functions `identity/mod.rs` names (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `arch::CROSSING` in both builds.
 #[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
-#[path = "x86_64.rs"]
-pub mod arch;
+#[path = "identity/mod.rs"]
+pub mod identity;
+// Shared code reaches the selected engine as `arch::` in both builds; identity builds alias it here.
+#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
+pub use identity as arch;
 #[cfg(feature = "qemu-guest")]
 #[path = "arch/qemu.rs"]
 pub mod arch;

@@ -16,9 +16,9 @@
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use atl_native_bridge::engine::arch;
+use atl_native_bridge::engine::identity;
 
-/// What `no_host_fs` passes as `why` (x86_64.rs).
+/// What `no_host_fs` passes as `why` (identity/mod.rs).
 const WHY: &str =
     "atl-native-bridge: fatal-signal report: no host thread pointer for the handler: sig 10 ";
 /// The fake TCB: one page, zeroed -> `%fs:16` (tcbhead_t.self) != FS and every bionic slot 0.
@@ -32,15 +32,15 @@ extern "C" fn on_usr1(_sig: i32, _info: *mut libc::siginfo_t, _uc: *mut libc::c_
 }
 
 fn child() -> ExitCode {
-    if !arch::supported() {
+    if !identity::supported() {
         eprintln!("g5: FAIL the engine is not supported here (no FSGSBASE)");
         return ExitCode::FAILURE;
     }
-    arch::set_signal_handler(libc::SIGUSR1 as usize, on_usr1 as *const () as usize);
+    identity::set_signal_handler(libc::SIGUSR1 as usize, on_usr1 as *const () as usize);
     // SAFETY: zeroed sigaction is empty; the engine entry has the SA_SIGINFO signature.
     let rc = unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = arch::signal_entry();
+        sa.sa_sigaction = identity::signal_entry();
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut())
     };

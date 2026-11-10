@@ -15,7 +15,7 @@ mod common;
 use std::ffi::CStr;
 use std::process::ExitCode;
 
-use atl_native_bridge::engine::{Guest, arch};
+use atl_native_bridge::engine::{Guest, identity};
 use common::{RTLD_NOW, host_intact, need};
 
 const LIB: &CStr = c"libatl-jni-test.so";
@@ -60,7 +60,7 @@ fn dlerror(g: &mut Guest) -> String {
 
 fn run(env: &common::Nb) -> Result<(), String> {
     let self0 = common::self0();
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     let mut g = common::start(env)?;
     host_intact(&g, self0, host, "__linker_init")?;
     let dlopen = need(&g.linker, "__dl___loader_dlopen")?;

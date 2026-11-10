@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Spike gate g4 (bridge-1 route N): crossing cost. RUNS runs x CALLS calls each of
-//! - guest->host: a guest loop (`g4_guest_loop`, run on a stand-in guest TCB) calls an engine thunk (`arch::bind`) bound to an empty host function: shadow-stack push, FS switch both ways;
-//! - host->guest: a host loop calls `arch::Identity`'s `Engine::call` on an empty guest function: FS switch both ways;
+//! - guest->host: a guest loop (`g4_guest_loop`, run on a stand-in guest TCB) calls an engine thunk (`identity::bind`) bound to an empty host function: shadow-stack push, FS switch both ways;
+//! - host->guest: a host loop calls `identity::Identity`'s `Engine::call` on an empty guest function: FS switch both ways;
 //! - baseline: the same guest loop calling the empty host function directly (loop + indirect call, no crossing), subtracted from guest->host.
 //!
 //! Reports median and min-max ns per call over the runs, and whether the CPU has FSGSBASE (without it the engine refuses to start).
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use atl_cpu_pressure::{Sampler, judge_window};
-use atl_native_bridge::engine::{Engine, HostThread, Tp, arch};
+use atl_native_bridge::engine::{Engine, HostThread, Tp, identity};
 
 /// Plan bridge1-plan step 3 g4: target < 50 ns per crossing.
 const BAND_NS: f64 = 50.0;
@@ -98,38 +98,38 @@ fn band(mut v: Vec<f64>) -> (f64, f64, f64) {
 }
 
 fn run() -> Result<String, String> {
-    if !arch::supported() {
+    if !identity::supported() {
         return Err("FSGSBASE: no (the engine cannot cross)".into());
     }
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
     // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
-    unsafe { arch::init_tcb(tcb, &raw mut *ht) };
-    let thunk = arch::bind(crossed_target as *const () as usize).ok_or("no free thunk")?;
+    unsafe { identity::init_tcb(tcb, &raw mut *ht) };
+    let thunk = identity::bind(crossed_target as *const () as usize).ok_or("no free thunk")?;
     let target = host_target as *const () as usize;
     let lp = g4_guest_loop as *const () as usize;
     let empty = g4_guest_empty as *const () as usize;
     let sampler = Sampler::start();
     let base = band(runs(|| {
         // SAFETY: the guest loop touches no TLS; host_target, called on the guest FS, only does an atomic add.
-        unsafe { arch::Identity.call(ht, Tp::Guest(tcb), lp, &[CALLS, target, 0, 0]) };
+        unsafe { identity::Identity.call(ht, Tp::Guest(tcb), lp, &[CALLS, target, 0, 0]) };
     }));
     HOST_CALLS.store(0, Ordering::Relaxed);
     let g2h = band(runs(|| {
         // SAFETY: as above; the thunk crosses back to crossed_target on the host FS.
-        unsafe { arch::Identity.call(ht, Tp::Guest(tcb), lp, &[CALLS, thunk, 0, 0]) };
+        unsafe { identity::Identity.call(ht, Tp::Guest(tcb), lp, &[CALLS, thunk, 0, 0]) };
     }));
     let h2g = band(runs(|| {
         for _ in 0..CALLS {
             // SAFETY: the empty guest fn touches nothing.
-            unsafe { arch::Identity.call(ht, Tp::Guest(tcb), empty, &[0; 4]) };
+            unsafe { identity::Identity.call(ht, Tp::Guest(tcb), empty, &[0; 4]) };
         }
     }));
     let pressure = sampler.stop();
-    if arch::fs_base() != host {
+    if identity::fs_base() != host {
         // SAFETY: this thread's own thread pointer, read above.
-        unsafe { arch::set_fs_base(host) };
+        unsafe { identity::set_fs_base(host) };
         return Err("FS not host after the runs".into());
     }
     let calls = HOST_CALLS.load(Ordering::Relaxed);

@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use atl_native_bridge::engine::{self, Engine, HostThread, Tp, arch};
+use atl_native_bridge::engine::{self, Engine, HostThread, Tp, identity};
 use common::{host_intact, need};
 
 /// Words of the stand-in guest TCB of stage A (as g1 stage 0).
@@ -59,7 +59,7 @@ static FAULT_ADDR: AtomicUsize = AtomicUsize::new(usize::MAX);
 static HITS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, uc: *mut c_void) {
-    HANDLER_FS.store(arch::fs_base(), Ordering::SeqCst);
+    HANDLER_FS.store(identity::fs_base(), Ordering::SeqCst);
     HITS.fetch_add(1, Ordering::SeqCst);
     // SAFETY: the kernel passes a valid siginfo and ucontext to an SA_SIGINFO handler.
     unsafe {
@@ -107,25 +107,25 @@ fn install_plain() -> Result<(), String> {
 /// Stage A's fault on a stand-in TCB; (handler FS, resumed FS, return, guest TCB).
 fn fault_a() -> Result<(usize, usize, usize, usize), String> {
     let self0 = common::self0();
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
     // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
-    unsafe { arch::init_tcb(tcb, &raw mut *ht) };
+    unsafe { identity::init_tcb(tcb, &raw mut *ht) };
     reset();
     MODE.store(0, Ordering::SeqCst);
     // SAFETY: g3_guest_load reads [rdi] (NULL -> the handler resumes it) and touches no TLS.
     let ret = unsafe {
-        arch::Identity.call(
+        identity::Identity.call(
             ht,
             Tp::Guest(tcb),
             g3_guest_load as *const () as usize,
             &[0; 4],
         )
     };
-    if arch::fs_base() != host {
+    if identity::fs_base() != host {
         // SAFETY: this thread's own thread pointer, read above.
-        unsafe { arch::set_fs_base(host) };
+        unsafe { identity::set_fs_base(host) };
         return Err("FS not host after the guest call".into());
     }
     common::probe(self0)?;
@@ -146,7 +146,7 @@ fn fault_a() -> Result<(usize, usize, usize, usize), String> {
 }
 
 fn stage_a() -> Result<(), String> {
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     engine::install_signal(libc::SIGSEGV, on_segv)?;
     let (hfs, resumed, ret, tcb) = fault_a().map_err(|e| format!("stage A: {e}"))?;
     if hfs != host {
@@ -182,7 +182,7 @@ fn control() -> Result<(), String> {
 
 fn stage_b(env: &common::Nb) -> Result<(), String> {
     let self0 = common::self0();
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     let mut g = common::start(env)?;
     host_intact(&g, self0, host, "__linker_init")?;
     engine::install_signal(libc::SIGSEGV, on_segv)?;

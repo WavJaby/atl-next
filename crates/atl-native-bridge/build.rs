@@ -673,7 +673,7 @@ const BREAK_ENV: &str = "ATL_NB_BREAK";
 const BREAKS: &[(&str, &str)] = &[
     // the app gate's `glesPbuffer` (engine/vdso.rs): glClear's stub bound to the front's raw address, no crossing
     ("gl_direct", "atl_nb_gl_direct"),
-    // the app gate's `jitUpCall` (engine::x86_64): GS = the record, not ART's Thread*, while an up call's host target runs
+    // the app gate's `jitUpCall` (engine::identity): GS = the record, not ART's Thread*, while an up call's host target runs
     ("foreign_gs", "atl_nb_foreign_gs"),
     // gate 4.4 (engine/jni.rs): a guest env slot = the host function, no crossing
     ("jni_direct", "atl_nb_jni_direct"),
@@ -681,9 +681,9 @@ const BREAKS: &[(&str, &str)] = &[
     ("ndk_env", "atl_nb_ndk_env"),
     // gate 4.4 (exports.rs): isNativeBridgeFunctionPointer answers false
     ("nbfp_false", "atl_nb_nbfp_false"),
-    // spike gates g1/g2 (engine::x86_64): the host->guest crossing without its FS restore
+    // spike gates g1/g2 (engine::identity): the host->guest crossing without its FS restore
     ("no_fs_restore", "atl_nb_no_fs_restore"),
-    // Q5-4 (engine/x86_64.rs `Identity::call`): the guest enters on the host thread pointer, so g1 stage 0's guest FS check fails
+    // Q5-4 (engine/identity/mod.rs `Identity::call`): the guest enters on the host thread pointer, so g1 stage 0's guest FS check fails
     ("swap_tp", "atl_nb_swap_tp"),
     // g4 (tests/g4.rs): a syscall in the host target, must leave the band
     ("g4_break", "atl_g4_break"),

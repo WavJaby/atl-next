@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Signals under one process-wide kernel action table shared by host and guest.
 //! Host handlers (ART's sigchain `SignalChain::Handler` above all) assume the host thread pointer, but a signal hitting guest code arrives on the guest's: x86_64 `rt_sigreturn` restores no FS base, and nothing between kernel and handler switches it. So every installed kernel handler is re-wrapped at kernel level (`rewrap_all`): raw `rt_sigaction` reads each action, a handler that is not the arch's signal entry moves into the entry's table and the entry takes its place; the entry switches to host FS, calls it, restores the interrupted FS. Rewrap points: NB `initialize` (after ART's `FaultManager::Init`), each guest library load, and the host side of guest `sigaction`. Gap: a host library calling `sigaction` after the last point leaves its handler unwrapped (plan D6 (a)).
-//! The entry decides from the interrupted FS alone (x86_64.rs `atl_nb_signal_entry`): host TCB -> as is; guest TCB -> its record's host FS. GS is ART's `Thread*`, never read or written.
+//! The entry decides from the interrupted FS alone (identity/mod.rs `atl_nb_signal_entry`): host TCB -> as is; guest TCB -> its record's host FS. GS is ART's `Thread*`, never read or written.
 //! Guest `sigaction` / `sigaction64` (bionic's own is a raw syscall): NBS stubs (patch 0003) -- bionic's `sigaction.o` defines only these two, so the guest libc's archive link never pulls it and bionic needs no patch (measured: shipped libc's `sigaction` = `jmp sigaction_stub`). The guest handler is registered with sigchain's `sigaction`, so ART keeps its claimed signals first; the host side runs it on the guest thread pointer through `guest_handler`. Old actions naming `guest_handler` are answered with the guest handler they stand for (as Berberis `guest_signal_action.cc` does).
 
 use std::ffi::{c_int, c_void};
@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::thread::layout;
-use super::{arch, call_guest, thread};
+use super::{call_guest, identity, thread};
 
 /// bionic LP64 `struct sigaction` / `sigaction64` (bits/signal_types.h `__SIGACTION_BODY`), offsets gated against the generated layout.
 #[repr(C)]
@@ -45,7 +45,7 @@ struct KernelSigaction {
 
 /// Kernel signal count (`_NSIG`); signals are 1..=NSIG.
 const NSIG: usize = 64;
-const _: () = assert!(arch::SIGNALS == NSIG + 1);
+const _: () = assert!(identity::SIGNALS == NSIG + 1);
 /// The dispositions that are no function: SIG_DFL, SIG_IGN.
 const NOT_A_FUNCTION: usize = 1;
 
@@ -65,7 +65,7 @@ fn raw_sigaction(
 
 /// Wraps every kernel handler not yet wrapped (see module docs); returns how many it wrapped.
 pub fn rewrap_all() -> usize {
-    let entry = arch::signal_entry();
+    let entry = identity::signal_entry();
     let mut n = 0;
     for sig in 1..=NSIG {
         if sig == libc::SIGKILL as usize || sig == libc::SIGSTOP as usize {
@@ -83,7 +83,7 @@ pub fn rewrap_all() -> usize {
         {
             continue;
         }
-        arch::set_signal_handler(sig, k.handler);
+        identity::set_signal_handler(sig, k.handler);
         let wrapped = KernelSigaction {
             handler: entry,
             ..k
@@ -139,7 +139,7 @@ extern "C" fn guest_handler(sig: c_int, info: *mut libc::siginfo_t, uc: *mut c_v
     // a fault reaching a guest handler is one ART's sigchain claims declined: the app's own crash handler takes it, which often re-raises with SIG_DFL and leaves no ART dump -> report first
     if [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE].contains(&sig) {
         // SAFETY: the kernel's siginfo / ucontext of this delivery.
-        unsafe { arch::fault_report("fault handed to the guest's handler", sig, info, uc, 0) };
+        unsafe { identity::fault_report("fault handed to the guest's handler", sig, info, uc, 0) };
     }
     // SAFETY: the guest's handler (SA_SIGINFO signature; a plain one ignores the extra arguments under the SysV ABI); `siginfo_t` is the kernel's for both libcs and `uc` the kernel frame.
     unsafe {

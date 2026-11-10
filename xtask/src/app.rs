@@ -103,7 +103,7 @@ const SERVICE_LINES: [(&str, &str, &str); 2] = [
         "network_state=0 camera=-1",
     ),
 ];
-/// The native bridge's report of a fault handed to a guest handler (x86_64.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
+/// The native bridge's report of a fault handed to a guest handler (identity/mod.rs fault_report via signal.rs guest_handler); bridge1's sigsegvRecover must produce one (SIGSEGV = 11).
 const GUEST_FAULT_REPORT: &str =
     "atl-native-bridge: fatal-signal report: fault handed to the guest's handler: sig 11 ";
 /// Main.mediaPlayerService's line: "returned" when the view answered the lookup and setDataSource(fd) returned, "no answer" when nothing did. A return means an answer (getMediaPlayerService waits for media.player, IMediaDeathNotifier.cpp:41); a native setDataSource error is logged and dropped by MediaPlayer.java:1305, so MEDIA_PLAYER_RAN carries the served service's own evidence.

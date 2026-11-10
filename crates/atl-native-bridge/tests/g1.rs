@@ -20,7 +20,7 @@ use std::ffi::{CStr, c_char};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atl_native_bridge::engine::{Engine, Guest, HostThread, Tp, arch, vdso};
+use atl_native_bridge::engine::{Engine, Guest, HostThread, Tp, identity, vdso};
 use common::{RTLD_NOW, need, probe};
 
 const ABORT_TEXT: &CStr = c"atl g1 abort probe";
@@ -29,22 +29,23 @@ const FAKE_TCB_WORDS: usize = 64;
 
 /// Stage 0's "guest": answers the thread pointer it runs on; inline asm only, no TLS.
 extern "C" fn read_fs(_: usize, _: usize, _: usize) -> usize {
-    arch::fs_base()
+    identity::fs_base()
 }
 
 fn crossing() -> Result<(), String> {
     let self0 = common::self0();
-    let host = arch::fs_base();
+    let host = identity::fs_base();
     let tcb = Box::leak(vec![0usize; FAKE_TCB_WORDS].into_boxed_slice()).as_mut_ptr() as usize;
     let ht = HostThread::leak();
     // SAFETY: a leaked FAKE_TCB_WORDS-word stand-in TCB (bionic's: 11 words); the record is leaked.
-    unsafe { arch::init_tcb(tcb, &raw mut *ht) };
+    unsafe { identity::init_tcb(tcb, &raw mut *ht) };
     // SAFETY: read_fs takes three integers and touches no TLS.
-    let inside =
-        unsafe { arch::Identity.call(ht, Tp::Guest(tcb), read_fs as *const () as usize, &[0; 4]) };
+    let inside = unsafe {
+        identity::Identity.call(ht, Tp::Guest(tcb), read_fs as *const () as usize, &[0; 4])
+    };
     if let Err(e) = probe(self0) {
         // SAFETY: `host` is this thread's own thread pointer, read above.
-        unsafe { arch::set_fs_base(host) };
+        unsafe { identity::set_fs_base(host) };
         return Err(format!("stage 0: {e}"));
     }
     if inside != tcb {

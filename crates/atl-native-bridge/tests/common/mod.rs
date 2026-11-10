@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use atl_native_bridge::engine::{Config, Guest, arch, image::Image};
+use atl_native_bridge::engine::{Config, Guest, identity, image::Image};
 
 pub const RTLD_NOW: usize = 2;
 
@@ -120,7 +120,7 @@ pub fn host_intact(
     host: usize,
     after: &str,
 ) -> Result<(), String> {
-    let fs = arch::fs_base();
+    let fs = identity::fs_base();
     if fs != host {
         g.force_host_fs();
         return Err(format!("after {after}: FS {fs:#x}, host {host:#x}"));
