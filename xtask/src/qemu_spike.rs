@@ -26,8 +26,6 @@ use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
 const FIXTURE_SRC: &str = "xtask/testdata/qemu-spike/fixture.c";
-/// The Q4-4 boot executable (BOOT with its auxv in x0): the engine `.so` gate boots it through the C ABI.
-const BOOT_SRC: &str = "xtask/testdata/qemu-linker/boot.c";
 /// The engine `.so`'s file name per arch (`libatl_engine_arm64.so`, plan Q5-1a).
 fn engine_name(arch: &str) -> String {
     format!("libatl_engine_{arch}.so")
@@ -650,7 +648,7 @@ fn engine_so(
 ) -> Result<()> {
     let out = dir.join("engine");
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-    let boot = boot_fixture(root, b, &out)?;
+    let boot = qemu::boot_exe(root, b, &out)?;
     let entry = llvm_entry(&boot)?;
     let expected: BTreeSet<String> = std::iter::once(engine_abi::TABLE)
         .chain(engine_abi::TLS_EXPORTS.iter().copied())
@@ -834,22 +832,6 @@ fn exports_gate(so: &Path, expected: &BTreeSet<String>) -> Result<()> {
         "defined dynamic symbols {got:?}, expected {expected:?}"
     );
     Ok(())
-}
-
-/// The Q4-4 boot executable, NDK-built static as the other fixtures.
-fn boot_fixture(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
-    let ndk = jni_fixture::default_ndk(root)?;
-    let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
-    let bin = out.join("boot");
-    let status = target
-        .cmd("clang")
-        .args(["-static", "-O1", "-Wall", "-Werror", "-o"])
-        .arg(&bin)
-        .arg(root.join(BOOT_SRC))
-        .status()
-        .context("running the NDK clang")?;
-    ensure!(status.success(), "NDK clang failed on {BOOT_SRC}");
-    Ok(bin)
 }
 
 /// e_entry as `llvm-readelf -h` prints it: the expected value, read without the engine.

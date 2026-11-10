@@ -54,6 +54,11 @@ harness = false
 name = "qemu_start"
 harness = false
 
+# Q6-5 gate: the QEMU engine booted through its installed paths (atl-android-paths engine_library / engine_boot) in a staged image, as `select` boots it; needs the staged /system (ATL_NB_STAGED, xtask qemu_linker.rs)
+[[test]]
+name = "qemu_staged"
+harness = false
+
 # Q4-5 gate: a guest dlopen under QEMU: the main executable's dlopen loads a library whose DT_NEEDED is another, the stub libc intercepts (QEMU bridge plan Q4-5); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
 [[test]]
 name = "qemu_dlopen"

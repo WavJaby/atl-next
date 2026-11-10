@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test qemu-thread`: guest threads under the QEMU crossing on the real arm64 NB images (QEMU bridge plan Q5-6). A guest `pthread_create` attaches its own engine CPU, the provider's foreach reaches a guest callback, a guest key destructor runs at thread exit through a crossing. Then each break must turn its run red.
 //!
-//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-linker` uses it. Fixture: `xtask/testdata/qemu-thread/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: `xtask/testdata/qemu-linker/boot.c` (static).
+//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-linker` uses it. Fixture: `xtask/testdata/qemu-thread/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-linker`.
 //! Harness: `tests/qemu_thread.rs` (harness-less; checks s, p, j, d) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `qt_skip_dtor`, `qt_routine_arg`.
 //! Property area (check p): the guest cannot set properties (the provider's set is ENOENT), so the gate writes `SEEDED` `atl.qt.p.<i>` properties and `atl.qt.expect` into a copy of the native out dir's build.prop, and the area writer (atl-property-service, the broker's own) lays out the area the provider maps through `ATL_PROP_AREA`.
@@ -70,8 +70,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ndk = jni_fixture::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
     let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
-    let boot =
-        qemu_linker::guest_build(root, &target, "boot", &dir.join("boot"), &["-static"], &[])?;
+    let boot = qemu::boot_exe(root, &b, &dir)?;
     let out = args
         .nb
         .ancestors()

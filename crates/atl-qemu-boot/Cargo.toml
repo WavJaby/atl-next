@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-qemu-boot"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Guest-side only: xtask (qemu.rs `boot_exe`) compiles src/lib.rs with rustc for the guest's arches.toml `rust` triple as a static `no_std` executable, linked by rust-lld (atl-android-paths `engine_boot`). Cargo builds it for the host only to lint it.
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true

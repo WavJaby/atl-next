@@ -49,6 +49,8 @@ pub struct Guest {
     pub android_abis: Vec<String>,
     pub clang: String,
     pub qemu_target: String,
+    /// Rust target triple of our guest code (the engine boot executable, atl-qemu-boot); absent = no Rust guest code for this arch yet.
+    pub rust: Option<String>,
 }
 
 pub fn load(root: &Path) -> Result<Arches> {
@@ -316,6 +318,42 @@ pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every guest row's `rust` is a target rustc knows (`rustc --print target-list`) whose arch part is the row's `qemu_target` (the CPU QEMU runs it on).
+pub fn check_guest_rust(root: &Path, arches: &Arches) -> Result<()> {
+    let out = Command::new("rustc")
+        .current_dir(root)
+        .args(["--print", "target-list"])
+        .output()
+        .context("running rustc --print target-list")?;
+    ensure!(out.status.success(), "rustc --print target-list failed");
+    let targets = String::from_utf8_lossy(&out.stdout);
+    for (name, guest) in arches
+        .iter()
+        .filter_map(|(n, a)| Some((n, a.guest.as_ref()?)))
+    {
+        let Some(rust) = &guest.rust else { continue };
+        ensure!(
+            targets.lines().any(|t| t == rust),
+            "{FILE}: {name}: guest rust {rust} is not a rustc target"
+        );
+        ensure!(
+            rust.split('-').next() == Some(guest.qemu_target.as_str()),
+            "{FILE}: {name}: guest rust {rust} does not run on qemu_target {}",
+            guest.qemu_target
+        );
+    }
+    Ok(())
+}
+
+/// The Rust target triple of guest arch `name`: its `[<name>.guest]` `rust` column.
+pub fn guest_rust<'a>(arches: &'a Arches, name: &str) -> Result<&'a str> {
+    arches
+        .get(name)
+        .and_then(|a| a.guest.as_ref())
+        .and_then(|g| g.rust.as_deref())
+        .with_context(|| format!("{FILE}: {name} has no [{name}.guest] rust triple"))
 }
 
 /// The target features rustc lists for `triple`: the first word of each indented feature line of `rustc --print target-features`.

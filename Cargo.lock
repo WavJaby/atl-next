@@ -535,6 +535,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-qemu-boot"
+version = "0.0.0"
+
+[[package]]
 name = "atl-qemu-engine"
 version = "0.0.0"
 dependencies = [

@@ -198,7 +198,7 @@ uses = ["generators", "android-paths", "cpu-pressure", "engine-api"]
 
 # the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h; exports its `Trap` to the native bridge's QEMU crossing (Q4)
 [qemu-engine]
-crates = ["atl-qemu-engine"]
+crates = ["atl-qemu-engine", "atl-qemu-boot"]
 exports = ["atl-qemu-engine"]
 uses = ["generators", "engine-api"]
 

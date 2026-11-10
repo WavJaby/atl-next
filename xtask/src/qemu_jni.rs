@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test qemu-jni`: guest JNI calls under the QEMU crossing, integer lanes only, on the real arm64 NB images (QEMU bridge plan Q6-2). The fixture's JNI calls reach a fake host JNIEnv; GetJavaVM, a special, routes to its own thunk. Then each break must turn its run red.
 //!
-//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/qemu-jni/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: `xtask/testdata/qemu-linker/boot.c` (static).
+//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/qemu-jni/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-linker`.
 //! Harness: `tests/qemu_jni.rs` (harness-less; checks s, v, e, c, j, t, d, f, a, p, the down calls o, m, x (Q6-4), and the refusals r, l, g and the down-call refusal R, each refusal run in a child process) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `jni_guest_env` (the host function gets the guest env, check e), `jni_swap` (x3 and x4 exchanged, check c), `v_drop` (fp lanes zeroed, checks d), `drop_stack` (stack words one early, check d), `ret_int` (fp results read from x0, checks d and f), `al_zero` (host calls with %al = 0, check p), `down_drop_stack` (a down call's stack words start one word late, check m), `down_swap_v` (a down call's %xmm0 and %xmm1 exchanged, checks m and x), `shorty_swap` (the first shorty parameter's class flipped, checks m, x and R), `down_noenv` (a down call's first argument is the host's env or vm, checks o, m and x).
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-jni/`, one log per run.
@@ -75,8 +75,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ndk = jni_fixture::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
     let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
-    let boot =
-        qemu_linker::guest_build(root, &target, "boot", &dir.join("boot"), &["-static"], &[])?;
+    let boot = qemu::boot_exe(root, &b, &dir)?;
     let env: [(&str, &Path); 5] = [
         ("ATL_ENGINE_SO", &so),
         ("ATL_NB_BOOT", &boot),

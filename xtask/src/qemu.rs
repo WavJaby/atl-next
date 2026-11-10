@@ -278,6 +278,38 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
     Ok(b.exe())
 }
 
+/// The engine boot executable's crate root (atl-qemu-boot): `no_std`, its entry in `global_asm!`.
+const BOOT_CRATE: &str = "crates/atl-qemu-boot/src/lib.rs";
+/// Its file name, as atl-android-paths `engine_boot` installs it.
+const BOOT_NAME: &str = "atl_engine_boot";
+
+/// The engine boot executable for `b`'s guest arch, `<out>/atl_engine_boot`: atl-qemu-boot compiled by rust-toolchain.toml's rustc for the arches.toml guest `rust` triple as a static non-PIE executable, linked by rust-lld (no NDK, no libc: the entry is the crate's `_start`).
+pub fn boot_exe(root: &Path, b: &Build, out: &Path) -> Result<PathBuf> {
+    let arches = arches::load(root)?;
+    let triple = arches::guest_rust(&arches, &b.arch)?;
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let bin = out.join(BOOT_NAME);
+    let status = Command::new("rustc")
+        .current_dir(root)
+        .args(["--edition", "2024", "--target", triple])
+        .args(["--crate-type", "bin", "--crate-name", BOOT_NAME])
+        .args(["-C", "panic=abort", "-C", "opt-level=1"])
+        .args(["-C", "linker=rust-lld", "-C", "linker-flavor=ld.lld"])
+        .args([
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "target-feature=+crt-static",
+        ])
+        .arg("-o")
+        .arg(&bin)
+        .arg(root.join(BOOT_CRATE))
+        .status()
+        .context("running rustc")?;
+    ensure!(status.success(), "rustc failed on {BOOT_CRATE} ({triple})");
+    Ok(bin)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let b = plan(root, &args.arch, args.out.as_deref(), args.pic)?;
     if !args.execute {

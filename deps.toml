@@ -320,11 +320,11 @@ rustup_target = "x86_64-linux-android"
 scope = ["build"]
 used_by = ["xtask:native"]
 
-# the arm64 native bridge side's Rust std (`--native-bridge arm64`): the same use as the x86-64 row, for arm64_device.go's RustTriple
+# the arm64 native bridge side's Rust std (`--native-bridge arm64`): the same use as the x86-64 row, for arm64_device.go's RustTriple; the QEMU engine boot executable (qemu.rs `boot_exe`, arches.toml [arm64.guest] rust)
 [rust-std-android-arm64]
 rustup_target = "aarch64-linux-android"
 scope = ["build"]
-used_by = ["xtask:native"]
+used_by = ["xtask:native", "xtask:test"]
 
 # the riscv64 cross build's std (`xtask cross --arch riscv64`, and the native build of the riscv64 host's crates)
 [rust-std-riscv64]

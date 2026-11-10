@@ -88,6 +88,15 @@ pub fn nb_guest_goals() -> Goals {
     Goals::nb(&nb).with(Goals::host(&["libnativeloader", "libnativebridge"]))
 }
 
+/// The QEMU engine in a test image, as (host file, Android path): the engine `.so` `so` at atl-android-paths `engine_library(isa)`, the boot executable `boot` at `engine_boot(isa)`, where `engine::select` of guest ISA `isa` boots them.
+/// Test images only: the engine `.so` is the QEMU bridge (GPL-3.0-or-later), and no product image ships it until its licence row and corresponding-source archive exist (QEMU Q6 plan D-8).
+pub fn qemu_engine_files(isa: &str, so: &Path, boot: &Path) -> [(PathBuf, String); 2] {
+    [
+        (so.to_owned(), atl_android_paths::engine_library(isa)),
+        (boot.to_owned(), atl_android_paths::engine_boot(isa)),
+    ]
+}
+
 /// Where `xtask native` puts GL front `module` under `out`.
 pub fn gl_front(out: &Path, module: &str) -> PathBuf {
     out.join("device").join(module).join(format!("{module}.so"))

@@ -167,6 +167,7 @@ impl Step {
                 arches::check_prebuilt_os(&layout, &arches)?;
                 arches::check_cross(root, &arches)?;
                 arches::check_qemu_target(&layout, &arches)?;
+                arches::check_guest_rust(root, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
                 let sources = sources::load(root)?;
                 eprintln!(

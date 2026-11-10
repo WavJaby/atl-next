@@ -5,7 +5,7 @@
 //!
 //! QEMU side (Q5-8): `tests/qemu_crossing.rs` on the real arm64 NB images: the fixture's N calls per binding count N, sizes fall in their literal bins, 2^16 crossings dump exactly once. Then the `qe_id` break (every binding calls its neighbour) must turn it red. Last, the library built without the feature has no counter symbol (`nm -C`), and the same probe finds one with the feature on (positive control).
 //!
-//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/crossing/fixture.c` (PIE, NDK clang, `-fno-builtin`). Boot: `xtask/testdata/qemu-linker/boot.c` (static).
+//! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask/testdata/crossing/fixture.c` (PIE, NDK clang, `-fno-builtin`). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`), built as for `test qemu-thread`; the identity side needs none.
 //! Cargo runs go through `unit_use` with the feature selected here. Output: `<out>/qemu/<target>-linux-user-pic/crossing/`, one log per run; `cargo-probe` holds the feature-off and feature-on cdylib builds of the probe.
 
@@ -16,7 +16,6 @@ use anyhow::{Context, Result, ensure};
 
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, GUEST_API};
-use crate::qemu_linker;
 use crate::qemu_spike;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
@@ -82,8 +81,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ndk = jni_fixture::default_ndk(root)?;
     let target = NdkTarget::new(root, &ndk, &b.arch, GUEST_API)?;
     let fixture = fixture_build(root, &target, &dir.join("fixture"))?;
-    let boot =
-        qemu_linker::guest_build(root, &target, "boot", &dir.join("boot"), &["-static"], &[])?;
+    let boot = qemu::boot_exe(root, &b, &dir)?;
     let env: [(&str, &Path); 5] = [
         ("ATL_ENGINE_SO", &so),
         ("ATL_NB_BOOT", &boot),

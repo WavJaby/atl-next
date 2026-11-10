@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test qemu-linker`: the QEMU crossing on the real arm64 NB images, three harnesses, each plain then with each of its breaks (QEMU bridge plan Q4-3, Q4-4, Q4-5).
 //!
-//! Library: the engine `.so` (`qemu_spike::engine_so_file`, QEMU bridge plan Q5-1b), which the core dlopens through its C ABI; the rlib route is retired. Fixtures in `xtask/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `boot.c` (static, the Q4-4 boot executable), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so).
+//! Library: the engine `.so` (`qemu_spike::engine_so_file`, QEMU bridge plan Q5-1b), which the core dlopens through its C ABI; the rlib route is retired. Fixtures in `xtask/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb/arm64`, from `xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`): `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest library directories `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android` that the Q4-5 harness puts on the guest's library path.
 //! Harnesses: `cargo test -p atl-native-bridge --test <name>` (each selects the QEMU engine itself), harness-less; each header lists its env and checks.
 //! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
 //! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). `qe_guest_base` is retired (Q5-1b): the engine's command line is `-B 0` and the C ABI has no base argument, so there is no nonzero-base run to refuse. The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
 //! - `qemu_dlopen` (Q4-5 guest dlopen): checks s (started), i (the stub libc intercepted stubs), d (dlopen returned a handle), y (dlsym found both functions), c (libfix's constructor saw libdep's relocated value), v (fix_value()). Break: `skip_reloc` (harness-level: the run's libdep.so has DT_ANDROID_RELRSZ zeroed, so its packed RELATIVE relocations are not applied; no product cfg). The AT_RANDOM break was dropped: nothing on this path aborts without AT_RANDOM.
+//! - `qemu_staged` (Q6-5 staging): the engine `.so` and the boot executable placed as a test image places them (atld_run.rs `qemu_engine_files`) into a stage root; the harness runs in a bwrap mount namespace whose `/system` is that root's, and `engine::select` boots from the installed paths, no override. Check b (booted). Break: `no_boot_exe` (harness-level: the stage without the boot executable).
 //!
 //! Pass: every check prints ok and the run exits 0; each break must turn its run red. Output: `<out>/qemu/<target>-linux-user-pic/qemu-linker/`, one log per run.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, ensure};
 use object::{Object, ObjectSection};
 
+use crate::atld_run;
+use crate::deps;
 use crate::jni_fixture::{self, NdkTarget};
 use crate::qemu::{self, GUEST_API};
 use crate::qemu_spike;
@@ -102,7 +106,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &["-static"],
         &[],
     )?;
-    let boot = guest_build(root, &target, "boot", &dir.join("boot"), &["-static"], &[])?;
+    let boot = qemu::boot_exe(root, &b, &dir)?;
     let exe = guest_build(
         root,
         &target,
@@ -180,6 +184,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         }
     }
+    let mut runs: Vec<Option<&str>> = vec![None];
+    if !args.no_breaks {
+        runs.extend(STAGED.breaks.iter().map(|b| Some(*b)));
+    }
+    for brk in runs {
+        total += 1;
+        let name = format!("{}-{}", STAGED.test, brk.unwrap_or("plain"));
+        if let Err(e) = staged(root, &dir, &b.arch, &so, &boot, brk, &name) {
+            fails.push(Failure::step(&name, format!("{e:#}")));
+        }
+    }
     let verdict = Verdict {
         cmd: "qemu-linker",
         total: Some((total, "runs")),
@@ -251,6 +266,68 @@ fn skip_relative(so: &Path, out: &Path) -> Result<()> {
     std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))
 }
 
+/// Harness-level break of `qemu_staged`: the stage leaves the boot executable out.
+const NO_BOOT_EXE: &str = "no_boot_exe";
+/// Breaks that change the run's files, not the product build: never passed as ATL_NB_BREAK.
+const HARNESS_BREAKS: [&str; 2] = [SKIP_RELOC, NO_BOOT_EXE];
+/// The Q6-5 staged boot (module doc).
+const STAGED: Harness = Harness {
+    test: "qemu_staged",
+    prefix: "qemu-staged",
+    checks: &['b'],
+    breaks: &[NO_BOOT_EXE],
+};
+
+/// One `qemu_staged` run: `<dir>/<name>-root` holds the test image's engine files at their Android paths (the boot executable left out under [`NO_BOOT_EXE`]); the harness runs under bwrap with that root's `/system` as `/system` and the host's top-level entries as they are.
+fn staged(
+    root: &Path,
+    dir: &Path,
+    isa: &str,
+    so: &Path,
+    boot: &Path,
+    brk: Option<&str>,
+    name: &str,
+) -> Result<()> {
+    let stage = dir.join(format!("{name}-root"));
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).with_context(|| format!("removing {}", stage.display()))?;
+    }
+    let skip = atl_android_paths::engine_boot(isa);
+    for (src, android) in atld_run::qemu_engine_files(isa, so, boot) {
+        if brk == Some(NO_BOOT_EXE) && android == skip {
+            continue;
+        }
+        let at = stage.join(android.trim_start_matches('/'));
+        let parent = at.parent().context("staged path has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::copy(&src, &at)
+            .with_context(|| format!("copying {} to {}", src.display(), at.display()))?;
+    }
+    let system = atl_android_paths::SYSTEM;
+    // bwrap's root is a tmpfs, so /system can be made on it; every host top-level entry is bound as it is (devices included: cargo, sccache), except one named /system
+    let mut wrap: Vec<OsString> = vec![deps::binary(root, "bubblewrap")?.into()];
+    for entry in std::fs::read_dir("/").context("listing /")? {
+        let path = entry?.path();
+        if path == Path::new(system) {
+            continue;
+        }
+        if let Ok(target) = std::fs::read_link(&path) {
+            wrap.extend(["--symlink".into(), target.into(), path.into()]);
+        } else {
+            wrap.extend(["--dev-bind".into(), path.clone().into(), path.into()]);
+        }
+    }
+    wrap.extend([
+        "--ro-bind".into(),
+        stage.join(system.trim_start_matches('/')).into(),
+    ]);
+    // no `--` before the command: unit_use inserts cargo's --message-format before the first `--` (cargo's own); the command is an absolute path, never taken for an option
+    wrap.extend([system.into(), "--die-with-parent".into()]);
+    let env: [(&str, &Path); 1] = [("ATL_NB_STAGED", Path::new("1"))];
+    harness_in(root, dir, &STAGED, &env, dir, brk, name, &wrap)
+}
+
 /// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit). `dllibs` is the guest library directory of `qemu_dlopen` (ATL_NB_DLLIBS).
 pub(crate) fn harness(
     root: &Path,
@@ -261,10 +338,29 @@ pub(crate) fn harness(
     brk: Option<&str>,
     name: &str,
 ) -> Result<()> {
+    harness_in(root, dir, h, env, dllibs, brk, name, &[])
+}
+
+/// [`harness`] with `wrap` (a command and its arguments, e.g. bwrap's) run around cargo.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "harness's arguments plus the wrapper"
+)]
+fn harness_in(
+    root: &Path,
+    dir: &Path,
+    h: &Harness,
+    env: &[(&str, &Path)],
+    dllibs: &Path,
+    brk: Option<&str>,
+    name: &str,
+    wrap: &[OsString],
+) -> Result<()> {
     // `timeout -s KILL` kills the run's whole process group and exits 137 (not 124): a hung run is a failed run either way
     let mut cmd = Command::new("timeout");
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())
+        .args(wrap)
         .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args([
         "test",
@@ -282,7 +378,9 @@ pub(crate) fn harness(
     .current_dir(root);
     match brk {
         // a harness-level break changes the fixture files, not the product build
-        Some(b) if b != SKIP_RELOC && h.breaks.contains(&b) => cmd.env("ATL_NB_BREAK", b),
+        Some(b) if !HARNESS_BREAKS.contains(&b) && h.breaks.contains(&b) => {
+            cmd.env("ATL_NB_BREAK", b)
+        }
         // a break the harness does not list is in the caller's env (an engine break): this run is judged as a break, the native build is plain
         _ => cmd.env_remove("ATL_NB_BREAK"),
     };
