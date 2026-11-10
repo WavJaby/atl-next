@@ -46,7 +46,10 @@ pub fn display_line(node: Option<&str>, renderer: &str) -> String {
 
 /// The display's (node, renderer) from the probe's output: its last [`DISPLAY_LINE`]; None when no well-formed line is there.
 pub fn parse_display_line(text: &str) -> Option<(Option<String>, String)> {
-    let line = text.lines().rev().find_map(|l| l.strip_prefix(DISPLAY_LINE))?;
+    let line = text
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(DISPLAY_LINE))?;
     let rest = line.trim_start().strip_prefix("node=")?;
     let (node, renderer) = rest.split_once(" renderer=")?;
     let node = (node != NO_NODE).then(|| node.to_owned());

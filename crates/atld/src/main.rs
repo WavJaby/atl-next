@@ -660,7 +660,10 @@ impl Host {
         }
         if let Some((node, source)) = &self.gpu {
             props.push((node::RENDER_NODE_PROPERTY.to_owned(), node.clone()));
-            props.push((node::NODE_SOURCE_PROPERTY.to_owned(), source.name().to_owned()));
+            props.push((
+                node::NODE_SOURCE_PROPERTY.to_owned(),
+                source.name().to_owned(),
+            ));
         }
         let path = self.root.process_properties(uid, name);
         std::fs::write(&path, atl_property_service::area(&props)?)

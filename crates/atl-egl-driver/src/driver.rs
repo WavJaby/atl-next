@@ -399,7 +399,9 @@ mod tests {
 fn choose_display(host: &Arc<Host>) -> Result<(Display, String)> {
     let get = |name: &str| {
         property(name)?.with_context(|| {
-            format!("{name} is unset: no gralloc node in this process (atld names it with --gralloc)")
+            format!(
+                "{name} is unset: no gralloc node in this process (atld names it with --gralloc)"
+            )
         })
     };
     let node = get(node::RENDER_NODE_PROPERTY)?;

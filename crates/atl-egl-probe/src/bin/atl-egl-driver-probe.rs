@@ -25,8 +25,8 @@ use atl_egl_driver::abi::window as w;
 use atl_gralloc::descriptor::Descriptor;
 use atl_gralloc::format::{DRM_FORMAT_ABGR8888, RGBA_8888};
 use atl_gralloc::handle::{NUM_FDS, NUM_INTS, Params};
-use atl_gralloc::shared::PAGE_SIZE;
 use atl_gralloc::node::{self, NodeSource};
+use atl_gralloc::shared::PAGE_SIZE;
 use atl_gralloc::usage;
 use atl_gralloc_dmabuf::{Mapping, SYNC_READ, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::{Backend, DRM_DIR};
@@ -300,7 +300,9 @@ fn base(magic: u32, size: usize) -> w::android_native_base_t {
 static PROPERTIES: OnceLock<Vec<(CString, CString)>> = OnceLock::new();
 
 /// bionic's `__system_property_get`, exported from this executable (build.rs) so the driver finds it in the global scope as it does in an app process: copies the value and returns its length, 0 when unset.
-/// SAFETY: the caller passes a NUL-terminated name and a buffer of PROP_VALUE_MAX (92) bytes, bionic's contract.
+///
+/// # Safety
+/// The caller passes a NUL-terminated name and a buffer of PROP_VALUE_MAX (92) bytes, bionic's contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __system_property_get(
     name: *const std::ffi::c_char,
