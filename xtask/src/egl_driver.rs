@@ -71,15 +71,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ))
     };
     let control = |name: &str, (passed, text, _): (bool, String, String), mark: &str| {
-        let caught = !passed && text.contains(mark);
-        println!(
-            "egl-driver: break {name}: {}",
-            if caught {
-                "red (expected)"
-            } else {
-                "NOT caught"
-            }
-        );
+        // the probe's own line that caught the break, verbatim: the evidence, not just the verdict
+        let hit = (!passed)
+            .then(|| text.lines().find(|l| l.contains(mark)))
+            .flatten();
+        match hit {
+            Some(line) => println!("egl-driver: break {name}: red (expected): {}", line.trim()),
+            None => println!("egl-driver: break {name}: NOT caught"),
+        }
+        let caught = hit.is_some();
         if !caught {
             print!("{text}");
             bail!("egl-driver: FAILED control: break {name} passed");
