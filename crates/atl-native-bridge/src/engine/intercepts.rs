@@ -5,13 +5,15 @@
 
 use std::ffi::c_void;
 
-use super::thread::layout;
+use super::thread::layout::{identity, qemu};
 use super::{call_guest, thread};
 
-// the pass-through set's types: bionic guest view == glibc host view
+// the pass-through set's types: bionic guest view == glibc host view, for both engines' guests
 const _: () = {
-    assert!(layout::pthread_attr_t::SIZE == size_of::<libc::pthread_attr_t>());
-    assert!(layout::pthread_attr_t::ALIGN == align_of::<libc::pthread_attr_t>());
+    assert!(identity::pthread_attr_t::SIZE == size_of::<libc::pthread_attr_t>());
+    assert!(identity::pthread_attr_t::ALIGN == align_of::<libc::pthread_attr_t>());
+    assert!(qemu::pthread_attr_t::SIZE == size_of::<libc::pthread_attr_t>());
+    assert!(qemu::pthread_attr_t::ALIGN == align_of::<libc::pthread_attr_t>());
     assert!(size_of::<libc::pthread_t>() == size_of::<std::ffi::c_long>());
     assert!(size_of::<libc::pthread_key_t>() == size_of::<std::ffi::c_int>());
 };

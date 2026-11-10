@@ -9,21 +9,74 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{HostThread, active, call_guest};
+use super::{Active, HostThread, active, call_guest};
 
-/// Generated layouts (`SIZE`, `ALIGN`, one offset per field, `bits::<field>` = (shift, width) of a bit-field).
-#[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
+/// Generated layouts, one per engine's guest bionic view (`SIZE`, `ALIGN`, one offset per field, `bits::<field>` = (shift, width) of a bit-field, the TLS slot macros): `identity` = the host arch, `qemu` = arm64. tls_defines.h slots differ per arch (x86_64 0..10, arm64 -3..7).
 pub(super) mod layout {
-    include!(concat!(env!("OUT_DIR"), "/bionic_thread.rs"));
+    #[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
+    pub mod identity {
+        include!(concat!(env!("OUT_DIR"), "/bionic_thread_identity.rs"));
+    }
+    #[allow(clippy::all, dead_code, reason = "generated from bionic's headers")]
+    pub mod qemu {
+        include!(concat!(env!("OUT_DIR"), "/bionic_thread_qemu.rs"));
+    }
 }
-use layout::{NativeBridgeStaticTlsConfig as tls_config, bionic_tls, pthread_internal_t as record};
 
-/// `uint32_t cached_pid_ : 31; uint32_t vforked_ : 1;` (pthread_internal.h): both in one `uint32_t` storage unit.
-const PID_UNIT: usize = record::cached_pid_;
-const _: () = {
-    assert!(record::vforked_ == PID_UNIT);
-    assert!(record::bits::cached_pid_.0 + record::bits::cached_pid_.1 <= u32::BITS);
-};
+/// What this file reads of one guest's generated layout: the active engine's ([`abi`]).
+#[derive(Clone, Copy)]
+struct Abi {
+    record_size: usize,
+    record_align: usize,
+    tid: usize,
+    /// `uint32_t cached_pid_ : 31; uint32_t vforked_ : 1;` (pthread_internal.h): both in one `uint32_t` storage unit.
+    pid_unit: usize,
+    /// (shift, width) of `cached_pid_`
+    pid_bits: (u32, u32),
+    /// the record's `bionic_tls` pointer field
+    bionic_tls: usize,
+    tls_size: usize,
+    tls_align: usize,
+    /// `NativeBridgeStaticTlsConfig`: size, tpoff, init_img, tls_slot_thread_id, tls_slot_bionic_tls
+    cfg: [usize; 5],
+}
+
+macro_rules! abi {
+    ($m:ident) => {{
+        use layout::$m::{
+            NativeBridgeStaticTlsConfig as c, bionic_tls as t, pthread_internal_t as r,
+        };
+        const _: () = {
+            assert!(r::vforked_ == r::cached_pid_);
+            assert!(r::bits::cached_pid_.0 + r::bits::cached_pid_.1 <= u32::BITS);
+        };
+        Abi {
+            record_size: r::SIZE,
+            record_align: r::ALIGN,
+            tid: r::tid,
+            pid_unit: r::cached_pid_,
+            pid_bits: r::bits::cached_pid_,
+            bionic_tls: r::bionic_tls,
+            tls_size: t::SIZE,
+            tls_align: t::ALIGN,
+            cfg: [
+                c::size,
+                c::tpoff,
+                c::init_img,
+                c::tls_slot_thread_id,
+                c::tls_slot_bionic_tls,
+            ],
+        }
+    }};
+}
+
+/// The active engine's guest layout.
+fn abi() -> Abi {
+    match active() {
+        Active::Identity => abi!(identity),
+        Active::Qemu => abi!(qemu),
+    }
+}
 
 thread_local! {
     static RECORD: Cell<usize> = const { Cell::new(0) };
@@ -74,7 +127,7 @@ pub fn attach_current() -> *mut HostThread {
             let ht: *mut HostThread = HostThread::leak();
             // SAFETY: `tp` is a fresh guest TCB inside static TLS; `ht` is leaked until this thread's detach, after which no guest code runs on `tp`.
             unsafe {
-                active::init_tcb(tp, ht);
+                active().init_tcb(tp, ht);
                 (*ht).set_guest_fs(tp);
             }
             ht
@@ -111,7 +164,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
             }
             ran = true;
             // plan O2 (Q5): under QEMU a guest destructor needs the crossing on the exiting thread; only the boot thread has one until guest threads land (Q5), so a non-NULL value traps here. Delete with the QEMU shim list in build.rs.
-            if cfg!(feature = "qemu-guest") {
+            if active() == Active::Qemu {
                 super::unsupported(
                     "qemu crossing: a guest destructor runs at thread exit: pending: shim under QEMU, Q5",
                 );
@@ -156,14 +209,12 @@ fn release_record() {
     if rec == 0 {
         return;
     }
-    // SAFETY: `rec` and its `bionic_tls` were allocated by `build` with these layouts.
+    let a = abi();
+    // SAFETY: `rec` and its `bionic_tls` were allocated by `build` with these layouts (the engine is chosen once per process).
     unsafe {
-        let tls = (rec as *const u8)
-            .add(record::bionic_tls)
-            .cast::<usize>()
-            .read();
-        free(tls, bionic_tls::SIZE, bionic_tls::ALIGN);
-        free(rec, record::SIZE, record::ALIGN);
+        let tls = (rec as *const u8).add(a.bionic_tls).cast::<usize>().read();
+        free(tls, a.tls_size, a.tls_align);
+        free(rec, a.record_size, a.record_align);
     }
 }
 
@@ -210,20 +261,15 @@ pub fn static_tls() -> Option<StaticTls> {
 /// # Safety
 /// `config` must point at a complete `NativeBridgeStaticTlsConfig` of the generated layout.
 pub unsafe fn configure(config: *const u8) {
+    let [size, tpoff, init_img, slot_thread_id, slot_bionic_tls] = abi().cfg;
     // SAFETY: caller contract; offsets and field types per the generated layout (`size_t`, `size_t`, `const void*`, `int`, `int`).
     let t = unsafe {
         StaticTls {
-            size: config.add(tls_config::size).cast::<usize>().read(),
-            tpoff: config.add(tls_config::tpoff).cast::<usize>().read(),
-            init_img: config.add(tls_config::init_img).cast::<usize>().read(),
-            slot_thread_id: config
-                .add(tls_config::tls_slot_thread_id)
-                .cast::<i32>()
-                .read(),
-            slot_bionic_tls: config
-                .add(tls_config::tls_slot_bionic_tls)
-                .cast::<i32>()
-                .read(),
+            size: config.add(size).cast::<usize>().read(),
+            tpoff: config.add(tpoff).cast::<usize>().read(),
+            init_img: config.add(init_img).cast::<usize>().read(),
+            slot_thread_id: config.add(slot_thread_id).cast::<i32>().read(),
+            slot_bionic_tls: config.add(slot_bionic_tls).cast::<i32>().read(),
         }
     };
     if let Ok(mut g) = STATIC_TLS.lock() {
@@ -231,7 +277,7 @@ pub unsafe fn configure(config: *const u8) {
     }
 }
 
-/// The calling thread's guest static TLS, as bionic's `__allocate_thread` + `__init_tcb` make one (pthread_create.cpp): `init_img` copied, the thread-id slot = this thread's record, the bionic-TLS slot = its `bionic_tls`. Returns the thread pointer; the arch's own TCB words (x86 self pointer) are `active::init_tcb`'s. Leaked: the thread's for its life.
+/// The calling thread's guest static TLS, as bionic's `__allocate_thread` + `__init_tcb` make one (pthread_create.cpp): `init_img` copied, the thread-id slot = this thread's record, the bionic-TLS slot = its `bionic_tls`. Returns the thread pointer; the arch's own TCB words (x86 self pointer) are `Active::init_tcb`'s. Leaked: the thread's for its life.
 /// Pointer-sized slots are host words: the identity engine's guest has the host's pointer width.
 pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
     if t.tpoff > t.size || t.size == 0 {
@@ -254,7 +300,7 @@ pub fn alloc_static_tls(t: &StaticTls) -> Result<usize, String> {
         std::ptr::copy_nonoverlapping(t.init_img as *const u8, block, t.size);
         let tp = block.add(t.tpoff).cast::<usize>();
         let tls = (rec as *const u8)
-            .add(record::bionic_tls)
+            .add(abi().bionic_tls)
             .cast::<usize>()
             .read();
         tp.offset(t.slot_thread_id as isize).write(rec);
@@ -277,18 +323,19 @@ fn zeroed(size: usize, align: usize) -> *mut u8 {
 }
 
 fn build() -> usize {
-    let tls = zeroed(bionic_tls::SIZE, bionic_tls::ALIGN);
-    let rec = zeroed(record::SIZE, record::ALIGN);
+    let a = abi();
+    let tls = zeroed(a.tls_size, a.tls_align);
+    let rec = zeroed(a.record_size, a.record_align);
     // SAFETY: plain syscalls without arguments.
     let (tid, pid) = unsafe { (libc::gettid(), libc::getpid()) };
-    let (shift, width) = record::bits::cached_pid_;
+    let (shift, width) = a.pid_bits;
     let mask = (1u32 << width) - 1;
     let pid_bits = (pid as u32 & mask) << shift;
-    // SAFETY: offsets inside `rec` (SIZE bytes) per the generated layout; `tid` is `pid_t` (i32), the pid unit `uint32_t`, `bionic_tls` a pointer; each at its natural alignment there (clang's layout).
+    // SAFETY: offsets inside `rec` (record_size bytes) per the generated layout; `tid` is `pid_t` (i32), the pid unit `uint32_t`, `bionic_tls` a pointer; each at its natural alignment there (clang's layout).
     unsafe {
-        rec.add(record::tid).cast::<i32>().write(tid);
-        rec.add(PID_UNIT).cast::<u32>().write(pid_bits);
-        rec.add(record::bionic_tls).cast::<*mut u8>().write(tls);
+        rec.add(a.tid).cast::<i32>().write(tid);
+        rec.add(a.pid_unit).cast::<u32>().write(pid_bits);
+        rec.add(a.bionic_tls).cast::<*mut u8>().write(tls);
     }
     rec as usize
 }

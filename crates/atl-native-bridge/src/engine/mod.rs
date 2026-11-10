@@ -4,36 +4,225 @@
 //! The linker is run directly (AT_ENTRY = its own `_start`, bionic linker_main.cpp `__linker_init`): it loads the main executable named by argv[1] itself -- NBS `app_process64`, the guest main executable berberis also starts -- links its closure, runs every constructor, and returns the executable's entry, which the engine does not jump to.
 //! Every thread that runs guest code has its own `HostThread` + guest static TLS (thread.rs attach/detach); guest threads are glibc threads (intercepts.rs `pthread_create`).
 
-/// The crossing: the host arch's FS switch (`identity/mod.rs`), or with feature `qemu-guest` QEMU's binding thunks (`qemu/mod.rs`, placement in `qemu/place.rs`). Both provide the functions shared code calls (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...). Guest calls go through `call_guest` / `call_bootstrap` below, which are `Engine::call` on `active::CROSSING` in both builds.
-#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
-#[path = "identity/mod.rs"]
-pub mod identity;
-#[cfg(feature = "qemu-guest")]
-pub mod qemu;
-/// The engine this build selects: shared code reaches it as `active::` in both builds.
-#[cfg(all(target_arch = "x86_64", not(feature = "qemu-guest")))]
-pub use identity as active;
-#[cfg(feature = "qemu-guest")]
-pub use qemu as active;
 mod args;
 pub mod bindings;
+/// The crossings, both compiled into every core: the host arch's FS switch (`identity/mod.rs`) and QEMU's binding thunks (`qemu/mod.rs`, placement in `qemu/place.rs`). Shared code reaches the process's one through [`active`] (an [`Active`]), whose methods dispatch to the functions both provide (`is_stub`, `patch_site`, `patch_hook`, `patch_entry`, `bind`, ...).
+#[cfg(target_arch = "x86_64")]
+pub mod identity;
 pub mod image;
 mod intercepts;
 pub mod jni;
 mod ndk;
 mod provider;
-#[cfg(not(feature = "qemu-guest"))]
+pub mod qemu;
 pub mod signal;
 pub mod thread;
 pub mod vdso;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-pub use active::HostThread;
+pub use identity::HostThread;
 use image::Image;
 
+/// The process's engine, chosen once (QEMU bridge plan 2.3, D-3): ART's `initialize` names the app's ISA ([`select`]); a process that never calls it runs the identity engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Active {
+    /// the host ISA: guest bionic built for the host arch, the FS switch
+    Identity,
+    /// a foreign ISA (arm64): the engine `.so` (atl-android-paths `engine_library`)
+    Qemu,
+}
+
+static ACTIVE: OnceLock<Active> = OnceLock::new();
+
+/// The process's engine: [`select`]'s choice, identity when none was made (fixed from the first call on).
+pub fn active() -> Active {
+    *ACTIVE.get_or_init(|| Active::Identity)
+}
+
+/// Chooses the process's engine for app ISA `isa` (`None`: ART named none) and starts it ([`Engine::start`]). A second call must name the same engine: one bridge per process, one ABI per app (plan README "only one process width"), so a second foreign ISA is refused.
+pub fn select(isa: Option<&str>) -> Result<Active, String> {
+    let engine = claim(isa)?;
+    engine.start()?;
+    Ok(engine)
+}
+
+/// Makes the engine for `isa` the process's ([`decide`]) without starting it. [`select`] starts it next; `qemu::boot` claims QEMU itself, so a process that boots QEMU directly (the QEMU gates) runs it everywhere.
+pub fn claim(isa: Option<&str>) -> Result<Active, String> {
+    let want = decide(ACTIVE.get().copied(), isa)?;
+    let got = *ACTIVE.get_or_init(|| want);
+    if got != want {
+        return Err(format!(
+            "ISA {isa:?}: engine {want:?} lost the race to {got:?}"
+        ));
+    }
+    Ok(got)
+}
+
+/// The engine for ISA `isa` in a process already running `current`: none or the host ISA -> identity, QEMU's guest ISA -> QEMU, anything else refused; a choice other than `current` is refused.
+fn decide(current: Option<Active>, isa: Option<&str>) -> Result<Active, String> {
+    let want = match isa {
+        // deliberate break (`ATL_NB_BREAK=host_qemu`): the host ISA routed to QEMU (unit test `selection`)
+        None | Some(identity::GUEST_ISA) if cfg!(atl_nb_host_qemu) => Active::Qemu,
+        None | Some(identity::GUEST_ISA) => Active::Identity,
+        Some(qemu::GUEST_ISA) => Active::Qemu,
+        Some(other) => return Err(format!("ISA {other}: no engine runs it")),
+    };
+    match current {
+        // deliberate break (`ATL_NB_BREAK=second_isa`): a second ISA accepted (unit test `selection`)
+        Some(got) if got != want && !cfg!(atl_nb_second_isa) => Err(format!(
+            "ISA {isa:?} needs the {want:?} engine, but this process already runs {got:?}: one engine per process"
+        )),
+        _ => Ok(want),
+    }
+}
+
+impl Active {
+    /// The engine's guest ISA (atl-android-paths `native_bridge_bin` / `native_bridge_lib` directory).
+    pub fn guest_isa(self) -> &'static str {
+        match self {
+            Active::Identity => identity::GUEST_ISA,
+            Active::Qemu => qemu::GUEST_ISA,
+        }
+    }
+
+    /// The ELF machine of the libraries this engine runs (elf.rs `classify`): the host's, or QEMU's guest machine.
+    pub fn machine(self) -> Result<object::elf::Machine, String> {
+        match self {
+            Active::Identity => crate::elf::host_machine(),
+            Active::Qemu => Ok(qemu::GUEST_MACHINE),
+        }
+    }
+
+    /// Boots the engine ([`Engine::start`]); once per process, later calls answer the first's result.
+    fn start(self) -> Result<(), String> {
+        static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
+        STARTED
+            .get_or_init(|| match self {
+                Active::Identity => identity::CROSSING.start(),
+                Active::Qemu => qemu::CROSSING.start(),
+            })
+            .clone()
+    }
+
+    /// Whether this host can run the engine's crossing.
+    pub fn supported(self) -> bool {
+        match self {
+            Active::Identity => identity::supported(),
+            Active::Qemu => qemu::supported(),
+        }
+    }
+
+    /// The kernel's auxv for the guest (args.rs).
+    pub fn kernel_auxv(self) -> Result<Vec<(usize, usize)>, String> {
+        match self {
+            Active::Identity => identity::kernel_auxv(),
+            Active::Qemu => qemu::kernel_auxv(),
+        }
+    }
+
+    /// Makes `images` reachable by guest code.
+    pub fn map_guest(self, images: &[&Image]) -> Result<(), String> {
+        match self {
+            Active::Identity => identity::map_guest(images),
+            Active::Qemu => qemu::map_guest(images),
+        }
+    }
+
+    /// The engine's own words of guest TCB `tp`.
+    ///
+    /// # Safety
+    /// `tp` is a guest TCB, live while `ht` is used on it.
+    pub unsafe fn init_tcb(self, tp: usize, ht: *mut HostThread) {
+        // SAFETY: caller contract.
+        unsafe {
+            match self {
+                Active::Identity => identity::init_tcb(tp, ht),
+                Active::Qemu => qemu::init_tcb(tp, ht),
+            }
+        }
+    }
+
+    /// A guest-callable address that crosses to host function `target`; None when the engine's thunks are used up.
+    pub fn bind(self, target: usize) -> Option<usize> {
+        match self {
+            Active::Identity => identity::bind(target),
+            Active::Qemu => qemu::bind(target),
+        }
+    }
+
+    /// Whether `addr` holds an unbound interceptable stub of this engine's guest ISA.
+    pub fn is_stub(self, addr: usize) -> bool {
+        match self {
+            Active::Identity => identity::is_stub(addr),
+            Active::Qemu => qemu::is_stub(addr),
+        }
+    }
+
+    /// Points stub `addr` at `thunk`; false when `addr` is not a stub.
+    pub fn patch_site(self, addr: usize, thunk: usize) -> bool {
+        match self {
+            Active::Identity => identity::patch_site(addr, thunk),
+            Active::Qemu => qemu::patch_site(addr, thunk),
+        }
+    }
+
+    /// Routes the linker hook at `at` to host function `host`.
+    pub fn patch_hook(self, at: usize, host: usize) -> Result<(), &'static str> {
+        match self {
+            Active::Identity => identity::patch_hook(at, host),
+            Active::Qemu => qemu::patch_hook(at, host),
+        }
+    }
+
+    /// Routes the vdso entry whose value lies at `value_at` to host function `host`.
+    pub fn patch_entry(
+        self,
+        vdso: &Image,
+        value_at: usize,
+        host: usize,
+    ) -> Result<(), &'static str> {
+        match self {
+            Active::Identity => identity::patch_entry(vdso, value_at, host),
+            Active::Qemu => qemu::patch_entry(vdso, value_at, host),
+        }
+    }
+
+    /// The guest-callable address of JNI table slot `slot`.
+    pub fn jni_stub(self, slot: usize) -> usize {
+        match self {
+            Active::Identity => identity::jni_stub(slot),
+            Active::Qemu => qemu::jni_stub(slot),
+        }
+    }
+
+    /// A host-callable address that runs guest `target` (loader.rs trampolines). The QEMU crossing has none: unsupported until Q6.
+    pub fn down(self, target: usize, kind: identity::Down) -> Result<usize, String> {
+        match self {
+            Active::Identity => identity::down(target, kind),
+            Active::Qemu => {
+                Err("qemu crossing: host->guest trampolines are unsupported until Q6".into())
+            }
+        }
+    }
+
+    /// [`Engine::call`] on this engine.
+    ///
+    /// # Safety
+    /// As [`Engine::call`].
+    unsafe fn call(self, cpu: &mut HostThread, tp: Tp, f: usize, args: &[usize; 4]) -> usize {
+        // SAFETY: caller contract.
+        unsafe {
+            match self {
+                Active::Identity => identity::CROSSING.call(cpu, tp, f, args),
+                Active::Qemu => qemu::CROSSING.call(cpu, tp, f, args),
+            }
+        }
+    }
+}
+
 /// Host `sigaction(sig)`, then `signal::rewrap_all`: `handler(sig, info, ucontext)` runs on the host thread pointer even when the signal hit guest code (spike gate g3) -- the path every host handler takes, ART's sigchain included.
-#[cfg(not(feature = "qemu-guest"))]
 pub fn install_signal(
     sig: i32,
     handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void),
@@ -79,9 +268,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`), for the crossing's guest ISA (identity: the host's own; QEMU: arm64).
+    /// The guest as the sandbox holds it (atl-android-paths `native_bridge_bin` / `native_bridge_lib`), for the active engine's guest ISA (identity: the host's own; QEMU: arm64).
     pub fn installed() -> Config {
-        let isa = active::GUEST_ISA;
+        let isa = active().guest_isa();
         let bin = PathBuf::from(atl_android_paths::native_bridge_bin(isa));
         let lib = PathBuf::from(atl_android_paths::native_bridge_lib(isa));
         Config {
@@ -105,10 +294,12 @@ pub enum Tp {
     Guest(usize),
 }
 
-/// Runs guest code on a host thread's CPU and registers guest memory. Two implementations, one per build: `identity::Identity` (the host's FS switch) and `qemu::Qemu` (QEMU's crossing); `active::CROSSING` is the one this build selects.
+/// Runs guest code on a host thread's CPU and registers guest memory. Two implementations: `identity::Identity` (the host's FS switch) and `qemu::Qemu` (QEMU's crossing); [`Active`] dispatches to the process's one.
 pub trait Engine {
-    /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`active::attach_current`).
+    /// The host thread's guest CPU. Identity: its crossing record. QEMU: its record too; the engine CPU belongs to the thread (`qemu::attach_current`).
     type Cpu;
+    /// Boots the engine for this process ([`select`], once). Identity: checks the crossing is supported. QEMU: loads the engine `.so` (atl-android-paths `engine_library`) and gives the calling thread its guest CPU.
+    fn start(&self) -> Result<(), String>;
     /// Registers guest memory `[start, start + len)` with `prot` (`PROT_*`). Identity: nothing to register, host memory is guest memory. QEMU: page flags.
     fn map(&self, start: usize, len: usize, prot: u32) -> Result<(), String>;
     /// Runs guest `f(args)` on `cpu` with thread pointer `tp`; returns x0. Nests: may run from inside a host function the guest called.
@@ -132,7 +323,7 @@ pub(crate) unsafe fn call_guest(
 ) -> usize {
     let tp = Tp::Guest(cpu.guest_fs());
     // SAFETY: caller contract.
-    unsafe { active::CROSSING.call(cpu, tp, f, &[a, b, c, d]) }
+    unsafe { active().call(cpu, tp, f, &[a, b, c, d]) }
 }
 
 /// `Guest::start`'s bootstrap call (`Tp::Bootstrap`).
@@ -148,7 +339,7 @@ pub(crate) unsafe fn call_bootstrap(
     d: usize,
 ) -> usize {
     // SAFETY: caller contract.
-    unsafe { active::CROSSING.call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
+    unsafe { active().call(cpu, Tp::Bootstrap, f, &[a, b, c, d]) }
 }
 
 /// A started guest: the linker initialised, its libraries constructed.
@@ -158,7 +349,6 @@ pub struct Guest {
     /// the main executable's entry `__linker_init` returned
     pub exe_entry: usize,
     /// the starting thread's record: valid while that thread lives (force_host_fs only)
-    #[cfg(not(feature = "qemu-guest"))]
     start_thread: *mut HostThread,
 }
 
@@ -168,7 +358,8 @@ unsafe impl Send for Guest {}
 impl Guest {
     /// Maps and initialises the guest. Returns right after the crossing back, before any allocation, so a probe can run on whatever thread pointer the crossing left.
     pub fn start(cfg: &Config) -> Result<Guest, String> {
-        if !active::supported() {
+        let engine = active();
+        if !engine.supported() {
             return Err(
                 "FSGSBASE not available (HWCAP2_FSGSBASE): no user-mode thread-pointer switch"
                     .into(),
@@ -183,8 +374,8 @@ impl Guest {
         let init = linker
             .symbol("__dl___linker_init")
             .ok_or("linker64 has no __dl___linker_init")?;
-        let block = args::build(cfg, &linker, &vdso, &active::kernel_auxv()?)?;
-        active::map_guest(&[&linker, &vdso])?;
+        let block = args::build(cfg, &linker, &vdso, &engine.kernel_auxv()?)?;
+        engine.map_guest(&[&linker, &vdso])?;
         let thread = HostThread::leak();
         // SAFETY: __linker_init(void* raw_args) is the guest linker's C entry (bionic linker_main.cpp), `block` its kernel-layout argument block, leaked for the process's life.
         let exe_entry = unsafe { call_bootstrap(thread, init, block, 0, 0, 0) };
@@ -193,7 +384,7 @@ impl Guest {
             .ok_or("the guest linker reported no static TLS (__native_bridge_config_static_tls)")?;
         let tp = thread::alloc_static_tls(&tls)?;
         // SAFETY: `tp` is a fresh guest TCB inside static TLS (bionic's TCB words lie in it); the record is leaked.
-        unsafe { active::init_tcb(tp, &raw mut *thread) };
+        unsafe { engine.init_tcb(tp, &raw mut *thread) };
         thread.set_guest_fs(tp);
         let start_thread: *mut HostThread = thread;
         thread::adopt(start_thread);
@@ -201,7 +392,6 @@ impl Guest {
             linker,
             vdso,
             exe_entry,
-            #[cfg(not(feature = "qemu-guest"))]
             start_thread,
         })
     }
@@ -222,9 +412,28 @@ impl Guest {
     }
 
     /// Puts the host thread pointer back on the starting thread. Only for a probe that found the crossing left the guest's in place (g1's break): host TLS is unreadable then, so the record comes from `self`.
-    #[cfg(not(feature = "qemu-guest"))]
     pub fn force_host_fs(&self) {
         // SAFETY: the starting thread's record (the probe runs on it, which has not exited); host_fs is the value the crossing read before entering the guest.
-        unsafe { active::set_fs_base((*self.start_thread).host_fs()) }
+        unsafe { identity::set_fs_base((*self.start_thread).host_fs()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-3: host ISA (or none) -> identity, QEMU's ISA -> QEMU, an unknown ISA and a second, different engine refused. Red under breaks `host_qemu` and `second_isa`.
+    #[test]
+    fn selection() {
+        assert_eq!(decide(None, None), Ok(Active::Identity));
+        assert_eq!(
+            decide(None, Some(std::env::consts::ARCH)),
+            Ok(Active::Identity)
+        );
+        assert_eq!(decide(None, Some("arm64")), Ok(Active::Qemu));
+        assert!(decide(None, Some("mips")).is_err());
+        assert_eq!(decide(Some(Active::Qemu), Some("arm64")), Ok(Active::Qemu));
+        assert!(decide(Some(Active::Qemu), Some(std::env::consts::ARCH)).is_err());
+        assert!(decide(Some(Active::Identity), Some("arm64")).is_err());
     }
 }

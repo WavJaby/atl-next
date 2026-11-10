@@ -12,9 +12,7 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# QEMU guest (QEMU bridge plan Q4, Q5-1b): the engine crosses through QEMU's aarch64 user-mode core (`engine/qemu/mod.rs`), not the FS switch; the NB core ART loads is not built. The engine is the engine `.so` behind its C ABI (atl-engine-api), dlopened at run time: no cargo edge to the QEMU engine crate.
-[features]
-qemu-guest = []
+# Both engines are in every build, one chosen per process at NB `initialize` (engine/mod.rs `Active`). The QEMU engine is the engine `.so` behind its C ABI (atl-engine-api), dlopened at run time: no cargo edge to the QEMU engine crate.
 
 # spike gates g1-g4 (bridge-1 route N), harness-less (main thread only, no runner threads touching TLS); env in tests/common/mod.rs, stages needing a native-bridge build skip without one
 # g1: guest linker init through the crossing, host intact after
@@ -42,23 +40,20 @@ harness = false
 name = "g5"
 harness = false
 
-# Q4-3 gate: the six NB entries placed in place on the real arm64 linker64 and vdso, the pages registered with QEMU, a guest calls each site (QEMU bridge plan Q4-3); needs feature qemu-guest and the engine `.so` (ATL_ENGINE_SO)
+# Q4-3 gate: the six NB entries placed in place on the real arm64 linker64 and vdso, the pages registered with QEMU, a guest calls each site (QEMU bridge plan Q4-3); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
 [[test]]
 name = "qemu_linker"
 harness = false
-required-features = ["qemu-guest"]
 
-# Q4-4 gate: the real arm64 guest linker's __linker_init runs under QEMU from a BOOT trap and returns the main executable's entry (QEMU bridge plan Q4-4); needs feature qemu-guest and the engine `.so` (ATL_ENGINE_SO)
+# Q4-4 gate: the real arm64 guest linker's __linker_init runs under QEMU from a BOOT trap and returns the main executable's entry (QEMU bridge plan Q4-4); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
 [[test]]
 name = "qemu_start"
 harness = false
-required-features = ["qemu-guest"]
 
-# Q4-5 gate: a guest dlopen under QEMU: the main executable's dlopen loads a library whose DT_NEEDED is another, the stub libc intercepts (QEMU bridge plan Q4-5); needs feature qemu-guest and the engine `.so` (ATL_ENGINE_SO)
+# Q4-5 gate: a guest dlopen under QEMU: the main executable's dlopen loads a library whose DT_NEEDED is another, the stub libc intercepts (QEMU bridge plan Q4-5); selects the QEMU engine, needs the engine `.so` (ATL_ENGINE_SO)
 [[test]]
 name = "qemu_dlopen"
 harness = false
-required-features = ["qemu-guest"]
 
 [dependencies]
 atl-android-paths = { path = "../atl-android-paths" }

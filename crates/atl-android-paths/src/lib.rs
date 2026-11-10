@@ -26,6 +26,16 @@ pub fn native_bridge_bin(isa: &str) -> String {
     format!("{SYSTEM_BIN}/{isa}")
 }
 
+/// The translating engine `.so` for guest ISA `isa` (a host library, C ABI `atl_engine_v1`): the NB core dlopens it when ART's `initialize` names a foreign ISA. ART hands `initialize` only an app-private directory, so the location is fixed here.
+pub fn engine_library(isa: &str) -> String {
+    format!("{SYSTEM_LIB}/libatl_engine_{isa}.so")
+}
+
+/// The engine's boot executable for guest ISA `isa`: a static guest executable whose first instruction raises BOOT, run by [`engine_library`]'s engine at start; a guest binary, so beside the guest's `linker64`.
+pub fn engine_boot(isa: &str) -> String {
+    format!("{}/atl_engine_boot", native_bridge_bin(isa))
+}
+
 /// libEGL's Loader.cpp `VENDOR_LIB_EGL_DIR` for the process's pointer width: where it looks for `lib{EGL,GLESv1_CM,GLESv2}_<ro.hardware.egl>.so`.
 pub const VENDOR_EGL: &str = if cfg!(target_pointer_width = "64") {
     "/vendor/lib64/egl"

@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
-use atl_native_bridge::engine::{Config, Guest, active, vdso};
+use atl_native_bridge::engine::{Config, Guest, qemu, vdso};
 use object::{Object, ObjectSymbol, read::elf::ElfFile64};
 
 /// The dl_exe.c functions the host calls, in the order `SYMBOLS` lists them.
@@ -247,7 +247,7 @@ fn main() -> ExitCode {
         println!("qemu-dlopen: FAIL {e}");
         return ExitCode::from(2);
     }
-    let r = active::run(&so, &boot, cfg, started);
+    let r = qemu::run(&so, &boot, cfg, started);
     println!("qemu-dlopen: FAIL QEMU main returned {r:?}");
     ExitCode::from(2)
 }

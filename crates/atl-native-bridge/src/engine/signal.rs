@@ -8,7 +8,7 @@ use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::thread::layout;
+use super::thread::layout::identity as layout;
 use super::{call_guest, identity, thread};
 
 /// bionic LP64 `struct sigaction` / `sigaction64` (bits/signal_types.h `__SIGACTION_BODY`), offsets gated against the generated layout.

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Which libraries the NB core takes: `isSupported` answers from the file alone, as libnativeloader asks it after glibc's `dlopen` refused the path.
-//! Ours = an ELF of the host's machine (route N: identity engine, bridge-1 plan section 0) that links against bionic: DT_NEEDED `libc.so` (bionic's soname; glibc's is `libc.so.6`).
+//! Ours = an ELF of the process engine's machine (engine/mod.rs `Active::machine`: the host's for identity, the guest's for QEMU) that links against bionic: DT_NEEDED `libc.so` (bionic's soname; glibc's is `libc.so.6`).
 //! No symbol-version marker: NDK stubs without version nodes produced binaries with no verneed at all, and those are the old games; a `LIBC` verneed exists only in newer NDK output.
-//! A foreign machine is the QEMU engine's (bridge 2) and is refused until that engine exists.
+//! Another machine is not this process's engine's: one engine per process (QEMU bridge plan 2.3).
 //! The host machine is read from `/proc/self/exe`, so no arch name or constant is stored here (arches.toml stays the only arch list).
 
 use object::read::elf::{Dyn, FileHeader};
@@ -14,21 +14,21 @@ const BIONIC_LIBC: &[u8] = b"libc.so";
 /// What `classify` makes of a file.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Host machine, linked against bionic: ours.
+    /// The engine's machine, linked against bionic: ours.
     Bridged,
     /// Not an ELF object this reader parses (the reason).
     NotElf(String),
-    /// Another machine's code: the QEMU engine's, not built yet.
-    ForeignMachine {
+    /// Another machine's code than the process engine runs.
+    OtherMachine {
         lib: elf::Machine,
-        host: elf::Machine,
+        engine: elf::Machine,
     },
-    /// Host machine but no bionic marker: glibc's loader's business, not ours.
+    /// The engine's machine but no bionic marker: glibc's loader's business, not ours.
     NotBionic,
 }
 
-/// `lib`'s verdict on a host whose ELF machine is `host`.
-pub fn classify(lib: &[u8], host: elf::Machine) -> Verdict {
+/// `lib`'s verdict in a process whose engine runs ELF machine `engine`.
+pub fn classify(lib: &[u8], engine: elf::Machine) -> Verdict {
     let parsed = match FileKind::parse(lib) {
         Ok(FileKind::Elf32) => markers::<elf::FileHeader32<Endianness>>(lib),
         Ok(FileKind::Elf64) => markers::<elf::FileHeader64<Endianness>>(lib),
@@ -39,10 +39,10 @@ pub fn classify(lib: &[u8], host: elf::Machine) -> Verdict {
         Ok(m) => m,
         Err(e) => return Verdict::NotElf(e.to_string()),
     };
-    if m.machine != host {
-        return Verdict::ForeignMachine {
+    if m.machine != engine {
+        return Verdict::OtherMachine {
             lib: m.machine,
-            host,
+            engine,
         };
     }
     if m.needed.iter().any(|n| n == BIONIC_LIBC) {
@@ -125,9 +125,9 @@ mod tests {
         let other = elf::Machine(host.0.wrapping_add(1));
         assert_eq!(
             classify(&exe, other),
-            Verdict::ForeignMachine {
+            Verdict::OtherMachine {
                 lib: host,
-                host: other
+                engine: other
             }
         );
     }

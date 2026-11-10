@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atl_engine_api::{PROT_EXEC, PROT_READ, PROT_WRITE};
 
-use crate::engine::bindings::THUNKS;
+use crate::engine::bindings::qemu::THUNKS;
 use crate::engine::image::{Image, write_sealed};
 use crate::engine::{Engine as _, unsupported};
 

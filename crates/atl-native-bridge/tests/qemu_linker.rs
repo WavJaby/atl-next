@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use atl_native_bridge::engine::{active, image::Image, thread, vdso};
+use atl_native_bridge::engine::{self, image::Image, qemu, thread, vdso};
 
 // ARM ARM encodings, written out here: atl-bridgegen's constants are the code under test.
 /// `svc #0`: the base encoding, imm16 at bits 20:5.
@@ -147,7 +147,7 @@ fn place(linker_path: &Path, vdso_path: &Path) -> Result<Plan, String> {
     let mut ids = [0u32; 6];
     for (k, &site) in sites.iter().enumerate() {
         ids[k] = thunk_id(words_at(site)).map_err(|e| format!("{}: {e}", ORDER[k]))?;
-        if active::is_stub(site) {
+        if qemu::is_stub(site) {
             return Err(format!("{}: still a placeholder", ORDER[k]));
         }
     }
@@ -172,11 +172,11 @@ extern "C" fn stub_answer(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64
 
 /// Binds the fixture's intercept stub (its address arrives as R0) to `stub_answer` and writes the thunk over it, the write `intercept_symbol` makes.
 fn patch_stub(stub: usize) -> Result<(), String> {
-    if !active::is_stub(stub) {
+    if !qemu::is_stub(stub) {
         return Err("the fixture's stub is not the 8-byte placeholder".into());
     }
-    let thunk = active::bind(stub_answer as *const () as usize).ok_or("out of thunks")?;
-    if !active::patch_site(stub, thunk) {
+    let thunk = qemu::bind(stub_answer as *const () as usize).ok_or("out of thunks")?;
+    if !qemu::patch_site(stub, thunk) {
         return Err("patch_site refused the stub".into());
     }
     let id = thunk_id(words_at(stub))?;
@@ -185,13 +185,13 @@ fn patch_stub(stub: usize) -> Result<(), String> {
 }
 
 /// The engine's trap callback for this gate. BOOT only records the fixture's `run_sites`: the engine answers BOOT at once, and [`checks`] runs on the attached thread after it.
-fn on_trap(trap: active::Trap) -> u64 {
+fn on_trap(trap: qemu::Trap) -> u64 {
     match trap {
-        active::Trap::Boot(run_sites) => {
+        qemu::Trap::Boot(run_sites) => {
             RUN_SITES.store(run_sites, Ordering::Relaxed);
             0
         }
-        active::Trap::Report(v) => {
+        qemu::Trap::Report(v) => {
             let first = {
                 let mut reports = REPORTS.lock().expect("reports");
                 reports.push(v);
@@ -202,15 +202,15 @@ fn on_trap(trap: active::Trap) -> u64 {
             }
             0
         }
-        active::Trap::Bind { id, args } => {
+        qemu::Trap::Bind { id, args } => {
             TRAPS.lock().expect("traps").push((id, args));
             match PLAN.get() {
                 Some(plan) if id == plan.ids[POST_INIT] => 0,
                 Some(plan) if id == plan.ids[CALL_GUEST] => CALL_GUEST_ANSWER,
-                _ => active::on_trap(trap),
+                _ => qemu::on_trap(trap),
             }
         }
-        other => active::on_trap(other),
+        other => qemu::on_trap(other),
     }
 }
 
@@ -221,12 +221,12 @@ fn checks(run_sites: u64) -> u64 {
         return 1;
     };
     let page = (&raw const SITES) as usize;
-    let registered = active::register(&[&plan.linker, &plan.vdso])
-        .and_then(|()| active::register_data(page, std::mem::size_of::<SitePage>()));
+    let registered = qemu::register(&[&plan.linker, &plan.vdso])
+        .and_then(|()| qemu::register_data(page, std::mem::size_of::<SitePage>()));
     if !check('r', registered) {
         return 1;
     }
-    active::call(run_sites, &[page as u64]);
+    qemu::call(run_sites, &[page as u64]);
     u64::from(!verify(plan))
 }
 
@@ -313,6 +313,11 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
+    // placement below follows the process's engine: QEMU, before `boot` claims it again
+    if let Err(e) = engine::claim(Some(qemu::GUEST_ISA)) {
+        println!("qemu-linker: FAIL engine: {e}");
+        return ExitCode::from(2);
+    }
     let plan = match place(Path::new(&linker), Path::new(&vdso)) {
         Ok(plan) => plan,
         Err(e) => {
@@ -330,11 +335,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     // BOOT answers at once; the engine is then up, and the checks run on this thread
-    if let Err(e) = active::boot(Path::new(&so), Path::new(&fixture), on_trap) {
+    if let Err(e) = qemu::boot(Path::new(&so), Path::new(&fixture), on_trap) {
         println!("qemu-linker: FAIL boot: {e}");
         return ExitCode::from(2);
     }
-    if let Err(e) = active::attach_current() {
+    if let Err(e) = qemu::attach_current() {
         println!("qemu-linker: FAIL attach: {e}");
         return ExitCode::from(2);
     }

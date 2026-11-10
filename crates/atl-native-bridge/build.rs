@@ -64,7 +64,7 @@ fn bionic_thread(
             .iter()
             .map(|d| format!("-I{}", up.aosp(d).display())),
     );
-    let unit = out.join("bionic_thread.cc");
+    let unit = out.join(format!("bionic_thread_{}.cc", host.arch));
     std::fs::write(
         &unit,
         "#include \"bionic/pthread_internal.h\"\n#include \"native_bridge_support/linker/static_tls_config.h\"\n",
@@ -639,16 +639,18 @@ fn bindings_table(
         code.push_str("        ],\n    },\n");
     }
     code.push_str("];\n\n");
-    // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/arch/qemu.rs) is generated at this size (aarch64_pool.rs)
+    // one pool slot per binding plus the JNI slots (QEMU's JNI stubs are binding ids too), rounded to a power of two; the QEMU pool (engine/qemu/place.rs) is generated at the QEMU table's size (aarch64_pool.rs)
     let thunks = (total + FIXED_BINDINGS + JNI_STUBS).next_power_of_two();
-    std::fs::write(
-        out.join("aarch64_pool.rs"),
-        format!(
-            "{}{}",
-            atl_bridgegen::aarch64::constants_rust(),
-            atl_bridgegen::aarch64::pool_rust(u32::try_from(thunks)?)
-        ),
-    )?;
+    if qemu {
+        std::fs::write(
+            out.join("aarch64_pool.rs"),
+            format!(
+                "{}{}",
+                atl_bridgegen::aarch64::constants_rust(),
+                atl_bridgegen::aarch64::pool_rust(u32::try_from(thunks)?)
+            ),
+        )?;
+    }
     code.push_str(&format!(
         "/// Thunk pool slots: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two.\npub const THUNKS: usize = {thunks};\n\n/// JNI stubs: one per slot of the largest JNI table (build.rs `JNI_STUBS`).\npub const JNI_STUBS: usize = {JNI_STUBS};\n\n/// The bionic provider's soname (cargo-c's, build.rs `provider_soname`): `Host::Provider` resolves on its handle.\npub const PROVIDER_SONAME: &str = {provider_soname:?};\n\n"
     ));
@@ -657,10 +659,10 @@ fn bindings_table(
         code.push_str(&format!("    ({lib:?}, {name:?}, {why:?}),\n"));
     }
     code.push_str(
-        "];\n\n/// `trap::<i>` per `Entry::Trap(i)`.\npub const TRAPS: &[extern \"C\" fn()] = &[\n",
+        "];\n\n/// A trapped stub of this table: aborts, naming `TRAP_NAMES[I]`.\nextern \"C\" fn trap<const I: usize>() {\n    super::trapped(TRAP_NAMES[I])\n}\n\n/// `trap::<i>` per `Entry::Trap(i)`.\npub const TRAPS: &[extern \"C\" fn()] = &[\n",
     );
     for i in 0..traps.len() {
-        code.push_str(&format!("    super::trap::<{i}>,\n"));
+        code.push_str(&format!("    trap::<{i}>,\n"));
     }
     code.push_str("];\n");
     Ok(code)
@@ -697,6 +699,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("qe_id", "atl_nb_qe_id"),
     // Q4-4 (engine/vdso.rs `bind_linker`): the static-TLS hook keeps its placeholder, so the linker's `bl` branches to 0 and the start gate goes red
     ("qe_no_tls", "atl_nb_qe_no_tls"),
+    // Q5-5 (engine/mod.rs `decide`): the host ISA routed to the QEMU engine (unit test `engine::tests::selection`)
+    ("host_qemu", "atl_nb_host_qemu"),
+    // Q5-5 (engine/mod.rs `decide`): a second ISA needing another engine accepted in one process (unit test `engine::tests::selection`)
+    ("second_isa", "atl_nb_second_isa"),
 ];
 
 /// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
@@ -733,19 +739,14 @@ fn main() -> Result<()> {
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }
-    let qemu = std::env::var_os("CARGO_FEATURE_QEMU_GUEST").is_some();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let checkout = buildscript::checkout(&manifest)?;
     let up = Upstreams::of(&checkout)?;
     let arches = checkout.join("arches.toml");
     let arches_text = std::fs::read_to_string(&arches)?;
     let host = buildscript::host_arch(&arches_text, &std::env::var("TARGET")?)?;
-    // the guest's bionic view: the identity guest is the host arch, the QEMU guest arm64 (engine/qemu/mod.rs GUEST_ISA)
-    let guest = if qemu {
-        buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?
-    } else {
-        host.clone()
-    };
+    // one guest bionic view per engine, both compiled into one core (runtime selection, engine/mod.rs `Active`): identity = the host arch, QEMU = arm64 (engine/qemu/mod.rs GUEST_ISA)
+    let qemu_guest = buildscript::guest_arch(&arches_text, QEMU_GUEST_ARCH)?;
     let path = up.file(&format!("aosp/{HEADER}"))?;
     let target = Target {
         arch: host.arch.clone(),
@@ -788,15 +789,22 @@ fn main() -> Result<()> {
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     std::fs::write(out.join("native_bridge.rs"), code)?;
     std::fs::write(
-        out.join("bionic_thread.rs"),
-        bionic_thread(&up, &guest, &out)?,
+        out.join("bionic_thread_identity.rs"),
+        bionic_thread(&up, &host, &out)?,
+    )?;
+    std::fs::write(
+        out.join("bionic_thread_qemu.rs"),
+        bionic_thread(&up, &qemu_guest, &out)?,
     )?;
     std::fs::write(out.join("jni_tables.rs"), jni_tables(&up, &target)?)?;
     std::fs::write(out.join("provider.rs"), provider(&up, &host, &out)?)?;
-    std::fs::write(
-        out.join("bindings_table.rs"),
-        bindings_table(&up, &host, &out, &provider_soname(&manifest)?, qemu)?,
-    )?;
+    let provider_soname = provider_soname(&manifest)?;
+    for (name, qemu) in [("identity", false), ("qemu", true)] {
+        std::fs::write(
+            out.join(format!("bindings_table_{name}.rs")),
+            bindings_table(&up, &host, &out, &provider_soname, qemu)?,
+        )?;
+    }
     println!("cargo::rerun-if-changed={}", arches.display());
     for rel in std::iter::once(&HEADER)
         .chain(std::iter::once(&JNI_HEADER))

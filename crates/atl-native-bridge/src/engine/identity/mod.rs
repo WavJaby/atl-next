@@ -16,7 +16,7 @@ const FRAME_WORDS: usize = 4;
 
 /// Byte offset of `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` from the guest thread pointer (generated from bionic's tls_defines.h).
 const SLOT_OFFSET: usize = {
-    let slot = super::thread::layout::TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE;
+    let slot = super::thread::layout::identity::TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE;
     assert!(
         slot >= 0,
         "x86_64 bionic slots lie above the thread pointer"
@@ -150,8 +150,8 @@ macro_rules! restore_host_fs {
 static atl_nb_host_targets: [AtomicUsize; THUNKS] = [const { AtomicUsize::new(0) }; THUNKS];
 /// Next free thunk.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
-/// Thunks: one per binding, derived from the generated binding table (bindings.rs `THUNKS`); the asm's `.rept` takes this count.
-pub const THUNKS: usize = super::bindings::THUNKS;
+/// Thunks: one per binding, derived from this engine's generated binding table (build.rs `bindings_table`); the asm's `.rept` takes this count.
+pub const THUNKS: usize = super::bindings::identity::THUNKS;
 /// Bytes per thunk: `call rel32` (5) padded to 8 (`.p2align 3` below).
 const THUNK_BYTES: usize = 8;
 
@@ -727,11 +727,23 @@ pub fn set_signal_handler(sig: usize, handler: usize) {
 /// The identity engine: the host arch's crossing, one `atl_nb_call_guest` per call.
 pub struct Identity;
 
-/// The identity implementation of the seam, the one a native build selects (`mod.rs` `call_guest`).
+/// The identity implementation of the seam (`mod.rs` `Active::Identity`).
 pub const CROSSING: Identity = Identity;
 
 impl super::Engine for Identity {
     type Cpu = HostThread;
+
+    /// Nothing to boot: the crossing is the CPU's own FS switch, refused where user code cannot write FS.
+    fn start(&self) -> Result<(), String> {
+        if supported() {
+            Ok(())
+        } else {
+            Err(
+                "FSGSBASE not available (HWCAP2_FSGSBASE): no user-mode thread-pointer switch"
+                    .into(),
+            )
+        }
+    }
 
     fn map(&self, _start: usize, _len: usize, _prot: u32) -> Result<(), String> {
         Ok(())

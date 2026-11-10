@@ -7,10 +7,42 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
 
-use super::unsupported;
+use super::{Active, active, unsupported};
 
-mod table {
-    include!(concat!(env!("OUT_DIR"), "/bindings_table.rs"));
+/// The identity engine's table: the host arch's NBS libc stub list, every shim bound.
+pub(super) mod identity {
+    include!(concat!(env!("OUT_DIR"), "/bindings_table_identity.rs"));
+}
+
+/// The QEMU engine's table: the arm64 NBS libc stub list; shims the QEMU crossing cannot serve yet trap (build.rs `QEMU_SHIM_PENDING`).
+pub(super) mod qemu {
+    include!(concat!(env!("OUT_DIR"), "/bindings_table_qemu.rs"));
+}
+
+/// One engine's generated table.
+struct Table {
+    libs: &'static [Lib],
+    trap_names: &'static [(&'static str, &'static str, &'static str)],
+    traps: &'static [extern "C" fn()],
+    provider_soname: &'static str,
+}
+
+/// The table of the process's engine.
+fn table() -> Table {
+    match active() {
+        Active::Identity => Table {
+            libs: identity::LIBS,
+            trap_names: identity::TRAP_NAMES,
+            traps: identity::TRAPS,
+            provider_soname: identity::PROVIDER_SONAME,
+        },
+        Active::Qemu => Table {
+            libs: qemu::LIBS,
+            trap_names: qemu::TRAP_NAMES,
+            traps: qemu::TRAPS,
+            provider_soname: qemu::PROVIDER_SONAME,
+        },
+    }
 }
 
 /// The host library a `Generic` entry's symbol is looked up in.
@@ -41,10 +73,9 @@ pub struct Lib {
     pub stubs: &'static [(&'static str, Entry)],
 }
 
-/// The thunk pool: one per binding (build.rs: the stub rows, the fixed bindings and the JNI slots, rounded to a power of two). The x86 thunks and the QEMU pool (`qemu/place.rs`) are this size.
-pub const THUNKS: usize = table::THUNKS;
 /// JNI stubs per engine: one per slot of the largest JNI table (build.rs `JNI_STUBS`).
-pub const JNI_STUBS: usize = table::JNI_STUBS;
+pub const JNI_STUBS: usize = identity::JNI_STUBS;
+const _: () = assert!(identity::JNI_STUBS == qemu::JNI_STUBS);
 
 /// One row of the table, for gates outside the engine (xtask `gl-proxies`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,23 +89,23 @@ pub enum Binding {
     Trap(&'static str),
 }
 
-/// Every (library, stub name, binding) of the table, in table order.
+/// Every (library, stub name, binding) of the process engine's table, in table order.
 pub fn rows() -> impl Iterator<Item = (&'static str, &'static str, Binding)> {
-    table::LIBS.iter().flat_map(|l| {
-        l.stubs.iter().map(|&(name, e)| {
+    let t = table();
+    t.libs.iter().flat_map(move |l| {
+        l.stubs.iter().map(move |&(name, e)| {
             let b = match e {
                 Entry::Generic(host, symbol) => Binding::Generic { host, symbol },
                 Entry::Shim => Binding::Shim,
-                Entry::Trap(i) => Binding::Trap(table::TRAP_NAMES[i].2),
+                Entry::Trap(i) => Binding::Trap(t.trap_names[i].2),
             };
             (l.soname, name, b)
         })
     })
 }
 
-/// A trapped stub: calling it aborts, naming the stub and why it is trapped.
-extern "C" fn trap<const I: usize>() {
-    let (lib, name, why) = table::TRAP_NAMES[I];
+/// A trapped stub (each generated table's `trap::<I>`): aborts, naming the stub and why it is trapped.
+fn trapped((lib, name, why): (&str, &str, &str)) {
     unsupported(&format!(
         "guest stub {lib}:{name} has no host binding ({why})"
     ))
@@ -88,7 +119,6 @@ fn shim(name: &str) -> Option<usize> {
         "pthread_key_delete" => super::intercepts::pthread_key_delete as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
-        #[cfg(not(feature = "qemu-guest"))]
         "sigaction" | "sigaction64" => super::signal::sigaction as *const () as usize,
         "AAssetManager_fromJava" => super::ndk::asset_manager_from_java as *const () as usize,
         "AndroidBitmap_getInfo" => super::ndk::bitmap_get_info as *const () as usize,
@@ -147,7 +177,7 @@ fn handle(host: Host, soname: &str) -> Option<usize> {
             libc::RTLD_NOW,
         ),
         Host::Provider => (
-            table::PROVIDER_SONAME.to_owned(),
+            table().provider_soname.to_owned(),
             libc::RTLD_NOW | libc::RTLD_NOLOAD,
         ),
         Host::Glibc => ("libc.so.6".to_owned(), libc::RTLD_NOW | libc::RTLD_NOLOAD),
@@ -184,7 +214,8 @@ pub fn system_symbol(soname: &str, name: &str) -> Option<usize> {
 
 /// What `native_bridge_intercept_symbol(_, soname, name)` binds the guest stub to; None when `soname` is not in the table.
 pub fn target(soname: &str, name: &str) -> Option<Target> {
-    let lib = table::LIBS.iter().find(|l| l.soname == soname)?;
+    let table = table();
+    let lib = table.libs.iter().find(|l| l.soname == soname)?;
     let entry = lib.stubs.iter().find(|(n, _)| *n == name).map(|&(_, e)| e);
     let found = |a: Option<usize>| match a {
         Some(a) => (Target::Host(a), 0),
@@ -194,9 +225,9 @@ pub fn target(soname: &str, name: &str) -> Option<Target> {
         Some(Entry::Generic(host, sym)) => found(symbol(host, lib.soname, sym)),
         Some(Entry::Shim) => found(shim(name)),
         Some(Entry::Trap(i)) => {
-            let why = table::TRAP_NAMES[i].2;
+            let why = table.trap_names[i].2;
             let outcome = if why.starts_with("unbound") { 1 } else { 2 };
-            (Target::Trap(table::TRAPS[i] as usize), outcome)
+            (Target::Trap(table.traps[i] as usize), outcome)
         }
         None => (Target::Absent, 3),
     };

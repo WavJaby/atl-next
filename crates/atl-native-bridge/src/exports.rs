@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::elf::{self, Verdict};
-use crate::engine::Config;
-use crate::engine::active::Down;
+use crate::engine::identity::Down;
+use crate::engine::{self, Config};
 use crate::generated::{
     NativeBridgeCallbacks, NativeBridgeRuntimeCallbacks, NativeBridgeRuntimeValues,
     kJNICallTypeCriticalNative, kJNICallTypeRegular, native_bridge_namespace_t, siginfo_t,
@@ -39,10 +39,10 @@ fn fail(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = c);
 }
 
-/// The host's ELF machine, read once.
-fn host_machine() -> Option<obj_elf::Machine> {
-    static HOST: OnceLock<Option<obj_elf::Machine>> = OnceLock::new();
-    *HOST.get_or_init(|| elf::host_machine().ok())
+/// The ELF machine of the process engine's libraries, read once.
+fn engine_machine() -> Option<obj_elf::Machine> {
+    static MACHINE: OnceLock<Option<obj_elf::Machine>> = OnceLock::new();
+    *MACHINE.get_or_init(|| engine::active().machine().ok())
 }
 
 /// # Safety
@@ -52,13 +52,29 @@ unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a CStr> {
     (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) })
 }
 
+/// # Safety
+/// `instruction_set` is null or a NUL-terminated string (native_bridge.h).
 pub unsafe fn initialize(
     _runtime_cbs: *const NativeBridgeRuntimeCallbacks,
     _private_dir: *const c_char,
-    _instruction_set: *const c_char,
+    instruction_set: *const c_char,
 ) -> bool {
+    // SAFETY: the header's contract for `instruction_set`.
+    let isa = unsafe { str_arg(instruction_set) };
+    let isa = match isa.map(CStr::to_str).transpose() {
+        Ok(isa) => isa,
+        Err(_) => {
+            fail("initialize: instruction set is not UTF-8".into());
+            return false;
+        }
+    };
+    // the app's ISA picks the process's one engine (QEMU bridge plan 2.3): host ISA -> identity, a foreign ISA -> the engine `.so`
+    if let Err(e) = engine::select(isa) {
+        fail(format!("atl-native-bridge: initialize: {e}"));
+        return false;
+    }
     // ART calls this after FaultManager::Init: its claimed signals get the host-FS entry before any guest code runs
-    crate::engine::signal::rewrap_all();
+    engine::signal::rewrap_all();
     true
 }
 
@@ -121,13 +137,13 @@ pub unsafe fn isSupported(libpath: *const c_char) -> bool {
     let Some(path) = (unsafe { str_arg(libpath) }) else {
         return false;
     };
-    let Some(host) = host_machine() else {
+    let Some(machine) = engine_machine() else {
         return false;
     };
     let Ok(path) = path.to_str() else {
         return false;
     };
-    std::fs::read(path).is_ok_and(|data| elf::classify(&data, host) == Verdict::Bridged)
+    std::fs::read(path).is_ok_and(|data| elf::classify(&data, machine) == Verdict::Bridged)
 }
 
 pub unsafe fn getAppEnv(_instruction_set: *const c_char) -> *const NativeBridgeRuntimeValues {

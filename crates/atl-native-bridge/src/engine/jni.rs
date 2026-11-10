@@ -14,8 +14,9 @@ mod slots {
 }
 use slots::{env, vm};
 
-const _: () =
-    assert!(env::SLOTS.len() <= active::JNI_STUBS && vm::SLOTS.len() <= active::JNI_STUBS);
+const _: () = assert!(
+    env::SLOTS.len() <= super::bindings::JNI_STUBS && vm::SLOTS.len() <= super::bindings::JNI_STUBS
+);
 
 /// jni.h `JNI_OK`.
 const JNI_OK: i32 = 0;
@@ -35,13 +36,14 @@ fn table(names: &[&str], specials: &[(usize, usize)], host: usize) -> Box<[usize
         .enumerate()
         .map(|(slot, name)| {
             if let Some(&(_, f)) = specials.iter().find(|&&(s, _)| s == slot) {
-                return active::bind(f)
+                return active()
+                    .bind(f)
                     .unwrap_or_else(|| super::unsupported("JNI specials: host thunks used up"));
             }
             if name.starts_with("reserved") {
                 return 0;
             }
-            direct_break(slot, host).unwrap_or_else(|| active::jni_stub(slot))
+            direct_break(slot, host).unwrap_or_else(|| active().jni_stub(slot))
         })
         .collect()
 }

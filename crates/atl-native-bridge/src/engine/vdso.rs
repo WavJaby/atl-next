@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Host side of NBS `libnative_bridge_vdso.so` (soname `linux-vdso.so.1`), the guest's door to the host: the guest linker takes it as the kernel vdso (auxv AT_SYSINFO_EHDR, bionic linker_main.cpp `add_vdso`), and the guest libc imports `native_bridge_intercept_symbol` from it.
-//! How an entry, a linker hook or a stub reaches its host function is the engine's (`active::patch_entry`, `active::patch_hook`, `active::patch_site`, `active::is_stub`): x86_64 rewrites `st_value` and movabs immediates, QEMU writes binding thunks in place. The vdso file stays unpatched.
+//! How an entry, a linker hook or a stub reaches its host function is the process engine's (`Active::patch_entry`, `patch_hook`, `patch_site`, `is_stub`): x86_64 rewrites `st_value` and movabs immediates, QEMU writes binding thunks in place. The vdso file stays unpatched.
 //! `native_bridge_intercept_symbol` binds a guest libc stub (NBS `interceptable_functions.h`) by writing the thunk of its binding (bindings.rs, keyed (library, name)) into the stub. A stub the table lacks, or whose host symbol is absent, stays unbound: it jumps to 0 if called.
 
 use std::ffi::{CStr, c_char, c_void};
@@ -22,7 +22,8 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     let name = name.to_string_lossy();
     let lib = lib.to_string_lossy();
     let addr = addr as usize;
-    if !active::is_stub(addr) {
+    let engine = active();
+    if !engine.is_stub(addr) {
         // the exported entry (`jmp name_stub`) or a variable: reaches the host through the stub
         return;
     }
@@ -33,12 +34,12 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     let bound = if name == "glClear" {
         host
     } else {
-        host.and_then(active::bind)
+        host.and_then(|h| engine.bind(h))
     };
     #[cfg(not(atl_nb_gl_direct))]
-    let bound = host.and_then(active::bind);
+    let bound = host.and_then(|h| engine.bind(h));
     match bound {
-        Some(thunk) if active::patch_site(addr, thunk) => {
+        Some(thunk) if engine.patch_site(addr, thunk) => {
             BOUND.fetch_add(1, Ordering::Relaxed);
         }
         _ => {
@@ -97,12 +98,14 @@ pub fn bind_linker(linker: &Image) -> Result<(), String> {
         let at = linker
             .symbol(name)
             .ok_or_else(|| format!("linker64 lacks {name}"))?;
-        active::patch_hook(at, host).map_err(|why| format!("{name}: {why}"))?;
+        active()
+            .patch_hook(at, host)
+            .map_err(|why| format!("{name}: {why}"))?;
     }
     Ok(())
 }
 
-/// Routes every entry of the mapped NB vdso to a host function (`active::patch_entry`); before `seal`.
+/// Routes every entry of the mapped NB vdso to a host function (`Active::patch_entry`); before `seal`.
 pub fn bind(vdso: &Image) -> Result<(), String> {
     for (name, value_at) in vdso.dynsym_values() {
         let host: usize = match name.as_str() {
@@ -112,7 +115,9 @@ pub fn bind(vdso: &Image) -> Result<(), String> {
             "native_bridge_trace" => trace as *const () as usize,
             _ => return Err(format!("NB vdso exports {name}, which has no host side")),
         };
-        active::patch_entry(vdso, value_at, host).map_err(|why| format!("{name}: {why}"))?;
+        active()
+            .patch_entry(vdso, value_at, host)
+            .map_err(|why| format!("{name}: {why}"))?;
     }
     Ok(())
 }
