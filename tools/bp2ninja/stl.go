@@ -4,6 +4,8 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -91,10 +93,19 @@ func stlLinkFlags(sel string) []string {
 // libcxxProvider: the libc++ headers the compiler's own -stdlib=libc++ searches, the first directory named c++/v1 in its search list.
 // Derived from the compiler the build uses, so the headers are the ones its libc++ is installed with. The probe is a query (no output
 // kept, no build), the only place -stdlib=libc++ remains.
-// cross: a cross host's target flags (HostCross.compileFlags); its headers must lie in its sysroot (libcxxInSysroot).
+// cross: the sysroot's own copy (libcxxSysrootDir), no probe: clang's search list names the build machine's libc++ even under --sysroot.
 func libcxxProvider(cxx string, cross HostCross) (string, error) {
-	args := append(append([]string{}, cross.compileFlags()...), "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null")
-	out, err := exec.Command(cxx, args...).CombinedOutput()
+	if cross.set() {
+		dir, err := libcxxSysrootDir(cross.Sysroot)
+		if err != nil {
+			return "", err
+		}
+		if err := libcxxInSysroot(dir, cross); err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
+	out, err := exec.Command(cxx, "-stdlib=libc++", "-x", "c++", "-E", "-v", "/dev/null").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("probing libc++ headers with %s: %v: %s", cxx, err, out)
 	}
@@ -102,10 +113,32 @@ func libcxxProvider(cxx string, cross HostCross) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%s -stdlib=libc++ searches no c++/v1 directory", cxx)
 	}
-	if err := libcxxInSysroot(dir, cross); err != nil {
-		return "", err
-	}
 	return dir, nil
+}
+
+// libcxxSysrootDir: a cross host's libc++ headers, the one directory named c++/v1 under its sysroot that holds __config (exactly one; experimental/__config does not count).
+// Debian's libc++-19-dev keeps __config_site beside __config. A split install (__config_site elsewhere) is refused: the converter takes one directory, so it fails instead of guessing.
+func libcxxSysrootDir(sysroot string) (string, error) {
+	var dirs []string
+	err := filepath.WalkDir(sysroot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && d.Name() == "__config" && filepath.Base(filepath.Dir(path)) == "v1" && filepath.Base(filepath.Dir(filepath.Dir(path))) == "c++" {
+			dirs = append(dirs, filepath.Dir(path))
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("searching sysroot %s for libc++ headers: %v", sysroot, err)
+	}
+	if len(dirs) != 1 {
+		return "", fmt.Errorf("sysroot %s holds %d c++/v1 directories with __config (%q), want exactly one", sysroot, len(dirs), dirs)
+	}
+	if _, err := os.Stat(filepath.Join(dirs[0], "__config_site")); err != nil {
+		return "", fmt.Errorf("libc++ headers %s have no __config_site beside __config (a split install is not supported): %v", dirs[0], err)
+	}
+	return dirs[0], nil
 }
 
 // libcxxInSysroot: a cross host's libc++ headers come from its sysroot only. The distro's own install searches its include dir (LLVM's here, found beside the driver even with --sysroot), which is the build machine's libc++: a probe would return it and the target would compile against it.

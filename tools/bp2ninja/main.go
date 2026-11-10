@@ -69,7 +69,7 @@ func main() {
 	release := flag.String("release", "", "build/release config (TARGET_RELEASE): build flags and aconfig values (aconfig flag libraries; Java goals)")
 	measure := flag.Bool("measure", false, "write <out>/measure.txt (module types and source kinds the goals reach, measure.go) instead of a build")
 	cxxProbe := flag.String("device-cxx-flags", "", "tree dir: instead of a build, write <out>/compat (the libc provider from -provided) and print as JSON {argv, android} the C++ command line a device module there gets with nothing of its own, and the -D__ANDROID__ define in it (xtask check step libcxx); takes no goals")
-	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory -cxx searches (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs); takes -cxx and the -host-* flags too")
+	libcxxHeaders := flag.Bool("libcxx-headers", false, "print the libc++ headers directory (stl.go libcxxProvider) and exit, for builds outside the converter that must compile C++ against the same libc++ (xtask upstream.rs): the one -cxx searches, or a cross host's sysroot copy (-cxx unused then); takes -cxx and the -host-* flags too")
 	hostTarget := flag.String("host-target", "", "cross host (the build machine is another arch): the clang triple of the host's code (arches.toml clang); with -host-sysroot and -host-isa, all three or none")
 	hostSysroot := flag.String("host-sysroot", "", "cross host: the target's sysroot directory (a fetched sysroot_debs row, deps.toml)")
 	hostISA := flag.String("host-isa", "", "cross host: -march of the host's code (arches.toml isa)")
