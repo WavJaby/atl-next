@@ -225,7 +225,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .iter()
         .filter(|(_, row)| {
             !row.is_none()
-                && !row.provider.as_deref().is_some_and(|p| p.starts_with("module:"))
+                && !row
+                    .provider
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("module:"))
                 && (row.provider.is_some() || !row.srcs.is_empty())
         })
         .map(|(m, _)| m.as_str())
@@ -236,7 +239,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Vec::new()
     };
     let unbuilt = providers::Providers::new();
-    let to_build = if cross.is_some() { &unbuilt } else { &providers };
+    let to_build = if cross.is_some() {
+        &unbuilt
+    } else {
+        &providers
+    };
     let crates = build_crates(root, &out, to_build)?;
     let mut systems = BTreeMap::new();
     for (_, row) in providers::systems(to_build) {
