@@ -72,14 +72,13 @@ const FRAMEWORK_JNI: [&str; 2] = ["libsoundpool", "libmedia_jni"];
 /// The NDK libraries whose host side the NativeBridge core loads from SYSTEM_LIB (C3, bindings.rs `Host::System`): their guest proxies forward to them.
 const NDK_HOST_LIBS: [&str; 2] = ["libandroid", "libjnigraphics"];
 
-/// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate, the GL fronts, and the host LLVM that llvmpipe JITs through (llvm_host.rs): declared once here for every gate using them.
+/// [`Runtime::with_gralloc`] + `with_gl_driver`: the allocator HAL's AIDL crate and the GL fronts, declared once here for every gate using them.
 pub fn gralloc_goals() -> Goals {
     Goals::host(&GL_FRONTS)
         .with(Goals::host(&ANGLE_FRONTS))
         .with(Goals::host(&[
             "android.hardware.graphics.allocator-V2-rust",
         ]))
-        .with(crate::llvm_host::goals())
 }
 
 /// [`Runtime::with_native_bridge_guest`]: the guest linker, app_process and [`NB_LIBS`], plus the host side that loads them.

@@ -409,7 +409,7 @@ pub struct Build {
 }
 
 /// The licence gate over each build (`check_build`): a line per build with its denied and unresolved files, then `<label>: verdict`. True when every build passes.
-/// The one route for an upstream CMake build (runtimes, host LLVM), so both judge by the same rules.
+/// The one route for an upstream CMake build (runtimes), so every such build is judged by the same rules.
 pub fn gate_builds(root: &Path, label: &str, builds: &[Build]) -> Result<bool> {
     let layout = atl_layout::Layout::of(root)?;
     let sources = crate::sources::load(root)?;

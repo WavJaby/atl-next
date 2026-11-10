@@ -160,7 +160,6 @@ impl Step {
                 let layout = Layout::of(root)?;
                 arches::check_kernel_arch(&layout, &arches)?;
                 arches::check_prebuilt_os(&layout, &arches)?;
-                arches::check_llvm_target(root, &arches)?;
                 arches::check_cross(root, &arches)?;
                 arches::check_qemu_target(&layout, &arches)?;
                 eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());

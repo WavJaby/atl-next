@@ -362,11 +362,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .arg(&release)
             .args(cache.iter().flat_map(CompilerCache::converter_args))
             .args(&nb.flags)
-            .args(
-                args.goals
-                    .iter()
-                    .filter(|g| g.as_str() != crate::llvm_host::GOAL),
-            )
+            .args(&args.goals)
             .args(&aidl_goals)
             .status()
             .context("running bp2ninja")?;
@@ -449,24 +445,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .stderr(std::fs::File::create(out.join("ninja.err"))?)
         .status()
         .context("running ninja")?;
-    // the host LLVM (llvm_host.rs) when a goal asks for it: CMake under the same token
-    let llvm_step = if args.goals.iter().any(|g| g == crate::llvm_host::GOAL) {
-        let cc = flag_or_row(&args.cc, root, "clang")?;
-        let cxx = flag_or_row(&args.cxx, root, "clang-cxx")?;
-        let step = crate::llvm_host::build(root, &out, &args.host, &cc, &cxx)
-            .and_then(|()| crate::llvm_host::licence(root, &out, &args.host));
-        match step {
-            Ok(true) => None,
-            Ok(false) => Some("licence gate failed: see the `llvm:` lines".to_owned()),
-            Err(e) => Some(format!("{e:#}")),
-        }
-    } else {
-        None
-    };
-    // a failed LLVM build leaves no record of its goal
-    if llvm_step.is_some() {
-        built_goals.remove(crate::llvm_host::GOAL);
-    }
     drop(token);
     let provided_libs: BTreeSet<&Path> = provided
         .values()
@@ -475,9 +453,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .collect();
     // every check that fails the run, with its first error line: the last line names and quotes them (`verdict`)
     let mut failed: Vec<Failure> = Vec::new();
-    if let Some(first) = llvm_step {
-        failed.push(Failure::step("llvm", first));
-    }
     if let Some(first) = gate(&out, provided_libs.into_iter())? {
         failed.push(Failure::step("provided gate", first));
     }
