@@ -17,7 +17,7 @@ import java.nio.FloatBuffer;
 /// `xtask test gl`'s driver: a GLES3 pbuffer through the framework's EGL14 / GLES20 (AOSP libEGL + libGLESv2 -> the driver), cleared to the colour given as four bytes and read back;
 /// then glGetInteger64vEXT, a name outside AOSP's entries.in, through eglGetProcAddress (native lib); then the timed scene ([`scene`]).
 /// Prints one `gl-probe:` line per result; the gate judges them. Args: path of the native lib, then w, h, r, g, b, a, scene w, scene h, frames, texel r, g, b, a [, "break"].
-/// Break (clear): no glClear, no draw in the timed frames, and the extension call goes to a no-op instead (what a dead forwarder does).
+/// Break (clear): no glClear, no draw in the timed frames, the extension call goes to a no-op instead (what a dead forwarder does), and the host renderer is mangled.
 public class Probe {
     private static final String TAG = "gl-probe";
     /// The scene's grid: GRID x GRID quads, two triangles each.
@@ -29,14 +29,14 @@ public class Probe {
 
     static native long ext64(boolean broken);
     static native String owner();
-    /// The kernel driver name of an open DRM fd (lib.rs drmDriver: DRM_IOCTL_VERSION); null when the ioctl fails.
-    static native String drmDriver(int fd);
+    /// The host EGL's GL_RENDERER on the device `nodes` (drmNodes) name: "ok <device> <renderer>" or "err <message>". Queried by the native lib on the host's libEGL.so.1 (atl-egl-host), not through AOSP's fronts or the driver; `broken` mangles the renderer.
+    static native String hostRenderer(String nodes, boolean broken);
 
     static void say(String text) {
         Log.i(TAG, text);
     }
 
-    /// The /dev/dri nodes this process holds open (its fds under /proc/self/fd), each with the kernel driver its DRM name gives (drmDriver). Mesa's DRI drivers hold the node they render on; a pure software rasteriser holds none. "none" when there is none.
+    /// The /dev/dri nodes this process holds open (its fds under /proc/self/fd): the node the host EGL renders on, plus any other holder in the process. "none" when there is none.
     static String drmNodes() {
         StringBuilder out = new StringBuilder();
         java.io.File[] fds = new java.io.File("/proc/self/fd").listFiles();
@@ -48,8 +48,7 @@ public class Probe {
                 continue;
             }
             if (!target.startsWith("/dev/dri/")) continue;
-            String driver = drmDriver(Integer.parseInt(fd.getName()));
-            out.append(out.length() == 0 ? "" : " ").append(target).append('=').append(driver == null ? "unreadable" : driver);
+            out.append(out.length() == 0 ? "" : " ").append(target);
         }
         return out.length() == 0 ? "none" : out.toString();
     }
@@ -188,7 +187,8 @@ public class Probe {
         EGLDisplay d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
         int[] version = new int[2];
         check(EGL14.eglInitialize(d, version, 0, version, 1), "eglInitialize");
-        say("drm " + drmNodes());
+        String held = drmNodes();
+        say("drm " + held);
         int[] attrs = {EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
             EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8, EGL14.EGL_NONE};
         EGLConfig[] config = new EGLConfig[1];
@@ -199,7 +199,9 @@ public class Probe {
         EGLSurface s = EGL14.eglCreatePbufferSurface(d, config[0], new int[] {EGL14.EGL_WIDTH, w, EGL14.EGL_HEIGHT, h, EGL14.EGL_NONE}, 0);
         check(s != EGL14.EGL_NO_SURFACE, "eglCreatePbufferSurface");
         check(EGL14.eglMakeCurrent(d, s, s, c), "eglMakeCurrent");
-        say("renderer " + GLES20.glGetString(GLES20.GL_RENDERER));
+        String renderer = GLES20.glGetString(GLES20.GL_RENDERER);
+        say("renderer " + (renderer == null ? "" : renderer));
+        say("host " + hostRenderer(held, broken));
         say("version " + GLES20.glGetString(GLES20.GL_VERSION));
 
         GLES20.glClearColor(rgba[0] / 255f, rgba[1] / 255f, rgba[2] / 255f, rgba[3] / 255f);

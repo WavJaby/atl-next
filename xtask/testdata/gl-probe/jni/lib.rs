@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! JNI natives of com.example.atlgl.Probe: `ext64` calls glGetInteger64vEXT(GL_MAX_TEXTURE_SIZE) through the address AOSP libEGL's eglGetProcAddress returns (patch 0010: the driver's, not a
-//! forwarder); `owner` names the object that address lies in (dladdr); `drmDriver` names the kernel driver of a DRM fd (DRM_IOCTL_VERSION, the name Mesa's loader reads). Test fixture: glibc's dl* and ioctl directly, no crates.
+//! forwarder); `owner` names the object that address lies in (dladdr); `hostRenderer` is the host EGL's GL_RENDERER on the device of the held DRM nodes, queried on the host's libEGL.so.1 through atl-egl-host, not through AOSP's fronts. Test fixture: glibc's dl* directly, atl-egl-host for the host EGL.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 #[repr(C)]
 struct DlInfo {
@@ -16,7 +16,6 @@ unsafe extern "C" {
     fn dlopen(file: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
-    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
 /// <dlfcn.h>: RTLD_NOW | RTLD_NOLOAD -- the libEGL the framework already loaded, never a second copy.
@@ -33,6 +32,9 @@ const NO_ENTRY: i64 = -3;
 const NAME: &CStr = c"glGetInteger64vEXT";
 /// JNINativeInterface's NewStringUTF slot (jni.h: 4 reserved entries, then the functions in order).
 const NEW_STRING_UTF: usize = 167;
+/// JNINativeInterface's GetStringUTFChars and ReleaseStringUTFChars slots.
+const GET_STRING_UTF_CHARS: usize = 169;
+const RELEASE_STRING_UTF_CHARS: usize = 170;
 
 type GetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type GetInteger64v = unsafe extern "C" fn(u32, *mut i64);
@@ -122,32 +124,6 @@ pub extern "C" fn Java_com_example_atlgl_Probe_owner(
     }
 }
 
-/// <drm.h> `struct drm_version` (Mesa's include/drm-uapi/drm.h L133-143): the kernel copies at most `name_len` bytes of the driver name into `name`, without a NUL, and sets `name_len` to the full length.
-#[allow(dead_code)] // the kernel also fills the version and date/desc fields, which are never read
-#[repr(C)]
-struct DrmVersion {
-    version_major: c_int,
-    version_minor: c_int,
-    version_patchlevel: c_int,
-    name_len: usize,
-    name: *mut c_char,
-    date_len: usize,
-    date: *mut c_char,
-    desc_len: usize,
-    desc: *mut c_char,
-}
-
-/// Room for a driver name (`i915`, `xe`, `vgem`, `virtio_gpu`, ...); a longer one reads as unreadable.
-const NAME_CAP: usize = 64;
-
-/// asm-generic/ioctl.h `_IOWR(type, nr, size)`: the encoding of x86, arm, arm64 and riscv.
-const fn iowr(ty: u8, nr: u8, size: usize) -> u32 {
-    (3 << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | nr as u32
-}
-
-/// drm.h `DRM_IOCTL_VERSION` (L1037) = `DRM_IOWR(0x00, struct drm_version)`; the size is the struct's for this pointer width.
-const DRM_IOCTL_VERSION: u32 = iowr(b'd', 0x00, std::mem::size_of::<DrmVersion>());
-
 /// JNI NewStringUTF of `text`; a NUL inside it makes the string empty (CString).
 fn new_string(env: *mut *const *const c_void, text: &str) -> *mut c_void {
     type New = unsafe extern "C" fn(*mut *const *const c_void, *const c_char) -> *mut c_void;
@@ -159,32 +135,76 @@ fn new_string(env: *mut *const *const c_void, text: &str) -> *mut c_void {
     }
 }
 
-/// The kernel driver of an open DRM fd, the name `drmGetVersion(fd)->name` gives (loader.c L108-118); null when the ioctl fails or the name does not fit NAME_CAP.
+/// JNI GetStringUTFChars: a Java string's text, copied out; None for null.
+fn java_text(env: *mut *const *const c_void, s: *mut c_void) -> Option<String> {
+    type Get =
+        unsafe extern "C" fn(*mut *const *const c_void, *mut c_void, *mut u8) -> *const c_char;
+    type Release = unsafe extern "C" fn(*mut *const *const c_void, *mut c_void, *const c_char);
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: env is the JNIEnv* JNI passes and s a jstring it passed in; the slots are GetStringUTFChars and ReleaseStringUTFChars, and the chars are read before their release.
+    unsafe {
+        let get: Get = std::mem::transmute(*(*env).add(GET_STRING_UTF_CHARS));
+        let release: Release = std::mem::transmute(*(*env).add(RELEASE_STRING_UTF_CHARS));
+        let chars = get(env, s, std::ptr::null_mut());
+        if chars.is_null() {
+            return None;
+        }
+        let text = CStr::from_ptr(chars).to_string_lossy().into_owned();
+        release(env, s, chars);
+        Some(text)
+    }
+}
+
+/// `hostRenderer(nodes, broken)`: `ok <device> <GL_RENDERER>`, or `err <message>`. The query runs on a thread of its own: the context it makes current is released when that thread ends, so the app's current context on the calling thread is never touched.
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_com_example_atlgl_Probe_drmDriver(
+pub extern "C" fn Java_com_example_atlgl_Probe_hostRenderer(
     env: *mut *const *const c_void,
     _class: *mut c_void,
-    fd: c_int,
+    nodes: *mut c_void,
+    broken: u8,
 ) -> *mut c_void {
-    let mut name = [0u8; NAME_CAP];
-    let mut v = DrmVersion {
-        version_major: 0,
-        version_minor: 0,
-        version_patchlevel: 0,
-        name_len: NAME_CAP,
-        name: name.as_mut_ptr().cast(),
-        date_len: 0,
-        date: std::ptr::null_mut(),
-        desc_len: 0,
-        desc: std::ptr::null_mut(),
+    let text = match java_text(env, nodes) {
+        None => "err no DRM node list".to_owned(),
+        Some(nodes) => {
+            match std::thread::spawn(move || host_renderer(&nodes, broken != 0)).join() {
+                Ok(Ok(text)) => format!("ok {text}"),
+                Ok(Err(err)) => format!("err {err}"),
+                Err(_) => "err host query panicked".to_owned(),
+            }
+        }
     };
-    // SAFETY: a fd that is not a DRM node fails with an errno; v is a drm_version whose name buffer (NAME_CAP bytes) outlives the call, and its date and desc lengths are 0, so the kernel writes nothing else.
-    let rc = unsafe { ioctl(fd, DRM_IOCTL_VERSION as c_ulong, &mut v as *mut DrmVersion) };
-    if rc != 0 || v.name_len > NAME_CAP {
-        return std::ptr::null_mut();
-    }
-    match std::str::from_utf8(&name[..v.name_len]) {
-        Ok(text) => new_string(env, text),
-        Err(_) => std::ptr::null_mut(),
-    }
+    new_string(env, &text)
+}
+
+/// `<device> <GL_RENDERER>` of the host EGL device the held nodes name: the device whose render or card node is held, else the software device. A held node no EGL device claims (gralloc's vgem) leaves the software device. `broken` mangles the renderer.
+fn host_renderer(nodes: &str, broken: bool) -> Result<String, String> {
+    let host = atl_egl_host::Host::load().map_err(|e| format!("{e:#}"))?;
+    let devices = host.devices().map_err(|e| format!("{e:#}"))?;
+    let held: Vec<&str> = nodes.split_whitespace().filter(|n| *n != "none").collect();
+    let claims = |d: &atl_egl_host::Device| {
+        held.iter()
+            .any(|n| d.render_node.as_deref() == Some(*n) || d.drm_file.as_deref() == Some(*n))
+    };
+    let device = devices
+        .iter()
+        .find(|d| claims(d))
+        .or_else(|| devices.iter().find(|d| d.is_software()))
+        .ok_or_else(|| format!("no EGL device for `{nodes}` and no software device"))?;
+    let name = device
+        .render_node
+        .clone()
+        .or_else(|| device.drm_file.clone())
+        .unwrap_or_else(|| "software".to_owned());
+    let display = device.display().map_err(|e| format!("{e:#}"))?;
+    let context = display.create_context().map_err(|e| format!("{e:#}"))?;
+    let gl = context.make_current().map_err(|e| format!("{e:#}"))?;
+    let renderer = gl.string(atl_egl_host::ffi::GL_RENDERER);
+    let renderer = if broken {
+        format!("{renderer} (mangled host)")
+    } else {
+        renderer
+    };
+    Ok(format!("{name} {renderer}"))
 }

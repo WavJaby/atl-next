@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# `xtask test gl`'s JNI library: eglGetProcAddress of an extension outside entries.in, called on the current context. Its own package (and workspace) for `unsafe`; never shipped.
+# `xtask test gl`'s JNI library: eglGetProcAddress of an extension outside entries.in, called on the current context; the host EGL's GL_RENDERER for the held device (atl-egl-host, dlopen only). Its own package (and workspace) for `unsafe`; never shipped.
 [package]
 name = "atl-gl-probe"
 version = "0.0.0"
@@ -10,6 +10,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 path = "lib.rs"
+
+[dependencies]
+atl-egl-host = { path = "../../../../crates/atl-egl-host" }
 
 [features]
 # the deliberate break of `xtask test gl`'s ELF check: the library imports glClear, as a Mesa object that binds back to AOSP's fronts would

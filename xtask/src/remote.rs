@@ -119,8 +119,6 @@ pub enum Break {
     DropLibunwind,
     /// Drops atld from the bundle: the prerequisite check names it as not delivered (`push --apply`), and a run without it stops at the executable check.
     DropAtld,
-    /// Test only (`remote test`; `push` refuses it): gl's tier table maps `xe` to llvmpipe, so the target's iris renderer must fail the gl gate's renderer check.
-    TierXeLlvmpipe,
 }
 
 pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
@@ -132,10 +130,6 @@ pub fn run(root: &Path, cmd: &Remote) -> Result<ExitCode> {
 }
 
 fn push(root: &Path, a: &PushArgs) -> Result<ExitCode> {
-    ensure!(
-        a.brk != Some(Break::TierXeLlvmpipe),
-        "--break tier-xe-llvmpipe is test-only: `remote test` runs it, push refuses it"
-    );
     let out = out_of(root, a.out.as_deref())?;
     let target = Target::of(&out, &a.gate, &a.host, a.brk)?;
     if a.list {
@@ -229,7 +223,7 @@ fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Resul
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
     let site = target.run_site(gl_probe::LIMIT, log.clone(), false);
-    let code = gl_probe::run_on(root, arch, out, site, a.brk)?;
+    let code = gl_probe::run_on(root, arch, out, site)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
 }

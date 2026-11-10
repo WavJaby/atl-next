@@ -262,10 +262,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 /// `xtask remote run-apk` (see [`RemoteArgs`]): the run on a target's desktop. Dry run by default: prints the bundle and the plan. `--apply` records the run, pushes the bundle, runs the target's check, then runs atld there with its limit at `window::LIMIT` + the hold (+ a pointer script's waits). The logs come back when the run ends, and the verdict is `run-apk`'s, on the target's clock.
 pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
-    ensure!(
-        a.brk != Some(remote::Break::TierXeLlvmpipe),
-        "--break tier-xe-llvmpipe is test-only: `remote test` runs it, run-apk refuses it"
-    );
     let mut shots = a.shot.clone();
     shots.sort_unstable();
     shots.dedup();
