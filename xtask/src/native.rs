@@ -123,13 +123,13 @@ fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> 
     }
 }
 
-/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa and the libc++ headers in that sysroot (cross::libcxx_dir, the one derivation). Empty for the build machine, whose compiler already targets it.
+/// The converter's flags for a cross host (`cross`: arches::cross_target): the target's clang triple, its fetched sysroot, its isa and the libc++ headers in that sysroot (atl_layout::libcxx_dir, the one derivation). Empty for the build machine, whose compiler already targets it.
 fn cross_args(root: &Path, cross: Option<&arches::CrossTarget>) -> Result<Vec<String>> {
     let Some(c) = cross else {
         return Ok(Vec::new());
     };
     let sysroot = deps::sysroot_root(root, &c.sysroot)?;
-    let libcxx = crate::cross::libcxx_dir(&sysroot)?;
+    let libcxx = atl_layout::libcxx_dir(&sysroot)?;
     Ok(vec![
         "-host-target".to_owned(),
         c.clang.clone(),

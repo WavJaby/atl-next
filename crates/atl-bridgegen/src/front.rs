@@ -109,7 +109,7 @@ pub fn resolve_include(lang: Lang, target: &Target, name: &str) -> Result<PathBu
     });
     let tu = index
         .parser(&probe)
-        .arguments(&args(lang, target))
+        .arguments(&args(lang, target)?)
         .unsaved(&[Unsaved::new(&probe, format!("#include <{name}>\n"))])
         .detailed_preprocessing_record(true)
         .parse()
@@ -192,7 +192,7 @@ pub fn probe_includes(
         let text = format!("#if __has_include(<{name}>)\n#include <{name}>\n#endif\n");
         let tu = index
             .parser(&path)
-            .arguments(&args(lang, target))
+            .arguments(&args(lang, target)?)
             .unsaved(&[Unsaved::new(&path, text)])
             .skip_function_bodies(true)
             .detailed_preprocessing_record(true)
@@ -236,7 +236,7 @@ pub fn source_errors(lang: Lang, target: &Target, units: &[String]) -> Result<Ve
         .map(|text| {
             let tu = index
                 .parser(&path)
-                .arguments(&args(lang, target))
+                .arguments(&args(lang, target)?)
                 .unsaved(&[Unsaved::new(&path, text)])
                 .skip_function_bodies(true)
                 .parse()
@@ -305,7 +305,7 @@ pub fn resolve_includes(
         .collect();
     let tu = index
         .parser(&path)
-        .arguments(&args(lang, target))
+        .arguments(&args(lang, target)?)
         .unsaved(&[Unsaved::new(&path, text)])
         .single_file_parse(true)
         .detailed_preprocessing_record(true)
@@ -492,7 +492,7 @@ fn declared(
     Ok(())
 }
 
-fn args(lang: Lang, t: &Target) -> Vec<String> {
+fn args(lang: Lang, t: &Target) -> Result<Vec<String>> {
     let (x, std) = match lang {
         Lang::C => ("c", "-std=gnu11"),
         Lang::Cxx => ("c++", "-std=gnu++23"),
@@ -503,25 +503,39 @@ fn args(lang: Lang, t: &Target) -> Vec<String> {
         args.push(format!("-resource-dir={}", dir.display()));
     }
     args.extend(t.args.iter().cloned());
-    args.extend(extra_clang_args());
-    args
+    args.extend(extra_clang_args()?);
+    Ok(args)
 }
 
-/// bindgen's extra clang args for this build script's target, read as bindgen reads them (its `get_target_dependent_env_var`): `BINDGEN_EXTRA_CLANG_ARGS_<TARGET>` (`-` as `_`) only; the unscoped variable is never read, since it would reach every target, the x86 probes included. Only xtask's cross sets the scoped one, to the target sysroot (cross.rs cargo_target); a build machine sets neither. Whitespace split, not shlex: cross refuses whitespace in these paths.
-fn extra_clang_args() -> Vec<String> {
-    const VAR: &str = "BINDGEN_EXTRA_CLANG_ARGS";
-    std::env::var("TARGET")
-        .ok()
-        .and_then(|target| {
-            [
-                format!("{VAR}_{target}"),
-                format!("{VAR}_{}", target.replace('-', "_")),
-            ]
-            .into_iter()
-            .find_map(|key| std::env::var(key).ok())
-        })
-        .map(|value| value.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default()
+/// The pinned host sysroot args of this build script's target (buildscript::host_sysroot_args), derived once per script; the first derivation prints the rerun on the sysroot's stamp. Outside a build script (no TARGET: unit tests on fake trees): none.
+#[allow(
+    clippy::print_stdout,
+    reason = "a build script's stdout is cargo's instruction channel"
+)]
+fn extra_clang_args() -> Result<Vec<String>> {
+    static ARGS: std::sync::OnceLock<std::result::Result<Vec<String>, String>> =
+        std::sync::OnceLock::new();
+    ARGS.get_or_init(|| {
+        let derive = || -> Result<Vec<String>> {
+            let Ok(target) = std::env::var("TARGET") else {
+                return Ok(Vec::new());
+            };
+            let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+            let checkout = crate::buildscript::checkout(&manifest)?;
+            Ok(
+                match crate::buildscript::host_sysroot_args(&checkout, &target)? {
+                    Some((args, stamp)) => {
+                        println!("cargo::rerun-if-changed={}", stamp.display());
+                        args
+                    }
+                    None => Vec::new(),
+                },
+            )
+        };
+        derive().map_err(|e| format!("{e:#}"))
+    })
+    .clone()
+    .map_err(|e| anyhow!(e))
 }
 
 /// clang's resource dir (builtin headers: `stddef.h`, `stdarg.h` ...), from the clang binary `clang_sys::support::Clang::find` pairs with libclang (bindgen's lookup), `-print-resource-dir`.
@@ -585,7 +599,7 @@ impl Unit<'_> {
 fn parse_one(index: &Index, src: &Source, t: &Target) -> Result<ArchView> {
     let tu = index
         .parser(src.path)
-        .arguments(&args(src.lang, t))
+        .arguments(&args(src.lang, t)?)
         .skip_function_bodies(true)
         .detailed_preprocessing_record(true)
         .parse()
@@ -936,7 +950,7 @@ fn macro_values(
     }
     let tu = index
         .parser(&probe)
-        .arguments(&args(src.lang, t))
+        .arguments(&args(src.lang, t)?)
         .unsaved(&[Unsaved::new(&probe, &text)])
         .skip_function_bodies(true)
         .parse()
@@ -1393,7 +1407,7 @@ mod tests {
             triple: "x86_64-linux-gnu".to_owned(),
             args: vec![],
         };
-        let args = super::args(crate::Lang::C, &t);
+        let args = super::args(crate::Lang::C, &t).unwrap();
         let dir = args
             .iter()
             .find_map(|a| a.strip_prefix("-resource-dir="))

@@ -78,6 +78,11 @@ impl Layout {
         &self.workspace
     }
 
+    /// The directory of deps.toml sysroot row `name`: `cache/sysroot/<name>`, holding the unpacked tree `root/` and `stamp.txt` (`xtask deps --fetch` writes both). The only place this path is built: xtask fetches and links against it, build scripts probe it.
+    pub fn sysroot(&self, name: &str) -> PathBuf {
+        self.workspace.join("cache").join("sysroot").join(name)
+    }
+
     /// The shared checkouts' root. Only for what is not one upstream's file: fetch's dry-run summary, the shared AOSP tree's root.
     pub fn src(&self) -> &Path {
         &self.src
@@ -164,6 +169,44 @@ pub fn git_store(root: &Path, dir: &Path) -> PathBuf {
     let mut name = dir.as_os_str().to_owned();
     name.push(".git");
     root.join(".git-dirs").join(name)
+}
+
+/// A sysroot's libc++ headers: the one `c++/v1` directory holding `__config`, with `__config_site` beside it.
+/// The one derivation: xtask native passes it to bp2ninja (`-host-libcxx`), atl-bridgegen's probes put it on the include path.
+pub fn libcxx_dir(sysroot: &Path) -> Result<PathBuf> {
+    let mut found = Vec::new();
+    config_dirs(sysroot, &mut found)?;
+    ensure!(
+        found.len() == 1,
+        "sysroot {} holds {} c++/v1 directories with __config ({found:?}), want exactly one",
+        sysroot.display(),
+        found.len()
+    );
+    let dir = found.swap_remove(0);
+    ensure!(
+        dir.join("__config_site").exists(),
+        "libc++ headers {} have no __config_site beside __config (a split install is not supported)",
+        dir.display()
+    );
+    Ok(dir)
+}
+
+/// Each `c++/v1` directory under `dir` that holds a `__config`. Symlinked directories are not followed, as filepath.WalkDir does not.
+fn config_dirs(dir: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            config_dirs(&path, found)?;
+        } else if entry.file_name().to_str() == Some("__config") {
+            found.extend(
+                path.parent()
+                    .filter(|p| p.ends_with("c++/v1"))
+                    .map(Path::to_path_buf),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `git <args>` in `dir`, stdout trimmed.
@@ -315,5 +358,53 @@ mod tests {
         assert_eq!(l.head, Some(ws.join("repo/.git/worktrees/x/HEAD")));
         assert!(Layout::of(&repo).unwrap().task().is_none());
         std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A fake sysroot under the temp dir holding empty `files` (paths relative to the root).
+    fn fake_sysroot(name: &str, files: &[&str]) -> PathBuf {
+        let root = temp(&format!("sysroot-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        for file in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn libcxx_dir_is_the_one_c_plus_plus_v1_holding_config() {
+        let v1 = "usr/lib/llvm-19/include/c++/v1";
+        let root = fake_sysroot(
+            "libcxx-one",
+            &[
+                &format!("{v1}/__config"),
+                &format!("{v1}/__config_site"),
+                // experimental/__config is not the libc++ root: not counted
+                &format!("{v1}/experimental/__config"),
+            ],
+        );
+        assert_eq!(libcxx_dir(&root).unwrap(), root.join(v1));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn libcxx_dir_refuses_two_copies_and_a_split_install() {
+        let two = fake_sysroot(
+            "libcxx-two",
+            &[
+                "a/c++/v1/__config",
+                "a/c++/v1/__config_site",
+                "b/c++/v1/__config",
+                "b/c++/v1/__config_site",
+            ],
+        );
+        let err = format!("{:#}", libcxx_dir(&two).unwrap_err());
+        assert!(err.contains("want exactly one"), "{err}");
+        std::fs::remove_dir_all(&two).unwrap();
+        let split = fake_sysroot("libcxx-split", &["c++/v1/__config"]);
+        let err = format!("{:#}", libcxx_dir(&split).unwrap_err());
+        assert!(err.contains("__config_site"), "{err}");
+        std::fs::remove_dir_all(&split).unwrap();
     }
 }

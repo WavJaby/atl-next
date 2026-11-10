@@ -24,9 +24,9 @@
 #            upstream:<sources.toml name or aosp>, xtask:<subcommand>, host:<arch> (the sysroot or rust std named by
 #            arches.toml [<arch>.host]: that cross host's native build uses it; checked against that row),
 #            optional:<crate, upstream or xtask reference> (that consumer runs without the row: a fallback path)
-# Cross-only row: every used_by is xtask:cross or host:<arch>. Plain `check` and `deps --check` skip it and name it;
-# `deps --check --host <arch>` checks it, and so does `cross --arch <arch>` at start (its sysroot and the rustup
-# target of its [<arch>.host] rust). `native --host <arch>` checks the same rows at its start.
+# Cross-only row: every used_by is xtask:cross or host:<arch>. Plain `check` and `deps --check` skip it and name it,
+# unless <arch> is the build machine (its host rows are required there); `deps --check --host <arch>` checks it, and so
+# does `cross --arch <arch>` at start (its sysroot and the rustup target of its [<arch>.host] rust). `native --host <arch>` checks the same rows at its start.
 # Optional row: every used_by is optional:. Plain `check`, `deps --check` and `--host` skip it and name it, so a
 # machine without it is green; the consumer takes its fallback (the Play token on stdin, not the Secret Service).
 # Not here: Rust itself (rust-toolchain.toml via rustup, the one prerequisite xtask cannot check); Gradle and the
@@ -365,6 +365,19 @@ sysroot_debs = [
 ]
 scope = ["build"]
 used_by = ["xtask:cross", "host:riscv64"]
+
+# the x86_64 host's header view for atl-bridgegen probes (atl-bridgegen buildscript::host_sysroot_args, as for every host): glibc + kernel headers and libc++ of trixie main, so generation reads pinned headers, never the build machine's /usr/include or its optional -dev packages.
+# Headers only: probes link nothing, and product binaries still compile and link against the build machine. libc++-19-dev's header Depends closure (libc++abi-19-dev, libunwind-19-dev), as the riscv64 row.
+[x86-64-sysroot]
+sysroot_debs = [
+    "libc6-dev=2.41-12+deb13u4",
+    "linux-libc-dev=6.12.107-1",
+    "libc++-19-dev=1:19.1.7-3+b1",
+    "libc++abi-19-dev=1:19.1.7-3+b1",
+    "libunwind-19-dev=1:19.1.7-3+b1",
+]
+scope = ["build"]
+used_by = ["host:x86_64"]
 
 # the headless gates' nested compositor (nested_wayland.rs:5-8: labwc over sway)
 [labwc]

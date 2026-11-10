@@ -199,6 +199,44 @@ pub fn checkout(manifest_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("no arches.toml above {}", manifest_dir.display()))
 }
 
+/// The clang args that make a probe read host `rust_target`'s pinned sysroot (arches.toml `[<arch>.host] sysroot`, a deps.toml `sysroot_debs` row) and its libc++: `--sysroot`, `-nostdinc++ -isystem <c++/v1>`, as device compiles use libc++.
+/// One environment for every host, build machine or cross: generation never reads the build machine's /usr/include, its optional -dev packages or libstdc++ (each once changed a verdict). None: `rust_target` is no arches.toml host (a guest target: its views carry their own `-nostdlibinc` headers).
+/// Also the sysroot's `stamp.txt`, for the build script to rerun on a refetch.
+pub fn host_sysroot_args(
+    checkout: &Path,
+    rust_target: &str,
+) -> Result<Option<(Vec<String>, PathBuf)>> {
+    let table: toml::Table =
+        toml::from_str(&std::fs::read_to_string(checkout.join("arches.toml"))?)
+            .context("parsing arches.toml")?;
+    let Some((arch, host)) = table.iter().find_map(|(arch, row)| {
+        let host = row.get("host")?;
+        (host.get("rust")?.as_str()? == rust_target).then_some((arch, host))
+    }) else {
+        return Ok(None);
+    };
+    let name = host
+        .get("sysroot")
+        .and_then(|s| s.as_str())
+        .with_context(|| {
+            format!("arches.toml [{arch}.host]: no sysroot (every host's probes read a pinned one)")
+        })?;
+    let dir = Layout::of(checkout)?.sysroot(name);
+    let root = dir.join("root");
+    ensure!(
+        root.is_dir(),
+        "sysroot {name} of host {arch} is not fetched: cargo xtask deps --fetch {name} --execute"
+    );
+    let libcxx = atl_layout::libcxx_dir(&root)?;
+    let args = vec![
+        format!("--sysroot={}", root.display()),
+        "-nostdinc++".to_owned(),
+        "-isystem".to_owned(),
+        libcxx.display().to_string(),
+    ];
+    Ok(Some((args, dir.join("stamp.txt"))))
+}
+
 /// The upstream sources a build script reads, where `atl_layout` places them for this repo checkout: a task copy (`xtask patch --edit`) replaces its `src/` checkout here exactly as in xtask.
 pub struct Upstreams {
     layout: Layout,

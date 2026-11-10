@@ -468,20 +468,21 @@ impl Report {
     }
 }
 
-/// Every deps.toml row against this host, read-only: required rows always, cross-only rows only when `host`
+/// Every deps.toml row against this host, read-only: required rows and the build machine's host rows (its sysroot: every probe reads it) always, other cross-only rows only when `host`
 /// names their arch, optional rows never (their consumer runs without them). `deps --check` and `xtask check`'s deps step both run it.
 pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
     let arches = arches::load(root)?;
-    let target = match host {
-        Some(arch) => Some((arch, host_rust(&arches, arch)?)),
-        None => None,
-    };
+    let (build, _) = arches::build_machine(root, &arches)?;
+    let mut targets = vec![(build.to_owned(), host_rust(&arches, build)?)];
+    if let Some(arch) = host {
+        targets.push((arch.to_owned(), host_rust(&arches, arch)?));
+    }
     check_rows(root, &arches, |_, dep| {
         !optional_only(dep)
             && (!cross_only(dep)
-                || target
-                    .as_ref()
-                    .is_some_and(|(arch, rust)| is_host_row(dep, arch, rust)))
+                || targets
+                    .iter()
+                    .any(|(arch, rust)| is_host_row(dep, arch, rust)))
     })
 }
 
@@ -712,13 +713,9 @@ fn parse_install_list(text: &str) -> BTreeMap<String, String> {
 
 // ---- sysroots (`sysroot_debs`) ------------------------------------------------------------------
 
-/// `cache/sysroot/<name>/`: `debs/` (the downloads), `root/` (the unpacked tree), `stamp.txt` (written last).
+/// `cache/sysroot/<name>/` (Layout::sysroot): `debs/` (the downloads), `root/` (the unpacked tree), `stamp.txt` (written last).
 fn sysroot_dir(root: &Path, name: &str) -> Result<PathBuf> {
-    Ok(Layout::of(root)?
-        .workspace()
-        .join("cache")
-        .join("sysroot")
-        .join(name))
+    Ok(Layout::of(root)?.sysroot(name))
 }
 
 /// The unpacked tree of sysroot row `name`, once every pin is fetched at its indexed SHA256. `xtask cross` links against it.

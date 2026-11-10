@@ -19,7 +19,7 @@
 #   isa               ISA baseline of this host's own code, cross builds only (`xtask cross`, `xtask native` of a host other than the build machine): `rv64gc_` + Z extensions. The Rust target fixes the base; each extension becomes a `+ext` rustc target feature. Checked: base is rv64gc, every extension is a rustc feature of `rust`. isa_gate checks each output's `Tag_RISCV_arch` against the closure (implied extensions included, arches.rs isa_closure).
 #   glibc_floor       newest GLIBC_x.y an output of this host may need: the glibc of the oldest machine it runs on (owner decision). Cross hosts only (with isa). Checked: dotted version; isa_gate fails any output that needs a newer one.
 #   clang             clang triple of the cross compiler and link driver (`--target=<it>`), cross builds only; its arch part is the arch name. Checked: clang accepts it.
-#   sysroot           deps.toml row of the sysroot cross builds use (a `sysroot_debs` row), cross builds only. Checked: the row exists.
+#   sysroot           deps.toml row of this host's sysroot (a `sysroot_debs` row). Every host's atl-bridgegen probes read it (atl-bridgegen buildscript::host_sysroot_args), the build machine's too; a cross build also links against it. Checked: the row exists.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -104,6 +104,7 @@ meson_cpu_family = "x86_64"
 debian = "amd64"
 archlinux = "x86_64"
 soong_prebuilt_os = "linux-x86"
+sysroot = "x86-64-sysroot"
 
 [x86_64.guest]
 android_abis = ["x86_64"]
