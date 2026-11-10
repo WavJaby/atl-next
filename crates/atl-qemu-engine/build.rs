@@ -97,6 +97,10 @@ const BREAKS: &[(&str, &str)] = &[
     ("no-boot-join", "atl_qe_no_boot_join"),
     // gate (r): attach skips the copy's queued work (its plugin init hook), so detach's exit hook asserts (plugins/core.c:293)
     ("no-init-drain", "atl_qe_no_init_drain"),
+    // gate (qemu-abi, d): call_ex writes no stack words, so the callee's 9th int and 9th double read whatever lies at sp
+    ("call-stack", "atl_qe_call_stack"),
+    // gate (qemu-abi, d): call_ex sets no FP lane, so the callee's double arguments read the CPU's own v0..v7
+    ("call-v", "atl_qe_call_v"),
 ];
 
 fn selected_breaks() -> Result<Vec<&'static str>> {

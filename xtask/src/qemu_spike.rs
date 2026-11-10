@@ -722,6 +722,18 @@ pub(crate) fn engine_so_file(root: &Path, b: &Build, out: &Path) -> Result<PathB
     )
 }
 
+/// The engine `.so` with break `brk` (atl-qemu-engine build.rs `BREAKS`) as `out/<brk>.so`, linked as [`engine_so_file`] links the plain one. Same `out` as the plain build: the cargo target dir is shared, so only the engine crate rebuilds.
+pub(crate) fn engine_so_break(root: &Path, b: &Build, out: &Path, brk: &str) -> Result<PathBuf> {
+    let staticlib = engine_staticlib(root, b, out, brk, Some(brk))?;
+    engine_link(
+        b,
+        &staticlib,
+        out,
+        &format!("{brk}.so"),
+        engine_abi::TLS_EXPORTS,
+    )
+}
+
 /// The engine's staticlib (`libatl_qemu_engine.a`) built with feature `engine-so`; `brk` selects a break's cfg. Copied to `out` under `tag`, so later builds do not overwrite it.
 fn engine_staticlib(
     root: &Path,

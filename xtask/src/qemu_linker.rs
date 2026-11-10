@@ -282,7 +282,8 @@ pub(crate) fn harness(
     .current_dir(root);
     match brk {
         // a harness-level break changes the fixture files, not the product build
-        Some(b) if b != SKIP_RELOC => cmd.env("ATL_NB_BREAK", b),
+        Some(b) if b != SKIP_RELOC && h.breaks.contains(&b) => cmd.env("ATL_NB_BREAK", b),
+        // a break the harness does not list is in the caller's env (an engine break): this run is judged as a break, the native build is plain
         _ => cmd.env_remove("ATL_NB_BREAK"),
     };
     let run =

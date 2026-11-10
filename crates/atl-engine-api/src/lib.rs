@@ -90,14 +90,14 @@ pub type MapFn =
 pub type AttachFn = unsafe extern "C" fn(engine: *mut AtlEngine, out: *mut *mut AtlCpu) -> c_int;
 /// `atl_engine_v1::detach`.
 pub type DetachFn = unsafe extern "C" fn(engine: *mut AtlEngine, cpu: *mut AtlCpu);
-/// `atl_engine_v1::call`: `tp` in and out, `args` is four u64.
-pub type CallFn = unsafe extern "C" fn(
+/// `atl_engine_v1::call_ex` (minor 1): `tp` in and out; `lanes` in and out (the answer is `x[0]` and `v[0]`).
+pub type CallExFn = unsafe extern "C" fn(
     engine: *mut AtlEngine,
     cpu: *mut AtlCpu,
     tp: *mut u64,
     f: u64,
-    args: *const u64,
-) -> u64;
+    lanes: *mut AtlLanesV1,
+);
 
 /// `atl_engine_v1`: the table the engine `.so` exports as `atl_engine_v1`.
 #[repr(C)]
@@ -119,6 +119,8 @@ pub struct AtlEngineV1 {
     pub attach: Option<AttachFn>,
     /// Releases a CPU from [`AtlEngineV1::attach`].
     pub detach: Option<DetachFn>,
-    /// Runs guest code on a CPU.
-    pub call: Option<CallFn>,
+    /// Minor 0's `call`, retired in minor 1: NULL. Keeps `call_ex`'s offset.
+    pub retired_call: Option<unsafe extern "C" fn()>,
+    /// Minor 1: runs guest code with lanes on a CPU.
+    pub call_ex: Option<CallExFn>,
 }

@@ -94,7 +94,9 @@ mod abi_check {
     const _: () = assert!(offset_of!(AtlEngineV1, map) as u64 == l::ATL_OFFSET_ENGINE_MAP);
     const _: () = assert!(offset_of!(AtlEngineV1, attach) as u64 == l::ATL_OFFSET_ENGINE_ATTACH);
     const _: () = assert!(offset_of!(AtlEngineV1, detach) as u64 == l::ATL_OFFSET_ENGINE_DETACH);
-    const _: () = assert!(offset_of!(AtlEngineV1, call) as u64 == l::ATL_OFFSET_ENGINE_CALL);
+    const _: () =
+        assert!(offset_of!(AtlEngineV1, retired_call) as u64 == l::ATL_OFFSET_ENGINE_RETIRED_CALL);
+    const _: () = assert!(offset_of!(AtlEngineV1, call_ex) as u64 == l::ATL_OFFSET_ENGINE_CALL_EX);
 }
 
 /// The C ABI (QEMU bridge plan Q5-1a), built into the engine `.so` only: the table `atl_engine_v1` and its functions, contract in `include/atl_engine.h`. One engine per process.
@@ -150,7 +152,7 @@ mod capi {
         unsafe { (host.trap)(host.ctx, kind as u32, 0, regs.as_ptr()) }
     }
 
-    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` (minor 1) with the guest's x0..x7, v0..v7 and eight stack words. The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
+    /// The engine's `OnTrap` for the C host. BOOT and REPORT go through `trap`; CALL and BIND through `trap_ex` (minor 1) with the guest's x0..x7, v0..v7 and eight stack words (a word past the guest's mapped memory is 0). The host's v0 answer is written to the guest here; its x0 is the trap's result (set by the trap dispatch).
     fn host_trap(g: Guest, t: Trap) -> u64 {
         let host = HOST
             .get()
@@ -168,7 +170,7 @@ mod capi {
         let mut lanes = AtlLanesV1 {
             x,
             v: std::array::from_fn(|i| g.v(i)),
-            stack: std::array::from_fn(|i| g.stack_word(i)),
+            stack: std::array::from_fn(|i| g.stack_word(i).unwrap_or(0)),
         };
         // SAFETY: host.trap_ex and host.ctx are the host's, valid by the ABI (HostRef); lanes is a live AtlLanesV1 that the host reads and answers.
         unsafe { (host.trap_ex)(host.ctx, kind as u32, id, &mut lanes) };
@@ -272,24 +274,23 @@ mod capi {
         drop(unsafe { Box::from_raw(cpu.cast::<Cpu>()) });
     }
 
-    unsafe extern "C" fn call(
+    unsafe extern "C" fn call_ex(
         engine: *mut AtlEngine,
         cpu: *mut AtlCpu,
         tp: *mut u64,
         f: u64,
-        args: *const u64,
-    ) -> u64 {
-        if !is_engine(engine) || cpu.is_null() || tp.is_null() || args.is_null() {
-            fail("call: not this process's engine, or no CPU, thread pointer or arguments");
+        lanes: *mut AtlLanesV1,
+    ) {
+        if !is_engine(engine) || cpu.is_null() || tp.is_null() || lanes.is_null() {
+            fail("call_ex: not this process's engine, or no CPU, thread pointer or lanes");
         }
         // SAFETY: cpu came from attach and lives until detach, on this thread (the ABI).
         let cpu = unsafe { &*cpu.cast::<Cpu>() };
-        // SAFETY: args points at four u64 and tp is writable (the ABI).
-        let (a, t) = unsafe { (std::slice::from_raw_parts(args, 4), *tp) };
-        let (x0, tp_out) = cpu.guest().call_on(t, f, a);
+        // SAFETY: lanes is a live AtlLanesV1 that the call reads and answers, and tp is writable (the ABI).
+        let (lanes, t) = unsafe { (&mut *lanes, *tp) };
+        let tp_out = cpu.guest().call_lanes(t, f, lanes);
         // SAFETY: tp is writable (the ABI).
         unsafe { *tp = tp_out };
-        x0
     }
 
     /// The table the engine `.so` exports (version script: `atl_engine_v1` is the only global symbol of its kind).
@@ -309,6 +310,7 @@ mod capi {
         map: Some(map),
         attach: Some(attach),
         detach: Some(detach),
-        call: Some(call),
+        retired_call: None,
+        call_ex: Some(call_ex),
     };
 }

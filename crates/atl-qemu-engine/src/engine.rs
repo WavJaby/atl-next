@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+use atl_engine_api::AtlLanesV1;
+
 use crate::layout::CPUArchState as Env;
 
 /// What reached the host from the guest.
@@ -516,12 +518,15 @@ impl Guest {
         self.set_reg(at + 8, 0);
     }
 
-    /// Stack word `i` (0..8) at the guest's sp: where a call's stack arguments sit. Guest = host (identity), so the word is read at its host address. Words past sp can run past a shallow thread's stack top (QEMU bridge plan R-5); the trap reads all eight.
-    pub fn stack_word(&self, i: usize) -> u64 {
+    /// Stack word `i` (0..8) at the guest's sp: where a call's stack arguments sit. `None` when the word's address is not mapped for the guest (QEMU bridge plan R-5: the trap reads all eight, and past a shallow thread's stack top they are refused, not read). Identity: a mapped word is read at its host address.
+    pub fn stack_word(&self, i: usize) -> Option<u64> {
         assert!(i < 8, "stack word {i}");
-        let sp = self.x(31) + 8 * i as u64;
-        // SAFETY: sp is the guest's stack in the identity map (the trapping CPU's own sp); the host address is mapped while the guest runs, and an unaligned read is fine for any alignment.
-        unsafe { (self.host_addr(sp) as *const u64).read_unaligned() }
+        let addr = self.x(31) + 8 * i as u64;
+        if addr > *lib().guest_addr_max as u64 || self.page_flags(addr) & page::VALID == 0 {
+            return None;
+        }
+        // SAFETY: the page is mapped for the guest, so its host address is mapped (identity); an unaligned read is fine for any alignment.
+        Some(unsafe { (self.host_addr(addr) as *const u64).read_unaligned() })
     }
 
     pub fn pc(&self) -> u64 {
@@ -559,30 +564,53 @@ impl Guest {
         self.call_on(self.tp(), f, args).0
     }
 
-    /// Calls guest function `f` with `args` in x0.. on thread pointer `tp`; returns its x0 and the thread pointer it returned with. Nested: may run from inside a trap callback, which may itself call again.
-    /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
+    /// Calls guest function `f` with `args` in x0.. on thread pointer `tp`; returns its x0 and the thread pointer it returned with. The integer lanes of [`Guest::call_lanes`].
     pub fn call_on(&self, tp: u64, f: u64, args: &[u64]) -> (u64, u64) {
         assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
+        let mut lanes = AtlLanesV1::default();
+        lanes.x[..args.len()].copy_from_slice(args);
+        let tp_out = self.call_lanes(tp, f, &mut lanes);
+        (lanes.x[0], tp_out)
+    }
+
+    /// Calls guest function `f` with `lanes` on thread pointer `tp`: x0..x7, v0..v7 (low 64 bits) and the eight stack words at the callee's sp. The answer is `lanes.x[0]` and `lanes.v[0]`; returns the thread pointer the call returned with. Nested: may run from inside a trap callback, which may itself call again.
+    /// The whole CPU state is saved and restored around the call (the thread pointer included), so the interrupted guest code resumes exactly where its trap left it.
+    pub fn call_lanes(&self, tp: u64, f: u64, lanes: &mut AtlLanesV1) -> u64 {
         let ret = ret_stub();
         assert!(ret != 0, "no BOOT trap yet: no return stub");
         let mut saved = vec![0u8; Env::SIZE];
         // SAFETY: env is a live CPUArchState of Env::SIZE bytes (clang layout); saved is that long.
         unsafe { std::ptr::copy_nonoverlapping(self.env, saved.as_mut_ptr(), Env::SIZE) };
         self.set_tp(tp);
-        for (i, a) in args.iter().enumerate() {
+        for (i, a) in lanes.x.iter().enumerate() {
             self.set_x(i, *a);
+        }
+        // break `call-v` (qemu-abi gate, check d): the FP lanes are not set, so v0..v7 keep the CPU's values
+        if !cfg!(atl_qe_call_v) {
+            for (i, v) in lanes.v.iter().enumerate() {
+                self.set_v(i, *v);
+            }
         }
         // AAPCS64: sp 16-aligned; below the interrupted frame (no red zone on aarch64, the margin is for a stray store)
         let sp = (self.x(31) - 256) & !15;
+        // break `call-stack` (qemu-abi gate, check d): the stack words are not written, so the callee's stack arguments are what lies at sp
+        if !cfg!(atl_qe_call_stack) {
+            for (i, w) in lanes.stack.iter().enumerate() {
+                // SAFETY: sp..sp+64 lies in the CPU's guest stack below the interrupted sp, where the callee's own frame goes too; the host address is mapped (identity).
+                unsafe { (self.host_addr(sp + 8 * i as u64) as *mut u64).write_unaligned(*w) };
+            }
+        }
         self.set_x(31, sp);
         self.set_x(30, ret);
         self.set_reg(Env::pc, f);
         // SAFETY: cpu_loop on this thread's CPU; P1 makes it return when the guest reaches `svc #RET` (trap.rs).
         unsafe { (lib().cpu_loop)(self.env.cast()) };
-        let r = (self.x(0), self.tp());
+        lanes.x[0] = self.x(0);
+        lanes.v[0] = self.v(0);
+        let tp_out = self.tp();
         // SAFETY: as for the save.
         unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.env, Env::SIZE) };
-        r
+        tp_out
     }
 
     /// Whether guest and host addresses are the same (`guest_base` 0, `-B 0`). Not merely a convenience: with a nonzero base TCG on an x86_64 host sets GS to it (tcg/x86_64/tcg-target.c.inc, `ARCH_SET_GS`), which ART owns on every thread.

@@ -225,28 +225,34 @@ pub fn detach_current() {
     unsafe { detach(e.handle, cpu) };
 }
 
-/// Calls guest `f(args)` on this thread's CPU (at most four arguments, the ABI's call) with thread pointer `tp` in and out; returns x0. Nests: from inside a trap callback too.
-fn call_on(tp: &mut u64, f: u64, args: &[u64]) -> u64 {
-    assert!(args.len() <= 4, "the engine's call takes four arguments");
+/// Calls guest `f` on this thread's CPU with thread pointer `tp` in and out (`atl_engine_v1.call_ex`): `lanes` in, the answer in `lanes.x[0]` and `lanes.v[0]`. Nests: from inside a trap callback too.
+fn call_on(tp: &mut u64, f: u64, lanes: &mut AtlLanesV1) {
     let e = engine();
     let cpu = CPU.with(Cell::get);
     if cpu.is_null() {
         unsupported("qemu crossing: no guest CPU on this thread (attach_current)");
     }
-    let call = e
+    let ex = e
         .table
-        .call
-        .unwrap_or_else(|| unsupported("engine table has no call"));
-    let mut a = [0u64; 4];
-    a[..args.len()].copy_from_slice(args);
-    // SAFETY: handle and cpu are the engine's; cpu was attached on this thread (CPU is set only by attach_current); tp is writable; a holds four u64.
-    unsafe { call(e.handle, cpu, tp, f, a.as_ptr()) }
+        .call_ex
+        .unwrap_or_else(|| unsupported("engine table has no call_ex"));
+    // SAFETY: handle and cpu are the engine's; cpu was attached on this thread (CPU is set only by attach_current); tp and lanes are writable and live for the call.
+    unsafe { ex(e.handle, cpu, tp, f, lanes) }
 }
 
-/// Calls guest `f(args)` on this thread's CPU with thread pointer 0 (the boot executable has none). For the gates; the crossing uses [`call_guest`].
+/// Calls guest `f(args)` (integer arguments, at most eight) on this thread's CPU with thread pointer 0 (the boot executable has none); returns x0. For the gates; the crossing uses [`call_guest`].
 pub fn call(f: u64, args: &[u64]) -> u64 {
+    assert!(args.len() <= 8, "{} arguments, x0..x7 only", args.len());
+    let mut lanes = AtlLanesV1::default();
+    lanes.x[..args.len()].copy_from_slice(args);
+    call_ex(f, &mut lanes);
+    lanes.x[0]
+}
+
+/// Calls guest `f` with `lanes` on this thread's CPU with thread pointer 0; the answer is `lanes.x[0]` and `lanes.v[0]`. For the gates (qemu-abi's host-to-guest checks).
+pub fn call_ex(f: u64, lanes: &mut AtlLanesV1) {
     let mut tp = 0;
-    call_on(&mut tp, f, args)
+    call_on(&mut tp, f, lanes);
 }
 
 /// Starts the guest: [`boot`] on `library` and `boot_exe`, [`attach_current`], `Guest::start(&cfg)`, then `then` with its result. `then`'s answer is the process's exit status, so this returns only if the start fails.
@@ -402,11 +408,12 @@ impl super::Engine for Qemu {
             super::Tp::Bootstrap => bootstrap_tcb(),
             super::Tp::Guest(t) => t,
         });
-        let args = args.map(|v| v as u64);
+        let mut lanes = AtlLanesV1::default();
+        lanes.x[..4].copy_from_slice(&args.map(|v| v as u64));
         let mut guest_tp = cpu.guest_fs() as u64;
-        let r = call_on(&mut guest_tp, f as u64, &args);
+        call_on(&mut guest_tp, f as u64, &mut lanes);
         cpu.set_guest_fs(guest_tp as usize);
-        r as usize
+        lanes.x[0] as usize
     }
 }
 

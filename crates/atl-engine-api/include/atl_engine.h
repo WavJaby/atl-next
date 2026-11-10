@@ -33,7 +33,7 @@ enum atl_trap_kind {
 typedef struct atl_engine atl_engine; /* opaque, one per process */
 typedef struct atl_cpu atl_cpu;       /* opaque, one per attached host thread */
 
-/* Minor 1: the lanes of a host call or trap beyond the integer registers. x = x0..x7 and v = the low 64 bits of v0..v7 (in); stack = the eight words at the guest's sp (in). The answer is x[0] and v[0]. */
+/* Minor 1: the lanes of a host call or trap beyond the integer registers. x = x0..x7 and v = the low 64 bits of v0..v7 (in); stack = the eight words at the guest's sp (in; a word past the guest's mapped memory is 0). The answer is x[0] and v[0]. */
 typedef struct atl_lanes_v1 {
     uint64_t x[8];
     uint64_t v[8];
@@ -59,8 +59,10 @@ typedef struct atl_engine_v1 {
     /* Gives the calling thread its guest CPU (a copy of the boot CPU, as clone makes one). */
     int (*attach)(atl_engine *engine, atl_cpu **out);
     void (*detach)(atl_engine *engine, atl_cpu *cpu);
-    /* Runs guest f(args...) on cpu; *tp is the thread pointer in and out; returns x0. */
-    uint64_t (*call)(atl_engine *engine, atl_cpu *cpu, uint64_t *tp, uint64_t f, const uint64_t args[4]);
+    /* Minor 0's call (x0..x3 in, x0 out) is retired in minor 1: call_ex replaces it, and the engine leaves this slot NULL. The slot stays so call_ex keeps its append-only offset. */
+    void *retired_call;
+    /* Minor 1: runs guest f(lanes) on cpu; *tp is the thread pointer in and out. lanes in and out: x, v and stack are the callee's arguments (stack at the callee's sp, below the interrupted sp); the answer is lanes->x[0] and lanes->v[0]. */
+    void (*call_ex)(atl_engine *engine, atl_cpu *cpu, uint64_t *tp, uint64_t f, atl_lanes_v1 *lanes);
 } atl_engine_v1;
 
 #endif /* ATL_ENGINE_H */
