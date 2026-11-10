@@ -39,7 +39,7 @@
 cargo = "apkeep"
 version = "1.1.0"
 scope = ["test"]
-used_by = ["xtask:fetch"]
+used_by = ["optional:xtask:fetch"]
 
 [bison]
 debian = "bison"
