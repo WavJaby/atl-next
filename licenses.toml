@@ -584,6 +584,10 @@ reason = "\"Generated automatically by makefixed()\" of inflate.c, under the zli
 licence = "Zlib"
 reason = "\"header created automatically with -DGEN_TREES_H\" by trees.c, under the zlib.h licence"
 
+[upstream.aosp.paths."external/zlib/Android.bp"]
+licence = "Zlib"
+reason = "no notice; the package declares SPDX-license-identifier-BSD and -Zlib (external_zlib_license), but its license_text LICENSE is the zlib licence alone (no BSD text)"
+
 [upstream.aosp.paths."frameworks/base/media/java/android/media/quality/include/quality/MediaQualityManager.h"]
 licence = "Apache-2.0"
 reason = "AOSP code without a notice; its package media/java/android/media/quality/Android.bp: the kinds imported from frameworks_base_license for it are \"SPDX-license-identifier-Apache-2.0\" alone"
