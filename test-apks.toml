@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: MIT
-# The test APKs `xtask run-apk <row>` runs: pinned official builds, never built here. A row's file is downloaded once into <workspace>/cache/test-apks/<sha256>.apk; every use re-verifies it, so a damaged or swapped file is refused by name, never run.
+# The test APKs `xtask run-apk <row>` runs: pinned official builds, never built here. A url row's file is downloaded once into <workspace>/cache/test-apks/<sha256>.apk; a google-play row's files are fetched by apkeep (`xtask fetch --test-apks --play --play-email <addr> --execute`) into the same cache, one file per sha256. Every use re-verifies the files, so a damaged or swapped file is refused by name, never run.
 #
 # Row key: the name `xtask run-apk` takes (lowercase letters, digits, `-`).
-# Fields, all required:
+# Fields, all required unless marked:
 #   package       application id. run-apk checks it against the APK's own manifest.
 #   version_name  the APK's own versionName: run-apk checks it against the manifest. A github-release url's tag need not equal it.
 #   version_code  integer. run-apk checks it against the manifest. fdroid: the url's file name must be `<package>_<version_code>.apk`.
+#   signer_sha256 64 lowercase hex digits of the signing certificate's SHA-256: the first certificate of the first signer of the v2 signing block (v3 when there is no v2), apksigner's `Signer #1 certificate SHA-256 digest`. Checked against every file of the row.
+#   source        fdroid | github-release | google-play. Decides the other fields.
+# url rows (fdroid, github-release):
 #   url           https. fdroid: https://f-droid.org/repo/<package>_<version_code>.apk. github-release: https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>.apk
 #   sha256        64 lowercase hex digits of the downloaded file. Checked at download and at every use of the cache.
 #   size          bytes of the downloaded file. Same.
-#   signer_sha256 64 lowercase hex digits of the signing certificate's SHA-256: the first certificate of the first signer of the v2 signing block (v3 when there is no v2), apksigner's `Signer #1 certificate SHA-256 digest`. Same.
-#   source        fdroid | github-release. Fixes the shape of the url.
-# `cargo xtask check` (step tables) checks the schema and the url and file-name invariants. The content fields are checked against the file itself: `xtask fetch --test-apks --execute` downloads and verifies every row, `xtask run-apk` verifies the row it runs. A mismatch refuses the row and names the field.
+# google-play rows (no url, sha256 or size):
+#   device        apkeep's device profile (`-o device=`), e.g. px_9a: Play serves each device its own splits. Checked by the fetch: another device's splits fail the pins.
+#   files         the base (`name = "base"`) and each split, as `{ name, sha256, size }`. Each is pinned like a url row's file. apkeep names them `<package>.apk` (base) and `<package>.<name>.apk`.
+# `cargo xtask check` (step tables) checks the schema and the url and file-name invariants. The content fields are checked against the files themselves: `xtask fetch --test-apks --execute` downloads and verifies every row, `xtask run-apk` verifies the row it runs. A mismatch refuses the row and names the file and the field.
 # Rows are added when a gate first needs them.
 
 # fdroid rows: signed with Fossify's key (CN=Naveen Singh), the signer the measured builds carry
@@ -45,3 +49,20 @@ sha256 = "fe8658062885413953798af76e2df85b4d65f9c756f233268dc5e607d7435e09"
 size = 35799987
 signer_sha256 = "597d7771ec20993d1c45310913d2d4e4e8de1638b4ba58c5fbfbc071812236f4"
 source = "github-release"
+
+# google-play row: Battle Cats TW 15.7.0, the base and every split. Values read from the local copy in ~/atl-next/apk/battle-cats-tw (2026-11-10).
+# device px_9a is inferred, not read back from Play: apkeep's default, and its arm64_v8a and xxhdpi splits fit a Pixel 9a.
+[battle-cats-tw]
+package = "jp.co.ponos.battlecatstw"
+version_name = "15.7.0"
+version_code = 1507000
+signer_sha256 = "baf876d554213331c6fe5f6bbf9ae9af2f95c20e82b14bc232b0ac3a77680cb1"
+source = "google-play"
+device = "px_9a"
+files = [
+  { name = "base", sha256 = "69287b3de76db4032eb9b27143440a7ff8f46bed8cbaab9d554721deb958d7c9", size = 25889348 },
+  { name = "InstallPack", sha256 = "f07f170a3d2dd22b2d1becbfa2c5b2471b3a5e02c51134d0807540d6bf275605", size = 116909532 },
+  { name = "config.arm64_v8a", sha256 = "88aa6d16397b8ed706d0fb4c4801e2a9b79ebc51a455cafa2687984e70e079c6", size = 15270778 },
+  { name = "config.xxhdpi", sha256 = "1556e749bcb7b2dc23a1007db4928bf2c705d86b397d0fc4b37b25464fbfdd87", size = 207150 },
+  { name = "config.en", sha256 = "36395ef2dde71e80ef49e31e0af27e337db802572239d141a909d532b050383d", size = 45266 },
+]

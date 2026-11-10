@@ -120,6 +120,19 @@ pub struct Args {
     /// Instead of the checkouts: every test APK of test-apks.toml into `<workspace>/cache/test-apks`, verified (size, sha256, signing certificate). Dry run unless --execute, which downloads what is missing or damaged.
     #[arg(long, conflicts_with_all = ["bump", "add", "migrate_git_dirs"])]
     test_apks: bool,
+    /// With --test-apks: also the google-play rows, fetched by apkeep with the Play token (tier 1: Secret Service; tier 2: stdin). Needs --play-email. Without it those rows are listed as skipped.
+    #[arg(long, requires_all = ["test_apks", "play_email"])]
+    play: bool,
+    /// With --test-apks --play: the Google account apkeep signs in with. This flag is the only way to give it.
+    #[arg(long, value_name = "EMAIL", requires = "play")]
+    play_email: Option<String>,
+    /// With --test-apks: store the Play token read from stdin in the Secret Service (`secret-tool store`) and exit. Nothing is downloaded.
+    #[arg(
+        long,
+        requires = "test_apks",
+        conflicts_with_all = ["play", "execute"]
+    )]
+    store_token: bool,
     /// Delete and clone again the checkouts of these pinned AOSP projects (tree paths) whose keep-set differs from sources.toml [aosp.sparse]: a keep-set is fixed at creation. Only a checkout at its pin with no uncommitted changes; the remote must still resolve the pin. Dry run unless --execute.
     #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with_all = ["bump", "add", "migrate_git_dirs", "test_apks"])]
     recreate: Vec<String>,
@@ -127,7 +140,16 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.test_apks {
-        crate::test_apks::fetch(root, args.execute)?;
+        if args.store_token {
+            crate::test_apks::store_token()?;
+        } else {
+            // clap requires --play and --play-email together, so the email is there exactly when Play is asked for
+            let play = match (args.play, args.play_email.as_deref()) {
+                (true, Some(email)) => Some(email),
+                _ => None,
+            };
+            crate::test_apks::fetch(root, args.execute, play)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if args.migrate_git_dirs {
@@ -159,6 +181,9 @@ pub fn add_and_fetch(root: &Path, paths: &[String]) -> Result<()> {
         jobs: None,
         migrate_git_dirs: false,
         test_apks: false,
+        play: false,
+        play_email: None,
+        store_token: false,
         recreate: Vec::new(),
     };
     ensure!(fetch(root, &args)?, "fetch failed (rows above)");
