@@ -93,6 +93,9 @@ pub struct RemoteArgs {
     /// A pointer script atld injects from the app's first present (`run-apk --pointer`).
     #[arg(long, value_name = "SCRIPT")]
     pointer: Option<String>,
+    /// A variable in atld's environment on the target, `KEY=VALUE`, repeatable: what the desktop sets for a launch, e.g. NVIDIA's offload `__NV_PRIME_RENDER_OFFLOAD=1` (the run is otherwise `env -i`).
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+    env: Vec<(String, String)>,
     /// The native out dir holding the record, the bundle and the run (default: this checkout's slot, see `xtask slot`).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -294,7 +297,8 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     let rt = match &a.display {
         Some(display) => rt.with_display(display.clone()),
         None => rt,
-    };
+    }
+    .with_desktop_env(&a.env);
     let work = rt.out.join("run-apk");
     std::fs::create_dir_all(&work)?;
     let (apk, m) = package(&rt, &apk_file, pin.as_ref(), &a.target, &work)?;
@@ -408,6 +412,9 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             end_ms,
         };
         judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
+    });
+    let outcome = outcome.and_then(|ok| {
+        display_node_check(&read(&run.scratch.join("atld.log"))).map(|gpu| format!("{ok}; {gpu}"))
     });
     copy_logs(&run, &logs)?;
     println!(
@@ -596,6 +603,32 @@ fn copy_logs(run: &Run, to: &Path) -> Result<()> {
 }
 
 /// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines, and where the logs are.
+/// `KEY=VALUE` of `--env`.
+fn parse_env(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
+        _ => Err(format!("`{s}`: want KEY=VALUE")),
+    }
+}
+
+/// A remote target's desktop with a DRM render node renders on a GPU (the gate's targets are real desktops; a software-only desktop is not one), so its Wayland EGL display must report that node: atld's `gpu:` line must be the display tier.
+/// The trial tier there means the probe lost the node (gpu-selection.md G1 break). Ok: atld's `gpu:` line.
+fn display_node_check(atld_log: &str) -> Result<String, String> {
+    let gpu = atld_log
+        .lines()
+        .find_map(|l| l.strip_prefix("atld: gpu: "))
+        .ok_or("atld logged no `gpu:` line")?;
+    let render_node = atld_log
+        .lines()
+        .any(|l| l.starts_with("atld: gpu-probe: devices") && l.contains("/dev/dri/renderD"));
+    if render_node && !gpu.contains("(display, ") {
+        return Err(format!(
+            "the target has a render node but its display reported none: gpu: {gpu}"
+        ));
+    }
+    Ok(format!("gpu: {gpu}"))
+}
+
 fn finish(
     outcome: Result<String, String>,
     app: &str,
@@ -714,6 +747,25 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.
+    #[test]
+    fn display_node_check_reds_a_lost_node() {
+        let probe = "atld: gpu-probe: devices [\"/dev/dri/card0\", \"/dev/dri/renderD128\"]\n";
+        let display = "atld: gpu: node /dev/dri/renderD128 (display, renderer Mesa Intel(R) Graphics (LNL))\n";
+        let trial = "atld: gpu: display reports no node (renderer llvmpipe); allocator node /dev/dri/renderD128 by trial\n";
+        assert!(display_node_check(&format!("{probe}{display}")).is_ok());
+        let e = display_node_check(&format!("{probe}{trial}")).unwrap_err();
+        assert!(e.contains("reported none"), "{e}");
+        // no render node shown to the probe: the trial tier is the display's real answer
+        assert!(
+            display_node_check(&format!(
+                "atld: gpu-probe: devices [\"/dev/dri/card0\"]\n{trial}"
+            ))
+            .is_ok()
+        );
+        assert!(display_node_check(probe).is_err());
+    }
 
     const RESUME: &str =
         "services: activity resumed org.x.Main at=100.000\nservices: activity settled at=100.001\n";

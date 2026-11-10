@@ -29,7 +29,7 @@ use atl_android_paths::{
     DATA, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_FONTS, SYSTEM_FRAMEWORK, VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StartRequest};
-use atl_broker::{Broker, Link, Mount, Process, Spawn, kill_sandbox, to_log};
+use atl_broker::{Broker, Link, Mount, Process, Spawn, gpu, kill_sandbox, to_log};
 use atl_gralloc::node::{self, NodeSource};
 use atl_gralloc::vintf;
 use atl_property_service::{LinearTier, Property};
@@ -213,8 +213,6 @@ const READY: Duration = Duration::from_secs(20);
 const READY_LINE: &str = "services: ready";
 /// What atl-gralloc-allocator prints once registered: `gralloc: ready (<DRM node>)`.
 const GRALLOC_READY_LINE: &str = "gralloc: ready";
-/// The DRM device directory the allocator opens (atl_gralloc_service::backend::DRM_DIR); the sandbox's `/dev` is otherwise minimal.
-const DRM_DIR: &str = "/dev/dri";
 /// framework-res's installed name in /system/framework (AssetManager.FRAMEWORK_APK_PATH_DEVICE).
 const FRAMEWORK_RES: &str = "framework-res.apk";
 /// The target SDK of a process that is not an app (the shell's `am`): 0 = the platform's level, bionic's own meaning (atl-app-launcher args).
@@ -590,7 +588,7 @@ struct Host {
     desktop_ro: Vec<Mount>,
     /// The desktop's PipeWire socket (atl_platform_host::app_access::pipewire_socket): every app process gets it read-only at its own path and names it to its launcher (`--pipewire-socket`). None: no server, and the apps' tracks fail.
     pipewire: Option<PathBuf>,
-    /// The device nodes each app process may open (set where the tier is probed, `run`).
+    /// The device nodes each app process may open: the run's GPU's class and the heap tier's heap (`run`).
     app_devices: Vec<PathBuf>,
     /// The run's GPU: gralloc's DRM node and how it was chosen, pushed to each app process (atl_gralloc::node). None: no gralloc in this run.
     gpu: Option<(String, NodeSource)>,
@@ -1079,14 +1077,6 @@ fn run(a: &Args) -> Result<ExitCode> {
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
     let defaults = property_area(a, &r, tier)?;
-    // the GPU's DRM nodes, as AOSP grants every non-isolated app gpu_device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them; without them it falls back to the software device, which cannot import a window's buffers.
-    // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
-    let app_devices = std::iter::once(PathBuf::from(DRM_DIR))
-        .chain(
-            (tier == LinearTier::DmaBufHeap)
-                .then(|| PathBuf::from(atl_property_service::DMA_HEAP_SYSTEM)),
-        )
-        .collect();
     let boot = system_layout(a, &r)?;
     let fonts = font_layout(a, &r)?;
     vintf_layout(a, &r)?;
@@ -1202,7 +1192,9 @@ fn run(a: &Args) -> Result<ExitCode> {
                     false,
                     None,
                 )?;
-                spawn.devices = vec![PathBuf::from(DRM_DIR)];
+                // every GPU's class: the probe asks which one the display picks, and NVIDIA's EGL opens its nodes even to decline
+                spawn.devices = gpu::all_device_classes().context("the GPUs' device nodes")?;
+                log(format_args!("gpu-probe: devices {:?}", spawn.devices));
                 spawn.mounts.extend(desktop_mounts()?);
                 let mut p = broker
                     .spawn(spawn)
@@ -1223,10 +1215,15 @@ fn run(a: &Args) -> Result<ExitCode> {
             }
         };
         let mut spawn = system_spawn("gralloc", program, vec![], false, None)?;
-        spawn.devices = vec![PathBuf::from(DRM_DIR)];
-        if let Ok((n, _)) = &display_node {
-            spawn.args = vec!["--drm-node".into(), n.into()];
+        // the display's GPU only; the trial tier tries every node, so it sees every GPU
+        spawn.devices = match &display_node {
+            Ok((n, _)) => {
+                spawn.args = vec!["--drm-node".into(), n.into()];
+                gpu::device_class(Path::new(n))
+            }
+            Err(_) => gpu::all_device_classes(),
         }
+        .context("gralloc's device nodes")?;
         let mut p = broker
             .spawn(spawn)
             .context("starting atl-gralloc-allocator")?;
@@ -1267,6 +1264,18 @@ fn run(a: &Args) -> Result<ExitCode> {
     let (done_tx, done_rx): (Sender<End>, Receiver<End>) = channel();
     // the services and every app process answer with this one display
     let display = a.display.unwrap_or_else(host_display);
+    // the run's GPU's device class (gpu::device_class), as AOSP grants an app gpu_device per device (system/sepolicy private/app.te:393): the host EGL driver renders into, and imports, the gralloc dmabufs through them;
+    // without them it falls back to the software device, which cannot import a window's buffers. No gralloc: no chosen GPU, every GPU's class.
+    // + the DMABUF system heap on the heap tier only (narrowest grant): Codec2 allocates linear blocks from it in the app process
+    let mut app_devices = match &gpu {
+        Some((n, _)) => gpu::device_class(Path::new(n)),
+        None => gpu::all_device_classes(),
+    }
+    .context("the apps' device nodes")?;
+    if tier == LinearTier::DmaBufHeap {
+        app_devices.push(PathBuf::from(atl_property_service::DMA_HEAP_SYSTEM));
+    }
+    log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
         app_devices,
         gpu,

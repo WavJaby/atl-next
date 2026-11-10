@@ -10,6 +10,7 @@
 
 pub mod bwrap;
 pub mod control;
+pub mod gpu;
 mod seccomp;
 
 use std::ffi::{OsStr, OsString};
